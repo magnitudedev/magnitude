@@ -3,6 +3,7 @@ import type { PlannerClient, ExecutorClient, TestCaseAgent, Magnus } from 'magni
 
 export interface TestOptions {
     url?: string;
+    path?: string;
     //name?: string;
 }
 
