@@ -28,16 +28,26 @@ function testDecl(
     const registry = TestRegistry.getInstance();
     const combinedOptions = { ...registry.getActiveOptions(), ...(options ?? {}) };
 
-    // TODO: implement relative URLs
     if (!combinedOptions.url) {
         throw Error("URL must be provided either through (1) env var MAGNITUDE_TEST_URL, (2) via test.config, or (3) in group or test options");
+    }
+
+    const baseUrl = addProtocolIfMissing(combinedOptions.url);
+    
+    let finalUrl = baseUrl;
+    if (combinedOptions.path) {
+        try {
+            finalUrl = new URL(combinedOptions.path, baseUrl).toString();
+        } catch (error) {
+            throw new Error(`Failed to combine URL '${baseUrl}' with path '${combinedOptions.path}': ${error}`);
+        }
     }
 
     // Add the declared test function as a runnable to the registry
     const runnable: TestRunnable = {
         fn: testFn,
         title: title,
-        url: addProtocolIfMissing(combinedOptions.url)
+        url: finalUrl
     }
     registry.register(runnable);
 
