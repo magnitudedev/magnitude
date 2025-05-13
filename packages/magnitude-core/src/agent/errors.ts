@@ -1,10 +1,12 @@
-import { FailureDescriptor } from "../common";
+import { FailureDescriptor, generateSimpleFailureString } from "../common";
+
 
 export class AgentError extends Error {
     public readonly failure: FailureDescriptor;
 
     constructor(failure: FailureDescriptor) {
-        super(`${failure.variant}: ${JSON.stringify(failure.variant, null, 4)}`)
+        super(generateSimpleFailureString(failure))
+        this.name = "AgentError";
         this.failure = failure;
     }
 }
