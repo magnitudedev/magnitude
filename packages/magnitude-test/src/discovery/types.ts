@@ -6,11 +6,19 @@ export interface TestOptions {
     //name?: string;
 }
 
+export interface WebServerConfig {
+    command: string;
+    url: string;
+    timeout?: number;
+    reuseExistingServer?: boolean;
+}
+
 export type MagnitudeConfig = {
     //apiKey?: string;
     url: string; // base URL used as default, required
     planner?: PlannerClient,
     executor?: ExecutorClient,
+    webServer?: WebServerConfig,
     browser?: {
         contextOptions?: BrowserContextOptions,
         launchOptions?: LaunchOptions

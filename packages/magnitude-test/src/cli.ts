@@ -22,6 +22,7 @@ import { execSync } from 'child_process';
 import { TestRunner } from './runner/testRunner'; // Import the new executor
 import { initializeTestStates } from './term-app/util';
 import { initializeUI, updateUI, cleanupUI } from '@/term-app'; // Import term-app functions
+import { startWebServer, stopWebServer } from './webServer';
 import chalk from 'chalk';
 
 interface CliOptions {
@@ -231,6 +232,19 @@ program
 
         logger.info({ ...config.executor }, "Executor:");
         //console.log(magnitudeBlue(`Using executor: ${config.executor.provider}`));
+
+        let webServerProcess: import('node:child_process').ChildProcess | null = null;
+        if (config.webServer) {
+            try {
+                webServerProcess = await startWebServer(config.webServer);
+                const cleanup = () => stopWebServer(webServerProcess);
+                process.on('exit', cleanup);
+                process.on('SIGINT', () => { cleanup(); process.exit(1); });
+            } catch (err) {
+                console.error('Error starting web server:', err);
+                process.exit(1);
+            }
+        }
 
 
 

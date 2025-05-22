@@ -60,6 +60,25 @@ npx magnitude
 ```
 This will run all Magnitude test files discovered with the `*.mag.ts` pattern.
 
+### Automatically start your dev server
+
+Add a `webServer` section in `magnitude.config.ts` to have Magnitude start your development server when tests run:
+
+```ts
+import { defineConfig } from 'magnitude-test';
+
+export default defineConfig({
+    baseUrl: 'http://localhost:3000',
+    webServer: {
+        command: 'npm run start',
+        url: 'http://localhost:3000',
+        reuseExistingServer: true
+    }
+});
+```
+
+Magnitude checks if the server is already running and skips the command when `reuseExistingServer` is `true`.
+
 Here's an example of a basic test case:
 ```ts
 // tests/example.mag.ts

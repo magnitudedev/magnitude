@@ -65,6 +65,26 @@ export default {
 } satisfies MagnitudeConfig;
 ```
 
+## Development web server
+
+Magnitude can automatically launch your development server when tests run. Configure `webServer` with the command to start the server and the URL it will listen on:
+
+```typescript
+import { type MagnitudeConfig } from 'magnitude-test';
+
+export default {
+    url: 'http://localhost:3000',
+    webServer: {
+        command: 'npm run start',
+        url: 'http://localhost:3000',
+        timeout: 120_000,
+        reuseExistingServer: true
+    }
+} satisfies MagnitudeConfig;
+```
+
+Magnitude checks if `webServer.url` is already reachable. If so and `reuseExistingServer` is `true`, the command is skipped. The server process is killed automatically once the test run completes.
+
 ## Test URL resolution
 
 Each test uses a URL that is built from the broader scope of configuration in this order:
