@@ -83,3 +83,76 @@ export interface CancelledFailure {
      */
     variant: 'cancelled'
 }
+
+/**
+ * Convert a failure variant to its human-readable title
+ * @param variant The failure variant
+ * @returns The human-readable title for the variant
+ */
+export function variantToTitle(variant: FailureDescriptor['variant']): string {
+    const titles: Record<typeof variant, string> = {
+        'bug': 'Bug detected',
+        'misalignment': 'Misalignment detected',
+        'cancelled': 'Operation cancelled',
+        'network': 'Network failure',
+        'browser': 'Browser failure',
+        'api_key': 'API authentication error',
+        'rate_limit': 'Rate limit hit',
+        'unknown': 'Error'
+    } as const;
+
+    return titles[variant] || variant;
+}
+
+/**
+ * Generate a simplified string representation of a failure suitable for Error messages
+ * @param failure The failure descriptor
+ * @returns A single string formatted for Error objects
+ */
+export function generateSimpleFailureString(failure: FailureDescriptor): string {
+    const lines: string[] = [];
+
+    const addSection = (header: string, content: string | string[]) =>
+        lines.push(header,
+            ...(Array.isArray(content)
+                ? content.map((line) => `  ${line}`)
+                : [`  ${content}`])
+        );
+
+    const addStandardError = (title: string, message?: string) =>
+        lines.push(message ? `${title}: ${message}` : title);
+
+    const variantTitle = variantToTitle(failure.variant)
+    switch (failure.variant) {
+        case 'bug':
+            addStandardError(variantTitle, failure.title);
+            addStandardError(variantToTitle(failure.variant));
+            addSection('Expected:', failure.expectedResult);
+            addSection('Actual:', failure.actualResult);
+            lines.push(`Severity: ${failure.severity.toUpperCase()}`);
+            break;
+
+        case 'cancelled':
+            addStandardError(variantTitle);
+            break;
+
+        case 'network':
+        case 'browser':
+        case 'misalignment':
+        case 'api_key':
+        case 'rate_limit':
+            addStandardError(variantTitle, failure.message);
+            break;
+
+        case 'unknown':
+        default:
+            if ('message' in failure && failure.message) {
+                addStandardError(variantTitle, failure.message);
+            } else {
+                lines.push(`Unknown error: ${failure.variant || 'unspecified'}`);
+            }
+            break;
+    }
+
+    return lines.join('\n');
+}

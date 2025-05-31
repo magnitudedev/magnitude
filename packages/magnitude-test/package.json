@@ -13,13 +13,25 @@
     "magnitude": "dist/cli.js"
   },
   "exports": {
-    "require": {
-      "types": "./dist/index.d.cts",
-      "default": "./dist/index.cjs"
+    ".": {
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      }
     },
-    "import": {
-      "types": "./dist/index.d.mts",
-      "default": "./dist/index.mjs"
+    "./standalone": {
+      "require": {
+        "types": "./dist/standalone/index.d.cts",
+        "default": "./dist/standalone/index.cjs"
+      },
+      "import": {
+        "types": "./dist/standalone/index.d.mts",
+        "default": "./dist/standalone/index.mjs"
+      }
     }
   },
   "repository": {

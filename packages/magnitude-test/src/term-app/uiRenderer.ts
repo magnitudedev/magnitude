@@ -1,7 +1,7 @@
 import logUpdate from 'log-update';
 import { CategorizedTestCases, TestRunnable } from '@/discovery/types';
 import { TestState, AllTestStates } from './types';
-import { FailureDescriptor } from 'magnitude-core';
+import { FailureDescriptor, variantToTitle } from 'magnitude-core';
 import { VERSION } from '@/version';
 import { formatDuration, getUniqueTestId, wrapText } from './util';
 import { 
@@ -81,18 +81,9 @@ export function generateFailureString(failure: FailureDescriptor, indent: number
     } else if (failure.variant === 'cancelled') {
         addSimpleLine('Cancelled', ANSI_GRAY);
     } else {
-        const prefixMap: Partial<Record<FailureDescriptor['variant'], string>> = {
-            'unknown': '',
-            'browser': 'BrowserError: ',
-            'network': 'NetworkError: ',
-            'misalignment': 'Misalignment: ',
-            'api_key': 'APIKeyError: ',
-            'rate_limit': 'RateLimitError: ',
-        };
         const typedFailure = failure as Extract<FailureDescriptor, { message?: string }>;
         if ('message' in typedFailure && typedFailure.message) {
-            const failurePrefix = prefixMap[typedFailure.variant] || `${typedFailure.variant}: `;
-            addLine(failurePrefix + typedFailure.message);
+            addLine(`${variantToTitle(typedFailure.variant)}: ${typedFailure.message}`);
         } else {
             addSimpleLine(typedFailure.variant || 'unknown error');
         }
