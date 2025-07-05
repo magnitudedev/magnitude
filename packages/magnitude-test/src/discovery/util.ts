@@ -1,7 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { glob } from 'glob';
-import { TestCompiler } from '@/compiler';
+import { Worker } from 'node:worker_threads';
+import { isDeno, isBun } from 'std-env';
 
 export async function findProjectRoot(startDir: string = process.cwd()): Promise<string | null> {
     // Try find package.json in cwd or parent folders
@@ -70,7 +71,7 @@ export function findConfig(searchRoot: string): string | null {
     try {
         // Use glob to find the first magnitude.config.ts file
         // Excluding node_modules and dist directories
-        const configFiles = glob.sync('**/magnitude.config.ts', {
+        const configFiles = glob.sync('**/magnitude.config.{mts,ts}', {
             cwd: searchRoot,
             ignore: ['**/node_modules/**', '**/dist/**'],
             absolute: true
@@ -83,22 +84,31 @@ export function findConfig(searchRoot: string): string | null {
     }
 }
 
-export async function readConfig(configPath: string): Promise<any> {
-    try {
-        const compiler = new TestCompiler();
+export function readConfig(configPath: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(
+            new URL('./worker/readConfig.js', import.meta.url),
+            {
+                env: { NODE_ENV: 'test', ...process.env, },
+                execArgv: !(isBun || isDeno) ? ["--import=jiti/register"] : []
+            }
+        );
 
-        // Use the compiler to transform the TypeScript config file
-        const compiledPath = await compiler.compileFile(configPath);
+        worker.once('message', ({ success, config, error }) => {
+            worker.terminate();
+            if (success) {
+                resolve(config);
+            } else {
+                reject(new Error(error));
+            }
+        });
+        worker.once("error", (error) => {
+            worker.terminate();
+            reject(error);
+        });
 
-        // Import the compiled module
-        const configModule = await import(`file://${compiledPath}`);
-
-        // Extract the default export
-        const config = configModule.default;
-
-        return config;
-    } catch (error) {
-        console.error(`Error reading config from ${configPath}:`, error);
-        return null;
-    }
+        worker.once("online", () => {
+            worker.postMessage({ configPath });
+        })
+    });
 }
