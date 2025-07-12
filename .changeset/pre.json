@@ -8,5 +8,8 @@
     "magnitude-mcp": "0.0.4",
     "magnitude-test": "0.2.18"
   },
-  "changesets": []
+  "changesets": [
+    "great-buses-sip",
+    "tough-rings-tell"
+  ]
 }

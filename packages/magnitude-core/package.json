@@ -1,6 +1,6 @@
 {
   "name": "magnitude-core",
-  "version": "0.2.20",
+  "version": "0.2.21-beta.0",
   "description": "Magnitude e2e testing agent",
   "publishConfig": {
     "access": "public"

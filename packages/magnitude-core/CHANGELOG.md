@@ -1,5 +1,11 @@
 # magnitude-core
 
+## 0.2.21-beta.0
+
+### Patch Changes
+
+- [`d48d4ea`](https://github.com/magnitudedev/magnitude/commit/d48d4ea312509ae2953f915055d0df338864cbc8) Thanks [@anerli](https://github.com/anerli)! - swap rebrowser-patches for patchright
+
 ## 0.2.20
 
 ### Patch Changes

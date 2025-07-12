@@ -1,5 +1,18 @@
 # magnitude-test
 
+## 0.3.0-beta.0
+
+### Minor Changes
+
+- [#68](https://github.com/magnitudedev/magnitude/pull/68) [`3701be5`](https://github.com/magnitudedev/magnitude/commit/3701be5cd805a4e7415dc975a35805edf66c6d8d) Thanks [@ewired](https://github.com/ewired)! - Each test file and magnitude.config.ts is now loaded in a separate thread using node:worker_threads, so you should be able to use any dependencies and not worry about global variable pollution.
+
+  Deno and Bun are supported to run your tests without an intermediate TypeScript compilation step.
+
+### Patch Changes
+
+- Updated dependencies [[`d48d4ea`](https://github.com/magnitudedev/magnitude/commit/d48d4ea312509ae2953f915055d0df338864cbc8)]:
+  - magnitude-core@0.2.21-beta.0
+
 ## 0.2.21
 
 ### Patch Changes
