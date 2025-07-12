@@ -1,6 +1,6 @@
 {
   "name": "magnitude-test",
-  "version": "0.2.21",
+  "version": "0.3.0-beta.0",
   "description": "A TypeScript client for running automated UI tests through the Magnitude testing platform",
   "publishConfig": {
     "access": "public"
@@ -73,7 +73,7 @@
     "glob": "^11.0.1",
     "jiti": "^2.4.2",
     "log-update": "^6.1.0",
-    "magnitude-core": "0.2.20",
+    "magnitude-core": "0.2.21-beta.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "playwright": "^1.51.0",
