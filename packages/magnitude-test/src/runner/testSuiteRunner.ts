@@ -23,6 +23,7 @@ export class TestSuiteRunner {
 
     private tests: RegisteredTest[];
     private executors: Map<string, ClosedTestExecutor> = new Map();
+    private lastTestResults: Array<{ test: RegisteredTest, result: TestResult }> = [];
 
     constructor(
         config: TestSuiteRunnerConfig
@@ -87,7 +88,13 @@ export class TestSuiteRunner {
         }
     }
 
-    async runTests(): Promise<boolean> {
+    async runTests(): Promise<{ 
+        success: boolean, 
+        results: Array<{ 
+            test: RegisteredTest, 
+            result: TestResult 
+        }> 
+    }> {
         if (!this.tests) throw new Error('No tests were registered');
         this.renderer = this.runnerConfig.createRenderer(this.tests);
         this.renderer.start?.();
@@ -111,17 +118,20 @@ export class TestSuiteRunner {
         });
 
         let overallSuccess = true;
+        let results: Array<{ test: RegisteredTest, result: TestResult }> = [];
         try {
             const poolResult: WorkerPoolResult<TestResult> = await workerPool.runTasks<TestResult>(
                 taskFunctions,
                 (taskOutcome: TestResult) => !taskOutcome.passed
             );
 
-            for (const result of poolResult.results) {
+            for (let i = 0; i < poolResult.results.length; i++) {
+                const result = poolResult.results[i];
+                const test = this.tests[i];
                 if (result === undefined || !result.passed) {
                     overallSuccess = false;
-                    break;
                 }
+                results.push({ test, result: result ?? { passed: false, failure: { message: 'No result' } } });
             }
             if (!poolResult.completed) { // If pool aborted for any reason (incl. a task failure)
                 overallSuccess = false;
@@ -130,9 +140,13 @@ export class TestSuiteRunner {
         } catch (error) {
             overallSuccess = false;
         }
+        this.lastTestResults = results;
         this.renderer.stop?.();
-        return overallSuccess;
+        return { success: overallSuccess, results };
+    }
 
+    public getLastTestResults() {
+        return this.lastTestResults;
     }
 }
 
@@ -176,7 +190,7 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
                         res(msg.result);
                     } else if (msg.type === "test_error") {
                         worker.off("message", messageHandler);
-                        rej(new Error(msg.error));
+                        res({ passed: false, failure: { message: msg.error } });
                     } else if (msg.type === "test_state_change") {
                         onStateChange(msg.state);
                     }
@@ -269,7 +283,7 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
                         res(msg.result);
                     } else if (msg.type === "test_error") {
                         emit.off('message', messageHandler);
-                        rej(new Error(msg.error));
+                        res({ passed: false, failure: { message: msg.error } });
                     } else if (msg.type === "test_state_change") {
                         onStateChange(msg.state);
                     }

@@ -12,7 +12,8 @@ export interface StepDescriptor {
     description: string,
     actions: ActionDescriptor[],
     //actions: Action[]
-    status: 'pending' | 'running' | 'passed' | 'failed' | 'cancelled'
+    status: 'pending' | 'running' | 'passed' | 'failed' | 'cancelled',
+    thoughts?: string[]
 }
 
 export interface CheckDescriptor {
@@ -52,12 +53,15 @@ export interface TestState {
     failure?: TestFailure
 }
 
-export type TestResult = {
-    passed: true
-} | {
-    passed: false
-    failure: TestFailure
+export type TestResult = { 
+    passed: true; 
+    state?: TestState 
 }
+  | { 
+    passed: false; 
+    failure: TestFailure; 
+    state?: TestState 
+};
 
 export interface TestFailure {
     message: string
@@ -106,6 +110,7 @@ export class TestStateTracker {
         this.agent.checkEvents.on('checkStarted', this.onCheckStarted, this);
         this.agent.checkEvents.on('checkDone', this.onCheckDone, this);
 
+        this.agent.events.on('thought', this.onThought, this);
         
 
         // this.agent.events.on('action', this.onAction, this);
@@ -215,6 +220,13 @@ export class TestStateTracker {
         // this.state.macroUsage = this.agent.getMacro().getInfo();
         // this.state.microUsage = this.agent.getMicro().getInfo();
         this.events.emit('stateChanged', this.state);
+    }
+
+    onThought(thought: string) {
+        if (this.lastStepOrCheck && this.lastStepOrCheck.variant === 'step') {
+            if (!this.lastStepOrCheck.thoughts) this.lastStepOrCheck.thoughts = [];
+            this.lastStepOrCheck.thoughts.push(thought);
+        }
     }
 
     // onStepStart(description: string) {

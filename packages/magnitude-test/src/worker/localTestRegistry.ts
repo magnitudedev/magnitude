@@ -121,8 +121,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
         postToParent({
             type: 'test_result',
             testId: test.id,
-            result: finalResult ??
-                { passed: false, failure: { message: "Test result doesn't exist" } },
+            result: { ...finalResult, state: finalState }
         });
     } catch (error) {
         postToParent({

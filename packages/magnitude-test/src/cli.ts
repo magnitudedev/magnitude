@@ -23,6 +23,7 @@ import { TermAppRenderer } from '@/term-app'; // Import TermAppRenderer
 // Removed import { initializeUI, updateUI, cleanupUI } from '@/term-app';
 import { startWebServers, stopWebServers } from './webServer';
 import chalk from 'chalk';
+import { renderHtmlReport } from './runner/htmlReport';
 
 interface CliOptions {
     workers?: number;
@@ -143,8 +144,9 @@ program
     .option('-w, --workers <number>', 'number of parallel workers for test execution', '1')
     .option('-p, --plain', 'disable pretty output and print lines instead')
     .option('-d, --debug', 'enable debug logs')
+    .option('--output-html <file>', 'write test results and agent history to an HTML file')
     // Changed action signature from (filters, options) to (filter, options)
-    .action(async (filter, options: CliOptions) => {
+    .action(async (filter, options: CliOptions & { outputHtml?: string }) => {
         dotenv.config();
         let logLevel: string;
 
@@ -269,7 +271,15 @@ program
         }
 
         try {
-            const overallSuccess = await testSuiteRunner.runTests();
+            const { success: overallSuccess, results: testResults } = await testSuiteRunner.runTests();
+
+            // HTML report export
+            if (options.outputHtml) {
+                const html = renderHtmlReport(testResults);
+                require('fs').writeFileSync(options.outputHtml, html, 'utf-8');
+                console.log(`\nWrote HTML report to ${options.outputHtml}`);
+            }
+
             process.exit(overallSuccess ? 0 : 1);
         } catch (error) {
             logger.error("Test suite execution failed:", error);
