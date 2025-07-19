@@ -1,6 +1,6 @@
 import { MagnitudeConfig, RegisteredTest, TestOptions } from '@/discovery/types';
 import { processUrl } from '../util';
-import { WorkerPool, WorkerPoolResult } from './workerPool';
+import { WorkerPool } from './workerPool';
 import { TestResult, TestState } from './state';
 import { TestRenderer } from '@/renderer';
 import { Worker } from 'node:worker_threads';
@@ -23,6 +23,7 @@ export class TestSuiteRunner {
 
     private tests: RegisteredTest[];
     private executors: Map<string, ClosedTestExecutor> = new Map();
+    private workerAborters: AbortController[] = [];
 
     constructor(
         config: TestSuiteRunnerConfig
@@ -32,26 +33,38 @@ export class TestSuiteRunner {
         this.config = config.config;
     }
 
-    private runTest(test: RegisteredTest, signal: AbortSignal): Promise<TestResult> {
+    private async runTest(test: RegisteredTest, signal: AbortSignal): Promise<TestResult> {
         const executor = this.executors.get(test.id);
         if (!executor) {
             throw new Error(`Test worker not found for test ID: ${test.id}`);
         }
 
-        return executor(
-            {
-                type: "execute",
-                test,
-                browserOptions: this.config.browser,
-                llm: this.config.llm,
-                grounding: this.config.grounding,
-                telemetry: this.config.telemetry
-            },
-            (state: TestState) => {
-                this.renderer?.onTestStateUpdated(test, state);
-            },
-            signal
-        );
+        try {
+            return await executor(
+                {
+                    type: "execute",
+                    test,
+                    browserOptions: this.config.browser,
+                    llm: this.config.llm,
+                    grounding: this.config.grounding,
+                    telemetry: this.config.telemetry
+                },
+                (state: TestState) => {
+                    this.renderer?.onTestStateUpdated(test, state);
+                },
+                signal
+            );
+        } catch (err: unknown) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            // user-facing, can happen e.g. when URL is not running
+            console.error(`Unexpected error during test '${test.title}':\n${errorMessage}`);
+            return {
+                passed: false,
+                failure: {
+                    message: errorMessage
+                }
+            };
+        }
     }
 
     private getActiveOptions(): TestOptions {
@@ -81,6 +94,7 @@ export class TestSuiteRunner {
             for (const test of result.tests) {
                 this.executors.set(test.id, result.executor);
             }
+            this.workerAborters.push(result.aborter);
         } catch (error) {
             console.error(`Failed to load test file ${relativeFilePath}:`, error);
             throw error;
@@ -93,27 +107,10 @@ export class TestSuiteRunner {
         this.renderer.start?.();
         const workerPool = new WorkerPool(this.runnerConfig.workerCount);
 
-        const taskFunctions = this.tests.map((test) => {
-            return async (signal: AbortSignal): Promise<TestResult> => {
-                try {
-                    return await this.runTest(test, signal);
-                } catch (err: unknown) {
-                    // user-facing, can happen e.g. when URL is not running
-                    if (err instanceof Error) {
-                        console.error(`Unexpected error during test '${test.title}':\n${err.message}`);
-                    } else {
-                        console.error(`Unexpected error during test '${test.title}':\n${err}`);
-                    }
-
-                    throw err;
-                }
-            };
-        });
-
         let overallSuccess = true;
         try {
-            const poolResult: WorkerPoolResult<TestResult> = await workerPool.runTasks<TestResult>(
-                taskFunctions,
+            const poolResult = await workerPool.runTasks(
+                this.tests.map((test) => (signal) => this.runTest(test, signal)),
                 (taskOutcome: TestResult) => !taskOutcome.passed
             );
 
@@ -129,6 +126,9 @@ export class TestSuiteRunner {
 
         } catch (error) {
             overallSuccess = false;
+        }
+        for (const aborter of this.workerAborters) {
+            aborter.abort();
         }
         this.renderer.stop?.();
         return overallSuccess;
@@ -147,6 +147,7 @@ type CreateTestWorker = (workerData: TestWorkerData) =>
     Promise<{
         tests: RegisteredTest[];
         executor: ClosedTestExecutor;
+        aborter: AbortController;
     }>;
 
 const createNodeTestWorker: CreateTestWorker = async (workerData) =>
@@ -165,6 +166,11 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
                 execArgv: !(isBun || isDeno) ? ["--import=jiti/register"] : []
             }
         );
+
+        const aborter = new AbortController();
+        aborter.signal.addEventListener('abort', () => {
+            worker.terminate();
+        });
 
         const executor: ClosedTestExecutor =
             (executeMessage, onStateChange, signal) => new Promise((res, rej) => {
@@ -207,7 +213,7 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
                     reject(new Error(`No tests registered for file ${relativeFilePath}`));
                     return;
                 }
-                resolve({ tests: registeredTests, executor });
+                resolve({ tests: registeredTests, executor, aborter });
             }
         });
 
@@ -259,6 +265,11 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
             },
         });
 
+        const aborter = new AbortController();
+        aborter.signal.addEventListener('abort', () => {
+            proc.kill("SIGKILL");
+        });
+
         const executor: ClosedTestExecutor = (executeMessage, onStateChange, signal) =>
             new Promise((res, rej) => {
                 const messageHandler = (msg: TestWorkerOutgoingMessage) => {
@@ -301,12 +312,12 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
                     reject(new Error(`No tests registered for file ${relativeFilePath}`));
                     return;
                 }
-                resolve({ tests: registeredTests, executor });
+                resolve({ tests: registeredTests, executor, aborter });
             }
         }));
 
         const timeout = setTimeout(() => {
-            proc.kill();
+            proc.kill("SIGKILL");
             reject(new Error(`Test file loading timeout: ${relativeFilePath}`));
         }, TEST_FILE_LOADING_TIMEOUT);
     });
