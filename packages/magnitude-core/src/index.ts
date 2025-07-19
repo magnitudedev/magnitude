@@ -13,6 +13,7 @@ export * from "@/actions";
 export * from "@/connectors";
 export * from "@/web/browserProvider";
 export * from "@/connectors/browserConnector";
+export * from "@/connectors/desktopConnector";
 export * from "@/agent/errors";
 export * from "@/types";
 export * from "@/ai/types";
