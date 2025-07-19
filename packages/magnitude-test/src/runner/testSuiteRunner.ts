@@ -23,6 +23,7 @@ export class TestSuiteRunner {
 
     private tests: RegisteredTest[];
     private executors: Map<string, ClosedTestExecutor> = new Map();
+    private workerAborters: AbortController[] = [];
 
     constructor(
         config: TestSuiteRunnerConfig
@@ -81,6 +82,7 @@ export class TestSuiteRunner {
             for (const test of result.tests) {
                 this.executors.set(test.id, result.executor);
             }
+            this.workerAborters.push(result.aborter);
         } catch (error) {
             console.error(`Failed to load test file ${relativeFilePath}:`, error);
             throw error;
@@ -130,6 +132,9 @@ export class TestSuiteRunner {
         } catch (error) {
             overallSuccess = false;
         }
+        for (const aborter of this.workerAborters) {
+            aborter.abort();
+        }
         this.renderer.stop?.();
         return overallSuccess;
 
@@ -147,6 +152,7 @@ type CreateTestWorker = (workerData: TestWorkerData) =>
     Promise<{
         tests: RegisteredTest[];
         executor: ClosedTestExecutor;
+        aborter: AbortController;
     }>;
 
 const createNodeTestWorker: CreateTestWorker = async (workerData) =>
@@ -165,6 +171,11 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
                 execArgv: !(isBun || isDeno) ? ["--import=jiti/register"] : []
             }
         );
+
+        const aborter = new AbortController();
+        aborter.signal.addEventListener('abort', () => {
+            worker.terminate();
+        });
 
         const executor: ClosedTestExecutor =
             (executeMessage, onStateChange, signal) => new Promise((res, rej) => {
@@ -207,7 +218,7 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
                     reject(new Error(`No tests registered for file ${relativeFilePath}`));
                     return;
                 }
-                resolve({ tests: registeredTests, executor });
+                resolve({ tests: registeredTests, executor, aborter });
             }
         });
 
@@ -259,6 +270,11 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
             },
         });
 
+        const aborter = new AbortController();
+        aborter.signal.addEventListener('abort', () => {
+            proc.kill("SIGKILL");
+        });
+
         const executor: ClosedTestExecutor = (executeMessage, onStateChange, signal) =>
             new Promise((res, rej) => {
                 const messageHandler = (msg: TestWorkerOutgoingMessage) => {
@@ -301,12 +317,12 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
                     reject(new Error(`No tests registered for file ${relativeFilePath}`));
                     return;
                 }
-                resolve({ tests: registeredTests, executor });
+                resolve({ tests: registeredTests, executor, aborter });
             }
         }));
 
         const timeout = setTimeout(() => {
-            proc.kill();
+            proc.kill("SIGKILL");
             reject(new Error(`Test file loading timeout: ${relativeFilePath}`));
         }, TEST_FILE_LOADING_TIMEOUT);
     });
