@@ -23,6 +23,7 @@ import { TermAppRenderer } from '@/term-app'; // Import TermAppRenderer
 // Removed import { initializeUI, updateUI, cleanupUI } from '@/term-app';
 import { startWebServers, stopWebServers } from './webServer';
 import chalk from 'chalk';
+import os from 'os';
 
 interface CliOptions {
     workers?: number;
@@ -195,6 +196,29 @@ program
 
         //console.log(config)
 
+        // Check if any API key is set in environment variables or config file
+        const hasApiKey = process.env.ANTHROPIC_API_KEY ||
+        (config.llm && 'options' in config.llm && 'apiKey' in config.llm.options && config.llm.options.apiKey);
+        
+        // Check if user is authenticated through Claude Code
+        let hasClaudeCodeAuth = false;
+        try {
+            const CREDS_PATH = path.join(os.homedir(), '.magnitude', 'credentials', 'claudeCode.json');
+            const data = await fs.promises.readFile(CREDS_PATH, 'utf-8');
+            const creds = JSON.parse(data);
+            hasClaudeCodeAuth = creds.expires_at > Date.now() + 60000;
+        } catch (error) {
+            hasClaudeCodeAuth = false;
+        }
+        
+        if (!hasApiKey && !hasClaudeCodeAuth) {
+            console.error("Missing API key for LLM provider");
+            console.error("You can either:");
+            console.error("  - Set ANTHROPIC_API_KEY environment variable");
+            console.error("  - Configure an API key in your magnitude.config.ts");
+            console.error("  - Authenticate with Claude Code");
+            process.exit(1);
+        }
 
         // // If planner not provided, make a choice based on available environment variables
         // if (!config.planner) {
