@@ -1,6 +1,6 @@
 import { MagnitudeConfig, RegisteredTest, TestOptions } from '@/discovery/types';
 import { processUrl } from '../util';
-import { WorkerPool, WorkerPoolResult } from './workerPool';
+import { WorkerPool } from './workerPool';
 import { TestResult, TestState } from './state';
 import { TestRenderer } from '@/renderer';
 import { Worker } from 'node:worker_threads';
@@ -33,26 +33,38 @@ export class TestSuiteRunner {
         this.config = config.config;
     }
 
-    private runTest(test: RegisteredTest, signal: AbortSignal): Promise<TestResult> {
+    private async runTest(test: RegisteredTest, signal: AbortSignal): Promise<TestResult> {
         const executor = this.executors.get(test.id);
         if (!executor) {
             throw new Error(`Test worker not found for test ID: ${test.id}`);
         }
 
-        return executor(
-            {
-                type: "execute",
-                test,
-                browserOptions: this.config.browser,
-                llm: this.config.llm,
-                grounding: this.config.grounding,
-                telemetry: this.config.telemetry
-            },
-            (state: TestState) => {
-                this.renderer?.onTestStateUpdated(test, state);
-            },
-            signal
-        );
+        try {
+            return await executor(
+                {
+                    type: "execute",
+                    test,
+                    browserOptions: this.config.browser,
+                    llm: this.config.llm,
+                    grounding: this.config.grounding,
+                    telemetry: this.config.telemetry
+                },
+                (state: TestState) => {
+                    this.renderer?.onTestStateUpdated(test, state);
+                },
+                signal
+            );
+        } catch (err: unknown) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            // user-facing, can happen e.g. when URL is not running
+            console.error(`Unexpected error during test '${test.title}':\n${errorMessage}`);
+            return {
+                passed: false,
+                failure: {
+                    message: errorMessage
+                }
+            };
+        }
     }
 
     private getActiveOptions(): TestOptions {
@@ -95,27 +107,10 @@ export class TestSuiteRunner {
         this.renderer.start?.();
         const workerPool = new WorkerPool(this.runnerConfig.workerCount);
 
-        const taskFunctions = this.tests.map((test) => {
-            return async (signal: AbortSignal): Promise<TestResult> => {
-                try {
-                    return await this.runTest(test, signal);
-                } catch (err: unknown) {
-                    // user-facing, can happen e.g. when URL is not running
-                    if (err instanceof Error) {
-                        console.error(`Unexpected error during test '${test.title}':\n${err.message}`);
-                    } else {
-                        console.error(`Unexpected error during test '${test.title}':\n${err}`);
-                    }
-
-                    throw err;
-                }
-            };
-        });
-
         let overallSuccess = true;
         try {
-            const poolResult: WorkerPoolResult<TestResult> = await workerPool.runTasks<TestResult>(
-                taskFunctions,
+            const poolResult = await workerPool.runTasks(
+                this.tests.map((test) => (signal) => this.runTest(test, signal)),
                 (taskOutcome: TestResult) => !taskOutcome.passed
             );
 
