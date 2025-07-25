@@ -19,6 +19,7 @@ import { retryOnError } from '@/common';
 import { renderContentParts } from '@/memory/rendering';
 import { MultiModelHarness } from '@/ai/multiModelHarness';
 
+const DEFAULT_MAX_STEPS = 100;
 
 export interface AgentOptions {
     llm?: LLMClient | LLMClient[];
@@ -31,9 +32,13 @@ export interface AgentOptions {
 
 export interface ActOptions {
     prompt?: string // additional task-level system prompt instructions
-    // TODO: reimpl, or maybe for tc agent specifically
-	data?: RenderableContent,//string | Record<string, string>
+
+	data?: RenderableContent//string | Record<string, string>
+    maxSteps?: number; // Maximum number of steps for this act() call (default: 100)
+    reuseMemory?: boolean; // Reuse memory from previous act() calls within the same agent instance
+
     memory?: AgentMemory,// optional memory starting point
+
 }
 
 // Options for the startAgent helper function
@@ -72,7 +77,8 @@ export class Agent {
     //public readonly memory: AgentMemory;
     private doneActing: boolean;
 
-    protected latestTaskMemory: AgentMemory;// | null = null;
+    protected latestTaskMemory: AgentMemory;
+    private persistentMemory?: AgentMemory; // Memory that persists across act() calls when reuseMemory is true
 
     constructor(baseConfig: Partial<AgentOptions> = {}) {
         this.options = {
@@ -242,7 +248,28 @@ export class Agent {
             ...(this.options.prompt ? [this.options.prompt] : []),
             ...(options.prompt ? [options.prompt] : []),
         ].join('\n');
-        const taskMemory = options.memory ?? new AgentMemory({ ...this.memoryOptions, instructions: instructions === '' ? undefined : instructions });
+
+        
+        let taskMemory: AgentMemory;
+        
+        if (options.reuseMemory && this.persistentMemory) {
+            // Reuse existing memory for this execution
+            taskMemory = this.persistentMemory;
+            logger.debug('Reusing persistent memory from previous act() calls');
+        } else {
+            // Create new memory
+            taskMemory = new AgentMemory({ 
+                ...this.memoryOptions, 
+                instructions: instructions === '' ? undefined : instructions 
+            });
+            
+            // Save for future reuse if requested
+            if (options.reuseMemory) {
+                this.persistentMemory = taskMemory;
+                logger.debug('Created new persistent memory for future reuse');
+            }
+        }
+
 
         if (Array.isArray(taskOrSteps)) {
             const steps = taskOrSteps;
@@ -304,7 +331,10 @@ export class Agent {
 
     async _act(description: string, memory: AgentMemory, options: ActOptions = {}): Promise<void> {
         this.doneActing = false;
-        logger.info(`Act: ${description}`);
+        const maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS; // Default to 100 steps
+        let currentStep = 0;
+        
+        logger.info(`Act: ${description} (max steps: ${maxSteps})`);
 
         // for now simply add data to task
         let dataContentParts: MultiMediaContentPart[] = [];
@@ -334,9 +364,9 @@ export class Agent {
         await this._recordConnectorObservations(memory);
         logger.info("Initial observations recorded");
 
-        while (true) {
+        while (!this.doneActing && currentStep < maxSteps) {
             // Removed direct screenshot/tabState access here; it's part of memoryContext via connectors
-            logger.info(`Creating partial recipe`);
+            logger.info(`Creating partial recipe (step ${currentStep + 1}/${maxSteps})`);
 
             let reasoning: string = "";
             let actions: Action[] = [];
@@ -406,9 +436,16 @@ export class Agent {
             if (this.doneActing) {
                 break;
             }
+            
+            currentStep++;
+        }
+        
+        if (currentStep >= maxSteps && !this.doneActing) {
+            logger.warn(`Reached maximum steps limit (${maxSteps}) without completing task: ${description}`);
+            this.events.emit('maxStepsReached', description, maxSteps);
         }
 
-        logger.info(`Done with step`);
+        logger.info(`Done with step after ${currentStep} steps`);
         //this.events.emit('stepSuccess');
         //this.currentTaskMemory = null;
     }
