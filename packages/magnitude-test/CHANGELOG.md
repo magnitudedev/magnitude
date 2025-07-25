@@ -1,5 +1,11 @@
 # magnitude-test
 
+## 0.3.6
+
+### Patch Changes
+
+- [#112](https://github.com/magnitudedev/magnitude/pull/112) [`c568651`](https://github.com/magnitudedev/magnitude/commit/c568651b186bb3fa94f7b3cd7f855f3bfc718762) Thanks [@ewired](https://github.com/ewired)! - Use inferred types for command line options
+
 ## 0.3.5
 
 ### Patch Changes
