@@ -9,6 +9,7 @@ import { isBun, isDeno } from 'std-env';
 import { EventEmitter } from 'node:events';
 
 const TEST_FILE_LOADING_TIMEOUT = 30000;
+const WORKER_SHUTDOWN_TIMEOUT = 60000;
 
 export interface TestSuiteRunnerConfig {
     workerCount: number;
@@ -24,7 +25,7 @@ export class TestSuiteRunner {
 
     private tests: RegisteredTest[];
     private executors: Map<string, ClosedTestExecutor> = new Map();
-    private workerAborters: AbortController[] = [];
+    private workerStoppers: (() => Promise<void>)[] = [];
 
     constructor(
         config: TestSuiteRunnerConfig
@@ -56,6 +57,15 @@ export class TestSuiteRunner {
                 signal
             );
         } catch (err: unknown) {
+            if (signal.aborted) {
+                return {
+                    passed: false,
+                    failure: {
+                        message: 'Test execution aborted'
+                    }
+                };
+            }
+
             const errorMessage = err instanceof Error ? err.message : String(err);
             // user-facing, can happen e.g. when URL is not running
             console.error(`Unexpected error during test '${test.title}':\n${errorMessage}`);
@@ -95,7 +105,7 @@ export class TestSuiteRunner {
             for (const test of result.tests) {
                 this.executors.set(test.id, result.executor);
             }
-            this.workerAborters.push(result.aborter);
+            this.workerStoppers.push(result.stopper);
         } catch (error) {
             console.error(`Failed to load test file ${relativeFilePath}:`, error);
             throw error;
@@ -130,9 +140,22 @@ export class TestSuiteRunner {
         } catch (error) {
             overallSuccess = false;
         }
-        for (const aborter of this.workerAborters) {
-            aborter.abort();
+
+        const stopperResults = await Promise.allSettled(
+            this.workerStoppers.map(stopper => stopper())
+        );
+
+        const stopperErrors = stopperResults
+            .filter(result => result.status === 'rejected');
+
+        if (stopperErrors.length > 0) {
+            overallSuccess = false;
+            console.error(`${stopperErrors.length} workers failed to stop`);
+            for (const error of stopperErrors) {
+                console.error(error);
+            }
         }
+
         this.renderer.stop?.();
         return overallSuccess;
 
@@ -150,7 +173,7 @@ type CreateTestWorker = (workerData: TestWorkerData) =>
     Promise<{
         tests: RegisteredTest[];
         executor: ClosedTestExecutor;
-        aborter: AbortController;
+        stopper: () => Promise<void>;
     }>;
 
 const createNodeTestWorker: CreateTestWorker = async (workerData) =>
@@ -170,15 +193,40 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
             }
         );
 
-        const aborter = new AbortController();
-        aborter.signal.addEventListener('abort', () => {
-            worker.terminate();
-        });
+        let hasRunTests = false;
+        const stopper = async (): Promise<void> => {
+            if (!hasRunTests) {
+                worker.terminate();
+                return;
+            }
+
+            worker.postMessage({ type: 'graceful_shutdown' });
+
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    worker.off('message', shutdownHandler);
+                    worker.terminate();
+                    reject(new Error('graceful shutdown timeout'));
+                }, WORKER_SHUTDOWN_TIMEOUT);
+
+                const shutdownHandler = (msg: TestWorkerOutgoingMessage) => {
+                    if (msg.type === 'graceful_shutdown_complete') {
+                        clearTimeout(timeout);
+                        worker.off('message', shutdownHandler);
+                        worker.terminate();
+                        resolve();
+                    }
+                };
+
+                worker.on('message', shutdownHandler);
+            });
+        };
 
         const executor: ClosedTestExecutor =
             (executeMessage, onStateChange, signal) => new Promise((res, rej) => {
                 const messageHandler = (msg: TestWorkerOutgoingMessage) => {
-                    if (!("testId" in msg) || msg.testId !== executeMessage.test.id) return;
+                    if ("test" in executeMessage && "testId" in msg && msg.testId !== executeMessage.test.id) return;
+                    hasRunTests = true;
 
                     if (msg.type === "test_result") {
                         worker.off("message", messageHandler);
@@ -216,7 +264,7 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
                     reject(new Error(`No tests registered for file ${relativeFilePath}`));
                     return;
                 }
-                resolve({ tests: registeredTests, executor, aborter });
+                resolve({ tests: registeredTests, executor, stopper });
             }
         });
 
@@ -268,15 +316,40 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
             },
         });
 
-        const aborter = new AbortController();
-        aborter.signal.addEventListener('abort', () => {
-            proc.kill("SIGKILL");
-        });
+        let hasRunTests = false;
+        const stopper = async (): Promise<void> => {
+            if (!hasRunTests) {
+                proc.kill("SIGKILL");
+                return;
+            }
+
+            proc.send({ type: 'graceful_shutdown' });
+
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    emit.off('message', shutdownHandler);
+                    proc.kill("SIGKILL");
+                    reject(new Error('graceful shutdown timeout'));
+                }, WORKER_SHUTDOWN_TIMEOUT);
+
+                const shutdownHandler = (msg: TestWorkerOutgoingMessage) => {
+                    if (msg.type === 'graceful_shutdown_complete') {
+                        clearTimeout(timeout);
+                        emit.off('message', shutdownHandler);
+                        proc.kill("SIGKILL");
+                        resolve();
+                    }
+                };
+
+                emit.on('message', shutdownHandler);
+            });
+        };
 
         const executor: ClosedTestExecutor = (executeMessage, onStateChange, signal) =>
             new Promise((res, rej) => {
                 const messageHandler = (msg: TestWorkerOutgoingMessage) => {
-                    if (!("testId" in msg) || msg.testId !== executeMessage.test.id) return;
+                    if ("test" in executeMessage && "testId" in msg && msg.testId !== executeMessage.test.id) return;
+                    hasRunTests = true;
 
                     if (msg.type === "test_result") {
                         emit.off('message', messageHandler);
@@ -315,7 +388,7 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
                     reject(new Error(`No tests registered for file ${relativeFilePath}`));
                     return;
                 }
-                resolve({ tests: registeredTests, executor, aborter });
+                resolve({ tests: registeredTests, executor, stopper });
             }
         }));
 

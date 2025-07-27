@@ -9,6 +9,7 @@ import { TestFunction } from "@/discovery/types";
 declare global {
     var __magnitudeTestFunctions: Map<string, TestFunction> | undefined;
     var __magnitudeMessageEmitter: EventEmitter | undefined;
+    var __magnitudeTestHooks: TestHooks | undefined;
 }
 
 if (!globalThis.__magnitudeTestFunctions) {
@@ -21,6 +22,22 @@ if (!globalThis.__magnitudeMessageEmitter) {
 }
 export const messageEmitter = globalThis.__magnitudeMessageEmitter;
 
+
+export type TestHooks = Record<
+    'beforeAll' | 'afterAll' | 'beforeEach' | 'afterEach',
+    (() => void | Promise<void>)[]
+>;
+
+if (!globalThis.__magnitudeTestHooks) {
+    globalThis.__magnitudeTestHooks = {
+        beforeAll: [],
+        afterAll: [],
+        beforeEach: [],
+        afterEach: [],
+    };
+}
+export const hooks = globalThis.__magnitudeTestHooks;
+
 export type TestWorkerIncomingMessage = {
     type: "execute"
     test: RegisteredTest;
@@ -28,6 +45,8 @@ export type TestWorkerIncomingMessage = {
     llm?: LLMClient;
     grounding?: GroundingClient;
     telemetry?: boolean;
+} | {
+    type: "graceful_shutdown"
 }
 
 export type TestWorkerOutgoingMessage = {
@@ -50,6 +69,8 @@ export type TestWorkerOutgoingMessage = {
     type: "test_state_change";
     testId: string;
     state: TestState;
+} | {
+    type: "graceful_shutdown_complete";
 }
 
 export function postToParent(message: TestWorkerOutgoingMessage) {
