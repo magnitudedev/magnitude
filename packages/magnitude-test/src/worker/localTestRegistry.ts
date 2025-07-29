@@ -1,6 +1,6 @@
 import { TestFunction, TestGroup, TestOptions } from "@/discovery/types";
 import cuid2 from "@paralleldrive/cuid2";
-import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks } from "./util";
+import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, groupHooks } from "./util";
 import { TestCaseAgent } from "@/agent";
 import { TestResult, TestState, TestStateTracker } from "@/runner/state";
 import { buildDefaultBrowserAgentOptions } from "magnitude-core";
@@ -38,6 +38,9 @@ let pendingAfterEach: Set<string> = new Set();
 let currentGroup: TestGroup | undefined;
 export function setCurrentGroup(group?: TestGroup) {
     currentGroup = group;
+}
+export function getCurrentGroup(): TestGroup | undefined {
+    return currentGroup;
 }
 export function currentGroupOptions(): TestOptions {
     return structuredClone(currentGroup?.options) ?? {};
@@ -159,6 +162,17 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
                 } catch (error) {
                     console.error(`beforeEach hook failed for test '${test.title}':`, error);
                     throw error;
+                }
+            }
+
+            if (test.group && groupHooks[test.group]) {
+                for (const beforeEachHook of groupHooks[test.group].beforeEach) {
+                    try {
+                        await beforeEachHook();
+                    } catch (error) {
+                        console.error(`Group beforeEach hook failed for test '${test.title}' in group '${test.group}':`, error);
+                        throw error;
+                    }
                 }
             }
             pendingAfterEach.add(test.id);
