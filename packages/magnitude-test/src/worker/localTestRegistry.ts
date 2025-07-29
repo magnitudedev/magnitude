@@ -1,4 +1,4 @@
-import { TestFunction, TestGroup, TestOptions } from "@/discovery/types";
+import { TestFunction, TestGroup, TestOptions, RegisteredTest } from "@/discovery/types";
 import cuid2 from "@paralleldrive/cuid2";
 import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, groupHooks } from "./util";
 import { TestCaseAgent } from "@/agent";
@@ -32,7 +32,7 @@ let beforeAllExecuted = false;
 let beforeAllError: Error | null = null;
 let afterAllExecuted = false;
 let isShuttingDown = false;
-let pendingAfterEach: Set<string> = new Set();
+let pendingAfterEach: Map<string, RegisteredTest> = new Map();
 // No state reset is needed because each test file is run in a separate worker
 
 let currentGroup: TestGroup | undefined;
@@ -46,37 +46,67 @@ export function currentGroupOptions(): TestOptions {
     return structuredClone(currentGroup?.options) ?? {};
 }
 
+async function executeAfterEachHooks(test: RegisteredTest) {
+    if (test.group && groupHooks[test.group]) {
+        for (const afterEachHook of groupHooks[test.group].afterEach) {
+            try {
+                await afterEachHook();
+            } catch (error) {
+                console.error(`Group afterEach hook failed for test '${test.title}' in group '${test.group}':`, error);
+                throw error;
+            }
+        }
+    }
+
+    for (const afterEachHook of hooks.afterEach) {
+        try {
+            await afterEachHook();
+        } catch (error) {
+            console.error(`afterEach hook failed for test '${test.title}':`, error);
+            throw error;
+        }
+    }
+}
+
 messageEmitter.removeAllListeners('message');
 messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
     if (message.type === 'graceful_shutdown') {
         isShuttingDown = true;
 
-        if (pendingAfterEach.size > 0) {
-            try {
-                await Promise.all(
-                    [...pendingAfterEach].map(async (_testId) => {
-                        for (const afterEachHook of hooks.afterEach) {
-                            await afterEachHook();
-                        }
-                    })
-                );
-            } catch (error) {
-                console.error("afterEach hooks failed during graceful shutdown:", error);
-            }
-        }
-
-        if (!afterAllExecuted) {
-            try {
-                for (const afterAllHook of hooks.afterAll) {
-                    await afterAllHook();
+        try {
+            if (pendingAfterEach.size > 0) {
+                try {
+                    await Promise.all(
+                        [...pendingAfterEach.values()].map(async (test) => {
+                            try {
+                                await executeAfterEachHooks(test);
+                            } catch (error) {
+                                console.error(`afterEach hooks failed during graceful shutdown for test '${test.title}':`, error);
+                                // Don't throw here - we want to continue with other tests
+                            }
+                        })
+                    );
+                } catch (error) {
+                    console.error("afterEach hooks failed during graceful shutdown:", error);
                 }
-                afterAllExecuted = true;
-            } catch (error) {
-                console.error("afterAll hook failed during graceful shutdown:\n", error);
             }
-        }
 
-        postToParent({ type: 'graceful_shutdown_complete' });
+            if (!afterAllExecuted) {
+                try {
+                    for (const afterAllHook of hooks.afterAll) {
+                        await afterAllHook();
+                    }
+                    afterAllExecuted = true;
+                } catch (error) {
+                    console.error("afterAll hook failed during graceful shutdown:\n", error);
+                }
+            }
+
+            postToParent({ type: 'graceful_shutdown_complete' });
+        } catch (error) {
+            console.error("Critical error during graceful shutdown:", error);
+            postToParent({ type: 'graceful_shutdown_complete' });
+        }
         return;
     }
 
@@ -175,20 +205,13 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
                     }
                 }
             }
-            pendingAfterEach.add(test.id);
+            pendingAfterEach.set(test.id, test);
 
             await testFn(agent);
 
             if (!isShuttingDown) {
                 pendingAfterEach.delete(test.id);
-                for (const afterEachHook of hooks.afterEach) {
-                    try {
-                        await afterEachHook();
-                    } catch (error) {
-                        console.error(`afterEach hook failed for test '${test.title}':`, error);
-                        throw error;
-                    }
-                }
+                await executeAfterEachHooks(test);
             }
 
             finalState = {
@@ -202,9 +225,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
             if (!isShuttingDown) {
                 pendingAfterEach.delete(test.id);
                 try {
-                    for (const afterEachHook of hooks.afterEach) {
-                        await afterEachHook();
-                    }
+                    await executeAfterEachHooks(test);
                 } catch (afterEachError) {
                     console.error(`afterEach hook failed for failing test '${test.title}':`, afterEachError);
                     const originalMessage = error instanceof Error ? error.message : String(error);
