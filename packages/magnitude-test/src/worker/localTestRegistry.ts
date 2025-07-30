@@ -33,6 +33,8 @@ let beforeAllError: Error | null = null;
 let afterAllExecuted = false;
 let isShuttingDown = false;
 let pendingAfterEach: Map<string, RegisteredTest> = new Map();
+let groupBeforeAllExecuted: Set<string> = new Set();
+let groupBeforeAllErrors: Map<string, Error> = new Map();
 // No state reset is needed because each test file is run in a separate worker
 
 let currentGroup: TestGroup | undefined;
@@ -68,6 +70,33 @@ async function executeAfterEachHooks(test: RegisteredTest) {
     }
 }
 
+async function executeGroupBeforeAllHooks(test: RegisteredTest) {
+    if (!test.group || !groupHooks[test.group]) {
+        return;
+    }
+
+    if (groupBeforeAllExecuted.has(test.group)) {
+        const error = groupBeforeAllErrors.get(test.group);
+        if (error) {
+            throw new Error(`Group beforeAll hook failed for group '${test.group}': ${error.message}`);
+        }
+        return;
+    }
+
+    groupBeforeAllExecuted.add(test.group);
+
+    try {
+        for (const beforeAllHook of groupHooks[test.group].beforeAll) {
+            await beforeAllHook();
+        }
+    } catch (error) {
+        const hookError = error instanceof Error ? error : new Error(String(error));
+        console.error(`Group beforeAll hook failed for group '${test.group}':`, hookError);
+        groupBeforeAllErrors.set(test.group, hookError);
+        throw hookError;
+    }
+}
+
 messageEmitter.removeAllListeners('message');
 messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
     if (message.type === 'graceful_shutdown') {
@@ -93,6 +122,18 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
 
             if (!afterAllExecuted) {
                 try {
+                    for (const groupName of groupBeforeAllExecuted) {
+                        if (groupHooks[groupName] && groupHooks[groupName].afterAll.length > 0) {
+                            try {
+                                for (const afterAllHook of groupHooks[groupName].afterAll) {
+                                    await afterAllHook();
+                                }
+                            } catch (error) {
+                                console.error(`Group afterAll hook failed during graceful shutdown for group '${groupName}':`, error);
+                            }
+                        }
+                    }
+
                     for (const afterAllHook of hooks.afterAll) {
                         await afterAllHook();
                     }
@@ -185,6 +226,8 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
             if (beforeAllError) {
                 throw new Error(`beforeAll hook failed: ${beforeAllError.message}`);
             }
+
+            await executeGroupBeforeAllHooks(test);
 
             for (const beforeEachHook of hooks.beforeEach) {
                 try {
