@@ -1,7 +1,7 @@
 import { TestDeclaration, TestOptions, TestFunction, TestGroupFunction } from '../discovery/types';
 import { addProtocolIfMissing, processUrl } from '@/util';
-import { getTestWorkerData, hooks, TestHooks } from '@/worker/util';
-import { currentGroupOptions, registerTest, setCurrentGroup } from '@/worker/localTestRegistry';
+import { getTestWorkerData, hooks, TestHooks, groupHooks } from '@/worker/util';
+import { currentGroupOptions, registerTest, setCurrentGroup, getCurrentGroup } from '@/worker/localTestRegistry';
 
 const workerData = getTestWorkerData();
 
@@ -85,7 +85,23 @@ function createHookRegistrar(kind: keyof TestHooks) {
         if (typeof fn !== "function") {
             throw new Error(`${kind} expects a function`);
         }
-        hooks[kind].push(fn);
+
+        const group = getCurrentGroup();
+        if (group) {
+            // Register as group-level hook
+            if (!groupHooks[group.name]) {
+                groupHooks[group.name] = {
+                    beforeAll: [],
+                    afterAll: [],
+                    beforeEach: [],
+                    afterEach: [],
+                };
+            }
+            groupHooks[group.name][kind].push(fn);
+        } else {
+            // Register as file-level hook
+            hooks[kind].push(fn);
+        }
     };
 }
 
