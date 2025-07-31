@@ -1,6 +1,6 @@
 import { Action } from '@/actions/types';
 import { ActOptions, Agent } from '@/agent';
-import { blueBright, bold, cyanBright, gray } from 'ansis';
+import { blueBright, bold, cyanBright, gray, yellow } from 'ansis';
 import { BrowserAgent } from './browserAgent';
 import { z } from 'zod';
 
@@ -56,6 +56,10 @@ export function narrateAgent(agent: Agent) {
     agent.events.on('actionStarted', (action: Action) => {
         const actionDefinition = agent.identifyAction(action);
         console.log(bold`  ${actionDefinition.render(action)}`);
+    });
+    
+    agent.events.on('maxStepsReached', (task: string, maxSteps: number) => {
+        console.log(yellow(bold(`⚠ [warning] Reached maximum steps limit (${maxSteps}) for task: "${task}"`)));
     });
 }
 

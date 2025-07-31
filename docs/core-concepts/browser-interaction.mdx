@@ -59,6 +59,54 @@ await agent.act('create a new task', {
 });
 ```
 
+### Controlling Execution Steps
+
+By default, each `act()` call is limited to 100 steps to prevent infinite loops. You can adjust this limit based on task complexity:
+
+```typescript
+// Simple task with default limit
+await agent.act('click the submit button');
+
+// Complex task that needs more steps
+await agent.act('fill out the entire application form', {
+    maxSteps: 200
+});
+
+// Very simple task with reduced limit
+await agent.act('close the modal', {
+    maxSteps: 3
+});
+```
+
+The agent will emit a warning event if it reaches the maximum steps without completing the task, which can help identify tasks that need adjustment or debugging.
+
+### Memory Persistence
+
+By default, each `act()` call starts with a fresh memory context. For tasks that build upon previous actions, you can enable memory persistence:
+
+```typescript
+// First action creates some state
+await agent.act('open the settings panel', {
+    reuseMemory: true  // Start persistent memory
+});
+
+// Subsequent actions remember previous context
+await agent.act('navigate to the security tab', {
+    reuseMemory: true  // Continues with memory from previous act()
+});
+
+await agent.act('enable two-factor authentication', {
+    reuseMemory: true  // Still has context from all previous actions
+});
+```
+
+This is particularly useful for:
+- Multi-step workflows where context matters
+- Complex interactions that reference previous actions
+- Test scenarios that need to maintain state across steps
+
+Note: Memory is only persisted within the same agent instance. Creating a new agent starts fresh.
+
 ## Navigating Directly
 
 While the agent is capable of navigating to URLs on its own, you may sometimes want to navigate to a specific URL directly.
