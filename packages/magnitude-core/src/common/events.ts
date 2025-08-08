@@ -20,4 +20,5 @@ export interface AgentEvents {
     'actionDone': (action: Action) => void;
 
     'tokensUsed': (usage: ModelUsage) => void;
+    'maxStepsReached': (task: string, maxSteps: number) => void;
 }

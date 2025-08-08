@@ -44,26 +44,47 @@ Defines a new test case.
   </ResponseField>
 </Expandable>
 
-## `test.group(id, options?, groupFn)`
-
-Defines a group of test cases, allowing shared options (like `url`) to be applied to all tests within the group.
-
 <RequestExample>
-```typescript Group Example
+```typescript Example with maxSteps
 import { test } from 'magnitude-test';
 
-test.group('User Authentication Flow', { url: '/login' }, () => {
-  test('should display login form', async (agent) => {
-    await agent.check("Login form is visible");
-  });
+test('should handle complex checkout flow', async (agent) => {
+    await agent.act('add items to cart and proceed to checkout', {
+        maxSteps: 200 // Allow more steps for multi-stage process
+    });
+    await agent.check('order confirmation is displayed');
+});
 
-  test('should allow login with valid credentials', async (agent) => {
-    await agent.act("Log in with valid credentials");
-    await agent.check("User is redirected to dashboard");
-  });
+```typescript Example with memory persistence
+import { test } from 'magnitude-test';
+
+test('should complete multi-step user onboarding', async (agent) => {
+    // Step 1: Initial setup
+    await agent.act('fill out basic profile information', {
+        maxSteps: 50,
+        reuseMemory: true  // Start persistent memory
+    });
+    
+    // Step 2: Uses context from step 1
+    await agent.act('select preferences based on my profile', {
+        maxSteps: 30,
+        reuseMemory: true  // Continues with previous context
+    });
+    
+    // Step 3: Final verification with all context
+    await agent.act('review and confirm all my selections', {
+        maxSteps: 20,
+        reuseMemory: true  // Has full context from steps 1 & 2
+    });
+    
+    await agent.check('onboarding completed successfully');
 });
 ```
 </RequestExample>
+
+## `test.group(id, options?, groupFn)`
+
+Defines a group of test cases, allowing shared options (like `url`) to be applied to all tests within the group.
 
 <ParamField path="id" type="string" required>
   A descriptive identifier for the test group.
@@ -82,3 +103,20 @@ test.group('User Authentication Flow', { url: '/login' }, () => {
 <ParamField path="groupFn" type="() => void" required>
   A synchronous function that contains the `test()` declarations belonging to this group.
 </ParamField>
+
+<RequestExample>
+```typescript Group Example
+import { test } from 'magnitude-test';
+
+test.group('User Authentication Flow', { url: '/login' }, () => {
+  test('should display login form', async (agent) => {
+    await agent.check("Login form is visible");
+  });
+
+  test('should allow login with valid credentials', async (agent) => {
+    await agent.act("Log in with valid credentials");
+    await agent.check("User is redirected to dashboard");
+  });
+});
+```
+</RequestExample>
