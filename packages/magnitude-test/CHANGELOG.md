@@ -1,5 +1,11 @@
 # magnitude-test
 
+## 0.3.11
+
+### Patch Changes
+
+- [`9123917`](https://github.com/magnitudedev/magnitude/commit/9123917e4dd8be30687b43be6797d152fdffc571) Thanks [@anerli](https://github.com/anerli)! - fix: add array llm client type to test config
+
 ## 0.3.10
 
 ### Patch Changes
