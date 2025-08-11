@@ -112,6 +112,30 @@ await agent.act("Enter {username} into the user field", {
   <ResponseField name="prompt" type="string">
     - **`string`**: Provide additional instructions for the LLM. These are injected into the system prompt.
   </ResponseField>
+  <ResponseField name="maxSteps" type="number">
+    Maximum number of steps the agent can take for this specific task. Defaults to 100. This prevents infinite loops and provides predictable resource usage.
+    
+    ```typescript
+    // Allow more steps for complex tasks
+    await agent.act("Complete the entire checkout process", {
+      maxSteps: 200
+    });
+    ```
+  </ResponseField>
+  <ResponseField name="reuseMemory" type="boolean">
+    When true, reuses memory from previous act() calls within the same agent instance. This allows the agent to maintain context across multiple tasks. Defaults to false.
+    
+    ```typescript
+    // Enable memory persistence for related tasks
+    await agent.act("Log into the application", {
+      reuseMemory: true
+    });
+    
+    await agent.act("Navigate to the dashboard", {
+      reuseMemory: true  // Remembers the login context
+    });
+    ```
+  </ResponseField>
 </Expandable>
 
 ### `nav(url: string)`
