@@ -44,11 +44,7 @@ export class TestSuiteRunner {
             return await executor(
                 {
                     type: "execute",
-                    test,
-                    browserOptions: this.config.browser,
-                    llm: this.config.llm,
-                    grounding: this.config.grounding,
-                    telemetry: this.config.telemetry
+                    testId: test.id
                 },
                 (state: TestState) => {
                     this.renderer?.onTestStateUpdated(test, state);
@@ -95,6 +91,10 @@ export class TestSuiteRunner {
                 relativeFilePath,
                 absoluteFilePath,
                 options: this.getActiveOptions(),
+                browserOptions: this.config.browser,
+                llm: this.config.llm,
+                grounding: this.config.grounding,
+                telemetry: this.config.telemetry
             } satisfies TestWorkerData;
 
             const createWorker = isBun ? createBunTestWorker : createNodeTestWorker;
@@ -235,7 +235,7 @@ const createNodeTestWorker: CreateTestWorker = async (workerData) =>
         const executor: ClosedTestExecutor =
             (executeMessage, onStateChange, signal) => new Promise((res, rej) => {
                 const messageHandler = (msg: TestWorkerOutgoingMessage) => {
-                    if ("test" in executeMessage && "testId" in msg && msg.testId !== executeMessage.test.id) return;
+                    if ("testId" in executeMessage && "testId" in msg && msg.testId !== executeMessage.testId) return;
                     hasRunTests = true;
 
                     if (msg.type === "test_result") {
@@ -357,7 +357,7 @@ const createBunTestWorker: CreateTestWorker = async (workerData) =>
         const executor: ClosedTestExecutor = (executeMessage, onStateChange, signal) =>
             new Promise((res, rej) => {
                 const messageHandler = (msg: TestWorkerOutgoingMessage) => {
-                    if ("test" in executeMessage && "testId" in msg && msg.testId !== executeMessage.test.id) return;
+                    if ("testId" in executeMessage && "testId" in msg && msg.testId !== executeMessage.testId) return;
                     hasRunTests = true;
 
                     if (msg.type === "test_result") {

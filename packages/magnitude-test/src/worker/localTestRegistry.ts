@@ -1,11 +1,10 @@
 import { TestFunction, TestGroup, TestOptions } from "@/discovery/types";
 import cuid2 from "@paralleldrive/cuid2";
-import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks } from "./util";
+import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, testRegistry, testPromptStack } from "./util";
 import { TestCaseAgent } from "@/agent";
 import { TestResult, TestState, TestStateTracker } from "@/runner/state";
 import { buildDefaultBrowserAgentOptions } from "magnitude-core";
 import { sendTelemetry } from "@/runner/telemetry";
-import { testPromptStack } from "@/worker/testDeclaration";
 
 // This module has to be separate so it only gets imported once after possible compilation by jiti.
 
@@ -16,6 +15,14 @@ const generateId = cuid2.init({ length: 12 });
 export function registerTest(testFn: TestFunction, title: string, url: string) {
     const testId = generateId();
     testFunctions.set(testId, testFn);
+
+    testRegistry.set(testId, {
+        title,
+        url,
+        filepath: workerData.relativeFilePath,
+        group: currentGroup?.name
+    });
+
     postToParent({
         type: 'registered',
         test: {
@@ -84,31 +91,42 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
     if (isShuttingDown) {
         postToParent({
             type: 'test_error',
-            testId: message.test.id,
+            testId: message.testId,
             error: 'Test cancelled due to graceful shutdown'
         });
         return;
     }
 
-    const { test, browserOptions, llm, grounding, telemetry } = message;
-    const testFn = testFunctions.get(test.id);
+    const { testId } = message;
+    const { browserOptions, llm, grounding, telemetry } = workerData;
+    const testFn = testFunctions.get(testId);
 
     if (!testFn) {
         postToParent({
             type: 'test_error',
-            testId: test.id,
-            error: `Test function not found: ${test.id}`
+            testId: testId,
+            error: `Test function not found: ${testId}`
+        });
+        return;
+    }
+
+    const testMetadata = testRegistry.get(testId);
+    if (!testMetadata) {
+        postToParent({
+            type: 'test_error',
+            testId: testId,
+            error: `Test metadata not found: ${testId}`
         });
         return;
     }
 
     try {
-        const promptStack = testPromptStack[test.title] || [];
+        const promptStack = testPromptStack[testMetadata.title] || [];
         const prompt = promptStack.length > 0 ? promptStack.join('\n') : undefined;
         const { agentOptions: defaultAgentOptions, browserOptions: defaultBrowserOptions } = buildDefaultBrowserAgentOptions({
             agentOptions: { llm, ...(prompt ? { prompt } : {}) },
             browserOptions: {
-                url: test.url,
+                url: testMetadata.url,
                 browser: browserOptions,
                 grounding
             }
@@ -125,7 +143,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
         tracker.events.on('stateChanged', (state) => {
             postToParent({
                 type: 'test_state_change',
-                testId: test.id,
+                testId: testId,
                 state
             });
         });
@@ -157,21 +175,21 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
                 try {
                     await beforeEachHook();
                 } catch (error) {
-                    console.error(`beforeEach hook failed for test '${test.title}':`, error);
+                    console.error(`beforeEach hook failed for test '${testMetadata.title}':`, error);
                     throw error;
                 }
             }
-            pendingAfterEach.add(test.id);
+            pendingAfterEach.add(testId);
 
             await testFn(agent);
 
             if (!isShuttingDown) {
-                pendingAfterEach.delete(test.id);
+                pendingAfterEach.delete(testId);
                 for (const afterEachHook of hooks.afterEach) {
                     try {
                         await afterEachHook();
                     } catch (error) {
-                        console.error(`afterEach hook failed for test '${test.title}':`, error);
+                        console.error(`afterEach hook failed for test '${testMetadata.title}':`, error);
                         throw error;
                     }
                 }
@@ -186,13 +204,13 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
             finalResult = { passed: true };
         } catch (error) {
             if (!isShuttingDown) {
-                pendingAfterEach.delete(test.id);
+                pendingAfterEach.delete(testId);
                 try {
                     for (const afterEachHook of hooks.afterEach) {
                         await afterEachHook();
                     }
                 } catch (afterEachError) {
-                    console.error(`afterEach hook failed for failing test '${test.title}':`, afterEachError);
+                    console.error(`afterEach hook failed for failing test '${testMetadata.title}':`, afterEachError);
                     const originalMessage = error instanceof Error ? error.message : String(error);
                     const afterEachMessage = afterEachError instanceof Error ? afterEachError.message : String(afterEachError);
                     error = new Error(`Test failed: ${originalMessage}. Additionally, afterEach hook failed: ${afterEachMessage}`);
@@ -217,7 +235,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
 
         postToParent({
             type: 'test_state_change',
-            testId: test.id,
+            testId: testId,
             state: finalState
         });
 
@@ -225,7 +243,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
 
         postToParent({
             type: 'test_result',
-            testId: test.id,
+            testId: testId,
             result: finalResult ??
                 { passed: false, failure: { message: "Test result doesn't exist" } },
         });
@@ -233,7 +251,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
         postToParent({
             type: 'test_error',
             error: error instanceof Error ? error.message : String(error),
-            testId: test.id,
+            testId: testId,
         });
     }
 });

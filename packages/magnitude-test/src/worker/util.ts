@@ -10,6 +10,8 @@ declare global {
     var __magnitudeTestFunctions: Map<string, TestFunction> | undefined;
     var __magnitudeMessageEmitter: EventEmitter | undefined;
     var __magnitudeTestHooks: TestHooks | undefined;
+    var __magnitudeTestPromptStack: Record<string, string[]> | undefined;
+    var __magnitudeTestRegistry: Map<string, TestMetadata> | undefined;
 }
 
 if (!globalThis.__magnitudeTestFunctions) {
@@ -28,6 +30,13 @@ export type TestHooks = Record<
     (() => void | Promise<void>)[]
 >;
 
+export type TestMetadata = {
+    title: string;
+    url: string;
+    filepath: string;
+    group?: string;
+};
+
 if (!globalThis.__magnitudeTestHooks) {
     globalThis.__magnitudeTestHooks = {
         beforeAll: [],
@@ -38,13 +47,19 @@ if (!globalThis.__magnitudeTestHooks) {
 }
 export const hooks = globalThis.__magnitudeTestHooks;
 
+if (!globalThis.__magnitudeTestPromptStack) {
+    globalThis.__magnitudeTestPromptStack = {};
+}
+export const testPromptStack = globalThis.__magnitudeTestPromptStack;
+
+if (!globalThis.__magnitudeTestRegistry) {
+    globalThis.__magnitudeTestRegistry = new Map<string, TestMetadata>();
+}
+export const testRegistry = globalThis.__magnitudeTestRegistry;
+
 export type TestWorkerIncomingMessage = {
     type: "execute"
-    test: RegisteredTest;
-    browserOptions?: BrowserOptions;
-    llm?: LLMClient | LLMClient[];
-    grounding?: GroundingClient;
-    telemetry?: boolean;
+    testId: string;
 } | {
     type: "graceful_shutdown"
 }
@@ -89,6 +104,10 @@ export type TestWorkerData = {
     absoluteFilePath: string;
     options: TestOptions;
     relativeFilePath: string;
+    browserOptions?: BrowserOptions;
+    llm?: LLMClient | LLMClient[];
+    grounding?: GroundingClient;
+    telemetry?: boolean;
 }
 
 export function getTestWorkerData() {

@@ -1,11 +1,9 @@
 import { TestDeclaration, TestOptions, TestFunction, TestGroupFunction } from '../discovery/types';
 import { addProtocolIfMissing, processUrl } from '@/util';
-import { getTestWorkerData, hooks, TestHooks } from '@/worker/util';
+import { getTestWorkerData, hooks, TestHooks, testPromptStack } from '@/worker/util';
 import { currentGroupOptions, registerTest, setCurrentGroup } from '@/worker/localTestRegistry';
 
 const workerData = getTestWorkerData();
-
-const testPromptStack: Record<string, string[]> = {};
 
 function testDecl(
     title: string,
@@ -27,7 +25,7 @@ function testDecl(
         testFn = testFnOrNothing;
     }
 
-  const groupOptions = currentGroupOptions();
+    const groupOptions = currentGroupOptions();
 
     const combinedOptions: TestOptions = {
         ...(workerData.options ?? {}),
@@ -77,8 +75,6 @@ testDecl.group = function (
 }
 
 export const test = testDecl as TestDeclaration;
-
-export { testPromptStack };
 
 function createHookRegistrar(kind: keyof TestHooks) {
     return function (fn: TestHooks[typeof kind][number]) {
