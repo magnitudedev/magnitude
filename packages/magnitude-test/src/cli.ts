@@ -22,6 +22,7 @@ import { TermAppRenderer } from '@/term-app'; // Import TermAppRenderer
 //import { initializeTestStates } from './term-app/util';
 // Removed import { initializeUI, updateUI, cleanupUI } from '@/term-app';
 import { startWebServers, stopWebServers } from './webServer';
+import { DebugRenderer } from './renderer/debugRenderer';
 import chalk from 'chalk';
 
 function getRelativePath(projectRoot: string, absolutePath: string): string {
@@ -248,16 +249,7 @@ program
                 : !config.continueAfterFailure,
             createRenderer: (tests) => showUI
                 ? new TermAppRenderer(config, tests)
-                : {
-                    // Plain/debug renderer
-                    onTestStateUpdated: (test, state) => {
-                        logger.info(`Test: ${test.title} (${test.id})`);
-                        logger.info(`  Status: ${state.failure ? 'failed' : (state.doneAt ? 'passed' : (state.startedAt ? 'running' : 'pending'))}`);
-                        if (state.failure) {
-                            logger.error(`  Failure: ${state.failure.message}`);
-                        }
-                    }
-                },
+                : new DebugRenderer(),
         });
 
         for (const filePath of absoluteFilePaths) {
