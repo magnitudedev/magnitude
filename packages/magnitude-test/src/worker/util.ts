@@ -29,6 +29,13 @@ export type TestHooks = Record<
     (() => void | Promise<void>)[]
 >;
 
+export type TestMetadata = {
+    title: string;
+    url: string;
+    filepath: string;
+    group?: string;
+    groupHierarchy?: Array<{ name: string; id?: string }>;
+};
 /** Group-level test hooks keyed by group name */
 export type GroupTestHooks = Record<string, TestHooks>;
 
@@ -46,6 +53,21 @@ if (!globalThis.__magnitudeGroupTestHooks) {
     globalThis.__magnitudeGroupTestHooks = {};
 }
 export const groupHooks = globalThis.__magnitudeGroupTestHooks;
+
+declare global {
+    var __magnitudeTestRegistry: Map<string, TestMetadata> | undefined;
+    var __magnitudeTestPromptStack: Record<string, string[]> | undefined;
+}
+
+if (!globalThis.__magnitudeTestRegistry) {
+    globalThis.__magnitudeTestRegistry = new Map<string, TestMetadata>();
+}
+export const testRegistry = globalThis.__magnitudeTestRegistry;
+
+if (!globalThis.__magnitudeTestPromptStack) {
+    globalThis.__magnitudeTestPromptStack = {};
+}
+export const testPromptStack = globalThis.__magnitudeTestPromptStack;
 
 export type TestWorkerIncomingMessage = {
     type: "execute"

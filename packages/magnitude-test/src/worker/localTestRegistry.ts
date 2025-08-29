@@ -1,11 +1,11 @@
 import { TestFunction, TestGroup, TestOptions, RegisteredTest } from "@/discovery/types";
 import cuid2 from "@paralleldrive/cuid2";
-import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, groupHooks } from "./util";
+import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, groupHooks, testRegistry } from "./util";
 import { TestCaseAgent } from "@/agent";
 import { TestResult, TestState, TestStateTracker } from "@/runner/state";
 import { buildDefaultBrowserAgentOptions } from "magnitude-core";
 import { sendTelemetry } from "@/runner/telemetry";
-import { testPromptStack } from "@/worker/testDeclaration";
+import { testPromptStack } from "./util";
 
 // This module has to be separate so it only gets imported once after possible compilation by jiti.
 
@@ -16,6 +16,15 @@ const generateId = cuid2.init({ length: 12 });
 export function registerTest(testFn: TestFunction, title: string, url: string) {
     const testId = generateId();
     testFunctions.set(testId, testFn);
+    const groupHierarchy = getCurrentGroupHierarchy().map(({ name, id }) => ({ name, id }));
+
+    testRegistry.set(testId, {
+        title,
+        url,
+        filepath: workerData.relativeFilePath,
+        group: getCurrentGroup()?.name,
+        groupHierarchy
+    });
     postToParent({
         type: 'registered',
         test: {
@@ -23,7 +32,8 @@ export function registerTest(testFn: TestFunction, title: string, url: string) {
             title,
             url,
             filepath: workerData.relativeFilePath,
-            group: currentGroup?.name
+            group: getCurrentGroup()?.name,
+            groupHierarchy
         }
     });
 }
@@ -37,15 +47,27 @@ let groupBeforeAllExecuted: Set<string> = new Set();
 let groupBeforeAllErrors: Map<string, Error> = new Map();
 // No state reset is needed because each test file is run in a separate worker
 
-let currentGroup: TestGroup | undefined;
-export function setCurrentGroup(group?: TestGroup) {
-    currentGroup = group;
+let currentGroupStack: TestGroup[] = [];
+export function pushCurrentGroup(group: TestGroup) {
+    currentGroupStack.push(group);
+}
+export function popCurrentGroup() {
+    currentGroupStack.pop();
 }
 export function getCurrentGroup(): TestGroup | undefined {
-    return currentGroup;
+    return currentGroupStack.length > 0 ? currentGroupStack[currentGroupStack.length - 1] : undefined;
+}
+export function getCurrentGroupHierarchy(): TestGroup[] {
+    return [...currentGroupStack];
 }
 export function currentGroupOptions(): TestOptions {
-    return structuredClone(currentGroup?.options) ?? {};
+    let mergedOptions: TestOptions = {};
+    for (const group of currentGroupStack) {
+        if (group.options) {
+            mergedOptions = { ...mergedOptions, ...group.options };
+        }
+    }
+    return structuredClone(mergedOptions);
 }
 
 async function executeAfterEachHooks(test: RegisteredTest) {

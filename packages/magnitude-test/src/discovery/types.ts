@@ -57,11 +57,12 @@ export type TestGroupFunction = () => void;
 export interface TestGroup {
     name: string;
     options?: TestOptions;
+    id?: string;
 }
 
 export interface TestGroupDeclaration {
-    (id: string, options: TestOptions, groupFn: TestGroupFunction): void;
-    (id: string, groupFn: TestGroupFunction): void;
+    (name: string, options: TestOptions, groupFn: TestGroupFunction): void;
+    (name: string, groupFn: TestGroupFunction): void;
 }
 
 export interface TestDeclaration {
@@ -85,4 +86,5 @@ export interface RegisteredTest {
     // meta
     filepath: string,
     group?: string,
+    groupHierarchy?: Array<{ name: string; id?: string }>,
 }
