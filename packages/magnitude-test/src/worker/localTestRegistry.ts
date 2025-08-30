@@ -1,17 +1,25 @@
 import { TestFunction, TestGroup, TestOptions, RegisteredTest } from "@/discovery/types";
 import cuid2 from "@paralleldrive/cuid2";
-import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, groupHooks, testRegistry } from "./util";
+import { getTestWorkerData, postToParent, testFunctions, messageEmitter, TestWorkerIncomingMessage, hooks, testRegistry, testPromptStack, getOrInitGroupHookSet } from "./util";
 import { TestCaseAgent } from "@/agent";
 import { TestResult, TestState, TestStateTracker } from "@/runner/state";
 import { buildDefaultBrowserAgentOptions } from "magnitude-core";
 import { sendTelemetry } from "@/runner/telemetry";
-import { testPromptStack } from "./util";
 
 // This module has to be separate so it only gets imported once after possible compilation by jiti.
 
 const workerData = getTestWorkerData();
 
 const generateId = cuid2.init({ length: 12 });
+
+/** Get all prefix keys for a hierarchy in outer → inner order */
+function keysForPrefixes(hierarchy: TestGroup[]): string[] {
+    const keys: string[] = [];
+    for (let i = 1; i <= hierarchy.length; i++) {
+        keys.push(hierarchy.slice(0, i).map(g => g.id).join('>'));
+    }
+    return keys;
+}
 
 export function registerTest(testFn: TestFunction, title: string, url: string) {
     const testId = generateId();
@@ -45,6 +53,7 @@ let isShuttingDown = false;
 let pendingAfterEach: Map<string, RegisteredTest> = new Map();
 let groupBeforeAllExecuted: Set<string> = new Set();
 let groupBeforeAllErrors: Map<string, Error> = new Map();
+let executedBeforeAllOrder: string[] = [];
 // No state reset is needed because each test file is run in a separate worker
 
 let currentGroupStack: TestGroup[] = [];
@@ -71,13 +80,19 @@ export function currentGroupOptions(): TestOptions {
 }
 
 async function executeAfterEachHooks(test: RegisteredTest) {
-    if (test.group && groupHooks[test.group]) {
-        for (const afterEachHook of groupHooks[test.group].afterEach) {
-            try {
-                await afterEachHook();
-            } catch (error) {
-                console.error(`Group afterEach hook failed for test '${test.title}' in group '${test.group}':`, error);
-                throw error;
+    // Run group-level afterEach hooks in inner → outer order
+    if (test.groupHierarchy && test.groupHierarchy.length > 0) {
+        const prefixKeys = keysForPrefixes(test.groupHierarchy);
+        for (const key of prefixKeys.reverse()) {
+            const hookSet = getOrInitGroupHookSet(key);
+            for (const afterEachHook of hookSet.afterEach) {
+                try {
+                    await afterEachHook();
+                } catch (error) {
+                    const groupNames = test.groupHierarchy.map(g => g.name).join(' > ');
+                    console.error(`Group afterEach hook failed for test '${test.title}' in hierarchy '${groupNames}':`, error);
+                    throw error;
+                }
             }
         }
     }
@@ -93,29 +108,37 @@ async function executeAfterEachHooks(test: RegisteredTest) {
 }
 
 async function executeGroupBeforeAllHooks(test: RegisteredTest) {
-    if (!test.group || !groupHooks[test.group]) {
+    if (!test.groupHierarchy || test.groupHierarchy.length === 0) {
         return;
     }
 
-    if (groupBeforeAllExecuted.has(test.group)) {
-        const error = groupBeforeAllErrors.get(test.group);
-        if (error) {
-            throw new Error(`Group beforeAll hook failed for group '${test.group}': ${error.message}`);
-        }
-        return;
-    }
+    const prefixKeys = keysForPrefixes(test.groupHierarchy);
 
-    groupBeforeAllExecuted.add(test.group);
-
-    try {
-        for (const beforeAllHook of groupHooks[test.group].beforeAll) {
-            await beforeAllHook();
+    for (const key of prefixKeys) {
+        if (groupBeforeAllExecuted.has(key)) {
+            const error = groupBeforeAllErrors.get(key);
+            if (error) {
+                const groupNames = test.groupHierarchy.map(g => g.name).join(' > ');
+                throw new Error(`Group beforeAll hook failed for hierarchy '${groupNames}': ${error.message}`);
+            }
+            continue;
         }
-    } catch (error) {
-        const hookError = error instanceof Error ? error : new Error(String(error));
-        console.error(`Group beforeAll hook failed for group '${test.group}':`, hookError);
-        groupBeforeAllErrors.set(test.group, hookError);
-        throw hookError;
+
+        groupBeforeAllExecuted.add(key);
+        executedBeforeAllOrder.push(key);
+
+        try {
+            const hookSet = getOrInitGroupHookSet(key);
+            for (const beforeAllHook of hookSet.beforeAll) {
+                await beforeAllHook();
+            }
+        } catch (error) {
+            const hookError = error instanceof Error ? error : new Error(String(error));
+            const groupNames = test.groupHierarchy.map(g => g.name).join(' > ');
+            console.error(`Group beforeAll hook failed for hierarchy '${groupNames}':`, hookError);
+            groupBeforeAllErrors.set(key, hookError);
+            throw hookError;
+        }
     }
 }
 
@@ -144,14 +167,16 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
 
             if (!afterAllExecuted) {
                 try {
-                    for (const groupName of groupBeforeAllExecuted) {
-                        if (groupHooks[groupName] && groupHooks[groupName].afterAll.length > 0) {
+                    // Run group afterAll hooks in reverse execution order (inner → outer)
+                    for (const key of executedBeforeAllOrder.reverse()) {
+                        const hookSet = getOrInitGroupHookSet(key);
+                        if (hookSet.afterAll.length > 0) {
                             try {
-                                for (const afterAllHook of groupHooks[groupName].afterAll) {
+                                for (const afterAllHook of hookSet.afterAll) {
                                     await afterAllHook();
                                 }
                             } catch (error) {
-                                console.error(`Group afterAll hook failed during graceful shutdown for group '${groupName}':`, error);
+                                console.error(`Group afterAll hook failed during graceful shutdown for hierarchy key '${key}':`, error);
                             }
                         }
                     }
@@ -231,6 +256,7 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
         let finalState: TestState;
         let finalResult: TestResult;
 
+
         try {
             if (!beforeAllExecuted && hooks.beforeAll.length > 0) {
                 try {
@@ -260,13 +286,19 @@ messageEmitter.on('message', async (message: TestWorkerIncomingMessage) => {
                 }
             }
 
-            if (test.group && groupHooks[test.group]) {
-                for (const beforeEachHook of groupHooks[test.group].beforeEach) {
-                    try {
-                        await beforeEachHook();
-                    } catch (error) {
-                        console.error(`Group beforeEach hook failed for test '${test.title}' in group '${test.group}':`, error);
-                        throw error;
+            // Run group-level beforeEach hooks in outer → inner order
+            if (test.groupHierarchy && test.groupHierarchy.length > 0) {
+                const prefixKeys = keysForPrefixes(test.groupHierarchy);
+                for (const key of prefixKeys) {
+                    const hookSet = getOrInitGroupHookSet(key);
+                    for (const beforeEachHook of hookSet.beforeEach) {
+                        try {
+                            await beforeEachHook();
+                        } catch (error) {
+                            const groupNames = test.groupHierarchy.map(g => g.name).join(' > ');
+                            console.error(`Group beforeEach hook failed for test '${test.title}' in hierarchy '${groupNames}':`, error);
+                            throw error;
+                        }
                     }
                 }
             }

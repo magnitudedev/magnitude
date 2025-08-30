@@ -1,7 +1,7 @@
 import { TestDeclaration, TestOptions, TestFunction, TestGroupFunction } from '../discovery/types';
 import { addProtocolIfMissing, processUrl } from '@/util';
-import { getTestWorkerData, hooks, TestHooks, testPromptStack, groupHooks } from '@/worker/util';
-import { currentGroupOptions, registerTest, pushCurrentGroup, popCurrentGroup, getCurrentGroup } from '@/worker/localTestRegistry';
+import { getTestWorkerData, hooks, TestHooks, testPromptStack, getOrInitGroupHookSet } from '@/worker/util';
+import { currentGroupOptions, registerTest, pushCurrentGroup, popCurrentGroup, getCurrentGroupHierarchy } from '@/worker/localTestRegistry';
 import cuid2 from "@paralleldrive/cuid2";
 
 const workerData = getTestWorkerData();
@@ -28,7 +28,7 @@ function testDecl(
         testFn = testFnOrNothing;
     }
 
-  const groupOptions = currentGroupOptions();
+    const groupOptions = currentGroupOptions();
 
     const combinedOptions: TestOptions = {
         ...(workerData.options ?? {}),
@@ -88,18 +88,11 @@ function createHookRegistrar(kind: keyof TestHooks) {
             throw new Error(`${kind} expects a function`);
         }
 
-        const group = getCurrentGroup();
-        if (group) {
-            // Register as group-level hook
-            if (!groupHooks[group.name]) {
-                groupHooks[group.name] = {
-                    beforeAll: [],
-                    afterAll: [],
-                    beforeEach: [],
-                    afterEach: [],
-                };
-            }
-            groupHooks[group.name][kind].push(fn);
+        const hierarchy = getCurrentGroupHierarchy();
+        if (hierarchy.length > 0) {
+            const key = hierarchy.map(g => g.id).join('>');
+            const hookSet = getOrInitGroupHookSet(key);
+            hookSet[kind].push(fn);
         } else {
             // Register as file-level hook
             hooks[kind].push(fn);

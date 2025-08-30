@@ -29,15 +29,6 @@ export type TestHooks = Record<
     (() => void | Promise<void>)[]
 >;
 
-export type TestMetadata = {
-    title: string;
-    url: string;
-    filepath: string;
-    group?: string;
-    groupHierarchy?: Array<{ name: string; id?: string }>;
-};
-/** Group-level test hooks keyed by group name */
-export type GroupTestHooks = Record<string, TestHooks>;
 
 if (!globalThis.__magnitudeTestHooks) {
     globalThis.__magnitudeTestHooks = {
@@ -48,6 +39,17 @@ if (!globalThis.__magnitudeTestHooks) {
     };
 }
 export const hooks = globalThis.__magnitudeTestHooks;
+
+export type TestMetadata = {
+    title: string;
+    url: string;
+    filepath: string;
+    group?: string;
+    groupHierarchy?: Array<{ name: string; id?: string }>;
+};
+
+/** Group-level test hooks keyed by hierarchy key */
+export type GroupTestHooks = Record<string, TestHooks>;
 
 if (!globalThis.__magnitudeGroupTestHooks) {
     globalThis.__magnitudeGroupTestHooks = {};
@@ -69,6 +71,18 @@ if (!globalThis.__magnitudeTestPromptStack) {
 }
 export const testPromptStack = globalThis.__magnitudeTestPromptStack;
 
+/** Helper to get or initialize hook set for a hierarchy key */
+export function getOrInitGroupHookSet(key: string): TestHooks {
+    if (!groupHooks[key]) {
+        groupHooks[key] = {
+            beforeAll: [],
+            afterAll: [],
+            beforeEach: [],
+            afterEach: [],
+        };
+    }
+    return groupHooks[key];
+}
 export type TestWorkerIncomingMessage = {
     type: "execute"
     test: RegisteredTest;
