@@ -12,7 +12,8 @@ export interface StepDescriptor {
     description: string,
     actions: ActionDescriptor[],
     //actions: Action[]
-    status: 'pending' | 'running' | 'passed' | 'failed' | 'cancelled'
+    status: 'pending' | 'running' | 'passed' | 'failed' | 'cancelled',
+    thoughts: string[]
 }
 
 export interface CheckDescriptor {
@@ -102,6 +103,7 @@ export class TestStateTracker {
         this.agent.events.on('actionDone', this.onActionDone, this);
 
         this.agent.events.on('tokensUsed', this.onTokensUsed, this);
+        this.agent.events.on('thought', this.onThought, this);
 
         this.agent.checkEvents.on('checkStarted', this.onCheckStarted, this);
         this.agent.checkEvents.on('checkDone', this.onCheckDone, this);
@@ -162,6 +164,13 @@ export class TestStateTracker {
         // console.log('total:', this.state.modelUsage);
     }
 
+    onThought(thought: string) {
+        if (this.lastStepOrCheck && this.lastStepOrCheck.variant === 'step') {
+            this.lastStepOrCheck.thoughts.push(thought);
+            this.events.emit('stateChanged', this.state);
+        }
+    }
+
     onActionStarted(action: Action) {
         // TODO: maybe allow detatched actions (e.g. synthetic load at beginning, or manual low-level actions)
         if (!this.lastStepOrCheck || this.lastStepOrCheck.variant !== 'step') {
@@ -197,7 +206,8 @@ export class TestStateTracker {
             variant: 'step',
             description: task,
             actions: [],
-            status: 'running'
+            status: 'running',
+            thoughts: []
         };
         this.state.stepsAndChecks.push(stepDescriptor);
         this.lastStepOrCheck = stepDescriptor;

@@ -1,4 +1,5 @@
 import pino from 'pino';
+import { PrettyOptions } from 'pino-pretty';
 
 export const logger = pino({
     level: process.env.MAGNITUDE_LOG_LEVEL || 'warn',
@@ -7,8 +8,9 @@ export const logger = pino({
         options: {
             colorize: !process.env.NO_COLOR,
             translateTime: 'SYS:HH:MM:ss.l',
-            ignore: 'pid,hostname'
-        }
+            ignore: 'pid,hostname',
+            singleLine: true
+        } satisfies PrettyOptions
     } : undefined
 }).child({
     name: "runner"
