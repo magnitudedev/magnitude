@@ -1,5 +1,5 @@
 import { writeFile, chmod, mkdir, copyFile, readFile } from 'fs/promises'
-import { resolve } from 'path'
+import { dirname, join, resolve } from 'path'
 import { existsSync } from 'fs'
 import { $ } from 'bun'
 
@@ -20,6 +20,8 @@ interface PatchTarget {
   getContent: (platform: string, arch: string) => string
 }
 
+const PROJECT_ROOT = resolve(import.meta.dir, '../..')
+
 const PATCH_TARGETS: PatchTarget[] = [
   {
     file: 'node_modules/oxc-parser/src-js/bindings.js',
@@ -39,7 +41,7 @@ const PATCH_TARGETS: PatchTarget[] = [
 
 async function patchNativeBindings(platform: string, arch: string): Promise<void> {
   for (const target of PATCH_TARGETS) {
-    const resolved = resolve('..', target.file)
+    const resolved = resolve(PROJECT_ROOT, target.file)
     await copyFile(resolved, resolved + '.bak')
     await writeFile(resolved, target.getContent(platform, arch))
     console.log('  [patch] ' + target.file)
@@ -48,7 +50,7 @@ async function patchNativeBindings(platform: string, arch: string): Promise<void
 
 async function restoreNativeBindings(): Promise<void> {
   for (const target of PATCH_TARGETS) {
-    const resolved = resolve('..', target.file)
+    const resolved = resolve(PROJECT_ROOT, target.file)
     if (existsSync(resolved + '.bak')) {
       await copyFile(resolved + '.bak', resolved)
       const { unlink } = await import('fs/promises')
@@ -81,14 +83,14 @@ const QUICKJS_EMSCRIPTEN_MODULES = [
 ]
 
 async function patchQuickJSWasm(): Promise<void> {
-  const wasmPath = resolve('..', QUICKJS_WASM_FILE)
+  const wasmPath = resolve(PROJECT_ROOT, QUICKJS_WASM_FILE)
 
   // Read WASM and base64 encode
   const wasmBinary = await readFile(wasmPath)
   const wasmBase64 = wasmBinary.toString('base64')
 
   for (const mod of QUICKJS_EMSCRIPTEN_MODULES) {
-    const modPath = resolve('..', mod.file)
+    const modPath = resolve(PROJECT_ROOT, mod.file)
     if (!existsSync(modPath)) continue
 
     // Backup original
@@ -110,7 +112,7 @@ async function patchQuickJSWasm(): Promise<void> {
 
 async function restoreQuickJSWasm(): Promise<void> {
   for (const mod of QUICKJS_EMSCRIPTEN_MODULES) {
-    const modPath = resolve('..', mod.file)
+    const modPath = resolve(PROJECT_ROOT, mod.file)
     if (existsSync(modPath + '.bak')) {
       await copyFile(modPath + '.bak', modPath)
       const { unlink } = await import('fs/promises')
@@ -141,19 +143,21 @@ const targetArg = process.argv[2]
 async function build(target: string) {
   const isWindows = target.includes('windows')
   const ext = isWindows ? '.exe' : ''
-  const binaryFile = 'bin/magnitude-' + target.replace('bun-', '') + ext
+  const binaryFile = resolve(PROJECT_ROOT, 'bin', 'magnitude-' + target.replace('bun-', '') + ext)
   const { platform, arch } = getTargetPlatformArch(target)
 
   console.log('Building ' + target + '...')
 
-  if (!existsSync('bin')) await mkdir('bin')
+  const binDir = resolve(PROJECT_ROOT, 'bin')
+  if (!existsSync(binDir)) await mkdir(binDir)
 
   // Patch NAPI-RS loaders and QuickJS WASM for compiled binary compatibility
   await patchNativeBindings(platform, arch)
   await patchQuickJSWasm()
 
   try {
-    await $`bun build src/index.tsx --compile --target=${target} --outfile=${binaryFile}`
+    const entrypoint = resolve(import.meta.dir, '..', 'src', 'index.tsx')
+    await $`bun build ${entrypoint} --compile --target=${target} --outfile=${binaryFile}`
   } finally {
     // Always restore original files
     await restoreNativeBindings()
