@@ -1,0 +1,19 @@
+{
+  "mutation_type": "duplicate-line-flip",
+  "mutation_category": "duplicate",
+  "difficulty": "nightmare",
+  "difficulty_score": 16,
+  "line_number": 106,
+  "original_snippet": "            return true;",
+  "mutated_snippet": "            return false;",
+  "file_path": "packages/eslint-plugin-react-hooks/src/shared/RunReactCompiler.ts",
+  "context": {
+    "file_lines": 334,
+    "is_repeated_line": true,
+    "repeat_count": 6,
+    "similar_block_count": 12,
+    "density": 0.777,
+    "line_indent": 12,
+    "containing_function": "checkTopLevelNode"
+  }
+}

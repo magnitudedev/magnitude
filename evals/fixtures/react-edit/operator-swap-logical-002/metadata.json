@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-logical",
+  "mutation_category": "operator",
+  "difficulty": "medium",
+  "difficulty_score": 7,
+  "line_number": 62,
+  "original_snippet": "          byteSize = (resourceEntry.transferSize: any) || 0;",
+  "mutated_snippet": "          byteSize = (resourceEntry.transferSize: any) && 0;",
+  "file_path": "packages/react-server-dom-webpack/src/client/ReactFlightClientConfigBundlerWebpackBrowser.js",
+  "context": {
+    "file_lines": 115,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 3,
+    "density": 0.756,
+    "line_indent": 10,
+    "containing_function": "addChunkDebugInfo"
+  }
+}

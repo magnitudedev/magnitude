@@ -1,0 +1,8 @@
+{
+  "id": "broken-sort",
+  "description": "Fix a broken array sort implementation",
+  "taskPrompt": "The sort function in src/index.ts is broken. The tests in test/index.test.ts are failing. Fix the source code so all tests pass. Do NOT modify any test files. Run `bun test` to verify, then call done().",
+  "verifyCommand": "bun test",
+  "language": "node",
+  "protectedFiles": ["test/index.test.ts"]
+}

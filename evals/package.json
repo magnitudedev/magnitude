@@ -1,0 +1,29 @@
+{
+  "name": "@magnitudedev/evals",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eval": "bun src/cli.ts",
+    "session": "bun src/tools/session-inspect.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "@commander-js/extra-typings": "^14.0.0",
+    "@magnitudedev/agent": "workspace:*",
+    "@magnitudedev/agent-definition": "workspace:*",
+    "@magnitudedev/browser-harness": "workspace:*",
+    "@magnitudedev/event-core": "workspace:*",
+
+    "@magnitudedev/llm-core": "workspace:*",
+    "@magnitudedev/providers": "workspace:*",
+    "ansis": "^3.17.0",
+    "fontoxpath": "^3.34.0",
+    "slimdom": "^4.3.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.8",
+    "typescript": "^5.8.3"
+  }
+}

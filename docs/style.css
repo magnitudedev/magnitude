@@ -1,0 +1,48 @@
+.nav-logo {
+    height: 48px !important;
+    max-height: 48px !important;
+}
+
+html.dark h1,
+html.dark h2,
+html.dark h3,
+html.dark h4,
+html.dark h5,
+html.dark h6 {
+    color: #ffffff !important;
+}
+
+html.dark p,
+html.dark li,
+html.dark td,
+html.dark th,
+html.dark span,
+html.dark a,
+html.dark label,
+html.dark blockquote,
+html.dark dt,
+html.dark dd {
+    color: #f1f5f9 !important;
+}
+
+html.dark .card {
+    border-color: #475569 !important;
+}
+
+html.dark table,
+html.dark table th,
+html.dark table td,
+html.dark table tr,
+html.dark table thead,
+html.dark table thead tr,
+html.dark table thead th {
+    border-color: #64748b !important;
+}
+
+html.dark div,
+html.dark nav,
+html.dark section,
+html.dark aside,
+html.dark hr {
+    border-color: #475569 !important;
+}

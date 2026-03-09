@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-named-imports",
+  "mutation_category": "import",
+  "difficulty": "hard",
+  "difficulty_score": 8,
+  "line_number": 15,
+  "original_snippet": "import { track, trackHydrated, updateValueIfChanged } from './inputValueTracking';",
+  "mutated_snippet": "import { trackHydrated, track, updateValueIfChanged } from './inputValueTracking';",
+  "file_path": "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+  "context": {
+    "file_lines": 475,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 6,
+    "density": 0.767,
+    "line_indent": 0,
+    "containing_function": null
+  }
+}

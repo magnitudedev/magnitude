@@ -1,0 +1,19 @@
+{
+  "mutation_type": "flip-boolean",
+  "mutation_category": "literal",
+  "difficulty": "nightmare",
+  "difficulty_score": 12,
+  "line_number": 561,
+  "original_snippet": "              adjust={true}",
+  "mutated_snippet": "              adjust={false}",
+  "file_path": "packages/react-devtools-shared/src/devtools/views/SuspenseTab/SuspenseRects.js",
+  "context": {
+    "file_lines": 571,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 16,
+    "density": 0.751,
+    "line_indent": 14,
+    "containing_function": "SuspenseRectsContainer"
+  }
+}

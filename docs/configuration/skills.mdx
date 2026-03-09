@@ -1,0 +1,86 @@
+---
+title: Skills
+description: "Add reusable agent behaviors with the Agent Skills standard"
+icon: wand
+---
+
+Magnitude supports the open source [Agent Skills](https://agentskills.io) standard — a cross-agent convention for defining reusable agent behaviors. Skills you create work in any agent that supports the standard.
+
+## What are skills?
+
+A skill is a markdown file (`SKILL.md`) that defines a reusable behavior the agent can activate. Each skill lives in its own directory and contains instructions that modify how the agent approaches a task.
+
+## Adding a skill
+
+Create a `SKILL.md` file in one of the scan directories:
+
+```
+.agents/skills/my-skill/SKILL.md
+```
+
+### SKILL.md format
+
+```markdown
+---
+name: my-skill
+description: A brief description of what this skill does
+trigger: When the user asks for X or wants Y
+---
+
+# My Skill
+
+Instructions for the agent when this skill is active.
+
+## Rules
+
+1. Do this
+2. Don't do that
+3. Follow this pattern
+```
+
+The YAML frontmatter requires:
+- **name** — skill identifier (used as the slash command)
+- **description** — what the skill does
+- **trigger** — when the skill should be activated
+
+## Activating a skill
+
+Type `/<skill-name>` in the chat to activate a skill. Skills show up alongside built-in commands in the autocomplete.
+
+## Scan locations
+
+Magnitude scans these directories for skills, in order of priority (later overrides earlier):
+
+| Location | Scope |
+|----------|-------|
+| `~/.agents/skills/` | Global (cross-agent standard) |
+| `~/.magnitude/skills/` | Global (Magnitude-specific) |
+| `<project>/.agents/skills/` | Project-local (cross-agent standard) |
+| `<project>/.magnitude/skills/` | Project-local (Magnitude-specific) |
+
+Project-local skills override global skills with the same name. Magnitude-specific directories override cross-agent directories.
+
+## Example: Debug skill
+
+```markdown
+---
+name: debug
+description: Take a scientific approach to debugging a problem
+trigger: User asks to debug an issue or track down a bug
+---
+
+# Debug
+
+You are debugging a difficult issue.
+Approach with a scientific method — collect evidence, form hypotheses,
+and verify them before declaring a root cause.
+
+## Rules
+
+1. Never jump to conclusions without a reproduction
+2. Collect as much information as possible
+3. Record evidence in `.magnitude/bugs/<date>/<title>.md`
+4. Only pull the user in if absolutely necessary
+```
+
+<Info>Learn more about the Agent Skills standard at [agentskills.io](https://agentskills.io).</Info>

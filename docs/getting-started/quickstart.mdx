@@ -1,0 +1,81 @@
+---
+title: Quick Start
+description: "Install Magnitude and start coding in under 2 minutes"
+icon: rocket
+---
+
+## Install
+
+<Tabs>
+  <Tab title="npm">
+    ```sh
+    npm install -g @magnitudedev/magnitude
+    ```
+  </Tab>
+  <Tab title="bun">
+    ```sh
+    bun install -g @magnitudedev/magnitude
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```sh
+    pnpm install -g @magnitudedev/magnitude
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```sh
+    yarn global add @magnitudedev/magnitude
+    ```
+  </Tab>
+</Tabs>
+
+## Get started
+
+<Steps>
+  <Step title="Launch Magnitude">
+    Navigate to your project directory and run:
+    ```sh
+    magnitude
+    ```
+  </Step>
+  <Step title="Complete the setup wizard">
+    On first launch, Magnitude walks you through a setup wizard that:
+
+    - **Connects a provider** — authenticate with Anthropic, OpenAI, or another supported provider via API key or OAuth
+    - **Configures models** — automatically selects recommended models for your provider
+    - **Sets up the browser agent** — installs Chromium if needed so the browser agent can verify UI changes
+
+    You can revisit these settings anytime with `/settings`.
+  </Step>
+  <Step title="Send your first message">
+    Type a message and press Enter. Magnitude will explore your codebase using specialized agents, then respond.
+
+    Try something like:
+    ```
+    What does this project do? Give me a summary of the architecture.
+    ```
+  </Step>
+  <Step title="Make changes">
+    When you're ready to make changes, just ask. Magnitude will talk through the approach with you, confirm direction, then implement autonomously.
+
+    ```
+    Add input validation to the signup form
+    ```
+
+    Press **Enter** to continue when you're ready, or type feedback to refine the plan. You can also reopen a prior session anytime with:
+    ```sh
+    magnitude --resume
+    ```
+  </Step>
+</Steps>
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="Providers & Auth" icon="plug" href="/configuration/providers">
+    Configure LLM providers and authentication
+  </Card>
+  <Card title="Interface & Shortcuts" icon="terminal" href="/using-magnitude/interface">
+    Learn the keyboard shortcuts and commands
+  </Card>
+</Columns>

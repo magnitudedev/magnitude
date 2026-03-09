@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-logical",
+  "mutation_category": "operator",
+  "difficulty": "hard",
+  "difficulty_score": 8,
+  "line_number": 252,
+  "original_snippet": "    if (options && options.signal) {",
+  "mutated_snippet": "    if (options || options.signal) {",
+  "file_path": "packages/react-server-dom-parcel/src/client/ReactFlightDOMClientBrowser.js",
+  "context": {
+    "file_lines": 270,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 19,
+    "density": 0.806,
+    "line_indent": 4,
+    "containing_function": null
+  }
+}

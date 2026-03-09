@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-call-args",
+  "mutation_category": "call",
+  "difficulty": "hard",
+  "difficulty_score": 10,
+  "line_number": 111,
+  "original_snippet": "    dispatchEvent(domEventName, eventSystemFlags, container, nativeEvent);",
+  "mutated_snippet": "    dispatchEvent(eventSystemFlags, domEventName, container, nativeEvent);",
+  "file_path": "packages/react-dom-bindings/src/events/ReactDOMEventListener.js",
+  "context": {
+    "file_lines": 387,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 10,
+    "density": 0.788,
+    "line_indent": 4,
+    "containing_function": "dispatchDiscreteEvent"
+  }
+}

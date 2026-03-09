@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-call-args",
+  "mutation_category": "call",
+  "difficulty": "easy",
+  "difficulty_score": 5,
+  "line_number": 62,
+  "original_snippet": "  fallbackText = endValue.slice(start, sliceTail);",
+  "mutated_snippet": "  fallbackText = endValue.slice(sliceTail, start);",
+  "file_path": "packages/react-dom-bindings/src/events/FallbackCompositionState.js",
+  "context": {
+    "file_lines": 72,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 4,
+    "density": 0.78,
+    "line_indent": 2,
+    "containing_function": "getData"
+  }
+}

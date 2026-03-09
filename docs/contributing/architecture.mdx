@@ -1,0 +1,78 @@
+---
+title: Architecture
+description: "How Magnitude's packages fit together"
+icon: blocks
+---
+
+Magnitude is a monorepo with layered packages that power agent behavior, runtime execution, and the terminal interface.
+
+## Package map
+
+```text
+CLI (cli/)
+  React + OpenTUI terminal interface
+  ↓
+Agent Core (packages/agent/)
+  Orchestrator + subagents, execution manager, tools, projections integration
+  ↓ uses
+Agent Definition (packages/agent-definition/)
+  Agent definitions, prompts, turn policies, model slot declarations
+  ↓ uses
+XML-ACT Runtime (packages/xml-act/)
+  Streaming XML parser, structured tool execution, refs/composition
+  ↓ uses
+Tools Framework (packages/tools/)
+  Tool definition + bindings
+  ↓
+Event Core (packages/event-core/)
+  Event system primitives used across runtime/projections/workers
+
+Agent Core also depends on:
+- `packages/providers/` (provider registry, auth, models)
+- `packages/llm-core/` (LLM abstraction and orchestration)
+- `packages/browser-harness/` (Playwright browser automation)
+- `packages/antml/` (ANTML parsing)
+- `packages/telemetry/` (anonymous usage events)
+- `packages/tracing/` (tracing/debugging)
+- `packages/js-act/` (legacy runtime support)
+```
+
+## Event-driven architecture
+
+Magnitude is event-driven:
+
+- **Events** capture all state transitions and actions.
+- **Projections** derive queryable state from the event stream.
+- **Workers** react to events and perform side effects.
+- **Signals** coordinate communication between runtime components.
+
+This architecture makes runs replayable and deterministic, and it enables robust inspection and debug workflows.
+
+## Subagent roles
+
+Magnitude uses a full agent taxonomy with distinct prompts and tool access:
+
+- **Orchestrator**: user-facing coordinator; manages delegation and conversation.
+- **Scout**: fast reconnaissance and codebase orientation.
+- **Researcher**: deep investigation and evidence gathering.
+- **Planner**: converts findings into actionable implementation plans.
+- **Builder**: performs concrete code changes and implementation.
+- **Debugger**: diagnoses failures and resolves regressions.
+- **Reviewer**: validates quality, risks, and completion criteria.
+- **Browser**: visual and web task execution using browser tooling.
+
+These roles are defined in `packages/agent/src/agents/`.
+
+## XML-ACT runtime
+
+Magnitude agents communicate using structured XML-ACT turns with dedicated sections for reasoning, communication, and actions. Tool calls are expressed as XML elements, and composition supports referencing earlier tool outputs with query-based selection.
+
+The XML-ACT runtime in `packages/xml-act/` handles streaming parse, validation, execution dispatch, and structured event emission. This is the primary runtime model for agent-tool interaction.
+
+## Forks
+
+Forks are parallel execution units with isolated state. Each fork maintains its own runtime context and activity stream. Subagents run as forks, allowing parallel task execution while keeping agent state scoped and auditable.
+
+## Terminal UI
+
+The CLI uses React with [OpenTUI](https://github.com/anomalyco/opentui). It renders conversation state, tool activity, and fork and subagent progress in the terminal.

@@ -1,0 +1,19 @@
+{
+  "mutation_type": "remove-negation",
+  "mutation_category": "operator",
+  "difficulty": "nightmare",
+  "difficulty_score": 8,
+  "line_number": 160,
+  "original_snippet": "        if (!workInProgress._debugOwner && info === '') {",
+  "mutated_snippet": "        if (workInProgress._debugOwner && info === '') {",
+  "file_path": "packages/react-reconciler/src/ReactFiberComponentStack.js",
+  "context": {
+    "file_lines": 202,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 4,
+    "density": 0.752,
+    "line_indent": 8,
+    "containing_function": "getOwnerStackByFiberInDev"
+  }
+}

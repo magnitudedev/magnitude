@@ -1,0 +1,19 @@
+{
+  "mutation_type": "delete-statement",
+  "mutation_category": "structural",
+  "difficulty": "easy",
+  "difficulty_score": 5,
+  "line_number": 127,
+  "original_snippet": "    const [unionTop, unionRight, unionBottom, unionLeft] = intermediateUnion;",
+  "mutated_snippet": "    const [nextTop, nextRight, nextBottom, nextLeft] = nextBox;",
+  "file_path": "packages/react-devtools-timeline/src/view-base/geometry.js",
+  "context": {
+    "file_lines": 138,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 11,
+    "density": 0.807,
+    "line_indent": 4,
+    "containing_function": "unionOfRects"
+  }
+}

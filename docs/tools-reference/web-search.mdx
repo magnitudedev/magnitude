@@ -1,0 +1,56 @@
+---
+title: Web Search
+description: "Search the web and extract structured data"
+icon: search
+---
+
+## webSearch
+
+Search the web and optionally extract structured data.
+
+```xml
+<webSearch>latest bun release notes</webSearch>
+```
+
+Returns web text plus sources, and may include structured data output when schema-driven extraction is used.
+
+Web search is available to research agents, planners, builders, and debuggers.
+
+## Provider routing
+
+Web search is routed through your primary model's provider using their native search capabilities:
+
+| Provider | Search support |
+|----------|---------------|
+| Anthropic | Native |
+| OpenAI | Native |
+| Google (Gemini) | Native |
+| Bedrock / Vertex (Anthropic models) | Routed through Anthropic |
+
+## Providers without native search
+
+If your primary provider doesn't support native web search (OpenRouter, Vercel, Cerebras, GitHub Copilot, Local), you can route search through a supported provider by setting:
+
+```sh
+export MAGNITUDE_SEARCH_PROVIDER=anthropic  # or "openai" or "gemini"
+```
+
+This requires valid credentials for the search provider (e.g. `ANTHROPIC_API_KEY` if routing through Anthropic).
+
+## Structured output
+
+Web search can also be used with schema-driven extraction so results are parsed into a specific data shape. This is used internally by research agents to gather structured information from the web.
+
+---
+
+## webFetch
+
+Fetch the content of a specific URL. When the agent finds a link from search results and wants to read the full page, it uses this tool.
+
+```xml
+<webFetch>https://docs.example.com/api-reference</webFetch>
+```
+
+Uses `curl` with a native `fetch()` fallback. Strips `<script>` and `<style>` from HTML. 5 MB max, 30s timeout, 5 redirect limit.
+
+Sites with aggressive bot detection (Cloudflare JS challenges) may still block requests.

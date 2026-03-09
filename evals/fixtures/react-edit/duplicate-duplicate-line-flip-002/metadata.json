@@ -1,0 +1,19 @@
+{
+  "mutation_type": "duplicate-line-flip",
+  "mutation_category": "duplicate",
+  "difficulty": "medium",
+  "difficulty_score": 13,
+  "line_number": 216,
+  "original_snippet": "  return true;",
+  "mutated_snippet": "  return false;",
+  "file_path": "packages/react-markup/src/ReactFizzConfigMarkup.js",
+  "context": {
+    "file_lines": 250,
+    "is_repeated_line": true,
+    "repeat_count": 5,
+    "similar_block_count": 13,
+    "density": 0.832,
+    "line_indent": 2,
+    "containing_function": "writeEndClientRenderedSuspenseBoundary"
+  }
+}

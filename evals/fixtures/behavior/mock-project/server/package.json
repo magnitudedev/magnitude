@@ -1,0 +1,19 @@
+{
+  "name": "task-manager-server",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "test": "bun test",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  },
+  "dependencies": {
+    "@elysiajs/cors": "^1.1.1",
+    "@elysiajs/jwt": "^1.2.0",
+    "@types/bcryptjs": "^2.4.6",
+    "bcryptjs": "^2.4.3",
+    "drizzle-kit": "^0.30.1",
+    "drizzle-orm": "^0.40.0",
+    "elysia": "^1.1.23"
+  }
+}

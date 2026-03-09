@@ -1,0 +1,19 @@
+{
+  "mutation_type": "remove-optional-chain",
+  "mutation_category": "access",
+  "difficulty": "medium",
+  "difficulty_score": 6,
+  "line_number": 166,
+  "original_snippet": "  switch (message?.source) {",
+  "mutated_snippet": "  switch (message.source) {",
+  "file_path": "packages/react-devtools-extensions/src/background/index.js",
+  "context": {
+    "file_lines": 196,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 8,
+    "density": 0.8,
+    "line_indent": 2,
+    "containing_function": null
+  }
+}

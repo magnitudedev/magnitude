@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-if-else",
+  "mutation_category": "structural",
+  "difficulty": "hard",
+  "difficulty_score": 11,
+  "line_number": 38,
+  "original_snippet": "          if (__DEV__) {\n            checkCSSPropertyStringCoercion(value, styleName);\n          }",
+  "mutated_snippet": "          if (typeof value === 'number' && value !== 0 && !isUnitlessNumber(styleName)) {",
+  "file_path": "packages/react-dom-bindings/src/client/CSSPropertyOperations.js",
+  "context": {
+    "file_lines": 244,
+    "is_repeated_line": true,
+    "repeat_count": 8,
+    "similar_block_count": 6,
+    "density": 0.741,
+    "line_indent": 10,
+    "containing_function": "createDangerousStringForStyles"
+  }
+}

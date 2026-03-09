@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-arithmetic",
+  "mutation_category": "operator",
+  "difficulty": "hard",
+  "difficulty_score": 10,
+  "line_number": 89,
+  "original_snippet": "    stringBuffer = messages[messages.length - 1];",
+  "mutated_snippet": "    stringBuffer = messages[messages.length + 1];",
+  "file_path": "packages/react-server-dom-parcel/src/server/ReactFlightDOMServerEdge.js",
+  "context": {
+    "file_lines": 322,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 17,
+    "density": 0.784,
+    "line_indent": 4,
+    "containing_function": "startReadingFromDebugChannelReadableStream"
+  }
+}

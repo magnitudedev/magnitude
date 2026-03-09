@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-named-imports",
+  "mutation_category": "import",
+  "difficulty": "medium",
+  "difficulty_score": 2,
+  "line_number": 15,
+  "original_snippet": "import { hasPointerEvent, setPointerEvent, platform } from './domEnvironment';",
+  "mutated_snippet": "import { setPointerEvent, hasPointerEvent, platform } from './domEnvironment';",
+  "file_path": "packages/dom-event-testing-library/index.js",
+  "context": {
+    "file_lines": 122,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 1,
+    "density": 0.809,
+    "line_indent": 0,
+    "containing_function": null
+  }
+}

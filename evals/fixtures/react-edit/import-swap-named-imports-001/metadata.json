@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-named-imports",
+  "mutation_category": "import",
+  "difficulty": "easy",
+  "difficulty_score": 2,
+  "line_number": 11,
+  "original_snippet": "import { useCallback, useContext, useEffect, useMemo, useRef } from 'react';",
+  "mutated_snippet": "import { useCallback, useContext, useRef, useMemo, useEffect } from 'react';",
+  "file_path": "packages/react-devtools-shared/src/devtools/views/Settings/SettingsModal.js",
+  "context": {
+    "file_lines": 140,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 2,
+    "density": 0.786,
+    "line_indent": 0,
+    "containing_function": null
+  }
+}

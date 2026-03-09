@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-equality",
+  "mutation_category": "operator",
+  "difficulty": "hard",
+  "difficulty_score": 12,
+  "line_number": 206,
+  "original_snippet": "  if (cacheFromPool !== null) {",
+  "mutated_snippet": "  if (cacheFromPool === null) {",
+  "file_path": "packages/react-reconciler/src/ReactFiberTransition.js",
+  "context": {
+    "file_lines": 318,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 18,
+    "density": 0.808,
+    "line_indent": 2,
+    "containing_function": "requestCacheFromPool"
+  }
+}

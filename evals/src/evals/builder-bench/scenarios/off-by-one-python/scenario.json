@@ -1,0 +1,8 @@
+{
+  "id": "off-by-one-python",
+  "description": "Fix an off-by-one error in a Python list chunking utility",
+  "taskPrompt": "The chunk_list function in src/utils.py has a bug causing incorrect chunking. The tests in tests/test_utils.py are failing. Fix the source code so all tests pass. Do NOT modify any test files. Run `python -m pytest tests/ -v` to verify, then call done().",
+  "verifyCommand": "python -m pytest tests/ -v",
+  "language": "python",
+  "protectedFiles": ["tests/test_utils.py"]
+}

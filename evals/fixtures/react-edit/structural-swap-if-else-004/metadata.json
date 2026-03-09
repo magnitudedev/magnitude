@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-if-else",
+  "mutation_category": "structural",
+  "difficulty": "nightmare",
+  "difficulty_score": 13,
+  "line_number": 116,
+  "original_snippet": "    resetTouchRecord(touchRecord, touch);\n  } else {",
+  "mutated_snippet": "    touchBank[identifier] = createTouchRecord(touch);",
+  "file_path": "packages/react-native-renderer/src/legacy-events/ResponderTouchHistoryStore.js",
+  "context": {
+    "file_lines": 234,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 9,
+    "density": 0.805,
+    "line_indent": 4,
+    "containing_function": "recordTouchStart"
+  }
+}

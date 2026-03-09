@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-equality",
+  "mutation_category": "operator",
+  "difficulty": "easy",
+  "difficulty_score": 8,
+  "line_number": 22,
+  "original_snippet": "  if (hook == null) {",
+  "mutated_snippet": "  if (hook != null) {",
+  "file_path": "packages/react-devtools-extensions/src/backend.js",
+  "context": {
+    "file_lines": 35,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 1,
+    "density": 0.856,
+    "line_indent": 2,
+    "containing_function": "setup"
+  }
+}

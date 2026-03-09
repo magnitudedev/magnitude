@@ -1,0 +1,81 @@
+---
+title: File Tools
+description: "How the agent reads, writes, and edits files"
+icon: file-code
+---
+
+The agent has a full set of filesystem tools for working with your code.
+
+## fs read
+
+Read the contents of a file.
+
+```xml
+<fs-read path="src/index.ts" />
+```
+
+- **path** — relative path from your project root
+
+## fs write
+
+Create or overwrite a file.
+
+```xml
+<fs-write path="src/index.ts">full file content here</fs-write>
+```
+
+- **path** — relative path from your project root
+- **content** — full file content
+
+## edit
+
+Edit a file using exact text-match find/replace.
+
+```xml
+<edit path="src/config.ts">
+  <old>const port = 3000;</old>
+  <new>const port = 8080;</new>
+</edit>
+```
+
+Optional `replaceAll`:
+
+```xml
+<edit path="src/config.ts" replaceAll="true">
+  <old>foo</old>
+  <new>bar</new>
+</edit>
+```
+
+- **path** — relative path from your project root
+- **old** — exact text to find in the file
+- **new** — replacement text
+- **replaceAll** — optional boolean; replace all occurrences instead of requiring uniqueness
+
+The `<old>` content must match the file exactly. Read the file first, then apply the edit.
+
+<Info>File edits require your approval. You'll see a diff preview before any changes are applied.</Info>
+
+## fs tree
+
+List directory structure.
+
+```xml
+<fs-tree path="src/" />
+```
+
+- Respects `.gitignore` by default
+- Useful for quickly understanding project layout
+
+## fs search
+
+Search file contents with regex.
+
+```xml
+<fs-search pattern="TODO|FIXME" path="src/" glob="*.ts" limit="50" />
+```
+
+- **pattern** — regex pattern to search for
+- **path** — optional directory to scope the search
+- **glob** — optional file filter (e.g. `"*.ts"`)
+- **limit** — optional maximum number of matches (default `50`)

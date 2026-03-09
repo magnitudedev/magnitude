@@ -1,0 +1,19 @@
+{
+  "mutation_type": "unicode-hyphen",
+  "mutation_category": "unicode",
+  "difficulty": "nightmare",
+  "difficulty_score": 8,
+  "line_number": 21,
+  "original_snippet": "} from 'react-client/src/ReactFlightClientConfig';",
+  "mutated_snippet": "} from 'react\\u2013client/src/ReactFlightClientConfig';",
+  "file_path": "packages/react-server/src/ReactFlightActionServer.js",
+  "context": {
+    "file_lines": 194,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 5,
+    "density": 0.79,
+    "line_indent": 0,
+    "containing_function": null
+  }
+}

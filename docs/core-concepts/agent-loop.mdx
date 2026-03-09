@@ -1,0 +1,34 @@
+---
+title: Overview
+description: "How Magnitude's orchestrator and subagents work together"
+icon: workflow
+---
+
+## The orchestrator
+
+The orchestrator is the agent you interact with directly. For quick tasks, it can read files, run commands, and make small edits on its own. For anything substantial, it deploys **subagents** — specialized agents that run in parallel on isolated forks.
+
+## The loop
+
+A typical workflow looks like:
+
+```
+You send a message
+  → Orchestrator scouts the codebase
+  → Orchestrator discusses findings with you
+  → Orchestrator deploys a planner
+  → You confirm the approach
+  → Orchestrator deploys a builder
+  → Orchestrator deploys a reviewer to verify
+  → Back to conversation
+```
+
+Not every task needs every step — the orchestrator adapts based on complexity. Simple questions get answered directly. Large changes get the full scout → plan → build → review treatment.
+
+## Subagents
+
+The orchestrator can deploy [7 types of subagents](/core-concepts/subagents), each specialized for a different job. Multiple subagents can run in parallel, and they share context through [artifacts](/core-concepts/artifacts).
+
+## Conversational by default
+
+Magnitude is conversational. You talk to the orchestrator, it understands your request, asks clarifying questions when needed, and aligns with you before doing significant work. There's no formal ceremony — just conversation.

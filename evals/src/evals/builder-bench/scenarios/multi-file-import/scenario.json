@@ -1,0 +1,8 @@
+{
+  "id": "multi-file-import",
+  "description": "Fix a bug in a transitive dependency — agent must trace imports across files",
+  "taskPrompt": "The tests in test/lib.test.ts are failing. The test file imports from src/lib.ts which re-exports from src/helpers.ts. The bug is somewhere in the source files. Fix the source code so all tests pass. Do NOT modify any test files. Run `bun test` to verify, then call done().",
+  "verifyCommand": "bun test",
+  "language": "node",
+  "protectedFiles": ["test/lib.test.ts"]
+}

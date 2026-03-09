@@ -1,0 +1,12 @@
+{
+  "name": "task-manager-workspace",
+  "private": true,
+  "workspaces": ["server", "client"],
+  "scripts": {
+    "dev": "concurrently \"bun run --cwd server dev\" \"bun run --cwd client dev\"",
+    "test": "bun run --cwd server test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}

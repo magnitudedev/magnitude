@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-arithmetic",
+  "mutation_category": "operator",
+  "difficulty": "easy",
+  "difficulty_score": 2,
+  "line_number": 26,
+  "original_snippet": "    this.n = (1 + this.n) | 0;",
+  "mutated_snippet": "    this.n = (1 - this.n) | 0;",
+  "file_path": "packages/eslint-plugin-react-hooks/src/code-path-analysis/id-generator.js",
+  "context": {
+    "file_lines": 38,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 0,
+    "density": 0.785,
+    "line_indent": 4,
+    "containing_function": null
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "mutation_type": "flip-boolean",
+  "mutation_category": "literal",
+  "difficulty": "hard",
+  "difficulty_score": 9,
+  "line_number": 80,
+  "original_snippet": "    if (value === '' && expected === true) {",
+  "mutated_snippet": "    if (value === '' && expected === false) {",
+  "file_path": "packages/react-dom-bindings/src/client/DOMPropertyOperations.js",
+  "context": {
+    "file_lines": 214,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 7,
+    "density": 0.742,
+    "line_indent": 4,
+    "containing_function": "getValueForAttributeOnCustomComponent"
+  }
+}

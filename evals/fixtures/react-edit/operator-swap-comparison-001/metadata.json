@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-comparison",
+  "mutation_category": "operator",
+  "difficulty": "easy",
+  "difficulty_score": 3,
+  "line_number": 57,
+  "original_snippet": "      if (mouseX + TOOLTIP_OFFSET_BOTTOM + element.offsetWidth >= width) {",
+  "mutated_snippet": "      if (mouseX + TOOLTIP_OFFSET_BOTTOM + element.offsetWidth > width) {",
+  "file_path": "packages/react-devtools-timeline/src/utils/useSmartTooltip.js",
+  "context": {
+    "file_lines": 78,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 1,
+    "density": 0.741,
+    "line_indent": 6,
+    "containing_function": "useSmartTooltip"
+  }
+}

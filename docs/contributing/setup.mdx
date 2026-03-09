@@ -1,0 +1,82 @@
+---
+title: Development Setup
+description: "Set up the Magnitude development environment"
+icon: wrench
+---
+
+## Prerequisites
+
+Magnitude is built with [Bun](https://bun.sh/). Install it first:
+
+<Tabs>
+  <Tab title="macOS / Linux">
+    ```sh
+    curl -fsSL https://bun.sh/install | bash
+    ```
+  </Tab>
+  <Tab title="Windows">
+    ```powershell
+    powershell -c "irm bun.sh/install.ps1 | iex"
+    ```
+  </Tab>
+</Tabs>
+
+## Clone and install
+
+```sh
+git clone https://github.com/magnitudedev/magnitude.git
+cd magnitude
+bun install
+```
+
+## Running in development
+
+```sh
+bun run dev
+```
+
+This starts Magnitude in development mode with the debug panel available (toggle with Ctrl+D). You can also pass `--debug` when running the installed CLI (`magnitude --debug`) for the same debug panel.
+
+## Running tests
+
+```sh
+bun test
+```
+
+## Monorepo structure
+
+| Package | Description |
+|---------|-------------|
+| `cli/` | Terminal UI (React + OpenTUI) |
+| `packages/agent/` | Agent core (orchestrator, subagents, execution, tools) |
+| `packages/agent-definition/` | Agent type definitions and prompts |
+| `packages/xml-act/` | XML-ACT protocol runtime (parser, execution, composition) |
+| `packages/js-act/` | Legacy JS sandbox (still present but secondary) |
+| `packages/llm-core/` | LLM abstraction layer (BAML) |
+| `packages/providers/` | Provider registry, auth, model management |
+| `packages/event-core/` | Event-driven framework (projections, workers, signals) |
+| `packages/tools/` | Tool definition framework |
+| `packages/antml/` | ANTML parser |
+| `packages/browser-harness/` | Playwright browser automation |
+| `packages/telemetry/` | Anonymous usage telemetry |
+| `packages/tracing/` | Tracing and debugging |
+
+## Session and debug tools
+
+Inspect past sessions with `bun session`:
+
+```sh
+bun session list
+bun session events <id>
+bun session events <id> --type turn_started,user_message
+bun session search <keyword> <id>
+bun session projection <id> Memory
+```
+
+View logger output for the current session:
+
+```sh
+bun logs
+```
+
+Session files are stored under `~/.magnitude/sessions/`.

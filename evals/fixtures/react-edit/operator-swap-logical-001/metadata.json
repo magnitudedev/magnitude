@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-logical",
+  "mutation_category": "operator",
+  "difficulty": "easy",
+  "difficulty_score": 4,
+  "line_number": 23,
+  "original_snippet": "  if (!__IS_CHROME__ && !__IS_EDGE__) {",
+  "mutated_snippet": "  if (!__IS_CHROME__ || !__IS_EDGE__) {",
+  "file_path": "packages/react-devtools-shared/src/frontend/utils/withPermissionsCheck.js",
+  "context": {
+    "file_lines": 36,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 1,
+    "density": 0.823,
+    "line_indent": 2,
+    "containing_function": "withPermissionsCheck"
+  }
+}

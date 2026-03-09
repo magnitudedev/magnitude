@@ -1,0 +1,19 @@
+{
+  "mutation_type": "remove-early-return",
+  "mutation_category": "structural",
+  "difficulty": "hard",
+  "difficulty_score": 8,
+  "line_number": 124,
+  "original_snippet": "  if (resourceCache.has(url)) {\n    return Promise.resolve(resourceCache.get(url));\n  }",
+  "mutated_snippet": "  return fetch(url)",
+  "file_path": "packages/react-devtools-core/src/standalone.js",
+  "context": {
+    "file_lines": 392,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 18,
+    "density": 0.79,
+    "line_indent": 2,
+    "containing_function": "fetchFileWithCaching"
+  }
+}

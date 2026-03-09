@@ -1,0 +1,45 @@
+---
+title: Artifacts
+description: "Shared named context that lets agents hand off work cleanly"
+icon: folder-kanban
+---
+
+Artifacts are named content stores that agents use to share context across work.
+
+Common artifact types include:
+
+- **Reports** (from scouts)
+- **Findings** (from researchers)
+- **Plans** (from planners)
+
+## Why artifacts matter
+
+Artifacts let work compound across agents instead of being re-discovered every time.
+
+For example:
+- A scout writes a report
+- A planner reads that report and writes a plan
+- A builder uses the plan to implement
+- A reviewer uses the same context to verify
+
+## How artifacts appear in the UI
+
+Artifacts are visible directly in the conversation:
+
+- Inline chips like **[≡ plan]** or **[≡ report]**
+- A clickable artifact side panel for browsing artifact contents
+
+This makes handoffs visible and easy to inspect.
+
+## Context passing between agents
+
+When the orchestrator launches a subagent, it can pass artifacts in two modes:
+
+- **context-artifact**: read-only context injected into the agent
+- **writable-artifact**: read/write artifact the agent can create or update
+
+This supports clean handoffs while controlling what each agent can modify.
+
+## Syncing artifacts to disk
+
+Artifacts can also be synced to files in your repo (for example under `specs/` or `bugs/`) when you want durable project records outside the live session.

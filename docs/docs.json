@@ -1,0 +1,137 @@
+{
+    "$schema": "https://mintlify.com/docs.json",
+    "name": "Magnitude",
+    "theme": "maple",
+    "description": "Open source AI coding agent for your terminal",
+    "logo": "/logo.svg",
+    "favicon": "/logo.svg",
+    "icons": {
+        "library": "lucide"
+    },
+    "fonts": {
+        "heading": {
+            "family": "Martian Mono",
+            "weight": 700
+        },
+        "body": {
+            "family": "Inter",
+            "weight": 400
+        }
+    },
+    "colors": {
+        "primary": "#0369a1",
+        "light": "#0ea5e9",
+        "dark": "#075985"
+    },
+    "background": {
+        "color": {
+            "dark": "#1e293b"
+        }
+    },
+    "navbar": {
+        "links": [
+            {
+                "label": "Community",
+                "href": "https://discord.gg/VcdpMh9tTy"
+            }
+        ],
+        "primary": {
+            "type": "button",
+            "label": "GitHub",
+            "href": "https://github.com/magnitudedev/magnitude"
+        }
+    },
+    "navigation": {
+        "global": {
+            "anchors": [
+                {
+                    "anchor": "GitHub",
+                    "icon": "github",
+                    "href": "https://github.com/magnitudedev/magnitude"
+                },
+                {
+                    "anchor": "Community",
+                    "icon": "discord",
+                    "href": "https://discord.gg/VcdpMh9tTy"
+                },
+                {
+                    "anchor": "Contact",
+                    "icon": "mail",
+                    "href": "mailto:founders@magnitude.dev"
+                }
+            ]
+        },
+        "groups": [
+            {
+                "group": "Getting Started",
+                "pages": [
+                    "getting-started/introduction",
+                    "getting-started/quickstart"
+                ]
+            },
+            {
+                "group": "Configuration",
+                "pages": [
+                    "configuration/providers",
+                    "configuration/models",
+                    "configuration/project-setup",
+                    "configuration/skills"
+                ]
+            },
+            {
+                "group": "Using Magnitude",
+                "pages": [
+                    "using-magnitude/interface",
+                    "using-magnitude/bash-mode",
+                    "using-magnitude/sessions"
+                ]
+            },
+            {
+                "group": "Core Concepts",
+                "pages": [
+                    "core-concepts/agent-loop",
+                    "core-concepts/subagents",
+                    "core-concepts/artifacts"
+                ]
+            },
+            {
+                "group": "Tools Reference",
+                "pages": [
+                    "tools-reference/file-tools",
+                    "tools-reference/shell",
+
+                    "tools-reference/web-search"
+                ]
+            },
+            {
+                "group": "Contributing",
+                "pages": [
+                    "contributing/setup",
+                    "contributing/architecture"
+                ]
+            }
+        ]
+    },
+    "styling": {
+        "codeblocks": {
+            "theme": {
+                "light": "github-light",
+                "dark": "github-dark"
+            }
+        }
+    },
+    "search": {
+        "prompt": "Search or ask..."
+    },
+    "seo": {
+        "indexing": "all"
+    },
+    "contextual": {
+        "options": [
+            "copy",
+            "view",
+            "chatgpt",
+            "claude"
+        ]
+    }
+}

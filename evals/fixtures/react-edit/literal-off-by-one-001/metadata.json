@@ -1,0 +1,19 @@
+{
+  "mutation_type": "off-by-one",
+  "mutation_category": "literal",
+  "difficulty": "easy",
+  "difficulty_score": 6,
+  "line_number": 33,
+  "original_snippet": "      input.selectionStart = 0;",
+  "mutated_snippet": "      input.selectionStart = 1;",
+  "file_path": "packages/react-devtools-shared/src/devtools/views/Components/NativeStyleEditor/AutoSizeInput.js",
+  "context": {
+    "file_lines": 59,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 2,
+    "density": 0.76,
+    "line_indent": 6,
+    "containing_function": "AutoSizeInput"
+  }
+}

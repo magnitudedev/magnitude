@@ -1,0 +1,19 @@
+{
+  "mutation_type": "remove-negation",
+  "mutation_category": "operator",
+  "difficulty": "easy",
+  "difficulty_score": 4,
+  "line_number": 67,
+  "original_snippet": "      {!isEmpty &&",
+  "mutated_snippet": "      {isEmpty &&",
+  "file_path": "packages/react-devtools-shared/src/devtools/views/Components/InspectedElementStateTree.js",
+  "context": {
+    "file_lines": 90,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 1,
+    "density": 0.763,
+    "line_indent": 6,
+    "containing_function": "InspectedElementStateTree"
+  }
+}

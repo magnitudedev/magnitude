@@ -1,0 +1,88 @@
+---
+title: Subagents
+description: "The specialized agents Magnitude deploys for exploration, planning, implementation, and verification"
+icon: users
+---
+
+Subagents are specialized workers the orchestrator deploys to handle non-trivial tasks.
+
+## The 7 subagent types
+
+### Scout
+
+- **Purpose:** Broad codebase exploration
+- **Access:** Read-only tools
+- **Output:** Report artifact (architecture, patterns, dependencies, test setup)
+
+Use a scout early when you need fast coverage of an unfamiliar area.
+
+### Researcher
+
+- **Purpose:** Deep investigation of a specific system or question
+- **Access:** Read-only tools + web search
+- **Output:** Findings artifact (analysis, evidence, recommendations)
+
+Use a researcher when you need depth, external references, or trade-off analysis.
+
+### Planner
+
+- **Purpose:** Evaluate implementation approaches and produce an execution plan
+- **Access:** Read-only tools + web search
+- **Output:** Plan artifact (steps, trade-offs, open questions)
+
+Use a planner before implementation when the change is non-trivial.
+
+### Builder
+
+- **Purpose:** Autonomous code implementation
+- **Access:** Full read-write tools + web search
+- **Output:** Code changes in the repository
+
+Use a builder when there is a clear plan and the task is ready to implement.
+
+### Debugger
+
+- **Purpose:** Root-cause diagnosis of bugs
+- **Access:** Full read-write tools + web search
+- **Output:** Diagnosis report (symptom, cause, evidence, recommended fix)
+
+Use a debugger when behavior is unclear and you need evidence-backed diagnosis.
+
+### Reviewer
+
+- **Purpose:** Independent verification
+- **Access:** Read-focused verification tools; runs tests/build/typechecks; can spawn browser agents
+- **Output:** Verification report with pass/fail findings
+
+Use a reviewer after significant builds to confirm behavior, not just code shape.
+
+### Browser
+
+- **Purpose:** Visual UI interaction and validation
+- **Access:** Playwright-style browser actions (navigate, click, type, screenshot, evaluate)
+- **Output:** Interaction log + visual findings
+
+Use a browser agent for layout, styling, and interactive UI checks.
+
+## How the orchestrator chooses
+
+The orchestrator chooses subagents based on the job:
+
+- Need broad context → **Scout**
+- Need deep analysis → **Researcher**
+- Need approach selection → **Planner**
+- Need implementation → **Builder**
+- Need bug diagnosis → **Debugger**
+- Need independent verification → **Reviewer**
+- Need visual UI checks → **Browser**
+
+A single request often uses multiple subagents in sequence.
+
+## Parallel execution
+
+Multiple subagents can run in parallel on separate forks.
+
+This lets Magnitude:
+- Explore different areas at once
+- Compare options faster
+- Keep independent workstreams isolated

@@ -1,0 +1,54 @@
+---
+title: Project Setup
+description: "Configure Magnitude for your project with AGENTS.md"
+icon: folder-cog
+---
+
+## AGENTS.md
+
+The `AGENTS.md` file gives Magnitude context about your project. It lives in the root of your project directory and is automatically included in the agent's context.
+
+### Generating AGENTS.md
+
+Run the `/init` command inside Magnitude. It will explore your codebase and generate an `AGENTS.md` file with:
+
+- Project overview and purpose
+- Key directories and file structure
+- Tech stack and dependencies
+- Important patterns and conventions
+
+### What to include
+
+A good `AGENTS.md` file helps the agent understand:
+
+- **What the project does** — a brief description
+- **Project structure** — key directories and what they contain
+- **Tech stack** — languages, frameworks, build tools
+- **Conventions** — coding style, naming patterns, architectural decisions
+- **How to run/test** — build commands, test commands, development workflow
+
+### Example
+
+```markdown
+# My Project
+
+A REST API built with Express and TypeScript.
+
+## Structure
+- `src/routes/` — API route handlers
+- `src/models/` — Database models (Prisma)
+- `src/middleware/` — Express middleware
+- `tests/` — Jest test files
+
+## Development
+- `npm run dev` — start dev server
+- `npm test` — run tests
+- `npm run build` — build for production
+
+## Conventions
+- Use Zod for request validation
+- All routes return standard response envelope
+- Database queries go in model files, not route handlers
+```
+
+<Info>You can edit `AGENTS.md` manually after generation. The `/init` command gives you a starting point — tailor it to highlight what matters most for your workflow.</Info>

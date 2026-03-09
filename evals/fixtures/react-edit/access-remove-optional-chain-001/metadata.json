@@ -1,0 +1,19 @@
+{
+  "mutation_type": "remove-optional-chain",
+  "mutation_category": "access",
+  "difficulty": "easy",
+  "difficulty_score": 7,
+  "line_number": 34,
+  "original_snippet": "        currentLoggingIFrame?.contentWindow?.postMessage(",
+  "mutated_snippet": "        currentLoggingIFrame.contentWindow?.postMessage(",
+  "file_path": "packages/react-devtools-shared/src/registerDevToolsEventLogger.js",
+  "context": {
+    "file_lines": 87,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 3,
+    "density": 0.749,
+    "line_indent": 8,
+    "containing_function": "registerDevToolsEventLogger"
+  }
+}

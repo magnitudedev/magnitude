@@ -1,0 +1,5 @@
+{
+  "ignoredModels": [
+    "openai:gpt-5.3-codex-spark"
+  ]
+}

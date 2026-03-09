@@ -1,0 +1,27 @@
+---
+title: Sessions
+description: "Resume previous conversations"
+icon: history
+---
+
+Magnitude automatically saves your conversations so you can resume them later.
+
+## Resuming a session
+
+There are three ways to resume:
+
+- **`/resume`** — opens a list of recent sessions to choose from
+- **Ctrl+R** — keyboard shortcut to open the recent chats overlay
+- **`magnitude --resume`** — resume your most recent session from the command line
+
+## Recent chats
+
+When you launch Magnitude, you'll see your 5 most recent conversations. Select one to resume, or choose "See all" to browse the full history.
+
+## Session storage
+
+Sessions are stored in `~/.magnitude/sessions/` as timestamped directories (e.g. `2026-02-11T06-10-39Z/`). Each session contains:
+
+- `events.jsonl` — agent events
+- `meta.json` — session metadata
+- `logs.jsonl` — logger output

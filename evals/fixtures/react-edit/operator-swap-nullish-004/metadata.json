@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-nullish",
+  "mutation_category": "operator",
+  "difficulty": "nightmare",
+  "difficulty_score": 12,
+  "line_number": 89,
+  "original_snippet": "      if (COMPONENT_NAME_PATTERN.test(name) || HOOK_NAME_PATTERN.test(name)) {",
+  "mutated_snippet": "      if (COMPONENT_NAME_PATTERN.test(name) ?? HOOK_NAME_PATTERN.test(name)) {",
+  "file_path": "packages/eslint-plugin-react-hooks/src/shared/RunReactCompiler.ts",
+  "context": {
+    "file_lines": 334,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 12,
+    "density": 0.777,
+    "line_indent": 6,
+    "containing_function": "checkTopLevelNode"
+  }
+}

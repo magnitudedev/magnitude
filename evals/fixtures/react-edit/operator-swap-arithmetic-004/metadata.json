@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-arithmetic",
+  "mutation_category": "operator",
+  "difficulty": "nightmare",
+  "difficulty_score": 12,
+  "line_number": 91,
+  "original_snippet": "    const entryName = isPrimaryEnv || env === undefined ? name : name + ' [' + env + ']';",
+  "mutated_snippet": "    const entryName = isPrimaryEnv || env === undefined ? name : name + ' [' + env - ']';",
+  "file_path": "packages/react-client/src/ReactFlightPerformanceTrack.js",
+  "context": {
+    "file_lines": 592,
+    "is_repeated_line": true,
+    "repeat_count": 3,
+    "similar_block_count": 13,
+    "density": 0.715,
+    "line_indent": 4,
+    "containing_function": "logComponentRender"
+  }
+}

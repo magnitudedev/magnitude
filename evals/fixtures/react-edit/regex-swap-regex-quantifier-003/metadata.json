@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-regex-quantifier",
+  "mutation_category": "regex",
+  "difficulty": "hard",
+  "difficulty_score": 8,
+  "line_number": 129,
+  "original_snippet": "  /^ {3} at (?:(.+) \\((?:(.+):(\\d+):(\\d+)|\\<anonymous\\>)\\)|(?:async )?(.+):(\\d+):(\\d+)|\\<anonymous\\>)$/;",
+  "mutated_snippet": "  /^ {3} at (?:(.+) \\((?:(.+):(\\d*):(\\d+)|\\<anonymous\\>)\\)|(?:async )?(.+):(\\d+):(\\d+)|\\<anonymous\\>)$/;",
+  "file_path": "packages/react-server/src/ReactFlightStackConfigV8.js",
+  "context": {
+    "file_lines": 228,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 7,
+    "density": 0.775,
+    "line_indent": 2,
+    "containing_function": null
+  }
+}

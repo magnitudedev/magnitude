@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-regex-quantifier",
+  "mutation_category": "regex",
+  "difficulty": "medium",
+  "difficulty_score": 8,
+  "line_number": 191,
+  "original_snippet": "  if (!/^[a-z]+$/i.test(word)) {",
+  "mutated_snippet": "  if (!/^[a-z]*$/i.test(word)) {",
+  "file_path": "packages/react-devtools-shared/src/devtools/views/utils.js",
+  "context": {
+    "file_lines": 246,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 11,
+    "density": 0.77,
+    "line_indent": 2,
+    "containing_function": "pluralize"
+  }
+}

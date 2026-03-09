@@ -1,0 +1,19 @@
+{
+  "mutation_type": "identifier-multi-edit",
+  "mutation_category": "identifier",
+  "difficulty": "easy",
+  "difficulty_score": 9,
+  "line_number": 41,
+  "original_snippet": "  return getEventPriority(currentEvent.type);",
+  "mutated_snippet": "  return getEventPriority(ucrrentEvent.type);",
+  "file_path": "packages/react-dom-bindings/src/client/ReactDOMUpdatePriority.js",
+  "context": {
+    "file_lines": 53,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 5,
+    "density": 0.844,
+    "line_indent": 2,
+    "containing_function": "resolveUpdatePriority"
+  }
+}

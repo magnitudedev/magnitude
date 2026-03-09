@@ -1,0 +1,3 @@
+<user mode="text" at="2026-Feb-17 12:00:00">
+Refactor the validation functions in src/utils/helpers.ts to use proper regex patterns and return template literal error messages instead of booleans.
+</user>

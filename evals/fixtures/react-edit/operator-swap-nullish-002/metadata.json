@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-nullish",
+  "mutation_category": "operator",
+  "difficulty": "medium",
+  "difficulty_score": 7,
+  "line_number": 71,
+  "original_snippet": "  if (resolvedModuleData.async === true || clientReference.$$async === true) {",
+  "mutated_snippet": "  if (resolvedModuleData.async === true ?? clientReference.$$async === true) {",
+  "file_path": "packages/react-server-dom-turbopack/src/server/ReactFlightServerConfigTurbopackBundler.js",
+  "context": {
+    "file_lines": 98,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 5,
+    "density": 0.815,
+    "line_indent": 2,
+    "containing_function": "resolveClientReferenceMetadata"
+  }
+}

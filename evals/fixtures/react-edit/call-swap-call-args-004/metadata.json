@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-call-args",
+  "mutation_category": "call",
+  "difficulty": "nightmare",
+  "difficulty_score": 15,
+  "line_number": 216,
+  "original_snippet": "        abort(request, reason);",
+  "mutated_snippet": "        abort(reason, request);",
+  "file_path": "packages/react-server-dom-webpack/src/server/ReactFlightDOMServerEdge.js",
+  "context": {
+    "file_lines": 312,
+    "is_repeated_line": true,
+    "repeat_count": 4,
+    "similar_block_count": 12,
+    "density": 0.78,
+    "line_indent": 8,
+    "containing_function": "prerender"
+  }
+}

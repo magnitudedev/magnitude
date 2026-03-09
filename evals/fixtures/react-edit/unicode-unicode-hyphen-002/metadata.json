@@ -1,0 +1,19 @@
+{
+  "mutation_type": "unicode-hyphen",
+  "mutation_category": "unicode",
+  "difficulty": "medium",
+  "difficulty_score": 8,
+  "line_number": 182,
+  "original_snippet": "      source: 'react-devtools-backend-manager',",
+  "mutated_snippet": "      source: 'react\\u2013devtools-backend-manager',",
+  "file_path": "packages/react-devtools-extensions/src/contentScripts/backendManager.js",
+  "context": {
+    "file_lines": 201,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 6,
+    "density": 0.804,
+    "line_indent": 6,
+    "containing_function": "updateRequiredBackends"
+  }
+}

@@ -1,0 +1,16 @@
+<results>
+<tool name="fs.read">
+<output>1:a1|export function validateEmail(email: string): boolean {
+2:b2|  return email.includes("@");
+3:c3|}
+4:d4|
+5:e5|export function validatePhone(phone: string): boolean {
+6:f6|  return phone.length >= 10;
+7:g7|}
+8:h8|
+9:i9|export function validateUrl(url: string): boolean {
+10:j0|  return url.startsWith("http");
+11:k1|}</output>
+</tool>
+<reminder>Your turn is still active. Use action tools (shell, fs, inspect, etc.) to continue working. Call done() only when you are finished and ready to yield to the user.</reminder>
+</results>

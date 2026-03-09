@@ -1,0 +1,19 @@
+{
+  "mutation_type": "remove-negation",
+  "mutation_category": "operator",
+  "difficulty": "hard",
+  "difficulty_score": 10,
+  "line_number": 329,
+  "original_snippet": "      if (!isKeypressCommand(nativeEvent)) {",
+  "mutated_snippet": "      if (isKeypressCommand(nativeEvent)) {",
+  "file_path": "packages/react-dom-bindings/src/events/plugins/BeforeInputEventPlugin.js",
+  "context": {
+    "file_lines": 424,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 12,
+    "density": 0.79,
+    "line_indent": 6,
+    "containing_function": "getFallbackBeforeInputChars"
+  }
+}

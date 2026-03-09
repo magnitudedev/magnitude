@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-adjacent-lines",
+  "mutation_category": "structural",
+  "difficulty": "nightmare",
+  "difficulty_score": 12,
+  "line_number": 71,
+  "original_snippet": "    delete (node: any)[internalRootNodeResourcesKey];",
+  "mutated_snippet": "    delete (node: any)[internalEventHandlerListenersKey];",
+  "file_path": "packages/react-dom-bindings/src/client/ReactDOMComponentTree.js",
+  "context": {
+    "file_lines": 365,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 24,
+    "density": 0.807,
+    "line_indent": 4,
+    "containing_function": "detachDeletedInstance"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "mutation_type": "swap-regex-quantifier",
+  "mutation_category": "regex",
+  "difficulty": "hard",
+  "difficulty_score": 7,
+  "line_number": 62,
+  "original_snippet": "const userProvidedKeyEscapeRegex = /\\/+/g;",
+  "mutated_snippet": "const userProvidedKeyEscapeRegex = /\\/*/g;",
+  "file_path": "packages/react/src/ReactChildren.js",
+  "context": {
+    "file_lines": 438,
+    "is_repeated_line": false,
+    "repeat_count": 0,
+    "similar_block_count": 12,
+    "density": 0.743,
+    "line_indent": 0,
+    "containing_function": null
+  }
+}

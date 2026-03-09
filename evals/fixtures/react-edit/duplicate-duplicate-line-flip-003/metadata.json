@@ -1,0 +1,19 @@
+{
+  "mutation_type": "duplicate-line-flip",
+  "mutation_category": "duplicate",
+  "difficulty": "hard",
+  "difficulty_score": 10,
+  "line_number": 168,
+  "original_snippet": "          payload: nextIndex === -1 ? null : activities[nextIndex].id,",
+  "mutated_snippet": "          payload: nextIndex !== -1 ? null : activities[nextIndex].id,",
+  "file_path": "packages/react-devtools-shared/src/devtools/views/SuspenseTab/ActivityList.js",
+  "context": {
+    "file_lines": 244,
+    "is_repeated_line": true,
+    "repeat_count": 2,
+    "similar_block_count": 8,
+    "density": 0.737,
+    "line_indent": 10,
+    "containing_function": "ActivityList"
+  }
+}
