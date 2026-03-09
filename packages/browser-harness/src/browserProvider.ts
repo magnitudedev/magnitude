@@ -1,8 +1,7 @@
 import { Browser, BrowserContext, BrowserContextOptions, chromium, LaunchOptions, CDPSession } from "playwright";
 import objectHash from 'object-hash';
 import { createId } from '@magnitudedev/generate-id';
-import logger from "./logger";
-import { Logger } from 'pino';
+import logger, { Logger } from "./logger";
 
 
 const DEFAULT_BROWSER_OPTIONS: LaunchOptions = {
@@ -30,7 +29,7 @@ export class BrowserProvider {
     private logger: Logger;
 
     private constructor() {
-        this.logger = logger.child({ name: 'browser_provider' });
+        this.logger = logger;
     }
 
     public static getInstance(): BrowserProvider {
@@ -54,7 +53,7 @@ export class BrowserProvider {
         
         let activeBrowser: ActiveBrowser;
         if (!(hash in this.activeBrowsers)) {
-            this.logger.trace("Launching new browser");
+            this.logger.debug({ name: 'browser_provider' }, "Launching new browser");
             // Launch new browser, get the PROMISE
             const launchPromise = chromium.launch({ ...DEFAULT_BROWSER_OPTIONS, ...options });
 
@@ -74,7 +73,7 @@ export class BrowserProvider {
 
             return activeBrowser;
         } else {
-            this.logger.trace("Browser with same launch options exists, reusing");
+            this.logger.debug({ name: 'browser_provider' }, "Browser with same launch options exists, reusing");
             return this.activeBrowsers[hash];
         }
     }
@@ -133,11 +132,11 @@ export class BrowserProvider {
             this._applyEmulationToContext(context, contextOptions);
             return context;
         } else if ('launchOptions' in options) {
-            this.logger.trace('Creating context with custom launch options');
+            this.logger.debug({ name: 'browser_provider' }, 'Creating context with custom launch options');
             return await this._createAndTrackContext(options);
         } else {
             // contextOptions might be passed but no instance | cdp | launchOptions
-            this.logger.trace('Creating context for default browser options');
+            this.logger.debug({ name: 'browser_provider' }, 'Creating context for default browser options');
             return await this._createAndTrackContext(options);
         }
     }

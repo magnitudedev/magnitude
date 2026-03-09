@@ -1,7 +1,6 @@
 import { Page, Request, Response } from 'playwright';
 import sharp from 'sharp';
-import logger from './logger';
-import { Logger } from 'pino';
+import logger, { Logger } from './logger';
 
 // Maximum wait time for page stability in ms
 const DEFAULT_PAGE_STABILITY_TIMEOUT = 5000;
@@ -59,9 +58,7 @@ export class PageStabilityAnalyzer {
             disableVisualStability: options.disableVisualStability ?? false
         };
         this.lastStart = Date.now();
-        this.logger = logger.child(
-            { name: 'magnus.stability' }
-        );
+        this.logger = logger;
     }
 
     setActivePage(page: Page) {
@@ -69,7 +66,7 @@ export class PageStabilityAnalyzer {
     }
 
     private log(message: string): void {
-        this.logger.trace(`[${Date.now() - this.lastStart}ms] ${message}`);
+        this.logger.debug(`[${Date.now() - this.lastStart}ms] ${message}`);
     }
 
     /**

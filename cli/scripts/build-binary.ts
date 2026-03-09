@@ -157,7 +157,7 @@ async function build(target: string) {
 
   try {
     const entrypoint = resolve(import.meta.dir, '..', 'src', 'index.tsx')
-    await $`bun build ${entrypoint} --compile --target=${target} --outfile=${binaryFile}`
+    await $`bun build ${entrypoint} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
   } finally {
     // Always restore original files
     await restoreNativeBindings()
