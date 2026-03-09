@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/react",
+    "baseUrl": ".",
+    "paths": {
+      "@magnitudedev/agent": ["packages/agent/src"],
+      "@magnitudedev/agent-definition": ["packages/agent-definition/src"],
+      "@magnitudedev/event-core": ["packages/event-core/src"],
+      "@magnitudedev/js-act": ["packages/js-act/src"],
+      "@magnitudedev/llm-core": ["packages/llm-core/src"],
+      "@magnitudedev/providers": ["packages/providers/src"],
+      "@magnitudedev/tools": ["packages/tools/src"],
+      "@magnitudedev/xml-act": ["packages/xml-act/src"],
+      "@magnitudedev/telemetry": ["packages/telemetry/src"]
+    }
+  }
+}

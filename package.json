@@ -1,0 +1,32 @@
+{
+  "name": "magnitude",
+  "private": true,
+  "packageManager": "bun@1.2.8",
+  "workspaces": ["cli", "evals", "packages/*"],
+  "scripts": {
+    "dev": "bun run --cwd packages/llm-core baml && BUN_JSC_useOMGJIT=0 bun run cli/src/index.tsx --debug",
+    "build": "turbo build",
+    "build:binary": "bun run cli/scripts/build-binary.ts",
+    "typecheck": "turbo typecheck",
+    "test": "bun test",
+    "session": "bun run --cwd evals session",
+    "dash": "bun run --cwd packages/tracing dashboard",
+    "events": "cat ~/.magnitude/logs/events.jsonl",
+    "events:tail": "tail -f ~/.magnitude/logs/events.jsonl",
+    "events:copy": "cat ~/.magnitude/logs/events.jsonl | pbcopy && echo 'Events copied to clipboard'",
+    "logs": "cat ~/.magnitude/logs/cli.jsonl",
+    "logs:tail": "tail -f ~/.magnitude/logs/cli.jsonl",
+    "logs:copy": "cat ~/.magnitude/logs/cli.jsonl | pbcopy && echo 'Logs copied to clipboard'"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.8",
+    "turbo": "^2.5.4",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "beautiful-mermaid": "^0.1.3"
+  },
+  "trustedDependencies": [
+    "protobufjs"
+  ]
+}

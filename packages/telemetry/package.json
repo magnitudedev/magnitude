@@ -1,0 +1,19 @@
+{
+  "name": "@magnitudedev/telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@magnitudedev/generate-id": "workspace:*",
+    "@magnitudedev/logger": "workspace:*",
+    "posthog-node": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

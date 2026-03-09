@@ -1,0 +1,11 @@
+{
+  "name": "@magnitudedev/generate-id",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@paralleldrive/cuid2": "^3.3.0"
+  }
+}

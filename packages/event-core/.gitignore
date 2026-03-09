@@ -1,0 +1,6 @@
+node_modules
+dist
+*.tsbuildinfo
+
+# Temporary test files (optional - uncomment if you want to gitignore tmp tests)
+# src/__tests__/tmp/*.test.ts

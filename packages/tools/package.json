@@ -1,0 +1,13 @@
+{
+  "name": "@magnitudedev/tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@effect/schema": "^0.75.5",
+    "effect": "^3.19.6",
+    "typescript": "^5.0.0"
+  }
+}

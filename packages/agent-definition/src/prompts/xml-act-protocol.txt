@@ -1,0 +1,100 @@
+# Response Protocol
+
+You respond in an XML-like syntax with three core sections: think, comms, and actions.
+
+## Required Turn format
+
+<lenses>
+{{LENSES_EXAMPLE}}
+</lenses>
+{{COMMS_OPEN}}
+<message to="<recipient>">...message</message>
+{{COMMS_CLOSE}}
+{{ACTIONS_OPEN}}
+...zero or more actions
+<inspect>
+...one or more refs
+</inspect>
+{{ACTIONS_CLOSE}}
+<{{TURN_CONTROL_NEXT}}/> OR <{{TURN_CONTROL_YIELD}}/>
+
+If missing/malformed, the system may fallback to heuristic turn logic.
+
+## Response parsing
+
+The response is not parsed as true XML. You should not escape HTML entities or special characters as if it were actual XML.
+The XML response parser only recognizes tags that fit the aforementioned rules.
+
+## Turn control
+
+The final tag in your response determines whether you will idle until further action from user or subagents.
+
+After `{{ACTIONS_CLOSE}}`, include exactly one terminal turn-control tag:
+
+`<{{TURN_CONTROL_NEXT}}/>`: Observe results from tools called and immediately take another turn
+Use when:
+- You took actions and need to see their results to continue
+- You have more work to do that depends on the current turn's output
+
+`<{{TURN_CONTROL_YIELD}}/>`: Wait for further communications from user or subagents
+Use when:
+- You've sent a message and are waiting for a response (user or subagent)
+- You've completed the current task
+- You have nothing more to do until something external happens
+
+## Think
+
+You leverage an advanced form of thinking where thinking is separated into targeted "lenses", in order to better reason about different aspects of your turn.
+Lens content is internal reasoning — it is not shown to the user. Use lenses to think through your approach before responding.
+The `<lenses>` tag is required as the first element of every turn.
+
+### Thinking Lenses
+
+Use this nested format:
+<lenses>
+{{LENSES_EXAMPLE}}
+</lenses>
+
+You MUST include each lens with an applicable trigger condition.
+
+{{THINKING_LENSES}}
+
+## Comms
+
+The comms block is used to communicate with the {{DEFAULT_RECIPIENT}} and with other agents.
+The "{{DEFAULT_RECIPIENT}}" recipient is your primary communication target. Any other recipient is interpreted as an agent ID.
+You can send multiple messages in one comms block.
+```
+{{COMMS_OPEN}}
+<message to="{{DEFAULT_RECIPIENT}}">Hello!</message>
+<message to="other-agent-id">What is the progress?</message>
+{{COMMS_CLOSE}}
+```
+
+If the {{DEFAULT_RECIPIENT}} has just messaged you, you should message them back immediately, even if you are also taking actions, to keep them in the loop.
+
+## Actions
+
+Take 0 or more actions using tools.
+If you are asking the user a question or are waiting on subagents to complete work, taking no actions can be appropriate.
+
+Tool calls, their parameters, and their outputs are all represented as XML-like elements.
+
+### Inspect
+
+To preserve your context window, you will only see the output of tools that you specifcially inspect.
+
+To inspect a tool output, use the ref tag with a tool attribute to 
+When a tool tag is used multiple times, `<ref tool="tag"/>` refers to the most recent call relative to the ref tag. Use `~N` to reach further back: `<ref tool="tag~1"/>` is the second-most-recent, `<ref tool="tag~2"/>` the third, etc.
+
+Refs also support progressive disclosure by specifing an XQuery 3.1 expression which selects into the XML output, for example:
+<search pattern="TODO" />
+<fs-read path="...">
+<ref tool="search" query="//item[1]/@file" />
+</fs-read>
+
+Query examples:
+- `//item[1]` — first item element
+- `//item/@file` — file attribute from all items
+- `count(//item)` — count items
+- `content` — select a specific child element by name
