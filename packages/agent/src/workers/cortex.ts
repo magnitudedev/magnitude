@@ -99,10 +99,11 @@ function buildXmlActSystemPrompt(
   agentDef: ReturnType<typeof getAgentDefinition>,
   implicitTools: readonly string[] = ['think'],
   defaultRecipient = 'user',
+  role: 'orchestrator' | 'subagent' = 'orchestrator',
 ): string {
   const toolDocs = generateXmlActToolDocs(agentDef, implicitTools)
   return roleDescription
-    .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol(defaultRecipient, agentDef.thinkingLenses))
+    .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol(defaultRecipient, agentDef.thinkingLenses, role))
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBasePrompt)
 }
@@ -247,8 +248,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // 2. Build system prompt with runtime protocol/tool-doc substitution
         const implicitTools = ['think'] as const
         const systemPrompt = variant === 'orchestrator'
-          ? buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'user')
-          : buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'parent')
+          ? buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'user', 'orchestrator')
+          : buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'parent', 'subagent')
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 

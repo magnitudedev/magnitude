@@ -1,8 +1,12 @@
 import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './xml-act-protocol.txt'
+import turnControlOrchestratorRaw from './turn-control-orchestrator.txt'
+import turnControlSubagentRaw from './turn-control-subagent.txt'
 import type { ThinkingLens } from '../thinking-lens'
 
 const XML_ACT_PROTOCOL_RAW = xmlActProtocolRaw
+const TURN_CONTROL_ORCHESTRATOR_RAW = turnControlOrchestratorRaw
+const TURN_CONTROL_SUBAGENT_RAW = turnControlSubagentRaw
 
 function renderThinkingLenses(lenses: ThinkingLens[]): string {
   return lenses.map((lens) => `#### ${lens.name}
@@ -17,8 +21,18 @@ function renderLensesExample(lenses: ThinkingLens[]): string {
     .join('\n')
 }
 
-export function getXmlActProtocol(defaultRecipient: string = 'user', lenses: ThinkingLens[]): string {
+export function getXmlActProtocol(
+  defaultRecipient: string = 'user',
+  lenses: ThinkingLens[],
+  role: 'orchestrator' | 'subagent' = 'orchestrator',
+): string {
+  const turnControlSection = role === 'subagent'
+    ? TURN_CONTROL_SUBAGENT_RAW
+    : TURN_CONTROL_ORCHESTRATOR_RAW
+
   return XML_ACT_PROTOCOL_RAW
+    // Inject turn control section first so its template vars get replaced by subsequent calls
+    .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
     .replaceAll('{{ACTIONS_OPEN}}', actionsTagOpen())
     .replaceAll('{{ACTIONS_CLOSE}}', actionsTagClose())
     .replaceAll('{{THINK_OPEN}}', thinkTagOpen())
