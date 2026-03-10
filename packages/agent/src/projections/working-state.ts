@@ -139,17 +139,18 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         currentChainId: willContinue ? fork.currentChainId : null
       }
 
+      // Emit stability first so downstream projections (e.g. AgentRegistry) update
+      // status to idle before shouldTriggerChanged wakes the parent fork
+      if (isStable(newFork) && !isStable(fork)) {
+        emit.forkBecameStable({ forkId: event.forkId })
+      }
+
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
         emit.shouldTriggerChanged({
           forkId: event.forkId,
           shouldTrigger: shouldTrigger(newFork),
           chainId: newFork.currentChainId
         })
-      }
-
-      // Emit if fork became stable (for fork completion detection)
-      if (isStable(newFork) && !isStable(fork)) {
-        emit.forkBecameStable({ forkId: event.forkId })
       }
 
       // Emit soft interrupt resolved if this fork was soft-interrupted and is now stable
