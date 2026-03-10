@@ -16,9 +16,9 @@ Good context.
 I will trace chart values and manifest changes to identify exactly where drift occurred.
 Then I will compare rollback versus patch-in-place.
 
-[5] 1775902207000 agent_created type=scout taskId=agent-scout-rollout-a
+[5] 1775902207000 agent_created type=explorer taskId=agent-explorer-rollout-a
 
-[6] 1775902208600 fork_started role=scout mode=spawn taskId=agent-scout-rollout-a
+[6] 1775902208600 fork_started role=explorer mode=spawn taskId=agent-explorer-rollout-a
 
 [7] 1775902339000 fork_completed result={"summary":"CrashLoop tied to missing REDIS_URL after values-key rename in latest chart release."}
 
@@ -36,9 +36,9 @@ Will do.
 I will verify release stability history and isolate what changed in the failing revision.
 If the delta is narrow, rollback should be safest.
 
-[11] 1775902586000 agent_created type=scout taskId=agent-scout-release-history-b
+[11] 1775902586000 agent_created type=explorer taskId=agent-explorer-release-history-b
 
-[12] 1775902587600 fork_started role=scout mode=spawn taskId=agent-scout-release-history-b
+[12] 1775902587600 fork_started role=explorer mode=spawn taskId=agent-explorer-release-history-b
 
 [13] 1775902741000 fork_completed result={"summary":"Previous revision stable for 11 days; failing release differs mainly in env mapping behavior."}
 
@@ -67,9 +67,9 @@ I will prepare a guarded command sequence with context verification.
 I will include rollout watch, error-rate checks, and API validation.
 I will wait for your confirmation before execution.
 
-[19] 1775903107000 agent_created type=scout taskId=agent-scout-rollback-plan-c
+[19] 1775903107000 agent_created type=explorer taskId=agent-explorer-rollback-plan-c
 
-[20] 1775903108600 fork_started role=scout mode=spawn taskId=agent-scout-rollback-plan-c
+[20] 1775903108600 fork_started role=explorer mode=spawn taskId=agent-explorer-rollback-plan-c
 
 [21] 1775903273000 fork_completed result={"summary":"Rollback sequence prepared with context guards and post-rollout verification checklist."}
 
@@ -87,9 +87,9 @@ Agreed.
 I will propose schema validation for required env keys, predeploy checks, and startup assertions.
 That should catch configuration drift early.
 
-[25] 1775903522000 agent_created type=scout taskId=agent-scout-hardening-d
+[25] 1775903522000 agent_created type=explorer taskId=agent-explorer-hardening-d
 
-[26] 1775903523600 fork_started role=scout mode=spawn taskId=agent-scout-hardening-d
+[26] 1775903523600 fork_started role=explorer mode=spawn taskId=agent-explorer-hardening-d
 
 [27] 1775903701000 fork_completed result={"summary":"Hardening plan includes schema enforcement, deploy-time validation, and fail-fast runtime checks."}
 
@@ -125,9 +125,9 @@ Absolutely.
 I will draft a concise timeline covering root cause, risk tradeoffs, and action gates.
 I will explicitly include the destructive-command approval rule.
 
-[35] 1775904210000 agent_created type=scout taskId=agent-scout-incident-note-e
+[35] 1775904210000 agent_created type=explorer taskId=agent-explorer-incident-note-e
 
-[36] 1775904211600 fork_started role=scout mode=spawn taskId=agent-scout-incident-note-e
+[36] 1775904211600 fork_started role=explorer mode=spawn taskId=agent-explorer-incident-note-e
 
 [37] 1775904394000 fork_completed result={"summary":"Incident note drafted with rollback rationale, env-drift root cause, and confirmation gate policy."}
 

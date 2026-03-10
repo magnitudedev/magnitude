@@ -20,7 +20,7 @@ export interface ForkInstance {
   readonly parentForkId: string | null
   /** Human-readable display title (e.g. "Haiku test 2") */
   readonly name: string
-  /** LLM-facing identifier used in comms routing (e.g. "haiku-researcher-2") */
+  /** LLM-facing identifier used in comms routing (e.g. "haiku-explorer-2") */
   readonly agentId: string
   readonly status: 'running' | 'completed'
   readonly context: string

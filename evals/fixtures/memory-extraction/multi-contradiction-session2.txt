@@ -16,9 +16,9 @@ Makes sense.
 I will include documentation-reference checks in the triage.
 I will flag any ambiguous cases.
 
-[5] 1775988627000 agent_created type=scout taskId=agent-scout-cleanup-a
+[5] 1775988627000 agent_created type=explorer taskId=agent-explorer-cleanup-a
 
-[6] 1775988628600 fork_started role=scout mode=spawn taskId=agent-scout-cleanup-a
+[6] 1775988628600 fork_started role=explorer mode=spawn taskId=agent-explorer-cleanup-a
 
 [7] 1775988765000 fork_completed result={"summary":"Found 37 stale *_backup_*.sql and *_temp_*.sql files not referenced in active migration chain."}
 
@@ -36,9 +36,9 @@ Agreed.
 I will scan runbooks and operational notes for direct references.
 I will separate deprecated references from active procedures.
 
-[11] 1775989007000 agent_created type=scout taskId=agent-scout-docs-b
+[11] 1775989007000 agent_created type=explorer taskId=agent-explorer-docs-b
 
-[12] 1775989008600 fork_started role=scout mode=spawn taskId=agent-scout-docs-b
+[12] 1775989008600 fork_started role=explorer mode=spawn taskId=agent-explorer-docs-b
 
 [13] 1775989161000 fork_completed result={"summary":"Six files referenced only in deprecated rollback section; current runbook supersedes those scripts."}
 
@@ -75,9 +75,9 @@ Crystal clear.
 I will treat this as your default workflow preference.
 Routine obvious cleanup will proceed without extra approval prompts.
 
-[21] 1775989662000 agent_created type=scout taskId=agent-scout-delete-plan-c
+[21] 1775989662000 agent_created type=explorer taskId=agent-explorer-delete-plan-c
 
-[22] 1775989663600 fork_started role=scout mode=spawn taskId=agent-scout-delete-plan-c
+[22] 1775989663600 fork_started role=explorer mode=spawn taskId=agent-explorer-delete-plan-c
 
 [23] 1775989842000 fork_completed result={"summary":"Prepared deterministic deletion list with exclusions for canonical migrations and active rollback assets."}
 
@@ -95,9 +95,9 @@ Will do.
 I will run validation immediately after cleanup.
 I will provide one concise result summary.
 
-[27] 1775990092000 agent_created type=scout taskId=agent-scout-validation-d
+[27] 1775990092000 agent_created type=explorer taskId=agent-explorer-validation-d
 
-[28] 1775990093600 fork_started role=scout mode=spawn taskId=agent-scout-validation-d
+[28] 1775990093600 fork_started role=explorer mode=spawn taskId=agent-explorer-validation-d
 
 [29] 1775990271000 fork_completed result={"summary":"Migration ordering intact, lint clean, and no stale references remain in docs/scripts."}
 
@@ -125,9 +125,9 @@ Good call.
 I will draft a brief changelog entry with rationale, categories removed, and validation results.
 That should make intent explicit.
 
-[35] 1775990653000 agent_created type=scout taskId=agent-scout-changelog-e
+[35] 1775990653000 agent_created type=explorer taskId=agent-explorer-changelog-e
 
-[36] 1775990654600 fork_started role=scout mode=spawn taskId=agent-scout-changelog-e
+[36] 1775990654600 fork_started role=explorer mode=spawn taskId=agent-explorer-changelog-e
 
 [37] 1775990835000 fork_completed result={"summary":"Prepared cleanup changelog note with rationale, validations, and exclusion rules for active migrations."}
 

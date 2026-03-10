@@ -52,11 +52,11 @@ Magnitude supports the [Agent Skills](https://agentskills.io) standard. Skills a
 
 ### Orchestrator → subagent architecture
 
-The orchestrator manages the conversation and delegates to specialized subagents (builder, debugger, scout, researcher, planner, reviewer, browser), each with its own context window, toolset, and permissions. Subagents do focused work and report back, keeping the orchestrator's context clean.
+The orchestrator manages the conversation and delegates to specialized subagents (builder, debugger, explorer, planner, reviewer, browser), each with its own context window, toolset, and permissions. Subagents do focused work and report back, keeping the orchestrator's context clean.
 
 ### Context sharing via artifacts
 
-Named documents that carry context between agents with scoped visibility. A researcher writes findings, a planner reads them and writes a plan, a builder reads the plan and implements. Each agent sees exactly what it needs without inheriting everything.
+Named documents that carry context between agents with scoped visibility. An explorer writes findings, a planner reads them and writes a plan, a builder reads the plan and implements. Each agent sees exactly what it needs without inheriting everything.
 
 ### Two-way agent communication
 

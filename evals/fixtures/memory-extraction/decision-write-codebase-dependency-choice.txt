@@ -12,9 +12,9 @@ Scope it to account settings routes and shared validator helpers only.
 Understood.
 I will keep the change local to those paths.
 
-[5] 1778200028000 agent_created type=scout taskId=task-validation-scan
+[5] 1778200028000 agent_created type=explorer taskId=task-validation-scan
 
-[6] 1778200035000 fork_started role=scout mode=read-only taskId=task-validation-scan
+[6] 1778200035000 fork_started role=explorer mode=read-only taskId=task-validation-scan
 
 [7] 1778200042000 fork_completed result={"status":"ok","summary":"Found mixed use of ad-hoc checks and legacy joi schemas in one route group."}
 

@@ -16,9 +16,9 @@ Understood.
 I will keep this change additive and narrow.
 No structural rewrites unless blocked.
 
-[5] 1775797625000 agent_created type=scout taskId=agent-scout-telemetry-a
+[5] 1775797625000 agent_created type=explorer taskId=agent-explorer-telemetry-a
 
-[6] 1775797626600 fork_started role=scout mode=spawn taskId=agent-scout-telemetry-a
+[6] 1775797626600 fork_started role=explorer mode=spawn taskId=agent-explorer-telemetry-a
 
 [7] 1775797767000 fork_completed result={"summary":"Telemetry uses named exports and typed metric descriptors; execution manager timing hooks are compatible."}
 
@@ -46,9 +46,9 @@ Good point.
 I will keep payload typing explicit and stable.
 I will mirror existing descriptor patterns.
 
-[13] 1775798135000 agent_created type=scout taskId=agent-scout-metrics-b
+[13] 1775798135000 agent_created type=explorer taskId=agent-explorer-metrics-b
 
-[14] 1775798136600 fork_started role=scout mode=spawn taskId=agent-scout-metrics-b
+[14] 1775798136600 fork_started role=explorer mode=spawn taskId=agent-explorer-metrics-b
 
 [15] 1775798293000 fork_completed result={"summary":"Added typed latency descriptors and mapped span timings into p50/p95 aggregation inputs."}
 
@@ -66,9 +66,9 @@ Will do.
 I will add focused tests for output shape and cadence behavior.
 I will keep scope tight.
 
-[19] 1775798541000 agent_created type=scout taskId=agent-scout-tests-c
+[19] 1775798541000 agent_created type=explorer taskId=agent-explorer-tests-c
 
-[20] 1775798542600 fork_started role=scout mode=spawn taskId=agent-scout-tests-c
+[20] 1775798542600 fork_started role=explorer mode=spawn taskId=agent-explorer-tests-c
 
 [21] 1775798719000 fork_completed result={"summary":"Added payload shape and emission cadence tests; suite passes."}
 
@@ -87,9 +87,9 @@ Confirmed.
 This change is named-export-only end to end.
 No default exports were introduced.
 
-[25] 1775798967000 agent_created type=scout taskId=agent-scout-final-check-d
+[25] 1775798967000 agent_created type=explorer taskId=agent-explorer-final-check-d
 
-[26] 1775798968600 fork_started role=scout mode=spawn taskId=agent-scout-final-check-d
+[26] 1775798968600 fork_started role=explorer mode=spawn taskId=agent-explorer-final-check-d
 
 [27] 1775799154000 fork_completed result={"summary":"Final verification: no default exports introduced; lint and tests green."}
 
@@ -117,9 +117,9 @@ Good call.
 I will include a concise note on named exports and explicit payload typing.
 That should improve copy-paste correctness.
 
-[33] 1775799529000 agent_created type=scout taskId=agent-scout-pr-note-e
+[33] 1775799529000 agent_created type=explorer taskId=agent-explorer-pr-note-e
 
-[34] 1775799530600 fork_started role=scout mode=spawn taskId=agent-scout-pr-note-e
+[34] 1775799530600 fork_started role=explorer mode=spawn taskId=agent-explorer-pr-note-e
 
 [35] 1775799708000 fork_completed result={"summary":"Prepared PR note: named-export convention retained and metric payload typing explicit."}
 

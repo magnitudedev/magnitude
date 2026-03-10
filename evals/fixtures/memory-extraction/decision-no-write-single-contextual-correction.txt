@@ -8,9 +8,9 @@ Absolutely.
 I'll inspect the webhook retry path and isolate where 429 handling drops events.
 Then I'll apply a targeted fix and validate behavior with focused tests.
 
-[40] 1777630013000 agent_created type=scout taskId=task-billing-webhook-map
+[40] 1777630013000 agent_created type=explorer taskId=task-billing-webhook-map
 
-[41] 1777630015000 fork_started role=scout mode=read-only taskId=task-billing-webhook-map
+[41] 1777630015000 fork_started role=explorer mode=read-only taskId=task-billing-webhook-map
 
 [88] 1777630022000 fork_completed result={"status":"ok","summary":"Drop occurs when 429 path exits early before enqueueRetry() under specific header parse failure."}
 
@@ -90,9 +90,9 @@ Got it.
 I'll use tenant_west_7 for this reproducer and ignore the earlier tenant identifier.
 That adjustment will stay local to this ticket context.
 
-[706] 1777630130000 agent_created type=scout taskId=task-billing-webhook-log-verify
+[706] 1777630130000 agent_created type=explorer taskId=task-billing-webhook-log-verify
 
-[707] 1777630132000 fork_started role=scout mode=read-only taskId=task-billing-webhook-log-verify
+[707] 1777630132000 fork_started role=explorer mode=read-only taskId=task-billing-webhook-log-verify
 
 [754] 1777630139000 fork_completed result={"status":"ok","summary":"Recent incident logs match missing Retry-After on 429. Corrected fixtures align with acct_test_42, tenant_west_7, and v2 retry route."}
 

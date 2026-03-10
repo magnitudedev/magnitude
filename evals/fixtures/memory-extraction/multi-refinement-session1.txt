@@ -16,9 +16,9 @@ Makes sense.
 I will prioritize readability and maintainability.
 I will keep optimization modest.
 
-[5] 1776316027000 agent_created type=scout taskId=agent-scout-ci-a
+[5] 1776316027000 agent_created type=explorer taskId=agent-explorer-ci-a
 
-[6] 1776316028600 fork_started role=scout mode=spawn taskId=agent-scout-ci-a
+[6] 1776316028600 fork_started role=explorer mode=spawn taskId=agent-explorer-ci-a
 
 [7] 1776316173000 fork_completed result={"summary":"Existing CI present but missing dedicated typecheck stage and stronger dependency cache tuning."}
 
@@ -36,9 +36,9 @@ Understood.
 I will keep a single runtime target for now.
 We can expand later if stability demands it.
 
-[11] 1776316421000 agent_created type=scout taskId=agent-scout-workflow-b
+[11] 1776316421000 agent_created type=explorer taskId=agent-explorer-workflow-b
 
-[12] 1776316422600 fork_started role=scout mode=spawn taskId=agent-scout-workflow-b
+[12] 1776316422600 fork_started role=explorer mode=spawn taskId=agent-explorer-workflow-b
 
 [13] 1776316587000 fork_completed result={"summary":"Prepared workflow update with lint, typecheck, tests, and cache restore/save steps."}
 
@@ -65,9 +65,9 @@ Will do.
 I will summarize why lint, typecheck, and test are split.
 I will keep explanation practical.
 
-[19] 1776316956000 agent_created type=scout taskId=agent-scout-validation-c
+[19] 1776316956000 agent_created type=explorer taskId=agent-explorer-validation-c
 
-[20] 1776316957600 fork_started role=scout mode=spawn taskId=agent-scout-validation-c
+[20] 1776316957600 fork_started role=explorer mode=spawn taskId=agent-explorer-validation-c
 
 [21] 1776317137000 fork_completed result={"summary":"Workflow dry-run succeeds; stage order improves failure feedback and avoids wasted test runtime."}
 
@@ -85,9 +85,9 @@ Absolutely.
 I will provide concise change summary and show diff first.
 I will not commit before your review.
 
-[25] 1776317385000 agent_created type=scout taskId=agent-scout-diff-prep-d
+[25] 1776317385000 agent_created type=explorer taskId=agent-explorer-diff-prep-d
 
-[26] 1776317386600 fork_started role=scout mode=spawn taskId=agent-scout-diff-prep-d
+[26] 1776317386600 fork_started role=explorer mode=spawn taskId=agent-explorer-diff-prep-d
 
 [27] 1776317569000 fork_completed result={"summary":"Prepared clean workflow diff with stage additions, cache strategy, and command updates."}
 
@@ -124,9 +124,9 @@ Will do.
 I will explicitly flag generated or lockfile changes in pre-commit summaries.
 That will make review quicker.
 
-[35] 1776318079000 agent_created type=scout taskId=agent-scout-summary-note-e
+[35] 1776318079000 agent_created type=explorer taskId=agent-explorer-summary-note-e
 
-[36] 1776318080600 fork_started role=scout mode=spawn taskId=agent-scout-summary-note-e
+[36] 1776318080600 fork_started role=explorer mode=spawn taskId=agent-explorer-summary-note-e
 
 [37] 1776318259000 fork_completed result={"summary":"Prepared summary template including filenames, key commands, and generated-file callouts before commit."}
 

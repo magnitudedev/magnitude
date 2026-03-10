@@ -5,19 +5,19 @@ Need cleanup in auth/session handling and middleware edge cases.
 Understood. I will inspect flow, patch, and validate.
 
 [3] 1774404010900 user_message
-For broad fixes, let's run scout first, then implementer, then reviewer before we finalize.
+For broad fixes, let's run explorer first, then implementer, then reviewer before we finalize.
 
 [4] 1774404016100 assistant_turn_completed
-Got it. I will follow scout, then implementer, then reviewer.
+Got it. I will follow explorer, then implementer, then reviewer.
 
-[5] 1774404023900 agent_created type=scout taskId=task-751
+[5] 1774404023900 agent_created type=explorer taskId=task-751
 
-[6] 1774404026300 fork_started role=scout mode=survey taskId=task-751
+[6] 1774404026300 fork_started role=explorer mode=survey taskId=task-751
 
 [7] 1774404032600 fork_completed result={"taskId":"task-751","summary":"Invalid-session branch and token fallback inconsistency found","status":"ok"}
 
 [8] 1774404041400 assistant_turn_completed
-Scout pass complete. Moving to implementation.
+Explorer pass complete. Moving to implementation.
 
 [9] 1774404049600 agent_created type=implementer taskId=task-752
 
@@ -41,16 +41,16 @@ Reviewer suggested one guard. I will repeat the sequence.
 Yes, keep that exact sequence each cycle.
 
 [18] 1774404105100 assistant_turn_completed
-Understood. I will keep scout, implementer, reviewer each cycle.
+Understood. I will keep explorer, implementer, reviewer each cycle.
 
-[19] 1774404113300 agent_created type=scout taskId=task-754
+[19] 1774404113300 agent_created type=explorer taskId=task-754
 
-[20] 1774404115800 fork_started role=scout mode=verify taskId=task-754
+[20] 1774404115800 fork_started role=explorer mode=verify taskId=task-754
 
 [21] 1774404122100 fork_completed result={"taskId":"task-754","summary":"Null-guard location confirmed for middleware preflight","status":"ok"}
 
 [22] 1774404130900 assistant_turn_completed
-Second scout pass complete. Moving to implementation.
+Second explorer pass complete. Moving to implementation.
 
 [23] 1774404139100 agent_created type=implementer taskId=task-755
 
@@ -80,7 +80,7 @@ Acknowledged for this task only.
 Keep that sequencing preference for future broad tasks too.
 
 [34] 1774404207100 assistant_turn_completed
-Confirmed. Use scout first, then implementer, then reviewer before finalizing.
+Confirmed. Use explorer first, then implementer, then reviewer before finalizing.
 
 [35] 1774404215300 user_message
 Do one brief confidence check before wrapping.
@@ -116,7 +116,7 @@ You are welcome.
 Please keep this workflow preference durable.
 
 [46] 1774404279400 assistant_turn_completed
-Confirmed. Use scout, then implementer, then reviewer before finalizing.
+Confirmed. Use explorer, then implementer, then reviewer before finalizing.
 
 [47] 1774404287700 user_message
 Closing this issue.

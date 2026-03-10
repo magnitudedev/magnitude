@@ -69,7 +69,7 @@ const DECISION_SCENARIOS: MemorySingleScenario[] = [
     transcript: loadTranscript('decision-no-write-tool-heavy-minimal-signal.txt'),
     currentMemory: richMem(
       ['Never import from barrel files in src/internal/ — causes circular deps', 'Run database migrations with prisma migrate before testing'],
-      ['Use a scout agent to map unfamiliar code areas before implementing changes']
+      ['Use an explorer agent to map unfamiliar code areas before implementing changes']
     ),
     expected: { expectEmpty: true, maxTotalOps: 0 },
   },

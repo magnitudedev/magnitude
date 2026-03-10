@@ -1,11 +1,10 @@
 /**
- * Generic eval runner — executes evals against models via BAML,
- * then runs responses through the real js-act sandbox with mock tools.
+ * Generic eval runner — executes evals against models,
+ * then runs scenario checks against raw responses.
  */
 
 import { type ChatMessage, BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { setModel, primary, getAuth } from '@magnitudedev/providers'
-import { runTestSandbox } from './test-sandbox'
 import { isRunnableEval, type Eval, type ModelSpec, type ScenarioResult, type EvalRunResult, type Scenario, type CheckResult } from './types'
 import { generateModelReport, generateSummaryReport } from './results'
 
@@ -21,16 +20,15 @@ function computeScenarioScore(checks: Record<string, CheckResult>): number {
 }
 
 /**
- * Evaluate a single scenario's response by running it through the real sandbox
+ * Evaluate a single scenario's response by running checks against the raw response.
+ * Note: The old js-act sandbox path has been removed. Checks now operate on raw response text.
  */
 export async function evaluateScenarioResponse(raw: string, scenario: Scenario): Promise<ScenarioResult> {
-  const result = await runTestSandbox(raw)
-
   const checks: Record<string, CheckResult> = {}
   let allPassed = true
 
   for (const check of scenario.checks) {
-    const checkResult = check.evaluate(raw, result)
+    const checkResult = check.evaluate(raw, null)
     checks[check.id] = checkResult
     if (!checkResult.passed) allPassed = false
   }

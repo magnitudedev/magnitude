@@ -148,7 +148,7 @@ describe('memory extraction integration', () => {
     await mkdir(join(homeDir, '.magnitude', 'sessions', sessionId), { recursive: true })
     await writeFile(eventsPath, toJsonl([
       userEvent('no, always use named exports'),
-      userEvent('always scout before planning'),
+      userEvent('always use an explorer before planning'),
       userEvent('please implement the endpoint'),
     ]), 'utf8')
 
@@ -156,7 +156,7 @@ describe('memory extraction integration', () => {
       result: {
         additions: [
           { category: 'codebase', content: 'always use named exports' },
-          { category: 'workflow', content: 'always scout before planning' },
+          { category: 'workflow', content: 'always use an explorer before planning' },
         ],
         updates: [],
         deletions: [],
@@ -174,7 +174,7 @@ describe('memory extraction integration', () => {
 
     const updated = await readMemory(cwd)
     expect(updated).toContain('always use named exports')
-    expect(updated).toContain('always scout before planning')
+    expect(updated).toContain('always use an explorer before planning')
     expect(updated).toContain('# Codebase')
     expect(updated).toContain('# Workflow')
   })

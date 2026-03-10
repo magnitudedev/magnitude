@@ -14,7 +14,7 @@ A typical workflow looks like:
 
 ```
 You send a message
-  → Orchestrator scouts the codebase
+  → Orchestrator deploys an explorer to investigate the codebase
   → Orchestrator discusses findings with you
   → Orchestrator deploys a planner
   → You confirm the approach
@@ -23,11 +23,11 @@ You send a message
   → Back to conversation
 ```
 
-Not every task needs every step — the orchestrator adapts based on complexity. Simple questions get answered directly. Large changes get the full scout → plan → build → review treatment.
+Not every task needs every step — the orchestrator adapts based on complexity. Simple questions get answered directly. Large changes get the full explore → plan → build → review treatment.
 
 ## Subagents
 
-The orchestrator can deploy [7 types of subagents](/core-concepts/subagents), each specialized for a different job. Multiple subagents can run in parallel, and they share context through [artifacts](/core-concepts/artifacts).
+The orchestrator can deploy [6 types of subagents](/core-concepts/subagents), each specialized for a different job. Multiple subagents can run in parallel, and they share context through [artifacts](/core-concepts/artifacts).
 
 ## Conversational by default
 

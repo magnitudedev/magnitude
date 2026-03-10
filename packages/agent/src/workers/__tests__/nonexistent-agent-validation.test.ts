@@ -32,15 +32,15 @@ describe('nonexistent agent destination validation', () => {
 
   test('returns empty when agent exists and is running', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-scout', status: 'running' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'running' as const }],
     ])
-    const messages = [{ id: '1', dest: 'my-scout' }]
+    const messages = [{ id: '1', dest: 'my-explorer' }]
     expect(findInvalidAgentDests(messages, forks)).toEqual([])
   })
 
   test('returns invalid dest when agent does not exist', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-scout', status: 'running' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'running' as const }],
     ])
     const messages = [{ id: '1', dest: 'nonexistent-agent' }]
     expect(findInvalidAgentDests(messages, forks)).toEqual(['nonexistent-agent'])
@@ -48,19 +48,19 @@ describe('nonexistent agent destination validation', () => {
 
   test('returns invalid dest when agent exists but is completed', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-scout', status: 'completed' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'completed' as const }],
     ])
-    const messages = [{ id: '1', dest: 'my-scout' }]
-    expect(findInvalidAgentDests(messages, forks)).toEqual(['my-scout'])
+    const messages = [{ id: '1', dest: 'my-explorer' }]
+    expect(findInvalidAgentDests(messages, forks)).toEqual(['my-explorer'])
   })
 
   test('returns multiple invalid dests', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-scout', status: 'running' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'running' as const }],
     ])
     const messages = [
       { id: '1', dest: 'bad-1' },
-      { id: '2', dest: 'my-scout' },
+      { id: '2', dest: 'my-explorer' },
       { id: '3', dest: 'bad-2' },
     ]
     expect(findInvalidAgentDests(messages, forks)).toEqual(['bad-1', 'bad-2'])

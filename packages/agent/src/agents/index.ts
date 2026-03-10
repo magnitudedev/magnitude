@@ -19,14 +19,12 @@ import orchestratorPromptRaw from './prompts/orchestrator.txt'
 import { createOrchestrator } from './orchestrator'
 import { createPlanner } from './planner'
 import plannerPromptRaw from './prompts/planner.txt'
-import researcherPromptRaw from './prompts/researcher.txt'
-import { createResearcher } from './researcher'
+import explorerPromptRaw from './prompts/explorer.txt'
+import { createExplorer } from './explorer'
 import reviewerPromptRaw from './prompts/reviewer.txt'
 import { createReviewer } from './reviewer'
-import scoutPromptRaw from './prompts/scout.txt'
-import { createScout } from './scout'
 
-export type AgentVariant = 'orchestrator' | 'builder' | 'researcher' | 'planner' | 'debugger' | 'reviewer' | 'scout' | 'browser'
+export type AgentVariant = 'orchestrator' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'
 
 const replacePromptTokens = (raw: string): string =>
   raw
@@ -41,11 +39,10 @@ const replacePromptTokens = (raw: string): string =>
 
 const ORCHESTRATOR_PROMPT = replacePromptTokens(orchestratorPromptRaw)
 const BUILDER_PROMPT = replacePromptTokens(builderPromptRaw)
-const RESEARCHER_PROMPT = replacePromptTokens(researcherPromptRaw)
+const EXPLORER_PROMPT = replacePromptTokens(explorerPromptRaw)
 const PLANNER_PROMPT = replacePromptTokens(plannerPromptRaw)
 const DEBUGGER_PROMPT = replacePromptTokens(debuggerPromptRaw)
 const REVIEWER_PROMPT = replacePromptTokens(reviewerPromptRaw)
-const SCOUT_PROMPT = replacePromptTokens(scoutPromptRaw)
 const BROWSER_PROMPT = replacePromptTokens(browserPromptRaw)
 
 // =============================================================================
@@ -62,11 +59,10 @@ function getAgents(): Record<AgentVariant, MagnitudeAgentDef> {
     _agents = {
       orchestrator: createOrchestrator(ORCHESTRATOR_PROMPT),
       builder: createBuilder(BUILDER_PROMPT),
-      researcher: createResearcher(RESEARCHER_PROMPT),
+      explorer: createExplorer(EXPLORER_PROMPT),
       planner: createPlanner(PLANNER_PROMPT),
       debugger: createDebugger(DEBUGGER_PROMPT),
       reviewer: createReviewer(REVIEWER_PROMPT),
-      scout: createScout(SCOUT_PROMPT),
       browser: createBrowser(BROWSER_PROMPT),
     }
   }

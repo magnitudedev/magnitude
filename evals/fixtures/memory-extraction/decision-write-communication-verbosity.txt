@@ -13,9 +13,9 @@ I only want middleware and the timeout helper touched.
 Understood.
 I will keep scope tight and avoid unrelated cleanup.
 
-[5] 1778400028000 agent_created type=scout taskId=task-timeout-scan
+[5] 1778400028000 agent_created type=explorer taskId=task-timeout-scan
 
-[6] 1778400035000 fork_started role=scout mode=read-only taskId=task-timeout-scan
+[6] 1778400035000 fork_started role=explorer mode=read-only taskId=task-timeout-scan
 
 [7] 1778400042000 fork_completed result={"status":"ok","summary":"Found stale session branch not honoring refreshed token timestamp."}
 

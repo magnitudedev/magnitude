@@ -13,9 +13,9 @@ No broad cache redesign.
 Understood.
 I'll keep the diff narrow.
 
-[5] 1778500028000 agent_created type=scout taskId=task-cache-scan
+[5] 1778500028000 agent_created type=explorer taskId=task-cache-scan
 
-[6] 1778500035000 fork_started role=scout mode=read-only taskId=task-cache-scan
+[6] 1778500035000 fork_started role=explorer mode=read-only taskId=task-cache-scan
 
 [7] 1778500042000 fork_completed result={"status":"ok","summary":"Cleanup hook supports one new helper registration with minimal wiring."}
 

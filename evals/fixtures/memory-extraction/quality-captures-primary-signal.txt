@@ -10,9 +10,9 @@ Start with cart routes before auth routes.
 [4] 1774401014300 assistant_turn_completed
 Understood. I will prioritize cart paths in this task.
 
-[5] 1774401021900 agent_created type=scout taskId=task-721
+[5] 1774401021900 agent_created type=explorer taskId=task-721
 
-[6] 1774401024100 fork_started role=scout mode=survey taskId=task-721
+[6] 1774401024100 fork_started role=explorer mode=survey taskId=task-721
 
 [7] 1774401030300 fork_completed result={"taskId":"task-721","summary":"Loose typing concentrated in serializer bridges and route adapters","status":"ok"}
 
@@ -73,9 +73,9 @@ Keep commit summary very short.
 [28] 1774401162800 assistant_turn_completed
 Will do.
 
-[29] 1774401170900 agent_created type=scout taskId=task-724
+[29] 1774401170900 agent_created type=explorer taskId=task-724
 
-[30] 1774401173300 fork_started role=scout mode=spot-check taskId=task-724
+[30] 1774401173300 fork_started role=explorer mode=spot-check taskId=task-724
 
 [31] 1774401179600 fork_completed result={"taskId":"task-724","summary":"Auth adapters still have pre-existing unknown casts; no blocker for requested scope","status":"ok"}
 

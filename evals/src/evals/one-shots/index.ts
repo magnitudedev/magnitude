@@ -23,8 +23,8 @@ interface OneShotDef {
 
 const SCENARIOS: OneShotDef[] = [
   {
-    id: 'researcher-long-artifact',
-    description: 'Researcher agent writes a 200+ line artifact about collaborative editors',
+    id: 'explorer-long-artifact',
+    description: 'Explorer agent writes a 200+ line artifact about collaborative editors',
     systemPrompt: `# XML-ACT Protocol
 
 You respond using the XML-ACT protocol to think, message the user, and take actions with tools.
@@ -117,9 +117,9 @@ Updating the port configuration.
 </actions>
 
 
-# Researcher
+# Explorer
 
-You are a researcher agent. Your job is to go deep — thoroughly understand a specific topic, mechanic, or problem space and produce a synthesized analysis.
+You are an explorer agent. Your job is to go deep — thoroughly understand a specific topic, mechanic, or problem space and produce a synthesized analysis.
 
 ## Use Cases
 
@@ -143,7 +143,7 @@ You are deployed when the orchestrator needs:
 
 ## Principles
 
-- Depth over breadth. You are not a scout — you don't map terrain. You drill into one area and understand it completely.
+- Depth over breadth. You don't just map terrain; you drill into one area and understand it completely.
 - Ground everything in evidence. Reference specific files, functions, types, code paths. Quote relevant code when it clarifies a point.
 - For ideation: don't just list options. Actively reason through trade-offs, eliminate weak approaches, and converge on a recommendation with clear rationale.
 

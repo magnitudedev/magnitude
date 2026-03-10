@@ -1,15 +1,9 @@
 /**
  * XML Response Parser for Orchestrator Dispatch Eval
  *
- * Regex-based extraction of agent-create, propose, submit, and direct tool
- * tags from the orchestrator's raw XML-ACT response.
- *
- * Does NOT use a DOM parser — XML-ACT is not strict XML.
+ * Regex-based extraction of agent/direct-tool tags from orchestrator XML-ACT responses.
+ * Does NOT use a strict XML parser.
  */
-
-// =============================================================================
-// Types
-// =============================================================================
 
 export interface ParsedArtifactCreate {
   id: string
@@ -20,29 +14,24 @@ export interface ParsedAgentCreate {
   agentId: string
   type: string
   title: string
-  /** Artifact IDs passed as writable to this agent */
   writableArtifactIds: string[]
-  /** Character index of the opening tag in the raw response */
   position: number
 }
 
-export interface ParsedPropose {
-  title: string
-  hasCriteria: boolean
-  criteriaCount: number
-  hasArtifacts: boolean
-  artifactCount: number
+export interface ParsedMessage {
+  to: string
+  body: string
   position: number
 }
 
-export interface ParsedSubmit {
-  summary: string
+export interface ParsedAgentPause {
+  agentId: string
+  reason: string
   position: number
 }
 
 export interface ParsedFsRead {
   path: string
-  /** Tool ref name for inspect (e.g. 'fs-read', 'fs-read~1') */
   refName: string
 }
 
@@ -87,6 +76,8 @@ export interface ParsedAgentDismiss {
   agentId: string
 }
 
+type TurnControl = 'next' | 'yield' | null
+
 export interface ParsedInspectRef {
   toolRef: string
 }
@@ -94,49 +85,30 @@ export interface ParsedInspectRef {
 export interface ParsedOrchestratorResponse {
   artifactCreates: ParsedArtifactCreate[]
   agentCreates: ParsedAgentCreate[]
-  proposes: ParsedPropose[]
-  submits: ParsedSubmit[]
-  /** All agent types created, in order of appearance */
+  messages: ParsedMessage[]
+  agentPauses: ParsedAgentPause[]
   agentTypesInOrder: string[]
-  /** Direct tool tags used by the orchestrator (e.g. 'fs-read', 'shell') */
   directToolUses: string[]
-  /** fs-read calls with paths */
   fsReads: ParsedFsRead[]
-  /** fs-search calls */
   fsSearches: ParsedFsSearch[]
-  /** fs-tree calls */
   fsTrees: ParsedFsTree[]
-  /** shell calls */
   shells: ParsedShell[]
-  /** fs-edit calls */
   fsEdits: ParsedFsEdit[]
-  /** fs-write calls */
   fsWrites: ParsedFsWrite[]
-  /** artifact-read calls with IDs */
   artifactReads: ParsedArtifactRead[]
-  /** artifact-write calls */
   artifactWrites: ParsedArtifactWrite[]
-  /** agent-dismiss calls */
   agentDismisses: ParsedAgentDismiss[]
-  /** inspect ref requests */
   inspectRefs: ParsedInspectRef[]
   hasThinkBlock: boolean
   hasUserMessage: boolean
+  turnControl: TurnControl
+  firstActionKind: string | null
 }
-
-// =============================================================================
-// Regex helpers
-// =============================================================================
 
 function extractChildTag(xml: string, tag: string): string {
   const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i')
   const m = xml.match(re)
   return m?.[1]?.trim() ?? ''
-}
-
-function countChildTags(xml: string, tag: string): number {
-  const re = new RegExp(`<${tag}\\b`, 'gi')
-  return (xml.match(re) ?? []).length
 }
 
 function extractAttribute(tag: string, attr: string): string {
@@ -155,18 +127,55 @@ function extractAllAttributes(xml: string, tag: string, attr: string): string[] 
   return results
 }
 
-// =============================================================================
-// Main parser
-// =============================================================================
+function detectTurnControl(raw: string): TurnControl {
+  const nextMatch = /<next\s*\/>/gi
+  const yieldMatch = /<yield\s*\/>/gi
+
+  let lastNext = -1
+  let lastYield = -1
+  let m: RegExpExecArray | null
+
+  while ((m = nextMatch.exec(raw)) !== null) lastNext = m.index
+  while ((m = yieldMatch.exec(raw)) !== null) lastYield = m.index
+
+  if (lastNext === -1 && lastYield === -1) return null
+  return lastNext > lastYield ? 'next' : 'yield'
+}
+
+function detectFirstActionKind(raw: string): string | null {
+  const actionPatterns: Array<{ re: RegExp; kind: string }> = [
+    { re: /<agent-create\b/gi, kind: 'agent:create' },
+    { re: /<artifact-create\b/gi, kind: 'artifact:create' },
+    { re: /<agent-dismiss\b/gi, kind: 'agent:dismiss' },
+    { re: /<agent-pause\b/gi, kind: 'agent:pause' },
+    { re: /<(?:fs-)?read\b/gi, kind: 'tool:fs-read' },
+    { re: /<(?:fs-)?search\b/gi, kind: 'tool:fs-search' },
+    { re: /<(?:fs-)?tree\b/gi, kind: 'tool:fs-tree' },
+    { re: /<shell\b/gi, kind: 'tool:shell' },
+    { re: /<(?:fs-)?edit\b/gi, kind: 'tool:fs-edit' },
+    { re: /<(?:fs-)?write\b/gi, kind: 'tool:fs-write' },
+    { re: /<artifact-read\b/gi, kind: 'tool:artifact-read' },
+    { re: /<artifact-write\b/gi, kind: 'tool:artifact-write' },
+  ]
+
+  let best: { index: number; kind: string } | null = null
+  for (const entry of actionPatterns) {
+    const m = entry.re.exec(raw)
+    if (!m) continue
+    if (!best || m.index < best.index) best = { index: m.index, kind: entry.kind }
+  }
+
+  return best?.kind ?? null
+}
 
 export function parseOrchestratorResponse(raw: string): ParsedOrchestratorResponse {
   const artifactCreates: ParsedArtifactCreate[] = []
   const agentCreates: ParsedAgentCreate[] = []
-  const proposes: ParsedPropose[] = []
-  const submits: ParsedSubmit[] = []
+  const messages: ParsedMessage[] = []
+  const agentPauses: ParsedAgentPause[] = []
   const directToolUses: string[] = []
 
-  // --- artifact-create ---
+  // artifact-create
   const artifactCreateRe = /<artifact-create\b([^>]*)\s*\/?>/gi
   let m: RegExpExecArray | null
   while ((m = artifactCreateRe.exec(raw)) !== null) {
@@ -176,7 +185,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // --- agent-create ---
+  // agent-create
   const agentCreateRe = /<agent-create\b([^>]*)>([\s\S]*?)<\/agent-create>/gi
   while ((m = agentCreateRe.exec(raw)) !== null) {
     const attrs = m[1]
@@ -190,42 +199,34 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // --- propose ---
-  const proposeRe = /<propose\b([^>]*)>([\s\S]*?)<\/propose>|<propose\b([^>]*)\s*\/>/gi
-  while ((m = proposeRe.exec(raw)) !== null) {
-    const attrs = m[1] ?? m[3] ?? ''
-    const body = m[2] ?? ''
-    const criteriaCount = countChildTags(body, 'criterion')
-    const artifactCount = countChildTags(body, 'artifact')
-    proposes.push({
-      title: extractAttribute(attrs, 'title'),
-      hasCriteria: criteriaCount > 0,
-      criteriaCount,
-      hasArtifacts: artifactCount > 0,
-      artifactCount,
+  // message
+  const messageRe = /<message\b([^>]*)>([\s\S]*?)<\/message>/gi
+  while ((m = messageRe.exec(raw)) !== null) {
+    messages.push({
+      to: extractAttribute(m[1], 'to'),
+      body: m[2].trim(),
       position: m.index,
     })
   }
 
-  // --- submit ---
-  const submitRe = /<submit\b[^>]*>([\s\S]*?)<\/submit>/gi
-  while ((m = submitRe.exec(raw)) !== null) {
-    submits.push({
-      summary: m[1]?.trim() ?? '',
+  // agent-pause
+  const agentPauseRe = /<agent-pause\b([^>]*)\s*\/?>/gi
+  while ((m = agentPauseRe.exec(raw)) !== null) {
+    agentPauses.push({
+      agentId: extractAttribute(m[1], 'agentId'),
+      reason: extractAttribute(m[1], 'reason'),
       position: m.index,
     })
   }
 
-  // --- direct tool usage detection ---
-  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'agent-dismiss', 'agent-pause']
+  // direct tool usage detection
+  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write', 'agent-dismiss', 'agent-pause']
   for (const tag of directToolTags) {
     const re = new RegExp(`<${tag}\\b`, 'i')
-    if (re.test(raw)) {
-      directToolUses.push(tag)
-    }
+    if (re.test(raw)) directToolUses.push(tag)
   }
 
-  // --- fs-read calls (both <fs-read> and <read>) ---
+  // fs-read (both fs-read + read)
   const fsReads: ParsedFsRead[] = []
   const fsReadRe = /<(?:fs-)?read\b[^>]*\bpath\s*=\s*"([^"]*)"[^>]*\/?>/gi
   let fsReadCount = 0
@@ -237,7 +238,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     fsReadCount++
   }
 
-  // --- fs-search calls (both <fs-search> and <search>) ---
+  // fs-search (both fs-search + search)
   const fsSearches: ParsedFsSearch[] = []
   const fsSearchRe = /<(?:fs-)?search\b([^>]*)\/?>/gi
   let fsSearchCount = 0
@@ -250,7 +251,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     fsSearchCount++
   }
 
-  // --- fs-tree calls (both <fs-tree> and <tree>) ---
+  // fs-tree (both fs-tree + tree)
   const fsTrees: ParsedFsTree[] = []
   const fsTreeRe = /<(?:fs-)?tree\b([^>]*)\/?>/gi
   let fsTreeCount = 0
@@ -262,7 +263,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     fsTreeCount++
   }
 
-  // --- shell calls ---
+  // shell
   const shells: ParsedShell[] = []
   const shellRe = /<shell\b[^>]*>([\s\S]*?)<\/shell>/gi
   let shellCount = 0
@@ -274,7 +275,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     shellCount++
   }
 
-  // --- fs-edit calls (both <fs-edit> and <edit>) ---
+  // fs-edit (both fs-edit + edit)
   const fsEdits: ParsedFsEdit[] = []
   const fsEditRe = /<(?:fs-)?edit\b[^>]*\bpath\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/(?:fs-)?edit>/gi
   while ((m = fsEditRe.exec(raw)) !== null) {
@@ -286,7 +287,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // --- fs-write calls (both <fs-write> and <write>) ---
+  // fs-write (both fs-write + write)
   const fsWrites: ParsedFsWrite[] = []
   const fsWriteRe = /<(?:fs-)?write\b[^>]*\bpath\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/(?:fs-)?write>/gi
   while ((m = fsWriteRe.exec(raw)) !== null) {
@@ -296,7 +297,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // --- artifact-read calls ---
+  // artifact-read
   const artifactReads: ParsedArtifactRead[] = []
   const artifactReadRe = /<artifact-read\b[^>]*\bid\s*=\s*"([^"]*)"[^>]*\/?>/gi
   let artReadCount = 0
@@ -308,7 +309,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     artReadCount++
   }
 
-  // --- artifact-write calls ---
+  // artifact-write
   const artifactWrites: ParsedArtifactWrite[] = []
   const artifactWriteRe = /<artifact-write\b[^>]*\bid\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/artifact-write>/gi
   while ((m = artifactWriteRe.exec(raw)) !== null) {
@@ -318,56 +319,46 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // --- agent-dismiss calls ---
+  // agent-dismiss
   const agentDismisses: ParsedAgentDismiss[] = []
   const agentDismissRe = /<agent-dismiss\b[^>]*\bagentId\s*=\s*"([^"]*)"[^>]*\/?>/gi
   while ((m = agentDismissRe.exec(raw)) !== null) {
     agentDismisses.push({ agentId: m[1] })
   }
 
-  // --- inspect refs ---
+  // inspect refs
   const inspectRefs: ParsedInspectRef[] = []
   const refRe = /<ref\s+tool\s*=\s*"([^"]*)"[^>]*\/>/gi
   while ((m = refRe.exec(raw)) !== null) {
     inspectRefs.push({ toolRef: m[1] })
   }
 
-  // --- think block ---
-  const hasThinkBlock = /<think\b/i.test(raw) && /<\/think>/i.test(raw)
+  const hasThinkBlock = /<lenses>/i.test(raw) && /<\/lenses>/i.test(raw)
+  const hasMessageToUser = messages.some(msg => msg.to.toLowerCase() === 'user')
 
-  // --- user message ---
-  let hasUserMessage = false
-  const thinkEnd = raw.indexOf('</think>')
+  let hasUserMessage = hasMessageToUser
+  if (!hasUserMessage && /<comms>/i.test(raw)) hasUserMessage = true
+
+  const thinkEnd = Math.max(raw.indexOf('</think>'), raw.indexOf('</lenses>'))
+  const thinkEndLen = raw.indexOf('</lenses>') > raw.indexOf('</think>') ? '</lenses>'.length : '</think>'.length
   const actionsStart = raw.indexOf('<actions>')
-
-  // Prose between </think> and <actions>
-  if (thinkEnd !== -1 && actionsStart !== -1 && actionsStart > thinkEnd) {
-    const between = raw.slice(thinkEnd + '</think>'.length, actionsStart).trim()
+  if (!hasUserMessage && thinkEnd !== -1 && actionsStart !== -1 && actionsStart > thinkEnd) {
+    const between = raw.slice(thinkEnd + thinkEndLen, actionsStart).trim()
     if (between.length > 0) hasUserMessage = true
   }
-  // Prose after </think> with no <actions> block at all
   if (!hasUserMessage && thinkEnd !== -1 && actionsStart === -1) {
-    const afterThink = raw.slice(thinkEnd + '</think>'.length).trim()
+    const afterThink = raw.slice(thinkEnd + thinkEndLen).trim()
     if (afterThink.length > 0) hasUserMessage = true
   }
-  // <comms> block anywhere
-  if (!hasUserMessage && /<comms>/i.test(raw)) {
-    hasUserMessage = true
-  }
-  // <message to="user"> tag
-  if (!hasUserMessage && /<message\b[^>]*to\s*=\s*"user"/i.test(raw)) {
-    hasUserMessage = true
-  }
 
-  // Build ordered agent types
   const sorted = [...agentCreates].sort((a, b) => a.position - b.position)
   const agentTypesInOrder = sorted.map(a => a.type)
 
   return {
     artifactCreates,
     agentCreates,
-    proposes,
-    submits,
+    messages,
+    agentPauses,
     agentTypesInOrder,
     directToolUses,
     fsReads,
@@ -382,5 +373,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     inspectRefs,
     hasThinkBlock,
     hasUserMessage,
+    turnControl: detectTurnControl(raw),
+    firstActionKind: detectFirstActionKind(raw),
   }
 }

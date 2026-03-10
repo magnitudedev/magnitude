@@ -10,9 +10,9 @@ Codebase preference: use snake_case for Python names and files in this repo.
 [4] 1774405015900 assistant_turn_completed
 Understood. Use snake_case for Python names and files.
 
-[5] 1774405023700 agent_created type=scout taskId=task-761
+[5] 1774405023700 agent_created type=explorer taskId=task-761
 
-[6] 1774405026100 fork_started role=scout mode=survey taskId=task-761
+[6] 1774405026100 fork_started role=explorer mode=survey taskId=task-761
 
 [7] 1774405032400 fork_completed result={"taskId":"task-761","summary":"Mixed Python naming found in jobs, utils, and tests","status":"ok"}
 
@@ -67,9 +67,9 @@ And keep snake_case as the Python standard.
 [26] 1774405154700 assistant_turn_completed
 Confirmed. Use snake_case for Python names and files.
 
-[27] 1774405162900 agent_created type=scout taskId=task-764
+[27] 1774405162900 agent_created type=explorer taskId=task-764
 
-[28] 1774405165300 fork_started role=scout mode=verify taskId=task-764
+[28] 1774405165300 fork_started role=explorer mode=verify taskId=task-764
 
 [29] 1774405171600 fork_completed result={"taskId":"task-764","summary":"No remaining camelCase Python identifiers in touched files","status":"ok"}
 

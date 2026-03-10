@@ -32,7 +32,7 @@ export type StrategyId = 'xml-act'
 // Work Agent Types
 // =============================================================================
 
-export type WorkAgentType = 'researcher' | 'planner' | 'builder' | 'debugger' | 'reviewer' | 'scout' | 'browser'
+export type WorkAgentType = 'explorer' | 'planner' | 'builder' | 'debugger' | 'reviewer' | 'browser'
 
 // =============================================================================
 // Session Events

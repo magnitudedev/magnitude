@@ -87,10 +87,10 @@ async function executeScenario(scenario: ToolUsageScenario, modelSpec: ModelSpec
 }
 
 export const VARIANTS: EvalVariant[] = [
-  { id: 'tool-usage/scout-vs-reads', label: 'Scout vs direct reads', count: 1 },
+  { id: 'tool-usage/explorer-vs-reads', label: 'Explorer vs direct reads', count: 1 },
   { id: 'tool-usage/builder-vs-edits', label: 'Builder vs direct edits', count: 1 },
   { id: 'tool-usage/planner-vs-self-plan', label: 'Planner vs self-planning', count: 1 },
-  { id: 'tool-usage/researcher-vs-scout', label: 'Researcher vs Scout', count: 1 },
+  { id: 'tool-usage/explorer-vs-direct-reads-depth', label: 'Explorer depth vs direct reads', count: 1 },
 ]
 
 export const toolUsageScenarios: Scenario[] = ALL_SCENARIOS

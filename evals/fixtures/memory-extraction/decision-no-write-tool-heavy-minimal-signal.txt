@@ -8,9 +8,9 @@ Absolutely.
 I'll map the auth-session refresh flow and isolate the background-recovery timeout path.
 Then I'll implement a focused fix and validate with targeted checks.
 
-[40] 1777640013000 agent_created type=scout taskId=task-auth-timeout-map
+[40] 1777640013000 agent_created type=explorer taskId=task-auth-timeout-map
 
-[41] 1777640015000 fork_started role=scout mode=read-only taskId=task-auth-timeout-map
+[41] 1777640015000 fork_started role=explorer mode=read-only taskId=task-auth-timeout-map
 
 [88] 1777640022000 fork_completed result={"status":"ok","summary":"Session refresh race between visibilitychange resume and stale token check causes occasional forced logout."}
 
@@ -80,9 +80,9 @@ Yes.
 I'll run contract snapshot checks for session endpoints to confirm no request/response shape changes.
 This should remain internal behavior only.
 
-[718] 1777640133000 agent_created type=scout taskId=task-auth-timeout-contract-scan
+[718] 1777640133000 agent_created type=explorer taskId=task-auth-timeout-contract-scan
 
-[719] 1777640135000 fork_started role=scout mode=read-only taskId=task-auth-timeout-contract-scan
+[719] 1777640135000 fork_started role=explorer mode=read-only taskId=task-auth-timeout-contract-scan
 
 [766] 1777640142000 fork_completed result={"status":"ok","summary":"No contract changes detected in session endpoint schemas or snapshots."}
 

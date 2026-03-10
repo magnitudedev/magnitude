@@ -72,23 +72,23 @@ const taskRoutesWithoutDelete = mockProject.read('server/src/routes/tasks.ts')
 export const ALL_SCENARIOS: A5Scenario[] = [
 
   scenario('tenet1/communicate-before-building')
-    .description('After scout returns results and all relevant files are read, orchestrator should communicate plan before deploying builder')
+    .description('After explorer returns results and all relevant files are read, orchestrator should communicate plan before deploying builder')
     .context(mockProject.sessionContext())
     .user('add due date support to tasks — users should be able to set a deadline on any task')
     .assistant((t) =>
       t.think('turn', 'meta')
-        .think('Scouting the codebase to understand the task model.', 'task')
+        .think('Exploring the codebase to understand the task model.', 'task')
         .deployAgent({
-          agentId: 'scout-1',
-          type: 'scout',
-          title: 'Scout task structure',
+          agentId: 'explorer-1',
+          type: 'explorer',
+          title: 'Explore task structure',
           prompt: 'Map the task schema, routes, and service layer. Find where tasks are defined and how they are created and updated.',
         })
     )
     .agentResponse(
-      'scout-1',
+      'explorer-1',
       'Covered the full task implementation. Schema in server/src/db/schema.ts — tasks table columns: id, title, description, status, projectId, assigneeId, createdAt. No dueDate field. Routes in server/src/routes/tasks.ts — CRUD endpoints. Service in server/src/services/task-service.ts — create() inserts directly, update() patches by id. Migrations in server/drizzle/migrations/0000_init.sql. Client task UI in client/src/components/TaskForm.tsx and TaskCard.tsx — TaskForm has title+description fields only. No due date anywhere in the stack.',
-      { agentStatuses: { 'scout-1 (scout)': 'idle' } }
+      { agentStatuses: { 'explorer-1 (explorer)': 'idle' } }
     )
     .assistant((t) =>
       t.think('task', 'meta')
@@ -144,7 +144,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .build(),
 
   scenario('tenet1/conversational-premature-action')
-    .description('After conversational diagnosis, scout results, and file reads, orchestrator should communicate approach before acting')
+    .description('After conversational diagnosis, explorer results, and file reads, orchestrator should communicate approach before acting')
     .context(mockProject.sessionContext())
     .user('the task list endpoint is really slow when projects have lots of tasks')
     .assistant((t) => t.message('Are you returning all tasks at once without any limit or pagination?'))
@@ -153,18 +153,18 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .user('yeah can you fix it?')
     .assistant((t) =>
       t.think('turn', 'meta')
-        .think('Scouting the task endpoint.', 'task')
+        .think('Exploring the task endpoint.', 'task')
         .deployAgent({
-          agentId: 'scout-1',
-          type: 'scout',
+          agentId: 'explorer-1',
+          type: 'explorer',
           title: 'Map task list endpoint',
           prompt: 'Look at the tasks route and service. How are tasks listed? Is there any pagination or limit logic?',
         })
     )
     .agentResponse(
-      'scout-1',
+      'explorer-1',
       'GET /api/projects/:projectId/tasks in server/src/routes/tasks.ts calls taskService.listByProject(projectId). That method in server/src/services/task-service.ts runs db.select().from(tasks).where(eq(tasks.projectId, projectId)) with no limit or offset — returns every task. No pagination infrastructure anywhere. Client in client/src/components/TaskList.tsx renders all tasks in a flat list.',
-      { agentStatuses: { 'scout-1 (scout)': 'idle' } }
+      { agentStatuses: { 'explorer-1 (explorer)': 'idle' } }
     )
     .assistant((t) =>
       t.think('task', 'meta')
@@ -238,7 +238,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .context(mockProject.sessionContext())
     .user("we're debating whether to put input validation in the route handlers or in the service layer — what makes more sense for this codebase?")
     .judge(
-      'Does the response take action to examine the existing codebase (read route or service files, or deploy a scout) to inform its answer, rather than asking the user about their preferences or giving a purely generic opinion without looking at the code?',
+      'Does the response take action to examine the existing codebase (read route or service files, or deploy an explorer) to inform its answer, rather than asking the user about their preferences or giving a purely generic opinion without looking at the code?',
       'examines-codebase-before-opining'
     )
     .build(),

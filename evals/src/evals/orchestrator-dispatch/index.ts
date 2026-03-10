@@ -3,15 +3,7 @@
  *
  * Tests orchestrator subagent dispatching across multiple turns.
  * Uses the real orchestrator system prompt, calls the model in a loop,
- * and injects synthetic agent responses to drive the orchestrator through
- * its full decision-making lifecycle.
- *
- * Agents create their own artifacts internally — the orchestrator doesn't
- * pre-create them. The turn loop attaches synthetic artifact content to
- * agent responses regardless of writable artifact IDs.
- *
- * When the orchestrator uses tools directly (fs-read, fs-search, shell, etc.),
- * the turn loop returns mock results from the scenario's mockFiles map.
+ * and injects synthetic agent responses to drive the orchestrator.
  */
 
 import type { RunnableEval, Scenario, ScenarioResult, ModelSpec, CheckResult, EvalVariant } from '../../types'
@@ -42,17 +34,12 @@ function getSystemPrompt(): string {
 // Synthetic response formatting
 // =============================================================================
 
-/** Counter for generating unique agent IDs within a scenario run */
 let agentIdCounter = 0
 
 function nextAgentId(type: string): string {
   return `${type}-${++agentIdCounter}`
 }
 
-/**
- * Build inspect refs and result lines for all direct tool uses.
- * Shared between buildTurnFeedback and buildDirectToolFeedback.
- */
 function buildToolResults(
   parsed: ParsedOrchestratorResponse,
   mockFiles: Record<string, string>,
@@ -61,7 +48,7 @@ function buildToolResults(
   const resultLines: string[] = []
   const inspectLines: string[] = []
 
-  // --- fs-read ---
+  // fs-read
   for (const fsRead of parsed.fsReads) {
     const content = mockFiles[fsRead.path]
     if (content !== undefined) {
@@ -71,7 +58,7 @@ function buildToolResults(
     }
   }
 
-  // --- fs-search ---
+  // fs-search
   for (const fsSearch of parsed.fsSearches) {
     const items: string[] = []
     let pattern: RegExp
@@ -80,31 +67,28 @@ function buildToolResults(
     } catch {
       pattern = new RegExp(fsSearch.pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
     }
+
     for (const [filePath, content] of Object.entries(mockFiles)) {
       if (fsSearch.path !== '.' && !filePath.startsWith(fsSearch.path.replace(/^\.\//, ''))) continue
       const lines = content.split('\n')
       for (let i = 0; i < lines.length; i++) {
-        if (pattern.test(lines[i])) {
-          items.push(`<item file="${filePath}">${i + 1}|${lines[i]}</item>`)
-        }
+        if (pattern.test(lines[i])) items.push(`<item file="${filePath}">${i + 1}|${lines[i]}</item>`)
         pattern.lastIndex = 0
       }
     }
-    if (items.length > 0) {
-      inspectLines.push(`<ref tool="${fsSearch.refName}">\n${items.join('\n')}\n</ref>`)
-    } else {
-      inspectLines.push(`<ref tool="${fsSearch.refName}">No matches found</ref>`)
-    }
+
+    if (items.length > 0) inspectLines.push(`<ref tool="${fsSearch.refName}">\n${items.join('\n')}\n</ref>`)
+    else inspectLines.push(`<ref tool="${fsSearch.refName}">No matches found</ref>`)
   }
 
-  // --- fs-tree ---
+  // fs-tree
   for (const fsTree of parsed.fsTrees) {
     const dirs = new Set<string>()
     const entries: string[] = []
     const prefix = fsTree.path === '.' ? '' : fsTree.path.replace(/^\.\//, '')
+
     for (const filePath of Object.keys(mockFiles).sort()) {
       if (prefix && !filePath.startsWith(prefix)) continue
-      // Collect parent directories
       const parts = filePath.split('/')
       for (let i = 1; i < parts.length; i++) {
         const dir = parts.slice(0, i).join('/')
@@ -115,14 +99,13 @@ function buildToolResults(
       }
       entries.push(`<entry path="${filePath}" name="${parts[parts.length - 1]}" type="file" />`)
     }
+
     inspectLines.push(`<ref tool="${fsTree.refName}">\n${entries.join('\n')}\n</ref>`)
   }
 
-  // --- shell ---
+  // shell
   for (const shell of parsed.shells) {
-    const cmd = shell.command
-    // Try to handle cat commands by looking up mock files
-    const catMatch = cmd.match(/cat\s+(\S+)/)
+    const catMatch = shell.command.match(/cat\s+(\S+)/)
     if (catMatch) {
       const path = catMatch[1].replace(/^\.\//, '')
       const content = mockFiles[path]
@@ -131,11 +114,10 @@ function buildToolResults(
         continue
       }
     }
-    // Generic success for everything else
     inspectLines.push(`<ref tool="${shell.refName}">\n<stdout></stdout>\n<stderr></stderr>\n<exitCode>0</exitCode>\n</ref>`)
   }
 
-  // --- fs-edit ---
+  // fs-edit
   for (const fsEdit of parsed.fsEdits) {
     const content = mockFiles[fsEdit.path]
     if (content !== undefined && fsEdit.oldText && content.includes(fsEdit.oldText)) {
@@ -148,13 +130,13 @@ function buildToolResults(
     }
   }
 
-  // --- fs-write ---
+  // fs-write
   for (const fsWrite of parsed.fsWrites) {
     mockFiles[fsWrite.path] = fsWrite.content
     inspectLines.push(`<ref tool="fs-write" />`)
   }
 
-  // --- artifact-read ---
+  // artifact-read
   for (const artRead of parsed.artifactReads) {
     const content = artifactStore.get(artRead.id)
     if (content !== undefined) {
@@ -164,22 +146,9 @@ function buildToolResults(
     }
   }
 
-  // --- agent-dismiss ---
-  for (const _dismiss of parsed.agentDismisses) {
-    // Silent success — no output needed
-  }
-
   return { resultLines, inspectLines }
 }
 
-/**
- * Build the results + agent responses injected after an orchestrator turn.
- *
- * Handles:
- * - Agent responses with artifacts (agents create their own artifacts)
- * - Direct tool results (fs-read, fs-search, shell, etc.) with inspect refs
- * - Agents status block
- */
 function buildTurnFeedback(
   parsed: ParsedOrchestratorResponse,
   scenario: DispatchScenario,
@@ -188,16 +157,12 @@ function buildTurnFeedback(
   const parts: string[] = []
   const mockFiles = scenario.mockFiles ?? {}
 
-  // Build results block
   const { resultLines, inspectLines } = buildToolResults(parsed, mockFiles, artifactStore)
   const allResultLines = ['<results>', ...resultLines]
-  if (inspectLines.length > 0) {
-    allResultLines.push('<inspect>', ...inspectLines, '</inspect>')
-  }
+  if (inspectLines.length > 0) allResultLines.push('<inspect>', ...inspectLines, '</inspect>')
   allResultLines.push('</results>')
   parts.push(allResultLines.join('\n'))
 
-  // Agent responses for each created agent
   for (const ac of parsed.agentCreates) {
     const agentId = ac.agentId || nextAgentId(ac.type)
     const syntheticResponse = scenario.syntheticResponses?.[ac.type]
@@ -209,9 +174,7 @@ function buildTurnFeedback(
         const artifactId = `${agentId}-report`
         artifactStore.set(artifactId, syntheticResponse.artifactContent)
 
-        for (const wId of ac.writableArtifactIds) {
-          artifactStore.set(wId, syntheticResponse.artifactContent)
-        }
+        for (const wId of ac.writableArtifactIds) artifactStore.set(wId, syntheticResponse.artifactContent)
 
         parts.push(`<artifact id="${artifactId}">\n${syntheticResponse.artifactContent}\n</artifact>`)
       }
@@ -220,7 +183,6 @@ function buildTurnFeedback(
     }
   }
 
-  // Agents status — all deployed agents are now idle
   if (parsed.agentCreates.length > 0) {
     const statusLines = parsed.agentCreates.map(ac => {
       const agentId = ac.agentId || `${ac.type}-1`
@@ -232,9 +194,6 @@ function buildTurnFeedback(
   return parts.join('\n')
 }
 
-/**
- * Build results for a turn with only direct tool uses (no agent creates).
- */
 function buildDirectToolFeedback(
   parsed: ParsedOrchestratorResponse,
   scenario: DispatchScenario,
@@ -244,34 +203,40 @@ function buildDirectToolFeedback(
   const { resultLines, inspectLines } = buildToolResults(parsed, mockFiles, artifactStore)
 
   const allLines = ['<results>', ...resultLines]
-  if (inspectLines.length > 0) {
-    allLines.push('<inspect>', ...inspectLines, '</inspect>')
-  }
+  if (inspectLines.length > 0) allLines.push('<inspect>', ...inspectLines, '</inspect>')
   allLines.push('</results>')
   return allLines.join('\n')
 }
 
-/**
- * Build the user-role message injected after a proposal.
- * Simulates user approval or rejection.
- */
-function buildProposalFeedback(scenario: DispatchScenario): string {
-  const result = scenario.proposalResult!
-  const parts: string[] = []
+interface ConversationScript {
+  approval?: string
+  rejection?: string
+  injectAfter?: number | 'first-plan-message'
+}
 
-  parts.push('<results>\n</results>')
+function getConversationScript(scenario: DispatchScenario): ConversationScript | undefined {
+  return (scenario as DispatchScenario & { conversationScript?: ConversationScript }).conversationScript
+}
 
-  if (result.approved) {
-    parts.push(`<autonomous_period_started taskId="eval-task-1">
-The user has approved this task. You are now in an autonomous period.
-Keep working until ALL criteria are met. Do not message the user unless absolutely necessary.
-Criteria will be independently verified before the autonomous period ends.
-</autonomous_period_started>`)
-  } else if (result.feedback) {
-    parts.push(`<user_task_feedback taskId="eval-task-1">\n${result.feedback}\n</user_task_feedback>`)
-  }
+function wrapScriptedUserMessage(text: string): string {
+  return `<user mode="text" at="2026-Mar-04 10:00:00">\n${text}\n</user>`
+}
 
-  return parts.join('\n')
+function hasAction(parsed: ParsedOrchestratorResponse): boolean {
+  return (
+    parsed.agentCreates.length > 0 ||
+    parsed.fsReads.length > 0 ||
+    parsed.fsSearches.length > 0 ||
+    parsed.fsTrees.length > 0 ||
+    parsed.shells.length > 0 ||
+    parsed.fsEdits.length > 0 ||
+    parsed.fsWrites.length > 0 ||
+    parsed.agentDismisses.length > 0 ||
+    parsed.agentPauses.length > 0 ||
+    parsed.artifactCreates.length > 0 ||
+    parsed.artifactWrites.length > 0 ||
+    parsed.artifactReads.length > 0
+  )
 }
 
 // =============================================================================
@@ -288,6 +253,10 @@ async function runTurnLoop(
   const allResponses: string[] = []
   const artifactStore = new Map<string, string>()
 
+  const script = getConversationScript(scenario)
+  let scriptInjected = false
+  let builderSeen = false
+
   agentIdCounter = 0
 
   for (let turn = 0; turn < SAFETY_CAP; turn++) {
@@ -301,57 +270,45 @@ async function runTurnLoop(
     allResponses.push(response)
     const parsed = parseOrchestratorResponse(response)
 
-    // Track artifact creates
-    for (const ac of parsed.artifactCreates) {
-      artifactStore.set(ac.id, '')
-    }
+    for (const ac of parsed.artifactCreates) artifactStore.set(ac.id, '')
 
-    // Add assistant turn to conversation
+    if (parsed.agentCreates.some(a => a.type === 'builder')) builderSeen = true
+
     messages.push({ role: 'assistant', content: [response] })
 
-    // Terminal: proposal made
-    if (parsed.proposes.length > 0) {
-      if (scenario.proposalResult) {
-        const feedback = buildProposalFeedback(scenario)
-        messages.push({ role: 'user', content: [feedback] })
-        scenario.proposalResult = undefined
+    const readyByTurn = typeof script?.injectAfter === 'number' ? turn + 1 >= script.injectAfter : false
+    const readyByFirstPlan = (script?.injectAfter ?? 'first-plan-message') === 'first-plan-message' &&
+      !builderSeen &&
+      parsed.messages.some(msg => msg.to.toLowerCase() === 'user')
+
+    if (script && !scriptInjected && (readyByTurn || readyByFirstPlan)) {
+      const payload = script.rejection ?? script.approval
+      if (payload) {
+        messages.push({ role: 'user', content: [wrapScriptedUserMessage(payload)] })
+        scriptInjected = true
         continue
       }
-      break
     }
 
-    // Terminal: submitted
-    if (parsed.submits.length > 0) break
+    if (!hasAction(parsed)) break
 
-    // Check if anything actionable happened
-    const hasAgents = parsed.agentCreates.length > 0
-    const hasReads = parsed.fsReads.length > 0 || parsed.artifactReads.length > 0
-    const hasSearches = parsed.fsSearches.length > 0
-    const hasTrees = parsed.fsTrees.length > 0
-    const hasShells = parsed.shells.length > 0
-    const hasEdits = parsed.fsEdits.length > 0
-    const hasWrites = parsed.fsWrites.length > 0
-    const hasDismisses = parsed.agentDismisses.length > 0
-    const hasArtifactCreates = parsed.artifactCreates.length > 0
-    const hasArtifactWrites = parsed.artifactWrites.length > 0
-    const hasAnyAction = hasAgents || hasReads || hasSearches || hasTrees || hasShells ||
-      hasEdits || hasWrites || hasDismisses || hasArtifactCreates || hasArtifactWrites
+    for (const aw of parsed.artifactWrites) artifactStore.set(aw.id, aw.content)
 
-    if (!hasAnyAction) break
-
-    // Process artifact writes into the store
-    for (const aw of parsed.artifactWrites) {
-      artifactStore.set(aw.id, aw.content)
-    }
-
-    // Build feedback
-    let feedback: string
-    if (hasAgents) {
-      feedback = buildTurnFeedback(parsed, scenario, artifactStore)
-    } else {
-      feedback = buildDirectToolFeedback(parsed, scenario, artifactStore)
-    }
+    const feedback = parsed.agentCreates.length > 0
+      ? buildTurnFeedback(parsed, scenario, artifactStore)
+      : buildDirectToolFeedback(parsed, scenario, artifactStore)
     messages.push({ role: 'user', content: [feedback] })
+
+    const completion = (scenario as DispatchScenario & {
+      completionExpectations?: { requireBuilder?: boolean; requireReviewer?: boolean }
+    }).completionExpectations
+
+    if (completion) {
+      const parsedAll = parseOrchestratorResponse(allResponses.join('\n'))
+      const hasBuilder = completion.requireBuilder ? parsedAll.agentCreates.some(a => a.type === 'builder') : true
+      const hasReviewer = completion.requireReviewer ? parsedAll.agentCreates.some(a => a.type === 'reviewer') : true
+      if (hasBuilder && hasReviewer && parsed.messages.some(msg => msg.to.toLowerCase() === 'user')) break
+    }
   }
 
   return { allResponses }
@@ -363,17 +320,13 @@ async function runTurnLoop(
 
 function makeFail(scenarioId: string, message: string, checks: readonly { id: string }[]): ScenarioResult {
   const checkResults: Record<string, CheckResult> = {}
-  for (const check of checks) {
-    checkResults[check.id] = { passed: false, message }
-  }
+  for (const check of checks) checkResults[check.id] = { passed: false, message }
   return { scenarioId, checks: checkResults, passed: false, score: 0, rawResponse: '' }
 }
 
 async function executeScenario(scenario: DispatchScenario, modelSpec: ModelSpec): Promise<ScenarioResult> {
-  // Deep copy mockFiles so edits/writes don't mutate the original scenario
   const scenarioCopy = {
     ...scenario,
-    proposalResult: scenario.proposalResult ? { ...scenario.proposalResult } : undefined,
     mockFiles: scenario.mockFiles ? { ...scenario.mockFiles } : undefined,
   }
 

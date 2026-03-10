@@ -14,9 +14,9 @@ I'll keep you informed with concise progress updates.
 
 Starting with a quick map of importer modules and test coverage.
 
-[45] 1777000015000 agent_created type=scout taskId=task-importer-map
+[45] 1777000015000 agent_created type=explorer taskId=task-importer-map
 
-[46] 1777000017000 fork_started role=scout mode=read-only taskId=task-importer-map
+[46] 1777000017000 fork_started role=explorer mode=read-only taskId=task-importer-map
 
 [89] 1777000023000 fork_completed result={"status":"ok","summary":"Mapped importer parser, dedupe logic, and retry flow. Found dead helper path and duplicated validation checks."}
 

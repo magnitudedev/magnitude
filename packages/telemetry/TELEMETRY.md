@@ -11,7 +11,7 @@ We collect high-level, aggregate usage data:
 - **Tool usage** — which tools are used and how often (e.g. file edit, file write, shell, search), success/failure counts
 - **Lines of code** — number of lines written, added, and removed by tools (not the actual code)
 - **Model and provider usage** — which LLM providers and models are selected, token consumption (input/output counts)
-- **Agent usage** — number and types of sub-agents spawned (researcher, builder, browser, etc.)
+- **Agent usage** — number and types of sub-agents spawned (explorer, builder, browser, etc.)
 
 ## What We Do NOT Collect
 

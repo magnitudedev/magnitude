@@ -2,7 +2,7 @@
 Can you handle the monorepo telemetry cleanup task?
 
 Quick way I want this run:
-for large cross-package work, do a scout map before coding,
+for large cross-package work, do a explorer map before coding,
 and keep updates short and practical.
 
 I want this done today with minimal back-and-forth.
@@ -10,21 +10,21 @@ I want this done today with minimal back-and-forth.
 [5] 1777400009000 assistant_turn_completed
 Understood.
 
-I'll start with a scout map, then execute in stages.
+I'll start with a explorer map, then execute in stages.
 I'll keep updates brief and practical throughout.
 
 Beginning with codebase mapping now.
 
-[45] 1777400015000 agent_created type=scout taskId=task-telemetry-map
+[45] 1777400015000 agent_created type=explorer taskId=task-telemetry-map
 
-[46] 1777400017000 fork_started role=scout mode=read-only taskId=task-telemetry-map
+[46] 1777400017000 fork_started role=explorer mode=read-only taskId=task-telemetry-map
 
 [89] 1777400025000 fork_completed result={"status":"ok","summary":"Mapped telemetry duplication in providers, agent runtime, and tools bindings. Found inconsistent retry metadata naming."}
 
 [120] 1777400032000 user_message
 Great.
 
-After scout, please stage this as:
+After explorer, please stage this as:
 shared core extraction first,
 then package migrations,
 then final verification.
@@ -119,7 +119,7 @@ I'll send a concise merge-ready summary after checks.
 
 [771] 1777400152000 fork_started role=reviewer mode=read-only taskId=task-telemetry-final-review
 
-[820] 1777400160000 fork_completed result={"status":"ok","summary":"Stage order followed: scout -> shared core -> migrations -> verification. Final tests green."}
+[820] 1777400160000 fork_completed result={"status":"ok","summary":"Stage order followed: explorer -> shared core -> migrations -> verification. Final tests green."}
 
 [860] 1777400167000 user_message
 Perfect.
@@ -130,7 +130,7 @@ Then I'll merge.
 [900] 1777400175000 assistant_turn_completed
 Done.
 
-Completed staged telemetry cleanup with scout-first workflow and concise reporting.
+Completed staged telemetry cleanup with explorer-first workflow and concise reporting.
 Routine edits were executed autonomously; no high-risk blockers encountered.
 Final verification passed and the task is merge-ready.
 
@@ -145,7 +145,7 @@ Great.
 Task complete and ready for release.</fs-read>
 [1200] 1777400197000 user_message
 Quick retrospective:
-the staged scout-first execution worked and concise updates were helpful.
+the staged explorer-first execution worked and concise updates were helpful.
 No further implementation requests here.
 
 [1240] 1777400203000 assistant_turn_completed

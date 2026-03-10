@@ -26,9 +26,9 @@ Makes sense.
 I will apply it consistently.
 For this task, dark mode will be persisted in the same preference mechanism.
 
-[7] 1776209753000 agent_created type=scout taskId=agent-scout-toggle-patterns-a
+[7] 1776209753000 agent_created type=explorer taskId=agent-explorer-toggle-patterns-a
 
-[8] 1776209754600 fork_started role=scout mode=spawn taskId=agent-scout-toggle-patterns-a
+[8] 1776209754600 fork_started role=explorer mode=spawn taskId=agent-explorer-toggle-patterns-a
 
 [9] 1776209899000 fork_completed result={"summary":"Existing settings toggles already use persisted preference hooks; dark mode can follow same path."}
 
@@ -47,9 +47,9 @@ Will do.
 I will use explicit preference keys and clear helper usage.
 That should make the convention obvious to future contributors.
 
-[13] 1776210147000 agent_created type=scout taskId=agent-scout-theme-b
+[13] 1776210147000 agent_created type=explorer taskId=agent-explorer-theme-b
 
-[14] 1776210148600 fork_started role=scout mode=spawn taskId=agent-scout-theme-b
+[14] 1776210148600 fork_started role=explorer mode=spawn taskId=agent-explorer-theme-b
 
 [15] 1776210312000 fork_completed result={"summary":"Dark mode toggle wired to theme provider with persisted preference key and migration-safe defaults."}
 
@@ -67,9 +67,9 @@ Agreed.
 I will add a focused persistence and restore test in settings flow.
 That should protect this convention.
 
-[19] 1776210560000 agent_created type=scout taskId=agent-scout-tests-c
+[19] 1776210560000 agent_created type=explorer taskId=agent-explorer-tests-c
 
-[20] 1776210561600 fork_started role=scout mode=spawn taskId=agent-scout-tests-c
+[20] 1776210561600 fork_started role=explorer mode=spawn taskId=agent-explorer-tests-c
 
 [21] 1776210741000 fork_completed result={"summary":"Added toggle persistence/restore test using shared preferences harness; passing."}
 
@@ -88,9 +88,9 @@ Confirmed.
 I will treat this as a standing codebase convention.
 New UI toggles should persist to user preferences by default.
 
-[25] 1776210989000 agent_created type=scout taskId=agent-scout-final-check-d
+[25] 1776210989000 agent_created type=explorer taskId=agent-explorer-final-check-d
 
-[26] 1776210990600 fork_started role=scout mode=spawn taskId=agent-scout-final-check-d
+[26] 1776210990600 fork_started role=explorer mode=spawn taskId=agent-explorer-final-check-d
 
 [27] 1776211173000 fork_completed result={"summary":"Final check: dark mode persisted; tests and lint pass; convention reflected in settings implementation."}
 
@@ -117,9 +117,9 @@ Good suggestion.
 I will add a concise settings doc note about toggle persistence.
 That should reduce repeated review guidance.
 
-[33] 1776211548000 agent_created type=scout taskId=agent-scout-doc-note-e
+[33] 1776211548000 agent_created type=explorer taskId=agent-explorer-doc-note-e
 
-[34] 1776211549600 fork_started role=scout mode=spawn taskId=agent-scout-doc-note-e
+[34] 1776211549600 fork_started role=explorer mode=spawn taskId=agent-explorer-doc-note-e
 
 [35] 1776211729000 fork_completed result={"summary":"Added concise settings note documenting toggle persistence convention for future UI controls."}
 

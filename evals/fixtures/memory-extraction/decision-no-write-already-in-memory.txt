@@ -11,9 +11,9 @@ Then I'll make a focused refactor and bug fix.
 
 I'll keep named exports throughout.
 
-[38] 1777600013000 agent_created type=scout taskId=task-settings-scout
+[38] 1777600013000 agent_created type=explorer taskId=task-settings-explorer
 
-[39] 1777600015000 fork_started role=scout mode=read-only taskId=task-settings-scout
+[39] 1777600015000 fork_started role=explorer mode=read-only taskId=task-settings-explorer
 
 [82] 1777600022000 fork_completed result={"status":"ok","summary":"Mapped settings module. Found toggle state race in useSettingsFlags and oversized settings index file."}
 
@@ -98,9 +98,9 @@ I'll report if any default export appears.
 
 Proceeding with that check now.
 
-[614] 1777600118000 agent_created type=scout taskId=task-settings-export-scan
+[614] 1777600118000 agent_created type=explorer taskId=task-settings-export-scan
 
-[615] 1777600120000 fork_started role=scout mode=read-only taskId=task-settings-export-scan
+[615] 1777600120000 fork_started role=explorer mode=read-only taskId=task-settings-export-scan
 
 [662] 1777600127000 fork_completed result={"status":"ok","summary":"No default exports found in modified settings files. Imports updated accordingly."}
 

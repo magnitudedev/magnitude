@@ -1,5 +1,5 @@
 /**
- * Researcher Agent Definition
+ * Explorer Agent Definition
  *
  * Read-only agent that answers informational questions by exploring the codebase.
  * Uses secondary model. Communicates back via parent.message.
@@ -29,8 +29,8 @@ const tools = toolSet({
   think:         thinkTool,
 })
 
-export const createResearcher = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
-  id: 'researcher',
+export const createExplorer = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
+  id: 'explorer',
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [taskThinkingLens, turnThinkingLens],
@@ -39,8 +39,8 @@ export const createResearcher = (systemPrompt: string) => defineAgent<typeof too
     shell(input) {
       const result = classifyShellCommand(input.command)
       if (result.tier === 'readonly') return p.allow()
-      // Researchers are read-only — reject anything above readonly
-      return p.reject('Researchers can only run read-only shell commands (ls, cat, git log, etc).')
+      // Explorers are read-only — reject anything above readonly
+      return p.reject('Explorers can only run read-only shell commands (ls, cat, git log, etc).')
     },
     _default() { return p.allow() },
   }),

@@ -28,7 +28,7 @@ interface Message {
 
 export interface DeployAgentOpts {
   agentId: string
-  type: 'scout' | 'researcher' | 'planner' | 'builder' | 'debugger' | 'reviewer' | 'browser'
+  type: 'explorer' | 'planner' | 'builder' | 'debugger' | 'reviewer' | 'browser'
   title: string
   prompt: string
 }

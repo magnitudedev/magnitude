@@ -10,9 +10,9 @@ Start with profile card, then header card.
 [4] 1774400013900 assistant_turn_completed
 Understood. I will patch profile first, then header.
 
-[5] 1774400021400 agent_created type=scout taskId=task-711
+[5] 1774400021400 agent_created type=explorer taskId=task-711
 
-[6] 1774400023600 fork_started role=scout mode=survey taskId=task-711
+[6] 1774400023600 fork_started role=explorer mode=survey taskId=task-711
 
 [7] 1774400029800 fork_completed result={"taskId":"task-711","summary":"Spacing token mismatch in profile and header cards","status":"ok"}
 
@@ -100,9 +100,9 @@ Please verify there are no remaining spacing outliers.
 [38] 1774400224700 assistant_turn_completed
 I will run a final verification pass.
 
-[39] 1774400232800 agent_created type=scout taskId=task-715
+[39] 1774400232800 agent_created type=explorer taskId=task-715
 
-[40] 1774400235100 fork_started role=scout mode=verify taskId=task-715
+[40] 1774400235100 fork_started role=explorer mode=verify taskId=task-715
 
 [41] 1774400241400 fork_completed result={"taskId":"task-715","summary":"No additional spacing outliers in related settings cards","status":"ok"}
 

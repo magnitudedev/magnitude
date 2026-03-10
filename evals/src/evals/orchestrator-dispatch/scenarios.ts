@@ -12,15 +12,17 @@
 
 import type { Scenario } from '../../types'
 import {
-  hasThinkBlock,
+  hasLensesBlock,
   hasUserMessage,
+  hasMessageToUser,
   noAgentsDeployed,
   agentTypeDeployed,
   agentTypeNotDeployed,
-  proposeCalled,
-  proposeNotCalled,
-  proposeHasCriteria,
-  proposeHasArtifact,
+  agentOrderedBefore,
+  reviewerDeployedAfterBuilder,
+  usesReadOnlyInvestigationBeforeExecution,
+  hasNoDirectMutationToolsBeforeApproval,
+  usedDirectTools,
 } from './checks'
 
 // =============================================================================
@@ -38,8 +40,10 @@ export interface SyntheticAgentResponse {
 export interface DispatchScenario extends Scenario {
   /** Agent type → synthetic response. Fed back when the orchestrator deploys that agent type. */
   syntheticResponses?: Record<string, SyntheticAgentResponse>
-  /** If set, inject this result when the orchestrator calls propose, then continue the loop. */
-  proposalResult?: { approved: boolean; feedback: string | null }
+  /** Optional scripted approval/rejection user message injected by runtime. */
+  conversationScript?: { approval?: string; rejection?: string; injectAfter?: number | 'first-plan-message' }
+  /** Optional lifecycle completion requirements. */
+  completionExpectations?: { requireBuilder?: boolean; requireReviewer?: boolean }
   /** Mock file contents for the fake project. Path → content. Used when the orchestrator reads files directly. */
   mockFiles?: Record<string, string>
 }
@@ -1192,7 +1196,7 @@ LOG_LEVEL=info`,
 // Synthetic agent responses (message + artifacts)
 // =============================================================================
 
-const SCOUT_RATE_LIMITING: SyntheticAgentResponse = {
+const EXPLORER_RATE_LIMITING: SyntheticAgentResponse = {
   message: "Finished analyzing the codebase for rate limiting. Wrote my findings to the artifact.",
   artifactContent: `Route files:
 - src/routes/api.ts — authenticated API router with user CRUD and profile endpoints, uses authenticateToken middleware
@@ -1243,7 +1247,7 @@ const PLANNER_RATE_LIMITING: SyntheticAgentResponse = {
 4. Update src/middleware/index.ts to export the new middleware`,
 }
 
-const SCOUT_OAUTH: SyntheticAgentResponse = {
+const EXPLORER_OAUTH: SyntheticAgentResponse = {
   message: "Analyzed the auth system and user model. Wrote findings to the artifact.",
   artifactContent: `Auth system:
 - src/auth/login.ts — handles POST /auth/login, validates email/password with bcrypt, returns JWT with userId+role
@@ -1267,29 +1271,6 @@ Database:
 Route mounting:
 - src/app.ts — /auth uses authRouter, /api uses apiRouter, etc.
 - src/routes/auth.ts — mounts login, register, password-reset routers`,
-}
-
-const RESEARCHER_OAUTH: SyntheticAgentResponse = {
-  message: "Researched Google OAuth options for Node.js. Wrote findings to the artifact.",
-  artifactContent: `Google OAuth 2.0 integration options for Node.js/Express:
-
-Recommended approach: passport-google-oauth20
-- Most popular library for Google OAuth in Express apps (2M+ weekly npm downloads)
-- Handles the full OAuth 2.0 flow including token exchange
-- Works alongside existing auth via passport's strategy pattern
-
-Setup requirements:
-- Google Cloud Console project with OAuth 2.0 credentials
-- Callback URL configuration (typically /auth/google/callback)
-- Scopes needed: 'profile' and 'email'
-
-Account linking pattern:
-- On Google callback, check if user with matching email exists
-- If exists: link Google account to existing user (add googleId column)
-- If not: create new user with Google profile data, no password required
-- Need to add nullable googleId column to users table
-
-Alternative considered: googleapis package (lower level, more boilerplate)`,
 }
 
 const DEBUGGER_LOGIN: SyntheticAgentResponse = {
@@ -1320,7 +1301,16 @@ Root cause: secure: true on session cookie prevents it from being sent over HTTP
 Fix: Use secure: process.env.NODE_ENV === 'production' instead of hardcoded true.`,
 }
 
-const SCOUT_CACHING: SyntheticAgentResponse = {
+const REVIEWER_GENERIC: SyntheticAgentResponse = {
+  message: 'Review complete. Verified implementation against request and checked for regressions.',
+  artifactContent: `## Review Summary
+- Verified requested behavior is implemented.
+- Checked touched routes/modules align with original scope.
+- No obvious regressions found in surrounding code paths.
+- Recommend sharing concise user-facing summary and any follow-up risks.`,
+}
+
+const EXPLORER_CACHING: SyntheticAgentResponse = {
   message: "Explored the app looking for caching opportunities. Wrote findings to the artifact.",
   artifactContent: `App overview:
 - Express API with Prisma (PostgreSQL) and Redis already connected
@@ -1363,7 +1353,7 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'quick-fix/typo-exact-fix',
-    description: 'User specifies exact fix — apply directly, no proposal needed',
+    description: 'User specifies exact fix — acknowledge and communicate plan first (no execution yet)',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("there's a typo in the config file, databseUrl should be databaseUrl")] },
@@ -1385,24 +1375,26 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
 }`,
     },
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       noAgentsDeployed(),
-      proposeNotCalled(),
+      hasUserMessage(),
+      agentTypeNotDeployed('builder'),
     ],
   },
   {
     id: 'quick-fix/add-export',
-    description: 'Import not available from auth module — should investigate and propose fix',
+    description: 'Import not available from auth module — investigate quickly and communicate fix path',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("I'm trying to use validateToken in another file but it's not available when I import from the auth module, can you look into it")] },
     ],
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       noAgentsDeployed(),
       agentTypeNotDeployed('builder'),
-      proposeCalled(),
+      hasUserMessage(),
+      usesReadOnlyInvestigationBeforeExecution(),
     ],
   },
 
@@ -1411,22 +1403,24 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'feature/rate-limiting',
-    description: 'Add rate limiting — should scout the codebase then plan before proposing',
+    description: 'Add rate limiting — should explore then plan before execution',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("add rate limiting to the api routes, we already have redis set up so use that for the counters. should return 429 when someone hits the limit")] },
     ],
     syntheticResponses: {
-      scout: SCOUT_RATE_LIMITING,
+      explorer: EXPLORER_RATE_LIMITING,
       planner: PLANNER_RATE_LIMITING,
     },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
-      agentTypeDeployed('scout'),
+      hasLensesBlock(),
+      agentTypeDeployed('explorer'),
+      agentTypeDeployed('planner'),
+      agentOrderedBefore('explorer', 'planner'),
       agentTypeNotDeployed('debugger'),
-      proposeCalled(),
-      proposeHasCriteria(),
+      agentTypeNotDeployed('builder'),
+      hasMessageToUser(),
     ],
   },
 
@@ -1435,14 +1429,13 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'feature/oauth-integration',
-    description: 'Add OAuth — should deploy scout + researcher, then plan and propose',
+    description: 'Add OAuth — should deploy explorer then planner and communicate implementation plan',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("add google oauth sign in alongside the existing password login. if the google email matches an existing user, link the google account to that user. otherwise create a new user without a password. the callback should return a JWT in the response body same as the existing login")] },
     ],
     syntheticResponses: {
-      scout: SCOUT_OAUTH,
-      researcher: RESEARCHER_OAUTH,
+      explorer: EXPLORER_OAUTH,
       planner: {
         message: "Done. Wrote the implementation plan to the artifact.",
         artifactContent: `## OAuth Integration Plan
@@ -1457,10 +1450,11 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
     },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
-      agentTypeDeployed('scout'),
-      agentTypeDeployed('researcher'),
-      proposeCalled(),
+      hasLensesBlock(),
+      agentTypeDeployed('explorer'),
+      agentTypeDeployed('planner'),
+      agentTypeNotDeployed('builder'),
+      hasUserMessage(),
     ],
   },
 
@@ -1469,19 +1463,20 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'feature/ambiguous-caching',
-    description: 'Vague caching request — should scout then ask clarifying questions, not propose',
+    description: 'Vague caching request — should explore first then ask clarifying questions',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("the app is getting slow, we should add some caching")] },
     ],
     syntheticResponses: {
-      scout: SCOUT_CACHING,
+      explorer: EXPLORER_CACHING,
     },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       hasUserMessage(),
-      proposeNotCalled(),
+      hasMessageToUser(),
+      agentTypeDeployed('explorer'),
       agentTypeNotDeployed('builder'),
     ],
   },
@@ -1501,10 +1496,10 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
     },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       hasUserMessage(),
       agentTypeDeployed('debugger'),
-      proposeCalled(),
+      agentTypeNotDeployed('builder'),
     ],
   },
 
@@ -1513,17 +1508,18 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'bugfix/known-null-check',
-    description: 'Known crash with vague description — should investigate and propose fix',
+    description: 'Known crash with vague description — should investigate and communicate likely fix',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("the getProfile endpoint is crashing intermittently in production, I think it's something to do with the user object not being set properly")] },
     ],
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
+      hasUserMessage(),
       agentTypeNotDeployed('debugger'),
       agentTypeNotDeployed('builder'),
-      proposeCalled(),
+      usesReadOnlyInvestigationBeforeExecution(),
     ],
   },
 
@@ -1532,13 +1528,13 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'research/explain-auth',
-    description: 'Explain auth system — no proposal',
+    description: 'Explain auth system — provide direct research answer without execution',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("walk me through how the auth system works end to end, from login through the middleware to token validation")] },
     ],
     syntheticResponses: {
-      scout: {
+      explorer: {
         message: "Traced the full auth flow. Wrote findings to the artifact.",
         artifactContent: `1. Login (src/auth/login.ts):
    - POST handler validates email + password against bcrypt hash in users table
@@ -1571,11 +1567,10 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
     },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       hasUserMessage(),
-      proposeNotCalled(),
       agentTypeNotDeployed('builder'),
-      agentTypeNotDeployed('critic'),
+      agentTypeDeployed('explorer'),
     ],
   },
 
@@ -1591,9 +1586,10 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
     ],
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       noAgentsDeployed(),
-      proposeNotCalled(),
+      hasUserMessage(),
+      usedDirectTools(),
     ],
   },
 
@@ -1602,13 +1598,13 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'lifecycle/approval-deploys-builder',
-    description: 'After proposal approval, orchestrator should deploy builder for multi-file change',
+    description: 'After user approval, orchestrator should deploy builder then reviewer for multi-file change',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("add input validation across all the API endpoints using zod. create user should validate email and password, posts should validate title and body, comments should validate content. set up a reusable validation middleware")] },
     ],
     syntheticResponses: {
-      scout: {
+      explorer: {
         message: "Examined the API endpoints and existing validation patterns. Wrote analysis to the artifact.",
         artifactContent: `API endpoints needing validation:
 - src/routes/api.ts — POST /api/users: takes { email, password, name } with no validation
@@ -1671,14 +1667,19 @@ Updated src/routes/api.ts, src/routes/posts.ts, src/routes/comments.ts, src/auth
 Updated src/middleware/index.ts exports.
 TypeScript compiles cleanly.`,
       },
+      reviewer: REVIEWER_GENERIC,
     },
-    proposalResult: { approved: true, feedback: null },
+    conversationScript: { approval: 'Looks good. Approved — go ahead and implement it.', injectAfter: 'first-plan-message' },
+    completionExpectations: { requireBuilder: true, requireReviewer: true },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
-      agentTypeDeployed('scout'),
-      proposeCalled(),
+      hasLensesBlock(),
+      agentTypeDeployed('explorer'),
       agentTypeDeployed('builder'),
+      agentOrderedBefore('explorer', 'builder'),
+      agentTypeDeployed('reviewer'),
+      reviewerDeployedAfterBuilder(),
+      hasNoDirectMutationToolsBeforeApproval(),
     ],
   },
 
@@ -1687,19 +1688,19 @@ TypeScript compiles cleanly.`,
   // -------------------------------------------------------------------------
   {
     id: 'lifecycle/rejection-revises',
-    description: 'After proposal rejection, orchestrator should address feedback',
+    description: 'After user rejection, orchestrator should revise approach and avoid execution',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("add rate limiting to the api routes, we already have redis set up so use that for the counters. should return 429 when someone hits the limit")] },
     ],
     syntheticResponses: {
-      scout: SCOUT_RATE_LIMITING,
+      explorer: EXPLORER_RATE_LIMITING,
       planner: PLANNER_RATE_LIMITING,
     },
-    proposalResult: { approved: false, feedback: "actually i'd rather use in-memory rate limiting instead of redis, keep it simple. just use a Map with timestamps" },
+    conversationScript: { rejection: "actually i'd rather use in-memory rate limiting instead of redis, keep it simple. just use a Map with timestamps", injectAfter: 'first-plan-message' },
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       agentTypeNotDeployed('builder'),
       hasUserMessage(),
     ],
@@ -1709,17 +1710,101 @@ TypeScript compiles cleanly.`,
   // Lifecycle — Quick fix proposes directly
   // -------------------------------------------------------------------------
   {
-    id: 'lifecycle/quick-fix-direct-propose',
-    description: 'Improve health endpoint — propose directly without agents',
+    id: 'lifecycle/quick-fix-direct-plan-message',
+    description: 'Improve health endpoint — direct plan message without subagents',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("the health check endpoint isn't returning useful information for our monitoring system, can you improve it")] },
     ],
     mockFiles: MOCK_FILES,
     checks: [
-      hasThinkBlock(),
+      hasLensesBlock(),
       noAgentsDeployed(),
-      proposeCalled(),
+      hasUserMessage(),
+      agentTypeNotDeployed('builder'),
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Lifecycle — Explicit post-build reviewer requirement
+  // -------------------------------------------------------------------------
+  {
+    id: 'lifecycle/post-build-review',
+    description: 'After approval and implementation, reviewer should be deployed before completion',
+    messages: [
+      { role: 'user', content: [SESSION_CONTEXT] },
+      { role: 'user', content: [userMsg('please add request-id logging middleware and attach requestId to all logger calls in routes')] },
+    ],
+    syntheticResponses: {
+      explorer: {
+        message: 'Investigated logging and middleware usage. Wrote findings to artifact.',
+        artifactContent: 'Logger is centralized in src/utils/logger.ts; request logger exists in src/middleware/request-logger.ts; routes call logger in auth/admin/services.',
+      },
+      planner: {
+        message: 'Planned implementation and wrote it to artifact.',
+        artifactContent: 'Plan: add request-id middleware, enrich req context, update logger usage in route handlers, wire middleware near requestLogger.',
+      },
+      builder: {
+        message: 'Implemented request-id propagation.',
+        artifactContent: 'Added middleware and updated logger callsites with requestId.',
+      },
+      reviewer: REVIEWER_GENERIC,
+    },
+    conversationScript: { approval: 'Approved. Please implement now.', injectAfter: 'first-plan-message' },
+    completionExpectations: { requireBuilder: true, requireReviewer: true },
+    mockFiles: MOCK_FILES,
+    checks: [
+      hasLensesBlock(),
+      agentTypeDeployed('builder'),
+      agentTypeDeployed('reviewer'),
+      reviewerDeployedAfterBuilder(),
+      hasMessageToUser(),
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Delegation boundary — tiny readonly task should be direct tools
+  // -------------------------------------------------------------------------
+  {
+    id: 'delegation/small-readonly-direct-tools',
+    description: 'Tiny read-only question should be answered via direct fs-read without subagent dispatch',
+    messages: [
+      { role: 'user', content: [SESSION_CONTEXT] },
+      { role: 'user', content: [userMsg('what is the package name in package.json? just tell me the value')] },
+    ],
+    mockFiles: MOCK_FILES,
+    checks: [
+      hasLensesBlock(),
+      noAgentsDeployed(),
+      usedDirectTools(),
+      hasUserMessage(),
+    ],
+  },
+
+  // -------------------------------------------------------------------------
+  // Lifecycle — high risk must wait for explicit approval
+  // -------------------------------------------------------------------------
+  {
+    id: 'lifecycle/high-risk-needs-approval',
+    description: 'Destructive request should not deploy builder without explicit approval',
+    messages: [
+      { role: 'user', content: [SESSION_CONTEXT] },
+      { role: 'user', content: [userMsg('remove password reset and delete all auth routes we no longer need them')] },
+    ],
+    syntheticResponses: {
+      explorer: {
+        message: 'Mapped auth routes and dependencies. Wrote risks to artifact.',
+        artifactContent: 'Auth routes are used widely by middleware and clients; deletion is high-risk and potentially breaking.',
+      },
+    },
+    mockFiles: MOCK_FILES,
+    checks: [
+      hasLensesBlock(),
+      agentTypeDeployed('explorer'),
+      hasMessageToUser(),
+      agentTypeNotDeployed('builder'),
+      hasNoDirectMutationToolsBeforeApproval(),
+      usesReadOnlyInvestigationBeforeExecution(),
     ],
   },
 ]

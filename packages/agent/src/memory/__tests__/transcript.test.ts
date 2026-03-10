@@ -24,7 +24,7 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<lenses><lens name="task">thinking</lens></lenses><comms><message to="user">Got it, I will update exports.</message><message to="scout-1">Please inspect files.</message></comms><actions><inspect><ref tool="fs-read"/></inspect></actions>',
+              '<lenses><lens name="task">thinking</lens></lenses><comms><message to="user">Got it, I will update exports.</message><message to="explorer-1">Please inspect files.</message></comms><actions><inspect><ref tool="fs-read"/></inspect></actions>',
           },
           {
             type: 'thinking',
@@ -55,7 +55,7 @@ describe('memory transcript', () => {
         forkId: null,
         agentId: 'a1',
         taskId: 'task1',
-        agentType: 'scout',
+        agentType: 'explorer',
         agentForkId: 'f1',
         prompt: 'scan',
       },
@@ -63,11 +63,11 @@ describe('memory transcript', () => {
         type: 'fork_started',
         forkId: 'f1',
         parentForkId: null,
-        name: 'Scout',
+        name: 'Explorer',
         agentId: 'a1',
         context: 'ctx',
         mode: 'clone',
-        role: 'scout',
+        role: 'explorer',
         taskId: 'task1',
       },
       {
@@ -174,7 +174,7 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<comms><message to="scout-1">Inspect src/</message></comms><actions><inspect><ref tool="fs-tree"/></inspect></actions>',
+              '<comms><message to="explorer-1">Inspect src/</message></comms><actions><inspect><ref tool="fs-tree"/></inspect></actions>',
           },
         ],
         toolCalls: [],
@@ -203,7 +203,7 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<comms><message to="researcher-1">Gather docs.</message><message to="user">Done.</message></comms>',
+              '<comms><message to="explorer-1">Gather docs.</message><message to="user">Done.</message></comms>',
           },
         ],
         toolCalls: [],

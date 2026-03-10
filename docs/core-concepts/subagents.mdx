@@ -6,23 +6,15 @@ icon: users
 
 Subagents are specialized workers the orchestrator deploys to handle non-trivial tasks.
 
-## The 7 subagent types
+## The 6 subagent types
 
-### Scout
+### Explorer
 
-- **Purpose:** Broad codebase exploration
-- **Access:** Read-only tools
-- **Output:** Report artifact (architecture, patterns, dependencies, test setup)
-
-Use a scout early when you need fast coverage of an unfamiliar area.
-
-### Researcher
-
-- **Purpose:** Deep investigation of a specific system or question
+- **Purpose:** Broad and deep investigation across codebase and external sources
 - **Access:** Read-only tools + web search
-- **Output:** Findings artifact (analysis, evidence, recommendations)
+- **Output:** Findings artifact (architecture, patterns, evidence, recommendations)
 
-Use a researcher when you need depth, external references, or trade-off analysis.
+Use an explorer when you need fast coverage, deeper analysis, external references, or trade-off evaluation.
 
 ### Planner
 
@@ -68,8 +60,7 @@ Use a browser agent for layout, styling, and interactive UI checks.
 
 The orchestrator chooses subagents based on the job:
 
-- Need broad context → **Scout**
-- Need deep analysis → **Researcher**
+- Need broad or deep investigation → **Explorer**
 - Need approach selection → **Planner**
 - Need implementation → **Builder**
 - Need bug diagnosis → **Debugger**

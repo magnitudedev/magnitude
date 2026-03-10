@@ -11,9 +11,9 @@ I only want memory module and immediate consumers.
 [4] 1778100021000 assistant_turn_completed
 Understood. I will keep scope narrow and avoid unrelated refactors.
 
-[5] 1778100028000 agent_created type=scout taskId=task-memory-exports-scan
+[5] 1778100028000 agent_created type=explorer taskId=task-memory-exports-scan
 
-[6] 1778100035000 fork_started role=scout mode=read-only taskId=task-memory-exports-scan
+[6] 1778100035000 fork_started role=explorer mode=read-only taskId=task-memory-exports-scan
 
 [7] 1778100042000 fork_completed result={"status":"ok","summary":"Found one default export in memory serializer and two dependent imports."}
 

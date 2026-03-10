@@ -14,13 +14,13 @@ export interface ToolUsageScenario extends Scenario {
 
 export const ALL_SCENARIOS: ToolUsageScenario[] = [
 
-  scenario('tool-usage/scout-vs-reads')
-    .description('When asked to add a feature to an unfamiliar area, orchestrator should deploy scout rather than reading files itself')
+  scenario('tool-usage/explorer-vs-reads')
+    .description('When asked to add a feature to an unfamiliar area, orchestrator should deploy an explorer rather than reading files itself')
     .context(mockProject.sessionContext())
     .user('add request logging to all routes — log method, path, status code, and duration for every request')
     .judge(
-      'Does the response deploy a scout agent to explore the codebase rather than immediately reading individual files itself using fs-read or similar tools?',
-      'deploys-scout-not-reads'
+      'Does the response deploy an explorer agent to explore the codebase rather than immediately reading individual files itself using fs-read or similar tools?',
+      'deploys-explorer-not-reads'
     )
     .build(),
 
@@ -84,13 +84,13 @@ export const ALL_SCENARIOS: ToolUsageScenario[] = [
     )
     .build(),
 
-  scenario('tool-usage/researcher-vs-scout')
-    .description('For a deep end-to-end question about a specific system, orchestrator should deploy researcher rather than scout')
+  scenario('tool-usage/explorer-vs-direct-reads-depth')
+    .description('For a deep end-to-end question about a specific system, orchestrator should deploy an explorer rather than performing direct reads itself')
     .context(mockProject.sessionContext())
     .user('how does auth token validation work end-to-end in this codebase? i want to understand exactly what happens from the moment a request comes in to when we know if the user is authenticated')
     .judge(
-      'Does the response deploy a researcher agent rather than a scout agent to investigate the auth token validation flow?',
-      'deploys-researcher-not-scout'
+      'Does the response deploy an explorer agent to investigate the auth token validation flow, rather than trying to do direct filesystem reads itself?',
+      'deploys-explorer-for-depth-analysis'
     )
     .build(),
 ]

@@ -10,9 +10,9 @@ I'll investigate the flaky path and isolate likely race conditions first.
 Then I'll propose a focused fix and validation plan.
 If evidence points elsewhere, I'll adjust based on what we observe.
 
-[40] 1777610013000 agent_created type=scout taskId=task-invite-flake-map
+[40] 1777610013000 agent_created type=explorer taskId=task-invite-flake-map
 
-[41] 1777610015000 fork_started role=scout mode=read-only taskId=task-invite-flake-map
+[41] 1777610015000 fork_started role=explorer mode=read-only taskId=task-invite-flake-map
 
 [88] 1777610022000 fork_completed result={"status":"ok","summary":"Flake appears near invite token hydration and delayed session cache update. Repro is intermittent under parallel test load."}
 
@@ -100,9 +100,9 @@ I'll avoid adding nonessential cleanup and keep this ticket focused on the flake
 If I spot a tiny adjacent fix, I'll call it out explicitly before including it.
 I'll keep scope decisions transparent.
 
-[690] 1777610130000 agent_created type=scout taskId=task-invite-flake-log-check
+[690] 1777610130000 agent_created type=explorer taskId=task-invite-flake-log-check
 
-[691] 1777610132000 fork_started role=scout mode=read-only taskId=task-invite-flake-log-check
+[691] 1777610132000 fork_started role=explorer mode=read-only taskId=task-invite-flake-log-check
 
 [738] 1777610139000 fork_completed result={"status":"ok","summary":"Historical failures align with token hydration race signature. No consistent evidence for retry delay root cause."}
 

@@ -8,9 +8,9 @@ Absolutely.
 I'll treat this as incident-local work and keep scope isolated.
 I'll implement only the temporary helper for this ticket.
 
-[40] 1777511013000 agent_created type=scout taskId=task-incident-script-map
+[40] 1777511013000 agent_created type=explorer taskId=task-incident-script-map
 
-[41] 1777511015000 fork_started role=scout mode=read-only taskId=task-incident-script-map
+[41] 1777511015000 fork_started role=explorer mode=read-only taskId=task-incident-script-map
 
 [82] 1777511022000 fork_completed result={"status":"ok","summary":"Mapped tmp script placement and incident execution entrypoint used by ops."}
 

@@ -16,9 +16,9 @@ Makes sense.
 I will check existing persistence hooks first.
 If easy, I will use them.
 
-[5] 1776123224000 agent_created type=scout taskId=agent-scout-dashboard-a
+[5] 1776123224000 agent_created type=explorer taskId=agent-explorer-dashboard-a
 
-[6] 1776123225600 fork_started role=scout mode=spawn taskId=agent-scout-dashboard-a
+[6] 1776123225600 fork_started role=explorer mode=spawn taskId=agent-explorer-dashboard-a
 
 [7] 1776123364000 fork_completed result={"summary":"Compact mode currently local-only; existing user-preferences store supports extra boolean keys."}
 
@@ -46,9 +46,9 @@ Understood.
 I will keep changes narrowly scoped to compact mode.
 No unrelated settings behavior will be touched.
 
-[13] 1776123732000 agent_created type=scout taskId=agent-scout-preferences-b
+[13] 1776123732000 agent_created type=explorer taskId=agent-explorer-preferences-b
 
-[14] 1776123733600 fork_started role=scout mode=spawn taskId=agent-scout-preferences-b
+[14] 1776123733600 fork_started role=explorer mode=spawn taskId=agent-explorer-preferences-b
 
 [15] 1776123890000 fork_completed result={"summary":"Preference hook can add compactMode key without conflicting with existing payload."}
 
@@ -67,9 +67,9 @@ Will do.
 I will add a focused restoration test.
 I will keep overall test scope minimal.
 
-[19] 1776124138000 agent_created type=scout taskId=agent-scout-tests-c
+[19] 1776124138000 agent_created type=explorer taskId=agent-explorer-tests-c
 
-[20] 1776124139600 fork_started role=scout mode=spawn taskId=agent-scout-tests-c
+[20] 1776124139600 fork_started role=explorer mode=spawn taskId=agent-explorer-tests-c
 
 [21] 1776124314000 fork_completed result={"summary":"Added restore-on-load test for compactMode; test passes with existing settings suite."}
 
@@ -88,9 +88,9 @@ Agreed.
 I will keep the change set focused.
 No unrelated refactors will be included.
 
-[25] 1776124562000 agent_created type=scout taskId=agent-scout-final-check-d
+[25] 1776124562000 agent_created type=explorer taskId=agent-explorer-final-check-d
 
-[26] 1776124563600 fork_started role=scout mode=spawn taskId=agent-scout-final-check-d
+[26] 1776124563600 fork_started role=explorer mode=spawn taskId=agent-explorer-final-check-d
 
 [27] 1776124746000 fork_completed result={"summary":"Final check confirms compact-mode persistence works; lint and tests clean."}
 
@@ -118,9 +118,9 @@ Good clarification.
 I will frame persistence here as a feature-specific choice.
 I will avoid presenting it as a broad policy.
 
-[33] 1776125121000 agent_created type=scout taskId=agent-scout-pr-note-e
+[33] 1776125121000 agent_created type=explorer taskId=agent-explorer-pr-note-e
 
-[34] 1776125122600 fork_started role=scout mode=spawn taskId=agent-scout-pr-note-e
+[34] 1776125122600 fork_started role=explorer mode=spawn taskId=agent-explorer-pr-note-e
 
 [35] 1776125302000 fork_completed result={"summary":"Prepared PR note: compact-mode persistence is task-specific UX choice, not global convention."}
 

@@ -12,9 +12,9 @@ Please keep this to execution and directly related files.
 Understood.
 I'll avoid broader refactors.
 
-[5] 1778300028000 agent_created type=scout taskId=task-import-gotcha-scan
+[5] 1778300028000 agent_created type=explorer taskId=task-import-gotcha-scan
 
-[6] 1778300035000 fork_started role=scout mode=read-only taskId=task-import-gotcha-scan
+[6] 1778300035000 fork_started role=explorer mode=read-only taskId=task-import-gotcha-scan
 
 [7] 1778300042000 fork_completed result={"status":"ok","summary":"Two runtime imports currently come through src/internal index barrels."}
 

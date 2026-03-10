@@ -2,21 +2,21 @@
 I need a cross-package refactor for auth token refresh behavior.
 
 Workflow preference:
-for big changes, always run a scout pass first before editing.
+for big changes, always run a explorer pass first before editing.
 
 I want a full impact map before any implementation begins.
 
 [5] 1777200009000 assistant_turn_completed
 Understood.
 
-I'll start with a scout pass and produce an impact map first.
+I'll start with a explorer pass and produce an impact map first.
 No implementation edits until that mapping is done.
 
 Then I'll execute in staged phases.
 
-[45] 1777200015000 agent_created type=scout taskId=task-auth-refresh-map
+[45] 1777200015000 agent_created type=explorer taskId=task-auth-refresh-map
 
-[46] 1777200017000 fork_started role=scout mode=read-only taskId=task-auth-refresh-map
+[46] 1777200017000 fork_started role=explorer mode=read-only taskId=task-auth-refresh-map
 
 [89] 1777200025000 fork_completed result={"status":"ok","summary":"Mapped token refresh logic in providers, agent runtime, and API client wrappers. Identified duplicate retry windows and inconsistent telemetry tags."}
 
@@ -24,7 +24,7 @@ Then I'll execute in staged phases.
 Great.
 
 Let's keep the same sequence:
-scout map -> shared abstraction -> package migrations -> full test pass.
+explorer map -> shared abstraction -> package migrations -> full test pass.
 
 That order keeps these bigger refactors from going sideways.
 
@@ -133,7 +133,7 @@ Then I'll merge.
 [900] 1777200175000 assistant_turn_completed
 Done.
 
-Stages completed in order: scout map, shared abstraction, providers migration, agent migration, final validation.
+Stages completed in order: explorer map, shared abstraction, providers migration, agent migration, final validation.
 Subagent-per-stage workflow followed.
 All requested checks passed; ready to merge.
 

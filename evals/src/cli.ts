@@ -9,10 +9,10 @@ import { detectProviders } from '@magnitudedev/providers'
 import ansis from 'ansis'
 import { readdirSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
-import { proseEval } from './evals/prose/index'
-import { reactEditEval } from './evals/react-edit/index'
+// import { proseEval } from './evals/prose/index' // TODO: broken — js-act removed
+// import { reactEditEval } from './evals/react-edit/index' // TODO: broken — js-act removed
 // import { builderBenchEval } from './evals/builder-bench/index' // TODO: broken — strategy system removed
-import { formatCompareEval } from './evals/format-compare/index'
+// import { formatCompareEval } from './evals/format-compare/index' // TODO: broken — js-act removed
 import { visualGroundingEval } from './evals/visual-grounding/index'
 import { xpathEval } from './evals/xpath/index'
 import { geminiGroundingEval } from './evals/gemini-grounding/index'
@@ -47,10 +47,10 @@ function loadIgnoredModels(): Set<string> {
 // =============================================================================
 
 const EVALS: Record<string, Eval> = {
-  prose: proseEval,
-  'react-edit': reactEditEval,
+  // prose: proseEval, // TODO: broken — js-act removed
+  // 'react-edit': reactEditEval, // TODO: broken — js-act removed
   // 'builder-bench': builderBenchEval, // TODO: broken — strategy system removed
-  'format-compare': formatCompareEval,
+  // 'format-compare': formatCompareEval, // TODO: broken — js-act removed
   'visual-grounding': visualGroundingEval,
   xpath: xpathEval,
   'gemini-grounding': geminiGroundingEval,

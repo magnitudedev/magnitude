@@ -51,11 +51,11 @@ export const ALL_SCENARIOS = [
       {
         role: 'assistant',
         content: [
-          '<think>I should scout the codebase first.</think>\\n' +
+          '<think>I should explore the codebase first.</think>\\n' +
           AO + '\\n' +
-          '<agent-create agentId="scout-1">\\n' +
-          '<type>scout</type>\\n' +
-          '<title>Scout codebase</title>\\n' +
+          '<agent-create agentId="explorer-1">\\n' +
+          '<type>explorer</type>\\n' +
+          '<title>Explore codebase</title>\\n' +
           '<prompt>Map the API routes.</prompt>\\n' +
           '</agent-create>\\n' +
           AC,
@@ -65,11 +65,11 @@ export const ALL_SCENARIOS = [
         role: 'user',
         content: [
           '<results>\\n</results>\\n' +
-          '<agent_response from="scout-1">\\n' +
+          '<agent_response from="explorer-1">\\n' +
           'Found 3 route files.\\n' +
           '</agent_response>\\n' +
           '<agents_status>\\n' +
-          '- scout-1 (scout): idle\\n' +
+          '- explorer-1 (explorer): idle\\n' +
           '</agents_status>',
         ],
       },

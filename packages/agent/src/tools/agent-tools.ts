@@ -92,9 +92,9 @@ export const agentCreateTool = createTool({
   group: 'agent' as const,
   description: 'Create a new agent and dispatch it with a title and message.',
   inputSchema: Schema.Struct({
-    agentId: Schema.String.annotations({ description: 'Unique agent ID (e.g. db-builder, researcher-1)' }),
+    agentId: Schema.String.annotations({ description: 'Unique agent ID (e.g. db-builder, explorer-1)' }),
     options: Schema.Struct({
-      type: Schema.Literal('researcher', 'planner', 'builder', 'debugger', 'reviewer', 'scout', 'browser').annotations({ description: 'Agent type' }),
+      type: Schema.Literal('explorer', 'planner', 'builder', 'debugger', 'reviewer', 'browser').annotations({ description: 'Agent type' }),
       title: Schema.String.annotations({ description: 'Concise title of what this agent should accomplish' }),
       message: Schema.String.annotations({ description: 'Detailed message/instructions for the agent' }),
     }),

@@ -1,32 +1,32 @@
 [1] 1776901000000 user_message
 Can you fix this production-only dashboard crash in optimized builds?
-Before implementation, I want a scout pass to map import cycles.
+Before implementation, I want a explorer pass to map import cycles.
 After that, do builder edits, then a reviewer pass.
 
 [5] 1776901007000 assistant_turn_completed
 Absolutely.
-I'll run scout first to map the problem, then builder for changes, then reviewer for verification.
+I'll run explorer first to map the problem, then builder for changes, then reviewer for verification.
 I'll keep updates concise as each phase completes.
 
-[40] 1776901013000 agent_created type=scout taskId=task-dashboard-cycle-map
+[40] 1776901013000 agent_created type=explorer taskId=task-dashboard-cycle-map
 
-[41] 1776901015000 fork_started role=scout mode=read-only taskId=task-dashboard-cycle-map
+[41] 1776901015000 fork_started role=explorer mode=read-only taskId=task-dashboard-cycle-map
 
 [82] 1776901022000 fork_completed result={"status":"ok","summary":"Located runtime imports through internal barrel that trigger production-only cycle in dashboard chunks."}
 
 [110] 1776901029000 assistant_turn_completed
-Scout phase complete.
+Explorer phase complete.
 I found the cycle source and now moving to builder edits as requested.
 I'll return with a focused change summary.
 
 [145] 1776901036000 user_message
 Great.
-That scout-first flow is exactly what I want for refactors like this.
+That explorer-first flow is exactly what I want for refactors like this.
 Please keep that sequencing in similar tasks going forward.
 
 [180] 1776901043000 assistant_turn_completed
 Understood.
-I'll use scout-first followed by builder and reviewer for similar multi-area refactors.
+I'll use explorer-first followed by builder and reviewer for similar multi-area refactors.
 Proceeding with builder now.
 
 [215] 1776901050000 agent_created type=builder taskId=task-dashboard-cycle-fix
@@ -53,7 +53,7 @@ I can provide merge summary when ready.
 
 [455] 1776901098000 user_message
 Perfect.
-And yes, keep using scout before builder for larger multi-package changes.
+And yes, keep using explorer before builder for larger multi-package changes.
 It reduces rework a lot on our side.
 
 [490] 1776901105000 assistant_turn_completed
@@ -64,21 +64,21 @@ Ready for your next item.
 [525] 1776901112000 user_message
 Next item:
 we need a config loading cleanup across client and server packages.
-Same approach please: scout map first, then build, then reviewer.
+Same approach please: explorer map first, then build, then reviewer.
 
 [560] 1776901119000 assistant_turn_completed
 Got it.
-I'll run scout first to map both package paths, then builder implementation, then reviewer validation.
-Starting scout pass now.
+I'll run explorer first to map both package paths, then builder implementation, then reviewer validation.
+Starting explorer pass now.
 
-[595] 1776901126000 agent_created type=scout taskId=task-config-loading-map
+[595] 1776901126000 agent_created type=explorer taskId=task-config-loading-map
 
-[596] 1776901128000 fork_started role=scout mode=read-only taskId=task-config-loading-map
+[596] 1776901128000 fork_started role=explorer mode=read-only taskId=task-config-loading-map
 
 [645] 1776901136000 fork_completed result={"status":"ok","summary":"Mapped duplicated env parsing logic across client bootstrap and server init, with shared schema mismatch risk."}
 
 [680] 1776901143000 assistant_turn_completed
-Scout pass complete for config loading.
+Explorer pass complete for config loading.
 I have the cross-package map and dependency touch points.
 Moving to builder edits next.
 
@@ -101,7 +101,7 @@ Proceeding to reviewer as the final stage.
 
 [920] 1776901191000 assistant_turn_completed
 Reviewer pass complete.
-Staged workflow executed cleanly: scout, builder, reviewer.
+Staged workflow executed cleanly: explorer, builder, reviewer.
 I can send concise final notes if you'd like.
 
 [955] 1776901198000 user_message
@@ -111,17 +111,17 @@ Assume that's the standard flow unless I call out a different one.
 
 [990] 1776901205000 assistant_turn_completed
 Understood.
-I'll treat scout → builder → reviewer as your default for broad multi-package tasks.
+I'll treat explorer → builder → reviewer as your default for broad multi-package tasks.
 I'll follow that unless you explicitly override it.
 
 [1025] 1776901212000 user_message
 Nice.
-For tiny one-file fixes, you can skip scout.
-But anything cross-cutting should start with scout mapping first.
+For tiny one-file fixes, you can skip explorer.
+But anything cross-cutting should start with explorer mapping first.
 
 [1060] 1776901219000 assistant_turn_completed
 Makes sense.
-For tiny isolated fixes I'll stay direct, and for cross-cutting work I'll start with scout.
+For tiny isolated fixes I'll stay direct, and for cross-cutting work I'll start with explorer.
 Then I'll continue with builder and reviewer stages.
 
 [1095] 1776901226000 user_message
@@ -131,17 +131,17 @@ Use the same sequence again so the team can track phases.
 
 [1130] 1776901233000 assistant_turn_completed
 Will do.
-I'll run scout mapping first, then builder implementation, then reviewer validation.
-Starting with scout now.
+I'll run explorer mapping first, then builder implementation, then reviewer validation.
+Starting with explorer now.
 
-[1165] 1776901240000 agent_created type=scout taskId=task-resume-reliability-map
+[1165] 1776901240000 agent_created type=explorer taskId=task-resume-reliability-map
 
-[1166] 1776901242000 fork_started role=scout mode=read-only taskId=task-resume-reliability-map
+[1166] 1776901242000 fork_started role=explorer mode=read-only taskId=task-resume-reliability-map
 
 [1215] 1776901250000 fork_completed result={"status":"ok","summary":"Mapped race between resume token write and worker hydration on fast restarts."}
 
 [1250] 1776901257000 assistant_turn_completed
-Scout findings are in.
+Explorer findings are in.
 I identified race boundaries and safe insertion points.
 Moving into builder edits now.
 
@@ -170,12 +170,12 @@ Ready for final summary.
 [1525] 1776901312000 user_message
 Perfect.
 This is why I prefer staged subagents:
-scout first to map, builder second to change, reviewer third to verify.
+explorer first to map, builder second to change, reviewer third to verify.
 Please keep that default workflow.
 
 [1560] 1776901319000 assistant_turn_completed
 Absolutely.
-I'll keep scout-first staging as your default workflow for broad tasks.
+I'll keep explorer-first staging as your default workflow for broad tasks.
 Then builder implementation, then reviewer verification.
 
 [1595] 1776901326000 user_message
@@ -184,7 +184,7 @@ Send a short final and close thread.
 
 [1630] 1776901333000 assistant_turn_completed
 Done.
-Completed all requested tasks using the staged sequence: scout mapping, builder edits, reviewer validation.
+Completed all requested tasks using the staged sequence: explorer mapping, builder edits, reviewer validation.
 Thread ready to close.
 
 [1665] 1776901340000 user_message
@@ -197,7 +197,7 @@ Thanks.
 
 [1735] 1776901354000 user_message
 Retrospective note:
-the staged scout-first workflow should remain the default for multi-package refactors.
+the staged explorer-first workflow should remain the default for multi-package refactors.
 No changes needed right now.
 
 [1770] 1776901361000 assistant_turn_completed

@@ -10,9 +10,9 @@ Please keep updates brief while you iterate.
 [4] 1774403014500 assistant_turn_completed
 Will do.
 
-[5] 1774403022200 agent_created type=scout taskId=task-741
+[5] 1774403022200 agent_created type=explorer taskId=task-741
 
-[6] 1774403024600 fork_started role=scout mode=survey taskId=task-741
+[6] 1774403024600 fork_started role=explorer mode=survey taskId=task-741
 
 [7] 1774403030900 fork_completed result={"taskId":"task-741","summary":"Flakes from timing assertions; validator false-positive path identified","status":"ok"}
 
@@ -73,9 +73,9 @@ For this ticket only, leave non-cart test files untouched.
 [28] 1774403164600 assistant_turn_completed
 Understood for this ticket only.
 
-[29] 1774403172700 agent_created type=scout taskId=task-744
+[29] 1774403172700 agent_created type=explorer taskId=task-744
 
-[30] 1774403175200 fork_started role=scout mode=verify taskId=task-744
+[30] 1774403175200 fork_started role=explorer mode=verify taskId=task-744
 
 [31] 1774403181500 fork_completed result={"taskId":"task-744","summary":"Only cart validator and cart tests changed","status":"ok"}
 

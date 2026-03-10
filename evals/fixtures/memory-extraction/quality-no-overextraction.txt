@@ -10,9 +10,9 @@ For this task only, skip snapshot updates unless tests fail.
 [4] 1774402015100 assistant_turn_completed
 Acknowledged for this task only.
 
-[5] 1774402022800 agent_created type=scout taskId=task-731
+[5] 1774402022800 agent_created type=explorer taskId=task-731
 
-[6] 1774402025200 fork_started role=scout mode=survey taskId=task-731
+[6] 1774402025200 fork_started role=explorer mode=survey taskId=task-731
 
 [7] 1774402031500 fork_completed result={"taskId":"task-731","summary":"Targets found in checkout calc, UI state, action creator, and docs","status":"ok"}
 
@@ -73,9 +73,9 @@ For this ticket only, skip changelog cleanup.
 [28] 1774402164500 assistant_turn_completed
 Acknowledged for this ticket only.
 
-[29] 1774402172700 agent_created type=scout taskId=task-734
+[29] 1774402172700 agent_created type=explorer taskId=task-734
 
-[30] 1774402175100 fork_started role=scout mode=verify taskId=task-734
+[30] 1774402175100 fork_started role=explorer mode=verify taskId=task-734
 
 [31] 1774402181400 fork_completed result={"taskId":"task-734","summary":"All submitOrder references updated to finalizeOrder in checkout scope","status":"ok"}
 

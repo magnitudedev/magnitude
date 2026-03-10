@@ -17,9 +17,9 @@ Understood.
 I will keep scope focused and avoid unrelated refactors.
 I will prioritize reliable delivery speed.
 
-[5] 1776402426000 agent_created type=scout taskId=agent-scout-export-a
+[5] 1776402426000 agent_created type=explorer taskId=agent-explorer-export-a
 
-[6] 1776402427600 fork_started role=scout mode=spawn taskId=agent-scout-export-a
+[6] 1776402427600 fork_started role=explorer mode=spawn taskId=agent-explorer-export-a
 
 [7] 1776402571000 fork_completed result={"summary":"Invoice table already has filter serialization helper; export endpoint can reuse it directly."}
 
@@ -47,9 +47,9 @@ Confirmed.
 I will treat this as your new default.
 Small clean changes can commit directly without pre-commit diff walkthrough.
 
-[13] 1776402940000 agent_created type=scout taskId=agent-scout-api-b
+[13] 1776402940000 agent_created type=explorer taskId=agent-explorer-api-b
 
-[14] 1776402941600 fork_started role=scout mode=spawn taskId=agent-scout-api-b
+[14] 1776402941600 fork_started role=explorer mode=spawn taskId=agent-explorer-api-b
 
 [15] 1776403105000 fork_completed result={"summary":"Added export endpoint with filter pass-through and streaming CSV response consistent with reporting conventions."}
 
@@ -68,9 +68,9 @@ Will do.
 I will add a focused parity test comparing table filters to export input.
 That directly protects the failure mode you described.
 
-[19] 1776403353000 agent_created type=scout taskId=agent-scout-tests-c
+[19] 1776403353000 agent_created type=explorer taskId=agent-explorer-tests-c
 
-[20] 1776403354600 fork_started role=scout mode=spawn taskId=agent-scout-tests-c
+[20] 1776403354600 fork_started role=explorer mode=spawn taskId=agent-explorer-tests-c
 
 [21] 1776403534000 fork_completed result={"summary":"Added filter parity test and CSV response assertion; tests pass."}
 
@@ -88,9 +88,9 @@ Understood.
 This qualifies as a small straightforward change.
 I will proceed directly and provide concise summary.
 
-[25] 1776403782000 agent_created type=scout taskId=agent-scout-final-check-d
+[25] 1776403782000 agent_created type=explorer taskId=agent-explorer-final-check-d
 
-[26] 1776403783600 fork_started role=scout mode=spawn taskId=agent-scout-final-check-d
+[26] 1776403783600 fork_started role=explorer mode=spawn taskId=agent-explorer-final-check-d
 
 [27] 1776403966000 fork_completed result={"summary":"Final check: CSV export complete, tests and lint pass, risk surface small."}
 
@@ -127,9 +127,9 @@ Agreed.
 If scope or risk expands, I will escalate to review-first mode and show diff before commit.
 I will call out that switch explicitly.
 
-[35] 1776404476000 agent_created type=scout taskId=agent-scout-mode-note-e
+[35] 1776404476000 agent_created type=explorer taskId=agent-explorer-mode-note-e
 
-[36] 1776404477600 fork_started role=scout mode=spawn taskId=agent-scout-mode-note-e
+[36] 1776404477600 fork_started role=explorer mode=spawn taskId=agent-explorer-mode-note-e
 
 [37] 1776404655000 fork_completed result={"summary":"Prepared short status-note template identifying direct-commit vs review-first mode and risk-triggered escalation."}
 

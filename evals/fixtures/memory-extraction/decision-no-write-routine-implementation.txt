@@ -8,9 +8,9 @@ Absolutely.
 I'll isolate the terminal failure path, patch requeue behavior, and keep scope tight.
 Then I'll run focused checks and report back.
 
-[40] 1777501013000 agent_created type=scout taskId=task-export-worker-map
+[40] 1777501013000 agent_created type=explorer taskId=task-export-worker-map
 
-[41] 1777501015000 fork_started role=scout mode=read-only taskId=task-export-worker-map
+[41] 1777501015000 fork_started role=explorer mode=read-only taskId=task-export-worker-map
 
 [82] 1777501022000 fork_completed result={"status":"ok","summary":"Mapped export write loop and retry wrapper; terminal chunk error path can exit before requeue."}
 
