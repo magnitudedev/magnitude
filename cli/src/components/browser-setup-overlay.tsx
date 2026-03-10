@@ -29,6 +29,7 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
   const [errorOutput, setErrorOutput] = useState<string>('')
   const [installPath, setInstallPath] = useState<string | null>(null)
   const [isInstallHovered, setIsInstallHovered] = useState(false)
+  const [closeHover, setCloseHover] = useState(false)
   const [countdown, setCountdown] = useState(5)
   const outputRef = useRef<string[]>([])
 
@@ -138,8 +139,12 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
             <text style={{ fg: theme.primary, flexGrow: 1 }}>
               <span attributes={TextAttributes.BOLD}>Browser Agent Setup</span>
             </text>
-            <Button onClick={() => onClose()}>
-              <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
+            <Button
+              onClick={() => onClose()}
+              onMouseOver={() => setCloseHover(true)}
+              onMouseOut={() => setCloseHover(false)}
+            >
+              <text style={{ fg: closeHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
             </Button>
             <text style={{ fg: theme.muted }}>
               <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>

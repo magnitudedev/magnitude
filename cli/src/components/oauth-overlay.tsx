@@ -25,10 +25,12 @@ interface OAuthOverlayProps {
 }
 
 export const OAuthOverlay = memo(function OAuthOverlay(props: OAuthOverlayProps) {
+  const [cancelHover, setCancelHover] = useState(false)
+
   if (props.mode === 'paste') {
-    return <PasteMode {...props} />
+    return <PasteMode {...props} cancelHover={cancelHover} setCancelHover={setCancelHover} />
   }
-  return <AutoMode {...props} />
+  return <AutoMode {...props} cancelHover={cancelHover} setCancelHover={setCancelHover} />
 })
 
 function useCopyFeedback() {
@@ -72,7 +74,9 @@ function PasteMode({
   onCancel,
   onCopyUrl,
   wizardMode,
-}: OAuthOverlayProps) {
+  cancelHover,
+  setCancelHover,
+}: OAuthOverlayProps & { cancelHover: boolean; setCancelHover: (hovered: boolean) => void }) {
   const theme = useTheme()
   const [code, setCode] = useState('')
   const urlCopy = useCopyFeedback()
@@ -145,8 +149,8 @@ function PasteMode({
               <span attributes={TextAttributes.BOLD}>Connect {providerName}</span>
             </text>
             <box style={{ flexDirection: 'row' }}>
-              <Button onClick={onCancel}>
-                <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
+              <Button onClick={onCancel} onMouseOver={() => setCancelHover(true)} onMouseOut={() => setCancelHover(false)}>
+                <text style={{ fg: cancelHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
               </Button>
               <text style={{ fg: theme.muted }}>
                 <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>
@@ -257,7 +261,9 @@ function AutoMode({
   onCopyUrl,
   onCopyCode,
   wizardMode,
-}: OAuthOverlayProps) {
+  cancelHover,
+  setCancelHover,
+}: OAuthOverlayProps & { cancelHover: boolean; setCancelHover: (hovered: boolean) => void }) {
   const theme = useTheme()
   const urlCopy = useCopyFeedback()
   const codeCopy = useCopyFeedback()
@@ -299,8 +305,8 @@ function AutoMode({
               <span attributes={TextAttributes.BOLD}>Connect {providerName}</span>
             </text>
             <box style={{ flexDirection: 'row' }}>
-              <Button onClick={onCancel}>
-                <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
+              <Button onClick={onCancel} onMouseOver={() => setCancelHover(true)} onMouseOut={() => setCancelHover(false)}>
+                <text style={{ fg: cancelHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
               </Button>
               <text style={{ fg: theme.muted }}>
                 <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>

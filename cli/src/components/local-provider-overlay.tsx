@@ -3,8 +3,7 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
-import { InputCursor } from './multiline-input'
-import { readClipboardText } from '../utils/clipboard'
+import { SingleLineInput } from './single-line-input'
 import { WizardHeader, type WizardMode } from './wizard-header'
 import { BOX_CHARS } from '../utils/ui-constants'
 
@@ -27,19 +26,13 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
 }: LocalProviderOverlayProps) {
   const theme = useTheme()
   const [backHovered, setBackHovered] = useState(false)
+  const [cancelHover, setCancelHover] = useState(false)
   const [focusedField, setFocusedField] = useState<FieldName>('url')
   const [url, setUrl] = useState(initialConfig?.url ?? '')
   const [model, setModel] = useState(initialConfig?.modelId ?? '')
   const [apiKey, setApiKey] = useState('')
   const [error, setError] = useState<string | null>(null)
 
-  const getFieldValue = (field: FieldName) => {
-    switch (field) {
-      case 'url': return url
-      case 'model': return model
-      case 'apiKey': return apiKey
-    }
-  }
 
   const setFieldValue = (field: FieldName, value: string) => {
     switch (field) {
@@ -103,47 +96,12 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
         return
       }
 
-      if (key.name === 'backspace' || key.name === 'delete') {
-        setFieldValue(focusedField, getFieldValue(focusedField).slice(0, -1))
-        setError(null)
-        return
-      }
 
-      // Cmd+V paste
-      if (key.meta && key.name === 'v') {
-        const clip = readClipboardText()
-        if (clip) {
-          setFieldValue(focusedField, getFieldValue(focusedField) + clip)
-          setError(null)
-        }
-        return
-      }
-
-      // Paste support — filter out ANSI escape sequences (arrow keys etc.)
-      if (key.sequence && key.sequence.length > 1 && !key.ctrl && !key.meta && !key.sequence.startsWith('\x1b')) {
-        setFieldValue(focusedField, getFieldValue(focusedField) + key.sequence)
-        setError(null)
-        return
-      }
-
-      // Type characters
-      if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
-        setFieldValue(focusedField, getFieldValue(focusedField) + key.sequence)
-        setError(null)
-      }
-    }, [onCancel, focusedField, handleSubmit, url, model, apiKey])
+    }, [onCancel, focusedField, handleSubmit])
   )
 
   return (
     <box
-      focusable={true}
-      focused={true}
-      onPaste={(event: any) => {
-        if (event.text) {
-          setFieldValue(focusedField, getFieldValue(focusedField) + event.text)
-          setError(null)
-        }
-      }}
       style={{ flexDirection: 'column', height: '100%' }}
     >
       {wizardMode ? (
@@ -168,8 +126,8 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
               <span attributes={TextAttributes.BOLD}>Connect Local</span>
             </text>
             <box style={{ flexDirection: 'row' }}>
-              <Button onClick={onCancel}>
-                <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
+              <Button onClick={onCancel} onMouseOver={() => setCancelHover(true)} onMouseOut={() => setCancelHover(false)}>
+                <text style={{ fg: cancelHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
               </Button>
               <text style={{ fg: theme.muted }}>
                 <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>
@@ -196,6 +154,10 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
           focused={focusedField === 'url'}
           theme={theme}
           onFocus={() => setFocusedField('url')}
+          onChange={(v) => {
+            setFieldValue('url', v)
+            setError(null)
+          }}
         />
 
         {/* Model ID */}
@@ -206,6 +168,10 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
           focused={focusedField === 'model'}
           theme={theme}
           onFocus={() => setFocusedField('model')}
+          onChange={(v) => {
+            setFieldValue('model', v)
+            setError(null)
+          }}
         />
 
         {/* API Key */}
@@ -217,6 +183,10 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
           theme={theme}
           mask
           onFocus={() => setFocusedField('apiKey')}
+          onChange={(v) => {
+            setFieldValue('apiKey', v)
+            setError(null)
+          }}
         />
 
         {/* Error */}
@@ -261,6 +231,7 @@ function Field({
   theme,
   mask,
   onFocus,
+  onChange,
 }: {
   label: string
   value: string
@@ -269,8 +240,8 @@ function Field({
   theme: Record<string, any>
   mask?: boolean
   onFocus?: () => void
+  onChange: (value: string) => void
 }) {
-  const displayValue = mask && value ? '•'.repeat(value.length) : value
 
   return (
     <box style={{ paddingBottom: 1, flexDirection: 'column' }}>
@@ -285,11 +256,13 @@ function Field({
           paddingRight: 1,
           flexShrink: 0,
         }}>
-          <text style={{ fg: theme.foreground }}>
-            {displayValue}
-            <InputCursor visible={true} focused={focused} />
-            {!value && <span style={{ fg: theme.muted }}>{placeholder}</span>}
-          </text>
+          <SingleLineInput
+            value={value}
+            onChange={onChange}
+            placeholder={placeholder}
+            focused={focused}
+            masked={mask}
+          />
         </box>
       </Button>
     </box>

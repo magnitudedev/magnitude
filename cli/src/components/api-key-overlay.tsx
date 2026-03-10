@@ -3,8 +3,7 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
-import { InputCursor } from './multiline-input'
-import { readClipboardText } from '../utils/clipboard'
+import { SingleLineInput } from './single-line-input'
 import { WizardHeader, type WizardMode } from './wizard-header'
 import { BOX_CHARS } from '../utils/ui-constants'
 
@@ -28,6 +27,7 @@ export const ApiKeyOverlay = memo(function ApiKeyOverlay({
   const theme = useTheme()
   const [apiKey, setApiKey] = useState(initialKey ?? '')
   const [error, setError] = useState<string | null>(null)
+  const [cancelHover, setCancelHover] = useState(false)
   const [backHovered, setBackHovered] = useState(false)
 
   const handleSubmit = useCallback(() => {
@@ -49,38 +49,12 @@ export const ApiKeyOverlay = memo(function ApiKeyOverlay({
         handleSubmit()
         return
       }
-      if (key.name === 'backspace' || key.name === 'delete') {
-        setApiKey(prev => prev.slice(0, -1))
-        setError(null)
-        return
-      }
-      // Cmd+V paste
-      if (key.meta && key.name === 'v') {
-        const clip = readClipboardText()
-        if (clip) {
-          setApiKey(prev => prev + clip)
-          setError(null)
-        }
-        return
-      }
-      // Type characters
-      if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
-        setApiKey(prev => prev + key.sequence)
-        setError(null)
-      }
+
     }, [onCancel, handleSubmit])
   )
 
   return (
     <box
-      focusable={true}
-      focused={true}
-      onPaste={(event: any) => {
-        if (event.text) {
-          setApiKey(prev => prev + event.text)
-          setError(null)
-        }
-      }}
       style={{ flexDirection: 'column', height: '100%' }}
     >
       {wizardMode ? (
@@ -105,8 +79,8 @@ export const ApiKeyOverlay = memo(function ApiKeyOverlay({
               <span attributes={TextAttributes.BOLD}>Connect {providerName}</span>
             </text>
             <box style={{ flexDirection: 'row' }}>
-              <Button onClick={onCancel}>
-                <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
+              <Button onClick={onCancel} onMouseOver={() => setCancelHover(true)} onMouseOut={() => setCancelHover(false)}>
+                <text style={{ fg: cancelHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Cancel</text>
               </Button>
               <text style={{ fg: theme.muted }}>
                 <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>
@@ -138,10 +112,15 @@ export const ApiKeyOverlay = memo(function ApiKeyOverlay({
           paddingRight: 1,
           flexShrink: 0,
         }}>
-          <text style={{ fg: theme.foreground }}>
-            {apiKey}<InputCursor visible={true} focused={true} />
-            {!apiKey && <span style={{ fg: theme.muted }}>Paste or type API key</span>}
-          </text>
+          <SingleLineInput
+            value={apiKey}
+            onChange={(v) => {
+              setApiKey(v)
+              setError(null)
+            }}
+            placeholder="Paste or type API key"
+            focused={true}
+          />
         </box>
 
         {/* Error */}

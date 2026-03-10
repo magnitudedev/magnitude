@@ -110,6 +110,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const [hoveredTab, setHoveredTab] = useState<SettingsTab | null>(null)
+  const [closeHover, setCloseHover] = useState(false)
 
   // Group model items by provider for section headers
   const modelSections = useMemo(() => {
@@ -153,8 +154,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           <span attributes={TextAttributes.BOLD}>Settings</span>
         </text>
         <box style={{ flexDirection: 'row' }}>
-          <Button onClick={onClose}>
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
+          <Button
+            onClick={onClose}
+            onMouseOver={() => setCloseHover(true)}
+            onMouseOut={() => setCloseHover(false)}
+          >
+            <text style={{ fg: closeHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
           </Button>
           <text style={{ fg: theme.muted }}>
             <span attributes={TextAttributes.DIM}>{' '}(Esc)  |  ←/→ tabs  |  ↑/↓ navigate  |  Enter select</span>

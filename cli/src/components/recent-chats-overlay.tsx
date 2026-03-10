@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
@@ -21,6 +21,7 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
   onClose,
 }: RecentChatsOverlayProps) {
   const theme = useTheme()
+  const [closeHover, setCloseHover] = useState(false)
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
@@ -36,8 +37,12 @@ export const RecentChatsOverlay = memo(function RecentChatsOverlay({
           <span attributes={TextAttributes.BOLD}>Recent Conversations</span>
         </text>
         <box style={{ flexDirection: 'row' }}>
-          <Button onClick={onClose}>
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
+          <Button
+            onClick={onClose}
+            onMouseOver={() => setCloseHover(true)}
+            onMouseOut={() => setCloseHover(false)}
+          >
+            <text style={{ fg: closeHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
           </Button>
           <text style={{ fg: theme.muted }}>
             <span attributes={TextAttributes.DIM}>{' '}(Esc or Ctrl+R)  |  Arrow keys to navigate  |  Enter to select</span>

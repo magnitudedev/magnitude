@@ -26,6 +26,7 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
   wizardMode,
 }: AuthMethodOverlayProps) {
   const theme = useTheme()
+  const [headerBackHovered, setHeaderBackHovered] = useState(false)
   const [backHovered, setBackHovered] = useState(false)
 
   return (
@@ -52,8 +53,12 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
               <span attributes={TextAttributes.BOLD}>Connect {providerName}</span>
             </text>
             <box style={{ flexDirection: 'row' }}>
-              <Button onClick={onBack}>
-                <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Back</text>
+              <Button
+                onClick={onBack}
+                onMouseOver={() => setHeaderBackHovered(true)}
+                onMouseOut={() => setHeaderBackHovered(false)}
+              >
+                <text style={{ fg: headerBackHovered ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Back</text>
               </Button>
               <text style={{ fg: theme.muted }}>
                 <span attributes={TextAttributes.DIM}>{' '}(Esc)  |  Enter to select</span>

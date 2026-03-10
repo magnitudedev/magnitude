@@ -30,6 +30,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   subscribeForkDisplay,
 }: ForkDetailOverlayProps) {
   const theme = useTheme()
+  const [closeHover, setCloseHover] = useState(false)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [isPromptCollapsed, setIsPromptCollapsed] = useState(true)
 
@@ -66,8 +67,12 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
           <span fg={theme.primary} attributes={TextAttributes.BOLD}>{forkName}</span>
         </text>
         <box style={{ flexDirection: 'row' }}>
-          <Button onClick={onClose}>
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
+          <Button
+            onClick={onClose}
+            onMouseOver={() => setCloseHover(true)}
+            onMouseOut={() => setCloseHover(false)}
+          >
+            <text style={{ fg: closeHover ? theme.foreground : theme.muted }} attributes={TextAttributes.UNDERLINE}>Close</text>
           </Button>
           <text style={{ fg: theme.muted }}>
             <span attributes={TextAttributes.DIM}>{' '}(Esc)</span>
