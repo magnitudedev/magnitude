@@ -12,6 +12,7 @@
 
 import React, { useRef, useState } from 'react'
 import { TextAttributes, type TextRenderable, type MouseEvent as OTMouseEvent, type TextBufferView, type LineInfo } from '@opentui/core'
+import { useRenderer } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { useArtifacts } from '../hooks/use-artifacts'
 import type { ArtifactRefSegment } from '../utils/artifact-refs'
@@ -57,6 +58,7 @@ export function ArtifactRefLine({
   onOpenArtifact?: (name: string, section?: string) => void
 }) {
   const theme = useTheme()
+  const renderer = useRenderer()
   const artifactState = useArtifacts()
   const textRef = useRef<TextRenderable | null>(null)
   const [hoveredRef, setHoveredRef] = useState<number | null>(null)
@@ -114,6 +116,7 @@ export function ArtifactRefLine({
         if (!el) return
         const hit = hitTestRef(event, el, hitZones)
         if (hit !== null) {
+          renderer.clearSelection()
           const seg = segments[hit]
           if (seg.type === 'ref') {
             onOpenArtifact?.(seg.artifactName, seg.section)
