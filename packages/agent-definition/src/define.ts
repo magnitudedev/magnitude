@@ -89,10 +89,6 @@ export function defineAgent<T extends ToolSet, Ctx = Record<string, unknown>>(
     return config.turn.decide(ctx as TurnContext<Ctx> & { tools: ToolNames<T>[] })
   }
 
-  function getReminder(ctx: TurnContext<Ctx>): string | null {
-    return config.turn.reminder?.(ctx) ?? null
-  }
-
   function getDisplay(tool: string, input: unknown, output: unknown): DisplayResult {
     return dispatchHandler(
       displayHandlers,
@@ -116,7 +112,6 @@ export function defineAgent<T extends ToolSet, Ctx = Record<string, unknown>>(
     thinkingLenses: config.thinkingLenses,
     getPermission,
     getTurn,
-    getReminder,
     getDisplay,
     getSlug,
   }

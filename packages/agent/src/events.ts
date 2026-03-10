@@ -10,6 +10,7 @@ import type { EditDiff } from './util/line-edit'
 import type { ContentPart } from './content'
 import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
+import type { ObservationPart } from '@magnitudedev/agent-definition'
 
 export type Attachment = ImageAttachment
 
@@ -75,6 +76,13 @@ export interface UserMessage {
   readonly mode: 'text' | 'audio'
   readonly synthetic: boolean  // true when sent by autopilot
   readonly taskMode: boolean
+}
+
+export interface ObservationsCaptured {
+  readonly type: 'observations_captured'
+  readonly forkId: string | null
+  readonly turnId: string
+  readonly parts: readonly ObservationPart[]
 }
 
 // =============================================================================
@@ -456,6 +464,7 @@ export interface UserReturnConfirmed {
 export type AppEvent =
   | SessionInitialized
   | UserMessage
+  | ObservationsCaptured
   | TurnStarted
   | TurnCompleted
   | TurnUnexpectedError

@@ -8,7 +8,7 @@
 
 import { toolSet, defineAgent, continue_, yield_, approvalThinkingLens, assumptionsThinkingLens, intentThinkingLens, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
 import type { PolicyContext } from './types'
-import { formatAgentsStatus, buildReminder } from '../prompts'
+import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { thinkTool } from '../tools/globals'
 import {
   agentCreateTool,
@@ -57,6 +57,7 @@ export const createOrchestrator = (systemPrompt: string) => {
     model: 'primary',
     systemPrompt,
     thinkingLenses: [approvalThinkingLens, assumptionsThinkingLens, intentThinkingLens, taskThinkingLens, turnThinkingLens],
+    observables: [agentsStatusObservable],
     permission: (p) => ({
       shell(input, pctx) {
         const result = classifyShellCommand(input.command)
@@ -80,9 +81,6 @@ export const createOrchestrator = (systemPrompt: string) => {
         if (turnCtx.lastTool && yielders.includes(turnCtx.lastTool)) return yield_()
         if (turnCtx.messagesSent.some(m => m.dest !== 'user')) return yield_()
         return continue_()
-      },
-      reminder(turnCtx) {
-        return buildReminder(formatAgentsStatus(turnCtx.state.agents))
       },
     },
 

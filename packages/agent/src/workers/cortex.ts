@@ -192,8 +192,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
       const rawCodeChunks: string[] = []
       return Effect.gen(function* () {
-        // 1. Get memory context for THIS fork (read auto-resolves forkId)
-        const forkMemory = yield* read(MemoryProjection)
         const sessionCtx = yield* read(SessionContextProjection)
         const forkState = yield* read(ForkProjection)
         const forkInstance = forkId ? forkState.forks.get(forkId) : null
@@ -231,19 +229,28 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           return
         }
 
-        // Build messages array
-        const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
-
         // Run agent observables
         const execManager = yield* ExecutionManager
         const observations: ObservationPart[] = []
-        if (forkId) {
-          const boundObs = execManager.getObservables(forkId)
-          for (const obs of boundObs) {
-            const parts = yield* obs.observe()
-            observations.push(...parts)
-          }
+        const boundObs = execManager.getObservables(forkId)
+        for (const obs of boundObs) {
+          const parts = yield* obs.observe()
+          observations.push(...parts)
         }
+
+        // Publish observations so memory projection includes them
+        if (observations.length > 0) {
+          yield* publish({
+            type: 'observations_captured',
+            forkId,
+            turnId,
+            parts: observations,
+          })
+        }
+
+        // Build messages array (now includes observations in system inbox)
+        const forkMemory = yield* read(MemoryProjection)
+        const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
 
         // 2. Build system prompt with runtime protocol/tool-doc substitution
         const implicitTools = ['think'] as const
@@ -263,15 +270,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             try: () => ensureValidAuth(modelSlot),
             catch: (e) => TurnErrorCtor.AuthFailed({ message: e instanceof Error ? e.message : String(e), cause: e })
           })
-
-          // Inject observations as user message
-          if (observations.length > 0) {
-            const observationContent: (string | BamlImage)[] = observations.map(part => {
-              if (part.type === 'text') return part.text
-              return BamlImage.fromBase64(part.mediaType, part.base64)
-            })
-            chatMessages.push({ role: 'user', content: observationContent })
-          }
 
           // Stream BAML response with first-chunk retry
           let attempt = 0

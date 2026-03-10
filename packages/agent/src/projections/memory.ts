@@ -85,6 +85,21 @@ function toCommsImageAttachment(attachment: Attachment): CommsAttachment {
   return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
 }
 
+/** Append system entries to a messages array, merging with the most recent system_inbox if no assistant message is in between */
+function appendSystemEntries(messages: readonly Message[], entries: readonly SystemEntry[]): readonly Message[] {
+  if (entries.length === 0) return messages
+  const result = [...messages]
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].source === 'agent') break
+    if (result[i].type === 'system_inbox') {
+      const existing = result[i] as Message & { readonly entries: readonly SystemEntry[] }
+      result[i] = { type: 'system_inbox', source: 'system' as const, entries: [...existing.entries, ...entries] }
+      return result
+    }
+  }
+  result.push({ type: 'system_inbox', source: 'system', entries })
+  return result
+}
 
 
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
@@ -196,6 +211,20 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
     tool_event: ({ fork }) => fork,
 
+    observations_captured: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+
+      const observationEntries: SystemEntry[] = event.parts.map(part => ({
+        kind: 'observation' as const,
+        part,
+      }))
+
+      return {
+        ...fork,
+        messages: appendSystemEntries(fork.messages, observationEntries),
+      }
+    },
+
     turn_completed: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
 
@@ -250,7 +279,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       if (fork.currentTurnId !== event.turnId) return fork
       return {
         ...fork,
-        messages: [...fork.messages, { type: 'system_inbox', source: 'system', entries: [{ kind: 'error', message: event.message }] }],
+        messages: appendSystemEntries(fork.messages, [{ kind: 'error', message: event.message }]),
         currentTurnId: null,
         currentTurnToolCalls: []
       }

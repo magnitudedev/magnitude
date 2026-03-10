@@ -50,6 +50,7 @@ import { ReplayProjection } from '../projections/replay'
 
 import type { AgentDefinition, ToolSet, BoundObservable } from '@magnitudedev/agent-definition'
 import { bindObservable } from '@magnitudedev/agent-definition'
+import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { PolicyContextProviderTag, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
 import type { TurnEvent } from './types'
@@ -710,14 +711,7 @@ const makeExecutionManager = Effect.gen(function* () {
                           : {}),
                     }
                   } else if (endResult.turnControl) {
-                    const policyCtx = yield* policyCtxProvider.get
-                    const reminder = agentDef.getReminder({
-                      toolsCalled: toolsCalledKeys,
-                      lastTool: lastToolKey,
-                      messagesSent,
-                      state: policyCtx,
-                    }) ?? undefined
-                    executionResult = { success: true, turnDecision: endResult.turnControl, reminder }
+                    executionResult = { success: true, turnDecision: endResult.turnControl }
                   } else {
                     const policyCtx = yield* policyCtxProvider.get
                     const turnResult = agentDef.getTurn({
@@ -726,13 +720,7 @@ const makeExecutionManager = Effect.gen(function* () {
                       messagesSent,
                       state: policyCtx,
                     })
-                    const reminder = agentDef.getReminder({
-                      toolsCalled: toolsCalledKeys,
-                      lastTool: lastToolKey,
-                      messagesSent,
-                      state: policyCtx,
-                    }) ?? undefined
-                    executionResult = { success: true, turnDecision: turnResult.action as TurnDecision, reminder }
+                    executionResult = { success: true, turnDecision: turnResult.action as TurnDecision, reminder: turnResult.reminder }
                   }
                 } else if (endResult._tag === 'Interrupted') {
                   executionResult = { success: false, error: 'Interrupted', cancelled: true }
@@ -828,6 +816,12 @@ const makeExecutionManager = Effect.gen(function* () {
       if (forkId !== null) {
         forkAgentVariants.set(forkId, variant)
       }
+
+      const projectionReader: ProjectionReader = {
+        getAgentRegistry: () => agentRegistryProjection.get,
+      }
+      const projectionReaderLayer = Layer.succeed(ProjectionReaderTag, projectionReader)
+      layers = Layer.merge(layers, projectionReaderLayer)
 
       // Cache the layers
       forkLayers.set(forkId, layers)

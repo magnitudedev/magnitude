@@ -9,6 +9,7 @@ import { DateTime } from 'luxon'
 import type { ConversationEntry } from '../projections/conversation'
 import type { ContentPart, ImageMediaType } from '../content'
 import type { InspectResult, TurnToolCall } from '../events'
+import type { ObservationPart } from '@magnitudedev/agent-definition'
 import { formatResults, formatInterrupted, formatError } from './results'
 
 
@@ -36,6 +37,7 @@ export type SystemEntry =
   | { readonly kind: 'agent_activity'; readonly entries: readonly AgentActivityEntry[] }
   | { readonly kind: 'autonomous_ended'; readonly taskId: string }
   | { readonly kind: 'task_feedback'; readonly text: string }
+  | { readonly kind: 'observation'; readonly part: ObservationPart }
 
 /** Build the context prompt injected into a sub-agent's fork */
 export function buildAgentContext(title: string, message: string, extraContext: string): string {
@@ -146,6 +148,9 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
       push(`${formatSubagentActivity([...entry.entries])}\n`)
     } else if (entry.kind === 'autonomous_ended' || entry.kind === 'task_feedback') {
       push(`${entry.kind === 'task_feedback' ? entry.text : ''}\n`)
+    } else if (entry.kind === 'observation') {
+      if (entry.part.type === 'text') push(entry.part.text + '\n')
+      else parts.push({ type: 'image', base64: entry.part.base64, mediaType: entry.part.mediaType as ImageMediaType, width: entry.part.width, height: entry.part.height })
     }
   }
   push('</system>')
