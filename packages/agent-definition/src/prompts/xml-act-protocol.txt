@@ -18,7 +18,7 @@ You respond in an XML-like syntax with three core sections: think, comms, and ac
 {{ACTIONS_CLOSE}}
 <{{TURN_CONTROL_NEXT}}/> OR <{{TURN_CONTROL_YIELD}}/>
 
-If missing/malformed, the system may fallback to heuristic turn logic.
+Your response must contain exactly ONE turn, never more than one. You must end your response and wait for turn to resolve before taking another.
 
 ## Response parsing
 
