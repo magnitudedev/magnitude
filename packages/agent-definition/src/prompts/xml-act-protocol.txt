@@ -33,6 +33,7 @@ The XML response parser only recognizes tags that fit the aforementioned rules.
 Each turn requires comms first, THEN actions.
 You cannot communicate the results of a turn in the same turn, because you don't have the results yet.
 Chain with another turn to take more actions and/or to communicate results.
+If an action fails, you will always recieve another turn to correct your mistake regardless of whether you chose to yield or not.
 
 {{TURN_CONTROL_SECTION}}
 
