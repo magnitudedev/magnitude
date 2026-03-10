@@ -1,5 +1,5 @@
-import { writeFile, chmod, mkdir, copyFile, readFile } from 'fs/promises'
-import { dirname, join, resolve } from 'path'
+import { writeFile, mkdir, copyFile, readFile } from 'fs/promises'
+import { resolve } from 'path'
 import { existsSync } from 'fs'
 import { $ } from 'bun'
 
@@ -23,13 +23,6 @@ interface PatchTarget {
 const PROJECT_ROOT = resolve(import.meta.dir, '../..')
 
 const PATCH_TARGETS: PatchTarget[] = [
-  {
-    file: 'node_modules/oxc-parser/src-js/bindings.js',
-    getContent: (platform, arch) => [
-      'const nativeBinding = require("@oxc-parser/binding-' + platform + '-' + arch + '");',
-      'export const { Severity, ParseResult, ExportExportNameKind, ExportImportNameKind, ExportLocalNameKind, ImportNameKind, parse, parseSync, rawTransferSupported, getBufferOffset, parseRaw, parseRawSync } = nativeBinding;',
-    ].join('\n'),
-  },
   {
     file: 'node_modules/@boundaryml/baml/native.js',
     getContent: (platform, arch) => [
@@ -80,24 +73,7 @@ interface WasmPatchTarget {
   }[]
 }
 
-const QUICKJS_WASM_DIR = 'node_modules/@jitl/quickjs-wasmfile-release-asyncify/dist'
-
 const WASM_PATCH_TARGETS: WasmPatchTarget[] = [
-  {
-    wasmFile: QUICKJS_WASM_DIR + '/emscripten-module.wasm',
-    modules: [
-      {
-        file: QUICKJS_WASM_DIR + '/emscripten-module.cjs',
-        pattern: 'var z=c.wasmBinary',
-        getReplacement: (b64) => 'var z=c.wasmBinary||Buffer.from("' + b64 + '","base64")',
-      },
-      {
-        file: QUICKJS_WASM_DIR + '/emscripten-module.mjs',
-        pattern: 'var D=c.wasmBinary',
-        getReplacement: (b64) => 'var D=c.wasmBinary||Buffer.from("' + b64 + '","base64")',
-      },
-    ],
-  },
   {
     wasmFile: 'packages/image/pkg/magnitude_image_bg.wasm',
     modules: [
@@ -184,7 +160,7 @@ async function build(target: string) {
   const binDir = resolve(PROJECT_ROOT, 'bin')
   if (!existsSync(binDir)) await mkdir(binDir)
 
-  // Patch NAPI-RS loaders and QuickJS WASM for compiled binary compatibility
+  // Patch NAPI-RS loaders and WASM modules for compiled binary compatibility
   await patchNativeBindings(platform, arch)
   await patchWasmModules()
 
@@ -198,31 +174,6 @@ async function build(target: string) {
   }
 
   console.log('Built ' + binaryFile)
-
-  // Create launcher wrapper that sets BUN_JSC_useOMGJIT=0
-  // This prevents pathological WASM JIT compilation of the Asyncified QuickJS binary
-  // See: bugs/26-02-14/cpu-spin-investigation.md
-  if (isWindows) {
-    const wrapperFile = binaryFile.replace('.exe', '-launcher.cmd')
-    const wrapperContent = [
-      '@echo off',
-      'set BUN_JSC_useOMGJIT=0',
-      '"%~dp0\\' + binaryFile.split('/').pop() + '" %*',
-    ].join('\r\n')
-    await writeFile(wrapperFile, wrapperContent)
-    console.log('Built ' + wrapperFile + ' (launcher)')
-  } else {
-    const wrapperFile = binaryFile + '-launcher'
-    const wrapperContent = [
-      '#!/bin/sh',
-      '# Disable JSC OMG JIT to prevent pathological WASM compilation',
-      'export BUN_JSC_useOMGJIT=0',
-      'exec "$(dirname "$0")/' + binaryFile.split('/').pop() + '" "$@"',
-    ].join('\n')
-    await writeFile(wrapperFile, wrapperContent)
-    await chmod(wrapperFile, 0o755)
-    console.log('Built ' + wrapperFile + ' (launcher)')
-  }
 }
 
 if (targetArg) {
