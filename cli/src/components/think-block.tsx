@@ -483,7 +483,7 @@ export const ThinkBlock = memo(function ThinkBlock({
                 <span attributes={TextAttributes.BOLD}>
                   Completed{completedDuration > 0 ? ` in ${formatDuration(completedDuration)}` : ''}{summary}
                 </span>
-                <span style={{ fg: theme.secondary }}>{isCollapsed ? ' \u2014 Click to expand' : ' \u2014 Click to collapse'}</span>
+                <span style={{ fg: isHeaderHovered ? theme.primary : theme.muted }}> · {isCollapsed ? 'Show' : 'Hide'}</span>
               </>
             )}
             {isCollapsed && isActive && !isEmpty && (
