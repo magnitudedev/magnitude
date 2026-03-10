@@ -38,15 +38,20 @@ export const red = {
   600: '#dc2626',
 } as const
 
-export const green = {
-  500: '#22c55e',
-  600: '#059669',
+export const orange = {
+  300: '#fdba74',
+  400: '#fb923c',
+  500: '#f97316',
+  600: '#ea580c',
+  700: '#c2410c',
 } as const
 
-export const teal = {
-  300: '#5eead4',
-  500: '#14b8a6',
-  600: '#0d9488',
+export const green = {
+  300: '#7ee8c7',
+  400: '#4dd4a8',
+  500: '#2ab88a',
+  600: '#1f9670',
+  700: '#17785a',
 } as const
 
 export const violet = {

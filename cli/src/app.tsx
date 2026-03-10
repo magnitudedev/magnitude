@@ -51,6 +51,7 @@ import { logger, clearLog, getLogPath, logEvent, clearEventLog, configureSession
 import { readFileSync } from 'fs'
 import { executeBashCommand, type BashResult } from './utils/bash-executor'
 
+import { orange } from './utils/theme'
 import { BashOutput } from './components/bash-output'
 import { Button } from './components/button'
 
@@ -2381,7 +2382,7 @@ function AppInner({
             style={{
               borderStyle: 'single',
               border: ['left'],
-              borderColor: bashMode ? theme.primary : modeColor,
+              borderColor: bashMode ? orange[400] : modeColor,
               customBorderChars: { ...BOX_CHARS, vertical: '┃' },
             }}
           >
@@ -2426,7 +2427,7 @@ function AppInner({
                       onPaste={handlePaste}
                       onKeyIntercept={handleKeyIntercept}
                       focused={!pendingApproval}
-                      highlightColor={bashMode ? theme.primary : undefined}
+                      highlightColor={bashMode ? orange[400] : undefined}
                       placeholder={
                         pendingApproval
                           ? 'Approve or reject the pending action...'
@@ -2444,7 +2445,7 @@ function AppInner({
                 </box>
                 <box style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
                   {bashMode ? (
-                    <text style={{ fg: theme.primary }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+                    <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
                   ) : (() => {
                     const summary = getProviderSummary()
                     return (
@@ -2476,7 +2477,7 @@ function AppInner({
               height: 1,
               borderStyle: 'single',
               border: ['left'],
-              borderColor: bashMode ? theme.primary : modeColor,
+              borderColor: bashMode ? orange[400] : modeColor,
               customBorderChars: {
                 topLeft: '', bottomLeft: '', topRight: '', bottomRight: '',
                 horizontal: ' ', vertical: '╹',

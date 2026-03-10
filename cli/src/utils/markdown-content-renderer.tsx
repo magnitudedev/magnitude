@@ -4,7 +4,7 @@ import stringWidth from 'string-width'
 import { renderMermaidAscii } from 'beautiful-mermaid'
 import { createLowlight, common } from 'lowlight'
 import type { Element, Text, RootContent } from 'hast'
-import { blue, slate, teal, violet } from './palette'
+import { blue, slate, green, violet } from './palette'
 
 // Create lowlight instance with common languages
 const lowlight = createLowlight(common)
@@ -48,12 +48,12 @@ export interface MarkdownRenderOptions {
 
 const defaultSyntaxColors: SyntaxColors = {
   keyword: violet[300],
-  string: teal[300],
+  string: green[300],
   number: blue[300],
   comment: slate[500],
   function: blue[400],
   variable: slate[200],
-  type: teal[300],
+  type: green[300],
   operator: slate[400],
   property: slate[200],
   punctuation: slate[500],
@@ -62,7 +62,7 @@ const defaultSyntaxColors: SyntaxColors = {
 }
 
 const defaultPalette: MarkdownPalette = {
-  inlineCodeFg: teal[300],
+  inlineCodeFg: green[300],
   codeBackground: 'transparent',
   codeBorderColor: slate[400],
   codeHeaderFg: slate[500],

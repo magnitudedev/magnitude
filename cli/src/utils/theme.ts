@@ -7,9 +7,9 @@ import type {
   MarkdownHeadingLevel,
   ThemeName,
 } from '../types/theme-system'
-import { blue, slate, red, green, teal, violet, indigo } from './palette'
+import { blue, slate, red, green, orange, violet, indigo } from './palette'
 
-export { blue, slate, red, green, teal, violet, indigo } from './palette'
+export { blue, slate, red, green, orange, violet, indigo } from './palette'
 
 /**
  * Theme Configuration System
@@ -207,7 +207,7 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
   name: 'dark',
   primary: blue[500],
   secondary: slate[400],
-  success: teal[300],
+  success: green[600],
   error: red[400],
   warning: violet[300],
   info: blue[500],
@@ -243,7 +243,7 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
     codeBackground: 'transparent',
     codeBorderColor: slate[400],
     codeHeaderFg: slate[500],
-    inlineCodeFg: teal[300],
+    inlineCodeFg: green[400],
     codeTextFg: slate[100],
     headingFg: {
       1: blue[400],
@@ -265,7 +265,7 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
   name: 'light',
   primary: blue[600],
   secondary: slate[500],
-  success: teal[500],
+  success: green[600],
   error: red[500],
   warning: violet[500],
   info: blue[600],
@@ -301,7 +301,7 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
     codeBackground: 'transparent',
     codeBorderColor: slate[300],
     codeHeaderFg: slate[500],
-    inlineCodeFg: teal[600],
+    inlineCodeFg: green[700],
     codeTextFg: slate[900],
     headingFg: {
       1: blue[600],
@@ -343,12 +343,12 @@ export const buildMarkdownColorPalette = (theme: ChatTheme): MarkdownPalette => 
   const syntaxColors = theme.name === 'light'
     ? {
         keyword: violet[600],
-        string: teal[600],
+        string: green[700],
         number: blue[600],
         comment: slate[500],
         function: blue[600],
         variable: slate[700],
-        type: teal[600],
+        type: green[700],
         operator: blue[600],
         property: blue[600],
         punctuation: slate[500],
@@ -357,12 +357,12 @@ export const buildMarkdownColorPalette = (theme: ChatTheme): MarkdownPalette => 
       }
     : {
         keyword: violet[300],
-        string: teal[300],
+        string: green[400],
         number: blue[300],
         comment: slate[500],
         function: blue[400],
         variable: slate[200],
-        type: teal[300],
+        type: green[400],
         operator: slate[400],
         property: slate[200],
         punctuation: slate[400],
