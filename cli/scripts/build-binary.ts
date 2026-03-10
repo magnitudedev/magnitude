@@ -60,63 +60,92 @@ async function restoreNativeBindings(): Promise<void> {
 }
 
 // =============================================================================
-// QuickJS WASM patching
+// WASM embedding
 // =============================================================================
 
 /**
- * The QuickJS emscripten module loads its WASM file via fs.readFileSync(__dirname + "/...").
- * Inside a compiled Bun binary, __dirname resolves to the virtual filesystem (/$bunfs/root/)
- * where the WASM file doesn't exist (it's loaded dynamically, not via require/import).
- *
- * We patch the emscripten module to embed the WASM binary inline as base64,
- * using the `wasmBinary` option that emscripten checks before filesystem loading.
+ * Modules that load WASM via fs.readFileSync or similar patterns break inside
+ * compiled Bun binaries (virtual filesystem /$bunfs/root/). We patch the JS
+ * loaders to embed WASM binaries inline as base64 before building.
  */
 
-const QUICKJS_WASM_DIR = 'node_modules/@jitl/quickjs-wasmfile-release-asyncify/dist'
-const QUICKJS_WASM_FILE = QUICKJS_WASM_DIR + '/emscripten-module.wasm'
+interface WasmPatchTarget {
+  /** Path to the .wasm file to embed */
+  wasmFile: string
+  /** JS files to patch, each with a find/replace pattern */
+  modules: {
+    file: string
+    pattern: string
+    getReplacement: (wasmBase64: string) => string
+  }[]
+}
 
-// Both CJS and MJS variants need patching — Bun may resolve either depending on import context.
-// The variable name for wasmBinary differs: `z` in CJS, `D` in MJS.
-const QUICKJS_EMSCRIPTEN_MODULES = [
-  { file: QUICKJS_WASM_DIR + '/emscripten-module.cjs', pattern: 'var z=c.wasmBinary', varName: 'z' },
-  { file: QUICKJS_WASM_DIR + '/emscripten-module.mjs', pattern: 'var D=c.wasmBinary', varName: 'D' },
+const QUICKJS_WASM_DIR = 'node_modules/@jitl/quickjs-wasmfile-release-asyncify/dist'
+
+const WASM_PATCH_TARGETS: WasmPatchTarget[] = [
+  {
+    wasmFile: QUICKJS_WASM_DIR + '/emscripten-module.wasm',
+    modules: [
+      {
+        file: QUICKJS_WASM_DIR + '/emscripten-module.cjs',
+        pattern: 'var z=c.wasmBinary',
+        getReplacement: (b64) => 'var z=c.wasmBinary||Buffer.from("' + b64 + '","base64")',
+      },
+      {
+        file: QUICKJS_WASM_DIR + '/emscripten-module.mjs',
+        pattern: 'var D=c.wasmBinary',
+        getReplacement: (b64) => 'var D=c.wasmBinary||Buffer.from("' + b64 + '","base64")',
+      },
+    ],
+  },
+  {
+    wasmFile: 'packages/image/pkg/magnitude_image_bg.wasm',
+    modules: [
+      {
+        file: 'packages/image/pkg/magnitude_image.js',
+        pattern: "const wasmBytes = require('fs').readFileSync(wasmPath);",
+        getReplacement: (b64) => 'const wasmBytes = Buffer.from("' + b64 + '","base64");',
+      },
+    ],
+  },
 ]
 
-async function patchQuickJSWasm(): Promise<void> {
-  const wasmPath = resolve(PROJECT_ROOT, QUICKJS_WASM_FILE)
+async function patchWasmModules(): Promise<void> {
+  for (const target of WASM_PATCH_TARGETS) {
+    const wasmPath = resolve(PROJECT_ROOT, target.wasmFile)
+    if (!existsSync(wasmPath)) continue
 
-  // Read WASM and base64 encode
-  const wasmBinary = await readFile(wasmPath)
-  const wasmBase64 = wasmBinary.toString('base64')
+    const wasmBinary = await readFile(wasmPath)
+    const wasmBase64 = wasmBinary.toString('base64')
 
-  for (const mod of QUICKJS_EMSCRIPTEN_MODULES) {
-    const modPath = resolve(PROJECT_ROOT, mod.file)
-    if (!existsSync(modPath)) continue
+    for (const mod of target.modules) {
+      const modPath = resolve(PROJECT_ROOT, mod.file)
+      if (!existsSync(modPath)) continue
 
-    // Backup original
-    await copyFile(modPath, modPath + '.bak')
+      await copyFile(modPath, modPath + '.bak')
 
-    // Read and patch
-    let content = await readFile(modPath, 'utf-8')
-    if (!content.includes(mod.pattern)) {
-      console.warn('  [patch] WARNING: Could not find "' + mod.pattern + '" in ' + mod.file + ', skipping')
-      continue
+      let content = await readFile(modPath, 'utf-8')
+      if (!content.includes(mod.pattern)) {
+        console.warn('  [patch] WARNING: Could not find "' + mod.pattern + '" in ' + mod.file + ', skipping')
+        continue
+      }
+
+      content = content.replace(mod.pattern, mod.getReplacement(wasmBase64))
+      await writeFile(modPath, content)
+      console.log('  [patch] ' + mod.file + ' (embedded ' + (wasmBinary.length / 1024).toFixed(0) + 'KB WASM)')
     }
-
-    const patched = 'var ' + mod.varName + '=c.wasmBinary||Buffer.from("' + wasmBase64 + '","base64")'
-    content = content.replace(mod.pattern, patched)
-    await writeFile(modPath, content)
-    console.log('  [patch] ' + mod.file + ' (embedded ' + (wasmBinary.length / 1024).toFixed(0) + 'KB WASM)')
   }
 }
 
-async function restoreQuickJSWasm(): Promise<void> {
-  for (const mod of QUICKJS_EMSCRIPTEN_MODULES) {
-    const modPath = resolve(PROJECT_ROOT, mod.file)
-    if (existsSync(modPath + '.bak')) {
-      await copyFile(modPath + '.bak', modPath)
-      const { unlink } = await import('fs/promises')
-      await unlink(modPath + '.bak').catch(() => {})
+async function restoreWasmModules(): Promise<void> {
+  for (const target of WASM_PATCH_TARGETS) {
+    for (const mod of target.modules) {
+      const modPath = resolve(PROJECT_ROOT, mod.file)
+      if (existsSync(modPath + '.bak')) {
+        await copyFile(modPath + '.bak', modPath)
+        const { unlink } = await import('fs/promises')
+        await unlink(modPath + '.bak').catch(() => {})
+      }
     }
   }
 }
@@ -148,12 +177,16 @@ async function build(target: string) {
 
   console.log('Building ' + target + '...')
 
+  // Build WASM dependencies
+  console.log('Building @magnitudedev/image WASM...')
+  await $`cd ${resolve(PROJECT_ROOT, 'packages/image')} && wasm-pack build --target nodejs --out-dir pkg --release`.quiet()
+
   const binDir = resolve(PROJECT_ROOT, 'bin')
   if (!existsSync(binDir)) await mkdir(binDir)
 
   // Patch NAPI-RS loaders and QuickJS WASM for compiled binary compatibility
   await patchNativeBindings(platform, arch)
-  await patchQuickJSWasm()
+  await patchWasmModules()
 
   try {
     const entrypoint = resolve(import.meta.dir, '..', 'src', 'index.tsx')
@@ -161,7 +194,7 @@ async function build(target: string) {
   } finally {
     // Always restore original files
     await restoreNativeBindings()
-    await restoreQuickJSWasm()
+    await restoreWasmModules()
   }
 
   console.log('Built ' + binaryFile)

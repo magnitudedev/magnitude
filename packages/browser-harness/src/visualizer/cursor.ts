@@ -151,7 +151,7 @@ export class CursorVisual {
         } catch (error: unknown) {
             // For example when:
             // TypeError: Failed to set the 'innerHTML' property on 'Element': This document requires 'TrustedHTML' assignment.
-            logger.trace(`Failed to draw visual: ${(error as Error).message}`);
+            logger.debug(`Failed to draw visual: ${(error as Error).message}`);
         }
     }
 
@@ -164,7 +164,7 @@ export class CursorVisual {
                 }
             }, this.visualElementId);
         } catch {
-            logger.trace(`Failed to hide pointer`);
+            logger.debug(`Failed to hide pointer`);
         }
     }
 
@@ -178,7 +178,7 @@ export class CursorVisual {
                 }
             }, this.visualElementId);
         } catch {
-            logger.trace(`Failed to show pointer`);
+            logger.debug(`Failed to show pointer`);
         }
     }
 

@@ -1,5 +1,5 @@
+import { Image, pixelDiff } from '@magnitudedev/image';
 import { Page, Request, Response } from 'playwright';
-import sharp from 'sharp';
 import logger, { Logger } from './logger';
 
 // Maximum wait time for page stability in ms
@@ -75,32 +75,18 @@ export class PageStabilityAnalyzer {
      */
     private async compareScreenshots(screenshot1: Buffer, screenshot2: Buffer): Promise<ImageDiff> {
         try {
-            // Convert screenshots to raw pixel data using Sharp
-            const img1 = await sharp(screenshot1).raw().toBuffer({ resolveWithObject: true });
-            const img2 = await sharp(screenshot2).raw().toBuffer({ resolveWithObject: true });
+            const img1 = Image.fromBuffer(screenshot1);
+            const img2 = Image.fromBuffer(screenshot2);
 
-            // Check for size mismatch
-            if (img1.info.width !== img2.info.width || img1.info.height !== img2.info.height) {
+            if (img1.width !== img2.width || img1.height !== img2.height) {
                 return {
                     difference: 1.0,
                     error: "Image sizes don't match"
                 };
             }
 
-            // Calculate pixel differences
-            let diffSum = 0;
-            for (let i = 0; i < img1.data.length; i++) {
-                diffSum += Math.abs(img1.data[i] - img2.data[i]);
-            }
-
-            // Calculate mean difference and normalize
-            const mse = diffSum / img1.data.length;
-
-            // Normalize to 0-1 range (assuming 8-bit color depth)
-            const maxDiff = 255.0 * (img1.info.channels || 3); // Multiply by number of channels
-            const normalizedDiff = mse / maxDiff;
-
-            return { difference: normalizedDiff };
+            const difference = pixelDiff(img1, img2);
+            return { difference };
         } catch (e) {
             return {
                 difference: 1.0,

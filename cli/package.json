@@ -8,8 +8,6 @@
   "files": ["dist", "bin"],
   "scripts": {
     "dev": "BUN_JSC_useOMGJIT=0 bun run src/index.tsx",
-    "build": "bun build src/index.tsx --outdir dist --target node",
-    "build:binary": "bun run scripts/build-binary.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "logs": "mkdir -p ~/.magnitude/logs && touch ~/.magnitude/logs/cli.jsonl && tail -F ~/.magnitude/logs/cli.jsonl",
@@ -20,6 +18,7 @@
     "@opentui/core": "^0.1.77",
     "@opentui/react": "^0.1.77",
     "@magnitudedev/generate-id": "workspace:*",
+    "@magnitudedev/image": "workspace:*",
     "beautiful-mermaid": "^0.1.3",
     "commander": "^14.0.1",
     "immer": "^10.1.3",

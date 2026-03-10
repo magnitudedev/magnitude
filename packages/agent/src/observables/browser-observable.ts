@@ -9,9 +9,10 @@ export const browserObservable = createObservable({
     const harness = yield* BrowserHarnessTag
     yield* Effect.promise(() => harness.waitForStability())
     const image = yield* Effect.promise(() => harness.screenshot())
-    const base64 = yield* Effect.promise(() => image.toBase64())
-    const format = yield* Effect.promise(() => image.getFormat())
-    const { width: imgWidth, height: imgHeight } = yield* Effect.promise(() => image.getDimensions())
+    const base64 = image.toBase64('png')
+    const format = 'png'
+    const imgWidth = image.width
+    const imgHeight = image.height
     // If virtual dimensions are set (e.g. Gemini's 1000x1000 grid), report those as the coordinate space
     const virtualDims = harness.virtualDimensions
     const width = virtualDims?.width ?? imgWidth

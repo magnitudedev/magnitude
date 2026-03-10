@@ -26,7 +26,7 @@ export class DOMTransformer {
             }).catch(() => false); // If evaluate fails (e.g., page closed), assume not injected.
 
             if (scriptAlreadyInjected) {
-                logger.trace('Select manager script already present on this page load.');
+                logger.debug('Select manager script already present on this page load.');
                 return;
             }
 
@@ -40,7 +40,7 @@ export class DOMTransformer {
                 window.__magnitudeShadowDOMAdapterInjected = true;
             `);
 
-            logger.trace(`Script injected into page: ${targetPage.url()}`);
+            logger.debug(`Script injected into page: ${targetPage.url()}`);
         } catch (error) {
             const url = targetPage.isClosed() ? '[closed page]' : targetPage.url();
             logger.warn(`Error injecting script into ${url}: ${(error as Error).message}`);

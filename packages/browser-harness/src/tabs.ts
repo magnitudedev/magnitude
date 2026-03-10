@@ -247,7 +247,7 @@ export class TabManager {
             if (mostRecentPage && 
                 mostRecentPage !== this.activePage && 
                 mostRecentTime > Date.now() - 1000) { // Activity within last second
-                logger.trace(`Activity detected on ${mostRecentPage.url()}, switching...`);
+                logger.debug(`Activity detected on ${mostRecentPage.url()}, switching...`);
                 this.setActivePage(mostRecentPage);
             }
         }, 200);

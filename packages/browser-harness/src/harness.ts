@@ -6,7 +6,7 @@ import { ActionVisualizer, ActionVisualizerOptions } from "./visualizer";
 import logger from "./logger";
 import { TabManager, TabState } from "./tabs";
 import { DOMTransformer } from "./transformer";
-import { Image } from "./image";
+import { Image } from "@magnitudedev/image";
 import EventEmitter from "eventemitter3";
 
 
@@ -62,7 +62,7 @@ export class WebHarness { // implements StateComponent
     }
 
     async setActivePage(page: Page) {
-        logger.trace(`WebHarness active page: ${page.url()}`);
+        logger.debug(`WebHarness active page: ${page.url()}`);
         this.stability.setActivePage(page);
         await this.visualizer.setActivePage(page);
         this.transformer.setActivePage(page);
@@ -143,8 +143,8 @@ export class WebHarness { // implements StateComponent
         // Rescale image based on DPR for:
         // (1) Save on tokens, don't need huge high res images
         // (2) Ensure coordinates are correct for agents not using virtual screen space
-        const { width, height } = await image.getDimensions();
-        const rescaledImage = await image.resize(width / dpr, height / dpr);
+        const { width, height } = { width: image.width, height: image.height };
+        const rescaledImage = image.resize(width / dpr, height / dpr);
 
         return rescaledImage;
     }

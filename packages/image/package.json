@@ -1,0 +1,9 @@
+{
+  "name": "@magnitudedev/image",
+  "version": "0.1.0",
+  "main": "ts/index.ts",
+  "types": "ts/index.ts",
+  "scripts": {
+    "build": "wasm-pack build --target nodejs --out-dir pkg --release"
+  }
+}

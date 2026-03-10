@@ -5,8 +5,7 @@
   "workspaces": ["cli", "evals", "packages/*"],
   "scripts": {
     "dev": "bun run --cwd packages/llm-core baml && BUN_JSC_useOMGJIT=0 bun run cli/src/index.tsx --debug",
-    "build": "turbo build",
-    "build:binary": "bun run cli/scripts/build-binary.ts",
+    "build": "turbo build && bun run cli/scripts/build-binary.ts",
     "typecheck": "turbo typecheck",
     "test": "bun test",
     "session": "bun run --cwd evals session",

@@ -6,6 +6,6 @@ export * from "./transformer";
 export * from "./types";
 export * from "./util";
 export * from "./visualizer";
-export * from "./image";
+
 export { default as logger } from "./logger";
 export { isBrowserInstalled, getBrowserExecutablePath, installBrowser, getInstallDescription } from "./browser-setup";
