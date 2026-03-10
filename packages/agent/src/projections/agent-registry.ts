@@ -9,6 +9,7 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent, WorkAgentType } from '../events'
 import { WorkingStateProjection } from './working-state'
+import { ForkProjection } from './fork'
 
 // =============================================================================
 // Types
@@ -33,11 +34,18 @@ export interface AgentRegistryState {
 // Signal Types
 // =============================================================================
 
-export interface AgentStatusChangedSignal {
+interface AgentStatusChangedBase {
   readonly agentId: string
-  readonly status: AgentStatus
+  readonly agentType: string
   readonly previousStatus: AgentStatus
+  readonly parentForkId: string | null
 }
+
+export type AgentStatusChangedSignal =
+  | AgentStatusChangedBase & { readonly status: 'idle'; readonly reason: 'stable' | 'interrupt' }
+  | AgentStatusChangedBase & { readonly status: 'running' }
+  | AgentStatusChangedBase & { readonly status: 'paused' }
+  | AgentStatusChangedBase & { readonly status: 'dismissed' }
 
 export const agentStatusChangedSignal = Signal.create<AgentStatusChangedSignal>('AgentRegistry/agentStatusChanged')
 
@@ -57,7 +65,7 @@ export const AgentRegistryProjection = Projection.define<AppEvent, AgentRegistry
   },
 
   eventHandlers: {
-    agent_created: ({ event, state, emit }) => {
+    agent_created: ({ event, state, emit, read }) => {
       const agents = new Map(state.agents)
       agents.set(event.agentId, {
         agentId: event.agentId,
@@ -67,38 +75,42 @@ export const AgentRegistryProjection = Projection.define<AppEvent, AgentRegistry
         status: 'running',
         message: event.message ?? null,
       })
-      emit.agentStatusChanged({ agentId: event.agentId, status: 'running', previousStatus: 'running' })
+      const parentForkId = read(ForkProjection).forks.get(event.agentForkId)?.parentForkId ?? null
+      emit.agentStatusChanged({ agentId: event.agentId, agentType: event.agentType, status: 'running', previousStatus: 'running', parentForkId })
       return { ...state, agents }
     },
 
-    agent_paused: ({ event, state, emit }) => {
+    agent_paused: ({ event, state, emit, read }) => {
       const existing = state.agents.get(event.agentId)
       if (!existing) return state
 
       const agents = new Map(state.agents)
       agents.set(event.agentId, { ...existing, status: 'paused' })
-      emit.agentStatusChanged({ agentId: event.agentId, status: 'paused', previousStatus: existing.status })
+      const parentForkId = read(ForkProjection).forks.get(existing.forkId)?.parentForkId ?? null
+      emit.agentStatusChanged({ agentId: event.agentId, agentType: existing.type, status: 'paused', previousStatus: existing.status, parentForkId })
       return { ...state, agents }
     },
 
-    agent_dismissed: ({ event, state, emit }) => {
+    agent_dismissed: ({ event, state, emit, read }) => {
       const existing = state.agents.get(event.agentId)
       if (!existing) return state
 
       const agents = new Map(state.agents)
       agents.set(event.agentId, { ...existing, status: 'dismissed' })
-      emit.agentStatusChanged({ agentId: event.agentId, status: 'dismissed', previousStatus: existing.status })
+      const parentForkId = read(ForkProjection).forks.get(existing.forkId)?.parentForkId ?? null
+      emit.agentStatusChanged({ agentId: event.agentId, agentType: existing.type, status: 'dismissed', previousStatus: existing.status, parentForkId })
       return { ...state, agents }
     },
 
-    interrupt: ({ event, state, emit }) => {
+    interrupt: ({ event, state, emit, read }) => {
       if (event.forkId === null) return state
 
       for (const [agentId, entry] of state.agents) {
         if (entry.forkId === event.forkId && entry.status === 'running') {
+          const parentForkId = read(ForkProjection).forks.get(entry.forkId)?.parentForkId ?? null
           const agents = new Map(state.agents)
           agents.set(agentId, { ...entry, status: 'idle' })
-          emit.agentStatusChanged({ agentId, status: 'idle', previousStatus: entry.status })
+          emit.agentStatusChanged({ agentId, agentType: entry.type, status: 'idle', previousStatus: entry.status, parentForkId, reason: 'interrupt' })
           return { ...state, agents }
         }
       }
@@ -106,14 +118,15 @@ export const AgentRegistryProjection = Projection.define<AppEvent, AgentRegistry
       return state
     },
 
-    turn_started: ({ event, state, emit }) => {
+    turn_started: ({ event, state, emit, read }) => {
       if (event.forkId === null) return state
 
       for (const [agentId, entry] of state.agents) {
         if (entry.forkId === event.forkId && (entry.status === 'idle' || entry.status === 'paused')) {
           const agents = new Map(state.agents)
           agents.set(agentId, { ...entry, status: 'running' })
-          emit.agentStatusChanged({ agentId, status: 'running', previousStatus: entry.status })
+          const parentForkId = read(ForkProjection).forks.get(entry.forkId)?.parentForkId ?? null
+          emit.agentStatusChanged({ agentId, agentType: entry.type, status: 'running', previousStatus: entry.status, parentForkId })
           return { ...state, agents }
         }
       }
@@ -122,16 +135,17 @@ export const AgentRegistryProjection = Projection.define<AppEvent, AgentRegistry
     },
   },
 
-  reads: [WorkingStateProjection] as const,
+  reads: [WorkingStateProjection, ForkProjection] as const,
 
   signalHandlers: (on) => [
-    on(WorkingStateProjection.signals.forkBecameStable, ({ value, state, emit }) => {
+    on(WorkingStateProjection.signals.forkBecameStable, ({ value, state, emit, read }) => {
       const { forkId } = value
       for (const [agentId, entry] of state.agents) {
         if (entry.forkId === forkId && entry.status === 'running') {
+          const parentForkId = read(ForkProjection).forks.get(entry.forkId)?.parentForkId ?? null
           const agents = new Map(state.agents)
           agents.set(agentId, { ...entry, status: 'idle' })
-          emit.agentStatusChanged({ agentId, status: 'idle', previousStatus: entry.status })
+          emit.agentStatusChanged({ agentId, agentType: entry.type, status: 'idle', previousStatus: entry.status, parentForkId, reason: 'stable' })
           return { ...state, agents }
         }
       }

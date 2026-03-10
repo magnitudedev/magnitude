@@ -24,7 +24,7 @@ import {
 import { UserPresenceProjection } from './user-presence'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { ContentPart, textParts, wrapTextParts } from '../content'
-import type { CommsAttachment, CommsEntry, SystemEntry } from '../prompts/agents'
+import { formatAgentIdleNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
 import { ArtifactAwarenessProjection } from './artifact-awareness'
 
 export type MessageSource = 'user' | 'agent' | 'system'
@@ -425,9 +425,23 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
+    on(AgentRegistryProjection.signals.agentStatusChanged, ({ value, state }) => {
+      if (value.status !== 'idle' || value.previousStatus !== 'running') return state
+      const parentState = state.forks.get(value.parentForkId)
+      if (!parentState) return state
 
+      const text = formatAgentIdleNotification(value.agentId, value.agentType, value.reason)
 
+      const entry: SystemEntry = { kind: 'reminder', text }
 
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.parentForkId, {
+          ...parentState,
+          queuedMessages: [...parentState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
+        })
+      }
+    }),
 
     on(UserPresenceProjection.signals.userReturnedAfterAbsence, ({ state }) => {
       const rootState = state.forks.get(null)

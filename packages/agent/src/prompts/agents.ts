@@ -158,6 +158,17 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
 }
 
 /** Per-turn reminder showing active sub-agents */
+export function formatAgentIdleNotification(
+  agentId: string,
+  agentType: string,
+  reason: 'stable' | 'interrupt'
+): string {
+  if (reason === 'interrupt') {
+    return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) was interrupted and is now idle. It will not take further action until you message it.</agent_idle>`
+  }
+  return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) has gone idle and will not take further action until you message it.</agent_idle>`
+}
+
 export function formatAgentsStatus(
   agents: readonly { agentId: string; type: string; status: string }[]
 ): string | null {
