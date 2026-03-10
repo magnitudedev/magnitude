@@ -23,6 +23,9 @@ If missing/malformed, the system may fallback to heuristic turn logic.
 ## Response parsing
 
 The response is not parsed as true XML. You should not escape HTML entities or special characters as if it were actual XML.
+Do NOT escape any HTML entities in thinking, comms, or action blocks - whether its in an attribute or body - including &, <, ?, ", and ' symbols.
+All characters passed to XML attributes or bodies are treated as literal, raw text and do not require escaping.
+
 The XML response parser only recognizes tags that fit the aforementioned rules.
 
 ## Turn control
