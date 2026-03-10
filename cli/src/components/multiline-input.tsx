@@ -555,15 +555,35 @@ export const MultilineInput = forwardRef<
         charIndex++
       }
 
-      // Clamp to valid range
+      const rawClickPosition = Math.min(charIndex, value.length)
+
+      const clickedSegment =
+        segmentContainingInterior(sortedPasteSegments, rawClickPosition) ??
+        segmentAtRightEdge(sortedPasteSegments, rawClickPosition) ??
+        segmentAtLeftEdge(sortedPasteSegments, rawClickPosition)
+
+      if (clickedSegment) {
+        if (
+          cursorPosition !== clickedSegment.end ||
+          selectedPasteSegmentId !== clickedSegment.id
+        ) {
+          commitInput({
+            text: value,
+            cursorPosition: clickedSegment.end,
+            selectedPasteSegmentId: clickedSegment.id,
+            lastEditDueToNav: false,
+          })
+        }
+        return
+      }
+
       const newCursorPosition = normalizeCursorPosition(
         sortedPasteSegments,
-        Math.min(charIndex, value.length),
+        rawClickPosition,
         value.length,
       )
 
-      // Update cursor position if changed
-      if (newCursorPosition !== cursorPosition) {
+      if (newCursorPosition !== cursorPosition || selectedPasteSegmentId) {
         commitInput({
           text: value,
           cursorPosition: newCursorPosition,
@@ -572,7 +592,15 @@ export const MultilineInput = forwardRef<
         })
       }
     },
-    [focused, lineInfo, value, cursorPosition, commitInput, sortedPasteSegments],
+    [
+      focused,
+      lineInfo,
+      value,
+      cursorPosition,
+      selectedPasteSegmentId,
+      commitInput,
+      sortedPasteSegments,
+    ],
   )
 
   const isPlaceholder = value.length === 0 && placeholder.length > 0
