@@ -26,8 +26,6 @@ Read aggressively:
 
 Use web search and web fetch when you need information beyond the codebase — library docs, API references, external context.
 
-Use `{{THINK_OPEN}}` to reason through complex findings before committing to conclusions.
-
 ## Process
 
 1. Understand what the orchestrator needs — read your task carefully
