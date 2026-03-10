@@ -28,6 +28,12 @@ All characters passed to XML attributes or bodies are treated as literal, raw te
 
 The XML response parser only recognizes tags that fit the aforementioned rules.
 
+## Turn order
+
+Each turn requires comms first, THEN actions.
+You cannot communicate the results of a turn in the same turn, because you don't have the results yet.
+Chain with another turn to take more actions and/or to communicate results.
+
 {{TURN_CONTROL_SECTION}}
 
 ## Think

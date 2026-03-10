@@ -36,7 +36,7 @@ Do not think about the task for too long - prefer to ground yourself by observin
 export const turnThinkingLens = defineThinkingLens({
   name: 'turn',
   trigger: 'When your turn involves communications and actions that could benefit from planning.',
-  description: 'Briefly plan out specifically what communications you will conduct and what actions you will perform this turn.',
+  description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
 })
 
 export const builtInThinkingLenses = [approvalThinkingLens, assumptionsThinkingLens, intentThinkingLens, taskThinkingLens, turnThinkingLens] as const
