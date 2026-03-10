@@ -8,7 +8,7 @@
 
 import React, { type ReactNode } from 'react'
 
-const ARTIFACT_REF_REGEX = /\[\[([^\]#]+?)(?:#([^\]]+?))?\]\]/g
+const ARTIFACT_REF_REGEX = /\[\[([^\]#|]+?)(?:#([^\]|]+?))?(?:\|([^\]]+?))?\]\]/g
 
 export function extractSection(content: string, sectionName: string): string | null {
   const lines = content.split('\n')
@@ -43,7 +43,7 @@ export function extractSection(content: string, sectionName: string): string | n
 
 export type ArtifactRefSegment =
   | { readonly type: 'text'; readonly content: string }
-  | { readonly type: 'ref'; readonly artifactName: string; readonly section?: string }
+  | { readonly type: 'ref'; readonly artifactName: string; readonly section?: string; readonly label?: string }
 
 /** Split a string into text and artifact ref segments */
 export function splitArtifactRefs(text: string): ArtifactRefSegment[] {
@@ -61,6 +61,7 @@ export function splitArtifactRefs(text: string): ArtifactRefSegment[] {
       type: 'ref',
       artifactName: match[1],
       section: match[2] || undefined,
+      label: match[3] || undefined,
     })
     lastIndex = regex.lastIndex
   }
@@ -117,8 +118,8 @@ function flattenToString(node: ReactNode): string | null {
  * Returns null if no artifact refs found — caller should render normally.
  * Returns segments array if refs found — caller should render via ArtifactRefLine.
  */
-export function extractArtifactRefSegments(content: ReactNode): ArtifactRefSegment[] | null {
+export function extractArtifactRefSegments(content: ReactNode): ArtifactRefSegment[] {
   const flat = flattenToString(content)
-  if (flat === null || !hasArtifactRefs(flat)) return null
+  if (flat === null) return [{ type: 'text', content: '' }]
   return splitArtifactRefs(flat)
 }

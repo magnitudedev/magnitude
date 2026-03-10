@@ -17,8 +17,8 @@ import {
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/use-theme'
-
-
+import { extractArtifactRefSegments } from '../utils/artifact-refs'
+import { ArtifactRefLine } from './artifact-ref-line'
 
 const COPY_FEEDBACK_RESET_MS = 2000
 
@@ -136,11 +136,14 @@ export const ChunksView = memo(function ChunksView({
       {chunks.map((chunk, idx) => {
         const isLast = idx === chunks.length - 1
         if (chunk.type === 'text') {
+          const segments = extractArtifactRefSegments(chunk.content)
           return (
-            <text key={idx} style={{ fg: foreground, wrapMode: 'word' }}>
-              {chunk.content}
-              {showCursor && isLast && <span style={{ fg: foreground }}>▍</span>}
-            </text>
+            <ArtifactRefLine
+              key={idx}
+              segments={segments}
+              foreground={foreground}
+              onOpenArtifact={onOpenArtifact}
+            />
           )
         } else if (chunk.type === 'code') {
           return (
