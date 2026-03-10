@@ -99,9 +99,6 @@ export interface ChatTheme {
   inputBg: string
 
   // Agent backgrounds (specific states that don't map to semantics)
-  /** Agent toggle header background */
-  agentToggleHeaderBg: string
-
   /** Agent toggle expanded background */
   agentToggleExpandedBg: string
 
@@ -126,9 +123,6 @@ export interface ChatTheme {
 
   /** Plan mode color (border + label) */
   modePlan: string
-
-  /** Auto Build mode color (border + label) */
-  modeAutoBuild: string
 
   // ============================================================================
   // IMAGE CARD

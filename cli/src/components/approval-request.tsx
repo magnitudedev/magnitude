@@ -1,7 +1,7 @@
 import { memo, useState } from 'react'
 import { useTheme } from '../hooks/use-theme'
 import { BOX_CHARS } from '../utils/ui-constants'
-import { slate } from '../utils/theme'
+
 import { Button } from './button'
 import { DiffView, computeDiffStats } from './diff-view'
 import type { ApprovalRequestMessage, ToolDisplay } from '@magnitudedev/agent'
@@ -39,7 +39,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
           paddingRight: 1,
           flexDirection: 'column',
           borderStyle: 'single',
-          borderColor: slate[700],
+          borderColor: theme.border,
           customBorderChars: BOX_CHARS,
         }}>
           <text>
@@ -56,7 +56,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
         flexDirection: 'column',
         marginBottom: 1,
         borderStyle: 'single',
-        borderColor: slate[700],
+        borderColor: theme.border,
         customBorderChars: BOX_CHARS,
         paddingLeft: 1,
         paddingRight: 1,
@@ -73,7 +73,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
             onMouseOut={() => setApproveHovered(false)}
             style={{
               borderStyle: 'single',
-              borderColor: approveHovered ? theme.success : slate[700],
+              borderColor: approveHovered ? theme.success : theme.border,
               customBorderChars: BOX_CHARS,
               paddingLeft: 1,
               paddingRight: 1,
@@ -87,7 +87,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
             onMouseOut={() => setRejectHovered(false)}
             style={{
               borderStyle: 'single',
-              borderColor: rejectHovered ? theme.muted : slate[700],
+              borderColor: rejectHovered ? theme.muted : theme.border,
               customBorderChars: BOX_CHARS,
               paddingLeft: 1,
               paddingRight: 1,
@@ -109,7 +109,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
         paddingRight: 1,
         flexDirection: 'column',
         borderStyle: 'single',
-        borderColor: slate[700],
+        borderColor: theme.border,
         customBorderChars: BOX_CHARS,
       }}>
         <text>
@@ -137,7 +137,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
       flexDirection: 'column',
       marginBottom: 1,
       borderStyle: 'single',
-      borderColor: slate[700],
+      borderColor: theme.border,
       customBorderChars: BOX_CHARS,
       paddingLeft: 1,
       paddingRight: 1,
@@ -161,7 +161,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
           onMouseOut={() => setApproveHovered(false)}
           style={{
             borderStyle: 'single',
-            borderColor: approveHovered ? theme.success : slate[700],
+            borderColor: approveHovered ? theme.success : theme.border,
             customBorderChars: BOX_CHARS,
             paddingLeft: 1,
             paddingRight: 1,
@@ -175,7 +175,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
           onMouseOut={() => setRejectHovered(false)}
           style={{
             borderStyle: 'single',
-            borderColor: rejectHovered ? theme.error : slate[700],
+            borderColor: rejectHovered ? theme.error : theme.border,
             customBorderChars: BOX_CHARS,
             paddingLeft: 1,
             paddingRight: 1,

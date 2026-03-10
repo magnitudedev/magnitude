@@ -71,7 +71,7 @@ function CopyButton({ content, theme }: { content: string; theme: any }) {
     }
   }, [])
 
-  const color = copied ? '#22c55e' : hovered ? theme.foreground : theme.muted
+  const color = copied ? theme.success : hovered ? theme.foreground : theme.muted
 
   return (
     <Button

@@ -143,7 +143,7 @@ export const UserMessage = memo(function UserMessage({ content, timestamp, taskM
           <box style={{ flexDirection: 'row' }}>
             {metadataVisible && (
               <>
-                <text style={{ fg: isCopied ? 'green' : theme.muted }} attributes={TextAttributes.DIM}>
+                <text style={{ fg: isCopied ? theme.success : theme.muted }} attributes={TextAttributes.DIM}>
                   {copyText}
                 </text>
                 <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>

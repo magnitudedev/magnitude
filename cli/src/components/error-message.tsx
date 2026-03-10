@@ -71,12 +71,12 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
       <box style={{
         width: '100%',
         borderStyle: 'single',
-        borderColor: '#ff4444',
+        borderColor: theme.error,
         customBorderChars: BOX_CHARS,
         paddingLeft: 1,
         paddingRight: 1,
       }}>
-        <text style={{ fg: '#ff4444' }}>
+        <text style={{ fg: theme.error }}>
           {fullError}
         </text>
       </box>

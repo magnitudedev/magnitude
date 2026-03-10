@@ -7,6 +7,9 @@ import type {
   MarkdownHeadingLevel,
   ThemeName,
 } from '../types/theme-system'
+import { blue, slate, red, green, teal, violet, indigo } from './palette'
+
+export { blue, slate, red, green, teal, violet, indigo } from './palette'
 
 /**
  * Theme Configuration System
@@ -197,78 +200,6 @@ export function terminalSupportsRgb24(env: CliEnv = collectCliEnv()): boolean {
 }
 
 // ============================================================================
-// Color Palette — each hex defined exactly once
-// ============================================================================
-
-export const blue = {
-  50: '#f0f9ff',
-  100: '#e0f2fe',
-  200: '#bae6fd',
-  300: '#7dd3fc',
-  400: '#38bdf8',
-  500: '#0ea5e9',
-  600: '#0284c7',
-  700: '#0369a1',
-  800: '#075985',
-  900: '#0c4a6e',
-} as const
-
-export const slate = {
-  50: '#f8fafc',
-  100: '#f1f5f9',
-  150: '#eaeff6',
-  200: '#e2e8f0',
-  250: '#d7dfe9',
-  300: '#cbd5e1',
-  400: '#94a3b8',
-  450: '#7d8fa4',
-  500: '#64748b',
-  600: '#475569',
-  700: '#334155',
-  750: '#293548',
-  800: '#1e293b',
-  900: '#0f172a',
-} as const
-
-export const red = {
-  500: '#ef4444',
-  600: '#dc2626',
-} as const
-
-export const green = {
-  500: '#22c55e',
-  600: '#059669',
-} as const
-
-export const orange = {
-  300: '#fdba74',
-  400: '#fb923c',
-  500: '#f97316',
-  600: '#ea580c',
-  700: '#c2410c',
-  800: '#9a3412',
-} as const
-
-export const yellow = {
-  400: '#facc15',
-} as const
-
-export const amber = {
-  400: '#fbbf24',
-  500: '#f59e0b',
-} as const
-
-export const emerald = {
-  400: '#34d399',
-  500: '#10b981',
-} as const
-
-export const indigo = {
-  600: '#1d4ed8',
-  700: '#1e40af',
-} as const
-
-// ============================================================================
 // Theme Definition
 // ============================================================================
 
@@ -276,9 +207,9 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
   name: 'dark',
   primary: blue[500],
   secondary: slate[400],
-  success: green[500],
-  error: red[500],
-  warning: orange[600],
+  success: teal[300],
+  error: red[400],
+  warning: violet[300],
   info: blue[500],
   link: blue[400],
   directory: slate[400],
@@ -296,7 +227,6 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
   userMessageHoverBg: slate[750],
   inputBg: '#232f41',
 
-  agentToggleHeaderBg: orange[500],
   agentToggleExpandedBg: indigo[600],
   agentFocusedBg: slate[700],
   agentContentBg: '#000000',
@@ -305,8 +235,7 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
   inputFocusedFg: '#ffffff',
 
   modeDefault: blue[500],
-  modePlan: amber[400],
-  modeAutoBuild: emerald[400],
+  modePlan: violet[300],
 
   imageCardBorder: slate[500],
 
@@ -314,7 +243,7 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
     codeBackground: 'transparent',
     codeBorderColor: slate[400],
     codeHeaderFg: slate[500],
-    inlineCodeFg: orange[400],
+    inlineCodeFg: teal[300],
     codeTextFg: slate[100],
     headingFg: {
       1: blue[400],
@@ -336,9 +265,9 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
   name: 'light',
   primary: blue[600],
   secondary: slate[500],
-  success: green[600],
+  success: teal[500],
   error: red[500],
-  warning: orange[700],
+  warning: violet[500],
   info: blue[600],
   link: blue[400],
   directory: slate[500],
@@ -356,7 +285,6 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
   userMessageHoverBg: slate[200],
   inputBg: slate[150],
 
-  agentToggleHeaderBg: orange[600],
   agentToggleExpandedBg: indigo[600],
   agentFocusedBg: slate[100],
   agentContentBg: '#ffffff',
@@ -365,8 +293,7 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
   inputFocusedFg: '#000000',
 
   modeDefault: blue[600],
-  modePlan: amber[500],
-  modeAutoBuild: emerald[500],
+  modePlan: violet[500],
 
   imageCardBorder: slate[500],
 
@@ -374,7 +301,7 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
     codeBackground: 'transparent',
     codeBorderColor: slate[300],
     codeHeaderFg: slate[500],
-    inlineCodeFg: orange[800],
+    inlineCodeFg: teal[600],
     codeTextFg: slate[900],
     headingFg: {
       1: blue[600],
@@ -415,13 +342,13 @@ export const buildMarkdownColorPalette = (theme: ChatTheme): MarkdownPalette => 
 
   const syntaxColors = theme.name === 'light'
     ? {
-        keyword: blue[600],
-        string: green[600],
+        keyword: violet[600],
+        string: teal[600],
         number: blue[600],
         comment: slate[500],
         function: blue[600],
-        variable: orange[700],
-        type: blue[600],
+        variable: slate[700],
+        type: teal[600],
         operator: blue[600],
         property: blue[600],
         punctuation: slate[500],
@@ -429,17 +356,17 @@ export const buildMarkdownColorPalette = (theme: ChatTheme): MarkdownPalette => 
         default: slate[900],
       }
     : {
-        keyword: blue[400],
-        string: green[500],
-        number: blue[400],
-        comment: slate[400],
-        function: yellow[400],
-        variable: orange[400],
-        type: blue[400],
-        operator: blue[400],
-        property: blue[400],
+        keyword: violet[300],
+        string: teal[300],
+        number: blue[300],
+        comment: slate[500],
+        function: blue[400],
+        variable: slate[200],
+        type: teal[300],
+        operator: slate[400],
+        property: slate[200],
         punctuation: slate[400],
-        literal: blue[400],
+        literal: blue[300],
         default: slate[100],
       }
 

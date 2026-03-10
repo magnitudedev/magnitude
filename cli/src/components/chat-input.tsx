@@ -2,6 +2,7 @@ import { useKeyboard } from '@opentui/react'
 import { useState, useCallback, memo, useEffect, useRef } from 'react'
 import { InputCursor } from './multiline-input'
 import { BOX_CHARS } from '../utils/ui-constants'
+import { useTheme } from '../hooks/use-theme'
 import type { InputValue } from '../utils/strings'
 import type { ScrollBoxRenderable } from '@opentui/core'
 
@@ -24,6 +25,7 @@ export const ChatInput = memo(function ChatInput({
   disabled = false,
   placeholder = 'Type a message...'
 }: ChatInputProps) {
+  const theme = useTheme()
   const [internalValue, setInternalValue] = useState('')
   const [internalCursor, setInternalCursor] = useState(0)
   const [lastActivity, setLastActivity] = useState(Date.now())
@@ -193,8 +195,8 @@ export const ChatInput = memo(function ChatInput({
   const displayValue = isPlaceholder ? placeholder : value
   const beforeCursor = displayValue.slice(0, cursorPosition)
   const afterCursor = displayValue.slice(cursorPosition)
-  const borderColor = disabled ? '#444444' : '#00aaff'
-  const textColor = disabled ? '#666666' : isPlaceholder ? '#666666' : undefined
+  const borderColor = disabled ? theme.border : theme.primary
+  const textColor = disabled ? theme.muted : isPlaceholder ? theme.muted : undefined
 
   return (
     <box
@@ -246,7 +248,7 @@ export const ChatInput = memo(function ChatInput({
                 visible={true}
                 focused={!disabled}
                 shouldBlink={true}
-                color="#00aaff"
+                color={theme.primary}
                 key={lastActivity}
               />
               {afterCursor}

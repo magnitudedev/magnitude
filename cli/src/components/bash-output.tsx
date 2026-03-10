@@ -1,7 +1,7 @@
 import { memo, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
-import { orange } from '../utils/theme'
+
 import { BOX_CHARS } from '../utils/ui-constants'
 import { Button } from './button'
 import { shortenCommandPreview } from '../utils/strings'
@@ -10,7 +10,7 @@ import type { BashResult } from '../utils/bash-executor'
 const BASH_BOX_CHARS = { ...BOX_CHARS, vertical: '▎' }
 const MAX_PREVIEW_LINES = 5
 const MAX_COMMAND_DISPLAY_LEN = 80
-const BASH_ACCENT = orange[400]
+
 
 interface BashOutputProps {
   result: BashResult
@@ -52,7 +52,7 @@ export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) 
           flexDirection: 'column',
           borderStyle: 'single',
           border: ['left'],
-          borderColor: BASH_ACCENT,
+          borderColor: theme.primary,
           customBorderChars: BASH_BOX_CHARS,
           paddingLeft: 1,
           paddingRight: 1,
@@ -62,7 +62,7 @@ export const BashOutput = memo(function BashOutput({ result }: BashOutputProps) 
       >
         {/* Command line */}
         <text style={{ fg: theme.foreground, wrapMode: isExpanded ? 'word' : 'none' }}>
-          <span fg={BASH_ACCENT} attributes={TextAttributes.BOLD}>$ </span>
+          <span fg={theme.primary} attributes={TextAttributes.BOLD}>$ </span>
           <span attributes={TextAttributes.BOLD}>{isExpanded ? result.command : shortenCommandPreview(result.command, MAX_COMMAND_DISPLAY_LEN)}</span>
         </text>
 

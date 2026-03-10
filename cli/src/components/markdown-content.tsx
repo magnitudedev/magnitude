@@ -5,8 +5,8 @@
  * and the spec panel can render markdown with the same code.
  */
 
-import React, { memo, useState } from 'react'
-import { TextAttributes } from '@opentui/core'
+import React, { memo, useRef, useState } from 'react'
+import { TextAttributes, type TextRenderable, type MouseEvent as OTMouseEvent, type TextBufferView, type LineInfo } from '@opentui/core'
 import {
   parseMarkdownToChunks,
   hasOddFenceCount,
@@ -17,8 +17,8 @@ import {
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/use-theme'
-import { extractArtifactRefSegments } from '../utils/artifact-refs'
-import { ArtifactRefLine } from './artifact-ref-line'
+import { injectArtifactRefsWithHitZones, type RefHitZone } from '../utils/artifact-refs'
+import { useArtifacts } from '../hooks/use-artifacts'
 
 const COPY_FEEDBACK_RESET_MS = 2000
 
@@ -111,6 +111,89 @@ export const MermaidBlockView = memo(function MermaidBlockView({
   )
 })
 
+// Render a text chunk preserving all markdown styling while making artifact refs clickable
+const StyledTextWithRefs = memo(function StyledTextWithRefs({
+  content,
+  foreground,
+  onOpenArtifact,
+}: {
+  content: React.ReactNode
+  foreground: string
+  onOpenArtifact?: (name: string, section?: string) => void
+}) {
+  const theme = useTheme()
+  const artifactState = useArtifacts()
+  const textRef = useRef<TextRenderable | null>(null)
+  const pressStartedRef = useRef<number | null>(null)
+  const [hoveredZone, setHoveredZone] = useState<number | null>(null)
+
+  const { node: transformedContent, hitZones } = injectArtifactRefsWithHitZones(
+    content,
+    { fg: theme.primary, attributes: TextAttributes.BOLD },
+    { fg: theme.link, attributes: TextAttributes.BOLD },
+    { fg: theme.muted, attributes: TextAttributes.DIM },
+    (name) => !!artifactState?.artifacts.get(name),
+    hoveredZone,
+  )
+
+  const hitTest = (event: OTMouseEvent): number | null => {
+    const el = textRef.current
+    if (!el || hitZones.length === 0) return null
+    const localX = event.x - el.x
+    const localY = event.y - el.y
+    const view = (el as object as Record<string, unknown>)['textBufferView'] as TextBufferView
+    const info: LineInfo = view.lineInfo
+    if (localY < 0 || localY >= info.lineStarts.length) return null
+    const charIndex = info.lineStarts[localY] + localX
+    for (let i = 0; i < hitZones.length; i++) {
+      if (charIndex >= hitZones[i].charStart && charIndex < hitZones[i].charEnd) {
+        return i
+      }
+    }
+    return null
+  }
+
+  const hasRefs = hitZones.length > 0
+
+  if (!hasRefs) {
+    return (
+      <text style={{ fg: foreground, wrapMode: 'word' }}>
+        {transformedContent}
+      </text>
+    )
+  }
+
+  return (
+    <text
+      ref={(el: TextRenderable | null) => { textRef.current = el }}
+      style={{ fg: foreground, wrapMode: 'word' }}
+      selectable={false}
+      onMouseDown={(event: OTMouseEvent) => {
+        const hit = hitTest(event)
+        if (hit !== null) {
+          pressStartedRef.current = hit
+        }
+      }}
+      onMouseUp={(event: OTMouseEvent) => {
+        const hit = hitTest(event)
+        if (hit !== null && hit === pressStartedRef.current) {
+          onOpenArtifact?.(hitZones[hit].artifactName, hitZones[hit].section)
+        }
+        pressStartedRef.current = null
+      }}
+      onMouseMove={(event: OTMouseEvent) => {
+        setHoveredZone(hitTest(event))
+      }}
+      onMouseOut={() => {
+        setHoveredZone(null)
+        pressStartedRef.current = null
+      }}
+    >
+      {transformedContent}
+    </text>
+  )
+})
+
 // Render chunks - text inline, code blocks as boxes
 export const ChunksView = memo(function ChunksView({
   chunks,
@@ -136,11 +219,10 @@ export const ChunksView = memo(function ChunksView({
       {chunks.map((chunk, idx) => {
         const isLast = idx === chunks.length - 1
         if (chunk.type === 'text') {
-          const segments = extractArtifactRefSegments(chunk.content)
           return (
-            <ArtifactRefLine
+            <StyledTextWithRefs
               key={idx}
-              segments={segments}
+              content={chunk.content}
               foreground={foreground}
               onOpenArtifact={onOpenArtifact}
             />

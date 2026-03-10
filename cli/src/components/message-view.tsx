@@ -8,6 +8,7 @@ import { InlineForkActivity } from './inline-fork-activity'
 import { ApprovalRequest } from './approval-request'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { ErrorMessage } from './error-message'
+import { useTheme } from '../hooks/use-theme'
 
 interface MessageViewProps {
   message: DisplayMessage
@@ -44,6 +45,7 @@ export const MessageView = memo(function MessageView({
   onArtifactClick,
   onForkExpand
 }: MessageViewProps) {
+  const theme = useTheme()
   // User messages have their own border structure providing left offset
   const isUserType = message.type === 'user_message' || message.type === 'queued_user_message'
 
@@ -91,7 +93,7 @@ export const MessageView = memo(function MessageView({
         }
         return (
           <box style={{ marginBottom: 1 }}>
-            <text style={{ fg: '#ff8800' }}>{interruptText}</text>
+            <text style={{ fg: theme.warning }}>{interruptText}</text>
           </box>
         )
       }

@@ -4,6 +4,7 @@ import stringWidth from 'string-width'
 import { renderMermaidAscii } from 'beautiful-mermaid'
 import { createLowlight, common } from 'lowlight'
 import type { Element, Text, RootContent } from 'hast'
+import { blue, slate, teal, violet } from './palette'
 
 // Create lowlight instance with common languages
 const lowlight = createLowlight(common)
@@ -46,40 +47,40 @@ export interface MarkdownRenderOptions {
 }
 
 const defaultSyntaxColors: SyntaxColors = {
-  keyword: '#ff7b72',
-  string: '#a5d6ff',
-  number: '#79c0ff',
-  comment: '#8b949e',
-  function: '#d2a8ff',
-  variable: '#ffa657',
-  type: '#7ee787',
-  operator: '#ff7b72',
-  property: '#79c0ff',
-  punctuation: '#8b949e',
-  literal: '#79c0ff',
-  default: '#e6edf3',
+  keyword: violet[300],
+  string: teal[300],
+  number: blue[300],
+  comment: slate[500],
+  function: blue[400],
+  variable: slate[200],
+  type: teal[300],
+  operator: slate[400],
+  property: slate[200],
+  punctuation: slate[500],
+  literal: blue[300],
+  default: slate[100],
 }
 
 const defaultPalette: MarkdownPalette = {
-  inlineCodeFg: '#86efac',
-  codeBackground: '#161b22',
-  codeBorderColor: '#30363d',
-  codeHeaderFg: '#8b949e',
+  inlineCodeFg: teal[300],
+  codeBackground: 'transparent',
+  codeBorderColor: slate[400],
+  codeHeaderFg: slate[500],
   headingFg: {
-    1: 'magenta',
-    2: 'green',
-    3: 'green',
-    4: 'green',
-    5: 'green',
-    6: 'green',
+    1: blue[400],
+    2: blue[400],
+    3: blue[400],
+    4: blue[400],
+    5: blue[400],
+    6: blue[400],
   },
-  listBulletFg: 'white',
-  blockquoteBorderFg: 'gray',
-  blockquoteTextFg: 'gray',
-  dividerFg: '#666',
-  codeTextFg: '#e6edf3',
+  listBulletFg: slate[400],
+  blockquoteBorderFg: slate[700],
+  blockquoteTextFg: slate[200],
+  dividerFg: slate[800],
+  codeTextFg: slate[100],
   codeMonochrome: false,
-  linkFg: '#3B82F6',
+  linkFg: blue[400],
   syntax: defaultSyntaxColors,
 }
 

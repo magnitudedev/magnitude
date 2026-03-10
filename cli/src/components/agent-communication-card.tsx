@@ -42,7 +42,7 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({ mes
             <span fg={theme.info}>{directionArrow} ✉ </span>
             <span fg={theme.muted}>{directionPrefix} </span>
             {isOrchestrator ? (
-              <span fg="#FFFFFF" attributes={TextAttributes.BOLD}>Orchestrator</span>
+              <span fg={theme.foreground} attributes={TextAttributes.BOLD}>Orchestrator</span>
             ) : (
               <>
                 <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{agentRole}: </span>
