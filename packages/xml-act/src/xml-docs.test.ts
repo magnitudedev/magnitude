@@ -1,29 +1,38 @@
 import { describe, test, expect } from 'bun:test'
 import { Schema } from '@effect/schema'
 import { generateXmlToolDoc, generateXmlToolGroupDoc } from './xml-docs'
-import { createTool } from '@magnitudedev/tools'
+import { createTool, type XmlBinding } from '@magnitudedev/tools'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeTool(config: {
+function makeTool<
+  I extends Schema.Schema.AnyNoContext,
+  O extends Schema.Schema.AnyNoContext = typeof Schema.Void,
+>(config: {
   name: string
   group?: string
   description?: string
-  inputSchema: Schema.Schema.AnyNoContext
-  outputSchema?: Schema.Schema.AnyNoContext
+  inputSchema: I
+  outputSchema?: O
   argMapping?: string[]
-  bindings?: Record<string, unknown>
+  bindings?: {
+    xmlInput: XmlBinding<Schema.Schema.Type<I>>
+    xmlOutput?: XmlBinding<Schema.Schema.Type<O>>
+  }
 }) {
   return createTool({
     name: config.name,
     group: config.group,
     description: config.description ?? '',
     inputSchema: config.inputSchema,
-    outputSchema: config.outputSchema ?? Schema.Void,
+    outputSchema: (config.outputSchema ?? Schema.Void) as O,
     argMapping: config.argMapping,
-    bindings: config.bindings as ReturnType<typeof createTool>['bindings'],
+    bindings: config.bindings ? {
+      xmlInput: config.bindings.xmlInput,
+      ...(config.bindings.xmlOutput ? { xmlOutput: config.bindings.xmlOutput } : {}),
+    } : undefined as any,
     execute: () => { throw new Error('not used') },
   })
 }
@@ -450,6 +459,66 @@ describe('output documentation', () => {
     expect(doc).toContain('exitCode="..."')
     expect(doc).toContain('<stdout>stdout</stdout>')
     expect(doc).toContain('<stderr>stderr</stderr>')
+  })
+
+  test('explicit output binding with body still works', () => {
+    const tool = makeTool({
+      name: 'read',
+      group: 'fs',
+      inputSchema: Schema.Struct({ path: Schema.String }),
+      outputSchema: Schema.Struct({ content: Schema.String }),
+      bindings: {
+        xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true },
+        xmlOutput: { type: 'tag', body: 'content' },
+      },
+    })
+    const doc = generateXmlToolDoc(tool)!
+    expect(doc).toContain('Returns:')
+    expect(doc).toContain('<fs-read>content</fs-read>')
+  })
+
+  test('explicit output items binding renders item attrs without body', () => {
+    const tool = makeTool({
+      name: 'tree',
+      group: 'fs',
+      inputSchema: Schema.Struct({ path: Schema.String }),
+      outputSchema: Schema.Array(Schema.Struct({
+        path: Schema.String,
+        name: Schema.String,
+        type: Schema.Literal('file', 'dir'),
+        depth: Schema.Number,
+      })),
+      bindings: {
+        xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true },
+        xmlOutput: { type: 'tag', items: { tag: 'entry', attributes: ['path', 'name', 'type', 'depth'] } },
+      },
+    })
+    const doc = generateXmlToolDoc(tool)!
+    expect(doc).toContain('Returns:')
+    expect(doc).toContain('<fs-tree>')
+    expect(doc).toContain('<entry path="..." name="..." type="..." depth="..." />')
+    expect(doc).toContain('</fs-tree>')
+  })
+
+  test('explicit output items binding renders item attrs + body', () => {
+    const tool = makeTool({
+      name: 'search',
+      group: 'fs',
+      inputSchema: Schema.Struct({ pattern: Schema.String }),
+      outputSchema: Schema.Array(Schema.Struct({
+        file: Schema.String,
+        match: Schema.String,
+      })),
+      bindings: {
+        xmlInput: { type: 'tag', attributes: ['pattern'], selfClosing: true },
+        xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['file'], body: 'match' } },
+      },
+    })
+    const doc = generateXmlToolDoc(tool)!
+    expect(doc).toContain('Returns:')
+    expect(doc).toContain('<fs-search>')
+    expect(doc).toContain('<item file="...">a string</item>')
+    expect(doc).toContain('</fs-search>')
   })
 })
 

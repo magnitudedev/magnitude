@@ -540,18 +540,47 @@ function buildOutputWithBinding(
   const hasBody = !!binding.body
   const hasChildTags = binding.childTags && binding.childTags.length > 0
   const hasChildren = binding.children && binding.children.length > 0
+  const hasItems = !!binding.items
 
-  if (!hasBody && !hasChildTags && !hasChildren) {
+  if (!hasBody && !hasChildTags && !hasChildren && !hasItems) {
     lines.push(`  <${tagName}${attrs} />`)
     return
   }
 
-  if (hasBody && !hasChildTags && !hasChildren) {
+  if (hasBody && !hasChildTags && !hasChildren && !hasItems) {
     lines.push(`  <${tagName}${attrs}>${binding.body}</${tagName}>`)
     return
   }
 
   lines.push(`  <${tagName}${attrs}>`)
+
+  if (hasItems) {
+    const itemsBinding = binding.items!
+    const itemTag = itemsBinding.tag
+    let itemAttrs = ''
+    if (itemsBinding.attributes) {
+      for (const attr of itemsBinding.attributes) {
+        itemAttrs += ` ${String(attr)}="..."`
+      }
+    }
+
+    const schema = unwrapAst(schemaAst)
+    const elemFields =
+      schema._tag === 'TupleType' && schema.rest.length > 0
+        ? getFieldInfos(unwrapAst(schema.rest[0].type))
+        : new Map<string, FieldInfo>()
+
+    if (itemsBinding.body) {
+      const bodyKey = String(itemsBinding.body)
+      const bodyInfo = elemFields.get(bodyKey)
+      const bodyText =
+        bodyInfo?.description
+        ?? (needsTypeComment(bodyInfo?.ast ?? unwrapAst(schemaAst)) ?? (bodyKey ? `${bodyKey} text` : 'value'))
+      lines.push(`    <${itemTag}${itemAttrs}>${bodyText}</${itemTag}>`)
+    } else {
+      lines.push(`    <${itemTag}${itemAttrs} />`)
+    }
+  }
 
   if (hasChildTags) {
     for (const ct of binding.childTags!) {

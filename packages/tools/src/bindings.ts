@@ -189,7 +189,9 @@ export type XmlBinding<T> = {
   }
   /** Direct array output binding (when output type is array<E>).
    *  Specifies how each array element is serialized as an item element. */
-  readonly items?: T extends ReadonlyArray<infer E> ? XmlItemBinding<E> : never
+  readonly items?: [T] extends [ReadonlyArray<infer E>]
+    ? XmlItemBinding<E>
+    : [unknown] extends [T] ? XmlItemBinding<Record<string, unknown>> : never
 }
 
 // =============================================================================
