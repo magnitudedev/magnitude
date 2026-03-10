@@ -710,7 +710,14 @@ const makeExecutionManager = Effect.gen(function* () {
                           : {}),
                     }
                   } else if (endResult.turnControl) {
-                    executionResult = { success: true, turnDecision: endResult.turnControl }
+                    const policyCtx = yield* policyCtxProvider.get
+                    const reminder = agentDef.getReminder({
+                      toolsCalled: toolsCalledKeys,
+                      lastTool: lastToolKey,
+                      messagesSent,
+                      state: policyCtx,
+                    }) ?? undefined
+                    executionResult = { success: true, turnDecision: endResult.turnControl, reminder }
                   } else {
                     const policyCtx = yield* policyCtxProvider.get
                     const turnResult = agentDef.getTurn({
@@ -719,7 +726,13 @@ const makeExecutionManager = Effect.gen(function* () {
                       messagesSent,
                       state: policyCtx,
                     })
-                    executionResult = { success: true, turnDecision: turnResult.action as TurnDecision, reminder: turnResult.reminder }
+                    const reminder = agentDef.getReminder({
+                      toolsCalled: toolsCalledKeys,
+                      lastTool: lastToolKey,
+                      messagesSent,
+                      state: policyCtx,
+                    }) ?? undefined
+                    executionResult = { success: true, turnDecision: turnResult.action as TurnDecision, reminder }
                   }
                 } else if (endResult._tag === 'Interrupted') {
                   executionResult = { success: false, error: 'Interrupted', cancelled: true }

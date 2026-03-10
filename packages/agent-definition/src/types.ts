@@ -80,6 +80,8 @@ export type TurnResult = {
 export interface TurnPolicy<T extends ToolSet, Ctx = Record<string, never>> {
   /** Called at end of turn to decide next action. */
   decide: (ctx: TurnContext<Ctx> & { tools: ToolNames<T>[] }) => TurnResult
+  /** Called at end of every turn to generate a reminder for the next turn. */
+  reminder?: (ctx: TurnContext<Ctx>) => string | null
 }
 
 // =============================================================================
@@ -170,6 +172,7 @@ export interface AgentDefinition<T extends ToolSet = ToolSet, Ctx = unknown> {
 
   getPermission(tool: string, input: unknown, ctx: Ctx): PermissionResult
   getTurn(ctx: TurnContext<Ctx>): TurnResult
+  getReminder(ctx: TurnContext<Ctx>): string | null
   getDisplay(tool: string, input: unknown, output: unknown): DisplayResult
 
   /** Get the slug for a definition key (e.g., 'fileRead' → 'fs.read') */

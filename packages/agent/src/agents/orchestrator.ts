@@ -72,18 +72,17 @@ export const createOrchestrator = (systemPrompt: string) => {
         if (turnCtx.cancelled) return yield_()
         if (turnCtx.error) return continue_()
 
-        const reminder = buildReminder(
-          formatAgentsStatus(turnCtx.state.agents),
-        )
-
         // No tools called — yield (messages alone don't justify another turn)
-        if (turnCtx.toolsCalled.length === 0) return yield_(reminder)
+        if (turnCtx.toolsCalled.length === 0) return yield_()
 
         // Yield only if the last tool in the turn was a yielder
         const yielders = ['agentCreate']
-        if (turnCtx.lastTool && yielders.includes(turnCtx.lastTool)) return yield_(reminder)
-        if (turnCtx.messagesSent.some(m => m.dest !== 'user')) return yield_(reminder)
-        return continue_(reminder)
+        if (turnCtx.lastTool && yielders.includes(turnCtx.lastTool)) return yield_()
+        if (turnCtx.messagesSent.some(m => m.dest !== 'user')) return yield_()
+        return continue_()
+      },
+      reminder(turnCtx) {
+        return buildReminder(formatAgentsStatus(turnCtx.state.agents))
       },
     },
 

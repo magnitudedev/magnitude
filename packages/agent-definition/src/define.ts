@@ -5,7 +5,7 @@
 import type {
   ToolSet, ToolNames, AgentConfig, AgentDefinition,
   PermissionResult, PermissionHelpers,
-  TurnContext, TurnResult, TurnPolicy,
+  TurnContext, TurnResult,
   DisplayResult, DisplayHelpers,
 } from './types'
 import { allow, approve, reject, hidden, visible } from './helpers'
@@ -86,9 +86,12 @@ export function defineAgent<T extends ToolSet, Ctx = Record<string, unknown>>(
   }
 
   function getTurn(ctx: TurnContext<Ctx>): TurnResult {
-    return (config.turn.decide as (ctx: TurnContext<Ctx>) => TurnResult)(ctx)
+    return config.turn.decide(ctx as TurnContext<Ctx> & { tools: ToolNames<T>[] })
   }
 
+  function getReminder(ctx: TurnContext<Ctx>): string | null {
+    return config.turn.reminder?.(ctx) ?? null
+  }
 
   function getDisplay(tool: string, input: unknown, output: unknown): DisplayResult {
     return dispatchHandler(
@@ -113,6 +116,7 @@ export function defineAgent<T extends ToolSet, Ctx = Record<string, unknown>>(
     thinkingLenses: config.thinkingLenses,
     getPermission,
     getTurn,
+    getReminder,
     getDisplay,
     getSlug,
   }
