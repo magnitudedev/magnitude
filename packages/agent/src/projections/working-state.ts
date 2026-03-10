@@ -333,34 +333,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       }
     }),
 
-    // Trigger parent's turn when fork completes
-    // Note: parentForkId=null means the root agent is the parent
-    on(ForkProjection.signals.forkCompleted, ({ value, state, emit }) => {
-      const { parentForkId } = value
-
-      const parentState = state.forks.get(parentForkId)
-      if (!parentState) return state
-
-      const newParentState: ForkWorkingState = {
-        ...parentState,
-        willContinue: true,
-        hasQueuedMessages: parentState.hasQueuedMessages || parentState.working
-      }
-
-      // Emit shouldTriggerChanged if parent should now trigger
-      if (shouldTrigger(newParentState) && !shouldTrigger(parentState)) {
-        emit.shouldTriggerChanged({
-          forkId: parentForkId,
-          shouldTrigger: true,
-          chainId: newParentState.currentChainId
-        })
-      }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(parentForkId, newParentState)
-      }
-    }),
 
     // Wake orchestrator (root) when sub-agent responds
     on(ForkProjection.signals.agentResponse, ({ value, state, emit }) => {
