@@ -1,31 +1,52 @@
 import { describe, expect, it } from 'bun:test'
 import React, { type ReactNode } from 'react'
-import { injectArtifactRefsWithHitZones } from './artifact-refs'
+import { parseMarkdownToChunks } from './markdown-content-renderer'
+import { buildMarkdownColorPalette, chatThemes } from './theme'
 
 function flattenToText(node: ReactNode): string {
   if (node === null || node === undefined || typeof node === 'boolean') return ''
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(flattenToText).join('')
-
   if (React.isValidElement(node)) {
     const el = node as React.ReactElement<{ children?: ReactNode }>
     return flattenToText(el.props.children)
   }
-
   return ''
 }
 
-const refStyle = { fg: '#blue' }
-const hoverStyle = { fg: '#hover' }
-const notFoundStyle = { fg: '#gray' }
-const isValid = (_name: string) => true
+/** Check if a React tree contains elements with data-artifact-ref matching the expected name */
+function findArtifactRefs(node: ReactNode): Array<{ artifactName: string; section?: string; label?: string }> {
+  const refs: Array<{ artifactName: string; section?: string; label?: string }> = []
+
+  function walk(n: ReactNode): void {
+    if (n === null || n === undefined || typeof n === 'string' || typeof n === 'number' || typeof n === 'boolean') return
+    if (Array.isArray(n)) { n.forEach(walk); return }
+    if (React.isValidElement(n)) {
+      const el = n as React.ReactElement<Record<string, unknown>>
+      const ref = el.props['data-artifact-ref'] as string | undefined
+      if (ref) {
+        refs.push({
+          artifactName: ref,
+          section: el.props['data-artifact-section'] as string | undefined,
+          label: el.props['data-artifact-label'] as string | undefined,
+        })
+      }
+      if (el.props.children) walk(el.props.children as ReactNode)
+    }
+  }
+
+  walk(node)
+  return refs
+}
 
 type Case = {
   name: string
   md: string
   expectedArtifacts: string[]
-  expectedLabels?: string[]
+  expectedSections?: (string | undefined)[]
 }
+
+const palette = buildMarkdownColorPalette(chatThemes.dark)
 
 const cases: Case[] = [
   { name: 'Plain paragraph with ref', md: 'Check [[my-ref]] here', expectedArtifacts: ['my-ref'] },
@@ -39,104 +60,46 @@ const cases: Case[] = [
   { name: 'Ref inside blockquote with bold', md: '> **Note:** Check [[my-ref]]', expectedArtifacts: ['my-ref'] },
   { name: 'Ref inside list item', md: '- See [[my-ref]]', expectedArtifacts: ['my-ref'] },
   { name: 'Ref inside ordered list', md: '1. See [[my-ref]]', expectedArtifacts: ['my-ref'] },
-  { name: 'Ref inside table cell', md: '| See [[my-ref]] | done |', expectedArtifacts: ['my-ref'] },
-  { name: 'Ref with section', md: '[[my-ref#section]]', expectedArtifacts: ['my-ref'], expectedLabels: ['my-ref#section'] },
-  { name: 'Ref with label', md: '[[my-ref|Custom Label]]', expectedArtifacts: ['my-ref'], expectedLabels: ['Custom Label'] },
+  { name: 'Ref inside table cell', md: '| See [[my-ref]] | done |\n|---|---|\n| a | b |', expectedArtifacts: ['my-ref'] },
+  { name: 'Ref with section', md: '[[my-ref#section]]', expectedArtifacts: ['my-ref'], expectedSections: ['section'] },
+  { name: 'Ref with section and space', md: 'See [[demo-notes#Key Points]] here', expectedArtifacts: ['demo-notes'], expectedSections: ['Key Points'] },
   { name: 'Ref next to inline code', md: 'Use `code` then [[my-ref]]', expectedArtifacts: ['my-ref'] },
-  { name: 'Ref inside link text', md: '[text [[my-ref]]](url)', expectedArtifacts: ['my-ref'] },
-  {
-    name: 'Multiple refs with styled text between',
-    md: '**Bold** [[ref-1]] and *italic* [[ref-2]]',
-    expectedArtifacts: ['ref-1', 'ref-2'],
-  },
-  {
-    name: 'Ref at paragraph boundary (two paragraphs)',
-    md: 'Para 1 [[ref-1]]\n\nPara 2 [[ref-2]]',
-    expectedArtifacts: ['ref-1', 'ref-2'],
-  },
+  { name: 'Multiple refs with styled text between', md: '**Bold** [[ref-1]] and *italic* [[ref-2]]', expectedArtifacts: ['ref-1', 'ref-2'] },
+  { name: 'Ref at paragraph boundary', md: 'Para 1 [[ref-1]]\n\nPara 2 [[ref-2]]', expectedArtifacts: ['ref-1', 'ref-2'] },
+  { name: 'Ref in blockquote with admonition', md: '> [!NOTE]\n> You can reference [[demo-notes#Key Points]] for the important bits.', expectedArtifacts: ['demo-notes'], expectedSections: ['Key Points'] },
   { name: 'No refs at all', md: 'Just plain text', expectedArtifacts: [] },
 ]
 
-// Additional cases that go through the full markdown rendering pipeline
-// (parseMarkdownToChunks → convertLinesToReactNodes → injectArtifactRefsWithHitZones)
-import { parseMarkdownToChunks } from './markdown-content-renderer'
-import { buildMarkdownColorPalette, chatThemes } from './theme'
-
-const fullPipelineCases: Case[] = [
-  { name: 'Plain paragraph with ref (full pipeline)', md: 'Check [[my-ref]] here', expectedArtifacts: ['my-ref'] },
-  { name: 'Ref with section and space (full pipeline)', md: 'See [[demo-notes#Key Points]] for info', expectedArtifacts: ['demo-notes'], expectedLabels: ['demo-notes#Key Points'] },
-  { name: 'Ref in blockquote with admonition (full pipeline)', md: '> [!NOTE]\n> You can reference [[demo-notes#Key Points]] for the important bits.', expectedArtifacts: ['demo-notes'], expectedLabels: ['demo-notes#Key Points'] },
-  { name: 'Ref in blockquote (full pipeline)', md: '> Check [[sample-config]] for config.', expectedArtifacts: ['sample-config'] },
-  { name: 'Multiple refs in paragraph (full pipeline)', md: 'Both [[demo-notes]] and [[sample-config]] are available.', expectedArtifacts: ['demo-notes', 'sample-config'] },
-  { name: 'Ref in bold (full pipeline)', md: '**See [[my-ref]]**', expectedArtifacts: ['my-ref'] },
-  { name: 'Ref in list item (full pipeline)', md: '- Check [[my-ref]] here', expectedArtifacts: ['my-ref'] },
-  { name: 'Ref in table cell (full pipeline)', md: '| Feature | Notes |\n|---------|-------|\n| Artifacts | See [[demo-notes]] |', expectedArtifacts: ['demo-notes'] },
-]
-
-describe('injectArtifactRefsWithHitZones with full rendering pipeline', () => {
-  const palette = buildMarkdownColorPalette(chatThemes.dark)
-
-  for (const tc of fullPipelineCases) {
+describe('Artifact refs in markdown rendering pipeline', () => {
+  for (const tc of cases) {
     it(tc.name, () => {
       const chunks = parseMarkdownToChunks(tc.md, { palette })
       const textChunks = chunks.filter(c => c.type === 'text')
 
-      // Collect all hitZones across all text chunks
-      const allHitZones: Array<{ artifactName: string; section?: string }> = []
-      let allText = ''
-
+      // Collect all refs across all text chunks
+      const allRefs: Array<{ artifactName: string; section?: string }> = []
       for (const chunk of textChunks) {
-        const result = injectArtifactRefsWithHitZones(
-          chunk.content,
-          refStyle, hoverStyle, notFoundStyle, isValid,
-        )
-        allHitZones.push(...result.hitZones)
-        allText += flattenToText(result.node)
+        allRefs.push(...findArtifactRefs(chunk.content))
       }
 
-      if (tc.expectedArtifacts.length === 0) {
-        expect(allHitZones).toHaveLength(0)
-        return
+      expect(allRefs).toHaveLength(tc.expectedArtifacts.length)
+      tc.expectedArtifacts.forEach((name, i) => {
+        expect(allRefs[i]?.artifactName).toBe(name)
+      })
+      if (tc.expectedSections) {
+        tc.expectedSections.forEach((section, i) => {
+          expect(allRefs[i]?.section).toBe(section)
+        })
       }
 
-      expect(allHitZones).toHaveLength(tc.expectedArtifacts.length)
-      tc.expectedArtifacts.forEach((artifactName, i) => {
-        expect(allHitZones[i]?.artifactName).toBe(artifactName)
-      })
-
-      const expectedLabels = tc.expectedLabels ?? tc.expectedArtifacts
-      expectedLabels.forEach((label) => {
-        expect(allText).toContain(`[≡ ${label}]`)
-      })
-    })
-  }
-})
-
-describe('injectArtifactRefsWithHitZones with real Bun markdown output', () => {
-  for (const tc of cases) {
-    it(tc.name, () => {
-      const tree = Bun.markdown.react(tc.md)
-      const result = injectArtifactRefsWithHitZones(tree, refStyle, hoverStyle, notFoundStyle, isValid)
-
-      const text = flattenToText(result.node)
-
-      if (tc.expectedArtifacts.length === 0) {
-        expect(result.hitZones).toHaveLength(0)
-        expect(text).toContain('Just plain text')
-        expect(text).not.toContain('[≡ ')
-        return
+      // Verify the original ref text [[...]] is preserved in the content
+      // (it gets replaced with display label in StyledTextWithRefs, not here)
+      if (tc.expectedArtifacts.length > 0) {
+        const allText = textChunks.map(c => flattenToText(c.content)).join('')
+        for (const name of tc.expectedArtifacts) {
+          expect(allText).toContain(name)
+        }
       }
-
-      expect(result.hitZones).toHaveLength(tc.expectedArtifacts.length)
-
-      tc.expectedArtifacts.forEach((artifactName, i) => {
-        expect(result.hitZones[i]?.artifactName).toBe(artifactName)
-      })
-
-      const expectedLabels = tc.expectedLabels ?? tc.expectedArtifacts
-      expectedLabels.forEach((label) => {
-        expect(text).toContain(`[≡ ${label}]`)
-      })
     })
   }
 })

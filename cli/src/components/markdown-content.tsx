@@ -7,6 +7,7 @@
 
 import React, { memo, useRef, useState } from 'react'
 import { TextAttributes, type TextRenderable, type MouseEvent as OTMouseEvent, type TextBufferView, type LineInfo } from '@opentui/core'
+import { useRenderer } from '@opentui/react'
 import {
   parseMarkdownToChunks,
   hasOddFenceCount,
@@ -17,8 +18,14 @@ import {
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/use-theme'
-import { injectArtifactRefsWithHitZones, type RefHitZone } from '../utils/artifact-refs'
 import { useArtifacts } from '../hooks/use-artifacts'
+
+interface RefHitZone {
+  charStart: number
+  charEnd: number
+  artifactName: string
+  section?: string
+}
 
 const COPY_FEEDBACK_RESET_MS = 2000
 
@@ -111,6 +118,67 @@ export const MermaidBlockView = memo(function MermaidBlockView({
   )
 })
 
+/**
+ * Walk a React tree, find elements with data-artifact-ref, replace their text
+ * with display labels, apply styling, and track character offsets for hit zones.
+ */
+function transformRefs(
+  node: React.ReactNode,
+  refStyle: { fg: string; attributes?: number },
+  refHoverStyle: { fg: string; attributes?: number },
+  refNotFoundStyle: { fg: string; attributes?: number },
+  isRefValid: (name: string) => boolean,
+  hoveredRefIndex: number | null,
+): { node: React.ReactNode; hitZones: RefHitZone[] } {
+  const hitZones: RefHitZone[] = []
+  let charOffset = 0
+
+  function walk(n: React.ReactNode): React.ReactNode {
+    if (typeof n === 'string') { charOffset += n.length; return n }
+    if (typeof n === 'number') { charOffset += String(n).length; return n }
+    if (n === null || n === undefined || typeof n === 'boolean') return n
+
+    if (Array.isArray(n)) {
+      return n.map((child, i) => <React.Fragment key={i}>{walk(child)}</React.Fragment>)
+    }
+
+    if (React.isValidElement(n)) {
+      const el = n as React.ReactElement<Record<string, unknown>>
+      const artifactRef = el.props['data-artifact-ref'] as string | undefined
+
+      if (artifactRef) {
+        const section = el.props['data-artifact-section'] as string | undefined
+        const label = el.props['data-artifact-label'] as string | undefined
+        const displayLabel = label ?? (section ? `${artifactRef}#${section}` : artifactRef)
+        const exists = isRefValid(artifactRef)
+        const displayText = exists ? `[≡ ${displayLabel}]` : `[≡ ${displayLabel} (not found)]`
+        const refIdx = hitZones.length
+
+        const start = charOffset
+        charOffset += displayText.length
+        if (exists) {
+          hitZones.push({ charStart: start, charEnd: charOffset, artifactName: artifactRef, section })
+        }
+        const style = !exists
+          ? refNotFoundStyle
+          : (hoveredRefIndex === refIdx ? refHoverStyle : refStyle)
+        return <span fg={style.fg} attributes={style.attributes}>{displayText}</span>
+      }
+
+      // Regular element — recurse into children
+      const children = el.props.children as React.ReactNode | undefined
+      if (children === undefined) return n
+      const newChildren = walk(children)
+      if (newChildren === children) return n
+      return React.cloneElement(el, {}, newChildren)
+    }
+
+    return n
+  }
+
+  return { node: walk(node), hitZones }
+}
+
 // Render a text chunk preserving all markdown styling while making artifact refs clickable
 const StyledTextWithRefs = memo(function StyledTextWithRefs({
   content,
@@ -122,12 +190,13 @@ const StyledTextWithRefs = memo(function StyledTextWithRefs({
   onOpenArtifact?: (name: string, section?: string) => void
 }) {
   const theme = useTheme()
+  const renderer = useRenderer()
   const artifactState = useArtifacts()
   const textRef = useRef<TextRenderable | null>(null)
   const pressStartedRef = useRef<number | null>(null)
   const [hoveredZone, setHoveredZone] = useState<number | null>(null)
 
-  const { node: transformedContent, hitZones } = injectArtifactRefsWithHitZones(
+  const { node: transformedContent, hitZones } = transformRefs(
     content,
     { fg: theme.primary, attributes: TextAttributes.BOLD },
     { fg: theme.link, attributes: TextAttributes.BOLD },
@@ -177,6 +246,7 @@ const StyledTextWithRefs = memo(function StyledTextWithRefs({
       onMouseUp={(event: OTMouseEvent) => {
         const hit = hitTest(event)
         if (hit !== null && hit === pressStartedRef.current) {
+          renderer.clearSelection()
           onOpenArtifact?.(hitZones[hit].artifactName, hitZones[hit].section)
         }
         pressStartedRef.current = null

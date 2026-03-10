@@ -158,6 +158,8 @@ interface StyledSegment {
   text: string
   fg?: string
   attributes?: number
+  /** If set, this segment is an artifact reference */
+  ref?: { artifactName: string; section?: string; label?: string }
 }
 
 type Line = StyledSegment[]
@@ -260,6 +262,75 @@ const styledSeg = (text: string, fg?: string, attributes?: number): StyledSegmen
 // Merge a segment into a line
 const lineWithPrefix = (prefix: Line, line: Line): Line => [...prefix, ...line]
 
+// Artifact ref pattern
+const ARTIFACT_REF_RE = /\[\[([^\]#|]+?)(?:#([^\]|]+?))?(?:\|([^\]]+?))?\]\]/g
+
+/**
+ * Process a line of styled segments, detecting [[artifact-ref]] patterns.
+ * Merges adjacent segments with identical styling first (to reassemble
+ * brackets split by Bun's markdown parser), then splits at ref boundaries.
+ */
+const processLineRefs = (line: Line): Line => {
+  if (line.length === 0) return line
+
+  // Step 1: merge adjacent segments with identical styling
+  const merged: StyledSegment[] = []
+  for (const seg of line) {
+    const prev = merged.length > 0 ? merged[merged.length - 1] : null
+    if (prev && !prev.ref && prev.fg === seg.fg && prev.attributes === seg.attributes) {
+      prev.text += seg.text
+    } else {
+      merged.push({ ...seg })
+    }
+  }
+
+  // Step 2: check if any merged segment contains a ref
+  const hasRef = merged.some(seg => {
+    ARTIFACT_REF_RE.lastIndex = 0
+    return ARTIFACT_REF_RE.test(seg.text)
+  })
+  if (!hasRef) return merged
+
+  // Step 3: split segments at ref boundaries
+  const result: StyledSegment[] = []
+  for (const seg of merged) {
+    ARTIFACT_REF_RE.lastIndex = 0
+    if (!ARTIFACT_REF_RE.test(seg.text)) {
+      result.push(seg)
+      continue
+    }
+
+    // Split this segment's text at ref boundaries
+    const regex = new RegExp(ARTIFACT_REF_RE.source, 'g')
+    let lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = regex.exec(seg.text)) !== null) {
+      // Text before the ref
+      if (match.index > lastIndex) {
+        result.push({ text: seg.text.slice(lastIndex, match.index), fg: seg.fg, attributes: seg.attributes })
+      }
+      // The ref segment
+      result.push({
+        text: match[0],
+        fg: seg.fg,
+        attributes: seg.attributes,
+        ref: {
+          artifactName: match[1],
+          section: match[2] || undefined,
+          label: match[3] || undefined,
+        },
+      })
+      lastIndex = regex.lastIndex
+    }
+    // Text after last ref
+    if (lastIndex < seg.text.length) {
+      result.push({ text: seg.text.slice(lastIndex), fg: seg.fg, attributes: seg.attributes })
+    }
+  }
+
+  return result
+}
+
 // Extract plain text from React children
 const childrenToText = (children: ReactNode): string => {
   if (typeof children === 'string') return children
@@ -328,12 +399,28 @@ const convertLinesToReactNodes = (lines: Line[]): ReactNode => {
 
   const result: ReactNode[] = []
 
-  lines.forEach((line, lineIdx) => {
+  // Process artifact refs in each line before rendering
+  const processedLines = lines.map(processLineRefs)
+
+  processedLines.forEach((line, lineIdx) => {
     if (line.length === 0) {
       result.push('\n')
     } else {
       line.forEach((seg) => {
-        if (seg.fg || seg.attributes) {
+        if (seg.ref) {
+          result.push(
+            <span
+              key={nextKey()}
+              fg={seg.fg}
+              attributes={seg.attributes}
+              data-artifact-ref={seg.ref.artifactName}
+              data-artifact-section={seg.ref.section}
+              data-artifact-label={seg.ref.label}
+            >
+              {seg.text}
+            </span>,
+          )
+        } else if (seg.fg || seg.attributes) {
           result.push(
             <span key={nextKey()} fg={seg.fg} attributes={seg.attributes}>
               {seg.text}
