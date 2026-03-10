@@ -2,6 +2,7 @@ import { writeFile, mkdir, copyFile, readFile } from 'fs/promises'
 import { resolve } from 'path'
 import { existsSync } from 'fs'
 import { $ } from 'bun'
+import { downloadRg } from '@magnitudedev/ripgrep'
 
 // =============================================================================
 // Native binding patching
@@ -135,6 +136,18 @@ function getTargetPlatformArch(target: string): { platform: string; arch: string
   return { platform: parts[0], arch: parts[1] }
 }
 
+function bunTargetToRipgrepTarget(bunTarget: string): string {
+  const { platform, arch } = getTargetPlatformArch(bunTarget)
+  const map: Record<string, Record<string, string>> = {
+    darwin: { arm64: 'aarch64-apple-darwin', x64: 'x86_64-apple-darwin' },
+    linux: { x64: 'x86_64-unknown-linux-musl', arm64: 'aarch64-unknown-linux-musl' },
+    windows: { x64: 'x86_64-pc-windows-msvc' },
+  }
+  const target = map[platform]?.[arch]
+  if (!target) throw new Error(`No ripgrep target for ${bunTarget}`)
+  return target
+}
+
 const targets = [
   'bun-darwin-arm64',
   'bun-darwin-x64',
@@ -157,6 +170,12 @@ async function build(target: string) {
   console.log('Building @magnitudedev/image WASM...')
   await $`cd ${resolve(PROJECT_ROOT, 'packages/image')} && wasm-pack build --target nodejs --out-dir pkg --release`.quiet()
 
+  // Download ripgrep binary for embedding
+  const rgBinDir = resolve(PROJECT_ROOT, 'packages/ripgrep/bin')
+  const rgTarget = bunTargetToRipgrepTarget(target)
+  console.log('Downloading ripgrep (' + rgTarget + ') for ' + target + '...')
+  const rgBinPath = await downloadRg(rgBinDir, rgTarget)
+
   const binDir = resolve(PROJECT_ROOT, 'bin')
   if (!existsSync(binDir)) await mkdir(binDir)
 
@@ -166,7 +185,7 @@ async function build(target: string) {
 
   try {
     const entrypoint = resolve(import.meta.dir, '..', 'src', 'index.tsx')
-    await $`bun build ${entrypoint} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
+    await $`bun build ${entrypoint} ${rgBinPath} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
   } finally {
     // Always restore original files
     await restoreNativeBindings()
@@ -176,7 +195,11 @@ async function build(target: string) {
   console.log('Built ' + binaryFile)
 }
 
-if (targetArg) {
+if (targetArg === '--all') {
+  for (const target of targets) {
+    await build(target)
+  }
+} else if (targetArg) {
   await build(targetArg)
 } else {
   const platform = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'

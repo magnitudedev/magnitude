@@ -7,7 +7,7 @@ import { Schema } from '@effect/schema'
 import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { ToolEmitTag } from '../execution/tool-emit'
 import { join, relative, resolve } from 'path'
-import { rgPath } from '@vscode/ripgrep'
+import { resolveRgPath } from '@magnitudedev/ripgrep'
 import { walk } from '../util/walk'
 import { createDefaultIgnore } from '../util/gitignore'
 import { validateAndApply, toEditDiff } from '../util/edit'
@@ -297,6 +297,7 @@ export async function searchFiles(
 
   args.push(searchPath)
 
+  const rgPath = await resolveRgPath()
   const proc = Bun.spawn([rgPath, ...args], {
     stdout: 'pipe',
     stderr: 'pipe',

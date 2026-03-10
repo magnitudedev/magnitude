@@ -20,7 +20,7 @@
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/tools": "workspace:*",
     "@magnitudedev/xml-act": "workspace:*",
-    "@vscode/ripgrep": "^1.17.0",
+    "@magnitudedev/ripgrep": "workspace:*",
     "effect": "^3.19.6",
     "ignore": "^7.0.5",
     "luxon": "^3.7.2",
