@@ -1,13 +1,145 @@
-import type { InputValue } from '../types/store'
+import type { InputPasteSegment, InputValue } from '../types/store'
 import { readClipboardText } from './clipboard'
 
 // Re-export InputValue type for backwards compatibility
 export type { InputValue } from '../types/store'
 
 export const LIST_BULLET_GLYPH = '• '
-export const PASTE_ATTACHMENT_CHAR_LIMIT = 2000
+
 /** Max number of lines to show in collapsed previews */
 export const PREVIEW_LINE_CAP = 3
+
+export function formatPastePlaceholder(charCount: number): string {
+  return `[${charCount.toLocaleString()} characters pasted]`
+}
+
+function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
+  return [...segments].sort((a, b) => a.start - b.start)
+}
+
+export function insertPasteSegment(
+  input: InputValue,
+  pastedText: string,
+  id: string,
+): InputValue {
+  const placeholder = formatPastePlaceholder(pastedText.length)
+  const insertAt = Math.max(0, Math.min(input.cursorPosition, input.text.length))
+  const before = input.text.slice(0, insertAt)
+  const after = input.text.slice(insertAt)
+  const delta = placeholder.length
+
+  const shifted = input.pasteSegments.map((segment) => {
+    if (segment.end <= insertAt) return segment
+    return {
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    }
+  })
+
+  return {
+    ...input,
+    text: before + placeholder + after,
+    cursorPosition: insertAt + delta,
+    lastEditDueToNav: false,
+    selectedPasteSegmentId: null,
+    pasteSegments: sortSegments([
+      ...shifted,
+      {
+        id,
+        placeholder,
+        content: pastedText,
+        start: insertAt,
+        end: insertAt + delta,
+      },
+    ]),
+  }
+}
+
+export function reconstituteInputText(input: InputValue): string {
+  if (input.pasteSegments.length === 0) return input.text
+
+  const segments = sortSegments(input.pasteSegments)
+  let cursor = 0
+  let output = ''
+
+  for (const segment of segments) {
+    if (segment.start > cursor) {
+      output += input.text.slice(cursor, segment.start)
+    }
+    output += segment.content
+    cursor = segment.end
+  }
+
+  if (cursor < input.text.length) {
+    output += input.text.slice(cursor)
+  }
+
+  return output
+}
+
+export function applyTextEditWithSegments(
+  input: InputValue,
+  start: number,
+  end: number,
+  insertedText: string,
+): InputValue {
+  const safeStart = Math.max(0, Math.min(start, input.text.length))
+  const safeEnd = Math.max(safeStart, Math.min(end, input.text.length))
+
+  let effectiveStart = safeStart
+  let effectiveEnd = safeEnd
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= safeStart || segment.start >= safeEnd)
+    if (!overlaps) continue
+    effectiveStart = Math.min(effectiveStart, segment.start)
+    effectiveEnd = Math.max(effectiveEnd, segment.end)
+  }
+
+  const nextText =
+    input.text.slice(0, effectiveStart) +
+    insertedText +
+    input.text.slice(effectiveEnd)
+
+  const removed = effectiveEnd - effectiveStart
+  const inserted = insertedText.length
+  const delta = inserted - removed
+
+  const remainingSegments: InputPasteSegment[] = []
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= effectiveStart || segment.start >= effectiveEnd)
+    if (overlaps) {
+      continue
+    }
+    if (segment.end <= effectiveStart) {
+      remainingSegments.push(segment)
+      continue
+    }
+    remainingSegments.push({
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    })
+  }
+
+  const proposedCursor = effectiveStart + inserted
+  let nextCursor = proposedCursor
+  for (const segment of remainingSegments) {
+    if (nextCursor > segment.start && nextCursor < segment.end) {
+      nextCursor = segment.end
+      break
+    }
+  }
+
+  return {
+    ...input,
+    text: nextText,
+    cursorPosition: nextCursor,
+    lastEditDueToNav: false,
+    pasteSegments: sortSegments(remainingSegments),
+    selectedPasteSegmentId: null,
+  }
+}
 
 /**
  * Truncate a command to a single line for display.
@@ -117,38 +249,9 @@ export function createTextInputPasteHandler(
       text: newText,
       cursorPosition: newCursor,
       lastEditDueToNav: false,
+      pasteSegments: [],
+      selectedPasteSegmentId: null,
     })
   }
 }
 
-/**
- * Creates a paste handler that supports text paste with optional long-text handling.
- *
- * When eventText is provided (from the terminal's paste event), uses that directly.
- * Only when NO eventText is provided do we fall back to reading from clipboard.
- */
-export function createSmartPasteHandler(options: {
-  text: string
-  cursorPosition: number
-  onChange: (value: InputValue) => void
-  onPasteLongText?: (text: string) => void
-}): (eventText?: string) => void {
-  const { text, cursorPosition, onChange, onPasteLongText } = options
-
-  return (eventText) => {
-    const pastedText = eventText || readClipboardText()
-    if (!pastedText) return
-
-    if (onPasteLongText && pastedText.length > PASTE_ATTACHMENT_CHAR_LIMIT) {
-      onPasteLongText(pastedText)
-      return
-    }
-
-    const { newText, newCursor } = spliceTextAtCursor(text, cursorPosition, pastedText)
-    onChange({
-      text: newText,
-      cursorPosition: newCursor,
-      lastEditDueToNav: false,
-    })
-  }
-}

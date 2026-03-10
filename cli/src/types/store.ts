@@ -1,10 +1,20 @@
 /** Types of banners that can appear at the top of the chat */
 export type TopBannerType = 'homeDir' | 'gitRoot' | null
 
+export type InputPasteSegment = {
+  id: string
+  placeholder: string
+  content: string
+  start: number
+  end: number
+}
+
 export type InputValue = {
   text: string
   cursorPosition: number
   lastEditDueToNav: boolean
+  pasteSegments: InputPasteSegment[]
+  selectedPasteSegmentId?: string | null
 }
 
 export type AskUserQuestion = {

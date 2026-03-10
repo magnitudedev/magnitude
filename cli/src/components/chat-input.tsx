@@ -38,7 +38,13 @@ export const ChatInput = memo(function ChatInput({
 
   const updateValue = useCallback((newValue: string, newCursor: number) => {
     if (onChange) {
-      onChange({ text: newValue, cursorPosition: newCursor, lastEditDueToNav: false })
+      onChange({
+        text: newValue,
+        cursorPosition: newCursor,
+        lastEditDueToNav: false,
+        pasteSegments: [],
+        selectedPasteSegmentId: null,
+      })
     } else {
       setInternalValue(newValue)
       setInternalCursor(newCursor)
@@ -93,7 +99,13 @@ export const ChatInput = memo(function ChatInput({
         if (key.name === 'left') {
           const newCursor = Math.max(0, cursorPosition - 1)
           if (onChange) {
-            onChange({ text: value, cursorPosition: newCursor, lastEditDueToNav: true })
+            onChange({
+              text: value,
+              cursorPosition: newCursor,
+              lastEditDueToNav: true,
+              pasteSegments: [],
+              selectedPasteSegmentId: null,
+            })
           } else {
             setInternalCursor(newCursor)
           }
@@ -104,7 +116,13 @@ export const ChatInput = memo(function ChatInput({
         if (key.name === 'right') {
           const newCursor = Math.min(value.length, cursorPosition + 1)
           if (onChange) {
-            onChange({ text: value, cursorPosition: newCursor, lastEditDueToNav: true })
+            onChange({
+              text: value,
+              cursorPosition: newCursor,
+              lastEditDueToNav: true,
+              pasteSegments: [],
+              selectedPasteSegmentId: null,
+            })
           } else {
             setInternalCursor(newCursor)
           }
@@ -114,7 +132,13 @@ export const ChatInput = memo(function ChatInput({
         // Home / Ctrl+A
         if (key.name === 'home' || (key.ctrl && key.name === 'a')) {
           if (onChange) {
-            onChange({ text: value, cursorPosition: 0, lastEditDueToNav: true })
+            onChange({
+              text: value,
+              cursorPosition: 0,
+              lastEditDueToNav: true,
+              pasteSegments: [],
+              selectedPasteSegmentId: null,
+            })
           } else {
             setInternalCursor(0)
           }
@@ -124,7 +148,13 @@ export const ChatInput = memo(function ChatInput({
         // End / Ctrl+E
         if (key.name === 'end' || (key.ctrl && key.name === 'e')) {
           if (onChange) {
-            onChange({ text: value, cursorPosition: value.length, lastEditDueToNav: true })
+            onChange({
+              text: value,
+              cursorPosition: value.length,
+              lastEditDueToNav: true,
+              pasteSegments: [],
+              selectedPasteSegmentId: null,
+            })
           } else {
             setInternalCursor(value.length)
           }

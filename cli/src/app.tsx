@@ -65,6 +65,7 @@ import { setSessionTracker } from './utils/telemetry-state'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import stringWidth from 'string-width'
 import { createId } from '@magnitudedev/generate-id'
+import { applyTextEditWithSegments, insertPasteSegment, reconstituteInputText } from './utils/strings'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
@@ -125,6 +126,8 @@ function AppInner({
     text: '',
     cursorPosition: 0,
     lastEditDueToNav: false,
+    pasteSegments: [],
+    selectedPasteSegmentId: null,
   })
   const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -610,7 +613,9 @@ function AppInner({
             return {
               text: restored,
               cursorPosition: restored.length,
-              lastEditDueToNav: false
+              lastEditDueToNav: false,
+              pasteSegments: [],
+              selectedPasteSegmentId: null,
             }
           })
         }
@@ -880,7 +885,7 @@ function AppInner({
 
   const exitBashMode = useCallback(() => {
     setBashMode(false)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
   }, [])
 
   const handleResumeChat = useCallback((chat: RecentChat) => {
@@ -1375,7 +1380,7 @@ function AppInner({
 
   const executeSlashCommand = useCallback((commandText: string) => {
     routeSlashCommand(commandText, commandContext)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
   }, [commandContext])
 
   const slashCommands = useSlashCommands(inputValue.text, executeSlashCommand)
@@ -1389,10 +1394,11 @@ function AppInner({
     return false
   }, [pendingApproval, bashMode, slashCommands.handleKeyIntercept, widgetNavActive, widgetNavigation.handleKeyEvent])
 
-  const handleSubmit = useCallback((message: string) => {
+  const handleSubmit = useCallback((message: string, visibleMessage?: string) => {
+    const slashText = visibleMessage ?? message
     // Check for slash commands first (skip in bash mode)
-    if (!bashMode && routeSlashCommand(message, commandContext)) {
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+    if (!bashMode && routeSlashCommand(slashText, commandContext)) {
+      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
       return
     }
 
@@ -1402,7 +1408,7 @@ function AppInner({
       if (!trimmed) return
       const result = executeBashCommand(trimmed)
       setBashOutputs(prev => [...prev, result])
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
       return
     }
 
@@ -1415,7 +1421,7 @@ function AppInner({
     setSystemMessages([])
     if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current)
     setEphemeralMessage(null)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
 
     const currentAttachments = [...attachments]
     const sendMessage = (c: AgentClient) => {
@@ -1441,7 +1447,7 @@ function AppInner({
     // Typing '!' as first character enters bash mode
     if (!bashMode && value.text === '!') {
       setBashMode(true)
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
       return
     }
     // Reset escape-to-clear hint when user types
@@ -1454,23 +1460,7 @@ function AppInner({
     setInputValue(value)
   }, [bashMode, nextEscWillClearInput])
 
-  const handlePasteLongText = useCallback((text: string) => {
-    logger.debug({ length: text.length }, 'handlePasteLongText called')
-    const message = `[Pasted ${text.length} characters]\n\n${text}`
-    if (client) {
-      client.send({ type: 'user_message', forkId: null, content: textParts(message), attachments: [...attachments], mode: 'text', synthetic: false, taskMode: false })
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
-    } else if (initClientRef.current) {
-      const initFn = initClientRef.current
-      initClientRef.current = null
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
-      initFn().then((newClient) => {
-        newClient.send({ type: 'user_message', forkId: null, content: textParts(message), attachments: [...attachments], mode: 'text', synthetic: false, taskMode: false })
-      }).catch((err) => {
-        logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client')
-      })
-    }
-  }, [client, attachments])
+  const INLINE_PASTE_PILL_CHAR_LIMIT = 1000
 
   const handlePaste = useCallback(async (eventText?: string) => {
     logger.debug({ eventText: eventText ? eventText.substring(0, 50) : null }, 'handlePaste called')
@@ -1495,23 +1485,19 @@ function AppInner({
       return
     }
 
-    if (pasteText.length > 2000) {
-      logger.debug('Falling back to long text paste handler')
-      handlePasteLongText(pasteText)
-      return
-    }
-
-    logger.debug({ cursorPosition: inputValue.cursorPosition }, 'Falling back to inserting paste text')
+    logger.debug({ cursorPosition: inputValue.cursorPosition }, 'Handling text paste with inline pill logic')
     setInputValue(prev => {
-      const before = prev.text.slice(0, prev.cursorPosition)
-      const after = prev.text.slice(prev.cursorPosition)
-      return {
-        text: before + pasteText + after,
-        cursorPosition: prev.cursorPosition + pasteText.length,
-        lastEditDueToNav: false,
+      if (pasteText.length > INLINE_PASTE_PILL_CHAR_LIMIT) {
+        return insertPasteSegment(prev, pasteText, createId())
       }
+      return applyTextEditWithSegments(
+        prev,
+        prev.cursorPosition,
+        prev.cursorPosition,
+        pasteText,
+      )
     })
-  }, [handlePasteLongText, inputValue.cursorPosition, addImageAttachment, addImageAttachmentFromFilePath])
+  }, [inputValue.cursorPosition, addImageAttachment, addImageAttachmentFromFilePath])
 
   const handleInterrupt = useCallback(() => {
     if (!client) return
@@ -1625,7 +1611,7 @@ function AppInner({
           if ('preventDefault' in key && typeof key.preventDefault === 'function') {
             key.preventDefault()
           }
-          setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+          setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
           return
         }
 
@@ -1680,7 +1666,7 @@ function AppInner({
           }
           if (nextEscWillClearInput) {
             // Second tap — clear the input
-            setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+            setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
             setNextEscWillClearInput(false)
             if (clearInputTimeoutRef.current) {
               clearTimeout(clearInputTimeoutRef.current)
@@ -1896,9 +1882,9 @@ function AppInner({
   const handleInputSubmit = useCallback(() => {
     // Normal message submission
     if (inputValue.text.trim() || attachments.length > 0) {
-      handleSubmit(inputValue.text)
+      handleSubmit(reconstituteInputText(inputValue), inputValue.text)
     }
-  }, [inputValue.text, handleSubmit, attachments.length])
+  }, [inputValue, handleSubmit, attachments.length])
 
   const selectedArtifactContent = useMemo(() => {
     if (!selectedArtifact || !artifactState) return null
@@ -2433,6 +2419,8 @@ function AppInner({
                       ref={multilineInputRef}
                       value={inputValue.text}
                       cursorPosition={inputValue.cursorPosition}
+                      pasteSegments={inputValue.pasteSegments}
+                      selectedPasteSegmentId={inputValue.selectedPasteSegmentId}
                       onChange={handleInputChange}
                       onSubmit={handleInputSubmit}
                       onPaste={handlePaste}

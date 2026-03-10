@@ -27,7 +27,8 @@ import { useTheme } from '../hooks/use-theme'
 import { terminalSupportsRgb24 } from '../utils/theme'
 import { stepCursorVertical } from './multiline-input.helpers'
 
-import type { InputValue } from '../types/store'
+import type { InputPasteSegment, InputValue } from '../types/store'
+import { applyTextEditWithSegments } from '../utils/strings'
 import type {
   KeyEvent,
   MouseEvent,
@@ -59,7 +60,60 @@ function renderIndexToSourceIndex(text: string, renderPos: number): number {
   return Math.min(sourcePos, text.length)
 }
 
+function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
+  return [...segments].sort((a, b) => a.start - b.start)
+}
 
+function findSegmentById(
+  segments: InputPasteSegment[],
+  id: string | null | undefined,
+): InputPasteSegment | undefined {
+  if (!id) return undefined
+  return segments.find((s) => s.id === id)
+}
+
+function segmentAtLeftEdge(
+  segments: InputPasteSegment[],
+  pos: number,
+): InputPasteSegment | undefined {
+  return segments.find((s) => s.end === pos)
+}
+
+function segmentAtRightEdge(
+  segments: InputPasteSegment[],
+  pos: number,
+): InputPasteSegment | undefined {
+  return segments.find((s) => s.start === pos)
+}
+
+function segmentContainingInterior(
+  segments: InputPasteSegment[],
+  pos: number,
+): InputPasteSegment | undefined {
+  return segments.find((s) => pos > s.start && pos < s.end)
+}
+
+function normalizeCursorPosition(
+  segments: InputPasteSegment[],
+  raw: number,
+  textLength: number,
+): number {
+  let pos = Math.max(0, Math.min(textLength, raw))
+
+  const interior = segmentContainingInterior(segments, pos)
+  if (interior) {
+    pos = (pos - interior.start <= interior.end - pos)
+      ? (interior.start === 0 ? 0 : interior.start - 1)
+      : interior.end
+  }
+
+  const atStart = segmentAtRightEdge(segments, pos)
+  if (atStart && atStart.start > 0) {
+    pos = atStart.start - 1
+  }
+
+  return pos
+}
 
 export { INPUT_CURSOR_CHAR } from './multiline-input.helpers'
 
@@ -69,6 +123,8 @@ interface CursorIndicatorProps {
   shouldBlink?: boolean
   char?: string
   color?: string
+  backgroundColor?: string
+  activeChar?: string
   blinkDelay?: number
   blinkInterval?: number
   bold?: boolean
@@ -80,9 +136,11 @@ export function InputCursor({
   shouldBlink = true,
   char = '▍',
   color,
+  backgroundColor,
+  activeChar,
   blinkDelay = 500,
   blinkInterval = 500,
-  bold = true,
+  bold = false,
 }: CursorIndicatorProps) {
   // false = normal/visible, true = invisible
   const [isBlinkHidden, setIsInvisible] = useState(false)
@@ -123,14 +181,19 @@ export function InputCursor({
     return null
   }
 
-  // When invisible, return a space to maintain layout
+  // When blink-off: show underlying character only for block cursor mode.
+  // For thin cursor mode, render nothing (never a space).
   if (isBlinkHidden) {
-    return <span> </span>
+    if (activeChar !== undefined) {
+      return <span>{activeChar}</span>
+    }
+    return null
   }
 
   return (
     <span
       {...(color ? { fg: color } : undefined)}
+      {...(backgroundColor ? { bg: backgroundColor } : undefined)}
       {...(bold ? { attributes: TextAttributes.BOLD } : undefined)}
     >
       {char}
@@ -158,6 +221,8 @@ interface MultilineInputProps {
   cursorPosition: number
   showScrollbar?: boolean
   highlightColor?: string
+  pasteSegments?: InputPasteSegment[]
+  selectedPasteSegmentId?: string | null
 }
 
 export type MultilineInputHandle = {
@@ -183,6 +248,8 @@ export const MultilineInput = forwardRef<
     cursorPosition,
     showScrollbar = false,
     highlightColor,
+    pasteSegments = [],
+    selectedPasteSegmentId = null,
   }: MultilineInputProps,
   forwardedRef,
 ) {
@@ -291,6 +358,31 @@ export const MultilineInput = forwardRef<
     }
   }, [scrollBoxRef.current, cursorPosition, focused, cursorRow])
 
+  const sortedPasteSegments = sortSegments(pasteSegments)
+
+  const commitInput = useCallback(
+    (
+      next: Partial<InputValue> & Pick<InputValue, 'text' | 'cursorPosition'>,
+    ) => {
+      const segments = next.pasteSegments ?? pasteSegments
+      onChange({
+        text: next.text,
+        cursorPosition: normalizeCursorPosition(
+          segments,
+          next.cursorPosition,
+          next.text.length,
+        ),
+        lastEditDueToNav: next.lastEditDueToNav ?? false,
+        pasteSegments: segments,
+        selectedPasteSegmentId:
+          next.selectedPasteSegmentId !== undefined
+            ? next.selectedPasteSegmentId
+            : selectedPasteSegmentId,
+      })
+    },
+    [onChange, pasteSegments, selectedPasteSegmentId],
+  )
+
   // Helper to get current selection in original text coordinates
   const readSelectedRange = useCallback((): { start: number; end: number } | null => {
     const textBufferView = (textRef.current as any)?.textBufferView
@@ -315,29 +407,29 @@ export const MultilineInput = forwardRef<
   }, [renderer])
 
   // Helper to delete selected text and return new value and cursor position
-  const cutSelectionRange = useCallback((): { newValue: string; newCursor: number } | null => {
-    const selection = readSelectedRange()
-    if (!selection) return null
-
-    const newValue = value.slice(0, selection.start) + value.slice(selection.end)
-    dismissSelection()
-    return { newValue, newCursor: selection.start }
-  }, [value, readSelectedRange, dismissSelection])
-
   // Helper to handle selection deletion and call onChange if selection existed
   // Returns true if selection was deleted, false otherwise
   const removeSelectionIfPresent = useCallback((): boolean => {
-    const deleted = cutSelectionRange()
-    if (deleted) {
-      onChange({
-        text: deleted.newValue,
-        cursorPosition: deleted.newCursor,
+    const selection = readSelectedRange()
+    if (!selection) return false
+    dismissSelection()
+    const next = applyTextEditWithSegments(
+      {
+        text: valueRef.current,
+        cursorPosition: cursorPositionRef.current,
         lastEditDueToNav: false,
-      })
-      return true
-    }
-    return false
-  }, [cutSelectionRange, onChange])
+        pasteSegments: sortedPasteSegments,
+        selectedPasteSegmentId,
+      },
+      selection.start,
+      selection.end,
+      '',
+    )
+    commitInput(next)
+    valueRef.current = next.text
+    cursorPositionRef.current = next.cursorPosition
+    return true
+  }, [readSelectedRange, dismissSelection, commitInput, sortedPasteSegments, selectedPasteSegmentId])
 
   const insertAtCaret = useCallback(
     (textToInsert: string) => {
@@ -346,64 +438,71 @@ export const MultilineInput = forwardRef<
       // Check if there's a selection to replace
       const selection = readSelectedRange()
       if (selection) {
-        // Replace selected text with the new text
         dismissSelection()
-        // Read from refs which have the latest values (updated synchronously below)
-        const currentValue = valueRef.current
-        const newValue =
-          currentValue.slice(0, selection.start) +
-          textToInsert +
-          currentValue.slice(selection.end)
-        const newCursor = selection.start + textToInsert.length
+        const next = applyTextEditWithSegments(
+          {
+            text: valueRef.current,
+            cursorPosition: cursorPositionRef.current,
+            lastEditDueToNav: false,
+            pasteSegments: sortedPasteSegments,
+            selectedPasteSegmentId,
+          },
+          selection.start,
+          selection.end,
+          textToInsert,
+        )
 
-        // Update refs synchronously BEFORE calling onChange - critical for IME input
-        // where multiple characters may arrive before React processes state updates
-        valueRef.current = newValue
-        cursorPositionRef.current = newCursor
-
-        onChange({
-          text: newValue,
-          cursorPosition: newCursor,
-          lastEditDueToNav: false,
-        })
+        valueRef.current = next.text
+        cursorPositionRef.current = next.cursorPosition
+        commitInput(next)
         return
       }
 
       // No selection, insert at cursor
       // Read from refs to get latest state (handles rapid IME input)
       const currentValue = valueRef.current
-      const currentCursor = cursorPositionRef.current
-      const newValue =
-        currentValue.slice(0, currentCursor) +
-        textToInsert +
-        currentValue.slice(currentCursor)
-      const newCursor = currentCursor + textToInsert.length
+      const currentCursor = normalizeCursorPosition(
+        sortedPasteSegments,
+        cursorPositionRef.current,
+        currentValue.length,
+      )
+      const next = applyTextEditWithSegments(
+        {
+          text: currentValue,
+          cursorPosition: currentCursor,
+          lastEditDueToNav: false,
+          pasteSegments: sortedPasteSegments,
+          selectedPasteSegmentId,
+        },
+        currentCursor,
+        currentCursor,
+        textToInsert,
+      )
 
-      // Update refs synchronously BEFORE calling onChange - critical for IME input
-      // where multiple characters may arrive before React processes state updates
-      valueRef.current = newValue
-      cursorPositionRef.current = newCursor
+      valueRef.current = next.text
+      cursorPositionRef.current = next.cursorPosition
 
-      onChange({
-        text: newValue,
-        cursorPosition: newCursor,
-        lastEditDueToNav: false,
-      })
+      commitInput(next)
     },
-    [onChange, readSelectedRange, dismissSelection],
+    [readSelectedRange, dismissSelection, sortedPasteSegments, selectedPasteSegmentId, commitInput],
   )
 
   const moveCursorTo = useCallback(
     (nextPosition: number) => {
-      const clamped = Math.max(0, Math.min(value.length, nextPosition))
-      if (clamped === cursorPosition) return
-      onChange({
+      const snapped = normalizeCursorPosition(
+        sortedPasteSegments,
+        nextPosition,
+        value.length,
+      )
+      if (snapped === cursorPosition && !selectedPasteSegmentId) return
+      commitInput({
         text: value,
-        cursorPosition: clamped,
+        cursorPosition: snapped,
+        selectedPasteSegmentId: null,
         lastEditDueToNav: false,
       })
     },
-    [cursorPosition, onChange, value],
+    [value, cursorPosition, selectedPasteSegmentId, sortedPasteSegments, commitInput],
   )
 
   // Handle mouse clicks to position cursor
@@ -457,23 +556,29 @@ export const MultilineInput = forwardRef<
       }
 
       // Clamp to valid range
-      const newCursorPosition = Math.min(charIndex, value.length)
+      const newCursorPosition = normalizeCursorPosition(
+        sortedPasteSegments,
+        Math.min(charIndex, value.length),
+        value.length,
+      )
 
       // Update cursor position if changed
       if (newCursorPosition !== cursorPosition) {
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: newCursorPosition,
           lastEditDueToNav: false,
+          selectedPasteSegmentId: null,
         })
       }
     },
-    [focused, lineInfo, value, cursorPosition, onChange],
+    [focused, lineInfo, value, cursorPosition, commitInput, sortedPasteSegments],
   )
 
   const isPlaceholder = value.length === 0 && placeholder.length > 0
   const displayValue = isPlaceholder ? placeholder : value
   const showCursor = focused
+  const showRenderableCursor = showCursor && !selectedPasteSegmentId
 
   // Replace tabs with spaces for proper rendering
   const displayValueForRendering = displayValue.replace(
@@ -565,26 +670,40 @@ export const MultilineInput = forwardRef<
 
         // For backslash+Enter, remove the backslash and insert newline
         if (isBackslashEnter) {
-          const newValue =
-            value.slice(0, cursorPosition - 1) +
-            '\n' +
-            value.slice(cursorPosition)
-          onChange({
-            text: newValue,
+          const next = applyTextEditWithSegments(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+            },
+            cursorPosition - 1,
             cursorPosition,
-            lastEditDueToNav: false,
-          })
+            '\n',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
           return true
         }
 
         // For other newline shortcuts (Shift+Enter, Option+Enter, Ctrl+J), just insert newline
-        const newValue =
-          value.slice(0, cursorPosition) + '\n' + value.slice(cursorPosition)
-        onChange({
-          text: newValue,
-          cursorPosition: cursorPosition + 1,
-          lastEditDueToNav: false,
-        })
+        const next = applyTextEditWithSegments(
+          {
+            text: value,
+            cursorPosition,
+            lastEditDueToNav: false,
+            pasteSegments: sortedPasteSegments,
+            selectedPasteSegmentId,
+          },
+          cursorPosition,
+          cursorPosition,
+          '\n',
+        )
+        valueRef.current = next.text
+        cursorPositionRef.current = next.cursorPosition
+        commitInput(next)
         return true
       }
 
@@ -596,8 +715,29 @@ export const MultilineInput = forwardRef<
 
       return false
     },
-    [value, cursorPosition, onChange, onSubmit],
+    [value, cursorPosition, onSubmit, commitInput, sortedPasteSegments, selectedPasteSegmentId],
   )
+
+  const deleteSegmentById = useCallback((segmentId: string): boolean => {
+    const segment = sortedPasteSegments.find((s) => s.id === segmentId)
+    if (!segment) return false
+    const next = applyTextEditWithSegments(
+      {
+        text: value,
+        cursorPosition,
+        lastEditDueToNav: false,
+        pasteSegments: sortedPasteSegments,
+        selectedPasteSegmentId,
+      },
+      segment.start,
+      segment.end,
+      '',
+    )
+    valueRef.current = next.text
+    cursorPositionRef.current = next.cursorPosition
+    commitInput(next)
+    return true
+  }, [sortedPasteSegments, value, cursorPosition, selectedPasteSegmentId, commitInput])
 
   // Handle deletion keys (backspace, delete, word/line deletion)
   const processDeletionKey = useCallback(
@@ -611,13 +751,21 @@ export const MultilineInput = forwardRef<
       if (key.name === 'backspace' && hasAltLikeModifier) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
-        const newValue =
-          value.slice(0, wordStart) + value.slice(cursorPosition)
-        onChange({
-          text: newValue,
-          cursorPosition: wordStart,
-          lastEditDueToNav: false,
-        })
+        const next = applyTextEditWithSegments(
+          {
+            text: value,
+            cursorPosition,
+            lastEditDueToNav: false,
+            pasteSegments: sortedPasteSegments,
+            selectedPasteSegmentId,
+          },
+          wordStart,
+          cursorPosition,
+          '',
+        )
+        valueRef.current = next.text
+        cursorPositionRef.current = next.cursorPosition
+        commitInput(next)
         return true
       }
 
@@ -650,11 +798,23 @@ export const MultilineInput = forwardRef<
         }
 
         if (newValue !== originalValue) {
-          onChange({
-            text: newValue,
-            cursorPosition: nextCursor,
-            lastEditDueToNav: false,
-          })
+          const deleteStart = Math.min(cursorPosition, nextCursor)
+          const deleteEnd = Math.max(cursorPosition, nextCursor)
+          const next = applyTextEditWithSegments(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+            },
+            deleteStart,
+            deleteEnd,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
         }
         return true
       }
@@ -663,12 +823,21 @@ export const MultilineInput = forwardRef<
       if (key.name === 'delete' && hasAltLikeModifier) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
-        const newValue = value.slice(0, cursorPosition) + value.slice(wordEnd)
-        onChange({
-          text: newValue,
+        const next = applyTextEditWithSegments(
+          {
+            text: value,
+            cursorPosition,
+            lastEditDueToNav: false,
+            pasteSegments: sortedPasteSegments,
+            selectedPasteSegmentId,
+          },
           cursorPosition,
-          lastEditDueToNav: false,
-        })
+          wordEnd,
+          '',
+        )
+        valueRef.current = next.text
+        cursorPositionRef.current = next.cursorPosition
+        commitInput(next)
         return true
       }
 
@@ -676,14 +845,41 @@ export const MultilineInput = forwardRef<
       if (key.name === 'backspace' && !key.ctrl && !key.meta && !key.option) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
-        if (cursorPosition > 0) {
-          const newValue =
-            value.slice(0, cursorPosition - 1) + value.slice(cursorPosition)
-          onChange({
-            text: newValue,
-            cursorPosition: cursorPosition - 1,
-            lastEditDueToNav: false,
+
+        const selectedSegment = findSegmentById(
+          sortedPasteSegments,
+          selectedPasteSegmentId,
+        )
+        if (selectedSegment) {
+          return deleteSegmentById(selectedSegment.id)
+        }
+
+        const leftSeg = segmentAtLeftEdge(sortedPasteSegments, cursorPosition)
+        if (leftSeg) {
+          commitInput({
+            text: value,
+            cursorPosition: leftSeg.end,
+            selectedPasteSegmentId: leftSeg.id,
           })
+          return true
+        }
+
+        if (cursorPosition > 0) {
+          const next = applyTextEditWithSegments(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+            },
+            cursorPosition - 1,
+            cursorPosition,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
         }
         return true
       }
@@ -692,21 +888,51 @@ export const MultilineInput = forwardRef<
       if (key.name === 'delete' && !key.ctrl && !key.meta && !key.option) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
-        if (cursorPosition < value.length) {
-          const newValue =
-            value.slice(0, cursorPosition) + value.slice(cursorPosition + 1)
-          onChange({
-            text: newValue,
-            cursorPosition,
-            lastEditDueToNav: false,
+
+        const selectedSegment = findSegmentById(
+          sortedPasteSegments,
+          selectedPasteSegmentId,
+        )
+        if (selectedSegment) {
+          return deleteSegmentById(selectedSegment.id)
+        }
+
+        const forwardSeg =
+          segmentAtRightEdge(sortedPasteSegments, cursorPosition + 1) ??
+          segmentAtRightEdge(sortedPasteSegments, cursorPosition)
+
+        if (forwardSeg) {
+          commitInput({
+            text: value,
+            cursorPosition: forwardSeg.end,
+            selectedPasteSegmentId: forwardSeg.id,
           })
+          return true
+        }
+
+        if (cursorPosition < value.length) {
+          const next = applyTextEditWithSegments(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+            },
+            cursorPosition,
+            cursorPosition + 1,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
         }
         return true
       }
 
       return false
     },
-    [value, cursorPosition, onChange, removeSelectionIfPresent],
+    [value, cursorPosition, commitInput, removeSelectionIfPresent, sortedPasteSegments, selectedPasteSegmentId, deleteSegmentById],
   )
 
   // Handle navigation keys (arrows, home, end, word navigation)
@@ -743,7 +969,7 @@ export const MultilineInput = forwardRef<
         (key.name === 'left' || lowerKeyName === 'b')
       ) {
         suppressKeyDefault(key)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: wordStart,
           lastEditDueToNav: false,
@@ -757,7 +983,7 @@ export const MultilineInput = forwardRef<
         (key.name === 'right' || lowerKeyName === 'f')
       ) {
         suppressKeyDefault(key)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: wordEnd,
           lastEditDueToNav: false,
@@ -771,7 +997,7 @@ export const MultilineInput = forwardRef<
         (key.name === 'home' && !key.ctrl && !key.meta)
       ) {
         suppressKeyDefault(key)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: visualLineStart,
           lastEditDueToNav: false,
@@ -785,7 +1011,7 @@ export const MultilineInput = forwardRef<
         (key.name === 'end' && !key.ctrl && !key.meta)
       ) {
         suppressKeyDefault(key)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: visualLineEnd,
           lastEditDueToNav: false,
@@ -799,7 +1025,7 @@ export const MultilineInput = forwardRef<
         (key.ctrl && key.name === 'home')
       ) {
         suppressKeyDefault(key)
-        onChange({ text: value, cursorPosition: 0, lastEditDueToNav: false })
+        commitInput({ text: value, cursorPosition: 0, lastEditDueToNav: false })
         return true
       }
 
@@ -809,7 +1035,7 @@ export const MultilineInput = forwardRef<
         (key.ctrl && key.name === 'end')
       ) {
         suppressKeyDefault(key)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: value.length,
           lastEditDueToNav: false,
@@ -817,9 +1043,44 @@ export const MultilineInput = forwardRef<
         return true
       }
 
+      const selectedSegment = findSegmentById(
+        sortedPasteSegments,
+        selectedPasteSegmentId,
+      )
+
+      if (selectedPasteSegmentId && !selectedSegment) {
+        commitInput({ text: value, cursorPosition, selectedPasteSegmentId: null })
+        return true
+      }
+
       // Left arrow (no modifiers)
       if (key.name === 'left' && !key.ctrl && !key.meta && !key.option) {
         suppressKeyDefault(key)
+
+        if (selectedSegment) {
+          const adjLeft = segmentAtLeftEdge(sortedPasteSegments, selectedSegment.start)
+          if (adjLeft) {
+            commitInput({
+              text: value,
+              cursorPosition: adjLeft.end,
+              selectedPasteSegmentId: adjLeft.id,
+            })
+          } else {
+            moveCursorTo(selectedSegment.start - 1)
+          }
+          return true
+        }
+
+        const leftSeg = segmentAtLeftEdge(sortedPasteSegments, cursorPosition)
+        if (leftSeg) {
+          commitInput({
+            text: value,
+            cursorPosition: leftSeg.end,
+            selectedPasteSegmentId: leftSeg.id,
+          })
+          return true
+        }
+
         moveCursorTo(cursorPosition - 1)
         return true
       }
@@ -827,6 +1088,31 @@ export const MultilineInput = forwardRef<
       // Right arrow (no modifiers)
       if (key.name === 'right' && !key.ctrl && !key.meta && !key.option) {
         suppressKeyDefault(key)
+
+        if (selectedSegment) {
+          const adjRight = segmentAtRightEdge(sortedPasteSegments, selectedSegment.end)
+          if (adjRight) {
+            commitInput({
+              text: value,
+              cursorPosition: adjRight.end,
+              selectedPasteSegmentId: adjRight.id,
+            })
+          } else {
+            moveCursorTo(selectedSegment.end + 1)
+          }
+          return true
+        }
+
+        const rightSeg = segmentAtRightEdge(sortedPasteSegments, cursorPosition + 1)
+        if (rightSeg) {
+          commitInput({
+            text: value,
+            cursorPosition: rightSeg.end,
+            selectedPasteSegmentId: rightSeg.id,
+          })
+          return true
+        }
+
         moveCursorTo(cursorPosition + 1)
         return true
       }
@@ -835,7 +1121,7 @@ export const MultilineInput = forwardRef<
       if (key.name === 'up' && !key.ctrl && !key.meta && !key.option) {
         suppressKeyDefault(key)
         const targetColumn = resolveStickyColumn(lineStarts, !shouldHighlight)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: stepCursorVertical({
             cursorPosition,
@@ -853,7 +1139,7 @@ export const MultilineInput = forwardRef<
       if (key.name === 'down' && !key.ctrl && !key.meta && !key.option) {
         suppressKeyDefault(key)
         const targetColumn = resolveStickyColumn(lineStarts, !shouldHighlight)
-        onChange({
+        commitInput({
           text: value,
           cursorPosition: stepCursorVertical({
             cursorPosition,
@@ -869,7 +1155,7 @@ export const MultilineInput = forwardRef<
 
       return false
     },
-    [value, cursorPosition, onChange, moveCursorTo, shouldHighlight, resolveStickyColumn],
+    [value, cursorPosition, commitInput, moveCursorTo, shouldHighlight, resolveStickyColumn, sortedPasteSegments, selectedPasteSegmentId],
   )
 
   // Handle character input (regular chars, tab, and IME/multi-byte input)
@@ -915,6 +1201,33 @@ export const MultilineInput = forwardRef<
       (key: KeyEvent) => {
         if (!focused) return
 
+        const selectedSegment = findSegmentById(
+          sortedPasteSegments,
+          selectedPasteSegmentId,
+        )
+        if (selectedPasteSegmentId && !selectedSegment) {
+          commitInput({
+            text: value,
+            cursorPosition,
+            selectedPasteSegmentId: null,
+          })
+          return
+        }
+
+        const isPillActionKey =
+          key.name === 'left' ||
+          key.name === 'right' ||
+          key.name === 'backspace' ||
+          key.name === 'delete'
+
+        if (selectedSegment && !isPillActionKey) {
+          commitInput({
+            text: value,
+            cursorPosition: selectedSegment.end,
+            selectedPasteSegmentId: null,
+          })
+        }
+
         if (onKeyIntercept) {
           const handled = onKeyIntercept(key)
           if (handled) return
@@ -939,6 +1252,11 @@ export const MultilineInput = forwardRef<
         processDeletionKey,
         processNavigationKey,
         processCharacterKey,
+        selectedPasteSegmentId,
+        sortedPasteSegments,
+        cursorPosition,
+        commitInput,
+        value,
       ],
     ),
   )
@@ -1020,36 +1338,107 @@ export const MultilineInput = forwardRef<
         ref={textRef}
         style={{ bg: 'transparent', fg: inputColor, wrapMode: 'word' }}
       >
-        {showCursor ? (
+        {isPlaceholder ? (
           <>
-            {beforeCursor}
-            {shouldHighlight ? (
-              <span
-                bg={highlightBg}
-                fg={theme.background}
-                attributes={TextAttributes.BOLD}
-              >
-                {activeChar === ' ' ? '\u00a0' : activeChar}
-              </span>
-            ) : (
+            {showRenderableCursor && (
               <InputCursor
                 visible={true}
                 focused={focused}
                 shouldBlink={effectiveShouldBlinkCursor}
+                char={'▍'}
                 color={terminalSupportsRgb24() ? (highlightColor ?? theme.info) : 'cyan'}
-                key={lastActivity}
+                activeChar={' '}
+                key={`placeholder-cursor-${lastActivity}`}
               />
             )}
-            {shouldHighlight
-              ? afterCursor.length > 0
-                ? afterCursor.slice(1)
-                : ''
-              : afterCursor}
+            {displayValueForRendering}
             {layoutMetrics.gutterEnabled ? '\n' : ''}
           </>
         ) : (
           <>
-            {displayValueForRendering}
+            {(() => {
+              const out: any[] = []
+              let pos = 0
+              let cursorRendered = false
+              let cursorRenderCount = 0
+
+              const pushCursor = (activeChar?: string) => {
+                if (!showRenderableCursor || cursorRendered) return
+                const cursorColor = terminalSupportsRgb24() ? (highlightColor ?? theme.info) : 'cyan'
+                const isBlockCursor =
+        activeChar !== undefined &&
+        activeChar !== ' ' &&
+        activeChar !== '\t'
+                out.push(
+                  <InputCursor
+                    key={`cursor-${cursorPosition}-${lastActivity}-${cursorRenderCount++}`}
+                    visible={true}
+                    focused={focused}
+                    shouldBlink={effectiveShouldBlinkCursor}
+                    char={isBlockCursor ? activeChar : '▍'}
+                    color={isBlockCursor ? undefined : cursorColor}
+                    backgroundColor={isBlockCursor ? cursorColor : undefined}
+                    activeChar={activeChar}
+                  />,
+                )
+                cursorRendered = true
+              }
+
+              const pushTextChunk = (text: string, key: string) => {
+                if (!text) return
+                if (
+                  showRenderableCursor &&
+                  !cursorRendered &&
+                  cursorPosition >= pos &&
+                  cursorPosition < pos + text.length
+                ) {
+                  const rel = cursorPosition - pos
+                  const activeChar = text.charAt(rel)
+                  out.push(<span key={`${key}-pre`}>{text.slice(0, rel)}</span>)
+                  pushCursor(activeChar)
+                  out.push(<span key={`${key}-post`}>{text.slice(rel + 1)}</span>)
+                } else {
+                  out.push(<span key={key}>{text}</span>)
+                }
+                pos += text.length
+              }
+
+              for (const segment of sortedPasteSegments) {
+                const preText = value.slice(pos, segment.start)
+
+                if (segment.start > pos) {
+                  pushTextChunk(preText, `t-${pos}`)
+                }
+
+                const segmentText = value.slice(segment.start, segment.end)
+                out.push(
+                  <span
+                    key={`p-${segment.id}`}
+                    fg={selectedPasteSegmentId === segment.id ? theme.link : theme.primary}
+                    attributes={
+                      selectedPasteSegmentId === segment.id
+                        ? TextAttributes.BOLD
+                        : undefined
+                    }
+                  >
+                    {segmentText}
+                  </span>,
+                )
+
+                pos = segment.end
+
+              }
+
+              if (pos < value.length) {
+                pushTextChunk(value.slice(pos), 'tail')
+              }
+
+              if (showRenderableCursor && !cursorRendered && cursorPosition === value.length) {
+                pushCursor()
+              }
+
+              return out
+            })()}
             {layoutMetrics.gutterEnabled ? '\n' : ''}
           </>
         )}
