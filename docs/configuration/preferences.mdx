@@ -1,0 +1,76 @@
+---
+title: Preferences
+description: "Global preferences, data storage, and project configuration"
+icon: sliders-horizontal
+---
+
+## `~/.magnitude/`
+
+Magnitude creates `~/.magnitude/` automatically to store your local settings, credentials, and runtime data.
+
+| Path | Purpose |
+|---|---|
+| `config.json` | Preferences and global settings |
+| `auth.json` | Stored provider credentials |
+| `sessions/` | Session history |
+| `logs/` | CLI and event logs |
+| `skills/` | Global Magnitude skills |
+| `models-cache.json` | Cached model list |
+| `traces/` | Debug trace data |
+
+## `config.json`
+
+`~/.magnitude/config.json` stores your global Magnitude preferences.
+
+You can edit these toggles directly:
+
+- `"memory": false` — disables learned preferences
+- `"telemetry": false` — opts out of anonymous telemetry (also controllable via `MAGNITUDE_TELEMETRY`)
+
+It also stores model selections, provider options, `machineId`, and `setupComplete` (typically managed through `/settings`).
+
+```json
+{
+  "primaryModel": { "providerId": "anthropic", "modelId": "claude-opus-4-6" },
+  "secondaryModel": { "providerId": "openai", "modelId": "gpt-5.3-codex" },
+  "browserModel": { "providerId": "anthropic", "modelId": "claude-haiku-4-5-20251001" },
+  "providerOptions": {
+    "local": { "baseUrl": "http://localhost:1234/v1", "modelId": "qwen2.5-coder" }
+  },
+  "setupComplete": true,
+  "machineId": "your-machine-id",
+  "memory": true,
+  "telemetry": true
+}
+```
+
+<Info>Use `/settings` for normal configuration changes. Edit `config.json` manually only when you need direct control.</Info>
+
+## `auth.json`
+
+`~/.magnitude/auth.json` stores provider API keys and OAuth tokens used by Magnitude.
+
+- File permissions are restricted (`600`)
+- Delete this file to clear saved credentials and re-authenticate providers
+
+
+
+## `AGENTS.md`
+
+Run `/init` to generate an `AGENTS.md` file that gives Magnitude context about your project.
+
+## `sessions/`
+
+`~/.magnitude/sessions/` stores your conversation history and artifacts. See [Sessions](/using-magnitude/sessions) for details.
+
+## `logs/`
+
+`~/.magnitude/logs/` stores CLI and event logs. You can inspect them with `bun logs`.
+
+## `models-cache.json`
+
+`~/.magnitude/models-cache.json` stores cached model metadata. You can delete it to force a refresh.
+
+## `traces/`
+
+`~/.magnitude/traces/` stores debug trace output when tracing is enabled.

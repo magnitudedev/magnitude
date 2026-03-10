@@ -1,0 +1,52 @@
+---
+title: Browser Agent
+description: "Visual browser interaction with web applications"
+icon: globe
+---
+
+## Overview
+
+Magnitude can control a browser visually using screenshots to observe the page and coordinate-based actions to interact with it.
+
+Common uses include:
+- Testing web UI behavior
+- Verifying interface changes
+- Web scraping and scripted browsing tasks
+
+## Setup
+
+The browser agent requires Chromium.
+
+- Run `/browser-setup` in Magnitude, or
+- Install manually with:
+
+```bash
+npx patchright install chromium
+```
+
+## How it works
+
+On each turn, the browser agent receives a fresh screenshot of the current page. It can then perform actions such as clicking, typing, scrolling, dragging, navigation, tab switching, or JavaScript evaluation.
+
+After actions, it waits for page stability before continuing so results are based on settled page state.
+
+## Supported models
+
+The browser agent requires a visually grounded model.
+
+See [Providers & Models](/configuration/providers-and-models) for compatibility details.
+
+## Capabilities
+
+- Click
+- Double-click
+- Right-click
+- Type (including special keys)
+- Scroll
+- Drag
+- Navigate
+- Go back
+- Tab management
+- Screenshots
+- JavaScript evaluation
+

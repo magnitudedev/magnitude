@@ -1,79 +1,45 @@
 ---
 title: Subagents
-description: "The specialized agents Magnitude deploys for exploration, planning, implementation, and verification"
+description: "Specialized agents the orchestrator delegates to for research, planning, implementation, debugging, and verification"
 icon: users
 ---
 
-Subagents are specialized workers the orchestrator deploys to handle non-trivial tasks.
+Magnitude uses an orchestrator + subagent model. The orchestrator delegates focused work to specialized agents, then combines their results into the next decision.
 
-## The 6 subagent types
+## Agent types
 
 ### Explorer
-
-- **Purpose:** Broad and deep investigation across codebase and external sources
-- **Access:** Read-only tools + web search
-- **Output:** Findings artifact (architecture, patterns, evidence, recommendations)
-
-Use an explorer when you need fast coverage, deeper analysis, external references, or trade-off evaluation.
+- **Purpose:** Investigate the codebase and gather evidence quickly.
+- **Access:** Read-only filesystem and shell access, web search.
 
 ### Planner
-
-- **Purpose:** Evaluate implementation approaches and produce an execution plan
-- **Access:** Read-only tools + web search
-- **Output:** Plan artifact (steps, trade-offs, open questions)
-
-Use a planner before implementation when the change is non-trivial.
+- **Purpose:** Evaluate approaches and produce an implementation plan.
+- **Access:** Read-only filesystem and shell access, web search.
 
 ### Builder
-
-- **Purpose:** Autonomous code implementation
-- **Access:** Full read-write tools + web search
-- **Output:** Code changes in the repository
-
-Use a builder when there is a clear plan and the task is ready to implement.
+- **Purpose:** Implement code changes.
+- **Access:** Read-write filesystem and shell access.
 
 ### Debugger
-
-- **Purpose:** Root-cause diagnosis of bugs
-- **Access:** Full read-write tools + web search
-- **Output:** Diagnosis report (symptom, cause, evidence, recommended fix)
-
-Use a debugger when behavior is unclear and you need evidence-backed diagnosis.
+- **Purpose:** Root-cause bugs through hypothesis testing.
+- **Access:** Read-write filesystem and shell access.
 
 ### Reviewer
-
-- **Purpose:** Independent verification
-- **Access:** Read-focused verification tools; runs tests/build/typechecks; can spawn browser agents
-- **Output:** Verification report with pass/fail findings
-
-Use a reviewer after significant builds to confirm behavior, not just code shape.
+- **Purpose:** Independently verify quality and behavior after changes.
+- **Access:** Read-only verification access; can spawn browser agents when visual checks are needed.
 
 ### Browser
+- **Purpose:** Visual browser interaction with web applications.
+- **Access:** Screenshot-based browser controls (click, type, scroll, navigate, tabs, evaluate JavaScript).
 
-- **Purpose:** Visual UI interaction and validation
-- **Access:** Playwright-style browser actions (navigate, click, type, screenshot, evaluate)
-- **Output:** Interaction log + visual findings
+## How subagents are used
 
-Use a browser agent for layout, styling, and interactive UI checks.
+- The orchestrator chooses the right specialist for each part of a task.
+- Multiple subagents can run in parallel.
+- Subagents are persistent workers that can be paused or dismissed.
+- Each agent has tool access levels appropriate to its role.
+- Activity appears inline in the interface as agent cards, so delegation is visible as it happens.
 
-## How the orchestrator chooses
-
-The orchestrator chooses subagents based on the job:
-
-- Need broad or deep investigation → **Explorer**
-- Need approach selection → **Planner**
-- Need implementation → **Builder**
-- Need bug diagnosis → **Debugger**
-- Need independent verification → **Reviewer**
-- Need visual UI checks → **Browser**
-
-A single request often uses multiple subagents in sequence.
-
-## Parallel execution
-
-Multiple subagents can run in parallel on separate forks.
-
-This lets Magnitude:
-- Explore different areas at once
-- Compare options faster
-- Keep independent workstreams isolated
+<Info>
+Subagents are not separate assistants you chat with directly. The orchestrator manages delegation and reports progress back in your main conversation.
+</Info>

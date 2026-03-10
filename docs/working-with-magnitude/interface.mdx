@@ -1,0 +1,40 @@
+---
+title: Interface
+description: "How to read Magnitude's chat interface"
+icon: app-window
+---
+
+Magnitude is designed so you can quickly understand what the agent is doing at every step.
+
+## Chat
+
+Assistant messages stream in real time, so you can follow progress as it happens.
+
+Think blocks appear inline while the agent works. They are collapsible and summarize internal reasoning and tool activity (reads, edits, searches, shell output, and more). Tool results are rendered with visual views so changes and outputs are easier to scan.
+
+<Info>
+Think blocks are there to help you follow execution, not just final answers.
+</Info>
+
+## Agent activity
+
+When work is delegated, you'll see inline subagent activity cards in the conversation.
+
+Each card shows what a subagent is doing, along with status and progress. Select **View details** to open a deeper timeline for that subagent, including its messages and think blocks. If that subagent delegates further, you can continue drilling into nested activity.
+
+## Artifacts
+
+When an agent references an artifact, it appears as a clickable `[[artifact]]` chip in the message.
+
+Selecting a chip opens the artifact reader side panel, where you can review content, copy it, and close the panel when done.
+
+## Context bar
+
+Near the input area, the context bar shows token usage so you can track how much context is currently in play during a session.
+
+## Recent chats
+
+On startup, Magnitude shows a recent chats widget so you can jump back into earlier work quickly.
+
+For a full list, open the recent chats overlay with `Ctrl+R`.
+

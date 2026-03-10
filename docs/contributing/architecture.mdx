@@ -31,10 +31,8 @@ Agent Core also depends on:
 - `packages/providers/` (provider registry, auth, models)
 - `packages/llm-core/` (LLM abstraction and orchestration)
 - `packages/browser-harness/` (Playwright browser automation)
-- `packages/antml/` (ANTML parsing)
 - `packages/telemetry/` (anonymous usage events)
 - `packages/tracing/` (tracing/debugging)
-- `packages/js-act/` (legacy runtime support)
 ```
 
 ## Event-driven architecture
@@ -53,8 +51,7 @@ This architecture makes runs replayable and deterministic, and it enables robust
 Magnitude uses a full agent taxonomy with distinct prompts and tool access:
 
 - **Orchestrator**: user-facing coordinator; manages delegation and conversation.
-- **Scout**: fast reconnaissance and codebase orientation.
-- **Researcher**: deep investigation and evidence gathering.
+- **Explorer**: codebase investigation and evidence gathering.
 - **Planner**: converts findings into actionable implementation plans.
 - **Builder**: performs concrete code changes and implementation.
 - **Debugger**: diagnoses failures and resolves regressions.

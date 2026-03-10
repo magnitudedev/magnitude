@@ -1,10 +1,10 @@
 ---
-title: Shell Commands
-description: "Execute shell commands from the agent"
+title: Shell & Permissions
+description: "Shell commands, permissions, and safety"
 icon: terminal
 ---
 
-## shell
+## Usage
 
 Execute a shell command.
 
@@ -26,23 +26,35 @@ Returns:
 - Output is capped at 10MB
 - Returns stdout, stderr, and exit code
 
-## Permissions
+## Command tiers
 
-Shell commands are classified into three tiers:
+Magnitude classifies shell commands into three safety tiers:
 
-- **Read-only** — commands like `ls`, `cat`, `grep`, `find`, `git status`, and `git log` that only read data. These always run freely.
-- **Standard** — commands like `npm install`, `npm test`, or `mkdir` that modify files or run processes. These are allowed within the current working directory but **blocked if they write outside it**.
-- **Forbidden** — destructive commands like `rm -rf /`, `mkfs`, or `dd` targeting system paths. These are always blocked.
+- **Read-only** — always allowed (`ls`, `cat`, `grep`, `find`, `git status`, `git log`, `git diff`, and similar)
+- **Standard** — allowed for most agents, but blocked if they target paths outside the working directory
+- **Forbidden** — always blocked, with no override
 
-**Non-read-only git commands are always blocked.**
+Forbidden commands include:
 
-### Working directory restriction
+- Destructive infrastructure commands (Docker/Kubernetes/Terraform mutations)
+- Cloud CLI mutations (AWS/GCP/Azure write operations)
+- Database destructive operations
+- System administration changes (power, network, firewall, critical services)
+- Package registry publishing (`npm publish`, `cargo publish`, and similar)
+- Dangerous Git operations (force push, reset, and similar)
 
-Standard commands are restricted to your project directory. Any command that writes to paths outside the current working directory is blocked (with exceptions for `/tmp` and `/dev/null`).
+Non-read-only Git commands are always blocked.
 
-### Per-agent access
+## Path safety
 
-Not all agents have the same shell access:
+All file writes, edits, and shell commands that target paths outside your working directory are blocked. Exceptions: `/tmp` and `/dev/null`.
 
-- **Read-only agents** (explorer, planner) — can only run read-only commands. Standard and forbidden commands are rejected.
-- **Write agents** (orchestrator, builder, debugger, reviewer) — can run read-only and standard commands within the working directory. Forbidden commands are always rejected.
+## Per-agent access
+
+Not all agents have the same access:
+
+- **Explorer** and **Planner** are read-only (read-only shell only, no file writes)
+- **Builder** and **Debugger** can write files and run standard shell commands within the working directory
+- The **Orchestrator** has the broadest access, but is still subject to shell safety rules
+
+<Info>If a command is blocked that you need, you can run it yourself in bash mode (`/bash`) or a separate terminal.</Info>

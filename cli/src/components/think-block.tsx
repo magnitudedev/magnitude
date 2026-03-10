@@ -454,7 +454,7 @@ export const ThinkBlock = memo(function ThinkBlock({
       {!hideHeader && (
         <Button
           onClick={() => { setExpandedSteps(new Set()); onToggle() }}
-          style={{ flexDirection: 'row' }}
+          style={{ flexDirection: 'row', alignSelf: 'flex-start' }}
           onMouseOver={() => setIsHeaderHovered(true)}
           onMouseOut={() => setIsHeaderHovered(false)}
         >

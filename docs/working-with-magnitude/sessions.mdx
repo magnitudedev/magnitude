@@ -1,0 +1,43 @@
+---
+title: Sessions
+description: "Resume, store, and inspect previous conversations"
+icon: history
+---
+
+Magnitude automatically saves conversations so you can return to them later.
+
+## Resuming sessions
+
+You can resume in three ways:
+
+- `magnitude --resume` resumes your most recent session immediately.
+- `/resume` opens the conversation picker so you can choose from recent conversations.
+- `Ctrl+R` opens the same recent conversations overlay as `/resume`.
+
+
+## Session storage
+
+Sessions are stored in `~/.magnitude/sessions/` in timestamped directories (for example, `2026-02-11T06-10-39Z/`).
+
+Each session directory includes:
+
+- `events.jsonl` — event stream for the session
+- `meta.json` — session metadata
+- `logs.jsonl` — logger output for that session
+
+## Session inspection
+
+For deeper debugging or auditing, use the `bun session` commands:
+
+```bash
+bun session list
+bun session events <id>
+bun session search <keyword> <id>
+bun session projection <id> Memory
+```
+
+These commands let you list sessions, inspect event timelines, search payloads, and replay projection state.
+
+<Warning>
+Session files are source data for inspection. Avoid manual edits unless you're doing controlled debugging.
+</Warning>
