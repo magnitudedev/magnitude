@@ -25,7 +25,7 @@ jobs:
             os: ubuntu-latest
             artifact: magnitude-linux-x64
           - target: bun-linux-arm64
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             artifact: magnitude-linux-arm64
           - target: bun-windows-x64
             os: windows-latest
@@ -39,6 +39,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - run: cargo install wasm-pack
+      - run: cd packages/llm-core && bunx baml-cli generate
       - run: bun run cli/scripts/build-binary.ts ${{ matrix.target }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

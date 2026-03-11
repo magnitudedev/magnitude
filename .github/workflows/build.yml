@@ -18,7 +18,7 @@ jobs:
           - target: bun-linux-x64
             os: ubuntu-latest
           - target: bun-linux-arm64
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
           - target: bun-windows-x64
             os: windows-latest
     runs-on: ${{ matrix.os }}
@@ -30,6 +30,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - run: cargo install wasm-pack
+      - run: cd packages/llm-core && bunx baml-cli generate
       - run: bun run cli/scripts/build-binary.ts ${{ matrix.target }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

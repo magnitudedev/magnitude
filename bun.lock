@@ -69,7 +69,7 @@
     },
     "packages/agent": {
       "name": "@magnitudedev/agent",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.74.0",
         "@google/genai": "^1.41.0",
@@ -98,7 +98,7 @@
     },
     "packages/agent-definition": {
       "name": "@magnitudedev/agent-definition",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/tools": "workspace:*",
       },
@@ -124,14 +124,14 @@
     },
     "packages/cli": {
       "name": "@magnitudedev/cli",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
     },
     "packages/dom-extract": {
       "name": "@magnitudedev/dom-extract",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/generate-id": "workspace:*",
         "cheerio": "^1.0.0",
@@ -142,7 +142,7 @@
     },
     "packages/event-core": {
       "name": "@magnitudedev/event-core",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/generate-id": "workspace:*",
         "effect": "^3.19.6",
@@ -154,18 +154,18 @@
     },
     "packages/generate-id": {
       "name": "@magnitudedev/generate-id",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@paralleldrive/cuid2": "^3.3.0",
       },
     },
     "packages/image": {
       "name": "@magnitudedev/image",
-      "version": "0.1.0",
+      "version": "0.0.1",
     },
     "packages/llm-core": {
       "name": "@magnitudedev/llm-core",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@boundaryml/baml": "^0.219.0",
       },
@@ -175,14 +175,14 @@
     },
     "packages/logger": {
       "name": "@magnitudedev/logger",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "devDependencies": {
         "@types/bun": "latest",
       },
     },
     "packages/providers": {
       "name": "@magnitudedev/providers",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "crypto": "*",
       },
@@ -195,14 +195,14 @@
     },
     "packages/ripgrep": {
       "name": "@magnitudedev/ripgrep",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "devDependencies": {
         "@types/bun": "latest",
       },
     },
     "packages/shell-classifier": {
       "name": "@magnitude/shell-classifier",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "typescript": "^5.0.0",
       },
@@ -212,7 +212,7 @@
     },
     "packages/telemetry": {
       "name": "@magnitudedev/telemetry",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/generate-id": "workspace:*",
         "@magnitudedev/logger": "workspace:*",
@@ -224,7 +224,7 @@
     },
     "packages/tools": {
       "name": "@magnitudedev/tools",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@effect/schema": "^0.75.5",
         "effect": "^3.19.6",
@@ -233,7 +233,7 @@
     },
     "packages/tracing": {
       "name": "@magnitudedev/tracing",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@magnitudedev/llm-core": "workspace:*",
         "@magnitudedev/logger": "workspace:*",
@@ -251,7 +251,7 @@
     },
     "packages/xml-act": {
       "name": "@magnitudedev/xml-act",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@effect/schema": "^0.75.5",
         "@magnitudedev/generate-id": "workspace:*",
