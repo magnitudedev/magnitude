@@ -6,7 +6,7 @@
  * No file write access — reviewers only observe, test, and report.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import { readTool, treeTool, searchTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
 
@@ -15,6 +15,30 @@ import { artifactReadTool } from '../tools/artifact-tools'
 import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
 import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+
+const intentLens = defineThinkingLens({
+  name: 'intent',
+  trigger: 'When beginning review or evaluating changes',
+  description: "What did the user actually ask for? Re-read the original request and any plans. Evaluate the work against the user's intent, not just against whether the code looks reasonable.",
+})
+
+const qualityLens = defineThinkingLens({
+  name: 'quality',
+  trigger: 'When examining implemented code',
+  description: 'Does the implementation match existing patterns and conventions? Is it consistent with the surrounding codebase? Look for style mismatches, abstraction violations, and unnecessary complexity.',
+})
+
+const skepticismLens = defineThinkingLens({
+  name: 'skepticism',
+  trigger: 'When evaluating whether work is complete and correct',
+  description: "Assume nothing works until proven. What could still be wrong? What edge cases haven't been tested? What claims are being made without evidence? Don't accept code reading as proof of correctness — run things.",
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When planning your next actions',
+  description: 'Plan what to verify this turn. What tests to run, what commands to execute, what code to inspect? Prioritize execution-based verification over code reading.',
+})
 
 const tools = toolSet({
   fileRead:       readTool,
@@ -33,7 +57,7 @@ export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools
   id: 'reviewer',
   model: 'secondary',
   systemPrompt,
-  thinkingLenses: [taskThinkingLens, turnThinkingLens],
+  thinkingLenses: [intentLens, qualityLens, skepticismLens, turnLens],
 
   permission: (p) => ({
     shell(input, ctx) {

@@ -6,7 +6,7 @@
  * Communicates back via parent.message.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import { readTool, treeTool, searchTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
@@ -17,6 +17,36 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
 import { classifyShellCommand } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+
+const ideateLens = defineThinkingLens({
+  name: 'ideate',
+  trigger: 'When considering how to approach the implementation',
+  description: "Brainstorm approaches freely. What are the different ways this could be implemented? Don't evaluate yet — generate options and explore the solution space.",
+})
+
+const velocityLens = defineThinkingLens({
+  name: 'velocity',
+  trigger: 'When evaluating an implementation approach',
+  description: "What's the fastest way to make this work? Minimize files touched, minimize changes to existing code. Consider the simplest path to a working solution.",
+})
+
+const alignmentLens = defineThinkingLens({
+  name: 'alignment',
+  trigger: 'When evaluating an implementation approach',
+  description: 'What approach best harmonizes with the existing system? What patterns, abstractions, and mechanisms already exist that this change should participate in?',
+})
+
+const capacityLens = defineThinkingLens({
+  name: 'capacity',
+  trigger: 'When evaluating an implementation approach',
+  description: 'What approach leaves the system best able to handle this kind of change going forward? Imagine five more similar changes — what would make all of them natural?',
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When planning your next actions',
+  description: 'Plan what to read, explore, or write this turn. What information do you still need? Are you ready to write the plan, or do you need to investigate more?',
+})
 
 const tools = toolSet({
   fileRead:     readTool,
@@ -37,7 +67,7 @@ export const createPlanner = (systemPrompt: string) => defineAgent<typeof tools,
   id: 'planner',
   model: 'secondary',
   systemPrompt,
-  thinkingLenses: [taskThinkingLens, turnThinkingLens],
+  thinkingLenses: [ideateLens, velocityLens, alignmentLens, capacityLens, turnLens],
 
   permission: (p) => ({
     shell(input) {

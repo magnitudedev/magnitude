@@ -6,7 +6,7 @@
  * to sub-agents via the agent tools.
  */
 
-import { toolSet, defineAgent, continue_, yield_, approvalThinkingLens, assumptionsThinkingLens, intentThinkingLens, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, defineThinkingLens } from '@magnitudedev/agent-definition'
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { thinkTool } from '../tools/globals'
@@ -28,6 +28,36 @@ import { webFetchTool } from '../tools/web-fetch-tool'
 import { webSearchTool } from '../tools/web-search-tool'
 
 import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
+
+const intentLens = defineThinkingLens({
+  name: 'intent',
+  trigger: 'When you receive a message from the user',
+  description: 'Carefully consider what the user means and what they actually want. Look past the literal request to understand the underlying goal.',
+})
+
+const ideateLens = defineThinkingLens({
+  name: 'ideate',
+  trigger: 'When the problem requires creative thinking or there are multiple possible approaches',
+  description: 'Think freely about the problem space. Generate and consider different approaches, ideas, or solutions before committing to one. Explore tradeoffs and implications.',
+})
+
+const strategyLens = defineThinkingLens({
+  name: 'strategy',
+  trigger: 'When deciding how to execute work',
+  description: 'Plan your execution approach. Consider parallelism, subagent delegation, and long-horizon sequencing. Which agents to create, reuse, or dismiss? What can run in parallel? What depends on what?',
+})
+
+const protocolLens = defineThinkingLens({
+  name: 'protocol',
+  trigger: "Before initiating any observable changes or making decisions the user hasn't explicitly specified",
+  description: 'Check your interaction protocol. Do you have approval to act? Are you making assumptions that should be communicated to the user first?',
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When your turn involves communications and actions that could benefit from planning',
+  description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
+})
 
 export const createOrchestrator = (systemPrompt: string) => {
   const tools = toolSet({
@@ -60,7 +90,7 @@ export const createOrchestrator = (systemPrompt: string) => {
     id: 'orchestrator',
     model: 'primary',
     systemPrompt,
-    thinkingLenses: [approvalThinkingLens, assumptionsThinkingLens, intentThinkingLens, taskThinkingLens, turnThinkingLens],
+    thinkingLenses: [intentLens, ideateLens, strategyLens, protocolLens, turnLens],
     observables: [agentsStatusObservable],
     permission: (p) => ({
       shell(input, pctx) {

@@ -5,7 +5,7 @@
  * Uses secondary model. Communicates back via parent.message.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import { readTool, treeTool, searchTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
@@ -15,6 +15,18 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool } from '../tools/artifact-tools'
 import { classifyShellCommand } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+
+const strategyLens = defineThinkingLens({
+  name: 'strategy',
+  trigger: 'When deciding what to investigate next',
+  description: "How can you gather the needed information quickly and efficiently? What tools and techniques will get you there fastest — tree, search, read, shell, web? Prioritize high-signal sources. Don't read aimlessly.",
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When planning your next actions',
+  description: 'Plan what to read, search, or explore this turn. Maximize coverage per turn by reading multiple files in parallel.',
+})
 
 const tools = toolSet({
   fileRead:      readTool,
@@ -33,7 +45,7 @@ export const createExplorer = (systemPrompt: string) => defineAgent<typeof tools
   id: 'explorer',
   model: 'secondary',
   systemPrompt,
-  thinkingLenses: [taskThinkingLens, turnThinkingLens],
+  thinkingLenses: [strategyLens, turnLens],
 
   permission: (p) => ({
     shell(input) {

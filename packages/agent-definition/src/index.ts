@@ -22,7 +22,7 @@ export {
 // Define
 export { toolSet, defineAgent } from './define'
 export { createObservable, bindObservable } from './observable'
-export { defineThinkingLens, approvalThinkingLens, assumptionsThinkingLens, intentThinkingLens, taskThinkingLens, turnThinkingLens, builtInThinkingLenses } from './thinking-lens'
+export { defineThinkingLens } from './thinking-lens'
 
 // Prompts
 export { getXmlActProtocol, buildAckTurn } from './prompts'

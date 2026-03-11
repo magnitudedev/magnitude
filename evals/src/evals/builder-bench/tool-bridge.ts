@@ -11,7 +11,7 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { createSandboxTool } from '@magnitudedev/js-act'
-import { toolSet, defineAgent, continue_, finish, perceive, omit, builtInThinkingLenses } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, finish, perceive, omit, defineThinkingLens } from '@magnitudedev/agent-definition'
 import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
 import type { PolicyContext } from '@magnitudedev/agent'
 import type { DockerContainer } from './docker'
@@ -51,6 +51,19 @@ const BENCH_AGENT_CONFIG = {
   model: 'primary' as const,
   systemPrompt: ROLE_DESCRIPTION,
 }
+
+const benchThinkingLenses = [
+  defineThinkingLens({
+    name: 'quality',
+    trigger: 'When writing or modifying code',
+    description: "Consider code quality and adherence to existing patterns. Does this match the conventions, abstractions, and style already in use? Is this consistent with the surrounding codebase? Don't just make it work — make it fit.",
+  }),
+  defineThinkingLens({
+    name: 'turn',
+    trigger: 'When planning your next actions',
+    description: 'Plan what to read and edit this turn. What files do you need to understand before making changes? What\'s the right order of edits?',
+  }),
+] as const
 
 // =============================================================================
 // Tool Factories
@@ -228,7 +241,7 @@ function createFsOnlyAgent(container: DockerContainer): AgentDefinition<ToolSet,
   const tools = toolSet({ message: messageTool, think: thinkTool, done: doneTool, fileRead: fsRead, fileWrite: fsWrite, fileTree: fsTree, fileSearch: fsSearch })
   return defineAgent(tools, {
     ...BENCH_AGENT_CONFIG,
-    thinkingLenses: builtInThinkingLenses.slice(),
+    thinkingLenses: benchThinkingLenses.slice(),
     permission: (p) => ({ _default: () => p.allow() }),
     turn: { decide: (turnCtx) => turnCtx.cancelled || turnCtx.toolsCalled.includes('done') ? finish() : continue_() },
     context: { message: omitCtx, think: omitCtx, done: omitCtx, fileRead: passthroughCtx, fileWrite: writeCtx, fileTree: structuredCtx, fileSearch: structuredCtx },
@@ -243,7 +256,7 @@ function createShellOnlyAgent(container: DockerContainer): AgentDefinition<ToolS
   const tools = toolSet({ message: messageTool, think: thinkTool, done: doneTool, shell })
   return defineAgent(tools, {
     ...BENCH_AGENT_CONFIG,
-    thinkingLenses: builtInThinkingLenses.slice(),
+    thinkingLenses: benchThinkingLenses.slice(),
     permission: (p) => ({ _default: () => p.allow() }),
     turn: { decide: (turnCtx) => turnCtx.cancelled || turnCtx.toolsCalled.includes('done') ? finish() : continue_() },
     context: { message: omitCtx, think: omitCtx, done: omitCtx, shell: shellCtx },
@@ -259,7 +272,7 @@ function createFsShellAgent(container: DockerContainer): AgentDefinition<ToolSet
   const tools = toolSet({ message: messageTool, think: thinkTool, done: doneTool, shell, fileRead: fsRead, fileWrite: fsWrite, fileTree: fsTree, fileSearch: fsSearch })
   return defineAgent(tools, {
     ...BENCH_AGENT_CONFIG,
-    thinkingLenses: builtInThinkingLenses.slice(),
+    thinkingLenses: benchThinkingLenses.slice(),
     permission: (p) => ({ _default: () => p.allow() }),
     turn: { decide: (turnCtx) => turnCtx.cancelled || turnCtx.toolsCalled.includes('done') ? finish() : continue_() },
     context: { message: omitCtx, think: omitCtx, done: omitCtx, shell: shellCtx, fileRead: passthroughCtx, fileWrite: writeCtx, fileTree: structuredCtx, fileSearch: structuredCtx },

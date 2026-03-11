@@ -5,7 +5,7 @@
  * Focuses on diagnosis — forming hypotheses, testing them, narrowing down causes.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
@@ -15,6 +15,30 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool } from '../tools/artifact-tools'
 import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+
+const hypothesisLens = defineThinkingLens({
+  name: 'hypothesis',
+  trigger: 'When investigating a bug or unexpected behavior',
+  description: "State your current hypothesis for the root cause. What evidence supports it? What evidence contradicts it? If you don't have a hypothesis yet, form one from the symptoms.",
+})
+
+const skepticismLens = defineThinkingLens({
+  name: 'skepticism',
+  trigger: 'After forming or updating a hypothesis',
+  description: 'Question your hypothesis. Is that really the root cause, or just where the symptom manifests? Could something else explain the evidence? What would disprove your current theory?',
+})
+
+const strategyLens = defineThinkingLens({
+  name: 'strategy',
+  trigger: 'When deciding how to investigate further',
+  description: "How can you best collect evidence to prove or disprove your hypothesis? What commands, logs, or code paths should you examine? Design targeted experiments — don't just read code and guess.",
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When planning your next actions',
+  description: "Plan what to run, read, or modify this turn. What's the most informative next step to test your hypothesis?",
+})
 
 const tools = toolSet({
   fileRead:      readTool,
@@ -35,7 +59,7 @@ export const createDebugger = (systemPrompt: string) => defineAgent<typeof tools
   id: 'debugger',
   model: 'secondary',
   systemPrompt,
-  thinkingLenses: [taskThinkingLens, turnThinkingLens],
+  thinkingLenses: [hypothesisLens, skepticismLens, strategyLens, turnLens],
 
   permission: (p) => ({
     shell(input, ctx) {

@@ -5,7 +5,7 @@
  * and parent.message for communicating with the orchestrator. No task management tools.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
@@ -15,6 +15,18 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
 import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+
+const qualityLens = defineThinkingLens({
+  name: 'quality',
+  trigger: 'When writing or modifying code',
+  description: "Consider code quality and adherence to existing patterns. Does this match the conventions, abstractions, and style already in use? Is this consistent with the surrounding codebase? Don't just make it work — make it fit.",
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When planning your next actions',
+  description: 'Plan what to read and edit this turn. What files do you need to understand before making changes? What\'s the right order of edits?',
+})
 
 const tools = toolSet({
   fileRead:       readTool,
@@ -36,7 +48,7 @@ export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools,
   id: 'builder',
   model: 'secondary',
   systemPrompt,
-  thinkingLenses: [taskThinkingLens, turnThinkingLens],
+  thinkingLenses: [qualityLens, turnLens],
 
   permission: (p) => ({
     shell(input, pctx) {

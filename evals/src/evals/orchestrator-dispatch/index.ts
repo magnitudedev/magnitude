@@ -10,7 +10,7 @@ import type { RunnableEval, Scenario, ScenarioResult, ModelSpec, CheckResult, Ev
 import type { ChatMessage } from '@magnitudedev/llm-core'
 import { callModel } from '../../runner'
 import { getAgentDefinition, generateXmlActToolDocs } from '@magnitudedev/agent'
-import { getXmlActProtocol, builtInThinkingLenses } from '@magnitudedev/agent-definition'
+import { getXmlActProtocol } from '@magnitudedev/agent-definition'
 import { parseOrchestratorResponse } from './xml-parser'
 import type { ParsedOrchestratorResponse } from './xml-parser'
 import { ALL_SCENARIOS, type DispatchScenario } from './scenarios'
@@ -25,7 +25,7 @@ function getSystemPrompt(): string {
   if (!cachedSystemPrompt) {
     const agentDef = getAgentDefinition('orchestrator')
     const toolDocs = generateXmlActToolDocs(agentDef, ['think'])
-    cachedSystemPrompt = `${getXmlActProtocol('user', builtInThinkingLenses.slice())}\n\n${agentDef.systemPrompt}\n\n## Tools\n\n${toolDocs}`
+    cachedSystemPrompt = `${getXmlActProtocol('user', agentDef.thinkingLenses.slice())}\n\n${agentDef.systemPrompt}\n\n## Tools\n\n${toolDocs}`
   }
   return cachedSystemPrompt
 }

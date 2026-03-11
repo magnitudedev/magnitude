@@ -8,7 +8,7 @@ const A5_SCENARIOS: A5Scenario[] = A5_SCENARIOS_RAW.map(s => ({ ...s, id: `a5/${
 // Re-use a5's execution logic
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { getXmlActProtocol, builtInThinkingLenses } from '@magnitudedev/agent-definition'
+import { getXmlActProtocol } from '@magnitudedev/agent-definition'
 import { getAgentDefinition, generateXmlActToolDocs } from '@magnitudedev/agent'
 import { callModel } from '../../runner'
 
@@ -23,7 +23,7 @@ function getSystemPrompt(): string {
     const agentDef = getAgentDefinition('orchestrator')
     const toolDocs = generateXmlActToolDocs(agentDef, ['think'])
     cachedSystemPrompt = raw
-      .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol('user', builtInThinkingLenses.slice()))
+      .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol('user', agentDef.thinkingLenses.slice()))
       .replaceAll('{{TOOL_DOCS}}', toolDocs)
   }
   return cachedSystemPrompt

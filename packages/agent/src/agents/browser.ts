@@ -5,7 +5,7 @@
  * Receives automatic screenshots before each turn.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, taskThinkingLens, turnThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import {
   clickTool, doubleClickTool, rightClickTool, typeTool,
   scrollTool, dragTool, navigateTool, goBackTool,
@@ -15,6 +15,18 @@ import {
 import { thinkTool } from '../tools/globals'
 import { browserObservable } from '../observables/browser-observable'
 import type { PolicyContext } from './types'
+
+const strategyLens = defineThinkingLens({
+  name: 'strategy',
+  trigger: 'When deciding how to interact with the page',
+  description: 'How should you use the browser tools to accomplish the task? What sequence of interactions is needed? Consider page state, loading, and what you need to observe.',
+})
+
+const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When planning your next actions',
+  description: 'Plan what browser actions to take this turn. What to click, type, or scroll? What can you do reliably before needing to observe the screen state again?',
+})
 
 const tools = toolSet({
   click:        clickTool,
@@ -37,7 +49,7 @@ export const createBrowser = (systemPrompt: string) => defineAgent<typeof tools,
   id: 'browser',
   model: 'browser',
   systemPrompt,
-  thinkingLenses: [taskThinkingLens, turnThinkingLens],
+  thinkingLenses: [strategyLens, turnLens],
 
   permission: (p) => ({
     _default() { return p.allow() },
