@@ -189,20 +189,12 @@ function bunTargetToRipgrepTarget(bunTarget: string): string {
   return target
 }
 
-const targets = [
-  'bun-darwin-arm64',
-  'bun-darwin-x64',
-  'bun-linux-x64',
-  'bun-linux-arm64',
-  'bun-windows-x64',
-] as const
-
 const targetArg = process.argv[2]
 
 async function build(target: string) {
   const isWindows = target.includes('windows')
   const ext = isWindows ? '.exe' : ''
-  const binaryFile = resolve(PROJECT_ROOT, 'bin', 'magnitude-' + target.replace('bun-', '') + ext)
+  const binaryFile = resolve(PROJECT_ROOT, 'bin', 'magnitude' + ext)
   const { platform, arch } = getTargetPlatformArch(target)
 
   console.log('Building ' + target + '...')
@@ -242,11 +234,7 @@ async function build(target: string) {
   console.log('Built ' + binaryFile)
 }
 
-if (targetArg === '--all') {
-  for (const target of targets) {
-    await build(target)
-  }
-} else if (targetArg) {
+if (targetArg) {
   await build(targetArg)
 } else {
   const platform = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'
