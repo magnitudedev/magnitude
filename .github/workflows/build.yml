@@ -31,6 +31,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: cargo install wasm-pack
       - run: bun run cli/scripts/build-binary.ts ${{ matrix.target }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
