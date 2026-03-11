@@ -23,10 +23,10 @@ Most coding agents are one long conversation that compacts and loses context. Ma
 ## Installation
 
 ```bash
-npm install -g @magnitudedev/magnitude
-bun add -g @magnitudedev/magnitude
-pnpm add -g @magnitudedev/magnitude
-yarn global add @magnitudedev/magnitude
+npm install -g @magnitudedev/cli
+bun add -g @magnitudedev/cli
+pnpm add -g @magnitudedev/cli
+yarn global add @magnitudedev/cli
 ```
 
 After installation, just run `magnitude` in your terminal to launch the TUI:
