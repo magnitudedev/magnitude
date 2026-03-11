@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.2
+
+### Patch Changes
+
+- [`0093019`](https://github.com/magnitudedev/magnitude/commit/00930198daf8759ee705b50587ec7ce4d2a1d1f1) Thanks [@anerli](https://github.com/anerli)! - fix distributed executable name
+
 ## 0.0.1-alpha.1
 
 ### Patch Changes
