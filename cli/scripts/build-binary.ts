@@ -225,6 +225,12 @@ async function build(target: string) {
     await restoreWasmModules()
   }
 
+  // Ad-hoc codesign macOS binaries to prevent Gatekeeper "damaged" warnings
+  if (target.includes('darwin')) {
+    await $`codesign --force --deep --sign - ${binaryFile}`
+    console.log('  [codesign] ' + binaryFile)
+  }
+
   console.log('Built ' + binaryFile)
 }
 
