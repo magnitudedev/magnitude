@@ -26,6 +26,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo install wasm-pack
       - run: bun run cli/scripts/build-binary.ts ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
