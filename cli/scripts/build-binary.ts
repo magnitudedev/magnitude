@@ -1,4 +1,4 @@
-import { writeFile, mkdir, copyFile, readFile } from 'fs/promises'
+import { writeFile, mkdir, copyFile, readFile, unlink } from 'fs/promises'
 import { resolve } from 'path'
 import { existsSync } from 'fs'
 import { $ } from 'bun'
@@ -16,38 +16,72 @@ import { downloadRg } from '@magnitudedev/ripgrep'
  * with the platform-specific package name, which Bun can resolve and embed.
  */
 
-interface PatchTarget {
-  file: string
-  getContent: (platform: string, arch: string) => string
-}
-
 const PROJECT_ROOT = resolve(import.meta.dir, '../..')
 
-const PATCH_TARGETS: PatchTarget[] = [
+/**
+ * A build-time patch that modifies a file before compilation and restores it after.
+ * - `file`: path relative to PROJECT_ROOT, or a function that resolves one dynamically.
+ * - `patch`: receives (originalContent, platform, arch) and returns the patched content.
+ */
+interface BuildPatch {
+  file: string | (() => string)
+  patch: (content: string, platform: string, arch: string) => string
+}
+
+function getBamlNativePackage(platform: string, arch: string): string {
+  if (platform === 'darwin') return `@boundaryml/baml-darwin-${arch}`
+  if (platform === 'windows') return `@boundaryml/baml-win32-${arch}-msvc`
+  return `@boundaryml/baml-linux-${arch}-gnu`
+}
+
+function getOpentuiNativePackage(platform: string, arch: string): string {
+  const p = platform === 'windows' ? 'win32' : platform
+  return `@opentui/core-${p}-${arch}`
+}
+
+function findOpentuiIndexFile(): string {
+  const dir = resolve(PROJECT_ROOT, 'node_modules/@opentui/core')
+  const files = require('fs').readdirSync(dir) as string[]
+  const match = files.find((f: string) => f.startsWith('index-') && f.endsWith('.js'))
+  if (!match) throw new Error('[patch] Could not find @opentui/core/index-*.js')
+  return 'node_modules/@opentui/core/' + match
+}
+
+const BUILD_PATCHES: BuildPatch[] = [
   {
     file: 'node_modules/@boundaryml/baml/native.js',
-    getContent: (platform, arch) => [
-      'const nativeBinding = require("@boundaryml/baml-' + platform + '-' + arch + '");',
-      'module.exports = nativeBinding;',
-    ].join('\n'),
+    patch: (_content, platform, arch) =>
+      'const nativeBinding = require("' + getBamlNativePackage(platform, arch) + '");\n' +
+      'module.exports = nativeBinding;\n',
+  },
+  {
+    file: findOpentuiIndexFile,
+    patch: (content, platform, arch) =>
+      content.replace(
+        'var module = await import(`@opentui/core-${process.platform}-${process.arch}/index.ts`);',
+        'var module = await import("' + getOpentuiNativePackage(platform, arch) + '/index.ts");',
+      ),
   },
 ]
 
-async function patchNativeBindings(platform: string, arch: string): Promise<void> {
-  for (const target of PATCH_TARGETS) {
-    const resolved = resolve(PROJECT_ROOT, target.file)
+async function applyBuildPatches(platform: string, arch: string): Promise<void> {
+  for (const p of BUILD_PATCHES) {
+    const file = typeof p.file === 'function' ? p.file() : p.file
+    const resolved = resolve(PROJECT_ROOT, file)
     await copyFile(resolved, resolved + '.bak')
-    await writeFile(resolved, target.getContent(platform, arch))
-    console.log('  [patch] ' + target.file)
+    const original = await readFile(resolved, 'utf-8')
+    const patched = p.patch(original, platform, arch)
+    await writeFile(resolved, patched)
+    console.log('  [patch] ' + file)
   }
 }
 
-async function restoreNativeBindings(): Promise<void> {
-  for (const target of PATCH_TARGETS) {
-    const resolved = resolve(PROJECT_ROOT, target.file)
+async function restoreBuildPatches(): Promise<void> {
+  for (const p of BUILD_PATCHES) {
+    const file = typeof p.file === 'function' ? p.file() : p.file
+    const resolved = resolve(PROJECT_ROOT, file)
     if (existsSync(resolved + '.bak')) {
       await copyFile(resolved + '.bak', resolved)
-      const { unlink } = await import('fs/promises')
       await unlink(resolved + '.bak').catch(() => {})
     }
   }
@@ -120,7 +154,6 @@ async function restoreWasmModules(): Promise<void> {
       const modPath = resolve(PROJECT_ROOT, mod.file)
       if (existsSync(modPath + '.bak')) {
         await copyFile(modPath + '.bak', modPath)
-        const { unlink } = await import('fs/promises')
         await unlink(modPath + '.bak').catch(() => {})
       }
     }
@@ -180,7 +213,7 @@ async function build(target: string) {
   if (!existsSync(binDir)) await mkdir(binDir)
 
   // Patch NAPI-RS loaders and WASM modules for compiled binary compatibility
-  await patchNativeBindings(platform, arch)
+  await applyBuildPatches(platform, arch)
   await patchWasmModules()
 
   try {
@@ -188,7 +221,7 @@ async function build(target: string) {
     await $`bun build ${entrypoint} ${rgBinPath} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
   } finally {
     // Always restore original files
-    await restoreNativeBindings()
+    await restoreBuildPatches()
     await restoreWasmModules()
   }
 
