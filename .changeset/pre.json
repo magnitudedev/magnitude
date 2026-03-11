@@ -23,6 +23,7 @@
     "@magnitudedev/xml-act": "0.0.1"
   },
   "changesets": [
+    "purple-sails-cheer",
     "six-pandas-smile"
   ]
 }
