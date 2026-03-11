@@ -22,5 +22,7 @@
     "@magnitudedev/tracing": "0.0.1",
     "@magnitudedev/xml-act": "0.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "six-pandas-smile"
+  ]
 }
