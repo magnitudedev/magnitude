@@ -62,6 +62,14 @@ const BUILD_PATCHES: BuildPatch[] = [
         'var module = await import("' + getOpentuiNativePackage(platform, arch) + '/index.ts");',
       ),
   },
+  {
+    file: 'node_modules/patchright-core/lib/server/utils/nodePlatform.js',
+    patch: (content) =>
+      content.replace(
+        'const coreDir = import_path.default.dirname(require.resolve("../../../package.json"));',
+        'const coreDir = __dirname;',
+      ),
+  },
 ]
 
 async function applyBuildPatches(platform: string, arch: string): Promise<void> {
