@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    branches: [main, release/alpha, release/beta]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            os: macos-latest
+            artifact: magnitude-darwin-arm64
+          - target: bun-darwin-x64
+            os: macos-13
+            artifact: magnitude-darwin-x64
+          - target: bun-linux-x64
+            os: ubuntu-latest
+            artifact: magnitude-linux-x64
+          - target: bun-linux-arm64
+            os: ubuntu-latest
+            artifact: magnitude-linux-arm64
+          - target: bun-windows-x64
+            os: windows-latest
+            artifact: magnitude-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run cli/scripts/build-binary.ts ${{ matrix.target }}
+      - name: Package binary
+        shell: bash
+        run: |
+          cd bin
+          tar -czf ${{ matrix.artifact }}.tar.gz *
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin/${{ matrix.artifact }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+
+      - name: Changesets
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          publish: bun run publish
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Attach binaries to GitHub Release
+        if: steps.changesets.outputs.published == 'true'
+        shell: bash
+        run: |
+          VERSION=$(node -e "console.log(require('./packages/cli/package.json').version)")
+          TAG="@magnitudedev/cli@${VERSION}"
+          for f in release-artifacts/**/*.tar.gz; do
+            gh release upload "$TAG" "$f" --clobber
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

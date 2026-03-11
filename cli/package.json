@@ -1,7 +1,8 @@
 {
-  "name": "magnitude",
+  "name": "@magnitudedev/cli-source",
   "version": "0.0.1",
   "type": "module",
+  "private": true,
   "bin": {
     "magnitude": "bin/magnitude"
   },

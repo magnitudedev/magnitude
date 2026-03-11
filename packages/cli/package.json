@@ -1,0 +1,16 @@
+{
+  "name": "@magnitudedev/cli",
+  "version": "0.0.1",
+  "description": "Magnitude AI coding agent",
+  "license": "MIT",
+  "bin": {
+    "magnitude": "bin/magnitude.js"
+  },
+  "files": ["bin", "lib"],
+  "scripts": {
+    "postinstall": "node lib/postinstall.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

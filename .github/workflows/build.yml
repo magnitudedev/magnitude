@@ -1,0 +1,33 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            os: macos-latest
+          - target: bun-darwin-x64
+            os: macos-13
+          - target: bun-linux-x64
+            os: ubuntu-latest
+          - target: bun-linux-arm64
+            os: ubuntu-latest
+          - target: bun-windows-x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run cli/scripts/build-binary.ts ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: bin/*

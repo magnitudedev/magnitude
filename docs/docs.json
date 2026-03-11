@@ -108,7 +108,8 @@
                 "group": "Contributing",
                 "pages": [
                     "contributing/setup",
-                    "contributing/architecture"
+                    "contributing/architecture",
+                    "contributing/releases"
                 ]
             }
         ]

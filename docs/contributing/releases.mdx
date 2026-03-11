@@ -1,0 +1,131 @@
+---
+title: Release Process
+description: How to version, release, and publish Magnitude
+icon: rocket
+---
+
+Magnitude uses [Changesets](https://github.com/changesets/changesets) for versioning and changelog management, with GitHub Actions for automated builds and publishing.
+
+## Adding a changeset
+
+When you make a change that should be noted in the changelog, run:
+
+```bash
+bun changeset
+```
+
+This will prompt you to:
+1. Select the package (`@magnitudedev/cli`)
+2. Choose the version bump type (patch, minor, or major)
+3. Write a summary of the change
+
+A markdown file is created in `.changeset/`. Commit it with your code.
+
+**When to add a changeset:**
+
+Magnitude currently follows pre-1.0 semver. Minor versions can include breaking changes. Major bumps are not yet used.
+
+- Breaking changes or new features → `minor`
+- Bug fixes → `patch`
+- Internal refactors with no user impact → no changeset needed
+
+## Stable releases
+
+### How it works
+
+1. As PRs with changesets merge to `main`, the release workflow automatically opens (or updates) a **"Version Packages" PR**
+2. This PR bumps the version in `packages/cli/package.json`, updates `CHANGELOG.md`, and removes consumed changeset files
+3. When you're ready to release, **merge the Version Packages PR**
+4. This triggers the full release:
+   - Builds binaries for all platforms (macOS arm64/x64, Linux x64/arm64, Windows x64)
+   - Creates a GitHub Release with binary tarballs attached
+   - Publishes `@magnitudedev/cli` to npm
+
+### Users get the update
+
+- New installs: `npm install -g @magnitudedev/cli`
+- Existing users: the launcher detects the version mismatch on next run and downloads the new binary automatically
+
+## Pre-releases (alpha/beta)
+
+### Starting an alpha
+
+```bash
+git checkout -b release/alpha
+bun run pre:alpha
+git add .changeset/pre.json
+git commit -m "Enter alpha prerelease"
+git push -u origin release/alpha
+```
+
+### Publishing alpha versions
+
+Work on the `release/alpha` branch. Add changesets as normal:
+
+```bash
+bun changeset
+# Write your change summary
+git add . && git commit -m "feat: experimental feature X" && git push
+```
+
+The release workflow runs on `release/alpha` and publishes versions like `0.2.0-alpha.0`, `0.2.0-alpha.1`, etc. with the `alpha` npm dist-tag.
+
+Users install with:
+```bash
+npm install -g @magnitudedev/cli@alpha
+```
+
+### Starting a beta
+
+Same flow, different channel:
+
+```bash
+git checkout -b release/beta
+bun run pre:beta
+git add .changeset/pre.json
+git commit -m "Enter beta prerelease"
+git push -u origin release/beta
+```
+
+Publishes `0.2.0-beta.0` etc. with `beta` dist-tag:
+```bash
+npm install -g @magnitudedev/cli@beta
+```
+
+### Promoting to stable
+
+When the pre-release is ready for stable:
+
+```bash
+bun run pre:exit
+git add .changeset/pre.json
+git commit -m "Exit prerelease"
+```
+
+Merge the pre-release branch into `main`. The next Version Packages PR on main will produce a stable release.
+
+## Available scripts
+
+| Script | Description |
+|---|---|
+| `bun changeset` | Create a new changeset |
+| `bun run version` | Apply pending changesets (usually done by CI) |
+| `bun run publish` | Publish to npm (usually done by CI) |
+| `bun run pre:alpha` | Enter alpha pre-release mode |
+| `bun run pre:beta` | Enter beta pre-release mode |
+| `bun run pre:exit` | Exit pre-release mode, next release will be stable |
+
+## CI/CD
+
+### Build workflow (`.github/workflows/build.yml`)
+- Runs on PRs and pushes to `main`
+- Builds binaries for all 5 platforms to verify compilation
+
+### Release workflow (`.github/workflows/release.yml`)
+- Runs on pushes to `main`, `release/alpha`, `release/beta`
+- Manages the Version Packages PR via changesets
+- On version merge: builds binaries, creates GitHub Release, publishes to npm
+
+### Required secrets
+- `NPM_TOKEN` — npm publish token for `@magnitudedev` scope
+- `GITHUB_TOKEN` — automatically provided by GitHub Actions

@@ -15,9 +15,18 @@
     "events:copy": "cat ~/.magnitude/logs/events.jsonl | pbcopy && echo 'Events copied to clipboard'",
     "logs": "cat ~/.magnitude/logs/cli.jsonl",
     "logs:tail": "tail -f ~/.magnitude/logs/cli.jsonl",
-    "logs:copy": "cat ~/.magnitude/logs/cli.jsonl | pbcopy && echo 'Logs copied to clipboard'"
+    "logs:copy": "cat ~/.magnitude/logs/cli.jsonl | pbcopy && echo 'Logs copied to clipboard'",
+    "cs": "changeset",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "publish": "changeset publish",
+    "pre:alpha": "changeset pre enter alpha",
+    "pre:beta": "changeset pre enter beta",
+    "pre:exit": "changeset pre exit"
   },
   "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.30.0",
     "@types/bun": "^1.3.8",
     "turbo": "^2.5.4",
     "typescript": "^5.8.3"
