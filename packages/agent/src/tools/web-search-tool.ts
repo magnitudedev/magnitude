@@ -18,7 +18,7 @@ import { webSearch } from './web-search'
 const WebSearchError = ToolErrorSchema('WebSearchError', {})
 
 export const webSearchTool = createTool({
-  name: 'webSearch',
+  name: 'web-search',
   group: 'default',
   description: 'Search the web and optionally extract structured data',
 

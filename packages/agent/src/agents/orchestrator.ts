@@ -24,6 +24,8 @@ import {
 // import { gatherTool } from '../tools/gather'
 import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
+import { webFetchTool } from '../tools/web-fetch-tool'
+import { webSearchTool } from '../tools/web-search-tool'
 
 import { classifyShellCommand, detectsOutsideCwd } from '@magnitude/shell-classifier'
 
@@ -39,6 +41,8 @@ export const createOrchestrator = (systemPrompt: string) => {
     fileTree:              treeTool,
     fileSearch:            searchTool,
     shell:                 shellTool,
+    webSearch:             webSearchTool,
+    webFetch:              webFetchTool,
 
     // Artifact management
     artifactSync:          artifactSyncTool,
