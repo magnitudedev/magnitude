@@ -13,7 +13,7 @@ import { shellTool } from '../tools/shell'
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool } from '../tools/artifact-tools'
 import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
-import { classifyShellCommand, detectsOutsideCwd } from '@magnitude/shell-classifier'
+import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 
 const tools = toolSet({

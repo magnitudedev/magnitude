@@ -13,7 +13,7 @@ import { webFetchTool } from '../tools/web-fetch-tool'
 
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
-import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitude/shell-classifier'
+import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 
 const tools = toolSet({

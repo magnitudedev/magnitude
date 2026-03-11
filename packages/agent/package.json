@@ -16,7 +16,7 @@
     "@google/genai": "^1.41.0",
     "@magnitudedev/agent-definition": "workspace:*",
     "@magnitudedev/browser-harness": "workspace:*",
-    "@magnitude/shell-classifier": "workspace:*",
+    "@magnitudedev/shell-classifier": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/tools": "workspace:*",
     "@magnitudedev/xml-act": "workspace:*",

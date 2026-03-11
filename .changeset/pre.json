@@ -1,0 +1,26 @@
+{
+  "mode": "pre",
+  "tag": "alpha",
+  "initialVersions": {
+    "@magnitudedev/cli-source": "0.0.1",
+    "@magnitudedev/evals": "0.1.0",
+    "@magnitudedev/agent": "0.0.1",
+    "@magnitudedev/agent-definition": "0.0.1",
+    "@magnitudedev/browser-harness": "0.0.1",
+    "@magnitudedev/cli": "0.0.0",
+    "@magnitudedev/dom-extract": "0.0.1",
+    "@magnitudedev/event-core": "0.0.1",
+    "@magnitudedev/generate-id": "0.0.1",
+    "@magnitudedev/image": "0.0.1",
+    "@magnitudedev/llm-core": "0.0.1",
+    "@magnitudedev/logger": "0.0.1",
+    "@magnitudedev/providers": "0.0.1",
+    "@magnitudedev/ripgrep": "0.0.1",
+    "@magnitudedev/shell-classifier": "0.0.1",
+    "@magnitudedev/telemetry": "0.0.1",
+    "@magnitudedev/tools": "0.0.1",
+    "@magnitudedev/tracing": "0.0.1",
+    "@magnitudedev/xml-act": "0.0.1"
+  },
+  "changesets": []
+}

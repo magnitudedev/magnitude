@@ -1,6 +1,7 @@
 {
   "name": "@magnitudedev/image",
   "version": "0.0.1",
+  "private": "true",
   "main": "ts/index.ts",
   "types": "ts/index.ts",
   "scripts": {

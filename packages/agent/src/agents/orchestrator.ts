@@ -27,7 +27,7 @@ import { shellTool } from '../tools/shell'
 import { webFetchTool } from '../tools/web-fetch-tool'
 import { webSearchTool } from '../tools/web-search-tool'
 
-import { classifyShellCommand, detectsOutsideCwd } from '@magnitude/shell-classifier'
+import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
 
 export const createOrchestrator = (systemPrompt: string) => {
   const tools = toolSet({

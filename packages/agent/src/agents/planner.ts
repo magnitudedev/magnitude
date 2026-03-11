@@ -15,7 +15,7 @@ import { webFetchTool } from '../tools/web-fetch-tool'
 import { thinkTool } from '../tools/globals'
 // import { gatherTool } from '../tools/gather'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
-import { classifyShellCommand } from '@magnitude/shell-classifier'
+import { classifyShellCommand } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 
 const tools = toolSet({
