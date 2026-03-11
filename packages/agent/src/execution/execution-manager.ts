@@ -223,7 +223,7 @@ function makeForkLayers(
 
   approvalState: ApprovalStateService,
   persistenceLayer: Layer.Layer<ChatPersistence, never, never>,
-  rawBeforeExecute: ReturnType<typeof buildPermissionInterceptor>,
+  permissionInterceptor: ReturnType<typeof buildPermissionInterceptor>,
   toolEmitRef: Ref.Ref<ToolDisplay | undefined>,
   cwd: string,
 ) {
@@ -263,11 +263,9 @@ function makeForkLayers(
     emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
   })
 
-  // Wrap the raw interceptor (which has service requirements) into a ToolInterceptor (R=never)
-  // by providing the services inline so the Effect has no remaining requirements.
-  const interceptor: ToolInterceptor = {
+  const providedInterceptor: ToolInterceptor = {
     beforeExecute: (ctx) =>
-      rawBeforeExecute(ctx).pipe(
+      permissionInterceptor(ctx).pipe(
         Effect.provideService(ForkContext, { forkId }),
         Effect.provideService(PolicyContextProviderTag, policyCtxProvider),
         Effect.provideService(ApprovalStateTag, approvalState),
@@ -287,7 +285,7 @@ function makeForkLayers(
     Layer.succeed(ApprovalStateTag, approvalState),
     Layer.succeed(WorkingDirectoryTag, { cwd }),
     Layer.succeed(PolicyContextProviderTag, policyCtxProvider),
-    Layer.succeed(ToolInterceptorTag, interceptor),
+    Layer.succeed(ToolInterceptorTag, providedInterceptor),
     toolEmitLayer,
     persistenceLayer,
   )

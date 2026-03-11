@@ -85,8 +85,8 @@ export function createTurnStream<R>(
 
       yield* Effect.forkScoped(
         producer(queue).pipe(
-          Effect.flatMap(() => Deferred.succeed(done, undefined)),
-          Effect.catchAll((error) => Deferred.fail(done, error)),
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.done(done, exit)),
           Effect.ensuring(Effect.yieldNow().pipe(Effect.andThen(Queue.shutdown(queue)))),
         )
       )
