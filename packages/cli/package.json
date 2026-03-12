@@ -1,6 +1,6 @@
 {
   "name": "@magnitudedev/cli",
-  "version": "0.0.1-alpha.2",
+  "version": "0.0.1-alpha.3",
   "description": "Magnitude AI coding agent",
   "license": "Apache-2.0",
   "repository": {
@@ -12,7 +12,13 @@
   "bugs": {
     "url": "https://github.com/magnitudedev/magnitude/issues"
   },
-  "keywords": ["ai", "coding", "agent", "cli", "magnitude"],
+  "keywords": [
+    "ai",
+    "coding",
+    "agent",
+    "cli",
+    "magnitude"
+  ],
   "author": {
     "name": "Magnitude",
     "email": "founders@magnitude.dev",
