@@ -48,31 +48,39 @@ Magnitude supports the [Agent Skills](https://agentskills.io) standard. Skills a
 3. `~/.magnitude/skills/`
 4. `~/.agents/skills/`
 
+## Philosophy
+
+**The coding agent primitive is not solved.** Models often know what to do, but still fail to turn that intent into correct changes in a messy, evolving codebase. In practice, most failures come from two recurring patterns: **context degradation** over long sessions, and **local maximum traps** where the agent settles for the nearest plausible fix. Magnitude is built around those failure modes with managed orchestration, specialized subagents, explicit context handoff, progressive disclosure of tool output, and role-specific reasoning.
+
 ## Features
 
 ### Orchestrator → subagent architecture
 
-The orchestrator manages the conversation and delegates to specialized subagents (builder, debugger, explorer, planner, reviewer, browser), each with its own context window, toolset, and permissions. Subagents do focused work and report back, keeping the orchestrator's context clean.
+The orchestrator manages the conversation and delegates to specialized subagents (explorer, planner, builder, reviewer, browser, debugger), each with its own context window, role-specific context, toolset, and permissions. Subagents do focused work and report back, keeping the orchestrator's context clean and focused on your intent.
 
 ### Context sharing via artifacts
 
-Named documents that carry context between agents with scoped visibility. An explorer writes findings, a planner reads them and writes a plan, a builder reads the plan and implements. Each agent sees exactly what it needs without inheriting everything.
+Shared markdown documents pass context between agents. Instead of the orchestrator summarizing and relaying information, agents read and write artifacts directly. An explorer writes findings, a planner reads them and produces a plan, a builder reads the plan and implements. No context is lost in translation, and the orchestrator doesn't burn output tokens on handoff.
 
 ### Two-way agent communication
 
-The orchestrator and subagents have full bidirectional messaging. The orchestrator can steer, redirect, or interrupt subagents mid-work. Not fire-and-forget delegation.
+The orchestrator and subagents have full bidirectional messaging. The orchestrator can steer, redirect, or interrupt subagents mid-work. Subagents can message back when they hit blockers or need clarification. Not fire-and-forget delegation.
 
-### Event-sourced runtime
+### Parallel by default
 
-Every action is an immutable event. Sessions are fully replayable and resumable.
+The orchestrator spins up multiple subagents concurrently and keeps working while they run. Independent tasks like exploring separate areas of the codebase, implementing unrelated features, or debugging multiple issues all happen in parallel.
+
+### Progressive disclosure of tool output
+
+Tool output does not flood the context window by default. Agents inspect results explicitly and pull in only what they need, keeping noisy, irrelevant output out of the main thread.
 
 ### Built-in browser agent
 
-A vision-based browser agent built on [browser-agent](https://github.com/magnitudedev/browser-agent) runs natively in the same runtime. Used to verify UI changes and behavior.
+A vision-based browser agent built on [browser-agent](https://github.com/magnitudedev/browser-agent) runs natively in the same runtime. It can be used to verify UI changes and behavior as part of the workflow.
 
 ### Steerable and hackable
 
-Skills, AGENTS.md, persistent memory, agent policies. The system adapts to how you work, not the other way around. Magnitude learns your preferences and codebase conventions over time, storing them in `.magnitude/memory.md` and applying them automatically to future sessions.
+Skills, AGENTS.md, and persistent memory let Magnitude adapt to how you work, not the other way around. It can learn your preferences and codebase conventions over time, storing them in `.magnitude/memory.md` and applying them automatically to future sessions.
 
 ## Additional Info
 
@@ -93,5 +101,3 @@ Full documentation is available at [docs.magnitude.dev](https://docs.magnitude.d
 Built on top of [BAML](https://boundaryml.com), [Effect](https://effect.website), and [OpenTUI](https://github.com/anomalyco/opentui).
 
 Inspired by other open-source coding agents, including [OpenCode](https://github.com/anomalyco/opencode) and [Codex](https://github.com/openai/codex).
-
-The future is open!
