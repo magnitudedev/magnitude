@@ -1,5 +1,6 @@
+import { Effect, Layer } from 'effect'
 import type { RunnableEval, Scenario, ScenarioResult, ModelSpec, CheckResult } from '../../types'
-import { secondary, setModel, getAuth } from '@magnitudedev/providers'
+import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer, ExtractMemoryDiff } from '@magnitudedev/providers'
 
 import { applyMemoryDiff } from '../../../../packages/agent/src/memory/memory-file'
 import { ALL_SCENARIOS, VARIANTS } from './scenarios'
@@ -34,10 +35,15 @@ async function runExtraction(transcript: string, currentMemory: string, modelSpe
   try {
     const auth = getAuth(modelSpec.provider)
     setModel('secondary', modelSpec.provider, modelSpec.model, auth ?? null, false)
-    const { result } = await secondary.extractMemoryDiff(
-      transcript,
-      currentMemory,
-      { forkId: null, callType: 'extract-memory-diff' as any }
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runtime = yield* ModelResolver
+        const model = yield* runtime.resolve('secondary')
+        return yield* model.invoke(
+          ExtractMemoryDiff,
+          { transcript, currentMemory },
+        )
+      }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(makeNoopTracer())), makeNoopTracer()))),
     )
     return { raw: JSON.stringify(result, null, 2), diff: result }
   } catch (error) {

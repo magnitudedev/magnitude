@@ -3,7 +3,7 @@ import { normalizeModelOutput, normalizeQuotesInString } from './output-normaliz
 
 describe('normalizeQuotesInString', () => {
   test('converts curly single and double quotes', () => {
-    expect(normalizeQuotesInString('“hello” it’s fine')).toBe(`"hello" it's fine`)
+    expect(normalizeQuotesInString('\u201chello\u201d it\u2019s fine')).toBe(`"hello" it's fine`)
   })
 
   test('returns unchanged string when no curly quotes', () => {
@@ -14,8 +14,8 @@ describe('normalizeQuotesInString', () => {
 describe('normalizeModelOutput', () => {
   test('normalizes nested object/array strings', () => {
     const input = {
-      title: '“Roadmap”',
-      nested: [{ text: 'it’s done' }, '“quoted”'],
+      title: '\u201cRoadmap\u201d',
+      nested: [{ text: 'it\u2019s done' }, '\u201cquoted\u201d'],
     }
     const out = normalizeModelOutput(input)
     expect(out).toEqual({
@@ -31,7 +31,7 @@ describe('normalizeModelOutput', () => {
   })
 
   test('handles cycles safely', () => {
-    const a: any = { text: '“x”' }
+    const a: any = { text: '\u201cx\u201d' }
     a.self = a
     const out: any = normalizeModelOutput(a)
     expect(out.text).toBe('"x"')
@@ -41,7 +41,7 @@ describe('normalizeModelOutput', () => {
 
 describe('normalizeModelOutput - array cycles', () => {
   test('handles array cycles safely', () => {
-    const a: any[] = ['“x”']
+    const a: any[] = ['\u201cx\u201d']
     a.push(a)
     const out: any = normalizeModelOutput(a)
     expect(out[0]).toBe('"x"')

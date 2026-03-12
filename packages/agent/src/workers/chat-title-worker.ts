@@ -12,8 +12,9 @@ import { logger } from '@magnitudedev/logger'
 import type { AppEvent } from '../events'
 import { MemoryProjection, type ForkMemoryState } from '../projections/memory'
 import { ChatPersistence } from '../persistence/chat-persistence-service'
-import { secondary } from '@magnitudedev/providers'
+import { ModelResolver, GenerateChatTitle } from '@magnitudedev/providers'
 import { updateTraceMeta } from '@magnitudedev/tracing'
+import { withTraceScope } from '../tracing'
 import { DEFAULT_CHAT_NAME } from '../constants'
 import { textOf } from '../content'
 
@@ -60,7 +61,7 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
       // Check if title already exists
       const persistence = yield* ChatPersistence
       const metadata = yield* persistence.getSessionMetadata().pipe(
-        Effect.catchAll(() => Effect.succeed({ chatName: '' } as { chatName: string }))
+        Effect.catchAll(() => Effect.succeed({ chatName: '' }))
       )
 
       if (metadata.chatName && metadata.chatName !== DEFAULT_CHAT_NAME) {
@@ -71,10 +72,15 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
 
       logger.info({ messageCount: parts.length, userMessageCount }, '[ChatTitleWorker] Generating chat title')
 
-      const result = yield* Effect.tryPromise({
-        try: () => secondary.generateChatTitle(conversation, DEFAULT_CHAT_NAME, { forkId: event.forkId, callType: 'title' }),
-        catch: (error) => error instanceof Error ? error : new Error(String(error))
-      }).pipe(
+      const runtime = yield* ModelResolver
+      const model = yield* runtime.resolve('secondary')
+      const result = yield* withTraceScope(
+        { metadata: { callType: 'title', forkId: event.forkId ?? null } },
+        model.invoke(
+          GenerateChatTitle,
+          { conversation, defaultName: DEFAULT_CHAT_NAME },
+        ),
+      ).pipe(
         Effect.catchAll((error) => {
           logger.error({ error: String(error) }, '[ChatTitleWorker] Failed to generate chat title')
           return Effect.succeed(null)

@@ -1,6 +1,7 @@
 import { Cause, Duration, Effect, Queue, Stream } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent, ResponsePart } from '../events'
+import { TransportError } from '@magnitudedev/providers'
 import { ExecutionManager } from '../execution/execution-manager'
 import { createTurnStream } from '../execution/types'
 import { drainTurnEventStream } from '../workers/turn-event-drain'
@@ -12,7 +13,7 @@ function frameToChunks(frame: MockTurnResponse): readonly string[] {
   return ['<comms><message to="user">ok</message></comms><yield/>']
 }
 
-function buildStream(frame: MockTurnResponse): Stream.Stream<string, Error> {
+function buildStream(frame: MockTurnResponse): Stream.Stream<string, import('@magnitudedev/providers').ModelError> {
   const chunks = frameToChunks(frame)
   const effective = frame.terminateStreamEarly ? chunks.slice(0, Math.max(0, chunks.length - 1)) : chunks
 
@@ -21,7 +22,7 @@ function buildStream(frame: MockTurnResponse): Stream.Stream<string, Error> {
     Stream.mapEffect(([chunk, idx]) => Effect.gen(function* () {
       const chunkNum = idx + 1
       if (frame.failAfterChunk !== undefined && chunkNum > frame.failAfterChunk) {
-        return yield* Effect.fail(new Error(`MockTurnScript failAfterChunk=${frame.failAfterChunk}`))
+        return yield* Effect.fail(new TransportError({ message: `MockTurnScript failAfterChunk=${frame.failAfterChunk}`, status: null }))
       }
       const delayMs = frame.delayMsBetweenChunks ?? 0
       if (delayMs > 0 && chunkNum > 1) {

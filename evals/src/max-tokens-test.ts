@@ -9,7 +9,8 @@
  * Default: anthropic:claude-sonnet-4-6
  */
 
-import { setModel, primary, getAuth } from '@magnitudedev/providers'
+import { Effect, Layer, Stream } from 'effect'
+import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer, CodingAgentChat } from '@magnitudedev/providers'
 import { BamlClientFinishReasonError, BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { getProvider } from '@magnitudedev/providers'
 import type { ChatMessage } from '@magnitudedev/llm-core'
@@ -45,13 +46,25 @@ const messages: ChatMessage[] = [
 
 console.log('--- Streaming (primary.chat) ---')
 try {
-  const chatStream = primary.chat(systemPrompt, messages, undefined, undefined, '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>')
-  let result = ''
+  const chatStream = await Effect.runPromise(
+    Effect.gen(function* () {
+      const runtime = yield* ModelResolver
+      const model = yield* runtime.resolve('primary')
+      return yield* model.invoke(
+        CodingAgentChat,
+        {
+          systemPrompt,
+          messages,
+          ackTurn: '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>',
+        },
+      )
+    }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(makeNoopTracer())), makeNoopTracer()))),
+  )
   let chunkCount = 0
-  for await (const chunk of chatStream.stream) {
-    result += chunk
+  const result = await Effect.runPromise(Stream.runFold(chatStream.stream, '', (acc, chunk) => {
     chunkCount++
-  }
+    return acc + chunk
+  }))
   console.log(`Completed without error`)
   console.log(`Chunks received: ${chunkCount}`)
   console.log(`Output length: ${result.length} chars`)
@@ -67,7 +80,8 @@ try {
   // Check collector data for stop reason
   const collectorData = chatStream.getCollectorData()
   console.log(`\n--- Collector Data ---`)
-  console.log(`rawRequestBody keys: ${collectorData.rawRequestBody ? Object.keys(collectorData.rawRequestBody as object).join(', ') : 'null'}`)
+  const rawRequestBody = collectorData._tag === 'Baml' ? collectorData.rawRequestBody : null
+  console.log(`rawRequestBody keys: ${rawRequestBody ? Object.keys(rawRequestBody as object).join(', ') : 'null'}`)
 
   // Look for stop_reason in response body
   const rawResp = collectorData.rawResponseBody as Record<string, unknown> | null
@@ -86,8 +100,8 @@ try {
   }
 
   // Look for stop reason in last SSE event
-  const sseEvents = collectorData.sseEvents
-  if (sseEvents && sseEvents.length > 0) {
+  const sseEvents: Array<Record<string, unknown>> = []
+  if (sseEvents.length > 0) {
     console.log(`\nSSE events count: ${sseEvents.length}`)
     // Check last few events for stop signals
     const lastEvents = sseEvents.slice(-3)
@@ -99,26 +113,35 @@ try {
       console.log(JSON.stringify(evt, null, 2))
     }
   } else {
-    console.log(`SSE events: ${sseEvents === null ? 'null' : 'empty'}`)
+    console.log(`SSE events: empty`)
   }
 
 } catch (error) {
-  const err = error as Error
-  console.log(`Error type: ${err.constructor.name}`)
-  console.log(`Message: ${err.message}`)
-  if (err instanceof BamlClientFinishReasonError) {
-    console.log(`Finish reason: ${err.finish_reason}`)
-    console.log(`Raw output length: ${err.raw_output.length} chars`)
-    console.log(`Raw output last 100: ${JSON.stringify(err.raw_output.slice(-100))}`)
-  }
-  if (err instanceof BamlClientHttpError) {
-    console.log(`Status: ${err.status_code}`)
-    console.log(`Detailed: ${err.detailed_message?.slice(0, 300)}`)
-    console.log(`Raw response: ${err.raw_response?.slice(0, 300)}`)
-  }
-  if (err instanceof BamlValidationError) {
-    console.log(`Detailed: ${err.detailed_message?.slice(0, 300)}`)
-    console.log(`Raw output length: ${err.raw_output.length} chars`)
+  const record = (typeof error === 'object' && error !== null) ? error as Record<string, unknown> : null
+  const errorType = error instanceof Error ? error.constructor.name : typeof error
+  const errorMessage = error instanceof Error ? error.message : String(error)
+
+  console.log(`Error type: ${errorType}`)
+  console.log(`Message: ${errorMessage}`)
+
+  if (error instanceof BamlClientFinishReasonError) {
+    const finishReason = typeof record?.finish_reason === 'string' ? record.finish_reason : undefined
+    const rawOutput = String(record?.raw_output ?? '')
+    console.log(`Finish reason: ${finishReason}`)
+    console.log(`Raw output length: ${rawOutput.length} chars`)
+    console.log(`Raw output last 100: ${JSON.stringify(rawOutput.slice(-100))}`)
+  } else if (error instanceof BamlClientHttpError) {
+    const status = typeof record?.status_code === 'number' ? record.status_code : undefined
+    const detailed = record?.detailed_message == null ? undefined : String(record.detailed_message)
+    const rawResponse = record?.raw_response == null ? undefined : String(record.raw_response)
+    console.log(`Status: ${status}`)
+    console.log(`Detailed: ${detailed?.slice(0, 300)}`)
+    console.log(`Raw response: ${rawResponse?.slice(0, 300)}`)
+  } else if (error instanceof BamlValidationError) {
+    const detailed = record?.detailed_message == null ? undefined : String(record.detailed_message)
+    const rawOutput = String(record?.raw_output ?? '')
+    console.log(`Detailed: ${detailed?.slice(0, 300)}`)
+    console.log(`Raw output length: ${rawOutput.length} chars`)
   }
 }
 

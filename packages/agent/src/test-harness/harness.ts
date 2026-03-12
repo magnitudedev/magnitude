@@ -40,6 +40,7 @@ import { UserPresenceWorker } from '../workers/user-presence-worker'
 // Runtime/services
 import { ExecutionManager, ExecutionManagerLive } from '../execution/execution-manager'
 import { BrowserServiceLive } from '../services/browser-service'
+import { makeTestResolver, type TestModelConfig } from '@magnitudedev/providers'
 import { registerApprovalBridge } from '../execution/approval-bridge'
 
 // Testing services
@@ -101,6 +102,7 @@ export interface HarnessOptions {
   toolOverrides?: Record<string, ToolOverrideHandler>
   extraLayers?: Layer.Layer<unknown, never, never>[]
   clock?: 'real' | 'fake'
+  model?: TestModelConfig
 }
 
 const ALL_VARIANTS: AgentVariant[] = [
@@ -116,20 +118,16 @@ const ALL_VARIANTS: AgentVariant[] = [
 type MagnitudeAgentDef = AgentDefinition<ToolSet, PolicyContext>
 
 function makeOverrideTool(source: Tool.Any, handler: ToolOverrideHandler): Tool.Any {
-  return createTool({
-    name: source.name,
-    group: source.group,
-    description: source.description,
-    inputSchema: source.inputSchema,
-    outputSchema: source.outputSchema,
-    argMapping: source.argMapping,
-    bindings: source.bindings,
-    execute: (input) =>
-      Effect.tryPromise({
-        try: () => Promise.resolve(handler(input)),
-        catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-      }).pipe(Effect.orDie),
-  }) as unknown as Tool.Any
+  const execute: Tool.Any['execute'] = (input) =>
+    Effect.tryPromise({
+      try: () => Promise.resolve(handler(input)),
+      catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+    }).pipe(Effect.orDie)
+
+  return {
+    ...source,
+    execute,
+  }
 }
 
 function applyToolOverrides(
@@ -140,11 +138,12 @@ function applyToolOverrides(
     const def = getAgentDefinition(variant)
     const tools: Partial<Record<keyof typeof def.tools, Tool.Any>> = {}
 
-    for (const [key, tool] of Object.entries(def.tools)) {
-      if (!tool) {
+    for (const key of Object.keys(def.tools) as Array<keyof typeof def.tools>) {
+      const concreteTool = def.tools[key]
+      if (!concreteTool) {
         continue
       }
-      const tagName = defaultXmlTagName(tool as Tool.Any)
+      const tagName = defaultXmlTagName(concreteTool)
       const override = handlers[tagName]
       const wrappedOverride = override
         ? async (input: unknown) => {
@@ -153,9 +152,9 @@ function applyToolOverrides(
         }
         : null
 
-      tools[key as keyof typeof def.tools] = wrappedOverride
-        ? makeOverrideTool(tool as Tool.Any, wrappedOverride)
-        : (tool as Tool.Any)
+      tools[key] = wrappedOverride
+        ? makeOverrideTool(concreteTool, wrappedOverride)
+        : concreteTool
     }
 
     const overridden: MagnitudeAgentDef = {
@@ -289,19 +288,21 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       }))
     ).pipe(Layer.provide(basePersistenceLayer))
 
-    type TestRequirementsLayer = Parameters<typeof TestCodingAgent.createClient>[0]
     const defaultWaitTimeoutMs = options.defaults?.waitTimeoutMs ?? DEFAULT_TIMEOUT_MS
     const fakeClock = options.clock === 'fake' ? createFakeClock() : null
 
     const runtimeLayer = Layer.mergeAll(
       ExecutionManagerLive,
       BrowserServiceLive,
+      ...(options.model
+        ? [makeTestResolver(options.model as TestModelConfig)]
+        : [makeTestResolver()]),
       MockTurnScriptLive,
       basePersistenceLayer,
       faultWrappedPersistenceLayer,
       ...(fakeClock ? [fakeClock.layer] : []),
       ...(options.extraLayers ?? []),
-    ) as TestRequirementsLayer
+    )
     const client = await TestCodingAgent.createClient(runtimeLayer)
 
     await client.runEffect(registerApprovalBridge)
@@ -468,16 +469,16 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       projection: async <S>(
         tag: Context.Tag<Projection.ProjectionInstance<S>, Projection.ProjectionInstance<S>>,
       ): Promise<S> =>
-        await client.runEffect(
+        client.runEffect(
           Effect.flatMap(tag, (projection) => projection.get),
-        ) as S,
+        ),
       projectionFork: async <S>(
         tag: Context.Tag<Projection.ForkedProjectionInstance<S>, Projection.ForkedProjectionInstance<S>>,
         forkId: string | null,
       ): Promise<S> =>
-        await client.runEffect(
+        client.runEffect(
           Effect.flatMap(tag, (projection) => projection.getFork(forkId)),
-        ) as S,
+        ),
       response: () => standaloneResponse(),
       turns: () => createTurnsBuilder(builtHarness),
       inspect: {

@@ -7,10 +7,10 @@
 
 import { Effect, Stream, Queue, Deferred, Scope, Data } from 'effect'
 import type { XmlRuntimeCrash, ToolCallEvent } from '@magnitudedev/xml-act'
-import type { TraceContext, TraceData } from '@magnitudedev/tracing'
 import type { ResponsePart, ToolDisplay } from '../events'
 import type { ExecuteResult } from './execution-manager'
 import type { CallUsage } from '@magnitudedev/providers'
+
 
 // =============================================================================
 // Turn Events
@@ -36,9 +36,6 @@ export type TurnEvent =
 
   // --- Tool events (forwarded xml-act ToolCallEvent with agent metadata) ---
   | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: string; readonly event: ToolCallEvent; readonly display?: ToolDisplay }
-
-  // --- Tracing (emitted after LLM stream is fully consumed) ---
-  | { readonly _tag: 'Trace'; readonly ctx: TraceContext; readonly request: TraceData['request']; readonly response: TraceData['response']; readonly usage: CallUsage }
 
   // --- Terminal (always last event in the stream) ---
   | { readonly _tag: 'TurnResult'; readonly value: TurnStrategyResult }

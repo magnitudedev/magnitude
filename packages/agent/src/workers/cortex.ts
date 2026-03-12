@@ -15,13 +15,14 @@
  * 5. Publishing turn_completed
  */
 
-import { Effect, Stream, Queue, Schedule, Duration } from 'effect'
+import { Effect, Stream, Queue, Either } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import { actionsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
+import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
-import { emitTrace } from '@magnitudedev/tracing'
-import { isTracing } from '@magnitudedev/tracing'
-import { isContextLimitError } from '../util/context-limit-error'
+
+import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError, NotConfigured, ProviderDisconnected } from '@magnitudedev/providers'
+import type { ModelError } from '@magnitudedev/providers'
 import { drainTurnEventStream } from './turn-event-drain'
 import type { ChatMessage } from '@magnitudedev/llm-core'
 import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
@@ -33,6 +34,7 @@ import { ContentPart } from '../content'
 import type { AppEvent, ResponsePart } from '../events'
 
 import { createTurnStream, TurnError as TurnErrorCtor } from '../execution/types'
+import type { TurnError } from '../execution/types'
 import { MemoryProjection, getView } from '../projections/memory'
 
 import { LLMMessage } from '../projections/memory'
@@ -43,7 +45,8 @@ import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
 import { getContextLimits } from '../constants'
-import { resolveModel, detectProviders, getProvider, ensureValidAuth, primary, secondary, browser as browserProxy } from '@magnitudedev/providers'
+import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
+import { withTraceScope } from '../tracing'
 
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
@@ -66,28 +69,27 @@ function toBamlMessages(messages: LLMMessage[]): ChatMessage[] {
 // Error Classification
 // =============================================================================
 
-function isNonRetryableError(error: unknown): boolean {
+type NonRetryableReason = 'context-limit' | 'auth' | 'parse' | 'client-error' | 'not-configured' | 'disconnected' | null
+
+function classifyRetryability(error: unknown): NonRetryableReason {
+  if (error instanceof ContextLimitExceeded) return 'context-limit'
+  if (error instanceof AuthFailed) return 'auth'
+  if (error instanceof ProviderParseError) return 'parse'
+  if (error instanceof ProviderTransportError) {
+    const s = error.status
+    if (s !== null && s >= 400 && s < 500 && s !== 408 && s !== 429) return 'client-error'
+    return null
+  }
+  // Legacy BAML error fallback
   if (error instanceof BamlClientHttpError) {
-    const statusCode = error.status_code
-    if (statusCode !== undefined && statusCode >= 400 && statusCode < 500) {
-      if (statusCode !== 408 && statusCode !== 429) {
-        logger.warn(`[Cortex] Non-retryable HTTP error (${statusCode}): ${error.message}`)
-        return true
-      }
-    }
-    return false
+    const s = error.status_code
+    if (s !== undefined && s >= 400 && s < 500 && s !== 408 && s !== 429) return 'client-error'
+    return null
   }
-  if (error instanceof BamlValidationError) {
-    logger.warn(`[Cortex] Non-retryable validation error: ${error.message}`)
-    return true
-  }
-  return false
+  if (error instanceof BamlValidationError) return 'parse'
+  return null
 }
 
-const retrySchedule = Schedule.exponential(Duration.seconds(1), 1.5).pipe(
-  Schedule.jittered,
-  Schedule.intersect(Schedule.recurs(6))
-)
 
 // =============================================================================
 // System Prompt Builder
@@ -138,29 +140,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const modelSlot = agentDef.model
         const timezone = sessionCtx.context?.timezone ?? null
 
-        // Validate provider is connected before attempting LLM call
-        const resolved = resolveModel(modelSlot)
-        if (!resolved) {
-          yield* publish({
-            type: 'turn_unexpected_error',
-            forkId,
-            turnId,
-            message: 'No model configured. Please connect a provider and select a model in /settings.',
-          })
-          return
-        }
+        const runtime = yield* ModelResolver
 
-        const connectedProviderIds = new Set(detectProviders().map(d => d.provider.id))
-        if (!connectedProviderIds.has(resolved.providerId)) {
-          const providerName = getProvider(resolved.providerId)?.name ?? resolved.providerId
-          yield* publish({
-            type: 'turn_unexpected_error',
-            forkId,
-            turnId,
-            message: `${providerName} is not connected. Please connect the provider or choose another provider/model in /settings.`,
-          })
-          return
-        }
+
 
         // Run agent observables
         const execManager = yield* ExecutionManager
@@ -193,84 +175,57 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 
+        // Step 1: Ensure model ready
+        const resolveResult = yield* runtime.resolve(modelSlot).pipe(Effect.either)
+        if (Either.isLeft(resolveResult)) {
+          const e = resolveResult.left
+          const message = e._tag === 'NotConfigured'
+            ? 'No model configured. Please connect a provider and select a model in /settings.'
+            : e._tag === 'ProviderDisconnected'
+            ? e.message
+            : `Authentication failed: ${e.message}`
+          yield* publish({ type: 'turn_unexpected_error', forkId, turnId, message })
+          return
+        }
+        const boundModel = resolveResult.right
+
         // 3. Build and consume the turn event stream
         const turnStream = createTurnStream((queue) => Effect.gen(function* () {
-          const slot = modelSlot
-          const startTime = Date.now()
 
-          // Ensure OAuth token is fresh
-          yield* Effect.tryPromise({
-            try: () => ensureValidAuth(modelSlot),
-            catch: (e) => TurnErrorCtor.AuthFailed({ message: e instanceof Error ? e.message : String(e), cause: e })
-          })
-
-          // Stream BAML response with first-chunk retry
-          let attempt = 0
-          const { firstChunk, restOfStream, chatStream } = yield* Effect.retry(
-            Effect.tryPromise({
-              try: async () => {
-                attempt++
-                const model = modelSlot === 'primary' ? primary : modelSlot === 'browser' ? browserProxy : secondary
-                const ackTurn = buildAckTurn(agentDef.thinkingLenses)
-                const cs = model.chat(systemPrompt, chatMessages, { forkId, forkName: forkInstance?.name ?? 'root', turnId, chainId, callType: 'chat' }, {}, ackTurn)
-                const iterator = cs.stream[Symbol.asyncIterator]()
-
-                const firstResult = await iterator.next()
-
-                if (firstResult.done) {
-                  return { firstChunk: null, restOfStream: iterator, chatStream: cs }
-                }
-                return { firstChunk: firstResult.value, restOfStream: iterator, chatStream: cs }
-              },
-              catch: (e) => TurnErrorCtor.LLMFailed({ message: e instanceof Error ? e.message : String(e), cause: e })
-            }),
+          const ackTurn = buildAckTurn(agentDef.thinkingLenses)
+          const cs = yield* withTraceScope(
             {
-              schedule: retrySchedule,
-              while: (error) => {
-                const shouldNotRetry = isNonRetryableError(error.cause)
-                logger.warn(`[Cortex] BAML stream connection failed (attempt ${attempt}/7): ${error.message}${shouldNotRetry ? '' : ' - will retry'}`)
-                return !shouldNotRetry
-              }
-            }
+              metadata: { callType: 'chat', forkId, forkName: forkInstance?.name ?? 'root', turnId, chainId },
+              strategyId: 'xml-act',
+              systemPrompt,
+            },
+            boundModel.invoke(
+              CodingAgentChat,
+              {
+                systemPrompt,
+                messages: chatMessages,
+                options: {},
+                ackTurn,
+              },
+            ),
+          ).pipe(
+            Effect.mapError((e) => TurnErrorCtor.LLMFailed({ message: e.message, cause: e })),
           )
 
-          // Combine first chunk with rest of stream
-          async function* combinedStream() {
-            try {
-              if (firstChunk !== null) {
-                yield firstChunk
-              }
-              let next = await restOfStream.next()
-              while (!next.done) {
-                yield next.value
-                next = await restOfStream.next()
-              }
-            } finally {
-              await restOfStream.return?.(undefined as never)
-            }
-          }
-
-          const rawStream = Stream.fromAsyncIterable(
-            combinedStream(),
-            (e) => e instanceof Error ? e : new Error(String(e))
+          // Collect raw chunks and execute via xml-act runtime
+          const xmlStream = cs.stream.pipe(
+            Stream.tap(chunk => Effect.sync(() => { rawCodeChunks.push(chunk) })),
           )
 
-          // Guard the stream first (truncate after \n</actions>, inject if missing),
-          // then tap to accumulate raw XML chunks (for interrupt preservation).
-          // Guard must come before the tap so injected closing tags are captured.
-          const xmlStream = rawStream.pipe(
-            Stream.tap(chunk => Effect.sync(() => { rawCodeChunks.push(chunk) }))
-          )
-
-          // Execute via xml-act runtime
           const executeResult = yield* execManager.execute(
             xmlStream,
             { forkId, turnId, chainId },
             queue,
           )
 
-          // Extract usage
-          const usage = chatStream.getUsage()
+          // Extract usage — tag as partial if execution failed
+          const usage = cs.getUsage()
+          const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
 
           // Build response parts — single text part containing the raw XML
           // If there's a synthetic inspect block, splice it inside the last </actions> tag
@@ -287,39 +242,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             ? [{ type: 'text', content: rawCode }]
             : []
 
-          // Emit trace
-          if (isTracing()) {
-            const resolvedModel = resolveModel(slot)
-            const collectorData = chatStream.getCollectorData()
-            const rawBody = collectorData.rawRequestBody
-            const collectorMessages = rawBody != null && typeof rawBody === 'object' && 'messages' in rawBody && Array.isArray(rawBody.messages)
-              ? rawBody.messages
-              : null
-
-            yield* Queue.offer(queue, {
-              _tag: 'Trace',
-              ctx: {
-                startTime,
-                model: resolvedModel?.modelId ?? null,
-                provider: resolvedModel?.providerId ?? null,
-                slot,
-                defaultCallType: 'chat',
-                meta: { callType: 'chat', forkId, forkName: forkInstance?.name ?? 'root', turnId, chainId },
-                strategyId: 'xml-act',
-                systemPrompt,
-              },
-              request: { messages: collectorMessages ?? chatMessages },
-              response: {
-                rawBody: collectorData.rawResponseBody,
-                sseEvents: collectorData.sseEvents,
-                rawOutput: rawCode,
-              },
-              usage,
-            })
-          }
-
           // Offer final result
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage, responseParts, rawCodeChunks } })
+          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, responseParts, rawCodeChunks } })
         }))
 
         // 3a. Drain turn stream, publishing events and collecting the final result
@@ -335,11 +259,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // 4. Detect output truncation — if output tokens hit the model limit,
         // the response was cut short (incomplete XML, broken tool calls, etc.)
         const outputTruncated = usage.outputTokens !== null
-          && resolved.maxOutputTokens !== undefined
-          && usage.outputTokens >= resolved.maxOutputTokens
+          && boundModel.model.maxOutputTokens !== null
+          && usage.outputTokens >= boundModel.model.maxOutputTokens
 
         const turnResult = outputTruncated
-          ? { success: false as const, error: `Your response was truncated because it hit the maximum output token limit (${resolved.maxOutputTokens} tokens). You MUST split your work into smaller steps — make fewer tool calls per turn, write shorter files, or break large operations into multiple turns.`, cancelled: false }
+          ? { success: false as const, error: `Your response was truncated because it hit the maximum output token limit (${boundModel.model.maxOutputTokens} tokens). You MUST split your work into smaller steps — make fewer tool calls per turn, write shorter files, or break large operations into multiple turns.`, cancelled: false }
           : executeResult.result
 
         // Publish turn_completed for this fork
@@ -385,6 +309,20 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         Effect.catchAll((error: XmlRuntimeCrash | TurnError) => Effect.gen(function* () {
           // XmlRuntimeCrash is an infrastructure defect — should not happen in normal operation
           if (error._tag === 'XmlRuntimeCrash') {
+            // Improvement C: if crash was caused by a typed ModelError, surface it as a turn error
+            const cause = error.cause
+            if (cause && typeof cause === 'object' && '_tag' in cause) {
+              const errorType = (cause as any)._tag as string
+              const errorMessage = (cause as any).message as string ?? error.message
+              logger.error({ context: 'Cortex', forkId, turnId, errorType }, `Cortex: Mid-stream ModelError (${errorType}): ${errorMessage}`)
+              yield* publish({
+                type: 'turn_unexpected_error',
+                forkId,
+                turnId,
+                message: `Stream error (${errorType}): ${errorMessage}`,
+              })
+              return
+            }
             return yield* Effect.die(error)
           }
 
@@ -392,7 +330,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const errorCause = error.cause
 
           // Tier 1: Definitive context-limit error (known provider patterns)
-          const definiteContextLimit = isContextLimitError(errorCause)
+          const definiteContextLimit = classifyRetryability(errorCause) === 'context-limit'
 
           // Tier 2: Heuristic — if over soft cap and compacting, any error is likely context-related
           let probableContextLimit = false

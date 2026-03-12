@@ -1,7 +1,7 @@
 import { Effect, Scope, Stream } from 'effect'
 import type { PublishFn } from '@magnitudedev/event-core'
 import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
-import { emitTrace } from '@magnitudedev/tracing'
+
 import type { AppEvent } from '../events'
 import type { TurnError, TurnEvent, TurnStrategyResult } from '../execution/types'
 
@@ -47,9 +47,6 @@ export function drainTurnEventStream<R>(
             break
           case 'ToolEvent':
             yield* publish({ type: 'tool_event', forkId, turnId, toolCallId: event.toolCallId, toolKey: event.toolKey, event: event.event, display: event.display })
-            break
-          case 'Trace':
-            emitTrace(event.ctx, event.request, event.response, event.usage)
             break
           case 'TurnResult':
             finalResult = event.value

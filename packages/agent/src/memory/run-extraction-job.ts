@@ -1,13 +1,15 @@
 import { writeFile } from 'fs/promises'
+import { Effect, Layer } from 'effect'
 import { logger } from '@magnitudedev/logger'
-import { initializeProviderState, secondary } from '@magnitudedev/providers'
+import { initializeProviderState, ModelResolver, makeModelResolver, makeNoopTracer, ExtractMemoryDiff } from '@magnitudedev/providers'
 import { applyMemoryDiff, enforceLineBudget, ensureMemoryFile, readMemory, type MemoryDiff } from './memory-file'
+import { withTraceScope } from '../tracing'
 import { buildExtractionTranscript, readEventsJsonl } from './transcript'
 import { markJobPending, markJobRunning, readJob, removeJob } from './job-queue'
 
 function parseJsonDiff(raw: unknown): MemoryDiff | null {
   if (!raw || typeof raw !== 'object') return null
-  const val = raw as any
+  const val = raw as Record<string, unknown>
   return {
     additions: Array.isArray(val.additions) ? val.additions : [],
     updates: Array.isArray(val.updates) ? val.updates : [],
@@ -30,10 +32,22 @@ export async function runExtractionJobFromFile(jobFilePath: string): Promise<voi
 
     const transcript = buildExtractionTranscript(events)
 
-    const { result } = await secondary.extractMemoryDiff(transcript, currentMemory, {
-      forkId: null,
-      callType: 'extract-memory-diff',
-    })
+    const tracerLayer = makeNoopTracer()
+    const resolverLayer = makeModelResolver()
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runtime = yield* ModelResolver
+        const model = yield* runtime.resolve('secondary')
+        return yield* withTraceScope(
+          { metadata: { callType: 'extract-memory-diff', forkId: null } },
+          model.invoke(
+            ExtractMemoryDiff,
+            { transcript, currentMemory },
+          ),
+        )
+      }).pipe(Effect.provide(Layer.merge(resolverLayer, tracerLayer))),
+    )
 
     const diff = parseJsonDiff(result)
     if (!diff) {
@@ -62,7 +76,11 @@ async function main(): Promise<void> {
     logger.warn('[memory] missing --job path')
     return
   }
-  const jobPath = args[idx + 1]!
+  const jobPath = args[idx + 1]
+  if (!jobPath) {
+    logger.warn('[memory] missing --job path')
+    return
+  }
   await runExtractionJobFromFile(jobPath)
 }
 

@@ -1,5 +1,7 @@
-import { setModel, getAuth, createProviderClient } from '@magnitudedev/providers'
+import { Effect, Layer } from 'effect'
+import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer } from '@magnitudedev/providers'
 import { type RunnableEval, type Scenario, type ScenarioResult, type Check, type CheckResult, type EvalVariant, type ModelSpec, type ChatMessage } from '../../types'
+import type { TestSandboxResult } from '../../test-sandbox'
 import { callModel } from '../../runner'
 import { FORMATS } from './formats'
 import { SCENARIO_DEFS, type ScenarioDef } from './scenarios'
@@ -35,6 +37,22 @@ const hasToolCall = (raw: string, formatId: string, toolName: string): boolean =
 }
 
 type DetectedCall = { toolName: string; args?: string; attrs?: string; body?: string; parsedArgs?: unknown }
+
+type OpenAIResponsesContentItem = {
+  type?: string
+  text?: string
+}
+
+type OpenAIResponsesOutputItem = {
+  type?: string
+  name?: string
+  arguments?: unknown
+  content?: OpenAIResponsesContentItem[]
+}
+
+type OpenAICompletedResponse = {
+  output?: OpenAIResponsesOutputItem[]
+}
 
 const detectToolCalls = (raw: string, formatId: string): DetectedCall[] => {
   const calls: DetectedCall[] = []
@@ -377,15 +395,23 @@ const callModelOpenAINative = async (
     strict: null,
   }))
 
-  const client = createProviderClient('primary')
-  const endpoint = client.getResponsesEndpoint()
-  const headers = client.getHeaders()
+  const bound = await Effect.runPromise(
+    Effect.gen(function* () {
+      const runtime = yield* ModelResolver
+      return yield* runtime.resolve('primary')
+    }).pipe(Effect.provide(makeModelResolver().pipe(Layer.provide(makeNoopTracer())))),
+  )
+  if (bound.connection._tag !== 'Responses') {
+    throw new Error('OpenAI native format requires a Responses connection')
+  }
+  const endpoint = bound.connection.endpoint
+  const headers = bound.connection.headers
 
   const body = {
     model: modelSpec.model,
     instructions: systemPrompt,
     input: messages.map((m) => ({
-      role: m.role as 'user',
+      role: m.role === 'assistant' ? 'assistant' : 'user',
       content: Array.isArray(m.content) ? m.content.join('') : String(m.content),
     })),
     tools: toolDefs,
@@ -412,7 +438,7 @@ const callModelOpenAINative = async (
   const decoder = new TextDecoder()
   let buffer = ''
   let textOutput = ''
-  let completedResponse: any = null
+  let completedResponse: OpenAICompletedResponse | null = null
 
   while (true) {
     const { done, value } = await reader.read()
@@ -459,11 +485,11 @@ const callModelOpenAINative = async (
 
   // Fallback: attempt to render message/function output from completed payload
   const fallback = outputItems
-    .map((item: any) => {
+    .map((item: OpenAIResponsesOutputItem) => {
       if (item?.type === 'message') {
         const text = item.content
-          ?.filter((c: any) => c.type === 'output_text')
-          .map((c: any) => c.text)
+          ?.filter((c: OpenAIResponsesContentItem) => c.type === 'output_text')
+          .map((c: OpenAIResponsesContentItem) => c.text ?? '')
           .join('')
         return text?.trim() ? text : ''
       }
@@ -533,8 +559,12 @@ const executeScenario = async (scenario: Scenario, modelSpec: ModelSpec): Promis
     }
   }
 
+  const emptySandboxResult: TestSandboxResult = {
+    calls: [],
+    events: [],
+  }
   const checks = Object.fromEntries(
-    scenario.checks.map((check) => [check.id, check.evaluate(rawResponse, {} as any)])
+    scenario.checks.map((check) => [check.id, check.evaluate(rawResponse, emptySandboxResult)])
   )
   const checkResults = Object.values(checks)
   const score = checkResults.length > 0

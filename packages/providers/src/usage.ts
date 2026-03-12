@@ -4,7 +4,8 @@
  * Extracted from model-proxy.ts so both model-proxy and provider-client can use them.
  */
 
-import type { ResolvedModel, CallUsage } from './provider-state'
+import type { Model } from './model/model'
+import type { CallUsage } from './state/provider-state'
 import { getModelCost } from './registry'
 
 /**
@@ -12,20 +13,21 @@ import { getModelCost } from './registry'
  * OAuth subscriptions are free ($0). Returns null costs if no pricing available.
  */
 export function calculateCosts(
-  resolved: ResolvedModel | null,
+  model: Model | null,
+  authType: string | null,
   inputTokens: number | null,
   outputTokens: number | null,
   cacheReadTokens: number | null,
   cacheWriteTokens: number | null,
 ): { inputCost: number | null; outputCost: number | null; totalCost: number | null } {
   // Subscription-based providers cost $0
-  if (resolved?.auth?.type === 'oauth') {
+  if (authType === 'oauth') {
     return { inputCost: 0, outputCost: 0, totalCost: 0 }
   }
 
-  if (!resolved) return { inputCost: null, outputCost: null, totalCost: null }
+  if (!model) return { inputCost: null, outputCost: null, totalCost: null }
 
-  const pricing = getModelCost(resolved.providerId, resolved.modelId)
+  const pricing = getModelCost(model.providerId, model.id)
   if (!pricing) return { inputCost: null, outputCost: null, totalCost: null }
 
   let inputCost: number | null = null
@@ -54,15 +56,16 @@ export function calculateCosts(
 
 /**
  * Build a complete CallUsage from raw token counts.
- * Calculates costs based on the resolved model's pricing.
+ * Calculates costs based on the model's pricing.
  */
 export function buildUsage(
-  resolved: ResolvedModel | null,
+  model: Model | null,
+  authType: string | null,
   inputTokens: number | null,
   outputTokens: number | null,
   cacheReadTokens: number | null,
   cacheWriteTokens: number | null,
 ): CallUsage {
-  const costs = calculateCosts(resolved, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
+  const costs = calculateCosts(model, authType, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
   return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, ...costs }
 }

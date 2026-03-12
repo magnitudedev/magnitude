@@ -8,6 +8,7 @@
  */
 
 import { Effect, Stream, Queue, Context, Layer, Ref, Deferred } from 'effect'
+import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
   ToolInterceptorTag,
@@ -118,7 +119,7 @@ export interface ExecutionManagerService {
    * Returns the accumulated execution result.
    */
   readonly execute: (
-    xmlStream: Stream.Stream<string, Error>,
+    xmlStream: Stream.Stream<string, ModelError>,
     options: ExecuteOptions,
     sink: Queue.Queue<TurnEvent>,
   ) => Effect.Effect<
@@ -343,7 +344,7 @@ const makeExecutionManager = Effect.gen(function* () {
   }
 
   const service: ExecutionManagerService = {
-    execute: (xmlStream, options, sink) => Effect.gen(function* () {
+    execute: (xmlStream: Stream.Stream<string, ModelError>, options, sink) => Effect.gen(function* () {
       const { forkId, turnId } = options
 
       // Resolve agent definition for this fork

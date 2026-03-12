@@ -41,8 +41,8 @@ type QueueItem = XmlRuntimeEvent | typeof END
 // =============================================================================
 
 export interface XmlRuntime {
-  readonly streamWith: (
-    xmlStream: Stream.Stream<string, Error>,
+  readonly streamWith: <E extends { message: string } = Error>(
+    xmlStream: Stream.Stream<string, E>,
     opts?: { readonly initialState?: ReactorState },
   ) => Stream.Stream<XmlRuntimeEvent, XmlRuntimeCrash>
 }
@@ -59,8 +59,8 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
   }
 
   return {
-    streamWith(
-      xmlStream: Stream.Stream<string, Error>,
+    streamWith<E extends { message: string } = Error>(
+      xmlStream: Stream.Stream<string, E>,
       opts?: { readonly initialState?: ReactorState },
     ): Stream.Stream<XmlRuntimeEvent, XmlRuntimeCrash> {
       return Stream.unwrapScoped(
