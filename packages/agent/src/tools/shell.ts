@@ -61,7 +61,8 @@ export const shellTool = createTool({
           const { stdout, stderr } = await execAsync(command, {
             cwd,
             timeout: 30000,
-            maxBuffer: 10 * 1024 * 1024 // 10MB
+            maxBuffer: 10 * 1024 * 1024, // 10MB
+            env: { ...process.env, NO_COLOR: '1' }
           })
           return { stdout, stderr, exitCode: 0 }
         } catch (error) {
