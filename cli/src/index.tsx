@@ -1,3 +1,5 @@
+process.env.BAML_LOG = 'off';
+
 import { createCliRenderer } from '@opentui/core'
 import { createRoot } from '@opentui/react'
 import { Command } from '@commander-js/extra-typings'
