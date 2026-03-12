@@ -25,19 +25,26 @@ export interface CollectorData {
 }
 
 /**
- * Generic trace data for an LLM call.
- * M is the metadata type — narrow it for type-safe access to call-specific fields.
+ * Transport-level trace input emitted by the driver.
+ * Contains only what the driver knows — no agent-level context.
  */
-export interface TraceData<M extends Record<string, unknown> = Record<string, unknown>> {
+export interface TraceInput {
   timestamp: string
   model: string | null
   provider: string | null
   slot: ModelSlot
-  callType: string
   request: { messages?: unknown[]; input?: unknown }
   response: { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string }
   usage: CallUsage
   durationMs: number
+}
+
+/**
+ * Full trace data for an LLM call — driver data enriched with agent context.
+ * M is the metadata type — narrow it for type-safe access to call-specific fields.
+ */
+export interface TraceData<M extends Record<string, unknown> = Record<string, unknown>> extends TraceInput {
+  callType: string
   metadata: M
   /** Strategy that produced this trace (null for non-strategy calls like compact/title) */
   strategyId: string | null

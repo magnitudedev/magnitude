@@ -3,9 +3,11 @@
  * then runs scenario checks against raw responses.
  */
 
+import { Effect, Layer, Stream } from 'effect'
 import { type ChatMessage, BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
-import { setModel, primary, getAuth } from '@magnitudedev/providers'
+import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer, CodingAgentChat } from '@magnitudedev/providers'
 import { isRunnableEval, type Eval, type ModelSpec, type ScenarioResult, type EvalRunResult, type Scenario, type CheckResult } from './types'
+import type { TestSandboxResult } from './test-sandbox'
 import { generateModelReport, generateSummaryReport } from './results'
 
 function resolveCheckScore(checkResult: CheckResult): number {
@@ -27,8 +29,12 @@ export async function evaluateScenarioResponse(raw: string, scenario: Scenario):
   const checks: Record<string, CheckResult> = {}
   let allPassed = true
 
+  const emptySandboxResult: TestSandboxResult = {
+    calls: [],
+    events: [],
+  }
   for (const check of scenario.checks) {
-    const checkResult = check.evaluate(raw, null)
+    const checkResult = check.evaluate(raw, emptySandboxResult)
     checks[check.id] = checkResult
     if (!checkResult.passed) allPassed = false
   }
@@ -86,11 +92,21 @@ export async function callModel(
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const { stream } = primary.chat(systemPrompt, messages, undefined, undefined, '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>')
-      let result = ''
-      for await (const chunk of stream) {
-        result += chunk
-      }
+      const chatStream = await Effect.runPromise(
+        Effect.gen(function* () {
+          const runtime = yield* ModelResolver
+          const model = yield* runtime.resolve('primary')
+          return yield* model.invoke(
+            CodingAgentChat,
+            {
+              systemPrompt,
+              messages,
+              ackTurn: '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>',
+            },
+          )
+        }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(makeNoopTracer())), makeNoopTracer()))),
+      )
+      const result = await Effect.runPromise(Stream.runFold(chatStream.stream, '', (acc, chunk) => acc + chunk))
       return result
     } catch (error) {
       if (attempt < MAX_RETRIES && isRetryableError(error)) {
@@ -124,7 +140,7 @@ async function runScenario(
   scenario: Scenario,
   modelSpec: ModelSpec
 ): Promise<ScenarioResult> {
-  const raw = await callModel('', scenario.messages as ChatMessage[], modelSpec)
+  const raw = await callModel('', scenario.messages, modelSpec)
   return evaluateScenarioResponse(raw, scenario)
 }
 
@@ -142,8 +158,9 @@ export async function runEval(
     resultsDir?: string
   }
 ): Promise<EvalRunResult> {
-  const scenarios = options?.scenarios
-    ? eval_.scenarios.filter(s => options.scenarios!.includes(s.id))
+  const selected = options?.scenarios ?? []
+  const scenarios = selected.length > 0
+    ? eval_.scenarios.filter(s => selected.includes(s.id))
     : eval_.scenarios
 
   const cb = options?.callbacks

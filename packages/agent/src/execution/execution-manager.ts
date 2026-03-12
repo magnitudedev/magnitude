@@ -8,6 +8,7 @@
  */
 
 import { Effect, Stream, Queue, Context, Layer, Ref, Deferred } from 'effect'
+import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
   ToolInterceptorTag,
@@ -118,7 +119,7 @@ export interface ExecutionManagerService {
    * Returns the accumulated execution result.
    */
   readonly execute: (
-    xmlStream: Stream.Stream<string, Error>,
+    xmlStream: Stream.Stream<string, ModelError>,
     options: ExecuteOptions,
     sink: Queue.Queue<TurnEvent>,
   ) => Effect.Effect<
@@ -223,7 +224,7 @@ function makeForkLayers(
 
   approvalState: ApprovalStateService,
   persistenceLayer: Layer.Layer<ChatPersistence, never, never>,
-  rawBeforeExecute: ReturnType<typeof buildPermissionInterceptor>,
+  permissionInterceptor: ReturnType<typeof buildPermissionInterceptor>,
   toolEmitRef: Ref.Ref<ToolDisplay | undefined>,
   cwd: string,
 ) {
@@ -263,11 +264,9 @@ function makeForkLayers(
     emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
   })
 
-  // Wrap the raw interceptor (which has service requirements) into a ToolInterceptor (R=never)
-  // by providing the services inline so the Effect has no remaining requirements.
-  const interceptor: ToolInterceptor = {
+  const providedInterceptor: ToolInterceptor = {
     beforeExecute: (ctx) =>
-      rawBeforeExecute(ctx).pipe(
+      permissionInterceptor(ctx).pipe(
         Effect.provideService(ForkContext, { forkId }),
         Effect.provideService(PolicyContextProviderTag, policyCtxProvider),
         Effect.provideService(ApprovalStateTag, approvalState),
@@ -287,7 +286,7 @@ function makeForkLayers(
     Layer.succeed(ApprovalStateTag, approvalState),
     Layer.succeed(WorkingDirectoryTag, { cwd }),
     Layer.succeed(PolicyContextProviderTag, policyCtxProvider),
-    Layer.succeed(ToolInterceptorTag, interceptor),
+    Layer.succeed(ToolInterceptorTag, providedInterceptor),
     toolEmitLayer,
     persistenceLayer,
   )
@@ -345,7 +344,7 @@ const makeExecutionManager = Effect.gen(function* () {
   }
 
   const service: ExecutionManagerService = {
-    execute: (xmlStream, options, sink) => Effect.gen(function* () {
+    execute: (xmlStream: Stream.Stream<string, ModelError>, options, sink) => Effect.gen(function* () {
       const { forkId, turnId } = options
 
       // Resolve agent definition for this fork

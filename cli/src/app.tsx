@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type ForkState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, getProviderSummary, setPrimaryModel, setSecondaryModel, clearPrimaryModel, clearSecondaryModel, setBrowserModel, clearBrowserModel, detectBrowserModel, detectProviders, detectProviderAuthMethods, getAuth, setAuth, removeAuth, setLocalProviderConfig, getLocalProviderConfig, loadConfig, saveConfig, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, startAnthropicOAuth, exchangeAnthropicCode, startOpenAIBrowserOAuth, startOpenAIDeviceOAuth, startCopilotAuth, getContextLimits, initializeProviderState, type ForkMemoryState, type ForkCompactionState, type ArtifactState, type AgentRegistryState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type ForkState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, setModel, clearModel, peekSlot, detectBrowserModel, detectProviders, detectProviderAuthMethods, getAuth, setAuth, removeAuth, setLocalProviderConfig, getLocalProviderConfig, loadConfig, saveConfig, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, startAnthropicOAuth, exchangeAnthropicCode, startOpenAIBrowserOAuth, startOpenAIDeviceOAuth, startCopilotAuth, getContextLimits, initializeProviderState, type ForkMemoryState, type ForkCompactionState, type ArtifactState, type AgentRegistryState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 import { MultilineInput, type MultilineInputHandle } from './components/multiline-input'
@@ -61,7 +61,7 @@ import { ContextUsageBar } from './components/context-usage-bar'
 import { DebugPanel } from './components/debug-panel'
 import type { InputValue } from './types/store'
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
-import { resolveModel } from '@magnitudedev/agent'
+
 import { setSessionTracker } from './utils/telemetry-state'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import stringWidth from 'string-width'
@@ -510,11 +510,11 @@ function AppInner({
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'orchestrator'
           const slot = roleToSlot(agentRole)
-          const resolved = resolveModel(slot)
+          const resolved = peekSlot(slot)
 
           trackTurnCompleted({
-            providerId: resolved?.providerId ?? null,
-            modelId: resolved?.modelId ?? null,
+            providerId: resolved?.model.providerId ?? null,
+            modelId: resolved?.model.id ?? null,
             modelSlot: slot,
             authType: resolved?.auth?.type ?? null,
             inputTokens: event.inputTokens,
@@ -922,7 +922,7 @@ function AppInner({
       cfg.primaryModel = selection
       // Update the runtime singleton so footer and API calls use this model
       const auth = getAuth(providerId)
-      setPrimaryModel(providerId, modelId, auth ?? null, false)
+      setModel('primary', providerId, modelId, auth ?? null, false)
     } else if (selectingModelFor === 'secondary') {
       setSecondaryModelState(selection)
       cfg.secondaryModel = selection
@@ -930,7 +930,7 @@ function AppInner({
       setBrowserModelState(selection)
       cfg.browserModel = selection
       const auth = getAuth(providerId)
-      setBrowserModel(providerId, modelId, auth ?? null, false)
+      setModel('browser', providerId, modelId, auth ?? null, false)
     }
 
     saveConfig(cfg)
@@ -1093,12 +1093,12 @@ function AppInner({
 
     // Set runtime models
     const primaryAuth = getAuth(result.primaryModel.providerId)
-    setPrimaryModel(result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, false)
+    setModel('primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, false)
     const secondaryAuth = getAuth(result.secondaryModel.providerId)
-    setSecondaryModel(result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
+    setModel('secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
     if (result.browserModel) {
       const browserAuth = getAuth(result.browserModel.providerId)
-      setBrowserModel(result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, false)
+      setModel('browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, false)
     }
 
     if (wizardNeedsChromium) {
@@ -1180,19 +1180,19 @@ function AppInner({
     let modelChanged = false
     if (primaryModel?.providerId === providerId) {
       setPrimaryModelState(null)
-      clearPrimaryModel()
+      clearModel('primary')
       cfg.primaryModel = null
       modelChanged = true
     }
     if (secondaryModel?.providerId === providerId) {
       setSecondaryModelState(null)
-      clearSecondaryModel()
+      clearModel('secondary')
       cfg.secondaryModel = null
       modelChanged = true
     }
     if (browserModel?.providerId === providerId) {
       setBrowserModelState(null)
-      clearBrowserModel()
+      clearModel('browser')
       cfg.browserModel = null
       modelChanged = true
     }
@@ -2447,7 +2447,11 @@ function AppInner({
                   {bashMode ? (
                     <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
                   ) : (() => {
-                    const summary = getProviderSummary()
+                    const _primaryModel = peekSlot('primary')?.model
+                    const summary = _primaryModel ? {
+                      provider: getProvider(_primaryModel.providerId)?.name ?? _primaryModel.providerId,
+                      model: _primaryModel.name,
+                    } : null
                     return (
                       <>
                         <Button

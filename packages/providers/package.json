@@ -9,12 +9,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "crypto": "*"
+    "crypto": "*",
+    "effect": "^3.19.6",
+    "@magnitudedev/tracing": "workspace:*"
   },
   "devDependencies": {
     "@magnitudedev/llm-core": "workspace:*",
     "@magnitudedev/logger": "workspace:*",
-    "@magnitudedev/tracing": "workspace:*",
     "@types/bun": "latest"
   }
 }

@@ -11,7 +11,7 @@
  */
 
 import { Projection, Signal } from '@magnitudedev/event-core'
-import { resolveModel } from '@magnitudedev/providers'
+import { peekSlot } from '@magnitudedev/providers'
 import type { AppEvent, SessionContext } from '../events'
 import { ForkProjection } from './fork'
 import { getContextLimits } from '../constants'
@@ -94,9 +94,9 @@ const estimators: Record<string, ImageTokenEstimator> = {
 }
 
 function getImageTokenEstimator(): ImageTokenEstimator {
-  const resolved = resolveModel('primary')
-  const modelId = resolved?.modelId ?? ''
-  const providerId = resolved?.providerId ?? 'anthropic'
+  const model = peekSlot('primary')?.model
+  const modelId = model?.id ?? ''
+  const providerId = model?.providerId ?? 'anthropic'
 
   // 1. Model name heuristic (most reliable)
   if (/claude/i.test(modelId)) return estimators.anthropic

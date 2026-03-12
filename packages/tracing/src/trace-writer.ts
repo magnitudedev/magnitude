@@ -44,7 +44,7 @@ export function initTraceSession(
 /**
  * Write a trace directly to disk. Pass this to onTrace().
  */
-export function writeTrace(trace: TraceData<any>): void {
+export function writeTrace(trace: TraceData): void {
   if (!tracesFilePath) {
     logger.warn('[Tracing] writeTrace called before initTraceSession')
     return

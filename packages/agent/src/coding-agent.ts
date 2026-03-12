@@ -61,7 +61,7 @@ import { ChatPersistence } from './persistence/chat-persistence-service'
 import { collectSessionContext } from './util/collect-session-context'
 
 // Providers
-import { initializeProviderState, loadConfig, onTrace } from '@magnitudedev/providers'
+import { initializeProviderState, loadConfig, makeModelResolver, makeNoopTracer, makeTracePersister } from '@magnitudedev/providers'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 import { join } from 'path'
 import { createMemoryExtractionJob, drainPendingJobsOnStartup, spawnDetachedMemoryExtractionWorker, writePendingJobSync } from './memory/job-queue'
@@ -177,10 +177,17 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   if (options.debug) {
     const traceSessionId = new Date().toISOString().replace(/:/g, '-').replace(/\.\d{3}Z$/, 'Z')
     initTraceSession(traceSessionId, { cwd: process.cwd(), platform: process.platform, gitBranch: null })
-    onTrace(writeTrace)
+
   }
 
-  const layer = Layer.mergeAll(ExecutionManagerLive, BrowserServiceLive, options.persistence)
+  const tracerLayer = options.debug ? makeTracePersister((trace) => writeTrace(trace)) : makeNoopTracer()
+  const layer = Layer.mergeAll(
+    ExecutionManagerLive,
+    BrowserServiceLive,
+    makeModelResolver(),
+    tracerLayer,
+    options.persistence,
+  )
   const client = await CodingAgent.createClient(layer)
 
   await client.runEffect(Effect.gen(function* () {

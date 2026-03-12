@@ -1,7 +1,7 @@
 // Types
 export type {
   ModelSlot, CallUsage, CollectorData,
-  TraceData, AgentTrace, AgentTraceMeta,
+  TraceInput, TraceData, AgentTrace, AgentTraceMeta,
   TraceSessionMeta,
 } from './types'
 

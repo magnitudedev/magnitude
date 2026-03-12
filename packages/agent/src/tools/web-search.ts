@@ -5,7 +5,7 @@
  * primary model selection. Exports shared types used by all provider implementations.
  */
 
-import { resolveModel, getAuth } from "@magnitudedev/providers";
+import { peekSlot, getAuth } from "@magnitudedev/providers";
 import type { AuthInfo } from "@magnitudedev/providers";
 
 // =============================================================================
@@ -112,8 +112,8 @@ function detectSearchProvider(): { provider: SearchProvider; auth: SearchAuth } 
   }
 
   // 2. Map primary provider to search provider
-  const resolved = resolveModel('primary');
-  const providerId = resolved?.providerId ?? null;
+  const model = peekSlot('primary')?.model;
+  const providerId = model?.providerId ?? null;
 
   switch (providerId) {
     case "anthropic":

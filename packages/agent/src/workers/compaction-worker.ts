@@ -31,12 +31,12 @@ import { SessionContextProjection } from '../projections/session-context'
 import { WorkingStateProjection } from '../projections/working-state'
 // ExecutionManager no longer needed — xml-act is stateless, no sandbox reset
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
-import { isContextLimitError } from '../util/context-limit-error'
-import { primary } from '@magnitudedev/providers'
 import { getAgentDefinition } from '../agents'
+import { ModelResolver, CodingAgentCompact } from '@magnitudedev/providers'
 import { getContextLimits } from '../constants'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
+import { withTraceScope } from '../tracing'
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
   return parts.map(part => {
@@ -134,22 +134,31 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
         const maxRetries = 5
 
         const bamlEffect = Effect.gen(function* () {
+          const runtime = yield* ModelResolver
+          const usable = yield* runtime.resolve('primary')
           for (let attempt = 0; attempt <= maxRetries; attempt++) {
-            try {
-              const { result } = yield* Effect.tryPromise({
-                try: () => primary.compact(getAgentDefinition('orchestrator').systemPrompt, trimmedMessages, { forkId, callType: 'compact' }),
-                catch: (error) => error instanceof Error ? error : new Error(String(error))
+            const result = yield* withTraceScope(
+              { metadata: { callType: 'compact', forkId } },
+              usable.invoke(
+                CodingAgentCompact,
+                {
+                  systemPrompt: getAgentDefinition('orchestrator').systemPrompt,
+                  messages: trimmedMessages,
+                },
+              ),
+            ).pipe(
+              Effect.map(({ text }) => ({ success: true as const, text })),
+              Effect.catchAll((error) => {
+                if (error._tag === 'ContextLimitExceeded' && trimmedMessages.length > 1 && attempt < maxRetries) {
+                  const trimAmount = Math.max(1, Math.floor(trimmedMessages.length * EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO))
+                  logger.warn({ attempt, trimAmount, remaining: trimmedMessages.length - trimAmount }, '[CompactionWorker] Compaction BAML failed with context error, trimming and retrying')
+                  trimmedMessages = trimmedMessages.slice(trimAmount)
+                  return Effect.succeed({ success: false as const, text: '' })
+                }
+                return Effect.fail(error)
               })
-              return result
-            } catch (error) {
-              if (isContextLimitError(error) && trimmedMessages.length > 1 && attempt < maxRetries) {
-                const trimAmount = Math.max(1, Math.floor(trimmedMessages.length * EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO))
-                logger.warn({ attempt, trimAmount, remaining: trimmedMessages.length - trimAmount }, '[CompactionWorker] Compaction BAML failed with context error, trimming and retrying')
-                trimmedMessages = trimmedMessages.slice(trimAmount)
-                continue
-              }
-              throw error
-            }
+            )
+            if (result.success) return result.text
           }
           logger.error('[CompactionWorker] Exhausted trim retries, using fallback truncation summary')
           return '[Previous conversation history was truncated because it exceeded the context window. The agent is continuing with recent messages only.]'

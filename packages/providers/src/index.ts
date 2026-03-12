@@ -19,8 +19,63 @@ export type {
   ProviderOptions,
 } from './types'
 
-// Model slot types
-export type { ModelSlot, ResolvedModel, CallUsage, SlotUsage } from './provider-state'
+// Model types
+export type { ModelSlot } from './state/provider-state'
+export type { ModelDriverId, ModelDriver } from './model/model-driver'
+export { DRIVERS } from './model/model-driver'
+export { Model, type ModelCosts } from './model/model'
+export { ModelConnection, type ModelConnection as ModelConnectionType } from './model/model-connection'
+export type { InferenceConfig } from './model/inference-config'
+export type { BoundModel, ChatStream, ModelFunctionDef, StreamingFn, CompleteFn } from './model/bound-model'
+
+// Model functions
+export {
+  CodingAgentChat,
+  CodingAgentCompact,
+  GenerateChatTitle,
+  ExtractMemoryDiff,
+  GatherSplit,
+  PatchFile,
+  CreateFile,
+  AutopilotContinuation,
+} from './model/model-function'
+
+// Errors
+export {
+  NotConfigured,
+  ProviderDisconnected,
+  AuthFailed,
+  ContextLimitExceeded,
+  RateLimited,
+  TransportError,
+  ParseError,
+} from './errors/model-error'
+export type { ModelError } from './errors/model-error'
+export { classifyHttpError, classifyUnknownError } from './errors/classify-error'
+
+// State management
+export type { CallUsage, SlotUsage } from './state/provider-state'
+export {
+  peekSlot,
+  setModel,
+  clearModel,
+  initializeProviderState,
+  getModelContextWindow,
+  validateModelSwitch,
+  getSlotUsage,
+  resetSlotUsage,
+  accumulateUsage,
+} from './state/provider-state'
+
+
+// Resolver (Effect services)
+export { ModelResolver } from './resolver/model-resolver'
+export type { ContextLimits } from './resolver/model-resolver'
+export { makeModelResolver } from './resolver/model-resolver-live'
+export { makeTestResolver } from './resolver/model-runtime-test'
+export type { TestModelConfig } from './resolver/model-runtime-test'
+export { TraceEmitter, TracePersister, makeTracePersister, makeNoopTracer, makeTestTracer } from './resolver/tracing'
+export type { TraceData } from './resolver/tracing'
 
 // Registry
 export { PROVIDERS, getProvider, getProviderIds, populateModels, getModelCost } from './registry'
@@ -47,53 +102,18 @@ export type { DetectedProvider, DetectedAuthMethod, ProviderAuthMethodStatus } f
 // ClientRegistry builder
 export { buildClientRegistry } from './client-registry-builder'
 
-// Constants
-
 // Reasoning effort
 export { getLowestEffortOptions } from './reasoning-effort'
-
-// Provider state (runtime singleton)
-export {
-  resolveModel,
-  getPrimaryProviderId,
-  getPrimaryModelId,
-  getClientRegistry,
-  isAnthropicOAuth,
-  isOpenAICodex,
-  isCopilotCodex,
-  getCodexAuth,
-  getCopilotCodexAuth,
-  setModel,
-  setPrimaryModel,
-  setSecondaryModel,
-  setBrowserModel,
-  clearPrimaryModel,
-  clearSecondaryModel,
-  clearBrowserModel,
-  initializeProviderState,
-  getProviderSummary,
-  ensureValidAuth,
-  getPrimaryModelContextWindow,
-  getModelContextWindow,
-  validateModelSwitch,
-  getSlotUsage,
-  resetSlotUsage,
-} from './provider-state'
-
-// Provider client
-export { createProviderClient } from './provider-client'
-export type { ProviderClient } from './provider-client'
 
 // Usage calculation
 export { buildUsage, calculateCosts } from './usage'
 
 // Output normalization
-export { normalizeModelOutput, normalizeQuotesInString } from './output-normalization'
+export { normalizeModelOutput, normalizeQuotesInString } from './util/output-normalization'
 
-// Model proxy
-export { createModelProxy, primary, secondary, browser, onTrace } from './model-proxy'
-export type { ModelProxy, ChatStream, CollectorData, TraceData } from './model-proxy'
-
+// Drivers
+export { BamlDriver } from './drivers/baml-driver'
+export { ResponsesDriver } from './drivers/responses-driver'
 
 // Browser-compatible models
 export {

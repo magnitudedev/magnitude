@@ -224,15 +224,9 @@ export {
   detectDefaultProvider,
   detectProviderAuthMethods,
   buildClientRegistry,
-  getPrimaryProviderId,
-  getPrimaryModelId,
-  getClientRegistry,
-  setPrimaryModel,
-  clearPrimaryModel,
   initializeProviderState,
-  getProviderSummary,
-  getPrimaryModelContextWindow,
   validateModelSwitch,
+  clearModel,
   setLocalProviderConfig,
   getLocalProviderConfig,
   startAnthropicOAuth,
@@ -245,18 +239,9 @@ export {
   startCopilotAuth,
   exchangeCopilotToken,
   COPILOT_HEADERS,
-  isOpenAICodex,
-  isCopilotCodex,
-  ensureValidAuth,
-  resolveModel,
-  createModelProxy,
-  primary,
-  secondary,
+
+  peekSlot,
   setModel,
-  setSecondaryModel,
-  clearSecondaryModel,
-  setBrowserModel,
-  clearBrowserModel,
   setBrowserSelection,
   getModelContextWindow,
   getSlotUsage,
@@ -289,9 +274,7 @@ export type {
   OpenAIDeviceOAuthStart,
   CopilotOAuthStart,
   ModelSlot,
-  ResolvedModel,
   ChatStream,
-  ModelProxy,
   CallUsage,
   SlotUsage,
   getModelCost,
@@ -299,6 +282,8 @@ export type {
 
 // Tracing
 export { initTraceSession, writeTrace, getTraceSessionId } from '@magnitudedev/tracing'
-export type { TraceSessionMeta, AgentTrace, AgentTraceMeta } from '@magnitudedev/tracing'
+export type { TraceSessionMeta, AgentTrace } from '@magnitudedev/tracing'
+export { withTraceScope } from './tracing'
+export type { TraceScope } from './tracing'
 export type { ContentPart, ImageMediaType } from './content'
 export { textParts, imagePart, textOf, hasImages, wrapTextParts, migrateContent } from './content'
