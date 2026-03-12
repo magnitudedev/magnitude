@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.3
+
+### Patch Changes
+
+- [`0cead3d`](https://github.com/magnitudedev/magnitude/commit/0cead3deff16482e654d5f38192a84e78da95861) Thanks [@anerli](https://github.com/anerli)! - fix: turn off baml logs env var on cli entry
+
+- [`948ecb1`](https://github.com/magnitudedev/magnitude/commit/948ecb10f22424f057589675481049cf39fa7576) Thanks [@anerli](https://github.com/anerli)! - update package info, use root README
+
 ## 0.0.1-alpha.2
 
 ### Patch Changes

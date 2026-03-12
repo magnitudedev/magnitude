@@ -23,8 +23,10 @@
     "@magnitudedev/xml-act": "0.0.1"
   },
   "changesets": [
+    "hip-ads-sleep",
     "purple-sails-cheer",
     "six-pandas-smile",
-    "sparkly-boats-live"
+    "sparkly-boats-live",
+    "tired-wasps-strive"
   ]
 }
