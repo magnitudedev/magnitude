@@ -48,49 +48,39 @@ describe('memory transcript', () => {
     expect(t).not.toContain('<actions>')
   })
 
-  test('includes delegation lifecycle but excludes removed proposal events', () => {
+  test('includes delegation lifecycle but excludes unrelated events', () => {
     const events = [
       {
         type: 'agent_created',
-        forkId: null,
-        agentId: 'a1',
-        taskId: 'task1',
-        agentType: 'explorer',
-        agentForkId: 'f1',
-        prompt: 'scan',
-      },
-      {
-        type: 'fork_started',
         forkId: 'f1',
         parentForkId: null,
-        name: 'Explorer',
         agentId: 'a1',
+        name: 'Explorer',
+        role: 'explorer',
         context: 'ctx',
         mode: 'clone',
-        role: 'explorer',
         taskId: 'task1',
+        message: 'scan',
       },
       {
-        type: 'fork_completed',
-        forkId: null,
-        childForkId: 'f1',
+        type: 'agent_dismissed',
+        forkId: 'f1',
+        parentForkId: null,
+        agentId: 'a1',
         result: { summary: 'done' },
+        reason: 'completed',
       },
       {
-        type: 'proposal_created',
+        type: 'chat_title_generated',
         forkId: null,
-        proposalId: 'p1',
-        goal: 'Implement feature',
-        criteria: {},
-        attachedArtifactIds: [],
+        title: 'Implement feature',
       },
     ] as unknown as AppEvent[]
 
     const t = buildExtractionTranscript(events)
     expect(t).toContain('agent_created')
-    expect(t).toContain('fork_started')
-    expect(t).toContain('fork_completed')
-    expect(t).not.toContain('proposal_created')
+    expect(t).toContain('agent_dismissed')
+    expect(t).not.toContain('chat_title_generated')
   })
 
   test('truncation keeps temporal order and drops oldest lines first', () => {

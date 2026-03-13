@@ -238,8 +238,8 @@ function getEventSummary(event: AppEvent): string {
     case 'turn_started': return `turn=${event.turnId.slice(0, 8)}`
     case 'turn_completed': return event.result.success ? 'success' : `error: ${event.result.error}`
     case 'tool_event': return `${event.toolKey} ${event.event._tag}`
-    case 'fork_started': return event.name
-    case 'fork_completed': return `fork=${event.forkId.slice(0, 6)}`
+    case 'agent_created': return event.name
+    case 'agent_dismissed': return `fork=${event.forkId.slice(0, 6)}`
     case 'message_end': return ''
     default: return ''
   }

@@ -3,7 +3,7 @@ import type { AppEvent, ResponsePart } from '../events'
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
 import { getAgentDefinition, type AgentVariant } from '../agents'
-import { ForkProjection } from './fork'
+import { AgentProjection, getAgentByForkId } from './agent'
 import { UNCLOSED_ACTIONS_REMINDER, UNCLOSED_INSPECT_REMINDER, UNCLOSED_THINK_REMINDER } from '../prompts'
 
 export interface ThinkBlock {
@@ -77,7 +77,7 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
 
 export const CanonicalTurnProjection = Projection.defineForked<AppEvent, CanonicalTurnState>()({
   name: 'CanonicalTurn',
-  reads: [ForkProjection] as const,
+  reads: [AgentProjection] as const,
   initialFork: createInitialCanonicalTurnState(),
   eventHandlers: {
     turn_started: ({ event, fork }) => ({
@@ -215,9 +215,9 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
       let canonicalXml: string
       if (clean) {
-        const forkState = read(ForkProjection)
+        const agentState = read(AgentProjection)
         const variant: AgentVariant = event.forkId
-          ? ((forkState.forks.get(event.forkId)?.role ?? 'builder') as AgentVariant)
+          ? ((getAgentByForkId(agentState, event.forkId)?.role ?? 'builder') as AgentVariant)
           : 'orchestrator'
         const agentDef = getAgentDefinition(variant)
         const bindings = getBindingRegistry(agentDef)
@@ -256,6 +256,6 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     interrupt: ({ fork }) => fork,
 
-    fork_completed: ({ fork }) => fork,
+    agent_dismissed: ({ fork }) => fork,
   }
 })

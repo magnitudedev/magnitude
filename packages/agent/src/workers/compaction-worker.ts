@@ -56,8 +56,8 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
   name: 'CompactionWorker',
 
   forkLifecycle: {
-    activateOn: 'fork_started',
-    completeOn: 'fork_completed'
+    activateOn: 'agent_created',
+    completeOn: 'agent_dismissed'
   },
 
   eventHandlers: {

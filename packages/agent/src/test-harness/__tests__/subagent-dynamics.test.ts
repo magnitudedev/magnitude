@@ -24,17 +24,12 @@ describe('subagent dynamics', () => {
 
       const created = await harness.wait.event(
         'agent_created',
-        (e) => e.agentId === 'test-explorer' && e.agentType === 'explorer',
+        (e) => e.agentId === 'test-explorer' && e.role === 'explorer',
       )
       expect(created.type).toBe('agent_created')
-      expect(created.forkId).toBeNull()
-
-      const forkStarted = await harness.wait.forkStarted(
-        (e) => e.agentId === 'test-explorer' && e.role === 'explorer' && e.mode === 'spawn',
-      )
-      expect(forkStarted.type).toBe('fork_started')
-      expect(forkStarted.parentForkId).toBeNull()
-      expect(forkStarted.name).toBe('test')
+      expect(created.forkId).not.toBeNull()
+      expect(created.parentForkId).toBeNull()
+      expect(created.name).toBe('test')
     } finally {
       await harness.dispose()
     }
@@ -62,15 +57,15 @@ describe('subagent dynamics', () => {
       const rootCompleted = await harness.wait.turnCompleted(null)
       expect(rootCompleted.result.success).toBe(true)
 
-      const forkStarted = await harness.wait.forkStarted((e) => e.agentId === 'test-explorer')
-      const subCompleted = await harness.wait.turnCompleted(forkStarted.forkId)
+      const created = await harness.wait.event('agent_created', (e) => e.agentId === 'test-explorer')
+      const subCompleted = await harness.wait.turnCompleted(created.forkId)
 
       expect(subCompleted.type).toBe('turn_completed')
-      expect(subCompleted.forkId).toBe(forkStarted.forkId)
+      expect(subCompleted.forkId).toBe(created.forkId)
 
       const hasSubagentTurn = harness
         .events()
-        .some((e: AppEvent) => e.type === 'turn_started' && e.forkId === forkStarted.forkId)
+        .some((e: AppEvent) => e.type === 'turn_started' && e.forkId === created.forkId)
       expect(hasSubagentTurn).toBe(true)
     } finally {
       await harness.dispose()

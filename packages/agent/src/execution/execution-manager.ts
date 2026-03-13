@@ -7,7 +7,7 @@
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
-import { Effect, Stream, Queue, Context, Layer, Ref, Deferred } from 'effect'
+import { Effect, Stream, Queue, Context, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
@@ -31,7 +31,7 @@ import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from
 import { BrowserService } from '../services/browser-service'
 import { BrowserHarnessTag } from '../tools/browser-tools'
 
-import { ForkStateReaderTag, type ForkStateReader } from '../tools/fork'
+import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { ArtifactStateReaderTag, type ArtifactStateReader } from '../tools/artifact-tools'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
 import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, UNCLOSED_INSPECT_REMINDER, formatNonexistentAgentError } from '../prompts'
@@ -43,9 +43,8 @@ import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
 
 import { ArtifactProjection, type ArtifactState } from '../projections/artifact'
-import { AgentRegistryProjection, type AgentRegistryState } from '../projections/agent-registry'
+import { AgentProjection, type AgentState, getActiveAgent, getAgentByForkId } from '../projections/agent'
 import { WorkingStateProjection, type ForkWorkingState } from '../projections/working-state'
-import { ForkProjection, type ForkState } from '../projections/fork'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
 
@@ -103,7 +102,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
-    Projection.ProjectionInstance<ForkState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ProjectionInstance<AgentRegistryState> | Projection.ForkedProjectionInstance<ForkWorkingState>
+    Projection.ProjectionInstance<AgentState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkWorkingState>
   >
 
   /**
@@ -117,7 +116,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     void,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<ForkState> | Projection.ProjectionInstance<ArtifactState> | Projection.ProjectionInstance<AgentRegistryState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService
   >
 
   /**
@@ -136,6 +135,7 @@ export interface ExecutionManagerService {
     name: string
     agentId: string
     prompt: string
+    message?: string
     outputSchema?: unknown
     mode: 'clone' | 'spawn'
     role: AgentVariant
@@ -143,26 +143,7 @@ export interface ExecutionManagerService {
   }) => Effect.Effect<
     string,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<ForkState> | Projection.ProjectionInstance<ArtifactState> | Projection.ProjectionInstance<AgentRegistryState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
-  >
-
-  /**
-   * Spawn a blocking fork. Blocks until the fork calls submit(), returns the parsed result.
-   */
-  readonly forkSync: (params: {
-    parentForkId: string | null
-    name: string
-    agentId: string
-    prompt: string
-    outputSchema?: unknown
-    mode: 'clone' | 'spawn'
-    role: AgentVariant
-    taskId: string
-    timeLimit?: number
-  }) => Effect.Effect<
-    unknown,
-    never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<ForkState> | Projection.ProjectionInstance<ArtifactState> | Projection.ProjectionInstance<AgentRegistryState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -191,15 +172,11 @@ function makeForkLayers(
   forkId: string | null,
 
   sessionContextProjection: Projection.ProjectionInstance<SessionContextState>,
-  forkProjection: Projection.ProjectionInstance<ForkState>,
+  agentProjection: Projection.ProjectionInstance<AgentState>,
   artifactProjection: Projection.ProjectionInstance<ArtifactState>,
-  agentRegistryProjection: Projection.ProjectionInstance<AgentRegistryState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
-  blockingDeferreds: Map<string, Deferred.Deferred<unknown, never>>,
-
-
   approvalState: ApprovalStateService,
   persistenceLayer: Layer.Layer<ChatPersistence, never, never>,
   permissionInterceptor: ReturnType<typeof buildPermissionInterceptor>,
@@ -211,7 +188,7 @@ function makeForkLayers(
   } satisfies ArtifactStateReader)
 
   const agentRegistryStateReaderLayer = Layer.succeed(AgentRegistryStateReaderTag, {
-    getState: () => agentRegistryProjection.get
+    getState: () => agentProjection.get
   } satisfies AgentRegistryStateReader)
 
   const skillStateReaderLayer = Layer.succeed(SkillStateReaderTag, {
@@ -225,18 +202,11 @@ function makeForkLayers(
     getState: () => conversationProjection.get
   } satisfies ConversationStateReader)
 
-  const forkStateReaderLayer = Layer.succeed(ForkStateReaderTag, {
-    getForkState: () => forkProjection.get,
-    registerBlocking: (forkId, deferred) => { blockingDeferreds.set(forkId, deferred) },
-    resolveBlocking: (forkId, result) => {
-      const deferred = blockingDeferreds.get(forkId)
-      if (!deferred) return Effect.void
-      blockingDeferreds.delete(forkId)
-      return Deferred.succeed(deferred, result)
-    }
-  } satisfies ForkStateReader)
+  const agentStateReaderLayer = Layer.succeed(AgentStateReaderTag, {
+    getAgentState: () => agentProjection.get,
+  } satisfies AgentStateReader)
 
-  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentRegistryProjection, workingStateProjection)
+  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentProjection, workingStateProjection)
 
   const toolEmitLayer = Layer.succeed(ToolEmitTag, {
     emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
@@ -258,7 +228,7 @@ function makeForkLayers(
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
     skillStateReaderLayer,
-    forkStateReaderLayer,
+    agentStateReaderLayer,
 
 
     Layer.succeed(ApprovalStateTag, approvalState),
@@ -284,9 +254,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
   // Bound observables map
   const boundObservables = new Map<string | null, BoundObservable[]>()
-
-  // Shared map for blocking fork deferreds (forkSync registers, submit resolves)
-  const blockingDeferreds = new Map<string, Deferred.Deferred<unknown, never>>()
 
   // Approval state for gated tool calls
   const approvalState = createApprovalState()
@@ -326,12 +293,12 @@ const makeExecutionManager = Effect.gen(function* () {
       const { forkId, turnId } = options
 
       // Resolve agent definition for this fork
-      const forkProjectionInst = yield* ForkProjection.Tag
-      const forkState = yield* forkProjectionInst.get
+      const agentProjectionInst = yield* AgentProjection.Tag
+      const agentState = yield* agentProjectionInst.get
       let variant: AgentVariant
       if (forkId) {
-        const forkInstance = forkState.forks.get(forkId)
-        variant = (forkInstance?.role ?? 'builder') as AgentVariant
+        const agentInstance = getAgentByForkId(agentState, forkId)
+        variant = (agentInstance?.role ?? 'builder') as AgentVariant
       } else {
         variant = 'orchestrator'
       }
@@ -438,9 +405,8 @@ const makeExecutionManager = Effect.gen(function* () {
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
         cwd,
-        yield* AgentRegistryProjection.Tag,
+        yield* AgentProjection.Tag,
         yield* WorkingStateProjection.Tag,
-
       )
 
       // Run xml-act runtime
@@ -588,9 +554,9 @@ const makeExecutionManager = Effect.gen(function* () {
 
                 // Validate agent message destinations inline during execution
                 if (event.dest !== 'user' && event.dest !== 'parent') {
-                  const currentForkState = yield* forkProjectionInst.get
-                  const targetFork = [...currentForkState.forks.values()].find(f => f.agentId === event.dest && f.status === 'running')
-                  if (!targetFork) {
+                  const currentAgentState = yield* agentProjectionInst.get
+                  const targetAgent = getActiveAgent(currentAgentState, event.dest)
+                  if (!targetAgent) {
                     hasNonexistentAgentDest = true
                     const destStr = `"${event.dest}"`
                     nonexistentAgentError = `<error>\n${formatNonexistentAgentError(destStr)}\n</error>`
@@ -756,9 +722,8 @@ const makeExecutionManager = Effect.gen(function* () {
     initFork: (forkId, variant) => Effect.gen(function* () {
 
       const sessionContextProjection = yield* SessionContextProjection.Tag
-      const forkProjection = yield* ForkProjection.Tag
+      const agentProjection = yield* AgentProjection.Tag
       const artifactProjection = yield* ArtifactProjection.Tag
-      const agentRegistryProjection = yield* AgentRegistryProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
@@ -774,10 +739,10 @@ const makeExecutionManager = Effect.gen(function* () {
 
       let layers = makeForkLayers(
         forkId,
-        sessionContextProjection, forkProjection,
-        artifactProjection, agentRegistryProjection, workingStateProjection,
+        sessionContextProjection, agentProjection,
+        artifactProjection, workingStateProjection,
         conversationProjection,
-        blockingDeferreds, approvalState,
+        approvalState,
         persistenceLayer, permissionInterceptor, toolEmitRef, cwd,
       )
       forkCwds.set(forkId, cwd)
@@ -795,7 +760,7 @@ const makeExecutionManager = Effect.gen(function* () {
       }
 
       const projectionReader: ProjectionReader = {
-        getAgentRegistry: () => agentRegistryProjection.get,
+        getAgentRegistry: () => agentProjection.get,
       }
       const projectionReaderLayer = Layer.succeed(ProjectionReaderTag, projectionReader)
       layers = Layer.merge(layers, projectionReaderLayer)
@@ -826,68 +791,20 @@ const makeExecutionManager = Effect.gen(function* () {
       yield* service.initFork(forkId, params.role)
 
       yield* workerBus.publish({
-        type: 'fork_started',
+        type: 'agent_created',
         forkId,
         parentForkId: params.parentForkId,
-        name: params.name,
         agentId: params.agentId,
-        context,
-        outputSchema: params.outputSchema,
-        blocking: false,
-        mode: params.mode,
+        name: params.name,
         role: params.role,
-        taskId: params.taskId,
+        context,
+        mode: params.mode,
+        taskId: params.taskId ?? '',
+        message: params.message ?? params.prompt,
+        outputSchema: params.outputSchema,
       })
 
       return forkId
-    }),
-
-    forkSync: (params) => Effect.gen(function* () {
-      const forkId = createId()
-
-      const deferred = yield* Deferred.make<unknown, never>()
-      blockingDeferreds.set(forkId, deferred)
-
-      const workerBus = yield* WorkerBusTag<AppEvent>()
-      const augmentedPrompt = params.timeLimit
-        ? `${params.prompt}\n\n[Time budget: ~${Math.round(params.timeLimit / 1000)}s. Use report() to log findings as you go.]`
-        : params.prompt
-      const context = yield* buildForkContext({ ...params, prompt: augmentedPrompt })
-
-      forkAgentVariants.set(forkId, params.role)
-      yield* service.initFork(forkId, params.role)
-
-      yield* workerBus.publish({
-        type: 'fork_started',
-        forkId,
-        parentForkId: params.parentForkId,
-        name: params.name,
-        agentId: params.agentId,
-        context,
-        outputSchema: params.outputSchema,
-        blocking: true,
-        mode: params.mode,
-        role: params.role,
-        taskId: params.taskId,
-      })
-
-      if (params.timeLimit) {
-        const result = yield* Effect.raceFirst(
-          Deferred.await(deferred).pipe(Effect.map(r => ({ _tag: 'completed' as const, value: r }))),
-          Effect.sleep(params.timeLimit).pipe(Effect.map(() => ({ _tag: 'timeout' as const })))
-        )
-
-        if (result._tag === 'timeout') {
-          blockingDeferreds.delete(forkId)
-          yield* workerBus.publish({ type: 'interrupt', forkId } as AppEvent)
-          return '[Research timed out]'
-        }
-
-        return result.value
-      }
-
-      const result = yield* Deferred.await(deferred)
-      return result
     }),
 
     approvalState,

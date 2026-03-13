@@ -45,9 +45,9 @@ interface TurnsHarness {
       pred?: (e: Extract<AppEvent, { type: T }>) => boolean,
     ): Promise<Extract<AppEvent, { type: T }>>
     turnCompleted(forkId?: string | null): Promise<Extract<AppEvent, { type: 'turn_completed' }>>
-    forkStarted(
-      pred?: (e: Extract<AppEvent, { type: 'fork_started' }>) => boolean,
-    ): Promise<Extract<AppEvent, { type: 'fork_started' }>>
+    agentCreated(
+      pred?: (e: Extract<AppEvent, { type: 'agent_created' }>) => boolean,
+    ): Promise<Extract<AppEvent, { type: 'agent_created' }>>
   }
   events(): readonly AppEvent[]
   onEvent(cb: (e: AppEvent) => void): () => void
@@ -64,15 +64,15 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
     const events = harness.events()
     for (let i = events.length - 1; i >= 0; i -= 1) {
       const event = events[i]
-      if (event.type === 'fork_started' && event.agentId === agentId) {
+      if (event.type === 'agent_created' && event.agentId === agentId) {
         forkByAgent.set(agentId, event.forkId)
         return event.forkId
       }
     }
 
-    const forkStarted = await harness.wait.forkStarted((e) => e.agentId === agentId)
-    forkByAgent.set(agentId, forkStarted.forkId)
-    return forkStarted.forkId
+    const agentCreated = await harness.wait.agentCreated((e) => e.agentId === agentId)
+    forkByAgent.set(agentId, agentCreated.forkId)
+    return agentCreated.forkId
   }
 
   const builder: TurnsBuilder = {
@@ -155,7 +155,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
       const fallback: MockTurnResponse = { xml: '<yield/>' }
 
       const unsub = harness.onEvent((event: AppEvent) => {
-        if (event.type === 'fork_started') {
+        if (event.type === 'agent_created') {
           forkByAgent.set(event.agentId, event.forkId)
         }
       })

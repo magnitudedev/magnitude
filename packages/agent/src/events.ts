@@ -48,7 +48,7 @@ export type StrategyId = 'xml-act'
 // Work Agent Types
 // =============================================================================
 
-export type WorkAgentType = 'explorer' | 'planner' | 'builder' | 'debugger' | 'reviewer' | 'browser'
+
 
 // =============================================================================
 // Session Events
@@ -301,41 +301,6 @@ export interface SoftInterrupt {
 }
 
 // =============================================================================
-// Fork Events
-// =============================================================================
-
-/** Fork created and started */
-export interface ForkStarted {
-  readonly type: 'fork_started'
-  readonly forkId: string
-  readonly parentForkId: string | null
-  readonly name: string
-  readonly agentId: string
-  readonly context: string
-  readonly outputSchema?: unknown  // JSON Schema for structured output
-  readonly blocking?: boolean  // true for cloneSync/spawnSync - blocks parent execution
-  readonly mode: 'clone' | 'spawn'  // clone = inherited context, spawn = fresh context
-  readonly role: string  // agent type: WorkAgentType
-  readonly taskId: string  // task this fork is working on (was workItemId)
-}
-
-/** Fork completed (triggered by dismiss) */
-export interface ForkCompleted {
-  readonly type: 'fork_completed'
-  readonly forkId: string
-  readonly parentForkId: string | null
-  readonly result: unknown
-}
-
-
-/** Fork removed (after cleanup delay) */
-export interface ForkRemoved {
-  readonly type: 'fork_removed'
-  readonly forkId: string
-  readonly parentForkId: string | null
-}
-
-// =============================================================================
 // Artifact Events
 // =============================================================================
 
@@ -363,28 +328,33 @@ export interface ArtifactSynced {
 /** Agent created and dispatched to a task */
 export interface AgentCreated {
   readonly type: 'agent_created'
-  readonly forkId: string | null
+  readonly forkId: string
+  readonly parentForkId: string | null
   readonly agentId: string
+  readonly name: string
+  readonly role: string
+  readonly context: string
+  readonly mode: 'clone' | 'spawn'
   readonly taskId: string
-  readonly agentType: WorkAgentType
-  readonly agentForkId: string
   readonly message: string
+  readonly outputSchema?: unknown
 }
 
 /** Agent paused (soft interrupt — current turn completes, then stops) */
 export interface AgentPaused {
   readonly type: 'agent_paused'
-  readonly forkId: null
+  readonly forkId: string
   readonly agentId: string
-  readonly agentForkId: string
 }
 
 /** Agent dismissed (removed permanently) */
 export interface AgentDismissed {
   readonly type: 'agent_dismissed'
-  readonly forkId: null
+  readonly forkId: string
+  readonly parentForkId: string | null
   readonly agentId: string
-  readonly agentForkId: string
+  readonly result: unknown
+  readonly reason: 'dismissed' | 'interrupted' | 'completed'
 }
 
 // =============================================================================
@@ -507,9 +477,6 @@ export type AppEvent =
   | WindowFocusChanged
   | Interrupt
   | SoftInterrupt
-  | ForkStarted
-  | ForkCompleted
-  | ForkRemoved
   | CompactionStarted
   | CompactionReady
   | CompactionCompleted

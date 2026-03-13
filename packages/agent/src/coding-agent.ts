@@ -22,11 +22,11 @@ import { CanonicalTurnProjection } from './projections/canonical-turn'
 import { MemoryProjection } from './projections/memory'
 import { SubagentActivityProjection } from './projections/subagent-activity'
 import { DisplayProjection } from './projections/display'
-import { ForkProjection } from './projections/fork'
+import { AgentProjection } from './projections/agent'
+import { AgentStatusBridgeProjection } from './projections/agent-status-bridge'
 import { CompactionProjection } from './projections/compaction'
 
 import { ArtifactProjection } from './projections/artifact'
-import { AgentRegistryProjection } from './projections/agent-registry'
 
 import { ReplayProjection } from './projections/replay'
 import { ChatTitleProjection } from './projections/chat-title'
@@ -38,7 +38,7 @@ import { ArtifactAwarenessProjection } from './projections/artifact-awareness'
 // Workers
 import { TurnController } from './workers/turn-controller'
 import { Cortex } from './workers/cortex'
-import { ForkOrchestrator } from './workers/fork-orchestrator'
+import { AgentOrchestrator } from './workers/agent-orchestrator'
 import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 
 import { Autopilot } from './workers/autopilot'
@@ -77,14 +77,14 @@ export const CodingAgent = Agent.define<AppEvent>()({
 
   projections: [
     SessionContextProjection,
-    ForkProjection,
+    AgentProjection,
     CompactionProjection,
     WorkingStateProjection,
     TurnProjection,
     CanonicalTurnProjection,
 
     ArtifactProjection,
-    AgentRegistryProjection,
+    AgentStatusBridgeProjection,
 
     ReplayProjection,
     SubagentActivityProjection,
@@ -100,7 +100,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
   workers: [
     TurnController,
     Cortex,
-    ForkOrchestrator,
+    AgentOrchestrator,
     LifecycleCoordinator,
     Autopilot,
     CompactionWorker,
@@ -124,10 +124,9 @@ export const CodingAgent = Agent.define<AppEvent>()({
       working: WorkingStateProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
-      forks: ForkProjection,
+      agents: AgentProjection,
 
       artifacts: ArtifactProjection,
-      agentRegistry: AgentRegistryProjection,
     }
   }
 })
@@ -243,35 +242,30 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       yield* hydrationContext.setHydrating(false)
 
       const executionManager = yield* ExecutionManager
-      const forkProjection = yield* ForkProjection.Tag
+      const agentProjection = yield* AgentProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
       yield* executionManager.initFork(null, 'orchestrator')
 
-      // Create sandboxes for all active (running) forks
-      const forkState = yield* forkProjection.get
-      for (const [forkId, fork] of forkState.forks) {
-        if (fork.status !== 'running') continue
-        yield* executionManager.initFork(forkId, (fork.role ?? 'orchestrator') as AgentVariant)
+      // Create execution resources for all non-dismissed agents
+      const agentState = yield* agentProjection.get
+      for (const [, agent] of agentState.agents) {
+        if (agent.status === 'dismissed') continue
+        yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
       }
 
-      // Hydration recovery: detect forks that were in-flight when the process
-      // died. After replay, WorkingState tells us whether each fork is in a
-      // valid settled state. If not stable, the fork was mid-turn, between
-      // turns, or otherwise in-flight — emit an interrupt to cleanly terminate
-      // it. The interrupt cascades through the normal handler chain:
-      //   interrupt → WorkingState resets + emits turnInterrupted signal
-      //   → ForkOrchestrator publishes synthetic turn_completed (if turn was active)
-      //   → ForkOrchestrator publishes fork_completed { interrupted: true }
-      //   → all projections settle into valid terminal state
-      for (const [forkId, fork] of forkState.forks) {
-        if (fork.status !== 'running') continue
-        const forkWorkingState = yield* workingStateProjection.getFork(forkId)
+      // Hydration recovery: detect agents that were in-flight when the process
+      // died. After replay, WorkingState tells us whether each agent fork is in
+      // a valid settled state. If not stable, emit an interrupt to cleanly
+      // terminate it through the normal recovery chain.
+      for (const [, agent] of agentState.agents) {
+        if (agent.status === 'dismissed') continue
+        const forkWorkingState = yield* workingStateProjection.getFork(agent.forkId)
         if (!isStable(forkWorkingState)) {
           yield* Effect.promise(() => client.send({
             type: 'interrupt',
-            forkId,
+            forkId: agent.forkId,
           }))
         }
       }
@@ -287,8 +281,8 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         }))
       }
 
-      // NOTE: fork_removed is not backfilled here. The event is vestigial and
-      // slated for removal as part of the fork→agent event simplification.
+      // NOTE: AgentProjection is the runtime source of truth for child agents.
+      // forkId remains the execution handle used by forked projections/workers.
 
       // Persist all recovery events immediately so reopening the same session
       // again won't re-run recovery for already-terminated forks.

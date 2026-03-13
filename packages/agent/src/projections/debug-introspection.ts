@@ -7,7 +7,7 @@
 
 import { Effect, Stream, SubscriptionRef } from 'effect'
 import { DisplayProjection } from './display'
-import { ForkProjection } from './fork'
+import { AgentProjection } from './agent'
 
 import { TurnProjection } from './turn'
 import { MemoryProjection } from './memory'
@@ -15,7 +15,6 @@ import { CompactionProjection } from './compaction'
 import { WorkingStateProjection } from './working-state'
 import { SessionContextProjection } from './session-context'
 
-import { AgentRegistryProjection } from './agent-registry'
 import { ArtifactProjection } from './artifact'
 import { ChatTitleProjection } from './chat-title'
 import { ReplayProjection } from './replay'
@@ -55,7 +54,7 @@ export interface DebugSnapshot {
 
 interface ResolvedProjections {
   displayProj: Effect.Effect.Success<typeof DisplayProjection.Tag>
-  forkProj: Effect.Effect.Success<typeof ForkProjection.Tag>
+  agentProj: Effect.Effect.Success<typeof AgentProjection.Tag>
 
   turnProj: Effect.Effect.Success<typeof TurnProjection.Tag>
   memoryProj: Effect.Effect.Success<typeof MemoryProjection.Tag>
@@ -63,7 +62,6 @@ interface ResolvedProjections {
   workingProj: Effect.Effect.Success<typeof WorkingStateProjection.Tag>
   sessionProj: Effect.Effect.Success<typeof SessionContextProjection.Tag>
 
-  agentRegistryProj: Effect.Effect.Success<typeof AgentRegistryProjection.Tag>
   artifactProj: Effect.Effect.Success<typeof ArtifactProjection.Tag>
   chatTitleProj: Effect.Effect.Success<typeof ChatTitleProjection.Tag>
   replayProj: Effect.Effect.Success<typeof ReplayProjection.Tag>
@@ -74,7 +72,7 @@ function resolveProjections() {
   return Effect.gen(function* () {
     return {
       displayProj: yield* DisplayProjection.Tag,
-      forkProj: yield* ForkProjection.Tag,
+      agentProj: yield* AgentProjection.Tag,
 
       turnProj: yield* TurnProjection.Tag,
       memoryProj: yield* MemoryProjection.Tag,
@@ -82,7 +80,6 @@ function resolveProjections() {
       workingProj: yield* WorkingStateProjection.Tag,
       sessionProj: yield* SessionContextProjection.Tag,
 
-      agentRegistryProj: yield* AgentRegistryProjection.Tag,
       artifactProj: yield* ArtifactProjection.Tag,
       chatTitleProj: yield* ChatTitleProjection.Tag,
       replayProj: yield* ReplayProjection.Tag,
@@ -100,7 +97,7 @@ function buildSnapshot(
 
     // Use SubscriptionRef.get for all projections — works for both standard and forked
     const displayRaw = yield* SubscriptionRef.get(projs.displayProj.state)
-    const forkState = yield* SubscriptionRef.get(projs.forkProj.state)
+    const agentState = yield* SubscriptionRef.get(projs.agentProj.state)
 
     const turnRaw = yield* SubscriptionRef.get(projs.turnProj.state)
     const memoryRaw = yield* SubscriptionRef.get(projs.memoryProj.state)
@@ -108,7 +105,6 @@ function buildSnapshot(
     const workingRaw = yield* SubscriptionRef.get(projs.workingProj.state)
     const sessionState = yield* SubscriptionRef.get(projs.sessionProj.state)
 
-    const agentRegistryState = yield* SubscriptionRef.get(projs.agentRegistryProj.state)
     const artifactState = yield* SubscriptionRef.get(projs.artifactProj.state)
     const chatTitleState = yield* SubscriptionRef.get(projs.chatTitleProj.state)
     const replayRaw = yield* SubscriptionRef.get(projs.replayProj.state)
@@ -126,8 +122,7 @@ function buildSnapshot(
     const projections: ProjectionSnapshot[] = [
 
       { name: 'WorkingStateProjection', state: workingForkState, timestamp },
-      { name: 'AgentRegistryProjection', state: agentRegistryState, timestamp },
-      { name: 'ForkProjection', state: forkState, timestamp },
+      { name: 'AgentProjection', state: agentState, timestamp },
 
       { name: 'TurnProjection', state: turnForkState, timestamp },
       { name: 'MemoryProjection', state: memoryForkState, timestamp },
@@ -173,7 +168,7 @@ export function createDebugStream(forkId: string | null) {
 
     const mergedStream = Stream.mergeAll([
       toTrigger(projs.displayProj.state.changes),
-      toTrigger(projs.forkProj.state.changes),
+      toTrigger(projs.agentProj.state.changes),
 
       toTrigger(projs.turnProj.state.changes),
       toTrigger(projs.memoryProj.state.changes),
@@ -181,7 +176,6 @@ export function createDebugStream(forkId: string | null) {
       toTrigger(projs.workingProj.state.changes),
       toTrigger(projs.sessionProj.state.changes),
 
-      toTrigger(projs.agentRegistryProj.state.changes),
       toTrigger(projs.artifactProj.state.changes),
       toTrigger(projs.chatTitleProj.state.changes),
       toTrigger(projs.replayProj.state.changes),

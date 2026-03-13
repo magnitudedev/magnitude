@@ -7,7 +7,7 @@
 
 import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { ForkProjection } from './fork'
+import { AgentProjection } from './agent'
 import { CompactionProjection } from './compaction'
 
 
@@ -272,7 +272,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       return newFork
     },
 
-    fork_started: ({ event, fork, emit }) => {
+    agent_created: ({ event, fork, emit }) => {
       const newFork: ForkWorkingState = {
         ...fork,
         willContinue: true
@@ -289,7 +289,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
 
     // Stop completed fork from continuing
-    fork_completed: ({ event, fork, emit }) => {
+    agent_dismissed: ({ event, fork, emit }) => {
       const newFork: ForkWorkingState = {
         ...fork,
         willContinue: false,  // Fork is done, don't continue
@@ -384,7 +384,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
 
     // Wake orchestrator (root) when sub-agent responds
-    on(ForkProjection.signals.agentResponse, ({ value, state, emit }) => {
+    on(AgentProjection.signals.agentResponse, ({ value, state, emit }) => {
       const forkId = value.targetForkId  // null = root (orchestrator)
       const forkState = state.forks.get(forkId)
       if (!forkState) return state
@@ -410,7 +410,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     }),
 
     // Wake sub-agent when orchestrator sends it a message
-    on(ForkProjection.signals.agentMessage, ({ value, state, emit }) => {
+    on(AgentProjection.signals.agentMessage, ({ value, state, emit }) => {
       const forkId = value.targetForkId
       const forkState = state.forks.get(forkId)
       if (!forkState) return state

@@ -8,7 +8,6 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { extractArtifactRefs } from '../util/artifact-links'
 import { OutboundMessagesProjection } from './outbound-messages'
-import { AgentRegistryProjection } from './agent-registry'
 import { ArtifactProjection } from './artifact'
 import type { ArtifactState } from './artifact'
 import { createCompactDiff, computeDiffStats, shouldUseDiff } from '../util/compact-diff'
@@ -80,7 +79,7 @@ function processArtifactRefs(
 
 export const ArtifactAwarenessProjection = Projection.defineForked<AppEvent, ForkArtifactAwarenessState>()({
   name: 'ArtifactAwareness',
-  reads: [OutboundMessagesProjection, AgentRegistryProjection, ArtifactProjection] as const,
+  reads: [OutboundMessagesProjection, ArtifactProjection] as const,
   initialFork: {
     awareArtifactIds: new Set(),
     pendingRefs: new Map(),
@@ -114,7 +113,7 @@ export const ArtifactAwarenessProjection = Projection.defineForked<AppEvent, For
       return { ...fork, awareArtifactIds: result.awareArtifactIds, pendingRefs: result.pendingRefs }
     },
 
-    fork_started: ({ event, fork, emit, read }) => {
+    agent_created: ({ event, fork, emit, read }) => {
       const refs = extractArtifactRefs(event.context)
       if (refs.length === 0) return fork
 

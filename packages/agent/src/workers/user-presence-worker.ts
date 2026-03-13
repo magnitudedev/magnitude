@@ -10,7 +10,8 @@ import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { UserPresenceProjection } from '../projections/user-presence'
-import { AgentRegistryProjection } from '../projections/agent-registry'
+import { AgentProjection } from '../projections/agent'
+import { WorkingStateProjection } from '../projections/working-state'
 import { USER_AWAY_RETURN_THRESHOLD_MS, USER_PRESENCE_CONFIRM_DELAY_MS } from '../constants'
 
 export const UserPresenceWorker = Worker.define<AppEvent>()({
@@ -33,11 +34,20 @@ export const UserPresenceWorker = Worker.define<AppEvent>()({
       const awayMs = presence.focusedAt - presence.blurredAt
       if (awayMs <= USER_AWAY_RETURN_THRESHOLD_MS) return
 
-      // Only trigger if there are active agents
-      const agentRegistry = yield* read(AgentRegistryProjection)
-      const hasActiveAgents = [...agentRegistry.agents.values()].some(
-        a => a.status === 'running'
-      )
+      // Only trigger if there are agents actively working (mid-turn).
+      // HACK: We need cross-fork WorkingState reads from a global worker, which
+      // the framework doesn't support via read(). Using Tag + getFork() directly.
+      const agentState = yield* read(AgentProjection)
+      const workingStateInst = yield* WorkingStateProjection.Tag
+      let hasActiveAgents = false
+      for (const agent of agentState.agents.values()) {
+        if (agent.status === 'dismissed') continue
+        const ws = yield* workingStateInst.getFork(agent.forkId)
+        if (ws.working) {
+          hasActiveAgents = true
+          break
+        }
+      }
       if (!hasActiveAgents) return
 
       yield* publish({ type: 'user_return_confirmed', forkId: null })

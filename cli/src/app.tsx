@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type ForkState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, type AgentRegistryState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 import { MultilineInput, type MultilineInputHandle } from './components/multiline-input'
@@ -125,9 +125,8 @@ function AppInner({
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const [client, setClient] = useState<AgentClient | null>(null)
   const [display, setDisplay] = useState<DisplayState | null>(null)
-  const [forkState, setForkState] = useState<ForkState | null>(null)
+  const [agentState, setAgentState] = useState<AgentState | null>(null)
   const [artifactState, setArtifactState] = useState<ArtifactState | null>(null)
-  const [agentRegistryState, setAgentRegistryState] = useState<AgentRegistryState | null>(null)
   const [selectedArtifact, setSelectedArtifact] = useState<{ name: string; section?: string } | null>(null)
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
@@ -196,7 +195,7 @@ function AppInner({
     : ''
 
   const escHintRenderedText = nextEscWillKillAll
-    ? 'Press Esc again to kill all forks'
+    ? 'Press Esc again to interrupt all subagents'
     : nextEscWillClearInput
       ? 'Press Esc again to clear text'
       : nextCtrlCWillExit
@@ -207,7 +206,7 @@ function AppInner({
 
   // Always reserve width for the longest possible escape hint so that
   // attachments don't reflow when hints appear/disappear.
-  const maxEscHintWidth = stringWidth('Press Esc again to kill all forks')
+  const maxEscHintWidth = stringWidth('Press Esc again to interrupt all subagents')
 
   const terminalWidth = process.stdout.columns ?? 80
   const footerRightGap = contextRenderedText ? 1 : 0
@@ -497,7 +496,7 @@ function AppInner({
           sessionTracker.recordUserMessage()
         }
 
-        if (event.type === 'fork_started') {
+        if (event.type === 'agent_created') {
           forkRoles.set(event.forkId, { role: event.role, startTime: Date.now() })
           trackAgentSpawned({
             agentType: event.role,
@@ -507,7 +506,7 @@ function AppInner({
           sessionTracker.recordAgentSpawned()
         }
 
-        if (event.type === 'fork_completed') {
+        if (event.type === 'agent_dismissed') {
           const forkInfo = forkRoles.get(event.forkId)
           if (forkInfo) {
             trackAgentCompleted({
@@ -609,25 +608,17 @@ function AppInner({
         setDisplay(prev => prev ? { ...prev, messages: [...prev.messages, errorMsg] } : prev)
       })
 
-      // Subscribe to fork state (standard projection)
-      client.state.forks.subscribe((state) => {
+      // Subscribe to agent state (global projection)
+      client.state.agents.subscribe((state) => {
         if (mounted) {
-          setForkState(state)
+          setAgentState(state)
         }
       })
-
 
       // Subscribe to artifact state (global projection)
       client.state.artifacts.subscribe((state) => {
         if (mounted) {
           setArtifactState(state)
-        }
-      })
-
-      // Subscribe to agent registry state (global projection)
-      client.state.agentRegistry.subscribe((state) => {
-        if (mounted) {
-          setAgentRegistryState(state)
         }
       })
 
@@ -800,8 +791,8 @@ function AppInner({
     return () => { if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current) }
   }, [])
 
-  const hasRunningForks = forkState
-    ? Array.from(forkState.forks.values()).some(f => f.status === 'running')
+  const hasRunningForks = agentState
+    ? Array.from(agentState.agents.values()).some(a => a.status === 'running')
     : false
 
   // Find pending approval request from display messages (for keyboard intercept)
@@ -1641,18 +1632,18 @@ function AppInner({
 
   const handleInterruptAll = useCallback(() => {
     if (!client) return
-    logger.info('Interrupt all: killing all forks')
+    logger.info('Interrupt all: interrupting all subagents')
     // Interrupt root with allKilled flag
     client.send({ type: 'interrupt', forkId: null, allKilled: true })
     // Interrupt every running fork
-    if (forkState) {
-      for (const [forkId, fork] of forkState.forks) {
-        if (fork.status === 'running') {
-          client.send({ type: 'interrupt', forkId })
+    if (agentState) {
+      for (const agent of agentState.agents.values()) {
+        if (agent.status === 'running' && agent.forkId) {
+          client.send({ type: 'interrupt', forkId: agent.forkId })
         }
       }
     }
-  }, [client, forkState])
+  }, [client, agentState])
 
   useKeyboard(
     useCallback(
@@ -1759,12 +1750,12 @@ function AppInner({
           return
         }
 
-        // Priority 2a: Second Esc while "kill all" prompt is active — kill all forks
+        // Priority 2a: Second Esc while "kill all" prompt is active — interrupt all subagents
         if (isEscape && nextEscWillKillAll) {
           if ('preventDefault' in key && typeof key.preventDefault === 'function') {
             key.preventDefault()
           }
-          logger.debug('Second Esc: killing all forks')
+          logger.debug('Second Esc: interrupting all subagents')
           handleInterruptAll()
           setNextEscWillKillAll(false)
           if (killAllTimeoutRef.current) {
@@ -1773,7 +1764,7 @@ function AppInner({
           return
         }
 
-        // Priority 2b: Esc while forks are running — interrupt viewed fork (if streaming) + prompt to kill all
+        // Priority 2b: Esc while forks are running — interrupt viewed fork (if streaming) + prompt to interrupt all
         if (isEscape && hasRunningForks) {
           if ('preventDefault' in key && typeof key.preventDefault === 'function') {
             key.preventDefault()
@@ -1783,7 +1774,7 @@ function AppInner({
             logger.debug('Interrupting stream (forks running)')
             handleInterrupt()
           }
-          // Show "press Esc again to kill all"
+          // Show "press Esc again to interrupt all"
           setNextEscWillKillAll(true)
           if (killAllTimeoutRef.current) {
             clearTimeout(killAllTimeoutRef.current)
@@ -2164,16 +2155,15 @@ function AppInner({
   }
 
   if (expandedForkId && client) {
-    const fork = forkState?.forks.get(expandedForkId)
-    const initialPrompt = Array.from(agentRegistryState?.agents.values() ?? []).find(
-      (entry) => entry.forkId === expandedForkId
-    )?.message ?? null
+    const agentId = agentState?.agentByForkId.get(expandedForkId)
+    const agent = agentId ? agentState?.agents.get(agentId) : undefined
+    const initialPrompt = agent?.message ?? null
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
         <ForkDetailOverlay
           forkId={expandedForkId}
-          forkName={fork?.name ?? 'Agent'}
-          forkRole={fork?.role ?? 'agent'}
+          forkName={agent?.name ?? 'Agent'}
+          forkRole={agent?.role ?? 'agent'}
           initialPrompt={initialPrompt}
           onClose={popForkOverlay}
           onForkExpand={pushForkOverlay}
@@ -2673,7 +2663,7 @@ function AppInner({
             {attachments.length > 0 ? (
               <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={attachmentsMaxWidth} />
             ) : nextEscWillKillAll ? (
-              <text style={{ fg: theme.secondary }}>Press Esc again to kill all forks</text>
+              <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all subagents</text>
             ) : nextEscWillClearInput ? (
               <text style={{ fg: theme.secondary }}>Press Esc again to clear text</text>
             ) : nextCtrlCWillExit ? (
@@ -2684,7 +2674,7 @@ function AppInner({
           </box>
           <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
             {attachments.length > 0 && (nextEscWillKillAll ? (
-              <text style={{ fg: theme.secondary }}>Press Esc again to kill all forks</text>
+              <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all subagents</text>
             ) : nextEscWillClearInput ? (
               <text style={{ fg: theme.secondary }}>Press Esc again to clear text</text>
             ) : nextCtrlCWillExit ? (

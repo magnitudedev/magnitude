@@ -125,10 +125,7 @@ export class JsonChatPersistence implements ChatPersistenceService {
       try: async () => {
         return await this.readEvents()
       },
-      catch: (error) => ({
-        _tag: 'LoadFailed' as const,
-        message: error instanceof Error ? error.message : String(error)
-      })
+      catch: (error) => new PersistenceError({ reason: 'LoadFailed', message: error instanceof Error ? error.message : String(error) })
     })
 
   readonly persistNewEvents = (events: AppEvent[]): Effect.Effect<void, PersistenceError> =>
@@ -162,10 +159,7 @@ export class JsonChatPersistence implements ChatPersistenceService {
           }
         })
       },
-      catch: (error) => ({
-        _tag: 'SaveFailed' as const,
-        message: error instanceof Error ? error.message : String(error)
-      })
+      catch: (error) => new PersistenceError({ reason: 'SaveFailed', message: error instanceof Error ? error.message : String(error) })
     })
 
   readonly getSessionMetadata = (): Effect.Effect<SessionMetadata, PersistenceError> =>
@@ -193,10 +187,7 @@ export class JsonChatPersistence implements ChatPersistenceService {
           updated: metadata.updated
         }
       },
-      catch: (error) => ({
-        _tag: 'LoadFailed' as const,
-        message: error instanceof Error ? error.message : String(error)
-      })
+      catch: (error) => new PersistenceError({ reason: 'LoadFailed', message: error instanceof Error ? error.message : String(error) })
     })
 
   readonly saveSessionMetadata = (
@@ -225,10 +216,7 @@ export class JsonChatPersistence implements ChatPersistenceService {
           await this.writeMetadata(metadata)
         })
       },
-      catch: (error) => ({
-        _tag: 'SaveFailed' as const,
-        message: error instanceof Error ? error.message : String(error)
-      })
+      catch: (error) => new PersistenceError({ reason: 'SaveFailed', message: error instanceof Error ? error.message : String(error) })
     })
 
   readonly saveArtifact = (name: string, content: string): Effect.Effect<void, PersistenceError> =>
@@ -238,7 +226,7 @@ export class JsonChatPersistence implements ChatPersistenceService {
         await fs.mkdir(artifactsDir, { recursive: true })
         await fs.writeFile(path.join(artifactsDir, name + '.md'), content)
       },
-      catch: (error) => PersistenceError({ message: `Failed to save artifact "${name}": ${error}` })
+      catch: (error) => new PersistenceError({ reason: 'SaveFailed', message: `Failed to save artifact "${name}": ${error}` })
     })
 
   /**

@@ -14,10 +14,9 @@ import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { MemoryProjection, getView } from '../projections/memory'
 import { SubagentActivityProjection } from '../projections/subagent-activity'
 import { DisplayProjection } from '../projections/display'
-import { ForkProjection } from '../projections/fork'
+import { AgentProjection } from '../projections/agent'
 import { CompactionProjection } from '../projections/compaction'
 import { ArtifactProjection } from '../projections/artifact'
-import { AgentRegistryProjection } from '../projections/agent-registry'
 
 import { ReplayProjection } from '../projections/replay'
 import { ChatTitleProjection } from '../projections/chat-title'
@@ -28,7 +27,7 @@ import { ArtifactAwarenessProjection } from '../projections/artifact-awareness'
 
 // Workers
 import { TurnController } from '../workers/turn-controller'
-import { ForkOrchestrator } from '../workers/fork-orchestrator'
+import { AgentOrchestrator } from '../workers/agent-orchestrator'
 import { LifecycleCoordinator } from '../workers/lifecycle-coordinator'
 import { ApprovalWorker } from '../workers/approval-worker'
 import { ArtifactSyncWorker } from '../workers/artifact-sync-worker'
@@ -205,7 +204,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const workers = [
       TurnController,
       MockCortex,
-      ForkOrchestrator,
+      AgentOrchestrator,
       LifecycleCoordinator,
       ApprovalWorker,
       ArtifactSyncWorker,
@@ -219,13 +218,12 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       name: 'TestCodingAgent',
       projections: [
         SessionContextProjection,
-        ForkProjection,
+        AgentProjection,
         CompactionProjection,
         WorkingStateProjection,
         TurnProjection,
         CanonicalTurnProjection,
         ArtifactProjection,
-        AgentRegistryProjection,
 
         ReplayProjection,
         SubagentActivityProjection,
@@ -248,7 +246,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           working: WorkingStateProjection,
           memory: MemoryProjection,
           compaction: CompactionProjection,
-          forks: ForkProjection,
+          agents: AgentProjection,
           artifacts: ArtifactProjection,
 
         },
@@ -268,9 +266,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             try: async () => {
               await faultRegistry.checkAsync('persistence.loadEvents')
             },
-            catch: (error) => PersistenceError.BackendError(
-              error instanceof Error ? error.message : String(error)
-            ),
+            catch: (error) => new PersistenceError({ reason: 'BackendError', message: error instanceof Error ? error.message : String(error) }),
           }).pipe(
             Effect.flatMap(() => persistence.loadEvents())
           ),
@@ -279,9 +275,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             try: async () => {
               await faultRegistry.checkAsync('persistence.persistNewEvents')
             },
-            catch: (error) => PersistenceError.BackendError(
-              error instanceof Error ? error.message : String(error)
-            ),
+            catch: (error) => new PersistenceError({ reason: 'BackendError', message: error instanceof Error ? error.message : String(error) }),
           }).pipe(
             Effect.flatMap(() => persistence.persistNewEvents(events))
           ),
@@ -410,10 +404,10 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         idle: async (forkId: string | null = null, opts?: WaitOptions) => {
           await waitEvent('turn_completed', (e) => e.forkId === forkId, opts)
         },
-        forkStarted: (
-          pred?: (e: Extract<AppEvent, { type: 'fork_started' }>) => boolean,
+        agentCreated: (
+          pred?: (e: Extract<AppEvent, { type: 'agent_created' }>) => boolean,
           opts?: WaitOptions,
-        ) => waitEvent('fork_started', pred, opts),
+        ) => waitEvent('agent_created', pred, opts),
         until: waitUntil,
       },
       script: {
@@ -439,7 +433,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         route: async (mapping: ScriptRouteMapping) => {
           const forksByAgent = new Map<string, string>()
           const unsub = onEvent((event) => {
-            if (event.type === 'fork_started') {
+            if (event.type === 'agent_created') {
               forksByAgent.set(event.agentId, event.forkId)
             }
           })
@@ -510,16 +504,14 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             compaction,
             working,
             memory,
-            fork,
-            agentRegistry,
+            agent,
             sessionContext,
           ] = await Promise.all([
             client.runEffect(Effect.flatMap(ArtifactProjection.Tag, (projection) => projection.get)),
             client.runEffect(Effect.flatMap(CompactionProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(MemoryProjection.Tag, (projection) => projection.getFork(null))),
-            client.runEffect(Effect.flatMap(ForkProjection.Tag, (projection) => projection.get)),
-            client.runEffect(Effect.flatMap(AgentRegistryProjection.Tag, (projection) => projection.get)),
+            client.runEffect(Effect.flatMap(AgentProjection.Tag, (projection) => projection.get)),
             client.runEffect(Effect.flatMap(SessionContextProjection.Tag, (projection) => projection.get)),
           ])
 
@@ -528,8 +520,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             CompactionProjection: compaction,
             WorkingStateProjection: working,
             MemoryProjection: memory,
-            ForkProjection: fork,
-            AgentRegistryProjection: agentRegistry,
+            AgentProjection: agent,
             SessionContextProjection: sessionContext,
           }
         },

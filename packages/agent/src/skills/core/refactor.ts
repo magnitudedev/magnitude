@@ -55,10 +55,10 @@ Create the task with startTask(). Include:
   - Linter: \`"function() { var r = shell('bun run lint'); return { passed: r.exitCode === 0, output: r.stderr }; }"\`
 - **Acceptance**: Must center on behavioral equivalence with verify functions:
   1. Tests that passed at baseline still pass: \`"function() { var r = shell('bun test'); return { passed: r.exitCode === 0, evidence: r.stdout }; }"\`
-  2. Structural improvement achieved: use forkSync for agent-based verification if needed
+  2. Structural improvement achieved
   3. No unexpected interface changes: \`"function() { var r = shell('bun run typecheck'); return { passed: r.exitCode === 0, evidence: 'Types check cleanly' }; }"\`
 
-Verify functions must be self-contained strings (no closures). Use \`var\` for declarations. Available globals: \`shell()\`, \`forkSync()\`, \`readFile()\`.
+Verify functions must be self-contained strings (no closures). Use \`var\` for declarations. Available globals: \`shell()\`, \`readFile()\`.
 Checks return \`{ passed: boolean, output?: any }\`. Acceptance returns \`{ passed: boolean, evidence?: string }\`.
 
 If existing tests need modification, that is a red flag — it likely means behavior changed.

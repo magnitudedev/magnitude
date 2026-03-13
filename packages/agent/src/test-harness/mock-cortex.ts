@@ -37,8 +37,8 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
   name: 'MockCortex',
 
   forkLifecycle: {
-    activateOn: 'fork_started',
-    completeOn: 'fork_completed',
+    activateOn: 'agent_created',
+    completeOn: 'agent_dismissed',
   },
 
   eventHandlers: {

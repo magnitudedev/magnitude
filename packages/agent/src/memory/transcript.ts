@@ -72,13 +72,10 @@ function toLine(index: number, event: AppEvent): string | null {
       return `[${index}] ${ts} turn_unexpected_error\n${event.message}`
 
     case 'agent_created':
-      return `[${index}] ${ts} agent_created type=${event.agentType} taskId=${event.taskId}`
+      return `[${index}] ${ts} agent_created role=${event.role} taskId=${event.taskId}`
 
-    case 'fork_started':
-      return `[${index}] ${ts} fork_started role=${event.role} mode=${event.mode} taskId=${event.taskId}`
-
-    case 'fork_completed':
-      return `[${index}] ${ts} fork_completed result=${summarizeResultValue(event.result)}`
+    case 'agent_dismissed':
+      return `[${index}] ${ts} agent_dismissed reason=${event.reason} result=${summarizeResultValue(event.result)}`
 
     default:
       return null

@@ -41,13 +41,13 @@ Create the task with startTask(). Include:
   - \`"function() { var r = shell('curl -s http://localhost:3000/api/projects'); return { passed: r.stdout.includes('['), evidence: r.stdout }; }"\`
   - \`"function() { var r = shell('bun test src/new-feature/'); return { passed: r.exitCode === 0, evidence: r.stdout }; }"\`
 
-Verify functions must be self-contained strings (no closures). Use \`var\` for declarations. Available globals: \`shell()\`, \`forkSync()\`, \`readFile()\`.
+Verify functions must be self-contained strings (no closures). Use \`var\` for declarations. Available globals: \`shell()\`, \`readFile()\`.
 Checks return \`{ passed: boolean, output?: any }\`. Acceptance returns \`{ passed: boolean, evidence?: string }\`.
 
 Criteria should be things that can be mechanically checked by running a command:
 - "GET /api/projects returns a list" — verified by shell command
 - "Existing tests pass without modification" — verified by test runner
-- "The new component renders correctly" — verified by forkSync with agent inspection
+- "The new component renders correctly" — verified by a mechanical check
 
 NOT: "The code is clean" or "The feature works correctly"
 

@@ -40,7 +40,7 @@ import { MemoryProjection, getView } from '../projections/memory'
 import { LLMMessage } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
-import { ForkProjection } from '../projections/fork'
+import { AgentProjection, getAgentByForkId } from '../projections/agent'
 import { WorkingStateProjection } from '../projections/working-state'
 import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, type AgentVariant } from '../agents'
@@ -119,8 +119,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
   name: 'Cortex',
 
   forkLifecycle: {
-    activateOn: 'fork_started',
-    completeOn: 'fork_completed'
+    activateOn: 'agent_created',
+    completeOn: 'agent_dismissed'
   },
 
   eventHandlers: {
@@ -130,12 +130,12 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       const rawCodeChunks: string[] = []
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
-        const forkState = yield* read(ForkProjection)
-        const forkInstance = forkId ? forkState.forks.get(forkId) : null
+        const agentState = yield* read(AgentProjection)
+        const agentInstance = forkId ? getAgentByForkId(agentState, forkId) : null
 
         // Determine agent: child forks use their role, root fork is always orchestrator.
-        const variant: AgentVariant = forkInstance
-          ? forkInstance.role as AgentVariant
+        const variant: AgentVariant = agentInstance
+          ? agentInstance.role as AgentVariant
           : 'orchestrator'
 
         const agentDef = getAgentDefinition(variant)
@@ -197,7 +197,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const ackTurn = buildAckTurn(agentDef.thinkingLenses)
           const cs = yield* withTraceScope(
             {
-              metadata: { callType: 'chat', forkId, forkName: forkInstance?.name ?? 'root', turnId, chainId },
+              metadata: { callType: 'chat', forkId, forkName: agentInstance?.name ?? 'root', turnId, chainId },
               strategyId: 'xml-act',
               systemPrompt,
             },
@@ -296,7 +296,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
           yield* publish(turnCompleted)
-        })),
+        }).pipe(Effect.orDie)),
         Effect.catchAll((error: XmlRuntimeCrash | TurnError) => Effect.gen(function* () {
           // XmlRuntimeCrash is an infrastructure defect — should not happen in normal operation
           if (error._tag === 'XmlRuntimeCrash') {

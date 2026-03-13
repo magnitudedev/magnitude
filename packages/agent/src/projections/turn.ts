@@ -124,7 +124,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnState>()({
       activeTurn: null
     }),
 
-    fork_completed: ({ event, fork }) => {
+    agent_dismissed: ({ event, fork }) => {
       // TODO: fork cleanup — need to design proper fork completion UX before removing state
       // return null
       return fork

@@ -1,23 +1,21 @@
 /**
  * Fork Services
  *
- * ForkStateReaderTag — service for tools to access fork projection state
+ * AgentStateReaderTag — service for tools to access agent projection state
  */
 
-import { Effect, Deferred, Context } from 'effect'
-import type { ForkState } from '../projections/fork'
+import { Effect, Context } from 'effect'
+import type { AgentState } from '../projections/agent'
 
 // =============================================================================
 // Fork State Reader Service (for tools to access fork projection state)
 // =============================================================================
 
-export interface ForkStateReader {
-  readonly getForkState: () => Effect.Effect<ForkState>
-  readonly registerBlocking: (forkId: string, deferred: Deferred.Deferred<unknown, never>) => void
-  readonly resolveBlocking: (forkId: string, result: unknown) => Effect.Effect<void>
+export interface AgentStateReader {
+  readonly getAgentState: () => Effect.Effect<AgentState>
 }
 
-export class ForkStateReaderTag extends Context.Tag('ForkStateReader')<
-  ForkStateReaderTag,
-  ForkStateReader
+export class AgentStateReaderTag extends Context.Tag('AgentStateReader')<
+  AgentStateReaderTag,
+  AgentStateReader
 >() {}

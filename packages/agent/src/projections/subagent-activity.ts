@@ -1,6 +1,6 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { ForkProjection } from './fork'
+import { AgentProjection, getAgentByForkId } from './agent'
 import { WorkingStateProjection } from './working-state'
 
 export interface TurnEntry {
@@ -26,7 +26,7 @@ export interface SubagentActivityState {
 export const SubagentActivityProjection = Projection.define<AppEvent, SubagentActivityState>()({
   name: 'SubagentActivity',
 
-  reads: [ForkProjection] as const,
+  reads: [AgentProjection] as const,
 
   initial: {
     entriesByParent: new Map(),
@@ -83,9 +83,9 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
     turn_completed: ({ event, state, read }) => {
       if (event.forkId === null) return state
 
-      const forkState = read(ForkProjection)
-      const fork = forkState.forks.get(event.forkId)
-      if (!fork) return state
+      const agentState = read(AgentProjection)
+      const agent = getAgentByForkId(agentState, event.forkId)
+      if (!agent) return state
 
       // Get accumulated prose from message_chunk events
       const rawProse = state.pendingProse.get(event.forkId) ?? ''
@@ -97,14 +97,14 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
 
       const entry: TurnEntry = {
         forkId: event.forkId,
-        agentId: fork.name,
+        agentId: agent.name,
         turnId: event.turnId,
         prose,
         toolsCalled,
         artifactsWritten: pendingArtifact.written,
       }
 
-      const parentForkId = fork.parentForkId
+      const parentForkId = agent.parentForkId
       const existing = state.entriesByParent.get(parentForkId) ?? []
 
       // Clear pending state for this fork

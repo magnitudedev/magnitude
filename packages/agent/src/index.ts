@@ -29,14 +29,12 @@ export type {
   ToolResult,
   ToolDisplay,
   Interrupt,
-  ForkStarted,
-  ForkCompleted,
   AutopilotMessageGenerated,
   AutopilotToggled,
   ToolApproved,
   ToolRejected,
   ChatTitleGenerated,
-  WorkAgentType,
+
   Attachment,
   ImageAttachment,
 } from './events'
@@ -92,9 +90,20 @@ export type {
 export { TurnProjection } from './projections/turn'
 export type { TurnState, ToolCall } from './projections/turn'
 
-export { ForkProjection } from './projections/fork'
-export type { ForkState, ForkInstance, ForkCreated, ForkCompletedSignal } from './projections/fork'
+export { AgentProjection } from './projections/agent'
+export type {
+  AgentState,
+  AgentInstance,
+  AgentLifecycleStatus,
+  AgentCreatedSignal,
+  AgentDismissedSignal,
+  AgentPausedSignal,
+  AgentMessageSignal,
+  AgentResponseSignal,
+} from './projections/agent'
 
+export { AgentStatusBridgeProjection } from './projections/agent-status-bridge'
+export type { AgentBecameIdleSignal, AgentResumedSignal } from './projections/agent-status-bridge'
 
 export { ArtifactProjection } from './projections/artifact'
 export type { ArtifactState, ArtifactItem } from './projections/artifact'
@@ -102,9 +111,6 @@ export { ArtifactAwarenessProjection } from './projections/artifact-awareness'
 export type { ForkArtifactAwarenessState } from './projections/artifact-awareness'
 export { OutboundMessagesProjection } from './projections/outbound-messages'
 export type { OutboundMessagesState, OutboundMessageCompletedSignal } from './projections/outbound-messages'
-
-export { AgentRegistryProjection } from './projections/agent-registry'
-export type { AgentRegistryState } from './projections/agent-registry'
 
 export { ChatTitleProjection } from './projections/chat-title'
 export type { ChatTitleState, ChatTitleGeneratedSignal } from './projections/chat-title'
@@ -166,7 +172,7 @@ export {
   navigateTool, goBackTool, switchTabTool, newTabTool, screenshotTool, evaluateTool,
   browserTools,
 } from './tools/browser-tools'
-export type { ForkStateReader } from './tools/fork'
+export type { AgentStateReader } from './tools/fork'
 export { skillTool } from './tools/skill'
 export type { SkillStateReader } from './tools/skill'
 
@@ -177,7 +183,7 @@ export type { CoreSkillEntry, ResolvedSkill, CoreSkillName } from './skills'
 // Workers
 export { TurnController } from './workers/turn-controller'
 export { Cortex } from './workers/cortex'
-export { ForkOrchestrator } from './workers/fork-orchestrator'
+export { AgentOrchestrator } from './workers/agent-orchestrator'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'

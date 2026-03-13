@@ -29,10 +29,9 @@ export function buildCloneContext(taskDescription: string, outputSchema?: JsonSc
   if (outputSchema) {
     const formatInstructions = outputFormatString(outputSchema)
     parts.push('')
-    parts.push('When you submit results, format them as follows:')
+    parts.push('Format your output as follows:')
     parts.push(formatInstructions)
   }
-  parts.push('When done, call submit() with a detailed report of everything you did, all changes made, and all findings.')
   parts.push('Do NOT create nested agents unless absolutely necessary.')
   parts.push('</instructions>')
 

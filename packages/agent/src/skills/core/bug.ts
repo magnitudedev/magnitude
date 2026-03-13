@@ -60,7 +60,7 @@ Create the task with startTask(). Include:
   1. The reproduction case flips from failure to success: \`"function() { var r = shell('bun test reproduction.test.ts'); return { passed: r.exitCode === 0, evidence: r.stdout }; }"\`
   2. No regressions — baseline tests still pass: \`"function() { var r = shell('bun test'); return { passed: r.exitCode === 0, evidence: r.stdout }; }"\`
 
-Verify functions must be self-contained strings (no closures). Use \`var\` for declarations. Available globals: \`shell()\`, \`forkSync()\`, \`readFile()\`.
+Verify functions must be self-contained strings (no closures). Use \`var\` for declarations. Available globals: \`shell()\`, \`readFile()\`.
 Checks return \`{ passed: boolean, output?: any }\`. Acceptance returns \`{ passed: boolean, evidence?: string }\`.
 
 The first acceptance criterion — the red/green flip — is non-negotiable. If you can't express the bug as a failing check that becomes a passing check, you don't understand the bug well enough.

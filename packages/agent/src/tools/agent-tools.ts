@@ -12,14 +12,14 @@ import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
-import type { AppEvent, WorkAgentType } from '../events'
+import type { AppEvent } from '../events'
+import type { AgentVariant } from '../agents'
 
 
-import { ForkStateReaderTag } from './fork'
 import { ExecutionManager } from '../execution/execution-manager'
-import { AgentRegistryStateReaderTag } from './agent-registry-reader'
 import { ConversationStateReaderTag } from './memory-reader'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
+import { AgentProjection, getActiveAgent } from '../projections/agent'
 
 const { ForkContext } = Fork
 
@@ -36,7 +36,7 @@ const AgentError = ToolErrorSchema('AgentError', {})
 /** Execute logic for agent.create */
 function executeAgentCreate({ agentId, options }: {
   agentId: string;
-  options: { type: WorkAgentType; title: string; message: string };
+  options: { type: AgentVariant; title: string; message: string };
 }) {
   return Effect.gen(function* () {
     const { type: agentType, title, message } = options
@@ -57,8 +57,6 @@ function executeAgentCreate({ agentId, options }: {
 
     const execManager = yield* ExecutionManager
     const { forkId: parentForkId } = yield* ForkContext
-    const bus = yield* WorkerBusTag<AppEvent>()
-
     // Use a synthetic task ID for the fork (agents no longer require pre-existing tasks)
     const taskId = `agent-${agentId}`
 
@@ -67,19 +65,10 @@ function executeAgentCreate({ agentId, options }: {
       name: title,
       agentId,
       prompt: context,
+      message,
       mode: 'spawn',
       role: agentType,
       taskId,
-    })
-
-    yield* bus.publish({
-      type: 'agent_created',
-      forkId: parentForkId,
-      agentId,
-      taskId,
-      agentType,
-      agentForkId: forkId,
-      message,
     })
 
     return { agentId, forkId }
@@ -136,11 +125,11 @@ export const agentPauseTool = createTool({
   } as const,
   execute: ({ agentId }) =>
     Effect.gen(function* () {
-      const registryReader = yield* AgentRegistryStateReaderTag
-      const registryState = yield* registryReader.getState()
-      const agent = registryState.agents.get(agentId)
+      const projection = yield* AgentProjection.Tag
+      const agentState = yield* projection.get
+      const agent = getActiveAgent(agentState, agentId)
 
-      if (!agent || agent.status === 'dismissed') {
+      if (!agent) {
         return yield* Effect.fail({ _tag: 'AgentError' as const, message: `No active agent "${agentId}" found` })
       }
 
@@ -148,9 +137,8 @@ export const agentPauseTool = createTool({
       yield* bus.publish({ type: 'soft_interrupt', forkId: agent.forkId })
       yield* bus.publish({
         type: 'agent_paused',
-        forkId: null,
+        forkId: agent.forkId,
         agentId,
-        agentForkId: agent.forkId,
       })
 
       return { agentId }
@@ -177,38 +165,23 @@ export const agentDismissTool = createTool({
   } as const,
   execute: ({ agentId }) =>
     Effect.gen(function* () {
-      const registryReader = yield* AgentRegistryStateReaderTag
-      const registryState = yield* registryReader.getState()
-      const agent = registryState.agents.get(agentId)
+      const projection = yield* AgentProjection.Tag
+      const agentState = yield* projection.get
+      const agent = getActiveAgent(agentState, agentId)
 
-      if (!agent || agent.status === 'dismissed') {
+      if (!agent) {
         return yield* Effect.fail({ _tag: 'AgentError' as const, message: `No active agent "${agentId}" found` })
       }
 
-      // Get parent fork ID from fork state
-      const forkStateReader = yield* ForkStateReaderTag
-      const forkState = yield* forkStateReader.getForkState()
-      const fork = forkState.forks.get(agent.forkId)
-      const parentForkId = fork?.parentForkId ?? null
-
       const bus = yield* WorkerBusTag<AppEvent>()
-
-      // fork_completed triggers full cleanup: Cortex fiber interrupted (completeOn),
-      // sandbox disposed (ForkOrchestrator), working state cleared (WorkingState).
-      // No separate interrupt event needed — that would cause ForkOrchestrator.interrupt
-      // to publish a duplicate fork_completed.
-      yield* bus.publish({
-        type: 'fork_completed',
-        forkId: agent.forkId,
-        parentForkId,
-        result: { dismissed: true },
-      })
 
       yield* bus.publish({
         type: 'agent_dismissed',
-        forkId: null,
-        agentId,
-        agentForkId: agent.forkId,
+        forkId: agent.forkId,
+        parentForkId: agent.parentForkId,
+        agentId: agent.agentId,
+        result: { dismissed: true },
+        reason: 'dismissed',
       })
 
       return { agentId }

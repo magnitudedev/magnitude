@@ -1,20 +1,19 @@
 /**
- * ForkOrchestrator Worker
+ * AgentOrchestrator Worker
  *
- * Handles fork infrastructure that tools can't own:
+ * Handles agent infrastructure that tools can't own:
  * - Root fork init on session start
- * - Disposing fork layers + browser harness on fork completion
- * - Auto-completing interrupted forks
- * - Scheduling delayed fork removal
+ * - Disposing fork layers + browser harness on agent dismissal
+ * - Auto-dismissing interrupted child agents
  *
- * fork(), forkSync(), submit(), and task.validate handle their own lifecycle directly.
+ * fork() and task.validate handle their own lifecycle directly.
  */
 
 import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { ExecutionManager } from '../execution/execution-manager'
-import { ForkProjection } from '../projections/fork'
+import { AgentProjection, getAgentByForkId } from '../projections/agent'
 import { WorkingStateProjection } from '../projections/working-state'
 
 import { BrowserService } from '../services/browser-service'
@@ -24,10 +23,10 @@ import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 // Worker
 // =============================================================================
 
-export const ForkOrchestrator = Worker.define<AppEvent>()({
-  name: 'ForkOrchestrator',
+export const AgentOrchestrator = Worker.define<AppEvent>()({
+  name: 'AgentOrchestrator',
 
-  // interrupt handler must not be interrupted itself (it auto-completes interrupted forks)
+  // interrupt handler must not be interrupted itself (it auto-dismisses interrupted child agents)
   ignoreInterrupt: ['interrupt'] as const,
 
   eventHandlers: {
@@ -38,41 +37,19 @@ export const ForkOrchestrator = Worker.define<AppEvent>()({
       yield* execManager.initFork(null, 'orchestrator')
     }).pipe(Effect.orDie),
 
-    // Auto-complete interrupted forks
-    interrupt: (event, publish, read) => Effect.gen(function* () {
-      const { forkId } = event
-      if (forkId === null) return
+    // Interrupt just stops the current turn — agent stays alive and goes idle.
+    // The interrupt flows through: WorkingState (clears state, emits turnInterrupted)
+    // → AgentOrchestrator signal handler (publishes synthetic turn_completed)
+    // → AgentStatusBridge (emits agentBecameIdle with reason 'interrupt')
+    interrupt: (_event, _publish, _read) => Effect.void,
 
-      const forkState = yield* read(ForkProjection)
-      const fork = forkState.forks.get(forkId)
-      if (!fork || fork.status !== 'running') return
-
-      yield* publish({
-        type: 'fork_completed',
-        forkId,
-        parentForkId: fork.parentForkId,
-        result: { interrupted: true },
-      })
-    }).pipe(Effect.orDie),
-
-    // Dispose fork resources and schedule removal
-    fork_completed: (event, publish) => Effect.gen(function* () {
+    // Dispose agent resources
+    agent_dismissed: (event, _publish) => Effect.gen(function* () {
       const browserService = yield* BrowserService
       yield* browserService.release(event.forkId)
 
       const execManager = yield* ExecutionManager
       yield* execManager.disposeFork(event.forkId)
-
-      yield* Effect.forkDaemon(
-        Effect.gen(function* () {
-          yield* Effect.sleep("2 seconds")
-          yield* publish({
-            type: 'fork_removed',
-            forkId: event.forkId,
-            parentForkId: event.parentForkId,
-          })
-        })
-      )
     }).pipe(Effect.orDie)
   },
 
@@ -80,6 +57,6 @@ export const ForkOrchestrator = Worker.define<AppEvent>()({
     on(WorkingStateProjection.signals.turnInterrupted, ({ forkId, turnId, chainId }, publish) => Effect.gen(function* () {
       const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
       yield* publish(turnCompleted)
-    }))
+    }).pipe(Effect.orDie))
   ]
 })

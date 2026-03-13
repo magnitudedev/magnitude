@@ -1,8 +1,8 @@
 import { Effect, Context } from 'effect'
-import type { AgentRegistryState } from '../projections/agent-registry'
+import type { AgentState } from '../projections/agent'
 
 export interface ProjectionReader {
-  getAgentRegistry(): Effect.Effect<AgentRegistryState>
+  getAgentRegistry(): Effect.Effect<AgentState>
 }
 
 export class ProjectionReaderTag extends Context.Tag('ProjectionReader')<ProjectionReaderTag, ProjectionReader>() {}

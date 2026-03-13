@@ -14,10 +14,10 @@ import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent, ToolResult, ToolDisplay } from '../events'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { getVisualRegistry } from '../visuals/registry'
-import { ForkProjection, type ForkState } from './fork'
+import { AgentProjection, type AgentState, getAgentByForkId } from './agent'
 
 import { WorkingStateProjection } from './working-state'
-import { AgentRegistryProjection } from './agent-registry'
+import { AgentStatusBridgeProjection } from './agent-status-bridge'
 
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
@@ -25,7 +25,7 @@ import { createId } from '../util/id'
 
 /**
  * Resolve display visibility for a tool call using the agent definition's display policy.
- * Reads the fork's role from ForkProjection to determine which agent definition to consult.
+ * Reads the agent role from AgentProjection to determine which agent definition to consult.
  */
 /** Map XmlToolResult → ToolResult for display. */
 function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay): ToolResult {
@@ -51,9 +51,9 @@ function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay
   }
 }
 
-function isToolHidden(toolKey: string, forkId: string | null, input: unknown, forkState: ForkState): boolean {
+function isToolHidden(toolKey: string, forkId: string | null, input: unknown, agentState: AgentState): boolean {
   const variant: AgentVariant = forkId
-    ? (forkState.forks.get(forkId)?.role ?? 'builder') as AgentVariant
+    ? (getAgentByForkId(agentState, forkId)?.role ?? 'builder') as AgentVariant
     : 'orchestrator'
   const agentDef = getAgentDefinition(variant)
   const result = agentDef.getDisplay(toolKey, input, undefined)
@@ -405,7 +405,7 @@ function toPreview(text: string): string {
 export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>()({
   name: 'Display',
 
-  reads: [ForkProjection, WorkingStateProjection, AgentRegistryProjection] as const,
+  reads: [AgentProjection, WorkingStateProjection] as const,
 
   initialFork: {
     status: 'idle',
@@ -678,8 +678,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           // Consult agent definition's display policy
-          const forkState = read(ForkProjection)
-          if (isToolHidden(event.toolKey, event.forkId, undefined, forkState)) {
+          const agentState = read(AgentProjection)
+          if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
             return fork
           }
 
@@ -735,8 +735,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           // Consult agent definition's display policy
-          const forkState = read(ForkProjection)
-          if (isToolHidden(event.toolKey, event.forkId, undefined, forkState)) {
+          const agentState = read(AgentProjection)
+          if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
             return fork
           }
 
@@ -886,8 +886,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    fork_completed: ({ event, fork }) => {
-      // Keep fork state until fork_removed event
+    agent_dismissed: ({ event, fork }) => {
+      // Keep fork state for display/debug history
       return fork
     },
 
@@ -895,11 +895,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
   },
 
   signalHandlers: (on) => [
-    // Insert inline fork activity block in parent's display when fork is created
-    on(ForkProjection.signals.forkCreated, ({ value, state, read }) => {
-      const { forkId, parentForkId, name } = value
-      const forkState = read(ForkProjection)
-      const forkInstance = forkState.forks.get(forkId)
+    // Insert inline fork activity block in parent's display when agent is created
+    on(AgentProjection.signals.agentCreated, ({ value, state }) => {
+      const { forkId, parentForkId, name, role } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
@@ -908,7 +906,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         type: 'fork_activity',
         forkId,
         name,
-        role: forkInstance?.role ?? 'agent',
+        role,
         status: 'running',
         startedAt: value.timestamp,
         resumeCount: 0,
@@ -929,11 +927,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const { forkId, toolKey } = value
       if (forkId === null) return state  // root fork tools, no parent activity to update
 
-      const forkState = read(ForkProjection)
-      const forkInstance = forkState.forks.get(forkId)
-      if (!forkInstance) return state
+      const agentState = read(AgentProjection)
+      const agent = getAgentByForkId(agentState, forkId)
+      if (!agent) return state
 
-      const parentState = state.forks.get(forkInstance.parentForkId)
+      const parentState = state.forks.get(agent.parentForkId)
       if (!parentState) return state
 
       const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
@@ -947,38 +945,12 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       return {
         ...state,
-        forks: new Map(state.forks).set(forkInstance.parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(agent.parentForkId, { ...parentState, messages: newMessages })
       }
     }),
 
-    // Mark fork activity as completed when fork becomes stable (idle)
-    on(WorkingStateProjection.signals.forkBecameStable, ({ value, state, read }) => {
-      const { forkId } = value
-      if (forkId === null) return state
-
-      const forkState = read(ForkProjection)
-      const forkInstance = forkState.forks.get(forkId)
-      if (!forkInstance) return state
-
-      const parentState = state.forks.get(forkInstance.parentForkId)
-      if (!parentState) return state
-
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
-      if (msgIndex === -1) return state
-
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
-      const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = { ...msg, status: 'completed', completedAt: value.timestamp }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(forkInstance.parentForkId, { ...parentState, messages: newMessages })
-      }
-    }),
-
-    // Mark fork activity as completed when fork completes
-    on(ForkProjection.signals.forkCompleted, ({ value, state }) => {
+    // Mark fork activity as completed when agent becomes idle
+    on(AgentStatusBridgeProjection.signals.agentBecameIdle, ({ value, state }) => {
       const { forkId, parentForkId } = value
 
       const parentState = state.forks.get(parentForkId)
@@ -998,19 +970,27 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(AgentRegistryProjection.signals.agentStatusChanged, ({ value, state, read }) => {
-      if (value.status !== 'running' || (value.previousStatus !== 'idle' && value.previousStatus !== 'paused')) return state
+    on(AgentProjection.signals.agentDismissed, ({ value, state }) => {
+      const { forkId, parentForkId } = value
+      const parentState = state.forks.get(parentForkId)
+      if (!parentState) return state
 
-      const registry = read(AgentRegistryProjection)
-      const entry = registry.agents.get(value.agentId)
-      if (!entry) return state
+      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
+        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
+      if (msgIndex === -1) return state
 
-      const forkId = entry.forkId
-      const forkState = read(ForkProjection)
-      const forkInstance = forkState.forks.get(forkId)
-      if (!forkInstance) return state
+      const msg = parentState.messages[msgIndex] as ForkActivityMessage
+      const newMessages = [...parentState.messages]
+      newMessages[msgIndex] = { ...msg, status: 'completed', completedAt: value.timestamp }
 
-      const parentForkId = forkInstance.parentForkId
+      return {
+        ...state,
+        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+      }
+    }),
+
+    on(AgentStatusBridgeProjection.signals.agentResumed, ({ value, state }) => {
+      const { forkId, parentForkId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
@@ -1019,6 +999,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       if (msgIndex === -1) return state
 
       const message = parentState.messages[msgIndex] as ForkActivityMessage
+      if (!message.completedAt) return state  // never went idle — first run, not a resume
+
       const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
         ...msg,
         status: 'running',
@@ -1033,14 +1015,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(ForkProjection.signals.agentMessage, ({ value, state, read }) => {
+    on(AgentProjection.signals.agentMessage, ({ value, state, read }) => {
       const { targetForkId, agentId, message, timestamp } = value
       const content = message.trim()
       if (!content) return state
 
-      const forkState = read(ForkProjection)
-      const targetFork = forkState.forks.get(targetForkId)
-      const parentForkId = targetFork?.parentForkId ?? null
+      const agentState = read(AgentProjection)
+      const targetAgent = getAgentByForkId(agentState, targetForkId)
+      const parentForkId = targetAgent?.parentForkId ?? null
       let nextState = state
 
       const parentDisplayFork = state.forks.get(parentForkId)
@@ -1050,8 +1032,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           type: 'agent_communication',
           direction: 'to_agent',
           agentId,
-          agentName: targetFork?.name,
-          agentRole: targetFork?.role,
+          agentName: targetAgent?.name,
+          agentRole: targetAgent?.role,
           forkId: targetForkId,
           content,
           preview: toPreview(content),
@@ -1094,13 +1076,13 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       return nextState
     }),
 
-    on(ForkProjection.signals.agentResponse, ({ value, state, read }) => {
+    on(AgentProjection.signals.agentResponse, ({ value, state, read }) => {
       const { targetForkId, agentId, message, timestamp } = value
       const content = message.trim()
       if (!content) return state
 
-      const forkState = read(ForkProjection)
-      const sourceFork = [...forkState.forks.values()].find(f => f.agentId === agentId)
+      const agentState = read(AgentProjection)
+      const sourceAgent = agentState.agents.get(agentId)
 
       let nextState = state
 
@@ -1111,8 +1093,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           type: 'agent_communication',
           direction: 'from_agent',
           agentId,
-          agentName: sourceFork?.name,
-          agentRole: sourceFork?.role,
+          agentName: sourceAgent?.name,
+          agentRole: sourceAgent?.role,
           forkId: targetForkId,
           content,
           preview: toPreview(content),
@@ -1128,8 +1110,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
       }
 
-      if (!sourceFork) return nextState
-      const sourceDisplayFork = nextState.forks.get(sourceFork.forkId)
+      if (!sourceAgent) return nextState
+      const sourceDisplayFork = nextState.forks.get(sourceAgent.forkId)
       if (!sourceDisplayFork) return nextState
 
       const childCommunication: AgentCommunicationMessage = {
@@ -1139,7 +1121,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         agentId: 'orchestrator',
         agentName: 'Orchestrator',
         agentRole: 'Orchestrator',
-        forkId: sourceFork.forkId,
+        forkId: sourceAgent.forkId,
         content,
         preview: toPreview(content),
         timestamp
@@ -1147,7 +1129,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       nextState = {
         ...nextState,
-        forks: new Map(nextState.forks).set(sourceFork.forkId, {
+        forks: new Map(nextState.forks).set(sourceAgent.forkId, {
           ...sourceDisplayFork,
           messages: insertBeforeQueuedMessages(sourceDisplayFork.messages, childCommunication)
         })

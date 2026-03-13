@@ -5,23 +5,17 @@
  * Implementations can use different backends (JSON files, SQLite, PostgreSQL, etc.)
  */
 
-import { Effect, Context } from 'effect'
+import { Effect, Context, Data } from 'effect'
 import type { AppEvent } from '../events'
 
 // =============================================================================
 // Error Types
 // =============================================================================
 
-export type PersistenceError =
-  | { readonly _tag: 'LoadFailed'; readonly message: string }
-  | { readonly _tag: 'SaveFailed'; readonly message: string }
-  | { readonly _tag: 'BackendError'; readonly message: string }
-
-export const PersistenceError = {
-  LoadFailed: (message: string): PersistenceError => ({ _tag: 'LoadFailed', message }),
-  SaveFailed: (message: string): PersistenceError => ({ _tag: 'SaveFailed', message }),
-  BackendError: (message: string): PersistenceError => ({ _tag: 'BackendError', message })
-}
+export class PersistenceError extends Data.TaggedError('PersistenceError')<{
+  readonly reason: 'LoadFailed' | 'SaveFailed' | 'BackendError'
+  readonly message: string
+}> {}
 
 // =============================================================================
 // Service Interface
