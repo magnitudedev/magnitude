@@ -29,6 +29,15 @@ export type MentionAttachment = {
   readonly contentType: 'text' | 'image' | 'directory'
   readonly content?: string  // optional for backward compat with old sessions
 }
+
+export type ResolvedMention = {
+  path: string
+  contentType: 'text' | 'image' | 'directory'
+  content?: string
+  error?: string
+  truncated?: boolean
+  originalBytes?: number
+}
 // =============================================================================
 // Strategy & Response Types (defined here to avoid circular imports)
 // =============================================================================
@@ -90,6 +99,13 @@ export interface ObservationsCaptured {
   readonly forkId: string | null
   readonly turnId: string
   readonly parts: readonly ObservationPart[]
+}
+
+export type FileMentionResolved = {
+  type: 'file_mention_resolved'
+  forkId: string | null
+  sourceMessageTimestamp: number
+  mentions: readonly ResolvedMention[]
 }
 
 // =============================================================================
@@ -472,6 +488,7 @@ export type AppEvent =
   | SessionInitialized
   | UserMessage
   | ObservationsCaptured
+  | FileMentionResolved
   | TurnStarted
   | TurnCompleted
   | TurnUnexpectedError

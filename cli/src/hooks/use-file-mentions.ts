@@ -123,7 +123,7 @@ async function loadFileIndex(): Promise<string[]> {
   inflightLoad = Promise.resolve().then(async () => {
     const rgPath = await resolveRgPath()
     const proc = Bun.spawn(
-      [rgPath, '--files', '--hidden', '-g', '!node_modules/**', '-g', '!dist/**'],
+      [rgPath, '--files', '-g', '!node_modules/**', '-g', '!dist/**'],
       { cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe' },
     )
     const stdout = await new Response(proc.stdout).text()
@@ -222,6 +222,7 @@ export function useFileMentions(
   inputText: string,
   cursorPosition: number,
   onConfirm?: (item: MentionFileItem) => void,
+  onExpandDirectory?: (item: MentionFileItem) => void,
 ): FileMentionsState {
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -363,12 +364,20 @@ export function useFileMentions(
     if (isEnter || isTab) {
       const item = items[selectedIndex] ?? (isTab && items.length === 1 ? items[0] : null)
       if (!item) return false
+
+      // Tab on a directory expands the @query in place (keeps menu open),
+      // while Enter and file Tab confirm a mention selection.
+      if (isTab && item.kind === 'directory') {
+        if (onExpandDirectory) onExpandDirectory(item)
+        return true
+      }
+
       confirmSelection(item)
       return true
     }
 
     return false
-  }, [isOpen, items, selectedIndex, moveUp, moveDown, close, confirmSelection])
+  }, [isOpen, items, selectedIndex, moveUp, moveDown, close, confirmSelection, onExpandDirectory])
 
   return {
     isOpen,

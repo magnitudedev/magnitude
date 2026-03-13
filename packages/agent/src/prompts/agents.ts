@@ -137,7 +137,7 @@ export function formatCommsInbox(entries: readonly CommsEntry[], timezone: strin
           } else if (attachment.content) {
             push(`\n<mention path="${attachment.path}">${attachment.content}</mention>`)
           } else {
-            push(`\n<mention path="${attachment.path}"/>`)
+            push(`\n<mention path="${attachment.path}" status="resolving"/>`)
           }
         }
       }

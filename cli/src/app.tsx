@@ -1413,7 +1413,30 @@ function AppInner({
     })
   }, [])
 
-  const fileMentions = useFileMentions(inputValue.text, inputValue.cursorPosition, onSelectMention)
+  const onExpandDirectoryMention = useCallback((item: { path: string }) => {
+    setInputValue(prev => {
+      const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
+      const match = left.match(/(?:^|\s)@([^\s@]*)$/)
+      if (!match) return prev
+      const atIndex = left.lastIndexOf('@')
+      if (atIndex < 0) return prev
+      const rangeStart = atIndex
+      const rangeEnd = left.length
+      return applyTextEditWithPastesAndMentions(
+        prev,
+        rangeStart,
+        rangeEnd,
+        `@${item.path}`,
+      )
+    })
+  }, [])
+
+  const fileMentions = useFileMentions(
+    inputValue.text,
+    inputValue.cursorPosition,
+    onSelectMention,
+    onExpandDirectoryMention,
+  )
 
   const slashCommands = useSlashCommands(inputValue.text, executeSlashCommand)
 

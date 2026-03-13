@@ -48,6 +48,7 @@ import type { AgentVariant } from './agents'
 import { ChatTitleWorker } from './workers/chat-title-worker'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { ArtifactSyncWorker } from './workers/artifact-sync-worker'
+import { FileMentionResolver } from './workers/file-mention-resolver'
 
 // Execution
 import { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
@@ -106,6 +107,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     ApprovalWorker,
 
     ArtifactSyncWorker,
+    FileMentionResolver,
 
     ChatTitleWorker,
     UserPresenceWorker,
