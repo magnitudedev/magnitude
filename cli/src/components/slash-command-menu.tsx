@@ -8,12 +8,14 @@ interface SlashCommandMenuProps {
   commands: SlashCommandDefinition[]
   selectedIndex: number
   onSelect: (command: SlashCommandDefinition) => void
+  onHoverIndex?: (index: number) => void
 }
 
 export const SlashCommandMenu = memo(function SlashCommandMenu({
   commands,
   selectedIndex,
   onSelect,
+  onHoverIndex,
 }: SlashCommandMenuProps) {
   const theme = useTheme()
 
@@ -27,6 +29,7 @@ export const SlashCommandMenu = memo(function SlashCommandMenu({
           <Button
             key={cmd.id}
             onClick={() => onSelect(cmd)}
+            onMouseOver={() => onHoverIndex?.(index)}
             style={{
               flexDirection: 'row',
               paddingLeft: 1,

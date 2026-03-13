@@ -81,8 +81,13 @@ function extractText(parts: readonly ContentPart[]): string {
     .join('')
 }
 
-function toCommsImageAttachment(attachment: Attachment): CommsAttachment {
-  return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
+function toCommsAttachment(attachment: Attachment): CommsAttachment {
+  switch (attachment.type) {
+    case 'image':
+      return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
+    case 'mention':
+      return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: attachment.content }
+  }
 }
 
 /** Append system entries to a messages array, merging with the most recent system_inbox if no assistant message is in between */
@@ -153,7 +158,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
     user_message: ({ event, fork }) => {
       const text = extractText(event.content)
-      const attachments = (event.attachments ?? []).map(toCommsImageAttachment)
+      const attachments = (event.attachments ?? []).map(toCommsAttachment)
       const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments }
 
       if (fork.currentTurnId !== null) {

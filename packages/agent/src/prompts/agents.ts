@@ -16,6 +16,7 @@ import { formatResults, formatInterrupted, formatError } from './results'
 export type CommsAttachment =
   | { readonly kind: 'image'; readonly base64: string; readonly mediaType: ImageMediaType; readonly width: number; readonly height: number }
   | { readonly kind: 'artifact'; readonly id: string; readonly content: string }
+  | { readonly kind: 'mention'; readonly path: string; readonly contentType: 'text' | 'image'; readonly content: string }
 
 export interface AgentActivityEntry {
   readonly agentId: string
@@ -80,6 +81,12 @@ function formatTimestamp(timestamp: number, timezone: string | null): string {
   return dt.toFormat('yyyy-LLL-dd HH:mm:ss')
 }
 
+function parseDataUrlImage(dataUrl: string): { mediaType: ImageMediaType; base64: string } | null {
+  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,(.+)$/s)
+  if (!match) return null
+  return { mediaType: match[1] as ImageMediaType, base64: match[2] }
+}
+
 export function formatCommsInbox(entries: readonly CommsEntry[], timezone: string | null): ContentPart[] {
   const parts: ContentPart[] = []
   const push = (text: string) => {
@@ -104,8 +111,17 @@ export function formatCommsInbox(entries: readonly CommsEntry[], timezone: strin
         if (attachment.kind === 'image') {
           push('\n')
           parts.push({ type: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height })
-        } else {
+        } else if (attachment.kind === 'artifact') {
           push(`\n<artifact id="${attachment.id}">${attachment.content}</artifact>`)
+        } else if (attachment.contentType === 'text') {
+          push(`\n<mention path="${attachment.path}">${attachment.content}</mention>`)
+        } else {
+          push(`\n<mention path="${attachment.path}"/>`)
+          const parsed = parseDataUrlImage(attachment.content)
+          if (parsed) {
+            push('\n')
+            parts.push({ type: 'image', base64: parsed.base64, mediaType: parsed.mediaType, width: 0, height: 0 })
+          }
         }
       }
       push('\n</attachments>')

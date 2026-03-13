@@ -439,7 +439,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               content: textOf(event.content),
               timestamp: event.timestamp,
               taskMode: event.taskMode,
-              attachments: (event.attachments ?? []).map(a => ({ type: a.type, width: a.width, height: a.height, filename: a.filename }))
+              attachments: (event.attachments ?? [])
+                .filter((a): a is Extract<typeof a, { type: 'image' }> => a.type === 'image')
+                .map(a => ({ type: a.type, width: a.width, height: a.height, filename: a.filename }))
             }
           ]
         }
@@ -456,7 +458,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             content: textOf(event.content),
             timestamp: event.timestamp,
             taskMode: event.taskMode,
-            attachments: (event.attachments ?? []).map(a => ({ type: a.type, width: a.width, height: a.height, filename: a.filename }))
+            attachments: (event.attachments ?? [])
+              .filter((a): a is Extract<typeof a, { type: 'image' }> => a.type === 'image')
+              .map(a => ({ type: a.type, width: a.width, height: a.height, filename: a.filename }))
           }
         ]
       }

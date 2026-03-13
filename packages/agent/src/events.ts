@@ -12,7 +12,7 @@ import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ObservationPart } from '@magnitudedev/agent-definition'
 
-export type Attachment = ImageAttachment
+export type Attachment = ImageAttachment | MentionAttachment
 
 export interface ImageAttachment {
   readonly type: 'image'
@@ -21,6 +21,13 @@ export interface ImageAttachment {
   readonly width: number
   readonly height: number
   readonly filename: string
+}
+
+export type MentionAttachment = {
+  readonly type: 'mention'
+  readonly path: string
+  readonly contentType: 'text' | 'image'
+  readonly content: string
 }
 // =============================================================================
 // Strategy & Response Types (defined here to avoid circular imports)

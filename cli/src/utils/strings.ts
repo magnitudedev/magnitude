@@ -1,4 +1,4 @@
-import type { InputPasteSegment, InputValue } from '../types/store'
+import type { InputMentionSegment, InputPasteSegment, InputValue } from '../types/store'
 import { readClipboardText } from './clipboard'
 
 // Re-export InputValue type for backwards compatibility
@@ -14,6 +14,12 @@ export function formatPastePlaceholder(charCount: number): string {
 }
 
 function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
+  return [...segments].sort((a, b) => a.start - b.start)
+}
+
+function sortMentionSegments(
+  segments: InputMentionSegment[],
+): InputMentionSegment[] {
   return [...segments].sort((a, b) => a.start - b.start)
 }
 
@@ -141,6 +147,183 @@ export function applyTextEditWithSegments(
   }
 }
 
+export function insertMentionSegment(
+  input: InputValue,
+  mention: { path: string; contentType: 'text' | 'image'; content: string },
+  id: string,
+  replaceStart: number,
+  replaceEnd: number,
+): InputValue {
+  const safeStart = Math.max(0, Math.min(replaceStart, input.text.length))
+  const safeEnd = Math.max(safeStart, Math.min(replaceEnd, input.text.length))
+  const placeholder = `@${mention.path}`
+  const before = input.text.slice(0, safeStart)
+  const after = input.text.slice(safeEnd)
+  const removed = safeEnd - safeStart
+  const inserted = placeholder.length
+  const delta = inserted - removed
+
+  const shiftedPasteSegments = input.pasteSegments.map((segment) => {
+    if (segment.end <= safeStart) return segment
+    return {
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    }
+  })
+
+  const shiftedMentionSegments = input.mentionSegments.map((segment) => {
+    if (segment.end <= safeStart) return segment
+    return {
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    }
+  })
+
+  return {
+    ...input,
+    text: before + placeholder + after,
+    cursorPosition: safeStart + inserted,
+    lastEditDueToNav: false,
+    pasteSegments: sortSegments(shiftedPasteSegments),
+    mentionSegments: sortMentionSegments([
+      ...shiftedMentionSegments,
+      {
+        id,
+        path: mention.path,
+        contentType: mention.contentType,
+        content: mention.content,
+        start: safeStart,
+        end: safeStart + inserted,
+      },
+    ]),
+    selectedPasteSegmentId: null,
+    selectedMentionSegmentId: null,
+  }
+}
+
+export function applyTextEditWithPastesAndMentions(
+  input: InputValue,
+  start: number,
+  end: number,
+  insertedText: string,
+): InputValue {
+  const safeStart = Math.max(0, Math.min(start, input.text.length))
+  const safeEnd = Math.max(safeStart, Math.min(end, input.text.length))
+
+  let effectiveStart = safeStart
+  let effectiveEnd = safeEnd
+
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= safeStart || segment.start >= safeEnd)
+    if (!overlaps) continue
+    effectiveStart = Math.min(effectiveStart, segment.start)
+    effectiveEnd = Math.max(effectiveEnd, segment.end)
+  }
+
+  for (const segment of input.mentionSegments) {
+    const overlaps = !(segment.end <= safeStart || segment.start >= safeEnd)
+    if (!overlaps) continue
+    effectiveStart = Math.min(effectiveStart, segment.start)
+    effectiveEnd = Math.max(effectiveEnd, segment.end)
+  }
+
+  const nextText =
+    input.text.slice(0, effectiveStart) +
+    insertedText +
+    input.text.slice(effectiveEnd)
+
+  const removed = effectiveEnd - effectiveStart
+  const inserted = insertedText.length
+  const delta = inserted - removed
+
+  const remainingPasteSegments: InputPasteSegment[] = []
+  for (const segment of input.pasteSegments) {
+    const overlaps = !(segment.end <= effectiveStart || segment.start >= effectiveEnd)
+    if (overlaps) continue
+    if (segment.end <= effectiveStart) {
+      remainingPasteSegments.push(segment)
+      continue
+    }
+    remainingPasteSegments.push({
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    })
+  }
+
+  const remainingMentionSegments: InputMentionSegment[] = []
+  for (const segment of input.mentionSegments) {
+    const overlaps = !(segment.end <= effectiveStart || segment.start >= effectiveEnd)
+    if (overlaps) continue
+    if (segment.end <= effectiveStart) {
+      remainingMentionSegments.push(segment)
+      continue
+    }
+    remainingMentionSegments.push({
+      ...segment,
+      start: segment.start + delta,
+      end: segment.end + delta,
+    })
+  }
+
+  const proposedCursor = effectiveStart + inserted
+  let nextCursor = proposedCursor
+  for (const segment of sortSegments(remainingPasteSegments)) {
+    if (nextCursor > segment.start && nextCursor < segment.end) {
+      nextCursor = segment.end
+      break
+    }
+  }
+  for (const segment of sortMentionSegments(remainingMentionSegments)) {
+    if (nextCursor > segment.start && nextCursor < segment.end) {
+      nextCursor = segment.end
+      break
+    }
+  }
+
+  return {
+    ...input,
+    text: nextText,
+    cursorPosition: nextCursor,
+    lastEditDueToNav: false,
+    pasteSegments: sortSegments(remainingPasteSegments),
+    mentionSegments: sortMentionSegments(remainingMentionSegments),
+    selectedPasteSegmentId: null,
+    selectedMentionSegmentId: null,
+  }
+}
+
+export function reconstituteInputTextWithMentions(
+  input: InputValue,
+): {
+  text: string
+  mentions: Array<{ path: string; contentType: 'text' | 'image'; content: string }>
+} {
+  const text = reconstituteInputText(input)
+  const seen = new Set<string>()
+  const mentions: Array<{
+    path: string
+    contentType: 'text' | 'image'
+    content: string
+  }> = []
+
+  for (const segment of input.mentionSegments) {
+    const path = segment.path.trim()
+    const key = `${path}|${segment.contentType}`
+    if (!path || seen.has(key)) continue
+    seen.add(key)
+    mentions.push({
+      path: segment.path,
+      contentType: segment.contentType,
+      content: segment.content,
+    })
+  }
+
+  return { text, mentions }
+}
+
 /**
  * Truncate a command to a single line for display.
  * Flattens newlines to spaces, collapses whitespace, truncates with '...' if over maxLen.
@@ -250,7 +433,9 @@ export function createTextInputPasteHandler(
       cursorPosition: newCursor,
       lastEditDueToNav: false,
       pasteSegments: [],
+      mentionSegments: [],
       selectedPasteSegmentId: null,
+      selectedMentionSegmentId: null,
     })
   }
 }

@@ -12,6 +12,7 @@ import { StickyWorkingHeader } from './components/think-block'
 import { LoadPreviousButton } from './components/chat-controls'
 import { ForkDetailOverlay } from './components/fork-detail-overlay'
 import { SlashCommandMenu } from './components/slash-command-menu'
+import { FileMentionMenu } from './components/file-mention-menu'
 import { usePaginatedTimeline } from './hooks/use-paginated-timeline'
 import { useCollapsedBlocks } from './hooks/use-collapsed-blocks'
 import { useSlashCommands } from './hooks/use-slash-commands'
@@ -43,12 +44,14 @@ import { useSettingsNavigation, type SettingsTab } from './hooks/use-settings-na
 import { useAuthMethodNavigation } from './hooks/use-auth-method-navigation'
 import { useAuthFlow } from './hooks/use-auth-flow'
 import { useSetupWizardNavigation } from './hooks/use-setup-wizard-navigation'
+import { useFileMentions } from './hooks/use-file-mentions'
 import { SetupWizardOverlay, type WizardStep } from './components/setup-wizard-overlay'
 import { BrowserSetupOverlay } from './components/browser-setup-overlay'
 import { getDefaultModels } from './utils/model-preferences'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, clearLog, getLogPath, logEvent, clearEventLog, configureSessionLogging, subscribeToLogs, type LogEntry } from '@magnitudedev/logger'
 import { readFileSync } from 'fs'
+import path from 'path'
 import { executeBashCommand, type BashResult } from './utils/bash-executor'
 
 import { orange } from './utils/theme'
@@ -56,7 +59,7 @@ import { BashOutput } from './components/bash-output'
 import { Button } from './components/button'
 
 import { ArtifactReaderPanel } from './components/artifact-reader-panel'
-import type { ImageAttachment, ImageMediaType } from '@magnitudedev/agent'
+import type { Attachment, ImageAttachment, ImageMediaType } from '@magnitudedev/agent'
 import { ContextUsageBar } from './components/context-usage-bar'
 import { DebugPanel } from './components/debug-panel'
 import type { InputValue } from './types/store'
@@ -66,7 +69,7 @@ import { setSessionTracker } from './utils/telemetry-state'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import stringWidth from 'string-width'
 import { createId } from '@magnitudedev/generate-id'
-import { applyTextEditWithSegments, insertPasteSegment, reconstituteInputText } from './utils/strings'
+import { applyTextEditWithPastesAndMentions, insertMentionSegment, insertPasteSegment, reconstituteInputTextWithMentions } from './utils/strings'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
@@ -128,7 +131,9 @@ function AppInner({
     cursorPosition: 0,
     lastEditDueToNav: false,
     pasteSegments: [],
+    mentionSegments: [],
     selectedPasteSegmentId: null,
+    selectedMentionSegmentId: null,
   })
   const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -616,7 +621,9 @@ function AppInner({
               cursorPosition: restored.length,
               lastEditDueToNav: false,
               pasteSegments: [],
+              mentionSegments: [],
               selectedPasteSegmentId: null,
+              selectedMentionSegmentId: null,
             }
           })
         }
@@ -886,7 +893,7 @@ function AppInner({
 
   const exitBashMode = useCallback(() => {
     setBashMode(false)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
   }, [])
 
   const handleResumeChat = useCallback((chat: RecentChat) => {
@@ -1381,25 +1388,66 @@ function AppInner({
 
   const executeSlashCommand = useCallback((commandText: string) => {
     routeSlashCommand(commandText, commandContext)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
   }, [commandContext])
+
+  const onSelectMention = useCallback(async (item: { path: string }) => {
+    const relPath = item.path
+    const absPath = path.resolve(process.cwd(), relPath)
+    const ext = path.extname(relPath).toLowerCase()
+    const isImage = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext)
+
+    let contentType: 'text' | 'image' = 'text'
+    let content = ''
+    if (isImage) {
+      const file = Bun.file(absPath)
+      const bytes = await file.arrayBuffer()
+      const base64 = Buffer.from(bytes).toString('base64')
+      const mime = file.type || (ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/png')
+      contentType = 'image'
+      content = `data:${mime};base64,${base64}`
+    } else {
+      contentType = 'text'
+      content = await Bun.file(absPath).text()
+    }
+
+    setInputValue(prev => {
+      const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
+      const match = left.match(/(?:^|\s)@([^\s@]*)$/)
+      if (!match) return prev
+      const atIndex = left.lastIndexOf('@')
+      if (atIndex < 0) return prev
+      const rangeStart = atIndex
+      const rangeEnd = left.length
+      return insertMentionSegment(
+        prev,
+        { path: relPath, contentType, content },
+        createId(),
+        rangeStart,
+        rangeEnd,
+      )
+    })
+  }, [])
+
+  const fileMentions = useFileMentions(inputValue.text, inputValue.cursorPosition, onSelectMention)
 
   const slashCommands = useSlashCommands(inputValue.text, executeSlashCommand)
 
-  // Combined key intercept: slash commands + widget navigation
+  // Combined key intercept: mentions + slash commands + widget navigation
   const handleKeyIntercept = useCallback((key: KeyEvent): boolean => {
     // Block all input during pending approval
     if (pendingApproval) return true
+    if (!bashMode && fileMentions.handleKeyIntercept(key)) return true
     if (!bashMode && slashCommands.handleKeyIntercept(key)) return true
     if (widgetNavActive && widgetNavigation.handleKeyEvent(key)) return true
     return false
-  }, [pendingApproval, bashMode, slashCommands.handleKeyIntercept, widgetNavActive, widgetNavigation.handleKeyEvent])
+  }, [pendingApproval, bashMode, fileMentions, slashCommands.handleKeyIntercept, widgetNavActive, widgetNavigation.handleKeyEvent])
 
-  const handleSubmit = useCallback((message: string, visibleMessage?: string) => {
+  const handleSubmit = useCallback((message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
     const slashText = visibleMessage ?? message
     // Check for slash commands first (skip in bash mode)
     if (!bashMode && routeSlashCommand(slashText, commandContext)) {
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
       return
     }
 
@@ -1409,7 +1457,7 @@ function AppInner({
       if (!trimmed) return
       const result = executeBashCommand(trimmed)
       setBashOutputs(prev => [...prev, result])
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
       return
     }
 
@@ -1422,9 +1470,9 @@ function AppInner({
     setSystemMessages([])
     if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current)
     setEphemeralMessage(null)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
 
-    const currentAttachments = [...attachments]
+    const currentAttachments: Attachment[] = [...attachments, ...mentionAttachments]
     const sendMessage = (c: AgentClient) => {
       c.send({ type: 'user_message', forkId: null, content: textParts(message), attachments: currentAttachments, mode: 'text', synthetic: false, taskMode: false })
     }
@@ -1448,7 +1496,7 @@ function AppInner({
     // Typing '!' as first character enters bash mode
     if (!bashMode && value.text === '!') {
       setBashMode(true)
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
       return
     }
     // Reset escape-to-clear hint when user types
@@ -1491,7 +1539,7 @@ function AppInner({
       if (pasteText.length > INLINE_PASTE_PILL_CHAR_LIMIT) {
         return insertPasteSegment(prev, pasteText, createId())
       }
-      return applyTextEditWithSegments(
+      return applyTextEditWithPastesAndMentions(
         prev,
         prev.cursorPosition,
         prev.cursorPosition,
@@ -1538,7 +1586,7 @@ function AppInner({
         const isCtrlV = key.ctrl && key.name === 'v' && !key.meta && !key.option
         const isCmdV = key.meta && key.name === 'v' && !key.ctrl && !key.option
         // Tab: toggle task panel + plan mode
-        if (key.name === 'tab' && !key.shift && !key.ctrl && !key.meta && !key.option) {
+        if (key.name === 'tab' && !key.shift && !key.ctrl && !key.meta && !key.option && !fileMentions.isOpen && !slashCommands.isSlashMenuOpen) {
           toggleTaskPanel()
           return
         }
@@ -1612,7 +1660,7 @@ function AppInner({
           if ('preventDefault' in key && typeof key.preventDefault === 'function') {
             key.preventDefault()
           }
-          setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+          setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
           return
         }
 
@@ -1667,7 +1715,7 @@ function AppInner({
           }
           if (nextEscWillClearInput) {
             // Second tap — clear the input
-            setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], selectedPasteSegmentId: null })
+            setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
             setNextEscWillClearInput(false)
             if (clearInputTimeoutRef.current) {
               clearTimeout(clearInputTimeoutRef.current)
@@ -1867,7 +1915,7 @@ function AppInner({
        bashMode, exitBashMode, debugMode, hasRunningForks, toggleTaskPanel, expandedForkId,
        pendingApproval, handleApprove, handleReject,
        showSetupWizard, wizardStep, handleWizardSkip, handleWizardBack, wizardProviderNavigation.handleKeyEvent, wizardModelNavigation.handleKeyEvent, selectedArtifact,
-       showBrowserSetup]
+       showBrowserSetup, fileMentions.isOpen, slashCommands.isSlashMenuOpen]
     )
   )
 
@@ -1883,7 +1931,14 @@ function AppInner({
   const handleInputSubmit = useCallback(() => {
     // Normal message submission
     if (inputValue.text.trim() || attachments.length > 0) {
-      handleSubmit(reconstituteInputText(inputValue), inputValue.text)
+      const { text, mentions } = reconstituteInputTextWithMentions(inputValue)
+      const mentionAttachments: Attachment[] = mentions.map((mention) => ({
+        type: 'mention',
+        path: mention.path,
+        contentType: mention.contentType,
+        content: mention.content,
+      }))
+      handleSubmit(text, inputValue.text, mentionAttachments)
     }
   }, [inputValue, handleSubmit, attachments.length])
 
@@ -2396,11 +2451,22 @@ function AppInner({
                 flexGrow: 1,
               }}
             >
+              {!bashMode && fileMentions.isOpen && (
+                <FileMentionMenu
+                  isOpen={fileMentions.isOpen}
+                  items={fileMentions.items}
+                  overflowCount={fileMentions.overflowCount}
+                  selectedIndex={fileMentions.selectedIndex}
+                  onSelect={fileMentions.confirmSelection}
+                  onHoverIndex={fileMentions.setSelectedIndex}
+                />
+              )}
               {!bashMode && slashCommands.isSlashMenuOpen && (
                 <SlashCommandMenu
                   commands={slashCommands.filteredCommands}
                   selectedIndex={slashCommands.selectedIndex}
                   onSelect={(cmd) => executeSlashCommand(`/${cmd.id}`)}
+                  onHoverIndex={slashCommands.setSelectedIndex}
                 />
               )}
               <box
@@ -2422,6 +2488,8 @@ function AppInner({
                       cursorPosition={inputValue.cursorPosition}
                       pasteSegments={inputValue.pasteSegments}
                       selectedPasteSegmentId={inputValue.selectedPasteSegmentId}
+                      mentionSegments={inputValue.mentionSegments}
+                      selectedMentionSegmentId={inputValue.selectedMentionSegmentId}
                       onChange={handleInputChange}
                       onSubmit={handleInputSubmit}
                       onPaste={handlePaste}

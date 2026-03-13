@@ -27,8 +27,12 @@ import { useTheme } from '../hooks/use-theme'
 import { terminalSupportsRgb24 } from '../utils/theme'
 import { stepCursorVertical } from './multiline-input.helpers'
 
-import type { InputPasteSegment, InputValue } from '../types/store'
-import { applyTextEditWithSegments } from '../utils/strings'
+import type {
+  InputMentionSegment,
+  InputPasteSegment,
+  InputValue,
+} from '../types/store'
+import { applyTextEditWithPastesAndMentions } from '../utils/strings'
 import type {
   KeyEvent,
   MouseEvent,
@@ -93,23 +97,69 @@ function segmentContainingInterior(
   return segments.find((s) => pos > s.start && pos < s.end)
 }
 
+function sortMentionSegments(segments: InputMentionSegment[]): InputMentionSegment[] {
+  return [...segments].sort((a, b) => a.start - b.start)
+}
+
+function findMentionById(
+  segments: InputMentionSegment[],
+  id: string | null | undefined,
+): InputMentionSegment | undefined {
+  if (!id) return undefined
+  return segments.find((s) => s.id === id)
+}
+
+function mentionAtLeftEdge(
+  segments: InputMentionSegment[],
+  pos: number,
+): InputMentionSegment | undefined {
+  return segments.find((s) => s.end === pos)
+}
+
+function mentionAtRightEdge(
+  segments: InputMentionSegment[],
+  pos: number,
+): InputMentionSegment | undefined {
+  return segments.find((s) => s.start === pos)
+}
+
+function mentionContainingInterior(
+  segments: InputMentionSegment[],
+  pos: number,
+): InputMentionSegment | undefined {
+  return segments.find((s) => pos > s.start && pos < s.end)
+}
+
 function normalizeCursorPosition(
-  segments: InputPasteSegment[],
+  pasteSegments: InputPasteSegment[],
+  mentionSegments: InputMentionSegment[],
   raw: number,
   textLength: number,
 ): number {
   let pos = Math.max(0, Math.min(textLength, raw))
 
-  const interior = segmentContainingInterior(segments, pos)
-  if (interior) {
-    pos = (pos - interior.start <= interior.end - pos)
-      ? (interior.start === 0 ? 0 : interior.start - 1)
-      : interior.end
+  const pasteInterior = segmentContainingInterior(pasteSegments, pos)
+  if (pasteInterior) {
+    pos = (pos - pasteInterior.start <= pasteInterior.end - pos)
+      ? (pasteInterior.start === 0 ? 0 : pasteInterior.start - 1)
+      : pasteInterior.end
   }
 
-  const atStart = segmentAtRightEdge(segments, pos)
-  if (atStart && atStart.start > 0) {
-    pos = atStart.start - 1
+  const mentionInterior = mentionContainingInterior(mentionSegments, pos)
+  if (mentionInterior) {
+    pos = (pos - mentionInterior.start <= mentionInterior.end - pos)
+      ? (mentionInterior.start === 0 ? 0 : mentionInterior.start - 1)
+      : mentionInterior.end
+  }
+
+  const atPasteStart = segmentAtRightEdge(pasteSegments, pos)
+  if (atPasteStart && atPasteStart.start > 0) {
+    pos = atPasteStart.start - 1
+  }
+
+  const atMentionStart = mentionAtRightEdge(mentionSegments, pos)
+  if (atMentionStart && atMentionStart.start > 0) {
+    pos = atMentionStart.start - 1
   }
 
   return pos
@@ -222,7 +272,9 @@ interface MultilineInputProps {
   showScrollbar?: boolean
   highlightColor?: string
   pasteSegments?: InputPasteSegment[]
+  mentionSegments?: InputMentionSegment[]
   selectedPasteSegmentId?: string | null
+  selectedMentionSegmentId?: string | null
 }
 
 export type MultilineInputHandle = {
@@ -249,7 +301,9 @@ export const MultilineInput = forwardRef<
     showScrollbar = false,
     highlightColor,
     pasteSegments = [],
+    mentionSegments = [],
     selectedPasteSegmentId = null,
+    selectedMentionSegmentId = null,
   }: MultilineInputProps,
   forwardedRef,
 ) {
@@ -359,28 +413,42 @@ export const MultilineInput = forwardRef<
   }, [scrollBoxRef.current, cursorPosition, focused, cursorRow])
 
   const sortedPasteSegments = sortSegments(pasteSegments)
+  const sortedMentionSegments = sortMentionSegments(mentionSegments)
 
   const commitInput = useCallback(
     (
       next: Partial<InputValue> & Pick<InputValue, 'text' | 'cursorPosition'>,
     ) => {
-      const segments = next.pasteSegments ?? pasteSegments
+      const nextPasteSegments = next.pasteSegments ?? pasteSegments
+      const nextMentionSegments = next.mentionSegments ?? mentionSegments
       onChange({
         text: next.text,
         cursorPosition: normalizeCursorPosition(
-          segments,
+          nextPasteSegments,
+          nextMentionSegments,
           next.cursorPosition,
           next.text.length,
         ),
         lastEditDueToNav: next.lastEditDueToNav ?? false,
-        pasteSegments: segments,
+        pasteSegments: nextPasteSegments,
+        mentionSegments: nextMentionSegments,
         selectedPasteSegmentId:
           next.selectedPasteSegmentId !== undefined
             ? next.selectedPasteSegmentId
             : selectedPasteSegmentId,
+        selectedMentionSegmentId:
+          next.selectedMentionSegmentId !== undefined
+            ? next.selectedMentionSegmentId
+            : selectedMentionSegmentId,
       })
     },
-    [onChange, pasteSegments, selectedPasteSegmentId],
+    [
+      onChange,
+      pasteSegments,
+      mentionSegments,
+      selectedPasteSegmentId,
+      selectedMentionSegmentId,
+    ],
   )
 
   // Helper to get current selection in original text coordinates
@@ -413,13 +481,15 @@ export const MultilineInput = forwardRef<
     const selection = readSelectedRange()
     if (!selection) return false
     dismissSelection()
-    const next = applyTextEditWithSegments(
+    const next = applyTextEditWithPastesAndMentions(
       {
         text: valueRef.current,
         cursorPosition: cursorPositionRef.current,
         lastEditDueToNav: false,
         pasteSegments: sortedPasteSegments,
+        mentionSegments: sortedMentionSegments,
         selectedPasteSegmentId,
+        selectedMentionSegmentId,
       },
       selection.start,
       selection.end,
@@ -429,7 +499,15 @@ export const MultilineInput = forwardRef<
     valueRef.current = next.text
     cursorPositionRef.current = next.cursorPosition
     return true
-  }, [readSelectedRange, dismissSelection, commitInput, sortedPasteSegments, selectedPasteSegmentId])
+  }, [
+    readSelectedRange,
+    dismissSelection,
+    commitInput,
+    sortedPasteSegments,
+    sortedMentionSegments,
+    selectedPasteSegmentId,
+    selectedMentionSegmentId,
+  ])
 
   const insertAtCaret = useCallback(
     (textToInsert: string) => {
@@ -439,13 +517,15 @@ export const MultilineInput = forwardRef<
       const selection = readSelectedRange()
       if (selection) {
         dismissSelection()
-        const next = applyTextEditWithSegments(
+        const next = applyTextEditWithPastesAndMentions(
           {
             text: valueRef.current,
             cursorPosition: cursorPositionRef.current,
             lastEditDueToNav: false,
             pasteSegments: sortedPasteSegments,
+            mentionSegments: sortedMentionSegments,
             selectedPasteSegmentId,
+            selectedMentionSegmentId,
           },
           selection.start,
           selection.end,
@@ -463,16 +543,19 @@ export const MultilineInput = forwardRef<
       const currentValue = valueRef.current
       const currentCursor = normalizeCursorPosition(
         sortedPasteSegments,
+        sortedMentionSegments,
         cursorPositionRef.current,
         currentValue.length,
       )
-      const next = applyTextEditWithSegments(
+      const next = applyTextEditWithPastesAndMentions(
         {
           text: currentValue,
           cursorPosition: currentCursor,
           lastEditDueToNav: false,
           pasteSegments: sortedPasteSegments,
+          mentionSegments: sortedMentionSegments,
           selectedPasteSegmentId,
+          selectedMentionSegmentId,
         },
         currentCursor,
         currentCursor,
@@ -484,25 +567,47 @@ export const MultilineInput = forwardRef<
 
       commitInput(next)
     },
-    [readSelectedRange, dismissSelection, sortedPasteSegments, selectedPasteSegmentId, commitInput],
+    [
+      readSelectedRange,
+      dismissSelection,
+      sortedPasteSegments,
+      sortedMentionSegments,
+      selectedPasteSegmentId,
+      selectedMentionSegmentId,
+      commitInput,
+    ],
   )
 
   const moveCursorTo = useCallback(
     (nextPosition: number) => {
       const snapped = normalizeCursorPosition(
         sortedPasteSegments,
+        sortedMentionSegments,
         nextPosition,
         value.length,
       )
-      if (snapped === cursorPosition && !selectedPasteSegmentId) return
+      if (
+        snapped === cursorPosition &&
+        !selectedPasteSegmentId &&
+        !selectedMentionSegmentId
+      ) return
       commitInput({
         text: value,
         cursorPosition: snapped,
         selectedPasteSegmentId: null,
+        selectedMentionSegmentId: null,
         lastEditDueToNav: false,
       })
     },
-    [value, cursorPosition, selectedPasteSegmentId, sortedPasteSegments, commitInput],
+    [
+      value,
+      cursorPosition,
+      selectedPasteSegmentId,
+      selectedMentionSegmentId,
+      sortedPasteSegments,
+      sortedMentionSegments,
+      commitInput,
+    ],
   )
 
   // Handle mouse clicks to position cursor
@@ -562,15 +667,39 @@ export const MultilineInput = forwardRef<
         segmentAtRightEdge(sortedPasteSegments, rawClickPosition) ??
         segmentAtLeftEdge(sortedPasteSegments, rawClickPosition)
 
+      const clickedMention =
+        mentionContainingInterior(sortedMentionSegments, rawClickPosition) ??
+        mentionAtRightEdge(sortedMentionSegments, rawClickPosition) ??
+        mentionAtLeftEdge(sortedMentionSegments, rawClickPosition)
+
       if (clickedSegment) {
         if (
           cursorPosition !== clickedSegment.end ||
-          selectedPasteSegmentId !== clickedSegment.id
+          selectedPasteSegmentId !== clickedSegment.id ||
+          selectedMentionSegmentId
         ) {
           commitInput({
             text: value,
             cursorPosition: clickedSegment.end,
             selectedPasteSegmentId: clickedSegment.id,
+            selectedMentionSegmentId: null,
+            lastEditDueToNav: false,
+          })
+        }
+        return
+      }
+
+      if (clickedMention) {
+        if (
+          cursorPosition !== clickedMention.end ||
+          selectedMentionSegmentId !== clickedMention.id ||
+          selectedPasteSegmentId
+        ) {
+          commitInput({
+            text: value,
+            cursorPosition: clickedMention.end,
+            selectedMentionSegmentId: clickedMention.id,
+            selectedPasteSegmentId: null,
             lastEditDueToNav: false,
           })
         }
@@ -579,16 +708,22 @@ export const MultilineInput = forwardRef<
 
       const newCursorPosition = normalizeCursorPosition(
         sortedPasteSegments,
+        sortedMentionSegments,
         rawClickPosition,
         value.length,
       )
 
-      if (newCursorPosition !== cursorPosition || selectedPasteSegmentId) {
+      if (
+        newCursorPosition !== cursorPosition ||
+        selectedPasteSegmentId ||
+        selectedMentionSegmentId
+      ) {
         commitInput({
           text: value,
           cursorPosition: newCursorPosition,
           lastEditDueToNav: false,
           selectedPasteSegmentId: null,
+          selectedMentionSegmentId: null,
         })
       }
     },
@@ -598,15 +733,18 @@ export const MultilineInput = forwardRef<
       value,
       cursorPosition,
       selectedPasteSegmentId,
+      selectedMentionSegmentId,
       commitInput,
       sortedPasteSegments,
+      sortedMentionSegments,
     ],
   )
 
   const isPlaceholder = value.length === 0 && placeholder.length > 0
   const displayValue = isPlaceholder ? placeholder : value
   const showCursor = focused
-  const showRenderableCursor = showCursor && !selectedPasteSegmentId
+  const showRenderableCursor =
+    showCursor && !selectedPasteSegmentId && !selectedMentionSegmentId
 
   // Replace tabs with spaces for proper rendering
   const displayValueForRendering = displayValue.replace(
@@ -698,13 +836,15 @@ export const MultilineInput = forwardRef<
 
         // For backslash+Enter, remove the backslash and insert newline
         if (isBackslashEnter) {
-          const next = applyTextEditWithSegments(
+          const next = applyTextEditWithPastesAndMentions(
             {
               text: value,
               cursorPosition,
               lastEditDueToNav: false,
               pasteSegments: sortedPasteSegments,
               selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
             },
             cursorPosition - 1,
             cursorPosition,
@@ -717,13 +857,15 @@ export const MultilineInput = forwardRef<
         }
 
         // For other newline shortcuts (Shift+Enter, Option+Enter, Ctrl+J), just insert newline
-        const next = applyTextEditWithSegments(
+        const next = applyTextEditWithPastesAndMentions(
           {
             text: value,
             cursorPosition,
             lastEditDueToNav: false,
             pasteSegments: sortedPasteSegments,
             selectedPasteSegmentId,
+            mentionSegments: sortedMentionSegments,
+            selectedMentionSegmentId: null,
           },
           cursorPosition,
           cursorPosition,
@@ -743,19 +885,30 @@ export const MultilineInput = forwardRef<
 
       return false
     },
-    [value, cursorPosition, onSubmit, commitInput, sortedPasteSegments, selectedPasteSegmentId],
+    [
+      value,
+      cursorPosition,
+      onSubmit,
+      commitInput,
+      sortedPasteSegments,
+      sortedMentionSegments,
+      selectedPasteSegmentId,
+      selectedMentionSegmentId,
+    ],
   )
 
   const deleteSegmentById = useCallback((segmentId: string): boolean => {
     const segment = sortedPasteSegments.find((s) => s.id === segmentId)
     if (!segment) return false
-    const next = applyTextEditWithSegments(
+    const next = applyTextEditWithPastesAndMentions(
       {
         text: value,
         cursorPosition,
         lastEditDueToNav: false,
         pasteSegments: sortedPasteSegments,
+        mentionSegments: sortedMentionSegments,
         selectedPasteSegmentId,
+        selectedMentionSegmentId,
       },
       segment.start,
       segment.end,
@@ -765,7 +918,46 @@ export const MultilineInput = forwardRef<
     cursorPositionRef.current = next.cursorPosition
     commitInput(next)
     return true
-  }, [sortedPasteSegments, value, cursorPosition, selectedPasteSegmentId, commitInput])
+  }, [
+    sortedPasteSegments,
+    sortedMentionSegments,
+    value,
+    cursorPosition,
+    selectedPasteSegmentId,
+    selectedMentionSegmentId,
+    commitInput,
+  ])
+
+  const deleteMentionById = useCallback((mentionId: string): boolean => {
+    const mention = sortedMentionSegments.find((s) => s.id === mentionId)
+    if (!mention) return false
+    const next = applyTextEditWithPastesAndMentions(
+      {
+        text: value,
+        cursorPosition,
+        lastEditDueToNav: false,
+        pasteSegments: sortedPasteSegments,
+        mentionSegments: sortedMentionSegments,
+        selectedPasteSegmentId,
+        selectedMentionSegmentId,
+      },
+      mention.start,
+      mention.end,
+      '',
+    )
+    valueRef.current = next.text
+    cursorPositionRef.current = next.cursorPosition
+    commitInput(next)
+    return true
+  }, [
+    sortedPasteSegments,
+    sortedMentionSegments,
+    value,
+    cursorPosition,
+    selectedPasteSegmentId,
+    selectedMentionSegmentId,
+    commitInput,
+  ])
 
   // Handle deletion keys (backspace, delete, word/line deletion)
   const processDeletionKey = useCallback(
@@ -779,13 +971,15 @@ export const MultilineInput = forwardRef<
       if (key.name === 'backspace' && hasAltLikeModifier) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
-        const next = applyTextEditWithSegments(
+        const next = applyTextEditWithPastesAndMentions(
           {
             text: value,
             cursorPosition,
             lastEditDueToNav: false,
             pasteSegments: sortedPasteSegments,
             selectedPasteSegmentId,
+            mentionSegments: sortedMentionSegments,
+            selectedMentionSegmentId: null,
           },
           wordStart,
           cursorPosition,
@@ -828,13 +1022,15 @@ export const MultilineInput = forwardRef<
         if (newValue !== originalValue) {
           const deleteStart = Math.min(cursorPosition, nextCursor)
           const deleteEnd = Math.max(cursorPosition, nextCursor)
-          const next = applyTextEditWithSegments(
+          const next = applyTextEditWithPastesAndMentions(
             {
               text: value,
               cursorPosition,
               lastEditDueToNav: false,
               pasteSegments: sortedPasteSegments,
               selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
             },
             deleteStart,
             deleteEnd,
@@ -851,13 +1047,15 @@ export const MultilineInput = forwardRef<
       if (key.name === 'delete' && hasAltLikeModifier) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
-        const next = applyTextEditWithSegments(
+        const next = applyTextEditWithPastesAndMentions(
           {
             text: value,
             cursorPosition,
             lastEditDueToNav: false,
             pasteSegments: sortedPasteSegments,
             selectedPasteSegmentId,
+            mentionSegments: sortedMentionSegments,
+            selectedMentionSegmentId: null,
           },
           cursorPosition,
           wordEnd,
@@ -882,24 +1080,46 @@ export const MultilineInput = forwardRef<
           return deleteSegmentById(selectedSegment.id)
         }
 
+        const selectedMention = findMentionById(
+          sortedMentionSegments,
+          selectedMentionSegmentId,
+        )
+        if (selectedMention) {
+          return deleteMentionById(selectedMention.id)
+        }
+
         const leftSeg = segmentAtLeftEdge(sortedPasteSegments, cursorPosition)
         if (leftSeg) {
           commitInput({
             text: value,
             cursorPosition: leftSeg.end,
             selectedPasteSegmentId: leftSeg.id,
+            selectedMentionSegmentId: null,
+          })
+          return true
+        }
+
+        const leftMention = mentionAtLeftEdge(sortedMentionSegments, cursorPosition)
+        if (leftMention) {
+          commitInput({
+            text: value,
+            cursorPosition: leftMention.end,
+            selectedMentionSegmentId: leftMention.id,
+            selectedPasteSegmentId: null,
           })
           return true
         }
 
         if (cursorPosition > 0) {
-          const next = applyTextEditWithSegments(
+          const next = applyTextEditWithPastesAndMentions(
             {
               text: value,
               cursorPosition,
               lastEditDueToNav: false,
               pasteSegments: sortedPasteSegments,
               selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
             },
             cursorPosition - 1,
             cursorPosition,
@@ -925,6 +1145,14 @@ export const MultilineInput = forwardRef<
           return deleteSegmentById(selectedSegment.id)
         }
 
+        const selectedMention = findMentionById(
+          sortedMentionSegments,
+          selectedMentionSegmentId,
+        )
+        if (selectedMention) {
+          return deleteMentionById(selectedMention.id)
+        }
+
         const forwardSeg =
           segmentAtRightEdge(sortedPasteSegments, cursorPosition + 1) ??
           segmentAtRightEdge(sortedPasteSegments, cursorPosition)
@@ -934,18 +1162,35 @@ export const MultilineInput = forwardRef<
             text: value,
             cursorPosition: forwardSeg.end,
             selectedPasteSegmentId: forwardSeg.id,
+            selectedMentionSegmentId: null,
+          })
+          return true
+        }
+
+        const forwardMention =
+          mentionAtRightEdge(sortedMentionSegments, cursorPosition + 1) ??
+          mentionAtRightEdge(sortedMentionSegments, cursorPosition)
+
+        if (forwardMention) {
+          commitInput({
+            text: value,
+            cursorPosition: forwardMention.end,
+            selectedMentionSegmentId: forwardMention.id,
+            selectedPasteSegmentId: null,
           })
           return true
         }
 
         if (cursorPosition < value.length) {
-          const next = applyTextEditWithSegments(
+          const next = applyTextEditWithPastesAndMentions(
             {
               text: value,
               cursorPosition,
               lastEditDueToNav: false,
               pasteSegments: sortedPasteSegments,
               selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
             },
             cursorPosition,
             cursorPosition + 1,
@@ -960,7 +1205,18 @@ export const MultilineInput = forwardRef<
 
       return false
     },
-    [value, cursorPosition, commitInput, removeSelectionIfPresent, sortedPasteSegments, selectedPasteSegmentId, deleteSegmentById],
+    [
+      value,
+      cursorPosition,
+      commitInput,
+      removeSelectionIfPresent,
+      sortedPasteSegments,
+      sortedMentionSegments,
+      selectedPasteSegmentId,
+      selectedMentionSegmentId,
+      deleteSegmentById,
+      deleteMentionById,
+    ],
   )
 
   // Handle navigation keys (arrows, home, end, word navigation)
@@ -1075,9 +1331,28 @@ export const MultilineInput = forwardRef<
         sortedPasteSegments,
         selectedPasteSegmentId,
       )
+      const selectedMention = findMentionById(
+        sortedMentionSegments,
+        selectedMentionSegmentId,
+      )
 
       if (selectedPasteSegmentId && !selectedSegment) {
-        commitInput({ text: value, cursorPosition, selectedPasteSegmentId: null })
+        commitInput({
+          text: value,
+          cursorPosition,
+          selectedPasteSegmentId: null,
+          selectedMentionSegmentId: null,
+        })
+        return true
+      }
+
+      if (selectedMentionSegmentId && !selectedMention) {
+        commitInput({
+          text: value,
+          cursorPosition,
+          selectedPasteSegmentId: null,
+          selectedMentionSegmentId: null,
+        })
         return true
       }
 
@@ -1092,9 +1367,25 @@ export const MultilineInput = forwardRef<
               text: value,
               cursorPosition: adjLeft.end,
               selectedPasteSegmentId: adjLeft.id,
+              selectedMentionSegmentId: null,
             })
           } else {
             moveCursorTo(selectedSegment.start - 1)
+          }
+          return true
+        }
+
+        if (selectedMention) {
+          const adjLeft = mentionAtLeftEdge(sortedMentionSegments, selectedMention.start)
+          if (adjLeft) {
+            commitInput({
+              text: value,
+              cursorPosition: adjLeft.end,
+              selectedMentionSegmentId: adjLeft.id,
+              selectedPasteSegmentId: null,
+            })
+          } else {
+            moveCursorTo(selectedMention.start - 1)
           }
           return true
         }
@@ -1105,6 +1396,18 @@ export const MultilineInput = forwardRef<
             text: value,
             cursorPosition: leftSeg.end,
             selectedPasteSegmentId: leftSeg.id,
+            selectedMentionSegmentId: null,
+          })
+          return true
+        }
+
+        const leftMention = mentionAtLeftEdge(sortedMentionSegments, cursorPosition)
+        if (leftMention) {
+          commitInput({
+            text: value,
+            cursorPosition: leftMention.end,
+            selectedMentionSegmentId: leftMention.id,
+            selectedPasteSegmentId: null,
           })
           return true
         }
@@ -1124,9 +1427,25 @@ export const MultilineInput = forwardRef<
               text: value,
               cursorPosition: adjRight.end,
               selectedPasteSegmentId: adjRight.id,
+              selectedMentionSegmentId: null,
             })
           } else {
             moveCursorTo(selectedSegment.end + 1)
+          }
+          return true
+        }
+
+        if (selectedMention) {
+          const adjRight = mentionAtRightEdge(sortedMentionSegments, selectedMention.end)
+          if (adjRight) {
+            commitInput({
+              text: value,
+              cursorPosition: adjRight.end,
+              selectedMentionSegmentId: adjRight.id,
+              selectedPasteSegmentId: null,
+            })
+          } else {
+            moveCursorTo(selectedMention.end + 1)
           }
           return true
         }
@@ -1137,6 +1456,18 @@ export const MultilineInput = forwardRef<
             text: value,
             cursorPosition: rightSeg.end,
             selectedPasteSegmentId: rightSeg.id,
+            selectedMentionSegmentId: null,
+          })
+          return true
+        }
+
+        const rightMention = mentionAtRightEdge(sortedMentionSegments, cursorPosition + 1)
+        if (rightMention) {
+          commitInput({
+            text: value,
+            cursorPosition: rightMention.end,
+            selectedMentionSegmentId: rightMention.id,
+            selectedPasteSegmentId: null,
           })
           return true
         }
@@ -1183,7 +1514,18 @@ export const MultilineInput = forwardRef<
 
       return false
     },
-    [value, cursorPosition, commitInput, moveCursorTo, shouldHighlight, resolveStickyColumn, sortedPasteSegments, selectedPasteSegmentId],
+    [
+      value,
+      cursorPosition,
+      commitInput,
+      moveCursorTo,
+      shouldHighlight,
+      resolveStickyColumn,
+      sortedPasteSegments,
+      sortedMentionSegments,
+      selectedPasteSegmentId,
+      selectedMentionSegmentId,
+    ],
   )
 
   // Handle character input (regular chars, tab, and IME/multi-byte input)
@@ -1233,11 +1575,26 @@ export const MultilineInput = forwardRef<
           sortedPasteSegments,
           selectedPasteSegmentId,
         )
+        const selectedMention = findMentionById(
+          sortedMentionSegments,
+          selectedMentionSegmentId,
+        )
         if (selectedPasteSegmentId && !selectedSegment) {
           commitInput({
             text: value,
             cursorPosition,
             selectedPasteSegmentId: null,
+            selectedMentionSegmentId: null,
+          })
+          return
+        }
+
+        if (selectedMentionSegmentId && !selectedMention) {
+          commitInput({
+            text: value,
+            cursorPosition,
+            selectedPasteSegmentId: null,
+            selectedMentionSegmentId: null,
           })
           return
         }
@@ -1248,11 +1605,12 @@ export const MultilineInput = forwardRef<
           key.name === 'backspace' ||
           key.name === 'delete'
 
-        if (selectedSegment && !isPillActionKey) {
+        if ((selectedSegment || selectedMention) && !isPillActionKey) {
           commitInput({
             text: value,
-            cursorPosition: selectedSegment.end,
+            cursorPosition: (selectedSegment ?? selectedMention)!.end,
             selectedPasteSegmentId: null,
+            selectedMentionSegmentId: null,
           })
         }
 
@@ -1281,7 +1639,9 @@ export const MultilineInput = forwardRef<
         processNavigationKey,
         processCharacterKey,
         selectedPasteSegmentId,
+        selectedMentionSegmentId,
         sortedPasteSegments,
+        sortedMentionSegments,
         cursorPosition,
         commitInput,
         value,
@@ -1431,30 +1791,57 @@ export const MultilineInput = forwardRef<
                 pos += text.length
               }
 
-              for (const segment of sortedPasteSegments) {
-                const preText = value.slice(pos, segment.start)
+              const orderedSegments = [
+                ...sortedPasteSegments.map((segment) => ({
+                  kind: 'paste' as const,
+                  segment,
+                })),
+                ...sortedMentionSegments.map((segment) => ({
+                  kind: 'mention' as const,
+                  segment,
+                })),
+              ].sort((a, b) => a.segment.start - b.segment.start)
 
-                if (segment.start > pos) {
+              for (const item of orderedSegments) {
+                const preText = value.slice(pos, item.segment.start)
+
+                if (item.segment.start > pos) {
                   pushTextChunk(preText, `t-${pos}`)
                 }
 
-                const segmentText = value.slice(segment.start, segment.end)
-                out.push(
-                  <span
-                    key={`p-${segment.id}`}
-                    fg={selectedPasteSegmentId === segment.id ? theme.link : theme.primary}
-                    attributes={
-                      selectedPasteSegmentId === segment.id
-                        ? TextAttributes.BOLD
-                        : undefined
-                    }
-                  >
-                    {segmentText}
-                  </span>,
-                )
+                const segmentText = value.slice(item.segment.start, item.segment.end)
 
-                pos = segment.end
+                if (item.kind === 'paste') {
+                  out.push(
+                    <span
+                      key={`p-${item.segment.id}`}
+                      fg={selectedPasteSegmentId === item.segment.id ? theme.link : theme.primary}
+                      attributes={
+                        selectedPasteSegmentId === item.segment.id
+                          ? TextAttributes.BOLD
+                          : undefined
+                      }
+                    >
+                      {segmentText}
+                    </span>,
+                  )
+                } else {
+                  out.push(
+                    <span
+                      key={`m-${item.segment.id}`}
+                      fg={selectedMentionSegmentId === item.segment.id ? theme.link : theme.info}
+                      attributes={
+                        selectedMentionSegmentId === item.segment.id
+                          ? TextAttributes.BOLD
+                          : undefined
+                      }
+                    >
+                      {segmentText}
+                    </span>,
+                  )
+                }
 
+                pos = item.segment.end
               }
 
               if (pos < value.length) {
