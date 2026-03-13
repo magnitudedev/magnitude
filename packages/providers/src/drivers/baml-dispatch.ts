@@ -44,9 +44,9 @@ export function bamlStreamRequest(
   return fn.call(b.streamRequest, ...args, opts)
 }
 
-export function bamlParse(name: string, text: string): Promise<unknown> {
+export function bamlParse(name: string, text: string): unknown {
   if (!(name in b.parse)) throw new Error(`Unknown BAML parse function: ${name}`)
-  const fn = b.parse[name as keyof ParseClient] as (text: string) => Promise<unknown>
+  const fn = b.parse[name as keyof ParseClient] as (text: string) => unknown
   return fn.call(b.parse, text)
 }
 

@@ -19,7 +19,7 @@ export interface DriverRequest {
 
 export type CollectorData = Data.TaggedEnum<{
   Baml: { readonly rawRequestBody: unknown; readonly rawResponseBody: unknown }
-  Responses: { readonly rawResponseBody: unknown }
+  Responses: { readonly rawRequestBody: unknown; readonly rawResponseBody: unknown; readonly sseEvents: unknown[] | null }
 }>
 
 export const CollectorData = Data.taggedEnum<CollectorData>()

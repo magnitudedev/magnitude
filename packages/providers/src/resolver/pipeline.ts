@@ -23,13 +23,32 @@ const connectionRetrySchedule = Schedule.exponential(Duration.seconds(1), 1.5).p
 
 
 
-function traceRequestFromCollectorOrFallback(
-  collectorData: unknown,
+function extractTraceRequest(
+  collectorData: CollectorData,
   fallback: { input: unknown },
 ): { messages?: unknown[]; input?: unknown } {
-  const maybe = collectorData as { rawRequestBody?: { messages?: unknown[] } } | null
-  if (maybe?.rawRequestBody?.messages) return { messages: maybe.rawRequestBody.messages }
+  const raw = collectorData.rawRequestBody as Record<string, unknown> | null | undefined
+  if (!raw) return fallback
+  // BAML driver: raw request has `messages` array
+  if (Array.isArray(raw.messages)) return { messages: raw.messages }
+  // Responses driver: BAML request body uses `input` instead of `messages`
+  if (Array.isArray(raw.input)) return { messages: raw.input }
   return fallback
+}
+
+function extractTraceResponse(
+  collectorData: CollectorData,
+  rawOutput: string | null,
+): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string } {
+  const rawBody = collectorData.rawResponseBody ?? null
+  const sseEvents = ('sseEvents' in collectorData && Array.isArray(collectorData.sseEvents))
+    ? collectorData.sseEvents
+    : null
+  return {
+    rawBody,
+    sseEvents,
+    ...(rawOutput != null ? { rawOutput } : {}),
+  }
 }
 
 export function createBoundModel(
@@ -102,22 +121,21 @@ function createBoundModelImpl(
 
           let traced = false
           let usageCache: ReturnType<typeof result.getUsage> | null = null
+          let accumulatedOutput = ''
 
           const maybeTrace = () => {
             if (traced) return
             traced = true
             const usage = usageCache ?? result.getUsage()
             const collectorData = result.getCollectorData()
-            const request = traceRequestFromCollectorOrFallback(collectorData, fallbackRequest)
             Effect.runSync(
               tracer.emit({
                 timestamp: new Date().toISOString(),
                 model: model.id,
                 provider: model.providerId,
                 slot,
-
-                request,
-                response: { rawBody: collectorData, sseEvents: null },
+                request: extractTraceRequest(collectorData, fallbackRequest),
+                response: extractTraceResponse(collectorData, accumulatedOutput || null),
                 usage: usage ?? {
                   inputTokens: null,
                   outputTokens: null,
@@ -128,7 +146,6 @@ function createBoundModelImpl(
                   totalCost: null,
                 },
                 durationMs: Date.now() - startMs,
-
               }),
             )
           }
@@ -138,6 +155,7 @@ function createBoundModelImpl(
             ? Stream.concat(Stream.make(firstChunk), tailStream)
             : tailStream
           ).pipe(
+            Stream.tap((chunk) => Effect.sync(() => { accumulatedOutput += chunk })),
             Stream.ensuring(
               Effect.all([
                 Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
@@ -191,13 +209,17 @@ function createBoundModelImpl(
           inference,
         })
 
+        // Extract raw output text for tracing
+        const rawOutput = typeof result === 'string' ? result
+          : (result != null ? JSON.stringify(result) : null)
+
         yield* tracer.emit({
           timestamp: new Date().toISOString(),
           model: model.id,
           provider: model.providerId,
           slot,
-          request: traceRequestFromCollectorOrFallback(collectorData, fallbackRequest),
-          response: { rawBody: collectorData, sseEvents: null },
+          request: extractTraceRequest(collectorData, fallbackRequest),
+          response: extractTraceResponse(collectorData, rawOutput),
           usage: usage ?? {
             inputTokens: null,
             outputTokens: null,

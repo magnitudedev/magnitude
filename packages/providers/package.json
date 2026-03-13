@@ -6,6 +6,8 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
+    "test": "bun test",
+    "test:live": "bun test tests/live-integration.*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

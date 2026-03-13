@@ -102,6 +102,8 @@ function streamViaResponsesApi(req: DriverRequest): StreamResult {
   let inputTokens: number | null = null
   let outputTokens: number | null = null
   let rawResponseBody: unknown = null
+  let rawRequestBody: unknown = null
+  let sseEvents: unknown[] = []
 
   async function* generate(): AsyncGenerator<string> {
     const clientRegistry = buildClientRegistry(
@@ -112,8 +114,9 @@ function streamViaResponsesApi(req: DriverRequest): StreamResult {
     )
     const bamlReq = await bamlStreamRequest(req.functionName, req.args, { clientRegistry })
     const maxOutputTokens = getCodexVariant(req.model, connection.auth) !== null ? undefined : req.model.maxOutputTokens ?? undefined
+    rawRequestBody = bamlReq.body.json()
     const transformed = transformForResponsesApi(
-      bamlReq.body.json(),
+      rawRequestBody as Record<string, unknown>,
       true,
       maxOutputTokens,
     )
@@ -154,6 +157,7 @@ function streamViaResponsesApi(req: DriverRequest): StreamResult {
 
         try {
           const event = JSON.parse(data)
+          sseEvents.push(event)
           if (event.type === 'response.output_text.delta') {
             yield normalizeQuotesInString(event.delta ?? '')
           } else if (event.type === 'response.completed') {
@@ -174,7 +178,7 @@ function streamViaResponsesApi(req: DriverRequest): StreamResult {
       return buildUsage(req.model, auth?.type ?? null, inputTokens, outputTokens, null, null)
     },
     getCollectorData() {
-      return CollectorData.Responses({ rawResponseBody })
+      return CollectorData.Responses({ rawRequestBody, rawResponseBody, sseEvents })
     },
   }
 }
@@ -205,7 +209,7 @@ export const ResponsesDriver: ExecutableDriver = {
           Stream.runFold(stream, '', (acc, chunk) => acc + chunk),
           (output) =>
             Effect.flatMap(
-              Effect.tryPromise({
+              Effect.try({
                 try: () => bamlParse(req.functionName, output),
                 catch: (error) => classifyUnknownError(error),
               }),
