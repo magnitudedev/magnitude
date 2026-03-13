@@ -47,7 +47,7 @@ export type { PolicyContext } from './agents/types'
 export { getAgentDefinition, registerAgentDefinition, clearAgentOverrides } from './agents'
 
 // Constants
-export { DEFAULT_CONTEXT_WINDOW, COMPACT_TRIGGER_RATIO, PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, getContextLimits, DEFAULT_CHAT_NAME, USER_BLUR_DEBOUNCE_MS } from './constants'
+export { DEFAULT_CONTEXT_WINDOW, COMPACT_TRIGGER_RATIO, PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, DEFAULT_CHAT_NAME, USER_BLUR_DEBOUNCE_MS } from './constants'
 
 // Session Context Collection
 export { collectSessionContext } from './util/collect-session-context'
@@ -213,22 +213,8 @@ export {
   getProviderIds,
   populateModels,
   initializeModels,
-  loadAuth,
-  getAuth,
-  setAuth,
-  removeAuth,
-  loadConfig,
-  saveConfig,
-  setPrimarySelection,
-  detectProviders,
   detectDefaultProvider,
-  detectProviderAuthMethods,
   buildClientRegistry,
-  initializeProviderState,
-  validateModelSwitch,
-  clearModel,
-  setLocalProviderConfig,
-  getLocalProviderConfig,
   startAnthropicOAuth,
   exchangeAnthropicCode,
   refreshAnthropicToken,
@@ -240,12 +226,6 @@ export {
   exchangeCopilotToken,
   COPILOT_HEADERS,
 
-  peekSlot,
-  setModel,
-  setBrowserSelection,
-  getModelContextWindow,
-  getSlotUsage,
-  resetSlotUsage,
   detectBrowserModel,
   isBrowserCompatible,
   getBrowserCompatibleModels,

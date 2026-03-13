@@ -99,9 +99,6 @@ export function makeTestResolver(config: TestModelConfig = {}): Layer.Layer<Mode
   return Layer.merge(
     Layer.succeed(ModelResolver, {
       resolve: (_slot: ModelSlot) => Effect.succeed(fakeBoundModel),
-      peek: () => fakeModel,
-      contextLimits: () => ({ hardCap: 200_000, softCap: 180_000 }),
-      contextWindow: () => 200_000,
     }),
     tracerLayer,
   )

@@ -10,10 +10,11 @@
  */
 
 import { Effect, Layer, Stream } from 'effect'
-import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer, CodingAgentChat } from '@magnitudedev/providers'
+import { ModelResolver, makeModelResolver, makeNoopTracer, CodingAgentChat } from '@magnitudedev/providers'
 import { BamlClientFinishReasonError, BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { getProvider } from '@magnitudedev/providers'
 import type { ChatMessage } from '@magnitudedev/llm-core'
+import { getEvalProviderClient } from './provider-runtime'
 
 const spec = process.argv[2] ?? 'anthropic:claude-sonnet-4-6'
 const [providerId, modelId] = [spec.slice(0, spec.indexOf(':')), spec.slice(spec.indexOf(':') + 1)]
@@ -36,8 +37,9 @@ if (provider) {
   }
 }
 
-const auth = getAuth(providerId)
-setModel('primary', providerId, modelId, auth ?? null, false)
+const providerClient = await getEvalProviderClient()
+const auth = await providerClient.auth.getAuth(providerId)
+await providerClient.state.setSelection('primary', providerId, modelId, auth ?? null, { persist: false })
 
 const systemPrompt = 'You are a helpful assistant.'
 const messages: ChatMessage[] = [
@@ -58,7 +60,7 @@ try {
           ackTurn: '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>',
         },
       )
-    }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(makeNoopTracer())), makeNoopTracer()))),
+    }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(providerClient.layer), Layer.provide(makeNoopTracer())), makeNoopTracer()))),
   )
   let chunkCount = 0
   const result = await Effect.runPromise(Stream.runFold(chatStream.stream, '', (acc, chunk) => {

@@ -5,8 +5,9 @@
  * primary model selection. Exports shared types used by all provider implementations.
  */
 
-import { peekSlot, getAuth } from "@magnitudedev/providers";
-import type { AuthInfo } from "@magnitudedev/providers";
+import { Effect } from 'effect'
+import { ProviderAuth, ProviderState } from '@magnitudedev/providers'
+import type { AuthInfo } from '@magnitudedev/providers'
 
 // =============================================================================
 // Shared Types
@@ -88,19 +89,7 @@ function resolveGeminiAuth(auth?: AuthInfo): SearchAuth {
  * Resolve auth for the MAGNITUDE_SEARCH_PROVIDER override.
  * Probes stored auth and env vars for the specified search provider.
  */
-function resolveOverrideAuth(provider: "anthropic" | "openai" | "gemini"): SearchAuth {
-  switch (provider) {
-    case "anthropic":
-      return resolveAnthropicAuth(getAuth("anthropic"));
-    case "openai":
-      return resolveOpenAIAuth(getAuth("openai"));
-    case "gemini":
-      return resolveGeminiAuth(getAuth("google"));
-  }
-}
-
-function detectSearchProvider(): { provider: SearchProvider; auth: SearchAuth } {
-  // 1. Explicit override via env var
+function detectSearchProvider(providerId: string | null): SearchProvider {
   const override = process.env.MAGNITUDE_SEARCH_PROVIDER as SearchProvider | undefined;
   if (override) {
     if (override !== "anthropic" && override !== "openai" && override !== "gemini") {
@@ -108,40 +97,42 @@ function detectSearchProvider(): { provider: SearchProvider; auth: SearchAuth } 
         `Invalid MAGNITUDE_SEARCH_PROVIDER value "${override}". Must be one of: anthropic, openai, gemini.`
       );
     }
-    return { provider: override, auth: resolveOverrideAuth(override) };
+    return override;
   }
-
-  // 2. Map primary provider to search provider
-  const model = peekSlot('primary')?.model;
-  const providerId = model?.providerId ?? null;
 
   switch (providerId) {
     case "anthropic":
-      return { provider: "anthropic", auth: resolveAnthropicAuth(getAuth("anthropic")) };
-
+      return "anthropic";
     case "openai":
-      return { provider: "openai", auth: resolveOpenAIAuth(getAuth("openai")) };
-
+      return "openai";
     case "google":
     case "google-vertex":
-      return { provider: "gemini", auth: resolveGeminiAuth(getAuth("google")) };
-
-    // Providers running Anthropic models on cloud infra — try to find Anthropic auth for search
+      return "gemini";
     case "google-vertex-anthropic":
     case "amazon-bedrock":
-      return { provider: "anthropic", auth: resolveAnthropicAuth(getAuth("anthropic")) };
-
-    // No provider set (BAML static fallback) — default to Anthropic with env var
     case null:
-      return { provider: "anthropic", auth: resolveAnthropicAuth(getAuth("anthropic")) };
-
-    // Providers that don't support native web search
+      return "anthropic";
     default:
       throw new Error(
         `Web search is not supported with the "${providerId}" provider. ` +
         `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to "anthropic", "openai", or "gemini".`
       );
   }
+}
+
+function resolveSearchAuth(provider: SearchProvider): Effect.Effect<SearchAuth, Error, ProviderAuth> {
+  return Effect.gen(function* () {
+    const auth = yield* ProviderAuth
+
+    switch (provider) {
+      case "anthropic":
+        return resolveAnthropicAuth(yield* auth.getAuth("anthropic"));
+      case "openai":
+        return resolveOpenAIAuth(yield* auth.getAuth("openai"));
+      case "gemini":
+        return resolveGeminiAuth(yield* auth.getAuth("google"));
+    }
+  })
 }
 
 // =============================================================================
@@ -151,33 +142,40 @@ function detectSearchProvider(): { provider: SearchProvider; auth: SearchAuth } 
 /**
  * Perform a web search using the provider determined by the user's primary model.
  */
-export async function webSearch(
+export function webSearch(
   query: string,
   options?: SearchOptions,
-): Promise<WebSearchResponse> {
-  const { provider, auth } = detectSearchProvider();
+): Effect.Effect<WebSearchResponse, Error, ProviderState | ProviderAuth> {
+  return Effect.gen(function* () {
+    const providerState = yield* ProviderState
+    const current = yield* providerState.peek('primary')
+    const provider = detectSearchProvider(current?.model.providerId ?? null)
+    const auth = yield* resolveSearchAuth(provider)
 
-  switch (provider) {
-    case "anthropic": {
-      const { anthropicWebSearch } = await import("./web-search-anthropic");
-      return anthropicWebSearch(query, auth, options);
+    switch (provider) {
+      case "anthropic": {
+        const { anthropicWebSearch } = yield* Effect.promise(() => import("./web-search-anthropic"));
+        return yield* Effect.promise(() => anthropicWebSearch(query, auth, options));
+      }
+      case "openai": {
+        const { openaiWebSearch } = yield* Effect.promise(() => import("./web-search-openai"));
+        return yield* Effect.promise(() => openaiWebSearch(query, auth, options));
+      }
+      case "gemini": {
+        const { geminiWebSearch } = yield* Effect.promise(() => import("./web-search-gemini"));
+        return yield* Effect.promise(() => geminiWebSearch(query, auth, options));
+      }
     }
-    case "openai": {
-      const { openaiWebSearch } = await import("./web-search-openai");
-      return openaiWebSearch(query, auth, options);
-    }
-    case "gemini": {
-      const { geminiWebSearch } = await import("./web-search-gemini");
-      return geminiWebSearch(query, auth, options);
-    }
-  }
+  })
 }
 
 /**
  * Streaming web search (Anthropic-only).
+ * Caller must provide already-resolved auth.
  */
 export async function* webSearchStream(
   query: string,
+  auth: SearchAuth,
   options?: SearchOptions,
 ): AsyncGenerator<
   | { type: "search_started"; query: string }
@@ -185,13 +183,6 @@ export async function* webSearchStream(
   | { type: "text_delta"; text: string }
   | { type: "done"; response: WebSearchResponse }
 > {
-  const { auth } = detectSearchProvider();
   const { anthropicWebSearchStream } = await import("./web-search-anthropic");
   yield* anthropicWebSearchStream(query, auth, options);
-}
-
-// Quick test
-if (import.meta.main) {
-  const result = await webSearch("What is the current price of Bitcoin?");
-  console.log(JSON.stringify(result, null, 2));
 }

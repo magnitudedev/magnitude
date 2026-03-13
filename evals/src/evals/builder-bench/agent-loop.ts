@@ -14,16 +14,13 @@ import {
   registerAgentDefinition,
   clearAgentOverrides,
   isStable,
-  setModel,
-  getAuth,
   textParts,
-  resetSlotUsage,
-  getSlotUsage,
   type SessionContext,
   type AppEvent,
   type ChatPersistenceService,
   type SlotUsage,
 } from '@magnitudedev/agent'
+import { getEvalProviderClient } from '../../provider-runtime'
 import type { ModelSpec } from '../../types'
 import type { ToolBridgeResult } from './tool-bridge'
 
@@ -118,9 +115,10 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
 
     // Configure LLM AFTER client creation — initializeProviderState() inside
     // createCodingAgentClient overwrites the primary slot from stored config
-    const auth = getAuth(modelSpec.provider)
-    setModel('primary', modelSpec.provider, modelSpec.model, auth ?? null, false)
-    resetSlotUsage('primary')
+    const providerClient = await getEvalProviderClient()
+    const auth = await providerClient.auth.getAuth(modelSpec.provider)
+    await providerClient.state.setSelection('primary', modelSpec.provider, modelSpec.model, auth ?? null, { persist: false })
+    await providerClient.state.resetUsage('primary')
 
     // Track turn count and completion
     let turnCount = 0
@@ -195,7 +193,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     clearTimeout(timeoutId!)
 
     // Collect usage and clean up
-    const usage = getSlotUsage('primary')
+    const usage = await providerClient.state.getUsage('primary')
     await client.dispose()
 
     return {

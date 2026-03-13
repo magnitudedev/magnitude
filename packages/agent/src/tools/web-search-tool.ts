@@ -45,32 +45,30 @@ export const webSearchTool = createTool({
   } as const,
 
   execute: ({ query, schema }) =>
-    Effect.tryPromise({
-      try: async () => {
-        const system = schema ? outputFormatString(schema) : undefined
-        const response = await webSearch(query, { system })
+    Effect.gen(function* () {
+      const system = schema ? outputFormatString(schema) : undefined
+      const response = yield* webSearch(query, { system }).pipe(
+        Effect.mapError((e) => ({ _tag: 'WebSearchError' as const, message: e instanceof Error ? e.message : String(e) })),
+      )
 
-        // Flatten sources from all search result groups
-        const sources: { title: string; url: string }[] = []
-        for (const r of response.results) {
-          if (typeof r !== 'string') {
-            for (const item of r.content) {
-              sources.push({ title: item.title, url: item.url })
-            }
+      const sources: { title: string; url: string }[] = []
+      for (const r of response.results) {
+        if (typeof r !== 'string') {
+          for (const item of r.content) {
+            sources.push({ title: item.title, url: item.url })
           }
         }
+      }
 
-        const result: { text: string; sources: { title: string; url: string }[]; data?: unknown } = {
-          text: response.textResponse,
-          sources,
-        }
+      const result: { text: string; sources: { title: string; url: string }[]; data?: unknown } = {
+        text: response.textResponse,
+        sources,
+      }
 
-        if (schema) {
-          result.data = schemaAlignedParse(response.textResponse, schema)
-        }
+      if (schema) {
+        result.data = schemaAlignedParse(response.textResponse, schema)
+      }
 
-        return result
-      },
-      catch: (e) => ({ _tag: 'WebSearchError' as const, message: e instanceof Error ? e.message : String(e) }),
+      return result
     }),
 })

@@ -1,10 +1,5 @@
 import { useState, useCallback } from 'react'
 import {
-  setAuth,
-  getAuth,
-  loadConfig,
-  saveConfig,
-  setLocalProviderConfig,
   startAnthropicOAuth,
   exchangeAnthropicCode,
   startOpenAIBrowserOAuth,
@@ -14,6 +9,7 @@ import {
 } from '@magnitudedev/agent'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { trackProviderConnected } from '@magnitudedev/telemetry'
+import { useProviderRuntime } from '../providers/provider-runtime'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,16 +39,15 @@ export interface UseAuthFlowOptions {
   onMessage: (message: string) => void
   showEphemeral: (msg: string, color: string, duration?: number) => void
   theme: { success: string; error: string }
+  reloadProviderState?: () => Promise<void>
 }
 
 export interface UseAuthFlowReturn {
-  // State
   oauthState: OAuthState | null
   apiKeySetup: ApiKeySetupState | null
   showLocalSetup: boolean
   showAuthMethodOverlay: boolean
   authMethodProvider: ProviderDefinition | null
-  // Actions
   startAuthForProvider: (provider: ProviderDefinition, methodIndex: number) => Promise<void>
   openApiKeyOverlay: (provider: ProviderDefinition, envKeyHint: string, existingKey?: string) => void
   openAuthMethodPicker: (provider: ProviderDefinition) => void
@@ -61,16 +56,12 @@ export interface UseAuthFlowReturn {
   handleOAuthCancel: () => void
   handleOAuthCopyCode: () => void
   handleOAuthCopyUrl: () => void
-  handleApiKeySubmit: (key: string) => void
+  handleApiKeySubmit: (key: string) => Promise<void>
   handleApiKeyCancel: () => void
-  handleLocalSetupSubmit: (config: { url: string; modelId: string; apiKey?: string }) => void
+  handleLocalSetupSubmit: (config: { url: string; modelId: string; apiKey?: string }) => Promise<void>
   handleLocalSetupCancel: () => void
   cancelAll: () => void
 }
-
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
 
 export function useAuthFlow({
   onAuthSuccess,
@@ -78,12 +69,18 @@ export function useAuthFlow({
   onMessage,
   showEphemeral,
   theme,
+  reloadProviderState,
 }: UseAuthFlowOptions): UseAuthFlowReturn {
+  const runtime = useProviderRuntime()
   const [oauthState, setOauthState] = useState<OAuthState | null>(null)
   const [apiKeySetup, setApiKeySetup] = useState<ApiKeySetupState | null>(null)
   const [showLocalSetup, setShowLocalSetup] = useState(false)
   const [showAuthMethodOverlay, setShowAuthMethodOverlay] = useState(false)
   const [authMethodProvider, setAuthMethodProvider] = useState<ProviderDefinition | null>(null)
+
+  const reload = useCallback(async () => {
+    await reloadProviderState?.()
+  }, [reloadProviderState])
 
   const openApiKeyOverlay = useCallback((provider: ProviderDefinition, envKeyHint: string, existingKey?: string) => {
     setApiKeySetup({ provider, envKeyHint, existingKey })
@@ -106,26 +103,23 @@ export function useAuthFlow({
     setAuthMethodProvider(null)
 
     if (method.type === 'api-key') {
-      // Check if env var already provides an API key
       const envKey = method.envKeys?.find(k => process.env[k])
       if (envKey) {
         showEphemeral(`Connected ${provider.name} (${envKey})`, theme.success)
+        await reload()
         onAuthSuccess(provider.id, provider.name)
       } else {
-        // Show API key input overlay, pre-populate if stored key exists
-        const storedAuth = getAuth(provider.id)
+        const storedAuth = await runtime.auth.getAuth(provider.id)
         const existingKey = storedAuth?.type === 'api' ? storedAuth.key : undefined
         setApiKeySetup({ provider, envKeyHint: method.envKeys?.[0] ?? '', existingKey })
       }
     } else if (method.type === 'oauth-pkce') {
-      // Anthropic PKCE — synchronous start, paste code overlay
       const { authUrl, codeVerifier } = startAnthropicOAuth()
       setOauthState({
         provider, mode: 'paste', methodLabel: method.label,
         url: authUrl, codeVerifier, codeError: null, isSubmitting: false,
       })
     } else if (method.type === 'oauth-device') {
-      // Device code flow (OpenAI headless or Copilot) — async start
       const startFn = provider.id === 'github-copilot' ? startCopilotAuth : startOpenAIDeviceOAuth
       try {
         const result = await startFn()
@@ -133,10 +127,10 @@ export function useAuthFlow({
           provider, mode: 'auto', methodLabel: method.label,
           url: result.verificationUrl, userCode: result.userCode,
         })
-        // Start polling in background
-        result.poll().then(auth => {
-          setAuth(provider.id, auth)
+        result.poll().then(async auth => {
+          await runtime.auth.setAuth(provider.id, auth)
           trackProviderConnected({ providerId: provider.id, authType: auth.type })
+          await reload()
           setOauthState(null)
           showEphemeral(`Connected ${provider.name}`, theme.success)
           onAuthSuccess(provider.id, provider.name)
@@ -148,17 +142,16 @@ export function useAuthFlow({
         showEphemeral(`Failed to start auth: ${err.message}`, theme.error, 8000)
       }
     } else if (method.type === 'oauth-browser') {
-      // OpenAI browser PKCE — async start with local callback server
       try {
         const result = await startOpenAIBrowserOAuth()
         setOauthState({
           provider, mode: 'auto', methodLabel: method.label,
           url: result.authUrl, cleanup: result.stop,
         })
-        // Wait for browser callback
-        result.waitForCallback().then(auth => {
-          setAuth(provider.id, auth)
+        result.waitForCallback().then(async auth => {
+          await runtime.auth.setAuth(provider.id, auth)
           trackProviderConnected({ providerId: provider.id, authType: auth.type })
+          await reload()
           setOauthState(null)
           showEphemeral(`Connected ${provider.name}`, theme.success)
           onAuthSuccess(provider.id, provider.name)
@@ -170,7 +163,6 @@ export function useAuthFlow({
         showEphemeral(`Failed to start auth: ${err.message}`, theme.error, 8000)
       }
     } else if (method.type === 'aws-chain') {
-      // AWS credential chain — check env vars
       const hasAccessKey = !!process.env.AWS_ACCESS_KEY_ID
       const hasProfile = !!process.env.AWS_PROFILE
       if (hasAccessKey || hasProfile) {
@@ -179,15 +171,15 @@ export function useAuthFlow({
           profile: process.env.AWS_PROFILE,
           region: process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION,
         }
-        setAuth(provider.id, auth)
+        await runtime.auth.setAuth(provider.id, auth)
         trackProviderConnected({ providerId: provider.id, authType: 'aws' })
+        await reload()
         showEphemeral(`Connected ${provider.name}`, theme.success)
         onAuthSuccess(provider.id, provider.name)
       } else {
         onMessage('Configure AWS credentials using aws configure, or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables, then restart Magnitude.')
       }
     } else if (method.type === 'gcp-credentials') {
-      // GCP service account — check credentials file
       const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS
       if (credPath) {
         const auth = {
@@ -196,8 +188,9 @@ export function useAuthFlow({
           project: process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
           location: process.env.GOOGLE_CLOUD_LOCATION,
         }
-        setAuth(provider.id, auth)
+        await runtime.auth.setAuth(provider.id, auth)
         trackProviderConnected({ providerId: provider.id, authType: 'gcp' })
+        await reload()
         showEphemeral(`Connected ${provider.name}`, theme.success)
         onAuthSuccess(provider.id, provider.name)
       } else {
@@ -207,19 +200,21 @@ export function useAuthFlow({
       if (provider.id === 'local') {
         setShowLocalSetup(true)
       } else {
+        await reload()
         showEphemeral(`Connected ${provider.name}`, theme.success)
         onAuthSuccess(provider.id, provider.name)
       }
     }
-  }, [showEphemeral, theme.success, theme.error, onAuthSuccess, onMessage])
+  }, [showEphemeral, theme.success, theme.error, onAuthSuccess, onMessage, runtime, reload])
 
   const handleOAuthCodeSubmit = useCallback(async (code: string) => {
     if (!oauthState || oauthState.mode !== 'paste' || !oauthState.codeVerifier) return
     setOauthState(prev => prev ? { ...prev, isSubmitting: true, codeError: null } : null)
     try {
       const auth = await exchangeAnthropicCode(code, oauthState.codeVerifier)
-      setAuth(oauthState.provider.id, auth)
+      await runtime.auth.setAuth(oauthState.provider.id, auth)
       trackProviderConnected({ providerId: oauthState.provider.id, authType: auth.type })
+      await reload()
       const providerName = oauthState.provider.name
       const providerId = oauthState.provider.id
       setOauthState(null)
@@ -228,7 +223,7 @@ export function useAuthFlow({
     } catch {
       setOauthState(prev => prev ? { ...prev, isSubmitting: false, codeError: 'Invalid code' } : null)
     }
-  }, [oauthState, showEphemeral, theme.success, onAuthSuccess])
+  }, [oauthState, showEphemeral, theme.success, onAuthSuccess, runtime, reload])
 
   const handleOAuthCancel = useCallback(() => {
     oauthState?.cleanup?.()
@@ -246,40 +241,41 @@ export function useAuthFlow({
     writeTextToClipboard(oauthState.url)
   }, [oauthState])
 
-  const handleLocalSetupSubmit = useCallback((config: { url: string; modelId: string; apiKey?: string }) => {
+  const handleLocalSetupSubmit = useCallback(async (config: { url: string; modelId: string; apiKey?: string }) => {
     setShowLocalSetup(false)
-    setLocalProviderConfig(config.url, config.modelId)
+    await runtime.config.setLocalProviderConfig(config.url, config.modelId)
     if (config.apiKey) {
-      setAuth('local', { type: 'api' as const, key: config.apiKey })
+      await runtime.auth.setAuth('local', { type: 'api' as const, key: config.apiKey })
       trackProviderConnected({ providerId: 'local', authType: 'api' })
     } else {
       trackProviderConnected({ providerId: 'local', authType: 'none' })
     }
-    // Persist base URL to config file so it survives restarts
-    const cfg = loadConfig()
+    const cfg = await runtime.config.loadConfig()
     cfg.providerOptions = cfg.providerOptions ?? {}
     cfg.providerOptions['local'] = { ...cfg.providerOptions['local'], baseUrl: config.url, modelId: config.modelId }
-    saveConfig(cfg)
+    await runtime.config.saveConfig(cfg)
+    await reload()
     showEphemeral(`Connected to local model: ${config.modelId}`, theme.success)
     onAuthSuccess('local', 'Local')
-  }, [showEphemeral, theme.success, onAuthSuccess])
+  }, [showEphemeral, theme.success, onAuthSuccess, runtime, reload])
 
   const handleLocalSetupCancel = useCallback(() => {
     setShowLocalSetup(false)
     onAuthCancel()
   }, [onAuthCancel])
 
-  const handleApiKeySubmit = useCallback((key: string) => {
+  const handleApiKeySubmit = useCallback(async (key: string) => {
     if (!apiKeySetup) return
     const auth = { type: 'api' as const, key }
-    setAuth(apiKeySetup.provider.id, auth)
+    await runtime.auth.setAuth(apiKeySetup.provider.id, auth)
     trackProviderConnected({ providerId: apiKeySetup.provider.id, authType: 'api' })
+    await reload()
     const providerName = apiKeySetup.provider.name
     const providerId = apiKeySetup.provider.id
     setApiKeySetup(null)
     showEphemeral(`Connected ${providerName} (API Key)`, theme.success)
     onAuthSuccess(providerId, providerName)
-  }, [apiKeySetup, showEphemeral, theme.success, onAuthSuccess])
+  }, [apiKeySetup, showEphemeral, theme.success, onAuthSuccess, runtime, reload])
 
   const handleApiKeyCancel = useCallback(() => {
     setApiKeySetup(null)

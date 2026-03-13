@@ -61,7 +61,7 @@ import { ChatPersistence } from './persistence/chat-persistence-service'
 import { collectSessionContext } from './util/collect-session-context'
 
 // Providers
-import { initializeProviderState, loadConfig, makeModelResolver, makeNoopTracer, makeTracePersister } from '@magnitudedev/providers'
+import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister, ProviderConfig } from '@magnitudedev/providers'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 import { join } from 'path'
 import { createMemoryExtractionJob, drainPendingJobsOnStartup, spawnDetachedMemoryExtractionWorker, writePendingJobSync } from './memory/job-queue'
@@ -162,12 +162,14 @@ export interface CreateClientOptions {
 let hasDrainedPendingMemoryJobs = false
 
 export async function createCodingAgentClient(options: CreateClientOptions) {
-  // Initialize provider state from stored config / env vars
-  await initializeProviderState()
+  // Bootstrap provider runtime from stored config / env vars
+  const providerRuntime = makeProviderRuntimeLive()
+  await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
+
+  const cfg = await Effect.runPromise(Effect.flatMap(ProviderConfig, (config) => config.loadConfig()).pipe(Effect.provide(providerRuntime)))
 
   if (!hasDrainedPendingMemoryJobs) {
     hasDrainedPendingMemoryJobs = true
-    const cfg = loadConfig()
     if (cfg.memory !== false) {
       drainPendingJobsOnStartup().catch(() => {})
     }
@@ -183,8 +185,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   const tracerLayer = options.debug ? makeTracePersister((trace) => writeTrace(trace)) : makeNoopTracer()
   const layer = Layer.mergeAll(
     ExecutionManagerLive,
-    BrowserServiceLive,
-    makeModelResolver(),
+    Layer.provide(BrowserServiceLive, providerRuntime),
+    Layer.provide(makeModelResolver(), providerRuntime),
+    providerRuntime,
     tracerLayer,
     options.persistence,
   )
@@ -202,7 +205,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
     if (events.length === 0) {
       // New session
-      const context = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext()))
+      const context = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext({
+        memoryEnabled: cfg.memory !== false,
+      })))
 
       yield* Effect.promise(() => client.send({
         type: 'session_initialized',
@@ -289,7 +294,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   // NOTE: Memory extraction trigger lives only here (wrapped dispose) so all teardown paths
   // (CLI and server) converge through one durable marker + best-effort detached worker flow.
   const dispose = async () => {
-    const cfg = loadConfig()
     const memoryEnabled = cfg.memory !== false
 
     let jobPath: string | null = null

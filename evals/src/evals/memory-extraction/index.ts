@@ -1,6 +1,7 @@
 import { Effect, Layer } from 'effect'
 import type { RunnableEval, Scenario, ScenarioResult, ModelSpec, CheckResult } from '../../types'
-import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer, ExtractMemoryDiff } from '@magnitudedev/providers'
+import { ModelResolver, makeModelResolver, makeNoopTracer, ExtractMemoryDiff } from '@magnitudedev/providers'
+import { getEvalProviderClient } from '../../provider-runtime'
 
 import { applyMemoryDiff } from '../../../../packages/agent/src/memory/memory-file'
 import { ALL_SCENARIOS, VARIANTS } from './scenarios'
@@ -33,8 +34,9 @@ function addCheck(checks: Record<string, CheckResult>, id: string, result: Check
 
 async function runExtraction(transcript: string, currentMemory: string, modelSpec: ModelSpec): Promise<{ raw: string; diff: MemoryDiffResult | null; parseError?: string }> {
   try {
-    const auth = getAuth(modelSpec.provider)
-    setModel('secondary', modelSpec.provider, modelSpec.model, auth ?? null, false)
+    const providerClient = await getEvalProviderClient()
+    const auth = await providerClient.auth.getAuth(modelSpec.provider)
+    await providerClient.state.setSelection('secondary', modelSpec.provider, modelSpec.model, auth ?? null, { persist: false })
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const runtime = yield* ModelResolver
@@ -43,7 +45,7 @@ async function runExtraction(transcript: string, currentMemory: string, modelSpe
           ExtractMemoryDiff,
           { transcript, currentMemory },
         )
-      }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(makeNoopTracer())), makeNoopTracer()))),
+      }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(providerClient.layer), Layer.provide(makeNoopTracer())), makeNoopTracer()))),
     )
     return { raw: JSON.stringify(result, null, 2), diff: result }
   } catch (error) {

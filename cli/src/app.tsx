@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type ForkState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, setModel, clearModel, peekSlot, detectBrowserModel, detectProviders, detectProviderAuthMethods, getAuth, setAuth, removeAuth, setLocalProviderConfig, getLocalProviderConfig, loadConfig, saveConfig, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, startAnthropicOAuth, exchangeAnthropicCode, startOpenAIBrowserOAuth, startOpenAIDeviceOAuth, startCopilotAuth, getContextLimits, initializeProviderState, type ForkMemoryState, type ForkCompactionState, type ArtifactState, type AgentRegistryState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type ForkState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, type AgentRegistryState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 import { MultilineInput, type MultilineInputHandle } from './components/multiline-input'
@@ -67,6 +67,8 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import stringWidth from 'string-width'
 import { createId } from '@magnitudedev/generate-id'
 import { applyTextEditWithSegments, insertPasteSegment, reconstituteInputText } from './utils/strings'
+import { useProviderRuntime } from './providers/provider-runtime'
+import { useProviderUiState } from './hooks/use-provider-ui-state'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
@@ -113,6 +115,8 @@ function AppInner({
   onResumeSession: (sessionId: string) => void
 }) {
   const renderer = useRenderer()
+  const providerRuntime = useProviderRuntime()
+  const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const [client, setClient] = useState<AgentClient | null>(null)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [forkState, setForkState] = useState<ForkState | null>(null)
@@ -149,6 +153,8 @@ function AppInner({
   const [providerDetailId, setProviderDetailId] = useState<string | null>(null)
   const [providerDetailSelectedIndex, setProviderDetailSelectedIndex] = useState(0)
   const [providerRefreshKey, setProviderRefreshKey] = useState(0)
+  const [providerDetailStatus, setProviderDetailStatus] = useState<ProviderAuthMethodStatus | null>(null)
+  const [contextHardCap, setContextHardCap] = useState<number | null>(null)
   const [agentProjectionMode, setAgentProjectionMode] = useState<string>('default')
   const [bashMode, setBashMode] = useState(false)
   const [bashOutputs, setBashOutputs] = useState<BashResult[]>([])
@@ -166,7 +172,6 @@ function AppInner({
   const [attachments, setAttachments] = useState<ImageAttachment[]>([])
   const [, setTerminalResizeTick] = useState(0)
 
-  const contextLimits = getContextLimits()
   const formatFooterTokens = (n: number) => {
     if (n >= 1000) {
       const v = (n / 1000).toFixed(1)
@@ -174,9 +179,11 @@ function AppInner({
     }
     return `${n}`
   }
-  const contextPercent = Math.round((tokenEstimate / contextLimits.hardCap) * 100)
-  const contextDisplayText = `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextLimits.hardCap)}`
-  const contextRenderedText = tokenEstimate > 0
+  const contextPercent = contextHardCap ? Math.round((tokenEstimate / contextHardCap) * 100) : 0
+  const contextDisplayText = contextHardCap
+    ? `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextHardCap)}`
+    : ''
+  const contextRenderedText = tokenEstimate > 0 && contextHardCap
     ? (isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText)
     : ''
 
@@ -329,22 +336,29 @@ function AppInner({
     logger.info({ logFile: getLogPath() }, 'App started')
     if (debugMode) logger.info('Debug mode enabled - press Ctrl+D to toggle debug panel')
     refreshRecentChats()
+  }, [refreshRecentChats])
 
-    // Load primary/secondary/browser model preferences into React state
-    const cfg = loadConfig()
-    if (cfg.primaryModel) setPrimaryModelState(cfg.primaryModel)
-    if (cfg.secondaryModel) setSecondaryModelState(cfg.secondaryModel)
-    if (cfg.browserModel) setBrowserModelState(cfg.browserModel)
+  useEffect(() => {
+    if (!providerUiState) return
 
-    // Initialize telemetry
-    initTelemetry({ telemetryEnabled: cfg.telemetry !== false })
+    setPrimaryModelState(providerUiState.primaryModel)
+    setSecondaryModelState(providerUiState.secondaryModel)
+    setBrowserModelState(providerUiState.browserModel)
 
-    // First-time setup wizard
-    if (!cfg.setupComplete) {
+    initTelemetry({ telemetryEnabled: providerUiState.config.telemetry !== false })
+
+    if (!providerUiState.config.setupComplete) {
       setShowSetupWizard(true)
     }
+  }, [providerUiState])
 
-  }, [refreshRecentChats])
+  useEffect(() => {
+    providerRuntime.state.contextLimits('primary').then((limits) => {
+      setContextHardCap(limits.hardCap)
+    }).catch((error) => {
+      logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Failed to load provider context limits')
+    })
+  }, [providerRuntime, primaryModel])
 
   // Check Chromium installation when wizard opens
   useEffect(() => {
@@ -374,18 +388,7 @@ function AppInner({
     let mounted = true
     let c: AgentClient | null = null
 
-    // Eagerly initialize provider state (models from models.dev, config,
-    // local provider, auto-detection) so the UI is fully populated
-    // before a chat session is created
-    initializeProviderState().then(() => {
-      if (!mounted) return
-      // Sync all model slots — providers may have been cleared or auto-detected during init
-      const postInitCfg = loadConfig()
-      setPrimaryModelState(postInitCfg.primaryModel ?? null)
-      setSecondaryModelState(postInitCfg.secondaryModel ?? null)
-      setBrowserModelState(postInitCfg.browserModel ?? null)
-      setModelsLoaded(n => n + 1)
-    })
+    setModelsLoaded(n => n + 1)
 
     // Register skills as slash commands (fire-and-forget, non-blocking)
     scanSkills(process.cwd()).then((skills) => {
@@ -510,21 +513,37 @@ function AppInner({
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'orchestrator'
           const slot = roleToSlot(agentRole)
-          const resolved = peekSlot(slot)
 
-          trackTurnCompleted({
-            providerId: resolved?.model.providerId ?? null,
-            modelId: resolved?.model.id ?? null,
-            modelSlot: slot,
-            authType: resolved?.auth?.type ?? null,
-            inputTokens: event.inputTokens,
-            outputTokens: event.outputTokens,
-            cacheReadTokens: event.cacheReadTokens,
-            cacheWriteTokens: event.cacheWriteTokens,
-            toolCount: event.toolCalls.length,
-            success: event.result.success,
-            forkId: event.forkId,
-            agentRole,
+          providerRuntime.state.peek(slot).then((resolved) => {
+            trackTurnCompleted({
+              providerId: resolved?.model.providerId ?? null,
+              modelId: resolved?.model.id ?? null,
+              modelSlot: slot,
+              authType: resolved?.auth?.type ?? null,
+              inputTokens: event.inputTokens,
+              outputTokens: event.outputTokens,
+              cacheReadTokens: event.cacheReadTokens,
+              cacheWriteTokens: event.cacheWriteTokens,
+              toolCount: event.toolCalls.length,
+              success: event.result.success,
+              forkId: event.forkId,
+              agentRole,
+            })
+          }).catch(() => {
+            trackTurnCompleted({
+              providerId: null,
+              modelId: null,
+              modelSlot: slot,
+              authType: null,
+              inputTokens: event.inputTokens,
+              outputTokens: event.outputTokens,
+              cacheReadTokens: event.cacheReadTokens,
+              cacheWriteTokens: event.cacheWriteTokens,
+              toolCount: event.toolCalls.length,
+              success: event.result.success,
+              forkId: event.forkId,
+              agentRole,
+            })
           })
 
           // Track individual tool calls
@@ -911,40 +930,55 @@ function AppInner({
   )
 
   // Model selection overlay handlers
-  const handleModelSelect = useCallback((providerId: string, modelId: string) => {
-    if (!selectingModelFor) return
+  const handleModelSelect = useCallback(async (providerId: string, modelId: string) => {
+    if (!selectingModelFor || !providerUiState) return
 
     const selection: ModelSelection = { providerId, modelId }
-    const cfg = loadConfig()
+    const cfg = { ...providerUiState.config }
 
     if (selectingModelFor === 'primary') {
       setPrimaryModelState(selection)
       cfg.primaryModel = selection
-      // Update the runtime singleton so footer and API calls use this model
-      const auth = getAuth(providerId)
-      setModel('primary', providerId, modelId, auth ?? null, false)
+      const auth = await providerRuntime.auth.getAuth(providerId)
+      await providerRuntime.state.setSelection('primary', providerId, modelId, auth ?? null, { persist: false })
     } else if (selectingModelFor === 'secondary') {
       setSecondaryModelState(selection)
       cfg.secondaryModel = selection
+      const auth = await providerRuntime.auth.getAuth(providerId)
+      await providerRuntime.state.setSelection('secondary', providerId, modelId, auth ?? null)
     } else if (selectingModelFor === 'browser') {
       setBrowserModelState(selection)
       cfg.browserModel = selection
-      const auth = getAuth(providerId)
-      setModel('browser', providerId, modelId, auth ?? null, false)
+      const auth = await providerRuntime.auth.getAuth(providerId)
+      await providerRuntime.state.setSelection('browser', providerId, modelId, auth ?? null, { persist: false })
     }
 
-    saveConfig(cfg)
+    await providerRuntime.config.saveConfig(cfg)
+    await reloadProviderState()
     setSelectingModelFor(null)
-    // Stay on model tab (primary/secondary/browser view)
-  }, [selectingModelFor])
+  }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderState])
 
-  // Provider detection — recompute when either overlay opens or after connect/disconnect
-  const detectedProviders = useMemo(() => detectProviders(), [settingsTab, showSetupWizard, providerRefreshKey])
+  const detectedProviders = providerUiState?.detectedProviders ?? []
 
-  const providerDetailStatus = useMemo(() => {
-    if (!providerDetailId) return null
-    return detectProviderAuthMethods(providerDetailId)
-  }, [providerDetailId, providerRefreshKey])
+  useEffect(() => {
+    if (!providerDetailId) {
+      setProviderDetailStatus(null)
+      return
+    }
+    setProviderDetailStatus(null)
+    let stale = false
+
+    providerRuntime.auth.detectProviderAuthMethods(providerDetailId).then((status) => {
+      if (!stale) setProviderDetailStatus(status)
+    }).catch((error) => {
+      logger.warn({
+        providerId: providerDetailId,
+        error: error instanceof Error ? error.message : String(error),
+      }, 'Failed to load provider auth methods')
+      if (!stale) setProviderDetailStatus(null)
+    })
+    return () => { stale = true }
+  }, [providerDetailId, providerRefreshKey, providerRuntime])
 
   const providerDetailActions = useMemo(() => {
     if (!providerDetailStatus) return []
@@ -970,8 +1004,48 @@ function AppInner({
     return PROVIDERS.filter(p => connectedIds.has(p.id))
   }, [detectedProviders, modelsLoaded])
 
+  const modelItems = useMemo(() => {
+    const result: Array<{ type: 'model'; providerId: string; providerName: string; modelId: string; modelName: string }> = []
+    for (const provider of connectedProviders) {
+      if (provider.id === 'local') {
+        if (providerUiState?.localProviderConfig.baseUrl && providerUiState?.localProviderConfig.modelId) {
+          result.push({
+            type: 'model',
+            providerId: 'local',
+            providerName: provider.name,
+            modelId: providerUiState.localProviderConfig.modelId,
+            modelName: providerUiState.localProviderConfig.baseUrl,
+          })
+        }
+        continue
+      }
+
+      const oauthOnly = provider.oauthOnlyModelIds
+      const oauthOnlySet = oauthOnly ? new Set(oauthOnly) : null
+      const detected = detectedProviders.find(d => d.provider.id === provider.id)
+      const isOAuth = oauthOnlySet ? detected?.auth?.type === 'oauth' : false
+
+      for (const model of provider.models) {
+        if (oauthOnlySet && !isOAuth && oauthOnlySet.has(model.id)) continue
+        result.push({
+          type: 'model',
+          providerId: provider.id,
+          providerName: provider.name,
+          modelId: model.id,
+          modelName: model.name,
+        })
+      }
+    }
+    return result
+  }, [connectedProviders, detectedProviders, providerUiState])
+
+  const filteredModelItems = useMemo(() => {
+    if (selectingModelFor !== 'browser') return modelItems
+    return modelItems.filter(item => isBrowserCompatible(item.providerId, item.modelId))
+  }, [modelItems, selectingModelFor])
+
   const modelNavigation = useModelSelectNavigation(
-    connectedProviders,
+    filteredModelItems,
     handleModelSelect,
     settingsTab === 'model',
   )
@@ -987,7 +1061,7 @@ function AppInner({
 
       if (showSetupWizardRef.current) {
         // Wizard mode: advance to models step with defaults for this provider
-        const detected = detectProviders()
+        const detected = detectedProviders
         const match = detected.find(d => d.provider.id === providerId)
         const isOAuth = match?.auth?.type === 'oauth'
         const defaults = getDefaultModels(providerId, isOAuth)
@@ -1030,6 +1104,7 @@ function AppInner({
     onMessage: (msg) => showSystemMessage(msg),
     showEphemeral,
     theme,
+    reloadProviderState,
   })
 
   // --- Setup wizard handlers ---
@@ -1038,8 +1113,7 @@ function AppInner({
     const provider = getProvider(providerId)
     if (!provider) return
 
-    // Check if provider already has auth
-    const detected = detectProviders()
+    const detected = detectedProviders
     const match = detected.find(d => d.provider.id === providerId)
 
     if (match) {
@@ -1064,7 +1138,7 @@ function AppInner({
       // Multiple auth methods — show picker
       authFlow.openAuthMethodPicker(provider)
     }
-  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker])
+  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders])
 
   const finishWizard = useCallback(() => {
     setShowSetupWizard(false)
@@ -1076,58 +1150,57 @@ function AppInner({
     setProviderRefreshKey(prev => prev + 1)
   }, [])
 
-  const handleWizardComplete = useCallback((result: { primaryModel: ModelSelection; secondaryModel: ModelSelection; browserModel: ModelSelection | null }) => {
+  const handleWizardComplete = useCallback(async (result: { primaryModel: ModelSelection; secondaryModel: ModelSelection; browserModel: ModelSelection | null }) => {
+    if (!providerUiState) return
     authFlow.cancelAll()
-    // Save model selections
-    const cfg = loadConfig()
+    const cfg = { ...providerUiState.config }
     cfg.primaryModel = result.primaryModel
     cfg.secondaryModel = result.secondaryModel
     if (result.browserModel) {
       cfg.browserModel = result.browserModel
     }
 
-    // Update React state
     setPrimaryModelState(result.primaryModel)
     setSecondaryModelState(result.secondaryModel)
     if (result.browserModel) setBrowserModelState(result.browserModel)
 
-    // Set runtime models
-    const primaryAuth = getAuth(result.primaryModel.providerId)
-    setModel('primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, false)
-    const secondaryAuth = getAuth(result.secondaryModel.providerId)
-    setModel('secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
+    const primaryAuth = await providerRuntime.auth.getAuth(result.primaryModel.providerId)
+    await providerRuntime.state.setSelection('primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, { persist: false })
+    const secondaryAuth = await providerRuntime.auth.getAuth(result.secondaryModel.providerId)
+    await providerRuntime.state.setSelection('secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
     if (result.browserModel) {
-      const browserAuth = getAuth(result.browserModel.providerId)
-      setModel('browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, false)
+      const browserAuth = await providerRuntime.auth.getAuth(result.browserModel.providerId)
+      await providerRuntime.state.setSelection('browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, { persist: false })
     }
 
     if (wizardNeedsChromium) {
-      // Save config but don't mark complete yet — advance to browser step
-      saveConfig(cfg)
+      await providerRuntime.config.saveConfig(cfg)
+      await reloadProviderState()
       setWizardStep('browser')
     } else {
-      // Chromium already installed — finish wizard
       cfg.setupComplete = true
-      saveConfig(cfg)
+      await providerRuntime.config.saveConfig(cfg)
+      await reloadProviderState()
       finishWizard()
     }
-  }, [authFlow.cancelAll, wizardNeedsChromium, finishWizard])
+  }, [authFlow.cancelAll, wizardNeedsChromium, finishWizard, providerUiState, providerRuntime, reloadProviderState])
 
-  const handleWizardBrowserComplete = useCallback(() => {
-    const cfg = loadConfig()
-    cfg.setupComplete = true
-    saveConfig(cfg)
+  const handleWizardBrowserComplete = useCallback(async () => {
+    if (!providerUiState) return
+    const cfg = { ...providerUiState.config, setupComplete: true }
+    await providerRuntime.config.saveConfig(cfg)
+    await reloadProviderState()
     finishWizard()
-  }, [finishWizard])
+  }, [finishWizard, providerUiState, providerRuntime, reloadProviderState])
 
-  const handleWizardSkip = useCallback(() => {
+  const handleWizardSkip = useCallback(async () => {
+    if (!providerUiState) return
     authFlow.cancelAll()
-    // Mark setup as complete so it doesn't reappear
-    const cfg = loadConfig()
-    cfg.setupComplete = true
-    saveConfig(cfg)
+    const cfg = { ...providerUiState.config, setupComplete: true }
+    await providerRuntime.config.saveConfig(cfg)
+    await reloadProviderState()
     finishWizard()
-  }, [authFlow.cancelAll, finishWizard])
+  }, [authFlow.cancelAll, finishWizard, providerUiState, providerRuntime, reloadProviderState])
 
   const handleWizardBack = useCallback(() => {
     if (wizardStep === 'browser') {
@@ -1172,47 +1245,47 @@ function AppInner({
   }, [])
 
 
-  const handleProviderDisconnect = useCallback((providerId: string) => {
-    removeAuth(providerId)
+  const handleProviderDisconnect = useCallback(async (providerId: string) => {
+    if (!providerUiState) return
+    await providerRuntime.auth.removeAuth(providerId)
 
-    // If primary/secondary/browser model uses this provider, clear it
-    const cfg = loadConfig()
+    const cfg = { ...providerUiState.config }
     let modelChanged = false
     if (primaryModel?.providerId === providerId) {
       setPrimaryModelState(null)
-      clearModel('primary')
+      await providerRuntime.state.clear('primary')
       cfg.primaryModel = null
       modelChanged = true
     }
     if (secondaryModel?.providerId === providerId) {
       setSecondaryModelState(null)
-      clearModel('secondary')
+      await providerRuntime.state.clear('secondary')
       cfg.secondaryModel = null
       modelChanged = true
     }
     if (browserModel?.providerId === providerId) {
       setBrowserModelState(null)
-      clearModel('browser')
+      await providerRuntime.state.clear('browser')
       cfg.browserModel = null
       modelChanged = true
     }
     if (modelChanged) {
-      saveConfig(cfg)
+      await providerRuntime.config.saveConfig(cfg)
     }
-    // Handle local provider: also clear providerOptions
     if (providerId === 'local') {
-      const lcfg = loadConfig()
-      if (lcfg.providerOptions?.local) {
-        delete lcfg.providerOptions.local
-        saveConfig(lcfg)
+      const localCfg = { ...cfg }
+      if (localCfg.providerOptions?.local) {
+        delete localCfg.providerOptions.local
+        await providerRuntime.config.saveConfig(localCfg)
       }
-      setLocalProviderConfig('', '')
+      await providerRuntime.config.setLocalProviderConfig('', '')
     }
 
+    await reloadProviderState()
     setProviderDetailSelectedIndex(0)
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(`Disconnected ${getProvider(providerId)?.name ?? providerId}`, theme.warning)
-  }, [primaryModel, secondaryModel, browserModel, showEphemeral, theme.warning])
+  }, [primaryModel, secondaryModel, browserModel, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderState])
 
   const handleProviderDetailBack = useCallback(() => {
     setProviderDetailId(null)
@@ -1550,9 +1623,10 @@ function AppInner({
               key.preventDefault()
             }
             // Single-tap exit during wizard — mark setup complete and exit
-            const cfg = loadConfig()
-            cfg.setupComplete = true
-            saveConfig(cfg)
+            if (providerUiState) {
+              const cfg = { ...providerUiState.config, setupComplete: true }
+              void providerRuntime.config.saveConfig(cfg).then(() => reloadProviderState())
+            }
             authFlow.cancelAll()
             process.kill(process.pid, 'SIGINT')
             return
@@ -2085,6 +2159,16 @@ function AppInner({
           onChangeBrowser={handleChangeBrowser}
           modelPrefsSelectedIndex={preferencesSelectedIndex}
           onModelPrefsHoverIndex={setPreferencesSelectedIndex}
+          localProviderConfig={providerUiState?.localProviderConfig
+            ? {
+                baseUrl: providerUiState.localProviderConfig.baseUrl ?? undefined,
+                modelId: providerUiState.localProviderConfig.modelId ?? undefined,
+              }
+            : null}
+          localProviderAuth={(() => {
+            const localDetected = detectedProviders.find((d) => d.provider.id === 'local')
+            return localDetected?.auth?.type === 'api' ? localDetected.auth : null
+          })()}
         />
       </box>
     )
@@ -2112,11 +2196,11 @@ function AppInner({
   }
 
   if (authFlow.showLocalSetup) {
-    const localConfig = getLocalProviderConfig()
+    const localConfig = providerUiState?.localProviderConfig
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
         <LocalProviderOverlay
-          initialConfig={{ url: localConfig.baseUrl, modelId: localConfig.modelId }}
+          initialConfig={{ url: localConfig?.baseUrl ?? '', modelId: localConfig?.modelId ?? '' }}
           onSubmit={authFlow.handleLocalSetupSubmit}
           onCancel={authFlow.handleLocalSetupCancel}
           wizardMode={showSetupWizard ? {
@@ -2447,10 +2531,9 @@ function AppInner({
                   {bashMode ? (
                     <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
                   ) : (() => {
-                    const _primaryModel = peekSlot('primary')?.model
-                    const summary = _primaryModel ? {
-                      provider: getProvider(_primaryModel.providerId)?.name ?? _primaryModel.providerId,
-                      model: _primaryModel.name,
+                    const summary = primaryModel ? {
+                      provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
+                      model: modelItems.find((item) => item.providerId === primaryModel.providerId && item.modelId === primaryModel.modelId)?.modelName ?? primaryModel.modelId,
                     } : null
                     return (
                       <>
@@ -2531,7 +2614,7 @@ function AppInner({
             {tokenEstimate > 0 && (
               <ContextUsageBar
                 tokenEstimate={tokenEstimate}
-                hardCap={contextLimits.hardCap}
+                hardCap={contextHardCap ?? tokenEstimate}
                 isCompacting={isCompacting}
               />
             )}

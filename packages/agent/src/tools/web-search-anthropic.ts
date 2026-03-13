@@ -1,5 +1,4 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { getAuth } from "@magnitudedev/providers";
 import type { SearchAuth, WebSearchResponse, WebSearchToolResult, SearchOptions } from "./web-search";
 
 /**
@@ -171,17 +170,4 @@ export async function* anthropicWebSearchStream(
   };
 }
 
-// Quick test
-if (import.meta.main) {
-  const auth = getAuth("anthropic");
-  if (!auth) {
-    console.error("No Anthropic auth found. Set ANTHROPIC_API_KEY or configure via the app.");
-    process.exit(1);
-  }
-  const searchAuth: SearchAuth =
-    auth.type === "oauth"
-      ? { type: "oauth-token", value: auth.accessToken }
-      : { type: "api-key", value: (auth as any).key };
-  const result = await anthropicWebSearch("What is the current price of Bitcoin?", searchAuth);
-  console.log(JSON.stringify(result, null, 2));
-}
+

@@ -8,7 +8,6 @@ import type { SessionContext, GitContext } from '../events'
 import { scanSkills } from './skill-scanner'
 import { runGitCommand } from './git-command'
 import { knapsackFolderTree } from './folder-tree-knapsack'
-import { loadConfig } from '@magnitudedev/providers'
 
 // =============================================================================
 // Constants
@@ -162,14 +161,13 @@ async function readUserMemory(cwd: string): Promise<string | null> {
 
 export interface CollectSessionContextOptions {
   cwd?: string
+  memoryEnabled?: boolean
 }
 
 export async function collectSessionContext(opts?: CollectSessionContextOptions): Promise<SessionContext> {
   const cwd = opts?.cwd ?? process.cwd()
   const platform = normalizePlatform(process.platform)
-
-  const cfg = loadConfig()
-  const memoryEnabled = cfg.memory !== false
+  const memoryEnabled = opts?.memoryEnabled ?? true
 
   const [git, folderStructure, userInfo, agentsFile, skills, userMemory] = await Promise.all([
     collectGitContext(cwd),

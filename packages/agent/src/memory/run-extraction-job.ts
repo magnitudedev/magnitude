@@ -1,7 +1,7 @@
 import { writeFile } from 'fs/promises'
 import { Effect, Layer } from 'effect'
 import { logger } from '@magnitudedev/logger'
-import { initializeProviderState, ModelResolver, makeModelResolver, makeNoopTracer, ExtractMemoryDiff } from '@magnitudedev/providers'
+import { bootstrapProviderRuntime, ModelResolver, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, ExtractMemoryDiff } from '@magnitudedev/providers'
 import { applyMemoryDiff, enforceLineBudget, ensureMemoryFile, readMemory, type MemoryDiff } from './memory-file'
 import { withTraceScope } from '../tracing'
 import { buildExtractionTranscript, readEventsJsonl } from './transcript'
@@ -22,7 +22,8 @@ export async function runExtractionJobFromFile(jobFilePath: string): Promise<voi
   await markJobRunning(jobFilePath, job)
 
   try {
-    await initializeProviderState()
+    const providerRuntime = makeProviderRuntimeLive()
+    await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
 
     await ensureMemoryFile(job.cwd)
     const [events, currentMemory] = await Promise.all([
@@ -33,7 +34,7 @@ export async function runExtractionJobFromFile(jobFilePath: string): Promise<voi
     const transcript = buildExtractionTranscript(events)
 
     const tracerLayer = makeNoopTracer()
-    const resolverLayer = makeModelResolver()
+    const resolverLayer = Layer.provide(makeModelResolver(), providerRuntime)
 
     const result = await Effect.runPromise(
       Effect.gen(function* () {
@@ -46,7 +47,7 @@ export async function runExtractionJobFromFile(jobFilePath: string): Promise<voi
             { transcript, currentMemory },
           ),
         )
-      }).pipe(Effect.provide(Layer.merge(resolverLayer, tracerLayer))),
+      }).pipe(Effect.provide(Layer.merge(resolverLayer, Layer.merge(providerRuntime, tracerLayer)))),
     )
 
     const diff = parseJsonDiff(result)

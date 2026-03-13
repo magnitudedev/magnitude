@@ -40,7 +40,7 @@ import { UserPresenceWorker } from '../workers/user-presence-worker'
 // Runtime/services
 import { ExecutionManager, ExecutionManagerLive } from '../execution/execution-manager'
 import { BrowserServiceLive } from '../services/browser-service'
-import { makeTestResolver, type TestModelConfig } from '@magnitudedev/providers'
+import { makeProviderRuntimeLive, makeTestResolver, type TestModelConfig } from '@magnitudedev/providers'
 import { registerApprovalBridge } from '../execution/approval-bridge'
 
 // Testing services
@@ -291,9 +291,11 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const defaultWaitTimeoutMs = options.defaults?.waitTimeoutMs ?? DEFAULT_TIMEOUT_MS
     const fakeClock = options.clock === 'fake' ? createFakeClock() : null
 
+    const providerRuntime = makeProviderRuntimeLive()
     const runtimeLayer = Layer.mergeAll(
       ExecutionManagerLive,
-      BrowserServiceLive,
+      Layer.provide(BrowserServiceLive, providerRuntime),
+      providerRuntime,
       ...(options.model
         ? [makeTestResolver(options.model as TestModelConfig)]
         : [makeTestResolver()]),

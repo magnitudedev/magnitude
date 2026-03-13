@@ -55,27 +55,23 @@ export { classifyHttpError, classifyUnknownError } from './errors/classify-error
 
 // State management
 export type { CallUsage, SlotUsage } from './state/provider-state'
-export {
-  peekSlot,
-  setModel,
-  clearModel,
-  initializeProviderState,
-  getModelContextWindow,
-  validateModelSwitch,
-  getSlotUsage,
-  resetSlotUsage,
-  accumulateUsage,
-} from './state/provider-state'
+export { peekSlot, getModelContextWindow } from './state/provider-state'
 
 
 // Resolver (Effect services)
 export { ModelResolver } from './resolver/model-resolver'
-export type { ContextLimits } from './resolver/model-resolver'
 export { makeModelResolver } from './resolver/model-resolver-live'
 export { makeTestResolver } from './resolver/model-runtime-test'
 export type { TestModelConfig } from './resolver/model-runtime-test'
 export { TraceEmitter, TracePersister, makeTracePersister, makeNoopTracer, makeTestTracer } from './resolver/tracing'
 export type { TraceData } from './resolver/tracing'
+
+// New runtime DI surface
+export { ProviderCatalog, ProviderState, ProviderConfig, ProviderAuth } from './runtime/contracts'
+export { makeProviderRuntimeLive } from './runtime/live'
+export { bootstrapProviderRuntime } from './runtime/bootstrap'
+export { createProviderClient } from './runtime/client'
+export type { ProviderClient } from './runtime/client'
 
 // Registry
 export { PROVIDERS, getProvider, getProviderIds, populateModels, getModelCost } from './registry'
@@ -84,16 +80,6 @@ export { PROVIDERS, getProvider, getProviderIds, populateModels, getModelCost } 
 export { initializeModels } from './models-dev'
 
 // Config / persistence
-export {
-  loadAuth,
-  getAuth,
-  setAuth,
-  removeAuth,
-  loadConfig,
-  saveConfig,
-  setPrimarySelection,
-  setBrowserSelection,
-} from './config'
 
 // Detection
 export { detectProviders, detectDefaultProvider, detectProviderAuthMethods } from './detect'
@@ -124,7 +110,6 @@ export {
 } from './browser-models'
 
 // Local provider config
-export { setLocalProviderConfig, getLocalProviderConfig } from './local-config'
 
 // OAuth flows
 export {

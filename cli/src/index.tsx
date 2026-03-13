@@ -3,8 +3,10 @@ process.env.BAML_LOG = 'off';
 import { createCliRenderer } from '@opentui/core'
 import { createRoot } from '@opentui/react'
 import { Command } from '@commander-js/extra-typings'
+import { createProviderClient } from '@magnitudedev/providers'
 import { App } from './app'
 import { initThemeStore, useThemeStateStore } from './hooks/use-theme'
+import { ProviderRuntimeProvider } from './providers/provider-runtime'
 import { isLightBackground } from './utils/theme'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
 import { useAltKeywords } from '@magnitudedev/xml-act'
@@ -38,7 +40,12 @@ async function main() {
       }).catch(() => {})
 
       installGracefulShutdownHandlers(renderer)
-      createRoot(renderer).render(<App resume={opts.resume ?? false} debug={opts.debug ?? false} />)
+      const providerRuntime = await createProviderClient()
+      createRoot(renderer).render(
+        <ProviderRuntimeProvider runtime={providerRuntime}>
+          <App resume={opts.resume ?? false} debug={opts.debug ?? false} />
+        </ProviderRuntimeProvider>
+      )
     })
 
   program

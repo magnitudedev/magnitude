@@ -10,8 +10,9 @@ import { CollectorData } from '../drivers/types'
 import { logger } from '@magnitudedev/logger'
 import type { ModelError } from '../errors/model-error'
 import { isRetryableError } from '../errors/classify-error'
-import { accumulateUsage } from '../state/provider-state'
+
 import type { ModelSlot } from '../state/provider-state'
+import { ProviderState, type ProviderStateShape } from '../runtime/contracts'
 import { TraceEmitter } from './tracing'
 
 /** Retry schedule for transient connection failures before first chunk */
@@ -37,6 +38,17 @@ export function createBoundModel(
   connection: ModelConnection,
   driver: ExecutableDriver,
   inference: InferenceConfig = {},
+): Effect.Effect<BoundModel, never, ProviderState> {
+  return Effect.map(ProviderState, (providerState) => createBoundModelImpl(slot, model, connection, driver, inference, providerState))
+}
+
+function createBoundModelImpl(
+  slot: ModelSlot,
+  model: Model,
+  connection: ModelConnection,
+  driver: ExecutableDriver,
+  inference: InferenceConfig,
+  providerState: ProviderStateShape,
 ): BoundModel {
   const boundModel: BoundModel = {
     model,
@@ -121,7 +133,7 @@ export function createBoundModel(
             )
           }
 
-          // Build the full stream: first chunk + tail, with scope cleanup and tracing
+          // Build the full stream: first chunk + tail, with scope cleanup, tracing, and usage accumulation
           const fullStream = (firstChunk !== null
             ? Stream.concat(Stream.make(firstChunk), tailStream)
             : tailStream
@@ -129,6 +141,14 @@ export function createBoundModel(
             Stream.ensuring(
               Effect.all([
                 Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
+                Effect.suspend(() => {
+                  const usage = result.getUsage()
+                  if (usage) {
+                    usageCache = usage
+                    return providerState.accumulateUsage(slot, usage)
+                  }
+                  return Effect.void
+                }),
                 Effect.sync(() => maybeTrace()),
               ])
             ),
@@ -139,7 +159,6 @@ export function createBoundModel(
             getUsage() {
               if (!usageCache) {
                 usageCache = result.getUsage()
-                accumulateUsage(slot, usageCache)
               }
               return usageCache
             },
@@ -191,7 +210,7 @@ export function createBoundModel(
           durationMs: Date.now() - startMs,
         })
 
-        accumulateUsage(slot, usage)
+        if (usage) yield* providerState.accumulateUsage(slot, usage)
         return { result: result as BamlResult<K>, usage }
       })
     },

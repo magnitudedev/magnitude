@@ -8,7 +8,7 @@
 
 import { Context, Effect, Layer } from 'effect'
 import { WebHarness, BrowserProvider, type WebHarnessOptions } from '@magnitudedev/browser-harness'
-import { peekSlot } from '@magnitudedev/providers'
+import { ProviderState } from '@magnitudedev/providers'
 
 export interface BrowserServiceShape {
   readonly get: (forkId: string) => Effect.Effect<WebHarness>
@@ -23,6 +23,7 @@ export class BrowserService extends Context.Tag('BrowserService')<
 export const BrowserServiceLive = Layer.scoped(
   BrowserService,
   Effect.gen(function* () {
+    const providerState = yield* ProviderState
     const harnesses = new Map<string, WebHarness>()
 
     yield* Effect.addFinalizer(() =>
@@ -46,8 +47,8 @@ export const BrowserServiceLive = Layer.scoped(
 
           // Gemini models use a 1000x1000 coordinate grid; set virtualScreenDimensions
           // so the harness transforms coordinates to the actual viewport
-          const browserModel = peekSlot('browser')?.model
-          const isGemini = browserModel?.providerId === 'google' || browserModel?.providerId === 'google-vertex'
+          const browserModel = await Effect.runPromise(providerState.peek('browser'))
+          const isGemini = browserModel?.model.providerId === 'google' || browserModel?.model.providerId === 'google-vertex'
           const harnessOptions: WebHarnessOptions = isGemini
             ? { virtualScreenDimensions: { width: 1000, height: 1000 } }
             : {}

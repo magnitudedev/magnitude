@@ -1,6 +1,7 @@
 import { Effect, Layer } from 'effect'
-import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer } from '@magnitudedev/providers'
+import { ModelResolver, makeModelResolver, makeNoopTracer } from '@magnitudedev/providers'
 import { type RunnableEval, type Scenario, type ScenarioResult, type Check, type CheckResult, type EvalVariant, type ModelSpec, type ChatMessage } from '../../types'
+import { getEvalProviderClient } from '../../provider-runtime'
 import type { TestSandboxResult } from '../../test-sandbox'
 import { callModel } from '../../runner'
 import { FORMATS } from './formats'
@@ -378,8 +379,9 @@ const callModelOpenAINative = async (
   modelSpec: ModelSpec,
   tools: FakeTool[]
 ): Promise<string> => {
-  const auth = getAuth(modelSpec.provider)
-  setModel('primary', modelSpec.provider, modelSpec.model, auth ?? null, false)
+  const providerClient = await getEvalProviderClient()
+  const auth = await providerClient.auth.getAuth(modelSpec.provider)
+  await providerClient.state.setSelection('primary', modelSpec.provider, modelSpec.model, auth ?? null, { persist: false })
 
   const toolDefs = tools.map((tool) => ({
     type: 'function' as const,
@@ -399,7 +401,7 @@ const callModelOpenAINative = async (
     Effect.gen(function* () {
       const runtime = yield* ModelResolver
       return yield* runtime.resolve('primary')
-    }).pipe(Effect.provide(makeModelResolver().pipe(Layer.provide(makeNoopTracer())))),
+    }).pipe(Effect.provide(makeModelResolver().pipe(Layer.provide(providerClient.layer), Layer.provide(makeNoopTracer())))),
   )
   if (bound.connection._tag !== 'Responses') {
     throw new Error('OpenAI native format requires a Responses connection')

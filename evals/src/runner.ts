@@ -5,10 +5,11 @@
 
 import { Effect, Layer, Stream } from 'effect'
 import { type ChatMessage, BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
-import { setModel, getAuth, ModelResolver, makeModelResolver, makeNoopTracer, CodingAgentChat } from '@magnitudedev/providers'
+import { ModelResolver, makeModelResolver, makeNoopTracer, CodingAgentChat } from '@magnitudedev/providers'
 import { isRunnableEval, type Eval, type ModelSpec, type ScenarioResult, type EvalRunResult, type Scenario, type CheckResult } from './types'
 import type { TestSandboxResult } from './test-sandbox'
 import { generateModelReport, generateSummaryReport } from './results'
+import { getEvalProviderClient } from './provider-runtime'
 
 function resolveCheckScore(checkResult: CheckResult): number {
   return checkResult.score ?? (checkResult.passed ? 1 : 0)
@@ -87,8 +88,9 @@ export async function callModel(
   messages: ChatMessage[],
   modelSpec: ModelSpec
 ): Promise<string> {
-  const auth = getAuth(modelSpec.provider)
-  setModel('primary', modelSpec.provider, modelSpec.model, auth ?? null, false)
+  const client = await getEvalProviderClient()
+  const auth = await client.auth.getAuth(modelSpec.provider)
+  await client.state.setSelection('primary', modelSpec.provider, modelSpec.model, auth ?? null, { persist: false })
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -104,7 +106,7 @@ export async function callModel(
               ackTurn: '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>',
             },
           )
-        }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(makeNoopTracer())), makeNoopTracer()))),
+        }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(client.layer), Layer.provide(makeNoopTracer())), makeNoopTracer()))),
       )
       const result = await Effect.runPromise(Stream.runFold(chatStream.stream, '', (acc, chunk) => acc + chunk))
       return result

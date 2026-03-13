@@ -3,7 +3,7 @@ import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { BOX_CHARS } from '../utils/ui-constants'
-import { getLocalProviderConfig, getAuth, type ProviderDefinition, type DetectedProvider, type ModelSelection, type ProviderAuthMethodStatus } from '@magnitudedev/agent'
+import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus } from '@magnitudedev/agent'
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
 
@@ -62,6 +62,8 @@ interface SettingsOverlayProps {
   onChangeBrowser: () => void
   modelPrefsSelectedIndex: number
   onModelPrefsHoverIndex?: (index: number) => void
+  localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null
+  localProviderAuth?: { type: 'api'; key: string } | null
 }
 
 function resolveModelDisplay(
@@ -107,6 +109,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onChangeBrowser,
   modelPrefsSelectedIndex,
   onModelPrefsHoverIndex,
+  localProviderConfig,
+  localProviderAuth,
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const [hoveredTab, setHoveredTab] = useState<SettingsTab | null>(null)
@@ -475,31 +479,29 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
                     {/* Local provider details */}
                     {m.connected && m.method.type === 'none' && providerDetailStatus.provider.id === 'local' && (() => {
-                      const localConfig = getLocalProviderConfig()
-                      const localAuth = getAuth('local')
                       return (
                         <>
-                          {localConfig.baseUrl && (
+                          {localProviderConfig?.baseUrl && (
                             <box style={{ paddingLeft: 4 }}>
                               <text style={{ fg: theme.foreground }}>
                                 {'URL: '}
-                                <span attributes={TextAttributes.DIM}>{localConfig.baseUrl}</span>
+                                <span attributes={TextAttributes.DIM}>{localProviderConfig.baseUrl}</span>
                               </text>
                             </box>
                           )}
-                          {localConfig.modelId && (
+                          {localProviderConfig?.modelId && (
                             <box style={{ paddingLeft: 4 }}>
                               <text style={{ fg: theme.foreground }}>
                                 {'Model: '}
-                                <span attributes={TextAttributes.DIM}>{localConfig.modelId}</span>
+                                <span attributes={TextAttributes.DIM}>{localProviderConfig.modelId}</span>
                               </text>
                             </box>
                           )}
-                          {localAuth?.type === 'api' && (
+                          {localProviderAuth?.type === 'api' && (
                             <box style={{ paddingLeft: 4 }}>
                               <text style={{ fg: theme.foreground }}>
                                 {'Key: '}
-                                <span attributes={TextAttributes.DIM}>{maskApiKey(localAuth.key)}</span>
+                                <span attributes={TextAttributes.DIM}>{maskApiKey(localProviderAuth.key)}</span>
                               </text>
                             </box>
                           )}
