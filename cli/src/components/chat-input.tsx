@@ -46,6 +46,8 @@ export const ChatInput = memo(function ChatInput({
         lastEditDueToNav: false,
         pasteSegments: [],
         selectedPasteSegmentId: null,
+      mentionSegments: [],
+      selectedMentionSegmentId: null,
       })
     } else {
       setInternalValue(newValue)
@@ -107,6 +109,8 @@ export const ChatInput = memo(function ChatInput({
               lastEditDueToNav: true,
               pasteSegments: [],
               selectedPasteSegmentId: null,
+      mentionSegments: [],
+      selectedMentionSegmentId: null,
             })
           } else {
             setInternalCursor(newCursor)
@@ -124,6 +128,8 @@ export const ChatInput = memo(function ChatInput({
               lastEditDueToNav: true,
               pasteSegments: [],
               selectedPasteSegmentId: null,
+      mentionSegments: [],
+      selectedMentionSegmentId: null,
             })
           } else {
             setInternalCursor(newCursor)
@@ -140,6 +146,8 @@ export const ChatInput = memo(function ChatInput({
               lastEditDueToNav: true,
               pasteSegments: [],
               selectedPasteSegmentId: null,
+      mentionSegments: [],
+      selectedMentionSegmentId: null,
             })
           } else {
             setInternalCursor(0)
@@ -156,6 +164,8 @@ export const ChatInput = memo(function ChatInput({
               lastEditDueToNav: true,
               pasteSegments: [],
               selectedPasteSegmentId: null,
+      mentionSegments: [],
+      selectedMentionSegmentId: null,
             })
           } else {
             setInternalCursor(value.length)

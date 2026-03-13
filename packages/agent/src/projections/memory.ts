@@ -6,14 +6,14 @@
  */
 
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart, StrategyId, Attachment } from '../events'
+import type { AppEvent, ResponsePart, StrategyId, Attachment, ResolvedMention } from '../events'
 import { ForkProjection } from './fork'
 
 import { SubagentActivityProjection } from './subagent-activity'
 import { AgentRegistryProjection } from './agent-registry'
 
 import { CanonicalTurnProjection } from './canonical-turn'
-import { SessionContextProjection } from './session-context'
+
 import { OutboundMessagesProjection } from './outbound-messages'
 
 import {
@@ -81,8 +81,62 @@ function extractText(parts: readonly ContentPart[]): string {
     .join('')
 }
 
-function toCommsImageAttachment(attachment: Attachment): CommsAttachment {
-  return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
+function toCommsAttachment(attachment: Attachment): CommsAttachment {
+  switch (attachment.type) {
+    case 'image':
+      return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
+    case 'mention':
+      return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: attachment.content }
+  }
+}
+
+function patchCommsEntryMentions(entry: CommsEntry, resolvedMentions: readonly ResolvedMention[]): CommsEntry {
+  if (entry.kind !== 'user' || !entry.attachments || entry.attachments.length === 0) return entry
+
+  const resolvedByKey = new Map(resolvedMentions.map(mention => [`${mention.contentType}:${mention.path}`, mention] as const))
+  let changed = false
+
+  const attachments = entry.attachments.map(attachment => {
+    if (attachment.kind !== 'mention') return attachment
+    const resolved = resolvedByKey.get(`${attachment.contentType}:${attachment.path}`)
+    if (!resolved) return attachment
+
+    changed = true
+    return {
+      ...attachment,
+      content: resolved.content,
+      error: resolved.error,
+      truncated: resolved.truncated,
+      originalBytes: resolved.originalBytes,
+    }
+  })
+
+  return changed ? { ...entry, attachments } : entry
+}
+
+function patchCommsCollections(
+  messages: readonly Message[],
+  queuedMessages: readonly QueuedMessage[],
+  sourceMessageTimestamp: number,
+  resolvedMentions: readonly ResolvedMention[]
+): { messages: readonly Message[]; queuedMessages: readonly QueuedMessage[] } {
+  const patchedMessages = messages.map(message => {
+    if (message.type !== 'comms_inbox') return message
+    const entries = message.entries.map(entry =>
+      entry.kind === 'user' && entry.timestamp === sourceMessageTimestamp
+        ? patchCommsEntryMentions(entry, resolvedMentions)
+        : entry
+    )
+    return { ...message, entries }
+  })
+
+  const patchedQueuedMessages = queuedMessages.map(queued => {
+    if (queued.kind !== 'comms') return queued
+    if (queued.entry.kind !== 'user' || queued.entry.timestamp !== sourceMessageTimestamp) return queued
+    return { ...queued, entry: patchCommsEntryMentions(queued.entry, resolvedMentions) }
+  })
+
+  return { messages: patchedMessages, queuedMessages: patchedQueuedMessages }
 }
 
 /** Append system entries to a messages array, merging with the most recent system_inbox if no assistant message is in between */
@@ -133,7 +187,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
-  reads: [ForkProjection, ArtifactAwarenessProjection, AgentRegistryProjection, SubagentActivityProjection, CanonicalTurnProjection, SessionContextProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
+  reads: [ForkProjection, ArtifactAwarenessProjection, AgentRegistryProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -153,7 +207,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
     user_message: ({ event, fork }) => {
       const text = extractText(event.content)
-      const attachments = (event.attachments ?? []).map(toCommsImageAttachment)
+      const attachments = (event.attachments ?? []).map(toCommsAttachment)
       const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments }
 
       if (fork.currentTurnId !== null) {
@@ -166,6 +220,20 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return {
         ...fork,
         messages: [...fork.messages, { type: 'comms_inbox', source: 'system', entries: [entry] }],
+      }
+    },
+
+    file_mention_resolved: ({ event, fork }) => {
+      const patched = patchCommsCollections(
+        fork.messages,
+        fork.queuedMessages,
+        event.sourceMessageTimestamp,
+        event.mentions
+      )
+      return {
+        ...fork,
+        messages: patched.messages,
+        queuedMessages: patched.queuedMessages,
       }
     },
 

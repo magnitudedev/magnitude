@@ -10,6 +10,8 @@ interface SlashCommandsState {
   filteredCommands: SlashCommandDefinition[]
   /** Index of the currently highlighted command */
   selectedIndex: number
+  /** Set highlighted index (used by mouse hover) */
+  setSelectedIndex: (index: number) => void
   /** Key intercept handler to pass to MultilineInput.onKeyIntercept */
   handleKeyIntercept: (key: KeyEvent) => boolean
   /** Get the command string for the currently selected item (e.g., "/exit") */
@@ -93,6 +95,7 @@ export function useSlashCommands(
     isSlashMenuOpen,
     filteredCommands,
     selectedIndex,
+    setSelectedIndex,
     handleKeyIntercept,
     getSelectedCommandText,
   }

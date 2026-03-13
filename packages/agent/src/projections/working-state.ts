@@ -27,6 +27,7 @@ export interface ForkWorkingState {
   readonly contextLimitBlocked: boolean
   readonly pendingApproval: boolean
   readonly softInterrupted: boolean
+  readonly pendingMentionTimestamps: readonly number[]
 }
 
 // =============================================================================
@@ -34,7 +35,7 @@ export interface ForkWorkingState {
 // =============================================================================
 
 export const shouldTrigger = (state: ForkWorkingState): boolean =>
-  !state.working && state.willContinue && !state.compactionPending && !state.contextLimitBlocked
+  !state.working && state.willContinue && !state.compactionPending && !state.contextLimitBlocked && state.pendingMentionTimestamps.length === 0
 
 export const isStable = (state: ForkWorkingState): boolean =>
   !state.working && !state.willContinue && !state.compactionPending && !state.contextLimitBlocked
@@ -56,7 +57,8 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     compactionPending: false,
     contextLimitBlocked: false,
     pendingApproval: false,
-    softInterrupted: false
+    softInterrupted: false,
+    pendingMentionTimestamps: []
   },
 
   signals: {
@@ -68,11 +70,15 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
   eventHandlers: {
     user_message: ({ event, fork, emit }) => {
       const isQueued = fork.working
+      const hasMentions = (event.attachments ?? []).some(attachment => attachment.type === 'mention')
 
       const newFork: ForkWorkingState = {
         ...fork,
         willContinue: true,
-        hasQueuedMessages: fork.hasQueuedMessages || isQueued
+        hasQueuedMessages: fork.hasQueuedMessages || isQueued,
+        pendingMentionTimestamps: hasMentions
+          ? [...fork.pendingMentionTimestamps, event.timestamp]
+          : fork.pendingMentionTimestamps
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -82,6 +88,25 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           chainId: newFork.currentChainId
         })
       }
+      return newFork
+    },
+
+    file_mention_resolved: ({ event, fork, emit }) => {
+      const newFork: ForkWorkingState = {
+        ...fork,
+        pendingMentionTimestamps: fork.pendingMentionTimestamps.filter(
+          timestamp => timestamp !== event.sourceMessageTimestamp
+        )
+      }
+
+      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
+        emit.shouldTriggerChanged({
+          forkId: event.forkId,
+          shouldTrigger: shouldTrigger(newFork),
+          chainId: newFork.currentChainId
+        })
+      }
+
       return newFork
     },
 

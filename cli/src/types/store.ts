@@ -9,12 +9,22 @@ export type InputPasteSegment = {
   end: number
 }
 
+export type InputMentionSegment = {
+  id: string
+  path: string
+  contentType: 'text' | 'image' | 'directory'
+  start: number
+  end: number
+}
+
 export type InputValue = {
   text: string
   cursorPosition: number
   lastEditDueToNav: boolean
   pasteSegments: InputPasteSegment[]
   selectedPasteSegmentId?: string | null
+  mentionSegments: InputMentionSegment[]
+  selectedMentionSegmentId?: string | null
 }
 
 export type AskUserQuestion = {

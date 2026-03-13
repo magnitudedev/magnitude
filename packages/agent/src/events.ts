@@ -12,7 +12,7 @@ import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ObservationPart } from '@magnitudedev/agent-definition'
 
-export type Attachment = ImageAttachment
+export type Attachment = ImageAttachment | MentionAttachment
 
 export interface ImageAttachment {
   readonly type: 'image'
@@ -21,6 +21,22 @@ export interface ImageAttachment {
   readonly width: number
   readonly height: number
   readonly filename: string
+}
+
+export type MentionAttachment = {
+  readonly type: 'mention'
+  readonly path: string
+  readonly contentType: 'text' | 'image' | 'directory'
+  readonly content?: string  // optional for backward compat with old sessions
+}
+
+export type ResolvedMention = {
+  path: string
+  contentType: 'text' | 'image' | 'directory'
+  content?: string
+  error?: string
+  truncated?: boolean
+  originalBytes?: number
 }
 // =============================================================================
 // Strategy & Response Types (defined here to avoid circular imports)
@@ -83,6 +99,13 @@ export interface ObservationsCaptured {
   readonly forkId: string | null
   readonly turnId: string
   readonly parts: readonly ObservationPart[]
+}
+
+export type FileMentionResolved = {
+  type: 'file_mention_resolved'
+  forkId: string | null
+  sourceMessageTimestamp: number
+  mentions: readonly ResolvedMention[]
 }
 
 // =============================================================================
@@ -465,6 +488,7 @@ export type AppEvent =
   | SessionInitialized
   | UserMessage
   | ObservationsCaptured
+  | FileMentionResolved
   | TurnStarted
   | TurnCompleted
   | TurnUnexpectedError
