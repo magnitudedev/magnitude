@@ -99,6 +99,24 @@ export function createStreamingXmlParser(
     return phase === FencePhase.Tick3 || phase === FencePhase.XML || phase === FencePhase.TrailingWs
   }
 
+  function structuralDepth(tagName: string): number {
+    return ctx.structuralDepths.get(tagName) ?? 0
+  }
+
+  function isInStructural(tagName: string): boolean {
+    return structuralDepth(tagName) > 0
+  }
+
+  function enterStructural(tagName: string): void {
+    ctx.structuralDepths.set(tagName, structuralDepth(tagName) + 1)
+  }
+
+  function exitStructural(tagName: string): void {
+    const depth = structuralDepth(tagName)
+    if (depth <= 1) ctx.structuralDepths.delete(tagName)
+    else ctx.structuralDepths.set(tagName, depth - 1)
+  }
+
   /** Emit prose chunk, updating proseAccum */
   function rawEmitProse(fence: FenceState, proseAccum: string, text: string): string {
     if (text.length === 0) return proseAccum
@@ -176,7 +194,7 @@ export function createStreamingXmlParser(
   }
 
   function appendProseChar(s: Extract<ParserState, { _tag: 'Prose' }>, ch: string): void {
-    if (ctx.inInspect) return
+    if (isInStructural('inspect')) return
     const fence = s.fence
 
     if (ch === '\n') {
@@ -294,7 +312,7 @@ export function createStreamingXmlParser(
   // ===========================================================================
 
   function isValidChildTag(parentTag: string, childTag: string): boolean {
-    if (childTag === 'ref') return true
+    if (childTag === 'ref') return resolveRef !== undefined
     const validSet = childTagMap.get(parentTag)
     return validSet ? validSet.has(childTag) : false
   }
@@ -348,25 +366,28 @@ export function createStreamingXmlParser(
   function resolveOpenTag(fence: FenceState, proseAccum: string, tagName: string, toolCallId: string, attrs: Map<string, AttributeValue>, raw: string): void {
     if (tagName === kw.actions) {
       endProseBlock(fence, proseAccum)
-      ctx.inActions = true
+      const outermost = !isInStructural(kw.actions)
+      enterStructural(kw.actions)
       ctx.lastCharNewline = false
-      emit({ _tag: 'ActionsOpen' })
+      if (outermost) emit({ _tag: 'ActionsOpen' })
       state = mkProse()
       return
     }
     if (tagName === 'inspect') {
       endProseBlock(fence, proseAccum)
-      ctx.inInspect = true
+      const outermost = !isInStructural('inspect')
+      enterStructural('inspect')
       ctx.lastCharNewline = false
-      emit({ _tag: 'InspectOpen' })
+      if (outermost) emit({ _tag: 'InspectOpen' })
       state = mkProse()
       return
     }
     if (tagName === kw.comms) {
       endProseBlock(fence, proseAccum)
-      ctx.inComms = true
+      const outermost = !isInStructural(kw.comms)
+      enterStructural(kw.comms)
       ctx.lastCharNewline = false
-      emit({ _tag: 'CommsOpen' })
+      if (outermost) emit({ _tag: 'CommsOpen' })
       state = mkProse()
       return
     }
@@ -391,7 +412,7 @@ export function createStreamingXmlParser(
       }
       return
     }
-    if (!ctx.inInspect && tagName === MESSAGE_TAG) {
+    if (!isInStructural('inspect') && tagName === MESSAGE_TAG) {
       endProseBlock(fence, proseAccum)
       const id = createMessageId()
       const dest = (attrs.get('to') as string | undefined) ?? defaultMessageDest
@@ -404,10 +425,12 @@ export function createStreamingXmlParser(
         artifactsRaw,
         body: '',
         pendingLt: false,
+        depth: 0,
+        pendingNewline: false,
       }
       return
     }
-    if (!ctx.inInspect && !ctx.inComms && knownTags.has(tagName)) {
+    if (!isInStructural('inspect') && !isInStructural(kw.comms) && knownTags.has(tagName)) {
       endProseBlock(fence, proseAccum)
       if (!toolCallId) toolCallId = generateId()
       emit({ _tag: 'TagOpened', tagName, toolCallId, attributes: new Map(attrs) })
@@ -436,7 +459,7 @@ export function createStreamingXmlParser(
       state = { _tag: 'Prose', fence, proseAccum }
       return
     }
-    if (!ctx.inActions && !ctx.inInspect && !ctx.inComms && (tagName === TURN_CONTROL_NEXT || tagName === TURN_CONTROL_YIELD)) {
+    if (!isInStructural(kw.actions) && !isInStructural('inspect') && !isInStructural(kw.comms) && (tagName === TURN_CONTROL_NEXT || tagName === TURN_CONTROL_YIELD)) {
       if (emittedTurnControl === null) {
         const decision: 'continue' | 'yield' = tagName === TURN_CONTROL_NEXT ? 'continue' : 'yield'
         emittedTurnControl = decision
@@ -445,16 +468,20 @@ export function createStreamingXmlParser(
       state = { _tag: 'Done' }
       return
     }
-    if (ctx.inInspect && tagName === 'ref') {
+    if (isInStructural('inspect') && tagName === 'ref') {
       const toolRef = attrs.get('tool')
       if (typeof toolRef === 'string') {
         const parsed = parseToolRef(toolRef)
         const query = attrs.get('query')
         if (parsed) {
-          const resolved = resolveRef?.(parsed.tag, parsed.recency, typeof query === 'string' ? query : undefined)
-          if (resolved !== undefined) {
-            emit({ _tag: 'InspectResult', toolRef, query: typeof query === 'string' ? query : undefined, content: resolved })
-          } else {
+          if (resolveRef) {
+            const resolved = resolveRef(parsed.tag, parsed.recency, typeof query === 'string' ? query : undefined)
+            if (resolved !== undefined) {
+              emit({ _tag: 'InspectResult', toolRef, query: typeof query === 'string' ? query : undefined, content: resolved })
+            } else {
+              emit({ _tag: 'ParseError', error: { _tag: 'InvalidRef', toolRef, detail: `Ref "${toolRef}" does not match any tool result from this response` } })
+            }
+          } else if (parsed.tag !== 'fs-write') {
             emit({ _tag: 'ParseError', error: { _tag: 'InvalidRef', toolRef, detail: `Ref "${toolRef}" does not match any tool result from this response` } })
           }
         } else {
@@ -464,14 +491,14 @@ export function createStreamingXmlParser(
       state = { _tag: 'Prose', fence, proseAccum }
       return
     }
-    if (!ctx.inInspect && tagName === MESSAGE_TAG) {
+    if (!isInStructural('inspect') && tagName === MESSAGE_TAG) {
       const id = createMessageId()
       const dest = (attrs.get('to') as string | undefined) ?? defaultMessageDest
       const artifactsRaw = (attrs.get('artifacts') as string | undefined) ?? null
       emit({ _tag: 'MessageTagOpen', id, dest, artifactsRaw })
       emit({ _tag: 'MessageTagClose', id })
       state = mkProse()
-    } else if (!ctx.inInspect && !ctx.inComms && knownTags.has(tagName)) {
+    } else if (!isInStructural('inspect') && !isInStructural(kw.comms) && knownTags.has(tagName)) {
       endProseBlock(fence, proseAccum)
       if (!toolCallId) toolCallId = generateId()
       const attrsCopy = new Map(attrs)
@@ -509,6 +536,7 @@ export function createStreamingXmlParser(
       case 'PendingStructuralOpen': return stepPendingStructuralOpen(state, ch)
       case 'PendingTopLevelClose': return stepPendingTopLevelClose(state, ch)
       case 'MessageBody': return stepMessageBody(state, ch)
+      case 'MessageBodyOpenTag': return stepMessageBodyOpenTag(state, ch)
       case 'MessageCloseTag': return stepMessageCloseTag(state, ch)
       case 'ToolBody': return stepToolBody(state, ch)
       case 'ToolCloseTag': return stepToolCloseTag(state, ch)
@@ -554,9 +582,9 @@ export function createStreamingXmlParser(
   /** Return the set of tags recognized in the current context.
    *  When afterNewline is false, structural tags are excluded — they only match after \n or start of input. */
   function activeTags(afterNewline: boolean): ReadonlySet<string> {
-    if (ctx.inInspect) return REF_TAG_SET
-    if (ctx.inComms) return MESSAGE_TAG_SET
-    if (ctx.inActions) return afterNewline ? actionsTags : knownTags
+    if (isInStructural('inspect')) return afterNewline ? new Set([...REF_TAG_SET, 'inspect']) : REF_TAG_SET
+    if (isInStructural(kw.comms)) return afterNewline ? new Set([...MESSAGE_TAG_SET, kw.comms]) : MESSAGE_TAG_SET
+    if (isInStructural(kw.actions)) return afterNewline ? actionsTags : knownTags
     return afterNewline ? topLevelTags : EMPTY_TAG_SET
   }
 
@@ -659,28 +687,28 @@ export function createStreamingXmlParser(
   function stepTopLevelCloseTag(s: Extract<ParserState, { _tag: 'TopLevelCloseTag' }>, ch: string): void {
     s.close.raw += ch
     if (ch === '>') {
-      if (s.afterNewline && s.close.name === kw.actions && ctx.inActions) {
-        ctx.inActions = false
+      if (s.afterNewline && s.close.name === kw.actions && isInStructural(kw.actions)) {
+        exitStructural(kw.actions)
         ctx.justClosedStructural = true
-        emit({ _tag: 'ActionsClose' })
+        if (!isInStructural(kw.actions)) emit({ _tag: 'ActionsClose' })
         state = mkProse()
-      } else if (s.afterNewline && s.close.name === 'inspect' && ctx.inInspect) {
-        ctx.inInspect = false
+      } else if (s.afterNewline && s.close.name === 'inspect' && isInStructural('inspect')) {
+        exitStructural('inspect')
         ctx.justClosedStructural = true
-        emit({ _tag: 'InspectClose' })
+        if (!isInStructural('inspect')) emit({ _tag: 'InspectClose' })
         state = mkProse()
-      } else if (s.afterNewline && s.close.name === kw.comms && ctx.inComms) {
-        ctx.inComms = false
+      } else if (s.afterNewline && s.close.name === kw.comms && isInStructural(kw.comms)) {
+        exitStructural(kw.comms)
         ctx.justClosedStructural = true
-        emit({ _tag: 'CommsClose' })
+        if (!isInStructural(kw.comms)) emit({ _tag: 'CommsClose' })
         state = mkProse()
-      } else if (!s.afterNewline && s.close.name === kw.actions && ctx.inActions) {
+      } else if (!s.afterNewline && s.close.name === kw.actions && isInStructural(kw.actions)) {
         // Actions close inline — defer: valid if next char is \n
         state = { _tag: 'PendingTopLevelClose', tagName: kw.actions, fence: s.fence, proseAccum: s.proseAccum, closeRaw: s.close.raw }
-      } else if (!s.afterNewline && s.close.name === 'inspect' && ctx.inInspect) {
+      } else if (!s.afterNewline && s.close.name === 'inspect' && isInStructural('inspect')) {
         // Inspect close inline — defer: valid if next char is \n
         state = { _tag: 'PendingTopLevelClose', tagName: 'inspect', fence: s.fence, proseAccum: s.proseAccum, closeRaw: s.close.raw }
-      } else if (!s.afterNewline && s.close.name === kw.comms && ctx.inComms) {
+      } else if (!s.afterNewline && s.close.name === kw.comms && isInStructural(kw.comms)) {
         // Comms close inline — defer: valid if next char is \n
         state = { _tag: 'PendingTopLevelClose', tagName: kw.comms, fence: s.fence, proseAccum: s.proseAccum, closeRaw: s.close.raw }
       } else {
@@ -835,10 +863,17 @@ export function createStreamingXmlParser(
     if (ch === '>') {
       if (s.think.tagName === kw.lenses && s.close.name === 'lens') {
         if (s.think.activeLens) {
-          const content = s.think.activeLens.content.trim()
-          emit({ _tag: 'LensEnd', name: s.think.activeLens.name, content })
-          s.think.lenses.push({ name: s.think.activeLens.name, content })
-          s.think.activeLens = null
+          if (s.think.activeLens.depth > 0) {
+            s.think.activeLens.depth--
+            for (const c of s.close.raw) emitThinkChar(s.think, c)
+          } else {
+            const content = s.think.activeLens.content.trim()
+            emit({ _tag: 'LensEnd', name: s.think.activeLens.name, content })
+            s.think.lenses.push({ name: s.think.activeLens.name, content })
+            s.think.activeLens = null
+          }
+        } else {
+          for (const c of s.close.raw) emitThinkChar(s.think, c)
         }
         state = { _tag: 'Think', think: s.think, pendingLt: false }
       } else if (s.close.name === s.think.tagName && s.afterNewline) {
@@ -930,7 +965,7 @@ export function createStreamingXmlParser(
     }
 
     if (ch === '>') {
-      s.think.activeLens = { name: '', content: '' }
+      s.think.activeLens = { name: '', content: '', depth: 0 }
       state = { _tag: 'Think', think: s.think, pendingLt: false }
       return
     }
@@ -944,9 +979,13 @@ export function createStreamingXmlParser(
       if (/\s/.test(ch)) return
       if (ch === '>') {
         const name = s.nameAttr ?? ''
-        emit({ _tag: 'LensStart', name })
-        emit({ _tag: 'LensEnd', name, content: '' })
-        s.think.lenses.push({ name, content: null })
+        if (s.think.activeLens) {
+          for (const c of `<lens${name ? ` name="${name}"` : ''} />`) emitThinkChar(s.think, c)
+        } else {
+          emit({ _tag: 'LensStart', name })
+          emit({ _tag: 'LensEnd', name, content: '' })
+          s.think.lenses.push({ name, content: null })
+        }
         state = { _tag: 'Think', think: s.think, pendingLt: false }
         return
       }
@@ -979,8 +1018,13 @@ export function createStreamingXmlParser(
 
     if (ch === '>') {
       const name = s.nameAttr ?? ''
-      s.think.activeLens = { name, content: '' }
-      emit({ _tag: 'LensStart', name })
+      if (s.think.activeLens) {
+        s.think.activeLens.depth++
+        for (const c of `<lens${name ? ` name="${name}"` : ''}>`) emitThinkChar(s.think, c)
+      } else {
+        s.think.activeLens = { name, content: '', depth: 0 }
+        emit({ _tag: 'LensStart', name })
+      }
       state = { _tag: 'Think', think: s.think, pendingLt: false }
       return
     }
@@ -1028,17 +1072,17 @@ export function createStreamingXmlParser(
   function stepPendingTopLevelClose(s: Extract<ParserState, { _tag: 'PendingTopLevelClose' }>, ch: string): void {
     if (ch === '\n') {
       if (s.tagName === kw.actions) {
-        ctx.inActions = false
+        exitStructural(kw.actions)
         ctx.justClosedStructural = true
-        emit({ _tag: 'ActionsClose' })
+        if (!isInStructural(kw.actions)) emit({ _tag: 'ActionsClose' })
       } else if (s.tagName === 'inspect') {
-        ctx.inInspect = false
+        exitStructural('inspect')
         ctx.justClosedStructural = true
-        emit({ _tag: 'InspectClose' })
+        if (!isInStructural('inspect')) emit({ _tag: 'InspectClose' })
       } else if (s.tagName === kw.comms) {
-        ctx.inComms = false
+        exitStructural(kw.comms)
         ctx.justClosedStructural = true
-        emit({ _tag: 'CommsClose' })
+        if (!isInStructural(kw.comms)) emit({ _tag: 'CommsClose' })
       }
       ctx.lastCharNewline = true
       state = mkProse()
@@ -1055,6 +1099,13 @@ export function createStreamingXmlParser(
   // Step: MessageBody / MessageCloseTag
   // ===========================================================================
 
+  function flushPendingMessageNewline(s: Extract<ParserState, { _tag: 'MessageBody' }>): void {
+    if (!s.pendingNewline) return
+    s.pendingNewline = false
+    s.body += '\n'
+    emit({ _tag: 'MessageBodyChunk', id: s.id, text: '\n' })
+  }
+
   function stepMessageBody(s: Extract<ParserState, { _tag: 'MessageBody' }>, ch: string): void {
     if (s.pendingLt) {
       s.pendingLt = false
@@ -1066,38 +1117,118 @@ export function createStreamingXmlParser(
           artifactsRaw: s.artifactsRaw,
           body: s.body,
           close: mkCloseTag(),
+          depth: s.depth,
+          pendingNewline: s.pendingNewline,
         }
-      } else {
-        const text = '<' + ch
-        s.body += text
-        emit({ _tag: 'MessageBodyChunk', id: s.id, text })
+        return
       }
-    } else if (ch === '<') {
+
+      if (/[a-zA-Z0-9_-]/.test(ch)) {
+        state = {
+          _tag: 'MessageBodyOpenTag',
+          id: s.id,
+          dest: s.dest,
+          artifactsRaw: s.artifactsRaw,
+          body: s.body,
+          depth: s.depth,
+          pendingNewline: s.pendingNewline,
+          raw: '<' + ch,
+          name: ch,
+          matchingName: MESSAGE_TAG.startsWith(ch),
+          inName: true,
+          selfClosing: false,
+        }
+        return
+      }
+
+      flushPendingMessageNewline(s)
+      const text = '<' + ch
+      s.body += text
+      emit({ _tag: 'MessageBodyChunk', id: s.id, text })
+      return
+    }
+
+    if (ch === '<') {
       s.pendingLt = true
-    } else {
-      s.body += ch
-      emit({ _tag: 'MessageBodyChunk', id: s.id, text: ch })
+      return
+    }
+
+    if (ch === '\n') {
+      if (s.body.length === 0 && s.depth === 0) return
+      s.pendingNewline = true
+      return
+    }
+
+    flushPendingMessageNewline(s)
+    s.body += ch
+    emit({ _tag: 'MessageBodyChunk', id: s.id, text: ch })
+  }
+
+  function stepMessageBodyOpenTag(s: Extract<ParserState, { _tag: 'MessageBodyOpenTag' }>, ch: string): void {
+    s.raw += ch
+
+    if (s.inName && /[a-zA-Z0-9_-]/.test(ch)) {
+      s.name += ch
+      s.matchingName = s.matchingName && MESSAGE_TAG.startsWith(s.name)
+      return
+    }
+
+    if (s.inName) {
+      s.inName = false
+      if (s.name !== MESSAGE_TAG) s.matchingName = false
+    }
+
+    if (ch === '>') {
+      if (s.pendingNewline) {
+        s.body += '\n'
+        emit({ _tag: 'MessageBodyChunk', id: s.id, text: '\n' })
+      }
+      const text = s.raw
+      s.body += text
+      emit({ _tag: 'MessageBodyChunk', id: s.id, text })
+      state = {
+        _tag: 'MessageBody',
+        id: s.id,
+        dest: s.dest,
+        artifactsRaw: s.artifactsRaw,
+        body: s.body,
+        pendingLt: false,
+        depth: s.matchingName && s.name === MESSAGE_TAG && !s.selfClosing ? s.depth + 1 : s.depth,
+        pendingNewline: false,
+      }
+      return
+    }
+
+    if (ch === '/') {
+      s.selfClosing = true
     }
   }
 
   function stepMessageCloseTag(s: Extract<ParserState, { _tag: 'MessageCloseTag' }>, ch: string): void {
     s.close.raw += ch
     if (ch === '>') {
-      if (s.close.name === 'message') {
+      if (s.close.name === MESSAGE_TAG && s.depth === 0) {
         emit({ _tag: 'MessageTagClose', id: s.id })
         state = mkProse()
-      } else {
-        const text = s.close.raw
-        s.body += text
-        emit({ _tag: 'MessageBodyChunk', id: s.id, text })
-        state = {
-          _tag: 'MessageBody',
-          id: s.id,
-          dest: s.dest,
-          artifactsRaw: s.artifactsRaw,
-          body: s.body,
-          pendingLt: false,
-        }
+        return
+      }
+
+      if (s.pendingNewline) {
+        s.body += '\n'
+        emit({ _tag: 'MessageBodyChunk', id: s.id, text: '\n' })
+      }
+      const text = s.close.raw
+      s.body += text
+      emit({ _tag: 'MessageBodyChunk', id: s.id, text })
+      state = {
+        _tag: 'MessageBody',
+        id: s.id,
+        dest: s.dest,
+        artifactsRaw: s.artifactsRaw,
+        body: s.body,
+        pendingLt: false,
+        depth: s.close.name === MESSAGE_TAG ? s.depth - 1 : s.depth,
+        pendingNewline: false,
       }
     } else {
       s.close.name += ch
@@ -1844,7 +1975,8 @@ export function createStreamingXmlParser(
         reconstructed = state.closeRaw
         break
       }
-      case 'MessageBody': {
+      case 'MessageBody':
+      case 'MessageBodyOpenTag': {
         emit({ _tag: 'MessageTagClose', id: state.id })
         break
       }
@@ -1974,7 +2106,7 @@ export function createStreamingXmlParser(
       events = []
       let i = 0
       while (i < chunk.length) {
-        if (state._tag === 'Prose' && !ctx.inInspect) {
+        if (state._tag === 'Prose' && !isInStructural('inspect')) {
           // Fast prose scan optimization
           const fence = state.fence
           let canFastScan = fence.phase === FencePhase.Broken
@@ -2006,6 +2138,23 @@ export function createStreamingXmlParser(
             processChar(chunk[i])
             i++
           }
+        } else if (state._tag === 'MessageBody' && !state.pendingLt && !state.openTagBuf) {
+          const start = i
+          while (i < chunk.length) {
+            const c = chunk[i]
+            if (c === '<' || c === '\n') break
+            i++
+          }
+          if (i > start) {
+            flushPendingMessageNewline(state)
+            const text = chunk.slice(start, i)
+            state.body += text
+            emit({ _tag: 'MessageBodyChunk', id: state.id, text })
+          }
+          if (i < chunk.length) {
+            processChar(chunk[i])
+            i++
+          }
         } else {
           processChar(chunk[i])
           i++
@@ -2021,13 +2170,13 @@ export function createStreamingXmlParser(
 
       flushState()
 
-      if (ctx.inActions) {
+      if (isInStructural(kw.actions)) {
         emit({ _tag: 'ParseError', error: { _tag: 'UnclosedActions', detail: 'Actions block was opened but never closed' } })
       }
-      if (ctx.inInspect) {
+      if (isInStructural('inspect')) {
         emit({ _tag: 'ParseError', error: { _tag: 'UnclosedInspect', detail: 'Inspect block was opened but never closed' } })
       }
-      if (ctx.inComms) {
+      if (isInStructural(kw.comms)) {
         emit({ _tag: 'CommsClose' })
       }
 

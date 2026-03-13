@@ -14,9 +14,7 @@ import type { AttributeValue, ParsedChild } from './types'
 
 /** Structural context — persists across all states */
 export interface StructuralCtx {
-  inActions: boolean
-  inInspect: boolean
-  inComms: boolean
+  structuralDepths: Map<string, number>
   justClosedStructural: boolean
   /** Whether the last character processed at prose level was a newline. Used to gate structural tag matching. */
   lastCharNewline: boolean
@@ -73,7 +71,7 @@ export interface ThinkState {
   /** Parsed lenses when tagName is lenses */
   lenses: { name: string; content: string | null }[]
   /** Active open <lens ...> content accumulator */
-  activeLens: { name: string; content: string } | null
+  activeLens: { name: string; content: string; depth: number } | null
 }
 
 /** Parent context — snapshot of parent tool tag, persists across child lifecycle */
@@ -306,6 +304,23 @@ export type ParserState =
       artifactsRaw: string | null
       body: string
       pendingLt: boolean
+      depth: number
+      pendingNewline: boolean
+    }
+  /** Tentatively matching an open tag inside message body */
+  | {
+      readonly _tag: 'MessageBodyOpenTag'
+      id: string
+      dest: string
+      artifactsRaw: string | null
+      body: string
+      depth: number
+      pendingNewline: boolean
+      raw: string
+      name: string
+      matchingName: boolean
+      inName: boolean
+      selfClosing: boolean
     }
   /** Close tag inside message body */
   | {
@@ -315,6 +330,8 @@ export type ParserState =
       artifactsRaw: string | null
       body: string
       close: CloseTagBuf
+      depth: number
+      pendingNewline: boolean
     }
   /** Terminal state — turn control tag emitted, no further parsing */
   | { readonly _tag: 'Done' }
@@ -339,7 +356,7 @@ export function mkProse(): Extract<ParserState, { _tag: 'Prose' }> {
 }
 
 export function mkStructural(): StructuralCtx {
-  return { inActions: false, inInspect: false, inComms: false, justClosedStructural: false, lastCharNewline: true }
+  return { structuralDepths: new Map(), justClosedStructural: false, lastCharNewline: true }
 }
 
 export function mkAttrState(): AttrState {

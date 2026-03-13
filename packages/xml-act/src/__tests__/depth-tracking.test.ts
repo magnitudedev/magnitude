@@ -1,0 +1,276 @@
+import { describe, it, expect } from 'bun:test'
+import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
+import type { ParseEvent } from '../parser/types'
+
+const knownTags = new Set(['shell'])
+const childTagMap = new Map<string, Set<string>>()
+
+function parse(xml: string): ParseEvent[] {
+  const parser = createStreamingXmlParser(knownTags, childTagMap)
+  return [...parser.processChunk(xml), ...parser.flush()]
+}
+
+function parseChunks(chunks: string[]): ParseEvent[] {
+  const parser = createStreamingXmlParser(knownTags, childTagMap)
+  const events: ParseEvent[] = []
+  for (const chunk of chunks) events.push(...parser.processChunk(chunk))
+  events.push(...parser.flush())
+  return events
+}
+
+function splitAtEveryPosition(xml: string): string[][] {
+  const chunks: string[][] = [[xml]]
+  for (let i = 1; i < xml.length; i++) {
+    chunks.push([xml.slice(0, i), xml.slice(i)])
+  }
+  return chunks
+}
+
+function normalizeEvents(events: ParseEvent[]): unknown {
+  const toolCallIds = new Map<string, string>()
+  const messageIds = new Map<string, string>()
+  let nextToolCallId = 0
+  let nextMessageId = 0
+
+  function normalizeToolCallId(id: string): string {
+    let normalized = toolCallIds.get(id)
+    if (!normalized) {
+      normalized = `tool-${nextToolCallId++}`
+      toolCallIds.set(id, normalized)
+    }
+    return normalized
+  }
+
+  function normalizeMessageId(id: string): string {
+    let normalized = messageIds.get(id)
+    if (!normalized) {
+      normalized = `message-${nextMessageId++}`
+      messageIds.set(id, normalized)
+    }
+    return normalized
+  }
+
+  const normalized = events.map((event) => {
+    if ('toolCallId' in event && typeof event.toolCallId === 'string') {
+      return {
+        ...event,
+        toolCallId: normalizeToolCallId(event.toolCallId),
+        ...('element' in event && event.element && typeof event.element === 'object' && 'toolCallId' in event.element
+          ? {
+              element: {
+                ...event.element,
+                toolCallId: normalizeToolCallId(event.element.toolCallId),
+              },
+            }
+          : {}),
+      }
+    }
+
+    if ('id' in event && typeof event.id === 'string') {
+      return {
+        ...event,
+        id: normalizeMessageId(event.id),
+      }
+    }
+
+    return event
+  })
+
+  const coalesced: unknown[] = []
+  for (const event of normalized) {
+    const prev = coalesced[coalesced.length - 1] as Record<string, unknown> | undefined
+    const current = event as Record<string, unknown>
+
+    if (
+      prev
+      && prev._tag === 'MessageBodyChunk'
+      && current._tag === 'MessageBodyChunk'
+      && prev.id === current.id
+    ) {
+      prev.text = String(prev.text) + String(current.text)
+      continue
+    }
+
+    if (
+      prev
+      && prev._tag === 'BodyChunk'
+      && current._tag === 'BodyChunk'
+      && prev.toolCallId === current.toolCallId
+    ) {
+      prev.text = String(prev.text) + String(current.text)
+      continue
+    }
+
+    coalesced.push(current)
+  }
+
+  return coalesced
+}
+
+function expectSameEventsForAllSingleSplits(xml: string): void {
+  const expected = normalizeEvents(parse(xml))
+  for (const chunks of splitAtEveryPosition(xml)) {
+    expect(normalizeEvents(parseChunks(chunks))).toEqual(expected)
+  }
+}
+
+function messages(events: ParseEvent[]) {
+  return events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageBodyChunk' }> => e._tag === 'MessageBodyChunk')
+}
+
+function lenses(events: ParseEvent[]) {
+  return events.filter((e): e is Extract<ParseEvent, { _tag: 'LensEnd' }> => e._tag === 'LensEnd')
+}
+
+describe('structural tag depth tracking', () => {
+  it('actions nested inside actions should not close the outer actions block early', () => {
+    const events = parse(
+      [
+        '<actions>',
+        '<shell>before</shell>',
+        '<actions>',
+        'inner literal body',
+        '</actions>',
+        '<shell>after</shell>',
+        '</actions>',
+      ].join('\n') + '\n',
+    )
+
+    const actionOpens = events.filter(e => e._tag === 'ActionsOpen')
+    const actionCloses = events.filter(e => e._tag === 'ActionsClose')
+    const shells = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
+        e._tag === 'TagClosed' && e.tagName === 'shell',
+    )
+
+    expect(actionOpens).toHaveLength(1)
+    expect(actionCloses).toHaveLength(1)
+    expect(shells).toHaveLength(2)
+    expect(shells.map(e => e.element.body)).toEqual(['before', 'after'])
+    expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
+  })
+
+  it('inspect nested inside inspect should not close the outer inspect block early', () => {
+    const events = parse(
+      [
+        '<actions>',
+        '<shell>before</shell>',
+        '<inspect>',
+        '<ref tool="shell" />',
+        '<inspect>',
+        '</inspect>',
+        '<ref tool="shell" />',
+        '</inspect>',
+        '<shell>after</shell>',
+        '</actions>',
+      ].join('\n') + '\n',
+    )
+
+    const inspectOpens = events.filter(e => e._tag === 'InspectOpen')
+    const inspectCloses = events.filter(e => e._tag === 'InspectClose')
+    const invalidRefs = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'ParseError' }> =>
+        e._tag === 'ParseError' && e.error._tag === 'InvalidRef',
+    )
+
+    expect(inspectOpens).toHaveLength(1)
+    expect(inspectCloses).toHaveLength(1)
+    expect(invalidRefs).toHaveLength(2)
+    expect(events.filter(e => e._tag === 'ParseError' && e.error._tag !== 'InvalidRef')).toHaveLength(0)
+  })
+
+  it('comms nested inside comms should not close the outer comms block early', () => {
+    const xml = [
+      '<comms>',
+      '<message to="parent">before</message>',
+      '<comms>',
+      '</comms>',
+      '<message to="parent">after</message>',
+      '</comms>',
+      '<actions>',
+      '<shell>done</shell>',
+      '</actions>',
+    ].join('\n') + '\n'
+
+    const events = parse(xml)
+
+    const commsOpens = events.filter(e => e._tag === 'CommsOpen')
+    const commsCloses = events.filter(e => e._tag === 'CommsClose')
+    const messageOpens = events.filter(e => e._tag === 'MessageTagOpen')
+    const messageCloses = events.filter(e => e._tag === 'MessageTagClose')
+    const closeIndex = events.findIndex(e => e._tag === 'CommsClose')
+    const secondMessageIndex = events.findIndex(
+      (e, i) => i > 0 && e._tag === 'MessageBodyChunk' && e.text.includes('after'),
+    )
+
+    expect(commsOpens).toHaveLength(1)
+    expect(commsCloses).toHaveLength(1)
+    expect(messageOpens).toHaveLength(2)
+    expect(messageCloses).toHaveLength(2)
+    expect(secondMessageIndex).toBeGreaterThan(-1)
+    expect(closeIndex).toBeGreaterThan(secondMessageIndex)
+    expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
+    expectSameEventsForAllSingleSplits(xml)
+  })
+
+  it('lens nested inside lens should not close the outer lens early', () => {
+    const events = parse(
+      [
+        '<lenses>',
+        '<lens name="outer">',
+        'before',
+        '<lens name="inner">',
+        '</lens>',
+        'after',
+        '</lens>',
+        '</lenses>',
+        '<actions>',
+        '<shell>done</shell>',
+        '</actions>',
+      ].join('\n') + '\n',
+    )
+
+    const shells = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
+        e._tag === 'TagClosed' && e.tagName === 'shell',
+    )
+
+    expect(lenses(events)).toEqual([{ _tag: 'LensEnd', name: 'outer', content: 'before\n<lens name="inner">\n</lens>\nafter' }])
+    expect(shells).toHaveLength(1)
+    expect(shells[0].element.body).toBe('done')
+    expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
+  })
+
+  it('message nested inside message should not close the outer message early', () => {
+    const xml = [
+      '<comms>',
+      '<message to="parent">',
+      'before',
+      '<message to="inner">',
+      '</message>',
+      'after',
+      '</message>',
+      '</comms>',
+      '<actions>',
+      '<shell>done</shell>',
+      '</actions>',
+    ].join('\n') + '\n'
+
+    const events = parse(xml)
+
+    const messageOpens = events.filter(e => e._tag === 'MessageTagOpen')
+    const messageCloses = events.filter(e => e._tag === 'MessageTagClose')
+    const shells = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
+        e._tag === 'TagClosed' && e.tagName === 'shell',
+    )
+
+    expect(messageOpens).toHaveLength(1)
+    expect(messageCloses).toHaveLength(1)
+    expect(messages(events).map(e => e.text).join('')).toBe('before\n<message to="inner">\n</message>\nafter')
+    expect(shells).toHaveLength(1)
+    expect(shells[0].element.body).toBe('done')
+    expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
+    expectSameEventsForAllSingleSplits(xml)
+  })
+})
