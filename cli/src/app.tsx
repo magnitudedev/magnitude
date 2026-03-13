@@ -2487,7 +2487,7 @@ function AppInner({
         )}
 
 
-        {(!primaryModel || !secondaryModel || !browserModel) && (
+        {providerUiState && (!primaryModel || !secondaryModel || !browserModel) && (
           <box style={{
             paddingLeft: 1,
             paddingRight: 1,
