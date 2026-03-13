@@ -39,11 +39,22 @@ async function main() {
         }
       }).catch(() => {})
 
-      installGracefulShutdownHandlers(renderer)
+      let clientRef: { dispose: () => Promise<void> } | null = null
+
+      installGracefulShutdownHandlers(renderer, async () => {
+        await clientRef?.dispose()
+      })
+
       const providerRuntime = await createProviderClient()
       createRoot(renderer).render(
         <ProviderRuntimeProvider runtime={providerRuntime}>
-          <App resume={opts.resume ?? false} debug={opts.debug ?? false} />
+          <App
+            resume={opts.resume ?? false}
+            debug={opts.debug ?? false}
+            onClientReady={(client) => {
+              clientRef = client
+            }}
+          />
         </ProviderRuntimeProvider>
       )
     })

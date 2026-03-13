@@ -16,7 +16,7 @@ import type { DebugSnapshot } from './projections/debug-introspection'
 
 // Projections
 import { SessionContextProjection } from './projections/session-context'
-import { WorkingStateProjection } from './projections/working-state'
+import { WorkingStateProjection, isStable } from './projections/working-state'
 import { TurnProjection } from './projections/turn'
 import { CanonicalTurnProjection } from './projections/canonical-turn'
 import { MemoryProjection } from './projections/memory'
@@ -195,6 +195,15 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   )
   const client = await CodingAgent.createClient(layer)
 
+  const flushPendingEvents = () => Effect.gen(function* () {
+    const persistence = yield* ChatPersistence
+    const eventSink = yield* EventSinkTag<AppEvent>()
+    const pending = yield* eventSink.drainPending()
+    if (pending.length > 0) {
+      yield* persistence.persistNewEvents(pending)
+    }
+  })
+
   await client.runEffect(Effect.gen(function* () {
     const persistence = yield* ChatPersistence
     const hydrationContext = yield* HydrationContext
@@ -235,6 +244,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
       const executionManager = yield* ExecutionManager
       const forkProjection = yield* ForkProjection.Tag
+      const workingStateProjection = yield* WorkingStateProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
       yield* executionManager.initFork(null, 'orchestrator')
@@ -246,19 +256,43 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         yield* executionManager.initFork(forkId, (fork.role ?? 'orchestrator') as AgentVariant)
       }
 
-      // Complete any orphaned forks (running forks with no fork_completed persisted —
-      // happens when the process is killed mid-run). Publishing fork_completed triggers
-      // ForkOrchestrator to dispose the sandbox and schedule fork_removed, and interrupts
-      // any idle Cortex fibers. These events are persisted so subsequent loads are clean.
+      // Hydration recovery: detect forks that were in-flight when the process
+      // died. After replay, WorkingState tells us whether each fork is in a
+      // valid settled state. If not stable, the fork was mid-turn, between
+      // turns, or otherwise in-flight — emit an interrupt to cleanly terminate
+      // it. The interrupt cascades through the normal handler chain:
+      //   interrupt → WorkingState resets + emits turnInterrupted signal
+      //   → ForkOrchestrator publishes synthetic turn_completed (if turn was active)
+      //   → ForkOrchestrator publishes fork_completed { interrupted: true }
+      //   → all projections settle into valid terminal state
       for (const [forkId, fork] of forkState.forks) {
         if (fork.status !== 'running') continue
+        const forkWorkingState = yield* workingStateProjection.getFork(forkId)
+        if (!isStable(forkWorkingState)) {
+          yield* Effect.promise(() => client.send({
+            type: 'interrupt',
+            forkId,
+          }))
+        }
+      }
+
+      // Same check for the root fork (orchestrator, forkId=null).
+      // Root doesn't get fork_completed, but the interrupt still closes
+      // any in-flight turn via the turnInterrupted → turn_completed path.
+      const rootState = yield* workingStateProjection.getFork(null)
+      if (!isStable(rootState)) {
         yield* Effect.promise(() => client.send({
-          type: 'fork_completed',
-          forkId,
-          parentForkId: fork.parentForkId,
-          result: { interrupted: true },
+          type: 'interrupt',
+          forkId: null,
         }))
       }
+
+      // NOTE: fork_removed is not backfilled here. The event is vestigial and
+      // slated for removal as part of the fork→agent event simplification.
+
+      // Persist all recovery events immediately so reopening the same session
+      // again won't re-run recovery for already-terminated forks.
+      yield* flushPendingEvents()
     }
   }))
 
@@ -313,6 +347,13 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         jobPath = writePendingJobSync(job)
       } catch {}
     }
+
+    try {
+      // Best-effort flush of pending events to disk. If the session was mid-turn,
+      // hydration recovery will detect non-stable forks on next startup and emit
+      // interrupts to bring them to a clean terminal state.
+      await client.runEffect(flushPendingEvents())
+    } catch {}
 
     await originalDispose()
 

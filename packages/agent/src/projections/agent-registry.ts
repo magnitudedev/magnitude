@@ -105,17 +105,18 @@ export const AgentRegistryProjection = Projection.define<AppEvent, AgentRegistry
     interrupt: ({ event, state, emit, read }) => {
       if (event.forkId === null) return state
 
+      let agents: Map<string, AgentEntry> | null = null
+
       for (const [agentId, entry] of state.agents) {
         if (entry.forkId === event.forkId && entry.status === 'running') {
           const parentForkId = read(ForkProjection).forks.get(entry.forkId)?.parentForkId ?? null
-          const agents = new Map(state.agents)
+          agents ??= new Map(state.agents)
           agents.set(agentId, { ...entry, status: 'idle' })
           emit.agentStatusChanged({ agentId, agentType: entry.type, status: 'idle', previousStatus: entry.status, parentForkId, reason: 'interrupt' })
-          return { ...state, agents }
         }
       }
 
-      return state
+      return agents ? { ...state, agents } : state
     },
 
     turn_started: ({ event, state, emit, read }) => {
@@ -132,6 +133,21 @@ export const AgentRegistryProjection = Projection.define<AppEvent, AgentRegistry
       }
 
       return state
+    },
+
+    fork_completed: ({ event, state, emit, read }) => {
+      let agents: Map<string, AgentEntry> | null = null
+
+      for (const [agentId, entry] of state.agents) {
+        if (entry.forkId === event.forkId && entry.status !== 'dismissed') {
+          const parentForkId = read(ForkProjection).forks.get(entry.forkId)?.parentForkId ?? null
+          agents ??= new Map(state.agents)
+          agents.set(agentId, { ...entry, status: 'dismissed' })
+          emit.agentStatusChanged({ agentId, agentType: entry.type, status: 'dismissed', previousStatus: entry.status, parentForkId })
+        }
+      }
+
+      return agents ? { ...state, agents } : state
     },
   },
 

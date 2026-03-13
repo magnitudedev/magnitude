@@ -41,12 +41,14 @@ import { LLMMessage } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
 import { ForkProjection } from '../projections/fork'
+import { WorkingStateProjection } from '../projections/working-state'
 import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
 import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
+import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
@@ -285,27 +287,16 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
 
       }).pipe(
-        Effect.onInterrupt(() => {
-          const rawCode = rawCodeChunks.join('')
-          const interruptResponseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-          return publish({
-            type: 'turn_completed',
-            forkId,
-            turnId,
-            chainId,
-            strategyId: 'xml-act',
-            responseParts: interruptResponseParts,
-            toolCalls: [],
-            inspectResults: [],
-            result: { success: false, error: 'Interrupted', cancelled: true },
-            inputTokens: null,
-            outputTokens: null,
-            cacheReadTokens: null,
-            cacheWriteTokens: null,
-          })
-        }),
+        Effect.onInterrupt(() => Effect.gen(function* () {
+          const forkWorkingState = yield* read(WorkingStateProjection)
+
+          if (forkWorkingState.working === false) {
+            return
+          }
+
+          const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
+          yield* publish(turnCompleted)
+        })),
         Effect.catchAll((error: XmlRuntimeCrash | TurnError) => Effect.gen(function* () {
           // XmlRuntimeCrash is an infrastructure defect — should not happen in normal operation
           if (error._tag === 'XmlRuntimeCrash') {

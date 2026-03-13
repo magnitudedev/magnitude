@@ -15,8 +15,10 @@ import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { ExecutionManager } from '../execution/execution-manager'
 import { ForkProjection } from '../projections/fork'
+import { WorkingStateProjection } from '../projections/working-state'
 
 import { BrowserService } from '../services/browser-service'
+import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 
 // =============================================================================
 // Worker
@@ -45,8 +47,6 @@ export const ForkOrchestrator = Worker.define<AppEvent>()({
       const fork = forkState.forks.get(forkId)
       if (!fork || fork.status !== 'running') return
 
-      const execManager = yield* ExecutionManager
-
       yield* publish({
         type: 'fork_completed',
         forkId,
@@ -74,5 +74,12 @@ export const ForkOrchestrator = Worker.define<AppEvent>()({
         })
       )
     }).pipe(Effect.orDie)
-  }
+  },
+
+  signalHandlers: (on) => [
+    on(WorkingStateProjection.signals.turnInterrupted, ({ forkId, turnId, chainId }, publish) => Effect.gen(function* () {
+      const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
+      yield* publish(turnCompleted)
+    }))
+  ]
 })

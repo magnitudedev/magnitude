@@ -64,7 +64,8 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
   signals: {
     shouldTriggerChanged: Signal.create<{ forkId: string | null; shouldTrigger: boolean; chainId: string | null }>('WorkingState/shouldTriggerChanged'),
     forkBecameStable: Signal.create<{ forkId: string | null }>('WorkingState/forkBecameStable'),
-    softInterruptResolved: Signal.create<{ forkId: string }>('WorkingState/softInterruptResolved')
+    softInterruptResolved: Signal.create<{ forkId: string }>('WorkingState/softInterruptResolved'),
+    turnInterrupted: Signal.create<{ forkId: string | null; turnId: string; chainId: string | null }>('WorkingState/turnInterrupted')
   },
 
   eventHandlers: {
@@ -213,13 +214,24 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     },
 
     interrupt: ({ event, fork, emit }) => {
+      const interruptedTurnId = fork.currentTurnId
+      const interruptedChainId = fork.currentChainId
+
       const newFork: ForkWorkingState = {
         ...fork,
         working: false,
         willContinue: false,
         hasQueuedMessages: false,
+        pendingWake: false,
         currentTurnId: null,
-        currentChainId: null
+        currentChainId: null,
+        compactionPending: false,
+        contextLimitBlocked: false,
+        softInterrupted: false
+      }
+
+      if (isStable(newFork) && !isStable(fork)) {
+        emit.forkBecameStable({ forkId: event.forkId })
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -227,6 +239,14 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           forkId: event.forkId,
           shouldTrigger: shouldTrigger(newFork),
           chainId: newFork.currentChainId
+        })
+      }
+
+      if (interruptedTurnId !== null) {
+        emit.turnInterrupted({
+          forkId: event.forkId,
+          turnId: interruptedTurnId,
+          chainId: interruptedChainId
         })
       }
 
@@ -350,6 +370,10 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           shouldTrigger: newShouldTrigger,
           chainId: newForkState.currentChainId
         })
+      }
+
+      if (isStable(newForkState) && !isStable(forkState)) {
+        emit.forkBecameStable({ forkId })
       }
 
       return {

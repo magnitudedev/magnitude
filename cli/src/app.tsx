@@ -75,7 +75,7 @@ import { useProviderUiState } from './hooks/use-provider-ui-state'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
-export function App({ resume, debug }: { resume: boolean; debug: boolean }) {
+export function App({ resume, debug, onClientReady }: { resume: boolean; debug: boolean; onClientReady?: (client: AgentClient | null) => void }) {
   const [conversationKey, setConversationKey] = useState(0)
   const [sessionSelection, setSessionSelection] = useState<string | null | undefined>(resume ? undefined : null)
   const hasAnimatedRef = useRef(false)
@@ -100,6 +100,7 @@ export function App({ resume, debug }: { resume: boolean; debug: boolean }) {
       sessionSelection={sessionSelection}
       onReset={handleReset}
       onResumeSession={handleResumeSession}
+      onClientReady={onClientReady}
     />
   )
 }
@@ -110,12 +111,14 @@ function AppInner({
   sessionSelection,
   onReset,
   onResumeSession,
+  onClientReady,
 }: {
   debugMode: boolean
   skipAnimation: boolean
   sessionSelection: string | null | undefined
   onReset: () => void
   onResumeSession: (sessionId: string) => void
+  onClientReady?: (client: AgentClient | null) => void
 }) {
   const renderer = useRenderer()
   const providerRuntime = useProviderRuntime()
@@ -455,6 +458,7 @@ function AppInner({
       }
       c = client
       setClient(client)
+      onClientReady?.(client)
       renderer.setTerminalTitle("Magnitude")
 
       // Telemetry tracking state
@@ -688,9 +692,10 @@ function AppInner({
     return () => {
       mounted = false
       initClientRef.current = null
+      onClientReady?.(null)
       c?.dispose()
     }
-  }, [sessionSelection])
+  }, [sessionSelection, onClientReady])
 
   // Subscribe to display state for selected fork
   useEffect(() => {
