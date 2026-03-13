@@ -1391,25 +1391,9 @@ function AppInner({
     setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
   }, [commandContext])
 
-  const onSelectMention = useCallback(async (item: { path: string }) => {
+  const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'image' | 'directory' }) => {
     const relPath = item.path
-    const absPath = path.resolve(process.cwd(), relPath)
-    const ext = path.extname(relPath).toLowerCase()
-    const isImage = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext)
-
-    let contentType: 'text' | 'image' = 'text'
-    let content = ''
-    if (isImage) {
-      const file = Bun.file(absPath)
-      const bytes = await file.arrayBuffer()
-      const base64 = Buffer.from(bytes).toString('base64')
-      const mime = file.type || (ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/png')
-      contentType = 'image'
-      content = `data:${mime};base64,${base64}`
-    } else {
-      contentType = 'text'
-      content = await Bun.file(absPath).text()
-    }
+    const contentType = item.contentType
 
     setInputValue(prev => {
       const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
@@ -1421,7 +1405,7 @@ function AppInner({
       const rangeEnd = left.length
       return insertMentionSegment(
         prev,
-        { path: relPath, contentType, content },
+        { path: relPath, contentType },
         createId(),
         rangeStart,
         rangeEnd,
@@ -1936,7 +1920,6 @@ function AppInner({
         type: 'mention',
         path: mention.path,
         contentType: mention.contentType,
-        content: mention.content,
       }))
       handleSubmit(text, inputValue.text, mentionAttachments)
     }
@@ -2454,7 +2437,9 @@ function AppInner({
               {!bashMode && fileMentions.isOpen && (
                 <FileMentionMenu
                   isOpen={fileMentions.isOpen}
+                  query={fileMentions.query}
                   items={fileMentions.items}
+                  recentItems={fileMentions.recentItems}
                   overflowCount={fileMentions.overflowCount}
                   selectedIndex={fileMentions.selectedIndex}
                   onSelect={fileMentions.confirmSelection}

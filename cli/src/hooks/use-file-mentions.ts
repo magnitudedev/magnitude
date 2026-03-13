@@ -7,6 +7,7 @@ import type { KeyEvent } from '@opentui/core'
 const CACHE_TTL_MS = 45_000
 const MAX_RESULTS = 40
 const MAX_VISIBLE_RESULTS = 10
+const MAX_RECENT_FILES = 10
 const LARGE_FILE_WARNING_BYTES = 500 * 1024
 
 const BINARY_EXTENSIONS = new Set([
@@ -23,15 +24,23 @@ type CachedIndex = {
   timestamp: number
 }
 
+type CachedRecent = {
+  files: string[]
+  timestamp: number
+}
+
 export type MentionFileItem = {
   path: string
-  warning: boolean
+  kind: 'file' | 'directory'
+  contentType: 'text' | 'image' | 'directory'
+  warning?: boolean
 }
 
 interface FileMentionsState {
   isOpen: boolean
   query: string
   items: MentionFileItem[]
+  recentItems: MentionFileItem[]
   overflowCount: number
   selectedIndex: number
   setSelectedIndex: (index: number) => void
@@ -46,6 +55,8 @@ interface FileMentionsState {
 
 let fileIndexCache: CachedIndex | null = null
 let inflightLoad: Promise<string[]> | null = null
+let recentFileCache: CachedRecent | null = null
+let inflightRecentLoad: Promise<string[]> | null = null
 
 function getExt(path: string): string {
   const idx = path.lastIndexOf('.')
@@ -54,8 +65,9 @@ function getExt(path: string): string {
 }
 
 function getBase(path: string): string {
-  const i = path.lastIndexOf('/')
-  return i >= 0 ? path.slice(i + 1) : path
+  const normalized = path.endsWith('/') ? path.slice(0, -1) : path
+  const i = normalized.lastIndexOf('/')
+  return i >= 0 ? normalized.slice(i + 1) : normalized
 }
 
 function isSubsequence(query: string, text: string): boolean {
@@ -85,6 +97,20 @@ function rankPath(path: string, queryLower: string): number {
   if (full.includes(queryLower)) return 1
   if (isSubsequence(queryLower, full)) return 2
   return 999
+}
+
+function collectDirectories(paths: string[]): string[] {
+  const dirs = new Set<string>()
+  for (const filePath of paths) {
+    const parts = filePath.split('/').filter(Boolean)
+    if (parts.length <= 1) continue
+    let current = ''
+    for (let i = 0; i < parts.length - 1; i++) {
+      current += `${parts[i]}/`
+      dirs.add(current)
+    }
+  }
+  return [...dirs].sort((a, b) => a.localeCompare(b))
 }
 
 async function loadFileIndex(): Promise<string[]> {
@@ -123,6 +149,51 @@ async function loadFileIndex(): Promise<string[]> {
   return inflightLoad
 }
 
+async function loadRecentFiles(indexedFiles: string[]): Promise<string[]> {
+  const now = Date.now()
+  if (recentFileCache && now - recentFileCache.timestamp < CACHE_TTL_MS) {
+    return recentFileCache.files
+  }
+  if (inflightRecentLoad) return inflightRecentLoad
+
+  const indexedSet = new Set(indexedFiles)
+
+  inflightRecentLoad = Promise.resolve().then(async () => {
+    const proc = Bun.spawn(
+      ['git', 'log', '--diff-filter=M', '--name-only', '--pretty=format:', '-n', '50'],
+      { cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe' },
+    )
+    const stdout = await new Response(proc.stdout).text()
+    const exitCode = await proc.exited
+    if (exitCode !== 0) {
+      recentFileCache = { files: [], timestamp: Date.now() }
+      return []
+    }
+
+    const seen = new Set<string>()
+    const recentFiles: string[] = []
+
+    for (const line of stdout.split('\n')) {
+      const path = line.trim()
+      if (!path || seen.has(path)) continue
+      seen.add(path)
+      if (!indexedSet.has(path)) continue
+      recentFiles.push(path)
+      if (recentFiles.length >= MAX_RECENT_FILES) break
+    }
+
+    recentFileCache = { files: recentFiles, timestamp: Date.now() }
+    return recentFiles
+  }).catch(() => {
+    recentFileCache = { files: [], timestamp: Date.now() }
+    return []
+  }).finally(() => {
+    inflightRecentLoad = null
+  })
+
+  return inflightRecentLoad
+}
+
 function detectQuery(inputText: string, cursorPosition: number): string | null {
   const left = inputText.slice(0, Math.max(0, cursorPosition))
   const match = left.match(/(?:^|\s)@([^\s@]*)$/)
@@ -130,7 +201,9 @@ function detectQuery(inputText: string, cursorPosition: number): string | null {
   return match[1] ?? ''
 }
 
-function withWarning(path: string): MentionFileItem {
+function toFileItem(path: string): MentionFileItem {
+  const ext = getExt(path)
+  const contentType: MentionFileItem['contentType'] = IMAGE_EXTENSIONS.has(ext) ? 'image' : 'text'
   let warning = false
   try {
     const s = statSync(path)
@@ -138,7 +211,11 @@ function withWarning(path: string): MentionFileItem {
   } catch {
     warning = false
   }
-  return { path, warning }
+  return { path, kind: 'file', contentType, warning }
+}
+
+function toDirectoryItem(path: string): MentionFileItem {
+  return { path, kind: 'directory', contentType: 'directory' }
 }
 
 export function useFileMentions(
@@ -149,6 +226,7 @@ export function useFileMentions(
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [loading, setLoading] = useState(false)
   const [indexedFiles, setIndexedFiles] = useState<string[]>([])
+  const [recentFiles, setRecentFiles] = useState<string[]>([])
   const [dismissedQuery, setDismissedQuery] = useState<string | null>(null)
   const justConfirmedRef = useRef(false)
 
@@ -165,28 +243,61 @@ export function useFileMentions(
     if (!isOpen) return
     let cancelled = false
     setLoading(true)
-    loadFileIndex().then(files => {
-      if (!cancelled) setIndexedFiles(files)
-    }).finally(() => {
-      if (!cancelled) setLoading(false)
-    })
+    loadFileIndex()
+      .then(files => {
+        if (!cancelled) setIndexedFiles(files)
+        return files
+      })
+      .then(files => loadRecentFiles(files))
+      .then(files => {
+        if (!cancelled) setRecentFiles(files)
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
     return () => { cancelled = true }
   }, [isOpen])
 
-  const { items, overflowCount } = useMemo(() => {
-    if (!isOpen) return { items: [], overflowCount: 0 }
-    const ranked = indexedFiles
-      .map(path => ({ path, rank: rankPath(path, queryLower) }))
+  const { items, recentItems, overflowCount } = useMemo(() => {
+    if (!isOpen) return { items: [], recentItems: [], overflowCount: 0 }
+
+    const directories = collectDirectories(indexedFiles)
+    const allCandidates: MentionFileItem[] = [
+      ...indexedFiles.map(toFileItem),
+      ...directories.map(toDirectoryItem),
+    ]
+
+    if (!queryLower) {
+      const recent = recentFiles.map(toFileItem)
+      const recentSet = new Set(recent.map((item) => item.path))
+      const rest = allCandidates
+        .filter((item) => !(item.kind === 'file' && recentSet.has(item.path)))
+        .sort((a, b) => a.path.localeCompare(b.path))
+        .slice(0, MAX_RESULTS)
+
+      const ranked = [...recent, ...rest]
+      const visible = ranked.slice(0, MAX_VISIBLE_RESULTS)
+      const visibleRecentCount = Math.min(recent.length, visible.length)
+      return {
+        items: visible,
+        recentItems: visible.slice(0, visibleRecentCount),
+        overflowCount: Math.max(0, ranked.length - MAX_VISIBLE_RESULTS),
+      }
+    }
+
+    const ranked = allCandidates
+      .map(item => ({ item, rank: rankPath(item.path, queryLower) }))
       .filter(x => x.rank < 999)
-      .sort((a, b) => (a.rank - b.rank) || a.path.localeCompare(b.path))
+      .sort((a, b) => (a.rank - b.rank) || a.item.path.localeCompare(b.item.path))
       .slice(0, MAX_RESULTS)
-      .map(x => x.path)
-    const visible = ranked.slice(0, MAX_VISIBLE_RESULTS).map(withWarning)
+      .map(x => x.item)
+
     return {
-      items: visible,
+      items: ranked.slice(0, MAX_VISIBLE_RESULTS),
+      recentItems: [],
       overflowCount: Math.max(0, ranked.length - MAX_VISIBLE_RESULTS),
     }
-  }, [isOpen, indexedFiles, queryLower])
+  }, [isOpen, indexedFiles, recentFiles, queryLower])
 
   const prevSignatureRef = useRef<string>('')
   useEffect(() => {
@@ -263,6 +374,7 @@ export function useFileMentions(
     isOpen,
     query: query ?? '',
     items,
+    recentItems,
     overflowCount,
     selectedIndex,
     setSelectedIndex,

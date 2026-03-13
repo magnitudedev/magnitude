@@ -12,8 +12,7 @@ export type InputPasteSegment = {
 export type InputMentionSegment = {
   id: string
   path: string
-  contentType: 'text' | 'image'
-  content: string
+  contentType: 'text' | 'image' | 'directory'
   start: number
   end: number
 }

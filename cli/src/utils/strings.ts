@@ -149,7 +149,7 @@ export function applyTextEditWithSegments(
 
 export function insertMentionSegment(
   input: InputValue,
-  mention: { path: string; contentType: 'text' | 'image'; content: string },
+  mention: { path: string; contentType: 'text' | 'image' | 'directory' },
   id: string,
   replaceStart: number,
   replaceEnd: number,
@@ -193,7 +193,6 @@ export function insertMentionSegment(
         id,
         path: mention.path,
         contentType: mention.contentType,
-        content: mention.content,
         start: safeStart,
         end: safeStart + inserted,
       },
@@ -299,14 +298,13 @@ export function reconstituteInputTextWithMentions(
   input: InputValue,
 ): {
   text: string
-  mentions: Array<{ path: string; contentType: 'text' | 'image'; content: string }>
+  mentions: Array<{ path: string; contentType: 'text' | 'image' | 'directory' }>
 } {
   const text = reconstituteInputText(input)
   const seen = new Set<string>()
   const mentions: Array<{
     path: string
-    contentType: 'text' | 'image'
-    content: string
+    contentType: 'text' | 'image' | 'directory'
   }> = []
 
   for (const segment of input.mentionSegments) {
@@ -317,7 +315,6 @@ export function reconstituteInputTextWithMentions(
     mentions.push({
       path: segment.path,
       contentType: segment.contentType,
-      content: segment.content,
     })
   }
 

@@ -6,8 +6,11 @@
  */
 
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart, StrategyId, Attachment } from '../events'
+import type { AppEvent, ResponsePart, StrategyId, Attachment, MentionAttachment } from '../events'
 import { ForkProjection } from './fork'
+import { extname, isAbsolute, relative, resolve } from 'path'
+import { readdirSync, readFileSync, statSync } from 'fs'
+import { ALWAYS_EXCLUDED, createDefaultIgnore } from '../util/gitignore'
 
 import { SubagentActivityProjection } from './subagent-activity'
 import { AgentRegistryProjection } from './agent-registry'
@@ -81,12 +84,132 @@ function extractText(parts: readonly ContentPart[]): string {
     .join('')
 }
 
-function toCommsAttachment(attachment: Attachment): CommsAttachment {
+const MAX_MENTION_TEXT_BYTES = 500 * 1024
+
+function isPathUnderCwd(cwd: string, fullPath: string): boolean {
+  const rel = relative(cwd, fullPath)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+function imageMimeFromPath(filePath: string): 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | null {
+  const ext = extname(filePath).toLowerCase()
+  if (ext === '.png') return 'image/png'
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg'
+  if (ext === '.gif') return 'image/gif'
+  if (ext === '.webp') return 'image/webp'
+  return null
+}
+
+function resolveMentionAttachment(attachment: MentionAttachment, cwd: string | null | undefined): CommsAttachment {
+  if (attachment.content) {
+    return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: attachment.content }
+  }
+
+  if (!cwd) {
+    return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: '', error: 'missing cwd' }
+  }
+
+  const fullPath = resolve(cwd, attachment.path)
+  if (!isPathUnderCwd(cwd, fullPath)) {
+    return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: '', error: 'path escapes cwd' }
+  }
+
+  if (attachment.contentType === 'text') {
+    try {
+      const buffer = readFileSync(fullPath)
+      const originalBytes = buffer.byteLength
+      if (originalBytes > MAX_MENTION_TEXT_BYTES) {
+        const content = buffer.subarray(0, MAX_MENTION_TEXT_BYTES).toString('utf8')
+        return {
+          kind: 'mention',
+          path: attachment.path,
+          contentType: 'text',
+          content: `${content}\n[truncated — file is ${(originalBytes / 1024).toFixed(0)} KB, showing first 500KB]`,
+          truncated: true,
+          originalBytes,
+        }
+      }
+      return { kind: 'mention', path: attachment.path, contentType: 'text', content: buffer.toString('utf8') }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'failed to read text mention'
+      return { kind: 'mention', path: attachment.path, contentType: 'text', content: '', error: message }
+    }
+  }
+
+  if (attachment.contentType === 'image') {
+    try {
+      const buffer = readFileSync(fullPath)
+      const mime = imageMimeFromPath(fullPath)
+      if (!mime) {
+        return { kind: 'mention', path: attachment.path, contentType: 'image', content: '', error: 'unsupported image type' }
+      }
+      const base64 = buffer.toString('base64')
+      return { kind: 'mention', path: attachment.path, contentType: 'image', content: `data:${mime};base64,${base64}` }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'failed to read image mention'
+      return { kind: 'mention', path: attachment.path, contentType: 'image', content: '', error: message }
+    }
+  }
+
+  try {
+    const rootStats = statSync(fullPath)
+    if (!rootStats.isDirectory()) {
+      return { kind: 'mention', path: attachment.path, contentType: 'directory', content: '', error: 'not a directory' }
+    }
+
+    const ignore = createDefaultIgnore()
+    type DirEntry = { path: string; name: string; type: 'file' | 'dir'; depth: number }
+    const entries: DirEntry[] = []
+
+    const walkDirectory = (dirPath: string, depth: number, relativePrefix: string) => {
+      const children = readdirSync(dirPath, { withFileTypes: true })
+      for (const child of children) {
+        if (ALWAYS_EXCLUDED.has(child.name)) continue
+
+        const childRelativePath = relativePrefix ? `${relativePrefix}/${child.name}` : child.name
+        if (ignore.ignores(childRelativePath)) continue
+
+        const childFullPath = resolve(dirPath, child.name)
+        const childIsDirectory = child.isDirectory()
+
+        entries.push({
+          path: childRelativePath,
+          name: child.name,
+          type: childIsDirectory ? 'dir' : 'file',
+          depth,
+        })
+
+        if (childIsDirectory) {
+          walkDirectory(childFullPath, depth + 1, childRelativePath)
+        }
+      }
+    }
+
+    walkDirectory(fullPath, 0, '')
+
+    const body = entries
+      .map(entry => `<entry path="${entry.path}" name="${entry.name}" type="${entry.type}" depth="${entry.depth}" />`)
+      .join('\n')
+    const content = `<fs-tree>\n${body}\n</fs-tree>`
+
+    return {
+      kind: 'mention',
+      path: attachment.path,
+      contentType: 'directory',
+      content,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'failed to read directory mention'
+    return { kind: 'mention', path: attachment.path, contentType: 'directory', content: '', error: message }
+  }
+}
+
+function toCommsAttachment(attachment: Attachment, cwd: string | null | undefined): CommsAttachment {
   switch (attachment.type) {
     case 'image':
       return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
     case 'mention':
-      return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: attachment.content }
+      return resolveMentionAttachment(attachment, cwd)
   }
 }
 
@@ -156,9 +279,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return { ...fork, messages: [sessionMsg, ...fork.messages] }
     },
 
-    user_message: ({ event, fork }) => {
+    user_message: ({ event, fork, read }) => {
       const text = extractText(event.content)
-      const attachments = (event.attachments ?? []).map(toCommsAttachment)
+      const cwd = read(SessionContextProjection).context?.cwd
+      const attachments = (event.attachments ?? []).map(attachment => toCommsAttachment(attachment, cwd))
       const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments }
 
       if (fork.currentTurnId !== null) {

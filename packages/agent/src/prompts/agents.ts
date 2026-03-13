@@ -16,7 +16,15 @@ import { formatResults, formatInterrupted, formatError } from './results'
 export type CommsAttachment =
   | { readonly kind: 'image'; readonly base64: string; readonly mediaType: ImageMediaType; readonly width: number; readonly height: number }
   | { readonly kind: 'artifact'; readonly id: string; readonly content: string }
-  | { readonly kind: 'mention'; readonly path: string; readonly contentType: 'text' | 'image'; readonly content: string }
+  | {
+    readonly kind: 'mention'
+    readonly path: string
+    readonly contentType: 'text' | 'image' | 'directory'
+    readonly content?: string
+    readonly error?: string
+    readonly truncated?: boolean
+    readonly originalBytes?: number
+  }
 
 export interface AgentActivityEntry {
   readonly agentId: string
@@ -113,14 +121,23 @@ export function formatCommsInbox(entries: readonly CommsEntry[], timezone: strin
           parts.push({ type: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height })
         } else if (attachment.kind === 'artifact') {
           push(`\n<artifact id="${attachment.id}">${attachment.content}</artifact>`)
-        } else if (attachment.contentType === 'text') {
-          push(`\n<mention path="${attachment.path}">${attachment.content}</mention>`)
-        } else {
-          push(`\n<mention path="${attachment.path}"/>`)
-          const parsed = parseDataUrlImage(attachment.content)
-          if (parsed) {
-            push('\n')
-            parts.push({ type: 'image', base64: parsed.base64, mediaType: parsed.mediaType, width: 0, height: 0 })
+        } else if (attachment.kind === 'mention') {
+          if (attachment.error) {
+            push(`\n<mention path="${attachment.path}" error="${attachment.error}"/>`)
+          } else if (attachment.contentType === 'image') {
+            const payload = attachment.content ?? ''
+            const parsed = parseDataUrlImage(payload)
+            if (parsed) {
+              push(`\n<mention path="${attachment.path}"/>`)
+              push('\n')
+              parts.push({ type: 'image', base64: parsed.base64, mediaType: parsed.mediaType, width: 0, height: 0 })
+            } else {
+              push(`\n<mention path="${attachment.path}" error="invalid image"/>`)
+            }
+          } else if (attachment.content) {
+            push(`\n<mention path="${attachment.path}">${attachment.content}</mention>`)
+          } else {
+            push(`\n<mention path="${attachment.path}"/>`)
           }
         }
       }

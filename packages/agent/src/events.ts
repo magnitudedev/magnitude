@@ -26,8 +26,8 @@ export interface ImageAttachment {
 export type MentionAttachment = {
   readonly type: 'mention'
   readonly path: string
-  readonly contentType: 'text' | 'image'
-  readonly content: string
+  readonly contentType: 'text' | 'image' | 'directory'
+  readonly content?: string  // optional for backward compat with old sessions
 }
 // =============================================================================
 // Strategy & Response Types (defined here to avoid circular imports)
