@@ -4,12 +4,12 @@
  * Fetches the full model registry, caches locally, and populates
  * the provider registry with up-to-date model lists.
  *
- * Cache: ~/.magnitude/models-cache.json (60-minute TTL)
+ * Cache: <global-storage>/models-cache.json (60-minute TTL)
  * Fallback chain: valid cache → network → stale cache → built-in fallbacks
  */
 
-import * as fs from 'fs'
-import * as path from 'path'
+import * as fs from 'node:fs'
+import { defaultGlobalStorageRoot } from '@magnitudedev/storage'
 import { logger } from '@magnitudedev/logger'
 import { populateModels } from './registry'
 import type { ModelDefinition } from './types'
@@ -48,8 +48,8 @@ type ModelsDevResponse = Record<string, ModelsDevProvider>
 // ---------------------------------------------------------------------------
 
 const API_URL = 'https://models.dev/api.json'
-const CACHE_DIR = path.join(process.env.HOME ?? '~', '.magnitude')
-const CACHE_PATH = path.join(CACHE_DIR, 'models-cache.json')
+const CACHE_DIR = defaultGlobalStorageRoot()
+const CACHE_PATH = `${CACHE_DIR}/models-cache.json`
 const CACHE_TTL_MS = 60 * 60 * 1000 // 60 minutes
 const FETCH_TIMEOUT_MS = 10_000       // 10 seconds
 const REFRESH_INTERVAL_MS = 60 * 60 * 1000 // 1 hour

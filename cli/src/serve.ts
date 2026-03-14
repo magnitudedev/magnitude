@@ -1,3 +1,4 @@
+import { createStorageClient } from '@magnitudedev/storage'
 import { SessionManager } from './serve/session-manager'
 import { handleSessionsRoute } from './serve/routes/sessions'
 import { handleEventsRoute } from './serve/routes/events'
@@ -44,7 +45,8 @@ export async function startServer(options: ServeOptions): Promise<void> {
     throw new Error('Invalid host')
   }
 
-  const sessionManager = new SessionManager({ debug: options.debug })
+  const storage = await createStorageClient({ cwd: process.cwd() })
+  const sessionManager = new SessionManager({ debug: options.debug, storage })
 
   const server = Bun.serve({
     port: options.port,

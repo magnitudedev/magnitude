@@ -1,5 +1,5 @@
 import { Context, Effect } from 'effect'
-import type { ProviderDefinition, ModelDefinition, AuthInfo, MagnitudeConfig, OAuthAuth } from '../types'
+import type { ProviderDefinition, ModelDefinition, AuthInfo, OAuthAuth } from '../types'
 import type { CallUsage, ModelSlot, SlotState, SlotUsage } from '../state/provider-state'
 import type { DetectedAuthMethod, ProviderAuthMethodStatus } from '../detect'
 import type { Model } from '../model/model'
@@ -41,19 +41,6 @@ export class ProviderState extends Context.Tag('ProviderState')<
   ProviderStateShape
 >() {}
 
-export interface ProviderConfigShape {
-  readonly loadConfig: () => Effect.Effect<MagnitudeConfig>
-  readonly saveConfig: (config: MagnitudeConfig) => Effect.Effect<void>
-  readonly setPrimarySelection: (providerId: string, modelId: string) => Effect.Effect<void>
-  readonly setBrowserSelection: (providerId: string, modelId: string) => Effect.Effect<void>
-  readonly getLocalProviderConfig: () => Effect.Effect<{ baseUrl: string | null; modelId: string | null }>
-  readonly setLocalProviderConfig: (baseUrl: string, modelId: string) => Effect.Effect<void>
-}
-
-export class ProviderConfig extends Context.Tag('ProviderConfig')<
-  ProviderConfig,
-  ProviderConfigShape
->() {}
 
 export interface ProviderAuthShape {
   readonly loadAuth: () => Effect.Effect<Record<string, AuthInfo>>

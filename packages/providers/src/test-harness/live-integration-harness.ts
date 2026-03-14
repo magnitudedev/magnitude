@@ -1,4 +1,5 @@
 import { Effect, Layer, ManagedRuntime, Stream } from 'effect'
+import type { ChatMessage } from '@magnitudedev/llm-core'
 import type { StreamResult, CompleteResult, ExecutableDriver } from '../drivers/types'
 import { BamlDriver, ResponsesDriver } from '../drivers'
 import {
@@ -13,10 +14,10 @@ import {
   TraceEmitter,
 } from '../index'
 import type { AuthInfo } from '../types'
-import type { ModelSlot, CallUsage } from '../src/state/provider-state'
-import type { Model } from '../src/model/model'
-import type { BoundModel } from '../src/model/bound-model'
-import type { TraceInput } from '../src/resolver/tracing'
+import type { ModelSlot, CallUsage } from '../state/provider-state'
+import type { Model } from '../model/model'
+import type { BoundModel } from '../model/bound-model'
+import type { TraceInput } from '../resolver/tracing'
 
 export type ExpectedDriver = 'baml' | 'openai-responses'
 
@@ -74,10 +75,14 @@ export function makeGenerateChatTitleInput() {
   }
 }
 
-export function makeCodingAgentChatInput() {
+export function makeCodingAgentChatInput(): {
+  systemPrompt: string
+  messages: ChatMessage[]
+  ackTurn: string
+} {
   return {
     systemPrompt: 'You are concise. Reply with 3-5 words.',
-    messages: [{ role: 'user', content: 'Say hello.' }] as const,
+    messages: [{ role: 'user', content: ['Say hello.'] }],
     ackTurn: 'ack-test',
   }
 }
@@ -187,6 +192,7 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
         connection,
         model: target.model,
         inference: {},
+        providerOptions: undefined,
       }),
     )
   }
@@ -202,6 +208,7 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
         connection,
         model: target.model,
         inference: {},
+        providerOptions: undefined,
       }),
     )
     const text = await runtime.runPromise(Stream.runFold(streamResult.stream, '', (acc, chunk) => acc + chunk))

@@ -13,6 +13,7 @@
   "dependencies": {
     "crypto": "*",
     "effect": "^3.19.6",
+    "@magnitudedev/storage": "workspace:*",
     "@magnitudedev/tracing": "workspace:*"
   },
   "devDependencies": {

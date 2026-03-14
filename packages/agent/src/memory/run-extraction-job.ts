@@ -1,11 +1,10 @@
-import { writeFile } from 'fs/promises'
 import { Effect, Layer } from 'effect'
 import { logger } from '@magnitudedev/logger'
+import { createStorageClient } from '@magnitudedev/storage'
 import { bootstrapProviderRuntime, ModelResolver, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, ExtractMemoryDiff } from '@magnitudedev/providers'
-import { applyMemoryDiff, enforceLineBudget, ensureMemoryFile, readMemory, type MemoryDiff } from './memory-file'
+import { applyMemoryDiff, enforceLineBudget, ensureMemoryFile, readMemory, writeMemory, type MemoryDiff } from './memory-file'
 import { withTraceScope } from '../tracing'
 import { buildExtractionTranscript, readEventsJsonl } from './transcript'
-import { markJobPending, markJobRunning, readJob, removeJob } from './job-queue'
 
 function parseJsonDiff(raw: unknown): MemoryDiff | null {
   if (!raw || typeof raw !== 'object') return null
@@ -18,17 +17,18 @@ function parseJsonDiff(raw: unknown): MemoryDiff | null {
 }
 
 export async function runExtractionJobFromFile(jobFilePath: string): Promise<void> {
-  const job = await readJob(jobFilePath)
-  await markJobRunning(jobFilePath, job)
+  const storage = await createStorageClient()
+  const job = await storage.memoryJobs.read({ filePath: jobFilePath })
+  await storage.memoryJobs.markRunning(job.jobId, job)
 
   try {
     const providerRuntime = makeProviderRuntimeLive()
     await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
 
-    await ensureMemoryFile(job.cwd)
+    await ensureMemoryFile(storage)
     const [events, currentMemory] = await Promise.all([
       readEventsJsonl(job.eventsPath),
-      readMemory(job.cwd),
+      readMemory(storage),
     ])
 
     const transcript = buildExtractionTranscript(events)
@@ -53,20 +53,20 @@ export async function runExtractionJobFromFile(jobFilePath: string): Promise<voi
     const diff = parseJsonDiff(result)
     if (!diff) {
       logger.warn('[memory] extraction returned invalid diff object; leaving job pending')
-      await markJobPending(jobFilePath, { ...job, status: 'pending', attempts: job.attempts + 1 })
+      await storage.memoryJobs.markPending(job.jobId, { ...job, status: 'pending', attempts: job.attempts + 1 })
       return
     }
 
     const applied = applyMemoryDiff(currentMemory, diff)
     const budgeted = enforceLineBudget(applied.updated, 150)
     if (applied.changed || budgeted !== currentMemory) {
-      await writeFile(job.memoryPath, budgeted, 'utf8')
+      await writeMemory(storage, budgeted)
     }
 
-    await removeJob(jobFilePath)
+    await storage.memoryJobs.remove(job.jobId)
   } catch (error) {
     logger.warn(`[memory] extraction job failed (${jobFilePath}): ${String(error)}`)
-    await markJobPending(jobFilePath, { ...job, status: 'pending', attempts: job.attempts + 1 }).catch(() => {})
+    await storage.memoryJobs.markPending(job.jobId, { ...job, status: 'pending', attempts: job.attempts + 1 }).catch(() => {})
   }
 }
 

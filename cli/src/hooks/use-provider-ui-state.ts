@@ -1,35 +1,37 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { MagnitudeConfig, ModelSelection } from '@magnitudedev/providers'
+import type { ModelSelection } from '@magnitudedev/providers'
 import type { DetectedProvider } from '@magnitudedev/agent'
 import { useProviderRuntime } from '../providers/provider-runtime'
+import { useStorage } from '../providers/storage-provider'
 
-type LocalProviderConfig = Awaited<
-  ReturnType<ReturnType<typeof useProviderRuntime>['config']['getLocalProviderConfig']>
->
+type LocalProviderConfig = Awaited<ReturnType<ReturnType<typeof useStorage>['config']['getLocalProviderConfig']>>
 
 interface ProviderUiState {
-  config: MagnitudeConfig
+  detectedProviders: DetectedProvider[]
   primaryModel: ModelSelection | null
   secondaryModel: ModelSelection | null
   browserModel: ModelSelection | null
-  detectedProviders: DetectedProvider[]
   localProviderConfig: LocalProviderConfig
+  setupComplete: boolean
+  telemetryEnabled: boolean
 }
 
 export function useProviderUiState() {
   const runtime = useProviderRuntime()
+  const storage = useStorage()
   const [state, setState] = useState<ProviderUiState | null>(null)
   const versionRef = useRef(0)
 
   const reload = useCallback(async () => {
     const version = ++versionRef.current
-    const [config, primarySlot, secondarySlot, browserSlot, runtimeDetectedProviders, localProviderConfig] = await Promise.all([
-      runtime.config.loadConfig(),
+    const [setupComplete, telemetryEnabled, primarySlot, secondarySlot, browserSlot, runtimeDetectedProviders, localProviderConfig] = await Promise.all([
+      storage.config.getSetupComplete(),
+      storage.config.getTelemetryEnabled(),
       runtime.state.peek('primary'),
       runtime.state.peek('secondary'),
       runtime.state.peek('browser'),
       runtime.auth.detectProviders(),
-      runtime.config.getLocalProviderConfig(),
+      storage.config.getLocalProviderConfig(),
     ])
 
     const detectedProviders: DetectedProvider[] = runtimeDetectedProviders.map((entry) => {
@@ -48,7 +50,6 @@ export function useProviderUiState() {
     if (version !== versionRef.current) return
 
     setState({
-      config,
       primaryModel: primarySlot?.model
         ? { providerId: primarySlot.model.providerId, modelId: primarySlot.model.id }
         : null,
@@ -60,8 +61,10 @@ export function useProviderUiState() {
         : null,
       detectedProviders,
       localProviderConfig,
+      setupComplete,
+      telemetryEnabled,
     })
-  }, [runtime])
+  }, [runtime, storage])
 
   useEffect(() => {
     reload().catch((error) => {

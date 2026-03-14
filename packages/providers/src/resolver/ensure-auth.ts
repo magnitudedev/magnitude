@@ -7,14 +7,14 @@
  * - Retries with disk re-read on failure as a final safety net
  */
 
-import * as fs from 'fs'
-import * as path from 'path'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
+import { defaultGlobalStorageRoot } from '@magnitudedev/storage'
 import { Effect } from 'effect'
 import { logger } from '@magnitudedev/logger'
 import type { ModelSlot } from '../state/provider-state'
 import { AuthFailed } from '../errors/model-error'
 import { ProviderAuth, ProviderState } from '../runtime/contracts'
-import { getAuth, setAuth } from '../config'
 import { refreshAnthropicToken } from '../auth/anthropic-oauth'
 import { refreshOpenAIToken } from '../auth/openai-oauth'
 import { exchangeCopilotToken } from '../auth/copilot-oauth'
@@ -22,7 +22,7 @@ import type { AuthInfo } from '../types'
 
 /** Refresh OAuth tokens 5 minutes before actual expiry */
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60_000
-const LOCK_DIR = path.join(process.env.HOME ?? '~', '.magnitude')
+const LOCK_DIR = defaultGlobalStorageRoot()
 const LOCK_STALE_MS = 30_000
 const LOCK_RETRY_DELAY_MS = 200
 const LOCK_MAX_ATTEMPTS = 50
@@ -130,30 +130,37 @@ export function ensureAuth(
 
     const result = yield* Effect.tryPromise({
       try: () =>
-        withProviderLock(providerId, async () => {
-          const lockedDiskAuth = getAuth(providerId)
-          if (isFreshOAuthAuth(lockedDiskAuth)) {
-            return { action: 'use-disk', auth: lockedDiskAuth } as const
-          }
+        withProviderLock(providerId, async () =>
+          Effect.runPromise(
+            Effect.gen(function* () {
+              const lockedDiskAuth = yield* auth.getAuth(providerId)
+              if (isFreshOAuthAuth(lockedDiskAuth)) {
+                return { action: 'use-disk', auth: lockedDiskAuth } as const
+              }
 
-          const refreshToken = getOAuthRefreshToken(lockedDiskAuth) ?? currentAuth.refreshToken
+              const refreshToken = getOAuthRefreshToken(lockedDiskAuth) ?? currentAuth.refreshToken
 
-          try {
-            const newAuth = await refreshForProvider(providerId, refreshToken)
-            if (!newAuth) {
-              return { action: 'unsupported' } as const
-            }
+              try {
+                const newAuth = yield* Effect.tryPromise({
+                  try: () => refreshForProvider(providerId, refreshToken),
+                  catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+                })
+                if (!newAuth) {
+                  return { action: 'unsupported' } as const
+                }
 
-            setAuth(providerId, newAuth)
-            return { action: 'refreshed', auth: newAuth } as const
-          } catch (error) {
-            const retryDiskAuth = getAuth(providerId)
-            if (isFreshOAuthAuth(retryDiskAuth)) {
-              return { action: 'use-disk', auth: retryDiskAuth } as const
-            }
-            throw error
-          }
-        }),
+                yield* auth.setAuth(providerId, newAuth)
+                return { action: 'refreshed', auth: newAuth } as const
+              } catch (error) {
+                const retryDiskAuth = yield* auth.getAuth(providerId)
+                if (isFreshOAuthAuth(retryDiskAuth)) {
+                  return { action: 'use-disk', auth: retryDiskAuth } as const
+                }
+                throw error
+              }
+            }),
+          ),
+        ),
       catch: (error) =>
         new AuthFailed({
           message: error instanceof Error ? error.message : 'Auth refresh failed',

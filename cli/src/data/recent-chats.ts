@@ -4,6 +4,7 @@
  * Uses centralized session utilities to load session summaries
  */
 
+import type { StorageClient } from '@magnitudedev/storage'
 import { listAllSessions, type SessionSummary } from '../persistence/session-utils'
 
 export interface RecentChat {
@@ -19,8 +20,8 @@ const MAX_RECENT_CHATS = 100
 /**
  * Get recent chats from all available sessions
  */
-export async function getRecentChats(limit = MAX_RECENT_CHATS): Promise<RecentChat[]> {
-  const summaries = await listAllSessions(limit)
+export async function getRecentChats(storage: StorageClient, limit = MAX_RECENT_CHATS): Promise<RecentChat[]> {
+  const summaries = await listAllSessions(storage, limit)
   
   return summaries.map(summary => ({
     id: summary.sessionId,

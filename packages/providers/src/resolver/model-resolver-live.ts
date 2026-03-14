@@ -1,4 +1,5 @@
 import { Effect, Layer } from 'effect'
+import { AppConfig } from '@magnitudedev/storage'
 import type { ModelSlot } from '../state/provider-state'
 import type { InferenceConfig } from '../model/inference-config'
 import { BamlDriver, ResponsesDriver } from '../drivers'
@@ -8,13 +9,14 @@ import { ModelResolver } from './model-resolver'
 import { NotConfigured, ProviderDisconnected } from '../errors/model-error'
 import { ProviderAuth, ProviderCatalog, ProviderState } from '../runtime/contracts'
 
-export function makeModelResolver(): Layer.Layer<ModelResolver, never, ProviderCatalog | ProviderState | ProviderAuth> {
+export function makeModelResolver(): Layer.Layer<ModelResolver, never, ProviderCatalog | ProviderState | ProviderAuth | AppConfig> {
   return Layer.effect(
     ModelResolver,
     Effect.gen(function* () {
       const catalog = yield* ProviderCatalog
       const state = yield* ProviderState
       const auth = yield* ProviderAuth
+      const appConfig = yield* AppConfig
 
       return {
         resolve: (slot: ModelSlot) =>
@@ -50,12 +52,14 @@ export function makeModelResolver(): Layer.Layer<ModelResolver, never, ProviderC
             const driver = (isCodex || isCopilotCodex) ? ResponsesDriver : BamlDriver
             const inference: InferenceConfig = {}
             const connection = yield* driver.connect(model, currentAuth, inference)
+            const config = yield* appConfig.load()
             return yield* createBoundModel(
               slot,
               model,
               connection,
               driver,
               inference,
+              config.providerOptions?.[model.providerId],
             ).pipe(Effect.provideService(ProviderState, state))
           }),
       }

@@ -1,18 +1,17 @@
 import { Context, Effect, Layer, ManagedRuntime } from 'effect'
+import { AppConfig, type AppConfigShape } from '@magnitudedev/storage'
 import { bootstrapProviderRuntime } from './bootstrap'
 import {
   ProviderAuth,
   ProviderCatalog,
-  ProviderConfig,
   ProviderState,
   type ProviderAuthShape,
   type ProviderCatalogShape,
-  type ProviderConfigShape,
   type ProviderStateShape,
 } from './contracts'
 import { makeProviderRuntimeLive } from './live'
 
-type ProviderRuntimeServices = ProviderCatalog | ProviderState | ProviderConfig | ProviderAuth
+type ProviderRuntimeServices = ProviderCatalog | ProviderState | AppConfig | ProviderAuth
 
 /** Maps an Effect service shape to a Promise-based facade */
 type Promisify<S> = {
@@ -24,7 +23,7 @@ type Promisify<S> = {
 export interface ProviderClient {
   readonly catalog: Promisify<ProviderCatalogShape>
   readonly state: Promisify<ProviderStateShape>
-  readonly config: Promisify<ProviderConfigShape>
+  readonly config: Promisify<AppConfigShape>
   readonly auth: Promisify<ProviderAuthShape>
   readonly layer: Layer.Layer<ProviderRuntimeServices>
 }
@@ -54,7 +53,7 @@ export async function createProviderClient(): Promise<ProviderClient> {
   return {
     catalog: buildServiceFacade(ProviderCatalog, (e) => runtime.runPromise(e)),
     state: buildServiceFacade(ProviderState, (e) => runtime.runPromise(e)),
-    config: buildServiceFacade(ProviderConfig, (e) => runtime.runPromise(e)),
+    config: buildServiceFacade(AppConfig, (e) => runtime.runPromise(e)),
     auth: buildServiceFacade(ProviderAuth, (e) => runtime.runPromise(e)),
     layer,
   }

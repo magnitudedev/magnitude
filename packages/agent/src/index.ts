@@ -4,8 +4,11 @@
  * A minimal coding agent using event-core architecture.
  */
 
+export type { StorageClient } from '@magnitudedev/storage'
+
 // Agent
 export { CodingAgent, createCodingAgentClient } from './coding-agent'
+export type { CreateClientOptions } from './coding-agent'
 
 // Events
 export type {

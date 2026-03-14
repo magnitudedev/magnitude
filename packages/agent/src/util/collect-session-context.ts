@@ -4,6 +4,7 @@
 
 import { readFile } from 'fs/promises'
 import { join } from 'path'
+import type { StorageClient } from '@magnitudedev/storage'
 import type { SessionContext, GitContext } from '../events'
 import { scanSkills } from './skill-scanner'
 import { runGitCommand } from './git-command'
@@ -145,9 +146,9 @@ async function readAgentsFile(cwd: string): Promise<{ filename: string; content:
   return null
 }
 
-async function readUserMemory(cwd: string): Promise<string | null> {
+async function readUserMemory(cwd: string, storage?: StorageClient): Promise<string | null> {
   try {
-    const content = await readFile(join(cwd, '.magnitude', 'memory.md'), 'utf8')
+    const content = storage ? await storage.memory.read() : await readFile(join(cwd, '.magnitude', 'memory.md'), 'utf8')
     const trimmed = content.trim()
     return trimmed.length > 0 ? trimmed : null
   } catch {
@@ -162,6 +163,7 @@ async function readUserMemory(cwd: string): Promise<string | null> {
 export interface CollectSessionContextOptions {
   cwd?: string
   memoryEnabled?: boolean
+  storage?: StorageClient
 }
 
 export async function collectSessionContext(opts?: CollectSessionContextOptions): Promise<SessionContext> {
@@ -175,7 +177,7 @@ export async function collectSessionContext(opts?: CollectSessionContextOptions)
     collectUserInfo(platform),
     readAgentsFile(cwd),
     scanSkills(cwd),
-    memoryEnabled ? readUserMemory(cwd) : Promise.resolve(null),
+    memoryEnabled ? readUserMemory(cwd, opts?.storage) : Promise.resolve(null),
   ])
 
   return {

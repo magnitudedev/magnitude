@@ -20,7 +20,6 @@ export type {
 } from './types'
 
 // Model types
-export type { ModelSlot } from './state/provider-state'
 export type { ModelDriverId, ModelDriver } from './model/model-driver'
 export { DRIVERS } from './model/model-driver'
 export { Model, type ModelCosts } from './model/model'
@@ -53,10 +52,9 @@ export {
 export type { ModelError } from './errors/model-error'
 export { classifyHttpError, classifyUnknownError } from './errors/classify-error'
 
-// State management
-export type { CallUsage, SlotUsage } from './state/provider-state'
+// Legacy singleton state (compatibility — prefer runtime DI surface for new code)
+export type { ModelSlot, CallUsage, SlotUsage } from './state/provider-state'
 export { peekSlot, getModelContextWindow } from './state/provider-state'
-
 
 // Resolver (Effect services)
 export { ModelResolver } from './resolver/model-resolver'
@@ -66,8 +64,8 @@ export type { TestModelConfig } from './resolver/model-runtime-test'
 export { TraceEmitter, TracePersister, makeTracePersister, makeNoopTracer, makeTestTracer } from './resolver/tracing'
 export type { TraceData } from './resolver/tracing'
 
-// New runtime DI surface
-export { ProviderCatalog, ProviderState, ProviderConfig, ProviderAuth } from './runtime/contracts'
+// Runtime DI surface
+export { ProviderCatalog, ProviderState, ProviderAuth } from './runtime/contracts'
 export { makeProviderRuntimeLive } from './runtime/live'
 export { bootstrapProviderRuntime } from './runtime/bootstrap'
 export { createProviderClient } from './runtime/client'
@@ -78,8 +76,6 @@ export { PROVIDERS, getProvider, getProviderIds, populateModels, getModelCost } 
 
 // Dynamic models (models.dev)
 export { initializeModels } from './models-dev'
-
-// Config / persistence
 
 // Detection
 export { detectProviders, detectDefaultProvider, detectProviderAuthMethods } from './detect'
@@ -108,8 +104,6 @@ export {
   getBrowserCompatibleModels,
   detectBrowserModel,
 } from './browser-models'
-
-// Local provider config
 
 // OAuth flows
 export {

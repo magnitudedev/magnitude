@@ -170,9 +170,12 @@ export async function startCopilotAuth(enterpriseDomain?: string): Promise<Copil
           const result = await exchangeCopilotToken(data.access_token)
 
           if (enterpriseDomain) {
-            result.providerSpecific = {
-              ...result.providerSpecific,
-              enterpriseUrl: domain,
+            return {
+              ...result,
+              providerSpecific: {
+                ...result.providerSpecific,
+                enterpriseUrl: domain,
+              },
             }
           }
 

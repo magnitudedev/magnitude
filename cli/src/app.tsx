@@ -49,7 +49,7 @@ import { SetupWizardOverlay, type WizardStep } from './components/setup-wizard-o
 import { BrowserSetupOverlay } from './components/browser-setup-overlay'
 import { getDefaultModels } from './utils/model-preferences'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
-import { logger, clearLog, getLogPath, logEvent, clearEventLog, configureSessionLogging, subscribeToLogs, type LogEntry } from '@magnitudedev/logger'
+import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
 import { readFileSync } from 'fs'
 import path from 'path'
 import { executeBashCommand, type BashResult } from './utils/bash-executor'
@@ -71,6 +71,7 @@ import stringWidth from 'string-width'
 import { createId } from '@magnitudedev/generate-id'
 import { applyTextEditWithPastesAndMentions, insertMentionSegment, insertPasteSegment, reconstituteInputTextWithMentions } from './utils/strings'
 import { useProviderRuntime } from './providers/provider-runtime'
+import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
@@ -122,6 +123,7 @@ function AppInner({
 }) {
   const renderer = useRenderer()
   const providerRuntime = useProviderRuntime()
+  const storage = useStorage()
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const [client, setClient] = useState<AgentClient | null>(null)
   const [display, setDisplay] = useState<DisplayState | null>(null)
@@ -334,16 +336,14 @@ function AppInner({
   const [recentChats, setRecentChats] = useState<RecentChat[] | null>(null)
 
   const refreshRecentChats = useCallback(() => {
-    getRecentChats().then(setRecentChats)
-  }, [])
+    getRecentChats(storage).then(setRecentChats)
+  }, [storage])
 
   useEffect(() => {
-    clearLog()
-    clearEventLog()
-    logger.info({ logFile: getLogPath() }, 'App started')
+    logger.info('App started')
     if (debugMode) logger.info('Debug mode enabled - press Ctrl+D to toggle debug panel')
     refreshRecentChats()
-  }, [refreshRecentChats])
+  }, [debugMode, refreshRecentChats])
 
   useEffect(() => {
     if (!providerUiState) return
@@ -352,9 +352,9 @@ function AppInner({
     setSecondaryModelState(providerUiState.secondaryModel)
     setBrowserModelState(providerUiState.browserModel)
 
-    initTelemetry({ telemetryEnabled: providerUiState.config.telemetry !== false })
+    initTelemetry({ telemetryEnabled: providerUiState.telemetryEnabled })
 
-    if (!providerUiState.config.setupComplete) {
+    if (!providerUiState.setupComplete) {
       setShowSetupWizard(true)
     }
   }, [providerUiState])
@@ -434,18 +434,25 @@ function AppInner({
     const createClient = async () => {
       let sessionId: string | undefined
       if (sessionSelection === undefined) {
-        sessionId = await JsonChatPersistence.findLatestSessionId() ?? undefined
+        sessionId = await storage.sessions.findLatest() ?? undefined
       } else if (sessionSelection === null) {
         sessionId = undefined
       } else {
         sessionId = sessionSelection
       }
 
-      const persistence = new JsonChatPersistence(sessionId)
-      configureSessionLogging(persistence.getSessionDir())
+      const persistence = new JsonChatPersistence({
+        storage,
+        workingDirectory: process.cwd(),
+        sessionId,
+      })
+      initLogger(persistence.getSessionId())
+      clearSessionLog(persistence.getSessionId())
+      logger.info({ logFile: getSessionLogPath(persistence.getSessionId()) }, 'Session logger initialized')
       const persistenceLayer = Layer.succeed(ChatPersistence, persistence)
       return createCodingAgentClient({
         persistence: persistenceLayer,
+        storage,
         debug: debugMode
       })
     }
@@ -472,7 +479,6 @@ function AppInner({
 
       // Log all events to event log file + collect for debug panel
       client.onEvent((event) => {
-        logEvent(event)
         if (debugMode && mounted) {
           setDebugEvents(prev => [...prev, event])
         }
@@ -501,7 +507,6 @@ function AppInner({
           trackAgentSpawned({
             agentType: event.role,
             mode: event.mode,
-            blocking: event.blocking ?? false,
           })
           sessionTracker.recordAgentSpawned()
         }
@@ -686,7 +691,7 @@ function AppInner({
       onClientReady?.(null)
       c?.dispose()
     }
-  }, [sessionSelection, onClientReady])
+  }, [debugMode, onClientReady, renderer, sessionSelection, storage])
 
   // Subscribe to display state for selected fork
   useEffect(() => {
@@ -937,29 +942,27 @@ function AppInner({
     if (!selectingModelFor || !providerUiState) return
 
     const selection: ModelSelection = { providerId, modelId }
-    const cfg = { ...providerUiState.config }
 
     if (selectingModelFor === 'primary') {
       setPrimaryModelState(selection)
-      cfg.primaryModel = selection
       const auth = await providerRuntime.auth.getAuth(providerId)
       await providerRuntime.state.setSelection('primary', providerId, modelId, auth ?? null, { persist: false })
+      await storage.config.setModelSelection('primary', selection)
     } else if (selectingModelFor === 'secondary') {
       setSecondaryModelState(selection)
-      cfg.secondaryModel = selection
       const auth = await providerRuntime.auth.getAuth(providerId)
       await providerRuntime.state.setSelection('secondary', providerId, modelId, auth ?? null)
+      await storage.config.setModelSelection('secondary', selection)
     } else if (selectingModelFor === 'browser') {
       setBrowserModelState(selection)
-      cfg.browserModel = selection
       const auth = await providerRuntime.auth.getAuth(providerId)
       await providerRuntime.state.setSelection('browser', providerId, modelId, auth ?? null, { persist: false })
+      await storage.config.setModelSelection('browser', selection)
     }
 
-    await providerRuntime.config.saveConfig(cfg)
     await reloadProviderState()
     setSelectingModelFor(null)
-  }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderState])
+  }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderState, storage])
 
   const detectedProviders = providerUiState?.detectedProviders ?? []
 
@@ -1011,7 +1014,7 @@ function AppInner({
     const result: Array<{ type: 'model'; providerId: string; providerName: string; modelId: string; modelName: string }> = []
     for (const provider of connectedProviders) {
       if (provider.id === 'local') {
-        if (providerUiState?.localProviderConfig.baseUrl && providerUiState?.localProviderConfig.modelId) {
+        if (providerUiState?.localProviderConfig?.baseUrl && providerUiState?.localProviderConfig?.modelId) {
           result.push({
             type: 'model',
             providerId: 'local',
@@ -1156,12 +1159,6 @@ function AppInner({
   const handleWizardComplete = useCallback(async (result: { primaryModel: ModelSelection; secondaryModel: ModelSelection; browserModel: ModelSelection | null }) => {
     if (!providerUiState) return
     authFlow.cancelAll()
-    const cfg = { ...providerUiState.config }
-    cfg.primaryModel = result.primaryModel
-    cfg.secondaryModel = result.secondaryModel
-    if (result.browserModel) {
-      cfg.browserModel = result.browserModel
-    }
 
     setPrimaryModelState(result.primaryModel)
     setSecondaryModelState(result.secondaryModel)
@@ -1169,41 +1166,42 @@ function AppInner({
 
     const primaryAuth = await providerRuntime.auth.getAuth(result.primaryModel.providerId)
     await providerRuntime.state.setSelection('primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, { persist: false })
+    await storage.config.setModelSelection('primary', result.primaryModel)
+
     const secondaryAuth = await providerRuntime.auth.getAuth(result.secondaryModel.providerId)
     await providerRuntime.state.setSelection('secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
+    await storage.config.setModelSelection('secondary', result.secondaryModel)
+
     if (result.browserModel) {
       const browserAuth = await providerRuntime.auth.getAuth(result.browserModel.providerId)
       await providerRuntime.state.setSelection('browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, { persist: false })
+      await storage.config.setModelSelection('browser', result.browserModel)
     }
 
     if (wizardNeedsChromium) {
-      await providerRuntime.config.saveConfig(cfg)
       await reloadProviderState()
       setWizardStep('browser')
     } else {
-      cfg.setupComplete = true
-      await providerRuntime.config.saveConfig(cfg)
+      await storage.config.setSetupComplete(true)
       await reloadProviderState()
       finishWizard()
     }
-  }, [authFlow.cancelAll, wizardNeedsChromium, finishWizard, providerUiState, providerRuntime, reloadProviderState])
+  }, [authFlow.cancelAll, wizardNeedsChromium, finishWizard, providerUiState, providerRuntime, reloadProviderState, storage])
 
   const handleWizardBrowserComplete = useCallback(async () => {
     if (!providerUiState) return
-    const cfg = { ...providerUiState.config, setupComplete: true }
-    await providerRuntime.config.saveConfig(cfg)
+    await storage.config.setSetupComplete(true)
     await reloadProviderState()
     finishWizard()
-  }, [finishWizard, providerUiState, providerRuntime, reloadProviderState])
+  }, [finishWizard, providerUiState, reloadProviderState, storage])
 
   const handleWizardSkip = useCallback(async () => {
     if (!providerUiState) return
     authFlow.cancelAll()
-    const cfg = { ...providerUiState.config, setupComplete: true }
-    await providerRuntime.config.saveConfig(cfg)
+    await storage.config.setSetupComplete(true)
     await reloadProviderState()
     finishWizard()
-  }, [authFlow.cancelAll, finishWizard, providerUiState, providerRuntime, reloadProviderState])
+  }, [authFlow.cancelAll, finishWizard, providerUiState, reloadProviderState, storage])
 
   const handleWizardBack = useCallback(() => {
     if (wizardStep === 'browser') {
@@ -1250,45 +1248,32 @@ function AppInner({
 
   const handleProviderDisconnect = useCallback(async (providerId: string) => {
     if (!providerUiState) return
-    await providerRuntime.auth.removeAuth(providerId)
+    await storage.auth.remove(providerId)
 
-    const cfg = { ...providerUiState.config }
-    let modelChanged = false
     if (primaryModel?.providerId === providerId) {
       setPrimaryModelState(null)
       await providerRuntime.state.clear('primary')
-      cfg.primaryModel = null
-      modelChanged = true
+      await storage.config.setModelSelection('primary', null)
     }
     if (secondaryModel?.providerId === providerId) {
       setSecondaryModelState(null)
       await providerRuntime.state.clear('secondary')
-      cfg.secondaryModel = null
-      modelChanged = true
+      await storage.config.setModelSelection('secondary', null)
     }
     if (browserModel?.providerId === providerId) {
       setBrowserModelState(null)
       await providerRuntime.state.clear('browser')
-      cfg.browserModel = null
-      modelChanged = true
-    }
-    if (modelChanged) {
-      await providerRuntime.config.saveConfig(cfg)
+      await storage.config.setModelSelection('browser', null)
     }
     if (providerId === 'local') {
-      const localCfg = { ...cfg }
-      if (localCfg.providerOptions?.local) {
-        delete localCfg.providerOptions.local
-        await providerRuntime.config.saveConfig(localCfg)
-      }
-      await providerRuntime.config.setLocalProviderConfig('', '')
+      await storage.config.setLocalProviderConfig(null)
     }
 
     await reloadProviderState()
     setProviderDetailSelectedIndex(0)
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(`Disconnected ${getProvider(providerId)?.name ?? providerId}`, theme.warning)
-  }, [primaryModel, secondaryModel, browserModel, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderState])
+  }, [primaryModel, secondaryModel, browserModel, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderState, storage])
 
   const handleProviderDetailBack = useCallback(() => {
     setProviderDetailId(null)
@@ -1675,8 +1660,7 @@ function AppInner({
             }
             // Single-tap exit during wizard — mark setup complete and exit
             if (providerUiState) {
-              const cfg = { ...providerUiState.config, setupComplete: true }
-              void providerRuntime.config.saveConfig(cfg).then(() => reloadProviderState())
+              void storage.config.setSetupComplete(true).then(() => reloadProviderState())
             }
             authFlow.cancelAll()
             process.kill(process.pid, 'SIGINT')

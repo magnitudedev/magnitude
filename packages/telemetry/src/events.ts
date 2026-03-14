@@ -82,7 +82,6 @@ export function trackToolUsage(props: {
 export function trackAgentSpawned(props: {
   agentType: string
   mode: 'clone' | 'spawn'
-  blocking: boolean
 }): void {
   capture('agent_spawned', props)
 }

@@ -3,8 +3,8 @@
  */
 
 import { PROVIDERS } from './registry'
-import { loadAuth } from './config'
-import { getLocalProviderConfig } from './local-config'
+
+type LocalProviderConfig = { baseUrl?: string; modelId?: string } | null | undefined
 import type { AuthInfo, AuthMethodDef, ProviderDefinition } from './types'
 
 export interface DetectedProvider {
@@ -17,8 +17,10 @@ export interface DetectedProvider {
  * Scan all providers and return those that have available auth.
  * Checks stored auth first, then env vars.
  */
-export function detectProviders(): DetectedProvider[] {
-  const storedAuth = loadAuth()
+export function detectProviders(
+  storedAuth: Record<string, AuthInfo>,
+  localProviderConfig?: LocalProviderConfig,
+): DetectedProvider[] {
   const detected: DetectedProvider[] = []
 
   for (const provider of PROVIDERS) {
@@ -40,8 +42,7 @@ export function detectProviders(): DetectedProvider[] {
     if (provider.authMethods.some(m => m.type === 'none')) {
       if (provider.id === 'local') {
         // Local is only "connected" when actually configured with a URL and model
-        const localConfig = getLocalProviderConfig()
-        if (localConfig.baseUrl && localConfig.modelId) {
+        if (localProviderConfig?.baseUrl && localProviderConfig?.modelId) {
           detected.push({ provider, auth: null, source: 'none' })
         }
       } else {
@@ -75,8 +76,11 @@ export function detectProviders(): DetectedProvider[] {
 /**
  * Get the best available provider (first detected, preferring stored auth).
  */
-export function detectDefaultProvider(): DetectedProvider | null {
-  const all = detectProviders()
+export function detectDefaultProvider(
+  storedAuth: Record<string, AuthInfo>,
+  localProviderConfig?: LocalProviderConfig,
+): DetectedProvider | null {
+  const all = detectProviders(storedAuth, localProviderConfig)
   // Prefer stored auth (user explicitly configured)
   const stored = all.find(d => d.source === 'stored')
   if (stored) return stored
@@ -156,11 +160,14 @@ export interface ProviderAuthMethodStatus {
  * Unlike detectProviders() which returns one entry per provider,
  * this returns per-method status so the UI can show all methods.
  */
-export function detectProviderAuthMethods(providerId: string): ProviderAuthMethodStatus | null {
+export function detectProviderAuthMethods(
+  providerId: string,
+  storedAuth: Record<string, AuthInfo>,
+  localProviderConfig?: LocalProviderConfig,
+): ProviderAuthMethodStatus | null {
   const provider = PROVIDERS.find(p => p.id === providerId)
   if (!provider) return null
 
-  const storedAuth = loadAuth()
   const stored = storedAuth[providerId] ?? null
   const methods: DetectedAuthMethod[] = []
 
@@ -218,8 +225,7 @@ export function detectProviderAuthMethods(providerId: string): ProviderAuthMetho
       }
     } else if (method.type === 'none') {
       if (provider.id === 'local') {
-        const localConfig = getLocalProviderConfig()
-        if (localConfig.baseUrl && localConfig.modelId) {
+        if (localProviderConfig?.baseUrl && localProviderConfig?.modelId) {
           connected = true
           source = 'none'
         }

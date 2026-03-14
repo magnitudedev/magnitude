@@ -7,6 +7,7 @@ import type { BamlFunctionName, BamlResult, BamlStreamFunctionName } from '../dr
 import type { BoundModel, ChatStream, CompleteOptions, CompleteResult, ModelFunctionDef, StreamOptions } from '../model/bound-model'
 import type { CallUsage } from '../state/provider-state'
 import { CollectorData } from '../drivers/types'
+import type { ProviderOptions } from '../types'
 import { logger } from '@magnitudedev/logger'
 import type { ModelError } from '../errors/model-error'
 import { isRetryableError } from '../errors/classify-error'
@@ -57,8 +58,12 @@ export function createBoundModel(
   connection: ModelConnection,
   driver: ExecutableDriver,
   inference: InferenceConfig = {},
+  providerOptions?: ProviderOptions,
 ): Effect.Effect<BoundModel, never, ProviderState> {
-  return Effect.map(ProviderState, (providerState) => createBoundModelImpl(slot, model, connection, driver, inference, providerState))
+  return Effect.map(
+    ProviderState,
+    (providerState) => createBoundModelImpl(slot, model, connection, driver, inference, providerOptions, providerState),
+  )
 }
 
 function createBoundModelImpl(
@@ -67,6 +72,7 @@ function createBoundModelImpl(
   connection: ModelConnection,
   driver: ExecutableDriver,
   inference: InferenceConfig,
+  providerOptions: ProviderOptions | undefined,
   providerState: ProviderStateShape,
 ): BoundModel {
   const boundModel: BoundModel = {
@@ -91,6 +97,7 @@ function createBoundModelImpl(
         connection,
         model,
         inference: requestInference,
+        providerOptions,
       }
 
       let attempt = 0
@@ -207,6 +214,7 @@ function createBoundModelImpl(
           connection,
           model,
           inference,
+          providerOptions,
         })
 
         // Extract raw output text for tracing

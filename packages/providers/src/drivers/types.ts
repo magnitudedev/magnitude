@@ -5,7 +5,7 @@ import type { InferenceConfig } from '../model/inference-config'
 import type { CallUsage } from '../state/provider-state'
 import type { ModelError } from '../errors/model-error'
 import type { ModelDriverId } from '../model/model-driver'
-import type { AuthInfo } from '../types'
+import type { AuthInfo, ProviderOptions } from '../types'
 import type { ModelSlot } from '../state/provider-state'
 
 export interface DriverRequest {
@@ -15,6 +15,7 @@ export interface DriverRequest {
   readonly connection: ModelConnection
   readonly model: Model
   readonly inference: InferenceConfig
+  readonly providerOptions?: ProviderOptions
 }
 
 export type CollectorData = Data.TaggedEnum<{

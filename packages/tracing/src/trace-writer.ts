@@ -4,31 +4,27 @@
  * Call initTraceSession() once at startup, then pass writeTrace to onTrace().
  */
 
-import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync } from 'fs'
-import { join } from 'path'
-import { homedir } from 'os'
+import {
+  appendTracesSync,
+  defaultGlobalStorageRoot,
+  getTraceDir,
+  initTraceSessionSync,
+  makeGlobalStoragePaths,
+  updateTraceMetaSync,
+} from '@magnitudedev/storage'
 import { logger } from '@magnitudedev/logger'
 import type { TraceData } from './types'
 import type { TraceSessionMeta } from './types'
 
-const TRACES_DIR = join(homedir(), '.magnitude', 'traces')
+const globalPaths = makeGlobalStoragePaths(defaultGlobalStorageRoot())
 
 let currentSessionId: string | null = null
-let currentSessionDir: string | null = null
-let tracesFilePath: string | null = null
 
-/**
- * Initialize a trace session. Creates the directory and writes meta.json.
- */
 export function initTraceSession(
   sessionId: string,
   context: { cwd: string | null; platform: string | null; gitBranch: string | null }
 ): void {
   currentSessionId = sessionId
-  currentSessionDir = join(TRACES_DIR, sessionId)
-  tracesFilePath = join(currentSessionDir, 'traces.jsonl')
-
-  mkdirSync(currentSessionDir, { recursive: true })
 
   const meta: TraceSessionMeta = {
     sessionId,
@@ -37,36 +33,38 @@ export function initTraceSession(
     platform: context.platform,
     gitBranch: context.gitBranch,
   }
-  writeFileSync(join(currentSessionDir, 'meta.json'), JSON.stringify(meta, null, 2))
-  logger.info({ sessionId, dir: currentSessionDir }, '[Tracing] Session initialized')
+
+  try {
+    initTraceSessionSync(globalPaths, sessionId, meta)
+    logger.info(
+      { sessionId, dir: getTraceDir(globalPaths, sessionId) },
+      '[Tracing] Session initialized'
+    )
+  } catch (e) {
+    logger.error({ error: e, sessionId }, '[Tracing] Failed to initialize session')
+  }
 }
 
-/**
- * Write a trace directly to disk. Pass this to onTrace().
- */
 export function writeTrace(trace: TraceData): void {
-  if (!tracesFilePath) {
+  if (!currentSessionId) {
     logger.warn('[Tracing] writeTrace called before initTraceSession')
     return
   }
   try {
-    appendFileSync(tracesFilePath, JSON.stringify(trace) + '\n')
+    appendTracesSync(globalPaths, currentSessionId, [trace])
   } catch (e) {
     logger.error({ error: e }, '[Tracing] Failed to write trace')
   }
 }
 
-/**
- * Update session meta.json with additional fields (e.g. title).
- */
 export function updateTraceMeta(updates: Record<string, unknown>): void {
-  if (!currentSessionDir) return
-  const metaPath = join(currentSessionDir, 'meta.json')
+  if (!currentSessionId) return
+
   try {
-    const existing = existsSync(metaPath)
-      ? JSON.parse(readFileSync(metaPath, 'utf-8'))
-      : {}
-    writeFileSync(metaPath, JSON.stringify({ ...existing, ...updates }, null, 2))
+    updateTraceMetaSync(globalPaths, currentSessionId, (existing) => ({
+      ...(existing ?? {}),
+      ...updates,
+    }))
   } catch (e) {
     logger.error({ error: e }, '[Tracing] Failed to update meta')
   }

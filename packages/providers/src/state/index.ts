@@ -2,7 +2,7 @@ export {
   peekSlot,
   setModel,
   clearModel,
-  initializeProviderState,
+
   getModelContextWindow,
   validateModelSwitch,
   getSlotUsage,

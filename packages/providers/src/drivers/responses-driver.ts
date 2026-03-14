@@ -110,6 +110,7 @@ function streamViaResponsesApi(req: DriverRequest): StreamResult {
       req.model.providerId,
       req.model.id,
       connection.auth,
+      req.providerOptions,
       req.inference.stopSequences ? [...req.inference.stopSequences] : undefined,
     )
     const bamlReq = await bamlStreamRequest(req.functionName, req.args, { clientRegistry })

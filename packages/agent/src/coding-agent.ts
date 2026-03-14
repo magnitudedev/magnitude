@@ -62,11 +62,11 @@ import { ChatPersistence } from './persistence/chat-persistence-service'
 import { collectSessionContext } from './util/collect-session-context'
 
 // Providers
-import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister, ProviderConfig } from '@magnitudedev/providers'
+import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister } from '@magnitudedev/providers'
+import type { StorageClient } from '@magnitudedev/storage'
+import { initLogger } from '@magnitudedev/logger'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
-import { join } from 'path'
-import { createMemoryExtractionJob, drainPendingJobsOnStartup, spawnDetachedMemoryExtractionWorker, writePendingJobSync } from './memory/job-queue'
-import { MEMORY_RELATIVE_PATH } from './memory/memory-file'
+import { createMemoryExtractionJob, drainPendingJobsOnStartup, spawnDetachedMemoryExtractionWorker, writePendingJob } from './memory/job-queue'
 
 // =============================================================================
 // Agent
@@ -143,6 +143,11 @@ export interface CreateClientOptions {
   persistence: Layer.Layer<ChatPersistence, never, never>
 
   /**
+   * Storage client for config, sessions, memory, and memory jobs.
+   */
+  storage: StorageClient
+
+  /**
    * Enable LLM call tracing to ~/.magnitude/traces/
    */
   debug?: boolean
@@ -164,16 +169,16 @@ export interface CreateClientOptions {
 let hasDrainedPendingMemoryJobs = false
 
 export async function createCodingAgentClient(options: CreateClientOptions) {
+  const memoryEnabled = await options.storage.config.getMemoryEnabled()
+
   // Bootstrap provider runtime from stored config / env vars
   const providerRuntime = makeProviderRuntimeLive()
   await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
 
-  const cfg = await Effect.runPromise(Effect.flatMap(ProviderConfig, (config) => config.loadConfig()).pipe(Effect.provide(providerRuntime)))
-
   if (!hasDrainedPendingMemoryJobs) {
     hasDrainedPendingMemoryJobs = true
-    if (cfg.memory !== false) {
-      drainPendingJobsOnStartup().catch(() => {})
+    if (memoryEnabled) {
+      drainPendingJobsOnStartup(options.storage).catch(() => {})
     }
   }
 
@@ -194,6 +199,14 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     options.persistence,
   )
   const client = await CodingAgent.createClient(layer)
+
+  try {
+    const metadata = await client.runEffect(Effect.gen(function* () {
+      const persistence = yield* ChatPersistence
+      return yield* persistence.getSessionMetadata()
+    }))
+    initLogger(metadata.sessionId)
+  } catch {}
 
   const flushPendingEvents = () => Effect.gen(function* () {
     const persistence = yield* ChatPersistence
@@ -217,7 +230,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     if (events.length === 0) {
       // New session
       const context = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext({
-        memoryEnabled: cfg.memory !== false,
+        cwd: process.cwd(),
+        memoryEnabled,
+        storage: options.storage,
       })))
 
       yield* Effect.promise(() => client.send({
@@ -325,7 +340,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   // NOTE: Memory extraction trigger lives only here (wrapped dispose) so all teardown paths
   // (CLI and server) converge through one durable marker + best-effort detached worker flow.
   const dispose = async () => {
-    const memoryEnabled = cfg.memory !== false
 
     let jobPath: string | null = null
     if (memoryEnabled) {
@@ -336,10 +350,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         }))
         const cwd = metadata.workingDirectory
         const sessionId = metadata.sessionId
-        const eventsPath = join(process.env.HOME || '', '.magnitude', 'sessions', sessionId, 'events.jsonl')
-        const memoryPath = join(cwd, MEMORY_RELATIVE_PATH)
+        const eventsPath = options.storage.sessions.getEventsPath(sessionId)
+        const memoryPath = options.storage.memory.getPath()
         const job = createMemoryExtractionJob({ sessionId, cwd, eventsPath, memoryPath })
-        jobPath = writePendingJobSync(job)
+        jobPath = await writePendingJob(options.storage, job)
       } catch {}
     }
 

@@ -1,5 +1,5 @@
 import { Layer } from 'effect'
-import { createId } from '@magnitudedev/generate-id'
+import type { StorageClient } from '@magnitudedev/storage'
 import { resolve } from 'path'
 import { stat } from 'fs/promises'
 import {
@@ -112,23 +112,30 @@ export class SessionManager {
   private globalBuffer: GlobalSseEnvelope[] = []
   private globalSubscribers = new Set<(evt: GlobalSseEnvelope) => void>()
 
-  constructor(opts: { debug: boolean }) {
+  private readonly storage: StorageClient
+
+  constructor(opts: { debug: boolean; storage: StorageClient }) {
     this.debug = opts.debug
+    this.storage = opts.storage
   }
 
   async createSession(opts?: CreateSessionOptions): Promise<SessionInfo> {
-    const id = createId()
-    const persistence = new JsonChatPersistence(id)
-    const layer = Layer.succeed(ChatPersistence, persistence)
-
+    const id = this.storage.sessions.createId()
     const requestedCwd = opts?.cwd ? resolve(opts.cwd) : process.cwd()
     const cwdStat = await stat(requestedCwd).catch(() => null)
     if (!cwdStat?.isDirectory()) {
       throw new Error(`Invalid cwd: ${requestedCwd}`)
     }
 
-    const sessionContext = await collectSessionContext({ cwd: requestedCwd })
-    const client = await createCodingAgentClient({ persistence: layer, debug: this.debug, sessionContext })
+    const persistence = new JsonChatPersistence({
+      storage: this.storage,
+      workingDirectory: requestedCwd,
+      sessionId: id,
+    })
+    const layer = Layer.succeed(ChatPersistence, persistence)
+
+    const sessionContext = await collectSessionContext({ cwd: requestedCwd, storage: this.storage })
+    const client = await createCodingAgentClient({ persistence: layer, storage: this.storage, debug: this.debug, sessionContext })
     const createdAt = new Date().toISOString()
 
     const record: SessionRecord = {

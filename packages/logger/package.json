@@ -8,6 +8,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@magnitudedev/storage": "workspace:*"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   }

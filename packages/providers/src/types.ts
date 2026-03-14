@@ -2,6 +2,18 @@
  * Provider and model type definitions for multi-provider LLM support.
  */
 
+export type {
+  ModelSelection,
+  MagnitudeConfig,
+  ProviderOptions,
+  ContextLimitPolicy,
+  AuthInfo,
+  ApiKeyAuth,
+  OAuthAuth,
+  AwsAuth,
+  GcpAuth,
+} from '@magnitudedev/storage'
+
 // BAML provider types that map to the BAML runtime
 export type BamlProviderType =
   | 'anthropic'
@@ -56,61 +68,6 @@ export interface ProviderDefinition {
   oauthOnlyModelIds?: string[]  // Model IDs that require OAuth (hidden for API key users)
 }
 
-// Stored auth info — discriminated union
-export type AuthInfo =
-  | ApiKeyAuth
-  | OAuthAuth
-  | AwsAuth
-  | GcpAuth
 
-export interface ApiKeyAuth {
-  type: 'api'
-  key: string
-}
 
-export interface OAuthAuth {
-  type: 'oauth'
-  accessToken: string
-  refreshToken: string
-  expiresAt: number       // Unix timestamp ms
-  accountId?: string      // ChatGPT account ID, GitHub Enterprise URL, etc.
-  providerSpecific?: Record<string, any>
-}
 
-export interface AwsAuth {
-  type: 'aws'
-  profile?: string
-  region?: string
-}
-
-export interface GcpAuth {
-  type: 'gcp'
-  credentialsPath: string
-  project?: string
-  location?: string
-}
-
-// Persisted config (non-secret preferences)
-export interface ModelSelection {
-  providerId: string
-  modelId: string
-}
-
-export interface MagnitudeConfig {
-  primaryModel?: ModelSelection | null
-  secondaryModel?: ModelSelection | null
-  browserModel?: ModelSelection | null
-  providerOptions?: Record<string, ProviderOptions>
-  setupComplete?: boolean
-  machineId?: string
-  telemetry?: boolean
-  memory?: boolean
-}
-
-export interface ProviderOptions {
-  baseUrl?: string          // Override base URL
-  region?: string           // Bedrock region
-  project?: string          // Vertex project
-  location?: string         // Vertex location
-  [key: string]: any        // Other provider-specific options
-}

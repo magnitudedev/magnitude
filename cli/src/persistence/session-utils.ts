@@ -1,16 +1,5 @@
-/**
- * Session utilities for loading and listing sessions
- * 
- * Supports UTC timestamp directory format only:
- * - Directory name: YYYY-MM-DDTHH-MM-SSZ (e.g., 2026-02-11T06-24-32Z)
- * - Contains: meta.json, events.jsonl, logs.jsonl
- */
+import type { StorageClient } from '@magnitudedev/storage'
 
-import { readdirSync, statSync, existsSync } from 'fs'
-import { join } from 'path'
-import { homedir } from 'os'
-
-const SESSIONS_DIR = join(homedir(), '.magnitude', 'sessions')
 const DEFAULT_CHAT_NAME = 'New Chat'
 
 export interface SessionSummary {
@@ -33,60 +22,32 @@ interface MetadataFile {
   messageCount: number
 }
 
-
-/**
- * List all sessions from UTC timestamp directories
- */
-export async function listAllSessions(limit = 100): Promise<SessionSummary[]> {
-  if (!existsSync(SESSIONS_DIR)) return []
-
-  const entries = readdirSync(SESSIONS_DIR, { withFileTypes: true })
+export async function listAllSessions(storage: StorageClient, limit?: number): Promise<SessionSummary[]> {
+  const ids = await storage.sessions.list()
   const summaries: SessionSummary[] = []
 
-  for (const entry of entries) {
-    // Only process directories with UTC timestamp format
-    if (!entry.isDirectory() || !/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$/.test(entry.name)) {
-      continue
-    }
-
+  for (const id of ids) {
     try {
-      const summary = await loadDirectorySessionSummary(entry.name)
-      if (summary) summaries.push(summary)
+      const meta = await storage.sessions.readMeta(id)
+      if (meta) {
+        summaries.push(buildSessionSummary(meta as MetadataFile))
+      }
     } catch (error) {
-      // Skip sessions that fail to load
-      console.error(`Failed to load session ${entry.name}:`, error)
+      console.error(`Failed to load session ${id}:`, error)
     }
   }
 
-  return summaries
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, limit)
+  summaries.sort((a, b) => b.timestamp - a.timestamp)
+  return limit ? summaries.slice(0, limit) : summaries
 }
 
-/**
- * Load a session summary by ID
- */
-export async function loadSessionSummary(sessionId: string): Promise<SessionSummary | null> {
-  const dirPath = join(SESSIONS_DIR, sessionId)
-  if (!existsSync(dirPath) || !statSync(dirPath).isDirectory()) {
-    return null
-  }
-
-  return loadDirectorySessionSummary(sessionId)
+export async function loadSessionSummary(storage: StorageClient, sessionId: string): Promise<SessionSummary | null> {
+  const meta = await storage.sessions.readMeta(sessionId)
+  if (!meta) return null
+  return buildSessionSummary(meta as MetadataFile)
 }
 
-/**
- * Load summary from directory format
- */
-async function loadDirectorySessionSummary(dirName: string): Promise<SessionSummary | null> {
-  const dirPath = join(SESSIONS_DIR, dirName)
-  const metaPath = join(dirPath, 'meta.json')
-
-  const metaFile = Bun.file(metaPath)
-  if (!(await metaFile.exists())) return null
-
-  const meta = await metaFile.json() as MetadataFile
-
+function buildSessionSummary(meta: MetadataFile): SessionSummary {
   const title = deriveTitle(meta.chatName, meta.firstUserMessage)
   const timestamp = Date.parse(meta.updated)
 
@@ -98,7 +59,6 @@ async function loadDirectorySessionSummary(dirName: string): Promise<SessionSumm
     messageCount: meta.messageCount,
   }
 }
-
 
 /**
  * Derive title from chat name or first user message

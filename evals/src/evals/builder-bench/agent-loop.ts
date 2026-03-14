@@ -106,15 +106,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   registerAgentDefinition('orchestrator', toolBridge.agentDef)
 
   try {
-    // Create headless agent client (calls initializeProviderState() internally)
+    // Create headless agent client (restores provider runtime state internally)
     const persistenceLayer = Layer.succeed(ChatPersistence, nullPersistence)
     const client = await createCodingAgentClient({
       persistence: persistenceLayer,
       sessionContext: buildSessionContext(workDir),
     })
 
-    // Configure LLM AFTER client creation — initializeProviderState() inside
-    // createCodingAgentClient overwrites the primary slot from stored config
+    // Configure LLM AFTER client creation — client bootstrap may restore the primary slot from stored config
+    // createCodingAgentClient can overwrite the primary slot from stored config
     const providerClient = await getEvalProviderClient()
     const auth = await providerClient.auth.getAuth(modelSpec.provider)
     await providerClient.state.setSelection('primary', modelSpec.provider, modelSpec.model, auth ?? null, { persist: false })

@@ -8,14 +8,10 @@
  */
 
 import type { ClientRegistry } from '@magnitudedev/llm-core'
+import type { ProviderOptions } from '@magnitudedev/storage'
 import { logger } from '@magnitudedev/logger'
 import { buildClientRegistry } from '../client-registry-builder'
 import { getProvider } from '../registry'
-import { setPrimarySelection, setBrowserSelection, loadConfig, saveConfig, getAuth, setAuth } from '../config'
-import { detectProviders } from '../detect'
-import { isBrowserCompatible } from '../browser-models'
-import { initializeModels } from '../models-dev'
-import { setLocalProviderConfig } from '../local-config'
 import type { AuthInfo } from '../types'
 import { DEFAULT_CONTEXT_WINDOW } from '../constants'
 import { Model } from '../model/model'
@@ -92,7 +88,7 @@ export function setModel(
   providerId: string,
   modelId: string,
   auth: AuthInfo | null,
-  persist = true,
+  providerOptions?: ProviderOptions,
 ): boolean {
   const provider = getProvider(providerId)
   if (!provider) {
@@ -100,19 +96,12 @@ export function setModel(
     return false
   }
 
-  const registry = buildClientRegistry(providerId, modelId, auth)
+  const registry = buildClientRegistry(providerId, modelId, auth, providerOptions)
 
   slots[slot].providerId = providerId
   slots[slot].modelId = modelId
   slots[slot].auth = auth
   slots[slot].registry = registry
-
-  if (persist && slot === 'primary') {
-    setPrimarySelection(providerId, modelId)
-  }
-  if (persist && slot === 'browser') {
-    setBrowserSelection(providerId, modelId)
-  }
 
   return true
 }
@@ -157,68 +146,6 @@ export function validateModelSwitch(providerId: string, modelId: string, current
     return `Cannot switch to ${model?.name ?? modelId} — current context usage (${formatTokens(currentTokenEstimate)} tokens) exceeds its context window (${formatTokens(contextWindow)} tokens)`
   }
   return null
-}
-
-/**
- * Initialize provider state on startup.
- *
- * Priority:
- * 1. Stored config (primaryModel from ~/.magnitude/config.json)
- * 2. Auto-detected provider (env vars, stored auth)
- * 3. No override (uses BAML static client — requires ANTHROPIC_API_KEY)
- */
-export async function initializeProviderState(): Promise<void> {
-  // 0. Fetch/cache dynamic model lists from models.dev
-  await initializeModels()
-
-  // 1. Check stored config
-  const config = loadConfig()
-
-  // Always restore local provider config if it exists on disk
-  const localOpts = config.providerOptions?.['local']
-  if (localOpts?.baseUrl && localOpts?.modelId) {
-    setLocalProviderConfig(localOpts.baseUrl, localOpts.modelId)
-  }
-
-  // Detect currently connected providers — used for validation
-  const connectedProviders = detectProviders()
-  const connectedIds = new Set(connectedProviders.map(d => d.provider.id))
-  let configChanged = false
-
-  // Primary model — restore from config if provider still connected, otherwise clear
-  if (config.primaryModel) {
-    if (connectedIds.has(config.primaryModel.providerId)) {
-      const auth = getAuth(config.primaryModel.providerId)
-      setModel('primary', config.primaryModel.providerId, config.primaryModel.modelId, auth ?? null, false)
-    } else {
-      config.primaryModel = null
-      configChanged = true
-    }
-  }
-
-  // Secondary model — restore from config if provider still connected, otherwise clear
-  if (config.secondaryModel) {
-    if (connectedIds.has(config.secondaryModel.providerId)) {
-      const auth = getAuth(config.secondaryModel.providerId)
-      setModel('secondary', config.secondaryModel.providerId, config.secondaryModel.modelId, auth ?? null, false)
-    } else {
-      config.secondaryModel = null
-      configChanged = true
-    }
-  }
-
-  // Browser model — restore from config if provider still connected and model is browser-compatible, otherwise clear
-  if (config.browserModel) {
-    if (connectedIds.has(config.browserModel.providerId) && isBrowserCompatible(config.browserModel.providerId, config.browserModel.modelId)) {
-      const auth = getAuth(config.browserModel.providerId)
-      setModel('browser', config.browserModel.providerId, config.browserModel.modelId, auth ?? null, false)
-    } else {
-      config.browserModel = null
-      configChanged = true
-    }
-  }
-
-  if (configChanged) saveConfig(config)
 }
 
 // =============================================================================

@@ -36,7 +36,9 @@ const zeroUsage: CallUsage = {
 
 const collectorData: CollectorData = {
   _tag: 'Responses',
+  rawRequestBody: null,
   rawResponseBody: null,
+  sseEvents: null,
 }
 
 function resolveCompleteResponse(

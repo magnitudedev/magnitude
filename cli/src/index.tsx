@@ -4,9 +4,11 @@ import { createCliRenderer } from '@opentui/core'
 import { createRoot } from '@opentui/react'
 import { Command } from '@commander-js/extra-typings'
 import { createProviderClient } from '@magnitudedev/providers'
+import { createStorageClient } from '@magnitudedev/storage'
 import { App } from './app'
 import { initThemeStore, useThemeStateStore } from './hooks/use-theme'
 import { ProviderRuntimeProvider } from './providers/provider-runtime'
+import { StorageProvider } from './providers/storage-provider'
 import { isLightBackground } from './utils/theme'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
 import { useAltKeywords } from '@magnitudedev/xml-act'
@@ -45,17 +47,20 @@ async function main() {
         await clientRef?.dispose()
       })
 
+      const storage = await createStorageClient({ cwd: process.cwd() })
       const providerRuntime = await createProviderClient()
       createRoot(renderer).render(
-        <ProviderRuntimeProvider runtime={providerRuntime}>
-          <App
-            resume={opts.resume ?? false}
-            debug={opts.debug ?? false}
-            onClientReady={(client) => {
-              clientRef = client
-            }}
-          />
-        </ProviderRuntimeProvider>
+        <StorageProvider client={storage}>
+          <ProviderRuntimeProvider runtime={providerRuntime}>
+            <App
+              resume={opts.resume ?? false}
+              debug={opts.debug ?? false}
+              onClientReady={(client) => {
+                clientRef = client
+              }}
+            />
+          </ProviderRuntimeProvider>
+        </StorageProvider>
       )
     })
 

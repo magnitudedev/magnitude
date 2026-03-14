@@ -9,8 +9,6 @@
 import { ClientRegistry } from '@magnitudedev/llm-core'
 import { logger } from '@magnitudedev/logger'
 import { getProvider } from './registry'
-import { loadConfig } from './config'
-import { getLocalProviderConfig } from './local-config'
 import { getLowestEffortOptions } from './reasoning-effort'
 import type { AuthInfo, ProviderDefinition, ProviderOptions } from './types'
 
@@ -26,6 +24,7 @@ export function buildClientRegistry(
   providerId: string,
   modelId: string,
   auth: AuthInfo | null,
+  providerOptions?: ProviderOptions,
   stopSequences?: string[],
 ): ClientRegistry | undefined {
   const def = getProvider(providerId)
@@ -34,8 +33,7 @@ export function buildClientRegistry(
     return undefined
   }
 
-  const config = loadConfig()
-  const providerOpts = config.providerOptions?.[providerId]
+  const providerOpts = providerOptions
 
   // For OpenAI with OAuth (ChatGPT subscription) or Copilot with Codex models,
   // use openai-responses provider which hits the /responses endpoint
@@ -83,7 +81,6 @@ function buildOptions(
         return buildAnthropicCompatibleOptions(def, modelId, auth, providerOpts, stopSequences, maxOutputTokens)
       }
       return buildAnthropicOptions(modelId, auth, stopSequences, maxOutputTokens)
-    case 'openai':
     case 'openai':
       return buildOpenAIOptions(modelId, auth, stopSequences, maxOutputTokens)
     case 'openai-responses':
@@ -199,9 +196,7 @@ function buildOpenAIGenericOptions(
   stopSequences?: string[],
   maxOutputTokens?: number,
 ): Record<string, any> | undefined {
-  // For the local provider, prefer runtime config override
-  const localConfig = def.id === 'local' ? getLocalProviderConfig() : null
-  const baseUrl = localConfig?.baseUrl ?? providerOpts?.baseUrl ?? def.defaultBaseUrl
+  const baseUrl = providerOpts?.baseUrl ?? def.defaultBaseUrl
   const base: Record<string, any> = {
     model: modelId,
     ...(maxOutputTokens ? { max_tokens: maxOutputTokens } : {}),

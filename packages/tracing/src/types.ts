@@ -43,7 +43,8 @@ export interface TraceInput {
  * Full trace data for an LLM call — driver data enriched with agent context.
  * M is the metadata type — narrow it for type-safe access to call-specific fields.
  */
-export interface TraceData<M extends Record<string, unknown> = Record<string, unknown>> extends TraceInput {
+export interface TraceData<M extends Record<string, unknown> = Record<string, unknown>>
+  extends TraceInput, Record<string, unknown> {
   callType: string
   metadata: M
   /** Strategy that produced this trace (null for non-strategy calls like compact/title) */
@@ -68,7 +69,7 @@ export type AgentTrace = TraceData<AgentTraceMeta>
 /**
  * Trace session metadata written to meta.json
  */
-export interface TraceSessionMeta {
+export interface TraceSessionMeta extends Record<string, unknown> {
   sessionId: string
   created: string
   cwd: string | null

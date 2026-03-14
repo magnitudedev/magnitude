@@ -1,78 +1,67 @@
 import { Effect } from 'effect'
+import { AppConfig } from '@magnitudedev/storage'
 import { isBrowserCompatible } from '../browser-models'
-import { ProviderAuth, ProviderCatalog, ProviderConfig, ProviderState } from './contracts'
+import { ProviderAuth, ProviderCatalog, ProviderState } from './contracts'
 
 export const bootstrapProviderRuntime = Effect.gen(function* () {
   const catalog = yield* ProviderCatalog
-  const config = yield* ProviderConfig
+  const config = yield* AppConfig
   const auth = yield* ProviderAuth
   const state = yield* ProviderState
 
   yield* catalog.refresh()
 
-  const currentConfig = yield* config.loadConfig()
-  const local = yield* config.getLocalProviderConfig()
-
-  const localOpts = currentConfig.providerOptions?.['local']
-  if ((!local.baseUrl || !local.modelId) && localOpts?.baseUrl && localOpts?.modelId) {
-    yield* config.setLocalProviderConfig(localOpts.baseUrl, localOpts.modelId)
-  }
+  const primaryModel = yield* config.getModelSelection('primary')
+  const secondaryModel = yield* config.getModelSelection('secondary')
+  const browserModel = yield* config.getModelSelection('browser')
 
   const connectedIds = yield* auth.connectedProviderIds()
-  let configChanged = false
 
-  if (currentConfig.primaryModel) {
-    if (connectedIds.has(currentConfig.primaryModel.providerId)) {
-      const providerAuth = (yield* auth.getAuth(currentConfig.primaryModel.providerId)) ?? null
+  if (primaryModel) {
+    if (connectedIds.has(primaryModel.providerId)) {
+      const providerAuth = (yield* auth.getAuth(primaryModel.providerId)) ?? null
       yield* state.setSelection(
         'primary',
-        currentConfig.primaryModel.providerId,
-        currentConfig.primaryModel.modelId,
+        primaryModel.providerId,
+        primaryModel.modelId,
         providerAuth,
         { persist: false },
       )
     } else {
-      currentConfig.primaryModel = null
-      configChanged = true
+      yield* config.setModelSelection('primary', null)
     }
   }
 
-  if (currentConfig.secondaryModel) {
-    if (connectedIds.has(currentConfig.secondaryModel.providerId)) {
-      const providerAuth = (yield* auth.getAuth(currentConfig.secondaryModel.providerId)) ?? null
+  if (secondaryModel) {
+    if (connectedIds.has(secondaryModel.providerId)) {
+      const providerAuth = (yield* auth.getAuth(secondaryModel.providerId)) ?? null
       yield* state.setSelection(
         'secondary',
-        currentConfig.secondaryModel.providerId,
-        currentConfig.secondaryModel.modelId,
+        secondaryModel.providerId,
+        secondaryModel.modelId,
         providerAuth,
         { persist: false },
       )
     } else {
-      currentConfig.secondaryModel = null
-      configChanged = true
+      yield* config.setModelSelection('secondary', null)
     }
   }
 
-  if (currentConfig.browserModel) {
+  if (browserModel) {
     if (
-      connectedIds.has(currentConfig.browserModel.providerId) &&
-      isBrowserCompatible(currentConfig.browserModel.providerId, currentConfig.browserModel.modelId)
+      connectedIds.has(browserModel.providerId) &&
+      isBrowserCompatible(browserModel.providerId, browserModel.modelId)
     ) {
-      const providerAuth = (yield* auth.getAuth(currentConfig.browserModel.providerId)) ?? null
+      const providerAuth = (yield* auth.getAuth(browserModel.providerId)) ?? null
       yield* state.setSelection(
         'browser',
-        currentConfig.browserModel.providerId,
-        currentConfig.browserModel.modelId,
+        browserModel.providerId,
+        browserModel.modelId,
         providerAuth,
         { persist: false },
       )
     } else {
-      currentConfig.browserModel = null
-      configChanged = true
+      yield* config.setModelSelection('browser', null)
     }
-  }
-
-  if (configChanged) {
-    yield* config.saveConfig(currentConfig)
   }
 })
