@@ -19,6 +19,7 @@ import type {
   UnclosedThinkDetail,
   UnclosedActionsDetail,
   UnclosedInspectDetail,
+  TurnControlConflictDetail,
 } from './parser/types'
 
 // =============================================================================
@@ -294,7 +295,7 @@ export interface InvalidRef {
 
 export interface StructuralParseError {
   readonly _tag: 'StructuralParseError'
-  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | UnclosedInspectDetail
+  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | UnclosedInspectDetail | TurnControlConflictDetail
 }
 
 

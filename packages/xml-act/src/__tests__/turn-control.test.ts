@@ -216,7 +216,7 @@ describe('content after turn control is dropped', () => {
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    const prose = events.filter(e => e._tag === 'Prose')
+    const prose = events.filter(e => e._tag === 'ProseChunk' || e._tag === 'ProseEnd')
     expect(prose).toHaveLength(0)
   })
 

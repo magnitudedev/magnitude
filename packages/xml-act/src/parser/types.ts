@@ -5,12 +5,10 @@
  * These are NOT exposed to consumers — the runtime maps them to tool-aware events.
  */
 
+import type { TagSchema } from '../execution/binding-validator'
+
 /** Scalar value type for parsed attributes (coerced from string during parsing) */
 export type AttributeValue = string | number | boolean
-
-// =============================================================================
-// Parsed Element (complete tag for dispatcher)
-// =============================================================================
 
 export interface ParsedChild {
   readonly tagName: string
@@ -26,104 +24,64 @@ export interface ParsedElement {
   readonly children: readonly ParsedChild[]
 }
 
-// =============================================================================
-// Parse Events (internal)
-// =============================================================================
-
-
 export type ParseEvent =
-  /** Tool tag opened — attributes available */
   | { readonly _tag: 'TagOpened'; readonly tagName: string; readonly toolCallId: string; readonly attributes: ReadonlyMap<string, AttributeValue> }
-  /** Body text chunk for the current tag */
   | { readonly _tag: 'BodyChunk'; readonly toolCallId: string; readonly text: string }
-  /** Child tag opened inside a tool tag — attributes available */
   | { readonly _tag: 'ChildOpened'; readonly parentToolCallId: string; readonly childTagName: string; readonly childIndex: number; readonly attributes: ReadonlyMap<string, AttributeValue> }
-  /** Child tag body text chunk */
   | { readonly _tag: 'ChildBodyChunk'; readonly parentToolCallId: string; readonly childTagName: string; readonly childIndex: number; readonly text: string }
-  /** Child tag closed — full child data available */
   | { readonly _tag: 'ChildComplete'; readonly parentToolCallId: string; readonly childTagName: string; readonly childIndex: number; readonly attributes: ReadonlyMap<string, AttributeValue>; readonly body: string }
-  /** Tool tag closed — complete element available for dispatch */
   | { readonly _tag: 'TagClosed'; readonly toolCallId: string; readonly tagName: string; readonly element: ParsedElement }
-  /** Prose text chunk (message or think) */
   | { readonly _tag: 'ProseChunk'; readonly patternId: 'prose' | 'think' | (string & {}); readonly text: string }
-  /** Prose block complete */
   | { readonly _tag: 'ProseEnd'; readonly patternId: 'prose' | 'think' | (string & {}); readonly content: string; readonly about: string | null }
-  /** Lens started */
   | { readonly _tag: 'LensStart'; readonly name: string }
-  /** Lens body text chunk */
   | { readonly _tag: 'LensChunk'; readonly text: string }
-  /** Lens closed */
   | { readonly _tag: 'LensEnd'; readonly name: string; readonly content: string }
-
-  /** Actions block opened */
   | { readonly _tag: 'ActionsOpen' }
-  /** Actions block closed */
   | { readonly _tag: 'ActionsClose' }
-  /** Inspect block opened */
   | { readonly _tag: 'InspectOpen' }
-  /** Inspect block closed */
   | { readonly _tag: 'InspectClose' }
-  /** Comms block opened */
   | { readonly _tag: 'CommsOpen' }
-  /** Comms block closed */
   | { readonly _tag: 'CommsClose' }
-  /** Message tag opened inside comms */
   | { readonly _tag: 'MessageTagOpen'; readonly id: string; readonly dest: string; readonly artifactsRaw: string | null }
-  /** Message body text chunk */
   | { readonly _tag: 'MessageBodyChunk'; readonly id: string; readonly text: string }
-  /** Message tag closed */
   | { readonly _tag: 'MessageTagClose'; readonly id: string }
-  /** Ref resolved inside inspect block — carries the resolved content */
   | { readonly _tag: 'InspectResult'; readonly toolRef: string; readonly query?: string; readonly content: string }
-  /** Explicit turn control */
   | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' }
-  /** Parse error — tool-scoped or structural */
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
-// =============================================================================
-// Parse Error Details (parser-internal, no call context)
-// =============================================================================
+export type StepResult =
+  | { _tag: 'Emit'; events: ParseEvent[] }
+  | { _tag: 'EmitAndReprocess'; events: ParseEvent[] }
+  | { _tag: 'Reprocess' }
+  | { _tag: 'Noop' }
 
-/** Base error detail — no tool call context. Returned by validators. */
+export const NOOP: StepResult = { _tag: 'Noop' }
+
+export function emit(...events: ParseEvent[]): StepResult {
+  return { _tag: 'Emit', events }
+}
+
+export function emitAndReprocess(...events: ParseEvent[]): StepResult {
+  return { _tag: 'EmitAndReprocess', events }
+}
+
+export function reprocess(): StepResult {
+  return { _tag: 'Reprocess' }
+}
+
 export type BaseToolParseErrorDetail =
-  | {
-      readonly _tag: 'IncompleteToolTag'
-      readonly detail: string
-    }
-  | {
-      readonly _tag: 'UnexpectedBody'
-      readonly detail: string
-    }
-  | {
-      readonly _tag: 'UnclosedChildTag'
-      readonly childTagName: string
-      readonly detail: string
-    }
-  | {
-      readonly _tag: 'UnknownAttribute'
-      readonly attribute: string
-      readonly detail: string
-    }
-  | {
-      readonly _tag: 'InvalidAttributeValue'
-      readonly attribute: string
-      readonly expected: string
-      readonly received: string
-      readonly detail: string
-    }
-  | {
-      readonly _tag: 'MissingRequiredFields'
-      readonly fields: readonly string[]
-      readonly detail: string
-    }
+  | { readonly _tag: 'IncompleteToolTag'; readonly detail: string }
+  | { readonly _tag: 'UnexpectedBody'; readonly detail: string }
+  | { readonly _tag: 'UnclosedChildTag'; readonly childTagName: string; readonly detail: string }
+  | { readonly _tag: 'UnknownAttribute'; readonly attribute: string; readonly detail: string }
+  | { readonly _tag: 'InvalidAttributeValue'; readonly attribute: string; readonly expected: string; readonly received: string; readonly detail: string }
+  | { readonly _tag: 'MissingRequiredFields'; readonly fields: readonly string[]; readonly detail: string }
 
-/** Tool-scoped error detail — base detail + tool call context. Added by the parser at emit time. */
 export type ToolParseErrorDetail = BaseToolParseErrorDetail & {
   readonly toolCallId: string
   readonly tagName: string
 }
 
-/** Non-tool error detail — structural errors like invalid refs. */
 export type InvalidRefDetail = {
   readonly _tag: 'InvalidRef'
   readonly toolRef: string
@@ -145,7 +103,11 @@ export type UnclosedInspectDetail = {
   readonly detail: string
 }
 
-/** Full parse error detail union — tool-scoped or structural. */
+export type TurnControlConflictDetail = {
+  readonly _tag: 'TurnControlConflict'
+  readonly detail: string
+}
+
 export type ParseErrorDetail =
   | ToolParseErrorDetail
   | InvalidRefDetail
@@ -153,3 +115,158 @@ export type ParseErrorDetail =
   | UnclosedActionsDetail
   | UnclosedInspectDetail
   | TurnControlConflictDetail
+
+export const enum FencePhase {
+  LeadingWs,
+  Tick1,
+  Tick2,
+  Tick3,
+  X,
+  XM,
+  XML,
+  TrailingWs,
+  Broken,
+}
+
+export interface FenceState {
+  phase: FencePhase
+  buffer: string
+  deferred: string
+  pendingWhitespace: string
+}
+
+export type AttrPhase =
+  | { readonly _tag: 'Idle' }
+  | { readonly _tag: 'PendingEquals'; readonly key: string }
+  | { readonly _tag: 'PendingSlash' }
+
+export interface AttrState {
+  phase: AttrPhase
+  key: string
+  value: string
+  attrs: Map<string, AttributeValue>
+  hasError: boolean
+}
+
+export interface ThinkState {
+  tagName: string
+  body: string
+  depth: number
+  openTagBuf: string
+  openAfterNewline: boolean
+  lastCharNewline: boolean
+  about: string | null
+  lenses: { name: string; content: string | null }[]
+  activeLens: { name: string; content: string; depth: number } | null
+}
+
+export interface CloseTagBuf {
+  name: string
+  raw: string
+}
+
+export type CdataPhase =
+  | { readonly _tag: 'Prefix'; index: number; buffer: string }
+  | { readonly _tag: 'Body'; buffer: string; closeBrackets: number }
+
+export interface ParserConfig {
+  knownTags: ReadonlySet<string>
+  childTagMap: ReadonlyMap<string, ReadonlySet<string>>
+  tagSchemas?: ReadonlyMap<string, TagSchema>
+  resolveRef?: (tag: string, recency: number, query?: string) => string | undefined
+  generateId: () => string
+  defaultMessageDest: string
+  keywords: {
+    actions: string
+    think: string
+    thinking: string
+    lenses: string
+    comms: string
+    next: string
+    yield: string
+  }
+  structuralTags: ReadonlySet<string>
+  actionsTags: ReadonlySet<string>
+  topLevelTags: ReadonlySet<string>
+  refTags: ReadonlySet<string>
+  messageTags: ReadonlySet<string>
+}
+
+export type ProseFrame = { readonly _tag: 'Prose'; fence: FenceState; proseAccum: string; lastCharNewline: boolean; justClosedStructural: boolean }
+export type ActionsFrame = { readonly _tag: 'Actions' }
+export type InspectFrame = { readonly _tag: 'Inspect' }
+export type CommsFrame = { readonly _tag: 'Comms' }
+export type TagNameFrame = { readonly _tag: 'TagName'; name: string; raw: string; afterNewline: boolean }
+export type TopLevelCloseTagFrame = { readonly _tag: 'TopLevelCloseTag'; close: CloseTagBuf; afterNewline: boolean }
+export type TagAttrsFrame = { readonly _tag: 'TagAttrs'; tagName: string; toolCallId: string; attr: AttrState; raw: string }
+export type TagAttrValueFrame = { readonly _tag: 'TagAttrValue'; tagName: string; toolCallId: string; attr: AttrState; raw: string }
+export type TagUnquotedAttrValueFrame = { readonly _tag: 'TagUnquotedAttrValue'; tagName: string; toolCallId: string; attr: AttrState; raw: string }
+export type PendingStructuralOpenFrame = { readonly _tag: 'PendingStructuralOpen'; tagName: string; raw: string }
+export type PendingTopLevelCloseFrame = { readonly _tag: 'PendingTopLevelClose'; tagName: string; closeRaw: string }
+export type ThinkFrame = { readonly _tag: 'Think'; think: ThinkState; pendingLt: boolean }
+export type ThinkCloseTagFrame = { readonly _tag: 'ThinkCloseTag'; think: ThinkState; close: CloseTagBuf; afterNewline: boolean }
+export type PendingThinkCloseFrame = { readonly _tag: 'PendingThinkClose'; think: ThinkState; closeRaw: string }
+export type LensTagNameFrame = { readonly _tag: 'LensTagName'; think: ThinkState; name: string }
+export type LensTagAttrsFrame = { readonly _tag: 'LensTagAttrs'; think: ThinkState; attrKey: string; attrValue: string; phase: 'key' | 'equals' | 'value'; nameAttr: string | null; pendingSlash: boolean }
+export type MessageBodyFrame = { readonly _tag: 'MessageBody'; id: string; dest: string; artifactsRaw: string | null; body: string; pendingLt: boolean; depth: number; pendingNewline: boolean }
+export type MessageBodyOpenTagFrame = { readonly _tag: 'MessageBodyOpenTag'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; raw: string; name: string; matchingName: boolean; inName: boolean; selfClosing: boolean }
+export type MessageCloseTagFrame = { readonly _tag: 'MessageCloseTag'; id: string; dest: string; artifactsRaw: string | null; body: string; close: CloseTagBuf; depth: number; pendingNewline: boolean }
+export type ToolBodyFrame = { readonly _tag: 'ToolBody'; tagName: string; toolCallId: string; attrs: Map<string, AttributeValue>; body: string; children: ParsedChild[]; childCounts: Map<string, number>; pendingLt: boolean }
+export type ToolCloseTagFrame = { readonly _tag: 'ToolCloseTag'; tagName: string; toolCallId: string; attrs: Map<string, AttributeValue>; body: string; children: ParsedChild[]; childCounts: Map<string, number>; close: CloseTagBuf; tool: ToolBodyFrame }
+export type ChildTagNameFrame = { readonly _tag: 'ChildTagName'; childName: string; tool: ToolBodyFrame }
+export type ChildAttrsFrame = { readonly _tag: 'ChildAttrs'; childTagName: string; attr: AttrState; tool: ToolBodyFrame }
+export type ChildAttrValueFrame = { readonly _tag: 'ChildAttrValue'; childTagName: string; attr: AttrState; tool: ToolBodyFrame }
+export type ChildUnquotedAttrValueFrame = { readonly _tag: 'ChildUnquotedAttrValue'; childTagName: string; attr: AttrState; tool: ToolBodyFrame }
+export type ChildBodyFrame = { readonly _tag: 'ChildBody'; childTagName: string; childAttrs: Map<string, AttributeValue>; childBody: string; pendingLt: boolean; tool: ToolBodyFrame }
+export type ChildCloseTagFrame = { readonly _tag: 'ChildCloseTag'; childTagName: string; childAttrs: Map<string, AttributeValue>; childBody: string; close: CloseTagBuf; tool: ToolBodyFrame }
+export type CdataFrame = { readonly _tag: 'Cdata'; cdata: CdataPhase; origin: ToolBodyFrame | ChildBodyFrame | ProseFrame }
+export type DoneFrame = { readonly _tag: 'Done' }
+
+export type StackFrame =
+  | ProseFrame
+  | ActionsFrame
+  | InspectFrame
+  | CommsFrame
+  | TagNameFrame
+  | TopLevelCloseTagFrame
+  | TagAttrsFrame
+  | TagAttrValueFrame
+  | TagUnquotedAttrValueFrame
+  | PendingStructuralOpenFrame
+  | PendingTopLevelCloseFrame
+  | ThinkFrame
+  | ThinkCloseTagFrame
+  | PendingThinkCloseFrame
+  | LensTagNameFrame
+  | LensTagAttrsFrame
+  | MessageBodyFrame
+  | MessageBodyOpenTagFrame
+  | MessageCloseTagFrame
+  | ToolBodyFrame
+  | ToolCloseTagFrame
+  | ChildTagNameFrame
+  | ChildAttrsFrame
+  | ChildAttrValueFrame
+  | ChildUnquotedAttrValueFrame
+  | ChildBodyFrame
+  | ChildCloseTagFrame
+  | CdataFrame
+  | DoneFrame
+
+export type ParseStack = [ProseFrame, ...StackFrame[]]
+
+export function mkFence(): FenceState {
+  return { phase: FencePhase.LeadingWs, buffer: '', deferred: '', pendingWhitespace: '' }
+}
+
+export function mkAttrState(): AttrState {
+  return { phase: { _tag: 'Idle' }, key: '', value: '', attrs: new Map(), hasError: false }
+}
+
+export function mkCloseTag(): CloseTagBuf {
+  return { name: '', raw: '</' }
+}
+
+export function mkRootProse(): ProseFrame {
+  return { _tag: 'Prose', fence: mkFence(), proseAccum: '', lastCharNewline: true, justClosedStructural: false }
+}

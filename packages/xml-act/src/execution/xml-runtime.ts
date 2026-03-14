@@ -719,6 +719,14 @@ function reactImpl(
           break
         }
 
+        if (error._tag === 'TurnControlConflict') {
+          currentState = yield* emitAndFold(currentState, {
+            _tag: 'StructuralParseError',
+            error,
+          })
+          break
+        }
+
         // Tool-scoped error — needs toolCallId/tagName from the detail
         if (currentState.deadToolCalls.has(error.toolCallId)) break
         if (hasPriorOutcome(priorOutcomes, error.toolCallId)) break
