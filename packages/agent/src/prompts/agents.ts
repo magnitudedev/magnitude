@@ -194,10 +194,13 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
 export function formatAgentIdleNotification(
   agentId: string,
   agentType: string,
-  reason: 'stable' | 'interrupt'
+  reason: 'stable' | 'interrupt' | 'error'
 ): string {
   if (reason === 'interrupt') {
     return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) was interrupted and is now idle. It will not take further action until you message it.</agent_idle>`
+  }
+  if (reason === 'error') {
+    return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) hit an unexpected error and is now idle. It may no longer be functional.</agent_idle>`
   }
   return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) has gone idle and will not take further action until you message it.</agent_idle>`
 }
@@ -205,7 +208,7 @@ export function formatAgentIdleNotification(
 export function formatAgentsStatus(
   agents: readonly { agentId: string; type: string; status: string }[]
 ): string | null {
-  const active = agents.filter(a => a.status === 'running' || a.status === 'idle')
+  const active = agents.filter(a => a.status !== 'dismissed')
   if (active.length === 0) return null
   const lines = active.map(a => `- ${a.agentId} (${a.type}): ${a.status}`)
   return `<agents_status>\n${lines.join('\n')}\n</agents_status>`

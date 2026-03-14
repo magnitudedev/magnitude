@@ -7,7 +7,7 @@
 
 import { Effect, Stream, SubscriptionRef } from 'effect'
 import { DisplayProjection } from './display'
-import { AgentProjection } from './agent'
+import { AgentRoutingProjection } from './agent-routing'
 
 import { TurnProjection } from './turn'
 import { MemoryProjection } from './memory'
@@ -54,7 +54,7 @@ export interface DebugSnapshot {
 
 interface ResolvedProjections {
   displayProj: Effect.Effect.Success<typeof DisplayProjection.Tag>
-  agentProj: Effect.Effect.Success<typeof AgentProjection.Tag>
+  agentProj: Effect.Effect.Success<typeof AgentRoutingProjection.Tag>
 
   turnProj: Effect.Effect.Success<typeof TurnProjection.Tag>
   memoryProj: Effect.Effect.Success<typeof MemoryProjection.Tag>
@@ -72,7 +72,7 @@ function resolveProjections() {
   return Effect.gen(function* () {
     return {
       displayProj: yield* DisplayProjection.Tag,
-      agentProj: yield* AgentProjection.Tag,
+      agentProj: yield* AgentRoutingProjection.Tag,
 
       turnProj: yield* TurnProjection.Tag,
       memoryProj: yield* MemoryProjection.Tag,
@@ -122,7 +122,7 @@ function buildSnapshot(
     const projections: ProjectionSnapshot[] = [
 
       { name: 'WorkingStateProjection', state: workingForkState, timestamp },
-      { name: 'AgentProjection', state: agentState, timestamp },
+      { name: 'AgentRoutingProjection', state: agentState, timestamp },
 
       { name: 'TurnProjection', state: turnForkState, timestamp },
       { name: 'MemoryProjection', state: memoryForkState, timestamp },

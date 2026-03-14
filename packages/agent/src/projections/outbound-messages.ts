@@ -6,7 +6,7 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { AgentProjection, getAgentByForkId } from './agent'
+import { AgentRoutingProjection, getAgentByForkId } from './agent-routing'
 
 export interface PendingOutboundMessage {
   readonly forkId: string | null
@@ -28,7 +28,7 @@ export interface OutboundMessageCompletedSignal {
 
 export const OutboundMessagesProjection = Projection.define<AppEvent, OutboundMessagesState>()({
   name: 'OutboundMessages',
-  reads: [AgentProjection] as const,
+  reads: [AgentRoutingProjection] as const,
 
   initial: {
     pendingMessages: new Map(),
@@ -61,7 +61,7 @@ export const OutboundMessagesProjection = Projection.define<AppEvent, OutboundMe
       const pendingMessages = new Map(state.pendingMessages)
       pendingMessages.delete(event.id)
 
-      const agentState = read(AgentProjection)
+      const agentState = read(AgentRoutingProjection)
       const targetForkId = entry.dest === 'user'
         ? null
         : entry.dest === 'parent'

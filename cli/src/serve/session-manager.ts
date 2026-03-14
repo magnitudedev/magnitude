@@ -9,7 +9,7 @@ import {
   textParts,
   type AppEvent,
   type DisplayState,
-  type AgentState,
+  type AgentRoutingState,
   type ForkWorkingState,
   type ArtifactState,
 } from '@magnitudedev/agent'
@@ -27,7 +27,7 @@ export interface SessionInfo {
 
 export interface SessionDetail extends SessionInfo {
   display: DisplayState
-  forkState: AgentState
+  forkState: AgentRoutingState
   workingState: ForkWorkingState
   artifactState: ArtifactState
 }
@@ -40,7 +40,7 @@ interface SessionRecord {
   client: AgentClient
   status: 'idle' | 'streaming'
   display: DisplayState | null
-  forkState: AgentState | null
+  forkState: AgentRoutingState | null
   workingState: ForkWorkingState | null
   artifactState: ArtifactState | null
   eventSeq: number
@@ -71,7 +71,7 @@ const DEFAULT_DISPLAY_STATE: DisplayState = {
   showButton: 'send',
 }
 
-const DEFAULT_FORK_STATE: AgentState = {
+const DEFAULT_FORK_STATE: AgentRoutingState = {
   agents: new Map(),
   agentByForkId: new Map(),
   pendingMessages: new Map(),
@@ -162,7 +162,7 @@ export class SessionManager {
       this.emitThrottledDisplay(record)
     }))
 
-    record.unsubscribers.push(client.state.agents.subscribe((state) => {
+    record.unsubscribers.push(client.state.agentRouting.subscribe((state) => {
       record.forkState = state
       this.pushSessionEvent(record, 'fork_state', state)
     }))

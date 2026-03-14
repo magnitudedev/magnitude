@@ -19,7 +19,7 @@ import type { AgentVariant } from '../agents'
 import { ExecutionManager } from '../execution/execution-manager'
 import { ConversationStateReaderTag } from './memory-reader'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
-import { AgentProjection, getActiveAgent } from '../projections/agent'
+import { AgentRoutingProjection, getActiveAgent } from '../projections/agent-routing'
 
 const { ForkContext } = Fork
 
@@ -125,7 +125,7 @@ export const agentPauseTool = createTool({
   } as const,
   execute: ({ agentId }) =>
     Effect.gen(function* () {
-      const projection = yield* AgentProjection.Tag
+      const projection = yield* AgentRoutingProjection.Tag
       const agentState = yield* projection.get
       const agent = getActiveAgent(agentState, agentId)
 
@@ -165,7 +165,7 @@ export const agentDismissTool = createTool({
   } as const,
   execute: ({ agentId }) =>
     Effect.gen(function* () {
-      const projection = yield* AgentProjection.Tag
+      const projection = yield* AgentRoutingProjection.Tag
       const agentState = yield* projection.get
       const agent = getActiveAgent(agentState, agentId)
 

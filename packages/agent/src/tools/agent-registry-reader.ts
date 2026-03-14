@@ -5,10 +5,10 @@
  */
 
 import { Effect, Context } from 'effect'
-import type { AgentState } from '../projections/agent'
+import type { AgentRoutingState } from '../projections/agent-routing'
 
 export interface AgentRegistryStateReader {
-  readonly getState: () => Effect.Effect<AgentState>
+  readonly getState: () => Effect.Effect<AgentRoutingState>
 }
 
 export class AgentRegistryStateReaderTag extends Context.Tag('AgentRegistryStateReader')<

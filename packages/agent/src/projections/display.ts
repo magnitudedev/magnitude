@@ -14,10 +14,9 @@ import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent, ToolResult, ToolDisplay } from '../events'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { getVisualRegistry } from '../visuals/registry'
-import { AgentProjection, type AgentState, getAgentByForkId } from './agent'
-
+import { AgentRoutingProjection, type AgentRoutingState, getAgentByForkId } from './agent-routing'
+import { AgentStatusProjection } from './agent-status'
 import { WorkingStateProjection } from './working-state'
-import { AgentStatusBridgeProjection } from './agent-status-bridge'
 
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
@@ -25,7 +24,7 @@ import { createId } from '../util/id'
 
 /**
  * Resolve display visibility for a tool call using the agent definition's display policy.
- * Reads the agent role from AgentProjection to determine which agent definition to consult.
+ * Reads the agent role from AgentRoutingProjection to determine which agent definition to consult.
  */
 /** Map XmlToolResult → ToolResult for display. */
 function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay): ToolResult {
@@ -51,7 +50,7 @@ function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay
   }
 }
 
-function isToolHidden(toolKey: string, forkId: string | null, input: unknown, agentState: AgentState): boolean {
+function isToolHidden(toolKey: string, forkId: string | null, input: unknown, agentState: AgentRoutingState): boolean {
   const variant: AgentVariant = forkId
     ? (getAgentByForkId(agentState, forkId)?.role ?? 'builder') as AgentVariant
     : 'orchestrator'
@@ -405,7 +404,7 @@ function toPreview(text: string): string {
 export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>()({
   name: 'Display',
 
-  reads: [AgentProjection, WorkingStateProjection] as const,
+  reads: [AgentRoutingProjection, AgentStatusProjection, WorkingStateProjection] as const,
 
   initialFork: {
     status: 'idle',
@@ -678,7 +677,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           // Consult agent definition's display policy
-          const agentState = read(AgentProjection)
+          const agentState = read(AgentRoutingProjection)
           if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
             return fork
           }
@@ -735,7 +734,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           // Consult agent definition's display policy
-          const agentState = read(AgentProjection)
+          const agentState = read(AgentRoutingProjection)
           if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
             return fork
           }
@@ -896,7 +895,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
   signalHandlers: (on) => [
     // Insert inline fork activity block in parent's display when agent is created
-    on(AgentProjection.signals.agentCreated, ({ value, state }) => {
+    on(AgentRoutingProjection.signals.agentCreated, ({ value, state }) => {
       const { forkId, parentForkId, name, role } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
@@ -927,7 +926,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const { forkId, toolKey } = value
       if (forkId === null) return state  // root fork tools, no parent activity to update
 
-      const agentState = read(AgentProjection)
+      const agentState = read(AgentRoutingProjection)
       const agent = getAgentByForkId(agentState, forkId)
       if (!agent) return state
 
@@ -950,7 +949,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     }),
 
     // Mark fork activity as completed when agent becomes idle
-    on(AgentStatusBridgeProjection.signals.agentBecameIdle, ({ value, state }) => {
+    on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
       const { forkId, parentForkId } = value
 
       const parentState = state.forks.get(parentForkId)
@@ -970,7 +969,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(AgentProjection.signals.agentDismissed, ({ value, state }) => {
+    on(AgentRoutingProjection.signals.agentDismissed, ({ value, state }) => {
       const { forkId, parentForkId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
@@ -989,7 +988,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(AgentStatusBridgeProjection.signals.agentResumed, ({ value, state }) => {
+    on(AgentStatusProjection.signals.agentBecameWorking, ({ value, state }) => {
       const { forkId, parentForkId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
@@ -1015,12 +1014,12 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(AgentProjection.signals.agentMessage, ({ value, state, read }) => {
+    on(AgentRoutingProjection.signals.agentMessage, ({ value, state, read }) => {
       const { targetForkId, agentId, message, timestamp } = value
       const content = message.trim()
       if (!content) return state
 
-      const agentState = read(AgentProjection)
+      const agentState = read(AgentRoutingProjection)
       const targetAgent = getAgentByForkId(agentState, targetForkId)
       const parentForkId = targetAgent?.parentForkId ?? null
       let nextState = state
@@ -1076,12 +1075,12 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       return nextState
     }),
 
-    on(AgentProjection.signals.agentResponse, ({ value, state, read }) => {
+    on(AgentRoutingProjection.signals.agentResponse, ({ value, state, read }) => {
       const { targetForkId, agentId, message, timestamp } = value
       const content = message.trim()
       if (!content) return state
 
-      const agentState = read(AgentProjection)
+      const agentState = read(AgentRoutingProjection)
       const sourceAgent = agentState.agents.get(agentId)
 
       let nextState = state

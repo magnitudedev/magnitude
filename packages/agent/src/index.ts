@@ -90,20 +90,23 @@ export type {
 export { TurnProjection } from './projections/turn'
 export type { TurnState, ToolCall } from './projections/turn'
 
-export { AgentProjection } from './projections/agent'
+export { AgentRoutingProjection } from './projections/agent-routing'
 export type {
-  AgentState,
+  AgentRoutingState,
   AgentInstance,
-  AgentLifecycleStatus,
   AgentCreatedSignal,
   AgentDismissedSignal,
-  AgentPausedSignal,
+
   AgentMessageSignal,
   AgentResponseSignal,
-} from './projections/agent'
-
-export { AgentStatusBridgeProjection } from './projections/agent-status-bridge'
-export type { AgentBecameIdleSignal, AgentResumedSignal } from './projections/agent-status-bridge'
+} from './projections/agent-routing'
+export { AgentStatusProjection } from './projections/agent-status'
+export type {
+  AgentStatusState,
+  AgentStatus,
+  AgentBecameIdleSignal,
+  AgentBecameWorkingSignal,
+} from './projections/agent-status'
 
 export { ArtifactProjection } from './projections/artifact'
 export type { ArtifactState, ArtifactItem } from './projections/artifact'

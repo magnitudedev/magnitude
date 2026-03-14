@@ -22,8 +22,8 @@ import { CanonicalTurnProjection } from './projections/canonical-turn'
 import { MemoryProjection } from './projections/memory'
 import { SubagentActivityProjection } from './projections/subagent-activity'
 import { DisplayProjection } from './projections/display'
-import { AgentProjection } from './projections/agent'
-import { AgentStatusBridgeProjection } from './projections/agent-status-bridge'
+import { AgentRoutingProjection } from './projections/agent-routing'
+import { AgentStatusProjection } from './projections/agent-status'
 import { CompactionProjection } from './projections/compaction'
 
 import { ArtifactProjection } from './projections/artifact'
@@ -77,14 +77,14 @@ export const CodingAgent = Agent.define<AppEvent>()({
 
   projections: [
     SessionContextProjection,
-    AgentProjection,
+    AgentRoutingProjection,
+    AgentStatusProjection,
     CompactionProjection,
     WorkingStateProjection,
     TurnProjection,
     CanonicalTurnProjection,
 
     ArtifactProjection,
-    AgentStatusBridgeProjection,
 
     ReplayProjection,
     SubagentActivityProjection,
@@ -124,7 +124,8 @@ export const CodingAgent = Agent.define<AppEvent>()({
       working: WorkingStateProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
-      agents: AgentProjection,
+      agentRouting: AgentRoutingProjection,
+      agentStatus: AgentStatusProjection,
 
       artifacts: ArtifactProjection,
     }
@@ -242,7 +243,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       yield* hydrationContext.setHydrating(false)
 
       const executionManager = yield* ExecutionManager
-      const agentProjection = yield* AgentProjection.Tag
+      const agentProjection = yield* AgentRoutingProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
@@ -251,7 +252,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // Create execution resources for all non-dismissed agents
       const agentState = yield* agentProjection.get
       for (const [, agent] of agentState.agents) {
-        if (agent.status === 'dismissed') continue
+        if (agent.dismissed) continue
         yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
       }
 
@@ -260,7 +261,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // a valid settled state. If not stable, emit an interrupt to cleanly
       // terminate it through the normal recovery chain.
       for (const [, agent] of agentState.agents) {
-        if (agent.status === 'dismissed') continue
+        if (agent.dismissed) continue
         const forkWorkingState = yield* workingStateProjection.getFork(agent.forkId)
         if (!isStable(forkWorkingState)) {
           yield* Effect.promise(() => client.send({
@@ -281,8 +282,8 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         }))
       }
 
-      // NOTE: AgentProjection is the runtime source of truth for child agents.
-      // forkId remains the execution handle used by forked projections/workers.
+      // NOTE: AgentRoutingProjection is the runtime source of truth for child agent identity/routing.
+      // AgentStatusProjection tracks real execution state. forkId remains the execution handle used by forked projections/workers.
 
       // Persist all recovery events immediately so reopening the same session
       // again won't re-run recovery for already-terminated forks.

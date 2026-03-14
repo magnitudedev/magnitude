@@ -1,6 +1,6 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { AgentProjection, getAgentByForkId } from './agent'
+import { AgentRoutingProjection, getAgentByForkId } from './agent-routing'
 import { WorkingStateProjection } from './working-state'
 
 export interface TurnEntry {
@@ -26,7 +26,7 @@ export interface SubagentActivityState {
 export const SubagentActivityProjection = Projection.define<AppEvent, SubagentActivityState>()({
   name: 'SubagentActivity',
 
-  reads: [AgentProjection] as const,
+  reads: [AgentRoutingProjection] as const,
 
   initial: {
     entriesByParent: new Map(),
@@ -83,7 +83,7 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
     turn_completed: ({ event, state, read }) => {
       if (event.forkId === null) return state
 
-      const agentState = read(AgentProjection)
+      const agentState = read(AgentRoutingProjection)
       const agent = getAgentByForkId(agentState, event.forkId)
       if (!agent) return state
 

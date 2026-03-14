@@ -7,7 +7,8 @@
 
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent, ResponsePart, StrategyId, Attachment, ResolvedMention } from '../events'
-import { AgentProjection, getAgentByForkId } from './agent'
+import { AgentRoutingProjection, getAgentByForkId } from './agent-routing'
+import { AgentStatusProjection } from './agent-status'
 
 import { SubagentActivityProjection } from './subagent-activity'
 
@@ -25,7 +26,6 @@ import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/p
 import { ContentPart, textParts, wrapTextParts } from '../content'
 import { formatAgentIdleNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
 import { ArtifactAwarenessProjection } from './artifact-awareness'
-import { AgentStatusBridgeProjection } from './agent-status-bridge'
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -187,7 +187,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
-  reads: [AgentProjection, ArtifactAwarenessProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
+  reads: [AgentRoutingProjection, AgentStatusProjection, ArtifactAwarenessProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -375,7 +375,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
 
   signalHandlers: (on) => [
-    on(AgentProjection.signals.agentCreated, ({ value, source, state }) => {
+    on(AgentRoutingProjection.signals.agentCreated, ({ value, source, state }) => {
       const { forkId, parentForkId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) throw new Error(`Parent fork ${parentForkId} not found in MemoryProjection`)
@@ -400,7 +400,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return { ...state, forks: new Map(state.forks).set(forkId, newForkState) }
     }),
 
-    on(AgentProjection.signals.agentDismissed, ({ value, state }) => {
+    on(AgentRoutingProjection.signals.agentDismissed, ({ value, state }) => {
       const { parentForkId, name, result, role, taskId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
@@ -419,7 +419,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
     on(OutboundMessagesProjection.signals.messageCompleted, ({ value, state, read }) => {
       if (value.dest === 'user') return state
 
-      const agentState = read(AgentProjection)
+      const agentState = read(AgentRoutingProjection)
       const senderAgentId = value.forkId === null
         ? 'orchestrator'
         : (getAgentByForkId(agentState, value.forkId)?.agentId ?? 'orchestrator')
@@ -493,7 +493,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(AgentStatusBridgeProjection.signals.agentBecameIdle, ({ value, state }) => {
+    on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
 

@@ -13,7 +13,6 @@ import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { ExecutionManager } from '../execution/execution-manager'
-import { AgentProjection, getAgentByForkId } from '../projections/agent'
 import { WorkingStateProjection } from '../projections/working-state'
 
 import { BrowserService } from '../services/browser-service'
@@ -39,8 +38,8 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
 
     // Interrupt just stops the current turn — agent stays alive and goes idle.
     // The interrupt flows through: WorkingState (clears state, emits turnInterrupted)
+    // → AgentStatusProjection (settles status and emits agentBecameIdle)
     // → AgentOrchestrator signal handler (publishes synthetic turn_completed)
-    // → AgentStatusBridge (emits agentBecameIdle with reason 'interrupt')
     interrupt: (_event, _publish, _read) => Effect.void,
 
     // Dispose agent resources

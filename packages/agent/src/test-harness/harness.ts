@@ -14,7 +14,8 @@ import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { MemoryProjection, getView } from '../projections/memory'
 import { SubagentActivityProjection } from '../projections/subagent-activity'
 import { DisplayProjection } from '../projections/display'
-import { AgentProjection } from '../projections/agent'
+import { AgentRoutingProjection } from '../projections/agent-routing'
+import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
 import { ArtifactProjection } from '../projections/artifact'
 
@@ -218,7 +219,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       name: 'TestCodingAgent',
       projections: [
         SessionContextProjection,
-        AgentProjection,
+        AgentRoutingProjection,
+        AgentStatusProjection,
         CompactionProjection,
         WorkingStateProjection,
         TurnProjection,
@@ -246,7 +248,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           working: WorkingStateProjection,
           memory: MemoryProjection,
           compaction: CompactionProjection,
-          agents: AgentProjection,
+          agentRouting: AgentRoutingProjection,
+          agentStatus: AgentStatusProjection,
           artifacts: ArtifactProjection,
 
         },
@@ -511,7 +514,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             client.runEffect(Effect.flatMap(CompactionProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(MemoryProjection.Tag, (projection) => projection.getFork(null))),
-            client.runEffect(Effect.flatMap(AgentProjection.Tag, (projection) => projection.get)),
+            client.runEffect(Effect.flatMap(AgentRoutingProjection.Tag, (projection) => projection.get)),
             client.runEffect(Effect.flatMap(SessionContextProjection.Tag, (projection) => projection.get)),
           ])
 
@@ -520,7 +523,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             CompactionProjection: compaction,
             WorkingStateProjection: working,
             MemoryProjection: memory,
-            AgentProjection: agent,
+            AgentRoutingProjection: agent,
             SessionContextProjection: sessionContext,
           }
         },

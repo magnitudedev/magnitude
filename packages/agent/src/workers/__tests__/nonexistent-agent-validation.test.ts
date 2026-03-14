@@ -3,12 +3,12 @@ import { describe, test, expect } from 'bun:test'
 /**
  * Tests the nonexistent agent ID validation logic used in execution-manager.ts at ExecutionEnd.
  * This mirrors the inline validation: filter sentMessages for non-user/non-parent dests,
- * check against running forks, flag invalid destinations.
+ * check against non-completed forks, flag invalid destinations.
  */
 
 interface MinimalFork {
   agentId: string
-  status: 'running' | 'completed'
+  status: 'working' | 'completed'
 }
 
 function findInvalidAgentDests(
@@ -17,7 +17,7 @@ function findInvalidAgentDests(
 ): string[] {
   const agentDests = messagesSent.filter(m => m.dest !== 'user' && m.dest !== 'parent')
   if (agentDests.length === 0) return []
-  const knownAgentIds = new Set([...forks.values()].filter(f => f.status === 'running').map(f => f.agentId))
+  const knownAgentIds = new Set([...forks.values()].filter(f => f.status === 'working').map(f => f.agentId))
   return agentDests.filter(m => !knownAgentIds.has(m.dest)).map(m => m.dest)
 }
 
@@ -30,9 +30,9 @@ describe('nonexistent agent destination validation', () => {
     expect(findInvalidAgentDests(messages, new Map())).toEqual([])
   })
 
-  test('returns empty when agent exists and is running', () => {
+  test('returns empty when agent exists and is working', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-explorer', status: 'running' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'working' as const }],
     ])
     const messages = [{ id: '1', dest: 'my-explorer' }]
     expect(findInvalidAgentDests(messages, forks)).toEqual([])
@@ -40,7 +40,7 @@ describe('nonexistent agent destination validation', () => {
 
   test('returns invalid dest when agent does not exist', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-explorer', status: 'running' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'working' as const }],
     ])
     const messages = [{ id: '1', dest: 'nonexistent-agent' }]
     expect(findInvalidAgentDests(messages, forks)).toEqual(['nonexistent-agent'])
@@ -56,7 +56,7 @@ describe('nonexistent agent destination validation', () => {
 
   test('returns multiple invalid dests', () => {
     const forks = new Map([
-      ['fork-1', { agentId: 'my-explorer', status: 'running' as const }],
+      ['fork-1', { agentId: 'my-explorer', status: 'working' as const }],
     ])
     const messages = [
       { id: '1', dest: 'bad-1' },

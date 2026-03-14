@@ -43,7 +43,8 @@ import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
 
 import { ArtifactProjection, type ArtifactState } from '../projections/artifact'
-import { AgentProjection, type AgentState, getActiveAgent, getAgentByForkId } from '../projections/agent'
+import { AgentRoutingProjection, type AgentRoutingState, getActiveAgent, getAgentByForkId } from '../projections/agent-routing'
+import { AgentStatusProjection, type AgentStatusState } from '../projections/agent-status'
 import { WorkingStateProjection, type ForkWorkingState } from '../projections/working-state'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
@@ -102,7 +103,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkWorkingState>
+    Projection.ProjectionInstance<AgentRoutingState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkWorkingState>
   >
 
   /**
@@ -116,7 +117,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     void,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService
   >
 
   /**
@@ -143,7 +144,7 @@ export interface ExecutionManagerService {
   }) => Effect.Effect<
     string,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -172,7 +173,8 @@ function makeForkLayers(
   forkId: string | null,
 
   sessionContextProjection: Projection.ProjectionInstance<SessionContextState>,
-  agentProjection: Projection.ProjectionInstance<AgentState>,
+  agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
+  agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   artifactProjection: Projection.ProjectionInstance<ArtifactState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
 
@@ -206,7 +208,7 @@ function makeForkLayers(
     getAgentState: () => agentProjection.get,
   } satisfies AgentStateReader)
 
-  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentProjection, workingStateProjection)
+  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentProjection, agentStatusProjection, workingStateProjection)
 
   const toolEmitLayer = Layer.succeed(ToolEmitTag, {
     emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
@@ -293,7 +295,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const { forkId, turnId } = options
 
       // Resolve agent definition for this fork
-      const agentProjectionInst = yield* AgentProjection.Tag
+      const agentProjectionInst = yield* AgentRoutingProjection.Tag
       const agentState = yield* agentProjectionInst.get
       let variant: AgentVariant
       if (forkId) {
@@ -405,7 +407,8 @@ const makeExecutionManager = Effect.gen(function* () {
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
         cwd,
-        yield* AgentProjection.Tag,
+        yield* AgentRoutingProjection.Tag,
+        yield* AgentStatusProjection.Tag,
         yield* WorkingStateProjection.Tag,
       )
 
@@ -722,7 +725,8 @@ const makeExecutionManager = Effect.gen(function* () {
     initFork: (forkId, variant) => Effect.gen(function* () {
 
       const sessionContextProjection = yield* SessionContextProjection.Tag
-      const agentProjection = yield* AgentProjection.Tag
+      const agentProjection = yield* AgentRoutingProjection.Tag
+      const agentStatusProjection = yield* AgentStatusProjection.Tag
       const artifactProjection = yield* ArtifactProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
 
@@ -739,7 +743,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       let layers = makeForkLayers(
         forkId,
-        sessionContextProjection, agentProjection,
+        sessionContextProjection, agentProjection, agentStatusProjection,
         artifactProjection, workingStateProjection,
         conversationProjection,
         approvalState,

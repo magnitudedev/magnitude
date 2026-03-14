@@ -7,7 +7,7 @@
 
 import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { AgentProjection } from './agent'
+import { AgentRoutingProjection } from './agent-routing'
 import { CompactionProjection } from './compaction'
 
 
@@ -384,7 +384,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
 
     // Wake orchestrator (root) when sub-agent responds
-    on(AgentProjection.signals.agentResponse, ({ value, state, emit }) => {
+    on(AgentRoutingProjection.signals.agentResponse, ({ value, state, emit }) => {
       const forkId = value.targetForkId  // null = root (orchestrator)
       const forkState = state.forks.get(forkId)
       if (!forkState) return state
@@ -410,7 +410,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     }),
 
     // Wake sub-agent when orchestrator sends it a message
-    on(AgentProjection.signals.agentMessage, ({ value, state, emit }) => {
+    on(AgentRoutingProjection.signals.agentMessage, ({ value, state, emit }) => {
       const forkId = value.targetForkId
       const forkState = state.forks.get(forkId)
       if (!forkState) return state
