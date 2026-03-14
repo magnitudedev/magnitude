@@ -5,14 +5,14 @@
  */
 
 import { Effect, Context } from 'effect'
-import type { AgentRoutingState } from '../projections/agent-routing'
+import type { AgentStatusState } from '../projections/agent-status'
 
 // =============================================================================
 // Fork State Reader Service (for tools to access fork projection state)
 // =============================================================================
 
 export interface AgentStateReader {
-  readonly getAgentState: () => Effect.Effect<AgentRoutingState>
+  readonly getAgentState: () => Effect.Effect<AgentStatusState>
 }
 
 export class AgentStateReaderTag extends Context.Tag('AgentStateReader')<

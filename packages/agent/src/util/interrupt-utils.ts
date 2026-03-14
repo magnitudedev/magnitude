@@ -5,7 +5,7 @@ import { mapXmlToolResult } from './tool-result'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { defaultXmlTagName } from '../tools'
 import { CanonicalTurnProjection, type CanonicalTurnState } from '../projections/canonical-turn'
-import { AgentRoutingProjection, getAgentByForkId } from '../projections/agent-routing'
+import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { ReplayProjection } from '../projections/replay'
 
 function buildResponseParts(canonical: CanonicalTurnState): readonly ResponsePart[] {
@@ -60,7 +60,7 @@ export const buildInterruptedTurnCompleted = (params: {
 
   const canonicalProjection = yield* CanonicalTurnProjection.Tag
   const replayProjection = yield* ReplayProjection.Tag
-  const agentProjection = yield* AgentRoutingProjection.Tag
+  const agentProjection = yield* AgentStatusProjection.Tag
 
   const canonical = yield* canonicalProjection.getFork(forkId)
   const replay = yield* replayProjection.getFork(forkId)

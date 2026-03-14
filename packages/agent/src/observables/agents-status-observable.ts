@@ -7,12 +7,11 @@ export const agentsStatusObservable = createObservable({
   name: 'agents-status',
   observe: () => Effect.gen(function* () {
     const reader = yield* ProjectionReaderTag
-    const registry = yield* reader.getAgentRouting()
     const statuses = yield* reader.getAgentStatus()
-    const agents = Array.from(registry.agents.values()).map(agent => ({
+    const agents = Array.from(statuses.agents.values()).map(agent => ({
       agentId: agent.agentId,
       type: agent.role,
-      status: statuses.statuses.get(agent.agentId) ?? (agent.dismissed ? 'dismissed' : 'starting'),
+      status: agent.status,
     }))
     const formatted = formatAgentsStatus(agents)
     if (!formatted) return []

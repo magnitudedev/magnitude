@@ -7,8 +7,7 @@
 
 import { Effect } from 'effect'
 import type { Projection } from '@magnitudedev/event-core'
-import type { AgentRoutingState, AgentInstance } from '../projections/agent-routing'
-import type { AgentStatusState } from '../projections/agent-status'
+import type { AgentStatusState, AgentInfo } from '../projections/agent-status'
 import type { ForkWorkingState } from '../projections/working-state'
 
 import type { PolicyContext, PolicyContextProvider } from './types'
@@ -17,25 +16,23 @@ import type { PolicyContext, PolicyContextProvider } from './types'
 export function createPolicyContextProvider(
   forkId: string | null,
   cwd: string,
-  agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
 ): PolicyContextProvider {
   return {
     get: Effect.gen(function* () {
-      const agentState = yield* agentProjection.get
       const agentStatuses = yield* agentStatusProjection.get
       const forkWorkingState = yield* workingStateProjection.getFork(forkId)
 
       return {
         forkId,
         cwd,
-        activeAgentCount: [...agentState.agents.values()].filter((a: AgentInstance) => agentStatuses.statuses.get(a.agentId) === 'working').length,
+        activeAgentCount: [...agentStatuses.agents.values()].filter((a: AgentInfo) => a.status === 'working').length,
         userMessagePending: forkWorkingState.hasQueuedMessages,
-        agents: [...agentState.agents.values()].map((a: AgentInstance) => ({
+        agents: [...agentStatuses.agents.values()].map((a: AgentInfo) => ({
           agentId: a.agentId,
           type: a.role,
-          status: agentStatuses.statuses.get(a.agentId) ?? (a.dismissed ? 'dismissed' : 'starting')
+          status: a.status,
         })),
       }
     })

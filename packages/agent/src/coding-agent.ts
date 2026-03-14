@@ -243,16 +243,16 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       yield* hydrationContext.setHydrating(false)
 
       const executionManager = yield* ExecutionManager
-      const agentProjection = yield* AgentRoutingProjection.Tag
+      const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
       yield* executionManager.initFork(null, 'orchestrator')
 
       // Create execution resources for all non-dismissed agents
-      const agentState = yield* agentProjection.get
+      const agentState = yield* agentStatusProjection.get
       for (const [, agent] of agentState.agents) {
-        if (agent.dismissed) continue
+        if (agent.status === 'dismissed') continue
         yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
       }
 
@@ -261,7 +261,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // a valid settled state. If not stable, emit an interrupt to cleanly
       // terminate it through the normal recovery chain.
       for (const [, agent] of agentState.agents) {
-        if (agent.dismissed) continue
+        if (agent.status === 'dismissed') continue
         const forkWorkingState = yield* workingStateProjection.getFork(agent.forkId)
         if (!isStable(forkWorkingState)) {
           yield* Effect.promise(() => client.send({
@@ -282,8 +282,8 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         }))
       }
 
-      // NOTE: AgentRoutingProjection is the runtime source of truth for child agent identity/routing.
-      // AgentStatusProjection tracks real execution state. forkId remains the execution handle used by forked projections/workers.
+      // NOTE: AgentStatusProjection is the source of truth for agent identity, metadata, and execution state.
+      // AgentRoutingProjection handles message routing only. forkId remains the execution handle used by forked projections/workers.
 
       // Persist all recovery events immediately so reopening the same session
       // again won't re-run recovery for already-terminated forks.

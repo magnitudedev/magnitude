@@ -6,7 +6,7 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { AgentRoutingProjection, getAgentByForkId } from './agent-routing'
+import { AgentRoutingProjection, getRoutingEntryByForkId } from './agent-routing'
 
 export interface PendingOutboundMessage {
   readonly forkId: string | null
@@ -67,7 +67,7 @@ export const OutboundMessagesProjection = Projection.define<AppEvent, OutboundMe
         : entry.dest === 'parent'
           ? entry.forkId === null
             ? null
-            : getAgentByForkId(agentState, entry.forkId)?.parentForkId
+            : getRoutingEntryByForkId(agentState, entry.forkId)?.parentForkId
           : agentState.agents.get(entry.dest)?.forkId
 
       emit.messageCompleted({

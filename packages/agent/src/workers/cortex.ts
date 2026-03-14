@@ -40,7 +40,7 @@ import { MemoryProjection, getView } from '../projections/memory'
 import { LLMMessage } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
-import { AgentRoutingProjection, getAgentByForkId } from '../projections/agent-routing'
+import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { WorkingStateProjection } from '../projections/working-state'
 import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, type AgentVariant } from '../agents'
@@ -130,7 +130,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       const rawCodeChunks: string[] = []
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
-        const agentState = yield* read(AgentRoutingProjection)
+        const agentState = yield* read(AgentStatusProjection)
         const agentInstance = forkId ? getAgentByForkId(agentState, forkId) : null
 
         // Determine agent: child forks use their role, root fork is always orchestrator.

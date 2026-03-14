@@ -93,17 +93,17 @@ export type { TurnState, ToolCall } from './projections/turn'
 export { AgentRoutingProjection } from './projections/agent-routing'
 export type {
   AgentRoutingState,
-  AgentInstance,
-  AgentCreatedSignal,
-  AgentDismissedSignal,
-
+  RoutingEntry,
   AgentMessageSignal,
   AgentResponseSignal,
 } from './projections/agent-routing'
 export { AgentStatusProjection } from './projections/agent-status'
 export type {
+  AgentInfo,
   AgentStatusState,
   AgentStatus,
+  AgentCreatedSignal,
+  AgentDismissedSignal,
   AgentBecameIdleSignal,
   AgentBecameWorkingSignal,
 } from './projections/agent-status'

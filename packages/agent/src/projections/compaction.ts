@@ -14,6 +14,7 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 import { peekSlot } from '@magnitudedev/providers'
 import type { AppEvent, SessionContext } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
+
 import { getContextLimits } from '../constants'
 import { CHARS_PER_TOKEN } from '../constants'
 import { SYSTEM_PROMPT_TOKENS } from '../generated/system-prompt-size'
@@ -306,7 +307,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
   },
 
   signalHandlers: (on) => [
-    on(AgentRoutingProjection.signals.agentCreated, ({ value, state }) => {
+    on(AgentRoutingProjection.signals.agentRegistered, ({ value, state }) => {
       const { forkId, parentForkId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) {

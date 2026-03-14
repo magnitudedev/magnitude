@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentRoutingState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 import { MultilineInput, type MultilineInputHandle } from './components/multiline-input'
@@ -125,7 +125,6 @@ function AppInner({
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const [client, setClient] = useState<AgentClient | null>(null)
   const [display, setDisplay] = useState<DisplayState | null>(null)
-  const [agentRoutingState, setAgentRoutingState] = useState<AgentRoutingState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
   const [artifactState, setArtifactState] = useState<ArtifactState | null>(null)
   const [selectedArtifact, setSelectedArtifact] = useState<{ name: string; section?: string } | null>(null)
@@ -610,12 +609,6 @@ function AppInner({
       })
 
       // Subscribe to agent state (global projection)
-      client.state.agentRouting.subscribe((state) => {
-        if (mounted) {
-          setAgentRoutingState(state)
-        }
-      })
-
       client.state.agentStatus.subscribe((state) => {
         if (mounted) {
           setAgentStatusState(state)
@@ -799,7 +792,7 @@ function AppInner({
   }, [])
 
   const hasRunningForks = agentStatusState
-    ? Array.from(agentStatusState.statuses.values()).some(s => s === 'working')
+    ? Array.from(agentStatusState.agents.values()).some(a => a.status === 'working')
     : false
 
   // Find pending approval request from display messages (for keyboard intercept)
@@ -1643,14 +1636,14 @@ function AppInner({
     // Interrupt root with allKilled flag
     client.send({ type: 'interrupt', forkId: null, allKilled: true })
     // Interrupt every running fork
-    if (agentRoutingState && agentStatusState) {
-      for (const agent of agentRoutingState.agents.values()) {
-        if (agentStatusState.statuses.get(agent.agentId) === 'working' && agent.forkId) {
+    if (agentStatusState) {
+      for (const agent of agentStatusState.agents.values()) {
+        if (agent.status === 'working') {
           client.send({ type: 'interrupt', forkId: agent.forkId })
         }
       }
     }
-  }, [client, agentRoutingState, agentStatusState])
+  }, [client, agentStatusState])
 
   useKeyboard(
     useCallback(
@@ -2162,8 +2155,8 @@ function AppInner({
   }
 
   if (expandedForkId && client) {
-    const agentId = agentRoutingState?.agentByForkId.get(expandedForkId)
-    const agent = agentId ? agentRoutingState?.agents.get(agentId) : undefined
+    const agentId = agentStatusState?.agentByForkId.get(expandedForkId)
+    const agent = agentId ? agentStatusState?.agents.get(agentId) : undefined
     const initialPrompt = agent?.message ?? null
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>

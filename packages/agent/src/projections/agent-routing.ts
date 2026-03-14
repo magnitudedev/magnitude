@@ -1,72 +1,38 @@
 /**
  * AgentRoutingProjection
  *
- * Global projection tracking child agent lifecycle metadata and message routing.
+ * Global projection tracking child agent message routing.
  */
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 
-export interface AgentInstance {
+export interface RoutingEntry {
   readonly agentId: string
   readonly forkId: string
   readonly parentForkId: string | null
-  readonly name: string
-  readonly role: string
-  readonly context: string
-  readonly mode: 'clone' | 'spawn'
-  readonly taskId: string
-  readonly message: string | null
-  readonly outputSchema?: unknown
-  readonly dismissed: boolean
-  readonly result?: unknown
-  readonly dismissReason?: 'dismissed' | 'interrupted' | 'completed'
-  readonly createdAt: number
-  readonly dismissedAt?: number
 }
 
 export interface AgentRoutingState {
-  readonly agents: ReadonlyMap<string, AgentInstance>
+  readonly agents: ReadonlyMap<string, RoutingEntry>
   readonly agentByForkId: ReadonlyMap<string, string>
   readonly pendingMessages: ReadonlyMap<string, { forkId: string | null; dest: string; text: string }>
   readonly deferredParentMessages: ReadonlyMap<string, readonly { text: string }[]>
 }
 
-export function getAgentByForkId(state: AgentRoutingState, forkId: string): AgentInstance | undefined {
+export function getRoutingEntry(state: AgentRoutingState, agentId: string): RoutingEntry | undefined {
+  return state.agents.get(agentId)
+}
+
+export function getRoutingEntryByForkId(state: AgentRoutingState, forkId: string): RoutingEntry | undefined {
   const agentId = state.agentByForkId.get(forkId)
   if (!agentId) return undefined
   return state.agents.get(agentId)
 }
 
-export function getActiveAgent(state: AgentRoutingState, agentId: string): AgentInstance | undefined {
-  const agent = state.agents.get(agentId)
-  if (!agent || agent.dismissed) return undefined
-  return agent
+export function isActiveRoute(state: AgentRoutingState, agentId: string): boolean {
+  return state.agents.has(agentId)
 }
-
-export interface AgentCreatedSignal {
-  readonly forkId: string
-  readonly parentForkId: string | null
-  readonly agentId: string
-  readonly name: string
-  readonly role: string
-  readonly taskId: string
-  readonly mode: 'clone' | 'spawn'
-  readonly timestamp: number
-}
-
-export interface AgentDismissedSignal {
-  readonly forkId: string
-  readonly parentForkId: string | null
-  readonly agentId: string
-  readonly name: string
-  readonly role: string
-  readonly taskId: string
-  readonly result: unknown
-  readonly reason: 'dismissed' | 'interrupted' | 'completed'
-  readonly timestamp: number
-}
-
 
 export interface AgentMessageSignal {
   readonly targetForkId: string
@@ -93,15 +59,12 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
   },
 
   signals: {
-    agentCreated: Signal.create<AgentCreatedSignal>('AgentRouting/created'),
-    agentDismissed: Signal.create<AgentDismissedSignal>('AgentRouting/dismissed'),
-
+    agentRegistered: Signal.create<{ forkId: string; parentForkId: string | null }>('AgentRouting/registered'),
     agentMessage: Signal.create<AgentMessageSignal>('AgentRouting/message'),
     agentResponse: Signal.create<AgentResponseSignal>('AgentRouting/response'),
   },
 
   eventHandlers: {
-
     agent_created: ({ event, state, emit }) => {
       const existingAgent = state.agents.get(event.agentId)
       if (existingAgent) {
@@ -113,42 +76,22 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         throw new Error(`[AgentRoutingProjection] Invalid state transition: agent_created for already indexed fork ${event.forkId} (agentId: ${existingForkAgentId})`)
       }
 
-      emit.agentCreated({
-        forkId: event.forkId,
-        parentForkId: event.parentForkId,
-        agentId: event.agentId,
-        name: event.name,
-        role: event.role,
-        taskId: event.taskId,
-        mode: event.mode,
-        timestamp: event.timestamp,
-      })
-
-      const instance: AgentInstance = {
+      const entry: RoutingEntry = {
         agentId: event.agentId,
         forkId: event.forkId,
         parentForkId: event.parentForkId,
-        name: event.name,
-        role: event.role,
-        context: event.context,
-        mode: event.mode,
-        taskId: event.taskId,
-        message: event.message ?? null,
-        outputSchema: event.outputSchema,
-        dismissed: false,
-        createdAt: event.timestamp,
       }
+
+      emit.agentRegistered({ forkId: event.forkId, parentForkId: event.parentForkId })
 
       return {
         ...state,
-        agents: new Map(state.agents).set(event.agentId, instance),
+        agents: new Map(state.agents).set(event.agentId, entry),
         agentByForkId: new Map(state.agentByForkId).set(event.forkId, event.agentId),
       }
     },
 
-
-
-    agent_dismissed: ({ event, state, emit }) => {
+    agent_dismissed: ({ event, state }) => {
       const resolvedAgentId = state.agents.has(event.agentId)
         ? event.agentId
         : state.agentByForkId.get(event.forkId)
@@ -162,30 +105,12 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         throw new Error(`[AgentRoutingProjection] Invalid state transition: agent_dismissed for missing indexed agent ${resolvedAgentId}`)
       }
 
-      if (existing.dismissed) return state
+      const agents = new Map(state.agents)
+      agents.delete(resolvedAgentId)
+      const agentByForkId = new Map(state.agentByForkId)
+      agentByForkId.delete(existing.forkId)
 
-      emit.agentDismissed({
-        forkId: existing.forkId,
-        parentForkId: existing.parentForkId,
-        agentId: existing.agentId,
-        name: existing.name,
-        role: existing.role,
-        taskId: existing.taskId,
-        result: event.result,
-        reason: event.reason,
-        timestamp: event.timestamp,
-      })
-
-      return {
-        ...state,
-        agents: new Map(state.agents).set(resolvedAgentId, {
-          ...existing,
-          dismissed: true,
-          result: event.result,
-          dismissReason: event.reason,
-          dismissedAt: event.timestamp,
-        }),
-      }
+      return { ...state, agents, agentByForkId }
     },
 
     message_start: ({ event, state }) => {
@@ -219,8 +144,8 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         nextState = { ...nextState, deferredParentMessages }
       }
 
-      if (entry.dest !== 'user' && entry.dest !== 'parent') {
-        const target = getActiveAgent(state, entry.dest)
+      if (entry.dest !== 'user' && entry.dest !== 'parent' && isActiveRoute(state, entry.dest)) {
+        const target = getRoutingEntry(state, entry.dest)
         if (target) {
           emit.agentMessage({
             targetForkId: target.forkId,
@@ -247,7 +172,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         return { ...state, deferredParentMessages }
       }
 
-      const agent = getAgentByForkId(state, event.forkId)
+      const agent = getRoutingEntryByForkId(state, event.forkId)
       if (!agent) {
         return { ...state, deferredParentMessages }
       }

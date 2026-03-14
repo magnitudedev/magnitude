@@ -507,7 +507,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             compaction,
             working,
             memory,
-            agent,
+            agentRouting,
+            agentStatus,
             sessionContext,
           ] = await Promise.all([
             client.runEffect(Effect.flatMap(ArtifactProjection.Tag, (projection) => projection.get)),
@@ -515,6 +516,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             client.runEffect(Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(MemoryProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(AgentRoutingProjection.Tag, (projection) => projection.get)),
+            client.runEffect(Effect.flatMap(AgentStatusProjection.Tag, (projection) => projection.get)),
             client.runEffect(Effect.flatMap(SessionContextProjection.Tag, (projection) => projection.get)),
           ])
 
@@ -523,7 +525,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             CompactionProjection: compaction,
             WorkingStateProjection: working,
             MemoryProjection: memory,
-            AgentRoutingProjection: agent,
+            AgentRoutingProjection: agentRouting,
+            AgentStatusProjection: agentStatus,
             SessionContextProjection: sessionContext,
           }
         },

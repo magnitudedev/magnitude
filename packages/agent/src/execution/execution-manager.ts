@@ -43,8 +43,8 @@ import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
 
 import { ArtifactProjection, type ArtifactState } from '../projections/artifact'
-import { AgentRoutingProjection, type AgentRoutingState, getActiveAgent, getAgentByForkId } from '../projections/agent-routing'
-import { AgentStatusProjection, type AgentStatusState } from '../projections/agent-status'
+import { AgentRoutingProjection, type AgentRoutingState, isActiveRoute, getRoutingEntryByForkId } from '../projections/agent-routing'
+import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentByForkId } from '../projections/agent-status'
 import { WorkingStateProjection, type ForkWorkingState } from '../projections/working-state'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
@@ -190,7 +190,7 @@ function makeForkLayers(
   } satisfies ArtifactStateReader)
 
   const agentRegistryStateReaderLayer = Layer.succeed(AgentRegistryStateReaderTag, {
-    getState: () => agentProjection.get
+    getState: () => agentStatusProjection.get
   } satisfies AgentRegistryStateReader)
 
   const skillStateReaderLayer = Layer.succeed(SkillStateReaderTag, {
@@ -205,10 +205,10 @@ function makeForkLayers(
   } satisfies ConversationStateReader)
 
   const agentStateReaderLayer = Layer.succeed(AgentStateReaderTag, {
-    getAgentState: () => agentProjection.get,
+    getAgentState: () => agentStatusProjection.get,
   } satisfies AgentStateReader)
 
-  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentProjection, agentStatusProjection, workingStateProjection)
+  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentStatusProjection, workingStateProjection)
 
   const toolEmitLayer = Layer.succeed(ToolEmitTag, {
     emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
@@ -295,8 +295,9 @@ const makeExecutionManager = Effect.gen(function* () {
       const { forkId, turnId } = options
 
       // Resolve agent definition for this fork
-      const agentProjectionInst = yield* AgentRoutingProjection.Tag
-      const agentState = yield* agentProjectionInst.get
+      const agentRoutingProjectionInst = yield* AgentRoutingProjection.Tag
+      const agentStatusProjectionInst = yield* AgentStatusProjection.Tag
+      const agentState = yield* agentStatusProjectionInst.get
       let variant: AgentVariant
       if (forkId) {
         const agentInstance = getAgentByForkId(agentState, forkId)
@@ -407,7 +408,6 @@ const makeExecutionManager = Effect.gen(function* () {
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
         cwd,
-        yield* AgentRoutingProjection.Tag,
         yield* AgentStatusProjection.Tag,
         yield* WorkingStateProjection.Tag,
       )
@@ -557,8 +557,8 @@ const makeExecutionManager = Effect.gen(function* () {
 
                 // Validate agent message destinations inline during execution
                 if (event.dest !== 'user' && event.dest !== 'parent') {
-                  const currentAgentState = yield* agentProjectionInst.get
-                  const targetAgent = getActiveAgent(currentAgentState, event.dest)
+                  const currentAgentState = yield* agentRoutingProjectionInst.get
+                  const targetAgent = isActiveRoute(currentAgentState, event.dest)
                   if (!targetAgent) {
                     hasNonexistentAgentDest = true
                     const destStr = `"${event.dest}"`
