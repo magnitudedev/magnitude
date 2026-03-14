@@ -764,7 +764,8 @@ const makeExecutionManager = Effect.gen(function* () {
       }
 
       const projectionReader: ProjectionReader = {
-        getAgentRegistry: () => agentProjection.get,
+        getAgentRouting: () => agentProjection.get,
+        getAgentStatus: () => agentStatusProjection.get,
       }
       const projectionReaderLayer = Layer.succeed(ProjectionReaderTag, projectionReader)
       layers = Layer.merge(layers, projectionReaderLayer)
