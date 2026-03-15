@@ -1902,7 +1902,7 @@ function AppInner({
       {selectedArtifact && (selectedArtifactContent !== null || selectedArtifactStreaming !== null) && (
         <box style={{ width: '45%', flexShrink: 0, paddingRight: 1, paddingBottom: 1 }}>
           <ArtifactReaderPanel
-            key={`${selectedArtifact.name}-${selectedArtifactStreaming?.toolCallId ?? 'static'}`}
+            key={selectedArtifact.name}
             artifactName={selectedArtifact.name}
             content={selectedArtifactContent}
             streaming={selectedArtifactStreaming ?? undefined}
