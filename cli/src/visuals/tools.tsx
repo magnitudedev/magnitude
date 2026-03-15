@@ -60,11 +60,7 @@ function pathSummary(paths: string[], max: number = 3): string {
   return rest > 0 ? `${shown.join(', ')} +${rest}` : shown.join(', ')
 }
 
-function tailPreview(text: string): string {
-  const lines = text.split('\n')
-  const lastLines = lines.slice(-10)
-  return lastLines.join('\n')
-}
+
 
 // =============================================================================
 // webSearchRender
@@ -328,7 +324,7 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
   const isOpenInPanel = selectedArtifact === name
   const fullPreviewContent = preview?.contentSoFar ?? ''
   const { displayedContent: revealedFull, showCursor: previewCursor } = useStreamingReveal(fullPreviewContent, !done)
-  const revealedPreview = tailPreview(revealedFull)
+
 
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -369,12 +365,23 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
               borderStyle: 'single',
               borderColor: isHovered ? theme.link : theme.border || theme.muted,
               customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
               height: 12,
-              overflow: 'hidden',
             }}>
-              <StreamingMarkdownContent content={revealedPreview} showCursor={previewCursor} />
+              <scrollbox
+                stickyScroll
+                stickyStart="bottom"
+                scrollX={false}
+                scrollbarOptions={{ visible: false }}
+                verticalScrollbarOptions={{ visible: false }}
+                style={{
+                  flexGrow: 1,
+                  rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+                  wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
+                  contentOptions: { justifyContent: 'flex-start' },
+                }}
+              >
+                <StreamingMarkdownContent content={revealedFull} showCursor={previewCursor} />
+              </scrollbox>
             </box>
           )}
         </box>
@@ -394,8 +401,7 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
   const isOpenInPanel = selectedArtifact === name
   const fullUpdateContent = preview?.newStringSoFar ?? ''
   const { displayedContent: revealedUpdateFull, showCursor: updatePreviewCursor } = useStreamingReveal(fullUpdateContent, !done)
-  const revealedUpdatePreview = tailPreview(revealedUpdateFull)
-  const oldPreview = tailPreview(preview?.oldStringSoFar ?? '')
+
   const showOldPreview = !done
     && !!preview
     && preview.childPhase === 'streaming_old'
@@ -447,12 +453,23 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
                   borderStyle: 'single',
                   borderColor: theme.warning,
                   customBorderChars: BOX_CHARS,
-                  paddingLeft: 1,
-                  paddingRight: 1,
                   height: 12,
-                  overflow: 'hidden',
                 }}>
-                  <StreamingMarkdownContent content={oldPreview} />
+                  <scrollbox
+                    stickyScroll
+                    stickyStart="bottom"
+                    scrollX={false}
+                    scrollbarOptions={{ visible: false }}
+                    verticalScrollbarOptions={{ visible: false }}
+                    style={{
+                      flexGrow: 1,
+                      rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+                      wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
+                      contentOptions: { justifyContent: 'flex-start' },
+                    }}
+                  >
+                    <StreamingMarkdownContent content={preview?.oldStringSoFar ?? ''} />
+                  </scrollbox>
                 </box>
               )}
               {showNewPreview && (
@@ -460,12 +477,23 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
                   borderStyle: 'single',
                   borderColor: theme.success,
                   customBorderChars: BOX_CHARS,
-                  paddingLeft: 1,
-                  paddingRight: 1,
                   height: 12,
-                  overflow: 'hidden',
                 }}>
-                  <StreamingMarkdownContent content={revealedUpdatePreview} showCursor={updatePreviewCursor} />
+                  <scrollbox
+                    stickyScroll
+                    stickyStart="bottom"
+                    scrollX={false}
+                    scrollbarOptions={{ visible: false }}
+                    verticalScrollbarOptions={{ visible: false }}
+                    style={{
+                      flexGrow: 1,
+                      rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+                      wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
+                      contentOptions: { justifyContent: 'flex-start' },
+                    }}
+                  >
+                    <StreamingMarkdownContent content={revealedUpdateFull} showCursor={updatePreviewCursor} />
+                  </scrollbox>
                 </box>
               )}
             </>
