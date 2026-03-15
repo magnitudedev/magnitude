@@ -10,7 +10,7 @@ import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
 import { StickyWorkingHeader } from './components/think-block'
 import { LoadPreviousButton } from './components/chat-controls'
-import { ForkDetailOverlay } from './components/fork-detail-overlay'
+
 import { SlashCommandMenu } from './components/slash-command-menu'
 import { FileMentionMenu } from './components/file-mention-menu'
 import { usePaginatedTimeline } from './hooks/use-paginated-timeline'
@@ -26,13 +26,7 @@ import { AttachmentsBar } from './components/attachments-bar'
 import { BOX_CHARS } from './utils/ui-constants'
 import { AnimatedLogo } from './components/animated-logo'
 import { RecentChatsWidget } from './components/recent-chats-widget'
-import { RecentChatsOverlay } from './components/recent-chats-overlay'
-import { SettingsOverlay } from './components/settings-overlay'
 import { SessionLoadingView } from './components/session-loading-view'
-import { AuthMethodOverlay } from './components/auth-method-overlay'
-import { OAuthOverlay } from './components/oauth-overlay'
-import { LocalProviderOverlay } from './components/local-provider-overlay'
-import { ApiKeyOverlay } from './components/api-key-overlay'
 import { routeSlashCommand, type CommandContext } from './commands/command-router'
 import { INIT_PROMPT } from './commands/init-prompt'
 import { registerSkillCommands, type SlashCommandDefinition } from './commands/slash-commands'
@@ -43,8 +37,8 @@ import { useProviderSelectNavigation } from './hooks/use-provider-select-navigat
 import type { SettingsTab } from './hooks/use-settings-navigation'
 import { useAuthFlow } from './hooks/use-auth-flow'
 import { useFileMentions } from './hooks/use-file-mentions'
-import { SetupWizardOverlay, type WizardStep } from './components/setup-wizard-overlay'
-import { BrowserSetupOverlay } from './components/browser-setup-overlay'
+import { type WizardStep } from './components/setup-wizard-overlay'
+import { AppOverlays } from './components/app-overlays'
 import { ChatSurfaceKeyboard } from './components/chat-surface-keyboard'
 import { getDefaultModels } from './utils/model-preferences'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
@@ -1738,6 +1732,20 @@ function AppInner({
     return () => clearInterval(interval)
   }, [activeThinkBlock, isCollapsed])
 
+  const onWizardCtrlCExit = useCallback(() => {
+    if (providerUiState) {
+      void storage.config.setSetupComplete(true).then(() => reloadProviderState())
+    }
+    authFlow.cancelAll()
+    process.kill(process.pid, 'SIGINT')
+  }, [providerUiState, storage, reloadProviderState, authFlow])
+
+  const onSettingsClose = useCallback(() => {
+    setSettingsTab(null)
+    setSelectingModelFor(null)
+    setProviderDetailId(null)
+  }, [])
+
   if (!display) {
     return (
       <SessionLoadingView
@@ -1747,237 +1755,90 @@ function AppInner({
     )
   }
 
-  if (showSetupWizard && wizardStep === 'browser') {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <BrowserSetupOverlay
-          onClose={() => handleWizardBrowserComplete()}
-          onResult={() => handleWizardBrowserComplete()}
-          wizardMode={{
-            stepLabel: `Browser (${wizardTotalSteps} of ${wizardTotalSteps})`,
-            subtitle: 'The browser agent requires Chromium to control web pages.',
-            onSkip: handleWizardSkip,
-            onBack: handleWizardBack,
-          }}
-        />
-      </box>
-    )
-  }
+  const overlayContent = (
+    <AppOverlays
+      showSetupWizard={showSetupWizard}
+      wizardStep={wizardStep}
+      wizardTotalSteps={wizardTotalSteps}
+      wizardPrimaryModel={wizardPrimaryModel}
+      wizardSecondaryModel={wizardSecondaryModel}
+      wizardBrowserModel={wizardBrowserModel}
+      wizardConnectedProvider={wizardConnectedProvider}
+      wizardProviderSelectedIndex={wizardProviderSelectedIndex}
+      wizardModelSelectedIndex={wizardModelSelectedIndex}
+      showBrowserSetup={showBrowserSetup}
+      setShowBrowserSetup={setShowBrowserSetup}
+      handleWizardBrowserComplete={handleWizardBrowserComplete}
+      handleWizardProviderSelected={handleWizardProviderSelected}
+      handleWizardComplete={handleWizardComplete}
+      handleWizardBack={handleWizardBack}
+      handleWizardSkip={handleWizardSkip}
+      setWizardProviderSelectedIndex={setWizardProviderSelectedIndex}
+      setWizardModelSelectedIndex={setWizardModelSelectedIndex}
+      wizardProviders={WIZARD_PROVIDERS}
+      onWizardCtrlCExit={onWizardCtrlCExit}
+      authFlow={authFlow}
+      authMethodSelectedIndex={authMethodSelectedIndex}
+      setAuthMethodSelectedIndex={setAuthMethodSelectedIndex}
+      detectedProviders={detectedProviders}
+      connectedProviders={connectedProviders}
+      primaryModel={primaryModel}
+      secondaryModel={secondaryModel}
+      browserModel={browserModel}
+      selectingModelFor={selectingModelFor}
+      setSelectingModelFor={setSelectingModelFor}
+      preferencesSelectedIndex={preferencesSelectedIndex}
+      setPreferencesSelectedIndex={setPreferencesSelectedIndex}
+      providerDetailStatus={providerDetailStatus}
+      providerDetailActions={providerDetailActions}
+      providerDetailSelectedIndex={providerDetailSelectedIndex}
+      setProviderDetailSelectedIndex={setProviderDetailSelectedIndex}
+      settingsTab={settingsTab}
+      handleSettingsTabChange={handleSettingsTabChange}
+      handleModelSelect={handleModelSelect}
+      handleProviderSelect={handleProviderSelect}
+      handleProviderDetailAction={handleProviderDetailAction}
+      handleProviderDetailBack={handleProviderDetailBack}
+      handleChangePrimary={handleChangePrimary}
+      handleChangeSecondary={handleChangeSecondary}
+      handleChangeBrowser={handleChangeBrowser}
+      modelTabHandleKeyEvent={modelTabHandleKeyEvent}
+      providerTabHandleKeyEvent={providerTabHandleKeyEvent}
+      modelNavigation={modelNavigation}
+      providerNavigation={providerNavigation}
+      onSettingsClose={onSettingsClose}
+      showRecentChatsOverlay={showRecentChatsOverlay}
+      recentChats={recentChats}
+      recentChatsSelectedIndex={recentChatsSelectedIndex}
+      setRecentChatsSelectedIndex={setRecentChatsSelectedIndex}
+      setShowRecentChatsOverlay={setShowRecentChatsOverlay}
+      handleResumeChat={handleResumeChat}
+      expandedForkId={expandedForkId}
+      client={client}
+      agentStatusState={agentStatusState}
+      popForkOverlay={popForkOverlay}
+      pushForkOverlay={pushForkOverlay}
+      localProviderConfig={providerUiState?.localProviderConfig
+        ? {
+            baseUrl: providerUiState.localProviderConfig.baseUrl ?? undefined,
+            modelId: providerUiState.localProviderConfig.modelId ?? undefined,
+          }
+        : null}
+    />
+  )
 
-  if (showSetupWizard && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <SetupWizardOverlay
-          step={wizardStep}
-          allProviders={WIZARD_PROVIDERS}
-          detectedProviders={detectedProviders}
-          primaryModel={wizardPrimaryModel}
-          secondaryModel={wizardSecondaryModel}
-          browserModel={wizardBrowserModel}
-          connectedProviderName={wizardConnectedProvider}
-          totalSteps={wizardTotalSteps}
-          onProviderSelected={handleWizardProviderSelected}
-          onComplete={handleWizardComplete}
-          onBack={handleWizardBack}
-          onSkip={handleWizardSkip}
-          onWizardCtrlCExit={() => {
-            if (providerUiState) {
-              void storage.config.setSetupComplete(true).then(() => reloadProviderState())
-            }
-            authFlow.cancelAll()
-            process.kill(process.pid, 'SIGINT')
-          }}
-          providerSelectedIndex={wizardProviderSelectedIndex}
-          onProviderSelectedIndexChange={setWizardProviderSelectedIndex}
-          onProviderHoverIndex={setWizardProviderSelectedIndex}
-          modelNavSelectedIndex={wizardModelSelectedIndex}
-          onModelNavSelectedIndexChange={setWizardModelSelectedIndex}
-          onModelNavHoverIndex={setWizardModelSelectedIndex}
-        />
-      </box>
-    )
-  }
+  const isOverlayActive = (showSetupWizard && wizardStep === 'browser')
+    || (showSetupWizard && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay)
+    || showRecentChatsOverlay
+    || (expandedForkId && client)
+    || showBrowserSetup
+    || settingsTab !== null
+    || (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider)
+    || authFlow.showLocalSetup
+    || authFlow.apiKeySetup
+    || authFlow.oauthState
 
-  if (showRecentChatsOverlay) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <RecentChatsOverlay
-          chats={recentChats ?? []}
-          selectedIndex={recentChatsSelectedIndex}
-          onSelectedIndexChange={setRecentChatsSelectedIndex}
-          onSelect={handleResumeChat}
-          onHoverIndex={setRecentChatsSelectedIndex}
-          onClose={() => setShowRecentChatsOverlay(false)}
-        />
-      </box>
-    )
-  }
-
-  if (expandedForkId && client) {
-    const agentId = agentStatusState?.agentByForkId.get(expandedForkId)
-    const agent = agentId ? agentStatusState?.agents.get(agentId) : undefined
-    const initialPrompt = agent?.message ?? null
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <ForkDetailOverlay
-          forkId={expandedForkId}
-          forkName={agent?.name ?? 'Agent'}
-          forkRole={agent?.role ?? 'agent'}
-          initialPrompt={initialPrompt}
-          onClose={popForkOverlay}
-          onForkExpand={pushForkOverlay}
-          subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}
-        />
-      </box>
-    )
-  }
-
-  if (showBrowserSetup) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <BrowserSetupOverlay
-          onClose={() => setShowBrowserSetup(false)}
-          onResult={() => setShowBrowserSetup(false)}
-        />
-      </box>
-    )
-  }
-
-  if (settingsTab !== null) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <SettingsOverlay
-          activeTab={settingsTab}
-          onTabChange={handleSettingsTabChange}
-          onClose={() => { setSettingsTab(null); setSelectingModelFor(null); setProviderDetailId(null) }}
-          modelProviders={connectedProviders}
-          modelItems={modelNavigation.items}
-          modelSelectedIndex={modelNavigation.selectedIndex}
-          onModelSelect={handleModelSelect}
-          onModelHoverIndex={modelNavigation.setSelectedIndex}
-          allProviders={PROVIDERS}
-          detectedProviders={detectedProviders}
-          providerSelectedIndex={providerNavigation.selectedIndex}
-          onProviderSelect={handleProviderSelect}
-          onProviderHoverIndex={providerNavigation.setSelectedIndex}
-          providerDetailStatus={providerDetailStatus}
-          providerDetailActions={providerDetailActions}
-          providerDetailSelectedIndex={providerDetailSelectedIndex}
-          onProviderDetailAction={handleProviderDetailAction}
-          onProviderDetailHoverIndex={setProviderDetailSelectedIndex}
-          primaryModel={primaryModel}
-          secondaryModel={secondaryModel}
-          browserModel={browserModel}
-          selectingModelFor={selectingModelFor}
-          onChangePrimary={handleChangePrimary}
-          onChangeSecondary={handleChangeSecondary}
-          onChangeBrowser={handleChangeBrowser}
-          modelPrefsSelectedIndex={preferencesSelectedIndex}
-          onModelPrefsHoverIndex={setPreferencesSelectedIndex}
-          localProviderConfig={providerUiState?.localProviderConfig
-            ? {
-                baseUrl: providerUiState.localProviderConfig.baseUrl ?? undefined,
-                modelId: providerUiState.localProviderConfig.modelId ?? undefined,
-              }
-            : null}
-          localProviderAuth={(() => {
-            const localDetected = detectedProviders.find((d) => d.provider.id === 'local')
-            return localDetected?.auth?.type === 'api' ? localDetected.auth : null
-          })()}
-          onModelHandleKeyEvent={modelTabHandleKeyEvent}
-          onProviderHandleKeyEvent={providerTabHandleKeyEvent}
-          onBackFromModelPicker={() => setSelectingModelFor(null)}
-          onBackFromProviderDetail={handleProviderDetailBack}
-        />
-      </box>
-    )
-  }
-
-  if (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <AuthMethodOverlay
-          providerName={authFlow.authMethodProvider.name}
-          methods={authFlow.authMethodProvider.authMethods}
-          selectedIndex={authMethodSelectedIndex}
-          onSelectedIndexChange={setAuthMethodSelectedIndex}
-          onSelect={(methodIndex) => authFlow.startAuthForProvider(authFlow.authMethodProvider!, methodIndex)}
-          onHoverIndex={setAuthMethodSelectedIndex}
-          onBack={authFlow.closeAuthMethodPicker}
-          wizardMode={showSetupWizard ? {
-            stepLabel: `Providers (1 of ${wizardTotalSteps})`,
-            subtitle: `Connect to ${authFlow.authMethodProvider.name} to get started.`,
-            onSkip: handleWizardSkip,
-            onBack: authFlow.closeAuthMethodPicker,
-          } : undefined}
-        />
-      </box>
-    )
-  }
-
-  if (authFlow.showLocalSetup) {
-    const localConfig = providerUiState?.localProviderConfig
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <LocalProviderOverlay
-          initialConfig={{ url: localConfig?.baseUrl ?? '', modelId: localConfig?.modelId ?? '' }}
-          onSubmit={authFlow.handleLocalSetupSubmit}
-          onCancel={authFlow.handleLocalSetupCancel}
-          wizardMode={showSetupWizard ? {
-            stepLabel: `Providers (1 of ${wizardTotalSteps})`,
-            subtitle: 'Configure your local provider to get started.',
-            onSkip: handleWizardSkip,
-            onBack: authFlow.handleLocalSetupCancel,
-          } : undefined}
-        />
-      </box>
-    )
-  }
-
-  if (authFlow.apiKeySetup) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <ApiKeyOverlay
-          providerName={authFlow.apiKeySetup.provider.name}
-          envKeyHint={authFlow.apiKeySetup.envKeyHint}
-          initialKey={authFlow.apiKeySetup.existingKey}
-          onSubmit={authFlow.handleApiKeySubmit}
-          onCancel={authFlow.handleApiKeyCancel}
-          wizardMode={showSetupWizard ? {
-            stepLabel: `Providers (1 of ${wizardTotalSteps})`,
-            subtitle: `Connect to ${authFlow.apiKeySetup.provider.name} to get started.`,
-            onSkip: handleWizardSkip,
-            onBack: authFlow.handleApiKeyCancel,
-          } : undefined}
-        />
-      </box>
-    )
-  }
-
-  if (authFlow.oauthState) {
-    return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
-        <OAuthOverlay
-          providerName={authFlow.oauthState.provider.name}
-          mode={authFlow.oauthState.mode}
-          url={authFlow.oauthState.url}
-          onSubmitCode={authFlow.handleOAuthCodeSubmit}
-          codeError={authFlow.oauthState.codeError}
-          isSubmitting={authFlow.oauthState.isSubmitting}
-          userCode={authFlow.oauthState.userCode}
-          onCancel={authFlow.handleOAuthCancel}
-          onCopyUrl={authFlow.handleOAuthCopyUrl}
-          onCopyCode={authFlow.handleOAuthCopyCode}
-          wizardMode={showSetupWizard ? {
-            stepLabel: `Providers (1 of ${wizardTotalSteps})`,
-            subtitle: `Connect to ${authFlow.oauthState.provider.name} to get started.`,
-            onSkip: handleWizardSkip,
-            onBack: authFlow.handleOAuthCancel,
-          } : undefined}
-        />
-      </box>
-    )
-  }
+  if (isOverlayActive) return overlayContent
 
   const chatScrollbox = (
     <scrollbox
