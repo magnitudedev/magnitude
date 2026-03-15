@@ -3,8 +3,7 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
-import { InputCursor } from './multiline-input'
-import { readClipboardText } from '../utils/clipboard'
+import { SingleLineInput } from './single-line-input'
 import { WizardHeader, type WizardMode } from './wizard-header'
 import { BOX_CHARS } from '../utils/ui-constants'
 
@@ -80,6 +79,7 @@ function PasteMode({
   const theme = useTheme()
   const [code, setCode] = useState('')
   const urlCopy = useCopyFeedback()
+  const [copyHovered, setCopyHovered] = useState(false)
   const [backHovered, setBackHovered] = useState(false)
 
   useOpenBrowser(url)
@@ -94,37 +94,32 @@ function PasteMode({
   useKeyboard(
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
-        onCancel()
+        key.preventDefault()
+        wizardMode?.onSkip?.() ?? onCancel()
         return
       }
       if ((key.name === 'return' || key.name === 'enter') && !key.shift) {
+        key.preventDefault()
         handleSubmit()
         return
       }
-      if (key.name === 'backspace' || key.name === 'delete') {
-        setCode(prev => prev.slice(0, -1))
+
+      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
+        key.preventDefault()
+        wizardMode.onBack()
         return
       }
-      // Paste
-      if (key.meta && key.name === 'v') {
-        const clip = readClipboardText()
-        if (clip) setCode(prev => prev + clip)
-        return
+
+      if (!key.defaultPrevented) {
+        key.preventDefault()
       }
-      // Type characters
-      if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
-        setCode(prev => prev + key.sequence)
-      }
-    }, [onCancel, handleSubmit])
+    }, [onCancel, wizardMode, handleSubmit])
   )
 
   return (
     <box
       focusable={true}
       focused={true}
-      onPaste={(event: any) => {
-        if (event.text) setCode(prev => prev + event.text)
-      }}
       style={{ flexDirection: 'column', height: '100%' }}
     >
       {wizardMode ? (
@@ -179,8 +174,12 @@ function PasteMode({
           <text style={{ fg: theme.primary }}>{url}</text>
         </box>
         <box style={{ paddingBottom: 1 }}>
-          <Button onClick={() => { onCopyUrl(); urlCopy.showCopied() }}>
-            <text style={{ fg: urlCopy.copied ? theme.success : theme.muted }}>
+          <Button
+            onClick={() => { onCopyUrl(); urlCopy.showCopied() }}
+            onMouseOver={() => setCopyHovered(true)}
+            onMouseOut={() => setCopyHovered(false)}
+          >
+            <text style={{ fg: urlCopy.copied ? theme.success : (copyHovered ? theme.foreground : theme.muted) }}>
               {urlCopy.copied ? '[Copied ✓]' : '[Copy]'}
             </text>
           </Button>
@@ -201,10 +200,12 @@ function PasteMode({
           paddingRight: 1,
           flexShrink: 0,
         }}>
-          <text style={{ fg: theme.foreground }}>
-            {code}<InputCursor visible={true} focused={true} />
-            {!code && <span style={{ fg: theme.muted }}>Authorization code</span>}
-          </text>
+          <SingleLineInput
+            value={code}
+            onChange={setCode}
+            placeholder="Authorization code"
+            focused={true}
+          />
         </box>
 
         {/* Warning banner */}
@@ -244,7 +245,7 @@ function PasteMode({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
             </box>
           </Button>
         </box>
@@ -267,6 +268,8 @@ function AutoMode({
   const theme = useTheme()
   const urlCopy = useCopyFeedback()
   const codeCopy = useCopyFeedback()
+  const [copyHovered, setCopyHovered] = useState(false)
+  const [codeCopyHovered, setCodeCopyHovered] = useState(false)
   const [backHovered, setBackHovered] = useState(false)
 
   // Only auto-open browser when there's no device code to copy first
@@ -275,10 +278,19 @@ function AutoMode({
   useKeyboard(
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
-        onCancel()
+        key.preventDefault()
+        wizardMode?.onSkip?.() ?? onCancel()
         return
       }
-    }, [onCancel])
+      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
+        key.preventDefault()
+        wizardMode.onBack()
+        return
+      }
+      if (!key.defaultPrevented) {
+        key.preventDefault()
+      }
+    }, [onCancel, wizardMode])
   )
 
   return (
@@ -335,8 +347,12 @@ function AutoMode({
           <text style={{ fg: theme.primary }}>{url}</text>
         </box>
         <box style={{ paddingBottom: 1 }}>
-          <Button onClick={() => { onCopyUrl(); urlCopy.showCopied() }}>
-            <text style={{ fg: urlCopy.copied ? theme.success : theme.muted }}>
+          <Button
+            onClick={() => { onCopyUrl(); urlCopy.showCopied() }}
+            onMouseOver={() => setCopyHovered(true)}
+            onMouseOut={() => setCopyHovered(false)}
+          >
+            <text style={{ fg: urlCopy.copied ? theme.success : (copyHovered ? theme.foreground : theme.muted) }}>
               {urlCopy.copied ? '[Copied ✓]' : '[Copy]'}
             </text>
           </Button>
@@ -353,8 +369,12 @@ function AutoMode({
                 {userCode}
               </text>
               <text> </text>
-              <Button onClick={() => { onCopyCode?.(); codeCopy.showCopied() }}>
-                <text style={{ fg: codeCopy.copied ? theme.success : theme.muted }}>
+              <Button
+                onClick={() => { onCopyCode?.(); codeCopy.showCopied() }}
+                onMouseOver={() => setCodeCopyHovered(true)}
+                onMouseOut={() => setCodeCopyHovered(false)}
+              >
+                <text style={{ fg: codeCopy.copied ? theme.success : (codeCopyHovered ? theme.foreground : theme.muted) }}>
                   {codeCopy.copied ? '[Copied ✓]' : '[Copy]'}
                 </text>
               </Button>
@@ -378,7 +398,7 @@ function AutoMode({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
             </box>
           </Button>
         </box>

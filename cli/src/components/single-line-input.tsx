@@ -2,6 +2,7 @@ import { type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { usePasteHandler } from '../hooks/use-paste-handler'
 import { useTheme } from '../hooks/use-theme'
 import { readClipboardText } from '../utils/clipboard'
 import { InputCursor } from './multiline-input'
@@ -66,6 +67,19 @@ export function SingleLineInput({
     [applyChange, cursorPosition, value],
   )
 
+  const handlePasteText = useCallback(
+    (eventText?: string) => {
+      const text = eventText ?? readClipboardText()
+      if (text) insertAtCursor(text)
+    },
+    [insertAtCursor],
+  )
+
+  const { handlePasteKey, handlePasteEvent } = usePasteHandler({
+    enabled: focused,
+    onPaste: handlePasteText,
+  })
+
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
@@ -119,12 +133,7 @@ export function SingleLineInput({
           return
         }
 
-        if ((key.meta || key.ctrl) && (key.name ?? '').toLowerCase() === 'v') {
-          key.preventDefault?.()
-          const clip = readClipboardText()
-          if (clip) insertAtCursor(clip)
-          return
-        }
+        if (handlePasteKey(key)) return
 
         if (
           key.sequence &&
@@ -138,7 +147,7 @@ export function SingleLineInput({
           insertAtCursor(key.sequence)
         }
       },
-      [focused, cursorPosition, value, applyChange, insertAtCursor],
+      [focused, cursorPosition, value, applyChange, insertAtCursor, handlePasteKey],
     ),
   )
 
@@ -158,11 +167,7 @@ export function SingleLineInput({
     <box
       focusable={focused}
       focused={focused}
-      onPaste={(event: any) => {
-        if (event.text) {
-          insertAtCursor(event.text)
-        }
-      }}
+      onPaste={handlePasteEvent}
     >
       <text style={{ fg: isPlaceholder ? theme.muted : theme.foreground }}>
         {isPlaceholder ? (

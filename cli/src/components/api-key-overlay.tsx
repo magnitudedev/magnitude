@@ -42,15 +42,26 @@ export const ApiKeyOverlay = memo(function ApiKeyOverlay({
   useKeyboard(
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
-        onCancel()
+        key.preventDefault()
+        wizardMode?.onSkip?.() ?? onCancel()
         return
       }
       if ((key.name === 'return' || key.name === 'enter') && !key.shift) {
+        key.preventDefault()
         handleSubmit()
         return
       }
 
-    }, [onCancel, handleSubmit])
+      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
+        key.preventDefault()
+        wizardMode.onBack()
+        return
+      }
+
+      if (!key.defaultPrevented) {
+        key.preventDefault()
+      }
+    }, [onCancel, wizardMode, handleSubmit])
   )
 
   return (
@@ -157,7 +168,7 @@ export const ApiKeyOverlay = memo(function ApiKeyOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
             </box>
           </Button>
         </box>

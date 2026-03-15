@@ -22,6 +22,7 @@ import {
 
   TAB_WIDTH,
 } from './multiline-input.helpers'
+import { usePasteHandler } from '../hooks/use-paste-handler'
 import { useTheme } from '../hooks/use-theme'
 
 import { terminalSupportsRgb24 } from '../utils/theme'
@@ -1529,6 +1530,11 @@ export const MultilineInput = forwardRef<
   )
 
   // Handle character input (regular chars, tab, and IME/multi-byte input)
+  const { handlePasteKey, handlePasteEvent } = usePasteHandler({
+    enabled: focused,
+    onPaste,
+  })
+
   const processCharacterKey = useCallback(
     (key: KeyEvent): boolean => {
       // Tab: let higher-level keyboard handlers (like chat keyboard shortcuts) handle it
@@ -1619,6 +1625,8 @@ export const MultilineInput = forwardRef<
           if (handled) return
         }
 
+        if (handlePasteKey(key)) return
+
         // Clear sticky column for non-vertical navigation
         const isVerticalNavKey = key.name === 'up' || key.name === 'down'
         if (!isVerticalNavKey) {
@@ -1645,6 +1653,7 @@ export const MultilineInput = forwardRef<
         cursorPosition,
         commitInput,
         value,
+        handlePasteKey,
       ],
     ),
   )
@@ -1699,7 +1708,7 @@ export const MultilineInput = forwardRef<
       }}
       onPaste={(event) => {
         logger.debug({ text: event.text?.substring(0, 50) }, 'SCROLLBOX PASTE EVENT')
-        onPaste(event.text)
+        handlePasteEvent(event)
       }}
       onMouseDown={handleMouseDown}
       style={{

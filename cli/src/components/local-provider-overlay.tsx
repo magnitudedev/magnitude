@@ -74,14 +74,18 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
   useKeyboard(
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
-        onCancel()
+        key.preventDefault()
+        wizardMode?.onSkip?.() ?? onCancel()
         return
       }
 
-      if (key.name === 'tab') {
+      if (key.name === 'tab' || key.name === 'up' || key.name === 'down') {
+        key.preventDefault()
         setError(null)
         const currentIndex = FIELDS.indexOf(focusedField)
-        if (key.shift) {
+        const goPrevious = key.name === 'up' || (key.name === 'tab' && key.shift)
+
+        if (goPrevious) {
           const prev = (currentIndex - 1 + FIELDS.length) % FIELDS.length
           setFocusedField(FIELDS[prev])
         } else {
@@ -92,12 +96,21 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
       }
 
       if ((key.name === 'return' || key.name === 'enter') && !key.shift) {
+        key.preventDefault()
         handleSubmit()
         return
       }
 
+      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
+        key.preventDefault()
+        wizardMode.onBack()
+        return
+      }
 
-    }, [onCancel, focusedField, handleSubmit])
+      if (!key.defaultPrevented) {
+        key.preventDefault()
+      }
+    }, [onCancel, wizardMode, focusedField, handleSubmit])
   )
 
   return (
@@ -199,7 +212,7 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
         {/* Hint */}
         <box style={{ paddingTop: 1 }}>
           <text style={{ fg: theme.muted }}>
-            <span attributes={TextAttributes.DIM}>Tab to move between fields  |  Enter to connect</span>
+            <span attributes={TextAttributes.DIM}>Tab or ↑/↓ to move between fields  |  Enter to connect</span>
           </text>
         </box>
       </box>
@@ -214,7 +227,7 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
             </box>
           </Button>
         </box>

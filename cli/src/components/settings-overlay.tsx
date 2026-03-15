@@ -1,5 +1,6 @@
-import { memo, useMemo, useState } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { memo, useMemo, useState, useCallback } from 'react'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { BOX_CHARS } from '../utils/ui-constants'
@@ -64,6 +65,10 @@ interface SettingsOverlayProps {
   onModelPrefsHoverIndex?: (index: number) => void
   localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null
   localProviderAuth?: { type: 'api'; key: string } | null
+  onModelHandleKeyEvent: (key: KeyEvent) => boolean
+  onProviderHandleKeyEvent: (key: KeyEvent) => boolean
+  onBackFromModelPicker: () => void
+  onBackFromProviderDetail: () => void
 }
 
 function resolveModelDisplay(
@@ -111,6 +116,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onModelPrefsHoverIndex,
   localProviderConfig,
   localProviderAuth,
+  onModelHandleKeyEvent,
+  onProviderHandleKeyEvent,
+  onBackFromModelPicker,
+  onBackFromProviderDetail,
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const [hoveredTab, setHoveredTab] = useState<SettingsTab | null>(null)
@@ -142,6 +151,55 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     { id: 'provider', label: 'Provider' },
     { id: 'model', label: 'Model' },
   ]
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    const plain = !key.ctrl && !key.meta && !key.option
+
+    if (key.name === 'escape') {
+      key.preventDefault()
+      onClose()
+      return
+    }
+
+    if (key.name === 'left' && plain) {
+      key.preventDefault()
+      onTabChange('provider')
+      return
+    }
+
+    if (key.name === 'right' && plain) {
+      key.preventDefault()
+      onTabChange('model')
+      return
+    }
+
+    if (activeTab === 'model' && selectingModelFor && key.name === 'b' && plain && !key.shift) {
+      key.preventDefault()
+      onBackFromModelPicker()
+      return
+    }
+
+    if (activeTab === 'provider' && providerDetailStatus && key.name === 'b' && plain && !key.shift) {
+      key.preventDefault()
+      onBackFromProviderDetail()
+      return
+    }
+
+    const handled = activeTab === 'model' ? onModelHandleKeyEvent(key) : onProviderHandleKeyEvent(key)
+    if (handled) {
+      key.preventDefault()
+    }
+  }, [
+    onClose,
+    onTabChange,
+    activeTab,
+    selectingModelFor,
+    providerDetailStatus,
+    onBackFromModelPicker,
+    onBackFromProviderDetail,
+    onModelHandleKeyEvent,
+    onProviderHandleKeyEvent,
+  ]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>

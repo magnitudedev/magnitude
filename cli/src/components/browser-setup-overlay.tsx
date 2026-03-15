@@ -8,7 +8,8 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { BOX_CHARS } from '../utils/ui-constants'
@@ -115,6 +116,33 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
       setState('failed')
     }
   }, [fireResult])
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    const plain = !key.ctrl && !key.meta && !key.option
+    const isEnter = (key.name === 'return' || key.name === 'enter') && plain && !key.shift
+
+    if (key.name === 'escape') {
+      key.preventDefault()
+      onClose()
+      return
+    }
+
+    if (wizardMode && key.name === 'b' && plain && !key.shift && state !== 'installing') {
+      key.preventDefault()
+      wizardMode.onBack?.()
+      return
+    }
+
+    if (isEnter && state === 'required') {
+      key.preventDefault()
+      void handleInstall()
+      return
+    }
+
+    if (!key.defaultPrevented) {
+      key.preventDefault()
+    }
+  }, [onClose, wizardMode, state, handleInstall]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>

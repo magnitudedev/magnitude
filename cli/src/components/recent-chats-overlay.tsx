@@ -1,5 +1,6 @@
-import { memo, useState } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { memo, useState, useCallback } from 'react'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { RecentChatEntry } from './recent-chat-entry'
@@ -8,6 +9,7 @@ import type { RecentChat } from '../data/recent-chats'
 interface RecentChatsOverlayProps {
   chats: RecentChat[]
   selectedIndex: number
+  onSelectedIndexChange: (index: number) => void
   onSelect: (chat: RecentChat) => void
   onHoverIndex?: (index: number) => void
   onClose: () => void
@@ -16,12 +18,40 @@ interface RecentChatsOverlayProps {
 export const RecentChatsOverlay = memo(function RecentChatsOverlay({
   chats,
   selectedIndex,
+  onSelectedIndexChange,
   onSelect,
   onHoverIndex,
   onClose,
 }: RecentChatsOverlayProps) {
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    if (key.name === 'escape') {
+      key.preventDefault()
+      onClose()
+      return
+    }
+
+    if (chats.length === 0) return
+
+    const plain = !key.ctrl && !key.meta && !key.option
+    if (key.name === 'up' && plain) {
+      key.preventDefault()
+      onSelectedIndexChange(Math.max(0, selectedIndex - 1))
+      return
+    }
+    if (key.name === 'down' && plain) {
+      key.preventDefault()
+      onSelectedIndexChange(Math.min(chats.length - 1, selectedIndex + 1))
+      return
+    }
+    if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+      key.preventDefault()
+      const chat = chats[selectedIndex]
+      if (chat) onSelect(chat)
+    }
+  }, [onClose, chats, selectedIndex, onSelectedIndexChange, onSelect]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>

@@ -1,5 +1,6 @@
-import { memo, useState, useEffect } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { memo, useState, useEffect, useCallback } from 'react'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
 import type { DisplayState, DisplayMessage } from '@magnitudedev/agent'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
@@ -33,6 +34,13 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   const [closeHover, setCloseHover] = useState(false)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [isPromptCollapsed, setIsPromptCollapsed] = useState(true)
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    if (key.name === 'escape') {
+      key.preventDefault()
+      onClose()
+    }
+  }, [onClose]))
 
   useEffect(() => setIsPromptCollapsed(true), [forkId, initialPrompt])
   const { isCollapsed, toggleCollapse } = useCollapsedBlocks()

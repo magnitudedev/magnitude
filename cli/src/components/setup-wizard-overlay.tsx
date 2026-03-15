@@ -1,5 +1,6 @@
 import { memo, useCallback, useMemo, useState } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { WizardHeader } from './wizard-header'
@@ -31,10 +32,12 @@ interface SetupWizardOverlayProps {
   onComplete: (result: { primaryModel: ModelSelection; secondaryModel: ModelSelection; browserModel: ModelSelection | null }) => void
   onBack: () => void
   onSkip: () => void
-  // Navigation state (managed by app.tsx keyboard handler)
+  onWizardCtrlCExit: () => void
   providerSelectedIndex: number
+  onProviderSelectedIndexChange: (index: number) => void
   onProviderHoverIndex?: (index: number) => void
   modelNavSelectedIndex: number
+  onModelNavSelectedIndexChange: (index: number) => void
   onModelNavHoverIndex?: (index: number) => void
 }
 
@@ -51,9 +54,12 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
   onComplete,
   onBack,
   onSkip,
+  onWizardCtrlCExit,
   providerSelectedIndex,
+  onProviderSelectedIndexChange,
   onProviderHoverIndex,
   modelNavSelectedIndex,
+  onModelNavSelectedIndexChange,
   onModelNavHoverIndex,
 }: SetupWizardOverlayProps) {
   const theme = useTheme()
@@ -86,6 +92,86 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
   const modelsSubtitle = connectedProviderName
     ? `You've successfully connected ${connectedProviderName}! We've configured default models based on your provider. You can change these anytime with /models.`
     : 'Your default models have been configured. You can change these anytime with /models.'
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    const plain = !key.ctrl && !key.meta && !key.option
+
+    if (key.ctrl && key.name === 'c' && !key.meta && !key.option) {
+      key.preventDefault()
+      onWizardCtrlCExit()
+      return
+    }
+
+    if (key.name === 'escape') {
+      key.preventDefault()
+      onSkip()
+      return
+    }
+
+    if (step === 'provider') {
+      if (allProviders.length === 0) {
+        key.preventDefault()
+        return
+      }
+      if (key.name === 'up' && plain) {
+        key.preventDefault()
+        onProviderSelectedIndexChange(Math.max(0, providerSelectedIndex - 1))
+        return
+      }
+      if (key.name === 'down' && plain) {
+        key.preventDefault()
+        onProviderSelectedIndexChange(Math.min(allProviders.length - 1, providerSelectedIndex + 1))
+        return
+      }
+      if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+        key.preventDefault()
+        const provider = allProviders[providerSelectedIndex]
+        if (provider) onProviderSelected(provider.id)
+        return
+      }
+      key.preventDefault()
+      return
+    }
+
+    if (step === 'models') {
+      if (key.name === 'b' && plain && !key.shift) {
+        key.preventDefault()
+        onBack()
+        return
+      }
+      if (key.name === 'up' && plain) {
+        key.preventDefault()
+        onModelNavSelectedIndexChange(Math.max(0, modelNavSelectedIndex - 1))
+        return
+      }
+      if (key.name === 'down' && plain) {
+        key.preventDefault()
+        onModelNavSelectedIndexChange(Math.min(3, modelNavSelectedIndex + 1))
+        return
+      }
+      if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+        key.preventDefault()
+        if (modelNavSelectedIndex === 0) handleConfirm()
+        return
+      }
+      key.preventDefault()
+      return
+    }
+
+    key.preventDefault()
+  }, [
+    step,
+    onWizardCtrlCExit,
+    onSkip,
+    allProviders,
+    providerSelectedIndex,
+    onProviderSelectedIndexChange,
+    onProviderSelected,
+    onBack,
+    modelNavSelectedIndex,
+    onModelNavSelectedIndexChange,
+    handleConfirm,
+  ]))
 
   if (step === 'models') {
     return (

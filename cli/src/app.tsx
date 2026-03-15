@@ -40,13 +40,12 @@ import { useSelectionAutoCopy } from './utils/clipboard'
 import { useRecentChatsNavigation } from './hooks/use-recent-chats-navigation'
 import { useModelSelectNavigation } from './hooks/use-model-select-navigation'
 import { useProviderSelectNavigation } from './hooks/use-provider-select-navigation'
-import { useSettingsNavigation, type SettingsTab } from './hooks/use-settings-navigation'
-import { useAuthMethodNavigation } from './hooks/use-auth-method-navigation'
+import type { SettingsTab } from './hooks/use-settings-navigation'
 import { useAuthFlow } from './hooks/use-auth-flow'
-import { useSetupWizardNavigation } from './hooks/use-setup-wizard-navigation'
 import { useFileMentions } from './hooks/use-file-mentions'
 import { SetupWizardOverlay, type WizardStep } from './components/setup-wizard-overlay'
 import { BrowserSetupOverlay } from './components/browser-setup-overlay'
+import { ChatSurfaceKeyboard } from './components/chat-surface-keyboard'
 import { getDefaultModels } from './utils/model-preferences'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
@@ -322,6 +321,9 @@ function AppInner({
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [wizardStep, setWizardStep] = useState<WizardStep>('provider')
   const [wizardProviderSelectedIndex, setWizardProviderSelectedIndex] = useState(0)
+  const [wizardModelSelectedIndex, setWizardModelSelectedIndex] = useState(0)
+  const [recentChatsSelectedIndex, setRecentChatsSelectedIndex] = useState(0)
+  const [authMethodSelectedIndex, setAuthMethodSelectedIndex] = useState(0)
   const [wizardPrimaryModel, setWizardPrimaryModel] = useState<ModelSelection | null>(null)
   const [wizardSecondaryModel, setWizardSecondaryModel] = useState<ModelSelection | null>(null)
   const [wizardBrowserModel, setWizardBrowserModel] = useState<ModelSelection | null>(null)
@@ -930,12 +932,11 @@ function AppInner({
     widgetNavActive,
   )
 
-  // Navigation for full-screen overlay
-  const overlayNavigation = useRecentChatsNavigation(
-    recentChats ?? [],
-    handleResumeChat,
-    showRecentChatsOverlay,
-  )
+  useEffect(() => {
+    if (showRecentChatsOverlay) {
+      setRecentChatsSelectedIndex(0)
+    }
+  }, [showRecentChatsOverlay])
 
   // Model selection overlay handlers
   const handleModelSelect = useCallback(async (providerId: string, modelId: string) => {
@@ -1220,25 +1221,14 @@ function AppInner({
     PROVIDERS.filter(p => !['google-vertex', 'google-vertex-anthropic', 'amazon-bedrock'].includes(p.id)),
   [])
 
-  // Wizard provider list navigation
-  const wizardProviderNavigation = useProviderSelectNavigation(
-    WIZARD_PROVIDERS,
-    handleWizardProviderSelected,
-    showSetupWizard && wizardStep === 'provider',
-  )
-
-  // Wizard model confirmation navigation
-  const wizardModelNavigation = useSetupWizardNavigation(
-    () => {
-      if (wizardPrimaryModel && wizardSecondaryModel) {
-        handleWizardComplete({ primaryModel: wizardPrimaryModel, secondaryModel: wizardSecondaryModel, browserModel: wizardBrowserModel })
-      }
-    },
-    () => {}, // onChangePrimary — not used yet
-    () => {}, // onChangeSecondary — not used yet
-    () => {}, // onChangeBrowser — not used yet
-    showSetupWizard && wizardStep === 'models',
-  )
+  useEffect(() => {
+    if (showSetupWizard && wizardStep === 'provider') {
+      setWizardProviderSelectedIndex(0)
+    }
+    if (showSetupWizard && wizardStep === 'models') {
+      setWizardModelSelectedIndex(0)
+    }
+  }, [showSetupWizard, wizardStep])
 
   const handleProviderSelect = useCallback((providerId: string) => {
     setProviderDetailId(providerId)
@@ -1362,16 +1352,11 @@ function AppInner({
     settingsTab === 'provider',
   )
 
-  const authMethodNavigation = useAuthMethodNavigation(
-    authFlow.authMethodProvider?.authMethods ?? [],
-    (methodIndex: number) => {
-      if (authFlow.authMethodProvider) {
-        authFlow.startAuthForProvider(authFlow.authMethodProvider, methodIndex)
-      }
-    },
-    authFlow.closeAuthMethodPicker,
-    authFlow.showAuthMethodOverlay,
-  )
+  useEffect(() => {
+    if (authFlow.showAuthMethodOverlay) {
+      setAuthMethodSelectedIndex(0)
+    }
+  }, [authFlow.showAuthMethodOverlay, authFlow.authMethodProvider?.id])
 
   const providerTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
     if (providerDetailId) {
@@ -1409,17 +1394,10 @@ function AppInner({
     setSettingsTab(tab)
   }, [selectingModelFor])
 
-  const settingsNavigation = useSettingsNavigation(
-    settingsTab ?? 'provider',
-    handleSettingsTabChange,
-    modelTabHandleKeyEvent,
-    providerTabHandleKeyEvent,
-    settingsTab !== null,
-  )
-
   const openSetup = useCallback(() => {
     setWizardStep('provider')
     setWizardProviderSelectedIndex(0)
+    setWizardModelSelectedIndex(0)
     setWizardPrimaryModel(null)
     setWizardSecondaryModel(null)
     setWizardBrowserModel(null)
@@ -1633,351 +1611,38 @@ function AppInner({
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
-        logger.debug({
-          name: key.name,
-          ctrl: key.ctrl,
-          meta: key.meta,
-          shift: key.shift,
-          option: key.option,
-          sequence: key.sequence
-        }, 'KEY EVENT')
+        if (key.defaultPrevented) return
 
-        const isEscape = key.name === 'escape'
         const isCtrlC = key.ctrl && key.name === 'c' && !key.meta && !key.option
-        const isCtrlV = key.ctrl && key.name === 'v' && !key.meta && !key.option
-        const isCmdV = key.meta && key.name === 'v' && !key.ctrl && !key.option
-        // Tab: toggle task panel + plan mode
-        if (key.name === 'tab' && !key.shift && !key.ctrl && !key.meta && !key.option && !fileMentions.isOpen && !slashCommands.isSlashMenuOpen) {
-          toggleTaskPanel()
-          return
-        }
-
-        // Priority 0.5: Setup wizard keyboard handling
-        if (showSetupWizard) {
-          if (isCtrlC) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            // Single-tap exit during wizard — mark setup complete and exit
-            if (providerUiState) {
-              void storage.config.setSetupComplete(true).then(() => reloadProviderState())
-            }
-            authFlow.cancelAll()
-            process.kill(process.pid, 'SIGINT')
-            return
-          }
-          if (isEscape) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            handleWizardSkip()
-            return
-          }
-          // Delegate arrow/enter to the appropriate wizard navigation hook
-          if (wizardStep === 'provider') {
-            if (wizardProviderNavigation.handleKeyEvent(key)) {
-              if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-                key.preventDefault()
-              }
-              return
-            }
-          } else if (wizardStep === 'models') {
-            // B goes back to provider selection
-            if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift) {
-              if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-                key.preventDefault()
-              }
-              handleWizardBack()
-              return
-            }
-            if (wizardModelNavigation.handleKeyEvent(key)) {
-              if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-                key.preventDefault()
-              }
-              return
-            }
-          } else if (wizardStep === 'browser') {
-            // B goes back to models step
-            if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift) {
-              if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-                key.preventDefault()
-              }
-              handleWizardBack()
-              return
-            }
-            // Enter triggers install (handled by BrowserSetupOverlay internally)
-            if ((key.name === 'return' || key.name === 'enter') && !key.shift && !key.ctrl && !key.meta && !key.option) {
-              // Let it pass through to the overlay
-              return
-            }
-          }
-          // Block all other keys when wizard is showing
-          return
-        }
-
-        // Priority 1: Clear input with Ctrl+C when there's text
-        if (isCtrlC && inputValue.text.trim().length > 0) {
-          logger.debug('Ctrl+C clearing input')
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-          return
-        }
-
-        // Escape closes fork overlay first (before any interrupt logic)
-        if (isEscape && expandedForkStack.length > 0) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          popForkOverlay()
-          return
-        }
-
-        // Priority 2a: Second Esc while "kill all" prompt is active — interrupt all subagents
-        if (isEscape && nextEscWillKillAll) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          logger.debug('Second Esc: interrupting all subagents')
-          handleInterruptAll()
-          setNextEscWillKillAll(false)
-          if (killAllTimeoutRef.current) {
-            clearTimeout(killAllTimeoutRef.current)
-          }
-          return
-        }
-
-        // Priority 2b: Esc while forks are running — interrupt viewed fork (if streaming) + prompt to interrupt all
-        if (isEscape && hasRunningForks) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          // Interrupt viewed fork if it's streaming
-          if (display?.status === 'streaming') {
-            logger.debug('Interrupting stream (forks running)')
-            handleInterrupt()
-          }
-          // Show "press Esc again to interrupt all"
-          setNextEscWillKillAll(true)
-          if (killAllTimeoutRef.current) {
-            clearTimeout(killAllTimeoutRef.current)
-          }
-          killAllTimeoutRef.current = setTimeout(() => {
-            setNextEscWillKillAll(false)
-          }, 2000)
-          return
-        }
-
-        // Priority 2b2: Double-tap Escape to clear input text
-        if (isEscape && inputValue.text.length > 0) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          if (nextEscWillClearInput) {
-            // Second tap — clear the input
-            setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-            setNextEscWillClearInput(false)
-            if (clearInputTimeoutRef.current) {
-              clearTimeout(clearInputTimeoutRef.current)
-            }
-          } else {
-            // First tap — show hint
-            setNextEscWillClearInput(true)
-            if (clearInputTimeoutRef.current) {
-              clearTimeout(clearInputTimeoutRef.current)
-            }
-            clearInputTimeoutRef.current = setTimeout(() => {
-              setNextEscWillClearInput(false)
-            }, 2000)
-          }
-          return
-        }
-
-        // Priority 2c: Interrupt streaming with Escape or Ctrl+C (no forks running)
-        if ((isEscape || isCtrlC) && display?.status === 'streaming') {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          logger.debug({ trigger: isEscape ? 'Escape' : 'Ctrl+C' }, 'Interrupting stream')
-          handleInterrupt()
-          return
-        }
-
-        // Priority 3: Two-tap Ctrl+C to exit
-        if (isCtrlC) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-
-          if (nextCtrlCWillExit) {
-            // Second tap - send SIGINT to trigger proper cleanup handlers
-            process.kill(process.pid, 'SIGINT')
-          } else {
-            // First tap - show warning
-            setNextCtrlCWillExit(true)
-
-            // Clear any existing timeout
-            if (exitTimeoutRef.current) {
-              clearTimeout(exitTimeoutRef.current)
-            }
-
-            // Reset after 2 seconds
-            exitTimeoutRef.current = setTimeout(() => {
-              setNextCtrlCWillExit(false)
-            }, 2000)
-          }
-          return
-        }
-
-        // Priority 4.5: Ctrl+D toggles debug panel (only when debug mode enabled)
         const isCtrlD = key.ctrl && key.name === 'd' && !key.meta && !key.option
-        if (isCtrlD && debugMode) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
+        const isCtrlR = key.ctrl && key.name === 'r' && !key.meta && !key.option
+
+        if (isCtrlC) {
+          key.preventDefault()
+          if (nextCtrlCWillExit) {
+            process.kill(process.pid, 'SIGINT')
+          } else {
+            setNextCtrlCWillExit(true)
+            if (exitTimeoutRef.current) clearTimeout(exitTimeoutRef.current)
+            exitTimeoutRef.current = setTimeout(() => setNextCtrlCWillExit(false), 2000)
           }
+          return
+        }
+
+        if (isCtrlD && debugMode) {
+          key.preventDefault()
           setDebugPanelVisible(prev => !prev)
           return
         }
 
-        // Priority 4: Ctrl+R toggles recent chats overlay
-        const isCtrlR = key.ctrl && key.name === 'r' && !key.meta && !key.option
         if (isCtrlR) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
+          key.preventDefault()
           hasAnimatedRef.current = true
           setShowRecentChatsOverlay(prev => !prev)
-          return
-        }
-
-        // Priority 5: Escape closes overlays (when not streaming)
-        if (isEscape && showBrowserSetup) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          setShowBrowserSetup(false)
-          return
-        }
-        if (isEscape && showRecentChatsOverlay) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          hasAnimatedRef.current = true
-          setShowRecentChatsOverlay(false)
-          return
-        }
-        if (isEscape && settingsTab !== null) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          setSettingsTab(null)
-          setSelectingModelFor(null)
-          return
-        }
-        if (isEscape && authFlow.oauthState) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          authFlow.handleOAuthCancel()
-          return
-        }
-        if (isEscape && authFlow.showAuthMethodOverlay) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          authFlow.closeAuthMethodPicker()
-          return
-        }
-        // Priority 5.4: Escape closes artifact panel
-        if (isEscape && selectedArtifact) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          setSelectedArtifact(null)
-          return
-        }
-        // Priority 5.5: Escape exits bash mode
-        if (isEscape && bashMode) {
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          exitBashMode()
-          return
-        }
-
-        // Priority 5.7: Approval keyboard shortcuts
-        if (pendingApproval) {
-          const isY = key.name === 'a' && !key.ctrl && !key.meta && !key.option
-          const isN = key.name === 'd' && !key.ctrl && !key.meta && !key.option
-          const isEnter = key.name === 'return' && !key.ctrl && !key.meta && !key.option
-
-          if (isY || isEnter) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            handleApprove()
-            return
-          }
-          if (isN || isEscape) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            handleReject()
-            return
-          }
-        }
-
-        // Priority 6: Arrow/Enter navigation for overlays
-        if (showRecentChatsOverlay) {
-          if (overlayNavigation.handleKeyEvent(key)) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            return
-          }
-        }
-        if (settingsTab !== null) {
-          if (settingsNavigation.handleKeyEvent(key)) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            return
-          }
-        }
-        if (authFlow.showAuthMethodOverlay) {
-          if (authMethodNavigation.handleKeyEvent(key)) {
-            if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-              key.preventDefault()
-            }
-            return
-          }
-        }
-        if (authFlow.oauthState || authFlow.showLocalSetup || authFlow.apiKeySetup) {
-          // Block all keys when OAuth/local/API key setup overlay is active (overlay handles its own keyboard)
-          return
-        }
-
-        // Priority 7: Paste
-        if (isCtrlV || isCmdV) {
-          logger.debug({ shortcut: isCtrlV ? 'Ctrl+V' : 'CMD+V' }, 'PASTE SHORTCUT DETECTED')
-          if ('preventDefault' in key && typeof key.preventDefault === 'function') {
-            key.preventDefault()
-          }
-          handlePaste()
-          return
         }
       },
-      [handlePaste, handleInterrupt, handleInterruptAll, inputValue.text, display?.status, nextCtrlCWillExit, nextEscWillKillAll, nextEscWillClearInput,
-       showRecentChatsOverlay, overlayNavigation.handleKeyEvent,
-       settingsTab, settingsNavigation.handleKeyEvent, selectingModelFor,
-       authFlow.showAuthMethodOverlay, authMethodNavigation.handleKeyEvent, authFlow.closeAuthMethodPicker,
-       authFlow.oauthState, authFlow.handleOAuthCancel, authFlow.showLocalSetup, authFlow.apiKeySetup,
-       bashMode, exitBashMode, debugMode, hasRunningForks, toggleTaskPanel, expandedForkId,
-       pendingApproval, handleApprove, handleReject,
-       showSetupWizard, wizardStep, handleWizardSkip, handleWizardBack, wizardProviderNavigation.handleKeyEvent, wizardModelNavigation.handleKeyEvent, selectedArtifact,
-       showBrowserSetup, fileMentions.isOpen, slashCommands.isSlashMenuOpen]
-    )
+      [nextCtrlCWillExit, debugMode],
+    ),
   )
 
   // Ensure input is focused for paste events to work reliably
@@ -2115,10 +1780,19 @@ function AppInner({
           onComplete={handleWizardComplete}
           onBack={handleWizardBack}
           onSkip={handleWizardSkip}
-          providerSelectedIndex={wizardProviderNavigation.selectedIndex}
-          onProviderHoverIndex={wizardProviderNavigation.setSelectedIndex}
-          modelNavSelectedIndex={wizardModelNavigation.selectedIndex}
-          onModelNavHoverIndex={wizardModelNavigation.setSelectedIndex}
+          onWizardCtrlCExit={() => {
+            if (providerUiState) {
+              void storage.config.setSetupComplete(true).then(() => reloadProviderState())
+            }
+            authFlow.cancelAll()
+            process.kill(process.pid, 'SIGINT')
+          }}
+          providerSelectedIndex={wizardProviderSelectedIndex}
+          onProviderSelectedIndexChange={setWizardProviderSelectedIndex}
+          onProviderHoverIndex={setWizardProviderSelectedIndex}
+          modelNavSelectedIndex={wizardModelSelectedIndex}
+          onModelNavSelectedIndexChange={setWizardModelSelectedIndex}
+          onModelNavHoverIndex={setWizardModelSelectedIndex}
         />
       </box>
     )
@@ -2129,9 +1803,10 @@ function AppInner({
       <box style={{ flexDirection: 'column', height: '100%' }}>
         <RecentChatsOverlay
           chats={recentChats ?? []}
-          selectedIndex={overlayNavigation.selectedIndex}
+          selectedIndex={recentChatsSelectedIndex}
+          onSelectedIndexChange={setRecentChatsSelectedIndex}
           onSelect={handleResumeChat}
-          onHoverIndex={overlayNavigation.setSelectedIndex}
+          onHoverIndex={setRecentChatsSelectedIndex}
           onClose={() => setShowRecentChatsOverlay(false)}
         />
       </box>
@@ -2209,6 +1884,10 @@ function AppInner({
             const localDetected = detectedProviders.find((d) => d.provider.id === 'local')
             return localDetected?.auth?.type === 'api' ? localDetected.auth : null
           })()}
+          onModelHandleKeyEvent={modelTabHandleKeyEvent}
+          onProviderHandleKeyEvent={providerTabHandleKeyEvent}
+          onBackFromModelPicker={() => setSelectingModelFor(null)}
+          onBackFromProviderDetail={handleProviderDetailBack}
         />
       </box>
     )
@@ -2220,9 +1899,10 @@ function AppInner({
         <AuthMethodOverlay
           providerName={authFlow.authMethodProvider.name}
           methods={authFlow.authMethodProvider.authMethods}
-          selectedIndex={authMethodNavigation.selectedIndex}
+          selectedIndex={authMethodSelectedIndex}
+          onSelectedIndexChange={setAuthMethodSelectedIndex}
           onSelect={(methodIndex) => authFlow.startAuthForProvider(authFlow.authMethodProvider!, methodIndex)}
-          onHoverIndex={authMethodNavigation.setSelectedIndex}
+          onHoverIndex={setAuthMethodSelectedIndex}
           onBack={authFlow.closeAuthMethodPicker}
           wizardMode={showSetupWizard ? {
             stepLabel: `Providers (1 of ${wizardTotalSteps})`,
@@ -2445,6 +2125,30 @@ function AppInner({
             </box>
           )}
           {chatScrollbox}
+          <ChatSurfaceKeyboard
+            status={display.status}
+            hasRunningForks={hasRunningForks}
+            nextEscWillKillAll={nextEscWillKillAll}
+            setNextEscWillKillAll={setNextEscWillKillAll}
+            killAllTimeoutRef={killAllTimeoutRef}
+            onInterrupt={handleInterrupt}
+            onInterruptAll={handleInterruptAll}
+            inputText={inputValue.text}
+            nextEscWillClearInput={nextEscWillClearInput}
+            setNextEscWillClearInput={setNextEscWillClearInput}
+            clearInputTimeoutRef={clearInputTimeoutRef}
+            onClearInput={() => setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })}
+            selectedArtifactOpen={selectedArtifact != null}
+            onCloseArtifact={() => setSelectedArtifact(null)}
+            bashMode={bashMode}
+            onExitBashMode={exitBashMode}
+            fileMentionOpen={fileMentions.isOpen}
+            slashMenuOpen={slashCommands.isSlashMenuOpen}
+            onToggleTaskPanel={toggleTaskPanel}
+            pendingApproval={pendingApproval != null}
+            onApprove={handleApprove}
+            onReject={handleReject}
+          />
         </box>
 
         {/* Clipboard copy toast — bottom-right overlay */}

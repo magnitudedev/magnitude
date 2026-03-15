@@ -1,5 +1,6 @@
-import { memo, useState } from 'react'
-import { TextAttributes } from '@opentui/core'
+import { memo, useState, useCallback } from 'react'
+import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { WizardHeader, type WizardMode } from './wizard-header'
@@ -10,6 +11,7 @@ interface AuthMethodOverlayProps {
   providerName: string
   methods: AuthMethodDef[]
   selectedIndex: number
+  onSelectedIndexChange: (index: number) => void
   onSelect: (methodIndex: number) => void
   onHoverIndex?: (index: number) => void
   onBack: () => void
@@ -20,6 +22,7 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
   providerName,
   methods,
   selectedIndex,
+  onSelectedIndexChange,
   onSelect,
   onHoverIndex,
   onBack,
@@ -28,6 +31,46 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
   const theme = useTheme()
   const [headerBackHovered, setHeaderBackHovered] = useState(false)
   const [backHovered, setBackHovered] = useState(false)
+
+  useKeyboard(useCallback((key: KeyEvent) => {
+    const plain = !key.ctrl && !key.meta && !key.option
+
+    if (key.name === 'escape') {
+      key.preventDefault()
+      wizardMode?.onSkip?.() ?? onBack()
+      return
+    }
+
+    if (methods.length === 0) return
+
+    if (key.name === 'up' && plain) {
+      key.preventDefault()
+      onSelectedIndexChange(Math.max(0, selectedIndex - 1))
+      return
+    }
+
+    if (key.name === 'down' && plain) {
+      key.preventDefault()
+      onSelectedIndexChange(Math.min(methods.length - 1, selectedIndex + 1))
+      return
+    }
+
+    if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+      key.preventDefault()
+      onSelect(selectedIndex)
+      return
+    }
+
+    if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
+      key.preventDefault()
+      wizardMode.onBack()
+      return
+    }
+
+    if (!key.defaultPrevented) {
+      key.preventDefault()
+    }
+  }, [onBack, wizardMode, methods.length, selectedIndex, onSelectedIndexChange, onSelect]))
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
@@ -117,7 +160,7 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
             </box>
           </Button>
         </box>
