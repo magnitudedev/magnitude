@@ -4,17 +4,17 @@ description: "Search the web and extract structured data"
 icon: search
 ---
 
-## webSearch
+## Web Search
 
 Search the web and optionally extract structured data.
 
 ```xml
-<webSearch>latest bun release notes</webSearch>
+<web-search>latest bun release notes</web-search>
 ```
 
 Returns web text plus sources, and may include structured data output when schema-driven extraction is used.
 
-Web search is available to research agents, planners, builders, and debuggers.
+Web search is available to the orchestrator, explorers, planners, builders, and debuggers.
 
 ## Provider routing
 
@@ -43,12 +43,12 @@ Web search can also be used with schema-driven extraction so results are parsed 
 
 ---
 
-## webFetch
+## Web Fetch
 
 Fetch the content of a specific URL. When the agent finds a link from search results and wants to read the full page, it uses this tool.
 
 ```xml
-<webFetch>https://docs.example.com/api-reference</webFetch>
+<web-fetch>https://docs.example.com/api-reference</web-fetch>
 ```
 
 Uses `curl` with a native `fetch()` fallback. Strips `<script>` and `<style>` from HTML. 5 MB max, 30s timeout, 5 redirect limit.
