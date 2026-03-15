@@ -20,8 +20,8 @@ export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[
     if (!frame) break
     switch (frame._tag) {
       case 'Think':
-      case 'ThinkCloseTag':
-      case 'LensTagName':
+      case 'ThinkClosePrefixMatch':
+      case 'LensOpenPrefixMatch':
       case 'LensTagAttrs':
         events.push({ _tag: 'ParseError', error: { _tag: 'UnclosedThink', detail: 'Think block was opened but never closed' } })
         if (frame.think.tagName !== config.keywords.lenses) {
@@ -41,29 +41,45 @@ export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[
         events.push(...emitProseChunk(state, frame.closeRaw))
         break
       case 'MessageBody':
-      case 'MessageBodyOpenTag':
-      case 'MessageCloseTag':
+        events.push({ _tag: 'MessageTagClose', id: frame.id })
+        break
+      case 'MessageOpenPrefixMatch':
+      case 'MessageClosePrefixMatch':
+        // Flush any buffered prefix raw as message content before closing
+        if (frame.prefix.raw.length > 0) {
+          events.push({ _tag: 'MessageBodyChunk', id: frame.id, text: frame.prefix.raw })
+        }
+        events.push({ _tag: 'MessageTagClose', id: frame.id })
+        break
+      case 'MessageOpenTagTail':
+        if (frame.raw.length > 0) {
+          events.push({ _tag: 'MessageBodyChunk', id: frame.id, text: frame.raw })
+        }
         events.push({ _tag: 'MessageTagClose', id: frame.id })
         break
       case 'ToolBody':
-      case 'ToolCloseTag': {
-        events.push(...emitIncompleteError(config, frame.toolCallId, frame.tagName, `Tag <${frame.tagName}> was opened but never closed`))
-        let reconstructed = `<${frame.tagName}`
-        for (const [k, v] of frame.attrs) reconstructed += ` ${k}="${v}"`
-        reconstructed += `>${frame.body}`
+      case 'ToolClosePrefixMatch': {
+        const tool = frame._tag === 'ToolBody' ? frame : frame.tool
+        events.push(...emitIncompleteError(config, tool.toolCallId, tool.tagName, `Tag <${tool.tagName}> was opened but never closed`))
+        let reconstructed = `<${tool.tagName}`
+        for (const [k, v] of tool.attrs) reconstructed += ` ${k}="${v}"`
+        reconstructed += `>${tool.body}`
         if (frame._tag === 'ToolBody' && frame.pendingLt) reconstructed += '<'
-        if (frame._tag === 'ToolCloseTag') reconstructed += frame.close.raw
+        if (frame._tag === 'ToolClosePrefixMatch') reconstructed += frame.prefix.raw
         events.push(...emitProseChunk(state, reconstructed))
         break
       }
-      case 'ChildTagName':
+      case 'ChildOpenPrefixMatch':
       case 'ChildAttrs':
       case 'ChildAttrValue':
       case 'ChildUnquotedAttrValue':
       case 'ChildBody':
-      case 'ChildCloseTag':
-        events.push(...emitIncompleteError(config, frame.tool.toolCallId, frame.tool.tagName, `Tag <${frame.tool.tagName}> was opened but never closed (incomplete child <${frame._tag === 'ChildTagName' ? frame.childName : frame.childTagName}>)`))
+      case 'ChildClosePrefixMatch': {
+        const tool = frame.tool
+        const childName = frame._tag === 'ChildOpenPrefixMatch' ? frame.prefix.matched : frame.childTagName
+        events.push(...emitIncompleteError(config, tool.toolCallId, tool.tagName, `Tag <${tool.tagName}> was opened but never closed (incomplete child <${childName}>)`))
         break
+      }
       case 'Cdata':
         if (frame.origin._tag === 'Prose') events.push(...emitProseChunk(state, frame.cdata.buffer))
         else {
@@ -71,11 +87,9 @@ export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[
           events.push(...emitIncompleteError(config, tool.toolCallId, tool.tagName, `Tag <${tool.tagName}> was opened but never closed (incomplete CDATA section)`))
         }
         break
-      case 'TagName':
-        events.push(...emitProseChunk(state, '<' + frame.name))
-        break
-      case 'TopLevelCloseTag':
-        events.push(...emitProseChunk(state, frame.close.raw))
+      case 'OpenPrefixMatch':
+      case 'ClosePrefixMatch':
+        events.push(...emitProseChunk(state, frame.prefix.raw))
         break
       case 'TagAttrs':
       case 'TagAttrValue':

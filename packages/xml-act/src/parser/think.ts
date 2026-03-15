@@ -1,16 +1,17 @@
 import type {
   LensTagAttrsFrame,
-  LensTagNameFrame,
+  LensOpenPrefixMatchFrame,
   ParseEvent,
   ParseStack,
   ParserConfig,
   PendingThinkCloseFrame,
   StepResult,
-  ThinkCloseTagFrame,
+  ThinkClosePrefixMatchFrame,
   ThinkFrame,
   ThinkState,
 } from './types'
 import { emit, NOOP } from './types'
+import { advancePrefixMatch } from './prefix-match'
 
 export function emitThinkChar(think: ThinkState, ch: string, config: ParserConfig): ParseEvent[] {
   if (think.tagName === config.keywords.lenses && think.activeLens) {
@@ -23,14 +24,17 @@ export function emitThinkChar(think: ThinkState, ch: string, config: ParserConfi
   if (think.tagName !== config.keywords.lenses) {
     events.push({ _tag: 'ProseChunk', patternId: 'think', text: ch })
   }
-  if (think.openTagBuf) {
-    if (ch === '>') {
-      if (think.openAfterNewline && think.openTagBuf === think.tagName) think.depth++
-      think.openTagBuf = ''
-    } else if (/[a-zA-Z]/.test(ch)) {
-      think.openTagBuf += ch
+  // Non-lenses nested open-tag depth tracking via prefix matching
+  if (think.openPrefix) {
+    const advanced = advancePrefixMatch(think.openPrefix, ch)
+    if (advanced._tag === 'Continue') {
+      think.openPrefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
+    } else if (advanced._tag === 'Matched' && advanced.delimiter === '>' && think.openAfterNewline) {
+      think.depth++
+      think.openPrefix = null
     } else {
-      think.openTagBuf = ''
+      // NoMatch or non-> delimiter — stop tracking
+      think.openPrefix = null
     }
   }
   think.lastCharNewline = ch === '\n'
@@ -43,22 +47,34 @@ export function stepThink({ frame, state, ch, config }: { frame: ThinkFrame; sta
     frame.pendingLt = false
     const wasAfterNewline = frame.think.lastCharNewline
     if (ch === '/') {
-      state[state.length - 1] = { _tag: 'ThinkCloseTag', think: frame.think, close: { name: '', raw: '</' }, afterNewline: wasAfterNewline }
+      // Close tag — build candidates
+      const closeCandidates: string[] = [frame.think.tagName]
+      if (frame.think.tagName === config.keywords.lenses) closeCandidates.push('lens')
+      state[state.length - 1] = {
+        _tag: 'ThinkClosePrefixMatch',
+        think: frame.think,
+        afterNewline: wasAfterNewline,
+        prefix: { candidates: closeCandidates, matched: '', raw: '</' },
+      }
     } else if (ch === '!') {
       events.push(...emitThinkChar(frame.think, '<', config))
       events.push(...emitThinkChar(frame.think, '!', config))
-    } else if (/[a-zA-Z0-9_-]/.test(ch)) {
-      if (frame.think.tagName === config.keywords.lenses) {
-        state[state.length - 1] = { _tag: 'LensTagName', think: frame.think, name: ch }
-      } else {
-        events.push(...emitThinkChar(frame.think, '<', config))
-        events.push(...emitThinkChar(frame.think, ch, config))
-        frame.think.openTagBuf = ch
-        frame.think.openAfterNewline = wasAfterNewline
+    } else if (frame.think.tagName === config.keywords.lenses && ch === 'l') {
+      // Only match <lens in lenses context
+      state[state.length - 1] = {
+        _tag: 'LensOpenPrefixMatch',
+        think: frame.think,
+        prefix: { candidates: ['lens'], matched: 'l', raw: '<l' },
       }
+    } else if (frame.think.tagName !== config.keywords.lenses && ch === frame.think.tagName[0]) {
+      // Non-lenses: start tracking potential nested open tag for depth
+      events.push(...emitThinkChar(frame.think, '<', config))
+      events.push(...emitThinkChar(frame.think, ch, config))
+      frame.think.openPrefix = { candidates: [frame.think.tagName], matched: ch, raw: '<' + ch }
+      frame.think.openAfterNewline = wasAfterNewline
     } else {
       events.push(...emitThinkChar(frame.think, '<', config))
-      frame.think.openTagBuf = ''
+      frame.think.openPrefix = null
       events.push(...emitThinkChar(frame.think, ch, config))
     }
   } else if (ch === '<') {
@@ -69,18 +85,35 @@ export function stepThink({ frame, state, ch, config }: { frame: ThinkFrame; sta
   return events.length > 0 ? emit(...events) : NOOP
 }
 
-export function stepThinkCloseTag({ frame, state, ch, config }: { frame: ThinkCloseTagFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+export function stepThinkClosePrefixMatch({ frame, state, ch, config }: { frame: ThinkClosePrefixMatchFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
   const events: ParseEvent[] = []
-  frame.close.raw += ch
-  if (ch !== '>') {
-    frame.close.name += ch
+  const advanced = advancePrefixMatch(frame.prefix, ch)
+
+  if (advanced._tag === 'Continue') {
+    frame.prefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
     return NOOP
   }
-  if (frame.think.tagName === config.keywords.lenses && frame.close.name === 'lens') {
+
+  if (advanced._tag === 'NoMatch') {
+    // Flush as literal think content
+    for (const c of advanced.literal) events.push(...emitThinkChar(frame.think, c, config))
+    state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
+    return emit(...events)
+  }
+
+  // Only accept > for close tags
+  if (advanced.delimiter !== '>') {
+    for (const c of advanced.raw) events.push(...emitThinkChar(frame.think, c, config))
+    state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
+    return emit(...events)
+  }
+
+  // Handle </lens> inside lenses
+  if (frame.think.tagName === config.keywords.lenses && advanced.tagName === 'lens') {
     if (frame.think.activeLens) {
       if (frame.think.activeLens.depth > 0) {
         frame.think.activeLens.depth--
-        for (const c of frame.close.raw) events.push(...emitThinkChar(frame.think, c, config))
+        for (const c of advanced.raw) events.push(...emitThinkChar(frame.think, c, config))
       } else {
         const content = frame.think.activeLens.content.trim()
         events.push({ _tag: 'LensEnd', name: frame.think.activeLens.name, content })
@@ -88,26 +121,30 @@ export function stepThinkCloseTag({ frame, state, ch, config }: { frame: ThinkCl
         frame.think.activeLens = null
       }
     } else {
-      for (const c of frame.close.raw) events.push(...emitThinkChar(frame.think, c, config))
+      for (const c of advanced.raw) events.push(...emitThinkChar(frame.think, c, config))
     }
     state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
     return events.length > 0 ? emit(...events) : NOOP
   }
-  if (frame.close.name === frame.think.tagName && frame.afterNewline) {
-    if (frame.think.depth > 0) {
-      frame.think.depth--
-      for (const c of frame.close.raw) events.push(...emitThinkChar(frame.think, c, config))
-      state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
-    } else {
-      if (frame.think.tagName !== config.keywords.lenses) {
-        events.push({ _tag: 'ProseEnd', patternId: 'think', content: frame.think.body, about: frame.think.about })
+
+  // Handle </think> or </thinking> or </lenses>
+  if (advanced.tagName === frame.think.tagName) {
+    if (frame.afterNewline) {
+      if (frame.think.depth > 0) {
+        frame.think.depth--
+        for (const c of advanced.raw) events.push(...emitThinkChar(frame.think, c, config))
+        state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
+      } else {
+        if (frame.think.tagName !== config.keywords.lenses) {
+          events.push({ _tag: 'ProseEnd', patternId: 'think', content: frame.think.body, about: frame.think.about })
+        }
+        state.pop()
       }
-      state.pop()
+    } else {
+      state[state.length - 1] = { _tag: 'PendingThinkClose', think: frame.think, closeRaw: advanced.raw }
     }
-  } else if (frame.close.name === frame.think.tagName && !frame.afterNewline) {
-    state[state.length - 1] = { _tag: 'PendingThinkClose', think: frame.think, closeRaw: frame.close.raw }
   } else {
-    for (const c of frame.close.raw) events.push(...emitThinkChar(frame.think, c, config))
+    for (const c of advanced.raw) events.push(...emitThinkChar(frame.think, c, config))
     state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
   }
   return events.length > 0 ? emit(...events) : NOOP
@@ -137,36 +174,41 @@ export function stepPendingThinkClose({ frame, state, ch, config }: { frame: Pen
   return emit(...events)
 }
 
-export function stepLensTagName({ frame, state, ch, config }: { frame: LensTagNameFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+export function stepLensOpenPrefixMatch({ frame, state, ch, config }: { frame: LensOpenPrefixMatchFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
   const events: ParseEvent[] = []
-  if (/[a-zA-Z]/.test(ch)) {
-    const next = frame.name + ch
-    if ('lens'.startsWith(next)) frame.name = next
-    else {
-      for (const c of '<' + next) events.push(...emitThinkChar(frame.think, c, config))
-      state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
-    }
-    return events.length > 0 ? emit(...events) : NOOP
+  const advanced = advancePrefixMatch(frame.prefix, ch)
+
+  if (advanced._tag === 'Continue') {
+    frame.prefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
+    return NOOP
   }
-  if (frame.name !== 'lens') {
-    for (const c of '<' + frame.name + ch) events.push(...emitThinkChar(frame.think, c, config))
+
+  if (advanced._tag === 'NoMatch') {
+    for (const c of advanced.literal) events.push(...emitThinkChar(frame.think, c, config))
     state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
     return emit(...events)
   }
-  if (/\s/.test(ch)) {
+
+  // Matched 'lens'
+  if (advanced.delimiter === '>') {
+    frame.think.activeLens = { name: '', content: '', depth: 0 }
+    events.push({ _tag: 'LensStart', name: '' })
+    state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
+    return emit(...events)
+  }
+
+  if (/\s/.test(advanced.delimiter)) {
     state[state.length - 1] = { _tag: 'LensTagAttrs', think: frame.think, attrKey: '', attrValue: '', phase: 'key', nameAttr: null, pendingSlash: false }
     return NOOP
   }
-  if (ch === '/') {
+
+  if (advanced.delimiter === '/') {
     state[state.length - 1] = { _tag: 'LensTagAttrs', think: frame.think, attrKey: '', attrValue: '', phase: 'key', nameAttr: null, pendingSlash: true }
     return NOOP
   }
-  if (ch === '>') {
-    frame.think.activeLens = { name: '', content: '', depth: 0 }
-    state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
-    return NOOP
-  }
-  for (const c of '<' + frame.name + ch) events.push(...emitThinkChar(frame.think, c, config))
+
+  // Unexpected delimiter
+  for (const c of advanced.raw) events.push(...emitThinkChar(frame.think, c, config))
   state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
   return emit(...events)
 }
@@ -206,6 +248,14 @@ export function stepLensTagAttrs({ frame, state, ch, config }: { frame: LensTagA
       frame.attrKey = ''
       frame.attrValue = ''
       frame.phase = 'key'
+    } else if (ch === '<') {
+      // Bail out: unclosed attr value. Flush as literal think content, reprocess '<'
+      let reconstructed = '<lens'
+      if (frame.nameAttr) reconstructed += ` name="${frame.nameAttr}"`
+      reconstructed += ` ${frame.attrKey}="${frame.attrValue}`
+      for (const c of reconstructed) events.push(...emitThinkChar(frame.think, c, config))
+      state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: true }
+      return emit(...events)
     } else frame.attrValue += ch
     return NOOP
   }
@@ -219,6 +269,15 @@ export function stepLensTagAttrs({ frame, state, ch, config }: { frame: LensTagA
       events.push({ _tag: 'LensStart', name })
     }
     state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: false }
+    return events.length > 0 ? emit(...events) : NOOP
+  }
+  if (ch === '<') {
+    // Bail out: tag was never closed. Flush as literal think content, reprocess '<'
+    let reconstructed = '<lens'
+    if (frame.nameAttr) reconstructed += ` name="${frame.nameAttr}"`
+    if (frame.attrKey) reconstructed += ` ${frame.attrKey}`
+    for (const c of reconstructed) events.push(...emitThinkChar(frame.think, c, config))
+    state[state.length - 1] = { _tag: 'Think', think: frame.think, pendingLt: true }
     return events.length > 0 ? emit(...events) : NOOP
   }
   if (ch === '/') { frame.pendingSlash = true; return NOOP }

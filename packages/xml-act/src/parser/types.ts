@@ -148,11 +148,17 @@ export interface AttrState {
   hasError: boolean
 }
 
+export interface PrefixMatch {
+  candidates: readonly string[]
+  matched: string
+  raw: string
+}
+
 export interface ThinkState {
   tagName: string
   body: string
   depth: number
-  openTagBuf: string
+  openPrefix: PrefixMatch | null
   openAfterNewline: boolean
   lastCharNewline: boolean
   about: string | null
@@ -196,29 +202,30 @@ export type ProseFrame = { readonly _tag: 'Prose'; fence: FenceState; proseAccum
 export type ActionsFrame = { readonly _tag: 'Actions' }
 export type InspectFrame = { readonly _tag: 'Inspect' }
 export type CommsFrame = { readonly _tag: 'Comms' }
-export type TagNameFrame = { readonly _tag: 'TagName'; name: string; raw: string; afterNewline: boolean }
-export type TopLevelCloseTagFrame = { readonly _tag: 'TopLevelCloseTag'; close: CloseTagBuf; afterNewline: boolean }
+export type OpenPrefixMatchFrame = { readonly _tag: 'OpenPrefixMatch'; prefix: PrefixMatch; afterNewline: boolean }
+export type ClosePrefixMatchFrame = { readonly _tag: 'ClosePrefixMatch'; prefix: PrefixMatch; afterNewline: boolean }
 export type TagAttrsFrame = { readonly _tag: 'TagAttrs'; tagName: string; toolCallId: string; attr: AttrState; raw: string }
 export type TagAttrValueFrame = { readonly _tag: 'TagAttrValue'; tagName: string; toolCallId: string; attr: AttrState; raw: string }
 export type TagUnquotedAttrValueFrame = { readonly _tag: 'TagUnquotedAttrValue'; tagName: string; toolCallId: string; attr: AttrState; raw: string }
 export type PendingStructuralOpenFrame = { readonly _tag: 'PendingStructuralOpen'; tagName: string; raw: string }
 export type PendingTopLevelCloseFrame = { readonly _tag: 'PendingTopLevelClose'; tagName: string; closeRaw: string }
 export type ThinkFrame = { readonly _tag: 'Think'; think: ThinkState; pendingLt: boolean }
-export type ThinkCloseTagFrame = { readonly _tag: 'ThinkCloseTag'; think: ThinkState; close: CloseTagBuf; afterNewline: boolean }
+export type ThinkClosePrefixMatchFrame = { readonly _tag: 'ThinkClosePrefixMatch'; think: ThinkState; afterNewline: boolean; prefix: PrefixMatch }
 export type PendingThinkCloseFrame = { readonly _tag: 'PendingThinkClose'; think: ThinkState; closeRaw: string }
-export type LensTagNameFrame = { readonly _tag: 'LensTagName'; think: ThinkState; name: string }
+export type LensOpenPrefixMatchFrame = { readonly _tag: 'LensOpenPrefixMatch'; think: ThinkState; prefix: PrefixMatch }
 export type LensTagAttrsFrame = { readonly _tag: 'LensTagAttrs'; think: ThinkState; attrKey: string; attrValue: string; phase: 'key' | 'equals' | 'value'; nameAttr: string | null; pendingSlash: boolean }
 export type MessageBodyFrame = { readonly _tag: 'MessageBody'; id: string; dest: string; artifactsRaw: string | null; body: string; pendingLt: boolean; depth: number; pendingNewline: boolean }
-export type MessageBodyOpenTagFrame = { readonly _tag: 'MessageBodyOpenTag'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; raw: string; name: string; matchingName: boolean; inName: boolean; selfClosing: boolean }
-export type MessageCloseTagFrame = { readonly _tag: 'MessageCloseTag'; id: string; dest: string; artifactsRaw: string | null; body: string; close: CloseTagBuf; depth: number; pendingNewline: boolean }
+export type MessageOpenPrefixMatchFrame = { readonly _tag: 'MessageOpenPrefixMatch'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; prefix: PrefixMatch }
+export type MessageClosePrefixMatchFrame = { readonly _tag: 'MessageClosePrefixMatch'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; prefix: PrefixMatch }
+export type MessageOpenTagTailFrame = { readonly _tag: 'MessageOpenTagTail'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; raw: string; selfClosing: boolean }
 export type ToolBodyFrame = { readonly _tag: 'ToolBody'; tagName: string; toolCallId: string; attrs: Map<string, AttributeValue>; body: string; children: ParsedChild[]; childCounts: Map<string, number>; pendingLt: boolean }
-export type ToolCloseTagFrame = { readonly _tag: 'ToolCloseTag'; tagName: string; toolCallId: string; attrs: Map<string, AttributeValue>; body: string; children: ParsedChild[]; childCounts: Map<string, number>; close: CloseTagBuf; tool: ToolBodyFrame }
-export type ChildTagNameFrame = { readonly _tag: 'ChildTagName'; childName: string; tool: ToolBodyFrame }
+export type ToolClosePrefixMatchFrame = { readonly _tag: 'ToolClosePrefixMatch'; tool: ToolBodyFrame; prefix: PrefixMatch }
+export type ChildOpenPrefixMatchFrame = { readonly _tag: 'ChildOpenPrefixMatch'; tool: ToolBodyFrame; prefix: PrefixMatch }
 export type ChildAttrsFrame = { readonly _tag: 'ChildAttrs'; childTagName: string; attr: AttrState; tool: ToolBodyFrame }
 export type ChildAttrValueFrame = { readonly _tag: 'ChildAttrValue'; childTagName: string; attr: AttrState; tool: ToolBodyFrame }
 export type ChildUnquotedAttrValueFrame = { readonly _tag: 'ChildUnquotedAttrValue'; childTagName: string; attr: AttrState; tool: ToolBodyFrame }
 export type ChildBodyFrame = { readonly _tag: 'ChildBody'; childTagName: string; childAttrs: Map<string, AttributeValue>; childBody: string; pendingLt: boolean; tool: ToolBodyFrame }
-export type ChildCloseTagFrame = { readonly _tag: 'ChildCloseTag'; childTagName: string; childAttrs: Map<string, AttributeValue>; childBody: string; close: CloseTagBuf; tool: ToolBodyFrame }
+export type ChildClosePrefixMatchFrame = { readonly _tag: 'ChildClosePrefixMatch'; childTagName: string; childAttrs: Map<string, AttributeValue>; childBody: string; tool: ToolBodyFrame; prefix: PrefixMatch }
 export type CdataFrame = { readonly _tag: 'Cdata'; cdata: CdataPhase; origin: ToolBodyFrame | ChildBodyFrame | ProseFrame }
 export type DoneFrame = { readonly _tag: 'Done' }
 
@@ -227,29 +234,30 @@ export type StackFrame =
   | ActionsFrame
   | InspectFrame
   | CommsFrame
-  | TagNameFrame
-  | TopLevelCloseTagFrame
+  | OpenPrefixMatchFrame
+  | ClosePrefixMatchFrame
   | TagAttrsFrame
   | TagAttrValueFrame
   | TagUnquotedAttrValueFrame
   | PendingStructuralOpenFrame
   | PendingTopLevelCloseFrame
   | ThinkFrame
-  | ThinkCloseTagFrame
+  | ThinkClosePrefixMatchFrame
   | PendingThinkCloseFrame
-  | LensTagNameFrame
+  | LensOpenPrefixMatchFrame
   | LensTagAttrsFrame
   | MessageBodyFrame
-  | MessageBodyOpenTagFrame
-  | MessageCloseTagFrame
+  | MessageOpenPrefixMatchFrame
+  | MessageClosePrefixMatchFrame
+  | MessageOpenTagTailFrame
   | ToolBodyFrame
-  | ToolCloseTagFrame
-  | ChildTagNameFrame
+  | ToolClosePrefixMatchFrame
+  | ChildOpenPrefixMatchFrame
   | ChildAttrsFrame
   | ChildAttrValueFrame
   | ChildUnquotedAttrValueFrame
   | ChildBodyFrame
-  | ChildCloseTagFrame
+  | ChildClosePrefixMatchFrame
   | CdataFrame
   | DoneFrame
 

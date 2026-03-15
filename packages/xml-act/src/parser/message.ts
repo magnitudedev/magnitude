@@ -1,5 +1,6 @@
-import type { MessageBodyFrame, MessageBodyOpenTagFrame, MessageCloseTagFrame, ParseEvent, ParseStack, ParserConfig, StepResult } from './types'
-import { emit, mkCloseTag, NOOP } from './types'
+import type { MessageBodyFrame, MessageClosePrefixMatchFrame, MessageOpenPrefixMatchFrame, MessageOpenTagTailFrame, ParseEvent, ParseStack, ParserConfig, StepResult } from './types'
+import { emit, NOOP } from './types'
+import { advancePrefixMatch } from './prefix-match'
 
 export function flushPendingMessageNewline(frame: MessageBodyFrame): ParseEvent[] {
   if (!frame.pendingNewline) return []
@@ -8,18 +9,43 @@ export function flushPendingMessageNewline(frame: MessageBodyFrame): ParseEvent[
   return [{ _tag: 'MessageBodyChunk', id: frame.id, text: '\n' }]
 }
 
+function toMessageBody(frame: { id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean }): MessageBodyFrame {
+  return { _tag: 'MessageBody', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, pendingLt: false, depth: frame.depth, pendingNewline: frame.pendingNewline }
+}
+
+function flushLiteralToBody(state: ParseStack, frame: { id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean }, literal: string): StepResult {
+  const bodyFrame = toMessageBody(frame)
+  state[state.length - 1] = bodyFrame
+  const events: ParseEvent[] = []
+  events.push(...flushPendingMessageNewline(bodyFrame))
+  bodyFrame.body += literal
+  events.push({ _tag: 'MessageBodyChunk', id: bodyFrame.id, text: literal })
+  return emit(...events)
+}
+
 export function stepMessageBody({ frame, state, ch }: { frame: MessageBodyFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
   const events: ParseEvent[] = []
   if (frame.pendingLt) {
     frame.pendingLt = false
     if (ch === '/') {
-      state[state.length - 1] = { _tag: 'MessageCloseTag', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, close: mkCloseTag(), depth: frame.depth, pendingNewline: frame.pendingNewline }
+      state[state.length - 1] = {
+        _tag: 'MessageClosePrefixMatch',
+        id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw,
+        body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline,
+        prefix: { candidates: ['message'], matched: '', raw: '</' },
+      }
       return NOOP
     }
-    if (/[a-zA-Z0-9_-]/.test(ch)) {
-      state[state.length - 1] = { _tag: 'MessageBodyOpenTag', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline, raw: '<' + ch, name: ch, matchingName: 'message'.startsWith(ch), inName: true, selfClosing: false }
+    if (ch === 'm') {
+      state[state.length - 1] = {
+        _tag: 'MessageOpenPrefixMatch',
+        id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw,
+        body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline,
+        prefix: { candidates: ['message'], matched: 'm', raw: '<m' },
+      }
       return NOOP
     }
+    // Any other char after < — emit literal
     events.push(...flushPendingMessageNewline(frame))
     const text = '<' + ch
     frame.body += text
@@ -38,52 +64,88 @@ export function stepMessageBody({ frame, state, ch }: { frame: MessageBodyFrame;
   return emit(...events)
 }
 
-export function stepMessageBodyOpenTag({ frame, state, ch }: { frame: MessageBodyOpenTagFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
-  const events: ParseEvent[] = []
-  frame.raw += ch
-  if (frame.inName && /[a-zA-Z0-9_-]/.test(ch)) {
-    frame.name += ch
-    frame.matchingName = frame.matchingName && 'message'.startsWith(frame.name)
+export function stepMessageOpenPrefixMatch({ frame, state, ch }: { frame: MessageOpenPrefixMatchFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+  const advanced = advancePrefixMatch(frame.prefix, ch)
+
+  if (advanced._tag === 'Continue') {
+    frame.prefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
     return NOOP
   }
-  if (frame.inName) {
-    frame.inName = false
-    if (frame.name !== 'message') frame.matchingName = false
+
+  if (advanced._tag === 'NoMatch') {
+    return flushLiteralToBody(state, frame, advanced.literal)
   }
-  if (ch === '>') {
-    if (frame.pendingNewline) {
-      frame.body += '\n'
-      events.push({ _tag: 'MessageBodyChunk', id: frame.id, text: '\n' })
-    }
-    const text = frame.raw
-    frame.body += text
-    events.push({ _tag: 'MessageBodyChunk', id: frame.id, text })
-    state[state.length - 1] = { _tag: 'MessageBody', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, pendingLt: false, depth: frame.matchingName && frame.name === 'message' && !frame.selfClosing ? frame.depth + 1 : frame.depth, pendingNewline: false }
+
+  // Matched 'message' — check delimiter
+  if (advanced.delimiter === '>') {
+    // Nested <message> — emit as literal, increment depth
+    const bodyFrame = toMessageBody({ ...frame, depth: frame.depth + 1 })
+    state[state.length - 1] = bodyFrame
+    const events: ParseEvent[] = []
+    events.push(...flushPendingMessageNewline(bodyFrame))
+    bodyFrame.body += advanced.raw
+    events.push({ _tag: 'MessageBodyChunk', id: bodyFrame.id, text: advanced.raw })
     return emit(...events)
   }
-  if (ch === '/') frame.selfClosing = true
+
+  // Delimiter is whitespace or / — enter tail mode to consume attrs until >
+  state[state.length - 1] = {
+    _tag: 'MessageOpenTagTail',
+    id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw,
+    body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline,
+    raw: advanced.raw,
+    selfClosing: advanced.delimiter === '/',
+  }
   return NOOP
 }
 
-export function stepMessageCloseTag({ frame, state, ch }: { frame: MessageCloseTagFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+export function stepMessageOpenTagTail({ frame, state, ch }: { frame: MessageOpenTagTailFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+  frame.raw += ch
+  if (ch === '/') frame.selfClosing = true
+  if (ch !== '>') return NOOP
+
+  // Got > — emit the whole tag as literal, adjust depth
+  const newDepth = frame.selfClosing ? frame.depth : frame.depth + 1
+  const bodyFrame = toMessageBody({ ...frame, depth: newDepth })
+  state[state.length - 1] = bodyFrame
   const events: ParseEvent[] = []
-  frame.close.raw += ch
-  if (ch !== '>') { frame.close.name += ch; return NOOP }
-  if (frame.close.name === 'message' && frame.depth === 0) {
-    events.push({ _tag: 'MessageTagClose', id: frame.id })
+  events.push(...flushPendingMessageNewline(bodyFrame))
+  bodyFrame.body += frame.raw
+  events.push({ _tag: 'MessageBodyChunk', id: bodyFrame.id, text: frame.raw })
+  return emit(...events)
+}
+
+export function stepMessageClosePrefixMatch({ frame, state, ch }: { frame: MessageClosePrefixMatchFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+  const advanced = advancePrefixMatch(frame.prefix, ch)
+
+  if (advanced._tag === 'Continue') {
+    frame.prefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
+    return NOOP
+  }
+
+  if (advanced._tag === 'NoMatch') {
+    return flushLiteralToBody(state, frame, advanced.literal)
+  }
+
+  // Matched 'message' — only accept > as delimiter
+  if (advanced.delimiter !== '>') {
+    return flushLiteralToBody(state, frame, advanced.raw)
+  }
+
+  // Real </message> close
+  if (frame.depth === 0) {
+    const events: ParseEvent[] = [{ _tag: 'MessageTagClose', id: frame.id }]
     state.pop()
-    if (state[state.length - 1]?._tag === 'Comms' && state[state.length - 2]?._tag === 'Prose') {
-      state.pop()
-    }
+    if (state[state.length - 1]?._tag === 'Comms' && state[state.length - 2]?._tag === 'Prose') state.pop()
     return emit(...events)
   }
-  if (frame.pendingNewline) {
-    frame.body += '\n'
-    events.push({ _tag: 'MessageBodyChunk', id: frame.id, text: '\n' })
-  }
-  const text = frame.close.raw
-  frame.body += text
-  events.push({ _tag: 'MessageBodyChunk', id: frame.id, text })
-  state[state.length - 1] = { _tag: 'MessageBody', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, pendingLt: false, depth: frame.close.name === 'message' ? frame.depth - 1 : frame.depth, pendingNewline: false }
+
+  // Nested </message> — emit as literal, decrement depth
+  const bodyFrame = toMessageBody({ ...frame, depth: frame.depth - 1 })
+  state[state.length - 1] = bodyFrame
+  const events: ParseEvent[] = []
+  events.push(...flushPendingMessageNewline(bodyFrame))
+  bodyFrame.body += advanced.raw
+  events.push({ _tag: 'MessageBodyChunk', id: bodyFrame.id, text: advanced.raw })
   return emit(...events)
 }

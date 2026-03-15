@@ -1,5 +1,6 @@
 import type { FenceState, ParseEvent, ParseStack, ParserConfig, ProseFrame, StepResult } from './types'
 import { emit, FencePhase, NOOP } from './types'
+import { activeOpenCandidates } from './stack-ops'
 
 export function isFenceComplete(phase: FencePhase): boolean {
   return phase === FencePhase.Tick3 || phase === FencePhase.XML || phase === FencePhase.TrailingWs
@@ -160,11 +161,15 @@ export function appendProseChar(state: ParseStack, ch: string): ParseEvent[] {
   return events
 }
 
-export function stepProse({ frame, state, ch }: { frame: ProseFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+export function stepProse({ frame, state, ch, config }: { frame: ProseFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
   const events: ParseEvent[] = []
   if (ch === '<') {
     events.push(...flushFenceBuffer(state))
-    state.push({ _tag: 'TagName', name: '', raw: '<', afterNewline: frame.lastCharNewline })
+    state.push({
+      _tag: 'OpenPrefixMatch',
+      prefix: { candidates: activeOpenCandidates(state, frame.lastCharNewline, config), matched: '', raw: '<' },
+      afterNewline: frame.lastCharNewline,
+    })
     frame.lastCharNewline = false
   } else {
     frame.lastCharNewline = ch === '\n'

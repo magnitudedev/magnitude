@@ -1,28 +1,23 @@
 import type {
   AttributeValue,
+  ClosePrefixMatchFrame,
+  OpenPrefixMatchFrame,
   ParseEvent,
   ParseStack,
   ParsedElement,
   PendingStructuralOpenFrame,
   PendingTopLevelCloseFrame,
   ParserConfig,
-  ProseFrame,
   StepResult,
   TagAttrsFrame,
   TagAttrValueFrame,
-  TagNameFrame,
   TagUnquotedAttrValueFrame,
-  TopLevelCloseTagFrame,
 } from './types'
 import { emit, emitAndReprocess, mkAttrState, mkRootProse, NOOP, reprocess } from './types'
 import { validateToolAttr } from './validate-attrs'
-import { activeTags, containerDepth } from './stack-ops'
+import { activeCloseCandidates, activeTags, containerDepth } from './stack-ops'
 import { emitProseChunk, endProseBlock } from './prose'
-
-export function isPrefixOfAny(prefix: string, tags: ReadonlySet<string>): boolean {
-  for (const tag of tags) if (tag.startsWith(prefix)) return true
-  return false
-}
+import { advancePrefixMatch } from './prefix-match'
 
 export function parseToolRef(raw: string): { tag: string; recency: number } | undefined {
   const match = /^([a-zA-Z0-9_-]+)(?:~(\d+))?$/.exec(raw)
@@ -30,39 +25,31 @@ export function parseToolRef(raw: string): { tag: string; recency: number } | un
   return { tag: match[1], recency: match[2] ? Number(match[2]) : 0 }
 }
 
-export function finalizeToolAttr(config: ParserConfig, tagName: string, toolCallId: string, attr: { attrs: Map<string, AttributeValue>; hasError: boolean }, key: string, raw: string): ParseEvent[] {
-  if (attr.hasError) return []
-  if (!config.knownTags.has(tagName)) {
-    attr.attrs.set(key, raw)
-    return []
-  }
+export function finalizeToolAttr(config: ParserConfig, tagName: string, toolCallId: string, attrs: Map<string, AttributeValue>, key: string, raw: string): ParseEvent[] {
   const schema = config.tagSchemas?.get(tagName)
   if (!schema) {
-    attr.attrs.set(key, raw)
+    attrs.set(key, raw)
     return []
   }
   const result = validateToolAttr(tagName, schema, key, raw)
   if (result.ok) {
-    attr.attrs.set(key, result.value)
+    attrs.set(key, result.value)
     return []
   }
-  attr.hasError = true
   return [{ _tag: 'ParseError', error: { ...result.error, toolCallId, tagName } }]
 }
 
 export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: string, attrs: Map<string, AttributeValue>, raw: string, config: ParserConfig): ParseEvent[] {
   const events: ParseEvent[] = []
-  const proseRoot = state[0]
   const kw = config.keywords
+  const proseRoot = state[0]
   if (tagName === kw.actions) {
     events.push(...endProseBlock(state))
     const outermost = containerDepth(state, 'Actions') === 0
     state.push({ _tag: 'Actions' })
-    {
-      const prose = mkRootProse()
-      prose.lastCharNewline = false
-      state.push(prose)
-    }
+    const actionsProse = mkRootProse()
+    actionsProse.lastCharNewline = false
+    state.push(actionsProse)
     proseRoot.lastCharNewline = false
     if (outermost) events.push({ _tag: 'ActionsOpen' })
     return events
@@ -71,11 +58,9 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     events.push(...endProseBlock(state))
     const outermost = containerDepth(state, 'Inspect') === 0
     state.push({ _tag: 'Inspect' })
-    {
-      const prose = mkRootProse()
-      prose.lastCharNewline = false
-      state.push(prose)
-    }
+    const inspectProse = mkRootProse()
+    inspectProse.lastCharNewline = false
+    state.push(inspectProse)
     proseRoot.lastCharNewline = false
     if (outermost) events.push({ _tag: 'InspectOpen' })
     return events
@@ -84,11 +69,9 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     events.push(...endProseBlock(state))
     const outermost = containerDepth(state, 'Comms') === 0
     state.push({ _tag: 'Comms' })
-    {
-      const prose = mkRootProse()
-      prose.lastCharNewline = false
-      state.push(prose)
-    }
+    const commsProse = mkRootProse()
+    commsProse.lastCharNewline = false
+    state.push(commsProse)
     proseRoot.lastCharNewline = false
     if (outermost) events.push({ _tag: 'CommsOpen' })
     return events
@@ -98,28 +81,25 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     proseRoot.lastCharNewline = false
     const aboutValue = attrs.get('about')
     const about = tagName === kw.lenses ? null : typeof aboutValue === 'string' ? aboutValue : null
-    state.push({ _tag: 'Think', think: { tagName, body: '', depth: 0, openTagBuf: '', openAfterNewline: false, lastCharNewline: false, about, lenses: [], activeLens: null }, pendingLt: false })
+    state.push({ _tag: 'Think', think: { tagName, body: '', depth: 0, openPrefix: null, openAfterNewline: false, lastCharNewline: false, about, lenses: [], activeLens: null }, pendingLt: false })
     return events
   }
   if (containerDepth(state, 'Inspect') === 0 && tagName === 'message') {
     events.push(...endProseBlock(state))
-    const id = config.generateId().slice(0, 8)
-    const toValue = attrs.get('to')
-    const artifactsValue = attrs.get('artifacts')
-    const dest = typeof toValue === 'string' ? toValue : config.defaultMessageDest
-    const artifactsRaw = typeof artifactsValue === 'string' ? artifactsValue : null
+    const dest = typeof attrs.get('to') === 'string' ? String(attrs.get('to')) : config.defaultMessageDest
+    const artifactsRaw = typeof attrs.get('artifacts') === 'string' ? String(attrs.get('artifacts')) : null
+    const id = config.generateId()
     events.push({ _tag: 'MessageTagOpen', id, dest, artifactsRaw })
     state.push({ _tag: 'MessageBody', id, dest, artifactsRaw, body: '', pendingLt: false, depth: 0, pendingNewline: false })
     return events
   }
-  if (containerDepth(state, 'Inspect') === 0 && containerDepth(state, 'Comms') === 0 && config.knownTags.has(tagName)) {
+  if (config.knownTags.has(tagName)) {
     events.push(...endProseBlock(state))
-    if (!toolCallId) toolCallId = config.generateId()
+    proseRoot.lastCharNewline = false
     events.push({ _tag: 'TagOpened', tagName, toolCallId, attributes: new Map(attrs) })
     state.push({ _tag: 'ToolBody', tagName, toolCallId, attrs, body: '', children: [], childCounts: new Map(), pendingLt: false })
     return events
   }
-  events.push(...emitProseChunk(state, raw))
   return events
 }
 
@@ -127,9 +107,8 @@ export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId:
   const events: ParseEvent[] = []
   const kw = config.keywords
   if (tagName === kw.actions || tagName === 'inspect' || tagName === kw.comms) return events
-  if (containerDepth(state, 'Actions') === 0 && containerDepth(state, 'Inspect') === 0 && containerDepth(state, 'Comms') === 0 && (tagName === config.keywords.next || tagName === config.keywords.yield)) {
-    const decision: 'continue' | 'yield' = tagName === config.keywords.next ? 'continue' : 'yield'
-    events.push({ _tag: 'TurnControl', decision })
+  if (containerDepth(state, 'Actions') === 0 && containerDepth(state, 'Inspect') === 0 && containerDepth(state, 'Comms') === 0 && (tagName === kw.next || tagName === kw.yield)) {
+    events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : 'yield' })
     state.push({ _tag: 'Done' })
     return events
   }
@@ -176,69 +155,100 @@ export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId:
   return events
 }
 
-export function stepTagName({ frame, state, ch, config }: { frame: TagNameFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+export function stepOpenPrefixMatch({ frame, state, ch, config }: { frame: OpenPrefixMatchFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
   const events: ParseEvent[] = []
-  frame.raw += ch
-  if (frame.name.length === 0 && ch === '/') {
-    state[state.length - 1] = { _tag: 'TopLevelCloseTag', close: { name: '', raw: '</' }, afterNewline: frame.afterNewline }
-  } else if (frame.name.length === 0 && ch === '!') {
+
+  // First char dispatch
+  if (frame.prefix.matched === '' && ch === '!') {
+    state.pop()
     state.push({ _tag: 'Cdata', cdata: { _tag: 'Prefix', index: 1, buffer: '<!' }, origin: state[0] })
-  } else if (/[a-zA-Z0-9_-]/.test(ch)) {
-    const candidate = frame.name + ch
-    if (isPrefixOfAny(candidate, activeTags(state, frame.afterNewline, config)) || isPrefixOfAny(candidate, config.structuralTags)) frame.name = candidate
-    else {
-      state.pop()
-      events.push(...emitProseChunk(state, '<' + candidate))
-    }
-  } else if (frame.name.length === 0) {
-    state.pop()
-    events.push(...emitProseChunk(state, '<' + ch))
-  } else if (/\s/.test(ch)) {
-    const tags = activeTags(state, frame.afterNewline, config)
-    if (tags.has(frame.name)) {
-      const toolCallId = config.knownTags.has(frame.name) ? config.generateId() : ''
-      state[state.length - 1] = { _tag: 'TagAttrs', tagName: frame.name, toolCallId, attr: mkAttrState(), raw: frame.raw }
-    } else {
-      state.pop()
-      events.push(...emitProseChunk(state, '<' + frame.name + ch))
-    }
-  } else if (ch === '>') {
-    const tags = activeTags(state, frame.afterNewline, config)
-    if (tags.has(frame.name)) {
-      state.pop()
-      events.push(...resolveOpenTag(state, frame.name, '', new Map(), frame.raw, config))
-    } else if (!frame.afterNewline && (frame.name === config.keywords.think || frame.name === config.keywords.thinking || frame.name === config.keywords.lenses)) {
-      state[state.length - 1] = { _tag: 'PendingStructuralOpen', tagName: frame.name, raw: frame.raw }
-    } else {
-      state.pop()
-      events.push(...emitProseChunk(state, '<' + frame.name + '>'))
-    }
-  } else if (ch === '/') {
-    const tags = activeTags(state, frame.afterNewline, config)
-    if (tags.has(frame.name)) {
-      const toolCallId = config.knownTags.has(frame.name) ? config.generateId() : ''
-      const attr = mkAttrState()
-      attr.phase = { _tag: 'PendingSlash' }
-      state[state.length - 1] = { _tag: 'TagAttrs', tagName: frame.name, toolCallId, attr, raw: frame.raw }
-    } else {
-      state.pop()
-      events.push(...emitProseChunk(state, '<' + frame.name + '/'))
-    }
-  } else {
-    state.pop()
-    events.push(...emitProseChunk(state, '<' + frame.name + ch))
+    return NOOP
   }
-  return events.length > 0 ? emit(...events) : NOOP
+
+  if (frame.prefix.matched === '' && ch === '/') {
+    const closeCandidates = activeCloseCandidates(state, frame.afterNewline, config)
+    if (closeCandidates.length === 0) {
+      state.pop()
+      events.push(...emitProseChunk(state, '</'))
+      return emit(...events)
+    }
+    state[state.length - 1] = {
+      _tag: 'ClosePrefixMatch',
+      prefix: { candidates: closeCandidates, matched: '', raw: '</' },
+      afterNewline: frame.afterNewline,
+    }
+    return NOOP
+  }
+
+  const advanced = advancePrefixMatch(frame.prefix, ch)
+
+  if (advanced._tag === 'Continue') {
+    frame.prefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
+    return NOOP
+  }
+
+  if (advanced._tag === 'NoMatch') {
+    state.pop()
+    events.push(...emitProseChunk(state, advanced.literal))
+    return emit(...events)
+  }
+
+  // Matched a tag name
+  const tags = activeTags(state, frame.afterNewline, config)
+
+  if (advanced.delimiter === '>') {
+    if (tags.has(advanced.tagName)) {
+      state.pop()
+      events.push(...resolveOpenTag(state, advanced.tagName, '', new Map(), advanced.raw, config))
+    } else if (!frame.afterNewline && (advanced.tagName === config.keywords.think || advanced.tagName === config.keywords.thinking || advanced.tagName === config.keywords.lenses)) {
+      state[state.length - 1] = { _tag: 'PendingStructuralOpen', tagName: advanced.tagName, raw: advanced.raw }
+    } else {
+      state.pop()
+      events.push(...emitProseChunk(state, advanced.raw))
+    }
+    return emit(...events)
+  }
+
+  // Delimiter is whitespace or /
+  if (!tags.has(advanced.tagName)) {
+    state.pop()
+    events.push(...emitProseChunk(state, advanced.raw))
+    return emit(...events)
+  }
+
+  const toolCallId = config.knownTags.has(advanced.tagName) ? config.generateId() : ''
+  const attr = mkAttrState()
+  if (advanced.delimiter === '/') attr.phase = { _tag: 'PendingSlash' }
+  state[state.length - 1] = { _tag: 'TagAttrs', tagName: advanced.tagName, toolCallId, attr, raw: advanced.raw }
+  return NOOP
 }
 
-export function stepTopLevelCloseTag({ frame, state, ch, config }: { frame: TopLevelCloseTagFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
+export function stepClosePrefixMatch({ frame, state, ch, config }: { frame: ClosePrefixMatchFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
   const events: ParseEvent[] = []
-  frame.close.raw += ch
-  if (ch !== '>') { frame.close.name += ch; return NOOP }
+  const advanced = advancePrefixMatch(frame.prefix, ch)
+
+  if (advanced._tag === 'Continue') {
+    frame.prefix = { candidates: advanced.candidates, matched: advanced.matched, raw: advanced.raw }
+    return NOOP
+  }
+
+  if (advanced._tag === 'NoMatch') {
+    state.pop()
+    events.push(...emitProseChunk(state, advanced.literal))
+    return emit(...events)
+  }
+
+  // Only accept > for structural close tags
+  if (advanced.delimiter !== '>') {
+    state.pop()
+    events.push(...emitProseChunk(state, advanced.raw))
+    return emit(...events)
+  }
+
   const proseRoot = state[0]
   const kw = config.keywords
   const closeIf = (name: string, kind: 'Actions' | 'Inspect' | 'Comms', ev: 'ActionsClose' | 'InspectClose' | 'CommsClose') => {
-    if (frame.afterNewline && frame.close.name === name && containerDepth(state, kind) > 0) {
+    if (frame.afterNewline && advanced.tagName === name && containerDepth(state, kind) > 0) {
       state.pop()
       if (state[state.length - 1]?._tag === 'Prose') state.pop()
       for (let i = state.length - 1; i >= 0; i--) {
@@ -253,17 +263,19 @@ export function stepTopLevelCloseTag({ frame, state, ch, config }: { frame: TopL
       state.push(prose)
       return true
     }
-    if (!frame.afterNewline && frame.close.name === name && containerDepth(state, kind) > 0) {
-      state[state.length - 1] = { _tag: 'PendingTopLevelClose', tagName: name, closeRaw: frame.close.raw }
+    if (!frame.afterNewline && advanced.tagName === name && containerDepth(state, kind) > 0) {
+      state[state.length - 1] = { _tag: 'PendingTopLevelClose', tagName: name, closeRaw: advanced.raw }
       return true
     }
     return false
   }
+
   if (closeIf(kw.actions, 'Actions', 'ActionsClose')) return events.length > 0 ? emit(...events) : NOOP
   if (closeIf('inspect', 'Inspect', 'InspectClose')) return events.length > 0 ? emit(...events) : NOOP
   if (closeIf(kw.comms, 'Comms', 'CommsClose')) return events.length > 0 ? emit(...events) : NOOP
+
   state.pop()
-  events.push(...emitProseChunk(state, frame.close.raw))
+  events.push(...emitProseChunk(state, advanced.raw))
   return emit(...events)
 }
 
@@ -274,6 +286,10 @@ export function stepTagAttrs({ frame, state, ch, config }: { frame: TagAttrsFram
   if (attr.phase._tag === 'PendingSlash') {
     if (ch === '>') {
       attr.phase = { _tag: 'Idle' }
+      if (attr.key) {
+        events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr.attrs, attr.key, ''))
+        attr.key = ''
+      }
       state.pop()
       events.push(...resolveSelfClose(state, frame.tagName, frame.toolCallId, attr.attrs, frame.raw, config))
     } else {
@@ -287,42 +303,45 @@ export function stepTagAttrs({ frame, state, ch, config }: { frame: TagAttrsFram
     const key = attr.phase.key
     attr.phase = { _tag: 'Idle' }
     if (ch === '"') {
-      attr.key = key
       attr.value = ''
+      attr.key = key
       state[state.length - 1] = { _tag: 'TagAttrValue', tagName: frame.tagName, toolCallId: frame.toolCallId, attr, raw: frame.raw }
     } else if (ch === '>' || ch === '/') {
-      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr, key, ''))
+      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr.attrs, key, ''))
       attr.key = ''
       return stepTagAttrs({ frame, state, ch, config })
     } else if (/\s/.test(ch)) {
-      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr, key, ''))
+      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr.attrs, key, ''))
       attr.key = ''
     } else {
-      attr.key = key
       attr.value = ch
+      attr.key = key
       state[state.length - 1] = { _tag: 'TagUnquotedAttrValue', tagName: frame.tagName, toolCallId: frame.toolCallId, attr, raw: frame.raw }
     }
     return events.length > 0 ? emit(...events) : NOOP
   }
   if (ch === '>') {
     if (attr.key) {
-      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr, attr.key, ''))
+      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr.attrs, attr.key, ''))
       attr.key = ''
     }
     state.pop()
     events.push(...resolveOpenTag(state, frame.tagName, frame.toolCallId, attr.attrs, frame.raw, config))
   } else if (ch === '/') {
     if (attr.key) {
-      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr, attr.key, ''))
+      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr.attrs, attr.key, ''))
       attr.key = ''
     }
     attr.phase = { _tag: 'PendingSlash' }
   } else if (ch === '=') {
     attr.phase = { _tag: 'PendingEquals', key: attr.key }
     attr.key = ''
+  } else if (ch === '"') {
+    attr.value = ''
+    state[state.length - 1] = { _tag: 'TagAttrValue', tagName: frame.tagName, toolCallId: frame.toolCallId, attr, raw: frame.raw }
   } else if (/\s/.test(ch)) {
     if (attr.key) {
-      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr, attr.key, ''))
+      events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, attr.attrs, attr.key, ''))
       attr.key = ''
     }
   } else attr.key += ch
@@ -333,7 +352,7 @@ export function stepTagAttrValue({ frame, state, ch, config }: { frame: TagAttrV
   const events: ParseEvent[] = []
   frame.raw += ch
   if (ch === '"') {
-    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr, frame.attr.key, frame.attr.value))
+    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr.attrs, frame.attr.key, frame.attr.value))
     frame.attr.key = ''
     frame.attr.value = ''
     frame.attr.phase = { _tag: 'Idle' }
@@ -346,19 +365,19 @@ export function stepTagUnquotedAttrValue({ frame, state, ch, config }: { frame: 
   const events: ParseEvent[] = []
   frame.raw += ch
   if (/\s/.test(ch)) {
-    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr, frame.attr.key, frame.attr.value))
+    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr.attrs, frame.attr.key, frame.attr.value))
     frame.attr.key = ''
     frame.attr.value = ''
     frame.attr.phase = { _tag: 'Idle' }
     state[state.length - 1] = { _tag: 'TagAttrs', tagName: frame.tagName, toolCallId: frame.toolCallId, attr: frame.attr, raw: frame.raw }
   } else if (ch === '>') {
-    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr, frame.attr.key, frame.attr.value))
+    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr.attrs, frame.attr.key, frame.attr.value))
     frame.attr.key = ''
     frame.attr.value = ''
     state.pop()
     events.push(...resolveOpenTag(state, frame.tagName, frame.toolCallId, frame.attr.attrs, frame.raw, config))
   } else if (ch === '/') {
-    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr, frame.attr.key, frame.attr.value))
+    events.push(...finalizeToolAttr(config, frame.tagName, frame.toolCallId, frame.attr.attrs, frame.attr.key, frame.attr.value))
     frame.attr.key = ''
     frame.attr.value = ''
     frame.attr.phase = { _tag: 'PendingSlash' }
@@ -368,24 +387,13 @@ export function stepTagUnquotedAttrValue({ frame, state, ch, config }: { frame: 
 }
 
 export function stepPendingStructuralOpen({ frame, state, ch, config }: { frame: PendingStructuralOpenFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
-  const events: ParseEvent[] = []
   if (ch === '\n') {
     state.pop()
-    events.push(...resolveOpenTag(state, frame.tagName, '', new Map(), frame.raw, config))
-    const top = state[state.length - 1]
-    if (top?._tag === 'Think') {
-      top.think.body += '\n'
-      if (top.think.tagName !== config.keywords.lenses) events.push({ _tag: 'ProseChunk', patternId: 'think', text: '\n' })
-      top.think.lastCharNewline = true
-    } else {
-      const prose = state[0]
-      prose.lastCharNewline = true
-    }
-    return events.length > 0 ? emit(...events) : NOOP
+    return emit(...resolveOpenTag(state, frame.tagName, '', new Map(), frame.raw, config))
   }
   state.pop()
-  events.push(...emitProseChunk(state, frame.raw))
-  return events.length > 0 ? emitAndReprocess(...events) : reprocess()
+  const events = emitProseChunk(state, frame.raw)
+  return emitAndReprocess(...events)
 }
 
 export function stepPendingTopLevelClose({ frame, state, ch, config }: { frame: PendingTopLevelCloseFrame; state: ParseStack; ch: string; config: ParserConfig }): StepResult {
@@ -415,5 +423,5 @@ export function stepPendingTopLevelClose({ frame, state, ch, config }: { frame: 
   }
   state.pop()
   events.push(...emitProseChunk(state, frame.closeRaw))
-  return events.length > 0 ? emitAndReprocess(...events) : reprocess()
+  return emitAndReprocess(...events)
 }

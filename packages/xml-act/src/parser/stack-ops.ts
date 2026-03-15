@@ -26,3 +26,21 @@ export function activeTags(stack: ParseStack, afterNewline: boolean, config: Par
   if (container === 'Actions') return afterNewline ? config.actionsTags : config.knownTags
   return afterNewline ? config.topLevelTags : new Set()
 }
+
+export function activeOpenCandidates(stack: ParseStack, afterNewline: boolean, config: ParserConfig): string[] {
+  const tags = activeTags(stack, afterNewline, config)
+  if (afterNewline) return Array.from(tags)
+  // When not after newline, also include think/thinking/lenses for PendingStructuralOpen
+  // but NOT other structural tags like actions/comms/next/yield
+  const kw = config.keywords
+  const combined = new Set([...tags, kw.think, kw.thinking, kw.lenses])
+  return Array.from(combined)
+}
+
+export function activeCloseCandidates(stack: ParseStack, afterNewline: boolean, config: ParserConfig): string[] {
+  const container = innermostContainer(stack)
+  if (container === 'Actions') return [config.keywords.actions]
+  if (container === 'Inspect') return ['inspect']
+  if (container === 'Comms') return [config.keywords.comms]
+  return []
+}
