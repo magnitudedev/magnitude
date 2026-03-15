@@ -35,6 +35,8 @@ export const AssistantMessage = memo(function AssistantMessage({
       <BlockRenderer
         blocks={blocks}
         foreground={theme.foreground}
+        palette={markdownPalette}
+        contentWidth={codeBlockWidth}
         showCursor={showCursor && !pendingText}
         onOpenArtifact={onOpenArtifact}
       />

@@ -1,8 +1,8 @@
 import { useMemo, useRef } from 'react'
-import { parseMarkdown } from '@magnitude/markdown-cst'
-import type { DocumentNode, DocumentItemNode } from '@magnitude/markdown-cst/src/schema'
+import type { Root } from 'mdast'
 import { hasOddFenceCount } from '../utils/markdown-content-renderer'
-import { renderDocumentItemToBlocks, type Block, type HighlightRange, type MarkdownPalette } from '../utils/render-blocks'
+import { parseMarkdownToMdast } from '../utils/markdown-parser'
+import { renderDocumentToBlocks, type Block, type HighlightRange, type MarkdownPalette } from '../utils/render-blocks'
 
 interface StreamingMarkdownCacheOptions {
   palette: MarkdownPalette
@@ -34,16 +34,23 @@ function areHighlightRangesEqual(
   })
 }
 
+function appendTrailingSpacer(blocks: Block[], source: string): Block[] {
+  const match = source.match(/\n\n+$/)
+  if (!match) return blocks
+  const lines = match[0].length - 1
+  if (lines <= 0) return blocks
+  return [...blocks, { type: 'spacer', lines }]
+}
+
 export function useStreamingMarkdownCache(
   content: string,
   options: StreamingMarkdownCacheOptions,
 ): StreamingMarkdownCacheResult {
   const cacheRef = useRef<{
     prevContent: string
-    prevDoc: DocumentNode | null
+    prevDoc: Root | null
     prevBlocks: Block[]
     prevPendingText: string
-    itemBlockCache: WeakMap<DocumentItemNode, Block[]>
     prevHighlightRanges: HighlightRange[] | undefined
     prevPalette: MarkdownPalette | null
     prevCodeBlockWidth: number | undefined
@@ -53,7 +60,6 @@ export function useStreamingMarkdownCache(
     prevDoc: null,
     prevBlocks: [],
     prevPendingText: '',
-    itemBlockCache: new WeakMap(),
     prevHighlightRanges: undefined,
     prevPalette: null,
     prevCodeBlockWidth: undefined,
@@ -66,7 +72,6 @@ export function useStreamingMarkdownCache(
 
     if (cache.prevStreaming && !options.streaming) {
       cache.prevDoc = null
-      cache.itemBlockCache = new WeakMap()
     }
     cache.prevStreaming = !!options.streaming
 
@@ -92,38 +97,26 @@ export function useStreamingMarkdownCache(
     const highlightChanged = !areHighlightRangesEqual(highlightRanges, cache.prevHighlightRanges)
     const paletteChanged = palette !== cache.prevPalette
     const codeBlockWidthChanged = codeBlockWidth !== cache.prevCodeBlockWidth
-    if (paletteChanged || codeBlockWidthChanged) {
-      cache.itemBlockCache = new WeakMap()
-    } else if (highlightChanged) {
-      cache.itemBlockCache = new WeakMap()
-    }
 
-    const doc = parseMarkdown(completeSection, {
-      previous: cache.prevDoc ?? undefined,
+    const doc = parseMarkdownToMdast(completeSection)
+    const rendered = renderDocumentToBlocks(doc, {
+      palette,
+      codeBlockWidth,
+      highlights: highlightRanges,
     })
-
-    const allBlocks: Block[] = []
-    for (const item of doc.content) {
-      let itemBlocks = cache.itemBlockCache.get(item)
-      if (!itemBlocks) {
-        itemBlocks = renderDocumentItemToBlocks(item, {
-          palette,
-          codeBlockWidth,
-          highlights: highlightRanges,
-        })
-        cache.itemBlockCache.set(item, itemBlocks)
-      }
-      allBlocks.push(...itemBlocks)
-    }
+    const finalBlocks =
+      paletteChanged || codeBlockWidthChanged || highlightChanged || content !== cache.prevContent
+        ? appendTrailingSpacer(rendered, completeSection)
+        : cache.prevBlocks
 
     cache.prevContent = content
     cache.prevDoc = doc
-    cache.prevBlocks = allBlocks
+    cache.prevBlocks = finalBlocks
     cache.prevPendingText = pendingText
     cache.prevHighlightRanges = highlightRanges
     cache.prevPalette = palette
     cache.prevCodeBlockWidth = codeBlockWidth
 
-    return { blocks: allBlocks, pendingText }
+    return { blocks: finalBlocks, pendingText }
   }, [content, options.palette, options.codeBlockWidth, options.highlightRanges, options.streaming])
 }

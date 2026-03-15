@@ -8,9 +8,7 @@ import { StreamingMarkdownContent } from './markdown-content'
 import { Button } from './button'
 import { slugify } from '../utils/markdown-content-renderer'
 
-const LARGE_ARTIFACT_CHARS = 100_000
-const LARGE_ARTIFACT_LINES = 2000
-const STREAM_TAIL_LINES = 50
+
 
 interface ChangedRange {
   start: number
@@ -22,25 +20,7 @@ interface OptimisticUpdatePreview {
   changedRanges: ChangedRange[]
 }
 
-function countLines(text: string): number {
-  if (!text) return 0
-  return text.split('\n').length
-}
 
-function isLargeArtifact(text: string): boolean {
-  return text.length > LARGE_ARTIFACT_CHARS || countLines(text) > LARGE_ARTIFACT_LINES
-}
-
-function buildTailPreview(text: string, linesToShow: number): { header: string | null; content: string } {
-  const lines = text.split('\n')
-  if (lines.length <= linesToShow) {
-    return { header: null, content: text }
-  }
-  return {
-    header: `… (showing last ${linesToShow} of ${lines.length} lines)`,
-    content: lines.slice(-linesToShow).join('\n'),
-  }
-}
 
 function findUniqueMatchRange(content: string | null | undefined, needle: string | undefined): ChangedRange | null {
   if (!content || !needle) return null
@@ -294,11 +274,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
     return streaming?.newStringSoFar ?? ''
   }, [isWriteStream, isUpdateStream, streaming, optimisticUpdatePreview, displayedContent])
 
-  const largeStreamingArtifact = !!streaming && isLargeArtifact(displayedContent)
-  const tailDisplay = useMemo(
-    () => largeStreamingArtifact ? buildTailPreview(displayedContent, STREAM_TAIL_LINES) : null,
-    [largeStreamingArtifact, displayedContent],
-  )
+
 
   const highlightCharRanges = useMemo(
     () => activeHighlightRanges.map((range) => ({
@@ -457,13 +433,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
           },
         }}
       >
-        {largeStreamingArtifact ? (
-          <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
-            {tailDisplay?.content ?? displayedContent}
-            {showCursor ? '▍' : ''}
-          </text>
-        ) : (
-          <StreamingMarkdownContent
+        <StreamingMarkdownContent
             content={displayedContent}
             onOpenArtifact={onOpenArtifact}
             showCursor={showCursor}
@@ -472,7 +442,6 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
             streaming={isActivelyStreaming}
             codeBlockWidth={codeBlockWidth}
           />
-        )}
       </scrollbox>
     </box>
   )

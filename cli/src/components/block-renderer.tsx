@@ -19,6 +19,8 @@ import type {
 } from '../utils/render-blocks'
 import { spansToText } from '../utils/render-blocks'
 import { useTheme } from '../hooks/use-theme'
+import type { MarkdownPalette } from '../utils/theme'
+import { buildMarkdownColorPalette } from '../utils/theme'
 import { useArtifacts } from '../hooks/use-artifacts'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { BOX_CHARS } from '../utils/ui-constants'
@@ -182,7 +184,17 @@ function CodeLine({ spans, fallbackFg }: { spans: Span[]; fallbackFg: string }) 
   )
 }
 
-function CodeBlockView({ block, foreground, id }: { block: CodeBlock; foreground: string; id?: string }) {
+function CodeBlockView({
+  block,
+  foreground,
+  palette,
+  id,
+}: {
+  block: CodeBlock
+  foreground: string
+  palette: MarkdownPalette
+  id?: string
+}) {
   const theme = useTheme()
   const [isHovered, setIsHovered] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -197,20 +209,20 @@ function CodeBlockView({ block, foreground, id }: { block: CodeBlock; foreground
   return (
     <box
       id={id}
-      style={{ flexDirection: 'column', position: 'relative', marginBottom: 1 }}
+      style={{ flexDirection: 'column', position: 'relative' }}
       onMouseOver={() => setIsHovered(true)}
       onMouseOut={() => setIsHovered(false)}
       onMouseDown={handleCopy}
     >
-      <text style={{ fg: theme.border || theme.muted }}>
-        ┌ <span fg={theme.muted} attributes={TextAttributes.DIM}>{block.language || ''}</span>
+      <text style={{ fg: palette.codeBorderColor }}>
+        ┌ <span fg={palette.codeHeaderFg} attributes={TextAttributes.DIM}>{block.language || ''}</span>
       </text>
       <box
         style={{
           flexDirection: 'row',
           borderStyle: 'single',
           border: ['left'],
-          borderColor: theme.border || theme.muted,
+          borderColor: palette.codeBorderColor,
           customBorderChars: BOX_CHARS,
           paddingLeft: 1,
           paddingRight: 2,
@@ -228,7 +240,44 @@ function CodeBlockView({ block, foreground, id }: { block: CodeBlock; foreground
         </box>
       </box>
       <text style={{ fg: copied ? theme.success : foreground }}>
-        <span fg={theme.border || theme.muted}>└</span>{isHovered && (copied ? ' [Copied ✔]' : ' [Copy ⧉ ]')}
+        <span fg={palette.codeBorderColor}>└</span>
+        {isHovered && (copied ? ' [Copied ✔]' : ' [Copy ⧉ ]')}
+      </text>
+    </box>
+  )
+}
+
+function MermaidBlockView({
+  ascii,
+  foreground,
+  palette,
+  id,
+}: {
+  ascii: string
+  foreground: string
+  palette: MarkdownPalette
+  id?: string
+}) {
+  return (
+    <box id={id} style={{ flexDirection: 'column' }}>
+      <text style={{ fg: palette.codeBorderColor }}>
+        ┌ <span fg={palette.codeHeaderFg} attributes={TextAttributes.DIM}>mermaid</span>
+      </text>
+      <box
+        style={{
+          flexDirection: 'row',
+          borderStyle: 'single',
+          border: ['left'],
+          borderColor: palette.codeBorderColor,
+          customBorderChars: BOX_CHARS,
+          paddingLeft: 1,
+          paddingRight: 2,
+        }}
+      >
+        <text style={{ fg: foreground }}>{ascii}</text>
+      </box>
+      <text style={{ fg: foreground }}>
+        <span fg={palette.codeBorderColor}>└</span>
       </text>
     </box>
   )
@@ -239,16 +288,7 @@ function itemContentWithMarker(item: ListBlock['items'][number]): Block[] {
   if (!first) {
     return [{ type: 'paragraph', content: [{ text: item.marker, fg: item.markerFg }], source: { start: 0, end: 0 } }]
   }
-  if (first.type === 'paragraph') {
-    return [
-      {
-        ...first,
-        content: [{ text: item.marker, fg: item.markerFg }, ...first.content],
-      },
-      ...rest,
-    ]
-  }
-  if (first.type === 'heading') {
+  if (first.type === 'paragraph' || first.type === 'heading') {
     return [
       {
         ...first,
@@ -266,10 +306,14 @@ function itemContentWithMarker(item: ListBlock['items'][number]): Block[] {
 function ListBlockView({
   block,
   foreground,
+  palette,
+  contentWidth,
   onOpenArtifact,
 }: {
   block: ListBlock
   foreground: string
+  palette: MarkdownPalette
+  contentWidth: number
   onOpenArtifact?: (name: string, section?: string) => void
 }) {
   return (
@@ -279,6 +323,8 @@ function ListBlockView({
           <BlockRenderer
             blocks={itemContentWithMarker(item)}
             foreground={foreground}
+            palette={palette}
+            contentWidth={contentWidth}
             onOpenArtifact={onOpenArtifact}
           />
         </box>
@@ -290,18 +336,27 @@ function ListBlockView({
 function BlockquoteView({
   block,
   foreground,
+  palette,
+  contentWidth,
   onOpenArtifact,
 }: {
   block: BlockquoteBlock
   foreground: string
+  palette: MarkdownPalette
+  contentWidth: number
   onOpenArtifact?: (name: string, section?: string) => void
 }) {
-  const theme = useTheme()
   return (
     <box style={{ flexDirection: 'row' }}>
-      <text style={{ fg: theme.muted, flexShrink: 0 }}>{'> '}</text>
+      <text style={{ fg: palette.blockquoteBorderFg, flexShrink: 0 }}>{'> '}</text>
       <box style={{ flexDirection: 'column', flexGrow: 1 }}>
-        <BlockRenderer blocks={block.content} foreground={foreground} onOpenArtifact={onOpenArtifact} />
+        <BlockRenderer
+          blocks={block.content}
+          foreground={foreground}
+          palette={palette}
+          contentWidth={Math.max(10, contentWidth - 2)}
+          onOpenArtifact={onOpenArtifact}
+        />
       </box>
     </box>
   )
@@ -352,20 +407,53 @@ function padSpans(spans: Span[], targetWidth: number): Span[] {
   return [...spans, { text: ' '.repeat(targetWidth - currentWidth) }]
 }
 
+function scaleTableWidths(widths: number[], contentWidth: number): number[] {
+  if (widths.length === 0) return widths
+  const maxTableWidth = Math.max(10, Math.min(contentWidth, 80))
+  const naturalTotal = widths.reduce((sum, width) => sum + width, 0) + Math.max(0, widths.length - 1) * 3 + 2
+  if (naturalTotal <= maxTableWidth) return widths
+
+  const availableForContent = Math.max(widths.length * 3, maxTableWidth - Math.max(0, widths.length - 1) * 3 - 2)
+  const totalNaturalContent = widths.reduce((sum, width) => sum + width, 0)
+  const scaled = widths.map((width) => Math.max(3, Math.floor((width / totalNaturalContent) * availableForContent)))
+
+  let used = scaled.reduce((sum, width) => sum + width, 0)
+  let remaining = availableForContent - used
+  while (remaining > 0) {
+    let changed = false
+    for (let i = 0; i < scaled.length && remaining > 0; i++) {
+      if (scaled[i] < widths[i]) {
+        scaled[i] += 1
+        remaining -= 1
+        changed = true
+      }
+    }
+    if (!changed) break
+    used = scaled.reduce((sum, width) => sum + width, 0)
+    remaining = availableForContent - used
+  }
+
+  return scaled
+}
+
 function TableRow({
   cells,
   widths,
   foreground,
+  borderColor,
+  headerColor,
   header,
 }: {
   cells: Span[][]
   widths: number[]
   foreground: string
+  borderColor: string
+  headerColor: string
   header?: boolean
 }) {
   return (
     <text style={{ fg: foreground }}>
-      <span>│</span>
+      <span fg={borderColor}>│</span>
       {cells.map((cell, idx) => {
         const clipped = clipSpans(cell, widths[idx] ?? 0)
         const padded = padSpans(clipped, widths[idx] ?? 0)
@@ -375,12 +463,17 @@ function TableRow({
             {padded.map((span, si) => {
               const attrs = header ? TextAttributes.BOLD : spanAttributes(span)
               return (
-                <span key={si} fg={span.fg ?? foreground} bg={span.bg} attributes={attrs}>
+                <span
+                  key={si}
+                  fg={header ? paletteOr(headerColor, span.fg ?? foreground) : (span.fg ?? foreground)}
+                  bg={span.bg}
+                  attributes={attrs}
+                >
                   {span.text}
                 </span>
               )
             })}
-            <span> │</span>
+            <span fg={borderColor}> │</span>
           </React.Fragment>
         )
       })}
@@ -388,21 +481,50 @@ function TableRow({
   )
 }
 
-function TableView({ block, foreground, id }: { block: TableBlock; foreground: string; id?: string }) {
-  const theme = useTheme()
-  const widths = block.columnWidths
+function paletteOr(primary: string | undefined, fallback: string): string {
+  return primary ?? fallback
+}
+
+function TableView({
+  block,
+  foreground,
+  palette,
+  contentWidth,
+  id,
+}: {
+  block: TableBlock
+  foreground: string
+  palette: MarkdownPalette
+  contentWidth: number
+  id?: string
+}) {
+  const widths = scaleTableWidths(block.columnWidths, contentWidth)
   const sep = (left: string, mid: string, right: string) =>
     `${left}${widths.map((w) => '─'.repeat(w + 2)).join(mid)}${right}`
 
   return (
     <box id={id} style={{ flexDirection: 'column' }}>
-      <text style={{ fg: theme.border || theme.muted }}>{sep('┌', '┬', '┐')}</text>
-      <TableRow cells={block.headers} widths={widths} foreground={foreground} header />
-      <text style={{ fg: theme.border || theme.muted }}>{sep('├', '┼', '┤')}</text>
+      <text style={{ fg: palette.dividerFg }}>{sep('┌', '┬', '┐')}</text>
+      <TableRow
+        cells={block.headers}
+        widths={widths}
+        foreground={foreground}
+        borderColor={palette.dividerFg}
+        headerColor={palette.headingFg[3]}
+        header
+      />
+      <text style={{ fg: palette.dividerFg }}>{sep('├', '┼', '┤')}</text>
       {block.rows.map((row, idx) => (
-        <TableRow key={idx} cells={row} widths={widths} foreground={foreground} />
+        <TableRow
+          key={idx}
+          cells={row}
+          widths={widths}
+          foreground={foreground}
+          borderColor={palette.dividerFg}
+          headerColor={palette.headingFg[3]}
+        />
       ))}
-      <text style={{ fg: theme.border || theme.muted }}>{sep('└', '┴', '┘')}</text>
+      <text style={{ fg: palette.dividerFg }}>{sep('└', '┴', '┘')}</text>
     </box>
   )
 }
@@ -415,6 +537,8 @@ function blockHasHighlight(block: Block, highlights: HighlightRange[]): boolean 
 export const BlockRenderer = memo(function BlockRenderer({
   blocks,
   foreground,
+  palette,
+  contentWidth = 79,
   onOpenArtifact,
   showCursor,
   highlightAnchorId,
@@ -422,12 +546,15 @@ export const BlockRenderer = memo(function BlockRenderer({
 }: {
   blocks: Block[]
   foreground: string
+  palette?: MarkdownPalette
+  contentWidth?: number
   onOpenArtifact?: (name: string, section?: string) => void
   showCursor?: boolean
   highlightAnchorId?: string
   highlights?: HighlightRange[]
 }) {
   const theme = useTheme()
+  const resolvedPalette = palette ?? buildMarkdownColorPalette(theme)
   let didAssignHighlightAnchor = false
 
   const maybeAnchorId = (block: Block) => {
@@ -468,13 +595,23 @@ export const BlockRenderer = memo(function BlockRenderer({
               />
             )
           case 'code':
-            return <CodeBlockView key={idx} block={block} foreground={foreground} id={anchorId} />
+            return (
+              <CodeBlockView
+                key={idx}
+                block={block}
+                foreground={foreground}
+                palette={resolvedPalette}
+                id={anchorId}
+              />
+            )
           case 'list':
             return (
               <ListBlockView
                 key={idx}
                 block={block}
                 foreground={foreground}
+                palette={resolvedPalette}
+                contentWidth={contentWidth}
                 onOpenArtifact={onOpenArtifact}
               />
             )
@@ -484,17 +621,41 @@ export const BlockRenderer = memo(function BlockRenderer({
                 key={idx}
                 block={block}
                 foreground={foreground}
+                palette={resolvedPalette}
+                contentWidth={contentWidth}
                 onOpenArtifact={onOpenArtifact}
               />
             )
           case 'table':
-            return <TableView key={idx} block={block} foreground={foreground} id={anchorId} />
+            return (
+              <TableView
+                key={idx}
+                block={block}
+                foreground={foreground}
+                palette={resolvedPalette}
+                contentWidth={contentWidth}
+                id={anchorId}
+              />
+            )
           case 'divider':
-            return <text key={idx} id={anchorId} style={{ fg: theme.muted }}>{'─'.repeat(40)}</text>
+            return (
+              <text key={idx} id={anchorId} style={{ fg: resolvedPalette.dividerFg }}>
+                {'─'.repeat(Math.max(10, Math.min(contentWidth, 80)))}
+              </text>
+            )
           case 'mermaid':
-            return <text key={idx} id={anchorId} style={{ fg: foreground }}>{block.ascii}</text>
+            return (
+              <MermaidBlockView
+                key={idx}
+                ascii={block.ascii}
+                foreground={foreground}
+                palette={resolvedPalette}
+                id={anchorId}
+              />
+            )
           case 'spacer':
-            return block.lines > 0 ? <text key={idx}>{'\n'.repeat(block.lines - 1)}</text> : null
+            if (block.lines <= 0) return null
+            return <text key={idx}>{block.lines > 1 ? '\n'.repeat(block.lines - 1) : ''}</text>
         }
       })}
     </>

@@ -1,12 +1,23 @@
 import React, { memo } from 'react'
 import { useRenderer } from '@opentui/react'
-import { parseMarkdown } from '@magnitude/markdown-cst'
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { hasOddFenceCount } from '../utils/markdown-content-renderer'
+import { parseMarkdownToMdast } from '../utils/markdown-parser'
 import { renderDocumentToBlocks, type HighlightRange } from '../utils/render-blocks'
 import { useStreamingMarkdownCache } from '../hooks/use-streaming-markdown-cache'
 import { useTheme } from '../hooks/use-theme'
 import { BlockRenderer } from './block-renderer'
+
+function appendTrailingSpacer<T extends ReturnType<typeof renderDocumentToBlocks>>(
+  blocks: T,
+  source: string,
+): T {
+  const match = source.match(/\n\n+$/)
+  if (!match) return blocks
+  const lines = match[0].length - 1
+  if (lines <= 0) return blocks
+  return [...blocks, { type: 'spacer', lines }] as T
+}
 
 export function parseStreamingContent(content: string, options: {
   palette: ReturnType<typeof buildMarkdownColorPalette>
@@ -16,19 +27,19 @@ export function parseStreamingContent(content: string, options: {
   pendingText: string
 } {
   if (!hasOddFenceCount(content)) {
-    const doc = parseMarkdown(content)
-    return { blocks: renderDocumentToBlocks(doc, options), pendingText: '' }
+    const doc = parseMarkdownToMdast(content)
+    return { blocks: appendTrailingSpacer(renderDocumentToBlocks(doc, options), content), pendingText: '' }
   }
 
   const lastFenceIndex = content.lastIndexOf('```')
   if (lastFenceIndex === -1) {
-    const doc = parseMarkdown(content)
-    return { blocks: renderDocumentToBlocks(doc, options), pendingText: '' }
+    const doc = parseMarkdownToMdast(content)
+    return { blocks: appendTrailingSpacer(renderDocumentToBlocks(doc, options), content), pendingText: '' }
   }
 
   const completeSection = content.slice(0, lastFenceIndex)
   const pendingText = content.slice(lastFenceIndex)
-  const blocks = completeSection ? renderDocumentToBlocks(parseMarkdown(completeSection), options) : []
+  const blocks = completeSection ? appendTrailingSpacer(renderDocumentToBlocks(parseMarkdownToMdast(completeSection), options), completeSection) : []
   return { blocks, pendingText }
 }
 
@@ -52,7 +63,7 @@ export const MarkdownContent = memo(function MarkdownContent({
   const palette = buildMarkdownColorPalette(theme)
   const effectiveCodeBlockWidth =
     codeBlockWidth ?? Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
-  const blocks = renderDocumentToBlocks(parseMarkdown(content), {
+  const blocks = renderDocumentToBlocks(parseMarkdownToMdast(content), {
     palette,
     codeBlockWidth: effectiveCodeBlockWidth,
     highlights: highlightRanges,

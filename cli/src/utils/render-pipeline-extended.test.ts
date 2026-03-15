@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { parseMarkdown } from '@magnitude/markdown-cst'
-import type { DocumentItemNode, DocumentNode } from '@magnitude/markdown-cst/src/schema'
+import type { Root, RootContent } from 'mdast'
+import { parseMarkdownToMdast } from './markdown-parser'
 import {
   renderDocumentItemToBlocks,
   renderDocumentToBlocks,
@@ -264,10 +264,10 @@ function areHighlightRangesEqual(
 
 interface CacheState {
   prevContent: string
-  prevDoc: DocumentNode | null
+  prevDoc: Root | null
   prevBlocks: Block[]
   prevPendingText: string
-  itemBlockCache: WeakMap<DocumentItemNode, Block[]>
+  itemBlockCache: WeakMap<RootContent, Block[]>
   prevHighlightRanges: HighlightRange[] | undefined
   prevPalette: RenderOptions['palette'] | null
   prevCodeBlockWidth: number | undefined
@@ -325,10 +325,10 @@ function simulateCacheStep(
     cache.itemBlockCache = new WeakMap()
   }
 
-  const doc = parseMarkdown(completeSection)
+  const doc = parseMarkdownToMdast(completeSection)
 
   const allBlocks: Block[] = []
-  for (const item of doc.content) {
+  for (const item of doc.children) {
     let itemBlocks = cache.itemBlockCache.get(item)
     if (!itemBlocks) {
       itemBlocks = renderDocumentItemToBlocks(item, {
@@ -580,7 +580,7 @@ function simulateArtifactUpdateLifecycle(
     // Only compare against fresh parse when there's no pending fence text,
     // because fence splitting intentionally produces fewer blocks
     if (!pendingText) {
-      const freshBlocks = renderDocumentToBlocks(parseMarkdown(displayedContent), {
+      const freshBlocks = renderDocumentToBlocks(parseMarkdownToMdast(displayedContent), {
         ...options,
         highlights,
       })
@@ -600,7 +600,7 @@ function simulateArtifactUpdateLifecycle(
     baseContent.slice(matchIdx + oldString.length)
 
   const { blocks: finalBlocks } = simulateCacheStep(cache, finalContent, { ...options, streaming: false })
-  const freshFinal = renderDocumentToBlocks(parseMarkdown(finalContent), options)
+  const freshFinal = renderDocumentToBlocks(parseMarkdownToMdast(finalContent), options)
   expectBlockStructuralEquality(finalBlocks, freshFinal)
   expect(finalBlocks.every((b) => !hasHighlight(b))).toBe(true)
 
@@ -622,7 +622,7 @@ describe('render pipeline extended - cache sequential streaming', () => {
             ? prefix.slice(0, prefix.lastIndexOf('```'))
             : prefix
           const fresh = effective.trim()
-            ? renderDocumentToBlocks(parseMarkdown(effective), baseOptions)
+            ? renderDocumentToBlocks(parseMarkdownToMdast(effective), baseOptions)
             : []
           expectBlockStructuralEquality(result.blocks, fresh)
           verifyBlockOrdering(result.blocks)
@@ -641,7 +641,7 @@ describe('render pipeline extended - cache streaming transition reset', () => {
         simulateCacheStep(cache, prefix, { ...baseOptions, streaming: true })
       }
       const result = simulateCacheStep(cache, doc, { ...baseOptions, streaming: false })
-      const fresh = renderDocumentToBlocks(parseMarkdown(doc), baseOptions)
+      const fresh = renderDocumentToBlocks(parseMarkdownToMdast(doc), baseOptions)
       expectBlockStructuralEquality(result.blocks, fresh)
       verifyBlockOrdering(result.blocks)
       verifySpacerConsistency(result.blocks)
@@ -668,13 +668,13 @@ describe('render pipeline extended - cache multiple edit cycles', () => {
             ? prefix.slice(0, prefix.lastIndexOf('```'))
             : prefix
           const fresh = effective.trim()
-            ? renderDocumentToBlocks(parseMarkdown(effective), baseOptions)
+            ? renderDocumentToBlocks(parseMarkdownToMdast(effective), baseOptions)
             : []
           expectBlockStructuralEquality(result.blocks, fresh)
         }
 
         const final = simulateCacheStep(cache, doc2, { ...baseOptions, streaming: false })
-        expectBlockStructuralEquality(final.blocks, renderDocumentToBlocks(parseMarkdown(doc2), baseOptions))
+        expectBlockStructuralEquality(final.blocks, renderDocumentToBlocks(parseMarkdownToMdast(doc2), baseOptions))
       })
     }
   }
@@ -713,7 +713,7 @@ describe('render pipeline extended - cache multiple edit cycles', () => {
           highlightRanges: secondHighlight,
         })
 
-        const fresh = renderDocumentToBlocks(parseMarkdown(updated), {
+        const fresh = renderDocumentToBlocks(parseMarkdownToMdast(updated), {
           ...baseOptions,
           highlights: secondHighlight,
         })
@@ -742,7 +742,7 @@ describe('render pipeline extended - cache highlight lifecycle', () => {
         streaming: true,
         highlightRanges: ranges,
       })
-      const freshWithHighlights = renderDocumentToBlocks(parseMarkdown(doc), {
+      const freshWithHighlights = renderDocumentToBlocks(parseMarkdownToMdast(doc), {
         ...baseOptions,
         highlights: ranges,
       })
@@ -787,7 +787,7 @@ describe('render pipeline extended - cache highlight lifecycle', () => {
       // Different highlights MAY produce different output, but don't assert it
       // because highlights on parser-consumed syntax can produce identical results
       expect(b.blocks.map(normalizeBlock)).toEqual(
-        renderDocumentToBlocks(parseMarkdown(updated), { ...baseOptions, highlights: highlightsB }).map(normalizeBlock),
+        renderDocumentToBlocks(parseMarkdownToMdast(updated), { ...baseOptions, highlights: highlightsB }).map(normalizeBlock),
       )
       expect(c.blocks.map(normalizeBlock)).toEqual(b.blocks.map(normalizeBlock))
     })
@@ -940,7 +940,7 @@ describe('render pipeline extended - full artifact update lifecycle', () => {
           backgroundColor: '#00ff00',
         })),
       })
-      const fresh = renderDocumentToBlocks(parseMarkdown(previewResult.content), {
+      const fresh = renderDocumentToBlocks(parseMarkdownToMdast(previewResult.content), {
         ...baseOptions,
         highlights: previewResult.changedRanges.map((range) => ({
           ...range,
@@ -973,7 +973,7 @@ describe('render pipeline extended - full artifact update lifecycle', () => {
 
       const final = simulateCacheStep(cache, updated, { ...baseOptions, streaming: false })
       expect(final.blocks.every((b) => !hasHighlight(b))).toBe(true)
-      expectBlockStructuralEquality(final.blocks, renderDocumentToBlocks(parseMarkdown(updated), baseOptions))
+      expectBlockStructuralEquality(final.blocks, renderDocumentToBlocks(parseMarkdownToMdast(updated), baseOptions))
     })
   }
 })
@@ -999,7 +999,7 @@ describe('render pipeline extended - ordering and spacing invariants', () => {
         const highlights: HighlightRange[] = [
           { start: matchIdx, end: matchIdx + revealed.length, backgroundColor: '#00ff00' },
         ]
-        const blocks = renderDocumentToBlocks(parseMarkdown(content), { ...baseOptions, highlights })
+        const blocks = renderDocumentToBlocks(parseMarkdownToMdast(content), { ...baseOptions, highlights })
         verifyBlockOrdering(blocks)
         verifySpacerConsistency(blocks, true)
       }
@@ -1016,7 +1016,7 @@ describe('render pipeline extended - ordering and spacing invariants', () => {
         `\`\`\`js\nconsole.log(${i})\n\`\`\`\n\nTail ${i}`,
       ]
       const doc = patterns[i % patterns.length]!
-      const blocks = renderDocumentToBlocks(parseMarkdown(doc), baseOptions)
+      const blocks = renderDocumentToBlocks(parseMarkdownToMdast(doc), baseOptions)
       verifyBlockOrdering(blocks)
       verifySpacerConsistency(blocks, true)
     })
@@ -1103,7 +1103,7 @@ describe('render pipeline extended - weakmap cache correctness', () => {
         const cache = createCacheState()
         simulateCacheStep(cache, docA, { ...baseOptions, streaming: true })
         const result = simulateCacheStep(cache, docB, { ...baseOptions, streaming: true })
-        const fresh = renderDocumentToBlocks(parseMarkdown(docB), baseOptions)
+        const fresh = renderDocumentToBlocks(parseMarkdownToMdast(docB), baseOptions)
         expectBlockStructuralEquality(result.blocks, fresh)
       })
     }
@@ -1115,7 +1115,7 @@ describe('render pipeline extended - weakmap cache correctness', () => {
       const first = simulateCacheStep(cache, doc, { ...baseOptions, streaming: true })
       const second = simulateCacheStep(cache, doc, { ...baseOptions, streaming: true, codeBlockWidth: 81 })
       expect(second.blocks.map(normalizeBlock)).toEqual(
-        renderDocumentToBlocks(parseMarkdown(doc), { ...baseOptions, codeBlockWidth: 81 }).map(normalizeBlock),
+        renderDocumentToBlocks(parseMarkdownToMdast(doc), { ...baseOptions, codeBlockWidth: 81 }).map(normalizeBlock),
       )
       expect(first.blocks.length).toBeGreaterThanOrEqual(0)
     })
@@ -1132,7 +1132,7 @@ describe('render pipeline extended - highlight visibility and content sanity', (
       const highlights: HighlightRange[] = [
         { start: matchIdx, end: matchIdx + reveal.length, backgroundColor: '#00ff00' },
       ]
-      const blocks = renderDocumentToBlocks(parseMarkdown(content), { ...baseOptions, highlights })
+      const blocks = renderDocumentToBlocks(parseMarkdownToMdast(content), { ...baseOptions, highlights })
       expect(blocks.some(hasHighlight)).toBe(collectHighlightedText(blocks).length > 0)
     })
   }
@@ -1142,9 +1142,9 @@ describe('render pipeline extended - highlight visibility and content sanity', (
       if (!scenario.base.includes(scenario.old)) return
       const ranges = buildReplaceAllRanges(scenario.base, scenario.old, scenario.new)
       const replaced = scenario.base.replaceAll(scenario.old, scenario.new)
-      const blocks = renderDocumentToBlocks(parseMarkdown(replaced), { ...baseOptions, highlights: ranges })
+      const blocks = renderDocumentToBlocks(parseMarkdownToMdast(replaced), { ...baseOptions, highlights: ranges })
       expect(blocks.map(normalizeBlock)).toEqual(
-        renderDocumentToBlocks(parseMarkdown(replaced), { ...baseOptions, highlights: ranges }).map(normalizeBlock),
+        renderDocumentToBlocks(parseMarkdownToMdast(replaced), { ...baseOptions, highlights: ranges }).map(normalizeBlock),
       )
     })
   }

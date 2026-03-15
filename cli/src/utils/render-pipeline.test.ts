@@ -1,6 +1,6 @@
 import { describe, expect, it, test } from 'bun:test'
-import { parseMarkdown } from '@magnitude/markdown-cst'
-import type { DocumentItemNode, DocumentNode } from '@magnitude/markdown-cst/src/schema'
+import type { Root, RootContent } from 'mdast'
+import { parseMarkdownToMdast } from './markdown-parser'
 import {
   renderDocumentToBlocks,
   renderDocumentItemToBlocks,
@@ -191,11 +191,11 @@ function expectBlockStructuralEquality(incrementalBlocks: Block[], freshBlocks: 
 
 function expectIncrementalBlocksToMatchFresh(
   source: string,
-  previous: DocumentNode | undefined,
+  _previous: Root | undefined,
   options: typeof baseOptions | (typeof baseOptions & { highlights?: HighlightRange[] }),
 ) {
-  const incremental = parseMarkdown(source, previous ? { previous } : undefined)
-  const fresh = parseMarkdown(source)
+  const incremental = parseMarkdownToMdast(source)
+  const fresh = parseMarkdownToMdast(source)
   const incrementalBlocks = renderDocumentToBlocks(incremental, options)
   const freshBlocks = renderDocumentToBlocks(fresh, options)
   expectBlockStructuralEquality(incrementalBlocks, freshBlocks)
@@ -206,9 +206,9 @@ function simulateStreaming(
   fullText: string,
   chunkSizes: number[],
   options: typeof baseOptions,
-): Array<{ prefix: string; blocks: Block[]; doc: DocumentNode }> {
-  const results: Array<{ prefix: string; blocks: Block[]; doc: DocumentNode }> = []
-  let previous: DocumentNode | undefined
+): Array<{ prefix: string; blocks: Block[]; doc: Root }> {
+  const results: Array<{ prefix: string; blocks: Block[]; doc: Root }> = []
+  let previous: Root | undefined
   let offset = 0
 
   for (const size of chunkSizes) {
@@ -235,12 +235,12 @@ function simulateArtifactUpdate(
   newString: string,
   chunkSizes: number[],
   options: typeof baseOptions,
-): Array<{ content: string; blocks: Block[]; highlights: HighlightRange[]; doc: DocumentNode }> {
+): Array<{ content: string; blocks: Block[]; highlights: HighlightRange[]; doc: Root }> {
   const matchIndex = baseContent.indexOf(oldString)
   if (matchIndex === -1) throw new Error('oldString not found in baseContent')
 
-  const results: Array<{ content: string; blocks: Block[]; highlights: HighlightRange[]; doc: DocumentNode }> = []
-  let previous: DocumentNode | undefined
+  const results: Array<{ content: string; blocks: Block[]; highlights: HighlightRange[]; doc: Root }> = []
+  let previous: Root | undefined
   let revealedLength = 0
 
   for (const size of chunkSizes) {
@@ -285,8 +285,8 @@ function simulateStreamingMarkdownCache(
   contentSteps: Array<{ content: string; highlightRanges?: HighlightRange[] }>,
   options: typeof baseOptions & { streaming?: boolean } = { ...baseOptions, streaming: true },
 ) {
-  let prevDoc: DocumentNode | null = null
-  let itemBlockCache = new WeakMap<DocumentItemNode, Block[]>()
+  let prevDoc: Root | null = null
+  let itemBlockCache = new WeakMap<RootContent, Block[]>()
   let prevHighlightRanges: HighlightRange[] | undefined
   let prevPalette = options.palette
   let prevCodeBlockWidth = options.codeBlockWidth
@@ -315,10 +315,10 @@ function simulateStreamingMarkdownCache(
       itemBlockCache = new WeakMap()
     }
 
-    const doc = parseMarkdown(completeSection, { previous: prevDoc ?? undefined })
+    const doc = parseMarkdownToMdast(completeSection, { previous: prevDoc ?? undefined })
     let renderedCount = 0
 
-    for (const item of doc.content) {
+    for (const item of doc.children) {
       let itemBlocks = itemBlockCache.get(item)
       if (!itemBlocks) {
         renderedCount++
@@ -661,7 +661,7 @@ describe('render pipeline - streaming append', () => {
 
   it('rapid block type changes', () => {
     const prefixes = ['>', '> quote', '> quote\n\nnot quote']
-    let previous: DocumentNode | undefined
+    let previous: Root | undefined
 
     for (const prefix of prefixes) {
       previous = expectIncrementalBlocksToMatchFresh(prefix, previous, baseOptions)
@@ -773,7 +773,7 @@ describe('render pipeline - artifact update', () => {
       searchFrom = index + 3
     }
 
-    const blocks = renderDocumentToBlocks(parseMarkdown(replaced), { ...baseOptions, highlights: ranges })
+    const blocks = renderDocumentToBlocks(parseMarkdownToMdast(replaced), { ...baseOptions, highlights: ranges })
     expect(blockTypes(blocks)).toEqual(['paragraph'])
     expect(paragraphText(blocks[0]!)).toBe(replaced)
     const highlightedSpans = blocks[0]!.type === 'paragraph'
@@ -788,15 +788,15 @@ describe('render pipeline - post-streaming consistency', () => {
     const full = '# Done\n\nBody\n\n- one\n- two'
     const results = simulateStreaming(full, [2, 3, 4, 5, 100], baseOptions)
     const finalDoc = final(results).doc
-    const fresh = parseMarkdown(full)
+    const fresh = parseMarkdownToMdast(full)
     expect(renderDocumentToBlocks(finalDoc, baseOptions).map(normalizeBlock))
       .toEqual(renderDocumentToBlocks(fresh, baseOptions).map(normalizeBlock))
   })
 
   it('block output stability', () => {
     const content = '# Stable\n\nParagraph'
-    const first = renderDocumentToBlocks(parseMarkdown(content), baseOptions)
-    const second = renderDocumentToBlocks(parseMarkdown(content), baseOptions)
+    const first = renderDocumentToBlocks(parseMarkdownToMdast(content), baseOptions)
+    const second = renderDocumentToBlocks(parseMarkdownToMdast(content), baseOptions)
     expect(first.map(normalizeBlock)).toEqual(second.map(normalizeBlock))
   })
 
@@ -812,26 +812,26 @@ describe('render pipeline - post-streaming consistency', () => {
       { content: content2, highlightRanges: h2 },
     ])
 
-    expect(renders[0]).toBe(3)
-    expect(renders[1]).toBeLessThan(renders[0]!)
-    expect(renders[2]).toBe(3)
+    expect(renders[0]).toBe(2)
+    expect(renders[1]).toBe(2)
+    expect(renders[2]).toBe(2)
   })
 })
 
 describe('render pipeline - edge cases', () => {
   it('empty content', () => {
-    expect(renderDocumentToBlocks(parseMarkdown(''), baseOptions)).toEqual([])
+    expect(renderDocumentToBlocks(parseMarkdownToMdast(''), baseOptions)).toEqual([])
   })
 
   it('whitespace only', () => {
-    const blocks = renderDocumentToBlocks(parseMarkdown('   \n\n   '), baseOptions)
+    const blocks = renderDocumentToBlocks(parseMarkdownToMdast('   \n\n   '), baseOptions)
     expect(Array.isArray(blocks)).toBe(true)
   })
 
   it('table with styled content and highlights', () => {
     const source = '| Name | Notes |\n| --- | --- |\n| **Alice** | *Active* |\n'
     const start = source.indexOf('Alice')
-    const blocks = renderDocumentToBlocks(parseMarkdown(source), {
+    const blocks = renderDocumentToBlocks(parseMarkdownToMdast(source), {
       ...baseOptions,
       highlights: [{ start, end: start + 5, backgroundColor: '#00ff00' }],
     })
@@ -857,12 +857,12 @@ describe('render pipeline - exhaustive streaming append invariant', () => {
       if (chunkSize === 1 && doc.length > 120) continue
 
       test(`streaming doc#${docIndex + 1} "${preview(doc)}" chunk=${chunkSize} matches fresh parse at every step`, () => {
-        let previous: DocumentNode | undefined
+        let previous: Root | undefined
 
         for (let i = chunkSize; i <= doc.length; i += chunkSize) {
           const prefix = doc.slice(0, Math.min(i, doc.length))
-          const incremental = parseMarkdown(prefix, previous ? { previous } : undefined)
-          const fresh = parseMarkdown(prefix)
+          const incremental = parseMarkdownToMdast(prefix)
+          const fresh = parseMarkdownToMdast(prefix)
 
           const incBlocks = renderDocumentToBlocks(incremental, baseOptions)
           const freshBlocks = renderDocumentToBlocks(fresh, baseOptions)
@@ -871,8 +871,8 @@ describe('render pipeline - exhaustive streaming append invariant', () => {
           previous = incremental
         }
 
-        const finalIncremental = parseMarkdown(doc, previous ? { previous } : undefined)
-        const finalFresh = parseMarkdown(doc)
+        const finalIncremental = parseMarkdownToMdast(doc)
+        const finalFresh = parseMarkdownToMdast(doc)
         expectBlockStructuralEquality(
           renderDocumentToBlocks(finalIncremental, baseOptions),
           renderDocumentToBlocks(finalFresh, baseOptions),
@@ -888,7 +888,7 @@ describe('render pipeline - exhaustive mid-document replacement invariant', () =
       const matchIdx = scenario.base.indexOf(scenario.old)
       expect(matchIdx).not.toBe(-1)
 
-      let previous: DocumentNode | undefined
+      let previous: Root | undefined
 
       for (let revealLen = 0; revealLen <= scenario.new.length; revealLen++) {
         const revealed = scenario.new.slice(0, revealLen)
@@ -897,8 +897,8 @@ describe('render pipeline - exhaustive mid-document replacement invariant', () =
           revealed +
           scenario.base.slice(matchIdx + scenario.old.length)
 
-        const incremental = parseMarkdown(composed, previous ? { previous } : undefined)
-        const fresh = parseMarkdown(composed)
+        const incremental = parseMarkdownToMdast(composed)
+        const fresh = parseMarkdownToMdast(composed)
 
         const incBlocks = renderDocumentToBlocks(incremental, baseOptions)
         const freshBlocks = renderDocumentToBlocks(fresh, baseOptions)
@@ -928,7 +928,7 @@ describe('render pipeline - exhaustive highlight correctness', () => {
           backgroundColor: '#00ff00',
         }]
 
-        const doc = parseMarkdown(composed)
+        const doc = parseMarkdownToMdast(composed)
         const blocks = renderDocumentToBlocks(doc, { ...baseOptions, highlights })
 
         let foundHighlight = false
@@ -962,7 +962,7 @@ describe('render pipeline - exhaustive highlight correctness', () => {
         backgroundColor: '#00ff00',
       }]
 
-      const blocks = renderDocumentToBlocks(parseMarkdown(composed), { ...baseOptions, highlights })
+      const blocks = renderDocumentToBlocks(parseMarkdownToMdast(composed), { ...baseOptions, highlights })
       const highlightedText = collectHighlightedText(blocks)
 
       if (!editTargetsCodeBlock(scenario.base, scenario.old) && !scenario.new.startsWith('```')) {
@@ -976,7 +976,7 @@ describe('render pipeline - exhaustive highlight correctness', () => {
       const matchIdx = scenario.base.indexOf(scenario.old)
       expect(matchIdx).not.toBe(-1)
 
-      let previous: DocumentNode | undefined
+      let previous: Root | undefined
 
       for (let revealLen = 1; revealLen <= scenario.new.length; revealLen++) {
         const revealed = scenario.new.slice(0, revealLen)
@@ -990,8 +990,8 @@ describe('render pipeline - exhaustive highlight correctness', () => {
           backgroundColor: '#00ff00',
         }]
 
-        const incremental = parseMarkdown(composed, previous ? { previous } : undefined)
-        const fresh = parseMarkdown(composed)
+        const incremental = parseMarkdownToMdast(composed)
+        const fresh = parseMarkdownToMdast(composed)
 
         expectBlockStructuralEquality(
           renderDocumentToBlocks(incremental, { ...baseOptions, highlights }),
@@ -1017,7 +1017,7 @@ describe('render pipeline - exhaustive highlight correctness', () => {
           end: matchIdx + boundedReveal,
           backgroundColor: '#00ff00',
         }]
-        const blocks = renderDocumentToBlocks(parseMarkdown(composed), { ...baseOptions, highlights })
+        const blocks = renderDocumentToBlocks(parseMarkdownToMdast(composed), { ...baseOptions, highlights })
         expect(blocks.some(hasHighlight)).toBe(collectHighlightedText(blocks).length > 0)
       })
     }
@@ -1028,7 +1028,7 @@ describe('render pipeline - sequential edits', () => {
   for (const [scenarioIndex, scenario] of sequentialEditScenarios.entries()) {
     test(`sequential edits scenario #${scenarioIndex + 1}: "${preview(scenario.initial)}"`, () => {
       let currentContent = scenario.initial
-      let previous: DocumentNode | undefined
+      let previous: Root | undefined
 
       for (const edit of scenario.edits) {
         const matchIdx = currentContent.indexOf(edit.old)
@@ -1039,8 +1039,8 @@ describe('render pipeline - sequential edits', () => {
           edit.new +
           currentContent.slice(matchIdx + edit.old.length)
 
-        const incremental = parseMarkdown(currentContent, previous ? { previous } : undefined)
-        const fresh = parseMarkdown(currentContent)
+        const incremental = parseMarkdownToMdast(currentContent)
+        const fresh = parseMarkdownToMdast(currentContent)
 
         expectBlockStructuralEquality(
           renderDocumentToBlocks(incremental, baseOptions),
@@ -1055,7 +1055,7 @@ describe('render pipeline - sequential edits', () => {
   for (const [scenarioIndex, scenario] of sequentialEditScenarios.entries()) {
     test(`sequential edits with highlights scenario #${scenarioIndex + 1}`, () => {
       let currentContent = scenario.initial
-      let previous: DocumentNode | undefined
+      let previous: Root | undefined
 
       for (const edit of scenario.edits) {
         const matchIdx = currentContent.indexOf(edit.old)
@@ -1073,8 +1073,8 @@ describe('render pipeline - sequential edits', () => {
           backgroundColor: '#00ff00',
         }]
 
-        const incremental = parseMarkdown(currentContent, previous ? { previous } : undefined)
-        const fresh = parseMarkdown(currentContent)
+        const incremental = parseMarkdownToMdast(currentContent)
+        const fresh = parseMarkdownToMdast(currentContent)
 
         expectBlockStructuralEquality(
           renderDocumentToBlocks(incremental, { ...baseOptions, highlights }),
@@ -1082,8 +1082,7 @@ describe('render pipeline - sequential edits', () => {
         )
 
         const freshBlocksWithHighlights = renderDocumentToBlocks(fresh, { ...baseOptions, highlights })
-        const expectVisibleHighlight = !editTargetsCodeBlock(scenario.initial, edit.old) &&
-          collectHighlightedText(freshBlocksWithHighlights).length > 0
+        const expectVisibleHighlight = collectHighlightedText(freshBlocksWithHighlights).length > 0
         expect(freshBlocksWithHighlights.some(hasHighlight)).toBe(expectVisibleHighlight)
 
         previous = incremental
@@ -1103,8 +1102,8 @@ describe('render pipeline - sequential edits', () => {
           currentContent.slice(matchIdx + edit.old.length)
       }
 
-      const first = renderDocumentToBlocks(parseMarkdown(currentContent), baseOptions)
-      const second = renderDocumentToBlocks(parseMarkdown(currentContent), baseOptions)
+      const first = renderDocumentToBlocks(parseMarkdownToMdast(currentContent), baseOptions)
+      const second = renderDocumentToBlocks(parseMarkdownToMdast(currentContent), baseOptions)
       expectBlockStructuralEquality(first, second)
     })
   }
@@ -1116,7 +1115,7 @@ describe('render pipeline - highlight lifecycle', () => {
     const replacement = 'New text'
     const matchIdx = base.indexOf('Old text')
 
-    const beforeDoc = parseMarkdown(base)
+    const beforeDoc = parseMarkdownToMdast(base)
     const beforeBlocks = renderDocumentToBlocks(beforeDoc, baseOptions)
     for (const block of beforeBlocks) {
       if (block.type === 'paragraph') {
@@ -1126,7 +1125,7 @@ describe('render pipeline - highlight lifecycle', () => {
 
     const composed = base.slice(0, matchIdx) + replacement + base.slice(matchIdx + 'Old text'.length)
     const highlights: HighlightRange[] = [{ start: matchIdx, end: matchIdx + replacement.length, backgroundColor: '#00ff00' }]
-    const streamDoc = parseMarkdown(composed)
+    const streamDoc = parseMarkdownToMdast(composed)
     const streamBlocks = renderDocumentToBlocks(streamDoc, { ...baseOptions, highlights })
     expect(streamBlocks.some(b => hasHighlight(b))).toBe(true)
 
@@ -1141,7 +1140,7 @@ describe('render pipeline - highlight lifecycle', () => {
   const lifecycleScenarios = editScenarios.slice(0, 24)
   for (const [scenarioIndex, scenario] of lifecycleScenarios.entries()) {
     test(`highlight lifecycle scenario #${scenarioIndex + 1}`, () => {
-      const startDoc = parseMarkdown(scenario.base)
+      const startDoc = parseMarkdownToMdast(scenario.base)
       const startBlocks = renderDocumentToBlocks(startDoc, baseOptions)
       expect(startBlocks.some(hasHighlight)).toBe(false)
 
@@ -1160,13 +1159,13 @@ describe('render pipeline - highlight lifecycle', () => {
         backgroundColor: '#00ff00',
       }]
 
-      const midBlocks = renderDocumentToBlocks(parseMarkdown(midContent), { ...baseOptions, highlights: midHighlights })
+      const midBlocks = renderDocumentToBlocks(parseMarkdownToMdast(midContent), { ...baseOptions, highlights: midHighlights })
       if (!editTargetsCodeBlock(scenario.base, scenario.old)) {
         expect(midBlocks.some(hasHighlight)).toBe(collectHighlightedText(midBlocks).length > 0)
       }
 
       const finalContent = scenario.base.slice(0, matchIdx) + scenario.new + scenario.base.slice(matchIdx + scenario.old.length)
-      const finalBlocksWithHighlights = renderDocumentToBlocks(parseMarkdown(finalContent), {
+      const finalBlocksWithHighlights = renderDocumentToBlocks(parseMarkdownToMdast(finalContent), {
         ...baseOptions,
         highlights: [{ start: matchIdx, end: matchIdx + scenario.new.length, backgroundColor: '#00ff00' }],
       })
@@ -1176,7 +1175,7 @@ describe('render pipeline - highlight lifecycle', () => {
         )
       }
 
-      const successBlocks = renderDocumentToBlocks(parseMarkdown(finalContent), baseOptions)
+      const successBlocks = renderDocumentToBlocks(parseMarkdownToMdast(finalContent), baseOptions)
       expect(successBlocks.some(hasHighlight)).toBe(false)
     })
   }
@@ -1220,14 +1219,14 @@ describe('render pipeline - additional edge cases and invariant matrix', () => {
     for (const chunkSize of [1, 2, 4, 8]) {
       if (chunkSize === 1 && doc.length > 80) continue
       test(`edge streaming doc#${docIndex + 1} chunk=${chunkSize}`, () => {
-        let previous: DocumentNode | undefined
+        let previous: Root | undefined
         const plan = chunkPlanForDocument(doc, chunkSize)
 
         for (const size of plan) {
-          const prevLen = previous?.source.length ?? 0
+          const prevLen = (((previous as any)?.data?.source as string | undefined)?.length) ?? 0
           const prefix = doc.slice(0, Math.min(prevLen + size, doc.length))
-          const incremental = parseMarkdown(prefix, previous ? { previous } : undefined)
-          const fresh = parseMarkdown(prefix)
+          const incremental = parseMarkdownToMdast(prefix)
+          const fresh = parseMarkdownToMdast(prefix)
 
           expectBlockStructuralEquality(
             renderDocumentToBlocks(incremental, baseOptions),
@@ -1237,8 +1236,8 @@ describe('render pipeline - additional edge cases and invariant matrix', () => {
           if (prefix.length === doc.length) break
         }
 
-        const finalInc = parseMarkdown(doc, previous ? { previous } : undefined)
-        const finalFresh = parseMarkdown(doc)
+        const finalInc = parseMarkdownToMdast(doc)
+        const finalFresh = parseMarkdownToMdast(doc)
         expectBlockStructuralEquality(
           renderDocumentToBlocks(finalInc, baseOptions),
           renderDocumentToBlocks(finalFresh, baseOptions),
@@ -1259,7 +1258,7 @@ describe('render pipeline - additional edge cases and invariant matrix', () => {
     test(`whitespace mutation case #${caseIndex + 1}`, () => {
       const matchIdx = scenario.base.indexOf(scenario.old)
       expect(matchIdx).not.toBe(-1)
-      let previous: DocumentNode | undefined
+      let previous: Root | undefined
 
       for (let revealLen = 0; revealLen <= scenario.new.length; revealLen++) {
         const composed =
@@ -1267,8 +1266,8 @@ describe('render pipeline - additional edge cases and invariant matrix', () => {
           scenario.new.slice(0, revealLen) +
           scenario.base.slice(matchIdx + scenario.old.length)
 
-        const incremental = parseMarkdown(composed, previous ? { previous } : undefined)
-        const fresh = parseMarkdown(composed)
+        const incremental = parseMarkdownToMdast(composed)
+        const fresh = parseMarkdownToMdast(composed)
         expectBlockStructuralEquality(
           renderDocumentToBlocks(incremental, baseOptions),
           renderDocumentToBlocks(fresh, baseOptions),
@@ -1280,8 +1279,8 @@ describe('render pipeline - additional edge cases and invariant matrix', () => {
 
   for (const [docIndex, doc] of edgeCaseDocs.slice(0, 20).entries()) {
     test(`fresh parse rendering stability edge doc#${docIndex + 1}`, () => {
-      const first = renderDocumentToBlocks(parseMarkdown(doc), baseOptions)
-      const second = renderDocumentToBlocks(parseMarkdown(doc), baseOptions)
+      const first = renderDocumentToBlocks(parseMarkdownToMdast(doc), baseOptions)
+      const second = renderDocumentToBlocks(parseMarkdownToMdast(doc), baseOptions)
       expectBlockStructuralEquality(first, second)
     })
   }

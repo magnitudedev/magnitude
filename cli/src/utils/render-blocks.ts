@@ -1,33 +1,24 @@
 import { createLowlight, common } from 'lowlight'
-import type { Element, RootContent, Text } from 'hast'
+import type { Element, RootContent as HastRootContent, Text as HastText } from 'hast'
 import { renderMermaidAscii } from 'beautiful-mermaid'
 import stringWidth from 'string-width'
 import type {
-  BlankLinesNode,
-  BlockquoteContentNode,
-  BlockquoteItemNode,
-  BlockquoteNode,
-  BulletItemNode,
-  BulletListNode,
-  CodeBlockNode,
-  DefinitionNode,
-  DocumentContentNode,
-  DocumentItemNode,
-  DocumentNode,
-  HeadingNode,
-  HorizontalRuleNode,
-  HtmlBlockNode,
-  InlineNode,
-  LinkNode,
-  OrderedItemNode,
-  OrderedListNode,
-  ParagraphNode,
-  RootBlockNode,
-  TableCellNode,
-  TableNode,
-  TaskItemNode,
-  TaskListNode,
-} from '@magnitude/markdown-cst/src/schema'
+  Blockquote,
+  Code,
+  Definition,
+  Heading,
+  Html,
+  Image,
+  Link,
+  List,
+  ListItem as MdastListItem,
+  Paragraph,
+  Root,
+  RootContent,
+  Table,
+  TableCell,
+  Text,
+} from 'mdast'
 import type { MarkdownPalette, SyntaxColors } from './markdown-content-renderer'
 
 const lowlight = createLowlight(common)
@@ -143,13 +134,29 @@ interface InlineStyle {
   dim?: boolean
 }
 
-const ARTIFACT_REF_RE = /\[\[([^\]|#]+?)(?:#([^\]|]+?))?(?:\|([^\]]+?))?\]\]/g
+type PhrasingNode = Text | Link | Image | import('mdast').WikiLink | { type: 'strong' | 'emphasis' | 'delete'; children: PhrasingNode[] } | { type: 'inlineCode'; value: string; position?: any } | { type: 'break' }
 
-function sourceOf(node: { position: { start: { offset: number }; end: { offset: number } } }): SourceRange {
+function sourceOf(node: { position?: { start?: { offset?: number }; end?: { offset?: number } } }): SourceRange {
   return {
-    start: node.position.start.offset,
-    end: node.position.end.offset,
+    start: node.position?.start?.offset ?? 0,
+    end: node.position?.end?.offset ?? 0,
   }
+}
+
+function sourceStart(node: { position?: { start?: { offset?: number } } }): number {
+  return node.position?.start?.offset ?? 0
+}
+
+function sourceEnd(node: { position?: { end?: { offset?: number } } }): number {
+  return node.position?.end?.offset ?? 0
+}
+
+function lineStart(node: { position?: { start?: { line?: number } } }): number {
+  return node.position?.start?.line ?? 1
+}
+
+function lineEnd(node: { position?: { end?: { line?: number } } }): number {
+  return node.position?.end?.line ?? lineStart(node)
 }
 
 export function slugify(text: string): string {
@@ -183,61 +190,20 @@ function mergeAdjacentSpans(spans: Span[]): Span[] {
   return result
 }
 
-function splitTextForArtifactRefs(
-  text: string,
-  baseStart: number,
-): Array<{ text: string; start: number; end: number; ref?: Span['ref'] }> {
-  const result: Array<{ text: string; start: number; end: number; ref?: Span['ref'] }> = []
-  const regex = new RegExp(ARTIFACT_REF_RE.source, 'g')
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      result.push({
-        text: text.slice(lastIndex, match.index),
-        start: baseStart + lastIndex,
-        end: baseStart + match.index,
-      })
-    }
-    result.push({
-      text: match[0],
-      start: baseStart + match.index,
-      end: baseStart + regex.lastIndex,
-      ref: {
-        name: match[1],
-        section: match[2] || undefined,
-        label: match[3] || undefined,
-      },
-    })
-    lastIndex = regex.lastIndex
-  }
-
-  if (lastIndex < text.length) {
-    result.push({
-      text: text.slice(lastIndex),
-      start: baseStart + lastIndex,
-      end: baseStart + text.length,
-    })
-  }
-
-  return result.length > 0 ? result : [{ text, start: baseStart, end: baseStart + text.length }]
-}
-
 function splitByHighlights(
   text: string,
-  sourceStart: number,
-  sourceEnd: number,
+  sourceStartOffset: number,
+  sourceEndOffset: number,
   style: Partial<Span>,
   highlights: HighlightRange[],
 ): Span[] {
   if (!text) return []
-  if (highlights.length === 0 || sourceEnd <= sourceStart) return [{ text, ...style }]
+  if (highlights.length === 0 || sourceEndOffset <= sourceStartOffset) return [{ text, ...style }]
 
-  const boundaries = new Set<number>([sourceStart, sourceEnd])
+  const boundaries = new Set<number>([sourceStartOffset, sourceEndOffset])
   for (const range of highlights) {
-    const overlapStart = Math.max(sourceStart, range.start)
-    const overlapEnd = Math.min(sourceEnd, range.end)
+    const overlapStart = Math.max(sourceStartOffset, range.start)
+    const overlapEnd = Math.min(sourceEndOffset, range.end)
     if (overlapStart < overlapEnd) {
       boundaries.add(overlapStart)
       boundaries.add(overlapEnd)
@@ -251,7 +217,7 @@ function splitByHighlights(
     const start = points[i]
     const end = points[i + 1]
     if (end <= start) continue
-    const part = text.slice(start - sourceStart, end - sourceStart)
+    const part = text.slice(start - sourceStartOffset, end - sourceStartOffset)
     if (!part) continue
 
     const active = highlights.find((range) => start < range.end && end > range.start)
@@ -265,49 +231,21 @@ function splitByHighlights(
   return spans.length > 0 ? spans : [{ text, ...style }]
 }
 
-function applyTextWithRefsAndHighlights(
-  text: string,
-  start: number,
-  style: Partial<Span>,
-  highlights: HighlightRange[],
-): Span[] {
-  const pieces = splitTextForArtifactRefs(text, start)
-  return mergeAdjacentSpans(
-    pieces.flatMap((piece) =>
-      splitByHighlights(piece.text, piece.start, piece.end, { ...style, ref: piece.ref ?? style.ref }, highlights),
-    ),
-  )
+function getSourceSlice(sourceText: string | undefined, node: { position?: { start?: { offset?: number }; end?: { offset?: number } } }): string | undefined {
+  if (!sourceText) return undefined
+  const start = sourceStart(node)
+  const end = sourceEnd(node)
+  return end >= start ? sourceText.slice(start, end) : undefined
 }
 
-function extractInlinePlainText(nodes: readonly InlineNode[] | undefined): string {
-  if (!nodes) return ''
-  return nodes
-    .map((node) => {
-      switch (node.type) {
-        case 'text':
-          return node.text
-        case 'image':
-          return `[${node.attrs.alt || 'image'}]`
-        case 'inlineCode':
-          return node.text
-        case 'softBreak':
-        case 'hardBreak':
-          return ' '
-        case 'emphasis':
-        case 'strong':
-        case 'strikethrough':
-        case 'link':
-          return extractInlinePlainText(node.content)
-      }
-    })
-    .join('')
-}
+
 
 function renderInline(
-  nodes: readonly InlineNode[] | undefined,
+  nodes: readonly PhrasingNode[] | undefined,
   style: InlineStyle,
   highlights: HighlightRange[],
   palette: MarkdownPalette,
+  sourceText?: string,
 ): Span[] {
   if (!nodes) return []
 
@@ -316,61 +254,88 @@ function renderInline(
   for (const node of nodes) {
     switch (node.type) {
       case 'text':
-        spans.push(
-          ...applyTextWithRefsAndHighlights(node.text, node.position.start.offset, style, highlights),
-        )
+        spans.push(...splitByHighlights(node.value, sourceStart(node), sourceEnd(node), style, highlights))
         break
       case 'emphasis':
-        spans.push(...renderInline(node.content, { ...style, italic: true }, highlights, palette))
+        spans.push(...renderInline(node.children, { ...style, italic: true }, highlights, palette, sourceText))
         break
       case 'strong':
-        spans.push(...renderInline(node.content, { ...style, bold: true }, highlights, palette))
+        spans.push(...renderInline(node.children, { ...style, bold: true }, highlights, palette, sourceText))
         break
-      case 'strikethrough':
-        spans.push(...renderInline(node.content, { ...style, dim: true }, highlights, palette))
+      case 'delete':
+        spans.push(...renderInline(node.children, { ...style, dim: true }, highlights, palette, sourceText))
         break
       case 'inlineCode':
         spans.push(
           ...splitByHighlights(
-            ` ${node.text} `,
-            node.position.start.offset,
-            node.position.end.offset,
+            ` ${node.value} `,
+            sourceStart(node),
+            sourceEnd(node),
             { ...style, fg: palette.inlineCodeFg, bold: true },
             highlights,
           ),
         )
         break
       case 'link':
-        spans.push(
-          ...renderInline(
-            node.content,
-            { ...style, fg: style.fg ?? palette.linkFg },
-            highlights,
-            palette,
-          ),
-        )
+        spans.push(...renderInline(node.children as PhrasingNode[], { ...style, fg: style.fg ?? palette.linkFg }, highlights, palette, sourceText))
         break
       case 'image':
         spans.push(
           ...splitByHighlights(
-            `[${node.attrs.alt || 'image'}]`,
-            node.position.start.offset,
-            node.position.end.offset,
+            `[${node.alt || 'image'}]`,
+            sourceStart(node),
+            sourceEnd(node),
             { ...style, fg: palette.linkFg },
             highlights,
           ),
         )
         break
-      case 'softBreak':
-        spans.push({ text: ' ', ...style })
-        break
-      case 'hardBreak':
+      case 'break':
         spans.push({ text: '\n', ...style })
         break
+      case 'wikiLink': {
+        const target = (node as any).value ?? ''
+        const alias = (node as any).data?.alias as string | undefined
+        const [name, section] = target.split('#', 2)
+        const hasExplicitLabel = alias != null && alias !== target
+        const displayText = hasExplicitLabel ? alias : (getSourceSlice(sourceText, node) ?? `[[${target}]]`)
+        const ref = { name, section: section || undefined, label: hasExplicitLabel ? alias : undefined }
+        spans.push(
+          ...splitByHighlights(displayText, sourceStart(node), sourceEnd(node), { ...style, ref }, highlights),
+        )
+        break
+      }
     }
   }
 
   return mergeAdjacentSpans(spans)
+}
+
+function extractInlinePlainText(nodes: readonly PhrasingNode[] | undefined, sourceText?: string): string {
+  if (!nodes) return ''
+  return nodes
+    .map((node) => {
+      switch (node.type) {
+        case 'text':
+          return node.value
+        case 'image':
+          return `[${node.alt || 'image'}]`
+        case 'inlineCode':
+          return node.value
+        case 'break':
+          return ' '
+        case 'emphasis':
+        case 'strong':
+        case 'delete':
+        case 'link':
+          return extractInlinePlainText((node as any).children, sourceText)
+        case 'wikiLink':
+          return getSourceSlice(sourceText, node) ?? `[[${node.value ?? ''}]]`
+        default:
+          return ''
+      }
+    })
+    .join('')
 }
 
 function hljsClassToColor(classNames: string[], syntax: SyntaxColors): string {
@@ -410,12 +375,12 @@ function hljsClassToColor(classNames: string[], syntax: SyntaxColors): string {
   return syntax.default
 }
 
-function highlightToLines(nodes: RootContent[], syntax: SyntaxColors): Span[][] {
+function highlightToLines(nodes: HastRootContent[], syntax: SyntaxColors): Span[][] {
   const lines: Span[][] = [[]]
 
-  const walk = (node: RootContent, inheritedColor?: string): void => {
+  const walk = (node: HastRootContent, inheritedColor?: string): void => {
     if (node.type === 'text') {
-      const textNode = node as Text
+      const textNode = node as HastText
       const parts = textNode.value.split('\n')
       parts.forEach((part, idx) => {
         if (idx > 0) lines.push([])
@@ -428,9 +393,7 @@ function highlightToLines(nodes: RootContent[], syntax: SyntaxColors): Span[][] 
       const el = node as Element
       const classNames = (el.properties?.className as string[]) ?? []
       const color = hljsClassToColor(classNames, syntax)
-      for (const child of el.children) {
-        walk(child as RootContent, color)
-      }
+      for (const child of el.children) walk(child as HastRootContent, color)
     }
   }
 
@@ -457,7 +420,7 @@ function tryHighlight(code: string, lang: string, syntax: SyntaxColors): Span[][
 
   try {
     const result = lowlight.highlight(normalizedLang, code)
-    return highlightToLines(result.children as RootContent[], syntax)
+    return highlightToLines(result.children as HastRootContent[], syntax)
   } catch {
     return null
   }
@@ -474,6 +437,47 @@ function applyHighlightsToCodeLine(
     return splitByHighlights(lineText || ' ', lineStart, lineStart + lineText.length, { fg: fallbackFg }, highlights)
   }
 
+  if (highlights.length > 0) {
+    const boundaries = new Set<number>([lineStart, lineStart + lineText.length])
+    for (const range of highlights) {
+      const start = Math.max(lineStart, range.start)
+      const end = Math.min(lineStart + lineText.length, range.end)
+      if (start < end) {
+        boundaries.add(start)
+        boundaries.add(end)
+      }
+    }
+
+    const points = [...boundaries].sort((a, b) => a - b)
+    const spans: Span[] = []
+
+    const colorAt = (offset: number): string => {
+      let cursor = lineStart
+      for (const seg of line) {
+        const end = cursor + seg.text.length
+        if (offset < end) return seg.fg ?? fallbackFg
+        cursor = end
+      }
+      return line[line.length - 1]?.fg ?? fallbackFg
+    }
+
+    for (let i = 0; i < points.length - 1; i++) {
+      const start = points[i]
+      const end = points[i + 1]
+      if (end <= start) continue
+      const text = lineText.slice(start - lineStart, end - lineStart)
+      if (!text) continue
+      const active = highlights.find((range) => start < range.end && end > range.start)
+      spans.push({
+        text,
+        fg: colorAt(start),
+        bg: active?.backgroundColor,
+      })
+    }
+
+    return mergeAdjacentSpans(spans)
+  }
+
   const out: Span[] = []
   let cursor = lineStart
   for (const seg of line) {
@@ -483,12 +487,19 @@ function applyHighlightsToCodeLine(
   return mergeAdjacentSpans(out)
 }
 
-function renderCodeBlockNode(node: CodeBlockNode, options: RenderOptions): CodeBlock | MermaidBlock {
-  const rawText = node.content?.map((t) => t.text).join('') ?? ''
-  const rawCode = rawText.endsWith('\n') ? rawText.slice(0, -1) : rawText
-  const codeStart = node.content?.[0]?.position.start.offset ?? node.position.start.offset
+function renderCodeBlockStart(node: Code, sourceText?: string): number {
+  const blockStart = sourceStart(node)
+  const raw = getSourceSlice(sourceText, node)
+  if (!raw) return blockStart
+  const firstNewline = raw.indexOf('\n')
+  return firstNewline === -1 ? blockStart : blockStart + firstNewline + 1
+}
 
-  if (node.attrs.language === 'mermaid') {
+function renderCodeBlockNode(node: Code, options: RenderOptions, sourceText?: string): CodeBlock | MermaidBlock {
+  const rawCode = node.value.endsWith('\n') ? node.value.slice(0, -1) : node.value
+  const codeStart = renderCodeBlockStart(node, sourceText)
+
+  if (node.lang === 'mermaid') {
     try {
       return {
         type: 'mermaid',
@@ -499,63 +510,57 @@ function renderCodeBlockNode(node: CodeBlockNode, options: RenderOptions): CodeB
         }),
         source: sourceOf(node),
       }
-    } catch {
-      // fall through to normal code block
-    }
+    } catch {}
   }
 
-  const syntaxLines = node.attrs.language ? tryHighlight(rawCode, node.attrs.language, options.palette.syntax) : null
+  const syntaxLines = node.lang ? tryHighlight(rawCode, node.lang, options.palette.syntax) : null
   const rawLines = rawCode.split('\n')
   let offset = codeStart
 
   const lines = rawLines.map((lineText, idx) => {
     const line = syntaxLines?.[idx] ?? [{ text: lineText || ' ', fg: options.palette.codeTextFg }]
-    const rendered = applyHighlightsToCodeLine(
-      line,
-      offset,
-      lineText,
-      options.highlights ?? [],
-      options.palette.codeTextFg,
-    )
+    const rendered = applyHighlightsToCodeLine(line, offset, lineText, options.highlights ?? [], options.palette.codeTextFg)
     offset += lineText.length + 1
     return rendered
   })
 
   return {
     type: 'code',
-    language: node.attrs.language ?? undefined,
+    language: node.lang ?? undefined,
     lines,
     rawCode,
     source: sourceOf(node),
   }
 }
 
-function renderParagraphNode(node: ParagraphNode, options: RenderOptions, fg?: string): ParagraphBlock {
+function renderParagraphNode(node: Paragraph, options: RenderOptions, sourceText?: string, fg?: string): ParagraphBlock {
   return {
     type: 'paragraph',
-    content: renderInline(node.content, { fg }, options.highlights ?? [], options.palette),
+    content: renderInline(node.children as PhrasingNode[], { fg }, options.highlights ?? [], options.palette, sourceText),
     source: sourceOf(node),
   }
 }
 
-function renderHeadingNode(node: HeadingNode, options: RenderOptions): HeadingBlock {
+function renderHeadingNode(node: Heading, options: RenderOptions, sourceText?: string): HeadingBlock {
+  const level = node.depth as 1 | 2 | 3 | 4 | 5 | 6
   const content = renderInline(
-    node.content,
-    { fg: options.palette.headingFg[node.attrs.level], bold: true },
+    node.children as PhrasingNode[],
+    { fg: options.palette.headingFg[level], bold: true },
     options.highlights ?? [],
     options.palette,
+    sourceText,
   )
   return {
     type: 'heading',
-    level: node.attrs.level,
+    level,
     content,
     slug: slugify(spansToText(content)),
     source: sourceOf(node),
   }
 }
 
-function renderTableCell(cell: TableCellNode, options: RenderOptions): Span[] {
-  return renderInline(cell.content[0]?.content, {}, options.highlights ?? [], options.palette)
+function renderTableCell(cell: TableCell, options: RenderOptions, sourceText?: string): Span[] {
+  return renderInline(cell.children as PhrasingNode[], {}, options.highlights ?? [], options.palette, sourceText)
 }
 
 function computeTableColumnWidths(allRows: Span[][][], availableWidth: number): number[] {
@@ -575,9 +580,7 @@ function computeTableColumnWidths(allRows: Span[][][], availableWidth: number): 
   const totalNatural = naturalWidths.reduce((a, b) => a + b, 0) + numSeparators * separatorWidth
   const effectiveAvailable = Math.max(20, availableWidth - 2)
 
-  if (totalNatural <= effectiveAvailable) {
-    return naturalWidths
-  }
+  if (totalNatural <= effectiveAvailable) return naturalWidths
 
   const availableForContent = effectiveAvailable - numSeparators * separatorWidth
   const totalNaturalContent = naturalWidths.reduce((a, b) => a + b, 0)
@@ -597,8 +600,8 @@ function computeTableColumnWidths(allRows: Span[][][], availableWidth: number): 
   return columnWidths
 }
 
-function renderTableNode(node: TableNode, options: RenderOptions): TableBlock {
-  const rows = node.content.map((row) => row.content.map((cell) => renderTableCell(cell, options)))
+function renderTableNode(node: Table, options: RenderOptions, sourceText?: string): TableBlock {
+  const rows = node.children.map((row) => row.children.map((cell) => renderTableCell(cell, options, sourceText)))
   const availableWidth = options.codeBlockWidth ?? 80
   const columnWidths = computeTableColumnWidths(rows, availableWidth)
 
@@ -611,76 +614,51 @@ function renderTableNode(node: TableNode, options: RenderOptions): TableBlock {
   }
 }
 
-function renderListItemContent(
-  content: readonly { content: ParagraphNode | BulletListNode | OrderedListNode | TaskListNode | BlankLinesNode }[],
-  options: RenderOptions,
-): Block[] {
-  return content.flatMap((item) => renderNodeToBlocks(item.content, options))
+function getListStyle(node: List): 'bullet' | 'ordered' | 'task' {
+  if (node.children.some((item) => typeof item.checked === 'boolean')) return 'task'
+  return node.ordered ? 'ordered' : 'bullet'
 }
 
-function renderBulletListNode(node: BulletListNode, options: RenderOptions): ListBlock {
+function renderListItemContent(node: MdastListItem, options: RenderOptions, sourceText?: string): Block[] {
+  return renderNodesToBlocks(node.children as RootContent[], options, sourceText)
+}
+
+function renderListNode(node: List, options: RenderOptions, sourceText?: string): ListBlock {
+  const style = getListStyle(node)
   return {
     type: 'list',
-    style: 'bullet',
-    items: node.content
-      .filter((item): item is BulletItemNode => item.type === 'bulletItem')
-      .map((item) => ({
-        marker: `${node.meta.marker} `,
-        markerFg: options.palette.listBulletFg,
-        content: renderListItemContent(item.content, options),
-      })),
+    style,
+    items: node.children.map((item, index) => ({
+      marker:
+        style === 'task'
+          ? `${node.ordered ? `${(node.start ?? 1) + index}. ` : '- '}${item.checked ? '[x] ' : '[ ] '}`
+          : node.ordered
+            ? `${(node.start ?? 1) + index}. `
+            : '- ',
+      markerFg: options.palette.listBulletFg,
+      checked: typeof item.checked === 'boolean' ? item.checked : undefined,
+      content: renderListItemContent(item, options, sourceText),
+    })),
     source: sourceOf(node),
   }
 }
 
-function renderOrderedListNode(node: OrderedListNode, options: RenderOptions): ListBlock {
-  return {
-    type: 'list',
-    style: 'ordered',
-    items: node.content
-      .filter((item): item is OrderedItemNode => item.type === 'orderedItem')
-      .map((item) => ({
-        marker: `${item.meta.number}${node.meta.delimiter} `,
-        markerFg: options.palette.listBulletFg,
-        content: renderListItemContent(item.content, options),
-      })),
-    source: sourceOf(node),
-  }
-}
-
-function renderTaskListNode(node: TaskListNode, options: RenderOptions): ListBlock {
-  return {
-    type: 'list',
-    style: 'task',
-    items: node.content
-      .filter((item): item is TaskItemNode => item.type === 'taskItem')
-      .map((item) => {
-        const prefix =
-          node.meta.style === 'ordered' && item.meta.number
-            ? `${item.meta.number}${node.meta.delimiter} `
-            : node.meta.style === 'bullet'
-              ? `${node.meta.marker} `
-              : ''
-        return {
-          marker: `${prefix}${item.attrs.checked ? '[x] ' : '[ ] '}`,
-          markerFg: options.palette.listBulletFg,
-          checked: item.attrs.checked,
-          content: renderListItemContent(item.content, options),
-        }
-      }),
-    source: sourceOf(node),
-  }
-}
-
-function renderBlockquoteNode(node: BlockquoteNode, options: RenderOptions): BlockquoteBlock {
-  const content: Block[] = []
-  for (const child of node.content) {
-    if (child.type === 'blockquoteItem') {
-      content.push(...renderNodeToBlocks(child.content, options, options.palette.blockquoteTextFg))
-    } else {
-      content.push({ type: 'spacer', lines: child.meta.blankLines.length || 1 })
-    }
-  }
+function renderBlockquoteNode(node: Blockquote, options: RenderOptions, sourceText?: string): BlockquoteBlock {
+  const content = renderNodesToBlocks(node.children as RootContent[], options, sourceText, options.palette.blockquoteTextFg).flatMap((block) =>
+    block.type === 'table'
+      ? [{
+          type: 'paragraph' as const,
+          content: splitByHighlights(
+            extractPlainTextFromBlock(block),
+            block.source.start,
+            block.source.end,
+            { fg: options.palette.blockquoteTextFg },
+            options.highlights ?? [],
+          ),
+          source: block.source,
+        }]
+      : [block],
+  )
 
   return {
     type: 'blockquote',
@@ -689,71 +667,78 @@ function renderBlockquoteNode(node: BlockquoteNode, options: RenderOptions): Blo
   }
 }
 
-function renderNodeToBlocks(
-  node: DocumentContentNode | BlockquoteContentNode,
-  options: RenderOptions,
-  inheritedParagraphFg?: string,
-): Block[] {
+function renderNodeToBlocks(node: RootContent, options: RenderOptions, sourceText?: string, inheritedParagraphFg?: string): Block[] {
   switch (node.type) {
-    case 'blankLines':
-      return [{ type: 'spacer', lines: node.count }]
     case 'paragraph':
-      return [renderParagraphNode(node, options, inheritedParagraphFg)]
+      return [renderParagraphNode(node, options, sourceText, inheritedParagraphFg)]
     case 'heading':
-      return [renderHeadingNode(node, options)]
-    case 'codeBlock':
-      return [renderCodeBlockNode(node, options)]
-    case 'horizontalRule':
+      return [renderHeadingNode(node, options, sourceText)]
+    case 'code':
+      return [renderCodeBlockNode(node, options, sourceText)]
+    case 'thematicBreak':
       return [{ type: 'divider', source: sourceOf(node) }]
-    case 'bulletList':
-      return [renderBulletListNode(node, options)]
-    case 'orderedList':
-      return [renderOrderedListNode(node, options)]
-    case 'taskList':
-      return [renderTaskListNode(node, options)]
+    case 'list':
+      return [renderListNode(node, options, sourceText)]
     case 'blockquote':
-      return [renderBlockquoteNode(node, options)]
+      return [renderBlockquoteNode(node, options, sourceText)]
     case 'table':
-      return [renderTableNode(node, options)]
-    case 'htmlBlock':
-      return [
-        {
-          type: 'paragraph',
-          content: splitByHighlights(
-            node.content,
-            node.position.start.offset,
-            node.position.end.offset,
-            {},
-            options.highlights ?? [],
-          ),
-          source: sourceOf(node),
-        },
-      ]
+      return [renderTableNode(node, options, sourceText)]
+    case 'html':
+      return [{
+        type: 'paragraph',
+        content: splitByHighlights(node.value, sourceStart(node), sourceEnd(node), {}, options.highlights ?? []),
+        source: sourceOf(node),
+      }]
     case 'definition':
       return []
     case 'image':
-      return [
-        {
-          type: 'paragraph',
-          content: splitByHighlights(
-            `[${node.attrs.alt || 'image'}]`,
-            node.position.start.offset,
-            node.position.end.offset,
-            { fg: options.palette.linkFg },
-            options.highlights ?? [],
-          ),
-          source: sourceOf(node),
-        },
-      ]
+      return [{
+        type: 'paragraph',
+        content: splitByHighlights(`[${node.alt || 'image'}]`, sourceStart(node), sourceEnd(node), { fg: options.palette.linkFg }, options.highlights ?? []),
+        source: sourceOf(node),
+      }]
+    default:
+      return []
   }
 }
 
-export function renderDocumentItemToBlocks(item: DocumentItemNode, options: RenderOptions): Block[] {
-  return renderNodeToBlocks(item.content, options)
+function countBlankLinesBetween(previous: RootContent, next: RootContent): number {
+  return Math.max(0, lineStart(next) - lineEnd(previous) - 1)
 }
 
-export function renderDocumentToBlocks(doc: DocumentNode, options: RenderOptions): Block[] {
-  return doc.content.flatMap((item) => renderDocumentItemToBlocks(item, options))
+function renderNodesToBlocks(
+  nodes: readonly RootContent[] | undefined,
+  options: RenderOptions,
+  sourceText?: string,
+  inheritedParagraphFg?: string,
+): Block[] {
+  if (!nodes) return []
+  const blocks: Block[] = []
+  let previousRenderable: RootContent | null = null
+
+  for (const node of nodes) {
+    const rendered = renderNodeToBlocks(node, options, sourceText, inheritedParagraphFg)
+    if (rendered.length === 0) continue
+
+    if (previousRenderable) {
+      const blankLines = countBlankLinesBetween(previousRenderable, node)
+      if (blankLines > 0) blocks.push({ type: 'spacer', lines: blankLines })
+    }
+
+    blocks.push(...rendered)
+    previousRenderable = node
+  }
+
+  return blocks
+}
+
+export function renderDocumentItemToBlocks(item: RootContent, options: RenderOptions): Block[] {
+  return renderNodeToBlocks(item, options)
+}
+
+export function renderDocumentToBlocks(doc: Root, options: RenderOptions): Block[] {
+  const sourceText = (doc as any).data?.source as string | undefined
+  return renderNodesToBlocks(doc.children, options, sourceText)
 }
 
 export function extractHeadingSlugsFromBlocks(blocks: Block[]): string[] {
@@ -778,14 +763,11 @@ export function extractPlainTextFromBlock(block: Block): string {
     case 'list':
       return block.items.map((item) => item.content.map(extractPlainTextFromBlock).join('\n')).join('\n')
     case 'table':
-      return [
-        block.headers.map(spansToText).join(' | '),
-        ...block.rows.map((row) => row.map(spansToText).join(' | ')),
-      ].join('\n')
+      return [block.headers.map(spansToText).join(' | '), ...block.rows.map((row) => row.map(spansToText).join(' | '))].join('\n')
   }
 }
 
-export function extractInlineText(nodes: readonly InlineNode[] | undefined): string {
+export function extractInlineText(nodes: readonly PhrasingNode[] | undefined): string {
   return extractInlinePlainText(nodes)
 }
 
