@@ -6,23 +6,23 @@ icon: book-open
 
 # What is Magnitude?
 
-Magnitude is an open source AI coding agent that runs in your terminal.
-
-It reads your codebase, makes edits, runs commands, and searches the web — all through a conversational interface.
+Magnitude is an open source coding agent where everything happens in specialized subagents. The main agent stays focused on your intent, leading to stronger performance on longer tasks and higher quality code.
 
 <img src="/images/interface.png" alt="Magnitude Interface" />
 
-Magnitude uses an advanced orchestrator → subagents model for better context management. The orchestrator talks to you and deploys specialized agents to research, plan, build, and verify changes. Each agent gets a focused context window, which means far less compaction, better performance on large tasks, and a superior overall experience.
+The main agent manages the conversation and delegates to specialized subagents — explorer, planner, builder, reviewer, browser, and debugger — each with its own role, specific context, and toolset. Subagents do focused work and report back, keeping the main agent's context clean.
 
 ## Why Magnitude?
 
-- **Less compaction.** Focused context windows mean far less dreaded "Compacting conversation..."
-- **Better performance on large tasks.** Doesn't lose the thread over complicated, long-horizon tasks.
-- **Built-in browser agent.** Uses a native browser agent to verify UI changes and behavior.
-- **Model agnostic.** Frontier models via API, open source models, local models, whatever you want.
+- **Avoids the dumb zone.** Since building happens in subagents, the main agent stays focused on your intent and effective even on longer, messier tasks.
+- **Steerable subagents.** Subagents can surface blockers, ask clarifying questions, and be paused, resumed, or redirected mid-task.
+- **Throw out the skills files.** Plan, review, debug, and browse are built-in subagents. No configuration needed, and the main agent actually uses them consistently.
+- **Mix your models.** Chat with Claude, build with Codex, or use whatever combination fits your preferences for intelligence, speed, and cost.
+- **Scoped toolsets, not modes.** Real coding jumps between planning and building too often for explicit mode toggles. Each subagent gets tools scoped to its role instead.
+- **Talk to it while it works.** The main agent isn't blocked by implementation. Ask questions, clarify mid-build, or start planning what's next without interrupting anything.
 
 ## Get started
 
 <Card title="Quick Start" icon="rocket" href="/getting-started/quickstart">
-  Install Magnitude and start coding in under 2 minutes
+  Install Magnitude and start coding in 30 seconds
 </Card>

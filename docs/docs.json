@@ -14,8 +14,7 @@
             "weight": 700
         },
         "body": {
-            "family": "Inter",
-            "weight": 400
+            "family": "Inter"
         }
     },
     "colors": {
