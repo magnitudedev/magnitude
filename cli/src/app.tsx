@@ -5,24 +5,19 @@ import { Effect, Layer, Cause } from 'effect'
 import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
-import { MultilineInput, type MultilineInputHandle } from './components/multiline-input'
+
 import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
 import { StickyWorkingHeader } from './components/think-block'
 import { LoadPreviousButton } from './components/chat-controls'
 
-import { SlashCommandMenu } from './components/slash-command-menu'
-import { FileMentionMenu } from './components/file-mention-menu'
+
 import { usePaginatedTimeline } from './hooks/use-paginated-timeline'
 import { useCollapsedBlocks } from './hooks/use-collapsed-blocks'
-import { useSlashCommands } from './hooks/use-slash-commands'
+
 import { useTheme } from './hooks/use-theme'
 import { ArtifactProvider } from './hooks/use-artifacts'
-import { readClipboardText } from './utils/clipboard'
-import { readClipboardBitmap } from './utils/clipboard'
-import { tryReadPastedImageFile } from './utils/pasted-image-path'
-import { autoScaleImageAttachmentIfNeeded } from './utils/image-scaling'
-import { AttachmentsBar } from './components/attachments-bar'
+
 import { BOX_CHARS } from './utils/ui-constants'
 import { AnimatedLogo } from './components/animated-logo'
 import { RecentChatsWidget } from './components/recent-chats-widget'
@@ -36,10 +31,10 @@ import { useModelSelectNavigation } from './hooks/use-model-select-navigation'
 import { useProviderSelectNavigation } from './hooks/use-provider-select-navigation'
 import type { SettingsTab } from './hooks/use-settings-navigation'
 import { useAuthFlow } from './hooks/use-auth-flow'
-import { useFileMentions } from './hooks/use-file-mentions'
+
 import { type WizardStep } from './components/setup-wizard-overlay'
 import { AppOverlays } from './components/app-overlays'
-import { ChatSurfaceKeyboard } from './components/chat-surface-keyboard'
+
 import { getDefaultModels } from './utils/model-preferences'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
@@ -47,22 +42,22 @@ import { readFileSync } from 'fs'
 import path from 'path'
 import { executeBashCommand, type BashResult } from './utils/bash-executor'
 
-import { orange } from './utils/theme'
+
 import { BashOutput } from './components/bash-output'
-import { Button } from './components/button'
+
 
 import { ArtifactReaderPanel } from './components/artifact-reader-panel'
-import type { Attachment, ImageAttachment, ImageMediaType } from '@magnitudedev/agent'
-import { ContextUsageBar } from './components/context-usage-bar'
+import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
-import type { InputValue } from './types/store'
+import { ChatController } from './components/chat/chat-controller'
+
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
 import { setSessionTracker } from './utils/telemetry-state'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
-import stringWidth from 'string-width'
+
 import { createId } from '@magnitudedev/generate-id'
-import { applyTextEditWithPastesAndMentions, insertMentionSegment, insertPasteSegment, reconstituteInputTextWithMentions } from './utils/strings'
+
 import { useProviderRuntime } from './providers/provider-runtime'
 import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
@@ -127,21 +122,10 @@ function AppInner({
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
   const popForkOverlay = () => setExpandedForkStack(s => s.slice(0, -1))
-  const [inputValue, setInputValue] = useState<InputValue>({
-    text: '',
-    cursorPosition: 0,
-    lastEditDueToNav: false,
-    pasteSegments: [],
-    mentionSegments: [],
-    selectedPasteSegmentId: null,
-    selectedMentionSegmentId: null,
-  })
+
   const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
-  const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const [nextEscWillClearInput, setNextEscWillClearInput] = useState(false)
-  const clearInputTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+
   const [systemMessages, setSystemMessages] = useState<Array<{ id: string; text: string; timestamp: number }>>([])
   const [showRecentChatsOverlay, setShowRecentChatsOverlay] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
@@ -149,8 +133,7 @@ function AppInner({
   const [primaryModel, setPrimaryModelState] = useState<ModelSelection | null>(null)
   const [secondaryModel, setSecondaryModelState] = useState<ModelSelection | null>(null)
   const [browserModel, setBrowserModelState] = useState<ModelSelection | null>(null)
-  const [isProviderHovered, setIsProviderHovered] = useState(false)
-  const [isModelHovered, setIsModelHovered] = useState(false)
+
   const [preferencesSelectedIndex, setPreferencesSelectedIndex] = useState(0)
   const [providerDetailId, setProviderDetailId] = useState<string | null>(null)
   const [providerDetailSelectedIndex, setProviderDetailSelectedIndex] = useState(0)
@@ -164,6 +147,8 @@ function AppInner({
   const [debugSnapshot, setDebugSnapshot] = useState<DebugSnapshot | null>(null)
   const [debugEvents, setDebugEvents] = useState<AppEvent[]>([])
   const [debugLogs, setDebugLogs] = useState<LogEntry[]>([])
+  const [inputHasText, setInputHasText] = useState(false)
+  const [restoredQueuedInputText, setRestoredQueuedInputText] = useState<string | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
   const [isCompacting, setIsCompacting] = useState(false)
   const returnToProviderDetailRef = useRef<string | null>(null)
@@ -171,8 +156,7 @@ function AppInner({
   const hasAnimatedRef = useRef(skipAnimation)
   const initClientRef = useRef<(() => Promise<AgentClient>) | null>(null)
   const [modelsLoaded, setModelsLoaded] = useState(0)
-  const [attachments, setAttachments] = useState<ImageAttachment[]>([])
-  const [, setTerminalResizeTick] = useState(0)
+
 
   const formatFooterTokens = (n: number) => {
     if (n >= 1000) {
@@ -189,19 +173,9 @@ function AppInner({
     ? (isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText)
     : ''
 
-  const escHintRenderedText = nextEscWillKillAll
-    ? 'Press Esc again to interrupt all subagents'
-    : nextEscWillClearInput
-      ? 'Press Esc again to clear text'
-      : nextCtrlCWillExit
-        ? 'Press Ctrl-C again to exit'
-        : bashMode
-          ? 'Esc to exit Bash mode'
-          : ''
-
   // Always reserve width for the longest possible escape hint so that
   // attachments don't reflow when hints appear/disappear.
-  const maxEscHintWidth = stringWidth('Press Esc again to interrupt all subagents')
+  const maxEscHintWidth = 'Press Esc again to interrupt all subagents'.length
 
   const terminalWidth = process.stdout.columns ?? 80
   const footerRightGap = contextRenderedText ? 1 : 0
@@ -212,101 +186,12 @@ function AppInner({
     terminalWidth
       - footerHorizontalPadding
       - maxEscHintWidth
-      - stringWidth(contextRenderedText)
+      - contextRenderedText.length
       - footerRightGap
       - footerSafetyBuffer,
   )
 
-  const addImageAttachment = useCallback(async () => {
-    const result = await readClipboardBitmap()
-    if (!result) return false
 
-    const scaled = await autoScaleImageAttachmentIfNeeded({
-      base64: result.base64,
-      mime: result.mime,
-      width: result.width,
-      height: result.height,
-      filename: 'clipboard-' + Date.now() + '.png',
-    })
-
-    logger.info(
-      {
-        wasScaled: scaled.wasScaled,
-        originalBytes: scaled.originalBytes,
-        finalBytes: scaled.finalBytes,
-        width: scaled.width,
-        height: scaled.height,
-      },
-      'Clipboard image attachment processed',
-    )
-
-    const extension = scaled.mime === 'image/jpeg' ? '.jpg' : '.png'
-    const attachment: ImageAttachment = {
-      type: 'image',
-      base64: scaled.base64,
-      mediaType: scaled.mime as ImageMediaType,
-      width: scaled.width,
-      height: scaled.height,
-      filename: 'clipboard-' + Date.now() + extension,
-    }
-    setAttachments(prev => [...prev, attachment])
-    return true
-  }, [])
-
-  const addImageAttachmentFromFilePath = useCallback(async (rawPasteText: string) => {
-    const result = await tryReadPastedImageFile(rawPasteText)
-    if (!result) return false
-
-    const scaled = await autoScaleImageAttachmentIfNeeded({
-      base64: result.base64,
-      mime: result.mediaType,
-      width: result.width,
-      height: result.height,
-      filename: result.filename,
-    })
-
-    logger.info(
-      {
-        wasScaled: scaled.wasScaled,
-        originalBytes: scaled.originalBytes,
-        finalBytes: scaled.finalBytes,
-        width: scaled.width,
-        height: scaled.height,
-      },
-      'File-path image attachment processed',
-    )
-
-    const parsed = result.filename.includes('.') ? result.filename.split('.') : [result.filename]
-    const stem = parsed.slice(0, -1).join('.') || result.filename
-    const filename = scaled.mime === 'image/jpeg' ? `${stem}.jpg` : result.filename
-
-    const attachment: ImageAttachment = {
-      type: 'image',
-      base64: scaled.base64,
-      mediaType: scaled.mime as ImageMediaType,
-      width: scaled.width,
-      height: scaled.height,
-      filename,
-    }
-
-    setAttachments(prev => [...prev, attachment])
-    return true
-  }, [])
-
-  const removeAttachment = useCallback((index: number) => {
-    setAttachments(prev => prev.filter((_, i) => i !== index))
-  }, [])
-
-  useEffect(() => {
-    const handleResize = () => {
-      setTerminalResizeTick(prev => prev + 1)
-    }
-
-    process.stdout.on('resize', handleResize)
-    return () => {
-      process.stdout.off('resize', handleResize)
-    }
-  }, [])
 
   // Browser setup overlay state
   const [showBrowserSetup, setShowBrowserSetup] = useState(false)
@@ -629,18 +514,7 @@ function AppInner({
         if (mounted && forkId === null && messages.length > 0) {
           const restored = messages.join('\n')
           logger.info({ restored, length: restored.length }, 'Restoring queued messages to input')
-          setInputValue(prev => {
-            logger.info({ prev, next: restored }, 'setInputValue functional update')
-            return {
-              text: restored,
-              cursorPosition: restored.length,
-              lastEditDueToNav: false,
-              pasteSegments: [],
-              mentionSegments: [],
-              selectedPasteSegmentId: null,
-              selectedMentionSegmentId: null,
-            }
-          })
+          setRestoredQueuedInputText(restored)
         }
       })
 
@@ -909,7 +783,6 @@ function AppInner({
 
   const exitBashMode = useCallback(() => {
     setBashMode(false)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
   }, [])
 
   const handleResumeChat = useCallback((chat: RecentChat) => {
@@ -919,7 +792,7 @@ function AppInner({
   }, [onResumeSession])
 
   // Navigation for startup widget (active when no messages, overlay closed, and input empty)
-  const widgetNavActive = !showRecentChatsOverlay && (display?.messages ?? []).length === 0 && inputValue.text.length === 0 && attachments.length === 0
+  const widgetNavActive = !showRecentChatsOverlay && (display?.messages ?? []).length === 0 && !inputHasText
   const widgetNavigation = useRecentChatsNavigation(
     recentChats ? recentChats.slice(0, 5) : [],
     handleResumeChat,
@@ -1412,174 +1285,7 @@ function AppInner({
     openBrowserSetup,
   }), [resetConversation, showEphemeral, theme.error, exitApp, openRecentChats, enterBashMode, activateSkill, initProject, openSettings, openSetup, openBrowserSetup])
 
-  const executeSlashCommand = useCallback((commandText: string) => {
-    routeSlashCommand(commandText, commandContext)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-  }, [commandContext])
 
-  const onSelectMention = useCallback((item: { path: string; contentType: 'text' | 'image' | 'directory' }) => {
-    const relPath = item.path
-    const contentType = item.contentType
-
-    setInputValue(prev => {
-      const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
-      const match = left.match(/(?:^|\s)@([^\s@]*)$/)
-      if (!match) return prev
-      const atIndex = left.lastIndexOf('@')
-      if (atIndex < 0) return prev
-      const rangeStart = atIndex
-      const rangeEnd = left.length
-      return insertMentionSegment(
-        prev,
-        { path: relPath, contentType },
-        createId(),
-        rangeStart,
-        rangeEnd,
-      )
-    })
-  }, [])
-
-  const onExpandDirectoryMention = useCallback((item: { path: string }) => {
-    setInputValue(prev => {
-      const left = prev.text.slice(0, Math.max(0, prev.cursorPosition))
-      const match = left.match(/(?:^|\s)@([^\s@]*)$/)
-      if (!match) return prev
-      const atIndex = left.lastIndexOf('@')
-      if (atIndex < 0) return prev
-      const rangeStart = atIndex
-      const rangeEnd = left.length
-      return applyTextEditWithPastesAndMentions(
-        prev,
-        rangeStart,
-        rangeEnd,
-        `@${item.path}`,
-      )
-    })
-  }, [])
-
-  const fileMentions = useFileMentions(
-    inputValue.text,
-    inputValue.cursorPosition,
-    onSelectMention,
-    onExpandDirectoryMention,
-  )
-
-  const slashCommands = useSlashCommands(inputValue.text, executeSlashCommand)
-
-  // Combined key intercept: mentions + slash commands + widget navigation
-  const handleKeyIntercept = useCallback((key: KeyEvent): boolean => {
-    // Block all input during pending approval
-    if (pendingApproval) return true
-    if (!bashMode && fileMentions.handleKeyIntercept(key)) return true
-    if (!bashMode && slashCommands.handleKeyIntercept(key)) return true
-    if (widgetNavActive && widgetNavigation.handleKeyEvent(key)) return true
-    return false
-  }, [pendingApproval, bashMode, fileMentions, slashCommands.handleKeyIntercept, widgetNavActive, widgetNavigation.handleKeyEvent])
-
-  const handleSubmit = useCallback((message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
-    const slashText = visibleMessage ?? message
-    // Check for slash commands first (skip in bash mode)
-    if (!bashMode && routeSlashCommand(slashText, commandContext)) {
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-      return
-    }
-
-    // Bash mode: execute terminal command
-    if (bashMode) {
-      const trimmed = message.trim()
-      if (!trimmed) return
-      const result = executeBashCommand(trimmed)
-      setBashOutputs(prev => [...prev, result])
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-      return
-    }
-
-    // Guard: all model slots must be configured (banner shows above input)
-    if (!primaryModel || !secondaryModel || !browserModel) {
-      return
-    }
-
-    // Normal message — send to agent
-    setSystemMessages([])
-    if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current)
-    setEphemeralMessage(null)
-    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-
-    const currentAttachments: Attachment[] = [...attachments, ...mentionAttachments]
-    const sendMessage = (c: AgentClient) => {
-      c.send({ type: 'user_message', forkId: null, content: textParts(message), attachments: currentAttachments, mode: 'text', synthetic: false, taskMode: false })
-    }
-    setAttachments([])
-
-    if (client) {
-      sendMessage(client)
-    } else if (initClientRef.current) {
-      // Lazy init: create client now, then send message
-      const initFn = initClientRef.current
-      initClientRef.current = null  // Prevent double init
-      initFn().then((newClient) => {
-        sendMessage(newClient)
-      }).catch((err) => {
-        logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client')
-      })
-    }
-  }, [client, commandContext, bashMode, attachments, primaryModel, secondaryModel, browserModel])
-
-  const handleInputChange = useCallback((value: InputValue) => {
-    // Typing '!' as first character enters bash mode
-    if (!bashMode && value.text === '!') {
-      setBashMode(true)
-      setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })
-      return
-    }
-    // Reset escape-to-clear hint when user types
-    if (nextEscWillClearInput) {
-      setNextEscWillClearInput(false)
-      if (clearInputTimeoutRef.current) {
-        clearTimeout(clearInputTimeoutRef.current)
-      }
-    }
-    setInputValue(value)
-  }, [bashMode, nextEscWillClearInput])
-
-  const INLINE_PASTE_PILL_CHAR_LIMIT = 1000
-
-  const handlePaste = useCallback(async (eventText?: string) => {
-    logger.debug({ eventText: eventText ? eventText.substring(0, 50) : null }, 'handlePaste called')
-
-    // Try clipboard image first
-    const wasClipboardImage = await addImageAttachment()
-    if (wasClipboardImage) {
-      logger.debug('Added clipboard image attachment')
-      return
-    }
-
-    const pasteText = eventText || readClipboardText()
-    logger.debug({ pasteText: pasteText ? pasteText.substring(0, 50) : null }, 'pasteText from clipboard')
-    if (!pasteText) {
-      logger.debug('No paste text available, returning')
-      return
-    }
-
-    const wasImagePath = await addImageAttachmentFromFilePath(pasteText)
-    if (wasImagePath) {
-      logger.debug('Added image attachment from pasted file path')
-      return
-    }
-
-    logger.debug({ cursorPosition: inputValue.cursorPosition }, 'Handling text paste with inline pill logic')
-    setInputValue(prev => {
-      if (pasteText.length > INLINE_PASTE_PILL_CHAR_LIMIT) {
-        return insertPasteSegment(prev, pasteText, createId())
-      }
-      return applyTextEditWithPastesAndMentions(
-        prev,
-        prev.cursorPosition,
-        prev.cursorPosition,
-        pasteText,
-      )
-    })
-  }, [inputValue.cursorPosition, addImageAttachment, addImageAttachmentFromFilePath])
 
   const handleInterrupt = useCallback(() => {
     if (!client) return
@@ -1639,27 +1345,7 @@ function AppInner({
     ),
   )
 
-  // Ensure input is focused for paste events to work reliably
-  const multilineInputRef = useRef<MultilineInputHandle | null>(null)
-  useEffect(() => {
-    // Focus input when not showing overlays
-    if (!showSetupWizard && !showBrowserSetup && !showRecentChatsOverlay && settingsTab === null && !authFlow.showAuthMethodOverlay && !authFlow.oauthState && !authFlow.showLocalSetup && !authFlow.apiKeySetup && !bashMode && expandedForkId === null) {
-      multilineInputRef.current?.focus()
-    }
-  }, [showSetupWizard, showBrowserSetup, showRecentChatsOverlay, settingsTab, authFlow.showAuthMethodOverlay, authFlow.oauthState, authFlow.showLocalSetup, authFlow.apiKeySetup, bashMode, expandedForkId])
 
-  const handleInputSubmit = useCallback(() => {
-    // Normal message submission
-    if (inputValue.text.trim() || attachments.length > 0) {
-      const { text, mentions } = reconstituteInputTextWithMentions(inputValue)
-      const mentionAttachments: Attachment[] = mentions.map((mention) => ({
-        type: 'mention',
-        path: mention.path,
-        contentType: mention.contentType,
-      }))
-      handleSubmit(text, inputValue.text, mentionAttachments)
-    }
-  }, [inputValue, handleSubmit, attachments.length])
 
   const selectedArtifactContent = useMemo(() => {
     if (!selectedArtifact || !artifactState) return null
@@ -1745,6 +1431,27 @@ function AppInner({
     setSelectingModelFor(null)
     setProviderDetailId(null)
   }, [])
+
+  const handleSubmitViaClientBoundary = useCallback((payload: {
+    message: string
+    attachments: Attachment[]
+  }) => {
+    const sendMessage = (c: AgentClient) => {
+      c.send({ type: 'user_message', forkId: null, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
+    }
+
+    if (client) {
+      sendMessage(client)
+    } else if (initClientRef.current) {
+      const initFn = initClientRef.current
+      initClientRef.current = null
+      initFn().then((newClient) => {
+        sendMessage(newClient)
+      }).catch((err) => {
+        logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client')
+      })
+    }
+  }, [client])
 
   if (!display) {
     return (
@@ -1936,7 +1643,7 @@ function AppInner({
                     onApprove={handleApprove}
                     onReject={handleReject}
 
-                    inputHasText={!!inputValue.text.trim()}
+                    inputHasText={inputHasText}
                     onArtifactClick={handleArtifactClick}
                     onForkExpand={pushForkOverlay}
                   />
@@ -1960,6 +1667,21 @@ function AppInner({
       })()}
     </scrollbox>
   )
+
+  const modelSummary = primaryModel ? {
+    provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
+    model: modelItems.find((item) => item.providerId === primaryModel.providerId && item.modelId === primaryModel.modelId)?.modelName ?? primaryModel.modelId,
+  } : null
+
+  const composerCanFocus = !showSetupWizard
+    && !showBrowserSetup
+    && !showRecentChatsOverlay
+    && settingsTab === null
+    && !authFlow.showAuthMethodOverlay
+    && !authFlow.oauthState
+    && !authFlow.showLocalSetup
+    && !authFlow.apiKeySetup
+    && expandedForkId === null
 
   const debugVisible = debugMode && debugPanelVisible
 
@@ -1986,29 +1708,49 @@ function AppInner({
             </box>
           )}
           {chatScrollbox}
-          <ChatSurfaceKeyboard
-            status={display.status}
-            hasRunningForks={hasRunningForks}
-            nextEscWillKillAll={nextEscWillKillAll}
-            setNextEscWillKillAll={setNextEscWillKillAll}
-            killAllTimeoutRef={killAllTimeoutRef}
-            onInterrupt={handleInterrupt}
-            onInterruptAll={handleInterruptAll}
-            inputText={inputValue.text}
-            nextEscWillClearInput={nextEscWillClearInput}
-            setNextEscWillClearInput={setNextEscWillClearInput}
-            clearInputTimeoutRef={clearInputTimeoutRef}
-            onClearInput={() => setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false, pasteSegments: [], mentionSegments: [], selectedPasteSegmentId: null, selectedMentionSegmentId: null })}
+          <ChatController
+            env={{
+              status: display.status,
+              pendingApproval: pendingApproval != null,
+              hasRunningForks,
+              bashMode,
+              modelsConfigured: !!primaryModel && !!secondaryModel && !!browserModel,
+              modelSummary,
+              tokenEstimate,
+              contextHardCap,
+              isCompacting,
+              theme,
+              modeColor,
+              attachmentsMaxWidth,
+              composerCanFocus,
+              widgetNavActive,
+              nextCtrlCWillExit,
+            }}
+            services={{
+              submitUserMessage: ({ message, attachments }) => handleSubmitViaClientBoundary({ message, attachments }),
+              runSlashCommand: (commandText: string) => routeSlashCommand(commandText, commandContext),
+              executeBash: executeBashCommand,
+              appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
+              clearSystemBanners: () => {
+                setSystemMessages([])
+                if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current)
+                setEphemeralMessage(null)
+              },
+              interrupt: handleInterrupt,
+              interruptAll: handleInterruptAll,
+              openSettings,
+              toggleTaskPanel,
+              handleWidgetKeyEvent: widgetNavigation.handleKeyEvent,
+              enterBashMode: () => setBashMode(true),
+              exitBashMode: exitBashMode,
+            }}
             selectedArtifactOpen={selectedArtifact != null}
             onCloseArtifact={() => setSelectedArtifact(null)}
-            bashMode={bashMode}
-            onExitBashMode={exitBashMode}
-            fileMentionOpen={fileMentions.isOpen}
-            slashMenuOpen={slashCommands.isSlashMenuOpen}
-            onToggleTaskPanel={toggleTaskPanel}
-            pendingApproval={pendingApproval != null}
             onApprove={handleApprove}
             onReject={handleReject}
+            onInputHasTextChange={setInputHasText}
+            restoredQueuedInputText={restoredQueuedInputText}
+            onRestoredQueuedInputHandled={() => setRestoredQueuedInputText(null)}
           />
         </box>
 
@@ -2065,181 +1807,6 @@ function AppInner({
             </box>
           </box>
         )}
-
-        <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-          <box
-            style={{
-              borderStyle: 'single',
-              border: ['left'],
-              borderColor: bashMode ? orange[400] : modeColor,
-              customBorderChars: { ...BOX_CHARS, vertical: '┃' },
-            }}
-          >
-            <box
-              style={{
-                backgroundColor: theme.inputBg,
-                paddingTop: 1,
-                paddingLeft: 1,
-                paddingRight: 2,
-                flexDirection: 'column',
-                flexGrow: 1,
-              }}
-            >
-              {!bashMode && fileMentions.isOpen && (
-                <FileMentionMenu
-                  isOpen={fileMentions.isOpen}
-                  query={fileMentions.query}
-                  items={fileMentions.items}
-                  recentItems={fileMentions.recentItems}
-                  overflowCount={fileMentions.overflowCount}
-                  selectedIndex={fileMentions.selectedIndex}
-                  onSelect={fileMentions.confirmSelection}
-                  onHoverIndex={fileMentions.setSelectedIndex}
-                />
-              )}
-              {!bashMode && slashCommands.isSlashMenuOpen && (
-                <SlashCommandMenu
-                  commands={slashCommands.filteredCommands}
-                  selectedIndex={slashCommands.selectedIndex}
-                  onSelect={(cmd) => executeSlashCommand(`/${cmd.id}`)}
-                  onHoverIndex={slashCommands.setSelectedIndex}
-                />
-              )}
-              <box
-                style={{
-                  flexDirection: 'column',
-                }}
-              >
-                <box
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    width: '100%',
-                  }}
-                >
-                  <box style={{ flexGrow: 1, minWidth: 0 }}>
-                    <MultilineInput
-                      ref={multilineInputRef}
-                      value={inputValue.text}
-                      cursorPosition={inputValue.cursorPosition}
-                      pasteSegments={inputValue.pasteSegments}
-                      selectedPasteSegmentId={inputValue.selectedPasteSegmentId}
-                      mentionSegments={inputValue.mentionSegments}
-                      selectedMentionSegmentId={inputValue.selectedMentionSegmentId}
-                      onChange={handleInputChange}
-                      onSubmit={handleInputSubmit}
-                      onPaste={handlePaste}
-                      onKeyIntercept={handleKeyIntercept}
-                      focused={!pendingApproval}
-                      highlightColor={bashMode ? orange[400] : undefined}
-                      placeholder={
-                        pendingApproval
-                          ? 'Approve or reject the pending action...'
-                          : bashMode
-                            ? 'Enter a command...'
-                            : display.status === 'streaming'
-                              ? 'Type to queue a message...'
-                              : 'Type a message...'
-                      }
-                      maxHeight={10}
-                      minHeight={1}
-                    />
-
-                  </box>
-                </box>
-                <box style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
-                  {bashMode ? (
-                    <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
-                  ) : (() => {
-                    const summary = primaryModel ? {
-                      provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
-                      model: modelItems.find((item) => item.providerId === primaryModel.providerId && item.modelId === primaryModel.modelId)?.modelName ?? primaryModel.modelId,
-                    } : null
-                    return (
-                      <>
-                        <Button
-                          onClick={() => openSettings('provider')}
-                          onMouseOver={() => setIsProviderHovered(true)}
-                          onMouseOut={() => setIsProviderHovered(false)}
-                        >
-                          <text style={{ fg: isProviderHovered ? theme.primary : theme.muted }}>{summary?.provider ?? 'No provider'}</text>
-                        </Button>
-                        <text style={{ fg: theme.muted }}> {'\u00b7'} </text>
-                        <Button
-                          onClick={() => openSettings('model')}
-                          onMouseOver={() => setIsModelHovered(true)}
-                          onMouseOut={() => setIsModelHovered(false)}
-                        >
-                          <text style={{ fg: isModelHovered ? theme.primary : theme.foreground }}>{summary?.model ?? 'No model'}</text>
-                        </Button>
-                      </>
-                    )
-                  })()}
-                </box>
-              </box>
-            </box>
-          </box>
-          <box
-            style={{
-              height: 1,
-              borderStyle: 'single',
-              border: ['left'],
-              borderColor: bashMode ? orange[400] : modeColor,
-              customBorderChars: {
-                topLeft: '', bottomLeft: '', topRight: '', bottomRight: '',
-                horizontal: ' ', vertical: '╹',
-                topT: '', bottomT: '', leftT: '', rightT: '', cross: '',
-              },
-            }}
-          >
-            <box
-              style={{
-                height: 1,
-                borderStyle: 'single',
-                border: ['bottom'],
-                borderColor: theme.inputBg,
-                customBorderChars: {
-                  topLeft: '', bottomLeft: '', topRight: '', bottomRight: '',
-                  horizontal: '▀', vertical: ' ',
-                  topT: '', bottomT: '', leftT: '', rightT: '', cross: '',
-                },
-              }}
-            />
-          </box>
-        </box>
-        <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
-          <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
-            {attachments.length > 0 ? (
-              <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={attachmentsMaxWidth} />
-            ) : nextEscWillKillAll ? (
-              <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all subagents</text>
-            ) : nextEscWillClearInput ? (
-              <text style={{ fg: theme.secondary }}>Press Esc again to clear text</text>
-            ) : nextCtrlCWillExit ? (
-              <text style={{ fg: theme.secondary }}>Press Ctrl-C again to exit</text>
-            ) : bashMode ? (
-              <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
-            ) : null}
-          </box>
-          <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
-            {attachments.length > 0 && (nextEscWillKillAll ? (
-              <text style={{ fg: theme.secondary }}>Press Esc again to interrupt all subagents</text>
-            ) : nextEscWillClearInput ? (
-              <text style={{ fg: theme.secondary }}>Press Esc again to clear text</text>
-            ) : nextCtrlCWillExit ? (
-              <text style={{ fg: theme.secondary }}>Press Ctrl-C again to exit</text>
-            ) : bashMode ? (
-              <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
-            ) : null)}
-            {tokenEstimate > 0 && (
-              <ContextUsageBar
-                tokenEstimate={tokenEstimate}
-                hardCap={contextHardCap ?? tokenEstimate}
-                isCompacting={isCompacting}
-              />
-            )}
-          </box>
-        </box>
       </box>
 
       {selectedArtifact && selectedArtifactContent !== null && (
