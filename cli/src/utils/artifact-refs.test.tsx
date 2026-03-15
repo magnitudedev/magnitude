@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import React, { type ReactNode } from 'react'
-import { parseMarkdownToChunks } from './markdown-content-renderer'
+import { parseMarkdownToChunks, convertLinesToReactNodes } from './markdown-content-renderer'
 import { buildMarkdownColorPalette, chatThemes } from './theme'
 
 function flattenToText(node: ReactNode): string {
@@ -79,7 +79,7 @@ describe('Artifact refs in markdown rendering pipeline', () => {
       // Collect all refs across all text chunks
       const allRefs: Array<{ artifactName: string; section?: string }> = []
       for (const chunk of textChunks) {
-        allRefs.push(...findArtifactRefs(chunk.content))
+        allRefs.push(...findArtifactRefs(convertLinesToReactNodes(chunk.lines)))
       }
 
       expect(allRefs).toHaveLength(tc.expectedArtifacts.length)
@@ -95,7 +95,7 @@ describe('Artifact refs in markdown rendering pipeline', () => {
       // Verify the original ref text [[...]] is preserved in the content
       // (it gets replaced with display label in StyledTextWithRefs, not here)
       if (tc.expectedArtifacts.length > 0) {
-        const allText = textChunks.map(c => flattenToText(c.content)).join('')
+        const allText = textChunks.map(c => flattenToText(convertLinesToReactNodes(c.lines))).join('')
         for (const name of tc.expectedArtifacts) {
           expect(allText).toContain(name)
         }

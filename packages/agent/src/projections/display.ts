@@ -21,6 +21,7 @@ import { WorkingStateProjection } from './working-state'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
 import { createId } from '../util/id'
+import { isActive, type ArtifactStreamPreview, type ArtifactVisualState, type Phase } from '../visuals/tools'
 
 /**
  * Resolve display visibility for a tool call using the agent definition's display policy.
@@ -395,6 +396,94 @@ function toPreview(text: string): string {
   const normalized = text.replace(/\s+/g, ' ').trim()
   if (normalized.length <= 120) return normalized
   return normalized.slice(0, 117) + '...'
+}
+
+function isArtifactToolKey(toolKey: string | undefined): toolKey is 'artifactWrite' | 'artifactUpdate' {
+  return toolKey === 'artifactWrite' || toolKey === 'artifactUpdate'
+}
+
+function hasArtifactPreview(
+  visualState: unknown,
+  includeTerminal: boolean
+): visualState is ArtifactVisualState & { preview: ArtifactStreamPreview } {
+  if (!visualState || typeof visualState !== 'object') return false
+  const state = visualState as ArtifactVisualState
+  const allowedPhase = includeTerminal
+    ? state.phase === 'streaming'
+      || state.phase === 'executing'
+      || state.phase === 'error'
+      || state.phase === 'rejected'
+      || state.phase === 'interrupted'
+    : isActive(state.phase)
+
+  return (
+    typeof state.name === 'string'
+    && state.name.length > 0
+    && allowedPhase
+    && state.preview !== undefined
+    && (state.preview.mode === 'write' || state.preview.mode === 'update')
+  )
+}
+
+export interface InProgressArtifactView {
+  artifactId: string
+  toolCallId: string
+  toolKey: 'artifactWrite' | 'artifactUpdate'
+  forkId: string | null
+  phase: Phase
+  preview: ArtifactStreamPreview
+}
+
+function collectArtifactStreams(
+  state: DisplayState,
+  includeTerminal: boolean
+): InProgressArtifactView[] {
+  const streams: InProgressArtifactView[] = []
+
+  for (const message of state.messages) {
+    if (message.type !== 'think_block') continue
+
+    for (const step of message.steps) {
+      if (step.type !== 'tool' || !isArtifactToolKey(step.toolKey)) continue
+      if (!hasArtifactPreview(step.visualState, includeTerminal)) continue
+
+      streams.push({
+        artifactId: step.visualState.name,
+        toolCallId: step.id,
+        toolKey: step.toolKey,
+        forkId: null,
+        phase: step.visualState.phase,
+        preview: step.visualState.preview,
+      })
+    }
+  }
+
+  return streams
+}
+
+export function getInProgressArtifactStreams(state: DisplayState): InProgressArtifactView[] {
+  return collectArtifactStreams(state, false)
+}
+
+export function getLatestInProgressArtifactStream(
+  state: DisplayState,
+  artifactId: string,
+  includeTerminal = false
+): InProgressArtifactView | null {
+  const streams = collectArtifactStreams(state, includeTerminal)
+  for (let i = streams.length - 1; i >= 0; i--) {
+    if (streams[i]?.artifactId === artifactId) {
+      return streams[i] ?? null
+    }
+  }
+  return null
+}
+
+export function getArtifactStreamForPanel(
+  state: DisplayState,
+  artifactId: string
+): InProgressArtifactView | null {
+  return getLatestInProgressArtifactStream(state, artifactId, true)
 }
 
 // =============================================================================
