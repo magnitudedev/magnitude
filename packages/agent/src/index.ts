@@ -230,8 +230,7 @@ export {
   PROVIDERS,
   getProvider,
   getProviderIds,
-  populateModels,
-  initializeModels,
+
   detectDefaultProvider,
   buildClientRegistry,
   startAnthropicOAuth,

@@ -72,10 +72,10 @@ export { createProviderClient } from './runtime/client'
 export type { ProviderClient } from './runtime/client'
 
 // Registry
-export { PROVIDERS, getProvider, getProviderIds, populateModels, getModelCost } from './registry'
+export { PROVIDERS, getProvider, getProviderIds, getStaticProviderModels, setProviderModels, getModelCost } from './registry'
 
-// Dynamic models (models.dev)
-export { initializeModels } from './models-dev'
+// Catalog
+export * from './catalog'
 
 // Detection
 export { detectProviders, detectDefaultProvider, detectProviderAuthMethods } from './detect'
@@ -83,6 +83,15 @@ export type { DetectedProvider, DetectedAuthMethod, ProviderAuthMethodStatus } f
 
 // ClientRegistry builder
 export { buildClientRegistry } from './client-registry-builder'
+
+// Recommendations
+export {
+  getModelRecommendation,
+  normalizeModelId,
+  resolveRecommendedModel,
+  MODEL_RECOMMENDATION_RULES,
+} from './model-recommendations'
+export type { ModelRecommendationRule, RecommendationMatch } from './model-recommendations'
 
 // Reasoning effort
 export { getLowestEffortOptions } from './reasoning-effort'

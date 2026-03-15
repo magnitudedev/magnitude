@@ -5,6 +5,10 @@ import {
   AuthStorageLive,
 } from './auth'
 import {
+  CatalogCache,
+  CatalogCacheLive,
+} from './catalog-cache'
+import {
   ConfigStorage,
   ConfigStorageLive,
   type ResolvedContextLimitPolicy,
@@ -33,6 +37,7 @@ import type {
 
 export type AllStorageServices =
   | AuthStorage
+  | CatalogCache
   | ConfigStorage
   | LogStorage
   | MemoryStorage
@@ -162,6 +167,7 @@ export async function createStorageClient(options?: {
   const globalLayer = Layer.mergeAll(
     ConfigStorageLive,
     AuthStorageLive,
+    CatalogCacheLive,
     SessionStorageLive,
     LogStorageLive,
     TraceStorageLive

@@ -58,9 +58,16 @@ export type AppOverlaysProps = {
   settingsTab: SettingsTab | null
   handleSettingsTabChange: (tab: SettingsTab) => void
   handleModelSelect: (providerId: string, modelId: string) => void | Promise<void>
+  modelSearch: string
+  onModelSearchChange: (value: string) => void
+  showAllProviders: boolean
+  onToggleShowAllProviders: () => void
+  showRecommendedOnly: boolean
+  onToggleShowRecommendedOnly: () => void
   handleProviderSelect: (providerId: string) => void
   handleProviderDetailAction: (idx: number) => void
   handleProviderDetailBack: () => void
+  onBackFromModelPicker: () => void
   handleChangePrimary: () => void
   handleChangeSecondary: () => void
   handleChangeBrowser: () => void
@@ -126,9 +133,16 @@ export function AppOverlays({
   settingsTab,
   handleSettingsTabChange,
   handleModelSelect,
+  modelSearch,
+  onModelSearchChange,
+  showAllProviders,
+  onToggleShowAllProviders,
+  showRecommendedOnly,
+  onToggleShowRecommendedOnly,
   handleProviderSelect,
   handleProviderDetailAction,
   handleProviderDetailBack,
+  onBackFromModelPicker,
   handleChangePrimary,
   handleChangeSecondary,
   handleChangeBrowser,
@@ -247,11 +261,16 @@ export function AppOverlays({
           activeTab={settingsTab}
           onTabChange={handleSettingsTabChange}
           onClose={onSettingsClose}
-          modelProviders={connectedProviders}
           modelItems={modelNavigation.items}
           modelSelectedIndex={modelNavigation.selectedIndex}
           onModelSelect={handleModelSelect}
           onModelHoverIndex={modelNavigation.setSelectedIndex}
+          modelSearch={modelSearch}
+          onModelSearchChange={onModelSearchChange}
+          showAllProviders={showAllProviders}
+          onToggleShowAllProviders={onToggleShowAllProviders}
+          showRecommendedOnly={showRecommendedOnly}
+          onToggleShowRecommendedOnly={onToggleShowRecommendedOnly}
           allProviders={PROVIDERS}
           detectedProviders={detectedProviders}
           providerSelectedIndex={providerNavigation.selectedIndex}
@@ -278,7 +297,7 @@ export function AppOverlays({
           })()}
           onModelHandleKeyEvent={modelTabHandleKeyEvent}
           onProviderHandleKeyEvent={providerTabHandleKeyEvent}
-          onBackFromModelPicker={() => setSelectingModelFor(null)}
+          onBackFromModelPicker={onBackFromModelPicker}
           onBackFromProviderDetail={handleProviderDetailBack}
         />
       </box>

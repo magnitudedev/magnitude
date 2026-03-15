@@ -1,7 +1,3 @@
-/**
- * Default primary/secondary/browser model mappings per provider.
- */
-
 export const MODEL_DEFAULTS: Record<string, { primary: string; secondary: string; browser: string }> = {
   'anthropic': { primary: 'claude-opus-4-6', secondary: 'claude-sonnet-4-6', browser: 'claude-haiku-4-5' },
   'openai': { primary: 'gpt-5.3-codex', secondary: 'gpt-5.3-codex', browser: 'gpt-5.3-codex' },
@@ -30,5 +26,5 @@ export function getDefaultModels(
   if (isOAuth && MODEL_OAUTH_DEFAULTS[providerId]) {
     return MODEL_OAUTH_DEFAULTS[providerId]
   }
-  return MODEL_DEFAULTS[providerId] ?? { primary: '', secondary: '', browser: '' }
+  return MODEL_DEFAULTS[providerId]!
 }

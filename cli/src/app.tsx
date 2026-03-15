@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentRoutingState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, getLatestInProgressArtifactStream } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, getLatestInProgressArtifactStream } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -30,11 +30,10 @@ import { useModelSelectNavigation } from './hooks/use-model-select-navigation'
 import { useProviderSelectNavigation } from './hooks/use-provider-select-navigation'
 import type { SettingsTab } from './hooks/use-settings-navigation'
 import { useAuthFlow } from './hooks/use-auth-flow'
-
 import { type WizardStep } from './components/setup-wizard-overlay'
 import { AppOverlays } from './components/app-overlays'
 
-import { getDefaultModels } from './utils/model-preferences'
+import { buildModelPickerItems, filterModelPickerItems, resolveSlotDefaultSelection } from './utils/model-picker'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
 import { readFileSync } from 'fs'
@@ -134,6 +133,9 @@ function AppInner({
   const [browserModel, setBrowserModelState] = useState<ModelSelection | null>(null)
 
   const [preferencesSelectedIndex, setPreferencesSelectedIndex] = useState(0)
+  const [showAllProviders, setShowAllProviders] = useState(false)
+  const [showRecommendedOnly, setShowRecommendedOnly] = useState(false)
+  const [modelSearch, setModelSearch] = useState('')
   const [providerDetailId, setProviderDetailId] = useState<string | null>(null)
   const [providerDetailSelectedIndex, setProviderDetailSelectedIndex] = useState(0)
   const [providerRefreshKey, setProviderRefreshKey] = useState(0)
@@ -154,8 +156,13 @@ function AppInner({
   const turnStartTimeRef = useRef<number | null>(null)
   const hasAnimatedRef = useRef(skipAnimation)
   const initClientRef = useRef<(() => Promise<AgentClient>) | null>(null)
-  const [modelsLoaded, setModelsLoaded] = useState(0)
 
+  const resetModelPickerState = useCallback(() => {
+    setModelSearch('')
+    setShowAllProviders(false)
+    setShowRecommendedOnly(false)
+    setSelectingModelFor(null)
+  }, [])
 
   const formatFooterTokens = (n: number) => {
     if (n >= 1000) {
@@ -274,8 +281,6 @@ function AppInner({
   useEffect(() => {
     let mounted = true
     let c: AgentClient | null = null
-
-    setModelsLoaded(n => n + 1)
 
     // Register skills as slash commands (fire-and-forget, non-blocking)
     scanSkills(process.cwd()).then((skills) => {
@@ -872,50 +877,54 @@ function AppInner({
     return actions
   }, [providerDetailStatus])
 
-  const connectedProviders = useMemo(() => {
-    const connectedIds = new Set(detectedProviders.map(d => d.provider.id))
-    return PROVIDERS.filter(p => connectedIds.has(p.id))
-  }, [detectedProviders, modelsLoaded])
+  const connectedProviderIds = useMemo(
+    () => new Set(detectedProviders.map(d => d.provider.id)),
+    [detectedProviders],
+  )
+
+  const connectedProviders = useMemo(
+    () => PROVIDERS.filter(p => connectedProviderIds.has(p.id)),
+    [connectedProviderIds],
+  )
+
+  const authStatusesByProviderId = useMemo(() => {
+    const map = new Map<string, ProviderAuthMethodStatus | null>()
+    if (providerDetailId) {
+      map.set(providerDetailId, providerDetailStatus)
+    }
+    return map
+  }, [providerDetailId, providerDetailStatus])
+
+  const detectedAuthTypeByProviderId = useMemo(() => {
+    const map = new Map<string, string | null>()
+    for (const detected of detectedProviders) {
+      map.set(detected.provider.id, detected.auth?.type ?? null)
+    }
+    return map
+  }, [detectedProviders])
 
   const modelItems = useMemo(() => {
-    const result: Array<{ type: 'model'; providerId: string; providerName: string; modelId: string; modelName: string }> = []
-    for (const provider of connectedProviders) {
-      if (provider.id === 'local') {
-        if (providerUiState?.localProviderConfig?.baseUrl && providerUiState?.localProviderConfig?.modelId) {
-          result.push({
-            type: 'model',
-            providerId: 'local',
-            providerName: provider.name,
-            modelId: providerUiState.localProviderConfig.modelId,
-            modelName: providerUiState.localProviderConfig.baseUrl,
-          })
-        }
-        continue
-      }
-
-      const oauthOnly = provider.oauthOnlyModelIds
-      const oauthOnlySet = oauthOnly ? new Set(oauthOnly) : null
-      const detected = detectedProviders.find(d => d.provider.id === provider.id)
-      const isOAuth = oauthOnlySet ? detected?.auth?.type === 'oauth' : false
-
-      for (const model of provider.models) {
-        if (oauthOnlySet && !isOAuth && oauthOnlySet.has(model.id)) continue
-        result.push({
-          type: 'model',
-          providerId: provider.id,
-          providerName: provider.name,
-          modelId: model.id,
-          modelName: model.name,
-        })
-      }
-    }
-    return result
-  }, [connectedProviders, detectedProviders, providerUiState])
+    if (!selectingModelFor) return []
+    return buildModelPickerItems({
+      allProviders: PROVIDERS,
+      connectedProviderIds,
+      selectingModelFor,
+      localProviderConfig: providerUiState?.localProviderConfig,
+      authStatusesByProviderId,
+      detectedAuthTypeByProviderId,
+    })
+  }, [selectingModelFor, connectedProviderIds, providerUiState, authStatusesByProviderId, detectedAuthTypeByProviderId])
 
   const filteredModelItems = useMemo(() => {
-    if (selectingModelFor !== 'browser') return modelItems
-    return modelItems.filter(item => isBrowserCompatible(item.providerId, item.modelId))
-  }, [modelItems, selectingModelFor])
+    if (!selectingModelFor) return []
+    return filterModelPickerItems({
+      items: modelItems,
+      selectingModelFor,
+      showAllProviders,
+      showRecommendedOnly,
+      search: modelSearch,
+    })
+  }, [modelItems, selectingModelFor, showAllProviders, showRecommendedOnly, modelSearch])
 
   const modelNavigation = useModelSelectNavigation(
     filteredModelItems,
@@ -934,20 +943,35 @@ function AppInner({
 
       if (showSetupWizardRef.current) {
         // Wizard mode: advance to models step with defaults for this provider
-        const detected = detectedProviders
-        const match = detected.find(d => d.provider.id === providerId)
-        const isOAuth = match?.auth?.type === 'oauth'
-        const defaults = getDefaultModels(providerId, isOAuth)
         const provider = getProvider(providerId)
-        const primaryModelId = defaults.primary || provider?.defaultModel || provider?.models[0]?.id || ''
-        const secondaryModelId = defaults.secondary || provider?.defaultSecondaryModel || provider?.defaultModel || provider?.models[0]?.id || ''
-        if (primaryModelId) setWizardPrimaryModel({ providerId, modelId: primaryModelId })
-        if (secondaryModelId) setWizardSecondaryModel({ providerId, modelId: secondaryModelId })
-        const browserModelId = defaults.browser || provider?.defaultBrowserModel
-        const browserSel = browserModelId
-          ? { providerId, modelId: browserModelId }
-          : detectBrowserModel(detected, providerId)
-        setWizardBrowserModel(browserSel)
+
+        const primarySelection = resolveSlotDefaultSelection({
+          allProviders: PROVIDERS,
+          connectedProviderIds,
+          slot: 'primary',
+          preferredProviderId: providerId,
+          detectedAuthTypeByProviderId,
+        })
+
+        const secondarySelection = resolveSlotDefaultSelection({
+          allProviders: PROVIDERS,
+          connectedProviderIds,
+          slot: 'secondary',
+          preferredProviderId: providerId,
+          detectedAuthTypeByProviderId,
+        })
+
+        const browserSelection = resolveSlotDefaultSelection({
+          allProviders: PROVIDERS,
+          connectedProviderIds,
+          slot: 'browser',
+          preferredProviderId: providerId,
+          detectedAuthTypeByProviderId,
+        })
+
+        if (primarySelection && provider?.models.some(model => model.id === primarySelection.modelId)) setWizardPrimaryModel(primarySelection)
+        if (secondarySelection) setWizardSecondaryModel(secondarySelection)
+        setWizardBrowserModel(browserSelection)
         setWizardConnectedProvider(providerName)
         setWizardStep('models')
       } else {
@@ -991,17 +1015,30 @@ function AppInner({
 
     if (match) {
       // Already authenticated — compute model defaults and go to models step
-      const isOAuth = match.auth?.type === 'oauth'
-      const defaults = getDefaultModels(providerId, isOAuth)
-      const primaryModelId = defaults.primary || provider.defaultModel || provider.models[0]?.id || ''
-      const secondaryModelId = defaults.secondary || provider.defaultSecondaryModel || provider.defaultModel || provider.models[0]?.id || ''
-      if (primaryModelId) setWizardPrimaryModel({ providerId, modelId: primaryModelId })
-      if (secondaryModelId) setWizardSecondaryModel({ providerId, modelId: secondaryModelId })
-      const browserModelId = defaults.browser || provider.defaultBrowserModel
-      const browserSel = browserModelId
-        ? { providerId, modelId: browserModelId }
-        : detectBrowserModel(detected, providerId)
-      setWizardBrowserModel(browserSel)
+      const primarySelection = resolveSlotDefaultSelection({
+        allProviders: PROVIDERS,
+        connectedProviderIds,
+        slot: 'primary',
+        preferredProviderId: providerId,
+      })
+
+      const secondarySelection = resolveSlotDefaultSelection({
+        allProviders: PROVIDERS,
+        connectedProviderIds,
+        slot: 'secondary',
+        preferredProviderId: providerId,
+      })
+
+      const browserSelection = resolveSlotDefaultSelection({
+        allProviders: PROVIDERS,
+        connectedProviderIds,
+        slot: 'browser',
+        preferredProviderId: providerId,
+      })
+
+      if (primarySelection) setWizardPrimaryModel(primarySelection)
+      if (secondarySelection) setWizardSecondaryModel(secondarySelection)
+      setWizardBrowserModel(browserSelection)
       setWizardConnectedProvider(provider.name)
       setWizardStep('models')
     } else if (provider.authMethods.length === 1) {
@@ -1168,16 +1205,19 @@ function AppInner({
 
 
   const handleChangePrimary = useCallback(() => {
+    resetModelPickerState()
     setSelectingModelFor('primary')
-  }, [])
+  }, [resetModelPickerState])
 
   const handleChangeSecondary = useCallback(() => {
+    resetModelPickerState()
     setSelectingModelFor('secondary')
-  }, [])
+  }, [resetModelPickerState])
 
   const handleChangeBrowser = useCallback(() => {
+    resetModelPickerState()
     setSelectingModelFor('browser')
-  }, [])
+  }, [resetModelPickerState])
 
   // Combined model tab keyboard handler — switches between primary/secondary/browser view and model picker
   const modelTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
@@ -1186,9 +1226,9 @@ function AppInner({
 
     // When in model picker sub-view
     if (selectingModelFor) {
-      // 'b' goes back to primary/secondary/browser view
-      if (key.name === 'b' && plain) {
-        setSelectingModelFor(null)
+      // Esc goes back to primary/secondary/browser view
+      if (key.name === 'escape') {
+        resetModelPickerState()
         return true
       }
       return modelNavigation.handleKeyEvent(key)
@@ -1210,7 +1250,7 @@ function AppInner({
       return true
     }
     return false
-  }, [settingsTab, selectingModelFor, modelNavigation.handleKeyEvent, preferencesSelectedIndex, handleChangePrimary, handleChangeSecondary, handleChangeBrowser])
+  }, [settingsTab, selectingModelFor, modelNavigation.handleKeyEvent, preferencesSelectedIndex, handleChangePrimary, handleChangeSecondary, handleChangeBrowser, resetModelPickerState])
 
   const providerNavigation = useProviderSelectNavigation(
     PROVIDERS,
@@ -1254,11 +1294,11 @@ function AppInner({
   const handleSettingsTabChange = useCallback((tab: SettingsTab) => {
     // If user navigates away from model tab while selecting, cancel selecting mode
     if (selectingModelFor && tab !== 'model') {
-      setSelectingModelFor(null)
+      resetModelPickerState()
     }
     setProviderDetailId(null)
     setSettingsTab(tab)
-  }, [selectingModelFor])
+  }, [selectingModelFor, resetModelPickerState])
 
   const openSetup = useCallback(() => {
     setWizardStep('provider')
@@ -1465,9 +1505,13 @@ function AppInner({
 
   const onSettingsClose = useCallback(() => {
     setSettingsTab(null)
-    setSelectingModelFor(null)
+    resetModelPickerState()
     setProviderDetailId(null)
-  }, [])
+  }, [resetModelPickerState])
+
+  const handleBackFromModelPicker = useCallback(() => {
+    resetModelPickerState()
+  }, [resetModelPickerState])
 
   const handleSubmitViaClientBoundary = useCallback((payload: {
     message: string
@@ -1540,6 +1584,12 @@ function AppInner({
       settingsTab={settingsTab}
       handleSettingsTabChange={handleSettingsTabChange}
       handleModelSelect={handleModelSelect}
+      modelSearch={modelSearch}
+      onModelSearchChange={setModelSearch}
+      showAllProviders={showAllProviders}
+      onToggleShowAllProviders={() => setShowAllProviders(prev => !prev)}
+      showRecommendedOnly={showRecommendedOnly}
+      onToggleShowRecommendedOnly={() => setShowRecommendedOnly(prev => !prev)}
       handleProviderSelect={handleProviderSelect}
       handleProviderDetailAction={handleProviderDetailAction}
       handleProviderDetailBack={handleProviderDetailBack}
@@ -1551,6 +1601,7 @@ function AppInner({
       modelNavigation={modelNavigation}
       providerNavigation={providerNavigation}
       onSettingsClose={onSettingsClose}
+      onBackFromModelPicker={handleBackFromModelPicker}
       showRecentChatsOverlay={showRecentChatsOverlay}
       recentChats={recentChats}
       recentChatsSelectedIndex={recentChatsSelectedIndex}
@@ -1707,7 +1758,7 @@ function AppInner({
 
   const modelSummary = primaryModel ? {
     provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
-    model: modelItems.find((item) => item.providerId === primaryModel.providerId && item.modelId === primaryModel.modelId)?.modelName ?? primaryModel.modelId,
+    model: getProvider(primaryModel.providerId)?.models.find(m => m.id === primaryModel.modelId)?.name ?? primaryModel.modelId,
   } : null
 
   const composerCanFocus = !showSetupWizard

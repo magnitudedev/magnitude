@@ -48,8 +48,11 @@ export const bootstrapProviderRuntime = Effect.gen(function* () {
   }
 
   if (browserModel) {
+    const browserDef = yield* catalog.getModel(browserModel.providerId, browserModel.modelId)
     if (
       connectedIds.has(browserModel.providerId) &&
+      browserDef &&
+      browserDef.status !== 'deprecated' &&
       isBrowserCompatible(browserModel.providerId, browserModel.modelId)
     ) {
       const providerAuth = (yield* auth.getAuth(browserModel.providerId)) ?? null

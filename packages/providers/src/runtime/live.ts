@@ -3,6 +3,7 @@ import {
   AppConfig,
   AuthStorage,
   AuthStorageLive,
+  CatalogCacheLive,
   ConfigStorageLive,
   GlobalStorageLive,
   computeContextLimits,
@@ -10,6 +11,7 @@ import {
 import { ProviderCatalog, ProviderState, ProviderAuth } from './contracts'
 import { PROVIDERS, getProvider } from '../registry'
 import { detectDefaultProvider, detectProviderAuthMethods, detectProviders } from '../detect'
+import { ModelCatalog, ModelCatalogLive } from '../catalog'
 
 import {
   peekSlot,
@@ -24,25 +26,35 @@ import {
 import { refreshAnthropicToken } from '../auth/anthropic-oauth'
 import { refreshOpenAIToken } from '../auth/openai-oauth'
 import { exchangeCopilotToken } from '../auth/copilot-oauth'
-import { initializeModels } from '../models-dev'
 
 export function makeProviderRuntimeLive() {
   const storageLayer = Layer.mergeAll(
     Layer.provide(ConfigStorageLive, GlobalStorageLive),
     Layer.provide(AuthStorageLive, GlobalStorageLive),
+    Layer.provide(CatalogCacheLive, GlobalStorageLive),
+  )
+
+  const catalogLayer = Layer.provide(ModelCatalogLive, storageLayer)
+
+  const providerCatalogLayer = Layer.effect(
+    ProviderCatalog,
+    Effect.gen(function* () {
+      const catalog = yield* ModelCatalog
+      return {
+        listProviders: () => Effect.succeed(PROVIDERS),
+        getProvider: (providerId: string) => Effect.succeed(getProvider(providerId) ?? null),
+        getProviderName: (providerId: string) => Effect.succeed(getProvider(providerId)?.name ?? providerId),
+        listModels: (providerId: string) => catalog.getModels(providerId),
+        getModel: (providerId: string, modelId: string) =>
+          Effect.map(catalog.getModels(providerId), (models) => models.find((model) => model.id === modelId) ?? null),
+        refresh: () => catalog.refresh(),
+      }
+    }),
   )
 
   const providerLayer = Layer.provide(
     Layer.mergeAll(
-      Layer.succeed(ProviderCatalog, {
-        listProviders: () => Effect.succeed(PROVIDERS),
-        getProvider: (providerId: string) => Effect.succeed(getProvider(providerId) ?? null),
-        getProviderName: (providerId: string) => Effect.succeed(getProvider(providerId)?.name ?? providerId),
-        listModels: (providerId: string) => Effect.succeed(getProvider(providerId)?.models ?? []),
-        getModel: (providerId: string, modelId: string) =>
-          Effect.succeed(getProvider(providerId)?.models.find((m) => m.id === modelId) ?? null),
-        refresh: () => Effect.promise(() => initializeModels()),
-      }),
+      providerCatalogLayer,
       Layer.effect(
         ProviderState,
         Effect.gen(function* () {
@@ -137,7 +149,7 @@ export function makeProviderRuntimeLive() {
         }),
       ),
     ),
-    storageLayer,
+    Layer.mergeAll(storageLayer, catalogLayer),
   )
 
   return Layer.mergeAll(storageLayer, providerLayer)

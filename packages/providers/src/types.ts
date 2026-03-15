@@ -41,17 +41,22 @@ export interface AuthMethodDef {
 }
 
 export interface ModelDefinition {
-  id: string              // API model ID, e.g. "claude-sonnet-4-5-20250929"
-  name: string            // Display name, e.g. "Claude Sonnet 4.5"
-  contextWindow?: number
+  id: string
+  name: string
+  contextWindow: number
+  supportsToolCalls: boolean
+  supportsReasoning: boolean
+  cost: { input: number; output: number; cache_read?: number; cache_write?: number }
+  family: string
+  releaseDate: string
   maxOutputTokens?: number
-  supportsToolCalls?: boolean
-  supportsReasoning?: boolean
-  // Extended fields from models.dev
-  cost?: { input: number; output: number; cache_read?: number; cache_write?: number }
-  family?: string
-  releaseDate?: string
+  supportsVision?: boolean
+  description?: string
   status?: 'alpha' | 'beta' | 'deprecated'
+  discovery?: {
+    primarySource: 'static' | 'models.dev' | 'openrouter-api'
+    fetchedAt?: string
+  }
 }
 
 export interface ProviderDefinition {
@@ -67,7 +72,3 @@ export interface ProviderDefinition {
   authMethods: AuthMethodDef[]  // All supported auth methods, in display order
   oauthOnlyModelIds?: string[]  // Model IDs that require OAuth (hidden for API key users)
 }
-
-
-
-

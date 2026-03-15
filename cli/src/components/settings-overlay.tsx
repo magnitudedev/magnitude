@@ -3,6 +3,7 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
+import { SingleLineInput } from './single-line-input'
 import { BOX_CHARS } from '../utils/ui-constants'
 import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus } from '@magnitudedev/agent'
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
@@ -36,11 +37,16 @@ interface SettingsOverlayProps {
   onTabChange: (tab: SettingsTab) => void
   onClose: () => void
   // Model tab — picker sub-view
-  modelProviders: ProviderDefinition[]
   modelItems: ModelSelectItem[]
   modelSelectedIndex: number
   onModelSelect: (providerId: string, modelId: string) => void
   onModelHoverIndex?: (index: number) => void
+  modelSearch: string
+  onModelSearchChange: (value: string) => void
+  showAllProviders: boolean
+  onToggleShowAllProviders: () => void
+  showRecommendedOnly: boolean
+  onToggleShowRecommendedOnly: () => void
   // Provider tab
   allProviders: ProviderDefinition[]
   detectedProviders: DetectedProvider[]
@@ -71,6 +77,19 @@ interface SettingsOverlayProps {
   onBackFromProviderDetail: () => void
 }
 
+function FilterCheckbox({ label, checked, onToggle }: { label: string; checked: boolean; onToggle: () => void }) {
+  const theme = useTheme()
+  const [hovered, setHovered] = useState(false)
+  const color = checked ? theme.primary : hovered ? theme.foreground : theme.muted
+  return (
+    <Button onClick={onToggle} onMouseOver={() => setHovered(true)} onMouseOut={() => setHovered(false)}>
+      <text style={{ fg: color }}>
+        {checked ? '[x]' : '[ ]'} {label}
+      </text>
+    </Button>
+  )
+}
+
 function resolveModelDisplay(
   selection: ModelSelection | null,
   modelItems: ModelSelectItem[],
@@ -80,9 +99,10 @@ function resolveModelDisplay(
   const item = modelItems.find(m => m.providerId === selection.providerId && m.modelId === selection.modelId)
   if (item) return { providerName: item.providerName, modelName: item.modelName }
   const provider = allProviders.find(p => p.id === selection.providerId)
+  const model = provider?.models.find(m => m.id === selection.modelId)
   return {
     providerName: provider?.name ?? selection.providerId,
-    modelName: selection.modelId,
+    modelName: model?.name ?? selection.modelId,
   }
 }
 
@@ -90,11 +110,16 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   activeTab,
   onTabChange,
   onClose,
-  modelProviders,
   modelItems,
   modelSelectedIndex,
   onModelSelect,
   onModelHoverIndex,
+  modelSearch,
+  onModelSearchChange,
+  showAllProviders,
+  onToggleShowAllProviders,
+  showRecommendedOnly,
+  onToggleShowRecommendedOnly,
   allProviders,
   detectedProviders,
   providerSelectedIndex,
@@ -127,7 +152,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
   // Group model items by provider for section headers
   const modelSections = useMemo(() => {
-    const groups: Array<{ providerName: string; entries: Array<{ item: ModelSelectItem; flatIndex: number }> }> = []
+    const groups: Array<{ providerId: string; providerName: string; connected: boolean; entries: Array<{ item: ModelSelectItem; flatIndex: number }> }> = []
     let currentProvider: string | null = null
     let currentGroup: typeof groups[number] | null = null
 
@@ -135,7 +160,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       const item = modelItems[i]
       if (item.providerId !== currentProvider) {
         currentProvider = item.providerId
-        currentGroup = { providerName: item.providerName, entries: [] }
+        currentGroup = {
+          providerId: item.providerId,
+          providerName: item.providerName,
+          connected: item.connected !== false,
+          entries: [],
+        }
         groups.push(currentGroup)
       }
       currentGroup!.entries.push({ item, flatIndex: i })
@@ -157,7 +187,13 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
     if (key.name === 'escape') {
       key.preventDefault()
-      onClose()
+      if (activeTab === 'provider' && providerDetailStatus) {
+        onBackFromProviderDetail()
+      } else if (activeTab === 'model' && selectingModelFor) {
+        onBackFromModelPicker()
+      } else {
+        onClose()
+      }
       return
     }
 
@@ -170,18 +206,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     if (key.name === 'right' && plain) {
       key.preventDefault()
       onTabChange('model')
-      return
-    }
-
-    if (activeTab === 'model' && selectingModelFor && key.name === 'b' && plain && !key.shift) {
-      key.preventDefault()
-      onBackFromModelPicker()
-      return
-    }
-
-    if (activeTab === 'provider' && providerDetailStatus && key.name === 'b' && plain && !key.shift) {
-      key.preventDefault()
-      onBackFromProviderDetail()
       return
     }
 
@@ -292,39 +316,72 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                 },
               }}
             >
-              <box style={{ paddingLeft: 1, paddingBottom: 1 }}>
+              <box style={{ paddingLeft: 1, paddingBottom: 1, flexDirection: 'column' }}>
                 <text style={{ fg: theme.warning }}>
-                  Select a model for your <span attributes={TextAttributes.BOLD}>{selectingModelFor === 'primary' ? 'Primary' : selectingModelFor === 'secondary' ? 'Secondary' : 'Browser Agent'}</span> model. Press b to go back.
+                  Select a model for your <span attributes={TextAttributes.BOLD}>{selectingModelFor === 'primary' ? 'Primary' : selectingModelFor === 'secondary' ? 'Secondary' : 'Browser Agent'}</span> model. Press Esc to go back.
                 </text>
+                <box style={{ paddingTop: 1, paddingRight: 1, flexDirection: 'column' }}>
+                  <box style={{
+                    borderStyle: 'single',
+                    borderColor: theme.border,
+                    customBorderChars: BOX_CHARS,
+                    paddingLeft: 1,
+                  }}>
+                    <SingleLineInput
+                      value={modelSearch}
+                      onChange={onModelSearchChange}
+                      placeholder="Search providers or models"
+                    />
+                  </box>
+                  <box style={{ flexDirection: 'row', gap: 2 }}>
+                    <FilterCheckbox label="Connected only" checked={!showAllProviders} onToggle={onToggleShowAllProviders} />
+                    <FilterCheckbox label="Recommended only" checked={showRecommendedOnly} onToggle={onToggleShowRecommendedOnly} />
+                  </box>
+                </box>
               </box>
-              {modelSections.length === 0 ? (
+              {modelItems.length === 0 ? (
                 <box style={{ paddingLeft: 1 }}>
                   <text style={{ fg: theme.muted }}>No models available.</text>
                 </box>
+              ) : modelSections.length === 0 ? (
+                <box style={{ paddingLeft: 1 }}>
+                  <text style={{ fg: theme.muted }}>No search matches.</text>
+                </box>
               ) : (
                 modelSections.map((section) => (
-                  <box key={section.providerName} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                  <box key={section.providerId} style={{ flexDirection: 'column', paddingBottom: 1 }}>
                     <box style={{ paddingLeft: 1, paddingBottom: 0 }}>
                       <text style={{ fg: theme.muted }}>
                         <span attributes={TextAttributes.BOLD}>{section.providerName}</span>
+                        {!section.connected && <span attributes={TextAttributes.DIM}> — not connected</span>}
                       </text>
                     </box>
                     {section.entries.map(({ item, flatIndex }) => {
                       const isSelected = flatIndex === modelSelectedIndex
+                      const selectable = item.selectable !== false
+
                       return (
                         <Button
                           key={`${item.providerId}:${item.modelId}`}
-                          onClick={() => onModelSelect(item.providerId, item.modelId)}
-                          onMouseOver={() => onModelHoverIndex?.(flatIndex)}
+                          onClick={() => {
+                            if (selectable) onModelSelect(item.providerId, item.modelId)
+                          }}
+                          onMouseOver={() => {
+                            if (selectable) onModelHoverIndex?.(flatIndex)
+                          }}
                           style={{
-                            flexDirection: 'row',
+                            flexDirection: 'column',
                             paddingLeft: 1,
                             paddingRight: 1,
                             backgroundColor: isSelected ? theme.surface : undefined,
                           }}
                         >
-                          <text style={{ fg: isSelected ? theme.primary : theme.foreground, flexGrow: 1 }}>
-                            {isSelected ? '> ' : '  '}{item.modelName}
+                          <text style={{ fg: !selectable ? theme.muted : isSelected ? theme.primary : theme.foreground, flexGrow: 1 }}>
+                            {isSelected ? '> ' : '  '}
+                            <span style={{ fg: item.recommended ? theme.primary : undefined }}>
+                              {item.recommended ? '[*] ' : '    '}
+                            </span>
+                            {item.modelName}
                             <span attributes={TextAttributes.DIM}> — {item.modelId}</span>
                           </text>
                         </Button>
@@ -597,7 +654,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             {/* Detail footer */}
             <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
               <text style={{ fg: theme.muted }}>
-                <span attributes={TextAttributes.DIM}>Press b or Esc to go back</span>
+                <span attributes={TextAttributes.DIM}>Press Esc to go back</span>
               </text>
             </box>
           </>

@@ -26,7 +26,7 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
     // Anthropic
     'anthropic/claude-opus-4.6', 'anthropic/claude-opus-4.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-sonnet-4.5', 'anthropic/claude-haiku-4.5',
     // Qwen
-    'qwen/qwen3.5-397b-a17b', 'qwen/qwen3.5-122b-a10b', 'qwen/qwen3.5-35b-a3b', 'qwen/qwen3.5-27b',
+    'qwen/qwen3.5-397b-a17b', 'qwen/qwen3.5-122b-a10b', 'qwen/qwen3.5-35b-a3b', 'qwen/qwen3.5-27b', 'qwen/qwen3.5-9b',
     'qwen/qwen3-max-thinking', 'qwen/qwen3.5-plus-02-15', 'qwen/qwen3.5-flash-02-23', 'qwen/qwen3-coder-next',
     // Kimi
     'moonshotai/kimi-k2.5', 'moonshotai/kimi-k2-thinking',
