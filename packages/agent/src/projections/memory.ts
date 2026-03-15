@@ -266,9 +266,15 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         flushedMessages.push({ type: 'comms_inbox', source: 'system', entries: commsEntries })
       }
 
+      let messages: readonly Message[] = [...fork.messages, ...flushedMessages]
+      const lastMessage = messages[messages.length - 1]
+      if (lastMessage && lastMessage.source === 'agent') {
+        messages = appendSystemEntries(messages, [{ kind: 'noop' }])
+      }
+
       return {
         ...fork,
-        messages: [...fork.messages, ...flushedMessages],
+        messages,
         queuedMessages: [],
         currentTurnId: event.turnId,
         currentTurnToolCalls: [],

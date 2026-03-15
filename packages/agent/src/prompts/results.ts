@@ -6,6 +6,7 @@
  */
 
 import type { TurnToolCall, InspectResult } from '../events'
+import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from './constants'
 import { type ContentPart } from '../content'
@@ -53,4 +54,9 @@ export function formatInterrupted(): string {
 /** Wrap error message */
 export function formatError(message: string): string {
   return `<error>${message}</error>`
+}
+
+/** Noop turn — agent continued without taking any actions */
+export function formatNoop(): string {
+  return `<noop>No actions were taken. Use <${TURN_CONTROL_YIELD}/> if you have nothing more to do, instead of <${TURN_CONTROL_NEXT}/>.</noop>`
 }

@@ -10,7 +10,7 @@ import type { ConversationEntry } from '../projections/conversation'
 import type { ContentPart, ImageMediaType } from '../content'
 import type { InspectResult, TurnToolCall } from '../events'
 import type { ObservationPart } from '@magnitudedev/agent-definition'
-import { formatResults, formatInterrupted, formatError } from './results'
+import { formatResults, formatInterrupted, formatError, formatNoop } from './results'
 
 
 export type CommsAttachment =
@@ -42,6 +42,7 @@ export type SystemEntry =
   | { readonly kind: 'reminder'; readonly text: string }
   | { readonly kind: 'interrupted' }
   | { readonly kind: 'error'; readonly message: string }
+  | { readonly kind: 'noop' }
   | { readonly kind: 'fork_result'; readonly taskId: string | null; readonly role: string; readonly name: string; readonly result: unknown }
   | { readonly kind: 'agent_activity'; readonly entries: readonly AgentActivityEntry[] }
   | { readonly kind: 'autonomous_ended'; readonly taskId: string }
@@ -175,6 +176,8 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
       push(`${formatInterrupted()}\n`)
     } else if (entry.kind === 'error') {
       push(`${formatError(entry.message)}\n`)
+    } else if (entry.kind === 'noop') {
+      push(`${formatNoop()}\n`)
     } else if (entry.kind === 'fork_result') {
       push(`${formatTaskResult(entry.taskId, entry.role, entry.name, entry.result)}\n`)
     } else if (entry.kind === 'agent_activity') {
