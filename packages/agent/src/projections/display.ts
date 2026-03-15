@@ -142,6 +142,7 @@ export interface ForkActivityToolCounts {
   readonly edits: number
   readonly searches: number
   readonly webSearches: number
+  readonly webFetches: number
   readonly artifactWrites: number
   readonly artifactUpdates: number
   readonly clicks: number
@@ -343,7 +344,7 @@ const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: st
 const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: string }, unknown>(forkToolStepSignalDef, 'Display')
 
 const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
-  commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
+  commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
 }
 
 function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
@@ -356,6 +357,7 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): Fo
     case 'fileSearch':
     case 'gather': return { ...counts, searches: counts.searches + 1 }
     case 'webSearch': return { ...counts, webSearches: counts.webSearches + 1 }
+    case 'webFetch': return { ...counts, webFetches: counts.webFetches + 1 }
     case 'artifactWrite': return { ...counts, artifactWrites: counts.artifactWrites + 1 }
     case 'artifactUpdate': return { ...counts, artifactUpdates: counts.artifactUpdates + 1 }
     case 'click':

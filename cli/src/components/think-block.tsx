@@ -48,7 +48,7 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
   let evaluations = 0
   for (const step of steps) {
     if (step.type !== 'tool') continue
-    if (step.toolKey === 'webSearch') webSearches++
+    if (step.toolKey === 'webSearch' || step.toolKey === 'webFetch') webSearches++
     else if (step.toolKey === 'shell') commands++
     else if (step.toolKey === 'fileRead') reads++
     else if (step.toolKey === 'fileWrite') writes++

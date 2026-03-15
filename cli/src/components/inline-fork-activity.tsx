@@ -26,7 +26,7 @@ function formatDuration(seconds: number): string {
 
 function getTotalToolCount(counts: ForkActivityToolCounts): number {
   return counts.reads + counts.writes + counts.edits + counts.commands
-    + counts.webSearches + counts.artifactWrites + counts.artifactUpdates
+    + counts.webSearches + counts.webFetches + counts.artifactWrites + counts.artifactUpdates
     + counts.searches + counts.clicks + counts.navigations + counts.inputs
     + counts.evaluations + counts.other
 }
@@ -48,7 +48,8 @@ const TOOL_DISPLAY: { key: keyof ForkActivityToolCounts; verb: string; noun: str
   { key: 'writes', verb: 'Wrote', noun: 'file', nounPlural: 'files' },
   { key: 'edits', verb: 'Edited', noun: 'file', nounPlural: 'files' },
   { key: 'commands', verb: 'Ran', noun: 'command', nounPlural: 'commands' },
-  { key: 'webSearches', verb: '', noun: 'web search', nounPlural: 'web searches' },
+  { key: 'webSearches', verb: 'Ran', noun: 'web search', nounPlural: 'web searches' },
+  { key: 'webFetches', verb: 'Fetched', noun: 'page', nounPlural: 'pages' },
   { key: 'navigations', verb: 'Visited', noun: 'page', nounPlural: 'pages' },
   { key: 'clicks', verb: 'Clicked', noun: 'element', nounPlural: 'elements' },
   { key: 'inputs', verb: 'Typed', noun: 'input', nounPlural: 'inputs' },
