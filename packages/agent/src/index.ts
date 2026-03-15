@@ -73,7 +73,12 @@ export type { CommsAttachment, CommsEntry, SystemEntry, AgentActivityEntry } fro
 export { CompactionProjection } from './projections/compaction'
 export type { ForkCompactionState } from './projections/compaction'
 
-export { DisplayProjection } from './projections/display'
+export {
+  DisplayProjection,
+  getInProgressArtifactStreams,
+  getLatestInProgressArtifactStream,
+  getArtifactStreamForPanel,
+} from './projections/display'
 export type {
   DisplayState,
   DisplayMessage,
@@ -88,6 +93,7 @@ export type {
   ForkActivityMessage,
   ForkActivityToolCounts,
   ApprovalRequestMessage,
+  InProgressArtifactView,
 } from './projections/display'
 
 export { TurnProjection } from './projections/turn'
@@ -148,6 +154,7 @@ export type {
   ShellState,
   ReadState, WriteState, EditState, TreeState, TreeEntry, SearchState, SearchMatch,
   Phase, WebSearchState, WebFetchState, BrowserState,
+  ArtifactStreamPreview, ArtifactWriteStreamPreview, ArtifactUpdateStreamPreview,
   ArtifactVisualState, ArtifactSyncState, AgentCreateState, AgentIdState, AgentMessageState,
   ParentMessageState, SkillState,
 } from './visuals'

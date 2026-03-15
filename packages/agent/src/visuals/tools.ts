@@ -302,12 +302,35 @@ export const evaluateReducer = defineBrowserReducer({
 // Artifact Tool Reducers
 // =============================================================================
 
+export interface ArtifactWriteStreamPreview {
+  mode: 'write'
+  contentSoFar: string
+  charCount: number
+  lineCount: number
+}
+
+export interface ArtifactUpdateStreamPreview {
+  mode: 'update'
+  oldStringSoFar: string
+  newStringSoFar: string
+  childPhase: 'idle' | 'streaming_old' | 'streaming_new'
+  replaceAll: boolean
+}
+
+export type ArtifactStreamPreview = ArtifactWriteStreamPreview | ArtifactUpdateStreamPreview
+
 export interface ArtifactVisualState {
   phase: Phase
   name: string
+  preview?: ArtifactStreamPreview
 }
 
-function artifactReduceName(state: ArtifactVisualState, event: ToolCallEvent): ArtifactVisualState {
+function countLines(text: string): number {
+  if (text.length === 0) return 0
+  return text.split('\n').length
+}
+
+function artifactReduceBase(state: ArtifactVisualState, event: ToolCallEvent): ArtifactVisualState {
   switch (event._tag) {
     case 'ToolInputFieldValue':
       if (event.field === 'id') return { ...state, name: String(event.value) }
@@ -348,19 +371,139 @@ export const artifactSyncReducer = reducer<ArtifactSyncState>({
 export const artifactReadReducer = reducer<ArtifactVisualState>({
   toolKey: 'artifactRead',
   initial: { phase: 'streaming', name: '' },
-  reduce: artifactReduceName,
+  reduce: artifactReduceBase,
 })
 
 export const artifactWriteReducer = reducer<ArtifactVisualState>({
   toolKey: 'artifactWrite',
-  initial: { phase: 'streaming', name: '' },
-  reduce: artifactReduceName,
+  initial: {
+    phase: 'streaming',
+    name: '',
+    preview: {
+      mode: 'write',
+      contentSoFar: '',
+      charCount: 0,
+      lineCount: 0,
+    },
+  },
+  reduce(state, event) {
+    const next = artifactReduceBase(state, event)
+    if (event._tag === 'ToolInputBodyChunk' && event.field === 'content') {
+      const preview = next.preview?.mode === 'write'
+        ? next.preview
+        : { mode: 'write' as const, contentSoFar: '', charCount: 0, lineCount: 0 }
+      const contentSoFar = preview.contentSoFar + event.text
+      return {
+        ...next,
+        preview: {
+          mode: 'write',
+          contentSoFar,
+          charCount: contentSoFar.length,
+          lineCount: countLines(contentSoFar),
+        },
+      }
+    }
+    return next
+  },
 })
 
 export const artifactUpdateReducer = reducer<ArtifactVisualState>({
   toolKey: 'artifactUpdate',
-  initial: { phase: 'streaming', name: '' },
-  reduce: artifactReduceName,
+  initial: {
+    phase: 'streaming',
+    name: '',
+    preview: {
+      mode: 'update',
+      oldStringSoFar: '',
+      newStringSoFar: '',
+      childPhase: 'idle',
+      replaceAll: false,
+    },
+  },
+  reduce(state, event) {
+    const next = artifactReduceBase(state, event)
+    const preview = next.preview?.mode === 'update'
+      ? next.preview
+      : {
+          mode: 'update' as const,
+          oldStringSoFar: '',
+          newStringSoFar: '',
+          childPhase: 'idle' as const,
+          replaceAll: false,
+        }
+
+    switch (event._tag) {
+      case 'ToolInputFieldValue':
+        if (event.field === 'replaceAll') {
+          return {
+            ...next,
+            preview: {
+              ...preview,
+              replaceAll: Boolean(event.value),
+            },
+          }
+        }
+        return next
+
+      case 'ToolInputChildStarted':
+        if (event.field === 'oldString') {
+          return {
+            ...next,
+            preview: {
+              ...preview,
+              childPhase: 'streaming_old',
+            },
+          }
+        }
+        if (event.field === 'newString') {
+          return {
+            ...next,
+            preview: {
+              ...preview,
+              childPhase: 'streaming_new',
+            },
+          }
+        }
+        return next
+
+      case 'ToolInputBodyChunk': {
+        if (event.field === 'oldString') {
+          return {
+            ...next,
+            preview: {
+              ...preview,
+              oldStringSoFar: preview.oldStringSoFar + event.text,
+            },
+          }
+        }
+        if (event.field === 'newString') {
+          return {
+            ...next,
+            preview: {
+              ...preview,
+              newStringSoFar: preview.newStringSoFar + event.text,
+            },
+          }
+        }
+        return next
+      }
+
+      case 'ToolInputChildComplete':
+        if (event.field === 'oldString' || event.field === 'newString') {
+          return {
+            ...next,
+            preview: {
+              ...preview,
+              childPhase: 'idle',
+            },
+          }
+        }
+        return next
+
+      default:
+        return next
+    }
+  },
 })
 
 // =============================================================================

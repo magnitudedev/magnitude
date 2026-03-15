@@ -1,7 +1,10 @@
-import React, { memo, useEffect, useRef, useState } from 'react'
+import React, { memo } from 'react'
+import { useRenderer } from '@opentui/react'
+import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { useTheme } from '../hooks/use-theme'
 import { buildMarkdownColorPalette } from '../utils/theme'
-import { ChunksView, parseStreamingContent } from './markdown-content'
+import { useStreamingMarkdownCache } from '../hooks/use-streaming-markdown-cache'
+import { BlockRenderer } from './block-renderer'
 
 interface AssistantMessageProps {
   content: string
@@ -17,57 +20,22 @@ export const AssistantMessage = memo(function AssistantMessage({
   onOpenArtifact,
 }: AssistantMessageProps) {
   const theme = useTheme()
+  const renderer = useRenderer()
   const markdownPalette = buildMarkdownColorPalette(theme)
-  const [displayedLength, setDisplayedLength] = useState(content.length)
-  const isLinearDrainRef = useRef(!isStreaming)
-
-  useEffect(() => {
-    if (isStreaming) {
-      isLinearDrainRef.current = false
-    } else {
-      isLinearDrainRef.current = true
-    }
-  }, [isStreaming])
-
-  useEffect(() => {
-    if (isInterrupted) setDisplayedLength(content.length)
-  }, [isInterrupted, content.length])
-
-  useEffect(() => {
-    if (!isStreaming && displayedLength >= content.length) return
-
-    const interval = setInterval(() => {
-      setDisplayedLength((prev) => {
-        const target = content.length
-        if (prev >= target) return prev
-
-        if (isLinearDrainRef.current) {
-          return Math.min(target, prev + 8)
-        }
-
-        const remaining = target - prev
-        const speed = Math.max(1, Math.floor(remaining * 0.15))
-        return Math.min(target, prev + speed)
-      })
-    }, 33)
-
-    return () => clearInterval(interval)
-  }, [content.length, displayedLength, isStreaming])
-
-  const displayContent = content.slice(0, displayedLength)
-  const { chunks, pendingText } = parseStreamingContent(displayContent, { palette: markdownPalette })
-  const showCursor = isStreaming || displayedLength < content.length
+  const { displayedContent, showCursor } = useStreamingReveal(content, isStreaming, isInterrupted)
+  const codeBlockWidth = Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
+  const { blocks, pendingText } = useStreamingMarkdownCache(displayedContent, {
+    palette: markdownPalette,
+    codeBlockWidth,
+    streaming: isStreaming,
+  })
 
   return (
     <box style={{ flexDirection: 'column', marginBottom: 1 }}>
-      <ChunksView
-        chunks={chunks}
-        codeBorderColor={markdownPalette.codeBorderColor}
-        headerColor={markdownPalette.codeHeaderFg}
-        textColor={markdownPalette.codeTextFg}
+      <BlockRenderer
+        blocks={blocks}
         foreground={theme.foreground}
         showCursor={showCursor && !pendingText}
-        onCodeBlockHoverChange={() => {}}
         onOpenArtifact={onOpenArtifact}
       />
       {pendingText && (

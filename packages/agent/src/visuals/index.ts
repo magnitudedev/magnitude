@@ -57,6 +57,9 @@ export type {
   WebSearchState, WebFetchState,
 
   BrowserState,
+  ArtifactStreamPreview,
+  ArtifactWriteStreamPreview,
+  ArtifactUpdateStreamPreview,
   ArtifactVisualState,
   ArtifactSyncState,
   AgentCreateState,

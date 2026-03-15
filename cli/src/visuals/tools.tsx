@@ -8,12 +8,16 @@
 import { useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
+import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { ShimmerText } from '../components/shimmer-text'
 import { Button } from '../components/button'
+import { MarkdownContent, StreamingMarkdownContent } from '../components/markdown-content'
+import { BOX_CHARS } from '../utils/ui-constants'
 import { render } from './define'
 import type { ToolVisualRenderer } from './define'
 
 import { isActive } from '@magnitudedev/agent'
+import { useSelectedArtifact } from '../hooks/use-artifacts'
 
 import type {
   WebSearchState,
@@ -54,6 +58,12 @@ function pathSummary(paths: string[], max: number = 3): string {
   })
   const rest = paths.length - max
   return rest > 0 ? `${shown.join(', ')} +${rest}` : shown.join(', ')
+}
+
+function tailPreview(text: string): string {
+  const lines = text.split('\n')
+  const lastLines = lines.slice(-10)
+  return lastLines.join('\n')
 }
 
 // =============================================================================
@@ -313,6 +323,12 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
   const isError = state.phase === 'error'
   const [isHovered, setIsHovered] = useState(false)
   const name = state.name
+  const preview = state.preview?.mode === 'write' ? state.preview : null
+  const selectedArtifact = useSelectedArtifact()
+  const isOpenInPanel = selectedArtifact === name
+  const fullPreviewContent = preview?.contentSoFar ?? ''
+  const { displayedContent: revealedFull, showCursor: previewCursor } = useStreamingReveal(fullPreviewContent, !done)
+  const revealedPreview = tailPreview(revealedFull)
 
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -321,27 +337,46 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
         onMouseOver={() => setIsHovered(true)}
         onMouseOut={() => setIsHovered(false)}
       >
-        <text style={{ wrapMode: 'word' }}>
-          <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ ✎ '}</span>
-          {!done ? (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Writing artifact '}</span>
-              <span style={{ fg: theme.muted }}>{name || '...'}</span>
-              <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-            </>
-          ) : isError ? (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Write artifact '}</span>
-              <span style={{ fg: theme.muted }}>{name}</span>
-              <span style={{ fg: theme.error }}>{' · Error'}</span>
-            </>
-          ) : (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Wrote artifact '}</span>
-              <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
-            </>
+        <box style={{ flexDirection: 'column' }}>
+          <text style={{ wrapMode: 'word' }}>
+            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ ✎ '}</span>
+            {!done ? (
+              <>
+                <span style={{ fg: theme.foreground }}>{'Writing artifact '}</span>
+                <span style={{ fg: theme.muted }}>{name || '...'}</span>
+                <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+              </>
+            ) : isError ? (
+              <>
+                <span style={{ fg: theme.foreground }}>{'Write artifact '}</span>
+                <span style={{ fg: theme.muted }}>{name}</span>
+                <span style={{ fg: theme.error }}>{' · Error'}</span>
+              </>
+            ) : (
+              <>
+                <span style={{ fg: theme.foreground }}>{'Wrote artifact '}</span>
+                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
+              </>
+            )}
+          </text>
+          {!done && preview && (
+            <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+              {`${preview.charCount} chars · ${preview.lineCount} lines`}
+            </text>
           )}
-        </text>
+          {!done && preview && preview.contentSoFar.length > 0 && !isOpenInPanel && (
+            <box style={{
+              borderStyle: 'single',
+              borderColor: isHovered ? theme.link : theme.border || theme.muted,
+              customBorderChars: BOX_CHARS,
+              paddingLeft: 1,
+              paddingRight: 1,
+              height: 12,
+            }}>
+              <StreamingMarkdownContent content={revealedPreview} showCursor={previewCursor} />
+            </box>
+          )}
+        </box>
       </Button>
     </box>
   )
@@ -353,6 +388,23 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
   const isError = state.phase === 'error'
   const [isHovered, setIsHovered] = useState(false)
   const name = state.name
+  const preview = state.preview?.mode === 'update' ? state.preview : null
+  const selectedArtifact = useSelectedArtifact()
+  const isOpenInPanel = selectedArtifact === name
+  const fullUpdateContent = preview?.newStringSoFar ?? ''
+  const { displayedContent: revealedUpdateFull, showCursor: updatePreviewCursor } = useStreamingReveal(fullUpdateContent, !done)
+  const revealedUpdatePreview = tailPreview(revealedUpdateFull)
+  const oldPreview = tailPreview(preview?.oldStringSoFar ?? '')
+  const showOldPreview = !done
+    && !!preview
+    && preview.childPhase === 'streaming_old'
+    && preview.oldStringSoFar.length > 0
+    && !isOpenInPanel
+  const showNewPreview = !done
+    && !!preview
+    && preview.childPhase === 'streaming_new'
+    && preview.newStringSoFar.length > 0
+    && !isOpenInPanel
 
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -361,27 +413,61 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
         onMouseOver={() => setIsHovered(true)}
         onMouseOut={() => setIsHovered(false)}
       >
-        <text style={{ wrapMode: 'word' }}>
-          <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ ✎ '}</span>
-          {!done ? (
+        <box style={{ flexDirection: 'column' }}>
+          <text style={{ wrapMode: 'word' }}>
+            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ ✎ '}</span>
+            {!done ? (
+              <>
+                <span style={{ fg: theme.foreground }}>{'Updating artifact '}</span>
+                <span style={{ fg: theme.muted }}>{name || '...'}</span>
+                <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+              </>
+            ) : isError ? (
+              <>
+                <span style={{ fg: theme.foreground }}>{'Update artifact '}</span>
+                <span style={{ fg: theme.muted }}>{name}</span>
+                <span style={{ fg: theme.error }}>{' · Error'}</span>
+              </>
+            ) : (
+              <>
+                <span style={{ fg: theme.foreground }}>{'Updated artifact '}</span>
+                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
+              </>
+            )}
+          </text>
+          {!done && preview && (
             <>
-              <span style={{ fg: theme.foreground }}>{'Updating artifact '}</span>
-              <span style={{ fg: theme.muted }}>{name || '...'}</span>
-              <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-            </>
-          ) : isError ? (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Update artifact '}</span>
-              <span style={{ fg: theme.muted }}>{name}</span>
-              <span style={{ fg: theme.error }}>{' · Error'}</span>
-            </>
-          ) : (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Updated artifact '}</span>
-              <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
+              <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+                {`old: ${preview.oldStringSoFar.length} chars → new: ${preview.newStringSoFar.length} chars`}
+                {preview.replaceAll ? ' · replace all' : ''}
+              </text>
+              {showOldPreview && (
+                <box style={{
+                  borderStyle: 'single',
+                  borderColor: theme.warning,
+                  customBorderChars: BOX_CHARS,
+                  paddingLeft: 1,
+                  paddingRight: 1,
+                  height: 12,
+                }}>
+                  <StreamingMarkdownContent content={oldPreview} />
+                </box>
+              )}
+              {showNewPreview && (
+                <box style={{
+                  borderStyle: 'single',
+                  borderColor: theme.success,
+                  customBorderChars: BOX_CHARS,
+                  paddingLeft: 1,
+                  paddingRight: 1,
+                  height: 12,
+                }}>
+                  <StreamingMarkdownContent content={revealedUpdatePreview} showCursor={updatePreviewCursor} />
+                </box>
+              )}
             </>
           )}
-        </text>
+        </box>
       </Button>
     </box>
   )

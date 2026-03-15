@@ -826,7 +826,7 @@ function resolveChildBinding(
 
   if (binding.childTags) {
     const ct = binding.childTags.find(ct => (ct.tag) === childTagName)
-    if (ct) return { field: ct.tag }
+    if (ct) return { field: ct.field, bodyField: ct.field }
   }
 
   if (binding.childRecord?.tag === childTagName) {

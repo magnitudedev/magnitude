@@ -1,378 +1,128 @@
-/**
- * Reusable markdown content renderer.
- *
- * Extracted from assistant-message.tsx so that both assistant messages
- * and the spec panel can render markdown with the same code.
- */
-
-import React, { memo, useRef, useState } from 'react'
-import { TextAttributes, type TextRenderable, type MouseEvent as OTMouseEvent, type TextBufferView, type LineInfo } from '@opentui/core'
+import React, { memo } from 'react'
 import { useRenderer } from '@opentui/react'
-import {
-  parseMarkdownToChunks,
-  hasOddFenceCount,
-  type MarkdownChunk,
-  type CodeChunk,
-  type MermaidChunk,
-} from '../utils/markdown-content-renderer'
+import { parseMarkdown } from '@magnitude/markdown-cst'
 import { buildMarkdownColorPalette } from '../utils/theme'
-import { writeTextToClipboard } from '../utils/clipboard'
+import { hasOddFenceCount } from '../utils/markdown-content-renderer'
+import { renderDocumentToBlocks, type HighlightRange } from '../utils/render-blocks'
+import { useStreamingMarkdownCache } from '../hooks/use-streaming-markdown-cache'
 import { useTheme } from '../hooks/use-theme'
-import { useArtifacts } from '../hooks/use-artifacts'
+import { BlockRenderer } from './block-renderer'
 
-interface RefHitZone {
-  charStart: number
-  charEnd: number
-  artifactName: string
-  section?: string
+export function parseStreamingContent(content: string, options: {
+  palette: ReturnType<typeof buildMarkdownColorPalette>
+  highlightRanges?: HighlightRange[]
+}): {
+  blocks: ReturnType<typeof renderDocumentToBlocks>
+  pendingText: string
+} {
+  if (!hasOddFenceCount(content)) {
+    const doc = parseMarkdown(content)
+    return { blocks: renderDocumentToBlocks(doc, options), pendingText: '' }
+  }
+
+  const lastFenceIndex = content.lastIndexOf('```')
+  if (lastFenceIndex === -1) {
+    const doc = parseMarkdown(content)
+    return { blocks: renderDocumentToBlocks(doc, options), pendingText: '' }
+  }
+
+  const completeSection = content.slice(0, lastFenceIndex)
+  const pendingText = content.slice(lastFenceIndex)
+  const blocks = completeSection ? renderDocumentToBlocks(parseMarkdown(completeSection), options) : []
+  return { blocks, pendingText }
 }
 
-const COPY_FEEDBACK_RESET_MS = 2000
-
-// Render a code block with proper box background
-export const CodeBlockView = memo(function CodeBlockView({
-  chunk,
-  codeBorderColor,
-  headerColor,
-  foreground,
-  onHoverChange,
+export const MarkdownContent = memo(function MarkdownContent({
+  content,
+  onOpenArtifact,
+  showCursor,
+  highlightRanges,
+  highlightAnchorId,
+  codeBlockWidth,
 }: {
-  chunk: CodeChunk
-  codeBorderColor: string
-  headerColor: string
-  foreground: string
-  onHoverChange: (hovered: boolean) => void
+  content: string
+  onOpenArtifact?: (name: string, section?: string) => void
+  showCursor?: boolean
+  highlightRanges?: HighlightRange[]
+  highlightAnchorId?: string
+  codeBlockWidth?: number
 }) {
-  const [isHovered, setIsHovered] = useState(false)
-  const [copied, setCopied] = useState(false)
-
-  const handleCopy = (e: { stopPropagation?: () => void }) => {
-    e.stopPropagation?.()
-    writeTextToClipboard(chunk.rawCode)
-    setCopied(true)
-    setTimeout(() => setCopied(false), COPY_FEEDBACK_RESET_MS)
-  }
-
-  const handleMouseOver = () => {
-    setIsHovered(true)
-    onHoverChange(true)
-  }
-
-  const handleMouseOut = () => {
-    setIsHovered(false)
-    onHoverChange(false)
-  }
+  const theme = useTheme()
+  const renderer = useRenderer()
+  const palette = buildMarkdownColorPalette(theme)
+  const effectiveCodeBlockWidth =
+    codeBlockWidth ?? Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
+  const blocks = renderDocumentToBlocks(parseMarkdown(content), {
+    palette,
+    codeBlockWidth: effectiveCodeBlockWidth,
+    highlights: highlightRanges,
+  })
 
   return (
-    <box
-      style={{ flexDirection: 'column', position: 'relative', marginBottom: 1 }}
-      onMouseOver={handleMouseOver}
-      onMouseOut={handleMouseOut}
-      onMouseDown={handleCopy}
-    >
-      <text style={{ fg: codeBorderColor }}>┌ <span fg={headerColor} attributes={TextAttributes.DIM}>{chunk.lang || ''}</span></text>
-      <box
-        style={{
-          flexDirection: 'row',
-          borderStyle: 'single',
-          border: ['left'],
-          borderColor: codeBorderColor,
-          paddingLeft: 1,
-          paddingRight: 2,
-        }}
-      >
-        <box style={{ flexGrow: 1, flexDirection: 'row' }}>
-          <text style={{ wrapMode: 'word', flexGrow: 1 }}>
-{chunk.lines.map((line, lineIdx) => (
-<React.Fragment key={lineIdx}>
-{line.map((seg, segIdx) => (
-<span key={segIdx} fg={seg.fg} attributes={seg.attributes}>
-{seg.text}
-</span>
-))}
-{lineIdx < chunk.lines.length - 1 && '\n'}
-</React.Fragment>
-))}
-          </text>
-        </box>
-      </box>
-      <text style={{ fg: copied ? 'green' : foreground }}>
-        <span fg={codeBorderColor}>└</span>{isHovered && (copied ? ' [Copied ✔]' : ' [Copy ⧉ ]')}
-      </text>
+    <box style={{ flexDirection: 'column' }}>
+      <BlockRenderer
+        blocks={blocks}
+        foreground={theme.foreground}
+        showCursor={showCursor}
+        onOpenArtifact={onOpenArtifact}
+        highlights={highlightRanges}
+        highlightAnchorId={highlightAnchorId}
+      />
+      {showCursor && blocks.length === 0 && (
+        <text style={{ fg: theme.foreground }}>▍</text>
+      )}
     </box>
   )
 })
 
-// Render a mermaid diagram as plain text
-export const MermaidBlockView = memo(function MermaidBlockView({
-  chunk,
-  foreground,
-}: {
-  chunk: MermaidChunk
-  foreground: string
-}) {
-  return (
-    <text style={{ fg: foreground }}>
-{chunk.ascii}
-    </text>
-  )
-})
-
-/**
- * Walk a React tree, find elements with data-artifact-ref, replace their text
- * with display labels, apply styling, and track character offsets for hit zones.
- */
-function transformRefs(
-  node: React.ReactNode,
-  refStyle: { fg: string; attributes?: number },
-  refHoverStyle: { fg: string; attributes?: number },
-  refNotFoundStyle: { fg: string; attributes?: number },
-  isRefValid: (name: string) => boolean,
-  hoveredRefIndex: number | null,
-): { node: React.ReactNode; hitZones: RefHitZone[] } {
-  const hitZones: RefHitZone[] = []
-  let charOffset = 0
-
-  function walk(n: React.ReactNode): React.ReactNode {
-    if (typeof n === 'string') { charOffset += n.length; return n }
-    if (typeof n === 'number') { charOffset += String(n).length; return n }
-    if (n === null || n === undefined || typeof n === 'boolean') return n
-
-    if (Array.isArray(n)) {
-      return n.map((child, i) => <React.Fragment key={i}>{walk(child)}</React.Fragment>)
-    }
-
-    if (React.isValidElement(n)) {
-      const el = n as React.ReactElement<Record<string, unknown>>
-      const artifactRef = el.props['data-artifact-ref'] as string | undefined
-
-      if (artifactRef) {
-        const section = el.props['data-artifact-section'] as string | undefined
-        const label = el.props['data-artifact-label'] as string | undefined
-        const displayLabel = label ?? (section ? `${artifactRef}#${section}` : artifactRef)
-        const exists = isRefValid(artifactRef)
-        const displayText = exists ? `[≡ ${displayLabel}]` : `[≡ ${displayLabel} (not found)]`
-        const refIdx = hitZones.length
-
-        const start = charOffset
-        charOffset += displayText.length
-        if (exists) {
-          hitZones.push({ charStart: start, charEnd: charOffset, artifactName: artifactRef, section })
-        }
-        const style = !exists
-          ? refNotFoundStyle
-          : (hoveredRefIndex === refIdx ? refHoverStyle : refStyle)
-        return <span fg={style.fg} attributes={style.attributes}>{displayText}</span>
-      }
-
-      // Regular element — recurse into children
-      const children = el.props.children as React.ReactNode | undefined
-      if (children === undefined) return n
-      const newChildren = walk(children)
-      if (newChildren === children) return n
-      return React.cloneElement(el, {}, newChildren)
-    }
-
-    return n
-  }
-
-  return { node: walk(node), hitZones }
-}
-
-// Render a text chunk preserving all markdown styling while making artifact refs clickable
-const StyledTextWithRefs = memo(function StyledTextWithRefs({
+export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
   content,
-  foreground,
+  showCursor,
   onOpenArtifact,
+  highlightRanges,
+  highlightAnchorId,
+  streaming,
+  codeBlockWidth,
 }: {
-  content: React.ReactNode
-  foreground: string
+  content: string
+  showCursor?: boolean
   onOpenArtifact?: (name: string, section?: string) => void
+  highlightRanges?: HighlightRange[]
+  highlightAnchorId?: string
+  streaming?: boolean
+  codeBlockWidth?: number
 }) {
   const theme = useTheme()
   const renderer = useRenderer()
-  const artifactState = useArtifacts()
-  const textRef = useRef<TextRenderable | null>(null)
-  const pressStartedRef = useRef<number | null>(null)
-  const [hoveredZone, setHoveredZone] = useState<number | null>(null)
-
-  const { node: transformedContent, hitZones } = transformRefs(
-    content,
-    { fg: theme.primary, attributes: TextAttributes.BOLD },
-    { fg: theme.link, attributes: TextAttributes.BOLD },
-    { fg: theme.muted, attributes: TextAttributes.DIM },
-    (name) => !!artifactState?.artifacts.get(name),
-    hoveredZone,
-  )
-
-  const hitTest = (event: OTMouseEvent): number | null => {
-    const el = textRef.current
-    if (!el || hitZones.length === 0) return null
-    const localX = event.x - el.x
-    const localY = event.y - el.y
-    const view = (el as object as Record<string, unknown>)['textBufferView'] as TextBufferView
-    const info: LineInfo = view.lineInfo
-    if (localY < 0 || localY >= info.lineStarts.length) return null
-    const charIndex = info.lineStarts[localY] + localX
-    for (let i = 0; i < hitZones.length; i++) {
-      if (charIndex >= hitZones[i].charStart && charIndex < hitZones[i].charEnd) {
-        return i
-      }
-    }
-    return null
-  }
-
-  const hasRefs = hitZones.length > 0
-
-  if (!hasRefs) {
-    return (
-      <text style={{ fg: foreground, wrapMode: 'word' }}>
-        {transformedContent}
-      </text>
-    )
-  }
-
-  return (
-    <text
-      ref={(el: TextRenderable | null) => { textRef.current = el }}
-      style={{ fg: foreground, wrapMode: 'word' }}
-      selectable={false}
-      onMouseDown={(event: OTMouseEvent) => {
-        const hit = hitTest(event)
-        if (hit !== null) {
-          pressStartedRef.current = hit
-        }
-      }}
-      onMouseUp={(event: OTMouseEvent) => {
-        const hit = hitTest(event)
-        if (hit !== null && hit === pressStartedRef.current) {
-          renderer.clearSelection()
-          onOpenArtifact?.(hitZones[hit].artifactName, hitZones[hit].section)
-        }
-        pressStartedRef.current = null
-      }}
-      onMouseMove={(event: OTMouseEvent) => {
-        setHoveredZone(hitTest(event))
-      }}
-      onMouseOut={() => {
-        setHoveredZone(null)
-        pressStartedRef.current = null
-      }}
-    >
-      {transformedContent}
-    </text>
-  )
-})
-
-// Render chunks - text inline, code blocks as boxes
-export const ChunksView = memo(function ChunksView({
-  chunks,
-  codeBorderColor,
-  headerColor,
-  textColor,
-  foreground,
-  showCursor,
-  onCodeBlockHoverChange,
-  onOpenArtifact,
-}: {
-  chunks: MarkdownChunk[]
-  codeBorderColor: string
-  headerColor: string
-  textColor: string
-  foreground: string
-  showCursor?: boolean
-  onCodeBlockHoverChange: (hovered: boolean) => void
-  onOpenArtifact?: (name: string, section?: string) => void
-}) {
-  return (
-    <>
-      {chunks.map((chunk, idx) => {
-        const isLast = idx === chunks.length - 1
-        if (chunk.type === 'text') {
-          return (
-            <StyledTextWithRefs
-              key={idx}
-              content={chunk.content}
-              foreground={foreground}
-              onOpenArtifact={onOpenArtifact}
-            />
-          )
-        } else if (chunk.type === 'code') {
-          return (
-            <React.Fragment key={idx}>
-              <CodeBlockView
-                chunk={chunk}
-                codeBorderColor={codeBorderColor}
-                headerColor={headerColor}
-                foreground={foreground}
-                onHoverChange={onCodeBlockHoverChange}
-              />
-              {showCursor && isLast && (
-                <text style={{ fg: foreground }}>▍</text>
-              )}
-            </React.Fragment>
-          )
-        } else if (chunk.type === 'mermaid') {
-          return (
-            <React.Fragment key={idx}>
-              <MermaidBlockView
-                chunk={chunk}
-                foreground={foreground}
-              />
-              {showCursor && isLast && (
-                <text style={{ fg: foreground }}>▍</text>
-              )}
-            </React.Fragment>
-          )
-        }
-        return null
-      })}
-    </>
-  )
-})
-
-// Parse streaming content - handle incomplete code fences
-export function parseStreamingContent(content: string, options: { palette: ReturnType<typeof buildMarkdownColorPalette> }): {
-  chunks: MarkdownChunk[]
-  pendingText: string
-} {
-  if (!hasOddFenceCount(content)) {
-    return { chunks: parseMarkdownToChunks(content, options), pendingText: '' }
-  }
-
-  // Split at last incomplete fence
-  const lastFenceIndex = content.lastIndexOf('```')
-  if (lastFenceIndex === -1) {
-    return { chunks: parseMarkdownToChunks(content, options), pendingText: '' }
-  }
-
-  const completeSection = content.slice(0, lastFenceIndex)
-  const pendingSection = content.slice(lastFenceIndex)
-
-  const chunks = completeSection ? parseMarkdownToChunks(completeSection, options) : []
-  return { chunks, pendingText: pendingSection }
-}
-
-/**
- * Simple markdown content renderer — parses and renders markdown text.
- * No copy indicators, no streaming, no hover state.
- */
-export const MarkdownContent = memo(function MarkdownContent({ content, onOpenArtifact }: { content: string; onOpenArtifact?: (name: string, section?: string) => void }) {
-  const theme = useTheme()
   const palette = buildMarkdownColorPalette(theme)
-  const chunks = parseMarkdownToChunks(content, { palette })
+  const effectiveCodeBlockWidth =
+    codeBlockWidth ?? Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
+  const { blocks, pendingText } = useStreamingMarkdownCache(content, {
+    palette,
+    codeBlockWidth: effectiveCodeBlockWidth,
+    highlightRanges,
+    streaming,
+  })
 
   return (
     <box style={{ flexDirection: 'column' }}>
-      <ChunksView
-        chunks={chunks}
-        codeBorderColor={palette.codeBorderColor}
-        headerColor={palette.codeHeaderFg}
-        textColor={palette.codeTextFg}
+      <BlockRenderer
+        blocks={blocks}
         foreground={theme.foreground}
-        onCodeBlockHoverChange={() => {}}
+        showCursor={showCursor && !pendingText}
         onOpenArtifact={onOpenArtifact}
+        highlights={highlightRanges}
+        highlightAnchorId={highlightAnchorId}
       />
+      {pendingText && (
+        <text style={{ fg: theme.foreground, wrapMode: 'word' }}>
+          {pendingText}
+          {showCursor && <span style={{ fg: theme.muted }}>▍</span>}
+        </text>
+      )}
+      {showCursor && blocks.length === 0 && !pendingText && (
+        <text style={{ fg: theme.foreground }}>▍</text>
+      )}
     </box>
   )
 })

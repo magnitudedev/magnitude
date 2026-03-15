@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentRoutingState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, detectBrowserModel, isBrowserCompatible, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, getLatestInProgressArtifactStream } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 import { MultilineInput, type MultilineInputHandle } from './components/multiline-input'
@@ -17,7 +17,7 @@ import { usePaginatedTimeline } from './hooks/use-paginated-timeline'
 import { useCollapsedBlocks } from './hooks/use-collapsed-blocks'
 import { useSlashCommands } from './hooks/use-slash-commands'
 import { useTheme } from './hooks/use-theme'
-import { ArtifactProvider } from './hooks/use-artifacts'
+import { ArtifactProvider, SelectedArtifactProvider } from './hooks/use-artifacts'
 import { readClipboardText } from './utils/clipboard'
 import { readClipboardBitmap } from './utils/clipboard'
 import { tryReadPastedImageFile } from './utils/pasted-image-path'
@@ -1667,6 +1667,44 @@ function AppInner({
     return artifact?.content ?? null
   }, [selectedArtifact, artifactState])
 
+  // Freeze baseContent when a stream starts — don't let it update
+  // as the artifact content changes during executing/saving phase.
+  const frozenBaseContentRef = useRef<{ toolCallId: string; content: string | null } | null>(null)
+
+  const selectedArtifactStreaming = useMemo(() => {
+    if (!selectedArtifact || !display) return null
+    const stream = getLatestInProgressArtifactStream(display, selectedArtifact.name, true)
+    if (!stream) {
+      frozenBaseContentRef.current = null
+      return null
+    }
+
+    // Freeze base content on first sight of this stream
+    if (!frozenBaseContentRef.current || frozenBaseContentRef.current.toolCallId !== stream.toolCallId) {
+      frozenBaseContentRef.current = {
+        toolCallId: stream.toolCallId,
+        content: selectedArtifactContent,
+      }
+    }
+
+    return {
+      active: stream.phase === 'streaming',
+      toolKey: stream.toolKey,
+      phase: stream.phase,
+      toolCallId: stream.toolCallId,
+      ...(stream.preview.mode === 'write'
+        ? {
+            contentSoFar: stream.preview.contentSoFar,
+          }
+        : {
+            oldStringSoFar: stream.preview.oldStringSoFar,
+            newStringSoFar: stream.preview.newStringSoFar,
+            replaceAll: stream.preview.replaceAll,
+          }),
+      baseContent: frozenBaseContentRef.current.content,
+    }
+  }, [selectedArtifact, display, selectedArtifactContent])
+
   const handleArtifactClick = useCallback((name: string, section?: string) => {
     setSelectedArtifact(prev => prev?.name === name && prev?.section === section ? null : { name, section })
   }, [])
@@ -1965,6 +2003,7 @@ function AppInner({
 
   return (
     <ArtifactProvider value={artifactState}>
+    <SelectedArtifactProvider value={selectedArtifact?.name ?? null}>
     <box style={{ flexDirection: 'row', height: '100%', paddingBottom: 0, marginBottom: 0 }}>
       {/* Left column — debug panel (only when enabled and visible) */}
       {debugVisible && (
@@ -2242,11 +2281,13 @@ function AppInner({
         </box>
       </box>
 
-      {selectedArtifact && selectedArtifactContent !== null && (
+      {selectedArtifact && (selectedArtifactContent !== null || selectedArtifactStreaming !== null) && (
         <box style={{ width: '45%', flexShrink: 0, paddingRight: 1, paddingBottom: 1 }}>
           <ArtifactReaderPanel
+            key={`${selectedArtifact.name}-${selectedArtifactStreaming?.toolCallId ?? 'static'}`}
             artifactName={selectedArtifact.name}
             content={selectedArtifactContent}
+            streaming={selectedArtifactStreaming ?? undefined}
             scrollToSection={selectedArtifact.section}
             onClose={() => setSelectedArtifact(null)}
             onOpenArtifact={handleArtifactClick}
@@ -2255,6 +2296,7 @@ function AppInner({
       )}
 
     </box>
+    </SelectedArtifactProvider>
     </ArtifactProvider>
   )
 }

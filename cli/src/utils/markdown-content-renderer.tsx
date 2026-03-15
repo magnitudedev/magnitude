@@ -4,12 +4,49 @@ import stringWidth from 'string-width'
 import { renderMermaidAscii } from 'beautiful-mermaid'
 import { createLowlight, common } from 'lowlight'
 import type { Element, Text, RootContent } from 'hast'
+import { parseMarkdown } from '@magnitude/markdown-cst'
+import type {
+  BlankLinesNode,
+  BlockquoteContentNode,
+  BlockquoteItemBreakNode,
+  BlockquoteItemNode,
+  BlockquoteNode,
+  BulletItemNode,
+  BulletListNode,
+  CodeBlockNode,
+  DefinitionNode,
+  DocumentItemNode,
+  DocumentNode,
+  DocumentContentNode,
+  HeadingNode,
+  HorizontalRuleNode,
+  HtmlBlockNode,
+  InlineCodeNode,
+  InlineImageNode,
+  InlineNode,
+  LinkNode,
+  ListItemBreakNode,
+  ListItemContentItemNode,
+  OrderedItemNode,
+  OrderedListNode,
+  ParagraphNode,
+  RootBlockNode,
+  SoftBreakNode,
+  HardBreakNode,
+  StrongNode,
+  EmphasisNode,
+  StrikethroughNode,
+  TableCellNode,
+  TableNode,
+  TaskItemNode,
+  TaskListNode,
+  TextNode,
+} from '@magnitude/markdown-cst/src/schema'
 import { blue, slate, green, violet } from './palette'
 
 // Create lowlight instance with common languages
 const lowlight = createLowlight(common)
 
-// Syntax highlighting color palette (GitHub dark inspired)
 export interface SyntaxColors {
   keyword: string
   string: string
@@ -44,6 +81,7 @@ export interface MarkdownPalette {
 export interface MarkdownRenderOptions {
   palette?: Partial<MarkdownPalette>
   codeBlockWidth?: number
+  highlightRanges?: CharacterHighlightRange[]
 }
 
 const defaultSyntaxColors: SyntaxColors = {
@@ -115,7 +153,6 @@ const buildMergedPalette = (overrides?: Partial<MarkdownPalette>): MarkdownPalet
   return palette
 }
 
-// Map hljs class names to our syntax color keys
 const hljsClassToColor = (classNames: string[], syntax: SyntaxColors): string => {
   for (const cls of classNames) {
     switch (cls) {
@@ -153,18 +190,22 @@ const hljsClassToColor = (classNames: string[], syntax: SyntaxColors): string =>
   return syntax.default
 }
 
-// A styled segment of text
-interface StyledSegment {
+export interface StyledSegment {
   text: string
   fg?: string
+  bg?: string
   attributes?: number
-  /** If set, this segment is an artifact reference */
   ref?: { artifactName: string; section?: string; label?: string }
 }
 
-type Line = StyledSegment[]
+export type Line = StyledSegment[]
 
-// Convert lowlight AST to styled lines
+export interface CharacterHighlightRange {
+  start: number
+  end: number
+  backgroundColor: string
+}
+
 const highlightToLines = (nodes: RootContent[], syntax: SyntaxColors): Line[] => {
   const lines: Line[] = [[]]
 
@@ -197,7 +238,6 @@ const highlightToLines = (nodes: RootContent[], syntax: SyntaxColors): Line[] =>
   return lines
 }
 
-// Try to highlight code, returns null if language not supported
 const tryHighlight = (code: string, lang: string, syntax: SyntaxColors): Line[] | null => {
   const langMap: Record<string, string> = {
     ts: 'typescript',
@@ -226,72 +266,78 @@ const tryHighlight = (code: string, lang: string, syntax: SyntaxColors): Line[] 
   }
 }
 
-// =============================================================================
-// Chunk-based rendering - separates code blocks from inline content
-// =============================================================================
-
-export interface TextChunk {
-  type: 'text'
-  content: ReactNode
+interface BaseChunk {
+  startLine: number
+  endLine: number
+  startChar: number
+  endChar: number
 }
 
-export interface CodeChunk {
+export interface TextChunk extends BaseChunk {
+  type: 'text'
+  lines: Line[]
+}
+
+export interface CodeChunk extends BaseChunk {
   type: 'code'
   lang?: string
-  lines: Line[] // syntax highlighted lines, or plain text lines
+  lines: Line[]
   rawCode: string
 }
 
-export interface MermaidChunk {
+export interface MermaidChunk extends BaseChunk {
   type: 'mermaid'
   ascii: string
 }
 
 export type MarkdownChunk = TextChunk | CodeChunk | MermaidChunk
 
-// Helper to create a simple text segment
+export function slugify(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+}
+
+export function extractHeadings(content: string): Array<{ slug: string; lineNumber: number }> {
+  const headings: Array<{ slug: string; lineNumber: number }> = []
+  content.split('\n').forEach((line, i) => {
+    const match = line.match(/^#{1,6}\s+(.+)$/)
+    if (match) {
+      headings.push({ slug: slugify(match[1].trim()), lineNumber: i })
+    }
+  })
+  return headings
+}
+
 const textSeg = (text: string): StyledSegment => ({ text })
 
-// Helper to create a styled segment
 const styledSeg = (text: string, fg?: string, attributes?: number): StyledSegment => ({
   text,
   fg,
   attributes,
 })
 
-// Merge a segment into a line
 const lineWithPrefix = (prefix: Line, line: Line): Line => [...prefix, ...line]
 
-// Artifact ref pattern
 const ARTIFACT_REF_RE = /\[\[([^\]#|]+?)(?:#([^\]|]+?))?(?:\|([^\]]+?))?\]\]/g
 
-/**
- * Process a line of styled segments, detecting [[artifact-ref]] patterns.
- * Merges adjacent segments with identical styling first (to reassemble
- * brackets split by Bun's markdown parser), then splits at ref boundaries.
- */
 const processLineRefs = (line: Line): Line => {
   if (line.length === 0) return line
 
-  // Step 1: merge adjacent segments with identical styling
   const merged: StyledSegment[] = []
   for (const seg of line) {
     const prev = merged.length > 0 ? merged[merged.length - 1] : null
-    if (prev && !prev.ref && prev.fg === seg.fg && prev.attributes === seg.attributes) {
+    if (prev && !prev.ref && prev.fg === seg.fg && prev.bg === seg.bg && prev.attributes === seg.attributes) {
       prev.text += seg.text
     } else {
       merged.push({ ...seg })
     }
   }
 
-  // Step 2: check if any merged segment contains a ref
   const hasRef = merged.some(seg => {
     ARTIFACT_REF_RE.lastIndex = 0
     return ARTIFACT_REF_RE.test(seg.text)
   })
   if (!hasRef) return merged
 
-  // Step 3: split segments at ref boundaries
   const result: StyledSegment[] = []
   for (const seg of merged) {
     ARTIFACT_REF_RE.lastIndex = 0
@@ -300,19 +346,22 @@ const processLineRefs = (line: Line): Line => {
       continue
     }
 
-    // Split this segment's text at ref boundaries
     const regex = new RegExp(ARTIFACT_REF_RE.source, 'g')
     let lastIndex = 0
     let match: RegExpExecArray | null
     while ((match = regex.exec(seg.text)) !== null) {
-      // Text before the ref
       if (match.index > lastIndex) {
-        result.push({ text: seg.text.slice(lastIndex, match.index), fg: seg.fg, attributes: seg.attributes })
+        result.push({
+          text: seg.text.slice(lastIndex, match.index),
+          fg: seg.fg,
+          bg: seg.bg,
+          attributes: seg.attributes,
+        })
       }
-      // The ref segment
       result.push({
         text: match[0],
         fg: seg.fg,
+        bg: seg.bg,
         attributes: seg.attributes,
         ref: {
           artifactName: match[1],
@@ -322,84 +371,19 @@ const processLineRefs = (line: Line): Line => {
       })
       lastIndex = regex.lastIndex
     }
-    // Text after last ref
     if (lastIndex < seg.text.length) {
-      result.push({ text: seg.text.slice(lastIndex), fg: seg.fg, attributes: seg.attributes })
+      result.push({ text: seg.text.slice(lastIndex), fg: seg.fg, bg: seg.bg, attributes: seg.attributes })
     }
   }
 
   return result
 }
 
-// Extract plain text from React children
-const childrenToText = (children: ReactNode): string => {
-  if (typeof children === 'string') return children
-  if (typeof children === 'number') return String(children)
-  if (children === null || children === undefined) return ''
-  if (Array.isArray(children)) return children.map(childrenToText).join('')
-  if (React.isValidElement(children)) {
-    const el = children as React.ReactElement<{ children?: ReactNode }>
-    return childrenToText(el.props.children)
-  }
-  return ''
-}
-
-// Truncate text to fit within specified width
-const clipToWidth = (text: string, maxWidth: number): string => {
-  if (maxWidth < 1) return ''
-  const textWidth = stringWidth(text)
-  if (textWidth <= maxWidth) return text
-  if (maxWidth === 1) return '…'
-
-  let truncated = ''
-  let width = 0
-  for (const char of text) {
-    const charWidth = stringWidth(char)
-    if (width + charWidth + 1 > maxWidth) break
-    truncated += char
-    width += charWidth
-  }
-  return truncated + '…'
-}
-
-// Pad text to exact width
-const rightPadToWidth = (text: string, targetWidth: number): string => {
-  const currentWidth = stringWidth(text)
-  if (currentWidth >= targetWidth) return text
-  return text + ' '.repeat(targetWidth - currentWidth)
-}
-
-interface RenderContext {
-  palette: MarkdownPalette
-  codeBlockWidth: number
-  chunks: MarkdownChunk[]
-  currentLines: Line[]
-}
-
-// Flush accumulated lines to a text chunk
-const flushLines = (ctx: RenderContext): void => {
-  if (ctx.currentLines.length === 0) return
-
-  // Trim trailing empty lines
-  while (ctx.currentLines.length > 0 && ctx.currentLines[ctx.currentLines.length - 1].length === 0) {
-    ctx.currentLines.pop()
-  }
-
-  if (ctx.currentLines.length === 0) return
-
-  const content = convertLinesToReactNodes(ctx.currentLines)
-  ctx.chunks.push({ type: 'text', content })
-  ctx.currentLines = []
-}
-
-// Convert lines to React nodes
-const convertLinesToReactNodes = (lines: Line[]): ReactNode => {
+export const convertLinesToReactNodes = (lines: Line[]): ReactNode => {
   let keyCounter = 0
   const nextKey = () => `md-${++keyCounter}`
 
   const result: ReactNode[] = []
-
-  // Process artifact refs in each line before rendering
   const processedLines = lines.map(processLineRefs)
 
   processedLines.forEach((line, lineIdx) => {
@@ -412,6 +396,7 @@ const convertLinesToReactNodes = (lines: Line[]): ReactNode => {
             <span
               key={nextKey()}
               fg={seg.fg}
+              bg={seg.bg}
               attributes={seg.attributes}
               data-artifact-ref={seg.ref.artifactName}
               data-artifact-section={seg.ref.section}
@@ -420,9 +405,9 @@ const convertLinesToReactNodes = (lines: Line[]): ReactNode => {
               {seg.text}
             </span>,
           )
-        } else if (seg.fg || seg.attributes) {
+        } else if (seg.fg || seg.bg || seg.attributes) {
           result.push(
-            <span key={nextKey()} fg={seg.fg} attributes={seg.attributes}>
+            <span key={nextKey()} fg={seg.fg} bg={seg.bg} attributes={seg.attributes}>
               {seg.text}
             </span>,
           )
@@ -448,414 +433,219 @@ const convertLinesToReactNodes = (lines: Line[]): ReactNode => {
   )
 }
 
-// Get element type name from a React element
-const getTypeName = (el: React.ReactElement): string => {
-  if (typeof el.type === 'string') return el.type
-  if (typeof el.type === 'function') return (el.type as { name?: string }).name || ''
-  if (typeof el.type === 'symbol') return ''
-  return ''
+const clipToWidth = (text: string, maxWidth: number): string => {
+  if (maxWidth < 1) return ''
+  const textWidth = stringWidth(text)
+  if (textWidth <= maxWidth) return text
+  if (maxWidth === 1) return '…'
+
+  let truncated = ''
+  let width = 0
+  for (const char of text) {
+    const charWidth = stringWidth(char)
+    if (width + charWidth + 1 > maxWidth) break
+    truncated += char
+    width += charWidth
+  }
+  return truncated + '…'
 }
 
-// Process a React node tree, accumulating lines and emitting chunks for code blocks
-const processMarkdownNode = (node: ReactNode, ctx: RenderContext): void => {
-  if (node === null || node === undefined) return
-
-  if (typeof node === 'string') {
-    if (node === '\n') {
-      ctx.currentLines.push([])
-    } else if (node.trim() !== '') {
-      ctx.currentLines.push([textSeg(node)])
-    }
-    return
-  }
-
-  if (typeof node === 'number') {
-    ctx.currentLines.push([textSeg(String(node))])
-    return
-  }
-
-  if (Array.isArray(node)) {
-    node.forEach((n) => processMarkdownNode(n, ctx))
-    return
-  }
-
-  if (!React.isValidElement(node)) return
-
-  const el = node as React.ReactElement<Record<string, unknown>>
-  const typeName = getTypeName(el)
-  const children = el.props.children as ReactNode
-
-  switch (typeName) {
-    case 'h1':
-    case 'h2':
-    case 'h3':
-    case 'h4':
-    case 'h5':
-    case 'h6': {
-      const depth = parseInt(typeName[1], 10)
-      const text = childrenToText(children)
-      const color = ctx.palette.headingFg[depth] || ctx.palette.headingFg[6]
-      ctx.currentLines.push([styledSeg(text, color, TextAttributes.BOLD)])
-      ctx.currentLines.push([])
-      return
-    }
-
-    case 'p': {
-      const content = renderInlineToLine(children, ctx)
-      ctx.currentLines.push(content)
-      ctx.currentLines.push([])
-      return
-    }
-
-    case 'blockquote': {
-      const prefix: Line = [styledSeg('> ', ctx.palette.blockquoteBorderFg)]
-      const innerLines = renderBlockToLines(children, ctx)
-      for (const line of innerLines) {
-        const styledLine = line.map((seg) => ({
-          ...seg,
-          fg: seg.fg || ctx.palette.blockquoteTextFg,
-        }))
-        ctx.currentLines.push(lineWithPrefix(prefix, styledLine))
-      }
-      return
-    }
-
-    case 'ul':
-    case 'ol': {
-      const isOrdered = typeName === 'ol'
-      const start = typeof el.props.start === 'number' ? (el.props.start as number) : 1
-      const items = React.Children.toArray(children)
-
-      items.forEach((item, idx) => {
-        if (React.isValidElement(item)) {
-          const itemEl = item as React.ReactElement<Record<string, unknown>>
-          const checked = itemEl.props.checked as boolean | undefined
-          const itemChildren = itemEl.props.children as ReactNode
-
-          let marker = isOrdered ? `${start + idx}. ` : '- '
-          if (checked === true) marker += '[x] '
-          else if (checked === false) marker += '[ ] '
-
-          const markerSeg: Line = [styledSeg(marker, ctx.palette.listBulletFg)]
-          const itemLines = renderListItemToLines(itemChildren, ctx)
-
-          if (itemLines.length === 0) {
-            ctx.currentLines.push(markerSeg)
-          } else {
-            const indent = ' '.repeat(stringWidth(marker))
-            const indentLine: Line = [textSeg(indent)]
-
-            itemLines.forEach((line, lineIdx) => {
-              if (lineIdx === 0) {
-                ctx.currentLines.push(lineWithPrefix(markerSeg, line))
-              } else {
-                ctx.currentLines.push(lineWithPrefix(indentLine, line))
-              }
-            })
-          }
-        }
-      })
-      ctx.currentLines.push([])
-      return
-    }
-
-    case 'pre': {
-      const lang = el.props.language as string | undefined
-      const content = childrenToText(children)
-
-      // Mermaid rendering
-      if (lang === 'mermaid') {
-        try {
-          const ascii = renderMermaidAscii(content.trim(), {
-            paddingX: 2,
-            paddingY: 2,
-            boxBorderPadding: 0,
-          })
-          // Flush any accumulated text first
-          flushLines(ctx)
-          ctx.chunks.push({ type: 'mermaid', ascii })
-          return
-        } catch {
-          // Fall through to normal code block
-        }
-      }
-
-      // Normal code block - flush text and emit code chunk
-      flushLines(ctx)
-
-      let codeContent = content
-      if (codeContent.endsWith('\n')) {
-        codeContent = codeContent.slice(0, -1)
-      }
-
-      // Try syntax highlighting
-      const highlighted = lang ? tryHighlight(codeContent, lang, ctx.palette.syntax) : null
-
-      let lines: Line[]
-      if (highlighted) {
-        lines = highlighted.map((line) =>
-          line.length === 0 ? [{ text: ' ', fg: ctx.palette.syntax.default }] : line,
-        )
-      } else {
-        // Plain text fallback
-        lines = codeContent.split('\n').map((line) => [{ text: line || ' ', fg: ctx.palette.codeTextFg }])
-      }
-
-      ctx.chunks.push({ type: 'code', lang, lines, rawCode: codeContent })
-      return
-    }
-
-    case 'hr': {
-      const width = Math.max(10, Math.min(ctx.codeBlockWidth, 80))
-      const divider = '─'.repeat(width)
-      ctx.currentLines.push([styledSeg(divider, ctx.palette.dividerFg)])
-      ctx.currentLines.push([])
-      return
-    }
-
-    case 'table': {
-      const tableLines = buildTableLines(children, ctx)
-      ctx.currentLines.push(...tableLines)
-      ctx.currentLines.push([])
-      return
-    }
-
-    case 'html': {
-      const text = childrenToText(children).trim()
-      if (text) {
-        ctx.currentLines.push([textSeg(text)])
-      }
-      return
-    }
-
-    default: {
-      // For inline elements or unknown, render inline
-      const line = renderInlineToLine(node, ctx)
-      if (line.length > 0) {
-        ctx.currentLines.push(line)
-      }
-      return
-    }
-  }
+const rightPadToWidth = (text: string, targetWidth: number): string => {
+  const currentWidth = stringWidth(text)
+  if (currentWidth >= targetWidth) return text
+  return text + ' '.repeat(targetWidth - currentWidth)
 }
 
-// Render block children to lines (for blockquote, etc. - doesn't handle code blocks specially)
-const renderBlockToLines = (children: ReactNode, ctx: RenderContext): Line[] => {
-  if (children === null || children === undefined) return []
+interface BlockEnv {
+  linePrefix?: string
+  linePrefixStyle?: Pick<StyledSegment, 'fg' | 'bg' | 'attributes'>
+  blockquoteDepth: number
+}
 
-  if (React.isValidElement(children)) {
-    const el = children as React.ReactElement<{ children?: ReactNode }>
-    if (el.type === React.Fragment) {
-      return renderBlockToLines(el.props.children, ctx)
+interface InlineStyle {
+  fg?: string
+  attributes?: number
+  bg?: string
+}
+
+interface CSTRenderContext {
+  source: string
+  palette: MarkdownPalette
+  codeBlockWidth: number
+  highlightRanges: CharacterHighlightRange[]
+  chunks: MarkdownChunk[]
+  currentLines: Line[]
+  currentLineNumber: number
+  minSourceOffset: number | null
+  maxSourceOffset: number | null
+}
+
+function splitByHighlights(
+  text: string,
+  sourceStart: number,
+  sourceEnd: number,
+  style: { fg?: string; bg?: string; attributes?: number; ref?: StyledSegment['ref'] },
+  ranges: CharacterHighlightRange[],
+): StyledSegment[] {
+  if (text.length === 0) return []
+  if (ranges.length === 0 || sourceEnd <= sourceStart) return [{ text, ...style }]
+
+  const result: StyledSegment[] = []
+  let cursor = 0
+
+  for (const range of ranges) {
+    const overlapStart = Math.max(range.start, sourceStart)
+    const overlapEnd = Math.min(range.end, sourceEnd)
+    if (overlapStart >= overlapEnd) continue
+
+    const localStart = overlapStart - sourceStart
+    const localEnd = overlapEnd - sourceStart
+
+    if (localStart > cursor) {
+      result.push({ text: text.slice(cursor, localStart), ...style })
     }
+    result.push({ text: text.slice(localStart, localEnd), ...style, bg: range.backgroundColor })
+    cursor = localEnd
   }
 
-  const lines: Line[] = []
-  const childArray = React.Children.toArray(children)
+  if (cursor < text.length) {
+    result.push({ text: text.slice(cursor), ...style })
+  }
 
-  for (const child of childArray) {
-    if (!React.isValidElement(child)) {
-      if (typeof child === 'string' && child.trim()) {
-        lines.push([textSeg(child)])
-      }
-      continue
-    }
+  return result.length > 0 ? result : [{ text, ...style }]
+}
 
-    const el = child as React.ReactElement<Record<string, unknown>>
-    const typeName = getTypeName(el)
-    const elChildren = el.props.children as ReactNode
+function ensureCurrentLine(ctx: CSTRenderContext): Line {
+  if (ctx.currentLines.length === 0) {
+    ctx.currentLines.push([])
+  }
+  return ctx.currentLines[ctx.currentLines.length - 1]
+}
 
-    switch (typeName) {
-      case 'p':
-        lines.push(renderInlineToLine(elChildren, ctx))
-        lines.push([])
+function emitSourceText(
+  ctx: CSTRenderContext,
+  text: string,
+  sourceStart: number,
+  sourceEnd: number,
+  style: { fg?: string; bg?: string; attributes?: number; ref?: StyledSegment['ref'] } = {},
+): void {
+  if (!text) return
+  const line = ensureCurrentLine(ctx)
+  const segments = splitByHighlights(text, sourceStart, sourceEnd, style, ctx.highlightRanges)
+  line.push(...segments)
+
+  if (ctx.minSourceOffset === null || sourceStart < ctx.minSourceOffset) ctx.minSourceOffset = sourceStart
+  if (ctx.maxSourceOffset === null || sourceEnd > ctx.maxSourceOffset) ctx.maxSourceOffset = sourceEnd
+}
+
+function emitSyntheticText(
+  ctx: CSTRenderContext,
+  text: string,
+  style: { fg?: string; bg?: string; attributes?: number; ref?: StyledSegment['ref'] } = {},
+): void {
+  if (!text) return
+  ensureCurrentLine(ctx).push({ text, ...style })
+}
+
+function newLine(ctx: CSTRenderContext): void {
+  ctx.currentLines.push([])
+  ctx.currentLineNumber++
+}
+
+function emitBlankLine(ctx: CSTRenderContext): void {
+  ctx.currentLines.push([])
+  ctx.currentLineNumber++
+}
+
+function flushTextChunk(ctx: CSTRenderContext): void {
+  if (ctx.currentLines.length === 0) return
+
+  while (ctx.currentLines.length > 0 && ctx.currentLines[ctx.currentLines.length - 1].length === 0) {
+    ctx.currentLines.pop()
+    ctx.currentLineNumber--
+  }
+
+  if (ctx.currentLines.length === 0) {
+    ctx.currentLines = [[]]
+    return
+  }
+
+  const startLine = ctx.currentLineNumber - ctx.currentLines.length + 1
+  ctx.chunks.push({
+    type: 'text',
+    lines: ctx.currentLines.map((line) => line.map((seg) => ({ ...seg }))),
+    startLine,
+    endLine: ctx.currentLineNumber,
+    startChar: ctx.minSourceOffset ?? 0,
+    endChar: ctx.maxSourceOffset ?? 0,
+  })
+  ctx.currentLines = [[]]
+  ctx.minSourceOffset = null
+  ctx.maxSourceOffset = null
+}
+
+function finishBlock(ctx: CSTRenderContext): void {
+  emitBlankLine(ctx)
+}
+
+function extractInlinePlainText(nodes: readonly InlineNode[] | undefined): string {
+  if (!nodes) return ''
+  let result = ''
+  for (const node of nodes) {
+    switch (node.type) {
+      case 'text':
+        result += node.text
         break
-      default:
-        lines.push(renderInlineToLine(child, ctx))
+      case 'image':
+        result += `[${node.attrs.alt || 'image'}]`
+        break
+      case 'inlineCode':
+        result += node.text
+        break
+      case 'softBreak':
+      case 'hardBreak':
+        result += ' '
+        break
+      case 'emphasis':
+      case 'strong':
+      case 'strikethrough':
+      case 'link':
+        result += extractInlinePlainText(node.content)
         break
     }
   }
-
-  return lines
+  return result
 }
 
-// Render list item children to lines
-const renderListItemToLines = (children: ReactNode, ctx: RenderContext): Line[] => {
-  if (children === null || children === undefined) return []
-
-  const childArray = React.Children.toArray(children)
-  const inlineContent: ReactNode[] = []
-  const nestedLines: Line[] = []
-
-  for (const child of childArray) {
-    if (React.isValidElement(child)) {
-      const typeName = getTypeName(child)
-      if (typeName === 'ul' || typeName === 'ol') {
-        // Render nested list
-        const tempCtx: RenderContext = {
-          ...ctx,
-          chunks: [],
-          currentLines: [],
-        }
-        processMarkdownNode(child, tempCtx)
-        nestedLines.push(...tempCtx.currentLines)
-      } else {
-        inlineContent.push(child)
-      }
-    } else {
-      inlineContent.push(child)
-    }
-  }
-
-  const lines: Line[] = []
-  if (inlineContent.length > 0) {
-    const text = childrenToText(inlineContent).trim()
-    if (text) {
-      lines.push([textSeg(text)])
-    }
-  }
-  lines.push(...nestedLines)
-
-  return lines
+function flattenTableCell(cell: TableCellNode): string {
+  return extractInlinePlainText(cell.content[0]?.content).trim()
 }
 
-// Render inline content to a single line
-const renderInlineToLine = (node: ReactNode, ctx: RenderContext): Line => {
-  if (node === null || node === undefined) return []
-  if (typeof node === 'string') return [textSeg(node)]
-  if (typeof node === 'number') return [textSeg(String(node))]
-  if (Array.isArray(node)) {
-    return node.flatMap((n) => renderInlineToLine(n, ctx))
-  }
-
-  if (!React.isValidElement(node)) return []
-
-  const el = node as React.ReactElement<Record<string, unknown>>
-  const typeName = getTypeName(el)
-  const children = el.props.children as ReactNode
-
-  switch (typeName) {
-    case 'strong':
-      return renderInlineToLine(children, ctx).map((seg) => ({
-        ...seg,
-        attributes: (seg.attributes || 0) | TextAttributes.BOLD,
-      }))
-
-    case 'em':
-      return renderInlineToLine(children, ctx).map((seg) => ({
-        ...seg,
-        attributes: (seg.attributes || 0) | TextAttributes.ITALIC,
-      }))
-
-    case 'del':
-      return renderInlineToLine(children, ctx).map((seg) => ({
-        ...seg,
-        attributes: (seg.attributes || 0) | TextAttributes.DIM,
-      }))
-
-    case 'code': {
-      const text = childrenToText(children)
-      return [styledSeg(` ${text} `, ctx.palette.inlineCodeFg, TextAttributes.BOLD)]
-    }
-
-    case 'a': {
-      const childLine = renderInlineToLine(children, ctx)
-      return childLine.map((seg) => ({
-        ...seg,
-        fg: seg.fg || ctx.palette.linkFg,
-      }))
-    }
-
-    case 'img': {
-      const alt = el.props.alt as string | undefined
-      const displayAlt = alt || 'image'
-      return [styledSeg(`[${displayAlt}]`, ctx.palette.linkFg)]
-    }
-
-    case 'br':
-      return [textSeg('\n')]
-
-    case 'u':
-      return renderInlineToLine(children, ctx).map((seg) => ({
-        ...seg,
-        attributes: (seg.attributes || 0) | TextAttributes.UNDERLINE,
-      }))
-
-    case 'math':
-      return [styledSeg(childrenToText(children), ctx.palette.inlineCodeFg)]
-
-    default:
-      return renderInlineToLine(children, ctx)
-  }
-}
-
-// Render table to lines
-const buildTableLines = (children: ReactNode, ctx: RenderContext): Line[] => {
-  const rows: string[][] = []
-
-  const extractRows = (node: ReactNode): void => {
-    if (!node) return
-    if (Array.isArray(node)) {
-      node.forEach(extractRows)
-      return
-    }
-    if (React.isValidElement(node)) {
-      const el = node as React.ReactElement<{ children?: ReactNode }>
-      const typeName = getTypeName(el)
-
-      if (typeName === 'tr') {
-        const cells: string[] = []
-        const extractCells = (cellNode: ReactNode): void => {
-          if (!cellNode) return
-          if (Array.isArray(cellNode)) {
-            cellNode.forEach(extractCells)
-            return
-          }
-          if (React.isValidElement(cellNode)) {
-            const cellEl = cellNode as React.ReactElement<{ children?: ReactNode }>
-            const cellTypeName = getTypeName(cellEl)
-            if (cellTypeName === 'td' || cellTypeName === 'th') {
-              cells.push(childrenToText(cellEl.props.children).trim())
-            }
-          }
-        }
-        extractCells(el.props.children)
-        if (cells.length > 0) {
-          rows.push(cells)
-        }
-      } else if (typeName === 'thead' || typeName === 'tbody') {
-        extractRows(el.props.children)
-      }
-    }
-  }
-  extractRows(children)
-
-  if (rows.length === 0) return []
+function renderTableNode(node: TableNode, ctx: CSTRenderContext): void {
+  const rows = node.content.map((row) => row.content.map((cell) => flattenTableCell(cell)))
+  if (rows.length === 0) return
 
   const numCols = Math.max(...rows.map((r) => r.length))
-  if (numCols === 0) return []
+  if (numCols === 0) return
 
   const naturalWidths: number[] = Array(numCols).fill(3)
   for (const row of rows) {
     for (let i = 0; i < row.length; i++) {
-      const cellWidth = stringWidth(row[i] || '')
-      naturalWidths[i] = Math.max(naturalWidths[i], cellWidth)
+      naturalWidths[i] = Math.max(naturalWidths[i], stringWidth(row[i] || ''))
     }
   }
 
   const separatorWidth = 3
-  const numSeparators = numCols - 1
-  const totalNaturalWidth = naturalWidths.reduce((a, b) => a + b, 0) + numSeparators * separatorWidth
   const availableWidth = Math.max(20, ctx.codeBlockWidth - 2)
+  const totalNaturalWidth = naturalWidths.reduce((a, b) => a + b, 0) + (numCols - 1) * separatorWidth
 
   let columnWidths: number[]
   if (totalNaturalWidth <= availableWidth) {
     columnWidths = naturalWidths
   } else {
-    const availableForContent = availableWidth - numSeparators * separatorWidth
+    const availableForContent = availableWidth - (numCols - 1) * separatorWidth
     const totalNaturalContent = naturalWidths.reduce((a, b) => a + b, 0)
     const scale = availableForContent / totalNaturalContent
-
     columnWidths = naturalWidths.map((w) => Math.max(3, Math.floor(w * scale)))
 
     let usedWidth = columnWidths.reduce((a, b) => a + b, 0)
@@ -869,126 +659,458 @@ const buildTableLines = (children: ReactNode, ctx: RenderContext): Line[] => {
     }
   }
 
-  const lines: Line[] = []
-
-  const renderSeparator = (leftChar: string, midChar: string, rightChar: string): Line => {
+  const renderSeparator = (leftChar: string, midChar: string, rightChar: string) => {
     let line = leftChar
     columnWidths.forEach((width, idx) => {
       line += '─'.repeat(width + 2)
       line += idx < columnWidths.length - 1 ? midChar : rightChar
     })
-    return [styledSeg(line, ctx.palette.dividerFg)]
+    emitSyntheticText(ctx, line, { fg: ctx.palette.dividerFg })
+    newLine(ctx)
   }
 
-  lines.push(renderSeparator('┌', '┬', '┐'))
+  renderSeparator('┌', '┬', '┐')
 
   rows.forEach((row, rowIdx) => {
     const isHeader = rowIdx === 0
-    const line: Line = []
-
+    emitSyntheticText(ctx, '│', { fg: ctx.palette.dividerFg })
     for (let cellIdx = 0; cellIdx < numCols; cellIdx++) {
       const cellText = row[cellIdx] || ''
       const colWidth = columnWidths[cellIdx]
       const displayText = rightPadToWidth(clipToWidth(cellText, colWidth), colWidth)
-
-      if (cellIdx === 0) {
-        line.push(styledSeg('│', ctx.palette.dividerFg))
-      }
-
-      line.push(
-        styledSeg(
-          ` ${displayText} `,
-          isHeader ? ctx.palette.headingFg[3] : undefined,
-          isHeader ? TextAttributes.BOLD : undefined,
-        ),
-      )
-
-      line.push(styledSeg('│', ctx.palette.dividerFg))
+      emitSyntheticText(ctx, ` ${displayText} `, {
+        fg: isHeader ? ctx.palette.headingFg[3] : undefined,
+        attributes: isHeader ? TextAttributes.BOLD : undefined,
+      })
+      emitSyntheticText(ctx, '│', { fg: ctx.palette.dividerFg })
     }
-    lines.push(line)
+    newLine(ctx)
 
     if (isHeader) {
-      lines.push(renderSeparator('├', '┼', '┤'))
+      renderSeparator('├', '┼', '┤')
     }
   })
 
-  lines.push(renderSeparator('└', '┴', '┘'))
-
-  return lines
+  renderSeparator('└', '┴', '┘')
 }
 
-// =============================================================================
-// Public API
-// =============================================================================
+function applyPrefixToCurrentLine(ctx: CSTRenderContext, env: BlockEnv): void {
+  if (env.linePrefix) {
+    emitSyntheticText(ctx, env.linePrefix, env.linePrefixStyle ?? {})
+  }
+}
 
-/**
- * Parse markdown into chunks (text and code blocks separated).
- * Code blocks are returned as separate chunks so they can be rendered
- * with proper box-level backgrounds.
- */
+function renderInline(
+  nodes: readonly InlineNode[] | undefined,
+  ctx: CSTRenderContext,
+  style: InlineStyle,
+  env: BlockEnv,
+): void {
+  if (!nodes) return
+
+  for (const node of nodes) {
+    switch (node.type) {
+      case 'text':
+        emitSourceText(ctx, node.text, node.position.start.offset, node.position.end.offset, style)
+        break
+      case 'emphasis':
+        renderInline(node.content, ctx, {
+          ...style,
+          attributes: (style.attributes ?? 0) | TextAttributes.ITALIC,
+        }, env)
+        break
+      case 'strong':
+        renderInline(node.content, ctx, {
+          ...style,
+          attributes: (style.attributes ?? 0) | TextAttributes.BOLD,
+        }, env)
+        break
+      case 'strikethrough':
+        renderInline(node.content, ctx, {
+          ...style,
+          attributes: (style.attributes ?? 0) | TextAttributes.DIM,
+        }, env)
+        break
+      case 'inlineCode': {
+        const contentStart = Math.min(node.position.end.offset, node.position.start.offset + node.meta.backticks)
+        const contentEnd = Math.max(contentStart, node.position.end.offset - node.meta.backticks)
+        emitSyntheticText(ctx, ' ', { fg: style.fg })
+        emitSourceText(ctx, node.text, contentStart, contentEnd, {
+          fg: ctx.palette.inlineCodeFg,
+          attributes: TextAttributes.BOLD,
+        })
+        emitSyntheticText(ctx, ' ', { fg: style.fg })
+        break
+      }
+      case 'link':
+        renderInline(node.content, ctx, { ...style, fg: style.fg ?? ctx.palette.linkFg }, env)
+        break
+      case 'image':
+        emitSourceText(ctx, `[${node.attrs.alt || 'image'}]`, node.position.start.offset, node.position.end.offset, {
+          fg: ctx.palette.linkFg,
+          attributes: style.attributes,
+        })
+        break
+      case 'softBreak':
+      case 'hardBreak':
+        newLine(ctx)
+        applyPrefixToCurrentLine(ctx, env)
+        break
+    }
+  }
+}
+
+function renderParagraph(node: ParagraphNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  applyPrefixToCurrentLine(ctx, env)
+  renderInline(node.content, ctx, env.blockquoteDepth > 0 ? { fg: ctx.palette.blockquoteTextFg } : {}, env)
+  finishBlock(ctx)
+}
+
+function renderHeading(node: HeadingNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  applyPrefixToCurrentLine(ctx, env)
+  renderInline(node.content, ctx, {
+    fg: ctx.palette.headingFg[node.attrs.level] ?? ctx.palette.headingFg[6],
+    attributes: TextAttributes.BOLD,
+  }, env)
+  finishBlock(ctx)
+}
+
+function highlightPlainCodeLine(
+  text: string,
+  lineStart: number,
+  ctx: CSTRenderContext,
+): Line {
+  return splitByHighlights(text || ' ', lineStart, lineStart + text.length, { fg: ctx.palette.codeTextFg }, ctx.highlightRanges)
+}
+
+function highlightColoredCodeLine(
+  line: Line,
+  lineStart: number,
+  ctx: CSTRenderContext,
+): Line {
+  const out: Line = []
+  let cursor = lineStart
+  for (const seg of line) {
+    const segText = seg.text
+    out.push(...splitByHighlights(segText, cursor, cursor + segText.length, seg, ctx.highlightRanges))
+    cursor += segText.length
+  }
+  if (out.length === 0) {
+    out.push({ text: ' ', fg: ctx.palette.syntax.default })
+  }
+  return out
+}
+
+function renderCodeBlock(node: CodeBlockNode, ctx: CSTRenderContext): void {
+  flushTextChunk(ctx)
+
+  const rawText = node.content?.map((t) => t.text).join('') ?? ''
+  const codeContent = rawText.endsWith('\n') ? rawText.slice(0, -1) : rawText
+  const codeStart = node.content?.[0]?.position.start.offset ?? node.position.start.offset
+
+  if (node.attrs.language === 'mermaid') {
+    try {
+      const ascii = renderMermaidAscii(codeContent.trim(), {
+        paddingX: 2,
+        paddingY: 2,
+        boxBorderPadding: 0,
+      })
+      const asciiLineCount = ascii.split('\n').length
+      ctx.chunks.push({
+        type: 'mermaid',
+        ascii,
+        startLine: ctx.currentLineNumber,
+        endLine: ctx.currentLineNumber + asciiLineCount - 1,
+        startChar: node.position.start.offset,
+        endChar: node.position.end.offset,
+      })
+      ctx.currentLineNumber += asciiLineCount
+      ctx.currentLines = [[]]
+      return
+    } catch {
+      // fallback to normal code chunk
+    }
+  }
+
+  const highlighted = node.attrs.language ? tryHighlight(codeContent, node.attrs.language, ctx.palette.syntax) : null
+
+  let lines: Line[]
+  if (highlighted) {
+    let offset = codeStart
+    lines = highlighted.map((line, lineIdx) => {
+      const sourceLineText = codeContent.split('\n')[lineIdx] ?? ''
+      const rendered = highlightColoredCodeLine(line.length === 0 ? [{ text: ' ', fg: ctx.palette.syntax.default }] : line, offset, ctx)
+      offset += sourceLineText.length + 1
+      return rendered
+    })
+  } else {
+    let offset = codeStart
+    lines = codeContent.split('\n').map((lineText) => {
+      const line = highlightPlainCodeLine(lineText, offset, ctx)
+      offset += lineText.length + 1
+      return line
+    })
+  }
+
+  ctx.chunks.push({
+    type: 'code',
+    lang: node.attrs.language ?? undefined,
+    lines,
+    rawCode: codeContent,
+    startLine: ctx.currentLineNumber,
+    endLine: ctx.currentLineNumber + Math.max(lines.length, 1) - 1,
+    startChar: node.position.start.offset,
+    endChar: node.position.end.offset,
+  })
+  ctx.currentLineNumber += Math.max(lines.length, 1)
+  ctx.currentLines = [[]]
+}
+
+function renderHorizontalRule(ctx: CSTRenderContext, env: BlockEnv): void {
+  applyPrefixToCurrentLine(ctx, env)
+  const width = Math.max(10, Math.min(ctx.codeBlockWidth, 80))
+  emitSyntheticText(ctx, '─'.repeat(width), { fg: ctx.palette.dividerFg })
+  finishBlock(ctx)
+}
+
+function renderHtmlBlock(node: HtmlBlockNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  applyPrefixToCurrentLine(ctx, env)
+  emitSourceText(ctx, node.content, node.position.start.offset, node.position.end.offset)
+  finishBlock(ctx)
+}
+
+function renderDefinition(node: DefinitionNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  applyPrefixToCurrentLine(ctx, env)
+  const title = node.title ? ` "${node.title}"` : ''
+  emitSourceText(ctx, `[${node.label}]: ${node.url}${title}`, node.position.start.offset, node.position.end.offset)
+  finishBlock(ctx)
+}
+
+function renderBlankLines(node: BlankLinesNode, ctx: CSTRenderContext): void {
+  for (let i = 0; i < node.count; i++) {
+    emitBlankLine(ctx)
+  }
+}
+
+function withNestedPrefix(env: BlockEnv, prefix: string, style?: Pick<StyledSegment, 'fg' | 'bg' | 'attributes'>): BlockEnv {
+  return {
+    blockquoteDepth: env.blockquoteDepth,
+    linePrefix: `${env.linePrefix ?? ''}${prefix}`,
+    linePrefixStyle: style,
+  }
+}
+
+function renderListItem(
+  item: BulletItemNode | OrderedItemNode | TaskItemNode,
+  marker: string,
+  ctx: CSTRenderContext,
+  env: BlockEnv,
+): void {
+  const baseStyle = env.blockquoteDepth > 0 ? { fg: ctx.palette.blockquoteTextFg } : undefined
+  const firstPrefix = `${env.linePrefix ?? ''}${marker}`
+  const continuationPrefix = `${env.linePrefix ?? ''}${' '.repeat(stringWidth(marker))}`
+
+  item.content.forEach((contentItem, index) => {
+    const childEnv: BlockEnv = {
+      blockquoteDepth: env.blockquoteDepth,
+      linePrefix: index === 0 ? firstPrefix : continuationPrefix,
+      linePrefixStyle: index === 0
+        ? { fg: ctx.palette.listBulletFg }
+        : baseStyle,
+    }
+    renderListItemContentItem(contentItem, ctx, childEnv)
+  })
+}
+
+function renderListItemContentItem(item: ListItemContentItemNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  renderBlock(item.content, ctx, env)
+}
+
+function renderListBreak(node: ListItemBreakNode, ctx: CSTRenderContext): void {
+  for (let i = 0; i < node.meta.blankLines.length; i++) {
+    emitBlankLine(ctx)
+  }
+}
+
+function renderBulletList(node: BulletListNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  for (const child of node.content) {
+    if (child.type === 'listItemBreak') {
+      renderListBreak(child, ctx)
+    } else {
+      renderListItem(child, `${node.meta.marker} `, ctx, env)
+    }
+  }
+  finishBlock(ctx)
+}
+
+function renderOrderedList(node: OrderedListNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  for (const child of node.content) {
+    if (child.type === 'listItemBreak') {
+      renderListBreak(child, ctx)
+    } else {
+      renderListItem(child, `${child.meta.number}${node.meta.delimiter} `, ctx, env)
+    }
+  }
+  finishBlock(ctx)
+}
+
+function renderTaskList(node: TaskListNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  for (const child of node.content) {
+    if (child.type === 'listItemBreak') {
+      renderListBreak(child, ctx)
+      continue
+    }
+
+    let marker = ''
+    if (node.meta.style === 'ordered' && child.meta.number) {
+      marker = `${child.meta.number}${node.meta.delimiter} `
+    } else if (node.meta.style === 'bullet') {
+      marker = `${node.meta.marker} `
+    }
+    marker += child.attrs.checked ? '[x] ' : '[ ] '
+    renderListItem(child, marker, ctx, env)
+  }
+  finishBlock(ctx)
+}
+
+function renderBlockquote(node: BlockquoteNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  const quoteEnv: BlockEnv = {
+    blockquoteDepth: env.blockquoteDepth + 1,
+    linePrefix: `${env.linePrefix ?? ''}> `,
+    linePrefixStyle: { fg: ctx.palette.blockquoteBorderFg },
+  }
+
+  for (const child of node.content) {
+    if (child.type === 'blockquoteItemBreak') {
+      for (let i = 0; i < child.meta.blankLines.length; i++) {
+        emitBlankLine(ctx)
+      }
+    } else {
+      renderBlockquoteItem(child, ctx, quoteEnv)
+    }
+  }
+
+  finishBlock(ctx)
+}
+
+function renderBlockquoteItem(node: BlockquoteItemNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  renderBlock(node.content, ctx, env)
+}
+
+function renderRootBlock(node: RootBlockNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  switch (node.type) {
+    case 'paragraph':
+      renderParagraph(node, ctx, env)
+      break
+    case 'heading':
+      renderHeading(node, ctx, env)
+      break
+    case 'codeBlock':
+      renderCodeBlock(node, ctx)
+      break
+    case 'horizontalRule':
+      renderHorizontalRule(ctx, env)
+      break
+    case 'blockquote':
+      renderBlockquote(node, ctx, env)
+      break
+    case 'bulletList':
+      renderBulletList(node, ctx, env)
+      break
+    case 'orderedList':
+      renderOrderedList(node, ctx, env)
+      break
+    case 'taskList':
+      renderTaskList(node, ctx, env)
+      break
+    case 'table':
+      applyPrefixToCurrentLine(ctx, env)
+      renderTableNode(node, ctx)
+      finishBlock(ctx)
+      break
+    case 'htmlBlock':
+      renderHtmlBlock(node, ctx, env)
+      break
+    case 'definition':
+      renderDefinition(node, ctx, env)
+      break
+    case 'image':
+      applyPrefixToCurrentLine(ctx, env)
+      emitSourceText(ctx, `[${node.attrs.alt || 'image'}]`, node.position.start.offset, node.position.end.offset, {
+        fg: ctx.palette.linkFg,
+      })
+      finishBlock(ctx)
+      break
+  }
+}
+
+function renderBlock(node: DocumentContentNode | BlockquoteContentNode, ctx: CSTRenderContext, env: BlockEnv): void {
+  if (node.type === 'blankLines') {
+    renderBlankLines(node, ctx)
+    return
+  }
+  renderRootBlock(node as RootBlockNode, ctx, env)
+}
+
+function renderDocumentItem(item: DocumentItemNode, ctx: CSTRenderContext): void {
+  renderBlock(item.content, ctx, { blockquoteDepth: 0 })
+}
+
+function renderDocument(doc: DocumentNode, ctx: CSTRenderContext): void {
+  ctx.currentLines = [[]]
+  for (const item of doc.content) {
+    renderDocumentItem(item, ctx)
+  }
+  flushTextChunk(ctx)
+}
+
 export function parseMarkdownToChunks(
   markdown: string,
   options: MarkdownRenderOptions = {},
 ): MarkdownChunk[] {
-  if (!markdown || markdown.trim() === '') {
-    return [{ type: 'text', content: markdown || '' }]
-  }
-
   const palette = buildMergedPalette(options.palette)
   const codeBlockWidth = options.codeBlockWidth ?? 80
+  const highlightRanges = [...(options.highlightRanges ?? [])].sort((a, b) => a.start - b.start)
 
-  const ctx: RenderContext = {
-    palette,
-    codeBlockWidth,
-    chunks: [],
-    currentLines: [],
+  if (!markdown || markdown.trim() === '') {
+    return [{ type: 'text', lines: [], startLine: 0, endLine: 0, startChar: 0, endChar: 0 }]
   }
 
   try {
-    const reactTree = Bun.markdown.react(markdown)
-
-    if (React.isValidElement(reactTree)) {
-      const el = reactTree as React.ReactElement<{ children?: ReactNode }>
-      if (el.type === React.Fragment) {
-        const childArray = React.Children.toArray(el.props.children)
-        for (const child of childArray) {
-          processMarkdownNode(child, ctx)
-        }
-      } else {
-        processMarkdownNode(reactTree, ctx)
-      }
-    } else if (Array.isArray(reactTree)) {
-      for (const node of reactTree as ReactNode[]) {
-        processMarkdownNode(node, ctx)
-      }
+    const doc = parseMarkdown(markdown)
+    const ctx: CSTRenderContext = {
+      source: markdown,
+      palette,
+      codeBlockWidth,
+      highlightRanges,
+      chunks: [],
+      currentLines: [[]],
+      currentLineNumber: 0,
+      minSourceOffset: null,
+      maxSourceOffset: null,
     }
 
-    // Flush any remaining lines
-    flushLines(ctx)
+    renderDocument(doc, ctx)
 
-    return ctx.chunks.length > 0 ? ctx.chunks : [{ type: 'text', content: markdown }]
+    return ctx.chunks.length > 0
+      ? ctx.chunks
+      : [{ type: 'text', lines: [[]], startLine: 0, endLine: 0, startChar: 0, endChar: 0 }]
   } catch (error) {
     console.error('Failed to parse markdown', error)
-    return [{ type: 'text', content: markdown }]
+    return [{ type: 'text', lines: [[{ text: markdown }]], startLine: 0, endLine: 0, startChar: 0, endChar: markdown.length }]
   }
 }
 
-/**
- * Render markdown to React nodes (legacy API - flattens code blocks).
- * For proper code block rendering with backgrounds, use parseMarkdownToChunks instead.
- */
 export function renderMarkdownContent(markdown: string, options: MarkdownRenderOptions = {}): ReactNode {
+  if (!markdown || markdown.trim() === '') return markdown || ''
   const chunks = parseMarkdownToChunks(markdown, options)
   const palette = buildMergedPalette(options.palette)
-
-  // Flatten chunks back to a single ReactNode
   const parts: ReactNode[] = []
 
   for (const chunk of chunks) {
     if (chunk.type === 'text') {
-      parts.push(chunk.content)
+      parts.push(convertLinesToReactNodes(chunk.lines))
     } else if (chunk.type === 'code') {
-      // Render code block inline (no box background in legacy mode)
       const codeContent = convertLinesToReactNodes(chunk.lines)
       parts.push(
         <React.Fragment key={parts.length}>
@@ -1039,7 +1161,6 @@ export function hasOddFenceCount(content: string): boolean {
   return fenceCount % 2 === 1
 }
 
-// Back-compat exports
 export const containsMarkdownSyntax = looksLikeMarkdown
 export const hasUnclosedCodeFence = hasOddFenceCount
 

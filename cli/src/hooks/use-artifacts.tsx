@@ -15,3 +15,11 @@ export const ArtifactProvider = ArtifactContext.Provider
 export function useArtifacts(): ArtifactState | null {
   return useContext(ArtifactContext)
 }
+
+const SelectedArtifactContext = createContext<string | null>(null)
+
+export const SelectedArtifactProvider = SelectedArtifactContext.Provider
+
+export function useSelectedArtifact(): string | null {
+  return useContext(SelectedArtifactContext)
+}
