@@ -37,20 +37,28 @@ const EMPTY_INPUT: InputValue = {
 }
 
 const INLINE_PASTE_PILL_CHAR_LIMIT = 1000
+const MAX_HISTORY = 200
 
-export function ChatController({
-  env,
-  services,
-  selectedArtifactOpen,
-  onCloseArtifact,
-  onApprove,
-  onReject,
-  onInputHasTextChange,
-  restoredQueuedInputText,
-  onRestoredQueuedInputHandled,
-}: ChatControllerProps) {
+export function ChatController(props: ChatControllerProps) {
+  const {
+    env,
+    services,
+    displayMessages,
+    selectedArtifactOpen,
+    onCloseArtifact,
+    onApprove,
+    onReject,
+    onInputHasTextChange,
+    restoredQueuedInputText,
+    onRestoredQueuedInputHandled,
+  } = props
   const [inputValue, setInputValue] = useState<InputValue>(EMPTY_INPUT)
   const [attachments, setAttachments] = useState<ImageAttachment[]>([])
+  const [history, setHistory] = useState<string[]>([])
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null)
+  const [savedDraft, setSavedDraft] = useState('')
+  const historySeededRef = useRef(false)
+  const historyNavRef = useRef(false)
   const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const [nextEscWillClearInput, setNextEscWillClearInput] = useState(false)
@@ -76,6 +84,57 @@ export function ChatController({
   useEffect(() => {
     if (env.composerCanFocus) multilineInputRef.current?.focus()
   }, [env.composerCanFocus])
+
+  useEffect(() => {
+    if (historySeededRef.current) return
+    if (!displayMessages || displayMessages.length === 0) return
+
+    const extractUserMessageText = (message: unknown): string => {
+      if (!message || typeof message !== 'object') return ''
+      const value = message as {
+        type?: string
+        message?: string
+        visibleMessage?: string
+        content?: unknown
+      }
+      if (value.type !== 'user_message') return ''
+      if (typeof value.visibleMessage === 'string') return value.visibleMessage.trim()
+      if (typeof value.message === 'string') return value.message.trim()
+
+      const content = value.content
+      if (typeof content === 'string') return content.trim()
+      if (Array.isArray(content)) {
+        return content
+          .map((part) => {
+            if (typeof part === 'string') return part
+            if (!part || typeof part !== 'object') return ''
+            const p = part as { text?: string; type?: string }
+            if (typeof p.text === 'string') return p.text
+            return ''
+          })
+          .join('')
+          .trim()
+      }
+      return ''
+    }
+
+    const seededHistory = displayMessages
+      .map((message) => extractUserMessageText(message))
+      .filter((message) => message.length > 0)
+      .slice(-MAX_HISTORY)
+
+    setHistory(seededHistory)
+    setHistoryIndex(null)
+    historySeededRef.current = true
+  }, [displayMessages])
+
+  const setComposerText = useCallback((text: string) => {
+    setInputValue({
+      ...EMPTY_INPUT,
+      text,
+      cursorPosition: text.length,
+    })
+  }, [])
 
   const addImageAttachment = useCallback(async () => {
     const result = await readClipboardBitmap()
@@ -173,21 +232,78 @@ export function ChatController({
     if (!env.bashMode && fileMentions.handleKeyIntercept(key)) return true
     if (!env.bashMode && slashCommands.handleKeyIntercept(key)) return true
     if (env.widgetNavActive && services.handleWidgetKeyEvent(key)) return true
+
+    const isPlainArrow = !key.ctrl && !key.meta && !key.option && !key.shift
+    if (!isPlainArrow) return false
+
+    if (key.name === 'up') {
+      if (history.length === 0) return false
+      if (inputValue.text.length > 0 && historyIndex == null) return false
+
+      if (historyIndex == null) {
+        const nextIndex = history.length - 1
+        setSavedDraft(inputValue.text)
+        setHistoryIndex(nextIndex)
+        historyNavRef.current = true
+        setComposerText(history[nextIndex] ?? '')
+        return true
+      }
+
+      const nextIndex = Math.max(0, historyIndex - 1)
+      setHistoryIndex(nextIndex)
+      historyNavRef.current = true
+      setComposerText(history[nextIndex] ?? '')
+      return true
+    }
+
+    if (key.name === 'down') {
+      if (historyIndex == null) return false
+      if (history.length === 0) {
+        setHistoryIndex(null)
+        setSavedDraft('')
+        historyNavRef.current = true
+        setComposerText(savedDraft)
+        return true
+      }
+
+      if (historyIndex < history.length - 1) {
+        const nextIndex = historyIndex + 1
+        setHistoryIndex(nextIndex)
+        historyNavRef.current = true
+        setComposerText(history[nextIndex] ?? '')
+        return true
+      }
+
+      setHistoryIndex(null)
+      historyNavRef.current = true
+      setComposerText(savedDraft)
+      setSavedDraft('')
+      return true
+    }
+
     return false
-  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services])
+  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText])
 
   const handleInputChange = useCallback((value: InputValue) => {
     if (!env.bashMode && value.text === '!') {
       services.enterBashMode()
       setInputValue(EMPTY_INPUT)
+      setHistoryIndex(null)
+      setSavedDraft('')
       return
     }
     if (nextEscWillClearInput) {
       setNextEscWillClearInput(false)
       if (clearInputTimeoutRef.current) clearTimeout(clearInputTimeoutRef.current)
     }
+    if (historyNavRef.current) {
+      historyNavRef.current = false
+    } else if (historyIndex != null && value.text !== (history[historyIndex] ?? '')) {
+      setHistoryIndex(null)
+      setSavedDraft('')
+    }
     setInputValue(value)
-  }, [env.bashMode, nextEscWillClearInput])
+  }, [env.bashMode, nextEscWillClearInput, historyIndex, history])
 
   const handlePaste = useCallback(async (eventText?: string) => {
     const wasClipboardImage = await addImageAttachment()
@@ -205,6 +321,8 @@ export function ChatController({
   const clearComposer = useCallback(() => {
     setInputValue(EMPTY_INPUT)
     setAttachments([])
+    setHistoryIndex(null)
+    setSavedDraft('')
   }, [])
 
   const handleSubmit = useCallback((message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
@@ -219,9 +337,18 @@ export function ChatController({
       const result = services.executeBash(trimmed)
       services.appendBashOutput(result)
       setInputValue(EMPTY_INPUT)
+      setHistoryIndex(null)
+      setSavedDraft('')
       return
     }
     if (!env.modelsConfigured) return
+
+    const historyText = (visibleMessage ?? message).trim()
+    if (historyText.length > 0) {
+      setHistory(prev => [...prev, historyText].slice(-MAX_HISTORY))
+    }
+    setHistoryIndex(null)
+    setSavedDraft('')
 
     services.clearSystemBanners()
     const currentAttachments: Attachment[] = [...attachments, ...mentionAttachments]
@@ -235,6 +362,8 @@ export function ChatController({
   }, [env.bashMode, env.modelsConfigured, services, attachments, clearComposer])
 
   const handleInputSubmit = useCallback(() => {
+    setHistoryIndex(null)
+    setSavedDraft('')
     if (inputValue.text.trim() || attachments.length > 0) {
       const { text, mentions } = reconstituteInputTextWithMentions(inputValue)
       const mentionAttachments: Attachment[] = mentions.map((mention) => ({
@@ -260,13 +389,13 @@ export function ChatController({
         nextEscWillClearInput={nextEscWillClearInput}
         setNextEscWillClearInput={setNextEscWillClearInput}
         clearInputTimeoutRef={clearInputTimeoutRef}
-        onClearInput={() => setInputValue(EMPTY_INPUT)}
+        onClearInput={clearComposer}
         selectedArtifactOpen={selectedArtifactOpen}
         onCloseArtifact={onCloseArtifact}
         bashMode={env.bashMode}
         onExitBashMode={() => {
           services.exitBashMode()
-          setInputValue(EMPTY_INPUT)
+          clearComposer()
         }}
         fileMentionOpen={fileMentions.isOpen}
         slashMenuOpen={slashCommands.isSlashMenuOpen}

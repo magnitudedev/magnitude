@@ -1833,6 +1833,7 @@ function AppInner({
               enterBashMode: () => setBashMode(true),
               exitBashMode: exitBashMode,
             }}
+            displayMessages={display.messages}
             selectedArtifactOpen={selectedArtifact != null}
             onCloseArtifact={() => setSelectedArtifact(null)}
             onApprove={handleApprove}

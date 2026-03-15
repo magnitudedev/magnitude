@@ -45,6 +45,7 @@ export type ChatControllerServices = {
 export type ChatControllerProps = {
   env: ChatControllerEnv
   services: ChatControllerServices
+  displayMessages: DisplayState['messages']
   selectedArtifactOpen: boolean
   onCloseArtifact: () => void
   onApprove: () => void
