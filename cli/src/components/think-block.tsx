@@ -415,7 +415,7 @@ export const ThinkBlock = memo(function ThinkBlock({
 
   // Preview: show last tool label or "thinking..."
   const lastToolStep = [...block.steps].reverse().find(s => s.type === 'tool')
-  const preview = lastToolStep?.label ?? 'thinking...'
+  const preview = lastToolStep?.label ?? 'Thinking...'
 
   // Summary for completed blocks
   const summary = buildSummary(block.steps)
@@ -487,7 +487,7 @@ export const ThinkBlock = memo(function ThinkBlock({
               </>
             )}
             {isCollapsed && isActive && !isEmpty && (
-              <span style={{ fg: theme.secondary }}> \u2014 {preview}</span>
+              <span style={{ fg: theme.secondary }}> — {preview}</span>
             )}
           </text>
         </Button>
