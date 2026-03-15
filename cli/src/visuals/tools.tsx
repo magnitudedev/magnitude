@@ -372,6 +372,7 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
               paddingLeft: 1,
               paddingRight: 1,
               height: 12,
+              overflow: 'hidden',
             }}>
               <StreamingMarkdownContent content={revealedPreview} showCursor={previewCursor} />
             </box>
@@ -449,6 +450,7 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
                   paddingLeft: 1,
                   paddingRight: 1,
                   height: 12,
+                  overflow: 'hidden',
                 }}>
                   <StreamingMarkdownContent content={oldPreview} />
                 </box>
@@ -461,6 +463,7 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
                   paddingLeft: 1,
                   paddingRight: 1,
                   height: 12,
+                  overflow: 'hidden',
                 }}>
                   <StreamingMarkdownContent content={revealedUpdatePreview} showCursor={updatePreviewCursor} />
                 </box>

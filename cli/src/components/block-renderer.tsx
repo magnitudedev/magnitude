@@ -127,7 +127,7 @@ const SpanRenderer = memo(function SpanRenderer({
 
   if (hitZones.length === 0) {
     return (
-      <text id={id} style={{ fg: foreground, wrapMode: 'word', flexGrow: 1 }}>
+      <text id={id} style={{ fg: foreground, wrapMode: 'word' }}>
         {elements}
       </text>
     )
@@ -139,7 +139,7 @@ const SpanRenderer = memo(function SpanRenderer({
       ref={(el: TextRenderable | null) => {
         textRef.current = el
       }}
-      style={{ fg: foreground, wrapMode: 'word', flexGrow: 1 }}
+      style={{ fg: foreground, wrapMode: 'word' }}
       selectable={false}
       onMouseDown={(event: OTMouseEvent) => {
         const hit = hitTest(event)
