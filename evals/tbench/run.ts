@@ -238,6 +238,30 @@ function formatElapsed(ms: number) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
+function getTaskCacheDir(task: TaskInfo) {
+  return path.dirname(task.tomlPath)
+}
+
+function getBaseTaskName(jobTaskDirName: string) {
+  return jobTaskDirName.split('__')[0] ?? jobTaskDirName
+}
+
+async function readTaskInstruction(task: TaskInfo): Promise<string | null> {
+  const instructionPath = path.join(getTaskCacheDir(task), 'instruction.md')
+  try {
+    const raw = await readFile(instructionPath, 'utf8')
+    const text = raw.trim().replace(/\s+/g, ' ')
+    return text || null
+  } catch {
+    return null
+  }
+}
+
+function formatTaskHeader(task: TaskInfo) {
+  const timeout = typeof task.timeoutSec === 'number' ? `${task.timeoutSec}s timeout` : 'unknown timeout'
+  return `${task.name} (${task.difficulty} · ${task.category} · ${timeout})`
+}
+
 async function tailFile(filePath: string, taskName: string, startedAt: number, signal: AbortSignal) {
   let position = 0
   let pending = ''
@@ -271,10 +295,11 @@ async function tailFile(filePath: string, taskName: string, startedAt: number, s
   }
 }
 
-async function watchTaskLogs(jobDir: string, signal: AbortSignal) {
+async function watchTaskLogs(jobDir: string, tasks: TaskInfo[], signal: AbortSignal) {
   const startedAt = Date.now()
   const tailed = new Set<string>()
   const tailPromises: Promise<void>[] = []
+  const taskByName = new Map(tasks.map(task => [task.name, task]))
 
   while (!signal.aborted) {
     try {
@@ -287,7 +312,21 @@ async function watchTaskLogs(jobDir: string, signal: AbortSignal) {
         const logPath = path.join(jobDir, taskName, 'agent', 'magnitude.txt')
         if (existsSync(logPath)) {
           tailed.add(taskName)
-          console.log(ansis.bold(`\n${taskName}`))
+
+          const baseTaskName = getBaseTaskName(taskName)
+          const task = taskByName.get(baseTaskName)
+
+          console.log()
+          if (task) {
+            console.log(ansis.bold(formatTaskHeader(task)))
+            const instruction = await readTaskInstruction(task)
+            if (instruction) {
+              console.log(`${instruction}`)
+            }
+          } else {
+            console.log(ansis.bold(taskName))
+          }
+
           tailPromises.push(tailFile(logPath, taskName, startedAt, signal))
         }
       }
@@ -543,7 +582,7 @@ export async function main() {
     jobDir = found
     if (found) {
       clack.log.info(`Watching ${path.relative(process.cwd(), found)}`)
-      await watchTaskLogs(found, abortController.signal)
+      await watchTaskLogs(found, tasks, abortController.signal)
     }
   })
 
