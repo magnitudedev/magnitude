@@ -9,6 +9,7 @@
     "typecheck": "turbo typecheck",
     "test": "bun test",
     "session": "bun run --cwd evals session",
+    "tbench": "bun run evals/tbench/cli.ts",
     "dash": "bun run --cwd packages/tracing dashboard",
     "events": "cat ~/.magnitude/logs/events.jsonl",
     "events:tail": "tail -f ~/.magnitude/logs/events.jsonl",
