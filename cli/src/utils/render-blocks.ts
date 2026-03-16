@@ -134,7 +134,7 @@ interface InlineStyle {
   dim?: boolean
 }
 
-type PhrasingNode = Text | Link | Image | import('mdast').WikiLink | { type: 'strong' | 'emphasis' | 'delete'; children: PhrasingNode[] } | { type: 'inlineCode'; value: string; position?: any } | { type: 'break' }
+type PhrasingNode = Text | Link | Image | Html | import('mdast').WikiLink | { type: 'strong' | 'emphasis' | 'delete'; children: PhrasingNode[] } | { type: 'inlineCode'; value: string; position?: any } | { type: 'break' }
 
 function sourceOf(node: { position?: { start?: { offset?: number }; end?: { offset?: number } } }): SourceRange {
   return {
@@ -253,6 +253,7 @@ function renderInline(
 
   for (const node of nodes) {
     switch (node.type) {
+      case 'html':
       case 'text':
         spans.push(...splitByHighlights(node.value, sourceStart(node), sourceEnd(node), style, highlights))
         break
@@ -316,6 +317,7 @@ function extractInlinePlainText(nodes: readonly PhrasingNode[] | undefined, sour
   return nodes
     .map((node) => {
       switch (node.type) {
+        case 'html':
         case 'text':
           return node.value
         case 'image':
