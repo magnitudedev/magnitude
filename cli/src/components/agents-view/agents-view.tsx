@@ -41,7 +41,7 @@ export const AgentsView = memo(function AgentsView({
           paddingLeft: 2,
           paddingRight: 1,
           paddingTop: 1,
-          paddingBottom: 1,
+
           justifyContent: 'flex-end',
         },
       }}
