@@ -40,6 +40,7 @@ export interface AgentCreatedSignal {
   readonly taskId: string
   readonly mode: 'clone' | 'spawn'
   readonly context: string
+  readonly message: string | null
   readonly timestamp: number
 }
 
@@ -131,6 +132,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         taskId: event.taskId,
         mode: event.mode,
         context: event.context,
+        message: event.message ?? null,
         timestamp: event.timestamp,
       })
 

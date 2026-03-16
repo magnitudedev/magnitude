@@ -69,6 +69,7 @@ const DEFAULT_DISPLAY_STATE: DisplayState = {
   streamingMessageId: null,
   activeThinkBlockId: null,
   showButton: 'send',
+  colorAssignments: new Map(),
 }
 
 const DEFAULT_FORK_STATE: AgentStatusState = {

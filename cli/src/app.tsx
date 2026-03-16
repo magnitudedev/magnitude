@@ -540,6 +540,7 @@ function AppInner({
         streamingMessageId: null,
         activeThinkBlockId: null,
         showButton: 'send',
+        colorAssignments: new Map(),
       })
       // Store factory so handleSubmit can create client lazily
       initClientRef.current = async () => {

@@ -78,6 +78,9 @@ export {
   getInProgressArtifactStreams,
   getLatestInProgressArtifactStream,
   getArtifactStreamForPanel,
+  ORCHESTRATOR_COLOR,
+  AGENT_COLORS,
+  AGENT_BG_COLORS,
 } from './projections/display'
 export type {
   DisplayState,
@@ -94,6 +97,8 @@ export type {
   ForkActivityToolCounts,
   ApprovalRequestMessage,
   InProgressArtifactView,
+  AgentCommunicationMessage,
+  AgentArtifactEventMessage,
 } from './projections/display'
 
 export { TurnProjection } from './projections/turn'

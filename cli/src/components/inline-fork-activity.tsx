@@ -3,7 +3,9 @@ import { TextAttributes } from '@opentui/core'
 import type { ForkActivityMessage, ForkActivityToolCounts } from '@magnitudedev/agent'
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
+import { AGENT_BG_COLORS } from '@magnitudedev/agent'
 import { BOX_CHARS } from '../utils/ui-constants'
+import { violet, rose, indigo } from '../utils/palette'
 
 interface InlineForkActivityProps {
   message: ForkActivityMessage
@@ -35,12 +37,19 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1)
 }
 
-// Pulse animation: ramp up through blue shades then back down
-const PULSE_COLORS = [
-  '#0c4a6e', '#075985', '#0369a1', '#0284c7', '#0ea5e9', '#38bdf8',
-  '#7dd3fc', '#38bdf8', '#0ea5e9', '#0284c7', '#0369a1', '#075985',
-]
 const PULSE_INTERVAL_MS = 200
+
+// Pulse shades: smooth wave 300→400→500→600→700→600→500→400→300 (9 steps, ~1.8s cycle)
+const PULSE_PALETTES: Record<string, string[]> = {
+  [violet[500]]: [violet[300], violet[400], violet[500], violet[600], violet[700], violet[600], violet[500], violet[400], violet[300]],
+  [rose[500]]:   [rose[300],   rose[400],   rose[500],   rose[600],   rose[700],   rose[600],   rose[500],   rose[400],   rose[300]],
+  [indigo[500]]: [indigo[300], indigo[400], indigo[500], indigo[600], indigo[700], indigo[600], indigo[500], indigo[400], indigo[300]],
+
+}
+
+function getPulseColors(agentColor: string): string[] {
+  return PULSE_PALETTES[agentColor] ?? [agentColor]
+}
 
 // Visible tool categories with their display format
 const TOOL_DISPLAY: { key: keyof ForkActivityToolCounts; verb: string; noun: string; nounPlural: string }[] = [
@@ -56,40 +65,19 @@ const TOOL_DISPLAY: { key: keyof ForkActivityToolCounts; verb: string; noun: str
   { key: 'evaluations', verb: 'Ran', noun: 'script', nounPlural: 'scripts' },
 ]
 
-const ArtifactChip = memo(function ArtifactChip({
-  name,
-  onClick,
-}: {
-  name: string
-  onClick?: () => void
-}) {
-  const theme = useTheme()
-  const [isHovered, setIsHovered] = useState(false)
-
-  return (
-    <Button
-      onClick={onClick}
-      onMouseOver={() => setIsHovered(true)}
-      onMouseOut={() => setIsHovered(false)}
-    >
-      <text style={{ fg: isHovered ? theme.link : theme.primary, wrapMode: 'none' }}>{'[≡ '}{name}{']'}</text>
-    </Button>
-  )
-})
-
 export const InlineForkActivity = memo(function InlineForkActivity({
   message,
   onExpand,
-  onArtifactClick,
 }: InlineForkActivityProps) {
   const theme = useTheme()
-  const [isDetailsHovered, setIsDetailsHovered] = useState(false)
+  const [showHovered, setShowHovered] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [pulseIndex, setPulseIndex] = useState(0)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const pulseRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const isRunning = message.status === 'running'
+  const agentColor = message.agentColor ?? theme.info
 
   // Live timer for running state
   useEffect(() => {
@@ -107,22 +95,24 @@ export const InlineForkActivity = memo(function InlineForkActivity({
     }
   }, [isRunning, message.startedAt, message.completedAt])
 
-  // Pulsing line animation
+  // Smooth pulsing border animation
   useEffect(() => {
     if (isRunning) {
+      const pulseColors = getPulseColors(agentColor)
       pulseRef.current = setInterval(() => {
-        setPulseIndex(prev => (prev + 1) % PULSE_COLORS.length)
+        setPulseIndex(prev => (prev + 1) % pulseColors.length)
       }, PULSE_INTERVAL_MS)
       return () => {
         if (pulseRef.current) clearInterval(pulseRef.current)
       }
     }
-  }, [isRunning])
+  }, [isRunning, agentColor])
 
-  // Determine line color
-  const lineColor = isRunning
-    ? PULSE_COLORS[pulseIndex]
-    : message.status === 'completed' ? theme.success : theme.error
+  // Determine border color: smooth pulse when running, static agent color when done
+  const pulseColors = getPulseColors(agentColor)
+  const borderColor = isRunning
+    ? pulseColors[pulseIndex % pulseColors.length]!
+    : agentColor
 
   const timeStr = isRunning ? formatElapsedTime(elapsed) : formatDuration(elapsed)
   const totalTools = getTotalToolCount(message.toolCounts)
@@ -144,86 +134,65 @@ export const InlineForkActivity = memo(function InlineForkActivity({
   return (
     <box
       style={{
-        alignSelf: 'flex-start',
+        flexGrow: 1,
         marginBottom: 1,
-        borderStyle: 'single',
-        border: ['left'],
-        borderColor: lineColor,
-        customBorderChars: { ...BOX_CHARS, vertical: '┃' },
-        paddingLeft: 1,
-        flexDirection: 'column',
+        marginLeft: 3,
+        marginRight: 3,
       }}
     >
-      {/* Line 1: role agent: name · timer · tools */}
-      <box style={{ flexDirection: 'row' }}>
-        <text style={{ wrapMode: 'none' }}>
-          <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{roleLabel}:</span>
-          {' '}
-          <span fg={theme.foreground}>{displayName}</span>
-          {resumed ? <span fg={theme.muted}> (resumed)</span> : null}
-          <span fg={theme.muted}>{' · '}</span>
-          <span fg={theme.muted}>{timeStr}</span>
-          {totalTools > 0 ? (
-            <>
-              <span fg={theme.muted}>{' · '}</span>
-              <span fg={theme.info}>{totalTools}</span>
-              <span fg={theme.muted}>{totalTools === 1 ? ' tool' : ' tools'}</span>
-            </>
-          ) : null}
-        </text>
-      </box>
-
-      {/* Line 2: tool summary */}
-      <box style={{ flexDirection: 'row' }}>
-        <text style={{ wrapMode: 'none' }}>
-          {toolParts.length === 0 ? (
-            <span fg={theme.muted}>Starting...</span>
-          ) : (
-            toolParts.map((part, i) => (
-              <span key={i}>
-                {i > 0 ? <span fg={theme.muted}>, </span> : null}
-                {part.verb ? (
-                  <>
-                    <span fg={theme.muted}>{part.verb} </span>
-                    <span fg={theme.info}>{part.count}</span>
-                    <span fg={theme.muted}> {part.noun}</span>
-                  </>
-                ) : (
-                  <>
-                    <span fg={theme.info}>{part.count}</span>
-                    <span fg={theme.muted}> {part.noun}</span>
-                  </>
-                )}
-              </span>
-            ))
-          )}
-        </text>
-      </box>
-
-      {/* Line 3: artifact chips */}
-      {message.artifactNames.length > 0 && (
-        <box style={{ flexDirection: 'row', gap: 1 }}>
-          <text style={{ fg: theme.muted, wrapMode: 'none' }}>Artifacts:</text>
-          {message.artifactNames.map((name) => (
-            <ArtifactChip
-              key={name}
-              name={name}
-              onClick={onArtifactClick ? () => onArtifactClick(name) : undefined}
-            />
-          ))}
-        </box>
-      )}
-
-      {/* Clickable details link */}
-      <Button
-        onClick={() => onExpand(message.forkId)}
-        onMouseOver={() => setIsDetailsHovered(true)}
-        onMouseOut={() => setIsDetailsHovered(false)}
+      {/* Outer box: border only */}
+      <box
+        style={{
+          borderStyle: 'single',
+          border: ['left'],
+          borderColor,
+          customBorderChars: { ...BOX_CHARS, vertical: '┃' },
+        }}
       >
-        <text style={{ fg: isDetailsHovered ? theme.foreground : theme.muted, wrapMode: 'none' }}>
-          View details →
+      {/* Inner box: background + padding */}
+      <box
+        style={{
+          flexDirection: 'column',
+          backgroundColor: AGENT_BG_COLORS[agentColor] ?? '#151520',
+          paddingLeft: 1,
+          paddingRight: 2,
+        }}
+      >
+      {/* Line 1: role (name) · timer · tools · Show */}
+      <box style={{ flexDirection: 'row' }}>
+        <text style={{ wrapMode: 'none' }}>
+          <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{roleLabel}</span>
+          <span fg={theme.muted}>{' ('}{displayName}{')'}</span>
+          {resumed ? <span fg={theme.muted}> (resumed)</span> : null}
+          <span fg={theme.muted}>{' · '}{timeStr}</span>
+          {totalTools > 0 ? <span fg={theme.muted}>{' · '}</span> : null}
+          {totalTools > 0 ? <span fg={theme.info}>{String(totalTools)}</span> : null}
+          {totalTools > 0 ? <span fg={theme.muted}>{totalTools === 1 ? ' tool' : ' tools'}</span> : null}
         </text>
-      </Button>
+        <Button
+          onClick={() => onExpand(message.forkId)}
+          onMouseOver={() => setShowHovered(true)}
+          onMouseOut={() => setShowHovered(false)}
+        >
+          <text style={{ fg: showHovered ? theme.foreground : theme.muted, wrapMode: 'none' }}>{' · Show'}</text>
+        </Button>
+      </box>
+
+      {/* Line 2: tool summary — all spans are direct children of <text> */}
+      <text style={{ wrapMode: 'none' }}>
+        {toolParts.length === 0 ? (
+          <span fg={theme.muted}>Starting...</span>
+        ) : (
+          toolParts.flatMap((part, i) => [
+            i > 0 ? <span key={`sep-${i}`} fg={theme.muted}>, </span> : null,
+            <span key={`verb-${i}`} fg={theme.muted}>{part.verb} </span>,
+            <span key={`count-${i}`} fg={theme.info}>{String(part.count)}</span>,
+            <span key={`noun-${i}`} fg={theme.muted}> {part.noun}</span>,
+          ].filter(Boolean))
+        )}
+      </text>
+      </box>
+      </box>
     </box>
   )
 })

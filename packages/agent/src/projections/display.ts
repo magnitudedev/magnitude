@@ -11,6 +11,26 @@
  */
 
 import { Signal, Projection } from '@magnitudedev/event-core'
+
+// =============================================================================
+// Color palette
+// =============================================================================
+
+export const AGENT_COLORS = [
+  '#8b5cf6',  // violet[500]
+  '#d17088',  // rose[500]
+  '#4573ea',  // indigo[500]
+] as const
+
+export const ORCHESTRATOR_COLOR = '#94a3b8'  // slate-400
+
+export const AGENT_BG_COLORS: Record<string, string> = {
+  '#8b5cf6': '#211e30',  // violet — subtle purple tint
+  '#d17088': '#271e24',  // rose — subtle pink tint
+  '#4573ea': '#1c2130',  // indigo — subtle blue tint
+
+  '#94a3b8': '#222832',  // orchestrator — cool blue-gray
+}
 import type { AppEvent, ToolResult, ToolDisplay } from '../events'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { getVisualRegistry } from '../visuals/registry'
@@ -164,6 +184,7 @@ export interface ForkActivityMessage {
   readonly resumeCount?: number
   readonly toolCounts: ForkActivityToolCounts
   readonly artifactNames: readonly string[]
+  readonly agentColor: string
   readonly timestamp: number
 }
 
@@ -177,6 +198,20 @@ export interface AgentCommunicationMessage {
   readonly forkId: string | null
   readonly content: string
   readonly preview: string
+  readonly agentColor: string
+  readonly attachedArtifacts: readonly string[]
+  readonly timestamp: number
+}
+
+export interface AgentArtifactEventMessage {
+  readonly id: string
+  readonly type: 'agent_artifact_event'
+  readonly forkId: string
+  readonly agentName: string
+  readonly agentRole: string
+  readonly agentColor: string
+  readonly operation: 'wrote' | 'updated'
+  readonly artifactName: string
   readonly timestamp: number
 }
 
@@ -202,6 +237,7 @@ export type DisplayMessage =
   | ForkResultMessage
   | ForkActivityMessage
   | AgentCommunicationMessage
+  | AgentArtifactEventMessage
   | ApprovalRequestMessage
 
 /** Per-fork display state */
@@ -212,6 +248,7 @@ export interface DisplayState {
   readonly streamingMessageId: string | null  // Tracks streaming assistant message
   readonly activeThinkBlockId: string | null
   readonly showButton: 'send' | 'stop'
+  readonly colorAssignments: ReadonlyMap<string, number>  // forkId → palette index (only meaningful on root fork)
 }
 
 // =============================================================================
@@ -338,10 +375,23 @@ function closeThinkBlock(state: DisplayState, timestamp: number): DisplayState {
   }
 }
 
-// Standalone signal definition (needed for self-referencing in signalHandlers)
+// Standalone signal definitions (needed for self-referencing in signalHandlers)
 const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: string }>('Display/forkToolStep')
 // Convert to Signal for use in signalHandlers on() calls (which expect Signal, not SignalDef)
 const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: string }, unknown>(forkToolStepSignalDef, 'Display')
+
+const forkArtifactEventSignalDef = Signal.create<{ forkId: string | null; toolKey: 'artifactWrite' | 'artifactUpdate'; artifactName: string }>('Display/forkArtifactEvent')
+const forkArtifactEventSignal = Signal.fromDef<{ forkId: string | null; toolKey: 'artifactWrite' | 'artifactUpdate'; artifactName: string }, unknown>(forkArtifactEventSignalDef, 'Display')
+
+const INITIAL_FORK_STATE: DisplayState = {
+  status: 'idle',
+  messages: [],
+  currentTurnId: null,
+  streamingMessageId: null,
+  activeThinkBlockId: null,
+  showButton: 'send',
+  colorAssignments: new Map(),
+}
 
 const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
   commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
@@ -392,6 +442,14 @@ function moveMessageToEndBeforeQueue<T extends DisplayMessage>(
   const updated = updater ? updater(target) : target
   const remaining = [...messages.slice(0, index), ...messages.slice(index + 1)]
   return insertBeforeQueuedMessages(remaining, updated)
+}
+
+/**
+ * Extract [[artifact-id]] wiki-link references from text.
+ */
+function parseWikiLinks(text: string): string[] {
+  const matches = text.matchAll(/\[\[([^\]]+)\]\]/g)
+  return [...matches].map(m => m[1]!).filter(Boolean)
 }
 
 function toPreview(text: string): string {
@@ -497,19 +555,12 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
   reads: [AgentRoutingProjection, AgentStatusProjection, WorkingStateProjection] as const,
 
-  initialFork: {
-    status: 'idle',
-    messages: [],
-    currentTurnId: null,
-    streamingMessageId: null,
-    activeThinkBlockId: null,
-    showButton: 'send',
-
-  },
+  initialFork: INITIAL_FORK_STATE,
 
   signals: {
     restoreQueuedMessages: Signal.create<{ forkId: string | null; messages: string[] }>('Display/restoreQueuedMessages'),
-    forkToolStep: forkToolStepSignalDef
+    forkToolStep: forkToolStepSignalDef,
+    forkArtifactEvent: forkArtifactEventSignalDef,
   },
 
   eventHandlers: {
@@ -819,6 +870,24 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
 
         case 'ToolExecutionEnded': {
+          // Emit artifact event signal for successful artifact writes/updates
+          if ((event.toolKey === 'artifactWrite' || event.toolKey === 'artifactUpdate') && inner.result._tag === 'Success') {
+            // Find artifact name from the existing tool step (populated during ToolInputReady)
+            let artifactName = ''
+            outer: for (const msg of fork.messages) {
+              if (msg.type !== 'think_block') continue
+              for (const step of msg.steps) {
+                if (step.id === event.toolCallId && step.input && typeof step.input === 'object' && 'id' in step.input) {
+                  artifactName = (step.input as { id: string }).id
+                  break outer
+                }
+              }
+            }
+            if (artifactName) {
+              emit.forkArtifactEvent({ forkId: event.forkId, toolKey: event.toolKey as 'artifactWrite' | 'artifactUpdate', artifactName })
+            }
+          }
+
           // Ignore if not for current turn
           if (fork.currentTurnId !== event.turnId) {
             return fork
@@ -987,28 +1056,67 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
   signalHandlers: (on) => [
     // Insert inline fork activity block in parent's display when agent is created
     on(AgentStatusProjection.signals.agentCreated, ({ value, state }) => {
-      const { forkId, parentForkId, name, role } = value
+      const { forkId, parentForkId, name, role, message, context } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
-      const msg: ForkActivityMessage = {
+      // Assign color from palette using root fork's colorAssignments
+      const rootFork = state.forks.get(null) ?? INITIAL_FORK_STATE
+      const nextIndex = rootFork.colorAssignments.size % AGENT_COLORS.length
+      const agentColor = AGENT_COLORS[nextIndex]!
+      const newColorAssignments = new Map(rootFork.colorAssignments).set(forkId, nextIndex)
+
+      // Parse attached artifact IDs from context
+      const attachedArtifacts = parseWikiLinks(context ?? '')
+
+      // Insert orchestrator to agent communication message
+      const commMsg: AgentCommunicationMessage = {
+        id: generateId(),
+        type: 'agent_communication',
+        direction: 'to_agent',
+        agentId: value.agentId,
+        agentName: value.agentId,
+        agentRole: role,
+        forkId,
+        content: message ?? '',
+        preview: toPreview(message ?? ''),
+        agentColor: ORCHESTRATOR_COLOR,
+        attachedArtifacts,
+        timestamp: value.timestamp,
+      }
+
+      const activityMsg: ForkActivityMessage = {
         id: generateId(),
         type: 'fork_activity',
         forkId,
-        name,
+        name: value.agentId,
         role,
         status: 'running',
         startedAt: value.timestamp,
         resumeCount: 0,
         toolCounts: EMPTY_TOOL_COUNTS,
         artifactNames: [],
-        timestamp: value.timestamp
+        agentColor,
+        timestamp: value.timestamp,
       }
 
-      const newMessages = insertBeforeQueuedMessages(parentState.messages, msg)
+      let newMessages = insertBeforeQueuedMessages(parentState.messages, commMsg)
+      newMessages = insertBeforeQueuedMessages(newMessages, activityMsg)
+
+      // When parentForkId is null, the parent IS the root fork — merge both updates
+      // into one object to avoid the second .set(null, ...) overwriting colorAssignments.
+      const updatedParentFork = parentForkId === null
+        ? { ...rootFork, colorAssignments: newColorAssignments, messages: newMessages }
+        : { ...parentState, messages: newMessages }
+
+      const newForks = new Map(state.forks).set(parentForkId, updatedParentFork)
+      if (parentForkId !== null) {
+        newForks.set(null, { ...rootFork, colorAssignments: newColorAssignments })
+      }
+
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+        forks: newForks,
       }
     }),
 
@@ -1088,20 +1196,30 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         m.type === 'fork_activity' && m.forkId === forkId)
       if (msgIndex === -1) return state
 
-      const message = parentState.messages[msgIndex] as ForkActivityMessage
-      if (!message.completedAt) return state  // never went idle — first run, not a resume
+      const existingMsg = parentState.messages[msgIndex] as ForkActivityMessage
+      if (!existingMsg.completedAt) return state  // still first run, not a resume
 
-      const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
-        ...msg,
+      // Keep existing completed block in history, insert a new running block
+      const newActivity: ForkActivityMessage = {
+        id: generateId(),
+        type: 'fork_activity',
+        forkId,
+        name: existingMsg.name,
+        role: existingMsg.role,
         status: 'running',
-        completedAt: undefined,
-        resumeCount: (msg.resumeCount ?? 0) + 1,
+        startedAt: value.timestamp,
+        resumeCount: (existingMsg.resumeCount ?? 0) + 1,
+        toolCounts: EMPTY_TOOL_COUNTS,
+        artifactNames: [],
+        agentColor: existingMsg.agentColor,
         timestamp: value.timestamp,
-      }))
+      }
+
+      const newMessages = insertBeforeQueuedMessages(parentState.messages, newActivity)
 
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: moved })
+        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
       }
     }),
 
@@ -1113,6 +1231,13 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const agentState = read(AgentStatusProjection)
       const targetAgent = getAgentByForkId(agentState, targetForkId)
       const parentForkId = targetAgent?.parentForkId ?? null
+
+      // Resolve agent color from root fork's colorAssignments
+      const rootFork = state.forks.get(null)
+      const colorIndex = rootFork?.colorAssignments.get(targetForkId)
+      const agentColor = colorIndex !== undefined ? AGENT_COLORS[colorIndex % AGENT_COLORS.length]! : ORCHESTRATOR_COLOR
+      const attachedArtifacts = parseWikiLinks(content)
+
       let nextState = state
 
       const parentDisplayFork = state.forks.get(parentForkId)
@@ -1122,12 +1247,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           type: 'agent_communication',
           direction: 'to_agent',
           agentId,
-          agentName: targetAgent?.name,
+          agentName: targetAgent?.agentId,
           agentRole: targetAgent?.role,
           forkId: targetForkId,
           content,
           preview: toPreview(content),
-          timestamp
+          agentColor: ORCHESTRATOR_COLOR,
+          attachedArtifacts,
+          timestamp,
         }
 
         nextState = {
@@ -1152,7 +1279,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         forkId: targetForkId,
         content,
         preview: toPreview(content),
-        timestamp
+        agentColor: ORCHESTRATOR_COLOR,
+        attachedArtifacts: [],
+        timestamp,
       }
 
       nextState = {
@@ -1174,6 +1303,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const agentState = read(AgentStatusProjection)
       const sourceAgent = agentState.agents.get(agentId)
 
+      // Resolve agent color from root fork's colorAssignments
+      const rootFork = state.forks.get(null)
+      const sourceForkId = sourceAgent?.forkId
+      const colorIndex = sourceForkId ? rootFork?.colorAssignments.get(sourceForkId) : undefined
+      const agentColor = colorIndex !== undefined ? AGENT_COLORS[colorIndex % AGENT_COLORS.length]! : ORCHESTRATOR_COLOR
       let nextState = state
 
       const displayFork = state.forks.get(targetForkId)
@@ -1183,12 +1317,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           type: 'agent_communication',
           direction: 'from_agent',
           agentId,
-          agentName: sourceAgent?.name,
+          agentName: sourceAgent?.agentId,
           agentRole: sourceAgent?.role,
           forkId: targetForkId,
           content,
           preview: toPreview(content),
-          timestamp
+          agentColor,
+          attachedArtifacts: [],
+          timestamp,
         }
 
         nextState = {
@@ -1207,14 +1343,16 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const childCommunication: AgentCommunicationMessage = {
         id: generateId(),
         type: 'agent_communication',
-        direction: 'to_agent',
+        direction: 'from_agent',
         agentId: 'orchestrator',
         agentName: 'Orchestrator',
         agentRole: 'Orchestrator',
         forkId: sourceAgent.forkId,
         content,
         preview: toPreview(content),
-        timestamp
+        agentColor,
+        attachedArtifacts: [],
+        timestamp,
       }
 
       nextState = {
@@ -1226,7 +1364,42 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
 
       return nextState
-    })
+    }),
+
+    // Insert AgentArtifactEventMessage into parent fork when a subagent writes/updates an artifact
+    on(forkArtifactEventSignal, ({ value, state, read }) => {
+      const { forkId, toolKey, artifactName } = value
+      if (forkId === null) return state  // root agent, no parent to notify
+
+      const agentState = read(AgentStatusProjection)
+      const agent = getAgentByForkId(agentState, forkId)
+      if (!agent) return state
+
+      const parentState = state.forks.get(agent.parentForkId)
+      if (!parentState) return state
+
+      const rootFork = state.forks.get(null)
+      const colorIndex = rootFork?.colorAssignments.get(forkId)
+      const agentColor = colorIndex !== undefined ? AGENT_COLORS[colorIndex % AGENT_COLORS.length]! : ORCHESTRATOR_COLOR
+
+      const artifactMsg: AgentArtifactEventMessage = {
+        id: generateId(),
+        type: 'agent_artifact_event',
+        forkId,
+        agentName: agent.agentId,
+        agentRole: agent.role,
+        agentColor,
+        operation: toolKey === 'artifactWrite' ? 'wrote' : 'updated',
+        artifactName,
+        timestamp: Date.now(),
+      }
+
+      const newMessages = insertBeforeQueuedMessages(parentState.messages, artifactMsg)
+      return {
+        ...state,
+        forks: new Map(state.forks).set(agent.parentForkId, { ...parentState, messages: newMessages })
+      }
+    }),
   ]
 })
 

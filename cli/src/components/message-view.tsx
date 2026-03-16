@@ -6,7 +6,8 @@ import { AssistantMessage } from './assistant-message'
 import { ThinkBlock } from './think-block'
 import { InlineForkActivity } from './inline-fork-activity'
 import { ApprovalRequest } from './approval-request'
-import { AgentCommunicationCard } from './agent-communication-card'
+import { AgentCommunicationBubble } from './agent-communication-bubble'
+import { AgentArtifactEventBlock } from './agent-artifact-event-block'
 import { ErrorMessage } from './error-message'
 import { useTheme } from '../hooks/use-theme'
 
@@ -48,6 +49,8 @@ export const MessageView = memo(function MessageView({
   const theme = useTheme()
   // User messages have their own border structure providing left offset
   const isUserType = message.type === 'user_message' || message.type === 'queued_user_message'
+  // These components handle their own borders/padding
+  const isBorderedType = message.type === 'agent_communication' || message.type === 'agent_artifact_event' || message.type === 'fork_activity'
 
   const content = (() => {
     switch (message.type) {
@@ -114,12 +117,15 @@ export const MessageView = memo(function MessageView({
         return <ApprovalRequest message={message} onApprove={onApprove} onReject={onReject} />
 
       case 'agent_communication':
-        return <AgentCommunicationCard message={message} />
+        return <AgentCommunicationBubble message={message} onArtifactClick={onArtifactClick} />
+
+      case 'agent_artifact_event':
+        return <AgentArtifactEventBlock message={message} onArtifactClick={onArtifactClick} />
 
     }
   })()
 
-  if (isUserType) {
+  if (isUserType || isBorderedType) {
     return content
   }
 
