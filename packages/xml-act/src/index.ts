@@ -110,7 +110,7 @@ export type { OutputNode } from './output-tree'
 export { guardStream, guardEffectStream } from './stream-guard'
 
 // Protocol constants & keyword configuration
-export { getKeywords, useAltKeywords, useDefaultKeywords, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from './constants'
+export { getKeywords, useAltKeywords, useDefaultKeywords, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, TURN_CONTROL_FINISH } from './constants'
 export type { KeywordSet } from './constants'
 
 // Parser (for testing — not part of the public API)

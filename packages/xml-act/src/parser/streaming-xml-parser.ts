@@ -2,7 +2,7 @@ import type { ParseEvent, ParseStack, ParserConfig } from './types'
 import { mkRootProse } from './types'
 import type { TagSchema } from '../execution/binding-validator'
 import { createId } from '../util'
-import { getKeywords, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '../constants'
+import { getKeywords, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, TURN_CONTROL_FINISH } from '../constants'
 import { processChar } from './dispatch'
 import { flushStack } from './flush'
 import { FencePhase } from './types'
@@ -28,14 +28,14 @@ export function createStreamingXmlParser(
   defaultMessageDest: string = 'user',
 ): StreamingXmlParser {
   const kw = getKeywords()
-  const structuralTags = new Set([kw.actions, kw.think, kw.thinking, kw.lenses, kw.comms, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD])
+  const structuralTags = new Set([kw.actions, kw.think, kw.thinking, kw.lenses, kw.comms, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, TURN_CONTROL_FINISH])
   const config: ParserConfig = {
     knownTags,
     childTagMap,
     tagSchemas,
     generateId,
     defaultMessageDest,
-    keywords: { actions: kw.actions, think: kw.think, thinking: kw.thinking, lenses: kw.lenses, comms: kw.comms, next: TURN_CONTROL_NEXT, yield: TURN_CONTROL_YIELD },
+    keywords: { actions: kw.actions, think: kw.think, thinking: kw.thinking, lenses: kw.lenses, comms: kw.comms, next: TURN_CONTROL_NEXT, yield: TURN_CONTROL_YIELD, finish: TURN_CONTROL_FINISH },
     structuralTags,
     actionsTags: new Set([...knownTags, ...structuralTags, 'message']),
     topLevelTags: new Set([...structuralTags, ...knownTags, 'message']),
@@ -43,7 +43,7 @@ export function createStreamingXmlParser(
   }
 
   const stack: ParseStack = [mkRootProse()]
-  let emittedTurnControl: 'continue' | 'yield' | null = null
+  let emittedTurnControl: 'continue' | 'yield' | 'finish' | null = null
 
   function filterTurnControl(events: ParseEvent[]): ParseEvent[] {
     const filtered: ParseEvent[] = []

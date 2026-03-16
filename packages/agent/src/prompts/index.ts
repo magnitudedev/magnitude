@@ -16,4 +16,4 @@ export {
 export type { CommsAttachment, CommsEntry, SystemEntry, AgentActivityEntry } from './agents'
 export { formatResults, formatInterrupted, formatError } from './results'
 export { buildReminder } from './reminders'
-export { UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, formatNonexistentAgentError } from './error-states'
+export { UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, ONESHOT_LIVENESS_REMINDER, formatNonexistentAgentError } from './error-states'

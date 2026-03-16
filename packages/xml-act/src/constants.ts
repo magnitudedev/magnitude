@@ -15,6 +15,7 @@ export interface KeywordSet {
 
 export const TURN_CONTROL_NEXT = 'next'
 export const TURN_CONTROL_YIELD = 'yield'
+export const TURN_CONTROL_FINISH = 'finish'
 
 const STANDARD: KeywordSet = {
   actions: 'actions',

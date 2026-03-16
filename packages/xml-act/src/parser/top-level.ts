@@ -113,10 +113,10 @@ export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId:
   const events: ParseEvent[] = []
   const kw = config.keywords
   if (tagName === kw.actions || tagName === kw.comms) return events
-  if (tagName === kw.next || tagName === kw.yield) {
+  if (tagName === kw.next || tagName === kw.yield || tagName === kw.finish) {
     if (containerDepth(state, 'Actions') > 0) events.push(...autoCloseContainer(state, 'Actions'))
     else if (containerDepth(state, 'Comms') > 0) events.push(...autoCloseContainer(state, 'Comms'))
-    events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : 'yield' })
+    events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : tagName === kw.yield ? 'yield' : 'finish' })
     state.push({ _tag: 'Done' })
     return events
   }

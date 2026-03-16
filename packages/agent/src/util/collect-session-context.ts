@@ -164,6 +164,9 @@ export interface CollectSessionContextOptions {
   cwd?: string
   memoryEnabled?: boolean
   storage?: StorageClient
+  oneshot?: {
+    prompt: string
+  }
 }
 
 export async function collectSessionContext(opts?: CollectSessionContextOptions): Promise<SessionContext> {
@@ -192,5 +195,6 @@ export async function collectSessionContext(opts?: CollectSessionContextOptions)
     agentsFile,
     skills: skills.length > 0 ? skills : null,
     userMemory,
+    oneshot: opts?.oneshot,
   }
 }

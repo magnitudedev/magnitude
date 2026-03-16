@@ -29,6 +29,7 @@
     "pino": "^10.3.0",
     "react": "^19.0.0",
     "string-width": "^8.1.1",
+    "ansis": "^3.17.0",
     "zustand": "^5.0.8"
   },
   "devDependencies": {

@@ -15,7 +15,9 @@ import browserPromptRaw from './prompts/browser.txt'
 import { createBuilder } from './builder'
 import { createDebugger } from './debugger'
 import debuggerPromptRaw from './prompts/debugger.txt'
+import orchestratorOneshotPromptRaw from './prompts/orchestrator-oneshot.txt'
 import orchestratorPromptRaw from './prompts/orchestrator.txt'
+import toolingSectionRaw from './prompts/orchestrator-tooling.txt'
 import { createOrchestrator } from './orchestrator'
 import { createPlanner } from './planner'
 import plannerPromptRaw from './prompts/planner.txt'
@@ -36,8 +38,10 @@ const replacePromptTokens = (raw: string): string =>
     .replaceAll('{{THINK_CLOSE}}', thinkTagClose())
     .replaceAll('{{COMMS_OPEN}}', commsTagOpen())
     .replaceAll('{{COMMS_CLOSE}}', commsTagClose())
+    .replaceAll('{{TOOLING_SECTION}}', toolingSectionRaw)
 
 const ORCHESTRATOR_PROMPT = replacePromptTokens(orchestratorPromptRaw)
+const ORCHESTRATOR_ONESHOT_PROMPT = replacePromptTokens(orchestratorOneshotPromptRaw)
 const BUILDER_PROMPT = replacePromptTokens(builderPromptRaw)
 const EXPLORER_PROMPT = replacePromptTokens(explorerPromptRaw)
 const PLANNER_PROMPT = replacePromptTokens(plannerPromptRaw)
@@ -93,3 +97,5 @@ export function getAgentDefinition(variant: AgentVariant): MagnitudeAgentDef {
   if (override) return override
   return getAgents()[variant]
 }
+
+export { ORCHESTRATOR_ONESHOT_PROMPT }

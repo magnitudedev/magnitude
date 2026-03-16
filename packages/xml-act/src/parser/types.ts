@@ -43,7 +43,7 @@ export type ParseEvent =
   | { readonly _tag: 'MessageTagOpen'; readonly id: string; readonly dest: string; readonly artifactsRaw: string | null }
   | { readonly _tag: 'MessageBodyChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageTagClose'; readonly id: string }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' }
+  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' | 'finish' }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
 export type StepResult =
@@ -173,6 +173,7 @@ export interface ParserConfig {
     comms: string
     next: string
     yield: string
+    finish: string
   }
   structuralTags: ReadonlySet<string>
   actionsTags: ReadonlySet<string>

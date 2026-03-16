@@ -35,6 +35,7 @@
         "@magnitudedev/ripgrep": "workspace:*",
         "@opentui/core": "0.1.77",
         "@opentui/react": "0.1.77",
+        "ansis": "^3.17.0",
         "beautiful-mermaid": "^0.1.3",
         "commander": "^14.0.1",
         "immer": "^10.1.3",

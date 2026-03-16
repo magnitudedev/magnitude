@@ -318,7 +318,7 @@ export type XmlToolResult<TOutput = unknown> =
   | { readonly _tag: 'Interrupted' }
 
 export type XmlExecutionResult =
-  | { readonly _tag: 'Success'; readonly turnControl: 'continue' | 'yield' | null }
+  | { readonly _tag: 'Success'; readonly turnControl: 'continue' | 'yield' | 'finish' | null }
   | { readonly _tag: 'Failure'; readonly error: string }
   | { readonly _tag: 'Interrupted' }
   | { readonly _tag: 'GateRejected'; readonly rejection: unknown }

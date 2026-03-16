@@ -1,10 +1,12 @@
-import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
+import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_FINISH, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './xml-act-protocol.txt'
+import turnControlOneshotRaw from './turn-control-oneshot.txt'
 import turnControlOrchestratorRaw from './turn-control-orchestrator.txt'
 import turnControlSubagentRaw from './turn-control-subagent.txt'
 import type { ThinkingLens } from '../thinking-lens'
 
 const XML_ACT_PROTOCOL_RAW = xmlActProtocolRaw
+const TURN_CONTROL_ONESHOT_RAW = turnControlOneshotRaw
 const TURN_CONTROL_ORCHESTRATOR_RAW = turnControlOrchestratorRaw
 const TURN_CONTROL_SUBAGENT_RAW = turnControlSubagentRaw
 
@@ -24,10 +26,12 @@ function renderLensesExample(lenses: ThinkingLens[]): string {
 export function getXmlActProtocol(
   defaultRecipient: string = 'user',
   lenses: ThinkingLens[],
-  role: 'orchestrator' | 'subagent' = 'orchestrator',
+  role: 'orchestrator' | 'subagent' | 'oneshot' = 'orchestrator',
 ): string {
   const turnControlSection = role === 'subagent'
     ? TURN_CONTROL_SUBAGENT_RAW
+    : role === 'oneshot'
+    ? TURN_CONTROL_ONESHOT_RAW
     : TURN_CONTROL_ORCHESTRATOR_RAW
 
   return XML_ACT_PROTOCOL_RAW
@@ -44,6 +48,7 @@ export function getXmlActProtocol(
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{TURN_CONTROL_NEXT}}', TURN_CONTROL_NEXT)
     .replaceAll('{{TURN_CONTROL_YIELD}}', TURN_CONTROL_YIELD)
+    .replaceAll('{{TURN_CONTROL_FINISH}}', TURN_CONTROL_FINISH)
 }
 
 export function buildAckTurn(lenses: ThinkingLens[]): string {

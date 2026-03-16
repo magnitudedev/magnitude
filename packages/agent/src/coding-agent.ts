@@ -157,6 +157,13 @@ export interface CreateClientOptions {
    * Useful for evals / headless runs where the agent operates in a container.
    */
   sessionContext?: SessionContext
+
+  /**
+   * Optional pre-configured provider runtime.
+   * When provided, provider bootstrap is skipped and the caller is responsible
+   * for initializing model selections/auth inside the runtime.
+   */
+  providerRuntime?: ReturnType<typeof makeProviderRuntimeLive>
 }
 
 /**
@@ -171,9 +178,12 @@ let hasDrainedPendingMemoryJobs = false
 export async function createCodingAgentClient(options: CreateClientOptions) {
   const memoryEnabled = await options.storage.config.getMemoryEnabled()
 
-  // Bootstrap provider runtime from stored config / env vars
-  const providerRuntime = makeProviderRuntimeLive()
-  await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
+  // Bootstrap provider runtime from stored config / env vars unless the caller
+  // supplied a pre-configured runtime (e.g. headless oneshot mode).
+  const providerRuntime = options.providerRuntime ?? makeProviderRuntimeLive()
+  if (!options.providerRuntime) {
+    await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
+  }
 
   if (!hasDrainedPendingMemoryJobs) {
     hasDrainedPendingMemoryJobs = true

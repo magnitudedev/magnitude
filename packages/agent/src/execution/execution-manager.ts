@@ -33,7 +33,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { ArtifactStateReaderTag, type ArtifactStateReader } from '../tools/artifact-tools'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, formatNonexistentAgentError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, ONESHOT_LIVENESS_REMINDER, formatNonexistentAgentError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
@@ -255,6 +255,9 @@ const makeExecutionManager = Effect.gen(function* () {
   // Bound observables map
   const boundObservables = new Map<string | null, BoundObservable[]>()
 
+  // Session-level oneshot mode flag (set once during root fork init, never changes)
+  let oneshotEnabled = false
+
   // Approval state for gated tool calls
   const approvalState = createApprovalState()
 
@@ -264,7 +267,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
   /**
    * Resolve the active agent definition for a fork.
-   * Child forks use their fixed role. Root fork is always orchestrator.
+   * Child forks use their fixed role. Root fork uses the orchestrator definition.
    */
   const resolveAgent: AgentResolver = (forkId) => {
     if (forkId !== null) {
@@ -406,6 +409,7 @@ const makeExecutionManager = Effect.gen(function* () {
         yield* AgentStatusProjection.Tag,
         yield* WorkingStateProjection.Tag,
       )
+
 
       // Run xml-act runtime
       const eventStream = runtime.streamWith(xmlStream, { initialState: replayState })
@@ -675,6 +679,18 @@ const makeExecutionManager = Effect.gen(function* () {
                     executionResult = { success: false, error: String(rejection) || 'Gate rejected', cancelled: true }
                   }
                 }
+
+                // Oneshot liveness guard: prevent stalling when nothing is active
+                if (executionResult.success && executionResult.turnDecision === 'yield' && oneshotEnabled) {
+                  const pCtx = yield* policyCtxProvider.get
+                  if (pCtx.activeAgentCount === 0) {
+                    executionResult = {
+                      success: true,
+                      turnDecision: 'continue',
+                      reminder: ONESHOT_LIVENESS_REMINDER,
+                    }
+                  }
+                }
                 break
               }
             }
@@ -708,6 +724,9 @@ const makeExecutionManager = Effect.gen(function* () {
 
       const sessionState = yield* sessionContextProjection.get
       const cwd = sessionState.context?.cwd ?? process.cwd()
+      if (forkId === null) {
+        oneshotEnabled = !!sessionState.context?.oneshot
+      }
 
       let layers = makeForkLayers(
         forkId,

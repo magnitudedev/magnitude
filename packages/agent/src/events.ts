@@ -72,6 +72,9 @@ export interface SessionContext {
   readonly agentsFile: { readonly filename: string; readonly content: string } | null  // Agent instruction file if present
   readonly skills: readonly { readonly name: string; readonly description: string; readonly trigger: string; readonly path: string }[] | null  // Available agent skills
   readonly userMemory?: string | null
+  readonly oneshot?: {
+    readonly prompt: string
+  }
 }
 
 export interface SessionInitialized {

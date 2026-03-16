@@ -43,7 +43,7 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { WorkingStateProjection } from '../projections/working-state'
 import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, ORCHESTRATOR_ONESHOT_PROMPT, type AgentVariant } from '../agents'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
 import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
@@ -102,7 +102,7 @@ function buildXmlActSystemPrompt(
   agentDef: ReturnType<typeof getAgentDefinition>,
   implicitTools: readonly string[] = ['think'],
   defaultRecipient = 'user',
-  role: 'orchestrator' | 'subagent' = 'orchestrator',
+  role: 'orchestrator' | 'subagent' | 'oneshot' = 'orchestrator',
 ): string {
   const toolDocs = generateXmlActToolDocs(agentDef, implicitTools)
   return roleDescription
@@ -171,8 +171,15 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // 2. Build system prompt with runtime protocol/tool-doc substitution
         const implicitTools = ['think'] as const
+        const isOneshot = variant === 'orchestrator' && !!sessionCtx.context?.oneshot
         const systemPrompt = variant === 'orchestrator'
-          ? buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'user', 'orchestrator')
+          ? buildXmlActSystemPrompt(
+              isOneshot ? ORCHESTRATOR_ONESHOT_PROMPT : agentDef.systemPrompt,
+              agentDef,
+              implicitTools,
+              'user',
+              isOneshot ? 'oneshot' : 'orchestrator',
+            )
           : buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'parent', 'subagent')
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
@@ -182,7 +189,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         if (Either.isLeft(resolveResult)) {
           const e = resolveResult.left
           const message = e._tag === 'NotConfigured'
-            ? 'No model configured. Please connect a provider and select a model in /settings.'
+            ? (isOneshot
+              ? 'No model configured. Ensure --provider and --model flags are set correctly.'
+              : 'No model configured. Please connect a provider and select a model in /settings.')
             : e._tag === 'ProviderDisconnected'
             ? e.message
             : `Authentication failed: ${e.message}`

@@ -12,6 +12,7 @@ import { StorageProvider } from './providers/storage-provider'
 import { isLightBackground } from './utils/theme'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
 import { useAltKeywords } from '@magnitudedev/xml-act'
+import { runOneshot } from './oneshot'
 
 async function main() {
   // Initialize theme store before rendering (defaults to dark)
@@ -23,10 +24,30 @@ async function main() {
     .option('--resume', 'Resume the most recent chat session')
     .option('--debug', 'Enable debug mode with debug panel')
     .option('--alt-keywords', 'Use alternate XML keywords (magniactions/magnithink) for self-development')
-    .action(async (opts) => {
+    .option('--oneshot [prompt]', 'Run autonomous oneshot task and exit on completion')
+    .option('--provider <id>', 'Provider ID for oneshot mode (e.g. anthropic, openai)')
+    .option('--model <id>', 'Model ID for oneshot mode')
+    .argument('[prompt]')
+    .action(async (promptArg, opts) => {
       if (opts.altKeywords) {
         useAltKeywords()
       }
+
+      if (opts.oneshot !== undefined) {
+        if (opts.resume) {
+          console.error('--resume and --oneshot cannot be used together')
+          process.exit(1)
+        }
+        const prompt = typeof opts.oneshot === 'string' ? opts.oneshot : promptArg
+        await runOneshot({
+          prompt,
+          providerId: opts.provider,
+          modelId: opts.model,
+          debug: opts.debug ?? false,
+        })
+        return
+      }
+
       const renderer = await createCliRenderer({
         exitOnCtrlC: false, // We handle Ctrl+C manually for two-tap exit
       })

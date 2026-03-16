@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test'
 import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose } from '../constants'
+import { TURN_CONTROL_FINISH, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose } from '../constants'
 import type { ParseEvent } from '../parser/types'
 
 const knownTags = new Set(['shell', 'fs-read'])
@@ -46,6 +46,13 @@ describe('basic turn control', () => {
     expect(tc[0].decision).toBe('yield')
   })
 
+  it('<finish/> emits finish decision', () => {
+    const events = parse(`<${TURN_CONTROL_FINISH}/>`)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
+  })
+
   it('<next/> char-by-char', () => {
     const events = parseCharByChar(`<${TURN_CONTROL_NEXT}/>`)
     const tc = turnControls(events)
@@ -58,6 +65,13 @@ describe('basic turn control', () => {
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('yield')
+  })
+
+  it('<finish/> char-by-char', () => {
+    const events = parseCharByChar(`<${TURN_CONTROL_FINISH}/>`)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
   })
 })
 
@@ -80,6 +94,14 @@ describe('turn control after content blocks', () => {
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('continue')
+  })
+
+  it('after actions block with <finish/>', () => {
+    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n<${TURN_CONTROL_FINISH}/>`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
   })
 
   it('after comms block', () => {
@@ -140,8 +162,35 @@ describe('duplicate turn control tags', () => {
     expect(parseErrors(events)).toHaveLength(0)
   })
 
+  it('duplicate <finish/> — only one TurnControl event', () => {
+    const xml = `<${TURN_CONTROL_FINISH}/>\n<${TURN_CONTROL_FINISH}/>`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
+    expect(parseErrors(events)).toHaveLength(0)
+  })
+
   it('<next/> then <yield/> — first wins', () => {
     const xml = `<${TURN_CONTROL_NEXT}/>\n<${TURN_CONTROL_YIELD}/>`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('continue')
+    expect(parseErrors(events)).toHaveLength(0)
+  })
+
+  it('<finish/> then <yield/> — first wins', () => {
+    const xml = `<${TURN_CONTROL_FINISH}/>\n<${TURN_CONTROL_YIELD}/>`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
+    expect(parseErrors(events)).toHaveLength(0)
+  })
+
+  it('<next/> then <finish/> — first wins', () => {
+    const xml = `<${TURN_CONTROL_NEXT}/>\n<${TURN_CONTROL_FINISH}/>`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -169,22 +218,32 @@ describe('duplicate turn control tags', () => {
 })
 
 // =============================================================================
-// Turn control inside structural blocks (should NOT be recognized)
+// Turn control inside structural blocks auto-closes the block
 // =============================================================================
 
-describe('turn control inside blocks is not recognized', () => {
-  it('inside actions block — not recognized as turn control', () => {
+describe('turn control inside blocks auto-closes and is recognized', () => {
+  it('inside actions block — auto-closes actions and emits turn control', () => {
     const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_NEXT}/>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('continue')
   })
 
-  it('inside comms block — not recognized as turn control', () => {
+  it('inside comms block — auto-closes comms and emits turn control', () => {
     const xml = `${commsTagOpen()}\n<${TURN_CONTROL_YIELD}/>\n${commsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('yield')
+  })
+
+  it('inside actions block with <finish/> — auto-closes and emits finish', () => {
+    const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_FINISH}/>\n${actionsTagClose()}`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
   })
 })
 
@@ -218,6 +277,16 @@ describe('content after turn control is dropped', () => {
     expect(tc).toHaveLength(1)
     const prose = events.filter(e => e._tag === 'ProseChunk' || e._tag === 'ProseEnd')
     expect(prose).toHaveLength(0)
+  })
+
+  it('content after <finish/> is dropped', () => {
+    const xml = `<${TURN_CONTROL_FINISH}/>\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('finish')
+    const tagCloseds = events.filter(e => e._tag === 'TagClosed')
+    expect(tagCloseds).toHaveLength(0)
   })
 
   it('no unclosed errors from content after turn control', () => {
