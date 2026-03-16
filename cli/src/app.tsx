@@ -50,6 +50,7 @@ import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
 
 import { AgentsView } from './components/agents-view/agents-view'
+import { AgentSummaryBar } from './components/agent-summary-bar'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -1853,6 +1854,14 @@ function AppInner({
                 onArtifactClick={handleArtifactClick}
               />
             )
+          )}
+          {agentsViewState && agentsViewState.items.length > 0 && (
+            <AgentSummaryBar
+              agentsViewState={agentsViewState}
+              onViewAll={() => handleTabSwitch('agents')}
+              onArtifactClick={handleArtifactClick}
+              activeTab={activeTab}
+            />
           )}
           <ChatController
             env={{

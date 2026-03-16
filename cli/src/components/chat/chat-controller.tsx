@@ -481,7 +481,7 @@ export function ChatController(props: ChatControllerProps) {
       </box>
       )}
 
-      <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between', marginTop: activeTab !== 'main' ? 1 : 0 }}>
+      <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between', marginTop: 0 }}>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
           <TabSwitcher
             activeTab={activeTab}

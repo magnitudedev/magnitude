@@ -8,7 +8,7 @@ import { InlineForkActivity } from './inline-fork-activity'
 import { ApprovalRequest } from './approval-request'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { ErrorMessage } from './error-message'
-import { AgentNotification } from './agent-notification'
+
 import { useTheme } from '../hooks/use-theme'
 
 interface MessageViewProps {
@@ -119,11 +119,6 @@ export const MessageView = memo(function MessageView({
       case 'agent_communication':
         return <AgentCommunicationCard message={message} />
 
-      case 'agent_started_notification':
-        return <AgentNotification type="started" agentRole={message.agentRole} agentName={message.agentName} colorIndex={message.colorIndex} onViewAgents={onViewAgents ?? (() => {})} />
-
-      case 'agent_completed_notification':
-        return <AgentNotification type="completed" agentRole={message.agentRole} agentName={message.agentName} colorIndex={message.colorIndex} durationSeconds={message.durationSeconds} totalTools={message.totalTools} onViewAgents={onViewAgents ?? (() => {})} />
 
     }
   })()

@@ -3,43 +3,47 @@ import { TextAttributes } from '@opentui/core'
 import type { AgentsViewArtifactItem } from '@magnitudedev/agent'
 import { Button } from '../button'
 import { useTheme } from '../../hooks/use-theme'
-import { getAgentPalette } from '../../utils/agent-colors'
+import { getAgentColorByRole } from '../../utils/agent-colors'
+import { LaneGutter, type LaneEntry } from './lane-gutter'
 
 interface AgentArtifactEventProps {
   item: AgentsViewArtifactItem
   onArtifactClick?: (name: string, section?: string) => void
+  lanes?: LaneEntry[]
 }
 
 export const AgentArtifactEvent = memo(function AgentArtifactEvent({
   item,
   onArtifactClick,
+  lanes = [],
 }: AgentArtifactEventProps) {
   const theme = useTheme()
   const [artifactHovered, setArtifactHovered] = useState(false)
-  const palette = getAgentPalette(item.colorIndex)
+  const palette = getAgentColorByRole(item.agentRole)
 
   const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
-  const actionLabel = item.action === 'wrote' ? 'Wrote' : 'Updated'
+  const actionLabel = item.action === 'wrote' ? 'created' : 'updated'
 
   return (
     <box
       style={{
-        marginBottom: 1,
         flexDirection: 'row',
-        alignItems: 'center',
+        alignItems: 'stretch',
+        minHeight: 1,
       }}
     >
-      <text style={{ fg: theme.muted, wrapMode: 'none' }}>
+      <LaneGutter lanes={lanes} />
+      <text style={{ wrapMode: 'none' }}>
         <span fg={palette.border}>{'✎ '}</span>
         <span fg={palette.border} attributes={TextAttributes.BOLD}>{capitalize(item.agentRole)}</span>
-        <span fg={theme.muted}>{' ('}{item.agentName}{')'}{' · '}{actionLabel}{' '}</span>
+        <span fg={theme.muted}>{' ('}{item.agentName}{')'}{' '}{actionLabel}{' '}</span>
       </text>
       <Button
         onClick={onArtifactClick ? () => onArtifactClick(item.artifactName) : undefined}
         onMouseOver={() => setArtifactHovered(true)}
         onMouseOut={() => setArtifactHovered(false)}
       >
-        <text style={{ fg: artifactHovered ? theme.link : theme.primary, wrapMode: 'none' }}>{'[≡ '}{item.artifactName}{']'}</text>
+        <text style={{ fg: artifactHovered ? theme.link : palette.border, wrapMode: 'none' }}>{'[≡ '}{item.artifactName}{']'}</text>
       </Button>
     </box>
   )

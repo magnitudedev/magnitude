@@ -4,12 +4,14 @@ import type { AgentsViewMessageItem } from '@magnitudedev/agent'
 import { Button } from '../button'
 import { MarkdownContent } from '../markdown-content'
 import { useTheme } from '../../hooks/use-theme'
-import { getAgentPalette, ORCHESTRATOR_PALETTE } from '../../utils/agent-colors'
+import { getAgentColorByRole } from '../../utils/agent-colors'
 import { BOX_CHARS } from '../../utils/ui-constants'
+import { LaneGutter, type LaneEntry } from './lane-gutter'
 
 interface AgentMessageBubbleProps {
   item: AgentsViewMessageItem
   onArtifactClick?: (name: string, section?: string) => void
+  lanes?: LaneEntry[]
 }
 
 function isLong(content: string): boolean {
@@ -47,62 +49,53 @@ const ArtifactChip = memo(function ArtifactChip({
 export const AgentMessageBubble = memo(function AgentMessageBubble({
   item,
   onArtifactClick,
+  lanes = [],
 }: AgentMessageBubbleProps) {
   const theme = useTheme()
   const [collapsed, setCollapsed] = useState(true)
   const [expandHovered, setExpandHovered] = useState(false)
 
   const isSenderOrchestrator = item.direction === 'to_agent'
-  const senderPalette = isSenderOrchestrator
-    ? ORCHESTRATOR_PALETTE
-    : getAgentPalette(item.fromColorIndex!)
-  const borderColor = senderPalette.border
-  const bgColor = senderPalette.bg
+
+  // Derive palettes from role
+  const orchestratorPalette = getAgentColorByRole('orchestrator')
+  const agentPalette = isSenderOrchestrator
+    ? getAgentColorByRole(item.toRole)
+    : getAgentColorByRole(item.fromRole)
+
 
   const long = isLong(item.content)
   const displayContent = long && collapsed ? truncate(item.content) : item.content
 
-  // Header: "Orchestrator → Role (name)" or "Role (name) → Orchestrator"
   const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
-  const fromLabel = item.fromColorIndex === null
-    ? 'Orchestrator'
-    : capitalize(item.fromRole)
-  const fromName = item.fromColorIndex === null ? null : item.fromName
-  const toLabel = item.toColorIndex === null
-    ? 'Orchestrator'
-    : capitalize(item.toRole)
-  const toName = item.toColorIndex === null ? null : item.toName
 
   return (
-    <box
-      style={{
-        marginBottom: 1,
-        borderStyle: 'single',
-        border: ['left'],
-        borderColor,
-        customBorderChars: { ...BOX_CHARS, vertical: '┃' },
-      }}
-    >
+    <box style={{ flexDirection: 'row', alignItems: 'stretch' }}>
+      <LaneGutter lanes={lanes} />
       <box
         style={{
-          paddingLeft: 1,
+          flexGrow: 1,
+        }}
+      >
+      <box
+        style={{
           flexDirection: 'column',
-          backgroundColor: bgColor,
         }}
       >
       {/* Header */}
       <text style={{ wrapMode: 'none' }}>
+        <span fg={theme.muted}>{'⌲ '}</span>
         {isSenderOrchestrator ? (
           <>
-            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{fromLabel}</span>
+            <span fg={orchestratorPalette.border} attributes={TextAttributes.BOLD}>{'Orchestrator'}</span>
             <span fg={theme.muted}>{' → '}</span>
-            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{toLabel}</span>
-            {toName ? <span fg={theme.muted}>{' ('}{toName}{')'}</span> : null}
+            <span fg={agentPalette.border} attributes={TextAttributes.BOLD}>{capitalize(item.toRole)}</span>
+            <span fg={theme.muted}>{' ('}{item.toName}{')'}</span>
           </>
         ) : (
           <>
-            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{fromLabel}</span>
-            {fromName ? <span fg={theme.muted}>{' ('}{fromName}{')'}</span> : null}
+            <span fg={agentPalette.border} attributes={TextAttributes.BOLD}>{capitalize(item.fromRole)}</span>
+            <span fg={theme.muted}>{' ('}{item.fromName}{')'}</span>
           </>
         )}
       </text>
@@ -140,6 +133,7 @@ export const AgentMessageBubble = memo(function AgentMessageBubble({
         </box>
       ) : null}
       </box>
+    </box>
     </box>
   )
 })

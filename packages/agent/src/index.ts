@@ -294,6 +294,8 @@ export type {
   AgentsViewState,
   AgentsViewItem,
   AgentsViewMessageItem,
-  AgentsViewActivityItem,
+  AgentsViewActivityStartItem,
+  AgentsViewActivityEndItem,
+  ActiveActivityEntry,
   AgentsViewArtifactItem,
 } from './projections/agents-view'

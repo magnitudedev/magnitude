@@ -35,18 +35,28 @@ export interface AgentsViewMessageItem {
   readonly attachedArtifacts: readonly string[]
 }
 
-export interface AgentsViewActivityItem {
+export interface AgentsViewActivityStartItem {
   readonly id: string
-  readonly type: 'agents_view_activity'
+  readonly type: 'agents_view_activity_start'
   readonly timestamp: number
   readonly forkId: string
   readonly agentRole: string
   readonly agentName: string
   readonly colorIndex: number
-  readonly status: 'active' | 'settled'
-  readonly toolCounts: ForkActivityToolCounts
   readonly startedAt: number
-  readonly completedAt?: number
+}
+
+export interface AgentsViewActivityEndItem {
+  readonly id: string
+  readonly type: 'agents_view_activity_end'
+  readonly timestamp: number
+  readonly forkId: string
+  readonly agentRole: string
+  readonly agentName: string
+  readonly colorIndex: number
+  readonly startedAt: number
+  readonly completedAt: number
+  readonly toolCounts: ForkActivityToolCounts
 }
 
 export interface AgentsViewArtifactItem {
@@ -63,13 +73,20 @@ export interface AgentsViewArtifactItem {
 
 export type AgentsViewItem =
   | AgentsViewMessageItem
-  | AgentsViewActivityItem
+  | AgentsViewActivityStartItem
+  | AgentsViewActivityEndItem
   | AgentsViewArtifactItem
+
+export interface ActiveActivityEntry {
+  readonly itemId: string
+  readonly startedAt: number
+  readonly toolCounts: ForkActivityToolCounts
+}
 
 export interface AgentsViewState {
   readonly items: readonly AgentsViewItem[]
-  /** forkId -> active activity item id */
-  readonly activeActivityIds: ReadonlyMap<string, string>
+  /** forkId -> active activity entry */
+  readonly activeActivityIds: ReadonlyMap<string, ActiveActivityEntry>
   /** toolCallId -> { toolKey, artifactName } buffered from ToolInputReady */
   readonly pendingToolInputs: ReadonlyMap<string, { toolKey: string; artifactName: string }>
 }
@@ -169,25 +186,12 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
   },
 
   signalHandlers: (on) => [
-    // Agent created: add active activity item
+    // Agent created: add initial message (outside lane) then start item
     on(AgentStatusProjection.signals.agentCreated, ({ value, state }) => {
-      const activityId = generateId()
-      const activityItem: AgentsViewActivityItem = {
-        id: activityId,
-        type: 'agents_view_activity',
-        timestamp: value.timestamp,
-        forkId: value.forkId,
-        agentRole: value.role,
-        agentName: value.agentId,
-        colorIndex: value.colorIndex,
-        status: 'active',
-        toolCounts: EMPTY_TOOL_COUNTS,
-        startedAt: value.timestamp,
-      }
-
+      const startId = generateId()
       const newItems: AgentsViewItem[] = [...state.items]
 
-      // Add initial orchestrator->agent message if present (before activity item)
+      // Add initial orchestrator->agent message BEFORE start item (outside the lane)
       const initialContent = value.message?.trim()
       if (initialContent) {
         const msgItem: AgentsViewMessageItem = {
@@ -207,75 +211,111 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
         newItems.push(msgItem)
       }
 
-      newItems.push(activityItem)
-
-      return {
-        ...state,
-        items: newItems,
-        activeActivityIds: new Map(state.activeActivityIds).set(value.forkId, activityId),
-      }
-    }),
-
-    // Agent became working (resume): add new active activity item
-    on(AgentStatusProjection.signals.agentBecameWorking, ({ value, state }) => {
-      // Only insert resume activity if there's no current active activity
-      const existingActivityId = state.activeActivityIds.get(value.forkId)
-      if (existingActivityId) return state  // already active (first run)
-
-      const activityId = generateId()
-      const item: AgentsViewActivityItem = {
-        id: activityId,
-        type: 'agents_view_activity',
+      const startItem: AgentsViewActivityStartItem = {
+        id: startId,
+        type: 'agents_view_activity_start',
         timestamp: value.timestamp,
         forkId: value.forkId,
         agentRole: value.role,
         agentName: value.agentId,
         colorIndex: value.colorIndex,
-        status: 'active',
-        toolCounts: EMPTY_TOOL_COUNTS,
         startedAt: value.timestamp,
       }
+      newItems.push(startItem)
+
+      const entry: ActiveActivityEntry = {
+        itemId: startId,
+        startedAt: value.timestamp,
+        toolCounts: EMPTY_TOOL_COUNTS,
+      }
+
       return {
         ...state,
-        items: [...state.items, item],
-        activeActivityIds: new Map(state.activeActivityIds).set(value.forkId, activityId),
+        items: newItems,
+        activeActivityIds: new Map(state.activeActivityIds).set(value.forkId, entry),
       }
     }),
 
-    // Agent became idle: settle active activity item
+    // Agent became working (resume): add new start item if not already active
+    on(AgentStatusProjection.signals.agentBecameWorking, ({ value, state }) => {
+      const existing = state.activeActivityIds.get(value.forkId)
+      if (existing) return state  // already active (first run)
+
+      const startId = generateId()
+      const startItem: AgentsViewActivityStartItem = {
+        id: startId,
+        type: 'agents_view_activity_start',
+        timestamp: value.timestamp,
+        forkId: value.forkId,
+        agentRole: value.role,
+        agentName: value.agentId,
+        colorIndex: value.colorIndex,
+        startedAt: value.timestamp,
+      }
+      const entry: ActiveActivityEntry = {
+        itemId: startId,
+        startedAt: value.timestamp,
+        toolCounts: EMPTY_TOOL_COUNTS,
+      }
+      return {
+        ...state,
+        items: [...state.items, startItem],
+        activeActivityIds: new Map(state.activeActivityIds).set(value.forkId, entry),
+      }
+    }),
+
+    // Agent became idle: append end item
     on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
-      const activityId = state.activeActivityIds.get(value.forkId)
-      if (!activityId) return state
+      const entry = state.activeActivityIds.get(value.forkId)
+      if (!entry) return state
+
+      const endItem: AgentsViewActivityEndItem = {
+        id: generateId(),
+        type: 'agents_view_activity_end',
+        timestamp: value.timestamp,
+        forkId: value.forkId,
+        agentRole: value.role,
+        agentName: value.agentId,
+        colorIndex: value.colorIndex,
+        startedAt: entry.startedAt,
+        completedAt: value.timestamp,
+        toolCounts: entry.toolCounts,
+      }
 
       const newActiveIds = new Map(state.activeActivityIds)
       newActiveIds.delete(value.forkId)
 
       return {
         ...state,
-        items: state.items.map(item =>
-          item.id === activityId && item.type === 'agents_view_activity'
-            ? { ...item, status: 'settled' as const, completedAt: value.timestamp }
-            : item
-        ),
+        items: [...state.items, endItem],
         activeActivityIds: newActiveIds,
       }
     }),
 
-    // Agent dismissed: settle active activity item
+    // Agent dismissed: append end item
     on(AgentStatusProjection.signals.agentDismissed, ({ value, state }) => {
-      const activityId = state.activeActivityIds.get(value.forkId)
-      if (!activityId) return state
+      const entry = state.activeActivityIds.get(value.forkId)
+      if (!entry) return state
+
+      const endItem: AgentsViewActivityEndItem = {
+        id: generateId(),
+        type: 'agents_view_activity_end',
+        timestamp: value.timestamp,
+        forkId: value.forkId,
+        agentRole: value.role,
+        agentName: value.agentId,
+        colorIndex: value.colorIndex,
+        startedAt: entry.startedAt,
+        completedAt: value.timestamp,
+        toolCounts: entry.toolCounts,
+      }
 
       const newActiveIds = new Map(state.activeActivityIds)
       newActiveIds.delete(value.forkId)
 
       return {
         ...state,
-        items: state.items.map(item =>
-          item.id === activityId && item.type === 'agents_view_activity'
-            ? { ...item, status: 'settled' as const, completedAt: value.timestamp }
-            : item
-        ),
+        items: [...state.items, endItem],
         activeActivityIds: newActiveIds,
       }
     }),
@@ -336,21 +376,22 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
       return { ...state, items: [...state.items, item] }
     }),
 
-    // Tool step: increment tool counts on active activity item
+    // Tool step: accumulate tool counts in active entry
     on(forkToolStepSignal, ({ value, state }) => {
       const { forkId, toolKey } = value
       if (!forkId) return state
 
-      const activityId = state.activeActivityIds.get(forkId)
-      if (!activityId) return state
+      const entry = state.activeActivityIds.get(forkId)
+      if (!entry) return state
+
+      const newEntry: ActiveActivityEntry = {
+        ...entry,
+        toolCounts: incrementToolCount(entry.toolCounts, toolKey),
+      }
 
       return {
         ...state,
-        items: state.items.map(item =>
-          item.id === activityId && item.type === 'agents_view_activity'
-            ? { ...item, toolCounts: incrementToolCount(item.toolCounts, toolKey) }
-            : item
-        ),
+        activeActivityIds: new Map(state.activeActivityIds).set(forkId, newEntry),
       }
     }),
   ],
