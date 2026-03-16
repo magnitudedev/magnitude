@@ -644,7 +644,7 @@ function renderListNode(node: List, options: RenderOptions, sourceText?: string)
 }
 
 function renderBlockquoteNode(node: Blockquote, options: RenderOptions, sourceText?: string): BlockquoteBlock {
-  const content = renderNodesToBlocks(node.children as RootContent[], options, sourceText, options.palette.blockquoteTextFg).flatMap((block) =>
+  const content = renderNodesToBlocks(node.children as RootContent[], options, sourceText, options.palette.blockquoteTextFg, true).flatMap((block) =>
     block.type === 'table'
       ? [{
           type: 'paragraph' as const,
@@ -711,6 +711,7 @@ function renderNodesToBlocks(
   options: RenderOptions,
   sourceText?: string,
   inheritedParagraphFg?: string,
+  ensureSpacers?: boolean,
 ): Block[] {
   if (!nodes) return []
   const blocks: Block[] = []
@@ -722,7 +723,9 @@ function renderNodesToBlocks(
 
     if (previousRenderable) {
       const blankLines = countBlankLinesBetween(previousRenderable, node)
-      if (blankLines > 0) blocks.push({ type: 'spacer', lines: blankLines })
+      const minSpacing = ensureSpacers ? 1 : 0
+      const lines = Math.max(minSpacing, blankLines)
+      if (lines > 0) blocks.push({ type: 'spacer', lines })
     }
 
     blocks.push(...rendered)
@@ -738,7 +741,7 @@ export function renderDocumentItemToBlocks(item: RootContent, options: RenderOpt
 
 export function renderDocumentToBlocks(doc: Root, options: RenderOptions): Block[] {
   const sourceText = (doc as any).data?.source as string | undefined
-  return renderNodesToBlocks(doc.children, options, sourceText)
+  return renderNodesToBlocks(doc.children, options, sourceText, undefined, true)
 }
 
 export function extractHeadingSlugsFromBlocks(blocks: Block[]): string[] {

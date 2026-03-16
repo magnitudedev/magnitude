@@ -318,17 +318,34 @@ function ListBlockView({
 }) {
   return (
     <box style={{ flexDirection: 'column' }}>
-      {block.items.map((item, idx) => (
-        <box key={idx} style={{ flexDirection: 'column' }}>
-          <BlockRenderer
-            blocks={itemContentWithMarker(item)}
-            foreground={foreground}
-            palette={palette}
-            contentWidth={contentWidth}
-            onOpenArtifact={onOpenArtifact}
-          />
-        </box>
-      ))}
+      {block.items.map((item, idx) => {
+        const markerWidth = stringWidth(item.marker)
+        const [first, ...rest] = itemContentWithMarker(item)
+        return (
+          <box key={idx} style={{ flexDirection: 'column' }}>
+            {first && (
+              <BlockRenderer
+                blocks={[first]}
+                foreground={foreground}
+                palette={palette}
+                contentWidth={contentWidth}
+                onOpenArtifact={onOpenArtifact}
+              />
+            )}
+            {rest.length > 0 && (
+              <box style={{ paddingLeft: markerWidth }}>
+                <BlockRenderer
+                  blocks={rest}
+                  foreground={foreground}
+                  palette={palette}
+                  contentWidth={Math.max(10, contentWidth - markerWidth)}
+                  onOpenArtifact={onOpenArtifact}
+                />
+              </box>
+            )}
+          </box>
+        )
+      })}
     </box>
   )
 }
