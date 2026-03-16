@@ -3,6 +3,7 @@ import { TextAttributes } from '@opentui/core'
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { getAgentPalette } from '../utils/agent-colors'
+import { orange, green } from '../utils/theme'
 
 interface AgentNotificationProps {
   type: 'started' | 'completed'
@@ -34,25 +35,28 @@ export const AgentNotification = memo(function AgentNotification({
   const [isLinkHovered, setIsLinkHovered] = useState(false)
   const palette = getAgentPalette(colorIndex)
 
+  const isStarted = type === 'started'
+  const statusColor = isStarted ? orange[400] : green[400]
+  const statusIcon = isStarted ? '▶' : '✔'
+  const statusLabel = isStarted ? 'Started' : 'Finished'
+
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text style={{ wrapMode: 'none' }}>
-        <span fg={palette.border}>{'◆'}</span>
+        <span fg={statusColor}>{statusIcon} {statusLabel}</span>
         {' '}
-        <span fg={palette.border} attributes={TextAttributes.BOLD}>{agentRole.charAt(0).toUpperCase() + agentRole.slice(1)}</span>
+        <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{agentRole.charAt(0).toUpperCase() + agentRole.slice(1)}</span>
         <span fg={theme.muted}>{' ('}{agentName}{')'}</span>
-        {' '}
-        <span fg={theme.muted}>{type === 'started' ? 'Started' : 'Finished'}</span>
-        {type === 'completed' && durationSeconds !== undefined ? (
+        {!isStarted && durationSeconds !== undefined ? (
           <span fg={theme.muted}>{' · '}{formatDuration(durationSeconds)}</span>
         ) : null}
-        {type === 'completed' && totalTools !== undefined ? (
+        {!isStarted && totalTools !== undefined ? (
           <span fg={theme.muted}>{' · '}</span>
         ) : null}
-        {type === 'completed' && totalTools !== undefined ? (
+        {!isStarted && totalTools !== undefined ? (
           <span fg={theme.info}>{String(totalTools)}</span>
         ) : null}
-        {type === 'completed' && totalTools !== undefined ? (
+        {!isStarted && totalTools !== undefined ? (
           <span fg={theme.muted}>{totalTools === 1 ? ' tool' : ' tools'}</span>
         ) : null}
         <span fg={theme.muted}>{' · '}</span>
@@ -63,7 +67,7 @@ export const AgentNotification = memo(function AgentNotification({
         onMouseOut={() => setIsLinkHovered(false)}
       >
         <text style={{ fg: isLinkHovered ? theme.foreground : theme.muted, wrapMode: 'none' }}>
-          {'View agents →'}
+          {'View agents tab →'}
         </text>
       </Button>
     </box>

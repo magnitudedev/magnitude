@@ -92,11 +92,19 @@ export const AgentMessageBubble = memo(function AgentMessageBubble({
       >
       {/* Header */}
       <text style={{ wrapMode: 'none' }}>
-        <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{fromLabel}</span>
-        {fromName ? <span fg={theme.muted}>{' ('}{fromName}{')'}</span> : null}
-        <span fg={theme.muted}>{' → '}</span>
-        <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{toLabel}</span>
-        {toName ? <span fg={theme.muted}>{' ('}{toName}{')'}</span> : null}
+        {isSenderOrchestrator ? (
+          <>
+            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{fromLabel}</span>
+            <span fg={theme.muted}>{' → '}</span>
+            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{toLabel}</span>
+            {toName ? <span fg={theme.muted}>{' ('}{toName}{')'}</span> : null}
+          </>
+        ) : (
+          <>
+            <span fg={theme.foreground} attributes={TextAttributes.BOLD}>{fromLabel}</span>
+            {fromName ? <span fg={theme.muted}>{' ('}{fromName}{')'}</span> : null}
+          </>
+        )}
       </text>
 
       {/* Content */}
