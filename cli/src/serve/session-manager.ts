@@ -69,11 +69,14 @@ const DEFAULT_DISPLAY_STATE: DisplayState = {
   streamingMessageId: null,
   activeThinkBlockId: null,
   showButton: 'send',
+  agentToolCounts: new Map(),
+  agentStartedAt: new Map(),
 }
 
 const DEFAULT_FORK_STATE: AgentStatusState = {
   agents: new Map(),
   agentByForkId: new Map(),
+  nextColorIndex: 0,
 }
 
 const DEFAULT_WORKING_STATE: ForkWorkingState = {

@@ -21,6 +21,7 @@ export interface AgentInfo {
   readonly taskId: string
   readonly message: string | null
   readonly status: AgentStatus
+  readonly colorIndex: number
   readonly result?: unknown
   readonly dismissReason?: 'dismissed' | 'interrupted' | 'completed'
 }
@@ -28,6 +29,7 @@ export interface AgentInfo {
 export interface AgentStatusState {
   readonly agents: ReadonlyMap<string, AgentInfo>
   readonly agentByForkId: ReadonlyMap<string, string>
+  readonly nextColorIndex: number
 }
 
 export interface AgentCreatedSignal {
@@ -40,6 +42,8 @@ export interface AgentCreatedSignal {
   readonly taskId: string
   readonly mode: 'clone' | 'spawn'
   readonly context: string
+  readonly message: string
+  readonly colorIndex: number
   readonly timestamp: number
 }
 
@@ -51,6 +55,7 @@ export interface AgentDismissedSignal {
   readonly role: string
   readonly type: string
   readonly taskId: string
+  readonly colorIndex: number
   readonly result: unknown
   readonly reason: 'dismissed' | 'interrupted' | 'completed'
   readonly timestamp: number
@@ -61,6 +66,9 @@ export interface AgentBecameIdleSignal {
   readonly forkId: string
   readonly type: string
   readonly parentForkId: string | null
+  readonly colorIndex: number
+  readonly name: string
+  readonly role: string
   readonly reason: 'stable' | 'interrupt' | 'error'
   readonly timestamp: number
 }
@@ -70,6 +78,9 @@ export interface AgentBecameWorkingSignal {
   readonly forkId: string
   readonly type: string
   readonly parentForkId: string | null
+  readonly colorIndex: number
+  readonly name: string
+  readonly role: string
   readonly timestamp: number
 }
 
@@ -100,6 +111,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
   initial: {
     agents: new Map(),
     agentByForkId: new Map(),
+    nextColorIndex: 0,
   },
 
   signals: {
@@ -121,6 +133,8 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         throw new Error(`[AgentStatusProjection] Invalid state transition: agent_created for already indexed fork ${event.forkId} (agentId: ${existingForkAgentId})`)
       }
 
+      const colorIndex = state.nextColorIndex
+
       emit.agentCreated({
         forkId: event.forkId,
         parentForkId: event.parentForkId,
@@ -131,6 +145,8 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         taskId: event.taskId,
         mode: event.mode,
         context: event.context,
+        message: event.message,
+        colorIndex,
         timestamp: event.timestamp,
       })
 
@@ -145,12 +161,14 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         taskId: event.taskId,
         message: event.message ?? null,
         status: 'starting',
+        colorIndex,
       }
 
       return {
         ...state,
         agents: new Map(state.agents).set(event.agentId, agent),
         agentByForkId: new Map(state.agentByForkId).set(event.forkId, event.agentId),
+        nextColorIndex: state.nextColorIndex + 1,
       }
     },
 
@@ -178,6 +196,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         role: existing.role,
         type: existing.role,
         taskId: existing.taskId,
+        colorIndex: existing.colorIndex,
         result: event.result,
         reason: event.reason,
         timestamp: event.timestamp,
@@ -215,6 +234,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
           forkId: agent.forkId,
           type: agent.role,
           parentForkId: agent.parentForkId,
+          colorIndex: agent.colorIndex,
+          name: agent.name,
+          role: agent.role,
           timestamp: event.timestamp,
         })
       }
@@ -237,6 +259,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
           forkId: agent.forkId,
           type: agent.role,
           parentForkId: agent.parentForkId,
+          colorIndex: agent.colorIndex,
+          name: agent.name,
+          role: agent.role,
           reason: 'error',
           timestamp: event.timestamp,
         })
@@ -260,6 +285,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
           forkId: agent.forkId,
           type: agent.role,
           parentForkId: agent.parentForkId,
+          colorIndex: agent.colorIndex,
+          name: agent.name,
+          role: agent.role,
           reason: 'interrupt',
           timestamp: event.timestamp,
         })
@@ -285,6 +313,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
           forkId: agent.forkId,
           type: agent.role,
           parentForkId: agent.parentForkId,
+          colorIndex: agent.colorIndex,
+          name: agent.name,
+          role: agent.role,
           reason: 'stable',
           timestamp: value.timestamp,
         })

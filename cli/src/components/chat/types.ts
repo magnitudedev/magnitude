@@ -53,4 +53,8 @@ export type ChatControllerProps = {
   onInputHasTextChange?: (hasText: boolean) => void
   restoredQueuedInputText?: string | null
   onRestoredQueuedInputHandled?: () => void
+  activeTab: 'main' | 'agents'
+  hasActiveAgents: boolean
+  hasUnreadMain: boolean
+  onTabSwitch: (tab: 'main' | 'agents') => void
 }

@@ -8,6 +8,7 @@ import { InlineForkActivity } from './inline-fork-activity'
 import { ApprovalRequest } from './approval-request'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { ErrorMessage } from './error-message'
+import { AgentNotification } from './agent-notification'
 import { useTheme } from '../hooks/use-theme'
 
 interface MessageViewProps {
@@ -26,6 +27,7 @@ interface MessageViewProps {
   inputHasText?: boolean
   onArtifactClick?: (name: string, section?: string) => void
   onForkExpand?: (forkId: string) => void
+  onViewAgents?: () => void
 }
 
 export const MessageView = memo(function MessageView({
@@ -43,7 +45,8 @@ export const MessageView = memo(function MessageView({
   onWorkReject,
   inputHasText,
   onArtifactClick,
-  onForkExpand
+  onForkExpand,
+  onViewAgents,
 }: MessageViewProps) {
   const theme = useTheme()
   // User messages have their own border structure providing left offset
@@ -115,6 +118,12 @@ export const MessageView = memo(function MessageView({
 
       case 'agent_communication':
         return <AgentCommunicationCard message={message} />
+
+      case 'agent_started_notification':
+        return <AgentNotification type="started" agentRole={message.agentRole} agentName={message.agentName} colorIndex={message.colorIndex} onViewAgents={onViewAgents ?? (() => {})} />
+
+      case 'agent_completed_notification':
+        return <AgentNotification type="completed" agentRole={message.agentRole} agentName={message.agentName} colorIndex={message.colorIndex} durationSeconds={message.durationSeconds} totalTools={message.totalTools} onViewAgents={onViewAgents ?? (() => {})} />
 
     }
   })()

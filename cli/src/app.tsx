@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, getLatestInProgressArtifactStream } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, type AgentsViewState, getLatestInProgressArtifactStream } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -48,6 +48,8 @@ import { ArtifactReaderPanel } from './components/artifact-reader-panel'
 import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
+
+import { AgentsView } from './components/agents-view/agents-view'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -114,6 +116,11 @@ function AppInner({
   const [client, setClient] = useState<AgentClient | null>(null)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
+  const [agentsViewState, setAgentsViewState] = useState<AgentsViewState | null>(null)
+  const [activeTab, setActiveTab] = useState<'main' | 'agents'>('main')
+  const [hasUnreadMain, setHasUnreadMain] = useState(false)
+  const activeTabRef = useRef<'main' | 'agents'>('main')
+  const prevAssistantCountRef = useRef(0)
   const [artifactState, setArtifactState] = useState<ArtifactState | null>(null)
   const [selectedArtifact, setSelectedArtifact] = useState<{ name: string; section?: string } | null>(null)
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
@@ -513,6 +520,15 @@ function AppInner({
         }
       })
 
+      // Subscribe to agents view state (global projection)
+      if (client.state.agentsView) {
+        client.state.agentsView.subscribe((state: AgentsViewState) => {
+          if (mounted) {
+            setAgentsViewState(state)
+          }
+        })
+      }
+
       // Subscribe to restore queued messages signal (only for main/root)
       client.on.restoreQueuedMessages(({ forkId, messages }) => {
         // Only restore if this is for the main agent (not a fork)
@@ -541,6 +557,8 @@ function AppInner({
         streamingMessageId: null,
         activeThinkBlockId: null,
         showButton: 'send',
+        agentToolCounts: new Map(),
+        agentStartedAt: new Map(),
       })
       // Store factory so handleSubmit can create client lazily
       initClientRef.current = async () => {
@@ -588,6 +606,13 @@ function AppInner({
         interruptedMessageIdRef.current = null
       } else if (state.status === 'idle' && state.messages.some(m => m.type === 'interrupted')) {
         interruptedMessageIdRef.current = lastStreamingMessageIdRef.current
+      }
+      if (activeTabRef.current === 'agents') {
+        const newCount = state.messages.filter(m => m.type === 'assistant_message').length
+        if (newCount > prevAssistantCountRef.current) {
+          setHasUnreadMain(true)
+        }
+        prevAssistantCountRef.current = newCount
       }
       setDisplay(state)
     })
@@ -1343,6 +1368,12 @@ function AppInner({
 
 
 
+  const handleTabSwitch = useCallback((tab: 'main' | 'agents') => {
+    setActiveTab(tab)
+    activeTabRef.current = tab
+    if (tab === 'main') setHasUnreadMain(false)
+  }, [])
+
   const handleInterrupt = useCallback(() => {
     if (!client) return
     logger.info({ forkId: null }, 'Sending interrupt event')
@@ -1751,6 +1782,7 @@ function AppInner({
                     inputHasText={inputHasText}
                     onArtifactClick={handleArtifactClick}
                     onForkExpand={pushForkOverlay}
+                    onViewAgents={() => handleTabSwitch('agents')}
                   />
                 </ErrorBoundary>
               )
@@ -1813,7 +1845,17 @@ function AppInner({
               />
             </box>
           )}
-          {chatScrollbox}
+          {activeTab === 'main' ? chatScrollbox : (
+            <box style={{ flexGrow: 1, minHeight: 0 }}>
+              {agentsViewState && (
+                <AgentsView
+                  items={agentsViewState.items}
+                  onForkExpand={pushForkOverlay}
+                  onArtifactClick={handleArtifactClick}
+                />
+              )}
+            </box>
+          )}
           <ChatController
             env={{
               status: display.status,
@@ -1862,6 +1904,10 @@ function AppInner({
             onInputHasTextChange={setInputHasText}
             restoredQueuedInputText={restoredQueuedInputText}
             onRestoredQueuedInputHandled={() => setRestoredQueuedInputText(null)}
+            activeTab={activeTab}
+            hasActiveAgents={hasRunningForks}
+            hasUnreadMain={hasUnreadMain}
+            onTabSwitch={handleTabSwitch}
           />
         </box>
 

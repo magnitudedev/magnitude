@@ -27,7 +27,7 @@ import { isActive, type ArtifactStreamPreview, type ArtifactVisualState, type Ph
  * Resolve display visibility for a tool call using the agent definition's display policy.
  * Reads the agent role from AgentStatusProjection to determine which agent definition to consult.
  */
-/** Map XmlToolResult → ToolResult for display. */
+/** Map XmlToolResult -> ToolResult for display. */
 function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay): ToolResult {
   switch (result._tag) {
     case 'Success':
@@ -192,6 +192,28 @@ export interface ApprovalRequestMessage {
   readonly display?: ToolDisplay
 }
 
+export interface AgentStartedNotificationMessage {
+  readonly id: string
+  readonly type: 'agent_started_notification'
+  readonly forkId: string
+  readonly agentRole: string
+  readonly agentName: string
+  readonly colorIndex: number
+  readonly timestamp: number
+}
+
+export interface AgentCompletedNotificationMessage {
+  readonly id: string
+  readonly type: 'agent_completed_notification'
+  readonly forkId: string
+  readonly agentRole: string
+  readonly agentName: string
+  readonly colorIndex: number
+  readonly durationSeconds: number
+  readonly totalTools: number
+  readonly timestamp: number
+}
+
 export type DisplayMessage =
   | UserMessageDisplay
   | QueuedUserMessageDisplay
@@ -203,6 +225,8 @@ export type DisplayMessage =
   | ForkActivityMessage
   | AgentCommunicationMessage
   | ApprovalRequestMessage
+  | AgentStartedNotificationMessage
+  | AgentCompletedNotificationMessage
 
 /** Per-fork display state */
 export interface DisplayState {
@@ -212,6 +236,8 @@ export interface DisplayState {
   readonly streamingMessageId: string | null  // Tracks streaming assistant message
   readonly activeThinkBlockId: string | null
   readonly showButton: 'send' | 'stop'
+  readonly agentToolCounts: ReadonlyMap<string, ForkActivityToolCounts>  // forkId -> tool counts
+  readonly agentStartedAt: ReadonlyMap<string, number>  // forkId -> startedAt timestamp
 }
 
 // =============================================================================
@@ -343,11 +369,13 @@ const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: st
 // Convert to Signal for use in signalHandlers on() calls (which expect Signal, not SignalDef)
 const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: string }, unknown>(forkToolStepSignalDef, 'Display')
 
-const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
+export { forkToolStepSignal as forkToolStepSignalExport }
+
+export const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
   commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
 }
 
-function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
+export function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
   switch (toolKey) {
     case 'shell': return { ...counts, commands: counts.commands + 1 }
     case 'fileRead':
@@ -488,6 +516,12 @@ export function getArtifactStreamForPanel(
   return getLatestInProgressArtifactStream(state, artifactId, true)
 }
 
+function totalToolCount(counts: ForkActivityToolCounts): number {
+  return counts.commands + counts.reads + counts.writes + counts.edits + counts.searches
+    + counts.webSearches + counts.webFetches + counts.artifactWrites + counts.artifactUpdates
+    + counts.clicks + counts.navigations + counts.inputs + counts.evaluations + counts.other
+}
+
 // =============================================================================
 // Projection
 // =============================================================================
@@ -504,7 +538,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     streamingMessageId: null,
     activeThinkBlockId: null,
     showButton: 'send',
-
+    agentToolCounts: new Map(),
+    agentStartedAt: new Map(),
   },
 
   signals: {
@@ -750,8 +785,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
     lens_end: ({ fork }) => fork,
 
-
-
     tool_event: ({ event, fork, read, emit }) => {
       const inner = event.event
       const registry = getVisualRegistry()
@@ -832,7 +865,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
           if (!fork.activeThinkBlockId) return fork
 
-          // Map XmlToolResult → ToolResult for display (include tool-emitted display data)
+          // Map XmlToolResult -> ToolResult for display (include tool-emitted display data)
           const result = mapXmlToolResultForDisplay(inner.result, event.display)
 
           return {
@@ -901,7 +934,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           status: 'idle' as const,
           streamingMessageId: null,
           showButton: 'send' as const,
-      
         }
       }
 
@@ -913,7 +945,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         status: 'idle' as const,
         streamingMessageId: null,
         showButton: 'send' as const,
-    
       }
     },
 
@@ -981,39 +1012,39 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       // Keep fork state for display/debug history
       return fork
     },
-
-
   },
 
   signalHandlers: (on) => [
-    // Insert inline fork activity block in parent's display when agent is created
+    // Insert agent_started_notification in parent's display when agent is created
     on(AgentStatusProjection.signals.agentCreated, ({ value, state }) => {
-      const { forkId, parentForkId, name, role } = value
+      const { forkId, parentForkId, name, role, colorIndex, timestamp } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
-      const msg: ForkActivityMessage = {
+      const msg: AgentStartedNotificationMessage = {
         id: generateId(),
-        type: 'fork_activity',
+        type: 'agent_started_notification',
         forkId,
-        name,
-        role,
-        status: 'running',
-        startedAt: value.timestamp,
-        resumeCount: 0,
-        toolCounts: EMPTY_TOOL_COUNTS,
-        artifactNames: [],
-        timestamp: value.timestamp
+        agentRole: role,
+        agentName: name,
+        colorIndex,
+        timestamp,
       }
 
       const newMessages = insertBeforeQueuedMessages(parentState.messages, msg)
+      const newAgentStartedAt = new Map(parentState.agentStartedAt).set(forkId, timestamp)
+
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(parentForkId, {
+          ...parentState,
+          messages: newMessages,
+          agentStartedAt: newAgentStartedAt,
+        })
       }
     }),
 
-    // Update tool counts in parent's ForkActivityMessage when a tool step runs
+    // Update tool counts in parent's agentToolCounts map when a tool step runs
     on(forkToolStepSignal, ({ value, state, read }) => {
       const { forkId, toolKey } = value
       if (forkId === null) return state  // root fork tools, no parent activity to update
@@ -1025,87 +1056,141 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const parentState = state.forks.get(agent.parentForkId)
       if (!parentState) return state
 
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
-      if (msgIndex === -1) return state
-
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
-      const newCounts = incrementToolCount(msg.toolCounts, toolKey)
-      const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = { ...msg, toolCounts: newCounts }
+      const existingCounts = parentState.agentToolCounts.get(forkId) ?? EMPTY_TOOL_COUNTS
+      const newCounts = incrementToolCount(existingCounts, toolKey)
+      const newAgentToolCounts = new Map(parentState.agentToolCounts).set(forkId, newCounts)
 
       return {
         ...state,
-        forks: new Map(state.forks).set(agent.parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(agent.parentForkId, {
+          ...parentState,
+          agentToolCounts: newAgentToolCounts,
+        })
       }
     }),
 
-    // Mark fork activity as completed when agent becomes idle
+    // Insert agent_completed_notification when agent becomes idle
     on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
-      const { forkId, parentForkId } = value
+      const { forkId, parentForkId, name, role, colorIndex, timestamp } = value
 
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
-      if (msgIndex === -1) return state
+      const startedAt = parentState.agentStartedAt.get(forkId)
+      const toolCounts = parentState.agentToolCounts.get(forkId) ?? EMPTY_TOOL_COUNTS
+      const durationSeconds = startedAt !== undefined
+        ? Math.round((timestamp - startedAt) / 1000)
+        : 0
+      const total = totalToolCount(toolCounts)
 
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
-      const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = { ...msg, status: 'completed', completedAt: value.timestamp }
+      const msg: AgentCompletedNotificationMessage = {
+        id: generateId(),
+        type: 'agent_completed_notification',
+        forkId,
+        agentRole: role,
+        agentName: name,
+        colorIndex,
+        durationSeconds,
+        totalTools: total,
+        timestamp,
+      }
+
+      const newMessages = insertBeforeQueuedMessages(parentState.messages, msg)
+
+      // Clean up tracking maps
+      const newAgentStartedAt = new Map(parentState.agentStartedAt)
+      newAgentStartedAt.delete(forkId)
+      const newAgentToolCounts = new Map(parentState.agentToolCounts)
+      newAgentToolCounts.delete(forkId)
 
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(parentForkId, {
+          ...parentState,
+          messages: newMessages,
+          agentStartedAt: newAgentStartedAt,
+          agentToolCounts: newAgentToolCounts,
+        })
       }
     }),
 
     on(AgentStatusProjection.signals.agentDismissed, ({ value, state }) => {
-      const { forkId, parentForkId } = value
+      const { forkId, parentForkId, name, role, colorIndex, timestamp } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
-      if (msgIndex === -1) return state
+      // Only insert completion notification if we have a start time (agent was active)
+      const startedAt = parentState.agentStartedAt.get(forkId)
+      if (startedAt === undefined) return state
 
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
-      const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = { ...msg, status: 'completed', completedAt: value.timestamp }
+      const toolCounts = parentState.agentToolCounts.get(forkId) ?? EMPTY_TOOL_COUNTS
+      const durationSeconds = Math.round((timestamp - startedAt) / 1000)
+      const total = totalToolCount(toolCounts)
+
+      const msg: AgentCompletedNotificationMessage = {
+        id: generateId(),
+        type: 'agent_completed_notification',
+        forkId,
+        agentRole: role,
+        agentName: name,
+        colorIndex,
+        durationSeconds,
+        totalTools: total,
+        timestamp,
+      }
+
+      const newMessages = insertBeforeQueuedMessages(parentState.messages, msg)
+
+      const newAgentStartedAt = new Map(parentState.agentStartedAt)
+      newAgentStartedAt.delete(forkId)
+      const newAgentToolCounts = new Map(parentState.agentToolCounts)
+      newAgentToolCounts.delete(forkId)
 
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(parentForkId, {
+          ...parentState,
+          messages: newMessages,
+          agentStartedAt: newAgentStartedAt,
+          agentToolCounts: newAgentToolCounts,
+        })
       }
     }),
 
+    // On resume: insert new agent_started_notification and reset tracking
     on(AgentStatusProjection.signals.agentBecameWorking, ({ value, state }) => {
-      const { forkId, parentForkId } = value
+      const { forkId, parentForkId, name, role, colorIndex, timestamp } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId)
-      if (msgIndex === -1) return state
+      // Only insert resume notification if agent was previously idle (has no startedAt = was cleaned up)
+      const existingStartedAt = parentState.agentStartedAt.get(forkId)
+      if (existingStartedAt !== undefined) return state  // still in first run, not a resume
 
-      const message = parentState.messages[msgIndex] as ForkActivityMessage
-      if (!message.completedAt) return state  // never went idle — first run, not a resume
+      const msg: AgentStartedNotificationMessage = {
+        id: generateId(),
+        type: 'agent_started_notification',
+        forkId,
+        agentRole: role,
+        agentName: name,
+        colorIndex,
+        timestamp,
+      }
 
-      const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
-        ...msg,
-        status: 'running',
-        completedAt: undefined,
-        resumeCount: (msg.resumeCount ?? 0) + 1,
-        timestamp: value.timestamp,
-      }))
+      const newMessages = insertBeforeQueuedMessages(parentState.messages, msg)
+      const newAgentStartedAt = new Map(parentState.agentStartedAt).set(forkId, timestamp)
 
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: moved })
+        forks: new Map(state.forks).set(parentForkId, {
+          ...parentState,
+          messages: newMessages,
+          agentStartedAt: newAgentStartedAt,
+        })
       }
     }),
 
+    // agentMessage: only insert into child fork (for overlay), not parent
     on(AgentRoutingProjection.signals.agentMessage, ({ value, state, read }) => {
       const { targetForkId, agentId, message, timestamp } = value
       const content = message.trim()
@@ -1113,35 +1198,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       const agentState = read(AgentStatusProjection)
       const targetAgent = getAgentByForkId(agentState, targetForkId)
-      const parentForkId = targetAgent?.parentForkId ?? null
-      let nextState = state
 
-      const parentDisplayFork = state.forks.get(parentForkId)
-      if (parentDisplayFork) {
-        const communication: AgentCommunicationMessage = {
-          id: generateId(),
-          type: 'agent_communication',
-          direction: 'to_agent',
-          agentId,
-          agentName: targetAgent?.name,
-          agentRole: targetAgent?.role,
-          forkId: targetForkId,
-          content,
-          preview: toPreview(content),
-          timestamp
-        }
-
-        nextState = {
-          ...nextState,
-          forks: new Map(nextState.forks).set(parentForkId, {
-            ...parentDisplayFork,
-            messages: insertBeforeQueuedMessages(parentDisplayFork.messages, communication)
-          })
-        }
-      }
-
-      const childDisplayFork = nextState.forks.get(targetForkId)
-      if (!childDisplayFork) return nextState
+      const childDisplayFork = state.forks.get(targetForkId)
+      if (!childDisplayFork) return state
 
       const childCommunication: AgentCommunicationMessage = {
         id: generateId(),
@@ -1156,54 +1215,27 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         timestamp
       }
 
-      nextState = {
-        ...nextState,
-        forks: new Map(nextState.forks).set(targetForkId, {
+      return {
+        ...state,
+        forks: new Map(state.forks).set(targetForkId, {
           ...childDisplayFork,
           messages: insertBeforeQueuedMessages(childDisplayFork.messages, childCommunication)
         })
       }
-
-      return nextState
     }),
 
+    // agentResponse: only insert into source (child) fork (for overlay), not parent
     on(AgentRoutingProjection.signals.agentResponse, ({ value, state, read }) => {
-      const { targetForkId, agentId, message, timestamp } = value
+      const { agentId, message, timestamp } = value
       const content = message.trim()
       if (!content) return state
 
       const agentState = read(AgentStatusProjection)
       const sourceAgent = agentState.agents.get(agentId)
+      if (!sourceAgent) return state
 
-      let nextState = state
-
-      const displayFork = state.forks.get(targetForkId)
-      if (displayFork) {
-        const communication: AgentCommunicationMessage = {
-          id: generateId(),
-          type: 'agent_communication',
-          direction: 'from_agent',
-          agentId,
-          agentName: sourceAgent?.name,
-          agentRole: sourceAgent?.role,
-          forkId: targetForkId,
-          content,
-          preview: toPreview(content),
-          timestamp
-        }
-
-        nextState = {
-          ...nextState,
-          forks: new Map(nextState.forks).set(targetForkId, {
-            ...displayFork,
-            messages: insertBeforeQueuedMessages(displayFork.messages, communication)
-          })
-        }
-      }
-
-      if (!sourceAgent) return nextState
-      const sourceDisplayFork = nextState.forks.get(sourceAgent.forkId)
-      if (!sourceDisplayFork) return nextState
+      const sourceDisplayFork = state.forks.get(sourceAgent.forkId)
+      if (!sourceDisplayFork) return state
 
       const childCommunication: AgentCommunicationMessage = {
         id: generateId(),
@@ -1218,15 +1250,13 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         timestamp
       }
 
-      nextState = {
-        ...nextState,
-        forks: new Map(nextState.forks).set(sourceAgent.forkId, {
+      return {
+        ...state,
+        forks: new Map(state.forks).set(sourceAgent.forkId, {
           ...sourceDisplayFork,
           messages: insertBeforeQueuedMessages(sourceDisplayFork.messages, childCommunication)
         })
       }
-
-      return nextState
     })
   ]
 })
@@ -1246,7 +1276,6 @@ function generateToolLabel(toolKey: string, input: unknown): string {
   if (toolKey === 'artifactUpdate' && input && typeof input === 'object' && 'id' in input) {
     return `Updated artifact "${(input as { id: string }).id}"`
   }
-
 
   // For shell, show the command
   if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input) {

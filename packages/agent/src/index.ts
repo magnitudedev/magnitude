@@ -94,6 +94,9 @@ export type {
   ForkActivityToolCounts,
   ApprovalRequestMessage,
   InProgressArtifactView,
+  AgentCommunicationMessage,
+  AgentStartedNotificationMessage,
+  AgentCompletedNotificationMessage,
 } from './projections/display'
 
 export { TurnProjection } from './projections/turn'
@@ -285,3 +288,12 @@ export { withTraceScope } from './tracing'
 export type { TraceScope } from './tracing'
 export type { ContentPart, ImageMediaType } from './content'
 export { textParts, imagePart, textOf, hasImages, wrapTextParts, migrateContent } from './content'
+// AgentsView Projection
+export { AgentsViewProjection } from './projections/agents-view'
+export type {
+  AgentsViewState,
+  AgentsViewItem,
+  AgentsViewMessageItem,
+  AgentsViewActivityItem,
+  AgentsViewArtifactItem,
+} from './projections/agents-view'

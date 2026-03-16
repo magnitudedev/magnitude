@@ -49,6 +49,8 @@ export const registerApprovalBridge = Effect.gen(function* () {
           streamingMessageId: null,
           activeThinkBlockId: null,
           showButton: 'send' as const,
+          agentToolCounts: new Map(),
+          agentStartedAt: new Map(),
         }
         const newForks = new Map(state.forks)
         newForks.set(forkId, {

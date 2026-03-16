@@ -25,6 +25,7 @@ import {
 } from '../../utils/strings'
 import type { InputValue } from '../../types/store'
 import type { ChatControllerProps } from './types'
+import { TabSwitcher } from '../tab-switcher'
 
 const EMPTY_INPUT: InputValue = {
   text: '',
@@ -51,6 +52,10 @@ export function ChatController(props: ChatControllerProps) {
     onInputHasTextChange,
     restoredQueuedInputText,
     onRestoredQueuedInputHandled,
+    activeTab,
+    hasActiveAgents,
+    hasUnreadMain,
+    onTabSwitch,
   } = props
   const [inputValue, setInputValue] = useState<InputValue>(EMPTY_INPUT)
   const [attachments, setAttachments] = useState<ImageAttachment[]>([])
@@ -405,6 +410,7 @@ export function ChatController(props: ChatControllerProps) {
         onReject={onReject}
       />
 
+      {activeTab === 'main' && (
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
           <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
@@ -473,9 +479,16 @@ export function ChatController(props: ChatControllerProps) {
           <box style={{ height: 1, borderStyle: 'single', border: ['bottom'], borderColor: env.theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▀', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
         </box>
       </box>
+      )}
 
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between' }}>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
+          <TabSwitcher
+            activeTab={activeTab}
+            hasActiveAgents={hasActiveAgents}
+            hasUnreadMain={hasUnreadMain}
+            onSwitch={onTabSwitch}
+          />
           {attachments.length > 0 ? (
             <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={env.attachmentsMaxWidth} />
           ) : nextEscWillKillAll ? (

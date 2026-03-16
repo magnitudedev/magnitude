@@ -19,7 +19,7 @@ import type {
 } from '../utils/render-blocks'
 import { spansToText } from '../utils/render-blocks'
 import { useTheme } from '../hooks/use-theme'
-import type { MarkdownPalette } from '../utils/theme'
+import type { MarkdownPalette } from '../utils/render-blocks'
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { useArtifacts } from '../hooks/use-artifacts'
 import { writeTextToClipboard } from '../utils/clipboard'

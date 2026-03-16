@@ -34,6 +34,7 @@ import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
 import { OutboundMessagesProjection } from './projections/outbound-messages'
 import { ArtifactAwarenessProjection } from './projections/artifact-awareness'
+import { AgentsViewProjection } from './projections/agents-view'
 
 // Workers
 import { TurnController } from './workers/turn-controller'
@@ -95,6 +96,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     ChatTitleProjection,
     ConversationProjection,
     UserPresenceProjection,
+    AgentsViewProjection,
   ],
 
   workers: [
@@ -128,6 +130,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
       agentStatus: AgentStatusProjection,
 
       artifacts: ArtifactProjection,
+      agentsView: AgentsViewProjection,
     }
   }
 })
