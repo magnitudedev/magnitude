@@ -169,9 +169,9 @@ function buildWithBinding(
   // Binding attributes from output
   if (binding.attributes) {
     for (const attr of binding.attributes) {
-      const val = obj[attr]
+      const val = resolveNestedField(obj, attr.field)
       if (val !== undefined && val !== null) {
-        attrs[attr] = String(val)
+        attrs[attr.attr] = String(val)
       }
     }
   }
@@ -282,9 +282,9 @@ function buildChildArray(children: OutputNode[], arr: unknown[], child: XmlChild
     const childAttrs: Record<string, string> = {}
     if (child.attributes) {
       for (const attr of child.attributes) {
-        const val = itemObj[attr]
+        const val = itemObj[attr.field]
         if (val !== undefined && val !== null) {
-          childAttrs[attr] = String(val)
+          childAttrs[attr.attr] = String(val)
         }
       }
     }

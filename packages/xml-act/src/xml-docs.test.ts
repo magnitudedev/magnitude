@@ -67,7 +67,7 @@ describe('self-closing tags', () => {
         path: Schema.String.annotations({ description: 'Relative path from cwd' }),
       }),
       argMapping: ['path'],
-      bindings: { xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('Read file content')
@@ -86,7 +86,7 @@ describe('self-closing tags', () => {
         path: Schema.String.annotations({ description: 'Directory' }),
       }),
       argMapping: ['pattern', 'path'],
-      bindings: { xmlInput: { type: 'tag', attributes: ['pattern', 'path'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }, { field: 'path', attr: 'path' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('<search')
@@ -123,7 +123,7 @@ describe('body tags', () => {
         content: Schema.String.annotations({ description: 'Content to write' }),
       }),
       argMapping: ['path', 'content'],
-      bindings: { xmlInput: { type: 'tag', attributes: ['path'], body: 'content' } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('path="..."')
@@ -155,11 +155,11 @@ describe('children tags', () => {
       bindings: {
         xmlInput: {
           type: 'tag',
-          attributes: ['path'],
+          attributes: [{ field: 'path', attr: 'path' }],
           children: [{
             field: 'edits',
             tag: 'edit-item',
-            attributes: ['from', 'to'],
+            attributes: [{ field: 'from', attr: 'from' }, { field: 'to', attr: 'to' }],
             body: 'content',
           }],
         },
@@ -190,7 +190,7 @@ describe('tag name override', () => {
       description: 'Read a file',
       inputSchema: Schema.Struct({ path: Schema.String }),
       argMapping: ['path'],
-      bindings: { xmlInput: { type: 'tag', tag: 'read', attributes: ['path'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', tag: 'read', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('<read')
@@ -209,7 +209,7 @@ describe('group documentation', () => {
     description: 'Read file',
     inputSchema: Schema.Struct({ path: Schema.String }),
     argMapping: ['path'],
-    bindings: { xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true } },
+    bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
   })
 
   const writeTool = makeTool({
@@ -221,7 +221,7 @@ describe('group documentation', () => {
       content: Schema.String,
     }),
     argMapping: ['path', 'content'],
-    bindings: { xmlInput: { type: 'tag', attributes: ['path'], body: 'content' } },
+    bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' } },
   })
 
   const noBindingTool = makeTool({
@@ -282,7 +282,7 @@ describe('childTags', () => {
       bindings: {
         xmlInput: {
           type: 'tag',
-          attributes: ['id'],
+          attributes: [{ field: 'id', attr: 'id' }],
           childTags: [
             { field: 'options.type', tag: 'type' },
             { field: 'options.goal', tag: 'goal' },
@@ -351,7 +351,7 @@ describe('childRecord', () => {
       bindings: {
         xmlInput: {
           type: 'tag',
-          attributes: ['title', 'description'],
+          attributes: [{ field: 'title', attr: 'title' }, { field: 'description', attr: 'description' }],
           childRecord: { field: 'criteria', tag: 'criterion', keyAttr: 'id' },
         },
       },
@@ -376,7 +376,7 @@ describe('output documentation', () => {
       name: 'write',
       inputSchema: Schema.Struct({ path: Schema.String, content: Schema.String }),
       outputSchema: Schema.Void,
-      bindings: { xmlInput: { type: 'tag', attributes: ['path'], body: 'content' } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).not.toContain('Returns')
@@ -388,7 +388,7 @@ describe('output documentation', () => {
       group: 'fs',
       inputSchema: Schema.Struct({ path: Schema.String }),
       outputSchema: Schema.String,
-      bindings: { xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('Returns: string')
@@ -424,7 +424,7 @@ describe('output documentation', () => {
         name: Schema.String,
         type: Schema.Literal('file', 'dir'),
       })),
-      bindings: { xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('Returns:')
@@ -446,7 +446,7 @@ describe('output documentation', () => {
         xmlInput: { type: 'tag', body: 'command' },
         xmlOutput: {
           type: 'tag',
-          attributes: ['exitCode'],
+          attributes: [{ field: 'exitCode', attr: 'exitCode' }],
           childTags: [
             { field: 'stdout', tag: 'stdout' },
             { field: 'stderr', tag: 'stderr' },
@@ -468,7 +468,7 @@ describe('output documentation', () => {
       inputSchema: Schema.Struct({ path: Schema.String }),
       outputSchema: Schema.Struct({ content: Schema.String }),
       bindings: {
-        xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true },
+        xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true },
         xmlOutput: { type: 'tag', body: 'content' },
       },
     })
@@ -489,7 +489,7 @@ describe('output documentation', () => {
         depth: Schema.Number,
       })),
       bindings: {
-        xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true },
+        xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true },
         xmlOutput: { type: 'tag', items: { tag: 'entry', attributes: ['path', 'name', 'type', 'depth'] } },
       },
     })
@@ -510,7 +510,7 @@ describe('output documentation', () => {
         match: Schema.String,
       })),
       bindings: {
-        xmlInput: { type: 'tag', attributes: ['pattern'], selfClosing: true },
+        xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }], selfClosing: true },
         xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['file'], body: 'match' } },
       },
     })
@@ -533,7 +533,7 @@ describe('type annotations', () => {
       inputSchema: Schema.Struct({
         count: Schema.Number.annotations({ description: 'Item count' }),
       }),
-      bindings: { xmlInput: { type: 'tag', attributes: ['count'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'count', attr: 'count' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('number')
@@ -546,7 +546,7 @@ describe('type annotations', () => {
       inputSchema: Schema.Struct({
         verbose: Schema.Boolean,
       }),
-      bindings: { xmlInput: { type: 'tag', attributes: ['verbose'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'verbose', attr: 'verbose' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('boolean')
@@ -558,7 +558,7 @@ describe('type annotations', () => {
       inputSchema: Schema.Struct({
         mode: Schema.Literal('fast', 'slow'),
       }),
-      bindings: { xmlInput: { type: 'tag', attributes: ['mode'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'mode', attr: 'mode' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('"fast" | "slow"')
@@ -571,7 +571,7 @@ describe('type annotations', () => {
         path: Schema.String,
         glob: Schema.optional(Schema.String.annotations({ description: 'Glob filter' })),
       }),
-      bindings: { xmlInput: { type: 'tag', attributes: ['path', 'glob'], selfClosing: true } },
+      bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }, { field: 'glob', attr: 'glob' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('optional')

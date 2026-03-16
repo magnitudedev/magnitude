@@ -68,7 +68,7 @@ export const artifactSyncTool = createTool({
   errorSchema: ArtifactError,
   argMapping: ['id', 'path'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['id', 'path'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'id', attr: 'id' }, { field: 'path', attr: 'path' }], selfClosing: true },
     xmlOutput: { type: 'tag', childTags: [{ tag: 'id', field: 'id' }, { tag: 'path', field: 'path' }] } as const,
   } as const,
   execute: ({ id, path }) =>
@@ -133,7 +133,7 @@ export const artifactReadTool = createTool({
   errorSchema: ArtifactError,
   argMapping: ['id'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['id'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'id', attr: 'id' }], selfClosing: true },
     xmlOutput: { type: 'tag' } as const,
   } as const,
   execute: ({ id }) =>
@@ -169,7 +169,7 @@ export const artifactWriteTool = createTool({
   errorSchema: ArtifactError,
   argMapping: ['id', 'content'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['id'], body: 'content' },
+    xmlInput: { type: 'tag', attributes: [{ field: 'id', attr: 'id' }], body: 'content' },
     xmlOutput: { type: 'tag' } as const,
   } as const,
   execute: ({ id, content }) =>
@@ -217,7 +217,7 @@ export const artifactUpdateTool = createTool({
   bindings: {
     xmlInput: {
       type: 'tag',
-      attributes: ['id', 'replaceAll'],
+      attributes: [{ field: 'id', attr: 'id' }, { field: 'replaceAll', attr: 'replaceAll' }],
       childTags: [
         { tag: 'old', field: 'oldString' },
         { tag: 'new', field: 'newString' },

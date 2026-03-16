@@ -47,7 +47,7 @@ export const skillTool = createTool({
   errorSchema: SkillError,
   argMapping: ['name'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['name'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'name', attr: 'name' }], selfClosing: true },
     xmlOutput: { type: 'tag' as const },
   } as const,
 

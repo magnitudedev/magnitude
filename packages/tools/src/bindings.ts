@@ -37,12 +37,20 @@ export type RecordFields<T> = {
   [K in keyof T]-?: NonNullable<T[K]> extends Record<string, string> ? K : never
 }[keyof T] & string
 
-/** Field paths for childTag bindings.
+/** Field paths for XML bindings.
  *  Top-level fields: 'name'. Nested fields: 'options.type'.
  *  Falls back to string when T is unknown. */
-export type ChildTagPath<T> = InputFields<T> | {
+export type FieldPath<T> = InputFields<T> | {
   [K in ObjectFields<T>]: `${K}.${Extract<keyof NonNullable<T[K]>, string>}`
 }[ObjectFields<T>]
+
+/** Backward-compatible alias for childTag bindings. */
+export type ChildTagPath<T> = FieldPath<T>
+
+export interface XmlAttrBinding<T> {
+  readonly field: FieldPath<T>
+  readonly attr: string
+}
 
 // =============================================================================
 // OpenAI Custom Tool Format (CFG constraint)
@@ -122,7 +130,7 @@ export type CodegenBinding =
 export interface XmlChildBinding {
   readonly field: string
   readonly tag?: string
-  readonly attributes?: readonly string[]
+  readonly attributes?: readonly { readonly field: string; readonly attr: string }[]
   readonly body?: string
 }
 
@@ -147,7 +155,10 @@ export type XmlArrayChildBinding<T> = [ArrayFields<T>] extends [never]
   : {
       [K in ArrayFields<T>]: XmlChildBinding & {
         readonly field: K
-        readonly attributes?: ReadonlyArray<InputFields<ArrayElement<T, K>>>
+        readonly attributes?: ReadonlyArray<{
+          readonly field: InputFields<ArrayElement<T, K>>
+          readonly attr: string
+        }>
         readonly body?: InputFields<ArrayElement<T, K>>
       }
     }[ArrayFields<T>]
@@ -167,15 +178,15 @@ export type XmlBinding<T> = {
   readonly type: 'tag'
   /** Override the XML tag name. Defaults to tool name. */
   readonly tag?: string
-  /** Input fields mapped to XML attributes (e.g., ['path', 'glob']). */
-  readonly attributes?: ReadonlyArray<InputFields<T>>
-  /** Input field mapped to inner text content (e.g., 'content' for write). */
-  readonly body?: InputFields<T>
+  /** Input fields mapped to XML attributes. */
+  readonly attributes?: ReadonlyArray<XmlAttrBinding<T>>
+  /** Input field mapped to inner text content. */
+  readonly body?: FieldPath<T>
   /** Whether the tag is self-closing when no body/children are present. */
   readonly selfClosing?: boolean
   /** Scalar fields rendered as child tags: <tag>value</tag>.
    *  Each entry specifies a field path and optional XML tag name override. */
-  readonly childTags?: ReadonlyArray<XmlChildTagBinding & { readonly field: ChildTagPath<T> }>
+  readonly childTags?: ReadonlyArray<XmlChildTagBinding & { readonly field: FieldPath<T> }>
   /** Array fields rendered as repeated child tags with their own structure. */
   readonly children?: ReadonlyArray<XmlArrayChildBinding<T>>
   /** Record field rendered as repeated child elements with key attr + body value. */

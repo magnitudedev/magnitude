@@ -188,9 +188,9 @@ function serializeWithBinding(
   let bindingAttrs = ''
   if (binding.attributes) {
     for (const attr of binding.attributes) {
-      const val = obj[attr]
+      const val = resolveNestedField(obj, attr.field)
       if (val !== undefined && val !== null) {
-        bindingAttrs += ` ${attr}="${escapeXmlAttr(String(val))}"`
+        bindingAttrs += ` ${attr.attr}="${escapeXmlAttr(String(val))}"`
       }
     }
   }
@@ -300,9 +300,9 @@ function serializeChildArray(parts: string[], arr: unknown[], child: XmlChildBin
     let childAttrs = ''
     if (child.attributes) {
       for (const attr of child.attributes) {
-        const val = itemObj[attr]
+        const val = itemObj[attr.field]
         if (val !== undefined && val !== null) {
-          childAttrs += ` ${attr}="${escapeXmlAttr(String(val))}"`
+          childAttrs += ` ${attr.attr}="${escapeXmlAttr(String(val))}"`
         }
       }
     }

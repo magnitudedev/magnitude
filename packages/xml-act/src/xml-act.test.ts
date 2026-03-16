@@ -244,15 +244,18 @@ const kvTool = createTool({
 // Bindings
 // ---------------------------------------------------------------------------
 
-const readBinding: XmlTagBinding = { attributes: ['path'] }
-const writeBinding: XmlTagBinding = { attributes: ['path'], body: 'content' }
+const readBinding: XmlTagBinding = { attributes: [{ field: 'path', attr: 'path' }] }
+const writeBinding: XmlTagBinding = { attributes: [{ field: 'path', attr: 'path' }], body: 'content' }
 const shellBinding: XmlTagBinding = { body: 'command' }
 const editBinding: XmlTagBinding = {
-  attributes: ['path'],
-  children: [{ field: 'edits', tag: 'edit', attributes: ['old'], body: 'new' }],
+  attributes: [{ field: 'path', attr: 'path' }],
+  children: [{ field: 'edits', tag: 'edit', attributes: [{ field: 'old', attr: 'old' }], body: 'new' }],
 }
-const addBinding: XmlTagBinding = { attributes: ['a', 'b'], selfClosing: true }
-const failBinding: XmlTagBinding = { attributes: ['reason'] }
+const addBinding: XmlTagBinding = {
+  attributes: [{ field: 'a', attr: 'a' }, { field: 'b', attr: 'b' }],
+  selfClosing: true,
+}
+const failBinding: XmlTagBinding = { attributes: [{ field: 'reason', attr: 'reason' }] }
 const kvBinding: XmlTagBinding = {
   childRecord: { field: 'vars', tag: 'var', keyAttr: 'name' },
 }
@@ -316,6 +319,48 @@ describe('xml-act end-to-end', () => {
     if (ended[0].result._tag === 'Success') {
       expect(ended[0].result.output).toBe('wrote out.txt')
     }
+  })
+
+  test('tool with dotted-path attribute and body bindings', async () => {
+    const nestedTool = createTool({
+      name: 'nested',
+      description: 'Nested binding test',
+      inputSchema: Schema.Struct({
+        options: Schema.Struct({
+          type: Schema.String,
+          message: Schema.String,
+        }),
+      }),
+      outputSchema: Schema.Struct({
+        type: Schema.String,
+        message: Schema.String,
+      }),
+      bindings: {
+        xmlInput: { type: 'tag' },
+        xmlOutput: { type: 'tag', childTags: [{ field: 'type', tag: 'type' }, { field: 'message', tag: 'message' }] },
+      } as const,
+      execute: ({ options }) => Effect.succeed({ type: options.type, message: options.message }),
+    })
+
+    const nestedBinding: XmlTagBinding = {
+      attributes: [{ field: 'options.type', attr: 'type' }],
+      body: 'options.message',
+    }
+
+    const cfg = config([registered(nestedTool, 'nested', nestedBinding)])
+    const events = await runStream(cfg, `${ACTIONS_TAG_OPEN}<nested id="r1" type="planner">build a plan</nested>${ACTIONS_TAG_CLOSE}`)
+
+    const fieldValues = eventsOfType(events, 'ToolInputFieldValue')
+    expect(fieldValues).toHaveLength(1)
+    expect(fieldValues[0].field).toBe('type')
+    expect(fieldValues[0].value).toBe('planner')
+
+    const bodyChunks = eventsOfType(events, 'ToolInputBodyChunk')
+    expect(bodyChunks.length).toBeGreaterThan(0)
+    expect(bodyChunks[0].path).toEqual(['options.message'])
+
+    const ready = eventsOfType(events, 'ToolInputReady')
+    expect(ready[0].input).toEqual({ options: { type: 'planner', message: 'build a plan' } })
   })
 
   test('tool with body-only binding (no attributes)', async () => {
@@ -824,7 +869,7 @@ ${ACTIONS_TAG_CLOSE}`
       bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
       execute: ({ enabled }) => Effect.succeed(enabled),
     })
-    const boolBinding: XmlTagBinding = { attributes: ['enabled'], selfClosing: true }
+    const boolBinding: XmlTagBinding = { attributes: [{ field: 'enabled', attr: 'enabled' }], selfClosing: true }
 
     for (const [input, expected] of [
       ['true', true], ['false', false],
@@ -906,7 +951,7 @@ ${ACTIONS_TAG_CLOSE}`
       bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
       execute: ({ enabled }) => Effect.succeed(enabled),
     })
-    const boolBinding: XmlTagBinding = { attributes: ['enabled'], selfClosing: true }
+    const boolBinding: XmlTagBinding = { attributes: [{ field: 'enabled', attr: 'enabled' }], selfClosing: true }
     const cfg = config([registered(boolTool, 'flag', boolBinding)])
     const events = await runStream(cfg, `${ACTIONS_TAG_OPEN}<flag id="r1" enabled="maybe"/>${ACTIONS_TAG_CLOSE}`)
 
@@ -975,7 +1020,7 @@ ${ACTIONS_TAG_CLOSE}`
       bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
       execute: () => Effect.succeed('ok'),
     })
-    const badBinding: XmlTagBinding = { attributes: ['items'] }
+    const badBinding: XmlTagBinding = { attributes: [{ field: 'items', attr: 'items' }] }
 
     expect(() => {
       createXmlRuntime(config([registered(badTool, 'bad', badBinding)]))
@@ -1011,7 +1056,9 @@ ${ACTIONS_TAG_CLOSE}`
       bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
       execute: () => Effect.succeed('ok'),
     })
-    const badBinding: XmlTagBinding = { attributes: ['path', 'nonexistent'] }
+    const badBinding: XmlTagBinding = {
+      attributes: [{ field: 'path', attr: 'path' }, { field: 'nonexistent', attr: 'nonexistent' }],
+    }
 
     expect(() => {
       createXmlRuntime(config([registered(badTool, 'bad', badBinding)]))

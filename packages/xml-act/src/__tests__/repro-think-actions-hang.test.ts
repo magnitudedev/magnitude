@@ -25,7 +25,7 @@ const gatherTool = createTool({
       children: [{
         field: 'targets',
         tag: 'target',
-        attributes: ['path'],
+        attributes: [{ field: 'path', attr: 'path' }],
         body: 'query',
       }],
     },
@@ -42,7 +42,7 @@ const GATHER_REG = {
     children: [{
       field: 'targets',
       tag: 'target',
-      attributes: ['path'],
+      attributes: [{ field: 'path', attr: 'path' }],
       body: 'query',
     }],
   },

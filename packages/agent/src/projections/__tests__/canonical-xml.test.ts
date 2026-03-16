@@ -4,12 +4,12 @@ import { serializeCanonicalTurn, type CanonicalTrace } from '../canonical-xml'
 
 const bindings = new Map<string, XmlTagBinding>([
   ['shell', { body: 'command' }],
-  ['fs-read', { attributes: ['path'] }],
-  ['fs-write', { attributes: ['path'], body: 'content' }],
-  ['edit', { attributes: ['path'], childTags: [{ tag: 'old', field: 'old' }, { tag: 'new', field: 'new' }] }],
-  ['items-tool', { children: [{ field: 'items', tag: 'item', attributes: ['k'], body: 'v' }] }],
+  ['fs-read', { attributes: [{ field: 'path', attr: 'path' }] }],
+  ['fs-write', { attributes: [{ field: 'path', attr: 'path' }], body: 'content' }],
+  ['edit', { attributes: [{ field: 'path', attr: 'path' }], childTags: [{ tag: 'old', field: 'old' }, { tag: 'new', field: 'new' }] }],
+  ['items-tool', { children: [{ field: 'items', tag: 'item', attributes: [{ field: 'k', attr: 'k' }], body: 'v' }] }],
   ['record-tool', { childRecord: { field: 'vars', keyAttr: 'name', tag: 'var' } }],
-  ['attr-order', { attributes: ['z', 'a'], body: 'content' }],
+  ['attr-order', { attributes: [{ field: 'z', attr: 'z' }, { field: 'a', attr: 'a' }], body: 'content' }],
 ])
 const emptyBindings = new Map<string, XmlTagBinding>()
 const withYield = (s: string) => `${s}\n<yield/>`

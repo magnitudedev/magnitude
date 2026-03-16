@@ -39,7 +39,7 @@ export const webSearchTool = createTool({
       children: [{
         field: 'sources',
         tag: 'source',
-        attributes: ['title', 'url'],
+        attributes: [{ field: 'title', attr: 'title' }, { field: 'url', attr: 'url' }],
       }],
     },
   } as const,

@@ -37,7 +37,7 @@ export const clickTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['x', 'y'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['x', 'y'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -61,7 +61,7 @@ export const doubleClickTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['x', 'y'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['x', 'y'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -85,7 +85,7 @@ export const rightClickTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['x', 'y'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['x', 'y'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -134,7 +134,7 @@ export const scrollTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['x', 'y', 'deltaX', 'deltaY'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['x', 'y', 'deltaX', 'deltaY'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }, { field: 'deltaX', attr: 'deltaX' }, { field: 'deltaY', attr: 'deltaY' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ x, y, deltaX, deltaY }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -160,7 +160,7 @@ export const dragTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['x1', 'y1', 'x2', 'y2'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['x1', 'y1', 'x2', 'y2'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x1', attr: 'x1' }, { field: 'y1', attr: 'y1' }, { field: 'x2', attr: 'x2' }, { field: 'y2', attr: 'y2' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ x1, y1, x2, y2 }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -183,7 +183,7 @@ export const navigateTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['url'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['url'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'url', attr: 'url' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ url }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -226,7 +226,7 @@ export const switchTabTool = createTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
   argMapping: ['index'],
-  bindings: { xmlInput: { type: 'tag', attributes: ['index'], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'index', attr: 'index' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
   execute: ({ index }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag

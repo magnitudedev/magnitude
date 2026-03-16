@@ -40,8 +40,12 @@ export type ResolvePath<T, P extends string> =
     ? H extends keyof T ? ResolvePath<NonNullable<T[H]>, R> : never
     : P extends keyof T ? T[P] : never
 
-/** Extract attribute field name literals from a binding */
-export type BindingAttrs<B> = B extends { readonly attributes: readonly (infer A extends string)[] } ? A : never
+/** Extract attribute binding objects from a binding */
+export type BindingAttrs<B> = B extends { readonly attributes: readonly (infer A)[] } ? A : never
+/** Extract XML attribute name literals from a binding */
+export type BindingAttrNames<B> = BindingAttrs<B> extends { readonly attr: infer A extends string } ? A : never
+/** Extract bound field path literals from a binding */
+export type BindingAttrFields<B> = BindingAttrs<B> extends { readonly field: infer F extends string } ? F : never
 /** Extract body field name literal from a binding */
 export type BindingBody<B> = B extends { readonly body: infer F extends string } ? F : never
 /** Extract children binding objects from a binding */
@@ -53,8 +57,12 @@ export type BindingChildRecord<B> = B extends { readonly childRecord: infer CR }
 
 /** Extract field name from a child binding */
 export type ChildBindingField<C> = C extends { readonly field: infer F extends string } ? F : never
-/** Extract attribute names from a child binding */
-export type ChildBindingAttrs<C> = C extends { readonly attributes: readonly (infer A extends string)[] } ? A : never
+/** Extract attribute binding objects from a child binding */
+export type ChildBindingAttrs<C> = C extends { readonly attributes: readonly (infer A)[] } ? A : never
+/** Extract child XML attribute names */
+export type ChildBindingAttrNames<C> = ChildBindingAttrs<C> extends { readonly attr: infer A extends string } ? A : never
+/** Extract child bound field names */
+export type ChildBindingAttrFields<C> = ChildBindingAttrs<C> extends { readonly field: infer F extends string } ? F : never
 /** Extract body field name from a child binding */
 export type ChildBindingBody<C> = C extends { readonly body: infer F extends string } ? F : never
 /** Extract field name from a childRecord binding */
@@ -70,7 +78,7 @@ export type ChildElem<TInput, C> =
 
 /** Pick only the attribute fields from a child element type */
 export type ChildAttrsPick<Elem, C> =
-  [ChildBindingAttrs<C>] extends [never] ? {} : Pick<Elem, ChildBindingAttrs<C> & keyof Elem>
+  [ChildBindingAttrFields<C>] extends [never] ? {} : Pick<Elem, ChildBindingAttrFields<C> & keyof Elem>
 
 // =============================================================================
 // Tool Call Context + Error (consumer-facing, self-contained)
@@ -118,10 +126,8 @@ export interface ToolInputStarted {
 export interface ToolInputFieldValue<TInput = unknown, B = unknown> {
   readonly _tag: 'ToolInputFieldValue'
   readonly toolCallId: string
-  readonly field: [BindingAttrs<B>] extends [never] ? string : BindingAttrs<B> & keyof TInput
-  readonly value: [BindingAttrs<B>] extends [never]
-    ? string | number | boolean
-    : TInput[BindingAttrs<B> & keyof TInput]
+  readonly field: [BindingAttrNames<B>] extends [never] ? string : BindingAttrNames<B>
+  readonly value: string | number | boolean
 }
 
 /** All body field names derivable from a binding — parent body + child body fields */

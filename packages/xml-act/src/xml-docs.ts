@@ -318,14 +318,14 @@ function buildAnnotatedInput(
   const hasAttrs = binding.attributes && binding.attributes.length > 0
 
   // Multi-line format when we have attrs to annotate
-  if (hasAttrs && (binding.attributes!.length > 1 || fields.get(binding.attributes![0])?.description)) {
+  if (hasAttrs && (binding.attributes!.length > 1 || resolveFieldInfoByPath(schemaAst, binding.attributes![0]!.field)?.description)) {
     // Opening tag on own line
     lines.push(`<${tagName}`)
 
     // Each attribute on its own line with inline annotation
     for (const attr of binding.attributes!) {
-      const info = fields.get(attr)
-      lines.push(`${attr}="..."${buildAttrAnnotation(info)}`)
+      const info = resolveFieldInfoByPath(schemaAst, attr.field)
+      lines.push(`${attr.attr}="..."${buildAttrAnnotation(info)}`)
     }
 
     if (!hasBody && !hasNested) {
@@ -344,9 +344,9 @@ function buildAnnotatedInput(
     let open = `<${tagName}`
     if (hasAttrs) {
       for (const attr of binding.attributes!) {
-        open += ` ${attr}="..."`
+        open += ` ${attr.attr}="..."`
       }
-      const info = fields.get(binding.attributes![0])
+      const info = resolveFieldInfoByPath(schemaAst, binding.attributes![0]!.field)
       open += buildAttrAnnotation(info)
     }
 
@@ -389,8 +389,8 @@ function buildAnnotatedInput(
           // Multi-line child with annotated attributes
           lines.push(`<${childTag}`)
           for (const attr of child.attributes) {
-            const info = elemFields.get(attr)
-            lines.push(`${attr}="..."${buildAttrAnnotation(info)}`)
+            const info = elemFields.get(attr.field)
+            lines.push(`${attr.attr}="..."${buildAttrAnnotation(info)}`)
           }
           if (child.body) {
             lines.push(`>${child.body}</${childTag}>`)
@@ -533,7 +533,7 @@ function buildOutputWithBinding(
   let attrs = ''
   if (binding.attributes) {
     for (const attr of binding.attributes) {
-      attrs += ` ${attr}="..."`
+      attrs += ` ${attr.attr}="..."`
     }
   }
 
@@ -600,7 +600,7 @@ function buildOutputWithBinding(
       let childAttrs = ''
       if (child.attributes) {
         for (const attr of child.attributes) {
-          childAttrs += ` ${attr}="..."`
+          childAttrs += ` ${attr.attr}="..."`
         }
       }
       if (child.body) {

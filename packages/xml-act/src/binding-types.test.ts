@@ -92,9 +92,12 @@ describe('type-level: XmlBinding<T> constraints', () => {
   }
 
   test('attributes constrained to InputFields<T>', () => {
-    const _good: XmlBinding<Input> = { type: 'tag', attributes: ['path', 'content', 'limit'] }
+    const _good: XmlBinding<Input> = {
+      type: 'tag',
+      attributes: [{ field: 'path', attr: 'path' }, { field: 'content', attr: 'content' }, { field: 'limit', attr: 'limit' }],
+    }
     // @ts-expect-error — 'nonexistent' is not a field of Input
-    const _bad: XmlBinding<Input> = { type: 'tag', attributes: ['nonexistent'] }
+    const _bad: XmlBinding<Input> = { type: 'tag', attributes: [{ field: 'nonexistent', attr: 'nonexistent' }] }
     expect(true).toBe(true)
   })
 
@@ -108,7 +111,7 @@ describe('type-level: XmlBinding<T> constraints', () => {
   test('children field constrained to ArrayFields<T>', () => {
     const _good: XmlBinding<Input> = {
       type: 'tag',
-      children: [{ field: 'edits', tag: 'edit', attributes: ['old'], body: 'new' }],
+      children: [{ field: 'edits', tag: 'edit', attributes: [{ field: 'old', attr: 'old' }], body: 'new' }],
     }
     // @ts-expect-error — 'path' is not an array field, so this child binding is invalid
     const _bad: XmlBinding<Input> = { type: 'tag', children: [{ field: 'path', tag: 'x' }] }
@@ -118,7 +121,7 @@ describe('type-level: XmlBinding<T> constraints', () => {
   test('children attributes constrained to element fields', () => {
     const _good: XmlBinding<Input> = {
       type: 'tag',
-      children: [{ field: 'edits', attributes: ['old', 'new'] }],
+      children: [{ field: 'edits', attributes: [{ field: 'old', attr: 'old' }, { field: 'new', attr: 'new' }] }],
     }
     // @ts-expect-error — 'nonexistent' is not a field of the edits element type
     const _bad: XmlBinding<Input> = { type: 'tag', children: [{ field: 'edits', attributes: ['nonexistent'] }] }
@@ -139,12 +142,12 @@ describe('type-level: XmlBinding<T> constraints', () => {
 describe('type-level: erased XmlTagBinding is usable', () => {
   test('XmlTagBinding accepts any string field names', () => {
     const binding: XmlTagBinding = {
-      attributes: ['anything', 'goes'],
+      attributes: [{ field: 'anything', attr: 'anything' }, { field: 'goes', attr: 'goes' }],
       body: 'whatever',
-      children: [{ field: 'stuff', tag: 'item', attributes: ['a', 'b'], body: 'c' }],
+      children: [{ field: 'stuff', tag: 'item', attributes: [{ field: 'a', attr: 'a' }, { field: 'b', attr: 'b' }], body: 'c' }],
       childRecord: { field: 'map', tag: 'entry', keyAttr: 'k' },
     }
-    const attr: string = binding.attributes![0]
+    const attr: string = binding.attributes![0]!.field
     const body: string = binding.body!
     const childField: string = binding.children![0].field
     const recordField: string = binding.childRecord!.field
@@ -158,7 +161,7 @@ describe('type-level: erased XmlTagBinding is usable', () => {
     const child: XmlArrayChildBinding<unknown> = {
       field: 'anything',
       tag: 'whatever',
-      attributes: ['any', 'string'],
+      attributes: [{ field: 'any', attr: 'any' }, { field: 'string', attr: 'string' }],
       body: 'text',
     }
     const f: string = child.field
@@ -253,14 +256,14 @@ describe('childTags runtime', () => {
     }),
     outputSchema: Schema.String,
     bindings: {
-      xmlInput: { type: 'tag', attributes: ['id'], childTags: [{ field: 'options.type', tag: 'type' }, { field: 'options.title', tag: 'title' }, { field: 'options.prompt', tag: 'prompt' }] },
+      xmlInput: { type: 'tag', attributes: [{ field: 'id', attr: 'id' }], childTags: [{ field: 'options.type', tag: 'type' }, { field: 'options.title', tag: 'title' }, { field: 'options.prompt', tag: 'prompt' }] },
       xmlOutput: { type: 'tag' },
     } as const,
     execute: ({ id, options }) => Effect.succeed(`created ${id}: ${options.type}`),
   })
 
   const agentBinding: XmlTagBinding = {
-    attributes: ['id'],
+    attributes: [{ field: 'id', attr: 'id' }],
     childTags: [
       { field: 'options.type', tag: 'type' },
       { field: 'options.title', tag: 'title' },
@@ -360,7 +363,7 @@ describe('childTags runtime', () => {
 
 describe('buildInput', () => {
   test('attributes only', () => {
-    const input = buildInput(el('read', { path: 'src/index.ts' }, ''), { attributes: ['path'] })
+    const input = buildInput(el('read', { path: 'src/index.ts' }, ''), { attributes: [{ field: 'path', attr: 'path' }] })
     expect(input).toEqual({ path: 'src/index.ts' })
   })
 
@@ -372,7 +375,7 @@ describe('buildInput', () => {
   test('attributes + body', () => {
     const input = buildInput(
       el('write', { path: 'f.ts' }, 'content here'),
-      { attributes: ['path'], body: 'content' },
+      { attributes: [{ field: 'path', attr: 'path' }], body: 'content' },
     )
     expect(input).toEqual({ path: 'f.ts', content: 'content here' })
   })
@@ -383,8 +386,8 @@ describe('buildInput', () => {
       { tagName: 'change', attributes: { old: 'c' }, body: 'd' },
     ])
     const input = buildInput(element, {
-      attributes: ['path'],
-      children: [{ field: 'edits', tag: 'change', attributes: ['old'], body: 'new' }],
+      attributes: [{ field: 'path', attr: 'path' }],
+      children: [{ field: 'edits', tag: 'change', attributes: [{ field: 'old', attr: 'old' }], body: 'new' }],
     })
     expect(input).toEqual({
       path: 'f.ts',
@@ -400,7 +403,7 @@ describe('buildInput', () => {
       { tagName: 'items', attributes: { name: 'x' }, body: '' },
     ])
     const input = buildInput(element, {
-      children: [{ field: 'items', attributes: ['name'] }],
+      children: [{ field: 'items', attributes: [{ field: 'name', attr: 'name' }] }],
     })
     expect(input).toEqual({ items: [{ name: 'x' }] })
   })
@@ -431,7 +434,7 @@ describe('buildInput', () => {
       { tagName: 'criterion', attributes: { id: 'c2' }, body: 'Second criterion' },
     ])
     const input = buildInput(element, {
-      attributes: ['title'],
+      attributes: [{ field: 'title', attr: 'title' }],
       childRecord: { field: 'criteria', tag: 'criterion', keyAttr: 'id' },
     })
     expect(input).toEqual({
@@ -448,7 +451,7 @@ describe('buildInput', () => {
   test('unbound attributes are ignored', () => {
     const input = buildInput(
       el('read', { path: 'a.ts', extra: 'ignored' }, ''),
-      { attributes: ['path'] },
+      { attributes: [{ field: 'path', attr: 'path' }] },
     )
     expect(input).toEqual({ path: 'a.ts' })
   })
@@ -499,7 +502,7 @@ describe('binding validation', () => {
       execute: () => Effect.succeed(''),
     })
     const binding: XmlTagBinding = {
-      attributes: ['id'],
+      attributes: [{ field: 'id', attr: 'id' }],
       childTags: [{ field: 'opts.mode', tag: 'mode' }, { field: 'opts.level', tag: 'level' }],
       childRecord: { field: 'vars', tag: 'var', keyAttr: 'name' },
     }
@@ -530,7 +533,7 @@ describe('xml-docs childRecord.field integration', () => {
       bindings: {
         xmlInput: {
           type: 'tag' as const,
-          attributes: ['title'] as const,
+          attributes: [{ field: 'title', attr: 'title' }] as const,
           childRecord: { field: 'criteria', tag: 'criterion', keyAttr: 'id' },
         },
         xmlOutput: { type: 'tag' as const },

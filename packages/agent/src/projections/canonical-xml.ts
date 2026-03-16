@@ -61,8 +61,8 @@ function serializeToolCall(tagName: string, input: unknown, query: string, bindi
   const attrs: Record<string, string> = { observe: query }
   if (binding.attributes) {
     for (const attr of binding.attributes) {
-      const value = obj[attr]
-      if (value !== undefined && value !== null) attrs[attr] = String(value)
+      const value = getByPath(obj, attr.field)
+      if (value !== undefined && value !== null) attrs[attr.attr] = String(value)
     }
   }
 
@@ -93,8 +93,8 @@ function serializeToolCall(tagName: string, input: unknown, query: string, bindi
         const childAttrs: Record<string, string> = {}
         if (child.attributes) {
           for (const a of child.attributes) {
-            const v = itemObj[a]
-            if (v !== undefined && v !== null) childAttrs[a] = String(v)
+            const v = itemObj[a.field]
+            if (v !== undefined && v !== null) childAttrs[a.attr] = String(v)
           }
         }
         let childBody: string | null = null

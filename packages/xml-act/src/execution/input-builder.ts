@@ -28,17 +28,17 @@ export function buildInput(element: ParsedElement, binding: XmlTagBinding): Reco
 
   // Attributes → input fields
   if (binding.attributes) {
-    for (const attrName of binding.attributes) {
-      const value = element.attributes.get(attrName)
+    for (const attrSpec of binding.attributes) {
+      const value = element.attributes.get(attrSpec.attr)
       if (value !== undefined) {
-        input[attrName] = value
+        setNestedValue(input, attrSpec.field, value)
       }
     }
   }
 
   // Body → input field
   if (binding.body) {
-    input[binding.body] = element.body.trim()
+    setNestedValue(input, binding.body, element.body.trim())
   }
 
   // ChildTags → scalar fields (fixed named child elements)
@@ -64,10 +64,10 @@ export function buildInput(element: ParsedElement, binding: XmlTagBinding): Reco
 
         // Child attributes
         if (childBinding.attributes) {
-          for (const attrName of childBinding.attributes) {
-            const value = child.attributes.get(attrName)
+          for (const attrSpec of childBinding.attributes) {
+            const value = child.attributes.get(attrSpec.attr)
             if (value !== undefined) {
-              entry[attrName] = value
+              entry[attrSpec.field] = value
             }
           }
         }

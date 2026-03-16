@@ -393,13 +393,13 @@ function reactImpl(
 
         // Emit ToolInputFieldValue for each bound attribute
         if (registered.binding.attributes) {
-          for (const attrName of registered.binding.attributes) {
-            const value = parseEvent.attributes.get(attrName)
+          for (const attrSpec of registered.binding.attributes) {
+            const value = parseEvent.attributes.get(attrSpec.attr)
             if (value !== undefined) {
               currentState = yield* emitAndFold(currentState, {
                 _tag: 'ToolInputFieldValue',
                 toolCallId: parseEvent.toolCallId,
-                field: attrName,
+                field: attrSpec.attr,
                 value,
               })
             }
@@ -496,9 +496,9 @@ function reactImpl(
         if (childInfo) {
           const value: Record<string, unknown> = {}
           if (childInfo.attributes) {
-            for (const attrName of childInfo.attributes) {
-              const v = parseEvent.attributes.get(attrName)
-              if (v !== undefined) value[attrName] = v
+            for (const attrSpec of childInfo.attributes) {
+              const v = parseEvent.attributes.get(attrSpec.attr)
+              if (v !== undefined) value[attrSpec.field] = v
             }
           }
           if (childInfo.bodyField) {
@@ -769,7 +769,7 @@ function resolveBodyField(
 interface ResolvedChildBinding {
   field: string
   bodyField?: string
-  attributes?: readonly string[]
+  attributes?: readonly { readonly field: string; readonly attr: string }[]
 }
 
 function resolveChildBinding(
@@ -805,7 +805,7 @@ function resolveChildBinding(
   if (binding.childRecord?.tag === childTagName) {
     return {
       field: binding.childRecord.field,
-      attributes: [binding.childRecord.keyAttr],
+      attributes: [{ field: binding.childRecord.keyAttr, attr: binding.childRecord.keyAttr }],
     }
   }
 

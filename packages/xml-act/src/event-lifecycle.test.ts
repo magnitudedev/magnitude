@@ -108,7 +108,7 @@ const readTool = createTool({
   inputSchema: Schema.Struct({ path: Schema.String }),
   outputSchema: Schema.Struct({ content: Schema.String, lines: Schema.Number }),
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['path'] },
+    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }] },
     xmlOutput: { type: 'tag', childTags: [{ field: 'content', tag: 'content' }, { field: 'lines', tag: 'lines' }] },
   } as const,
   execute: ({ path }) => Effect.succeed({ content: `contents of ${path}`, lines: 42 }),
@@ -119,7 +119,7 @@ const writeTool = createTool({
   inputSchema: Schema.Struct({ path: Schema.String, content: Schema.String }),
   outputSchema: Schema.String,
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['path'], body: 'content' },
+    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' },
     xmlOutput: { type: 'tag' },
   } as const,
   execute: ({ path }) => Effect.succeed(`wrote ${path}`),
@@ -144,7 +144,7 @@ const editTool = createTool({
   }),
   outputSchema: Schema.String,
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['path'], children: [{ field: 'edits', tag: 'edit', attributes: ['old'], body: 'new' }] },
+    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], children: [{ field: 'edits', tag: 'edit', attributes: [{ field: 'old', attr: 'old' }], body: 'new' }] },
     xmlOutput: { type: 'tag' },
   } as const,
   execute: ({ path, edits }) => Effect.succeed(`edited ${path}: ${edits.length} changes`),
@@ -155,7 +155,7 @@ const addTool = createTool({
   inputSchema: Schema.Struct({ a: Schema.Number, b: Schema.Number }),
   outputSchema: Schema.Number,
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['a', 'b'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'a', attr: 'a' }, { field: 'b', attr: 'b' }], selfClosing: true },
     xmlOutput: { type: 'tag' },
   } as const,
   execute: ({ a, b }) => Effect.succeed(a + b),
@@ -166,7 +166,7 @@ const failTool = createTool({
   inputSchema: Schema.Struct({ reason: Schema.String }),
   outputSchema: Schema.String, errorSchema: Schema.String,
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['reason'] },
+    xmlInput: { type: 'tag', attributes: [{ field: 'reason', attr: 'reason' }] },
     xmlOutput: { type: 'tag' },
   } as const,
   execute: ({ reason }) => Effect.fail(reason),
@@ -177,7 +177,7 @@ const boolTool = createTool({
   inputSchema: Schema.Struct({ on: Schema.Boolean }),
   outputSchema: Schema.Boolean,
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['on'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'on', attr: 'on' }], selfClosing: true },
     xmlOutput: { type: 'tag' },
   } as const,
   execute: ({ on }) => Effect.succeed(on),
@@ -191,7 +191,7 @@ const optionalTool = createTool({
   }),
   outputSchema: Schema.String,
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['query', 'limit'] },
+    xmlInput: { type: 'tag', attributes: [{ field: 'query', attr: 'query' }, { field: 'limit', attr: 'limit' }] },
     xmlOutput: { type: 'tag' },
   } as const,
   execute: ({ query, limit }) => Effect.succeed(`${query} (limit: ${limit ?? 'none'})`),
@@ -212,17 +212,17 @@ const kvTool = createTool({
 // Bindings
 // ---------------------------------------------------------------------------
 
-const readBinding: XmlTagBinding = { attributes: ['path'] }
-const writeBinding: XmlTagBinding = { attributes: ['path'], body: 'content' }
+const readBinding: XmlTagBinding = { attributes: [{ field: 'path', attr: 'path' }] }
+const writeBinding: XmlTagBinding = { attributes: [{ field: 'path', attr: 'path' }], body: 'content' }
 const shellBinding: XmlTagBinding = { body: 'command' }
 const editBinding: XmlTagBinding = {
-  attributes: ['path'],
-  children: [{ field: 'edits', tag: 'edit', attributes: ['old'], body: 'new' }],
+  attributes: [{ field: 'path', attr: 'path' }],
+  children: [{ field: 'edits', tag: 'edit', attributes: [{ field: 'old', attr: 'old' }], body: 'new' }],
 }
-const addBinding: XmlTagBinding = { attributes: ['a', 'b'], selfClosing: true }
-const failBinding: XmlTagBinding = { attributes: ['reason'] }
-const boolBinding: XmlTagBinding = { attributes: ['on'], selfClosing: true }
-const optionalBinding: XmlTagBinding = { attributes: ['query', 'limit'] }
+const addBinding: XmlTagBinding = { attributes: [{ field: 'a', attr: 'a' }, { field: 'b', attr: 'b' }], selfClosing: true }
+const failBinding: XmlTagBinding = { attributes: [{ field: 'reason', attr: 'reason' }] }
+const boolBinding: XmlTagBinding = { attributes: [{ field: 'on', attr: 'on' }], selfClosing: true }
+const optionalBinding: XmlTagBinding = { attributes: [{ field: 'query', attr: 'query' }, { field: 'limit', attr: 'limit' }] }
 const kvBinding: XmlTagBinding = { childRecord: { field: 'vars', tag: 'var', keyAttr: 'name' } }
 
 
@@ -788,7 +788,7 @@ describe('binding validation', () => {
       bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
       execute: () => Effect.succeed(''),
     })
-    expect(() => createXmlRuntime(cfg([reg(tool, 'bad', { attributes: ['items'] })]))).toThrow(/attributes must be scalar/)
+    expect(() => createXmlRuntime(cfg([reg(tool, 'bad', { attributes: [{ field: 'items', attr: 'items' }] })]))).toThrow(/attributes must be scalar/)
   })
 
   test('rejects non-string body field', () => {
@@ -810,7 +810,7 @@ describe('binding validation', () => {
       bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
       execute: () => Effect.succeed(''),
     })
-    expect(() => createXmlRuntime(cfg([reg(tool, 'bad', { attributes: ['path', 'ghost'] })]))).toThrow(/does not exist/)
+    expect(() => createXmlRuntime(cfg([reg(tool, 'bad', { attributes: [{ field: 'path', attr: 'path' }, { field: 'ghost', attr: 'ghost' }] })]))).toThrow(/does not exist/)
   })
 
   test('rejects nonexistent body field', () => {

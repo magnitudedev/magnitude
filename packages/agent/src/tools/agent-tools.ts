@@ -94,12 +94,12 @@ export const agentCreateTool = createTool({
   bindings: {
     xmlInput: {
       type: 'tag' as const,
-      attributes: ['agentId'],
-      childTags: [
-        { field: 'options.type', tag: 'type' },
-        { field: 'options.title', tag: 'title' },
-        { field: 'options.message', tag: 'message' },
+      attributes: [
+        { field: 'agentId', attr: 'agentId' },
+        { field: 'options.type', attr: 'type' },
+        { field: 'options.title', attr: 'title' },
       ],
+      body: 'options.message',
     },
     xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
   } as const,
@@ -120,7 +120,7 @@ export const agentPauseTool = createTool({
   errorSchema: AgentError,
   argMapping: ['agentId'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['agentId'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'agentId', attr: 'agentId' }], selfClosing: true },
     xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }] },
   } as const,
   execute: ({ agentId }) =>
@@ -160,7 +160,7 @@ export const agentDismissTool = createTool({
   errorSchema: AgentError,
   argMapping: ['agentId'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['agentId'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'agentId', attr: 'agentId' }], selfClosing: true },
     xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }] },
   } as const,
   execute: ({ agentId }) =>

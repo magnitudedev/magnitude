@@ -29,6 +29,23 @@ function getScalarType(ast: AST.AST): ScalarType | undefined {
     case 'StringKeyword': return 'string'
     case 'NumberKeyword': return 'number'
     case 'BooleanKeyword': return 'boolean'
+    case 'Literal': {
+      const lit = unwrapped.literal
+      if (typeof lit === 'string') return 'string'
+      if (typeof lit === 'number') return 'number'
+      if (typeof lit === 'boolean') return 'boolean'
+      return undefined
+    }
+    case 'Union': {
+      // Union of literals (e.g., Schema.Literal('a', 'b', 'c')) — resolve if all members share one scalar type
+      const memberTypes = unwrapped.types
+        .map(t => getScalarType(t))
+        .filter((t): t is ScalarType => t !== undefined)
+      if (memberTypes.length === 0) return undefined
+      const first = memberTypes[0]
+      if (memberTypes.every(t => t === first)) return first
+      return undefined
+    }
     default: return undefined
   }
 }
@@ -172,23 +189,23 @@ export function validateBinding(
 
   // --- Validate attribute fields ---
   if (binding.attributes) {
-    for (const attrName of binding.attributes) {
-      const prop = findProperty(schemaAst, attrName)
+    for (const attrSpec of binding.attributes) {
+      const prop = resolveFieldPath(schemaAst, attrSpec.field)
       if (!prop) {
         throw new Error(
-          `Binding error on <${tagName}>: attribute '${attrName}' does not exist in the schema`
+          `Binding error on <${tagName}>: attribute field '${attrSpec.field}' does not exist in the schema`
         )
       }
 
       const scalarType = getPropertyScalarType(prop)
       if (!scalarType) {
         throw new Error(
-          `Binding error on <${tagName}>: attribute field '${attrName}' has type '${describeType(prop.type)}' — ` +
+          `Binding error on <${tagName}>: attribute field '${attrSpec.field}' has type '${describeType(prop.type)}' — ` +
           `attributes must be scalar (string, number, or boolean)`
         )
       }
 
-      attributes.set(attrName, {
+      attributes.set(attrSpec.attr, {
         type: scalarType,
         required: !prop.isOptional,
       })
@@ -201,7 +218,7 @@ export function validateBinding(
   const hasChildren = !!(binding.children?.length || binding.childTags?.length || binding.childRecord)
   const acceptsBody = binding.body !== undefined || hasChildren
   if (binding.body) {
-    const prop = findProperty(schemaAst, binding.body)
+    const prop = resolveFieldPath(schemaAst, binding.body)
     if (!prop) {
       throw new Error(
         `Binding error on <${tagName}>: body field '${binding.body}' does not exist in the schema`
@@ -262,6 +279,11 @@ export function validateBinding(
     })
   }
 
+  // Tool tags always accept an optional `id` attribute for stable toolCall identity.
+  if (!attributes.has('id')) {
+    attributes.set('id', { type: 'string', required: false })
+  }
+
   return { attributes, acceptsBody, children }
 }
 
@@ -292,11 +314,11 @@ function validateChildBinding(
 
   // Validate child attributes
   if (childBinding.attributes) {
-    for (const attrName of childBinding.attributes) {
-      const childProp = findProperty(elemAst, attrName)
+    for (const attrSpec of childBinding.attributes) {
+      const childProp = findProperty(elemAst, attrSpec.field)
       if (!childProp) {
         throw new Error(
-          `Binding error on <${parentTagName}>: child <${childTag}> attribute '${attrName}' ` +
+          `Binding error on <${parentTagName}>: child <${childTag}> attribute field '${attrSpec.field}' ` +
           `does not exist in the element schema`
         )
       }
@@ -304,12 +326,12 @@ function validateChildBinding(
       const scalarType = getPropertyScalarType(childProp)
       if (!scalarType) {
         throw new Error(
-          `Binding error on <${parentTagName}>: child <${childTag}> attribute '${attrName}' ` +
+          `Binding error on <${parentTagName}>: child <${childTag}> attribute field '${attrSpec.field}' ` +
           `has type '${describeType(childProp.type)}' — attributes must be scalar`
         )
       }
 
-      attributes.set(attrName, {
+      attributes.set(attrSpec.attr, {
         type: scalarType,
         required: !childProp.isOptional,
       })

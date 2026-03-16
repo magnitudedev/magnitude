@@ -152,7 +152,7 @@ describe('buildOutputTree — body', () => {
   test('body with attributes', () => {
     expect(render('write', { path: 'out.ts', content: 'hello' }, {
       type: 'tag',
-      attributes: ['path'],
+      attributes: [{ field: 'path', attr: 'path' }],
       body: 'content',
     } as XmlBinding<unknown>)).toBe('<write path="out.ts">hello</write>')
   })
@@ -173,28 +173,28 @@ describe('buildOutputTree — attributes', () => {
   test('output fields as attributes', () => {
     expect(render('result', { status: 'ok', code: 200 }, {
       type: 'tag',
-      attributes: ['status', 'code'],
+      attributes: [{ field: 'status', attr: 'status' }, { field: 'code', attr: 'code' }],
     } as XmlBinding<unknown>)).toBe('<result status="ok" code="200" />')
   })
 
   test('attributes skip null/undefined', () => {
     expect(render('result', { status: 'ok', code: undefined }, {
       type: 'tag',
-      attributes: ['status', 'code'],
+      attributes: [{ field: 'status', attr: 'status' }, { field: 'code', attr: 'code' }],
     } as XmlBinding<unknown>)).toBe('<result status="ok" />')
   })
 
   test('attributes combined with echoAttrs', () => {
     expect(render('result', { status: 'ok' }, {
       type: 'tag',
-      attributes: ['status'],
+      attributes: [{ field: 'status', attr: 'status' }],
     } as XmlBinding<unknown>, { id: 'r1' })).toBe('<result id="r1" status="ok" />')
   })
 
   test('attributes + childTags', () => {
     expect(render('result', { status: 'ok', message: 'done' }, {
       type: 'tag',
-      attributes: ['status'],
+      attributes: [{ field: 'status', attr: 'status' }],
       childTags: [{ field: 'message', tag: 'message' }],
     } as XmlBinding<unknown>)).toBe('<result status="ok"><message>done</message></result>')
   })
@@ -279,7 +279,7 @@ describe('buildOutputTree — children', () => {
     }
     expect(render('grep', output, {
       type: 'tag',
-      children: [{ field: 'results', tag: 'match', attributes: ['path', 'line'] }],
+      children: [{ field: 'results', tag: 'match', attributes: [{ field: 'path', attr: 'path' }, { field: 'line', attr: 'line' }] }],
     } as XmlBinding<unknown>)).toBe('<grep><match path="a.ts" line="10" /><match path="b.ts" line="20" /></grep>')
   })
 
@@ -292,7 +292,7 @@ describe('buildOutputTree — children', () => {
     }
     expect(render('help', output, {
       type: 'tag',
-      children: [{ field: 'entries', tag: 'entry', attributes: ['name'], body: 'description' }],
+      children: [{ field: 'entries', tag: 'entry', attributes: [{ field: 'name', attr: 'name' }], body: 'description' }],
     } as XmlBinding<unknown>)).toBe('<help><entry name="foo">A foo thing</entry><entry name="bar">A bar thing</entry></help>')
   })
 
@@ -302,14 +302,14 @@ describe('buildOutputTree — children', () => {
     }
     expect(render('list', output, {
       type: 'tag',
-      children: [{ field: 'items', attributes: ['id'] }],
+      children: [{ field: 'items', attributes: [{ field: 'id', attr: 'id' }] }],
     } as XmlBinding<unknown>)).toBe('<list><items id="1" /><items id="2" /></list>')
   })
 
   test('children skips non-array field', () => {
     expect(render('list', { items: 'not an array' }, {
       type: 'tag',
-      children: [{ field: 'items', tag: 'item', attributes: ['id'] }],
+      children: [{ field: 'items', tag: 'item', attributes: [{ field: 'id', attr: 'id' }] }],
     } as XmlBinding<unknown>)).toBe('<list />')
   })
 
@@ -364,7 +364,7 @@ describe('buildOutputTree — combined bindings', () => {
     const output = { id: 'r1', status: 'ok', message: 'done', body: 'full details here' }
     expect(render('result', output, {
       type: 'tag',
-      attributes: ['id', 'status'],
+      attributes: [{ field: 'id', attr: 'id' }, { field: 'status', attr: 'status' }],
       childTags: [{ field: 'message', tag: 'message' }],
       body: 'body',
     } as XmlBinding<unknown>)).toBe('<result id="r1" status="ok"><message>done</message>full details here</result>')
@@ -378,7 +378,7 @@ describe('buildOutputTree — combined bindings', () => {
     expect(render('list', output, {
       type: 'tag',
       childTags: [{ field: 'total', tag: 'total' }],
-      children: [{ field: 'items', tag: 'item', attributes: ['name'] }],
+      children: [{ field: 'items', tag: 'item', attributes: [{ field: 'name', attr: 'name' }] }],
     } as XmlBinding<unknown>)).toBe('<list><total>5</total><item name="a" /><item name="b" /></list>')
   })
 
@@ -403,7 +403,7 @@ describe('buildOutputTree — self-closing', () => {
   test('object with attributes only', () => {
     expect(render('ping', { status: 'ok' }, {
       type: 'tag',
-      attributes: ['status'],
+      attributes: [{ field: 'status', attr: 'status' }],
     } as XmlBinding<unknown>)).toBe('<ping status="ok" />')
   })
 
@@ -418,7 +418,7 @@ describe('buildOutputTree — self-closing', () => {
 
 describe('buildOutputTree — errors', () => {
   test('throws for non-tag binding with object output', () => {
-    expect(() => build('tool', { x: 1 }, { type: 'omit' } as XmlBinding<unknown>))
+    expect(() => build('tool', { x: 1 }, { type: 'omit' } as unknown as XmlBinding<unknown>))
       .toThrow('buildOutputTree: tool output <tool> is missing required xmlOutput binding')
   })
 })
@@ -436,8 +436,8 @@ describe('buildOutputTree — XPath integration', () => {
     const { root } = outputToDOM(tree)
     const result = evaluateXPath('content', root, null, null,
       evaluateXPath.ALL_RESULTS_TYPE,
-      { language: evaluateXPath.XQUERY_3_1_LANGUAGE })
-    expect(result[0].textContent).toBe('hello <world>')
+      { language: evaluateXPath.XQUERY_3_1_LANGUAGE }) as Node[]
+    expect(result[0]?.textContent).toBe('hello <world>')
   })
 
   test('XPath count on items', () => {
@@ -460,8 +460,8 @@ describe('buildOutputTree — XPath integration', () => {
     const { root } = outputToDOM(tree)
     const result = evaluateXPath('entry[@type="dir"]/@file', root, null, null,
       evaluateXPath.ALL_RESULTS_TYPE,
-      { language: evaluateXPath.XQUERY_3_1_LANGUAGE })
-    expect(result[0].value).toBe('b/')
+      { language: evaluateXPath.XQUERY_3_1_LANGUAGE }) as Attr[]
+    expect(result[0]?.value).toBe('b/')
   })
 
   test('XPath . on scalar returns full element', () => {
@@ -469,8 +469,8 @@ describe('buildOutputTree — XPath integration', () => {
     const { root } = outputToDOM(tree)
     const result = evaluateXPath('.', root, null, null,
       evaluateXPath.ALL_RESULTS_TYPE,
-      { language: evaluateXPath.XQUERY_3_1_LANGUAGE })
-    expect(result[0].textContent).toBe('7')
+      { language: evaluateXPath.XQUERY_3_1_LANGUAGE }) as Node[]
+    expect(result[0]?.textContent).toBe('7')
   })
 
   test('DOM round-trip preserves structure', () => {

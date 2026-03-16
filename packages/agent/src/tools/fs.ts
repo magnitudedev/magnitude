@@ -47,7 +47,7 @@ export const readTool = createTool({
   errorSchema: FsError,
   argMapping: ['path', 'offset', 'limit'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['path', 'offset', 'limit'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }, { field: 'offset', attr: 'offset' }, { field: 'limit', attr: 'limit' }], selfClosing: true },
     xmlOutput: { type: 'tag' },
   } as const,
 
@@ -107,7 +107,7 @@ export const writeTool = createTool({
   errorSchema: FsError,
   argMapping: ['path', 'content'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['path'], body: 'content' },
+    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' },
     xmlOutput: { type: 'tag' },
   } as const,
 
@@ -153,7 +153,7 @@ export const editTool = createTool({
   bindings: {
     xmlInput: {
       type: 'tag',
-      attributes: ['path', 'replaceAll'],
+      attributes: [{ field: 'path', attr: 'path' }, { field: 'replaceAll', attr: 'replaceAll' }],
       childTags: [
         { tag: 'old', field: 'oldString' },
         { tag: 'new', field: 'newString' },
@@ -239,7 +239,7 @@ export const treeTool = createTool({
   errorSchema: FsError,
   argMapping: ['path', 'options'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['path'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true },
     xmlOutput: { type: 'tag', items: { tag: 'entry', attributes: ['path', 'name', 'type', 'depth'] } },
   } as const,
 
@@ -359,7 +359,7 @@ export const searchTool = createTool({
   errorSchema: FsError,
   argMapping: ['pattern', 'path', 'glob', 'limit', 'options'],
   bindings: {
-    xmlInput: { type: 'tag', attributes: ['pattern', 'path', 'glob', 'limit'], selfClosing: true },
+    xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }, { field: 'path', attr: 'path' }, { field: 'glob', attr: 'glob' }, { field: 'limit', attr: 'limit' }], selfClosing: true },
     xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['file'], body: 'match' } },
   } as const,
 
