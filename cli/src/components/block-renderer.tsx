@@ -1,4 +1,4 @@
-import React, { memo, useRef, useState } from 'react'
+import React, { memo, useEffect, useRef, useState } from 'react'
 import stringWidth from 'string-width'
 import {
   TextAttributes,
@@ -198,13 +198,24 @@ function CodeBlockView({
   const theme = useTheme()
   const [isHovered, setIsHovered] = useState(false)
   const [copied, setCopied] = useState(false)
+  const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const handleCopy = (e: { stopPropagation?: () => void }) => {
     e.stopPropagation?.()
     void writeTextToClipboard(block.rawCode)
     setCopied(true)
-    setTimeout(() => setCopied(false), COPY_FEEDBACK_RESET_MS)
+    if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current)
+    copiedTimeoutRef.current = setTimeout(() => {
+      setCopied(false)
+      copiedTimeoutRef.current = null
+    }, COPY_FEEDBACK_RESET_MS)
   }
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current)
+    }
+  }, [])
 
   return (
     <box

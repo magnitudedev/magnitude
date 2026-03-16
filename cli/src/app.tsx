@@ -125,6 +125,7 @@ function AppInner({
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   const [systemMessages, setSystemMessages] = useState<Array<{ id: string; text: string; timestamp: number }>>([])
+  const systemMessageTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const [showRecentChatsOverlay, setShowRecentChatsOverlay] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
   const [selectingModelFor, setSelectingModelFor] = useState<'primary' | 'secondary' | 'browser' | null>(null)
@@ -716,10 +717,26 @@ function AppInner({
 
   const showSystemMessage = useCallback((message: string, durationMs = 10000) => {
     const id = createId()
+    const existingTimeout = systemMessageTimeoutsRef.current.get(id)
+    if (existingTimeout) clearTimeout(existingTimeout)
+
     setSystemMessages(prev => [...prev, { id, text: message, timestamp: Date.now() }])
-    setTimeout(() => {
+
+    const timeoutId = setTimeout(() => {
+      systemMessageTimeoutsRef.current.delete(id)
       setSystemMessages(prev => prev.filter(m => m.id !== id))
     }, durationMs)
+
+    systemMessageTimeoutsRef.current.set(id, timeoutId)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      for (const timeoutId of systemMessageTimeoutsRef.current.values()) {
+        clearTimeout(timeoutId)
+      }
+      systemMessageTimeoutsRef.current.clear()
+    }
   }, [])
 
   const exitApp = useCallback(() => {
@@ -1822,6 +1839,10 @@ function AppInner({
               appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
               clearSystemBanners: () => {
                 setSystemMessages([])
+                for (const timeoutId of systemMessageTimeoutsRef.current.values()) {
+                  clearTimeout(timeoutId)
+                }
+                systemMessageTimeoutsRef.current.clear()
                 if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current)
                 setEphemeralMessage(null)
               },

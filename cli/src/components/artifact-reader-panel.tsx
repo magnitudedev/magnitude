@@ -287,6 +287,8 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
 
   const highlightAnchorId = highlightCharRanges.length > 0 ? 'artifact-highlight-anchor' : undefined
   const codeBlockWidth = Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 10)
+  const targetSectionScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const highlightAnchorScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const targetSectionId = useMemo(
     () => scrollToSection ? `section-${slugify(scrollToSection)}` : null,
@@ -294,6 +296,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   )
 
   useEffect(() => {
+    if (targetSectionScrollTimeoutRef.current) clearTimeout(targetSectionScrollTimeoutRef.current)
     if (!targetSectionId) return
 
     const scrollbox = scrollboxRef.current
@@ -324,16 +327,24 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
       scrollbox.scrollTo(offsetY)
     }
 
-    setTimeout(doScroll, 50)
+    targetSectionScrollTimeoutRef.current = setTimeout(doScroll, 50)
+
+    return () => {
+      if (targetSectionScrollTimeoutRef.current) {
+        clearTimeout(targetSectionScrollTimeoutRef.current)
+        targetSectionScrollTimeoutRef.current = null
+      }
+    }
   }, [targetSectionId])
 
   useEffect(() => {
+    if (highlightAnchorScrollTimeoutRef.current) clearTimeout(highlightAnchorScrollTimeoutRef.current)
     if (!highlightAnchorId) return
 
     const scrollbox = scrollboxRef.current
     if (!scrollbox) return
 
-    setTimeout(() => {
+    highlightAnchorScrollTimeoutRef.current = setTimeout(() => {
       const contentNode = scrollbox.content
       if (!contentNode) return
 
@@ -350,6 +361,13 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
 
       scrollbox.scrollTo(offsetY)
     }, 50)
+
+    return () => {
+      if (highlightAnchorScrollTimeoutRef.current) {
+        clearTimeout(highlightAnchorScrollTimeoutRef.current)
+        highlightAnchorScrollTimeoutRef.current = null
+      }
+    }
   }, [highlightAnchorId, displayedContent])
 
   const headerLabel = scrollToSection
