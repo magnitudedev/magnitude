@@ -2,12 +2,12 @@
  * ToolDispatcher — executes a parsed tool element.
  *
  * Triggered when TagClosed fires (element is complete).
- * Handles: input building, validation, interceptor, execution, and ref serialization.
+ * Handles: input building, validation, interceptor, execution, and output-tree serialization.
  *
  * The dispatcher receives an `emit` callback from the reactor. It calls emit
  * at the right moments (ToolExecutionStarted before execution, ToolExecutionEnded
  * after). The reactor provides emitAndFold as the callback, so state stays in
- * sync automatically. The dispatcher never touches the queue or refStore directly.
+ * sync automatically. The dispatcher never touches the queue or replay state directly.
  */
 
 import { Effect, Either } from "effect"
@@ -111,9 +111,16 @@ export function dispatchTool(
     }
 
     const { tool, groupName, binding, meta } = registered
+    const observe = typeof element.attributes.get('observe') === 'string' ? String(element.attributes.get('observe')) : '.'
+    const sanitizedAttributes = new Map(element.attributes)
+    sanitizedAttributes.delete('observe')
+    const sanitizedElement: ParsedElement = {
+      ...element,
+      attributes: sanitizedAttributes,
+    }
 
     // 1. Build input from element + binding
-    let rawInput = buildInput(element, binding)
+    let rawInput = buildInput(sanitizedElement, binding)
 
     // 2. Check for missing required fields
     const missingFields = findMissingRequiredFields(rawInput, tool.inputSchema.ast)
@@ -194,8 +201,8 @@ export function dispatchTool(
     } else {
       const output = executionResult.right
       
-      const refTree = buildOutputTree(element.tagName, output, tool.bindings.xmlOutput)
-      result = { _tag: 'Success', output, ref: { tag: element.tagName, tree: refTree } }
+      const outputTree = buildOutputTree(element.tagName, output, tool.bindings.xmlOutput)
+      result = { _tag: 'Success', output, outputTree: { tag: element.tagName, tree: outputTree }, query: observe }
     }
 
     // 7. Interceptor afterExecute

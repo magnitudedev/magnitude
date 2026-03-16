@@ -57,7 +57,6 @@ function dispatch(state: ParseStack, ch: string, config: ParserConfig): StepResu
     case 'ChildClosePrefixMatch': return stepChildClosePrefixMatch({ frame, state, ch, config })
     case 'Cdata': return stepCdata({ frame, state, ch, config })
     case 'Actions':
-    case 'Inspect':
     case 'Comms':
     case 'Done':
       return NOOP

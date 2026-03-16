@@ -150,34 +150,6 @@ describe('structural tag depth tracking', () => {
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
-  it('inspect nested inside inspect should not close the outer inspect block early', () => {
-    const events = parse(
-      [
-        '<actions>',
-        '<shell>before</shell>',
-        '<inspect>',
-        '<ref tool="shell" />',
-        '<inspect>',
-        '</inspect>',
-        '<ref tool="shell" />',
-        '</inspect>',
-        '<shell>after</shell>',
-        '</actions>',
-      ].join('\n') + '\n',
-    )
-
-    const inspectOpens = events.filter(e => e._tag === 'InspectOpen')
-    const inspectCloses = events.filter(e => e._tag === 'InspectClose')
-    const invalidRefs = events.filter(
-      (e): e is Extract<ParseEvent, { _tag: 'ParseError' }> =>
-        e._tag === 'ParseError' && e.error._tag === 'InvalidRef',
-    )
-
-    expect(inspectOpens).toHaveLength(1)
-    expect(inspectCloses).toHaveLength(1)
-    expect(invalidRefs).toHaveLength(2)
-    expect(events.filter(e => e._tag === 'ParseError' && e.error._tag !== 'InvalidRef')).toHaveLength(0)
-  })
 
   it('comms nested inside comms should not close the outer comms block early', () => {
     const xml = [

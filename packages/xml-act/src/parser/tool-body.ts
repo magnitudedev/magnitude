@@ -19,7 +19,6 @@ import { validateChildAttr } from './validate-attrs'
 import { advancePrefixMatch, candidatesStartingWith } from './prefix-match'
 
 function isValidChildTag(tool: ToolBodyFrame, childTag: string, config: ParserConfig): boolean {
-  if (childTag === 'ref') return config.resolveRef !== undefined
   const validSet = config.childTagMap.get(tool.tagName)
   return validSet ? validSet.has(childTag) : false
 }
@@ -28,7 +27,6 @@ function childOpenCandidates(tool: ToolBodyFrame, config: ParserConfig): string[
   const candidates: string[] = []
   const validSet = config.childTagMap.get(tool.tagName)
   if (validSet) candidates.push(...validSet)
-  if (config.resolveRef !== undefined) candidates.push('ref')
   return candidates
 }
 
@@ -170,21 +168,6 @@ export function stepChildAttrs({ frame, state, ch, config }: { frame: ChildAttrs
   if (attr.phase._tag === 'PendingSlash') {
     if (ch === '>') {
       attr.phase = { _tag: 'Idle' }
-      if (frame.childTagName === 'ref' && config.resolveRef) {
-        const toolRef = attr.attrs.get('tool')
-        if (typeof toolRef === 'string') {
-          const m = /^([a-zA-Z0-9_-]+)(?:~(\d+))?$/.exec(toolRef)
-          if (m) {
-            const resolved = config.resolveRef(m[1], m[2] ? Number(m[2]) : 0, typeof attr.attrs.get('query') === 'string' ? String(attr.attrs.get('query')) : undefined)
-            if (resolved !== undefined) {
-              tool.body += resolved
-              events.push({ _tag: 'BodyChunk', toolCallId: tool.toolCallId, text: resolved })
-            }
-          }
-        }
-        state.pop()
-        return events.length > 0 ? emit(...events) : NOOP
-      }
       const attrsCopy = new Map(attr.attrs)
       const idx = getChildIndex(tool, frame.childTagName)
       events.push({ _tag: 'ChildOpened', parentToolCallId: tool.toolCallId, childTagName: frame.childTagName, childIndex: idx, attributes: attrsCopy })

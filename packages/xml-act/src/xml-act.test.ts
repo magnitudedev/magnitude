@@ -578,338 +578,6 @@ describe('xml-act end-to-end', () => {
   })
 
   // =========================================================================
-  // Ref store (id attribute + interpolation)
-  // =========================================================================
-
-  test('ref without query returns raw XML', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="source.ts"/><write id="r2" path="dest.ts"><ref tool="read"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const ended = eventsOfType(events, 'ToolExecutionEnded')
-    expect(ended).toHaveLength(2)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    // No query → raw XML string
-    const content = (writeStart!.input as { content: string }).content
-    expect(content).toContain('<content>contents of source.ts</content>')
-    expect(content).toContain('<lines>42</lines>')
-  })
-
-  // =========================================================================
-  // Ref store queries — XPath on XML structure
-  // =========================================================================
-
-  test('XPath child element extracts field from struct output', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // readTool returns { content: "contents of source.ts", lines: 42 }
-    // XML: <read><content>...</content><lines>42</lines></read>
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="source.ts"/><write id="r2" path="dest.ts"><ref tool="read" query="content"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('contents of source.ts')
-  })
-
-  test('XPath child element extracts numeric field', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="source.ts"/><write id="r2" path="dest.ts"><ref tool="read" query="lines"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('42')
-  })
-
-  test('XPath extracts field from shell output', async () => {
-    const cfg = config([
-      registered(shellTool, 'shell', shellBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // shellTool returns { stdout: "output of: ls", exitCode: 0 }
-    // XML: <shell><stdout>...</stdout><exitCode>0</exitCode></shell>
-    const xml = `${ACTIONS_TAG_OPEN}<shell id="s1">ls</shell><write id="r2" path="out.txt"><ref tool="shell" query="stdout"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('output of: ls')
-  })
-
-  test('XPath with item attributes on array-struct output', async () => {
-    // Tool that returns array-struct at top level (serializes as <item> elements with attributes)
-    const searchTool = createTool({
-      name: 'search',
-      description: 'Search files',
-      inputSchema: Schema.Struct({ pattern: Schema.String }),
-      outputSchema: Schema.Array(Schema.Struct({
-        file: Schema.String,
-        line: Schema.Number,
-        text: Schema.String,
-      })),
-      bindings: {
-        xmlInput: { type: 'tag' },
-        xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['file', 'line', 'text'] } },
-      } as const,
-      execute: () => Effect.succeed([
-        { file: 'a.ts', line: 10, text: 'import foo' },
-        { file: 'b.ts', line: 20, text: 'import bar' },
-        { file: 'c.ts', line: 30, text: 'import baz' },
-      ]),
-    })
-    const searchBinding: XmlTagBinding = { attributes: ['pattern'] }
-
-    const cfg = config([
-      registered(searchTool, 'search', searchBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // XML: <search><item file="a.ts" line="10" text="import foo" />...</search>
-    // XPath: get all file attributes
-    const xml = `${ACTIONS_TAG_OPEN}<search id="s1" pattern="import"/><write id="r2" path="files.txt"><ref tool="search" query="//item/@file"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('a.ts\nb.ts\nc.ts')
-  })
-
-  test('XPath predicate filter on item attributes', async () => {
-    const apiTool = createTool({
-      name: 'api',
-      description: 'Call API',
-      inputSchema: Schema.Struct({ endpoint: Schema.String }),
-      outputSchema: Schema.Array(Schema.Struct({
-        name: Schema.String,
-        role: Schema.String,
-        active: Schema.Boolean,
-      })),
-      bindings: {
-        xmlInput: { type: 'tag' },
-        xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['name', 'role', 'active'] } },
-      } as const,
-      execute: () => Effect.succeed([
-        { name: 'Alice', role: 'admin', active: true },
-        { name: 'Bob', role: 'user', active: true },
-        { name: 'Carol', role: 'admin', active: false },
-      ]),
-    })
-    const apiBinding: XmlTagBinding = { attributes: ['endpoint'] }
-
-    const cfg = config([
-      registered(apiTool, 'api', apiBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // XML: <api><item name="Alice" role="admin" active="true" />...</api>
-    // Filter: admin items
-    const xml = `${ACTIONS_TAG_OPEN}<api id="a1" endpoint="/users"/><write id="r2" path="admins.txt"><ref tool="api" query="//item[@role='admin']/@name"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('Alice\nCarol')
-  })
-
-  // =========================================================================
-  // Ref store queries — JSON within XML body (parse-json)
-  // =========================================================================
-
-  test('parse-json on string output navigates JSON', async () => {
-    // Tool that returns a raw JSON string
-    const fetchTool = createTool({
-      name: 'fetch',
-      description: 'Fetch URL',
-      inputSchema: Schema.Struct({ url: Schema.String }),
-      outputSchema: Schema.String,
-      bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
-      execute: () => Effect.succeed('{"status": 200, "data": {"id": 42, "name": "test"}}'),
-    })
-    const fetchBinding: XmlTagBinding = { attributes: ['url'] }
-
-    const cfg = config([
-      registered(fetchTool, 'fetch', fetchBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // XML body is the JSON string — parse-json(.) converts to XQuery map, then ?field navigates
-    const xml = `${ACTIONS_TAG_OPEN}<fetch id="f1" url="https://api.example.com"/><write id="r2" path="name.txt"><ref tool="fetch" query="parse-json(.)?data?name"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('test')
-  })
-
-  test('parse-json extracts numeric field', async () => {
-    const fetchTool = createTool({
-      name: 'fetch',
-      description: 'Fetch URL',
-      inputSchema: Schema.Struct({ url: Schema.String }),
-      outputSchema: Schema.String,
-      bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag' } } as const,
-      execute: () => Effect.succeed('{"status": 200, "data": {"id": 42, "name": "test"}}'),
-    })
-    const fetchBinding: XmlTagBinding = { attributes: ['url'] }
-
-    const cfg = config([
-      registered(fetchTool, 'fetch', fetchBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    const xml = `${ACTIONS_TAG_OPEN}<fetch id="f1" url="https://api.example.com"/><write id="r2" path="status.txt"><ref tool="fetch" query="parse-json(.)?status"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('200')
-  })
-
-  // =========================================================================
-  // Ref store queries — count, fallbacks, edge cases
-  // =========================================================================
-
-  test('XPath count() on child elements', async () => {
-    // Tool with array-scalar at top level → <item> children with body text
-    const listTool = createTool({
-      name: 'list',
-      description: 'List items',
-      inputSchema: Schema.Struct({ dir: Schema.String }),
-      outputSchema: Schema.Array(Schema.String),
-      bindings: { xmlInput: { type: 'tag' }, xmlOutput: { type: 'tag', items: { tag: 'item' } } } as const,
-      execute: () => Effect.succeed(['a.ts', 'b.ts', 'c.ts', 'd.ts']),
-    })
-    const listBinding: XmlTagBinding = { attributes: ['dir'] }
-
-    const cfg = config([
-      registered(listTool, 'list', listBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // XML: <list><item>a.ts</item><item>b.ts</item>...</list>
-    const xml = `${ACTIONS_TAG_OPEN}<list id="l1" dir="src"/><write id="r2" path="count.txt"><ref tool="list" query="count(item)"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('4')
-  })
-
-  test('invalid query expression falls back to raw XML', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><write id="r2" path="b.ts"><ref tool="read" query="%%%totally invalid"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    // Falls back to raw XML on invalid query
-    const content = (writeStart!.input as { content: string }).content
-    expect(content).toContain('<content>contents of a.ts</content>')
-  })
-
-  test('query with no matching elements falls back to raw XML', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // Query a child element that doesn't exist — empty result → fallback to raw XML
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><write id="r2" path="b.ts"><ref tool="read" query="nonexistent_field"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    const content = (writeStart!.input as { content: string }).content
-    expect(content).toContain('<content>contents of a.ts</content>')
-  })
-
-  test('multiple refs with different queries in same body', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(shellTool, 'shell', shellBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><shell id="s1">pwd</shell><write id="r3" path="out.txt">file: <ref tool="read" query="content"/> exit: <ref tool="shell" query="exitCode"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('file: contents of a.ts exit: 0')
-  })
-
-  test('ref query on number output', async () => {
-    const cfg = config([
-      registered(addTool, 'add', addBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // addTool returns a plain number (7) — raw XML is <add>7</add>, query="." extracts text content
-    const xml = `${ACTIONS_TAG_OPEN}<add id="sum" a=3 b=4/><write id="r2" path="result.txt">The sum is <ref tool="add" query="."/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('The sum is 7')
-  })
-
-  test('query-based ref injection decodes XML entities in tool output', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // readTool returns { content: "contents of source.ts", lines: 42 }
-    // The content field is entity-safe in the stored XML, then decoded on ref resolution
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="source.ts"/><write id="r2" path="dest.txt"><ref tool="read" query="content"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    const content = (writeStart!.input as { content: string }).content
-    expect(content).toBe('contents of source.ts')
-    expect(content).not.toContain('&lt;')
-    expect(content).not.toContain('&gt;')
-  })
-
-  test('no-query ref injection decodes entity-encoded XML wrapper', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
-
-    // Without a query, resolve returns the full stored XML wrapper decoded
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="source.ts"/><write id="r2" path="dest.txt"><ref tool="read"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const writeStart = eventsOfType(events, 'ToolExecutionStarted').find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    const content = (writeStart!.input as { content: string }).content
-    // Full XML wrapper is returned, with entities decoded
-    expect(content).toContain('<read>')
-    expect(content).toContain('<content>contents of source.ts</content>')
-  })
-
-  // =========================================================================
   // Actions wrapper
   // =========================================================================
 
@@ -1073,22 +741,6 @@ echo "world"</write>${ACTIONS_TAG_CLOSE}`
     const thinkEnds = proseEnds.filter(p => p.patternId === 'think')
     expect(thinkEnds).toHaveLength(1)
     expect(thinkEnds[0].content).toBe('hmm...\n')
-  })
-
-  // =========================================================================
-  // Inspect block suppresses prose
-  // =========================================================================
-
-  test('text inside inspect block does not emit prose', async () => {
-    const cfg = config([registered(readTool, 'read', readBinding)])
-    const xml = `<inspect>reviewing context\n</inspect>\n${ACTIONS_TAG_OPEN}\n<read id="r1" path="x.ts"/>\n${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const proseEnds = eventsOfType(events, 'ProseEnd')
-    expect(proseEnds.every(p => !p.content.includes('reviewing context'))).toBe(true)
-
-    const ended = eventsOfType(events, 'ToolExecutionEnded')
-    expect(ended).toHaveLength(1)
   })
 
   // =========================================================================
@@ -1534,8 +1186,8 @@ describe('foldReactorState', () => {
 
   test('ToolExecutionEnded adds Completed outcome', () => {
     const state = initialReactorState()
-    const refTree: OutputNode = { tag: 'element', name: 'read', attrs: {}, children: [] }
-    const result = { _tag: 'Success' as const, output: { data: 1 }, ref: { tag: 'read', tree: refTree } }
+    const outputTree: OutputNode = { tag: 'element', name: 'read', attrs: {}, children: [] }
+    const result = { _tag: 'Success' as const, output: { data: 1 }, outputTree: { tag: 'read', tree: outputTree }, query: '.' }
     const next = foldReactorState(state, {
       _tag: 'ToolExecutionEnded',
       toolCallId: 'tc_1',
@@ -1546,9 +1198,9 @@ describe('foldReactorState', () => {
     expect(next.toolOutcomes.get('tc_1')).toEqual({ _tag: 'Completed', result })
   })
 
-  test('ToolExecutionEnded Success adds ref to refStore', () => {
+  test('ToolExecutionEnded Success does not update outputTrees', () => {
     const state = initialReactorState()
-    const refTree: OutputNode = { tag: 'element', name: 'read', attrs: {}, children: [
+    const outputTree: OutputNode = { tag: 'element', name: 'read', attrs: {}, children: [
       { tag: 'element', name: 'content', attrs: {}, children: [{ tag: 'text', value: 'hello' }] },
     ] }
     const next = foldReactorState(state, {
@@ -1556,12 +1208,12 @@ describe('foldReactorState', () => {
       toolCallId: 'tc_1',
       group: 'default',
       toolName: 'read',
-      result: { _tag: 'Success', output: { content: 'hello' }, ref: { tag: 'read', tree: refTree } },
+      result: { _tag: 'Success', output: { content: 'hello' }, outputTree: { tag: 'read', tree: outputTree }, query: '.' },
     })
-    expect(next.refStore.get('read')).toEqual([refTree])
+    expect(next.outputTrees.size).toBe(0)
   })
 
-  test('ToolExecutionEnded Error does not add to refStore', () => {
+  test('ToolExecutionEnded Error does not add to outputTrees', () => {
     const state = initialReactorState()
     const next = foldReactorState(state, {
       _tag: 'ToolExecutionEnded',
@@ -1570,7 +1222,7 @@ describe('foldReactorState', () => {
       toolName: 'read',
       result: { _tag: 'Error', error: 'something went wrong' },
     })
-    expect(next.refStore.size).toBe(0)
+    expect(next.outputTrees.size).toBe(0)
   })
 
   test('TurnEnd sets stopped', () => {
@@ -1611,7 +1263,7 @@ describe('replay (initialState with toolOutcomes)', () => {
     })
     state = foldReactorState(state, {
       _tag: 'ToolExecutionEnded', toolCallId: 'tc_1', group: 'default', toolName: 'read',
-      result: { _tag: 'Success', output: { content: 'cached', lines: 1 }, ref: { tag: 'read', tree: { tag: 'element' as const, name: 'read', attrs: {}, children: [] } } },
+      result: { _tag: 'Success', output: { content: 'cached', lines: 1 }, outputTree: { tag: 'read', tree: { tag: 'element' as const, name: 'read', attrs: {}, children: [] } }, query: '.' },
     })
 
     // Replay same XML — first tool should be suppressed, second should execute fresh
@@ -1670,14 +1322,14 @@ describe('replay (initialState with toolOutcomes)', () => {
     })
     state = foldReactorState(state, {
       _tag: 'ToolExecutionEnded', toolCallId: 'tc_1', group: 'default', toolName: 'read',
-      result: { _tag: 'Success', output: { content: 'cached', lines: 1 }, ref: { tag: 'read', tree: { tag: 'element' as const, name: 'read', attrs: {}, children: [] } } },
+      result: { _tag: 'Success', output: { content: 'cached', lines: 1 }, outputTree: { tag: 'read', tree: { tag: 'element' as const, name: 'read', attrs: {}, children: [] } }, query: '.' },
     })
     state = foldReactorState(state, {
       _tag: 'ToolInputStarted', toolCallId: 'tc_2', tagName: 'write', toolName: 'write', group: 'default',
     })
     state = foldReactorState(state, {
       _tag: 'ToolExecutionEnded', toolCallId: 'tc_2', group: 'default', toolName: 'write',
-      result: { _tag: 'Success', output: 'wrote b.ts', ref: { tag: 'write', tree: { tag: 'element' as const, name: 'write', attrs: {}, children: [] } } },
+      result: { _tag: 'Success', output: 'wrote b.ts', outputTree: { tag: 'write', tree: { tag: 'element' as const, name: 'write', attrs: {}, children: [] } }, query: '.' },
     })
 
     const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><write id="r2" path="b.ts">content</write><shell id="r3">echo hi</shell>${ACTIONS_TAG_CLOSE}`
@@ -1695,36 +1347,7 @@ describe('replay (initialState with toolOutcomes)', () => {
     expect(ended[0].result._tag).toBe('Success')
   })
 
-  test('refStore from initial state enables ref interpolation for new tools', async () => {
-    const cfg = config([
-      registered(readTool, 'read', readBinding),
-      registered(writeTool, 'write', writeBinding),
-    ])
 
-    const refTree: OutputNode = { tag: 'element', name: 'read', attrs: {}, children: [
-      { tag: 'element', name: 'content', attrs: {}, children: [{ tag: 'text', value: 'from cache' }] },
-      { tag: 'element', name: 'lines', attrs: {}, children: [{ tag: 'text', value: '1' }] },
-    ] }
-
-    // Build initial state: tc_1 completed with ref r1
-    let state = initialReactorState()
-    state = foldReactorState(state, {
-      _tag: 'ToolInputStarted', toolCallId: 'tc_1', tagName: 'read', toolName: 'read', group: 'default',
-    })
-    state = foldReactorState(state, {
-      _tag: 'ToolExecutionEnded', toolCallId: 'tc_1', group: 'default', toolName: 'read',
-      result: { _tag: 'Success', output: { content: 'from cache', lines: 1 }, ref: { tag: 'read', tree: refTree } },
-    })
-
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><write id="r2" path="b.ts"><ref tool="read" query="content"/></write>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml, { initialState: state })
-
-    // Write tool should have received interpolated ref from initial state
-    const execStarted = eventsOfType(events, 'ToolExecutionStarted')
-    const writeStart = execStarted.find(e => e.toolName === 'write')
-    expect(writeStart).toBeDefined()
-    expect((writeStart!.input as { content: string }).content).toBe('from cache')
-  })
 })
 
 // =============================================================================
@@ -1956,53 +1579,7 @@ describe('prose streaming (parser-level)', () => {
     expect(proseChunks.map(c => c.text).join('')).toBe('X')
   })
 
-  test('think then actions with self-closing tool and inspect ref', () => {
-    const xml = `<think>
-The user wants to see the exact syntax from the xml-hybrid eval.
-</think>
-${ACTIONS_TAG_OPEN}
-<fs-read id="r1" path="evals/src/evals/react-edit/formats/xml-hybrid.ts" />
-<inspect>
-  <ref tool="read" />
-</inspect>
-${ACTIONS_TAG_CLOSE}`
-    const events = parseChunked([xml], ['fs-read'])
 
-    // Think block parsed correctly
-    const thinkEnds = parseEvents(events, 'ProseEnd').filter(e => e.patternId === 'think')
-    expect(thinkEnds).toHaveLength(1)
-    expect(thinkEnds[0].content).toContain('xml-hybrid eval')
-
-    // Actions structure
-    const actionsOpen = parseEvents(events, 'ActionsOpen')
-    expect(actionsOpen).toHaveLength(1)
-    const actionsClose = parseEvents(events, 'ActionsClose')
-    expect(actionsClose).toHaveLength(1)
-
-    // Self-closing tool tag with attributes inside actions
-    const tagOpened = parseEvents(events, 'TagOpened')
-    expect(tagOpened).toHaveLength(1)
-    expect(tagOpened[0].tagName).toBe('fs-read')
-    expect(tagOpened[0].attributes.get('id')).toBe('r1')
-    expect(tagOpened[0].attributes.get('path')).toBe('evals/src/evals/react-edit/formats/xml-hybrid.ts')
-
-    const tagClosed = parseEvents(events, 'TagClosed')
-    expect(tagClosed.length).toBeGreaterThanOrEqual(1)
-    const fsReadClosed = tagClosed.find(e => e.tagName === 'fs-read')
-    expect(fsReadClosed).toBeDefined()
-    expect(fsReadClosed!.element.attributes.get('path')).toBe('evals/src/evals/react-edit/formats/xml-hybrid.ts')
-
-    // Inspect with ref
-    const inspectOpen = parseEvents(events, 'InspectOpen')
-    expect(inspectOpen).toHaveLength(1)
-    const inspectClose = parseEvents(events, 'InspectClose')
-    expect(inspectClose).toHaveLength(1)
-    // ref inside <inspect> is not a tool tag — it emits ParseError (InvalidRef)
-    // since no resolveRef callback is provided to the parser
-    const parseErrors = parseEvents(events, 'ParseError')
-    expect(parseErrors).toHaveLength(1)
-    expect(parseErrors[0].error).toMatchObject({ _tag: 'InvalidRef', toolRef: 'read' })
-  })
 
   test('think then actions with self-closing tool — character by character', () => {
     const xml = `<think>thought\n</think>\n${ACTIONS_TAG_OPEN}\n<fs-read id="r1" path="x.ts" />\n${ACTIONS_TAG_CLOSE}`

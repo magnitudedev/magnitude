@@ -3,16 +3,15 @@ import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
 import type { ParseEvent } from '../parser/types'
 
 /**
- * Repro: <fs-write> body contains embedded structural tags like <inspect>,
- * </inspect>, <results>, </results>, <think>, <actions>, <ref> etc.
+ * Repro: <fs-write> body contains embedded structural tags like <results>,
+ * </results>, <think>, <actions>, and tool tags with observe attrs.
  *
  * The parser should treat ALL content inside the fs-write body as literal
- * text — not as structural open/close events. But the embedded </inspect>
- * and </results> (or other structural-looking close tags) may cause the
- * parser to break out of the tool body prematurely.
+ * text — not as structural open/close events. But embedded structural-looking
+ * close tags may cause the parser to break out of the tool body prematurely.
  *
  * From a real scenario where the LLM writes a file containing XML-like
- * content that references structural tags.
+ * content that references protocol tags.
  */
 
 const knownTags = new Set(['fs-write', 'fs-read', 'fs-search', 'agent-create', 'shell'])
@@ -34,7 +33,7 @@ function parseCharByChar(xml: string): ParseEvent[] {
 }
 
 // The actual content from the breaking scenario — fs-write body contains
-// embedded structural tags like <think>, <actions>, <inspect>, <ref>, </inspect>, </results>
+// embedded structural tags like <think>, <actions>, tool tags, and </results>
 const FS_WRITE_BODY = `import type { Scenario } from '../../types'
 import { hasThinkBlock } from './checks'
 import { actionsTagOpen, actionsTagClose } from '@magnitudedev/xml-act'
@@ -83,12 +82,8 @@ export const ALL_SCENARIOS = [
         content: [
           '<think>I need to find the header.</think>\\n' +
           AO + '\\n' +
-          '<fs-read path="src/styles/tokens.ts" />\\n' +
-          '<fs-search pattern="header" path="src/" />\\n' +
-          '<inspect>\\n' +
-          '<ref tool="fs-read" />\\n' +
-          '<ref tool="fs-search" />\\n' +
-          '</inspect>\\n' +
+          '<fs-read path="src/styles/tokens.ts" observe="." />\\n' +
+          '<fs-search pattern="header" path="src/" observe="//item" />\\n' +
           AC,
         ],
       },
@@ -96,12 +91,10 @@ export const ALL_SCENARIOS = [
         role: 'user',
         content: [
           '<results>\\n' +
-          '<inspect>\\n' +
-          '<ref tool="fs-read">export const colors = {}</ref>\\n' +
-          '<ref tool="fs-search">\\n' +
+          '<fs-read observe=".">export const colors = {}</fs-read>\\n' +
+          '<fs-search observe="//item">\\n' +
           '<item file="src/app.ts">12|  header</item>\\n' +
-          '</ref>\\n' +
-          '</inspect>\\n' +
+          '</fs-search>\\n' +
           '</results>',
         ],
       },
@@ -112,25 +105,22 @@ export const ALL_SCENARIOS = [
 
 const FULL_XML = `<actions>
 <fs-write path="evals/src/evals/a5/scenarios.ts">${FS_WRITE_BODY}</fs-write>
-<inspect>
-<ref tool="fs-write" />
-</inspect>
+<fs-read path="evals/src/evals/a5/scenarios.ts" observe="content" />
 </actions>`
 
-describe('isolation: ref is the sole issue', () => {
-  it('fs-write body with <ref> gets ref consumed as child, corrupting body', () => {
-    const xml = '<actions>\n<fs-write path="x.ts">before <ref tool="foo" /> after</fs-write>\n</actions>'
+describe('isolation: embedded tool-like tags are treated as literal text', () => {
+  it('fs-write body with an observe-bearing tool tag stays literal', () => {
+    const xml = '<actions>\n<fs-write path="x.ts">before <fs-read path="foo" observe="." /> after</fs-write>\n</actions>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
         e._tag === 'TagClosed' && e.tagName === 'fs-write',
     )
     expect(closed).toHaveLength(1)
-    // This is the bug: <ref> gets eaten as a child instead of literal body text
-    expect(closed[0].element.body).toBe('before <ref tool="foo" /> after')
+    expect(closed[0].element.body).toBe('before <fs-read path="foo" observe="." /> after')
   })
 
-  it('fs-write body with non-ref unknown tags like <foo> is fine (treated as literal)', () => {
+  it('fs-write body with unknown tags like <foo> is fine (treated as literal)', () => {
     const xml = '<actions>\n<fs-write path="x.ts">before <foo bar="1">baz</foo> after</fs-write>\n</actions>'
     const events = parse(xml)
     const closed = events.filter(
@@ -155,7 +145,7 @@ describe('isolation: ref is the sole issue', () => {
 })
 
 describe('repro: fs-write body with embedded structural tags', () => {
-  it('parses fs-write with embedded <inspect>, </inspect>, <results>, </results> in body', () => {
+  it('parses fs-write with embedded tool and structural tags in body', () => {
     const events = parse(FULL_XML)
 
     // Should have actions open/close
@@ -172,12 +162,6 @@ describe('repro: fs-write body with embedded structural tags', () => {
 
     // The body should contain the full file content
     expect(closed[0].element.body).toBe(FS_WRITE_BODY)
-
-    // Inspect block after the fs-write should still be parsed
-    const inspectOpen = events.filter(e => e._tag === 'InspectOpen')
-    const inspectClose = events.filter(e => e._tag === 'InspectClose')
-    expect(inspectOpen).toHaveLength(1)
-    expect(inspectClose).toHaveLength(1)
 
     // No parse errors
     const errors = events.filter(e => e._tag === 'ParseError')
@@ -200,9 +184,9 @@ describe('repro: fs-write body with embedded structural tags', () => {
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
-  it('embedded </inspect> inside fs-write body does not corrupt the body', () => {
+  it('embedded </results> inside fs-write body does not corrupt the body', () => {
     const xml = `<actions>
-<fs-write path="test.ts">some code with </inspect> in it and </results> too</fs-write>
+<fs-write path="test.ts">some code with </results> in it and observe="." too</fs-write>
 </actions>`
 
     const events = parse(xml)
@@ -212,7 +196,7 @@ describe('repro: fs-write body with embedded structural tags', () => {
         e._tag === 'TagClosed' && e.tagName === 'fs-write',
     )
     expect(closed).toHaveLength(1)
-    expect(closed[0].element.body).toBe('some code with </inspect> in it and </results> too')
+    expect(closed[0].element.body).toBe('some code with </results> in it and observe="." too')
     expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
     expect(events.some(e => e._tag === 'ActionsClose')).toBe(true)
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)

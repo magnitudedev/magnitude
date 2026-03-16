@@ -18,7 +18,6 @@ import type {
   BaseToolParseErrorDetail,
   UnclosedThinkDetail,
   UnclosedActionsDetail,
-  UnclosedInspectDetail,
   TurnControlConflictDetail,
 } from './parser/types'
 
@@ -274,28 +273,23 @@ export type ToolCallEvent<TInput = unknown, TOutput = unknown, B = unknown> =
   | ToolInputParseError
   | ToolExecutionStarted<TInput>
   | ToolExecutionEnded<TOutput>
+  | ToolObservation
 
 // =============================================================================
 // Combined Event Union
 // =============================================================================
 
-/** Ref resolved inside an inspect block — carries resolved content for LLM context */
-export interface InspectResolved {
-  readonly _tag: 'InspectResolved'
-  readonly toolRef: string
-  readonly query?: string
+export interface ToolObservation {
+  readonly _tag: 'ToolObservation'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly query: string
   readonly content: string
-}
-
-/** Ref inside an inspect block referenced a nonexistent tool ref */
-export interface InvalidRef {
-  readonly _tag: 'InvalidRef'
-  readonly toolRef: string
 }
 
 export interface StructuralParseError {
   readonly _tag: 'StructuralParseError'
-  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | UnclosedInspectDetail | TurnControlConflictDetail
+  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | TurnControlConflictDetail
 }
 
 
@@ -304,7 +298,7 @@ export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown> =
   | ToolCallEvent<TInput, TOutput, B>
   | ProseChunk | ProseEnd | LensStart | LensChunk | LensEnd
   | MessageStart | MessageChunk | MessageEnd
-  | InspectResolved | InvalidRef | StructuralParseError
+  | StructuralParseError
   | TurnEnd
 
 // =============================================================================
@@ -312,7 +306,7 @@ export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown> =
 // =============================================================================
 
 export type XmlToolResult<TOutput = unknown> =
-  | { readonly _tag: 'Success'; readonly output: TOutput; readonly ref: { readonly tag: string; readonly tree: OutputNode } }
+  | { readonly _tag: 'Success'; readonly output: TOutput; readonly outputTree: { readonly tag: string; readonly tree: OutputNode }; readonly query: string }
   | { readonly _tag: 'Error'; readonly error: string }
   | { readonly _tag: 'Rejected'; readonly rejection: unknown }
   | { readonly _tag: 'Interrupted' }
@@ -377,7 +371,7 @@ export type ToolOutcome =
 export interface ReactorState {
   readonly toolCallMap: ReadonlyMap<string, string>       // toolCallId → tagName
   readonly deadToolCalls: ReadonlySet<string>              // toolCallIds with parse errors
-  readonly refStore: ReadonlyMap<string, readonly OutputNode[]> // tool output trees keyed by tool tag (recency stack)
+  readonly outputTrees: ReadonlyMap<string, readonly OutputNode[]> // retained successful output trees from older replay state
   readonly stopped: boolean                                // processing halted
   readonly toolOutcomes: ReadonlyMap<string, ToolOutcome>  // known outcomes for replay
 }

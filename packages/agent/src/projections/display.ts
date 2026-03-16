@@ -854,6 +854,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
         default: {
           // All other streaming events: reduce visual state only
+          if (inner._tag === 'ToolObservation') return fork
           if (fork.currentTurnId !== event.turnId) return fork
           if (!fork.activeThinkBlockId) return fork
           if (!visual) return fork

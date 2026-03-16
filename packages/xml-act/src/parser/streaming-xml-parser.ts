@@ -20,30 +20,25 @@ export interface StreamingXmlParser {
   flush(): ParseEvent[]
 }
 
-export type RefResolver = (tag: string, recency: number, query?: string) => string | undefined
-
 export function createStreamingXmlParser(
   knownTags: ReadonlySet<string>,
   childTagMap: ReadonlyMap<string, ReadonlySet<string>>,
   tagSchemas?: ReadonlyMap<string, TagSchema>,
-  resolveRef?: RefResolver,
   generateId: IdGenerator = defaultIdGenerator,
   defaultMessageDest: string = 'user',
 ): StreamingXmlParser {
   const kw = getKeywords()
-  const structuralTags = new Set([kw.actions, kw.think, kw.thinking, kw.lenses, 'inspect', kw.comms, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD])
+  const structuralTags = new Set([kw.actions, kw.think, kw.thinking, kw.lenses, kw.comms, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD])
   const config: ParserConfig = {
     knownTags,
     childTagMap,
     tagSchemas,
-    resolveRef,
     generateId,
     defaultMessageDest,
     keywords: { actions: kw.actions, think: kw.think, thinking: kw.thinking, lenses: kw.lenses, comms: kw.comms, next: TURN_CONTROL_NEXT, yield: TURN_CONTROL_YIELD },
     structuralTags,
     actionsTags: new Set([...knownTags, ...structuralTags, 'message']),
     topLevelTags: new Set([...structuralTags, ...knownTags, 'message']),
-    refTags: new Set(['ref']),
     messageTags: new Set(['message']),
   }
 

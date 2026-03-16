@@ -323,9 +323,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const systemEntries: SystemEntry[] = []
       const hasError = !event.result.success
       const errorMessage = hasError ? event.result.error : undefined
-      const inspectResults = isCancelled ? [] : event.inspectResults
-      if (event.toolCalls.length > 0 || inspectResults.length > 0 || hasError) {
-        systemEntries.push({ kind: 'tool_results', toolCalls: event.toolCalls, inspectResults, error: errorMessage })
+      const observedResults = isCancelled ? [] : event.observedResults
+      if (event.toolCalls.length > 0 || observedResults.length > 0 || hasError) {
+        systemEntries.push({ kind: 'tool_results', toolCalls: event.toolCalls, observedResults, error: errorMessage })
       }
       if (event.result.success && event.result.reminder) {
         systemEntries.push({ kind: 'reminder', text: event.result.reminder })

@@ -186,7 +186,8 @@ const events = await Effect.runPromise(
 //   { _tag: 'ToolInputFieldValue', toolCallId: 'tc_1', field: 'path', value: 'src/index.ts' },
 //   { _tag: 'ToolInputReady', toolCallId: 'tc_1', input: { path: 'src/index.ts' } },
 //   { _tag: 'ToolExecutionStarted', toolCallId: 'tc_1', ... },
-//   { _tag: 'ToolExecutionEnded', toolCallId: 'tc_1', result: { _tag: 'Success', output: '...', perceived: '...' } },
+//   { _tag: 'ToolExecutionEnded', toolCallId: 'tc_1', result: { _tag: 'Success', output: '...', outputTree: { tag: 'read', tree: ... }, observe: '.' } },
+//   { _tag: 'ToolObservation', toolCallId: 'tc_1', tagName: 'read', observe: '.', content: '...' },
 //   { _tag: 'ExecutionEnd', result: { _tag: 'Success' } },
 // ]
 ```
@@ -212,7 +213,7 @@ Rejection produces `ToolExecutionEnded { result: Rejected }` and halts the strea
 
 ### ToolObserverTag — event stream monitoring
 
-Receives every runtime event in real-time. Should be fast (push to queue, update ref).
+Receives every runtime event in real-time. Should be fast (push to queue, update state).
 
 ```typescript
 interface ToolObserver {
@@ -230,16 +231,26 @@ interface ToolProgressService {
 }
 ```
 
-## RefStore — tool result interpolation
+## Observation with `observe`
 
-Tools with an `id` attribute store their output. Later tools can reference it with `<ref id="..."/>`:
+Every tool call uses an `observe` attribute to control what part of that tool's own output is surfaced after execution.
+
+Use `observe="."` for the full output:
 
 ```xml
-<read id="file1" path="src/index.ts"/>
-<analyze>Process: <ref id="file1"/></analyze>
+<read path="src/index.ts" observe="."/>
 ```
 
-The ref is replaced with `JSON.stringify(storedOutput)` before dispatch.
+Use an XPath/XQuery expression to select a subset of the tool's output tree:
+
+```xml
+<search pattern="TODO" observe="//item[1]/@file"/>
+```
+
+Observation is execution-driven:
+- `observe` is framework metadata, not tool input.
+- The query runs against the current tool call's output tree.
+- Invalid or empty queries fall back to the full output.
 
 ## Binding Validation
 
@@ -263,7 +274,7 @@ The parser is designed to handle messy LLM output gracefully. Rather than failin
 - **Unquoted attribute values** — `<read limit=100/>` works the same as `<read limit="100"/>`. The parser handles both quoted and unquoted forms.
 - **Empty attribute values** — `key=` with no value before a terminator stores an empty string.
 - **Boolean coercion** — accepts `true`, `True`, `TRUE`, `1`, `yes`, `Yes`, `YES` (and matching falsy variants). Rejects anything else.
-- **`id` attribute always valid** — the `id` attr is a RefStore convention and is never rejected as unknown, regardless of the tool's binding.
+- **`id` and `observe` attributes are always valid** — these framework attrs are never rejected as unknown, regardless of the tool's binding.
 - **Unknown child attributes pass through** — unrecognized attributes on child elements are silently kept as strings (buildInput drops them if they're not in the binding).
 
 ### Unknown/malformed tag recovery

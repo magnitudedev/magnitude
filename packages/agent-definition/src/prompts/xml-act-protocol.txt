@@ -12,9 +12,6 @@ You respond in an XML-like syntax with three core sections: think, comms, and ac
 {{COMMS_CLOSE}}
 {{ACTIONS_OPEN}}
 ...zero or more actions
-<inspect>
-...one or more refs
-</inspect>
 {{ACTIONS_CLOSE}}
 <{{TURN_CONTROL_NEXT}}/> OR <{{TURN_CONTROL_YIELD}}/>
 
@@ -75,21 +72,22 @@ If you are asking the user a question or are waiting on subagents to complete wo
 
 Tool calls, their parameters, and their outputs are all represented as XML-like elements.
 
-### Inspect
+### Observe
 
-To preserve your context window, you will only see the output of tools that you specifcially inspect.
+Every tool call must include an `observe` attribute.
 
-To inspect a tool output, use the ref tag with a tool attribute to 
-When a tool tag is used multiple times, `<ref tool="tag"/>` refers to the most recent call relative to the ref tag. Use `~N` to reach further back: `<ref tool="tag~1"/>` is the second-most-recent, `<ref tool="tag~2"/>` the third, etc.
+- Use `observe="."` to return the tool's full output.
+- Use an XPath/XQuery expression to return a filtered subset of the tool's own output.
+- If a query is invalid or returns nothing, the runtime falls back to the tool's full output.
+- `observe` is framework metadata, not tool input.
 
-Refs also support progressive disclosure by specifing an XQuery 3.1 expression which selects into the XML output, for example:
-<search pattern="TODO" />
-<fs-read path="...">
-<ref tool="search" query="//item[1]/@file" />
-</fs-read>
+Examples:
+<search pattern="TODO" observe="//item[1]/@file" />
+<shell observe="//stdout">echo hello</shell>
 
 Query examples:
+- `.` — full output
 - `//item[1]` — first item element
 - `//item/@file` — file attribute from all items
 - `count(//item)` — count items
-- `content` — select a specific child element by name
+- `//stdout` — select a specific child element by name

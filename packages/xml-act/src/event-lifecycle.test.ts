@@ -251,6 +251,7 @@ describe('Case 1: normal execution', () => {
       'ToolInputReady',
       'ToolExecutionStarted',
       'ToolExecutionEnded',
+      'ToolObservation',
     ])
     assertPairingGuarantee(events)
   })
@@ -268,7 +269,8 @@ describe('Case 1: normal execution', () => {
     expect(seq.includes('ToolInputBodyChunk')).toBe(true)
     expect(seq.includes('ToolInputReady')).toBe(true)
     expect(seq.includes('ToolExecutionStarted')).toBe(true)
-    expect(seq[seq.length - 1]).toBe('ToolExecutionEnded')
+    expect(seq.includes('ToolExecutionEnded')).toBe(true)
+    expect(seq[seq.length - 1]).toBe('ToolObservation')
 
     const ended = ofType(events, 'ToolExecutionEnded')
     expect(ended[0].result._tag).toBe('Success')
@@ -287,7 +289,8 @@ describe('Case 1: normal execution', () => {
     expect(seq[0]).toBe('ToolInputStarted')
     expect(seq.includes('ToolInputChildStarted')).toBe(true)
     expect(seq.includes('ToolInputChildComplete')).toBe(true)
-    expect(seq[seq.length - 1]).toBe('ToolExecutionEnded')
+    expect(seq.includes('ToolExecutionEnded')).toBe(true)
+    expect(seq[seq.length - 1]).toBe('ToolObservation')
 
     const childStarted = ofType(events, 'ToolInputChildStarted')
     expect(childStarted).toHaveLength(2)

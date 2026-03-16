@@ -19,12 +19,6 @@ import { activeCloseCandidates, activeTags, containerDepth } from './stack-ops'
 import { emitProseChunk, endProseBlock } from './prose'
 import { advancePrefixMatch } from './prefix-match'
 
-export function parseToolRef(raw: string): { tag: string; recency: number } | undefined {
-  const match = /^([a-zA-Z0-9_-]+)(?:~(\d+))?$/.exec(raw)
-  if (!match) return undefined
-  return { tag: match[1], recency: match[2] ? Number(match[2]) : 0 }
-}
-
 export function finalizeToolAttr(config: ParserConfig, tagName: string, toolCallId: string, attrs: Map<string, AttributeValue>, key: string, raw: string): ParseEvent[] {
   const schema = config.tagSchemas?.get(tagName)
   if (!schema) {
@@ -54,17 +48,6 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     if (outermost) events.push({ _tag: 'ActionsOpen' })
     return events
   }
-  if (tagName === 'inspect') {
-    events.push(...endProseBlock(state))
-    const outermost = containerDepth(state, 'Inspect') === 0
-    state.push({ _tag: 'Inspect' })
-    const inspectProse = mkRootProse()
-    inspectProse.lastCharNewline = false
-    state.push(inspectProse)
-    proseRoot.lastCharNewline = false
-    if (outermost) events.push({ _tag: 'InspectOpen' })
-    return events
-  }
   if (tagName === kw.comms) {
     events.push(...endProseBlock(state))
     const outermost = containerDepth(state, 'Comms') === 0
@@ -84,7 +67,7 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     state.push({ _tag: 'Think', think: { tagName, body: '', depth: 0, openPrefix: null, openAfterNewline: false, lastCharNewline: false, about, lenses: [], activeLens: null }, pendingLt: false })
     return events
   }
-  if (containerDepth(state, 'Inspect') === 0 && tagName === 'message') {
+  if (tagName === 'message') {
     events.push(...endProseBlock(state))
     const dest = typeof attrs.get('to') === 'string' ? String(attrs.get('to')) : config.defaultMessageDest
     const artifactsRaw = typeof attrs.get('artifacts') === 'string' ? String(attrs.get('artifacts')) : null
@@ -106,33 +89,13 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
 export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId: string, attrs: Map<string, AttributeValue>, raw: string, config: ParserConfig): ParseEvent[] {
   const events: ParseEvent[] = []
   const kw = config.keywords
-  if (tagName === kw.actions || tagName === 'inspect' || tagName === kw.comms) return events
-  if (containerDepth(state, 'Actions') === 0 && containerDepth(state, 'Inspect') === 0 && containerDepth(state, 'Comms') === 0 && (tagName === kw.next || tagName === kw.yield)) {
+  if (tagName === kw.actions || tagName === kw.comms) return events
+  if (containerDepth(state, 'Actions') === 0 && containerDepth(state, 'Comms') === 0 && (tagName === kw.next || tagName === kw.yield)) {
     events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : 'yield' })
     state.push({ _tag: 'Done' })
     return events
   }
-  if (containerDepth(state, 'Inspect') > 0 && tagName === 'ref') {
-    const toolRef = attrs.get('tool')
-    if (typeof toolRef === 'string') {
-      const parsed = parseToolRef(toolRef)
-      const query = attrs.get('query')
-      if (parsed) {
-        if (config.resolveRef) {
-          const queryText = typeof query === 'string' ? query : undefined
-          const resolved = config.resolveRef(parsed.tag, parsed.recency, queryText)
-          if (resolved !== undefined) events.push({ _tag: 'InspectResult', toolRef, query: queryText, content: resolved })
-          else events.push({ _tag: 'ParseError', error: { _tag: 'InvalidRef', toolRef, detail: `Ref "${toolRef}" does not match any tool result from this response` } })
-        } else if (parsed.tag !== 'fs-write') {
-          events.push({ _tag: 'ParseError', error: { _tag: 'InvalidRef', toolRef, detail: `Ref "${toolRef}" does not match any tool result from this response` } })
-        }
-      } else {
-        events.push({ _tag: 'ParseError', error: { _tag: 'InvalidRef', toolRef, detail: `Invalid tool ref "${toolRef}". Expected format "tag" or "tag~N"` } })
-      }
-    }
-    return events
-  }
-  if (containerDepth(state, 'Inspect') === 0 && tagName === 'message') {
+  if (tagName === 'message') {
     const id = config.generateId().slice(0, 8)
     const toValue = attrs.get('to')
     const artifactsValue = attrs.get('artifacts')
@@ -142,7 +105,7 @@ export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId:
     events.push({ _tag: 'MessageTagClose', id })
     return events
   }
-  if (containerDepth(state, 'Inspect') === 0 && containerDepth(state, 'Comms') === 0 && config.knownTags.has(tagName)) {
+  if (containerDepth(state, 'Comms') === 0 && config.knownTags.has(tagName)) {
     events.push(...endProseBlock(state))
     if (!toolCallId) toolCallId = config.generateId()
     const attrsCopy = new Map(attrs)
@@ -247,7 +210,7 @@ export function stepClosePrefixMatch({ frame, state, ch, config }: { frame: Clos
 
   const proseRoot = state[0]
   const kw = config.keywords
-  const closeIf = (name: string, kind: 'Actions' | 'Inspect' | 'Comms', ev: 'ActionsClose' | 'InspectClose' | 'CommsClose') => {
+  const closeIf = (name: string, kind: 'Actions' | 'Comms', ev: 'ActionsClose' | 'CommsClose') => {
     if (frame.afterNewline && advanced.tagName === name && containerDepth(state, kind) > 0) {
       state.pop()
       if (state[state.length - 1]?._tag === 'Prose') state.pop()
@@ -271,7 +234,6 @@ export function stepClosePrefixMatch({ frame, state, ch, config }: { frame: Clos
   }
 
   if (closeIf(kw.actions, 'Actions', 'ActionsClose')) return events.length > 0 ? emit(...events) : NOOP
-  if (closeIf('inspect', 'Inspect', 'InspectClose')) return events.length > 0 ? emit(...events) : NOOP
   if (closeIf(kw.comms, 'Comms', 'CommsClose')) return events.length > 0 ? emit(...events) : NOOP
 
   state.pop()
@@ -400,7 +362,7 @@ export function stepPendingTopLevelClose({ frame, state, ch, config }: { frame: 
   const events: ParseEvent[] = []
   const proseRoot = state[0]
   if (ch === '\n') {
-    const close = (name: string, kind: 'Actions' | 'Inspect' | 'Comms', ev: 'ActionsClose' | 'InspectClose' | 'CommsClose') => {
+    const close = (name: string, kind: 'Actions' | 'Comms', ev: 'ActionsClose' | 'CommsClose') => {
       if (frame.tagName !== name) return false
       state.pop()
       if (state[state.length - 1]?._tag === 'Prose') state.pop()
@@ -417,7 +379,6 @@ export function stepPendingTopLevelClose({ frame, state, ch, config }: { frame: 
       return true
     }
     if (close(config.keywords.actions, 'Actions', 'ActionsClose')) return events.length > 0 ? emit(...events) : NOOP
-    if (close('inspect', 'Inspect', 'InspectClose')) return events.length > 0 ? emit(...events) : NOOP
     close(config.keywords.comms, 'Comms', 'CommsClose')
     return events.length > 0 ? emit(...events) : NOOP
   }

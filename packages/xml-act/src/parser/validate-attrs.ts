@@ -18,7 +18,7 @@ export type AttrValidationResult =
 /**
  * Validate and coerce a top-level tool attribute.
  *
- * - 'id' is always valid (RefStore convention)
+ * - 'id' is always valid (framework metadata convention)
  * - Unknown attributes → UnknownAttribute error
  * - Invalid values → InvalidAttributeValue error
  * - Valid values → coerced to declared type
@@ -29,8 +29,8 @@ export function validateToolAttr(
   key: string,
   raw: string,
 ): AttrValidationResult {
-  // 'id' is always valid (used by RefStore)
-  if (key === 'id') return { ok: true, value: raw }
+  // 'observe' is always valid (framework-managed attribute)
+  if (key === 'observe') return { ok: true, value: raw }
 
   // about attr on think
   if (tagName === 'think') return { ok: true, value: raw }

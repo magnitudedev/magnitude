@@ -16,7 +16,7 @@ export function initialReactorState(): ReactorState {
   return {
     toolCallMap: new Map(),
     deadToolCalls: new Set(),
-    refStore: new Map(),
+    outputTrees: new Map(),
     stopped: false,
     toolOutcomes: new Map(),
   }
@@ -42,21 +42,12 @@ export function foldReactorState(state: ReactorState, event: XmlRuntimeEvent): R
       const toolOutcomes = new Map(state.toolOutcomes)
       const outcome: ToolOutcome = { _tag: 'Completed', result: event.result }
       toolOutcomes.set(event.toolCallId, outcome)
-
-      if (event.result._tag === 'Success') {
-        const refStore = new Map(state.refStore)
-        const stack = [...(refStore.get(event.result.ref.tag) ?? []), event.result.ref.tree]
-        refStore.set(event.result.ref.tag, stack)
-        return { ...state, toolOutcomes, refStore }
-      }
-
       return { ...state, toolOutcomes }
     }
 
     case 'TurnEnd':
       return { ...state, stopped: true }
 
-    case 'InvalidRef':
     case 'StructuralParseError':
       return state
 

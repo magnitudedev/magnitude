@@ -8,7 +8,7 @@
 import { DateTime } from 'luxon'
 import type { ConversationEntry } from '../projections/conversation'
 import type { ContentPart, ImageMediaType } from '../content'
-import type { InspectResult, TurnToolCall } from '../events'
+import type { ObservedResult, TurnToolCall } from '../events'
 import type { ObservationPart } from '@magnitudedev/agent-definition'
 import { formatResults, formatInterrupted, formatError, formatNoop } from './results'
 
@@ -38,7 +38,7 @@ export type CommsEntry =
   | { readonly kind: 'agent'; readonly from: string; readonly timestamp: number; readonly text: string; readonly attachments?: readonly CommsAttachment[] }
 
 export type SystemEntry =
-  | { readonly kind: 'tool_results'; readonly toolCalls: readonly TurnToolCall[]; readonly inspectResults: readonly InspectResult[]; readonly error?: string }
+  | { readonly kind: 'tool_results'; readonly toolCalls: readonly TurnToolCall[]; readonly observedResults: readonly ObservedResult[]; readonly error?: string }
   | { readonly kind: 'reminder'; readonly text: string }
   | { readonly kind: 'interrupted' }
   | { readonly kind: 'error'; readonly message: string }
@@ -164,7 +164,7 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
   push('<system>\n')
   for (const entry of entries) {
     if (entry.kind === 'tool_results') {
-      const rendered = formatResults(entry.toolCalls, entry.inspectResults, entry.error)
+      const rendered = formatResults(entry.toolCalls, entry.observedResults, entry.error)
       for (const part of rendered) {
         if (part.type === 'text') push(part.text)
         else parts.push(part)

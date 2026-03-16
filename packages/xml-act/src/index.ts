@@ -27,8 +27,7 @@ export type {
   ProseEnd,
   ToolExecutionStarted,
   ToolExecutionEnded,
-  InspectResolved,
-  InvalidRef,
+  ToolObservation,
   StructuralParseError,
   TurnEnd,
 } from './types'
@@ -52,7 +51,7 @@ export type {
 
 // Core types — errors
 export type { ToolCallContext, ToolCallError } from './types'
-export type { UnclosedThinkDetail, UnclosedActionsDetail, UnclosedInspectDetail } from './parser/types'
+export type { UnclosedThinkDetail, UnclosedActionsDetail } from './parser/types'
 
 // Core types — results
 export type {
@@ -88,7 +87,6 @@ export {
 } from './types'
 
 // Utilities
-export { RefStore } from './composition/ref-store'
 export { buildInput } from './execution/input-builder'
 
 // Binding validation
@@ -100,6 +98,9 @@ export { generateXmlToolDoc, generateXmlToolGroupDoc, defaultXmlTagName } from '
 
 // Output serializer
 export { serializeOutput } from './output-serializer'
+
+// Output query
+export { observeOutput } from './output-query'
 
 // Output tree (structured tool output AST)
 export { buildOutputTree, outputToText, outputToDOM, outputFromDOM } from './output-tree'

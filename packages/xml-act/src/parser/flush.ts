@@ -12,7 +12,6 @@ function emitIncompleteError(config: ParserConfig, toolCallId: string, tagName: 
 export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[] {
   const events: ParseEvent[] = []
   let sawActions = false
-  let sawInspect = false
   let sawComms = false
 
   while (state.length > 1) {
@@ -109,9 +108,6 @@ export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[
       case 'Actions':
         sawActions = true
         break
-      case 'Inspect':
-        sawInspect = true
-        break
       case 'Comms':
         sawComms = true
         break
@@ -123,7 +119,6 @@ export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[
   }
 
   if (sawActions || containerDepth(state, 'Actions')) events.push({ _tag: 'ParseError', error: { _tag: 'UnclosedActions', detail: 'Actions block was opened but never closed' } })
-  if (sawInspect || containerDepth(state, 'Inspect')) events.push({ _tag: 'ParseError', error: { _tag: 'UnclosedInspect', detail: 'Inspect block was opened but never closed' } })
   if (sawComms || containerDepth(state, 'Comms')) events.push({ _tag: 'CommsClose' })
 
   const prose = state[0]

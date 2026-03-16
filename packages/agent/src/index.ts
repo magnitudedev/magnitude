@@ -19,7 +19,7 @@ export type {
   UserMessage,
   TurnStarted,
   TurnCompleted,
-  InspectResult,
+  ObservedResult,
   TurnUnexpectedError,
   TurnResult,
   TurnDecision,

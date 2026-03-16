@@ -72,13 +72,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             totalCost: null,
           }
 
-          let rawCode = rawCodeChunks.join('')
-          if (executeResult.syntheticInspectCode) {
-            const idx = rawCode.lastIndexOf('</actions>')
-            if (idx !== -1) {
-              rawCode = rawCode.slice(0, idx) + executeResult.syntheticInspectCode + rawCode.slice(idx)
-            }
-          }
+          const rawCode = rawCodeChunks.join('')
 
           const responseParts: readonly ResponsePart[] = rawCode.trim()
             ? [{ type: 'text', content: rawCode }]
@@ -98,7 +92,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
           strategyId: 'xml-act',
           responseParts,
           toolCalls: executeResult.toolCalls,
-          inspectResults: executeResult.inspectResults,
+          observedResults: executeResult.observedResults,
           result: executeResult.result,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
@@ -120,7 +114,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             strategyId: 'xml-act',
             responseParts,
             toolCalls: [],
-            inspectResults: [],
+            observedResults: [],
             result: { success: false, error: 'Interrupted', cancelled: true },
             inputTokens: null,
             outputTokens: null,

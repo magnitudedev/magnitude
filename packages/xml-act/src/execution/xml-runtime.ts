@@ -23,9 +23,9 @@ import type {
   ReactorState,
 } from '../types'
 import { XmlRuntimeCrash, ToolInterceptorTag } from '../types'
-import { RefStore } from '../composition/ref-store'
 import { dispatchTool, type DispatchContext, type DispatchResult } from './tool-dispatcher'
 import { buildInput } from './input-builder'
+import { observeOutput } from '../output-query'
 import { validateBinding, type TagSchema } from './binding-validator'
 import { initialReactorState, foldReactorState } from './reactor-state'
 
@@ -98,23 +98,13 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             childTagMap.set(tag, valid)
           }
 
-          // Single ref store instance — the reactor writes to it (via the emit
-          // callback in the dispatcher) and the parser's resolveRef callback reads
-          // from it. Stores tool output trees. Char-by-char processing ensures
-          // the store is populated before the parser encounters <ref>.
-          const liveRefStore = new RefStore()
-          // Seed from initial state for replay
-          if (opts?.initialState?.refStore) {
-            for (const [tag, stack] of opts.initialState.refStore) {
-              for (const tree of stack) {
-                liveRefStore.set(tag, tree)
-              }
-            }
-          }
-
-          const parser = createStreamingXmlParser(knownTags, childTagMap, tagSchemas, (tag, recency, query) => {
-            return liveRefStore.resolve(tag, recency, query)
-          }, generateId, config.defaultProseDest ?? 'user')
+          const parser = createStreamingXmlParser(
+            knownTags,
+            childTagMap,
+            tagSchemas,
+            generateId,
+            config.defaultProseDest ?? 'user',
+          )
 
           // ---------------------------------------------------------------
           // Text coalescing queue
@@ -242,7 +232,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             return reactImpl(
               state, parseEvent, emitAndFold,
               config, tagSchemas, Option.getOrUndefined(interceptor),
-              priorToolCallIds, priorOutcomes, liveRefStore,
+              priorToolCallIds, priorOutcomes,
               {
                 get: () => activeProseMessageId,
                 set: (id) => { activeProseMessageId = id },
@@ -373,7 +363,6 @@ function reactImpl(
   interceptor: ToolInterceptor | undefined,
   priorToolCallIds: ReadonlySet<string>,
   priorOutcomes: ReadonlyMap<string, unknown>,
-  liveRefStore: RefStore,
   proseMessage: {
     readonly get: () => string | null
     readonly set: (id: string | null) => void
@@ -543,9 +532,14 @@ function reactImpl(
           interceptor,
           emit: (event) => Effect.gen(function* () {
             currentState = yield* emitAndFold(currentState, event)
-            // Keep liveRefStore in sync for the parser's resolveRef callback
             if (event._tag === 'ToolExecutionEnded' && event.result._tag === 'Success') {
-              liveRefStore.set(event.result.ref.tag, event.result.ref.tree)
+              currentState = yield* emitAndFold(currentState, {
+                _tag: 'ToolObservation',
+                toolCallId: event.toolCallId,
+                tagName: event.result.outputTree.tag,
+                query: event.result.query,
+                content: observeOutput(event.result.outputTree.tree, event.result.query),
+              })
             }
           }),
         }
@@ -702,16 +696,7 @@ function reactImpl(
       case 'ParseError': {
         const error = parseEvent.error
 
-        if (error._tag === 'InvalidRef') {
-          // Non-tool error — emit directly as InvalidRef
-          currentState = yield* emitAndFold(currentState, {
-            _tag: 'InvalidRef',
-            toolRef: error.toolRef,
-          })
-          break
-        }
-
-        if (error._tag === 'UnclosedThink' || error._tag === 'UnclosedActions' || error._tag === 'UnclosedInspect') {
+        if (error._tag === 'UnclosedThink' || error._tag === 'UnclosedActions') {
           currentState = yield* emitAndFold(currentState, {
             _tag: 'StructuralParseError',
             error,
@@ -746,20 +731,8 @@ function reactImpl(
         break
       }
 
-      case 'InspectResult': {
-        currentState = yield* emitAndFold(currentState, {
-          _tag: 'InspectResolved',
-          toolRef: parseEvent.toolRef,
-          query: parseEvent.query,
-          content: parseEvent.content,
-        })
-        break
-      }
-
       case 'ActionsOpen':
       case 'ActionsClose':
-      case 'InspectOpen':
-      case 'InspectClose':
       case 'CommsOpen':
       case 'CommsClose':
         // Structural — no runtime events

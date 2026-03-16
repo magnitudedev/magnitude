@@ -32,7 +32,7 @@ const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'turn_comp
   strategyId: 'xml-act',
   responseParts: [],
   toolCalls: [],
-  inspectResults: [],
+  observedResults: [],
 
   inputTokens: null,
   outputTokens: null,
@@ -42,16 +42,16 @@ const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'turn_comp
   ...overrides,
 })
 
-describe('Compaction', () => {
-  describe('Projection state transitions', () => {
-    test('initial token estimate includes system prompt tokens', () =>
+describe('Compaction', async () => {
+  describe('Projection state transitions', async () => {
+    test('initial token estimate includes system prompt tokens', async () =>
       withHarness(async (h) => {
         const state = await h.projectionFork(CompactionProjection.Tag, root)
         expect(state.tokenEstimate).toBeGreaterThanOrEqual(SYSTEM_PROMPT_TOKENS)
         expect(state.shouldCompact).toBe(false)
       }))
 
-    test('user_message increments token estimate', () =>
+    test('user_message increments token estimate', async () =>
       withHarness(async (h) => {
         const before = await h.projectionFork(CompactionProjection.Tag, root)
 
@@ -69,7 +69,7 @@ describe('Compaction', () => {
         expect(after.tokenEstimate).toBe(before.tokenEstimate + Math.ceil(300 / CHARS_PER_TOKEN))
       }))
 
-    test('turn_completed with inputTokens resets estimate baseline', () =>
+    test('turn_completed with inputTokens resets estimate baseline', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
@@ -90,7 +90,7 @@ describe('Compaction', () => {
         expect(state.tokenEstimate).toBe(1234 + Math.ceil(300 / CHARS_PER_TOKEN))
       }))
 
-    test('turn_completed without inputTokens adds to estimate', () =>
+    test('turn_completed without inputTokens adds to estimate', async () =>
       withHarness(async (h) => {
         const before = await h.projectionFork(CompactionProjection.Tag, root)
 
@@ -103,7 +103,7 @@ describe('Compaction', () => {
         expect(after.tokenEstimate).toBe(before.tokenEstimate + Math.ceil(150 / CHARS_PER_TOKEN))
       }))
 
-    test('compaction_started sets isCompacting', () =>
+    test('compaction_started sets isCompacting', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'compaction_started',
@@ -115,7 +115,7 @@ describe('Compaction', () => {
         expect(state.isCompacting).toBe(true)
       }))
 
-    test('compaction_ready sets pendingFinalization and pending payload', () =>
+    test('compaction_ready sets pendingFinalization and pending payload', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'compaction_started',
@@ -138,7 +138,7 @@ describe('Compaction', () => {
         expect(state.pendingCompactionData?.summary).toBe('short summary')
       }))
 
-    test('compaction_completed clears flags and subtracts tokensSaved', () =>
+    test('compaction_completed clears flags and subtracts tokensSaved', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'compaction_started',
@@ -173,7 +173,7 @@ describe('Compaction', () => {
         expect(after.pendingCompactionData).toBeNull()
       }))
 
-    test('compaction_failed clears flags', () =>
+    test('compaction_failed clears flags', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'compaction_started',
@@ -203,15 +203,15 @@ describe('Compaction', () => {
       }))
   })
 
-  describe('Context limit behavior', () => {
-    test('context_limit_hit forces contextLimitBlocked true', () =>
+  describe('Context limit behavior', async () => {
+    test('context_limit_hit forces contextLimitBlocked true', async () =>
       withHarness(async (h) => {
         await h.send({ type: 'context_limit_hit', forkId: root, error: 'cap hit' })
         const state = await h.projectionFork(CompactionProjection.Tag, root)
         expect(state.contextLimitBlocked).toBe(true)
       }))
 
-    test('context_limit_hit when not compacting keeps state.shouldCompact unchanged', () =>
+    test('context_limit_hit when not compacting keeps state.shouldCompact unchanged', async () =>
       withHarness(async (h) => {
         const before = await h.projectionFork(CompactionProjection.Tag, root)
         await h.send({ type: 'context_limit_hit', forkId: root, error: 'cap hit' })
@@ -220,8 +220,8 @@ describe('Compaction', () => {
       }))
   })
 
-  describe('Working state gating', () => {
-    test('compactionPending blocks shouldTrigger', () =>
+  describe('Working state gating', async () => {
+    test('compactionPending blocks shouldTrigger', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
@@ -247,7 +247,7 @@ describe('Compaction', () => {
         expect(shouldTrigger(after)).toBe(false)
       }))
 
-    test('contextLimitBlocked blocks shouldTrigger', () =>
+    test('contextLimitBlocked blocks shouldTrigger', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
@@ -265,7 +265,7 @@ describe('Compaction', () => {
         expect(shouldTrigger(state)).toBe(false)
       }))
 
-    test('compaction_completed unblocks working state', () =>
+    test('compaction_completed unblocks working state', async () =>
       withHarness(async (h) => {
         await h.send({ type: 'context_limit_hit', forkId: root, error: 'cap hit' })
         await h.send({
@@ -291,7 +291,7 @@ describe('Compaction', () => {
         expect(state.compactionPending).toBe(false)
       }))
 
-    test('compaction_failed unblocks working state', () =>
+    test('compaction_failed unblocks working state', async () =>
       withHarness(async (h) => {
         await h.send({ type: 'context_limit_hit', forkId: root, error: 'cap hit' })
         await h.send({
@@ -314,8 +314,8 @@ describe('Compaction', () => {
       }))
   })
 
-  describe('Memory rewrite', () => {
-    test('compaction_completed rewrites messages with summary', () =>
+  describe('Memory rewrite', async () => {
+    test('compaction_completed rewrites messages with summary', async () =>
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
@@ -353,7 +353,7 @@ describe('Compaction', () => {
         }
       }))
 
-    test('refreshedContext replaces session context', () =>
+    test('refreshedContext replaces session context', async () =>
       withHarness(async (h) => {
         const refreshed: SessionContext = {
           ...baseContext(),
@@ -379,8 +379,8 @@ describe('Compaction', () => {
       }))
   })
 
-  describe('Full lifecycle with compaction worker', () => {
-    test('context_limit_hit triggers worker and emits compaction_ready', () =>
+  describe('Full lifecycle with compaction worker', async () => {
+    test('context_limit_hit triggers worker and emits compaction_ready', async () =>
       withHarness(
         { workers: { compaction: true }, model: { completeResponse: 'worker summary' } },
         async (h) => {

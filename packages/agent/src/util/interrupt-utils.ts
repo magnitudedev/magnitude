@@ -1,6 +1,6 @@
 import { Effect } from 'effect'
-import { outputToText, type OutputNode, type ReactorState, type XmlToolResult } from '@magnitudedev/xml-act'
-import type { InspectResult, ResponsePart, ToolResult, TurnCompleted, TurnToolCall } from '../events'
+import { observeOutput, type ReactorState } from '@magnitudedev/xml-act'
+import type { ObservedResult, ResponsePart, ToolResult, TurnCompleted, TurnToolCall } from '../events'
 import { mapXmlToolResult } from './tool-result'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { defaultXmlTagName } from '../tools'
@@ -33,22 +33,22 @@ function buildResponseParts(canonical: CanonicalTurnState): readonly ResponsePar
   return responseParts
 }
 
-function buildInspectResults(refStore: ReactorState['refStore']): readonly InspectResult[] {
-  const inspectResults: InspectResult[] = []
+function buildObservedResults(replay: ReactorState): readonly ObservedResult[] {
+  const observedResults: ObservedResult[] = []
 
-  for (const [tag, trees] of refStore.entries()) {
-    trees.forEach((tree: OutputNode, index) => {
-      const recency = trees.length - index - 1
-      const toolRef = recency === 0 ? tag : `${tag}~${recency}`
-      inspectResults.push({
-        status: 'resolved',
-        toolRef,
-        content: outputToText(tree),
-      })
+  for (const [toolCallId, outcome] of replay.toolOutcomes.entries()) {
+    if (outcome._tag !== 'Completed') continue
+    if (outcome.result._tag !== 'Success') continue
+
+    observedResults.push({
+      toolCallId,
+      tagName: outcome.result.outputTree.tag,
+      query: outcome.result.query,
+      content: observeOutput(outcome.result.outputTree.tree, outcome.result.query),
     })
   }
 
-  return inspectResults
+  return observedResults
 }
 
 export const buildInterruptedTurnCompleted = (params: {
@@ -107,7 +107,7 @@ export const buildInterruptedTurnCompleted = (params: {
   }
 
   const responseParts = buildResponseParts(canonical)
-  const inspectResults = buildInspectResults(replay.refStore)
+  const observedResults = buildObservedResults(replay)
 
   const event: TurnCompleted = {
     type: 'turn_completed',
@@ -117,7 +117,7 @@ export const buildInterruptedTurnCompleted = (params: {
     strategyId: 'xml-act',
     responseParts,
     toolCalls,
-    inspectResults,
+    observedResults,
     result: { success: false, error: 'Interrupted', cancelled: true },
     inputTokens: null,
     outputTokens: null,

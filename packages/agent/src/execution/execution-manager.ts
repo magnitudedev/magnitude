@@ -17,10 +17,9 @@ import {
   type ReactorState,
   type ToolInterceptor,
   type OutputNode,
-  outputToText,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ToolDisplay, InspectResult } from '../events'
+import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ToolDisplay, ObservedResult } from '../events'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
 import { defaultXmlTagName } from '../tools'
@@ -34,7 +33,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { ArtifactStateReaderTag, type ArtifactStateReader } from '../tools/artifact-tools'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, UNCLOSED_INSPECT_REMINDER, formatNonexistentAgentError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, formatNonexistentAgentError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
@@ -82,8 +81,7 @@ export interface ExecuteResult {
   readonly result: TurnResult
   readonly code: string
   readonly toolCalls: readonly TurnToolCall[]
-  readonly inspectResults: readonly InspectResult[]
-  readonly syntheticInspectCode?: string
+  readonly observedResults: readonly ObservedResult[]
 }
 
 // =============================================================================
@@ -103,7 +101,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentRoutingState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkWorkingState>
+    Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkWorkingState>
   >
 
   /**
@@ -117,7 +115,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     void,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService
   >
 
   /**
@@ -144,7 +142,7 @@ export interface ExecutionManagerService {
   }) => Effect.Effect<
     string,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ProjectionInstance<ArtifactState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -384,11 +382,8 @@ const makeExecutionManager = Effect.gen(function* () {
       // Track tag names for ToolStarted events
       const toolCallTagNames = new Map<string, string>()
 
-      // Accumulate inspect block results
-      const inspectResults: InspectResult[] = []
-
-      // Track successful tool refs for synthetic inspect injection (in execution order)
-      const toolRefs: { tag: string; tree: OutputNode }[] = []
+      // Accumulate observed tool output results
+      const observedResults: ObservedResult[] = []
 
       let hasStructuralParseError = false
       let structuralParseErrorReminder: string | null = null
@@ -520,10 +515,6 @@ const makeExecutionManager = Effect.gen(function* () {
                   result: toolResult,
                 })
 
-                if (event.result._tag === 'Success') {
-                  toolRefs.push({ tag: event.result.ref.tag, tree: event.result.ref.tree })
-                }
-
                 // Forward event (attach display data if emitted by tool)
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
@@ -610,15 +601,19 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
 
-              // --- Inspect Resolved (ref resolved in inspect block) ---
-              case 'InspectResolved': {
-                inspectResults.push({ status: 'resolved', toolRef: event.toolRef, query: event.query, content: event.content })
-                break
-              }
-
-              // --- Invalid Ref (tool ref doesn't exist) ---
-              case 'InvalidRef': {
-                inspectResults.push({ status: 'invalid_ref', toolRef: event.toolRef })
+              case 'ToolObservation': {
+                observedResults.push({
+                  toolCallId: event.toolCallId,
+                  tagName: event.tagName,
+                  query: event.query,
+                  content: event.content,
+                })
+                yield* Queue.offer(sink, {
+                  _tag: 'ToolEvent',
+                  toolCallId: event.toolCallId,
+                  toolKey: toolCallKeys.get(event.toolCallId)!,
+                  event,
+                })
                 break
               }
 
@@ -626,9 +621,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 hasStructuralParseError = true
                 const msg = event.error._tag === 'UnclosedThink'
                   ? UNCLOSED_THINK_REMINDER
-                  : event.error._tag === 'UnclosedActions'
-                    ? UNCLOSED_ACTIONS_REMINDER
-                    : UNCLOSED_INSPECT_REMINDER
+                  : UNCLOSED_ACTIONS_REMINDER
                 structuralParseErrorReminder = `<error>\n${msg}\n</error>`
                 break
               }
@@ -644,9 +637,8 @@ const makeExecutionManager = Effect.gen(function* () {
                   // Errors within the turn always force continuation so the agent sees
                   // the error feedback and can retry. The turn policy only decides for clean turns.
                   const hasToolErrors = toolCalls.some(tc => tc.result.status === 'error')
-                  const hasInvalidRefs = inspectResults.some(ir => ir.status === 'invalid_ref')
 
-                  if (hasToolErrors || hasInvalidRefs || hasStructuralParseError || hasNonexistentAgentDest) {
+                  if (hasToolErrors || hasStructuralParseError || hasNonexistentAgentDest) {
                     executionResult = {
                       success: true,
                       turnDecision: 'continue',
@@ -690,35 +682,11 @@ const makeExecutionManager = Effect.gen(function* () {
         )
       )
 
-      let syntheticInspectCode: string | undefined
-      if (inspectResults.length === 0 && toolRefs.length > 0) {
-        const totals = new Map<string, number>()
-        for (const ref of toolRefs) {
-          totals.set(ref.tag, (totals.get(ref.tag) ?? 0) + 1)
-        }
-        const seen = new Map<string, number>()
-
-        const inspectLines: string[] = []
-        inspectLines.push('<inspect>')
-        for (const ref of toolRefs) {
-          const index = (seen.get(ref.tag) ?? 0) + 1 // 1-based index within this tag
-          seen.set(ref.tag, index)
-          const total = totals.get(ref.tag) ?? index
-          const recency = total - index
-          const toolRef = recency === 0 ? ref.tag : `${ref.tag}~${recency}`
-          inspectLines.push(`<ref tool="${toolRef}" />`)
-          inspectResults.push({ status: 'resolved', toolRef, content: outputToText(ref.tree) })
-        }
-        inspectLines.push('</inspect>')
-        syntheticInspectCode = '\n' + inspectLines.join('\n') + '\n'
-      }
-
       return {
         result: executionResult,
         code: accumulatedCode,
         toolCalls,
-        inspectResults,
-        syntheticInspectCode,
+        observedResults,
       }
     }),
 

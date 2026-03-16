@@ -4,7 +4,7 @@ import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
-import { UNCLOSED_ACTIONS_REMINDER, UNCLOSED_INSPECT_REMINDER, UNCLOSED_THINK_REMINDER } from '../prompts'
+import { UNCLOSED_ACTIONS_REMINDER, UNCLOSED_THINK_REMINDER } from '../prompts'
 
 export interface ThinkBlock {
   about: string | null
@@ -17,9 +17,9 @@ export interface CanonicalTurnState {
   thinkBlocks: ThinkBlock[]
   messages: Array<{ id: string; dest: string; text: string; order: number }>
   messageMap: Map<string, number>
-  toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; order: number }>
+  toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
   toolCallMap: Map<string, number>
-  inspectResults: Array<{ status: 'resolved' | 'invalid_ref'; toolRef: string; query?: string }>
+  observedResults: Array<{ toolCallId: string; tagName: string; query: string; content: string }>
   hasParseError: boolean
   hasStructuralError: boolean
   orderCounter: number
@@ -35,7 +35,7 @@ export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   messageMap: new Map(),
   toolCalls: [],
   toolCallMap: new Map(),
-  inspectResults: [],
+  observedResults: [],
   hasParseError: false,
   hasStructuralError: false,
   orderCounter: 0,
@@ -54,7 +54,6 @@ function isStructuralReminder(reminder?: string): boolean {
   if (!reminder) return false
   return reminder.includes(UNCLOSED_THINK_REMINDER)
     || reminder.includes(UNCLOSED_ACTIONS_REMINDER)
-    || reminder.includes(UNCLOSED_INSPECT_REMINDER)
 }
 
 function resetActive(state: CanonicalTurnState): CanonicalTurnState {
@@ -67,7 +66,7 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     messageMap: new Map(),
     toolCalls: [],
     toolCallMap: new Map(),
-    inspectResults: [],
+    observedResults: [],
     hasParseError: false,
     hasStructuralError: false,
     orderCounter: 0,
@@ -177,6 +176,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
             toolCallId: event.toolCallId,
             tagName: event.event.tagName,
             input: {},
+            query: '.',
             order: fork.orderCounter,
           }]
           const nextMap = new Map(fork.toolCallMap)
@@ -197,6 +197,24 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           return { ...fork, toolCalls: next }
         }
 
+        case 'ToolObservation': {
+          const idx = fork.toolCallMap.get(event.toolCallId)
+          const nextToolCalls = [...fork.toolCalls]
+          if (idx !== undefined) {
+            nextToolCalls[idx] = { ...nextToolCalls[idx], query: event.event.query }
+          }
+          return {
+            ...fork,
+            toolCalls: nextToolCalls,
+            observedResults: [...fork.observedResults, {
+              toolCallId: event.toolCallId,
+              tagName: event.event.tagName,
+              query: event.event.query,
+              content: event.event.content,
+            }],
+          }
+        }
+
         case 'ToolInputParseError':
           return { ...fork, hasParseError: true }
 
@@ -211,7 +229,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const hasStructuralError = fork.hasStructuralError || (event.result.success ? isStructuralReminder(event.result.reminder) : false)
       const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
 
-      const inspectResults = [...event.inspectResults]
+      const observedResults = [...event.observedResults]
 
       let canonicalXml: string
       if (clean) {
@@ -229,8 +247,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
             .map(({ dest, text }) => ({ dest, text })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
-            .map(({ tagName, input }) => ({ tagName, input })),
-          inspectResults,
+            .map(({ tagName, input, query }) => ({ tagName, input, query })),
           turnDecision: event.result.turnDecision === 'continue' ? 'continue' : 'yield',
         }
         canonicalXml = serializeCanonicalTurn(trace, bindings)
@@ -240,7 +257,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
       const finalized: CanonicalTurnState = {
         ...fork,
-        inspectResults,
+        observedResults,
         hasStructuralError,
         lastCompleted: {
           turnId: event.turnId,

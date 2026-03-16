@@ -38,14 +38,11 @@ export type ParseEvent =
   | { readonly _tag: 'LensEnd'; readonly name: string; readonly content: string }
   | { readonly _tag: 'ActionsOpen' }
   | { readonly _tag: 'ActionsClose' }
-  | { readonly _tag: 'InspectOpen' }
-  | { readonly _tag: 'InspectClose' }
   | { readonly _tag: 'CommsOpen' }
   | { readonly _tag: 'CommsClose' }
   | { readonly _tag: 'MessageTagOpen'; readonly id: string; readonly dest: string; readonly artifactsRaw: string | null }
   | { readonly _tag: 'MessageBodyChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageTagClose'; readonly id: string }
-  | { readonly _tag: 'InspectResult'; readonly toolRef: string; readonly query?: string; readonly content: string }
   | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
@@ -82,12 +79,6 @@ export type ToolParseErrorDetail = BaseToolParseErrorDetail & {
   readonly tagName: string
 }
 
-export type InvalidRefDetail = {
-  readonly _tag: 'InvalidRef'
-  readonly toolRef: string
-  readonly detail: string
-}
-
 export type UnclosedThinkDetail = {
   readonly _tag: 'UnclosedThink'
   readonly detail: string
@@ -98,11 +89,6 @@ export type UnclosedActionsDetail = {
   readonly detail: string
 }
 
-export type UnclosedInspectDetail = {
-  readonly _tag: 'UnclosedInspect'
-  readonly detail: string
-}
-
 export type TurnControlConflictDetail = {
   readonly _tag: 'TurnControlConflict'
   readonly detail: string
@@ -110,10 +96,8 @@ export type TurnControlConflictDetail = {
 
 export type ParseErrorDetail =
   | ToolParseErrorDetail
-  | InvalidRefDetail
   | UnclosedThinkDetail
   | UnclosedActionsDetail
-  | UnclosedInspectDetail
   | TurnControlConflictDetail
 
 export const enum FencePhase {
@@ -179,7 +163,6 @@ export interface ParserConfig {
   knownTags: ReadonlySet<string>
   childTagMap: ReadonlyMap<string, ReadonlySet<string>>
   tagSchemas?: ReadonlyMap<string, TagSchema>
-  resolveRef?: (tag: string, recency: number, query?: string) => string | undefined
   generateId: () => string
   defaultMessageDest: string
   keywords: {
@@ -194,13 +177,11 @@ export interface ParserConfig {
   structuralTags: ReadonlySet<string>
   actionsTags: ReadonlySet<string>
   topLevelTags: ReadonlySet<string>
-  refTags: ReadonlySet<string>
   messageTags: ReadonlySet<string>
 }
 
 export type ProseFrame = { readonly _tag: 'Prose'; fence: FenceState; proseAccum: string; lastCharNewline: boolean; justClosedStructural: boolean }
 export type ActionsFrame = { readonly _tag: 'Actions' }
-export type InspectFrame = { readonly _tag: 'Inspect' }
 export type CommsFrame = { readonly _tag: 'Comms' }
 export type OpenPrefixMatchFrame = { readonly _tag: 'OpenPrefixMatch'; prefix: PrefixMatch; afterNewline: boolean }
 export type ClosePrefixMatchFrame = { readonly _tag: 'ClosePrefixMatch'; prefix: PrefixMatch; afterNewline: boolean }
@@ -232,7 +213,6 @@ export type DoneFrame = { readonly _tag: 'Done' }
 export type StackFrame =
   | ProseFrame
   | ActionsFrame
-  | InspectFrame
   | CommsFrame
   | OpenPrefixMatchFrame
   | ClosePrefixMatchFrame

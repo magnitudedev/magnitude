@@ -230,16 +230,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
 
           // Build response parts — single text part containing the raw XML
-          // If there's a synthetic inspect block, splice it inside the last </actions> tag
-          // so the LLM memory sees it as part of the actions block
-          let rawCode = rawCodeChunks.join('')
-
-          if (executeResult.syntheticInspectCode) {
-            const idx = rawCode.lastIndexOf(actionsTagClose())
-            if (idx !== -1) {
-              rawCode = rawCode.slice(0, idx) + executeResult.syntheticInspectCode + rawCode.slice(idx)
-            }
-          }
+          const rawCode = rawCodeChunks.join('')
           const responseParts: readonly ResponsePart[] = rawCode.trim()
             ? [{ type: 'text', content: rawCode }]
             : []
@@ -277,7 +268,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           strategyId: 'xml-act',
           responseParts,
           toolCalls: executeResult.toolCalls,
-          inspectResults: executeResult.inspectResults,
+          observedResults: executeResult.observedResults,
           result: turnResult,
           inputTokens,
           outputTokens: usage.outputTokens,
@@ -356,7 +347,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               strategyId: 'xml-act',
               responseParts: [],
               toolCalls: [],
-              inspectResults: [],
+              observedResults: [],
               result: { success: false, error: `Context limit exceeded, waiting for compaction: ${errorMessage}`, cancelled: false },
               inputTokens: null,
               outputTokens: null,

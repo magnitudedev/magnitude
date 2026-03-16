@@ -9,8 +9,7 @@ export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
   messages: Array<{ dest: string; text: string }>
-  toolCalls: Array<{ tagName: string; input: unknown }>
-  inspectResults: Array<{ status: 'resolved' | 'invalid_ref'; toolRef: string; query?: string }>
+  toolCalls: Array<{ tagName: string; input: unknown; query: string }>
   turnDecision: 'continue' | 'yield'
 }
 
@@ -50,16 +49,16 @@ function serializeTag(name: string, attrs: Record<string, string>, body: string 
   return `<${name}${attrStr}>${children.join('')}${body ?? ''}</${name}>`
 }
 
-function serializeToolCall(tagName: string, input: unknown, binding: XmlTagBinding | undefined): string {
+function serializeToolCall(tagName: string, input: unknown, query: string, binding: XmlTagBinding | undefined): string {
   const obj = (input && typeof input === 'object') ? input as Record<string, unknown> : {}
 
   if (!binding) {
     return Object.keys(obj).length === 0
-      ? `<${tagName} />`
-      : `<${tagName}>${JSON.stringify(input)}</${tagName}>`
+      ? `<${tagName} observe="${query}" />`
+      : `<${tagName} observe="${query}">${JSON.stringify(input)}</${tagName}>`
   }
 
-  const attrs: Record<string, string> = {}
+  const attrs: Record<string, string> = { observe: query }
   if (binding.attributes) {
     for (const attr of binding.attributes) {
       const value = obj[attr]
@@ -159,18 +158,8 @@ export function serializeCanonicalTurn(
   const actionLines: string[] = []
   if (trace.toolCalls.length > 0) {
     for (const call of trace.toolCalls) {
-      actionLines.push(serializeToolCall(call.tagName, call.input, bindings.get(call.tagName)))
+      actionLines.push(serializeToolCall(call.tagName, call.input, call.query, bindings.get(call.tagName)))
     }
-  }
-
-  const resolvedInspect = trace.inspectResults.filter((r) => r.status === 'resolved')
-  if (resolvedInspect.length > 0) {
-    const refs = resolvedInspect.map((r) => {
-      const attrs: Record<string, string> = { tool: r.toolRef }
-      if (r.query !== undefined) attrs.query = r.query
-      return serializeTag('ref', attrs, null, [])
-    }).join('\n')
-    actionLines.push(`<inspect>\n${refs}\n</inspect>`)
   }
 
   if (actionLines.length > 0) {

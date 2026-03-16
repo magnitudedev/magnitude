@@ -24,7 +24,7 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<lenses><lens name="task">thinking</lens></lenses><comms><message to="user">Got it, I will update exports.</message><message to="explorer-1">Please inspect files.</message></comms><actions><inspect><ref tool="fs-read"/></inspect></actions>',
+              '<lenses><lens name="task">thinking</lens></lenses><comms><message to="user">Got it, I will update exports.</message><message to="explorer-1">Please review the files.</message></comms><actions><fs-read path="src/index.ts" observe="." /></actions>',
           },
           {
             type: 'thinking',
@@ -32,7 +32,7 @@ describe('memory transcript', () => {
           },
         ],
         toolCalls: [],
-        inspectResults: [],
+        observedResults: [],
         result: { success: true, turnDecision: 'finish' },
         inputTokens: null,
         outputTokens: null,
@@ -44,7 +44,7 @@ describe('memory transcript', () => {
     const t = buildExtractionTranscript(events)
     expect(t).toContain('Use named exports, not default exports.')
     expect(t).toContain('Got it, I will update exports.')
-    expect(t).not.toContain('Please inspect files.')
+    expect(t).not.toContain('Please review the files.')
     expect(t).not.toContain('<actions>')
   })
 
@@ -137,7 +137,7 @@ describe('memory transcript', () => {
           },
         ],
         toolCalls: [],
-        inspectResults: [],
+        observedResults: [],
         result: { success: true, turnDecision: 'finish' },
         inputTokens: null,
         outputTokens: null,
@@ -164,11 +164,11 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<comms><message to="explorer-1">Inspect src/</message></comms><actions><inspect><ref tool="fs-tree"/></inspect></actions>',
+              '<comms><message to="explorer-1">Review src/</message></comms><actions><fs-tree path="src" observe="." /></actions>',
           },
         ],
         toolCalls: [],
-        inspectResults: [],
+        observedResults: [],
         result: { success: true, turnDecision: 'finish' },
         inputTokens: null,
         outputTokens: null,
@@ -197,7 +197,7 @@ describe('memory transcript', () => {
           },
         ],
         toolCalls: [],
-        inspectResults: [],
+        observedResults: [],
         result: { success: true, turnDecision: 'finish' },
         inputTokens: null,
         outputTokens: null,

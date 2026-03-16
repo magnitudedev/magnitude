@@ -138,9 +138,12 @@ export type ResponsePart =
   | { readonly type: 'text'; readonly content: string }
   | { readonly type: 'thinking'; readonly content: string }
 
-export type InspectResult =
-  | { readonly status: 'resolved'; readonly toolRef: string; readonly query?: string; readonly content: string }
-  | { readonly status: 'invalid_ref'; readonly toolRef: string }
+export interface ObservedResult {
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly query: string
+  readonly content: string
+}
 
 export interface TurnCompleted {
   readonly type: 'turn_completed'
@@ -150,7 +153,7 @@ export interface TurnCompleted {
   readonly strategyId: StrategyId
   readonly responseParts: readonly ResponsePart[]
   readonly toolCalls: readonly TurnToolCall[]
-  readonly inspectResults: readonly InspectResult[]
+  readonly observedResults: readonly ObservedResult[]
   readonly result: TurnResult
   /** Actual input token count from LLM provider (via BAML Collector). Null when unavailable (e.g. Codex path, interrupted turns). */
   readonly inputTokens: number | null
@@ -243,7 +246,7 @@ export interface MessageEnd {
 // Tool Events
 // =============================================================================
 
-/** Unified tool event — wraps every xml-act ToolCallEvent with agent metadata. */
+/** Unified tool event — wraps every xml-act tool-scoped runtime event with agent metadata. */
 export interface ToolEvent {
   readonly type: 'tool_event'
   readonly forkId: string | null
