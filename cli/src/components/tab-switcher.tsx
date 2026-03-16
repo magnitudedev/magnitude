@@ -58,7 +58,7 @@ export const TabSwitcher = memo(function TabSwitcher({
           >
             {'Main'}
           </span>
-          {hasUnreadMain && <span fg={red[400]}>{'●'}</span>}
+          {hasUnreadMain && <span fg={red[400]}>{' ●'}</span>}
           <span fg={mainColor}>{']'}</span>
         </text>
       </Button>
@@ -76,7 +76,7 @@ export const TabSwitcher = memo(function TabSwitcher({
           >
             {'Agents'}
           </span>
-          {hasActiveAgents && <span fg={GREEN_PULSE[pulseIndex]}>{'●'}</span>}
+          {hasActiveAgents && <span fg={GREEN_PULSE[pulseIndex]}>{' ●'}</span>}
           <span fg={agentsColor}>{']'}</span>
         </text>
       </Button>

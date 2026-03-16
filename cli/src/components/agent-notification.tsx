@@ -37,7 +37,6 @@ export const AgentNotification = memo(function AgentNotification({
   return (
     <box style={{ flexDirection: 'row', marginBottom: 1 }}>
       <text style={{ wrapMode: 'none' }}>
-        {'  '}
         <span fg={palette.border}>{'◆'}</span>
         {' '}
         <span fg={palette.border} attributes={TextAttributes.BOLD}>{agentRole.charAt(0).toUpperCase() + agentRole.slice(1)}</span>

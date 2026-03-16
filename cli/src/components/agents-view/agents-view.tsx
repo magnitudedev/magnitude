@@ -21,7 +21,30 @@ export const AgentsView = memo(function AgentsView({
       stickyScroll
       stickyStart="bottom"
       scrollX={false}
-      style={{ flexDirection: 'column', flexGrow: 1, paddingLeft: 2 }}
+      focusable={false}
+      scrollbarOptions={{ visible: false }}
+      verticalScrollbarOptions={{
+        visible: true,
+        trackOptions: { width: 1 },
+      }}
+      style={{
+        flexGrow: 1,
+        rootOptions: {
+          flexGrow: 1,
+          backgroundColor: 'transparent',
+        },
+        wrapperOptions: {
+          border: false,
+          backgroundColor: 'transparent',
+        },
+        contentOptions: {
+          paddingLeft: 2,
+          paddingRight: 1,
+          paddingTop: 1,
+          paddingBottom: 1,
+          justifyContent: 'flex-end',
+        },
+      }}
     >
       {items.map((item) => {
         if (item.type === 'agents_view_message') {

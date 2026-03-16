@@ -1846,15 +1846,13 @@ function AppInner({
             </box>
           )}
           {activeTab === 'main' ? chatScrollbox : (
-            <box style={{ flexGrow: 1, minHeight: 0 }}>
-              {agentsViewState && (
-                <AgentsView
-                  items={agentsViewState.items}
-                  onForkExpand={pushForkOverlay}
-                  onArtifactClick={handleArtifactClick}
-                />
-              )}
-            </box>
+            agentsViewState && (
+              <AgentsView
+                items={agentsViewState.items}
+                onForkExpand={pushForkOverlay}
+                onArtifactClick={handleArtifactClick}
+              />
+            )
           )}
           <ChatController
             env={{
