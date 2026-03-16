@@ -1847,13 +1847,11 @@ function AppInner({
             </box>
           )}
           {activeTab === 'main' ? chatScrollbox : (
-            agentsViewState && (
-              <AgentsView
-                items={agentsViewState.items}
-                onForkExpand={pushForkOverlay}
-                onArtifactClick={handleArtifactClick}
-              />
-            )
+            <AgentsView
+              items={agentsViewState?.items ?? []}
+              onForkExpand={pushForkOverlay}
+              onArtifactClick={handleArtifactClick}
+            />
           )}
           {agentsViewState && agentsViewState.items.length > 0 && (
             <AgentSummaryBar

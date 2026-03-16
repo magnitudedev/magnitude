@@ -44,6 +44,24 @@ export const AgentsView = memo(function AgentsView({
     items.filter(i => i.type === 'agents_view_activity_end').map(i => (i as AgentsViewActivityEndItem).forkId)
   )
 
+  if (items.length === 0) {
+    return (
+      <box
+        style={{
+          flexGrow: 1,
+          width: '100%',
+          height: '100%',
+          borderStyle: 'round',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 2,
+        }}
+      >
+        <text style={{ dimColor: true }}>Subagent activity will appear here</text>
+      </box>
+    )
+  }
+
   return (
     <scrollbox
       stickyScroll
@@ -75,7 +93,8 @@ export const AgentsView = memo(function AgentsView({
     >
       {items.map((item, index) => {
         const itemLanes = lanes[index] ?? []
-        const spacerLanes = lanes[index + 1] ?? []
+        const nextItem = items[index + 1]
+        const spacerLanes = (nextItem?.type === 'agents_view_activity_start' ? lanes[index] : lanes[index + 1]) ?? []
         let rendered: React.ReactNode = null
         if (item.type === 'agents_view_message') {
           rendered = (
