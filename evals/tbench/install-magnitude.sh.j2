@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+
+# Install Bun if not available
+if ! command -v bun &> /dev/null; then
+    curl -fsSL https://bun.sh/install | bash
+    export BUN_INSTALL="$HOME/.bun"
+    export PATH="$BUN_INSTALL/bin:$PATH"
+fi
+
+# Install Magnitude CLI
+{% if version %}
+bun install -g @magnitudedev/cli@{{ version }}
+{% else %}
+bun install -g @magnitudedev/cli
+{% endif %}
+
+# Verify installation
+magnitude --version

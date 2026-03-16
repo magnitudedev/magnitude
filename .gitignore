@@ -8,3 +8,5 @@ dist
 !.env.example
 .DS_Store
 release-artifacts
+/jobs
+

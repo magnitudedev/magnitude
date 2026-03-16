@@ -1,0 +1,19 @@
+FROM --platform=linux/amd64 oven/bun:latest
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN cargo install wasm-pack
+
+WORKDIR /repo
+
+COPY . .
+
+RUN bun install
+RUN bun run cli/scripts/build-binary.ts bun-linux-x64
+
+CMD ["bash", "-lc", "test -f bin/magnitude && ls -l bin/magnitude"]
