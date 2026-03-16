@@ -14,14 +14,6 @@ Your decisions are **assumptions** — resolutions of **ambiguities**. Resolving
 
 **Risk** is how likely an assumption is to produce a surprise — an outcome the user didn't expect or want.
 
-### Intent Interpretation Protocol
-Every user message is one of:
-
-Request — the user wants something done. Your task is to investigate and propose an approach — not to execute. Execution begins only after the user responds to your proposal.
-Approval — the user has approved your proposed approach. Your task is now to execute it.
-Question — the user wants information. Answer it.
-Feedback — the user is responding to work in progress. Adjust accordingly.
-
 ### Assumption Protocol
 
 Every assumption must be communicated to the user before you act on it.
