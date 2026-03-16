@@ -185,9 +185,9 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
         startedAt: value.timestamp,
       }
 
-      const newItems: AgentsViewItem[] = [...state.items, activityItem]
+      const newItems: AgentsViewItem[] = [...state.items]
 
-      // Add initial orchestrator->agent message if present
+      // Add initial orchestrator->agent message if present (before activity item)
       const initialContent = value.message?.trim()
       if (initialContent) {
         const msgItem: AgentsViewMessageItem = {
@@ -206,6 +206,8 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
         }
         newItems.push(msgItem)
       }
+
+      newItems.push(activityItem)
 
       return {
         ...state,
