@@ -1886,3 +1886,120 @@ EOF</shell>${ACTIONS_TAG_CLOSE}`
     expect(ended[0].result._tag).toBe('Success')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Structural tag auto-close
+// ---------------------------------------------------------------------------
+// When the parser encounters a structural tag that comes later in the
+// sequence (lenses → comms → actions → next/yield), it should auto-close
+// the currently open earlier structural block.
+
+describe('structural tag auto-close', () => {
+  // --- lenses → comms ---
+  test('unclosed lenses auto-closes when comms opens', () => {
+    const events = parseChunked([
+      '<lenses>\n<lens name="foo">thinking</lens>\n<comms>\n<message to="user">hi</message>\n</comms>',
+    ])
+    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'MessageTagOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'MessageTagClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- lenses → actions ---
+  test('unclosed lenses auto-closes when actions opens', () => {
+    const events = parseChunked([
+      '<lenses>\n<lens name="foo">thinking</lens>\n<actions>\n</actions>',
+    ], ['read'])
+    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- lenses → next ---
+  test('unclosed lenses auto-closes when next is encountered', () => {
+    const events = parseChunked([
+      '<lenses>\n<lens name="foo">thinking</lens>\n<next/>',
+    ])
+    const tc = parseEvents(events, 'TurnControl')
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('continue')
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- lenses → yield ---
+  test('unclosed lenses auto-closes when yield is encountered', () => {
+    const events = parseChunked([
+      '<lenses>\n<lens name="foo">thinking</lens>\n<yield/>',
+    ])
+    const tc = parseEvents(events, 'TurnControl')
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('yield')
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- comms → actions ---
+  test('unclosed comms auto-closes when actions opens', () => {
+    const events = parseChunked([
+      '<comms>\n<message to="user">hi</message>\n<actions>\n</actions>',
+    ], ['read'])
+    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- comms → next ---
+  test('unclosed comms auto-closes when next is encountered', () => {
+    const events = parseChunked([
+      '<comms>\n<message to="user">hi</message>\n<next/>',
+    ])
+    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
+    const tc = parseEvents(events, 'TurnControl')
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('continue')
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- comms → yield ---
+  test('unclosed comms auto-closes when yield is encountered', () => {
+    const events = parseChunked([
+      '<comms>\n<message to="user">hi</message>\n<yield/>',
+    ])
+    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
+    const tc = parseEvents(events, 'TurnControl')
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('yield')
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- actions → next ---
+  test('unclosed actions auto-closes when next is encountered', () => {
+    const events = parseChunked([
+      '<actions>\n<next/>',
+    ], ['read'])
+    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    const tc = parseEvents(events, 'TurnControl')
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('continue')
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+
+  // --- actions → yield ---
+  test('unclosed actions auto-closes when yield is encountered', () => {
+    const events = parseChunked([
+      '<actions>\n<yield/>',
+    ], ['read'])
+    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    const tc = parseEvents(events, 'TurnControl')
+    expect(tc).toHaveLength(1)
+    expect(tc[0].decision).toBe('yield')
+    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+  })
+})

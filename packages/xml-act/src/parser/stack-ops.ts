@@ -21,7 +21,17 @@ export function innermostContainer(stack: ParseStack): 'Actions' | 'Comms' | nul
 
 export function activeTags(stack: ParseStack, afterNewline: boolean, config: ParserConfig): ReadonlySet<string> {
   const container = innermostContainer(stack)
-  if (container === 'Comms') return afterNewline ? new Set([...config.messageTags, config.keywords.comms]) : config.messageTags
+  if (container === 'Comms') {
+    return afterNewline
+      ? new Set([
+          ...config.messageTags,
+          config.keywords.comms,
+          config.keywords.actions,
+          config.keywords.next,
+          config.keywords.yield,
+        ])
+      : config.messageTags
+  }
   if (container === 'Actions') return afterNewline ? config.actionsTags : config.knownTags
   return afterNewline ? config.topLevelTags : new Set()
 }

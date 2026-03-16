@@ -13,7 +13,7 @@ import type {
   TagAttrValueFrame,
   TagUnquotedAttrValueFrame,
 } from './types'
-import { emit, emitAndReprocess, mkAttrState, mkRootProse, NOOP, reprocess } from './types'
+import { emit, emitAndReprocess, mkAttrState, mkRootProse, NOOP } from './types'
 import { validateToolAttr } from './validate-attrs'
 import { activeCloseCandidates, activeTags, containerDepth } from './stack-ops'
 import { emitProseChunk, endProseBlock } from './prose'
@@ -33,11 +33,34 @@ export function finalizeToolAttr(config: ParserConfig, tagName: string, toolCall
   return [{ _tag: 'ParseError', error: { ...result.error, toolCallId, tagName } }]
 }
 
+function autoCloseContainer(state: ParseStack, kind: 'Actions' | 'Comms'): ParseEvent[] {
+  const events: ParseEvent[] = []
+  const proseRoot = state[0]
+  if (state[state.length - 1]?._tag === 'Prose') state.pop()
+  for (let i = state.length - 1; i >= 1; i--) {
+    if (state[i]?._tag === kind) {
+      state.splice(i, 1)
+      break
+    }
+  }
+  proseRoot.justClosedStructural = true
+  proseRoot.lastCharNewline = true
+  const prose = mkRootProse()
+  prose.justClosedStructural = true
+  prose.lastCharNewline = true
+  state.push(prose)
+  if (containerDepth(state, kind) === 0) {
+    events.push({ _tag: kind === 'Actions' ? 'ActionsClose' : 'CommsClose' })
+  }
+  return events
+}
+
 export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: string, attrs: Map<string, AttributeValue>, raw: string, config: ParserConfig): ParseEvent[] {
   const events: ParseEvent[] = []
   const kw = config.keywords
   const proseRoot = state[0]
   if (tagName === kw.actions) {
+    if (containerDepth(state, 'Comms') > 0) events.push(...autoCloseContainer(state, 'Comms'))
     events.push(...endProseBlock(state))
     const outermost = containerDepth(state, 'Actions') === 0
     state.push({ _tag: 'Actions' })
@@ -90,7 +113,9 @@ export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId:
   const events: ParseEvent[] = []
   const kw = config.keywords
   if (tagName === kw.actions || tagName === kw.comms) return events
-  if (containerDepth(state, 'Actions') === 0 && containerDepth(state, 'Comms') === 0 && (tagName === kw.next || tagName === kw.yield)) {
+  if (tagName === kw.next || tagName === kw.yield) {
+    if (containerDepth(state, 'Actions') > 0) events.push(...autoCloseContainer(state, 'Actions'))
+    else if (containerDepth(state, 'Comms') > 0) events.push(...autoCloseContainer(state, 'Comms'))
     events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : 'yield' })
     state.push({ _tag: 'Done' })
     return events

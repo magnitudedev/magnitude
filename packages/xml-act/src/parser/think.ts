@@ -10,7 +10,7 @@ import type {
   ThinkFrame,
   ThinkState,
 } from './types'
-import { emit, NOOP } from './types'
+import { emit, emitAndReprocess, NOOP } from './types'
 import { advancePrefixMatch } from './prefix-match'
 
 export function emitThinkChar(think: ThinkState, ch: string, config: ParserConfig): ParseEvent[] {
@@ -46,6 +46,26 @@ export function stepThink({ frame, state, ch, config }: { frame: ThinkFrame; sta
   if (frame.pendingLt) {
     frame.pendingLt = false
     const wasAfterNewline = frame.think.lastCharNewline
+    const laterStructuralStarts = new Set([
+      config.keywords.comms[0],
+      config.keywords.actions[0],
+      config.keywords.next[0],
+      config.keywords.yield[0],
+    ])
+    if (wasAfterNewline && laterStructuralStarts.has(ch)) {
+      if (frame.think.tagName !== config.keywords.lenses) {
+        events.push({ _tag: 'ProseEnd', patternId: 'think', content: frame.think.body, about: frame.think.about })
+      }
+      state.pop()
+      const prose = state[0]
+      prose.lastCharNewline = true
+      state.push({
+        _tag: 'OpenPrefixMatch',
+        prefix: { candidates: Array.from(config.topLevelTags), matched: '', raw: '<' },
+        afterNewline: true,
+      })
+      return emitAndReprocess(...events)
+    }
     if (ch === '/') {
       // Close tag — build candidates
       const closeCandidates: string[] = [frame.think.tagName]

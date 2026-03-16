@@ -291,6 +291,10 @@ The parser is designed to handle messy LLM output gracefully. Rather than failin
 - **Incomplete tags on flush** — if the stream ends mid-tag, known tool tags get an `IncompleteToolTag` error. The partial content is reconstructed as prose.
 - **CDATA with prefix mismatch fallback** — `<![CDATA[...]]>` is fully supported in prose, parent body, and child body. If the prefix doesn't fully match (e.g. `<!D` instead of `<![CDATA[`), the accumulated buffer is flushed as normal body/prose text.
 
+### Structural tag auto-close
+
+- **Omitted closing tags on structural blocks** — if the model omits a closing tag for a structural block (`lenses`, `comms`, `actions`) and opens a later one in the sequence (`lenses` → `comms` → `actions` → `next`/`yield`), the earlier block is auto-closed. For example, `<lenses>...<comms>` auto-closes `lenses` before opening `comms`, and `<actions>...<yield/>` auto-closes `actions` before emitting turn control. No parse errors are emitted — this is intentional recovery.
+
 ### Prose cleanup
 
 - **Code fence stripping** — lines matching `` ```xml `` or `` ``` `` are stripped from prose output. LLMs frequently wrap XML in markdown code fences; the parser silently removes them.
