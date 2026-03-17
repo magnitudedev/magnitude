@@ -52,6 +52,7 @@ import { ChatController } from './components/chat/chat-controller'
 
 import { AgentsView } from './components/agents-view/agents-view'
 import { AgentSummaryBar } from './components/agent-summary-bar'
+import type { SummaryBarSeenTracker } from './components/agent-summary-bar'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -156,6 +157,14 @@ function AppInner({
   const [activeTab, setActiveTab] = useState<'main' | 'agents'>('main')
   const [hasUnreadMain, setHasUnreadMain] = useState(false)
   const activeTabRef = useRef<'main' | 'agents'>('main')
+  const seenMessageIdsRef = useRef(new Set<string>())
+  const seenActivityStartIdsRef = useRef(new Set<string>())
+  const seenArtifactEventIdsRef = useRef(new Set<string>())
+  const summaryBarSeenTracker: SummaryBarSeenTracker = useMemo(() => ({
+    seenMessageIds: seenMessageIdsRef,
+    seenActivityStartIds: seenActivityStartIdsRef,
+    seenArtifactEventIds: seenArtifactEventIdsRef,
+  }), [])
   const prevAssistantCountRef = useRef(0)
   const [artifactState, setArtifactState] = useState<ArtifactState | null>(null)
   const [selectedArtifact, setSelectedArtifact] = useState<{ name: string; section?: string } | null>(null)
@@ -1932,6 +1941,7 @@ function AppInner({
               agentsViewState={agentsViewState}
               onViewAll={() => handleTabSwitch('agents')}
               onArtifactClick={handleArtifactClick}
+              seenTracker={summaryBarSeenTracker}
               activeTab={activeTab}
             />
           )}
@@ -2004,6 +2014,7 @@ function AppInner({
                       agentsViewState={agentsViewState}
                       onViewAll={() => handleTabSwitch('agents')}
                       onArtifactClick={handleArtifactClick}
+                      seenTracker={summaryBarSeenTracker}
                       activeTab={activeTab}
                       variant="main-content"
                     />

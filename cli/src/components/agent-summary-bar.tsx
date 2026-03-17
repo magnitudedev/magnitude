@@ -1,14 +1,22 @@
 import { memo, useState, useEffect, useRef } from 'react'
+import type { MutableRefObject } from 'react'
 import { TextAttributes } from '@opentui/core'
 import type { AgentsViewState, AgentsViewActivityStartItem, AgentsViewMessageItem, AgentsViewArtifactItem } from '@magnitudedev/agent'
 import { getAgentColorByRole } from '../utils/agent-colors'
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 
+export interface SummaryBarSeenTracker {
+  seenMessageIds: MutableRefObject<Set<string>>
+  seenActivityStartIds: MutableRefObject<Set<string>>
+  seenArtifactEventIds: MutableRefObject<Set<string>>
+}
+
 interface AgentSummaryBarProps {
   agentsViewState: AgentsViewState
   onViewAll: () => void
   onArtifactClick: (name: string) => void
+  seenTracker: SummaryBarSeenTracker
   activeTab?: 'main' | 'agents'
   variant?: 'default' | 'main-content'
 }
@@ -182,6 +190,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
   agentsViewState,
   onViewAll,
   onArtifactClick,
+  seenTracker,
   activeTab = 'main',
   variant = 'default',
 }: AgentSummaryBarProps) {
@@ -223,11 +232,10 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
   const artifacts = Array.from(artifactMap.values()).slice(-3)
 
   // Track message blink
-  const prevLastMessageRef = useRef<string | null>(null)
   const lastMessageKey = lastMessage ? lastMessage.id : null
   useEffect(() => {
-    if (lastMessageKey !== null && lastMessageKey !== prevLastMessageRef.current) {
-      prevLastMessageRef.current = lastMessageKey
+    if (lastMessageKey !== null && !seenTracker.seenMessageIds.current.has(lastMessageKey)) {
+      seenTracker.seenMessageIds.current.add(lastMessageKey)
       if (messageBlinkTimerRef.current) clearTimeout(messageBlinkTimerRef.current)
       setIsMessageBlinking(true)
       setMessageBlinkTrigger(prev => prev + 1)
@@ -235,21 +243,19 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
         setIsMessageBlinking(false)
         messageBlinkTimerRef.current = null
       }, BLINK_DURATION_MS)
-    } else if (lastMessageKey === null) {
-      prevLastMessageRef.current = null
     }
-  }, [lastMessageKey])
+  }, [lastMessageKey, seenTracker])
 
   // Track agent blink
   const runningAgentsKey = runningAgents.map(a => a.id).join('|')
-  const prevRunningAgentIdsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
-    const currentIds = new Set(runningAgents.map(a => a.id))
     const newIds = new Set<string>()
-    for (const id of currentIds) {
-      if (!prevRunningAgentIdsRef.current.has(id)) newIds.add(id)
+    for (const agent of runningAgents) {
+      if (!seenTracker.seenActivityStartIds.current.has(agent.id)) {
+        seenTracker.seenActivityStartIds.current.add(agent.id)
+        newIds.add(agent.id)
+      }
     }
-    prevRunningAgentIdsRef.current = currentIds
 
     if (newIds.size > 0) {
       setBlinkingAgents(prev => {
@@ -267,18 +273,18 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
         agentBlinkTimersRef.current.set(id, t)
       }
     }
-  }, [runningAgentsKey])
+  }, [runningAgentsKey, runningAgents, seenTracker])
 
   // Track artifact blink
   const artifactsIdentityKey = artifacts.map(a => a.id).join('|')
-  const prevArtifactIdsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
-    const currentIds = new Set(artifacts.map(a => a.id))
     const newArtifactNames = new Set<string>()
     for (const artifact of artifacts) {
-      if (!prevArtifactIdsRef.current.has(artifact.id)) newArtifactNames.add(artifact.artifactName)
+      if (!seenTracker.seenArtifactEventIds.current.has(artifact.id)) {
+        seenTracker.seenArtifactEventIds.current.add(artifact.id)
+        newArtifactNames.add(artifact.artifactName)
+      }
     }
-    prevArtifactIdsRef.current = currentIds
 
     if (newArtifactNames.size > 0) {
       setBlinkingArtifacts(prev => {
@@ -296,7 +302,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
         artifactBlinkTimersRef.current.set(name, t)
       }
     }
-  }, [artifactsIdentityKey])
+  }, [artifactsIdentityKey, artifacts, seenTracker])
 
   const messageBlinkOn = useBlinkSequence(isMessageBlinking, messageBlinkTrigger)
 
