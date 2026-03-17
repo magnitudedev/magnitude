@@ -76,6 +76,8 @@ export interface AgentsViewArtifactItem {
   readonly colorIndex: number
   readonly artifactName: string
   readonly action: 'wrote' | 'updated'
+  readonly phase: 'streaming' | 'complete' | 'error'
+  readonly toolCallId: string
 }
 
 export type AgentsViewItem =
@@ -199,19 +201,40 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
       const inner = event.event
       if (event.forkId === null) return state  // root fork tools not shown in agents view
 
-      if (inner._tag === 'ToolInputReady') {
+      if (inner._tag === 'ToolInputFieldValue' && inner.field === 'id') {
         const toolKey = event.toolKey
         if (toolKey === 'artifactWrite' || toolKey === 'artifactUpdate') {
-          const input = inner.input as { id?: string } | null
-          const artifactName = input && typeof input === 'object' && typeof input.id === 'string'
-            ? input.id
-            : null
+          const artifactName = typeof inner.value === 'string' ? inner.value : String(inner.value)
           if (artifactName) {
             const newPending = new Map(state.pendingToolInputs).set(event.toolCallId, {
               toolKey,
               artifactName,
             })
-            return { ...state, pendingToolInputs: newPending }
+
+            // Emit a streaming artifact item immediately
+            const agentState = read(AgentStatusProjection)
+            const agent = getAgentByForkId(agentState, event.forkId)
+            if (!agent) return { ...state, pendingToolInputs: newPending }
+
+            const streamingItem: AgentsViewArtifactItem = {
+              id: event.toolCallId,
+              type: 'agents_view_artifact',
+              timestamp: event.timestamp,
+              forkId: event.forkId,
+              agentRole: agent.role,
+              agentName: agent.agentId,
+              colorIndex: agent.colorIndex,
+              artifactName,
+              action: toolKey === 'artifactWrite' ? 'wrote' : 'updated',
+              phase: 'streaming',
+              toolCallId: event.toolCallId,
+            }
+
+            return {
+              ...state,
+              pendingToolInputs: newPending,
+              items: [...state.items, streamingItem],
+            }
           }
         }
         return state
@@ -224,31 +247,17 @@ export const AgentsViewProjection = Projection.define<AppEvent, AgentsViewState>
         // Clean up pending entry
         const newPending = new Map(state.pendingToolInputs)
         newPending.delete(event.toolCallId)
-        const nextState = { ...state, pendingToolInputs: newPending }
 
-        // Only emit artifact item on success
-        if (inner.result._tag !== 'Success') {
-          return nextState
-        }
+        const newPhase = inner.result._tag === 'Success' ? 'complete' : 'error'
 
-        // Get agent info
-        const agentState = read(AgentStatusProjection)
-        const agent = getAgentByForkId(agentState, event.forkId)
-        if (!agent) return nextState
+        // Update the existing streaming item in place
+        const newItems = state.items.map(item =>
+          item.type === 'agents_view_artifact' && item.id === event.toolCallId
+            ? { ...item, phase: newPhase, timestamp: event.timestamp } as AgentsViewArtifactItem
+            : item
+        )
 
-        const artifactItem: AgentsViewArtifactItem = {
-          id: generateId(),
-          type: 'agents_view_artifact',
-          timestamp: event.timestamp,
-          forkId: event.forkId,
-          agentRole: agent.role,
-          agentName: agent.agentId,
-          colorIndex: agent.colorIndex,
-          artifactName: pending.artifactName,
-          action: pending.toolKey === 'artifactWrite' ? 'wrote' : 'updated',
-        }
-
-        return { ...nextState, items: [...nextState.items, artifactItem] }
+        return { ...state, pendingToolInputs: newPending, items: newItems }
       }
 
       return state

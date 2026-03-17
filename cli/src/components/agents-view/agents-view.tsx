@@ -12,6 +12,7 @@ interface AgentsViewProps {
   onArtifactClick: (name: string, section?: string) => void
   onViewAgents?: () => void
   scrollboxRef?: React.RefObject<any>
+  subscribeForkDisplay: (forkId: string | null, cb: (state: any) => void) => () => void
 }
 
 function computeLanes(items: readonly AgentsViewItem[]): LaneEntry[][] {
@@ -41,6 +42,7 @@ export const AgentsView = memo(function AgentsView({
   onForkExpand,
   onArtifactClick,
   scrollboxRef,
+  subscribeForkDisplay,
 }: AgentsViewProps) {
   const lanes = computeLanes(items)
 
@@ -117,14 +119,19 @@ export const AgentsView = memo(function AgentsView({
         } else if (item.type === 'agents_view_activity_end') {
           rendered = null  // kept for lane computation, not rendered
         } else if (item.type === 'agents_view_artifact') {
-          rendered = (
-            <AgentArtifactEvent
-              key={item.id}
-              item={item as AgentsViewArtifactItem}
-              onArtifactClick={onArtifactClick}
-              lanes={itemLanes}
-            />
-          )
+          if ((item as AgentsViewArtifactItem).phase === 'error') {
+            rendered = null
+          } else {
+            rendered = (
+              <AgentArtifactEvent
+                key={item.id}
+                item={item as AgentsViewArtifactItem}
+                onArtifactClick={onArtifactClick}
+                lanes={itemLanes}
+                subscribeForkDisplay={subscribeForkDisplay}
+              />
+            )
+          }
         }
         if (rendered === null) return null
         return (

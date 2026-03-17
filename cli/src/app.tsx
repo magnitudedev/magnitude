@@ -1899,6 +1899,7 @@ function AppInner({
                 onForkExpand={pushForkOverlay}
                 onArtifactClick={handleArtifactClick}
                 scrollboxRef={agentsScrollboxRef}
+                subscribeForkDisplay={(forkId, cb) => client!.state.display.subscribeFork(forkId, cb)}
               />
             </box>
           )}
