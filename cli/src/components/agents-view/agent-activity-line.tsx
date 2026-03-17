@@ -22,8 +22,8 @@ function sweepColors(name: string, sweepPos: number, baseColor: string, pulse: s
   const cursor = mod < name.length ? mod : period - mod
   return Array.from(name, (_, i) => {
     const dist = Math.abs(i - cursor)
-    if (dist === 0) return pulse[0]!
-    if (dist === 1) return pulse[1]!
+    if (dist <= 1) return pulse[0]!
+    if (dist === 2) return pulse[1]!
     return baseColor
   })
 }

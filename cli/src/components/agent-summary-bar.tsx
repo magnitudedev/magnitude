@@ -15,6 +15,7 @@ interface AgentSummaryBarProps {
 
 const PULSE_INTERVAL_MS = 200
 const SWEEP_INTERVAL_MS = 200
+const BLINK_DURATION_MS = 1500
 
 function sweepColors(name: string, sweepPos: number, baseColor: string, pulse: string[]): string[] {
   if (name.length <= 1) return [pulse[0]!]
@@ -23,9 +24,9 @@ function sweepColors(name: string, sweepPos: number, baseColor: string, pulse: s
   const cursor = mod < name.length ? mod : period - mod
   return Array.from(name, (_, i) => {
     const dist = Math.abs(i - cursor)
-    if (dist === 0) return pulse[0]!   // center: shade 300
-    if (dist === 1) return pulse[1]!   // adjacent: shade 400
-    return baseColor                    // everything else: normal color
+    if (dist <= 1) return pulse[0]!
+    if (dist === 2) return pulse[1]!
+    return baseColor
   })
 }
 
@@ -36,7 +37,6 @@ function formatElapsed(startedAt: number): string {
   const s = seconds % 60
   return s > 0 ? `${m}m ${s}s` : `${m}m`
 }
-
 
 function messagePreview(content: string, max: number): string {
   const trimmed = content.trimEnd()
@@ -49,24 +49,73 @@ function messagePreview(content: string, max: number): string {
   }
 }
 
+/**
+ * Runs a single flash sequence when `active` becomes true or `trigger` changes (while > 0).
+ * Returns blinkOn: true = highlight phase, false = settled phase.
+ */
+function useBlinkSequence(active: boolean, trigger?: number): boolean {
+  const [blinkOn, setBlinkOn] = useState(false)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const startBlink = () => {
+    setBlinkOn(true)
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    timeoutRef.current = setTimeout(() => {
+      setBlinkOn(false)
+      timeoutRef.current = null
+    }, BLINK_DURATION_MS)
+  }
+
+  useEffect(() => {
+    if (active) {
+      startBlink()
+    } else {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current)
+        timeoutRef.current = null
+      }
+      setBlinkOn(false)
+    }
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current)
+        timeoutRef.current = null
+      }
+    }
+  }, [active])
+
+  // Re-trigger when trigger counter increments (and active)
+  useEffect(() => {
+    if (trigger !== undefined && trigger > 0 && active) {
+      startBlink()
+    }
+  }, [trigger, active])
+
+  return blinkOn
+}
+
 const ArtifactChip = memo(function ArtifactChip({
   artifact,
   index,
-  isRecent,
+  isBlinking,
   onArtifactClick,
 }: {
   artifact: AgentsViewArtifactItem
   index: number
-  isRecent: boolean
+  isBlinking: boolean
   onArtifactClick: (name: string) => void
 }) {
   const theme = useTheme()
   const [hovered, setHovered] = useState(false)
+  const blinkOn = useBlinkSequence(isBlinking)
 
   const defaultColor = theme.primary
   const hoverColor = theme.link
-  const recentColor = getAgentColorByRole(artifact.agentRole).border
-  const color = hovered ? hoverColor : isRecent ? recentColor : defaultColor
+  const color = hovered
+    ? hoverColor
+    : isBlinking
+      ? (blinkOn ? theme.link : theme.muted)
+      : defaultColor
 
   return (
     <Button
@@ -76,13 +125,13 @@ const ArtifactChip = memo(function ArtifactChip({
     >
       <text style={{ wrapMode: 'none' }}>
         {index > 0 ? <span fg={theme.muted}>{' · '}</span> : null}
-        <span fg={color}>{'[≡ '}{artifact.artifactName}{']'}</span>
+        <span fg={color} attributes={isBlinking && blinkOn ? TextAttributes.BOLD : TextAttributes.NONE}>{'[≡ '}{artifact.artifactName}{']'}</span>
       </text>
     </Button>
   )
 })
 
-const RunningAgentChip = memo(function RunningAgentChip({ item }: { item: AgentsViewActivityStartItem }) {
+const RunningAgentChip = memo(function RunningAgentChip({ item, isBlinking }: { item: AgentsViewActivityStartItem; isBlinking: boolean }) {
   const [pulseIndex, setPulseIndex] = useState(0)
   const [sweepPos, setSweepPos] = useState(0)
   const [elapsed, setElapsed] = useState(() => formatElapsed(item.startedAt))
@@ -91,6 +140,7 @@ const RunningAgentChip = memo(function RunningAgentChip({ item }: { item: Agents
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const palette = getAgentColorByRole(item.agentRole)
+  const blinkOn = useBlinkSequence(isBlinking)
 
   useEffect(() => {
     pulseRef.current = setInterval(() => {
@@ -113,13 +163,15 @@ const RunningAgentChip = memo(function RunningAgentChip({ item }: { item: Agents
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
   }, [item.startedAt])
 
-  const nameColors = sweepColors(item.agentName, sweepPos, palette.border, palette.pulse)
+  const nameColors = isBlinking
+    ? Array.from(item.agentName, () => blinkOn ? palette.pulse[0]! : palette.border)
+    : sweepColors(item.agentName, sweepPos, palette.border, palette.pulse)
 
   return (
     <text style={{ wrapMode: 'none' }}>
-      <span fg={palette.pulse[pulseIndex]!}>{'◆ '}</span>
+      <span fg={isBlinking ? palette.pulse[0]! : palette.pulse[pulseIndex]!} attributes={isBlinking && blinkOn ? TextAttributes.BOLD : TextAttributes.NONE}>{'◆ '}</span>
       {Array.from(item.agentName).map((ch, i) => (
-        <span key={i} fg={nameColors[i]}>{ch}</span>
+        <span key={i} fg={nameColors[i]} attributes={isBlinking && blinkOn ? TextAttributes.BOLD : TextAttributes.NONE}>{ch}</span>
       ))}
       <span fg={'#888888'}>{' '}{elapsed}{'  '}</span>
     </text>
@@ -135,11 +187,17 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
 }: AgentSummaryBarProps) {
   const theme = useTheme()
   const [viewAllHovered, setViewAllHovered] = useState(false)
-  const [recentArtifacts, setRecentArtifacts] = useState<Set<string>>(new Set())
+  const [blinkingAgents, setBlinkingAgents] = useState<Set<string>>(new Set())
+  const [isMessageBlinking, setIsMessageBlinking] = useState(false)
+  const [messageBlinkTrigger, setMessageBlinkTrigger] = useState(0)
+  const [blinkingArtifacts, setBlinkingArtifacts] = useState<Set<string>>(new Set())
+  const agentBlinkTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const artifactBlinkTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const messageBlinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const items = agentsViewState.items
 
-  // Derive running agents (start items without a corresponding end item)
+  // Derive running agents
   const runningForkIds = new Set<string>()
   for (const item of items) {
     if (item.type === 'agents_view_activity_start') runningForkIds.add(item.forkId)
@@ -164,33 +222,83 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
   }
   const artifacts = Array.from(artifactMap.values()).slice(-3)
 
-  // Track recently updated artifacts for highlight
-  const prevArtifactNamesRef = useRef<Set<string>>(new Set(artifacts.map(a => a.artifactName)))
+  // Track message blink
+  const prevLastMessageRef = useRef<string | null>(null)
+  const lastMessageKey = lastMessage ? lastMessage.id : null
   useEffect(() => {
-    const currentNames = new Set(artifacts.map(a => a.artifactName))
-    const newNames = new Set<string>()
-    for (const name of currentNames) {
-      if (!prevArtifactNamesRef.current.has(name)) {
-        newNames.add(name)
-      }
+    if (lastMessageKey !== null && lastMessageKey !== prevLastMessageRef.current) {
+      prevLastMessageRef.current = lastMessageKey
+      if (messageBlinkTimerRef.current) clearTimeout(messageBlinkTimerRef.current)
+      setIsMessageBlinking(true)
+      setMessageBlinkTrigger(prev => prev + 1)
+      messageBlinkTimerRef.current = setTimeout(() => {
+        setIsMessageBlinking(false)
+        messageBlinkTimerRef.current = null
+      }, BLINK_DURATION_MS)
+    } else if (lastMessageKey === null) {
+      prevLastMessageRef.current = null
     }
-    prevArtifactNamesRef.current = currentNames
-    if (newNames.size > 0) {
-      setRecentArtifacts(prev => {
+  }, [lastMessageKey])
+
+  // Track agent blink
+  const runningAgentsKey = runningAgents.map(a => a.forkId).join('|')
+  const prevRunningForkIdsRef = useRef<Set<string>>(new Set(runningAgents.map(a => a.forkId)))
+  useEffect(() => {
+    const currentIds = new Set(runningAgents.map(a => a.forkId))
+    const newIds = new Set<string>()
+    for (const id of currentIds) {
+      if (!prevRunningForkIdsRef.current.has(id)) newIds.add(id)
+    }
+    prevRunningForkIdsRef.current = currentIds
+
+    if (newIds.size > 0) {
+      setBlinkingAgents(prev => {
         const next = new Set(prev)
-        for (const n of newNames) next.add(n)
+        for (const id of newIds) next.add(id)
         return next
       })
-      const timeout = setTimeout(() => {
-        setRecentArtifacts(prev => {
-          const next = new Set(prev)
-          for (const n of newNames) next.delete(n)
-          return next
-        })
-      }, 2000)
-      return () => clearTimeout(timeout)
+      for (const id of newIds) {
+        const existing = agentBlinkTimersRef.current.get(id)
+        if (existing) clearTimeout(existing)
+        const t = setTimeout(() => {
+          setBlinkingAgents(prev => { const next = new Set(prev); next.delete(id); return next })
+          agentBlinkTimersRef.current.delete(id)
+        }, BLINK_DURATION_MS)
+        agentBlinkTimersRef.current.set(id, t)
+      }
     }
-  }, [artifacts.length])
+  }, [runningAgentsKey])
+
+  // Track artifact blink
+  const artifactsIdentityKey = artifacts.map(a => a.id).join('|')
+  const prevArtifactIdsRef = useRef<Set<string>>(new Set(artifacts.map(a => a.id)))
+  useEffect(() => {
+    const currentIds = new Set(artifacts.map(a => a.id))
+    const newArtifactNames = new Set<string>()
+    for (const artifact of artifacts) {
+      if (!prevArtifactIdsRef.current.has(artifact.id)) newArtifactNames.add(artifact.artifactName)
+    }
+    prevArtifactIdsRef.current = currentIds
+
+    if (newArtifactNames.size > 0) {
+      setBlinkingArtifacts(prev => {
+        const next = new Set(prev)
+        for (const n of newArtifactNames) next.add(n)
+        return next
+      })
+      for (const name of newArtifactNames) {
+        const existing = artifactBlinkTimersRef.current.get(name)
+        if (existing) clearTimeout(existing)
+        const t = setTimeout(() => {
+          setBlinkingArtifacts(prev => { const next = new Set(prev); next.delete(name); return next })
+          artifactBlinkTimersRef.current.delete(name)
+        }, BLINK_DURATION_MS)
+        artifactBlinkTimersRef.current.set(name, t)
+      }
+    }
+  }, [artifactsIdentityKey])
+
+  const messageBlinkOn = useBlinkSequence(isMessageBlinking, messageBlinkTrigger)
 
   const LABEL_WIDTH = 18
   const pl = variant === 'main-content' ? 1 : 2
@@ -208,7 +316,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
           ) : (
             <box style={{ flexDirection: 'row', overflow: 'hidden' }}>
               {runningAgents.map(agent => (
-                <RunningAgentChip key={agent.forkId} item={agent} />
+                <RunningAgentChip key={agent.forkId} item={agent} isBlinking={blinkingAgents.has(agent.forkId)} />
               ))}
             </box>
           )}
@@ -223,10 +331,24 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
             <text><span fg={theme.muted}>{'—'}</span></text>
           ) : (
             <text style={{ wrapMode: 'none' }}>
-              <span fg={getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}>
+              <span
+                fg={isMessageBlinking
+                  ? (messageBlinkOn
+                    ? getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').pulse[0]
+                    : getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border)
+                  : getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}
+                attributes={isMessageBlinking && messageBlinkOn ? TextAttributes.BOLD : TextAttributes.NONE}
+
+              >
                 {'⌲ '}{lastMessage.direction === 'from_agent' ? `${lastMessage.fromName}` : 'Orchestrator'}{': '}
               </span>
-              <span fg={theme.muted}>{'"'}{messagePreview(lastMessage.content, 80)}{'"'}</span>
+              <span
+                fg={isMessageBlinking ? (messageBlinkOn ? theme.foreground : theme.muted) : theme.muted}
+                attributes={isMessageBlinking && messageBlinkOn ? TextAttributes.BOLD : TextAttributes.NONE}
+
+              >
+                {'"'}{messagePreview(lastMessage.content, 80)}{'"'}
+              </span>
             </text>
           )}
         </box>
@@ -245,7 +367,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
                   key={artifact.artifactName}
                   artifact={artifact}
                   index={i}
-                  isRecent={recentArtifacts.has(artifact.artifactName)}
+                  isBlinking={blinkingArtifacts.has(artifact.artifactName)}
                   onArtifactClick={onArtifactClick}
                 />
               ))}
@@ -297,7 +419,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
         ) : (
           <box style={{ flexDirection: 'row', overflow: 'hidden' }}>
             {runningAgents.map(agent => (
-              <RunningAgentChip key={agent.forkId} item={agent} />
+              <RunningAgentChip key={agent.forkId} item={agent} isBlinking={blinkingAgents.has(agent.forkId)} />
             ))}
           </box>
         )}
@@ -312,10 +434,24 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
           <text><span fg={theme.muted}>{'—'}</span></text>
         ) : (
           <text style={{ wrapMode: 'none' }}>
-            <span fg={getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}>
+            <span
+              fg={isMessageBlinking
+                ? (messageBlinkOn
+                  ? getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').pulse[0]
+                  : getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border)
+                : getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}
+              attributes={isMessageBlinking && messageBlinkOn ? TextAttributes.BOLD : TextAttributes.NONE}
+
+            >
               {'⌲ '}{lastMessage.direction === 'from_agent' ? `${lastMessage.fromName}` : 'Orchestrator'}{': '}
             </span>
-            <span fg={theme.muted}>{'"'}{messagePreview(lastMessage.content, 80)}{'"'}</span>
+            <span
+              fg={isMessageBlinking ? (messageBlinkOn ? theme.foreground : theme.muted) : theme.muted}
+              attributes={isMessageBlinking && messageBlinkOn ? TextAttributes.BOLD : TextAttributes.NONE}
+
+            >
+              {'"'}{messagePreview(lastMessage.content, 80)}{'"'}
+            </span>
           </text>
         )}
       </box>
@@ -334,7 +470,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
                 key={artifact.artifactName}
                 artifact={artifact}
                 index={i}
-                isRecent={recentArtifacts.has(artifact.artifactName)}
+                isBlinking={blinkingArtifacts.has(artifact.artifactName)}
                 onArtifactClick={onArtifactClick}
               />
             ))}
