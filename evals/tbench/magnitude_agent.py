@@ -6,6 +6,10 @@ from harbor.agents.installed.base import BaseInstalledAgent, ExecInput
 from harbor.models.agent.context import AgentContext
 
 
+class AgentUnexpectedError(Exception):
+    pass
+
+
 class MagnitudeAgent(BaseInstalledAgent):
 
     @staticmethod
@@ -85,5 +89,17 @@ class MagnitudeAgent(BaseInstalledAgent):
         return [ExecInput(command=cmd, env=env)]
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        # TODO: parse magnitude output for token counts / cost if available
-        pass
+        # Check if the agent exited with a non-zero return code
+        rc_path = self.logs_dir / "command-0" / "return-code.txt"
+        if rc_path.exists():
+            rc = int(rc_path.read_text().strip())
+            if rc != 0:
+                # Read last few lines of agent output for context
+                log_path = self.logs_dir / "magnitude.txt"
+                tail = ""
+                if log_path.exists():
+                    lines = log_path.read_text().strip().splitlines()
+                    tail = "\n".join(lines[-5:])
+                raise AgentUnexpectedError(
+                    f"Magnitude exited with code {rc}\n{tail}"
+                )
