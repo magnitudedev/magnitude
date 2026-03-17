@@ -212,7 +212,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         content: textParts(
           '<task>\n'
           + event.prompt
-          + '\n</task>\n\n<critical-reminder>You must follow every phase of the Task Workflow carefully to ensure precise and correct completion of the task.\nEstablish the [[task]] artifact with initial content and then work through each phase systematically, one-by-one.</critical-reminder>'
+          + '\n</task>\n\n<critical-reminder>Thoroughly and efficiently complete this task. Be strategic and creative, try multiple approaches in parallel when appropriate, but ensure that the task is fully complete and the environment is clean before you finish.</critical-reminder>'
         ),
       }
       return {

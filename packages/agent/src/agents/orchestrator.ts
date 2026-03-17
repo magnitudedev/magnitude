@@ -59,21 +59,29 @@ const turnLens = defineThinkingLens({
   description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
 })
 
-// One-shot specific lense
-const phaseLens = defineThinkingLens({
-  name: 'phase',
-  trigger: 'Every turn',
-  description: 'Where are you in the execution protocol? What has been completed and what remains? Have you satisfied the criteria to move to the next phase?',
+// One-shot specific lenses
+const constraintsLens = defineThinkingLens({
+  name: 'constraints',
+  trigger: 'When planning work, delegating to subagents, or evaluating progress',
+  description:
+    'What are the exact requirements? Have I extracted all testable constraints? Which have I verified? Which remain? Am I missing any implicit requirements?',
 })
 
-// One-shot specific lense
-const verificationLens = defineThinkingLens({
-  name: 'verification',
-  trigger: 'When evaluating progress or considering completion',
-  description: 'What is your verification plan? Have all checks been defined? Have they been run? What evidence do you have that each requirement is met?',
+const pivotLens = defineThinkingLens({
+  name: 'pivot',
+  trigger: 'When an approach is not making progress or results are unexpected',
+  description:
+    'Is my current approach working? Are my subagents stuck or spinning? Should I try a different strategy, parallelize an alternative, or cut losses on this path? What signals indicate I should change direction?',
 })
 
-export const oneshotThinkingLenses = [phaseLens, ideateLens, strategyLens, verificationLens, turnLens]
+const validationLens = defineThinkingLens({
+  name: 'validation',
+  trigger: 'When evaluating whether work is complete or results are acceptable',
+  description:
+    'Have I empirically tested my complete solution, not just individual pieces? Are there edge cases or details I haven\'t checked? Am I accepting results that look wrong or suspicious?',
+})
+
+export const oneshotThinkingLenses = [constraintsLens, pivotLens, strategyLens, validationLens, turnLens]
 
 export const createOrchestrator = (systemPrompt: string) => {
   const tools = toolSet({
