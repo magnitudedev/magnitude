@@ -228,10 +228,7 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
           void exit(0)
           return
         }
-        if (isRoot && !event.result.success && !event.result.cancelled) {
-          void exit(1)
-          return
-        }
+
         break
       }
 
