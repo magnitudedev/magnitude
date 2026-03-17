@@ -107,13 +107,15 @@ export const AgentsView = memo(function AgentsView({
             />
           )
         } else if (item.type === 'agents_view_activity_start') {
+          const startItem = item as AgentsViewActivityStartItem
+          const activeEntry = activeActivityIds.get(startItem.forkId)
           rendered = (
             <AgentActivityLine
               key={item.id}
-              item={item as AgentsViewActivityStartItem}
+              item={startItem}
               onForkExpand={onForkExpand}
               lanes={itemLanes}
-              activeEntry={activeActivityIds.get((item as AgentsViewActivityStartItem).forkId)}
+              activeEntry={activeEntry?.itemId === startItem.id ? activeEntry : undefined}
             />
           )
         } else if (item.type === 'agents_view_activity_end') {

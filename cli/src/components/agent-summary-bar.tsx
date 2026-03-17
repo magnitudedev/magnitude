@@ -30,8 +30,8 @@ function sweepColors(name: string, sweepPos: number, baseColor: string, pulse: s
   })
 }
 
-function formatElapsed(startedAt: number): string {
-  const seconds = Math.floor((Date.now() - startedAt) / 1000)
+function formatElapsed(startedAt: number, priorElapsedMs = 0): string {
+  const seconds = Math.floor((Date.now() - startedAt + priorElapsedMs) / 1000)
   if (seconds < 60) return `${seconds}s`
   const m = Math.floor(seconds / 60)
   const s = seconds % 60
@@ -134,7 +134,7 @@ const ArtifactChip = memo(function ArtifactChip({
 const RunningAgentChip = memo(function RunningAgentChip({ item, isBlinking }: { item: AgentsViewActivityStartItem; isBlinking: boolean }) {
   const [pulseIndex, setPulseIndex] = useState(0)
   const [sweepPos, setSweepPos] = useState(0)
-  const [elapsed, setElapsed] = useState(() => formatElapsed(item.startedAt))
+  const [elapsed, setElapsed] = useState(() => formatElapsed(item.startedAt, item.priorElapsedMs ?? 0))
   const pulseRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const sweepRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -157,11 +157,11 @@ const RunningAgentChip = memo(function RunningAgentChip({ item, isBlinking }: { 
   }, [])
 
   useEffect(() => {
-    const update = () => setElapsed(formatElapsed(item.startedAt))
+    const update = () => setElapsed(formatElapsed(item.startedAt, item.priorElapsedMs ?? 0))
     update()
     timerRef.current = setInterval(update, 1000)
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [item.startedAt])
+  }, [item.startedAt, item.priorElapsedMs])
 
   const nameColors = isBlinking
     ? Array.from(item.agentName, () => blinkOn ? palette.pulse[0]! : palette.border)
@@ -173,7 +173,7 @@ const RunningAgentChip = memo(function RunningAgentChip({ item, isBlinking }: { 
       {Array.from(item.agentName).map((ch, i) => (
         <span key={i} fg={nameColors[i]} attributes={isBlinking && blinkOn ? TextAttributes.BOLD : TextAttributes.NONE}>{ch}</span>
       ))}
-      <span fg={'#888888'}>{' '}{elapsed}{'  '}</span>
+      <span fg={'#888888'}>{' '}{elapsed}{item.isResume ? ' (resumed)' : ''}{'  '}</span>
     </text>
   )
 })
@@ -197,16 +197,16 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
 
   const items = agentsViewState.items
 
-  // Derive running agents
-  const runningForkIds = new Set<string>()
+  // Derive running agents from active item ids (one chip per active run)
+  const startItemsById = new Map<string, AgentsViewActivityStartItem>()
   for (const item of items) {
-    if (item.type === 'agents_view_activity_start') runningForkIds.add(item.forkId)
-    if (item.type === 'agents_view_activity_end') runningForkIds.delete(item.forkId)
+    if (item.type === 'agents_view_activity_start') {
+      startItemsById.set(item.id, item)
+    }
   }
-  const runningAgents = items.filter(
-    (item): item is AgentsViewActivityStartItem =>
-      item.type === 'agents_view_activity_start' && runningForkIds.has(item.forkId)
-  )
+  const runningAgents = Array.from(agentsViewState.activeActivityIds.values())
+    .map(entry => startItemsById.get(entry.itemId))
+    .filter((item): item is AgentsViewActivityStartItem => item !== undefined)
 
   // Derive last message
   const lastMessage = [...items].reverse().find(
@@ -241,15 +241,15 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
   }, [lastMessageKey])
 
   // Track agent blink
-  const runningAgentsKey = runningAgents.map(a => a.forkId).join('|')
-  const prevRunningForkIdsRef = useRef<Set<string>>(new Set())
+  const runningAgentsKey = runningAgents.map(a => a.id).join('|')
+  const prevRunningAgentIdsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
-    const currentIds = new Set(runningAgents.map(a => a.forkId))
+    const currentIds = new Set(runningAgents.map(a => a.id))
     const newIds = new Set<string>()
     for (const id of currentIds) {
-      if (!prevRunningForkIdsRef.current.has(id)) newIds.add(id)
+      if (!prevRunningAgentIdsRef.current.has(id)) newIds.add(id)
     }
-    prevRunningForkIdsRef.current = currentIds
+    prevRunningAgentIdsRef.current = currentIds
 
     if (newIds.size > 0) {
       setBlinkingAgents(prev => {
@@ -316,7 +316,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
           ) : (
             <box style={{ flexDirection: 'row', overflow: 'hidden' }}>
               {runningAgents.map(agent => (
-                <RunningAgentChip key={agent.forkId} item={agent} isBlinking={blinkingAgents.has(agent.forkId)} />
+                <RunningAgentChip key={agent.id} item={agent} isBlinking={blinkingAgents.has(agent.id)} />
               ))}
             </box>
           )}
@@ -419,7 +419,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
         ) : (
           <box style={{ flexDirection: 'row', overflow: 'hidden' }}>
             {runningAgents.map(agent => (
-              <RunningAgentChip key={agent.forkId} item={agent} isBlinking={blinkingAgents.has(agent.forkId)} />
+              <RunningAgentChip key={agent.id} item={agent} isBlinking={blinkingAgents.has(agent.id)} />
             ))}
           </box>
         )}
