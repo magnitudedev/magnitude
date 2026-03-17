@@ -50,13 +50,18 @@ export const AgentArtifactEvent = memo(function AgentArtifactEvent({
   const previewLines = useMemo(() => {
     if (!liveContent) return []
     const lines = liveContent.split('\n').filter(l => l.trim().length > 0)
-    return lines.slice(-2)
+    // Gutter: lanes*2+1 (or 2 if no lanes) + pipe "│ " (2) + scrollbox padding (3)
+    const gutterWidth = lanes.length > 0 ? lanes.length * 2 + 1 : 2
+    const reservedWidth = gutterWidth + 2 + 3
+    const maxWidth = Math.max(20, (process.stdout.columns ?? 80) - reservedWidth)
+    return lines.slice(-2).map(l => l.length > maxWidth ? l.slice(0, maxWidth) + '…' : l)
   }, [liveContent])
 
   return (
     <box style={{ flexDirection: 'row', alignItems: 'stretch' }}>
       <LaneGutter lanes={lanes} />
-      <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+      <box style={{ flexGrow: 1, minWidth: 0 }}>
+      <box style={{ flexDirection: 'column' }}>
         <box
           style={{
             flexDirection: 'row',
@@ -84,6 +89,7 @@ export const AgentArtifactEvent = memo(function AgentArtifactEvent({
             <text style={{ flexShrink: 1, fg: theme.muted, wrapMode: 'none', overflow: 'hidden' }}>{line}</text>
           </box>
         ))}
+      </box>
       </box>
     </box>
   )
