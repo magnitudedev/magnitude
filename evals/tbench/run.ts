@@ -20,6 +20,11 @@ type TaskInfo = {
 
 type TaskMode = 'specific' | 'all' | 'easy' | 'medium' | 'hard'
 
+export type RunOptions = {
+  concurrency: number
+  trials: number
+}
+
 // Harbor result.json types
 type HarborJobResult = {
   id: string
@@ -82,21 +87,7 @@ const TASKS_ROOT = path.join(os.homedir(), '.cache/harbor/tasks')
 const POLL_MS = 500
 const TAIL_POLL_MS = 300
 
-function printHelp() {
-  console.log(`Magnitude TB2 Runner
 
-Usage:
-  bun run evals/tbench/run.ts [-c <concurrency>]
-
-Interactive wrapper around:
-  harbor run -d terminal-bench@2.0 --agent-import-path evals.tbench.magnitude_agent:MagnitudeAgent ...
-
-Prerequisites:
-  - evals/tbench/bin/magnitude built
-  - harbor on PATH
-  - Docker running
-  - terminal-bench@2.0 dataset downloaded`)
-}
 
 function normalizeDifficulty(value: unknown): Difficulty {
   if (typeof value !== 'string') return 'unknown'
@@ -163,7 +154,7 @@ function countByDifficulty(tasks: TaskInfo[]) {
   }
 }
 
-function commandForRun(model: string, selectedTasks: string[], concurrency: number) {
+function commandForRun(model: string, selectedTasks: string[], concurrency: number, trials: number) {
   const args = [
     'harbor',
     'run',
@@ -180,6 +171,7 @@ function commandForRun(model: string, selectedTasks: string[], concurrency: numb
   }
 
   args.push('-n', String(concurrency))
+  args.push('-k', String(trials))
   args.push('-q')
   return args
 }
@@ -432,11 +424,9 @@ function buildSpecificTaskOptions(tasks: TaskInfo[]) {
   return options
 }
 
-export async function main() {
-  if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    printHelp()
-    return
-  }
+export async function main(options: Partial<RunOptions> = {}) {
+  const concurrency = options.concurrency ?? 1
+  const trials = options.trials ?? 1
 
   clack.intro(ansis.bold('Magnitude TB2 Runner'))
 
@@ -521,11 +511,7 @@ export async function main() {
     process.exit(1)
   }
 
-  const concurrencyFlag = process.argv.indexOf('-c')
-  const concurrency = concurrencyFlag !== -1 && process.argv[concurrencyFlag + 1]
-    ? Number.parseInt(process.argv[concurrencyFlag + 1]!, 10) || 1
-    : 1
-  const commandArgs = commandForRun(model as string, selectedTasks.map(task => task.name), concurrency)
+  const commandArgs = commandForRun(model as string, selectedTasks.map(task => task.name), concurrency, trials)
 
   console.log()
   console.log(ansis.bold('Ready to run'))
@@ -540,6 +526,7 @@ export async function main() {
     }`,
   )
   if (concurrency > 1) console.log(`  Concurrency: ${concurrency}`)
+  if (trials > 1) console.log(`  Trials:      ${trials}`)
   console.log()
   console.log(ansis.dim(renderCommand(commandArgs)))
   console.log()
