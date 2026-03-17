@@ -242,7 +242,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
 
   // Track agent blink
   const runningAgentsKey = runningAgents.map(a => a.forkId).join('|')
-  const prevRunningForkIdsRef = useRef<Set<string>>(new Set(runningAgents.map(a => a.forkId)))
+  const prevRunningForkIdsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     const currentIds = new Set(runningAgents.map(a => a.forkId))
     const newIds = new Set<string>()
@@ -271,7 +271,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
 
   // Track artifact blink
   const artifactsIdentityKey = artifacts.map(a => a.id).join('|')
-  const prevArtifactIdsRef = useRef<Set<string>>(new Set(artifacts.map(a => a.id)))
+  const prevArtifactIdsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     const currentIds = new Set(artifacts.map(a => a.id))
     const newArtifactNames = new Set<string>()
