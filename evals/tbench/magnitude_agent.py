@@ -65,6 +65,7 @@ class MagnitudeAgent(BaseInstalledAgent):
             "--disable-cwd-safeguards",
             "--provider", shlex.quote(provider),
             "--model", shlex.quote(model),
+            "--",
             escaped,
         ]) + " 2>&1 | tee /logs/agent/magnitude.txt"
 
