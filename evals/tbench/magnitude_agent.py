@@ -29,6 +29,9 @@ class MagnitudeAgent(BaseInstalledAgent):
         )
         await environment.exec(command="chmod +x /usr/local/bin/magnitude")
 
+        # Ensure CA certificates are available for SSL verification
+        await environment.exec(command="apt-get update -qq && apt-get install -y -qq ca-certificates >/dev/null 2>&1 || true")
+
         # Upload OAuth credentials if available (for Claude Pro/Max, ChatGPT Plus/Pro, etc.)
         auth_path = Path.home() / ".magnitude" / "auth.json"
         if auth_path.exists():

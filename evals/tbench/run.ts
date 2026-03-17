@@ -76,7 +76,7 @@ type TaskToml = {
   }
 }
 
-const MODELS = ['anthropic/claude-sonnet-4-6'] as const
+const MODELS = ['anthropic/claude-sonnet-4-6', 'openai/gpt-5.4', 'openai/gpt-5.3-codex', 'openai/gpt-5.3-codex-spark'] as const
 const JOBS_DIR = path.join(process.cwd(), 'jobs')
 const TASKS_ROOT = path.join(os.homedir(), '.cache/harbor/tasks')
 const POLL_MS = 500
