@@ -1895,6 +1895,7 @@ function AppInner({
             <box style={{ flexGrow: 1, minWidth: 0 }}>
               <AgentsView
                 items={agentsViewState?.items ?? []}
+                activeActivityIds={agentsViewState?.activeActivityIds ?? new Map()}
                 onForkExpand={pushForkOverlay}
                 onArtifactClick={handleArtifactClick}
                 scrollboxRef={agentsScrollboxRef}

@@ -375,6 +375,28 @@ export const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
   commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
 }
 
+export function addToolCounts(
+  a: ForkActivityToolCounts,
+  b: ForkActivityToolCounts
+): ForkActivityToolCounts {
+  return {
+    reads: a.reads + b.reads,
+    writes: a.writes + b.writes,
+    edits: a.edits + b.edits,
+    commands: a.commands + b.commands,
+    webSearches: a.webSearches + b.webSearches,
+    webFetches: a.webFetches + b.webFetches,
+    artifactWrites: a.artifactWrites + b.artifactWrites,
+    artifactUpdates: a.artifactUpdates + b.artifactUpdates,
+    searches: a.searches + b.searches,
+    clicks: a.clicks + b.clicks,
+    navigations: a.navigations + b.navigations,
+    inputs: a.inputs + b.inputs,
+    evaluations: a.evaluations + b.evaluations,
+    other: a.other + b.other,
+  }
+}
+
 export function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
   switch (toolKey) {
     case 'shell': return { ...counts, commands: counts.commands + 1 }

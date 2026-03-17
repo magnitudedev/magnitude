@@ -1,13 +1,13 @@
 import React, { memo, Fragment } from 'react'
-import type { AgentsViewItem, AgentsViewMessageItem, AgentsViewActivityStartItem, AgentsViewActivityEndItem, AgentsViewArtifactItem } from '@magnitudedev/agent'
+import type { AgentsViewItem, AgentsViewMessageItem, AgentsViewActivityStartItem, AgentsViewActivityEndItem, AgentsViewArtifactItem, ActiveActivityEntry } from '@magnitudedev/agent'
 import { AgentMessageBubble } from './agent-message-bubble'
 import { AgentActivityLine } from './agent-activity-line'
-import { AgentActivityEndLine } from './agent-activity-end-line'
 import { AgentArtifactEvent } from './agent-artifact-event'
 import { LaneGutter, type LaneEntry } from './lane-gutter'
 
 interface AgentsViewProps {
   items: readonly AgentsViewItem[]
+  activeActivityIds: ReadonlyMap<string, ActiveActivityEntry>
   onForkExpand: (forkId: string) => void
   onArtifactClick: (name: string, section?: string) => void
   onViewAgents?: () => void
@@ -37,14 +37,12 @@ function computeLanes(items: readonly AgentsViewItem[]): LaneEntry[][] {
 
 export const AgentsView = memo(function AgentsView({
   items,
+  activeActivityIds,
   onForkExpand,
   onArtifactClick,
   scrollboxRef,
 }: AgentsViewProps) {
   const lanes = computeLanes(items)
-  const finishedForkIds = new Set(
-    items.filter(i => i.type === 'agents_view_activity_end').map(i => (i as AgentsViewActivityEndItem).forkId)
-  )
 
   if (items.length === 0) {
     return (
@@ -113,18 +111,11 @@ export const AgentsView = memo(function AgentsView({
               item={item as AgentsViewActivityStartItem}
               onForkExpand={onForkExpand}
               lanes={itemLanes}
-              isFinished={finishedForkIds.has((item as AgentsViewActivityStartItem).forkId)}
+              activeEntry={activeActivityIds.get((item as AgentsViewActivityStartItem).forkId)}
             />
           )
         } else if (item.type === 'agents_view_activity_end') {
-          rendered = (
-            <AgentActivityEndLine
-              key={item.id}
-              item={item as AgentsViewActivityEndItem}
-              onForkExpand={onForkExpand}
-              lanes={itemLanes}
-            />
-          )
+          rendered = null  // kept for lane computation, not rendered
         } else if (item.type === 'agents_view_artifact') {
           rendered = (
             <AgentArtifactEvent
