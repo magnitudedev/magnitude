@@ -1,0 +1,65 @@
+You are participating in a syntax comparison experiment.
+
+Grammar:
+response := <turn> lenses declare tool+ terminal </turn>
+         | <turn> lenses conclude </turn>
+lenses   := <lenses> lens+ </lenses>
+declare  := <declare> text </declare>
+terminal := <observe/> | <conclude> text </conclude>
+
+
+Produce exactly one turn in wrapped XML v2 format. Follow this grammar and rules exactly.
+
+Grammar:
+<turn>
+<lenses>
+  <lens name="intent">...</lens>
+  <lens name="state">...</lens>
+  <lens name="strategy">...</lens>
+</lenses>
+<declare>intent</declare>
+zero or more tool calls
+<observe/> OR <conclude>message</conclude>
+</turn>
+
+Tools:
+<read path="..."/>
+<write path="...">content</write>
+<edit path="..."><old>...</old><new>...</new></edit>
+<search path="..." pattern="..."/>
+<run>command</run>
+<tree path="..."/>
+
+Observation:
+- Any tool may include observe="filter"
+- If you need tool results before continuing, add observe="filter" to the tool and end with <observe/>
+- Tool results arrive next turn, so do not report tool results in the same turn
+
+Turn behavior:
+- Use exactly one outer <turn>...</turn>
+- Use exactly one <lenses> block inside it
+- For tasks requiring file contents, search results, command output, or other observations, use <declare>...</declare>, call tools with observe="...", then end with <observe/>
+- For fire-and-forget writes/edits that do not need results, end with <conclude>...</conclude>
+- For direct answers that need no tools, you may omit tools and use <conclude>...</conclude>
+
+Important:
+- Content is literal, no HTML entity escaping
+- Return only the XML turn, with no prose around it
+
+Anti-example (wrong because it simulates multiple turns in one response):
+<turn>
+<lenses>
+  <lens name="intent">Read then answer</lens>
+</lenses>
+<declare>Reading config</declare>
+<read path="config.json" observe=".content"/>
+<observe/>
+</turn>
+<turn>
+<lenses>
+  <lens name="intent">Now answer</lens>
+</lenses>
+<conclude>The file says ...</conclude>
+</turn>
+
+That is invalid because a response must contain exactly one <turn>.

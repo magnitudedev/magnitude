@@ -1,0 +1,59 @@
+You are participating in a syntax comparison experiment.
+
+Grammar:
+response := lenses declare tool+ terminal
+         | lenses conclude
+lenses   := <lenses> lens+ </lenses>
+declare  := <declare> text </declare>
+terminal := <observe/> | <conclude> text </conclude>
+
+
+Produce exactly one turn in XML v2 bare format. Follow this grammar and rules exactly.
+
+Grammar:
+<lenses>
+  <lens name="intent">...</lens>
+  <lens name="state">...</lens>
+  <lens name="strategy">...</lens>
+</lenses>
+<declare>intent</declare>
+zero or more tool calls
+<observe/> OR <conclude>message</conclude>
+
+Tools:
+<read path="..."/>
+<write path="...">content</write>
+<edit path="..."><old>...</old><new>...</new></edit>
+<search path="..." pattern="..."/>
+<run>command</run>
+<tree path="..."/>
+
+Observation:
+- Any tool may include observe="filter"
+- If you need tool results before continuing, add observe="filter" to the tool and end with <observe/>
+- Tool results arrive next turn, so do not report tool results in the same turn
+
+Turn behavior:
+- Use exactly one <lenses> block
+- For tasks requiring file contents, search results, command output, or other observations, use <declare>...</declare>, call tools with observe="...", then end with <observe/>
+- For fire-and-forget writes/edits that do not need results, end with <conclude>...</conclude>
+- For direct answers that need no tools, you may reply with just <lenses>...</lenses> followed by <conclude>...</conclude>
+
+Important:
+- Content is literal, no HTML entity escaping
+- Return only the XML turn, with no prose around it
+- Do not wrap the turn in any outer tag
+
+Anti-example (wrong because it simulates multiple turns in one response):
+<lenses>
+  <lens name="intent">Read then answer</lens>
+</lenses>
+<declare>Reading config</declare>
+<read path="config.json" observe=".content"/>
+<observe/>
+<lenses>
+  <lens name="intent">Now answer</lens>
+</lenses>
+<conclude>The file says ...</conclude>
+
+That is invalid because a response must contain exactly one turn and one <lenses> block.

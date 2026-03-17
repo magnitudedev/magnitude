@@ -1,0 +1,87 @@
+You are participating in a syntax comparison experiment.
+
+Grammar:
+response := <turn:work> lenses tool+ </turn:work>
+          | <turn:ask> lenses text </turn:ask>
+          | <turn:answer> lenses text </turn:answer>
+lenses   := <lenses> lens+ </lenses>
+
+
+Produce exactly one turn in typed XML v2 format. Follow this grammar and rules exactly.
+
+Grammar:
+<turn:work>
+<lenses>
+  <lens name="intent">...</lens>
+  <lens name="state">...</lens>
+  <lens name="strategy">...</lens>
+</lenses>
+zero or more tool calls
+</turn:work>
+
+OR
+
+<turn:ask>
+<lenses>
+  <lens name="intent">...</lens>
+  <lens name="state">...</lens>
+  <lens name="strategy">...</lens>
+</lenses>
+question for the user
+</turn:ask>
+
+OR
+
+<turn:answer>
+<lenses>
+  <lens name="intent">...</lens>
+  <lens name="state">...</lens>
+  <lens name="strategy">...</lens>
+</lenses>
+final answer for the user
+</turn:answer>
+
+Tools:
+<read path="..."/>
+<write path="...">content</write>
+<edit path="..."><old>...</old><new>...</new></edit>
+<search path="..." pattern="..."/>
+<run>command</run>
+<tree path="..."/>
+
+Observation:
+- Any tool may include observe="filter"
+- In <turn:work>, use observe="filter" on tools when you need results next turn
+- Tool results arrive next turn, so do not report tool results in the same turn
+- There are no <declare>, <observe/>, or <conclude> tags in this format
+- The turn type itself carries the meaning:
+  - <turn:work> means continue after tools
+  - <turn:ask> means ask the user a question
+  - <turn:answer> means provide the final answer
+
+Turn behavior:
+- Use exactly one of <turn:work>, <turn:ask>, or <turn:answer>
+- Use exactly one <lenses> block inside it
+- For tasks requiring file contents, search results, command output, or other observations, use <turn:work> with tools and observe="..."
+- For fire-and-forget writes/edits that do not need results, still use <turn:work> with the tool calls
+- For direct answers that need no tools, use <turn:answer>
+
+Important:
+- Content is literal, no HTML entity escaping
+- Return only the XML turn, with no prose around it
+
+Anti-example (wrong because it simulates multiple turns in one response):
+<turn:work>
+<lenses>
+  <lens name="intent">Read then answer</lens>
+</lenses>
+<read path="config.json" observe=".content"/>
+</turn:work>
+<turn:answer>
+<lenses>
+  <lens name="intent">Now answer</lens>
+</lenses>
+The file says ...
+</turn:answer>
+
+That is invalid because a response must contain exactly one turn and one <lenses> block.

@@ -1,0 +1,112 @@
+// Grammar for a single xml-act turn.
+// Structure: optional <lenses>, optional <comms>, optional <actions>, then <next/> or <yield/>.
+// The grammar is intentionally practical and permissive about whitespace.
+
+start: ws? turn ws?
+
+turn: lenses_block comms_block actions_block turn_control
+
+// --------------------
+// Lenses
+// --------------------
+
+lenses_block: OPEN_LENSES ws? lens* CLOSE_LENSES
+
+lens: LENS_OPEN ws? NAME_ATTR ws? EQ ws? quoted_string ws? TAG_END lens_body LENS_CLOSE
+
+lens_body: text*
+
+// --------------------
+// Comms
+// --------------------
+
+comms_block: OPEN_COMMS ws? message* CLOSE_COMMS
+
+message: MESSAGE_OPEN (ws message_attr)* ws? TAG_END message_body MESSAGE_CLOSE
+
+message_attr: TO_ATTR ws? EQ ws? quoted_string
+
+message_body: text*
+
+// --------------------
+// Actions
+// --------------------
+
+actions_block: OPEN_ACTIONS ws? action_item* CLOSE_ACTIONS
+
+?action_item: tool_call
+            | inspect_block
+            | ws
+
+inspect_block: INSPECT_OPEN ws? ref* INSPECT_CLOSE
+
+ref: REF_OPEN (ws ref_attr)* ws? SELF_CLOSE
+
+ref_attr: TOOL_ATTR ws? EQ ws? quoted_string
+        | QUERY_ATTR ws? EQ ws? quoted_string
+
+// Generic tool calls inside <actions>.
+// Bodies are free-form text (no nested tags), matching the requested simplified model.
+tool_call: tool_open tool_body tool_close
+         | tool_self_closing
+
+tool_open: "<" TOOL_TAG_NAME (ws generic_attr)* ws? TAG_END
+tool_close: "</" TOOL_TAG_NAME ">"
+tool_self_closing: "<" TOOL_TAG_NAME (ws generic_attr)* ws? SELF_CLOSE
+
+generic_attr: ATTR_NAME ws? EQ ws? quoted_string
+
+tool_body: text*
+
+// --------------------
+// Turn control
+// --------------------
+
+turn_control: NEXT | YIELD
+
+// --------------------
+// Atoms
+// --------------------
+
+quoted_string: DQ_STRING | SQ_STRING
+text: TEXT
+ws: WS
+
+OPEN_LENSES: "<lenses>"
+CLOSE_LENSES: "</lenses>"
+OPEN_COMMS: "<comms>"
+CLOSE_COMMS: "</comms>"
+OPEN_ACTIONS: "<actions>"
+CLOSE_ACTIONS: "</actions>"
+
+LENS_OPEN: "<lens"
+LENS_CLOSE: "</lens>"
+MESSAGE_OPEN: "<message"
+MESSAGE_CLOSE: "</message>"
+INSPECT_OPEN: "<inspect>"
+INSPECT_CLOSE: "</inspect>"
+REF_OPEN: "<ref"
+
+NEXT: "<next/>"
+YIELD: "<yield/>"
+
+NAME_ATTR: "name"
+TO_ATTR: "to"
+TOOL_ATTR: "tool"
+QUERY_ATTR: "query"
+
+// Tool tag names — add more as needed for your tool set
+TOOL_TAG_NAME: "shell" | "fs-read" | "fs-write" | "fs-tree" | "fs-search" | "edit" | "web-fetch" | "web-search" | "artifact-read" | "artifact-write" | "artifact-update" | "artifact-sync" | "agent-create" | "agent-pause" | "agent-dismiss"
+ATTR_NAME: /[A-Za-z_][A-Za-z0-9_:-]*/
+
+TAG_END: ">"
+SELF_CLOSE: "/>"
+EQ: "="
+
+DQ_STRING: /"[^"]*"/
+SQ_STRING: /'[^']*'/
+
+// Free-form text content: any characters except '<'
+TEXT: /[^<]+/
+
+WS: /[ \t\r\n]+/

@@ -21,6 +21,20 @@ export const CodingAgentChat: StreamingFn<
     ),
 }
 
+export const SimpleChat: StreamingFn<
+  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] } },
+  ChatStream
+> = {
+  name: 'SimpleChat',
+  mode: 'stream',
+  execute: (model, input) =>
+    model.stream(
+      'SimpleChat',
+      [input.systemPrompt, input.messages],
+      { stopSequences: input.options?.stopSequences },
+    ),
+}
+
 export const CodingAgentCompact: CompleteFn<
   { systemPrompt: string; messages: ChatMessage[] },
   { text: string; usage: CallUsage }

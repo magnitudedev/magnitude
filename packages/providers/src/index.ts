@@ -30,6 +30,7 @@ export type { BoundModel, ChatStream, ModelFunctionDef, StreamingFn, CompleteFn 
 // Model functions
 export {
   CodingAgentChat,
+  SimpleChat,
   CodingAgentCompact,
   GenerateChatTitle,
   ExtractMemoryDiff,

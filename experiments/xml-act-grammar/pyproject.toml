@@ -1,0 +1,15 @@
+[project]
+name = "xml-act-grammar"
+version = "0.1.0"
+description = "Grammar-constrained xml-act generation experiment"
+requires-python = ">=3.11"
+dependencies = [
+  "outlines[mlxlm]",
+  "llguidance",
+]
+
+[project.optional-dependencies]
+server = [
+  "fastapi",
+  "uvicorn",
+]
