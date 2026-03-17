@@ -86,6 +86,12 @@ class MagnitudeAgent(BaseInstalledAgent):
             if val:
                 env[key] = val
 
+        # Forward BAML/Boundary env vars if present
+        for key in ["BOUNDARY_PROJECT_ID", "BOUNDARY_SECRET", "BOUNDARY_API_KEY"]:
+            val = os.environ.get(key, "")
+            if val:
+                env[key] = val
+
         return [ExecInput(command=cmd, env=env)]
 
     def populate_context_post_run(self, context: AgentContext) -> None:

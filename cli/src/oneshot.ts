@@ -153,6 +153,7 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
 
   const agentNames = new Map<string, string>()
   const agentRoles = new Map<string, string>()
+  const activeLensContent = new Map<string | null, string>()
   const pendingAgents: Array<{ forkId: string; role: string; name: string }> = []
   const shownAgents = new Set<string>()
   let lastForkId: string | null | undefined = undefined
@@ -217,6 +218,21 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
     switch (event.type) {
       case 'turn_started':
         break
+
+      case 'lens_start':
+        activeLensContent.set(event.forkId, '')
+        break
+
+      case 'lens_chunk':
+        activeLensContent.set(event.forkId, (activeLensContent.get(event.forkId) ?? '') + event.text)
+        break
+
+      case 'lens_end': {
+        const content = (activeLensContent.get(event.forkId) ?? '').trim()
+        line(dim(`[${event.name}] ${content}`))
+        activeLensContent.delete(event.forkId)
+        break
+      }
 
       case 'turn_completed': {
         const isRoot = event.forkId === null
