@@ -59,6 +59,22 @@ const turnLens = defineThinkingLens({
   description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
 })
 
+// One-shot specific lense
+const phaseLens = defineThinkingLens({
+  name: 'phase',
+  trigger: 'Every turn',
+  description: 'Where are you in the execution protocol? What has been completed and what remains? Have you satisfied the criteria to move to the next phase?',
+})
+
+// One-shot specific lense
+const verificationLens = defineThinkingLens({
+  name: 'verification',
+  trigger: 'When evaluating progress or considering completion',
+  description: 'What is your verification plan? Have all checks been defined? Have they been run? What evidence do you have that each requirement is met?',
+})
+
+export const oneshotThinkingLenses = [phaseLens, ideateLens, strategyLens, verificationLens, turnLens]
+
 export const createOrchestrator = (systemPrompt: string) => {
   const tools = toolSet({
     think:                 thinkTool,

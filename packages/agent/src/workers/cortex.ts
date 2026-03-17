@@ -44,6 +44,7 @@ import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-st
 import { WorkingStateProjection } from '../projections/working-state'
 import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, ORCHESTRATOR_ONESHOT_PROMPT, type AgentVariant } from '../agents'
+import { oneshotThinkingLenses } from '../agents/orchestrator'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
 import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
@@ -103,10 +104,11 @@ function buildXmlActSystemPrompt(
   implicitTools: readonly string[] = ['think'],
   defaultRecipient = 'user',
   role: 'orchestrator' | 'subagent' | 'oneshot' = 'orchestrator',
+  lenses = agentDef.thinkingLenses,
 ): string {
   const toolDocs = generateXmlActToolDocs(agentDef, implicitTools)
   return roleDescription
-    .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol(defaultRecipient, agentDef.thinkingLenses, role))
+    .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol(defaultRecipient, lenses, role))
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBasePrompt)
 }
@@ -179,6 +181,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               implicitTools,
               'user',
               isOneshot ? 'oneshot' : 'orchestrator',
+              isOneshot ? oneshotThinkingLenses : agentDef.thinkingLenses,
             )
           : buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'parent', 'subagent')
 

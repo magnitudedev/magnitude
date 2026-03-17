@@ -171,7 +171,8 @@ export interface TurnCompleted {
 export type TurnDecision = 'continue' | 'yield' | 'finish'
 
 export type TurnResult =
-  | { readonly success: true; readonly turnDecision: TurnDecision; readonly reminder?: string }
+  | { readonly success: true; readonly turnDecision: 'continue' | 'yield'; readonly reminder?: string }
+  | { readonly success: true; readonly turnDecision: 'finish'; readonly reminder?: string; readonly evidence: string }
   | { readonly success: false; readonly error: string; readonly cancelled: boolean }
 
 // Turn unexpected error (irrecoverable - e.g. LLM connection failure after all retries)
@@ -460,8 +461,15 @@ export interface UserReturnConfirmed {
 
 
 
+export interface OneshotTask {
+  readonly type: 'oneshot_task'
+  readonly forkId: null
+  readonly prompt: string
+}
+
 export type AppEvent =
   | SessionInitialized
+  | OneshotTask
   | UserMessage
   | ObservationsCaptured
   | FileMentionResolved

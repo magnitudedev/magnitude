@@ -14,11 +14,14 @@ Use when:
 - You've dispatched subagents and need their results before continuing
 - You are blocked on subagent output
 
-`<{{TURN_CONTROL_FINISH}}/>`: Declare the task fully and verifiably complete
-Use when:
-- You have completed the task AND empirically verified completion
-- All verification checks have passed
-- You are confident the result satisfies the original prompt
+`<{{TURN_CONTROL_FINISH}}>`: Declare the task fully and verifiably complete
+Provide a summary of verification evidence as body content:
+
+<{{TURN_CONTROL_FINISH}}>
+- Requirement X: verified by running `npm test` (all 42 tests pass)
+- Requirement Y: confirmed by reading back src/foo.ts (lines 10-20 match spec)
+- Build: `npm run build` exits 0
+</{{TURN_CONTROL_FINISH}}>
 
 Do NOT use finish if any verification step failed or was skipped.
 Do NOT yield when no subagents are active — either continue working or finish.

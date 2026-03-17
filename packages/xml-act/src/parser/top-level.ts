@@ -90,6 +90,13 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     state.push({ _tag: 'Think', think: { tagName, body: '', depth: 0, openPrefix: null, openAfterNewline: false, lastCharNewline: false, about, lenses: [], activeLens: null }, pendingLt: false })
     return events
   }
+  if (tagName === kw.finish) {
+    if (containerDepth(state, 'Actions') > 0) events.push(...autoCloseContainer(state, 'Actions'))
+    else if (containerDepth(state, 'Comms') > 0) events.push(...autoCloseContainer(state, 'Comms'))
+    events.push(...endProseBlock(state))
+    state.push({ _tag: 'FinishBody', body: '', pendingLt: false })
+    return events
+  }
   if (tagName === 'message') {
     events.push(...endProseBlock(state))
     const dest = typeof attrs.get('to') === 'string' ? String(attrs.get('to')) : config.defaultMessageDest
@@ -116,7 +123,12 @@ export function resolveSelfClose(state: ParseStack, tagName: string, toolCallId:
   if (tagName === kw.next || tagName === kw.yield || tagName === kw.finish) {
     if (containerDepth(state, 'Actions') > 0) events.push(...autoCloseContainer(state, 'Actions'))
     else if (containerDepth(state, 'Comms') > 0) events.push(...autoCloseContainer(state, 'Comms'))
-    events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : tagName === kw.yield ? 'yield' : 'finish' })
+    if (tagName === kw.finish) {
+      // Self-closing <finish/> is not allowed — evidence body is required
+      events.push({ _tag: 'ParseError', error: { _tag: 'FinishWithoutEvidence', detail: '<finish/> requires a body with verification evidence. Use <finish>your evidence here</finish> instead.' } })
+    } else {
+      events.push({ _tag: 'TurnControl', decision: tagName === kw.next ? 'continue' : 'yield' })
+    }
     state.push({ _tag: 'Done' })
     return events
   }

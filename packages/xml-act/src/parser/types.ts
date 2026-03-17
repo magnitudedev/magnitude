@@ -43,7 +43,8 @@ export type ParseEvent =
   | { readonly _tag: 'MessageTagOpen'; readonly id: string; readonly dest: string; readonly artifactsRaw: string | null }
   | { readonly _tag: 'MessageBodyChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageTagClose'; readonly id: string }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' | 'finish' }
+  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' }
+  | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
 export type StepResult =
@@ -94,11 +95,17 @@ export type TurnControlConflictDetail = {
   readonly detail: string
 }
 
+export type FinishWithoutEvidenceDetail = {
+  readonly _tag: 'FinishWithoutEvidence'
+  readonly detail: string
+}
+
 export type ParseErrorDetail =
   | ToolParseErrorDetail
   | UnclosedThinkDetail
   | UnclosedActionsDetail
   | TurnControlConflictDetail
+  | FinishWithoutEvidenceDetail
 
 export const enum FencePhase {
   LeadingWs,
@@ -196,6 +203,8 @@ export type ThinkClosePrefixMatchFrame = { readonly _tag: 'ThinkClosePrefixMatch
 export type PendingThinkCloseFrame = { readonly _tag: 'PendingThinkClose'; think: ThinkState; closeRaw: string }
 export type LensOpenPrefixMatchFrame = { readonly _tag: 'LensOpenPrefixMatch'; think: ThinkState; prefix: PrefixMatch }
 export type LensTagAttrsFrame = { readonly _tag: 'LensTagAttrs'; think: ThinkState; attrKey: string; attrValue: string; phase: 'key' | 'equals' | 'value'; nameAttr: string | null; pendingSlash: boolean }
+export type FinishBodyFrame = { _tag: 'FinishBody'; body: string; pendingLt: boolean }
+export type FinishClosePrefixMatchFrame = { _tag: 'FinishClosePrefixMatch'; body: string; prefix: { candidates: readonly string[]; matched: string; raw: string } }
 export type MessageBodyFrame = { readonly _tag: 'MessageBody'; id: string; dest: string; artifactsRaw: string | null; body: string; pendingLt: boolean; depth: number; pendingNewline: boolean }
 export type MessageOpenPrefixMatchFrame = { readonly _tag: 'MessageOpenPrefixMatch'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; prefix: PrefixMatch }
 export type MessageClosePrefixMatchFrame = { readonly _tag: 'MessageClosePrefixMatch'; id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean; prefix: PrefixMatch }
@@ -213,6 +222,8 @@ export type DoneFrame = { readonly _tag: 'Done' }
 
 export type StackFrame =
   | ProseFrame
+  | FinishBodyFrame
+  | FinishClosePrefixMatchFrame
   | ActionsFrame
   | CommsFrame
   | OpenPrefixMatchFrame

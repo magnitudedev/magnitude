@@ -128,6 +128,12 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
   line(`✓ ${dim('session initialized')}`)
   line('')
 
+  await client.send({
+    type: 'oneshot_task',
+    forkId: null,
+    prompt,
+  })
+
   // ---------------------------------------------------------------------------
   // Exit handling
   // ---------------------------------------------------------------------------
@@ -283,13 +289,4 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
   process.once('SIGINT', () => void exit(130))
   process.once('SIGTERM', () => void exit(130))
 
-  await client.send({
-    type: 'user_message',
-    forkId: null,
-    content: [{ type: 'text', text: prompt }],
-    attachments: [],
-    mode: 'text',
-    synthetic: false,
-    taskMode: true,
-  })
 }

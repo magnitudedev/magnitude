@@ -52,6 +52,10 @@ function getEventTimestamp(event: AppEvent): string {
 function toLine(index: number, event: AppEvent): string | null {
   const ts = getEventTimestamp(event)
   switch (event.type) {
+    case 'oneshot_task': {
+      return `[${index}] ${ts} oneshot_task\n${event.prompt}`
+    }
+
     case 'user_message': {
       const text = event.content
         .filter((c: any) => c.type === 'text')

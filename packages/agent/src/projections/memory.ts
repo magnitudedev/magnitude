@@ -205,6 +205,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return { ...fork, messages: [sessionMsg, ...fork.messages] }
     },
 
+    oneshot_task: ({ event, fork }) => {
+      const taskMessage: Message = {
+        type: 'session_context',
+        source: 'system',
+        content: textParts(
+          '<task>\nYou have been assigned the following task. Read it carefully — every detail, constraint, and requirement matters.\n\n<description>\n'
+          + event.prompt
+          + '\n</description>\n</task>'
+        ),
+      }
+      return {
+        ...fork,
+        messages: [...fork.messages, taskMessage],
+      }
+    },
+
     user_message: ({ event, fork }) => {
       const text = extractText(event.content)
       const attachments = (event.attachments ?? []).map(toCommsAttachment)

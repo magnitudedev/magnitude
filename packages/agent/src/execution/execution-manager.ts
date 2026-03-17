@@ -635,6 +635,8 @@ const makeExecutionManager = Effect.gen(function* () {
                 hasStructuralParseError = true
                 const msg = event.error._tag === 'UnclosedThink'
                   ? UNCLOSED_THINK_REMINDER
+                  : event.error._tag === 'FinishWithoutEvidence'
+                  ? event.error.detail
                   : UNCLOSED_ACTIONS_REMINDER
                 structuralParseErrorReminder = `<error>\n${msg}\n</error>`
                 break
@@ -663,7 +665,7 @@ const makeExecutionManager = Effect.gen(function* () {
                           : {}),
                     }
                   } else if (endResult.turnControl) {
-                    executionResult = { success: true, turnDecision: endResult.turnControl }
+                    executionResult = { success: true, turnDecision: endResult.turnControl, evidence: endResult.evidence }
                   } else {
                     const policyCtx = yield* policyCtxProvider.get
                     const turnResult = agentDef.getTurn({

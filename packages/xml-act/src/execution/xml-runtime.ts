@@ -688,7 +688,7 @@ function reactImpl(
       case 'TurnControl': {
         currentState = yield* emitAndFold(currentState, {
           _tag: 'TurnEnd',
-          result: { _tag: 'Success', turnControl: parseEvent.decision },
+          result: { _tag: 'Success', turnControl: parseEvent.decision, evidence: parseEvent.evidence },
         })
         break
       }
@@ -704,7 +704,7 @@ function reactImpl(
           break
         }
 
-        if (error._tag === 'TurnControlConflict') {
+        if (error._tag === 'TurnControlConflict' || error._tag === 'FinishWithoutEvidence') {
           currentState = yield* emitAndFold(currentState, {
             _tag: 'StructuralParseError',
             error,

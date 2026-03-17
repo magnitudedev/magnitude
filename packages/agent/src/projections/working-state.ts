@@ -69,6 +69,21 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
   },
 
   eventHandlers: {
+    oneshot_task: ({ event, fork, emit }) => {
+      const newFork: ForkWorkingState = {
+        ...fork,
+        willContinue: true,
+      }
+      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
+        emit.shouldTriggerChanged({
+          forkId: event.forkId,
+          shouldTrigger: shouldTrigger(newFork),
+          chainId: newFork.currentChainId,
+        })
+      }
+      return newFork
+    },
+
     user_message: ({ event, fork, emit }) => {
       const isQueued = fork.working
       const hasMentions = (event.attachments ?? []).some(attachment => attachment.type === 'mention')

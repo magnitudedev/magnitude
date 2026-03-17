@@ -17,6 +17,7 @@ import type { OutputNode } from './output-tree'
 import type {
   BaseToolParseErrorDetail,
   UnclosedThinkDetail,
+  FinishWithoutEvidenceDetail,
   UnclosedActionsDetail,
   TurnControlConflictDetail,
 } from './parser/types'
@@ -295,7 +296,7 @@ export interface ToolObservation {
 
 export interface StructuralParseError {
   readonly _tag: 'StructuralParseError'
-  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | TurnControlConflictDetail
+  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | TurnControlConflictDetail | FinishWithoutEvidenceDetail
 }
 
 
@@ -318,7 +319,8 @@ export type XmlToolResult<TOutput = unknown> =
   | { readonly _tag: 'Interrupted' }
 
 export type XmlExecutionResult =
-  | { readonly _tag: 'Success'; readonly turnControl: 'continue' | 'yield' | 'finish' | null }
+  | { readonly _tag: 'Success'; readonly turnControl: 'continue' | 'yield' | null }
+  | { readonly _tag: 'Success'; readonly turnControl: 'finish'; readonly evidence: string }
   | { readonly _tag: 'Failure'; readonly error: string }
   | { readonly _tag: 'Interrupted' }
   | { readonly _tag: 'GateRejected'; readonly rejection: unknown }

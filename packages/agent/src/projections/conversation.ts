@@ -44,6 +44,8 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
   },
 
   eventHandlers: {
+    oneshot_task: ({ state }) => state,
+
     user_message: ({ event, state }) => {
       // Only track root fork (orchestrator) conversation
       if (event.forkId !== null) return state

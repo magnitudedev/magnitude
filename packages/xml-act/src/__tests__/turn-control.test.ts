@@ -46,11 +46,21 @@ describe('basic turn control', () => {
     expect(tc[0].decision).toBe('yield')
   })
 
-  it('<finish/> emits finish decision', () => {
+  it('<finish/> without evidence emits ParseError', () => {
     const events = parse(`<${TURN_CONTROL_FINISH}/>`)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(0)
+    const errors = parseErrors(events)
+    expect(errors).toHaveLength(1)
+    expect(errors[0].error._tag).toBe('FinishWithoutEvidence')
+  })
+
+  it('<finish>evidence</finish> emits finish with evidence', () => {
+    const events = parse(`<${TURN_CONTROL_FINISH}>task verified</${TURN_CONTROL_FINISH}>`)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('finish')
+    expect((tc[0] as any).evidence).toBe('task verified')
   })
 
   it('<next/> char-by-char', () => {
@@ -67,11 +77,12 @@ describe('basic turn control', () => {
     expect(tc[0].decision).toBe('yield')
   })
 
-  it('<finish/> char-by-char', () => {
-    const events = parseCharByChar(`<${TURN_CONTROL_FINISH}/>`)
+  it('<finish>evidence</finish> char-by-char', () => {
+    const events = parseCharByChar(`<${TURN_CONTROL_FINISH}>all tests pass</${TURN_CONTROL_FINISH}>`)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('finish')
+    expect((tc[0] as any).evidence).toBe('all tests pass')
   })
 })
 
@@ -96,8 +107,8 @@ describe('turn control after content blocks', () => {
     expect(tc[0].decision).toBe('continue')
   })
 
-  it('after actions block with <finish/>', () => {
-    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n<${TURN_CONTROL_FINISH}/>`
+  it('after actions block with <finish>evidence</finish>', () => {
+    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n<${TURN_CONTROL_FINISH}>verified</${TURN_CONTROL_FINISH}>`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -162,13 +173,13 @@ describe('duplicate turn control tags', () => {
     expect(parseErrors(events)).toHaveLength(0)
   })
 
-  it('duplicate <finish/> — only one TurnControl event', () => {
+  it('duplicate <finish/> — emits ParseError, no TurnControl', () => {
     const xml = `<${TURN_CONTROL_FINISH}/>\n<${TURN_CONTROL_FINISH}/>`
     const events = parse(xml)
     const tc = turnControls(events)
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
-    expect(parseErrors(events)).toHaveLength(0)
+    expect(tc).toHaveLength(0)
+    const errors = parseErrors(events)
+    expect(errors.some(e => e.error._tag === 'FinishWithoutEvidence')).toBe(true)
   })
 
   it('<next/> then <yield/> — first wins', () => {
@@ -180,13 +191,11 @@ describe('duplicate turn control tags', () => {
     expect(parseErrors(events)).toHaveLength(0)
   })
 
-  it('<finish/> then <yield/> — first wins', () => {
+  it('<finish/> then <yield/> — finish errors, no turn control', () => {
     const xml = `<${TURN_CONTROL_FINISH}/>\n<${TURN_CONTROL_YIELD}/>`
     const events = parse(xml)
-    const tc = turnControls(events)
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
-    expect(parseErrors(events)).toHaveLength(0)
+    const errors = parseErrors(events)
+    expect(errors.some(e => e.error._tag === 'FinishWithoutEvidence')).toBe(true)
   })
 
   it('<next/> then <finish/> — first wins', () => {
@@ -238,8 +247,8 @@ describe('turn control inside blocks auto-closes and is recognized', () => {
     expect(tc[0].decision).toBe('yield')
   })
 
-  it('inside actions block with <finish/> — auto-closes and emits finish', () => {
-    const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_FINISH}/>\n${actionsTagClose()}`
+  it('inside actions block with <finish>evidence</finish> — auto-closes and emits finish', () => {
+    const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_FINISH}>verified</${TURN_CONTROL_FINISH}>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -279,8 +288,8 @@ describe('content after turn control is dropped', () => {
     expect(prose).toHaveLength(0)
   })
 
-  it('content after <finish/> is dropped', () => {
-    const xml = `<${TURN_CONTROL_FINISH}/>\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
+  it('content after <finish>evidence</finish> is dropped', () => {
+    const xml = `<${TURN_CONTROL_FINISH}>done</${TURN_CONTROL_FINISH}>\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)

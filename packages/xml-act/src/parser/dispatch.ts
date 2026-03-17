@@ -10,6 +10,7 @@ import { stepThink, stepThinkClosePrefixMatch, stepPendingThinkClose, stepLensOp
 import { stepMessageBody, stepMessageOpenPrefixMatch, stepMessageOpenTagTail, stepMessageClosePrefixMatch } from './message'
 import { stepToolBody, stepToolClosePrefixMatch, stepChildOpenPrefixMatch, stepChildAttrs, stepChildAttrValue, stepChildUnquotedAttrValue, stepChildBody, stepChildClosePrefixMatch } from './tool-body'
 import { stepOpenPrefixMatch, stepClosePrefixMatch, stepTagAttrs, stepTagAttrValue, stepTagUnquotedAttrValue, stepPendingStructuralOpen, stepPendingTopLevelClose } from './top-level'
+import { stepFinishBody, stepFinishClosePrefixMatch } from './finish'
 import { stepCdata } from './cdata'
 
 export function processChar(state: ParseStack, ch: string, config: ParserConfig): ParseEvent[] {
@@ -56,6 +57,8 @@ function dispatch(state: ParseStack, ch: string, config: ParserConfig): StepResu
     case 'ChildBody': return stepChildBody({ frame, state, ch, config })
     case 'ChildClosePrefixMatch': return stepChildClosePrefixMatch({ frame, state, ch, config })
     case 'Cdata': return stepCdata({ frame, state, ch, config })
+    case 'FinishBody': return stepFinishBody({ frame, state, ch, config })
+    case 'FinishClosePrefixMatch': return stepFinishClosePrefixMatch({ frame, state, ch, config })
     case 'Actions':
     case 'Comms':
     case 'Done':

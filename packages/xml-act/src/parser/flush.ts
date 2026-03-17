@@ -105,6 +105,12 @@ export function flushStack(state: ParseStack, config: ParserConfig): ParseEvent[
         events.push(...emitProseChunk(state, reconstructed))
         break
       }
+      case 'FinishBody':
+        events.push({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim() })
+        break
+      case 'FinishClosePrefixMatch':
+        events.push({ _tag: 'TurnControl', decision: 'finish', evidence: (frame.body + frame.prefix.raw).trim() })
+        break
       case 'Actions':
         sawActions = true
         break

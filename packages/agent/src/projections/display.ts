@@ -513,6 +513,24 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
   },
 
   eventHandlers: {
+    oneshot_task: ({ event, fork }) => {
+      const messageId = generateId()
+      return {
+        ...fork,
+        messages: [
+          ...fork.messages,
+          {
+            id: messageId,
+            type: 'user_message' as const,
+            content: event.prompt,
+            timestamp: event.timestamp,
+            taskMode: true,
+            attachments: [],
+          }
+        ]
+      }
+    },
+
     user_message: ({ event, fork }) => {
       const messageId = generateId()
 
