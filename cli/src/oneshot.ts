@@ -267,7 +267,11 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
         break
 
       case 'turn_unexpected_error':
-        line(`✗ ${err(event.message)}`)
+        line(`✗ ${err(`UNEXPECTED ERROR: ${event.message}`)}`)
+        if (event.forkId === null) {
+          void exit(1)
+          return
+        }
         break
     }
   })
