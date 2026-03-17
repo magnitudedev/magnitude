@@ -161,8 +161,30 @@ function AppInner({
   const [selectedArtifact, setSelectedArtifact] = useState<{ name: string; section?: string } | null>(null)
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
-  const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
-  const popForkOverlay = () => setExpandedForkStack(s => s.slice(0, -1))
+  const agentsScrollboxRef = useRef<any>(null)
+  const agentsScrollPositionRef = useRef<number | null>(null)
+  const pushForkOverlay = (forkId: string) => {
+    const scrollbox = agentsScrollboxRef.current
+    if (scrollbox) {
+      agentsScrollPositionRef.current = scrollbox.scrollTop ?? null
+    }
+    setExpandedForkStack(s => [...s, forkId])
+  }
+  const popForkOverlay = () => {
+    setExpandedForkStack(s => {
+      const newStack = s.slice(0, -1)
+      if (newStack.length === 0) {
+        setTimeout(() => {
+          const scrollbox = agentsScrollboxRef.current
+          if (scrollbox && agentsScrollPositionRef.current != null) {
+            scrollbox.scrollTo(agentsScrollPositionRef.current)
+            agentsScrollPositionRef.current = null
+          }
+        }, 0)
+      }
+      return newStack
+    })
+  }
 
   const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -1541,7 +1563,6 @@ function AppInner({
 
   // Scroll-tracking for sticky header
   const scrollboxRef = useRef<any>(null)
-  const agentsScrollboxRef = useRef<any>(null)
   const thinkBlockRef = useRef<any>(null)
   const lastStreamingMessageIdRef = useRef<string | null>(null)
   const interruptedMessageIdRef = useRef<string | null>(null)
