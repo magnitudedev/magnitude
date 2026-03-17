@@ -29,6 +29,15 @@ class MagnitudeAgent(BaseInstalledAgent):
         )
         await environment.exec(command="chmod +x /usr/local/bin/magnitude")
 
+        # Upload OAuth credentials if available (for Claude Pro/Max, ChatGPT Plus/Pro, etc.)
+        auth_path = Path.home() / ".magnitude" / "auth.json"
+        if auth_path.exists():
+            await environment.exec(command="mkdir -p /root/.magnitude")
+            await environment.upload_file(
+                source_path=auth_path,
+                target_path="/root/.magnitude/auth.json",
+            )
+
     def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
         escaped = shlex.quote(instruction)
 
