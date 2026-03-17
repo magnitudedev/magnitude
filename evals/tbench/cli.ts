@@ -4,7 +4,7 @@ import { spawn } from 'bun'
 import path from 'path'
 import { Command } from '@commander-js/extra-typings'
 import { jobsMain, submitMain } from './jobs'
-import { main as runMain } from './run'
+import { main as runMain, resumeMain } from './run'
 
 function parsePositiveInt(value: string, fallback: number) {
   const parsed = Number.parseInt(value, 10)
@@ -20,11 +20,17 @@ program
   .description('Start the interactive TB2 runner')
   .option('-c, --concurrency <number>', 'Concurrency to pass to harbor via -n', '1')
   .option('-t, --trials <number>', 'Trials to pass to harbor via -k', '1')
+  .option('-r, --resume <jobDir>', 'Resume a previous job, retrying errored trials (except timeouts)')
   .action(async options => {
-    await runMain({
-      concurrency: parsePositiveInt(options.concurrency, 1),
-      trials: parsePositiveInt(options.trials, 1),
-    })
+    const concurrency = parsePositiveInt(options.concurrency, 1)
+    if (options.resume) {
+      await resumeMain(options.resume, { concurrency })
+    } else {
+      await runMain({
+        concurrency,
+        trials: parsePositiveInt(options.trials, 1),
+      })
+    }
   })
 
 program

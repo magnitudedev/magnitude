@@ -106,6 +106,9 @@ class MagnitudeAgent(BaseInstalledAgent):
                 if log_path.exists():
                     lines = log_path.read_text().strip().splitlines()
                     tail = "\n".join(lines[-5:])
+                # Populate context so is_empty() returns False, preventing
+                # harbor from calling this again inside its except handler
+                context.metadata = {"error": f"Magnitude exited with code {rc}\n{tail}"}
                 raise AgentUnexpectedError(
                     f"Magnitude exited with code {rc}\n{tail}"
                 )

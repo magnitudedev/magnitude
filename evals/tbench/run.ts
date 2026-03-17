@@ -315,9 +315,9 @@ async function tailFile(filePath: string, taskName: string, startedAt: number, s
   }
 }
 
-async function watchTaskLogs(jobDir: string, tasks: TaskInfo[], signal: AbortSignal) {
+async function watchTaskLogs(jobDir: string, tasks: TaskInfo[], signal: AbortSignal, alreadyTailed?: Set<string>) {
   const startedAt = Date.now()
-  const tailed = new Set<string>()
+  const tailed = new Set<string>(alreadyTailed)
   const tailPromises: Promise<void>[] = []
   const taskByName = new Map(tasks.map(task => [task.name, task]))
 
@@ -626,6 +626,121 @@ export async function main(options: Partial<RunOptions> = {}) {
     printResultsTable(rows, path.relative(process.cwd(), resultPath))
   } catch (error) {
     clack.log.warn(`Run finished, but could not parse result.json: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  clack.outro('Done')
+}
+
+export async function resumeMain(jobDirName: string, options: { concurrency: number }) {
+  const { concurrency } = options
+  const jobDir = path.join(JOBS_DIR, jobDirName)
+
+  if (!existsSync(jobDir)) {
+    clack.log.error(`Job directory not found: ${jobDir}`)
+    process.exit(1)
+  }
+
+  const configPath = path.join(jobDir, 'config.json')
+  if (!existsSync(configPath)) {
+    clack.log.error(`No config.json found in ${jobDir}`)
+    process.exit(1)
+  }
+
+  // Scan trial subdirectories for retryable errors
+  const errorTypeCounts = new Map<string, number>()
+
+  const entries = readdirSync(jobDir, { withFileTypes: true })
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const trialResultPath = path.join(jobDir, entry.name, 'result.json')
+    if (!existsSync(trialResultPath)) continue
+    try {
+      const parsed = JSON.parse(await readFile(trialResultPath, 'utf8')) as {
+        exception_info?: { exception_type: string } | null
+      }
+      const exType = parsed.exception_info?.exception_type
+      if (exType && exType !== 'AgentTimeoutError') {
+        errorTypeCounts.set(exType, (errorTypeCounts.get(exType) ?? 0) + 1)
+      }
+    } catch {
+      // skip unparseable result.json
+    }
+  }
+
+  // Print summary
+  clack.log.info('Resume summary:')
+  if (errorTypeCounts.size > 0) {
+    for (const [exType, count] of errorTypeCounts) {
+      console.log(`  ${exType}: ${count} trial(s) (retrying)`)
+    }
+  } else {
+    console.log('  No retryable errors found')
+  }
+  console.log('  Harbor will also pick up any incomplete (no result) trials automatically')
+
+  // Always include CancelledError
+  const filterErrors = new Set(errorTypeCounts.keys())
+  filterErrors.add('CancelledError')
+
+  const commandArgs = ['harbor', 'jobs', 'resume', '-p', jobDir]
+  for (const exType of filterErrors) {
+    commandArgs.push('-f', exType)
+  }
+  // Note: harbor jobs resume doesn't support -q or -n flags;
+  // concurrency comes from the existing job config
+
+  console.log()
+  console.log(ansis.dim(renderCommand(commandArgs)))
+  console.log()
+
+  const tasks = await discoverTasks()
+
+  // Pre-populate already-tailed tasks to avoid replaying old logs
+  const alreadyTailed = new Set<string>()
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const logPath = path.join(jobDir, entry.name, 'agent', 'magnitude.txt')
+    if (existsSync(logPath)) {
+      alreadyTailed.add(entry.name)
+    }
+  }
+
+  const abortController = new AbortController()
+  let child: ReturnType<typeof Bun.spawn> | null = null
+
+  process.on('SIGINT', () => {
+    abortController.abort()
+    if (child) child.kill()
+  })
+
+  child = Bun.spawn(commandArgs, {
+    stdout: 'pipe',
+    stderr: 'inherit',
+    stdin: 'inherit',
+  })
+
+  clack.log.info(`Watching ${path.relative(process.cwd(), jobDir)}`)
+  const watchPromise = watchTaskLogs(jobDir, tasks, abortController.signal, alreadyTailed)
+
+  const exitCode = await child.exited
+  abortController.abort()
+  await watchPromise
+
+  if (exitCode !== 0) {
+    clack.log.error(`harbor exited with code ${exitCode}`)
+    process.exit(exitCode)
+  }
+
+  const resultPath = path.join(jobDir, 'result.json')
+  try {
+    await access(resultPath)
+    const parsed = JSON.parse(await readFile(resultPath, 'utf8')) as HarborJobResult
+    const rows = getResultRows(parsed)
+    printResultsTable(rows, path.relative(process.cwd(), resultPath))
+  } catch (error) {
+    clack.log.warn(
+      `Resume finished, but could not parse result.json: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
 
   clack.outro('Done')
