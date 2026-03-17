@@ -127,7 +127,7 @@ export const artifactReadTool = createTool({
   group: 'artifact',
   description: 'Read the current content of an artifact.',
   inputSchema: Schema.Struct({
-    id: Schema.String.annotations({ description: 'Artifact ID (logical name, e.g. "plan"; not a file path).' }),
+    id: Schema.String.annotations({ description: 'Existing artifact ID of the artifact to read.' }),
   }),
   outputSchema: Schema.String,
   errorSchema: ArtifactError,
@@ -162,7 +162,7 @@ export const artifactWriteTool = createTool({
   group: 'artifact',
   description: 'Write content to an artifact (creates if missing, full replace).',
   inputSchema: Schema.Struct({
-    id: Schema.String.annotations({ description: 'Artifact ID (logical name, e.g. "plan"; not a file path).' }),
+    id: Schema.String.annotations({ description: 'Artifact ID (descriptive name, e.g. "auth-report"; not a file path).' }),
     content: Schema.String.annotations({ description: 'New content for the artifact' }),
   }),
   outputSchema: Schema.String,
@@ -206,7 +206,7 @@ export const artifactUpdateTool = createTool({
   group: 'artifact',
   description: 'Update an artifact using exact find/replace. The <old> content must match the artifact exactly.',
   inputSchema: Schema.Struct({
-    id: Schema.String.annotations({ description: 'Artifact ID (logical name, e.g. "plan"; not a file path).' }),
+    id: Schema.String.annotations({ description: 'Existing artifact ID of the artifact to update.' }),
     oldString: Schema.String.annotations({ description: 'Exact text to find in the artifact' }),
     newString: Schema.String.annotations({ description: 'Replacement text' }),
     replaceAll: Schema.optional(Schema.Boolean.annotations({ description: 'Replace all occurrences instead of requiring uniqueness' })),
