@@ -21,7 +21,6 @@ export const AgentArtifactEvent = memo(function AgentArtifactEvent({
   const [artifactHovered, setArtifactHovered] = useState(false)
   const palette = getAgentColorByRole(item.agentRole)
 
-  const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
   const actionLabel = item.action === 'wrote' ? 'created' : 'updated'
 
   return (
@@ -35,15 +34,15 @@ export const AgentArtifactEvent = memo(function AgentArtifactEvent({
       <LaneGutter lanes={lanes} />
       <text style={{ wrapMode: 'none' }}>
         <span fg={palette.border}>{'✎ '}</span>
-        <span fg={palette.border} attributes={TextAttributes.BOLD}>{capitalize(item.agentRole)}</span>
-        <span fg={theme.muted}>{' ('}{item.agentName}{')'}{' '}{actionLabel}{' '}</span>
+        <span fg={palette.border}>{item.agentName}</span>
+        <span fg={theme.muted}>{' '}{actionLabel}{' '}</span>
       </text>
       <Button
         onClick={onArtifactClick ? () => onArtifactClick(item.artifactName) : undefined}
         onMouseOver={() => setArtifactHovered(true)}
         onMouseOut={() => setArtifactHovered(false)}
       >
-        <text style={{ fg: artifactHovered ? theme.link : palette.border, wrapMode: 'none' }}>{'[≡ '}{item.artifactName}{']'}</text>
+        <text style={{ fg: artifactHovered ? theme.link : theme.primary, wrapMode: 'none' }}>{'[≡ '}{item.artifactName}{']'}</text>
       </Button>
     </box>
   )

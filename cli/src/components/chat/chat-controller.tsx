@@ -56,6 +56,8 @@ export function ChatController(props: ChatControllerProps) {
     hasActiveAgents,
     hasUnreadMain,
     onTabSwitch,
+    aboveInputSlot,
+    inputTopSlot,
   } = props
   const [inputValue, setInputValue] = useState<InputValue>(EMPTY_INPUT)
   const [attachments, setAttachments] = useState<ImageAttachment[]>([])
@@ -412,8 +414,14 @@ export function ChatController(props: ChatControllerProps) {
 
       {activeTab === 'main' && (
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
+        {aboveInputSlot}
+        <box style={{ height: 1, borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╻', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
+          <box style={{ height: 1, borderStyle: 'single', border: ['top'], borderColor: env.theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▄', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
+        </box>
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
-          <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
+          <box style={{ backgroundColor: env.theme.inputBg, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
+            {inputTopSlot}
+            <box style={{ height: 1 }} />
             {!env.bashMode && fileMentions.isOpen && (
               <FileMentionMenu
                 isOpen={fileMentions.isOpen}

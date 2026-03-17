@@ -10,6 +10,7 @@ import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
 import { StickyWorkingHeader } from './components/think-block'
 import { LoadPreviousButton } from './components/chat-controls'
+import { Button } from './components/button'
 
 
 import { usePaginatedTimeline } from './hooks/use-paginated-timeline'
@@ -64,6 +65,23 @@ import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
+
+function ViewAllActivityButton({ onViewAll, theme }: { onViewAll: () => void; theme: ReturnType<typeof useTheme> }) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <box style={{ flexDirection: 'row', justifyContent: 'flex-end', paddingRight: 2 }}>
+      <Button
+        onClick={onViewAll}
+        onMouseOver={() => setHovered(true)}
+        onMouseOut={() => setHovered(false)}
+      >
+        <text style={{ wrapMode: 'none' }}>
+          <span fg={hovered ? theme.primary : theme.muted}>{'View all activity →'}</span>
+        </text>
+      </Button>
+    </box>
+  )
+}
 
 export function App({ resume, debug, onClientReady }: { resume: boolean; debug: boolean; onClientReady?: (client: AgentClient | null) => void }) {
   const [conversationKey, setConversationKey] = useState(0)
@@ -1373,6 +1391,15 @@ function AppInner({
     setActiveTab(tab)
     activeTabRef.current = tab
     if (tab === 'main') setHasUnreadMain(false)
+    if (tab === 'agents') {
+      setTimeout(() => {
+        const scrollbox = agentsScrollboxRef.current
+        if (scrollbox) {
+          const contentHeight = scrollbox.content?.yogaNode?.getComputedHeight?.() ?? 999999
+          scrollbox.scrollTo(contentHeight)
+        }
+      }, 0)
+    }
   }, [])
 
   const handleInterrupt = useCallback(() => {
@@ -1497,6 +1524,7 @@ function AppInner({
 
   // Scroll-tracking for sticky header
   const scrollboxRef = useRef<any>(null)
+  const agentsScrollboxRef = useRef<any>(null)
   const thinkBlockRef = useRef<any>(null)
   const lastStreamingMessageIdRef = useRef<string | null>(null)
   const interruptedMessageIdRef = useRef<string | null>(null)
@@ -1847,13 +1875,16 @@ function AppInner({
             </box>
           )}
           {activeTab === 'main' ? chatScrollbox : (
-            <AgentsView
-              items={agentsViewState?.items ?? []}
-              onForkExpand={pushForkOverlay}
-              onArtifactClick={handleArtifactClick}
-            />
+            <box style={{ flexGrow: 1, minWidth: 0 }}>
+              <AgentsView
+                items={agentsViewState?.items ?? []}
+                onForkExpand={pushForkOverlay}
+                onArtifactClick={handleArtifactClick}
+                scrollboxRef={agentsScrollboxRef}
+              />
+            </box>
           )}
-          {agentsViewState && agentsViewState.items.length > 0 && (
+          {agentsViewState && agentsViewState.items.length > 0 && activeTab === 'agents' && (
             <AgentSummaryBar
               agentsViewState={agentsViewState}
               onViewAll={() => handleTabSwitch('agents')}
@@ -1913,6 +1944,29 @@ function AppInner({
             hasActiveAgents={hasRunningForks}
             hasUnreadMain={hasUnreadMain}
             onTabSwitch={handleTabSwitch}
+            aboveInputSlot={
+              agentsViewState && agentsViewState.items.length > 0 && activeTab === 'main'
+                ? (
+                    <ViewAllActivityButton
+                      onViewAll={() => handleTabSwitch('agents')}
+                      theme={theme}
+                    />
+                  )
+                : undefined
+            }
+            inputTopSlot={
+              agentsViewState && agentsViewState.items.length > 0 && activeTab === 'main'
+                ? (
+                    <AgentSummaryBar
+                      agentsViewState={agentsViewState}
+                      onViewAll={() => handleTabSwitch('agents')}
+                      onArtifactClick={handleArtifactClick}
+                      activeTab={activeTab}
+                      variant="main-content"
+                    />
+                  )
+                : undefined
+            }
           />
         </box>
 

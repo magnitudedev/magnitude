@@ -13,12 +13,12 @@ function buildPulse(shades: Record<number, string>): string[] {
 
 export const AGENT_ROLE_PALETTES: Record<string, AgentColorPalette> = {
   orchestrator: { name: 'slate',  border: slate[400],   bg: '#222832', pulse: buildPulse(slate)   },
-  explorer:     { name: 'violet', border: violet[500],  bg: '#211e30', pulse: buildPulse(violet)  },
+  explorer:     { name: 'green',  border: green[500],   bg: '#1a2a1e', pulse: buildPulse(green)   },
   builder:      { name: 'rose',   border: rose[500],    bg: '#271e24', pulse: buildPulse(rose)    },
   planner:      { name: 'indigo', border: indigo[500],  bg: '#1c2130', pulse: buildPulse(indigo)  },
-  reviewer:     { name: 'orange', border: orange[500],  bg: '#2a2018', pulse: buildPulse(orange)  },
-  debugger:     { name: 'red',    border: red[500],     bg: '#2a1a1a', pulse: buildPulse(red)     },
-  browser:      { name: 'green',  border: green[500],   bg: '#1a2a1e', pulse: buildPulse(green)   },
+  reviewer:     { name: 'red',    border: red[500],     bg: '#2a1a1a', pulse: buildPulse(red)     },
+  debugger:     { name: 'orange', border: orange[500],  bg: '#2a2018', pulse: buildPulse(orange)  },
+  browser:      { name: 'violet', border: violet[400],  bg: '#211e30', pulse: buildPulse(violet)  },
 }
 
 export function getAgentColorByRole(role: string): AgentColorPalette {

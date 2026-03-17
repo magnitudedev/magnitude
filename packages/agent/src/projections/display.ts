@@ -1202,26 +1202,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const childDisplayFork = state.forks.get(targetForkId)
       if (!childDisplayFork) return state
 
-      const childCommunication: AgentCommunicationMessage = {
-        id: generateId(),
-        type: 'agent_communication',
-        direction: 'from_agent',
-        agentId: 'orchestrator',
-        agentName: 'Orchestrator',
-        agentRole: 'Orchestrator',
-        forkId: targetForkId,
-        content,
-        preview: toPreview(content),
-        timestamp
-      }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(targetForkId, {
-          ...childDisplayFork,
-          messages: insertBeforeQueuedMessages(childDisplayFork.messages, childCommunication)
-        })
-      }
+      return state
     }),
 
     // agentResponse: only insert into source (child) fork (for overlay), not parent
@@ -1237,26 +1218,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const sourceDisplayFork = state.forks.get(sourceAgent.forkId)
       if (!sourceDisplayFork) return state
 
-      const childCommunication: AgentCommunicationMessage = {
-        id: generateId(),
-        type: 'agent_communication',
-        direction: 'to_agent',
-        agentId: 'orchestrator',
-        agentName: 'Orchestrator',
-        agentRole: 'Orchestrator',
-        forkId: sourceAgent.forkId,
-        content,
-        preview: toPreview(content),
-        timestamp
-      }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(sourceAgent.forkId, {
-          ...sourceDisplayFork,
-          messages: insertBeforeQueuedMessages(sourceDisplayFork.messages, childCommunication)
-        })
-      }
+      return state
     })
   ]
 })

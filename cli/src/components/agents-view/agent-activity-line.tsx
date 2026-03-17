@@ -15,7 +15,6 @@ interface AgentActivityLineProps {
 
 const PULSE_INTERVAL_MS = 200
 
-const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
 export const AgentActivityLine = memo(function AgentActivityLine({
   item,
@@ -55,8 +54,7 @@ export const AgentActivityLine = memo(function AgentActivityLine({
         onMouseOut={() => setNameHovered(false)}
       >
         <text style={{ wrapMode: 'none' }}>
-          <span fg={nameHovered ? palette.pulse[0] : palette.border} attributes={TextAttributes.BOLD}>{capitalize(item.agentRole)}</span>
-          <span fg={theme.muted}>{' ('}{item.agentName}{')'}</span>
+          <span fg={nameHovered ? palette.pulse[0] : palette.border}>{item.agentName}</span>
         </text>
       </Button>
       <text style={{ wrapMode: 'none' }}>

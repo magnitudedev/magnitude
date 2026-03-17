@@ -28,7 +28,6 @@ function getTotalToolCount(counts: ForkActivityToolCounts): number {
     + counts.evaluations + counts.other
 }
 
-const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
 export const AgentActivityEndLine = memo(function AgentActivityEndLine({
   item,
@@ -61,8 +60,7 @@ export const AgentActivityEndLine = memo(function AgentActivityEndLine({
         onMouseOut={() => setNameHovered(false)}
       >
         <text style={{ wrapMode: 'none' }}>
-          <span fg={nameHovered ? palette.pulse[0] : palette.border} attributes={TextAttributes.BOLD}>{capitalize(item.agentRole)}</span>
-          <span fg={theme.muted}>{' ('}{item.agentName}{')'}</span>
+          <span fg={nameHovered ? palette.pulse[0] : palette.border}>{item.agentName}</span>
         </text>
       </Button>
       <text style={{ wrapMode: 'none' }}>

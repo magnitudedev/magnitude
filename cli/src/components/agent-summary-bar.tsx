@@ -1,4 +1,5 @@
 import { memo, useState, useEffect, useRef } from 'react'
+import { TextAttributes } from '@opentui/core'
 import type { AgentsViewState, AgentsViewActivityStartItem, AgentsViewMessageItem, AgentsViewArtifactItem } from '@magnitudedev/agent'
 import { getAgentColorByRole } from '../utils/agent-colors'
 import { Button } from './button'
@@ -9,6 +10,7 @@ interface AgentSummaryBarProps {
   onViewAll: () => void
   onArtifactClick: (name: string) => void
   activeTab?: 'main' | 'agents'
+  variant?: 'default' | 'main-content'
 }
 
 const PULSE_INTERVAL_MS = 200
@@ -21,9 +23,6 @@ function formatElapsed(startedAt: number): string {
   return s > 0 ? `${m}m ${s}s` : `${m}m`
 }
 
-function capitalize(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1)
-}
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max - 1) + '…' : s
@@ -87,8 +86,7 @@ const RunningAgentChip = memo(function RunningAgentChip({ item }: { item: Agents
   return (
     <text style={{ wrapMode: 'none' }}>
       <span fg={palette.pulse[pulseIndex]!}>{'◆ '}</span>
-      <span fg={palette.border}>{capitalize(item.agentRole)}</span>
-      <span fg={'#888888'}>{' ('}{item.agentName}{')'}</span>
+      <span fg={palette.border}>{item.agentName}</span>
       <span fg={'#888888'}>{' '}{elapsed}{'  '}</span>
     </text>
   )
@@ -99,6 +97,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
   onViewAll,
   onArtifactClick,
   activeTab = 'main',
+  variant = 'default',
 }: AgentSummaryBarProps) {
   const theme = useTheme()
   const [viewAllHovered, setViewAllHovered] = useState(false)
@@ -129,10 +128,10 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
       artifactMap.set(item.artifactName, item)
     }
   }
-  const artifacts = Array.from(artifactMap.values())
+  const artifacts = Array.from(artifactMap.values()).slice(-3)
 
   // Track recently updated artifacts for highlight
-  const prevArtifactNamesRef = useRef<Set<string>>(new Set())
+  const prevArtifactNamesRef = useRef<Set<string>>(new Set(artifacts.map(a => a.artifactName)))
   useEffect(() => {
     const currentNames = new Set(artifacts.map(a => a.artifactName))
     const newNames = new Set<string>()
@@ -159,7 +158,69 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
     }
   }, [artifacts.length])
 
-  const LABEL_WIDTH = 12
+  const LABEL_WIDTH = 18
+  const pl = variant === 'main-content' ? 1 : 2
+
+  if (variant === 'main-content') {
+    return (
+      <>
+        {/* Line 2: Running subagents */}
+        <box style={{ flexDirection: 'row', paddingLeft: pl, paddingRight: 2 }}>
+          <text style={{ wrapMode: 'none', width: LABEL_WIDTH }}>
+            <span fg={theme.muted}>{'Subagents:  '}</span>
+          </text>
+          {runningAgents.length === 0 ? (
+            <text><span fg={theme.muted}>{'None currently running'}</span></text>
+          ) : (
+            <box style={{ flexDirection: 'row', overflow: 'hidden' }}>
+              {runningAgents.map(agent => (
+                <RunningAgentChip key={agent.forkId} item={agent} />
+              ))}
+            </box>
+          )}
+        </box>
+
+        {/* Line 3: Last message */}
+        <box style={{ flexDirection: 'row', paddingLeft: pl, paddingRight: 2 }}>
+          <text style={{ wrapMode: 'none', width: LABEL_WIDTH }}>
+            <span fg={theme.muted}>{'Last Message: '}</span>
+          </text>
+          {lastMessage === null ? (
+            <text><span fg={theme.muted}>{'—'}</span></text>
+          ) : (
+            <text style={{ wrapMode: 'none' }}>
+              <span fg={getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}>
+                {'⌲ '}{lastMessage.direction === 'from_agent' ? `${lastMessage.fromName}` : 'Orchestrator'}{': '}
+              </span>
+              <span fg={theme.muted}>{'"'}{truncate(lastMessage.content.split('\n')[0]!, 80)}{'"'}</span>
+            </text>
+          )}
+        </box>
+
+        {/* Line 4: Artifacts */}
+        <box style={{ flexDirection: 'row', paddingLeft: pl, paddingRight: 2 }}>
+          <text style={{ wrapMode: 'none', width: LABEL_WIDTH }}>
+            <span fg={theme.muted}>{'Recent Artifacts: '}</span>
+          </text>
+          {artifacts.length === 0 ? (
+            <text><span fg={theme.muted}>{'—'}</span></text>
+          ) : (
+            <box style={{ flexDirection: 'row', overflow: 'hidden' }}>
+              {artifacts.map((artifact, i) => (
+                <ArtifactChip
+                  key={artifact.artifactName}
+                  artifact={artifact}
+                  index={i}
+                  isRecent={recentArtifacts.has(artifact.artifactName)}
+                  onArtifactClick={onArtifactClick}
+                />
+              ))}
+            </box>
+          )}
+        </box>
+      </>
+    )
+  }
 
   return (
     <box
@@ -179,7 +240,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
     >
       {/* Line 1: View all activity (only when not on agents tab) */}
       {activeTab !== 'agents' && (
-        <box style={{ flexDirection: 'row', justifyContent: 'flex-end', paddingRight: 1 }}>
+        <box style={{ flexDirection: 'row', justifyContent: 'flex-end', paddingRight: 2 }}>
           <Button
             onClick={onViewAll}
             onMouseOver={() => setViewAllHovered(true)}
@@ -193,7 +254,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
       )}
 
       {/* Line 2: Running subagents */}
-      <box style={{ flexDirection: 'row', paddingLeft: 1, paddingRight: 1 }}>
+      <box style={{ flexDirection: 'row', paddingLeft: 2, paddingRight: 2 }}>
         <text style={{ wrapMode: 'none', width: LABEL_WIDTH }}>
           <span fg={theme.muted}>{'Subagents:  '}</span>
         </text>
@@ -209,16 +270,16 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
       </box>
 
       {/* Line 3: Last message */}
-      <box style={{ flexDirection: 'row', paddingLeft: 1, paddingRight: 1 }}>
+      <box style={{ flexDirection: 'row', paddingLeft: 2, paddingRight: 2 }}>
         <text style={{ wrapMode: 'none', width: LABEL_WIDTH }}>
-          <span fg={theme.muted}>{'Messages:   '}</span>
+          <span fg={theme.muted}>{'Last Message: '}</span>
         </text>
         {lastMessage === null ? (
           <text><span fg={theme.muted}>{'—'}</span></text>
         ) : (
           <text style={{ wrapMode: 'none' }}>
             <span fg={getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}>
-              {'⌲ '}{lastMessage.direction === 'from_agent' ? `${capitalize(lastMessage.fromRole)} (${lastMessage.fromName})` : 'Orchestrator'}{': '}
+              {'⌲ '}{lastMessage.direction === 'from_agent' ? `${lastMessage.fromName}` : 'Orchestrator'}{': '}
             </span>
             <span fg={theme.muted}>{'"'}{truncate(lastMessage.content.split('\n')[0]!, 80)}{'"'}</span>
           </text>
@@ -226,9 +287,9 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
       </box>
 
       {/* Line 4: Artifacts */}
-      <box style={{ flexDirection: 'row', paddingLeft: 1, paddingRight: 1 }}>
+      <box style={{ flexDirection: 'row', paddingLeft: 2, paddingRight: 2 }}>
         <text style={{ wrapMode: 'none', width: LABEL_WIDTH }}>
-          <span fg={theme.muted}>{'Artifacts:  '}</span>
+          <span fg={theme.muted}>{'Recent Artifacts: '}</span>
         </text>
         {artifacts.length === 0 ? (
           <text><span fg={theme.muted}>{'—'}</span></text>

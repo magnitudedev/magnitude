@@ -67,14 +67,13 @@ export const AgentMessageBubble = memo(function AgentMessageBubble({
   const long = isLong(item.content)
   const displayContent = long && collapsed ? truncate(item.content) : item.content
 
-  const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
-
   return (
     <box style={{ flexDirection: 'row', alignItems: 'stretch' }}>
       <LaneGutter lanes={lanes} />
       <box
         style={{
           flexGrow: 1,
+          minWidth: 0,
         }}
       >
       <box
@@ -87,15 +86,13 @@ export const AgentMessageBubble = memo(function AgentMessageBubble({
         <span fg={theme.muted}>{'⌲ '}</span>
         {isSenderOrchestrator ? (
           <>
-            <span fg={orchestratorPalette.border} attributes={TextAttributes.BOLD}>{'Orchestrator'}</span>
+            <span fg={orchestratorPalette.border}>{'Orchestrator'}</span>
             <span fg={theme.muted}>{' → '}</span>
-            <span fg={agentPalette.border} attributes={TextAttributes.BOLD}>{capitalize(item.toRole)}</span>
-            <span fg={theme.muted}>{' ('}{item.toName}{')'}</span>
+            <span fg={agentPalette.border}>{item.toName}</span>
           </>
         ) : (
           <>
-            <span fg={agentPalette.border} attributes={TextAttributes.BOLD}>{capitalize(item.fromRole)}</span>
-            <span fg={theme.muted}>{' ('}{item.fromName}{')'}</span>
+            <span fg={agentPalette.border}>{item.fromName}</span>
           </>
         )}
       </text>

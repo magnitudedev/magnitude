@@ -57,4 +57,6 @@ export type ChatControllerProps = {
   hasActiveAgents: boolean
   hasUnreadMain: boolean
   onTabSwitch: (tab: 'main' | 'agents') => void
+  aboveInputSlot?: React.ReactNode
+  inputTopSlot?: React.ReactNode
 }

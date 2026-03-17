@@ -26,6 +26,7 @@ export function LaneGutter({ lanes }: { lanes: LaneEntry[] }) {
           key={i}
           style={{
             width: 1,
+            marginRight: 1,
             alignSelf: 'stretch',
             borderStyle: 'single',
             border: ['left'],

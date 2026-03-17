@@ -11,6 +11,7 @@ interface AgentsViewProps {
   onForkExpand: (forkId: string) => void
   onArtifactClick: (name: string, section?: string) => void
   onViewAgents?: () => void
+  scrollboxRef?: React.RefObject<any>
 }
 
 function computeLanes(items: readonly AgentsViewItem[]): LaneEntry[][] {
@@ -38,6 +39,7 @@ export const AgentsView = memo(function AgentsView({
   items,
   onForkExpand,
   onArtifactClick,
+  scrollboxRef,
 }: AgentsViewProps) {
   const lanes = computeLanes(items)
   const finishedForkIds = new Set(
@@ -49,12 +51,10 @@ export const AgentsView = memo(function AgentsView({
       <box
         style={{
           flexGrow: 1,
-          width: '100%',
-          height: '100%',
           borderStyle: 'round',
           alignItems: 'center',
           justifyContent: 'center',
-          padding: 2,
+          margin: 2,
         }}
       >
         <text style={{ dimColor: true }}>Subagent activity will appear here</text>
@@ -64,6 +64,7 @@ export const AgentsView = memo(function AgentsView({
 
   return (
     <scrollbox
+      ref={scrollboxRef}
       stickyScroll
       stickyStart="top"
       scrollX={false}
@@ -77,6 +78,7 @@ export const AgentsView = memo(function AgentsView({
         flexGrow: 1,
         rootOptions: {
           flexGrow: 1,
+          width: '100%',
           backgroundColor: 'transparent',
         },
         wrapperOptions: {

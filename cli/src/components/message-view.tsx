@@ -6,7 +6,7 @@ import { AssistantMessage } from './assistant-message'
 import { ThinkBlock } from './think-block'
 import { InlineForkActivity } from './inline-fork-activity'
 import { ApprovalRequest } from './approval-request'
-import { AgentCommunicationCard } from './agent-communication-card'
+
 import { ErrorMessage } from './error-message'
 
 import { useTheme } from '../hooks/use-theme'
@@ -116,8 +116,6 @@ export const MessageView = memo(function MessageView({
       case 'approval_request':
         return <ApprovalRequest message={message} onApprove={onApprove} onReject={onReject} />
 
-      case 'agent_communication':
-        return <AgentCommunicationCard message={message} />
 
 
     }
