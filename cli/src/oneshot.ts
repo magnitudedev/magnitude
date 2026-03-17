@@ -260,6 +260,20 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
         pendingAgents.push({ forkId: event.forkId, role: event.role, name: event.name })
         break
 
+      case 'artifact_changed': {
+        _flushMessage?.()
+        line('')
+        line(lbl(`artifact`) + dim(` › ${event.id}`))
+        line(dim('─'.repeat(60)))
+        const contentLines = event.content.split('\n')
+        for (const l of contentLines) {
+          line(l)
+        }
+        line(dim('─'.repeat(60)))
+        line('')
+        break
+      }
+
       case 'agent_dismissed':
         if (lastForkId === event.forkId) lastForkId = undefined
         agentNames.delete(event.forkId)

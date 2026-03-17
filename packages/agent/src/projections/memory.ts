@@ -210,9 +210,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         type: 'session_context',
         source: 'system',
         content: textParts(
-          '<task>\nYou have been assigned the following task. Read it carefully — every detail, constraint, and requirement matters.\n\n<description>\n'
+          '<task>\n'
           + event.prompt
-          + '\n</description>\n</task>'
+          + '\n</task>\n\n<critical-reminder>You must follow every phase of the Task Workflow carefully to ensure precise and correct completion of the task.\nEstablish the [[task]] artifact with initial content and then work through each phase systematically, one-by-one.</critical-reminder>'
         ),
       }
       return {
