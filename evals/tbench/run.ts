@@ -81,7 +81,7 @@ type TaskToml = {
   }
 }
 
-const MODELS = ['anthropic/claude-sonnet-4-6', 'openai/gpt-5.4', 'openai/gpt-5.3-codex', 'openai/gpt-5.3-codex-spark'] as const
+const MODELS = ['anthropic/claude-sonnet-4-6', 'openai/gpt-5.4', 'openai/gpt-5.3-codex', 'openai/gpt-5.3-codex-spark', 'openrouter/qwen/qwen3.5-27b'] as const
 const JOBS_DIR = path.join(process.cwd(), 'jobs')
 const TASKS_ROOT = path.join(os.homedir(), '.cache/harbor/tasks')
 const POLL_MS = 500
@@ -365,11 +365,27 @@ function getResultRows(jobResult: HarborJobResult): ResultRow[] {
   for (const evalResult of Object.values(jobResult.stats.evals)) {
     // Build exception lookup: trialName -> exceptionType
     const exceptionByTrial = new Map<string, string>()
-    for (const [exType, trials] of Object.entries(evalResult.exception_stats)) {
+    for (const [exType, trials] of Object.entries(evalResult.exception_stats ?? {})) {
       for (const trial of trials) exceptionByTrial.set(trial, exType)
     }
 
-    for (const [rewardStr, trials] of Object.entries(evalResult.reward_stats.reward)) {
+    // Add rows for error-only trials (no reward entry)
+    const trialsSeen = new Set<string>()
+    for (const trials of Object.values(evalResult.reward_stats.reward ?? {})) {
+      for (const t of trials) trialsSeen.add(t)
+    }
+    for (const [trialName, exType] of exceptionByTrial) {
+      if (trialsSeen.has(trialName)) continue
+      const taskName = trialName.split('__')[0] ?? trialName
+      rows.push({
+        task: taskName,
+        reward: 0,
+        status: `error (${exType})`,
+        exception: exType,
+      })
+    }
+
+    for (const [rewardStr, trials] of Object.entries(evalResult.reward_stats.reward ?? {})) {
       const reward = parseFloat(rewardStr)
       for (const trialName of trials) {
         const taskName = trialName.split('__')[0] ?? trialName
@@ -385,6 +401,23 @@ function getResultRows(jobResult: HarborJobResult): ResultRow[] {
   }
 
   return rows
+}
+
+async function printExceptionDetails(jobDir: string) {
+  const entries = readdirSync(jobDir, { withFileTypes: true })
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    const exPath = path.join(jobDir, entry.name, 'exception.txt')
+    if (!existsSync(exPath)) continue
+    try {
+      const content = await readFile(exPath, 'utf8')
+      const lines = content.trim().split('\n')
+      // Show last line (the actual error) plus the task name
+      const errorLine = lines[lines.length - 1] ?? content.trim()
+      console.log()
+      clack.log.error(`${ansis.bold(entry.name)}: ${errorLine}`)
+    } catch {}
+  }
 }
 
 function printResultsTable(rows: ResultRow[], resultPath: string) {
@@ -624,8 +657,10 @@ export async function main(options: Partial<RunOptions> = {}) {
     const parsed = JSON.parse(await readFile(resultPath, 'utf8')) as HarborJobResult
     const rows = getResultRows(parsed)
     printResultsTable(rows, path.relative(process.cwd(), resultPath))
+    await printExceptionDetails(jobDir)
   } catch (error) {
     clack.log.warn(`Run finished, but could not parse result.json: ${error instanceof Error ? error.message : String(error)}`)
+    await printExceptionDetails(jobDir)
   }
 
   clack.outro('Done')
@@ -737,10 +772,12 @@ export async function resumeMain(jobDirName: string, options: { concurrency: num
     const parsed = JSON.parse(await readFile(resultPath, 'utf8')) as HarborJobResult
     const rows = getResultRows(parsed)
     printResultsTable(rows, path.relative(process.cwd(), resultPath))
+    await printExceptionDetails(jobDir)
   } catch (error) {
     clack.log.warn(
       `Resume finished, but could not parse result.json: ${error instanceof Error ? error.message : String(error)}`,
     )
+    await printExceptionDetails(jobDir)
   }
 
   clack.outro('Done')
