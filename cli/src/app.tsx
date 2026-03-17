@@ -83,6 +83,23 @@ function ViewAllActivityButton({ onViewAll, theme }: { onViewAll: () => void; th
   )
 }
 
+function ViewMainChatButton({ onViewMain, theme }: { onViewMain: () => void; theme: ReturnType<typeof useTheme> }) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <box style={{ flexDirection: 'row', justifyContent: 'flex-end', paddingRight: 2 }}>
+      <Button
+        onClick={onViewMain}
+        onMouseOver={() => setHovered(true)}
+        onMouseOut={() => setHovered(false)}
+      >
+        <text style={{ wrapMode: 'none' }}>
+          <span fg={hovered ? theme.primary : theme.muted}>{'← View main chat'}</span>
+        </text>
+      </Button>
+    </box>
+  )
+}
+
 export function App({ resume, debug, onClientReady }: { resume: boolean; debug: boolean; onClientReady?: (client: AgentClient | null) => void }) {
   const [conversationKey, setConversationKey] = useState(0)
   const [sessionSelection, setSessionSelection] = useState<string | null | undefined>(resume ? undefined : null)
@@ -1883,6 +1900,9 @@ function AppInner({
                 scrollboxRef={agentsScrollboxRef}
               />
             </box>
+          )}
+          {agentsViewState && agentsViewState.items.length > 0 && activeTab === 'agents' && (
+            <ViewMainChatButton onViewMain={() => handleTabSwitch('main')} theme={theme} />
           )}
           {agentsViewState && agentsViewState.items.length > 0 && activeTab === 'agents' && (
             <AgentSummaryBar

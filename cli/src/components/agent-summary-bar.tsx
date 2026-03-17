@@ -14,6 +14,20 @@ interface AgentSummaryBarProps {
 }
 
 const PULSE_INTERVAL_MS = 200
+const SWEEP_INTERVAL_MS = 200
+
+function sweepColors(name: string, sweepPos: number, baseColor: string, pulse: string[]): string[] {
+  if (name.length <= 1) return [pulse[0]!]
+  const period = (name.length - 1) * 2
+  const mod = sweepPos % period
+  const cursor = mod < name.length ? mod : period - mod
+  return Array.from(name, (_, i) => {
+    const dist = Math.abs(i - cursor)
+    if (dist === 0) return pulse[0]!   // center: shade 300
+    if (dist === 1) return pulse[1]!   // adjacent: shade 400
+    return baseColor                    // everything else: normal color
+  })
+}
 
 function formatElapsed(startedAt: number): string {
   const seconds = Math.floor((Date.now() - startedAt) / 1000)
@@ -24,8 +38,15 @@ function formatElapsed(startedAt: number): string {
 }
 
 
-function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max - 1) + '…' : s
+function messagePreview(content: string, max: number): string {
+  const trimmed = content.trimEnd()
+  const firstLine = trimmed.split('\n')[0]!
+  const isComplete = firstLine === trimmed
+  if (isComplete) {
+    return firstLine.length > max ? firstLine.slice(0, max - 1) + '…' : firstLine
+  } else {
+    return firstLine.length > max ? firstLine.slice(0, max - 1) + '…' : firstLine + '…'
+  }
 }
 
 const ArtifactChip = memo(function ArtifactChip({
@@ -63,8 +84,10 @@ const ArtifactChip = memo(function ArtifactChip({
 
 const RunningAgentChip = memo(function RunningAgentChip({ item }: { item: AgentsViewActivityStartItem }) {
   const [pulseIndex, setPulseIndex] = useState(0)
+  const [sweepPos, setSweepPos] = useState(0)
   const [elapsed, setElapsed] = useState(() => formatElapsed(item.startedAt))
   const pulseRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const sweepRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const palette = getAgentColorByRole(item.agentRole)
@@ -77,16 +100,27 @@ const RunningAgentChip = memo(function RunningAgentChip({ item }: { item: Agents
   }, [palette.pulse.length])
 
   useEffect(() => {
+    sweepRef.current = setInterval(() => {
+      setSweepPos(prev => prev + 1)
+    }, SWEEP_INTERVAL_MS)
+    return () => { if (sweepRef.current) clearInterval(sweepRef.current) }
+  }, [])
+
+  useEffect(() => {
     const update = () => setElapsed(formatElapsed(item.startedAt))
     update()
     timerRef.current = setInterval(update, 1000)
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
   }, [item.startedAt])
 
+  const nameColors = sweepColors(item.agentName, sweepPos, palette.border, palette.pulse)
+
   return (
     <text style={{ wrapMode: 'none' }}>
       <span fg={palette.pulse[pulseIndex]!}>{'◆ '}</span>
-      <span fg={palette.border}>{item.agentName}</span>
+      {Array.from(item.agentName).map((ch, i) => (
+        <span key={i} fg={nameColors[i]}>{ch}</span>
+      ))}
       <span fg={'#888888'}>{' '}{elapsed}{'  '}</span>
     </text>
   )
@@ -192,7 +226,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
               <span fg={getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}>
                 {'⌲ '}{lastMessage.direction === 'from_agent' ? `${lastMessage.fromName}` : 'Orchestrator'}{': '}
               </span>
-              <span fg={theme.muted}>{'"'}{truncate(lastMessage.content.split('\n')[0]!, 80)}{'"'}</span>
+              <span fg={theme.muted}>{'"'}{messagePreview(lastMessage.content, 80)}{'"'}</span>
             </text>
           )}
         </box>
@@ -281,7 +315,7 @@ export const AgentSummaryBar = memo(function AgentSummaryBar({
             <span fg={getAgentColorByRole(lastMessage.direction === 'from_agent' ? lastMessage.fromRole : 'orchestrator').border}>
               {'⌲ '}{lastMessage.direction === 'from_agent' ? `${lastMessage.fromName}` : 'Orchestrator'}{': '}
             </span>
-            <span fg={theme.muted}>{'"'}{truncate(lastMessage.content.split('\n')[0]!, 80)}{'"'}</span>
+            <span fg={theme.muted}>{'"'}{messagePreview(lastMessage.content, 80)}{'"'}</span>
           </text>
         )}
       </box>

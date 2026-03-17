@@ -66,7 +66,6 @@ export const AgentsView = memo(function AgentsView({
     <scrollbox
       ref={scrollboxRef}
       stickyScroll
-      stickyStart="top"
       scrollX={false}
       focusable={false}
       scrollbarOptions={{ visible: false }}

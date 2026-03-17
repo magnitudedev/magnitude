@@ -491,12 +491,12 @@ export function ChatController(props: ChatControllerProps) {
 
       <box style={{ paddingLeft: 2, paddingRight: 2, flexShrink: 0, height: 1, minHeight: 1, maxHeight: 1, flexDirection: 'row', justifyContent: 'space-between', marginTop: 0 }}>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
-          <TabSwitcher
+          {env.tokenEstimate > 0 && <TabSwitcher
             activeTab={activeTab}
             hasActiveAgents={hasActiveAgents}
             hasUnreadMain={hasUnreadMain}
             onSwitch={onTabSwitch}
-          />
+          />}
           {attachments.length > 0 ? (
             <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={env.attachmentsMaxWidth} />
           ) : nextEscWillKillAll ? (

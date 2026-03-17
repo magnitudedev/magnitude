@@ -18,7 +18,7 @@ export const AGENT_ROLE_PALETTES: Record<string, AgentColorPalette> = {
   planner:      { name: 'indigo', border: indigo[500],  bg: '#1c2130', pulse: buildPulse(indigo)  },
   reviewer:     { name: 'red',    border: red[500],     bg: '#2a1a1a', pulse: buildPulse(red)     },
   debugger:     { name: 'orange', border: orange[500],  bg: '#2a2018', pulse: buildPulse(orange)  },
-  browser:      { name: 'violet', border: violet[400],  bg: '#211e30', pulse: buildPulse(violet)  },
+  browser:      { name: 'violet', border: violet[500],  bg: '#211e30', pulse: buildPulse(violet)  },
 }
 
 export function getAgentColorByRole(role: string): AgentColorPalette {

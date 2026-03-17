@@ -14,6 +14,22 @@ interface AgentActivityLineProps {
 }
 
 const PULSE_INTERVAL_MS = 200
+const SWEEP_INTERVAL_MS = 200
+
+function sweepColors(name: string, sweepPos: number, baseColor: string, pulse: string[]): string[] {
+  if (name.length <= 1) return [pulse[0]!]
+  const period = (name.length - 1) * 2
+  const mod = sweepPos % period
+  const cursor = mod < name.length ? mod : period - mod
+  return Array.from(name, (_, i) => {
+    const dist = Math.abs(i - cursor)
+    if (dist === 0) return pulse[0]!   // center: shade 300
+    if (dist === 1) return pulse[1]!   // adjacent: shade 400
+    return baseColor                    // everything else: normal color
+  })
+}
+
+
 
 
 export const AgentActivityLine = memo(function AgentActivityLine({
@@ -25,6 +41,7 @@ export const AgentActivityLine = memo(function AgentActivityLine({
   const theme = useTheme()
   const [nameHovered, setNameHovered] = useState(false)
   const [pulseIndex, setPulseIndex] = useState(0)
+  const [sweepPos, setSweepPos] = useState(0)
 
   const palette = getAgentColorByRole(item.agentRole)
 
@@ -35,6 +52,14 @@ export const AgentActivityLine = memo(function AgentActivityLine({
     }, PULSE_INTERVAL_MS)
     return () => clearInterval(id)
   }, [palette.pulse.length, isFinished])
+
+  useEffect(() => {
+    if (isFinished) return
+    const id = setInterval(() => {
+      setSweepPos(prev => prev + 1)
+    }, SWEEP_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [isFinished])
 
   return (
     <box
@@ -54,7 +79,17 @@ export const AgentActivityLine = memo(function AgentActivityLine({
         onMouseOut={() => setNameHovered(false)}
       >
         <text style={{ wrapMode: 'none' }}>
-          <span fg={nameHovered ? palette.pulse[0] : palette.border}>{item.agentName}</span>
+          {nameHovered
+            ? <span fg={palette.pulse[0]}>{item.agentName}</span>
+            : isFinished
+              ? <span fg={palette.border}>{item.agentName}</span>
+              : (() => {
+                  const nameColors = sweepColors(item.agentName, sweepPos, palette.border, palette.pulse)
+                  return Array.from(item.agentName).map((ch, i) => (
+                    <span key={i} fg={nameColors[i]}>{ch}</span>
+                  ))
+                })()
+          }
         </text>
       </Button>
       <text style={{ wrapMode: 'none' }}>
