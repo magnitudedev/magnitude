@@ -207,6 +207,34 @@ function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+async function sha256File(filePath: string): Promise<string> {
+  const bytes = await Bun.file(filePath).arrayBuffer()
+  return new Bun.CryptoHasher('sha256').update(bytes).digest('hex')
+}
+
+async function writeMagnitudeMeta(jobDir: string, startedAtIso: string) {
+  try {
+    const binaryPath = path.join(process.cwd(), 'evals/tbench/bin/magnitude')
+    const binaryHash = await sha256File(binaryPath)
+    await Bun.write(
+      path.join(jobDir, 'magnitude-meta.json'),
+      JSON.stringify(
+        {
+          binaryHash,
+          binaryPath,
+          timestamp: startedAtIso,
+        },
+        null,
+        2,
+      ),
+    )
+  } catch (error) {
+    clack.log.warn(
+      `Failed to write magnitude-meta.json: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
 async function waitForJobDir(before: Set<string>, signal: AbortSignal): Promise<string | null> {
   while (!signal.aborted) {
     if (existsSync(JOBS_DIR)) {
@@ -558,6 +586,8 @@ export async function main(options: Partial<RunOptions> = {}) {
     }
   })
 
+  const runStartedAt = new Date().toISOString()
+
   child = Bun.spawn(commandArgs, {
     stdout: 'pipe',
     stderr: 'inherit',
@@ -568,6 +598,7 @@ export async function main(options: Partial<RunOptions> = {}) {
   const watchJobPromise = waitForJobDir(beforeJobs, abortController.signal).then(async found => {
     jobDir = found
     if (found) {
+      await writeMagnitudeMeta(found, runStartedAt)
       clack.log.info(`Watching ${path.relative(process.cwd(), found)}`)
       await watchTaskLogs(found, tasks, abortController.signal)
     }

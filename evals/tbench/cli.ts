@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 
 import { spawn } from 'bun'
+import path from 'path'
 import { Command } from '@commander-js/extra-typings'
+import { jobsMain, submitMain } from './jobs'
 import { main as runMain } from './run'
 
 function parsePositiveInt(value: string, fallback: number) {
@@ -36,6 +38,45 @@ program
     })
     const code = await child.exited
     process.exit(code)
+  })
+
+program
+  .command('jobs')
+  .description('List Harbor tbench jobs under ./jobs')
+  .option('--model <filter>', 'Filter jobs by model substring')
+  .option('--verbose', 'Show per-task breakdown under each job', false)
+  .action(async options => {
+    await jobsMain({
+      modelFilter: options.model,
+      verbose: Boolean(options.verbose),
+    })
+  })
+
+program
+  .command('submit')
+  .description('Package completed tbench jobs for leaderboard submission')
+  .option('--model <model>', 'Model to submit')
+  .option('--jobs <ids>', 'Comma-separated job IDs / folder names to include')
+  .option('--force', 'Allow submission packaging despite validation warnings/errors that are force-overridable', false)
+  .option(
+    '--output <dir>',
+    'Submission root directory',
+    path.join(process.cwd(), 'submissions', 'terminal-bench', '2.0'),
+  )
+  .action(async options => {
+    await submitMain({
+      model: options.model,
+      jobs:
+        typeof options.jobs === 'string'
+          ? options.jobs
+              .split(',')
+              .map((s: string) => s.trim())
+              .filter(Boolean)
+          : undefined,
+      force: Boolean(options.force),
+      outputDir: options.output,
+      interactive: !options.model && !options.jobs,
+    })
   })
 
 await program.parseAsync(process.argv)
