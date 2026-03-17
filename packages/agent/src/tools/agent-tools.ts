@@ -97,9 +97,11 @@ export const agentCreateTool = createTool({
       attributes: [
         { field: 'agentId', attr: 'agentId' },
         { field: 'options.type', attr: 'type' },
-        { field: 'options.title', attr: 'title' },
       ],
-      body: 'options.message',
+      childTags: [
+        { field: 'options.title', tag: 'title' },
+        { field: 'options.message', tag: 'message' },
+      ],
     },
     xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
   } as const,
