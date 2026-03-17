@@ -52,7 +52,7 @@ import { createTurnsBuilder } from './scenario-builder'
 import { clearAgentOverrides, getAgentDefinition, registerAgentDefinition, type AgentVariant } from '../agents'
 import { defaultXmlTagName } from '../tools'
 import { createDefaultToolOverrides, createVirtualFs } from './virtual-fs'
-import type { PolicyContext } from '../agents/types'
+import { EphemeralSessionContextTag, type PolicyContext } from '../agents/types'
 import { ChatPersistence, PersistenceError, type ChatPersistenceService } from '../persistence/chat-persistence-service'
 import { createFaultRegistry, type FaultPlan, type FaultRegistry, type FaultScope } from './faults'
 import { createFakeClock } from './fake-clock'
@@ -289,8 +289,12 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const fakeClock = options.clock === 'fake' ? createFakeClock() : null
 
     const providerRuntime = makeProviderRuntimeLive()
+    const ephemeralSessionContextLayer = Layer.succeed(EphemeralSessionContextTag, {
+      disableShellSafeguards: false,
+      disableCwdSafeguards: false,
+    })
     const runtimeLayer = Layer.mergeAll(
-      ExecutionManagerLive,
+      Layer.provide(ExecutionManagerLive, ephemeralSessionContextLayer),
       Layer.provide(BrowserServiceLive, providerRuntime),
       providerRuntime,
       ...(options.model

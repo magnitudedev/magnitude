@@ -55,12 +55,12 @@ export function buildPermissionInterceptor(
             const result = classifyShellCommand(input.command)
 
             if (result.tier === 'normal') {
-              if (detectsOutsideCwd(input.command, policyCtx.cwd)) {
+              if (!policyCtx.disableCwdSafeguards && detectsOutsideCwd(input.command, policyCtx.cwd)) {
                 return reject(PermissionRejection.Forbidden({
                   reason: 'Non read-only shell commands outside the working directory are not allowed.'
                 }))
               }
-              if (!isGitAllowed(input.command)) {
+              if (!policyCtx.disableShellSafeguards && !isGitAllowed(input.command)) {
                 return reject(PermissionRejection.Forbidden({
                   reason: 'Only read-only git commands are allowed (status, log, diff, show, branch).'
                 }))

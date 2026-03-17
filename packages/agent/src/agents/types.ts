@@ -4,12 +4,24 @@
 
 import { Context, Effect } from 'effect'
 
+export interface EphemeralSessionContext {
+  readonly disableShellSafeguards: boolean
+  readonly disableCwdSafeguards: boolean
+}
+
+export class EphemeralSessionContextTag extends Context.Tag('EphemeralSessionContext')<
+  EphemeralSessionContextTag,
+  EphemeralSessionContext
+>() {}
+
 /** Framework state provided to agent policies (permission + turn) for decision-making. */
 export interface PolicyContext {
   readonly forkId: string | null
   readonly cwd: string
   readonly activeAgentCount: number
   readonly userMessagePending: boolean
+  readonly disableShellSafeguards: boolean
+  readonly disableCwdSafeguards: boolean
 
   readonly agents: readonly { agentId: string; type: string; status: string }[]
 }

@@ -53,16 +53,16 @@ export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools,
   permission: (p) => ({
     shell(input, pctx) {
       const result = classifyShellCommand(input.command)
-      if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-      if (detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+      if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
+      if (!pctx.disableCwdSafeguards && detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
       return p.allow()
     },
     fileWrite(input, ctx) {
-      if (isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
+      if (!ctx.disableCwdSafeguards && isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
       return p.allow()
     },
     fileEdit(input, ctx) {
-      if (isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
+      if (!ctx.disableCwdSafeguards && isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
       return p.allow()
     },
     _default() { return p.allow() },

@@ -38,10 +38,19 @@ export interface RunOneshotOptions {
   providerId?: string
   modelId?: string
   debug?: boolean
+  disableShellSafeguards?: boolean
+  disableCwdSafeguards?: boolean
 }
 
 export async function runOneshot(options: RunOneshotOptions): Promise<void> {
-  const { prompt, providerId, modelId, debug } = options
+  const {
+    prompt,
+    providerId,
+    modelId,
+    debug,
+    disableShellSafeguards,
+    disableCwdSafeguards,
+  } = options
 
   if (!prompt) {
     console.error('A prompt is required for oneshot mode')
@@ -112,6 +121,8 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
     debug,
     sessionContext,
     providerRuntime,
+    disableShellSafeguards,
+    disableCwdSafeguards,
   })
 
   line(`✓ ${dim('session initialized')}`)

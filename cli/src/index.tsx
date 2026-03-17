@@ -27,6 +27,8 @@ async function main() {
     .option('--oneshot [prompt]', 'Run autonomous oneshot task and exit on completion')
     .option('--provider <id>', 'Provider ID for oneshot mode (e.g. anthropic, openai)')
     .option('--model <id>', 'Model ID for oneshot mode')
+    .option('--disable-shell-safeguards', 'Disable shell command classification safeguards for this oneshot run')
+    .option('--disable-cwd-safeguards', 'Disable working-directory boundary safeguards for this oneshot run')
     .argument('[prompt]')
     .action(async (promptArg, opts) => {
       if (opts.altKeywords) {
@@ -44,6 +46,8 @@ async function main() {
           providerId: opts.provider,
           modelId: opts.model,
           debug: opts.debug ?? false,
+          disableShellSafeguards: opts.disableShellSafeguards ?? false,
+          disableCwdSafeguards: opts.disableCwdSafeguards ?? false,
         })
         return
       }

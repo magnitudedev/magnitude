@@ -95,8 +95,8 @@ export const createOrchestrator = (systemPrompt: string) => {
     permission: (p) => ({
       shell(input, pctx) {
         const result = classifyShellCommand(input.command)
-        if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-        if (detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+        if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
+        if (!pctx.disableCwdSafeguards && detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
         return p.allow()
       },
       _default() { return p.allow() },

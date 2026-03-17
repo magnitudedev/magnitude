@@ -51,7 +51,7 @@ import { ReplayProjection } from '../projections/replay'
 import type { AgentDefinition, ToolSet, BoundObservable } from '@magnitudedev/agent-definition'
 import { bindObservable } from '@magnitudedev/agent-definition'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
-import { PolicyContextProviderTag, type PolicyContext } from '../agents/types'
+import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
 import type { TurnEvent } from './types'
 import { ToolEmitTag } from './tool-emit'
@@ -182,6 +182,7 @@ function makeForkLayers(
   permissionInterceptor: ReturnType<typeof buildPermissionInterceptor>,
   toolEmitRef: Ref.Ref<ToolDisplay | undefined>,
   cwd: string,
+  ephemeralSessionContext: EphemeralSessionContext,
 ) {
   const artifactStateReaderLayer = Layer.succeed(ArtifactStateReaderTag, {
     getState: () => artifactProjection.get
@@ -206,7 +207,13 @@ function makeForkLayers(
     getAgentState: () => agentStatusProjection.get,
   } satisfies AgentStateReader)
 
-  const policyCtxProvider = createPolicyContextProvider(forkId, cwd, agentStatusProjection, workingStateProjection)
+  const policyCtxProvider = createPolicyContextProvider(
+    forkId,
+    cwd,
+    ephemeralSessionContext,
+    agentStatusProjection,
+    workingStateProjection,
+  )
 
   const toolEmitLayer = Layer.succeed(ToolEmitTag, {
     emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
@@ -233,6 +240,7 @@ function makeForkLayers(
 
     Layer.succeed(ApprovalStateTag, approvalState),
     Layer.succeed(WorkingDirectoryTag, { cwd }),
+    Layer.succeed(EphemeralSessionContextTag, ephemeralSessionContext),
     Layer.succeed(PolicyContextProviderTag, policyCtxProvider),
     Layer.succeed(ToolInterceptorTag, providedInterceptor),
     toolEmitLayer,
@@ -245,6 +253,7 @@ function makeForkLayers(
  * No sandboxes — xml-act runtime is created fresh per execute() call.
  */
 const makeExecutionManager = Effect.gen(function* () {
+  const ephemeralSessionContext = yield* EphemeralSessionContextTag
   // Per-fork cached layers (built during initFork, reused across turns)
   const forkLayers = new Map<string | null, Layer.Layer<never>>()
   const forkCwds = new Map<string | null, string>()
@@ -406,6 +415,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
         cwd,
+        ephemeralSessionContext,
         yield* AgentStatusProjection.Tag,
         yield* WorkingStateProjection.Tag,
       )
@@ -734,7 +744,7 @@ const makeExecutionManager = Effect.gen(function* () {
         artifactProjection, workingStateProjection,
         conversationProjection,
         approvalState,
-        persistenceLayer, permissionInterceptor, toolEmitRef, cwd,
+        persistenceLayer, permissionInterceptor, toolEmitRef, cwd, ephemeralSessionContext,
       )
       forkCwds.set(forkId, cwd)
 

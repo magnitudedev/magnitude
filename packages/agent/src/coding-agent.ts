@@ -67,6 +67,7 @@ import type { StorageClient } from '@magnitudedev/storage'
 import { initLogger } from '@magnitudedev/logger'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 import { createMemoryExtractionJob, drainPendingJobsOnStartup, spawnDetachedMemoryExtractionWorker, writePendingJob } from './memory/job-queue'
+import { EphemeralSessionContextTag } from './agents/types'
 
 // =============================================================================
 // Agent
@@ -164,6 +165,16 @@ export interface CreateClientOptions {
    * for initializing model selections/auth inside the runtime.
    */
   providerRuntime?: ReturnType<typeof makeProviderRuntimeLive>
+
+  /**
+   * Disable shell command classification safeguards for this runtime only.
+   */
+  disableShellSafeguards?: boolean
+
+  /**
+   * Disable working-directory boundary safeguards for this runtime only.
+   */
+  disableCwdSafeguards?: boolean
 }
 
 /**
@@ -200,8 +211,12 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   }
 
   const tracerLayer = options.debug ? makeTracePersister((trace) => writeTrace(trace)) : makeNoopTracer()
+  const ephemeralSessionContextLayer = Layer.succeed(EphemeralSessionContextTag, {
+    disableShellSafeguards: options.disableShellSafeguards ?? false,
+    disableCwdSafeguards: options.disableCwdSafeguards ?? false,
+  })
   const layer = Layer.mergeAll(
-    ExecutionManagerLive,
+    Layer.provide(ExecutionManagerLive, ephemeralSessionContextLayer),
     Layer.provide(BrowserServiceLive, providerRuntime),
     Layer.provide(makeModelResolver(), providerRuntime),
     providerRuntime,

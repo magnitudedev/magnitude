@@ -45,6 +45,8 @@ class MagnitudeAgent(BaseInstalledAgent):
         # Build the command
         cmd = " ".join([
             "magnitude", "--oneshot",
+            "--disable-shell-safeguards",
+            "--disable-cwd-safeguards",
             "--provider", shlex.quote(provider),
             "--model", shlex.quote(model),
             escaped,
