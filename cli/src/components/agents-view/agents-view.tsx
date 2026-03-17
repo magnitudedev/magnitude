@@ -77,6 +77,7 @@ export const AgentsView = memo(function AgentsView({
         flexGrow: 1,
         rootOptions: {
           flexGrow: 1,
+          minHeight: 0,
           width: '100%',
           backgroundColor: 'transparent',
         },

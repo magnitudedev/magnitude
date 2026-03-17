@@ -172,6 +172,58 @@ function AppInner({
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const agentsScrollboxRef = useRef<any>(null)
   const agentsScrollPositionRef = useRef<number | null>(null)
+  const agentsScrollIntentRef = useRef<'bottom' | { restore: number } | null>(null)
+  const agentsScrollAttemptRef = useRef(0)
+
+  const applyAgentsScrollIntentWhenReady = useCallback(() => {
+    const intent = agentsScrollIntentRef.current
+    if (!intent) return
+
+    const scrollbox = agentsScrollboxRef.current
+    if (!scrollbox) return
+
+    const contentHeightRaw = scrollbox.content?.yogaNode?.getComputedHeight?.()
+    const contentHeight = Number.isFinite(contentHeightRaw) ? Number(contentHeightRaw) : null
+    const viewportHeightRaw = scrollbox.yogaNode?.getComputedHeight?.()
+    const viewportHeight = Number.isFinite(viewportHeightRaw) ? Number(viewportHeightRaw) : null
+
+    const hasValidContentHeight = contentHeight != null && contentHeight > 0
+    const hasValidViewportHeight = viewportHeight == null || viewportHeight > 0
+
+    if (!hasValidContentHeight || !hasValidViewportHeight) {
+      if (agentsScrollAttemptRef.current >= 4) {
+        if (intent === 'bottom') {
+          agentsScrollIntentRef.current = null
+        }
+        agentsScrollAttemptRef.current = 0
+        return
+      }
+      agentsScrollAttemptRef.current += 1
+      setTimeout(() => {
+        applyAgentsScrollIntentWhenReady()
+      }, 0)
+      return
+    }
+
+    if (intent === 'bottom') {
+      scrollbox.scrollTo(contentHeight)
+    } else {
+      const clamped = Math.max(0, Math.min(intent.restore, contentHeight))
+      scrollbox.scrollTo(clamped)
+      agentsScrollPositionRef.current = null
+    }
+
+    agentsScrollIntentRef.current = null
+    agentsScrollAttemptRef.current = 0
+  }, [])
+
+  const scheduleApplyAgentsScrollIntent = useCallback(() => {
+    agentsScrollAttemptRef.current = 0
+    setTimeout(() => {
+      applyAgentsScrollIntentWhenReady()
+    }, 0)
+  }, [applyAgentsScrollIntentWhenReady])
+
   const pushForkOverlay = (forkId: string) => {
     const scrollbox = agentsScrollboxRef.current
     if (scrollbox) {
@@ -179,21 +231,16 @@ function AppInner({
     }
     setExpandedForkStack(s => [...s, forkId])
   }
-  const popForkOverlay = () => {
+  const popForkOverlay = useCallback(() => {
     setExpandedForkStack(s => {
       const newStack = s.slice(0, -1)
-      if (newStack.length === 0) {
-        setTimeout(() => {
-          const scrollbox = agentsScrollboxRef.current
-          if (scrollbox && agentsScrollPositionRef.current != null) {
-            scrollbox.scrollTo(agentsScrollPositionRef.current)
-            agentsScrollPositionRef.current = null
-          }
-        }, 0)
+      if (newStack.length === 0 && agentsScrollPositionRef.current != null) {
+        agentsScrollIntentRef.current = { restore: agentsScrollPositionRef.current }
+        scheduleApplyAgentsScrollIntent()
       }
       return newStack
     })
-  }
+  }, [scheduleApplyAgentsScrollIntent])
 
   const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -1440,15 +1487,12 @@ function AppInner({
     activeTabRef.current = tab
     if (tab === 'main') setHasUnreadMain(false)
     if (tab === 'agents') {
-      setTimeout(() => {
-        const scrollbox = agentsScrollboxRef.current
-        if (scrollbox) {
-          const contentHeight = scrollbox.content?.yogaNode?.getComputedHeight?.() ?? 999999
-          scrollbox.scrollTo(contentHeight)
-        }
-      }, 0)
+      if (agentsScrollIntentRef.current == null || agentsScrollIntentRef.current === 'bottom') {
+        agentsScrollIntentRef.current = 'bottom'
+      }
+      scheduleApplyAgentsScrollIntent()
     }
-  }, [])
+  }, [scheduleApplyAgentsScrollIntent])
 
   const handleInterrupt = useCallback(() => {
     if (!client) return
@@ -1922,7 +1966,7 @@ function AppInner({
             </box>
           )}
           {activeTab === 'main' ? chatScrollbox : (
-            <box style={{ flexGrow: 1, minWidth: 0 }}>
+            <box style={{ flexGrow: 1, minWidth: 0, minHeight: 0 }}>
               <AgentsView
                 items={agentsViewState?.items ?? []}
                 activeActivityIds={agentsViewState?.activeActivityIds ?? new Map()}
