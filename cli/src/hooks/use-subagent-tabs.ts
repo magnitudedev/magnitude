@@ -59,8 +59,10 @@ export function reconcileForkMeta(args: {
     const isDismissed = forkAgent?.status === 'dismissed'
     if (isDismissed) continue
 
-    const isActive = activity.status === 'running' && (!agentStatusState || forkAgent?.status === 'working')
-    const completedAt = activity.completedAt ?? previous?.completedAt ?? (isActive ? undefined : now)
+    const phase: ForkMeta['phase'] = activity.status === 'running' ? 'active' : 'idle'
+    const completedAt = phase === 'active'
+      ? undefined
+      : (activity.completedAt ?? previous?.completedAt)
 
     next[forkId] = {
       agentId: forkAgent?.agentId ?? previous?.agentId ?? forkId,
@@ -69,7 +71,7 @@ export function reconcileForkMeta(args: {
       completedAt,
       toolCount: sumForkToolCounts(activity.toolCounts),
       toolCounts: activity.toolCounts,
-      phase: isActive ? 'active' : 'idle',
+      phase,
     }
   }
 

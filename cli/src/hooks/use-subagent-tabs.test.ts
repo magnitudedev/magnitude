@@ -17,7 +17,7 @@ describe('sortSubagentTabs', () => {
 })
 
 describe('reconcileForkMeta', () => {
-  test('freezes timer semantics on active -> idle transition when completedAt is missing', () => {
+  test('does not synthesize completedAt on active -> idle transition when completedAt is missing', () => {
     const running = new Map<string, any>([
       ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, status: 'running', toolCounts: {} }],
     ])
@@ -40,7 +40,7 @@ describe('reconcileForkMeta', () => {
       now: 9000,
     })
     expect(second.next['fork-1']?.phase).toBe('idle')
-    expect(second.next['fork-1']?.completedAt).toBe(9000)
+    expect(second.next['fork-1']?.completedAt).toBeUndefined()
 
     const third = reconcileForkMeta({
       prev: second.next,
@@ -49,7 +49,90 @@ describe('reconcileForkMeta', () => {
       now: 12000,
     })
     expect(third.next['fork-1']?.phase).toBe('idle')
-    expect(third.next['fork-1']?.completedAt).toBe(9000)
+    expect(third.next['fork-1']?.completedAt).toBeUndefined()
+  })
+
+  test('restored idle without completedAt preserves prior completedAt (no now fallback freeze)', () => {
+    const latestByFork = new Map<string, any>([
+      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, status: 'completed', toolCounts: {} }],
+    ])
+
+    const result = reconcileForkMeta({
+      prev: {
+        'fork-1': {
+          agentId: 'a',
+          name: 'A',
+          activeSince: 1000,
+          toolCount: 0,
+          toolCounts: {},
+          phase: 'idle' as const,
+          completedAt: 7000,
+        },
+      },
+      latestByFork,
+      agentStatusState: null,
+      now: 9000,
+    })
+
+    expect(result.next['fork-1']?.phase).toBe('idle')
+    expect(result.next['fork-1']?.completedAt).toBe(7000)
+  })
+
+  test('derives phase from fork activity status (not agent status) and preserves activity completedAt', () => {
+    const latestByFork = new Map<string, any>([
+      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, status: 'completed', completedAt: 7000, toolCounts: {} }],
+    ])
+    const agentStatusState = {
+      agents: new Map([
+        ['a', { agentId: 'a', forkId: 'fork-1', status: 'working' }],
+      ]),
+    } as any
+
+    const result = reconcileForkMeta({
+      prev: {
+        'fork-1': {
+          agentId: 'a',
+          name: 'A',
+          activeSince: 1000,
+          toolCount: 0,
+          toolCounts: {},
+          phase: 'idle' as const,
+          completedAt: 6000,
+        },
+      },
+      latestByFork,
+      agentStatusState,
+      now: 9000,
+    })
+
+    expect(result.next['fork-1']?.phase).toBe('idle')
+    expect(result.next['fork-1']?.completedAt).toBe(7000)
+  })
+
+  test('clears completedAt when status returns to running', () => {
+    const latestByFork = new Map<string, any>([
+      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, status: 'running', toolCounts: {} }],
+    ])
+
+    const result = reconcileForkMeta({
+      prev: {
+        'fork-1': {
+          agentId: 'a',
+          name: 'A',
+          activeSince: 1000,
+          toolCount: 0,
+          toolCounts: {},
+          phase: 'idle' as const,
+          completedAt: 7000,
+        },
+      },
+      latestByFork,
+      agentStatusState: null,
+      now: 9000,
+    })
+
+    expect(result.next['fork-1']?.phase).toBe('active')
+    expect(result.next['fork-1']?.completedAt).toBeUndefined()
   })
 
   test('marks dismissed or nonexistent prior forks for prune', () => {

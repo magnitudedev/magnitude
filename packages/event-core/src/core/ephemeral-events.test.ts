@@ -24,8 +24,8 @@ import {
 // ---------------------------------------------------------------------------
 
 type TestEvent =
-  | { readonly type: 'normal_event'; readonly data: string }
-  | { readonly type: 'ephemeral_event'; readonly ephemeral: true; readonly data: string }
+  | { readonly type: 'normal_event'; readonly data: string; readonly timestamp?: number }
+  | { readonly type: 'ephemeral_event'; readonly ephemeral: true; readonly data: string; readonly timestamp?: number }
 
 // ---------------------------------------------------------------------------
 // Layer setup
@@ -142,6 +142,45 @@ describe('ephemeral events', () => {
             'second',
             'third',
           ])
+        }),
+      ).pipe(Effect.provide(makeTestLayers())),
+    )
+  })
+
+  test('publish preserves provided timestamp', async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const bus = yield* BusTag
+          const sink = yield* SinkTag
+          const historicalTimestamp = 1234567890
+
+          yield* bus.publish({ type: 'normal_event', data: 'historical', timestamp: historicalTimestamp })
+
+          const pending = yield* sink.readPending()
+          expect(pending).toHaveLength(1)
+          expect(pending[0].timestamp).toBe(historicalTimestamp)
+        }),
+      ).pipe(Effect.provide(makeTestLayers())),
+    )
+  })
+
+  test('publish assigns timestamp when absent', async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const bus = yield* BusTag
+          const sink = yield* SinkTag
+          const before = Date.now()
+
+          yield* bus.publish({ type: 'normal_event', data: 'no-ts' })
+
+          const after = Date.now()
+          const pending = yield* sink.readPending()
+          expect(pending).toHaveLength(1)
+          expect(typeof pending[0].timestamp).toBe('number')
+          expect(pending[0].timestamp).toBeGreaterThanOrEqual(before)
+          expect(pending[0].timestamp).toBeLessThanOrEqual(after)
         }),
       ).pipe(Effect.provide(makeTestLayers())),
     )

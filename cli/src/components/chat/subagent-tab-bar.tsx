@@ -110,7 +110,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         const tabIdColor = theme.foreground
         const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
 
-        const timer = formatElapsed(tab.activeSince, now, isIdle ? (tab.completedAt ?? tab.activeSince) : tab.completedAt)
+        const timer = formatElapsed(tab.activeSince, now, tab.completedAt)
         const detailsPart = `• ${tab.toolCount} tools • ${timer}`
         const line1Prefix = isIdle ? '○ ' : '● '
         const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - detailsPart.length - 1
