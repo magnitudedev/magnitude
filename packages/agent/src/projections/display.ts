@@ -859,13 +859,17 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               fork.messages,
               fork.activeThinkBlockId,
               event.toolCallId,
-              (s) => ({
-                ...s,
-                result,
-                visualState: visual && s.visualState !== undefined
-                  ? visual.reduce(s.visualState, inner)
-                  : s.visualState,
-              })
+              (s) => {
+                const completedLabel = generateCompletedToolLabel(event.toolKey, s.input)
+                return {
+                  ...s,
+                  result,
+                  ...(completedLabel ? { label: completedLabel } : {}),
+                  visualState: visual && s.visualState !== undefined
+                    ? visual.reduce(s.visualState, inner)
+                    : s.visualState,
+                }
+              }
             )
           }
         }
@@ -1253,16 +1257,26 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 // Helpers
 // =============================================================================
 
+function generateCompletedToolLabel(toolKey: string, input: unknown): string | null {
+  if (toolKey === 'artifactWrite' && input && typeof input === 'object' && 'id' in input) {
+    return `Wrote artifact "${(input as { id: string }).id}"`
+  }
+  if (toolKey === 'artifactUpdate' && input && typeof input === 'object' && 'id' in input) {
+    return `Updated artifact "${(input as { id: string }).id}"`
+  }
+  return null
+}
+
 function generateToolLabel(toolKey: string, input: unknown): string {
   // Artifact tools
   if (toolKey === 'artifactRead' && input && typeof input === 'object' && 'id' in input) {
     return `Read artifact "${(input as { id: string }).id}"`
   }
   if (toolKey === 'artifactWrite' && input && typeof input === 'object' && 'id' in input) {
-    return `Wrote artifact "${(input as { id: string }).id}"`
+    return `Writing artifact "${(input as { id: string }).id}"`
   }
   if (toolKey === 'artifactUpdate' && input && typeof input === 'object' && 'id' in input) {
-    return `Updated artifact "${(input as { id: string }).id}"`
+    return `Updating artifact "${(input as { id: string }).id}"`
   }
 
 

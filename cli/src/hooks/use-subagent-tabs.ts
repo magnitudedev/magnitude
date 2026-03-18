@@ -19,6 +19,7 @@ type UseSubagentTabsArgs = {
 }
 
 type ForkMeta = {
+  agentId: string
   name: string
   startedAt: number
   toolCount: number
@@ -57,9 +58,13 @@ export function useSubagentTabs({
         if (!forkAgent || forkAgent.status !== 'working') continue
       }
       activeForkIds.add(forkId)
+      const forkAgent = agentStatusState
+        ? Array.from(agentStatusState.agents.values()).find(a => a.forkId === forkId)
+        : undefined
       setForkMeta(prev => {
         const existing = prev[forkId]
         const nextMeta: ForkMeta = {
+          agentId: forkAgent?.agentId ?? forkId,
           name: activity.name,
           startedAt: activity.startedAt,
           toolCount: sumForkToolCounts(activity.toolCounts),
@@ -67,6 +72,7 @@ export function useSubagentTabs({
         }
         if (
           existing
+          && existing.agentId === nextMeta.agentId
           && existing.name === nextMeta.name
           && existing.startedAt === nextMeta.startedAt
           && existing.toolCount === nextMeta.toolCount
@@ -144,6 +150,7 @@ export function useSubagentTabs({
         const statusLine = truncateSubagentTabText(deriveSubagentStatusLine(forkMessages[forkId] ?? []))
         return {
           forkId,
+          agentId: meta.agentId,
           name: meta.name,
           startedAt: meta.startedAt,
           toolCount: meta.toolCount,

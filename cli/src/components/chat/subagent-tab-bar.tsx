@@ -59,7 +59,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
     : theme.muted
 
   return (
-    <box style={{ paddingLeft: 2, paddingRight: 2, paddingBottom: 1, flexDirection: 'row', gap: 1, flexWrap: 'wrap' }}>
+    <box style={{ paddingLeft: 2, paddingRight: 2, flexDirection: 'row', gap: 1, flexWrap: 'wrap', flexShrink: 0 }}>
       {/* Main tab */}
       <Button
         onClick={() => onSelect(null)}
@@ -94,12 +94,11 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         const attrs = exiting ? TextAttributes.DIM : undefined
 
         const timer = formatElapsed(tab.startedAt, now)
-        const toolStr = `${tab.toolCount}t`
 
-        // Line 1: name (left) + timer + toolStr (right), padded to TAB_INNER_WIDTH
-        const rightPart = `${timer} ${toolStr}`
+        // Line 1: agentId (left) + timer (right), padded to TAB_INNER_WIDTH
+        const rightPart = timer
         const nameMaxLen = TAB_INNER_WIDTH - rightPart.length - 1
-        const namePart = truncate(tab.name, nameMaxLen)
+        const namePart = truncate(tab.agentId, nameMaxLen)
         const line1 = padRight(namePart, TAB_INNER_WIDTH - rightPart.length) + rightPart
 
         // Line 2: status line, truncated
