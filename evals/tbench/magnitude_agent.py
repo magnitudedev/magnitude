@@ -26,10 +26,22 @@ class MagnitudeAgent(BaseInstalledAgent):
         if result.return_code != 0:
             return False
 
-        print("Installing magnitude from mounted volume...")
-        await environment.exec(
-            command="cp /opt/magnitude-volume/magnitude/sha256/$(cat /opt/magnitude-volume/magnitude/current)/magnitude /usr/local/bin/magnitude && chmod +x /usr/local/bin/magnitude"
+        print("Installing magnitude from mounted volume...", flush=True)
+        hash_result = await environment.exec(command=f"cat {current_path} | tr -d '\\n'")
+        if hash_result.return_code != 0 or not hash_result.stdout or not hash_result.stdout.strip():
+            print("Failed to read volume hash pointer", flush=True)
+            return False
+
+        binary_hash = hash_result.stdout.strip()
+        volume_binary = f"/opt/magnitude-volume/magnitude/sha256/{binary_hash}/magnitude"
+
+        copy_result = await environment.exec(
+            command=f"cp {volume_binary} /usr/local/bin/magnitude && chmod +x /usr/local/bin/magnitude"
         )
+        if copy_result.return_code != 0:
+            print(f"Failed to copy binary from volume: {copy_result.stderr}", flush=True)
+            return False
+
         return True
 
     async def setup(self, environment) -> None:

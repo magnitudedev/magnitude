@@ -107,8 +107,10 @@ async def seed_volume(name: str, binary_path: Path, force: bool) -> str:
             if exists and not force:
                 print(f"Binary already present for sha256 {sha256}, updating current pointer only")
             else:
+                print(f"Uploading binary ({size} bytes)...", flush=True)
                 await sandbox.fs.upload_file(binary_bytes, remote_binary_path)
-                await sandbox.fs.set_file_permissions(remote_binary_path, mode="755")
+                print("Upload complete, setting permissions...", flush=True)
+                await sandbox.process.exec(f"chmod +x {remote_binary_path}")
 
             manifest = {
                 "sha256": sha256,
