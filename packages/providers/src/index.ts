@@ -73,7 +73,7 @@ export { createProviderClient } from './runtime/client'
 export type { ProviderClient } from './runtime/client'
 
 // Registry
-export { PROVIDERS, getProvider, getProviderIds, getStaticProviderModels, setProviderModels, getModelCost } from './registry'
+export { PROVIDERS, compareProviderOrder, getProvider, getProviderIds, getStaticProviderModels, setProviderModels, getModelCost } from './registry'
 
 // Catalog
 export * from './catalog'

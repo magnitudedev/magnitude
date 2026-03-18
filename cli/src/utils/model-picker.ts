@@ -5,6 +5,7 @@ import type {
 import { isBrowserCompatible } from '@magnitudedev/providers'
 import type { ModelSlot, ProviderDefinition } from '@magnitudedev/providers'
 import {
+  compareProviderOrder,
   getModelRecommendation,
   resolveRecommendedModel,
 } from '@magnitudedev/providers'
@@ -128,8 +129,7 @@ export function buildModelPickerItems({
 
   return items.sort((a, b) => {
     if (a.connected !== b.connected) return Number(b.connected) - Number(a.connected)
-    if (a.providerName !== b.providerName) return a.providerName.localeCompare(b.providerName)
-    if (a.providerId !== b.providerId) return a.providerId.localeCompare(b.providerId)
+    if (a.providerId !== b.providerId) return compareProviderOrder(a.providerId, b.providerId)
     return compareItemsForSlot(a, b, selectingModelFor)
   })
 }
@@ -171,7 +171,7 @@ export function resolveSlotDefaultSelection({
     const aPreferred = a.id === preferredProviderId ? -1 : 0
     const bPreferred = b.id === preferredProviderId ? -1 : 0
     if (aPreferred !== bPreferred) return aPreferred - bPreferred
-    return a.name.localeCompare(b.name)
+    return compareProviderOrder(a.id, b.id)
   })
 
   // 1. Try hardcoded per-provider defaults first
