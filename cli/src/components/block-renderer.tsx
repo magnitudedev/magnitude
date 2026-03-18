@@ -1,4 +1,4 @@
-import React, { memo, useEffect, useRef, useState } from 'react'
+import React, { memo, useRef, useState } from 'react'
 import stringWidth from 'string-width'
 import {
   TextAttributes,
@@ -18,9 +18,13 @@ import type {
   HighlightRange,
 } from '../utils/render-blocks'
 import { spansToText } from '../utils/render-blocks'
+import { useMountedRef } from '../hooks/use-mounted-ref'
+import { useSafeEvent } from '../hooks/use-safe-event'
+import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { useTheme } from '../hooks/use-theme'
-import type { MarkdownPalette } from '../utils/theme'
+import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
 import { buildMarkdownColorPalette } from '../utils/theme'
+import type { MarkdownPalette } from '../utils/markdown-content-renderer'
 import { useArtifacts } from '../hooks/use-artifacts'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { BOX_CHARS } from '../utils/ui-constants'
@@ -51,6 +55,7 @@ const SpanRenderer = memo(function SpanRenderer({
   const theme = useTheme()
   const renderer = useRenderer()
   const artifactState = useArtifacts()
+  const mountedRef = useMountedRef()
   const textRef = useRef<TextRenderable | null>(null)
   const pressStartedRef = useRef<number | null>(null)
   const [hoveredZone, setHoveredZone] = useState<number | null>(null)
@@ -111,19 +116,54 @@ const SpanRenderer = memo(function SpanRenderer({
   }
 
   const hitTest = (event: OTMouseEvent): number | null => {
-    const el = textRef.current
-    if (!el || hitZones.length === 0) return null
-    const localX = event.x - el.x
-    const localY = event.y - el.y
-    const view = (el as unknown as Record<string, unknown>).textBufferView as TextBufferView
-    const info: LineInfo = view.lineInfo
-    if (localY < 0 || localY >= info.lineStarts.length) return null
-    const charIndex = info.lineStarts[localY] + localX
-    for (let i = 0; i < hitZones.length; i++) {
-      if (charIndex >= hitZones[i].charStart && charIndex < hitZones[i].charEnd) return i
-    }
-    return null
+    if (hitZones.length === 0) return null
+    return safeRenderableAccess(
+      textRef.current,
+      (el) => {
+        const localX = event.x - el.x
+        const localY = event.y - el.y
+        const view = (el as unknown as Record<string, unknown>).textBufferView as TextBufferView
+        const info: LineInfo = view.lineInfo
+        if (localY < 0 || localY >= info.lineStarts.length) return null
+        const charIndex = info.lineStarts[localY] + localX
+        for (let i = 0; i < hitZones.length; i++) {
+          if (charIndex >= hitZones[i].charStart && charIndex < hitZones[i].charEnd) return i
+        }
+        return null
+      },
+      {
+        mountedRef,
+        fallback: null,
+      },
+    )
   }
+
+  const handleMouseDown = useSafeEvent((event: OTMouseEvent) => {
+    const hit = hitTest(event)
+    if (hit !== null) pressStartedRef.current = hit
+  })
+
+  const handleMouseUp = useSafeEvent((event: OTMouseEvent) => {
+    const hit = hitTest(event)
+    if (hit !== null && hit === pressStartedRef.current) {
+      safeRenderableCall(
+        renderer,
+        (r) => r.clearSelection(),
+        { mountedRef },
+      )
+      onOpenArtifact?.(hitZones[hit].name, hitZones[hit].section)
+    }
+    pressStartedRef.current = null
+  })
+
+  const handleMouseMove = useSafeEvent((event: OTMouseEvent) => {
+    setHoveredZone(hitTest(event))
+  })
+
+  const handleMouseOut = useSafeEvent(() => {
+    setHoveredZone(null)
+    pressStartedRef.current = null
+  })
 
   if (hitZones.length === 0) {
     return (
@@ -141,25 +181,10 @@ const SpanRenderer = memo(function SpanRenderer({
       }}
       style={{ fg: foreground, wrapMode: 'word' }}
       selectable={false}
-      onMouseDown={(event: OTMouseEvent) => {
-        const hit = hitTest(event)
-        if (hit !== null) pressStartedRef.current = hit
-      }}
-      onMouseUp={(event: OTMouseEvent) => {
-        const hit = hitTest(event)
-        if (hit !== null && hit === pressStartedRef.current) {
-          renderer.clearSelection()
-          onOpenArtifact?.(hitZones[hit].name, hitZones[hit].section)
-        }
-        pressStartedRef.current = null
-      }}
-      onMouseMove={(event: OTMouseEvent) => {
-        setHoveredZone(hitTest(event))
-      }}
-      onMouseOut={() => {
-        setHoveredZone(null)
-        pressStartedRef.current = null
-      }}
+      onMouseDown={handleMouseDown}
+      onMouseUp={handleMouseUp}
+      onMouseMove={handleMouseMove}
+      onMouseOut={handleMouseOut}
     >
       {elements}
     </text>
@@ -199,23 +224,18 @@ function CodeBlockView({
   const [isHovered, setIsHovered] = useState(false)
   const [copied, setCopied] = useState(false)
   const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const safeTimeout = useSafeTimeout()
 
   const handleCopy = (e: { stopPropagation?: () => void }) => {
     e.stopPropagation?.()
     void writeTextToClipboard(block.rawCode)
     setCopied(true)
-    if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current)
-    copiedTimeoutRef.current = setTimeout(() => {
+    safeTimeout.clear(copiedTimeoutRef.current)
+    copiedTimeoutRef.current = safeTimeout.set(() => {
       setCopied(false)
       copiedTimeoutRef.current = null
     }, COPY_FEEDBACK_RESET_MS)
   }
-
-  useEffect(() => {
-    return () => {
-      if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current)
-    }
-  }, [])
 
   return (
     <box

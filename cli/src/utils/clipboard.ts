@@ -6,6 +6,10 @@ import path from 'path'
 import { useRenderer } from '@opentui/react'
 import { useEffect, useRef, useState } from 'react'
 import { INPUT_CURSOR_CHAR } from '../components/multiline-input'
+import { useMountedRef } from '../hooks/use-mounted-ref'
+import { useSafeAsync } from '../hooks/use-safe-async'
+import { useSafeTimeout } from '../hooks/use-safe-timeout'
+import { safeRenderableAccess, safeRenderableCall } from './safe-renderable-access'
 
 // =============================================================================
 // Read from Clipboard (cross-platform)
@@ -235,6 +239,9 @@ const TOAST_DURATION_MS = 3500
 
 export function useSelectionAutoCopy() {
   const renderer = useRenderer()
+  const mountedRef = useMountedRef()
+  const safeTimeout = useSafeTimeout()
+  const safeAsync = useSafeAsync()
   const [showCopiedToast, setShowCopiedToast] = useState(false)
   const copyDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const toastHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -243,7 +250,11 @@ export function useSelectionAutoCopy() {
 
   useEffect(() => {
     const onSelectionChanged = (selectionEvent: any) => {
-      const selectionObj = selectionEvent ?? renderer?.getSelection?.()
+      const selectionObj = selectionEvent ?? safeRenderableAccess(
+        renderer,
+        (r) => r.getSelection?.(),
+        { mountedRef, fallback: null },
+      )
       const rawText: string | null = selectionObj?.getSelectedText
         ? selectionObj.getSelectedText()
         : typeof selectionObj === 'string'
@@ -255,7 +266,7 @@ export function useSelectionAutoCopy() {
       if (!cleanedText || cleanedText.trim().length === 0) {
         pendingSelectionRef.current = null
         if (copyDebounceTimerRef.current) {
-          clearTimeout(copyDebounceTimerRef.current)
+          safeTimeout.clear(copyDebounceTimerRef.current)
           copyDebounceTimerRef.current = null
         }
         return
@@ -265,24 +276,28 @@ export function useSelectionAutoCopy() {
 
       pendingSelectionRef.current = cleanedText
 
-      if (copyDebounceTimerRef.current) clearTimeout(copyDebounceTimerRef.current)
+      if (copyDebounceTimerRef.current) safeTimeout.clear(copyDebounceTimerRef.current)
 
-      copyDebounceTimerRef.current = setTimeout(() => {
+      copyDebounceTimerRef.current = safeTimeout.set(() => {
         copyDebounceTimerRef.current = null
         const pending = pendingSelectionRef.current
         if (!pending || pending === lastCopiedSelectionRef.current) return
 
         lastCopiedSelectionRef.current = pending
-        void writeTextToClipboard(pending)
-          .then(() => {
-            renderer.clearSelection()
+        void safeAsync.run(async (ctx) => {
+          try {
+            await writeTextToClipboard(pending)
+            if (!ctx.checkpoint()) return
+            safeRenderableCall(renderer, (r) => r.clearSelection(), {
+              mountedRef,
+            })
             setShowCopiedToast(true)
-            if (toastHideTimerRef.current) clearTimeout(toastHideTimerRef.current)
-            toastHideTimerRef.current = setTimeout(() => setShowCopiedToast(false), TOAST_DURATION_MS)
-          })
-          .catch(() => {
+            if (toastHideTimerRef.current) safeTimeout.clear(toastHideTimerRef.current)
+            toastHideTimerRef.current = safeTimeout.set(() => setShowCopiedToast(false), TOAST_DURATION_MS)
+          } catch {
             // Errors logged within writeTextToClipboard
-          })
+          }
+        })
       }, COPY_DEBOUNCE_MS)
     }
 
@@ -293,14 +308,7 @@ export function useSelectionAutoCopy() {
       }
     }
     return undefined
-  }, [renderer])
-
-  useEffect(() => {
-    return () => {
-      if (copyDebounceTimerRef.current) clearTimeout(copyDebounceTimerRef.current)
-      if (toastHideTimerRef.current) clearTimeout(toastHideTimerRef.current)
-    }
-  }, [])
+  }, [mountedRef, renderer, safeAsync, safeTimeout])
 
   return { showCopiedToast }
 }
