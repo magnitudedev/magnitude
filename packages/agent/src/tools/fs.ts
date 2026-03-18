@@ -303,13 +303,17 @@ export async function searchFiles(
     stderr: 'pipe',
   })
 
-  const stdout = await new Response(proc.stdout).text()
-  await proc.exited
-
   const matches: SearchMatch[] = []
+  const decoder = new TextDecoder()
+  const reader = proc.stdout.getReader()
 
-  for (const line of stdout.split('\n')) {
-    if (!line.trim()) continue
+  let buffer = ''
+  let timedOut = false
+  let stoppedEarly = false
+
+  const processLine = (line: string) => {
+    if (!line.trim()) return
+
     try {
       const msg = JSON.parse(line)
       if (msg.type === 'match') {
@@ -321,14 +325,59 @@ export async function searchFiles(
           file: filePath,
           match: `${lineNum}|${lineText}`
         })
-        if (matches.length >= limit) break
+        if (matches.length >= limit) {
+          stoppedEarly = true
+          proc.kill()
+        }
       }
     } catch {
-      continue
+      // Ignore malformed lines from rg output
     }
   }
 
-  return matches
+  const timeout = setTimeout(() => {
+    timedOut = true
+    proc.kill()
+  }, 5000)
+
+  try {
+    while (!stoppedEarly) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      let newlineIndex = buffer.indexOf('\n')
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex)
+        buffer = buffer.slice(newlineIndex + 1)
+        processLine(line)
+        if (stoppedEarly) break
+        newlineIndex = buffer.indexOf('\n')
+      }
+    }
+
+    if (!stoppedEarly) {
+      buffer += decoder.decode()
+      if (buffer) {
+        processLine(buffer)
+      }
+    }
+
+    await proc.exited
+
+    if (timedOut) {
+      throw new Error('Search timed out after 5s — try a more specific pattern or glob filter')
+    }
+
+    return matches
+  } finally {
+    clearTimeout(timeout)
+    if (!timedOut && !stoppedEarly) {
+      proc.kill()
+    }
+    reader.releaseLock()
+  }
 }
 
 export const searchTool = createTool({
