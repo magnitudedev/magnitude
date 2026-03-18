@@ -1294,6 +1294,12 @@ function generateToolLabel(toolKey: string, input: unknown): string {
     return `Searching web for "${shortQuery}"`
   }
 
+  // For webFetch, show the URL
+  if (toolKey === 'webFetch' && input && typeof input === 'string') {
+    const shortUrl = input.length > 60 ? input.slice(0, 57) + '...' : input
+    return `Fetching ${shortUrl}`
+  }
+
   // For fileRead, show the path
   if (toolKey === 'fileRead' && input && typeof input === 'object' && 'path' in input) {
     return `Read ${(input as { path: string }).path}`
