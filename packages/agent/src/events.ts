@@ -319,8 +319,6 @@ export interface BackgroundProcessExited {
   readonly exitCode: number | null
   readonly signal: string | null
   readonly status: 'exited' | 'killed'
-  readonly stdoutTail: string
-  readonly stderrTail: string
 }
 
 

@@ -156,8 +156,7 @@ describe('BackgroundProcessesProjection', () => {
         exitCode: 0,
         signal: null,
         status: 'exited',
-        stdoutTail: 'done',
-        stderrTail: '',
+
       },
     ] satisfies AppEvent[])
 
@@ -165,7 +164,7 @@ describe('BackgroundProcessesProjection', () => {
     expect(process.status).toBe('exited')
     expect(process.exitCode).toBe(0)
     expect(process.signal).toBeNull()
-    expect(process.unreadStdout).toBe('done')
+    expect(process.unreadStdout).toBe('')
   })
 
   test('observations_captured clears unread fields and removes exited processes', async () => {
@@ -197,8 +196,7 @@ describe('BackgroundProcessesProjection', () => {
         exitCode: 0,
         signal: null,
         status: 'exited',
-        stdoutTail: 'final',
-        stderrTail: '',
+
       },
       {
         type: 'observations_captured',

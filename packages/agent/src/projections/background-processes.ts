@@ -147,8 +147,8 @@ export const BackgroundProcessesProjection = Projection.define<AppEvent, Backgro
         status: event.status,
         exitCode: event.exitCode,
         signal: event.signal,
-        unreadStdout: existing.unreadStdout + event.stdoutTail,
-        unreadStderr: existing.unreadStderr + event.stderrTail,
+        unreadStdout: existing.unreadStdout,
+        unreadStderr: existing.unreadStderr,
       })
 
       next.set(forkKey, forkProcesses)

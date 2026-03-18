@@ -338,8 +338,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
             exitCode: null,
             signal: 'SIGTERM',
             status: 'killed',
-            stdoutTail: '',
-            stderrTail: '',
+
           }))
         }
       }

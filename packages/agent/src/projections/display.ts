@@ -1002,8 +1002,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             status: event.status,
             exitCode: event.exitCode,
             signal: event.signal,
-            stdout: event.stdoutTail || msg.stdout,
-            stderr: event.stderrTail || msg.stderr,
+            stdout: msg.stdout,
+            stderr: msg.stderr,
             updatedAt: event.timestamp,
           })
         )

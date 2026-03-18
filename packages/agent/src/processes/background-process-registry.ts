@@ -168,9 +168,6 @@ export function make(
     record.exitCode = exitCode
     record.signal = signal
 
-    const stdoutTail = computeTail(record.stdoutBuffer, TAIL_MAX_CHARS)
-    const stderrTail = computeTail(record.stderrBuffer, TAIL_MAX_CHARS)
-
     flushRecord(record)
 
     const event: BackgroundProcessExited = {
@@ -180,8 +177,6 @@ export function make(
       exitCode,
       signal,
       status: signal ? 'killed' : 'exited',
-      stdoutTail,
-      stderrTail,
     }
     publish(event)
   }
