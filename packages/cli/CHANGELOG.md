@@ -1,5 +1,15 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.4
+
+### Patch Changes
+
+- [`cdfd178`](https://github.com/magnitudedev/magnitude/commit/cdfd178cb108314d75ce57ea7bc3ce779719fe82) Thanks [@anerli](https://github.com/anerli)! - pass NO_COLOR=1 for shell tool
+
+- [`b34cba1`](https://github.com/magnitudedev/magnitude/commit/b34cba17b094a330b7a4ec30a8c51f7ce3fd5eba) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - file picker
+
+- [`241a629`](https://github.com/magnitudedev/magnitude/commit/241a6293d33dbe2b8edc3446ed40e65cff64e8be) Thanks [@anerli](https://github.com/anerli)! - fix: auth refresh coordination with multiple sessions
+
 ## 0.0.1-alpha.3
 
 ### Patch Changes
