@@ -26,6 +26,9 @@ export type {
 export { ToolErrorSchema } from './errors'
 export type { ToolErrorBase } from './errors'
 
+export { ToolImageSchema } from './image-types'
+export type { ImageMediaType, ToolImageValue, ContentPart } from './image-types'
+
 // ETS: Effect Schema to TypeScript (tool interface generation)
 export {
   generateToolInterface,

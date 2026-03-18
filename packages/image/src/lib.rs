@@ -4,6 +4,8 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{ColorType, DynamicImage, ImageBuffer, ImageFormat, ImageReader, Rgba};
 use serde::Serialize;
+use tiny_skia::{Pixmap, Transform};
+use usvg::{Options, Tree};
 use wasm_bindgen::prelude::*;
 
 #[derive(Serialize)]
@@ -42,8 +44,58 @@ pub fn dimensions(buf: &[u8]) -> JsValue {
         .expect("failed to serialize dimensions output")
 }
 
+fn is_svg(buf: &[u8]) -> bool {
+    let trimmed = match std::str::from_utf8(buf) {
+        Ok(s) => s.trim_start_matches(char::is_whitespace),
+        Err(_) => return false,
+    };
+
+    trimmed.starts_with("<svg") || trimmed.starts_with("<?xml")
+}
+
+#[wasm_bindgen]
+pub fn render_svg(svg_data: &[u8], max_width: u32, max_height: u32) -> JsValue {
+    let svg = std::str::from_utf8(svg_data).expect("failed to parse SVG as UTF-8");
+    let opt = Options::default();
+    let tree = Tree::from_str(svg, &opt).expect("failed to parse SVG");
+
+    let size = tree.size();
+    let intrinsic_width = size.width();
+    let intrinsic_height = size.height();
+    assert!(
+        intrinsic_width > 0.0 && intrinsic_height > 0.0,
+        "SVG must have positive intrinsic size"
+    );
+
+    let max_width = if max_width == 0 { 1 } else { max_width };
+    let max_height = if max_height == 0 { 1 } else { max_height };
+
+    let scale = (max_width as f32 / intrinsic_width)
+        .min(max_height as f32 / intrinsic_height);
+    let width = ((intrinsic_width * scale).round() as u32).max(1);
+    let height = ((intrinsic_height * scale).round() as u32).max(1);
+
+    let sx = width as f32 / intrinsic_width;
+    let sy = height as f32 / intrinsic_height;
+
+    let mut pixmap = Pixmap::new(width, height).expect("failed to allocate pixmap");
+    let mut pixmap_mut = pixmap.as_mut();
+    resvg::render(&tree, Transform::from_scale(sx, sy), &mut pixmap_mut);
+
+    let out = DecodedImage {
+        data: pixmap.data().to_vec(),
+        width,
+        height,
+    };
+    serde_wasm_bindgen::to_value(&out).expect("failed to serialize SVG render output")
+}
+
 #[wasm_bindgen]
 pub fn format(buf: &[u8]) -> String {
+    if is_svg(buf) {
+        return "svg".to_string();
+    }
+
     let fmt = image::guess_format(buf).expect("unknown image format");
     match fmt {
         ImageFormat::Png => "png",

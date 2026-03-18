@@ -145,7 +145,7 @@ export interface ObservedResult {
   readonly toolCallId: string
   readonly tagName: string
   readonly query: string
-  readonly content: string
+  readonly content: ContentPart[]
 }
 
 export interface TurnCompleted {

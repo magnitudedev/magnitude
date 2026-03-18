@@ -1,5 +1,6 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent, ResponsePart } from '../events'
+import type { ContentPart } from '../content'
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
 import { getAgentDefinition, type AgentVariant } from '../agents'
@@ -19,7 +20,7 @@ export interface CanonicalTurnState {
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
   toolCallMap: Map<string, number>
-  observedResults: Array<{ toolCallId: string; tagName: string; query: string; content: string }>
+  observedResults: Array<{ toolCallId: string; tagName: string; query: string; content: ContentPart[] }>
   hasParseError: boolean
   hasStructuralError: boolean
   orderCounter: number

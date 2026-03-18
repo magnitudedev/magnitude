@@ -12,7 +12,7 @@
  */
 
 import { Context, Effect, Layer } from "effect"
-import type { Tool, XmlBinding, XmlChildBinding } from "@magnitudedev/tools"
+import type { Tool, XmlBinding, XmlChildBinding, ContentPart } from "@magnitudedev/tools"
 import type { OutputNode } from './output-tree'
 import type {
   BaseToolParseErrorDetail,
@@ -291,7 +291,7 @@ export interface ToolObservation {
   readonly toolCallId: string
   readonly tagName: string
   readonly query: string
-  readonly content: string
+  readonly content: ContentPart[]
 }
 
 export interface StructuralParseError {

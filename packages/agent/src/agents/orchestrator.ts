@@ -23,7 +23,7 @@ import {
   artifactUpdateTool,
 } from '../tools/artifact-tools'
 // import { gatherTool } from '../tools/gather'
-import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
+import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
 import { shellTool } from '../tools/shell'
 import { webFetchTool } from '../tools/web-fetch-tool'
 import { webSearchTool } from '../tools/web-search-tool'
@@ -95,6 +95,7 @@ export const createOrchestrator = (systemPrompt: string) => {
     fileEdit:              editTool,
     fileTree:              treeTool,
     fileSearch:            searchTool,
+    fileView:              viewTool,
     shell:                 shellTool,
     webSearch:             webSearchTool,
     webFetch:              webFetchTool,

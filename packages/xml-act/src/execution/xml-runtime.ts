@@ -688,7 +688,9 @@ function reactImpl(
       case 'TurnControl': {
         currentState = yield* emitAndFold(currentState, {
           _tag: 'TurnEnd',
-          result: { _tag: 'Success', turnControl: parseEvent.decision, evidence: parseEvent.evidence },
+          result: parseEvent.decision === 'finish'
+            ? { _tag: 'Success', turnControl: 'finish', evidence: parseEvent.evidence }
+            : { _tag: 'Success', turnControl: parseEvent.decision },
         })
         break
       }

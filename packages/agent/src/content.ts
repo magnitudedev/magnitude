@@ -1,8 +1,6 @@
-export type ContentPart =
-  | { readonly type: 'text'; readonly text: string }
-  | { readonly type: 'image'; readonly base64: string; readonly mediaType: ImageMediaType; readonly width: number; readonly height: number }
+import type { ContentPart, ImageMediaType } from '@magnitudedev/tools'
 
-export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+export type { ContentPart, ImageMediaType }
 
 /** Wrap a plain string as ContentPart[] */
 export function textParts(s: string): ContentPart[] {

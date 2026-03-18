@@ -201,7 +201,7 @@ export function dispatchTool(
     } else {
       const output = executionResult.right
       
-      const outputTree = buildOutputTree(element.tagName, output, tool.bindings.xmlOutput)
+      const outputTree = buildOutputTree(element.tagName, output, tool.bindings.xmlOutput, undefined, { outputSchema: tool.outputSchema })
       result = { _tag: 'Success', output, outputTree: { tag: element.tagName, tree: outputTree }, query: observe }
     }
 

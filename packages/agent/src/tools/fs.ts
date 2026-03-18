@@ -4,7 +4,7 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { createTool, ToolErrorSchema, ToolImageSchema } from '@magnitudedev/tools'
 import { ToolEmitTag } from '../execution/tool-emit'
 import { join, relative, resolve } from 'path'
 import { resolveRgPath } from '@magnitudedev/ripgrep'
@@ -12,6 +12,7 @@ import { walk } from '../util/walk'
 import { createDefaultIgnore } from '../util/gitignore'
 import { validateAndApply, toEditDiff } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
+import { readImageFileForModel } from '../util/read-image-file'
 
 // =============================================================================
 // Errors
@@ -432,7 +433,43 @@ export const searchTool = createTool({
 })
 
 // =============================================================================
+// fs.view()
+// =============================================================================
+
+export const viewTool = createTool({
+  name: 'view',
+  group: 'fs',
+  description: 'Read an image file and return it as image output for visual inspection. Supports PNG, JPEG, WebP, GIF, and SVG files.',
+  inputSchema: Schema.Struct({
+    path: Schema.String.annotations({
+      description: 'Relative path to an image file from cwd'
+    }),
+  }),
+  outputSchema: ToolImageSchema,
+  errorSchema: FsError,
+  argMapping: ['path'],
+  bindings: {
+    xmlInput: {
+      type: 'tag',
+      attributes: [{ field: 'path', attr: 'path' }],
+      selfClosing: true,
+    },
+    xmlOutput: { type: 'tag' },
+  } as const,
+
+  execute: ({ path: filePath }) => Effect.gen(function* () {
+    const { cwd } = yield* WorkingDirectoryTag
+    const fullPath = resolve(cwd, filePath)
+
+    return yield* Effect.tryPromise({
+      try: () => readImageFileForModel(fullPath),
+      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to read image: ${filePath}`),
+    })
+  })
+})
+
+// =============================================================================
 // Filesystem Tools Group
 // =============================================================================
 
-export const fsTools = [readTool, writeTool, editTool, treeTool, searchTool]
+export const fsTools = [readTool, writeTool, editTool, treeTool, searchTool, viewTool]

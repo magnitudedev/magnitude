@@ -5,8 +5,9 @@
  * Each reducer processes streaming ToolCallEvents.
  */
 
+import type { ToolImageValue } from '@magnitudedev/tools'
 import type { ToolCallEvent, XmlToolResult } from '@magnitudedev/xml-act'
-import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
+import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
 import { defineToolReducer, defineCluster } from './define'
 
 // =============================================================================
@@ -29,6 +30,8 @@ function phaseFromEvent(tag: ToolCallEvent['_tag']): Phase | null {
     case 'ToolExecutionEnded':
     case 'ToolInputParseError':
       return 'done'
+    default:
+      return null
   }
 }
 
@@ -213,6 +216,38 @@ export const searchReducer = defineToolReducer({
         }
         return phase !== state.phase ? { ...state, phase } : state
       }
+      case 'ToolExecutionEnded':
+        return { ...state, phase: 'done', result: event.result }
+      case 'ToolInputParseError':
+        return { ...state, phase: 'done' }
+      default:
+        return phase !== state.phase ? { ...state, phase } : state
+    }
+  },
+})
+
+// =============================================================================
+// viewReducer
+// =============================================================================
+
+export interface ViewState {
+  readonly phase: Phase
+  readonly path: string
+  readonly result: XmlToolResult<ToolImageValue> | null
+}
+
+export const viewReducer = defineToolReducer({
+  tool: viewTool,
+  toolKey: 'fileView',
+  initial: { phase: 'streaming', path: '', result: null } satisfies ViewState,
+
+  reduce(state: ViewState, event): ViewState {
+    const phase = phaseFromEvent(event._tag) ?? state.phase
+
+    switch (event._tag) {
+      case 'ToolInputFieldValue':
+        if (event.field === 'path') return { ...state, phase, path: String(event.value) }
+        return phase !== state.phase ? { ...state, phase } : state
       case 'ToolExecutionEnded':
         return { ...state, phase: 'done', result: event.result }
       case 'ToolInputParseError':

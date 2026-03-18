@@ -3,6 +3,7 @@ import {
   decode as wasmDecode,
   dimensions as wasmDimensions,
   format as wasmFormat,
+  render_svg as wasmRenderSvg,
   resize as wasmResize,
   encode_png as wasmEncodePng,
   encode_jpeg as wasmEncodeJpeg,
@@ -39,6 +40,18 @@ export class Image {
 
   static fromBase64(base64: string): Image {
     return Image.fromBuffer(Buffer.from(base64, "base64"));
+  }
+
+  static fromSvg(
+    svgData: Buffer | Uint8Array | string,
+    options?: { maxWidth?: number; maxHeight?: number },
+  ): Image {
+    const bytes =
+      typeof svgData === "string" ? new TextEncoder().encode(svgData) : toUint8Array(svgData);
+    const maxWidth = options?.maxWidth ?? 1568;
+    const maxHeight = options?.maxHeight ?? 1568;
+    const decoded = wasmRenderSvg(bytes, maxWidth, maxHeight) as ImageData;
+    return new Image(new Uint8Array(decoded.data), decoded.width, decoded.height);
   }
 
   get width(): number {
