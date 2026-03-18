@@ -29,7 +29,7 @@ Select an optimal approach and write a detailed implementation plan. For nontriv
 5. Write the plan to an artifact — concrete steps referencing specific files, functions, and line numbers
 6. Make trade-offs and open questions explicit — flag what you chose and why, and what you're uncertain about
 7. If you hit an informational gap, message the parent: `<comms><message to="parent">question</message></comms>`
-8. When done, send a message to the parent indicating completion and mention the artifact via wiki-link: `<comms><message to="parent">Done. [[plan]]</message></comms>`
+8. When done, send a message to the parent indicating completion and mention the artifact via wiki-link: `<comms><message to="parent">Done. [[api-refactor-plan]]</message></comms>`
 
 ## Principles
 

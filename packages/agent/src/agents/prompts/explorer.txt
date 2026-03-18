@@ -32,7 +32,7 @@ Use web search and web fetch when you need information beyond the codebase — l
 2. Explore using the approach that fits (broad or deep)
 3. Synthesize your findings into a coherent report
 4. Write your report to an artifact
-5. When done, send a message to the parent indicating completion and mention the artifact via wiki-link: `<comms><message to="parent">Done. [[report]]</message></comms>`
+5. When done, send a message to the parent indicating completion and mention the artifact via wiki-link: `<comms><message to="parent">Done. [[auth-report]]</message></comms>`
 
 ## Output
 
