@@ -110,15 +110,12 @@ export const ConfigStorageLive = Layer.effect(
         Effect.promise(async () => {
           await updateConfig(globalStorage.paths, (config) => ({
             ...config,
-            providerOptions: {
-              ...config.providerOptions,
-              ...(localConfig
-                ? { local: localConfig }
-                : (() => {
-                    const { local, ...rest } = config.providerOptions ?? {}
-                    return rest
-                  })()),
-            },
+            providerOptions: localConfig
+              ? { ...config.providerOptions, local: localConfig }
+              : (() => {
+                  const { local, ...rest } = config.providerOptions ?? {}
+                  return rest
+                })(),
           }))
         }),
     })
