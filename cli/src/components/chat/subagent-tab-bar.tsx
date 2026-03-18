@@ -3,10 +3,25 @@ import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../button'
 import { TAB_BORDER_CHARS } from '../../utils/ui-constants'
+import { slate } from '../../utils/palette'
 
 import type { SubagentTabItem } from './types'
 
 const TAB_INNER_WIDTH = 36 // inner content width (chars), excluding border+padding
+
+const PULSE_SLATE_SHADES = [
+  slate[200],
+  slate[300],
+  slate[400],
+  slate[500],
+  slate[600],
+  slate[700],
+  slate[600],
+  slate[500],
+  slate[400],
+  slate[300],
+  slate[200],
+] as const
 
 type Props = {
   tabs: readonly SubagentTabItem[]
@@ -14,8 +29,9 @@ type Props = {
   onSelect: (forkId: string | null) => void
 }
 
-function formatElapsed(startedAt: number, now: number): string {
-  const elapsed = Math.max(0, Math.floor((now - startedAt) / 1000))
+function formatElapsed(activeSince: number, now: number, completedAt?: number): string {
+  const end = completedAt ?? now
+  const elapsed = Math.max(0, Math.floor((end - activeSince) / 1000))
   const m = Math.floor(elapsed / 60)
   const s = elapsed % 60
   return `${m}:${String(s).padStart(2, '0')}`
@@ -36,11 +52,15 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
   const [now, setNow] = useState(() => Date.now())
   const [hoveredId, setHoveredId] = useState<null | string | 'main'>(null)
 
+  const hasActiveTabs = tabs.some((tab) => tab.phase === 'active')
+
   useEffect(() => {
     if (tabs.length === 0) return
-    const interval = setInterval(() => setNow(Date.now()), 1000)
+    const tickMs = hasActiveTabs ? 200 : 1000
+    setNow(Date.now())
+    const interval = setInterval(() => setNow(Date.now()), tickMs)
     return () => clearInterval(interval)
-  }, [tabs.length])
+  }, [hasActiveTabs, tabs.length])
 
   const mainSelected = selectedForkId === null
   const mainHovered = hoveredId === 'main'
@@ -92,13 +112,17 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         const tabIdColor = theme.foreground
         const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
 
-        const timer = formatElapsed(tab.startedAt, now)
+        const timer = formatElapsed(tab.activeSince, now, tab.completedAt)
         const detailsPart = `• ${tab.toolCount} tools • ${timer}`
-        const nameMaxLen = TAB_INNER_WIDTH - detailsPart.length - 1
+        const line1Prefix = '● '
+        const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - detailsPart.length - 1
         const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))
         const line1Rest = ` ${detailsPart}`
         // const line2 = truncate(tab.toolSummaryLine, TAB_INNER_WIDTH)
         const line2 = truncate(tab.statusLine, TAB_INNER_WIDTH)
+        const isRunning = tab.phase === 'active'
+        const pulseColor = PULSE_SLATE_SHADES[Math.floor(now / 200) % PULSE_SLATE_SHADES.length]
+        const dotColor = isRunning ? pulseColor : tabIdColor
 
         return (
           <Button
@@ -119,6 +143,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
             >
               <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', width: TAB_INNER_WIDTH + 2, height: 2, minHeight: 2, maxHeight: 2 }}>
                 <box style={{ flexDirection: 'row' }}>
+                  <text style={{ fg: dotColor }} attributes={attrs}>{line1Prefix}</text>
                   <text style={{ fg: tabIdColor }} attributes={attrs}>{namePart}</text>
                   <text style={{ fg: tabRestLine1Color }} attributes={attrs}>{line1Rest}</text>
                 </box>

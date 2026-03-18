@@ -47,7 +47,8 @@ export type SubagentTabItem = {
   forkId: string
   agentId: string
   name: string
-  startedAt: number
+  activeSince: number
+  completedAt?: number
   toolCount: number
   toolSummaryLine: string
   statusLine: string

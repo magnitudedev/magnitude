@@ -26,7 +26,8 @@ type UseSubagentTabsArgs = {
 type ForkMeta = {
   agentId: string
   name: string
-  startedAt: number
+  activeSince: number
+  completedAt?: number
   toolCount: number
   toolCounts: ForkActivityMessage['toolCounts']
   phase: 'active' | 'exiting'
@@ -72,7 +73,8 @@ export function useSubagentTabs({
         const nextMeta: ForkMeta = {
           agentId: forkAgent?.agentId ?? forkId,
           name: activity.name,
-          startedAt: activity.startedAt,
+          activeSince: activity.activeSince,
+          completedAt: activity.completedAt,
           toolCount: sumForkToolCounts(activity.toolCounts),
           toolCounts: activity.toolCounts,
           phase: 'active',
@@ -81,7 +83,8 @@ export function useSubagentTabs({
           existing
           && existing.agentId === nextMeta.agentId
           && existing.name === nextMeta.name
-          && existing.startedAt === nextMeta.startedAt
+          && existing.activeSince === nextMeta.activeSince
+          && existing.completedAt === nextMeta.completedAt
           && existing.toolCount === nextMeta.toolCount
           && existing.toolCounts === nextMeta.toolCounts
           && existing.phase === nextMeta.phase
@@ -161,13 +164,14 @@ export function useSubagentTabs({
           forkId,
           agentId: meta.agentId,
           name: meta.name,
-          startedAt: meta.startedAt,
+          activeSince: meta.activeSince,
+          completedAt: meta.completedAt,
           toolCount: meta.toolCount,
           toolSummaryLine,
           statusLine,
           phase: meta.phase,
         }
       })
-      .sort((a, b) => a.startedAt - b.startedAt)
+      .sort((a, b) => a.activeSince - b.activeSince)
   }, [forkMeta, forkMessages])
 }

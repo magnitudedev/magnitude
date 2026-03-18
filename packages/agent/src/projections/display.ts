@@ -159,7 +159,8 @@ export interface ForkActivityMessage {
   readonly name: string
   readonly role: string
   readonly status: 'running' | 'completed'
-  readonly startedAt: number
+  readonly createdAt: number
+  readonly activeSince: number
   readonly completedAt?: number
   readonly resumeCount?: number
   readonly toolCounts: ForkActivityToolCounts
@@ -1021,7 +1022,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         name,
         role,
         status: 'running',
-        startedAt: value.timestamp,
+        createdAt: value.timestamp,
+        activeSince: value.timestamp,
         resumeCount: 0,
         toolCounts: EMPTY_TOOL_COUNTS,
         artifactNames: [],
@@ -1117,6 +1119,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
         ...msg,
         status: 'running',
+        activeSince: value.timestamp,
         completedAt: undefined,
         resumeCount: (msg.resumeCount ?? 0) + 1,
         timestamp: value.timestamp,

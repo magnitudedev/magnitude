@@ -63,7 +63,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
   signals: {
     shouldTriggerChanged: Signal.create<{ forkId: string | null; shouldTrigger: boolean; chainId: string | null }>('WorkingState/shouldTriggerChanged'),
-    forkBecameStable: Signal.create<{ forkId: string | null }>('WorkingState/forkBecameStable'),
+    forkBecameStable: Signal.create<{ forkId: string | null; timestamp: number }>('WorkingState/forkBecameStable'),
     softInterruptResolved: Signal.create<{ forkId: string }>('WorkingState/softInterruptResolved'),
     turnInterrupted: Signal.create<{ forkId: string | null; turnId: string; chainId: string | null }>('WorkingState/turnInterrupted')
   },
@@ -183,7 +183,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       // Emit stability first so downstream projections (e.g. AgentRegistry) update
       // status to idle before shouldTriggerChanged wakes the parent fork
       if (isStable(newFork) && !isStable(fork)) {
-        emit.forkBecameStable({ forkId: event.forkId })
+        emit.forkBecameStable({ forkId: event.forkId, timestamp: event.timestamp })
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -222,7 +222,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       }
 
       if (isStable(newFork) && !isStable(fork)) {
-        emit.forkBecameStable({ forkId: event.forkId })
+        emit.forkBecameStable({ forkId: event.forkId, timestamp: event.timestamp })
       }
 
       return newFork
@@ -246,7 +246,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       }
 
       if (isStable(newFork) && !isStable(fork)) {
-        emit.forkBecameStable({ forkId: event.forkId })
+        emit.forkBecameStable({ forkId: event.forkId, timestamp: event.timestamp })
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -354,7 +354,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
       // Emit stable if became stable
       if (isStable(newForkState) && !isStable(forkState)) {
-        emit.forkBecameStable({ forkId })
+        emit.forkBecameStable({ forkId, timestamp: value.timestamp })
       }
 
       return {
@@ -388,7 +388,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       }
 
       if (isStable(newForkState) && !isStable(forkState)) {
-        emit.forkBecameStable({ forkId })
+        emit.forkBecameStable({ forkId, timestamp: value.timestamp })
       }
 
       return {

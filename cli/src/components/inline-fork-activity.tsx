@@ -95,7 +95,7 @@ export const InlineForkActivity = memo(function InlineForkActivity({
   useEffect(() => {
     if (isRunning) {
       const update = () => {
-        setElapsed(Math.floor((Date.now() - message.startedAt) / 1000))
+        setElapsed(Math.floor((Date.now() - message.activeSince) / 1000))
       }
       update()
       timerRef.current = setInterval(update, 1000)
@@ -103,9 +103,9 @@ export const InlineForkActivity = memo(function InlineForkActivity({
         if (timerRef.current) clearInterval(timerRef.current)
       }
     } else if (message.completedAt) {
-      setElapsed(Math.floor((message.completedAt - message.startedAt) / 1000))
+      setElapsed(Math.floor((message.completedAt - message.activeSince) / 1000))
     }
-  }, [isRunning, message.startedAt, message.completedAt])
+  }, [isRunning, message.activeSince, message.completedAt])
 
   // Pulsing line animation
   useEffect(() => {
