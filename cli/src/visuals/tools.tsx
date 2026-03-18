@@ -66,6 +66,11 @@ function pathSummary(paths: string[], max: number = 3): string {
 // webSearchRender
 // =============================================================================
 
+export function webSearchLiveText({ state }: { state: WebSearchState }): string {
+  const target = state.query ? `"${state.query}"` : 'the web'
+  return isActive(state.phase) ? `Searching web for ${target}` : `Searched web for ${target}`
+}
+
 export const webSearchRender = render<WebSearchState>(({ state, isExpanded, onToggle }) => {
   const theme = useTheme()
 
@@ -135,6 +140,12 @@ export const webSearchRender = render<WebSearchState>(({ state, isExpanded, onTo
 // =============================================================================
 // webFetchRender
 // =============================================================================
+
+export function webFetchLiveText({ state }: { state: WebFetchState }): string {
+  const target = state.url || 'URL'
+  if (isActive(state.phase)) return `Fetching ${target}`
+  return state.phase === 'error' ? `Fetch ${target}` : `Fetched ${target}`
+}
 
 export const webFetchRender = render<WebFetchState>(({ state, stepResult }) => {
   const theme = useTheme()
@@ -210,6 +221,18 @@ function browserRender(config: {
   })
 }
 
+export function browserLiveText({ state }: { state: BrowserState }): string {
+  const label = state.label.trim().replace(/\s+/g, ' ')
+  const detail = (state.detail ?? '').trim().replace(/\s+/g, ' ')
+  if (label.length === 0) return 'Browser action'
+  if (detail.length === 0) return label
+
+  const noSpaceBeforeDetail = /^[,.;:!?)]/.test(detail)
+  const noSpaceAfterLabel = /[([]$/.test(label)
+  const separator = (noSpaceBeforeDetail || noSpaceAfterLabel) ? '' : ' '
+  return `${label}${separator}${detail}`
+}
+
 export const clickRender = browserRender({ icon: '◎' })
 export const doubleClickRender = browserRender({ icon: '◎◎' })
 export const rightClickRender = browserRender({ icon: '◎' })
@@ -226,6 +249,12 @@ export const evaluateRender = browserRender({ icon: '▶' })
 // =============================================================================
 // Artifact Tools — restored interactivity, styling, and shimmer
 // =============================================================================
+
+export function artifactCreateLiveText({ state }: { state: ArtifactVisualState }): string {
+  const target = state.name ? `artifact ${state.name}` : 'artifact'
+  if (isActive(state.phase)) return `Creating ${target}`
+  return state.phase === 'error' ? `Create ${target}` : `Created ${target}`
+}
 
 export const artifactCreateRender = render<ArtifactVisualState>(({ state }) => {
   const theme = useTheme()
@@ -248,6 +277,12 @@ export const artifactCreateRender = render<ArtifactVisualState>(({ state }) => {
     </text>
   )
 })
+
+export function artifactSyncLiveText({ state }: { state: ArtifactSyncState }): string {
+  const target = state.name ? `artifact ${state.name}` : 'artifact'
+  if (isActive(state.phase)) return `Syncing ${target}`
+  return state.phase === 'error' ? `Sync ${target}` : `Synced ${target}`
+}
 
 export const artifactSyncRender = render<ArtifactSyncState>(({ state }) => {
   const theme = useTheme()
@@ -272,6 +307,12 @@ export const artifactSyncRender = render<ArtifactSyncState>(({ state }) => {
     </text>
   )
 })
+
+export function artifactReadLiveText({ state }: { state: ArtifactVisualState }): string {
+  const target = state.name ? `artifact ${state.name}` : 'artifact'
+  if (isActive(state.phase)) return `Reading ${target}`
+  return `Read ${target}`
+}
 
 export const artifactReadRender = render<ArtifactVisualState>(({ state, onArtifactClick }) => {
   const theme = useTheme()
@@ -312,6 +353,12 @@ export const artifactReadRender = render<ArtifactVisualState>(({ state, onArtifa
     </box>
   )
 })
+
+export function artifactWriteLiveText({ state }: { state: ArtifactVisualState }): string {
+  const target = state.name ? `artifact ${state.name}` : 'artifact'
+  if (isActive(state.phase)) return `Writing ${target}`
+  return state.phase === 'error' ? `Write ${target}` : `Wrote ${target}`
+}
 
 export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtifactClick }) => {
   const theme = useTheme()
@@ -389,6 +436,12 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
     </box>
   )
 })
+
+export function artifactUpdateLiveText({ state }: { state: ArtifactVisualState }): string {
+  const target = state.name ? `artifact ${state.name}` : 'artifact'
+  if (isActive(state.phase)) return `Updating ${target}`
+  return state.phase === 'error' ? `Update ${target}` : `Updated ${target}`
+}
 
 export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArtifactClick }) => {
   const theme = useTheme()
@@ -508,6 +561,12 @@ export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArti
 // Agent Tools
 // =============================================================================
 
+export function agentCreateLiveText({ state }: { state: AgentCreateState }): string {
+  const target = state.id ? `agent "${state.id}"` : 'agent'
+  if (isActive(state.phase)) return `Starting ${target}`
+  return state.phase === 'error' ? `Start ${target}` : `Started ${target}`
+}
+
 export const agentCreateRender = render<AgentCreateState>(({ state }) => {
   const theme = useTheme()
   const label = state.id ? `Started agent "${state.id}"` : 'Starting agent...'
@@ -529,6 +588,12 @@ export const agentCreateRender = render<AgentCreateState>(({ state }) => {
   )
 })
 
+export function agentPauseLiveText({ state }: { state: AgentIdState }): string {
+  const target = state.id ? `agent "${state.id}"` : 'agent'
+  if (isActive(state.phase)) return `Pausing ${target}`
+  return `Paused ${target}`
+}
+
 export const agentPauseRender = render<AgentIdState>(({ state }) => {
   const theme = useTheme()
   const label = state.id ? `Paused agent "${state.id}"` : 'Pausing agent...'
@@ -540,6 +605,12 @@ export const agentPauseRender = render<AgentIdState>(({ state }) => {
   )
 })
 
+export function agentDismissLiveText({ state }: { state: AgentIdState }): string {
+  const target = state.id ? `agent "${state.id}"` : 'agent'
+  if (isActive(state.phase)) return `Dismissing ${target}`
+  return `Dismissed ${target}`
+}
+
 export const agentDismissRender = render<AgentIdState>(({ state }) => {
   const theme = useTheme()
   const label = state.id ? `Dismissed agent "${state.id}"` : 'Dismissing agent...'
@@ -550,6 +621,12 @@ export const agentDismissRender = render<AgentIdState>(({ state }) => {
     </text>
   )
 })
+
+export function agentMessageLiveText({ state }: { state: AgentMessageState }): string {
+  const target = state.id ? `agent "${state.id}"` : 'agent'
+  if (isActive(state.phase)) return `Messaging ${target}`
+  return `Messaged ${target}`
+}
 
 export const agentMessageRender = render<AgentMessageState>(({ state, isExpanded, onToggle }) => {
   const theme = useTheme()
@@ -586,6 +663,10 @@ export const agentMessageRender = render<AgentMessageState>(({ state, isExpanded
 // =============================================================================
 // parentMessageRender — restored ↑ icon and shimmer
 // =============================================================================
+
+export function parentMessageLiveText({ state }: { state: ParentMessageState }): string {
+  return isActive(state.phase) ? 'Messaging orchestrator' : 'Messaged orchestrator'
+}
 
 export const parentMessageRender = render<ParentMessageState>(({ state, isExpanded, onToggle }) => {
   const theme = useTheme()
@@ -625,6 +706,12 @@ export const parentMessageRender = render<ParentMessageState>(({ state, isExpand
 // =============================================================================
 // skillRender
 // =============================================================================
+
+export function skillLiveText({ state }: { state: SkillState }): string {
+  const target = state.name ? `skill "${state.name}"` : 'skill'
+  if (isActive(state.phase)) return `Activating ${target}`
+  return `Activated ${target}`
+}
 
 export const skillRender = render<SkillState>(({ state }) => {
   const theme = useTheme()

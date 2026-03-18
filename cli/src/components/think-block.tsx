@@ -6,6 +6,7 @@ import { useTheme } from '../hooks/use-theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
 import { renderRegistry, clusterRenderRegistry } from '../visuals/registry'
+import { selectLatestLiveActivityFromThinkSteps } from '../utils/live-activity'
 
 const SHIMMER_INTERVAL_MS = 160
 
@@ -413,9 +414,7 @@ export const ThinkBlock = memo(function ThinkBlock({
     })
   }, [])
 
-  // Preview: show last tool label or "thinking..."
-  const lastToolStep = [...block.steps].reverse().find(s => s.type === 'tool')
-  const preview = lastToolStep?.label ?? 'Thinking...'
+  const preview = selectLatestLiveActivityFromThinkSteps(block.steps) ?? 'Thinking...'
 
   // Summary for completed blocks
   const summary = buildSummary(block.steps)

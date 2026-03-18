@@ -6,7 +6,7 @@
  *    can reduce visual state as events stream in.
  */
 
-import { createRenderRegistry, createClusterRenderRegistry } from './define'
+import { createRenderRegistry, createClusterRenderRegistry, createLiveTextRegistry } from './define'
 import {
   setVisualRegistry,
   shellReducer,
@@ -21,8 +21,8 @@ import {
 import type { VisualReducerRegistry, ToolVisualReducer } from '@magnitudedev/agent'
 
 // Renderers
-import { shellRender } from './shell'
-import { readRender, writeRender, editRender, editClusterRender, treeRender, searchRender } from './fs'
+import { shellRender, shellLiveText } from './shell'
+import { readRender, writeRender, editRender, editClusterRender, treeRender, searchRender, readLiveText, writeLiveText, editLiveText, treeLiveText, searchLiveText } from './fs'
 import {
   webSearchRender, webFetchRender,
   clickRender, doubleClickRender, rightClickRender, typeRender, scrollRender, dragRender,
@@ -30,6 +30,10 @@ import {
   artifactSyncRender, artifactReadRender, artifactWriteRender, artifactUpdateRender,
   agentCreateRender, agentPauseRender, agentDismissRender, agentMessageRender, parentMessageRender,
   skillRender,
+  webSearchLiveText, webFetchLiveText, browserLiveText,
+  artifactSyncLiveText, artifactReadLiveText, artifactWriteLiveText, artifactUpdateLiveText,
+  agentCreateLiveText, agentPauseLiveText, agentDismissLiveText, agentMessageLiveText, parentMessageLiveText,
+  skillLiveText,
 } from './tools'
 
 // =============================================================================
@@ -97,6 +101,41 @@ setVisualRegistry(reducerRegistry)
 // =============================================================================
 // Cluster render registry — cluster key → cluster render function
 // =============================================================================
+
+export const liveTextRegistry = createLiveTextRegistry({
+  shell: ({ state }) => shellLiveText({ state: state as any }),
+  fileRead: ({ state }) => readLiveText({ state: state as any }),
+  fileWrite: ({ state }) => writeLiveText({ state: state as any }),
+  fileEdit: ({ state }) => editLiveText({ state: state as any }),
+  fileTree: ({ state }) => treeLiveText({ state: state as any }),
+  fileSearch: ({ state }) => searchLiveText({ state: state as any }),
+  webSearch: ({ state }) => webSearchLiveText({ state: state as any }),
+  webFetch: ({ state }) => webFetchLiveText({ state: state as any }),
+
+  click: ({ state }) => browserLiveText({ state: state as any }),
+  doubleClick: ({ state }) => browserLiveText({ state: state as any }),
+  rightClick: ({ state }) => browserLiveText({ state: state as any }),
+  type: ({ state }) => browserLiveText({ state: state as any }),
+  scroll: ({ state }) => browserLiveText({ state: state as any }),
+  drag: ({ state }) => browserLiveText({ state: state as any }),
+  navigate: ({ state }) => browserLiveText({ state: state as any }),
+  goBack: ({ state }) => browserLiveText({ state: state as any }),
+  switchTab: ({ state }) => browserLiveText({ state: state as any }),
+  newTab: ({ state }) => browserLiveText({ state: state as any }),
+  screenshot: ({ state }) => browserLiveText({ state: state as any }),
+  evaluate: ({ state }) => browserLiveText({ state: state as any }),
+
+  artifactSync: ({ state }) => artifactSyncLiveText({ state: state as any }),
+  artifactRead: ({ state }) => artifactReadLiveText({ state: state as any }),
+  artifactWrite: ({ state }) => artifactWriteLiveText({ state: state as any }),
+  artifactUpdate: ({ state }) => artifactUpdateLiveText({ state: state as any }),
+  agentCreate: ({ state }) => agentCreateLiveText({ state: state as any }),
+  agentPause: ({ state }) => agentPauseLiveText({ state: state as any }),
+  agentDismiss: ({ state }) => agentDismissLiveText({ state: state as any }),
+  agentMessage: ({ state }) => agentMessageLiveText({ state: state as any }),
+  parentMessage: ({ state }) => parentMessageLiveText({ state: state as any }),
+  skill: ({ state }) => skillLiveText({ state: state as any }),
+})
 
 export const clusterRenderRegistry = createClusterRenderRegistry({
   edit: editClusterRender,

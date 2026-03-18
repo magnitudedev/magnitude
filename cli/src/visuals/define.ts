@@ -33,6 +33,15 @@ export interface RenderRegistry {
   readonly get: (toolKey: string) => ToolVisualRenderer | undefined
 }
 
+export type ToolLiveTextGetter = (args: {
+  readonly state: unknown
+  readonly step?: import('@magnitudedev/agent').ThinkBlockStep
+}) => string | null | undefined
+
+export interface LiveTextRegistry {
+  readonly get: (toolKey: string) => ToolLiveTextGetter | undefined
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -52,6 +61,15 @@ export function createRenderRegistry(
   renderers: Record<string, ToolVisualRenderer>,
 ): RenderRegistry {
   const map = new Map(Object.entries(renderers))
+  return {
+    get: (toolKey: string) => map.get(toolKey),
+  }
+}
+
+export function createLiveTextRegistry(
+  getters: Record<string, ToolLiveTextGetter>,
+): LiveTextRegistry {
+  const map = new Map(Object.entries(getters))
   return {
     get: (toolKey: string) => map.get(toolKey),
   }

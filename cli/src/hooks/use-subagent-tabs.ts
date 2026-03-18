@@ -2,11 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentStatusState, DisplayMessage, DisplayState, ForkActivityMessage } from '@magnitudedev/agent'
 import type { SubagentTabItem } from '../components/chat/types'
 import {
-  deriveSubagentStatusLine,
   formatSubagentToolSummaryLine,
   sumForkToolCounts,
   truncateSubagentTabText,
 } from '../utils/subagent-tabs'
+import { selectLatestLiveActivityFromMessages } from '../utils/live-activity'
 
 type AgentClientLike = {
   state: {
@@ -156,7 +156,7 @@ export function useSubagentTabs({
     return Object.entries(forkMeta)
       .map(([forkId, meta]): SubagentTabItem => {
         const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
-        const statusLine = truncateSubagentTabText(deriveSubagentStatusLine(forkMessages[forkId] ?? []))
+        const statusLine = truncateSubagentTabText(selectLatestLiveActivityFromMessages(forkMessages[forkId] ?? []) ?? 'Running…')
         return {
           forkId,
           agentId: meta.agentId,

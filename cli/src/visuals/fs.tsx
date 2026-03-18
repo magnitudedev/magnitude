@@ -78,6 +78,11 @@ function getResultDiffs(result: ToolResult | undefined): readonly EditDiff[] | n
 // readRender
 // =============================================================================
 
+export function readLiveText({ state }: { state: ReadState }): string {
+  const target = state.path || 'file'
+  return state.phase === 'done' ? `Read ${target}` : `Reading ${target}`
+}
+
 export const readRender = render<ReadState>(({ state }) => {
   const theme = useTheme()
   const isRunning = state.phase !== 'done'
@@ -120,6 +125,12 @@ export const readRender = render<ReadState>(({ state }) => {
 // =============================================================================
 // writeRender — restored system/user rejection distinction
 // =============================================================================
+
+export function writeLiveText({ state }: { state: WriteState }): string {
+  const target = state.path || 'file'
+  if (state.phase !== 'done') return `Writing ${target}`
+  return state.result?._tag === 'Success' ? `Wrote ${target}` : `Write ${target}`
+}
 
 export const writeRender = render<WriteState>(({ state, isExpanded, onToggle, stepResult }) => {
   const theme = useTheme()
@@ -192,6 +203,12 @@ export const writeRender = render<WriteState>(({ state, isExpanded, onToggle, st
 // =============================================================================
 // editRender — per-step fallback (used when cluster renderer is not available)
 // =============================================================================
+
+export function editLiveText({ state }: { state: EditState }): string {
+  const target = state.path || 'file'
+  if (state.phase !== 'done') return `Editing ${target}`
+  return state.result?._tag === 'Success' ? `Edited ${target}` : `Edit ${target}`
+}
 
 export const editRender = render<EditState>(({ state, isExpanded, onToggle, stepResult }) => {
   const theme = useTheme()
@@ -381,6 +398,12 @@ export const editClusterRender = clusterRender<EditState>(({ steps }) => {
 // treeRender
 // =============================================================================
 
+export function treeLiveText({ state }: { state: TreeState }): string {
+  const target = state.path || 'files'
+  if (state.phase !== 'done') return `Listing ${target}`
+  return state.result?._tag === 'Success' ? `Listed ${target}` : `List ${target}`
+}
+
 export const treeRender = render<TreeState>(({ state, isExpanded, onToggle }) => {
   const theme = useTheme()
   const isRunning = state.phase !== 'done'
@@ -450,6 +473,12 @@ export const treeRender = render<TreeState>(({ state, isExpanded, onToggle }) =>
 // =============================================================================
 // searchRender
 // =============================================================================
+
+export function searchLiveText({ state }: { state: SearchState }): string {
+  const summary = formatSearchInputs(state)
+  const target = summary.length > 0 ? summary : 'files'
+  return state.phase === 'done' ? `Searched ${target}` : `Searching ${target}`
+}
 
 export const searchRender = render<SearchState>(({ state, isExpanded, onToggle }) => {
   const theme = useTheme()

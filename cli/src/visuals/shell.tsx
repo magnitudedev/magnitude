@@ -36,6 +36,14 @@ function truncateLine(text: string, max: number): string {
 // Render
 // =============================================================================
 
+export function shellLiveText({ state }: { state: ShellState }): string {
+  const command = state.command.trim()
+  if (state.phase !== 'done') return command.length > 0 ? `$ ${command}` : 'Running shell command'
+  if (state.done?.kind === 'error') return command.length > 0 ? `Shell error: $ ${command}` : 'Shell error'
+  if (state.done?.kind === 'rejected') return command.length > 0 ? `Rejected: $ ${command}` : 'Shell command rejected'
+  return command.length > 0 ? `$ ${command}` : 'Ran shell command'
+}
+
 export const shellRender = render<ShellState>(({ state, isExpanded, onToggle }) => {
   const theme = useTheme()
   const { phase, command, done } = state
