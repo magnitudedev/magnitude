@@ -48,9 +48,8 @@ export function reconcileForkMeta(args: {
   prev: Record<string, ForkMeta>
   latestByFork: ReadonlyMap<string, ForkActivityMessage>
   agentStatusState: AgentStatusState | null
-  now: number
 }): { next: Record<string, ForkMeta>; pruneForkIds: string[] } {
-  const { prev, latestByFork, agentStatusState, now } = args
+  const { prev, latestByFork, agentStatusState } = args
   const next: Record<string, ForkMeta> = {}
 
   for (const [forkId, activity] of latestByFork.entries()) {
@@ -106,10 +105,9 @@ export function useSubagentTabs({
   }, [rootDisplayMessages])
 
   useEffect(() => {
-    const now = Date.now()
     let pruneForkIds: string[] = []
     setForkMeta(prev => {
-      const reconciled = reconcileForkMeta({ prev, latestByFork, agentStatusState, now })
+      const reconciled = reconcileForkMeta({ prev, latestByFork, agentStatusState })
       pruneForkIds = reconciled.pruneForkIds
       const prevKeys = Object.keys(prev)
       const nextKeys = Object.keys(reconciled.next)

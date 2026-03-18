@@ -25,7 +25,6 @@ describe('reconcileForkMeta', () => {
       prev: {},
       latestByFork: running,
       agentStatusState: null,
-      now: 5000,
     })
     expect(first.next['fork-1']?.phase).toBe('active')
     expect(first.next['fork-1']?.completedAt).toBeUndefined()
@@ -37,7 +36,6 @@ describe('reconcileForkMeta', () => {
       prev: first.next,
       latestByFork: completed,
       agentStatusState: null,
-      now: 9000,
     })
     expect(second.next['fork-1']?.phase).toBe('idle')
     expect(second.next['fork-1']?.completedAt).toBeUndefined()
@@ -46,7 +44,6 @@ describe('reconcileForkMeta', () => {
       prev: second.next,
       latestByFork: completed,
       agentStatusState: null,
-      now: 12000,
     })
     expect(third.next['fork-1']?.phase).toBe('idle')
     expect(third.next['fork-1']?.completedAt).toBeUndefined()
@@ -71,7 +68,6 @@ describe('reconcileForkMeta', () => {
       },
       latestByFork,
       agentStatusState: null,
-      now: 9000,
     })
 
     expect(result.next['fork-1']?.phase).toBe('idle')
@@ -128,7 +124,6 @@ describe('reconcileForkMeta', () => {
       },
       latestByFork,
       agentStatusState: null,
-      now: 9000,
     })
 
     expect(result.next['fork-1']?.phase).toBe('active')
@@ -167,7 +162,6 @@ describe('reconcileForkMeta', () => {
       prev,
       latestByFork: new Map(),
       agentStatusState,
-      now: 6000,
     })
 
     expect(result.pruneForkIds.sort()).toEqual(['fork-dismissed', 'fork-missing'])
