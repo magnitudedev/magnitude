@@ -51,8 +51,11 @@ function formatLocalModelName(localProviderConfig?: { baseUrl?: string | null; m
   return localProviderConfig?.baseUrl?.trim() || 'Local model'
 }
 
-function normalizeSearch(search: string): string {
-  return search.trim().toLowerCase()
+function normalizeForSearch(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/(\d)[-_.](\d)/g, '$1.$2')  // keep version numbers together: 4-5 → 4.5
+    .replace(/[-_]/g, ' ')                // word separators → space
 }
 
 function compareItemsForSlot(a: ModelPickerItem, b: ModelPickerItem, slot: ModelSlot): number {
@@ -141,18 +144,17 @@ export function filterModelPickerItems({
   showRecommendedOnly,
   search,
 }: FilterModelPickerItemsArgs): ModelPickerItem[] {
-  const normalized = normalizeSearch(search)
+  const terms = normalizeForSearch(search).trim().split(/\s+/).filter(Boolean)
 
   return items.filter((item) => {
     if (!showAllProviders && !item.connected) return false
     if (showRecommendedOnly && !item.recommended) return false
-    if (!normalized) return true
+    if (terms.length === 0) return true
 
-    return [
-      item.providerName,
-      item.modelName,
-      item.modelId,
-    ].some(value => value.toLowerCase().includes(normalized))
+    const haystack = normalizeForSearch(
+      `${item.providerName} ${item.modelName} ${item.modelId}`
+    )
+    return terms.every(term => haystack.includes(term))
   })
 }
 
