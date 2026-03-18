@@ -806,7 +806,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               toolKey: event.toolKey,
               cluster: visual?.cluster,
               input: undefined,
-              label: event.toolKey + '()',
+              label: ({ artifactWrite: 'Writing artifact…', fileEdit: 'Editing file…' } as Record<string, string>)[event.toolKey] ?? event.toolKey + '()',
               visualState: initialVisualState,
             })
           }

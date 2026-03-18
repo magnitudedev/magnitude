@@ -25,6 +25,7 @@ import {
 } from '../../utils/strings'
 import type { InputValue } from '../../types/store'
 import type { ChatControllerProps } from './types'
+import { SubagentTabBar } from './subagent-tab-bar'
 
 const EMPTY_INPUT: InputValue = {
   text: '',
@@ -44,6 +45,9 @@ export function ChatController(props: ChatControllerProps) {
     env,
     services,
     displayMessages,
+    subagentTabs,
+    selectedForkId,
+    onSubagentTabSelect,
     selectedArtifactOpen,
     onCloseArtifact,
     onApprove,
@@ -326,6 +330,7 @@ export function ChatController(props: ChatControllerProps) {
   }, [])
 
   const handleSubmit = useCallback((message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
+    if (env.isSubagentView) return
     const slashText = visibleMessage ?? message
     if (!env.bashMode && services.runSlashCommand(slashText)) {
       clearComposer()
@@ -359,7 +364,7 @@ export function ChatController(props: ChatControllerProps) {
       mentionAttachments,
       attachments: currentAttachments,
     })
-  }, [env.bashMode, env.modelsConfigured, services, attachments, clearComposer])
+  }, [env.bashMode, env.modelsConfigured, env.isSubagentView, services, attachments, clearComposer])
 
   const handleInputSubmit = useCallback(() => {
     setHistoryIndex(null)
@@ -405,6 +410,8 @@ export function ChatController(props: ChatControllerProps) {
         onReject={onReject}
       />
 
+      <SubagentTabBar tabs={subagentTabs} selectedForkId={selectedForkId} onSelect={onSubagentTabSelect} />
+
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
           <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
@@ -445,7 +452,7 @@ export function ChatController(props: ChatControllerProps) {
                     onKeyIntercept={handleKeyIntercept}
                     focused={!env.pendingApproval}
                     highlightColor={env.bashMode ? orange[400] : undefined}
-                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.status === 'streaming' ? 'Type to queue a message...' : 'Type a message...'}
+                    placeholder={env.isSubagentView ? 'Select Main to return to chat...' : env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.status === 'streaming' ? 'Type to queue a message...' : 'Type a message...'}
                     maxHeight={10}
                     minHeight={1}
                   />
@@ -454,6 +461,12 @@ export function ChatController(props: ChatControllerProps) {
               <box style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
                 {env.bashMode ? (
                   <text style={{ fg: orange[400] }} attributes={TextAttributes.BOLD}>Bash Mode</text>
+                ) : env.isSubagentView ? (
+                  <>
+                    <text style={{ fg: env.theme.muted }}>{env.modelSummary?.provider ?? '—'}</text>
+                    <text style={{ fg: env.theme.muted }}> {'\u00b7'} </text>
+                    <text style={{ fg: env.theme.foreground }}>{env.modelSummary?.model ?? '—'}</text>
+                  </>
                 ) : (
                   <>
                     <Button onClick={() => services.openSettings('provider')} onMouseOver={() => setIsProviderHovered(true)} onMouseOut={() => setIsProviderHovered(false)}>

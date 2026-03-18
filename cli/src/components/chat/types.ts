@@ -20,6 +20,7 @@ export type ChatControllerEnv = {
   composerCanFocus: boolean
   widgetNavActive: boolean
   nextCtrlCWillExit: boolean
+  isSubagentView: boolean
 }
 
 export type ChatControllerServices = {
@@ -42,10 +43,22 @@ export type ChatControllerServices = {
   exitBashMode: () => void
 }
 
+export type SubagentTabItem = {
+  forkId: string
+  name: string
+  startedAt: number
+  toolCount: number
+  statusLine: string
+  phase: 'active' | 'exiting'
+}
+
 export type ChatControllerProps = {
   env: ChatControllerEnv
   services: ChatControllerServices
   displayMessages: DisplayState['messages']
+  subagentTabs: SubagentTabItem[]
+  selectedForkId: string | null
+  onSubagentTabSelect: (forkId: string | null) => void
   selectedArtifactOpen: boolean
   onCloseArtifact: () => void
   onApprove: () => void

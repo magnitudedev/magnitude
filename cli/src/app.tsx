@@ -48,6 +48,7 @@ import { ArtifactReaderPanel } from './components/artifact-reader-panel'
 import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
+import { useSubagentTabs } from './hooks/use-subagent-tabs'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -59,6 +60,12 @@ import { createId } from '@magnitudedev/generate-id'
 import { useProviderRuntime } from './providers/provider-runtime'
 import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
+
+const roleToSlot = (role: string): 'primary' | 'secondary' | 'browser' => {
+  if (role === 'browser') return 'browser'
+  if (role === 'orchestrator') return 'primary'
+  return 'secondary'
+}
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
@@ -119,7 +126,15 @@ function AppInner({
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
-  const popForkOverlay = () => setExpandedForkStack(s => s.slice(0, -1))
+  const [selectedTabForkId, setSelectedTabForkId] = useState<string | null>(null)
+  const popForkOverlay = () => {
+    setExpandedForkStack(s => s.slice(0, -1))
+    setSelectedTabForkId(null)
+  }
+
+  const [forkDisplay, setForkDisplay] = useState<DisplayState | null>(null)
+  const [forkTokenEstimate, setForkTokenEstimate] = useState(0)
+  const [forkIsCompacting, setForkIsCompacting] = useState(false)
 
   const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
   const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -622,6 +637,32 @@ function AppInner({
     return unsubscribe
   }, [client])
 
+  // Subscribe to selected fork's display
+  useEffect(() => {
+    if (!client || !selectedTabForkId) {
+      setForkDisplay(null)
+      return
+    }
+    const unsubscribe = client.state.display.subscribeFork(selectedTabForkId, (state) => {
+      setForkDisplay(state)
+    })
+    return unsubscribe
+  }, [client, selectedTabForkId])
+
+  // Subscribe to selected fork's compaction state
+  useEffect(() => {
+    if (!client || !selectedTabForkId) {
+      setForkTokenEstimate(0)
+      setForkIsCompacting(false)
+      return
+    }
+    const unsubscribe = client.state.compaction.subscribeFork(selectedTabForkId, (state: ForkCompactionState) => {
+      setForkTokenEstimate(state.tokenEstimate)
+      setForkIsCompacting(state.isCompacting)
+    })
+    return unsubscribe
+  }, [client, selectedTabForkId])
+
   // Subscribe to debug stream when debug mode is enabled and panel is visible
   useEffect(() => {
     if (!client || !debugMode || !debugPanelVisible) return
@@ -634,8 +675,48 @@ function AppInner({
   }, [client, debugMode, debugPanelVisible])
 
 
+  const subagentTabs = useSubagentTabs({
+    client,
+    rootDisplayMessages: display?.messages ?? [],
+    agentStatusState,
+  })
+
+  // Auto-deselect fork tab when fork is gone
+  useEffect(() => {
+    if (!selectedTabForkId) return
+    const tab = subagentTabs.find(t => t.forkId === selectedTabForkId)
+    if (!tab) {
+      setSelectedTabForkId(null)
+    }
+  }, [subagentTabs, selectedTabForkId])
+
+  const activeDisplay = selectedTabForkId ? forkDisplay : display
+
+  const activeModelSummary = useMemo(() => {
+    const rootModelSummary = primaryModel ? {
+      provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
+      model: getProvider(primaryModel.providerId)?.models.find(m => m.id === primaryModel.modelId)?.name ?? primaryModel.modelId,
+    } : null
+    if (!selectedTabForkId || !agentStatusState) return rootModelSummary
+    const agentId = agentStatusState.agentByForkId.get(selectedTabForkId)
+    const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
+    if (!agent) return rootModelSummary
+    const slot = roleToSlot(agent.role)
+    const selection = slot === 'primary' ? primaryModel : slot === 'browser' ? browserModel : secondaryModel
+    if (!selection) return null
+    return {
+      provider: getProvider(selection.providerId)?.name ?? selection.providerId,
+      model: getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)?.name ?? selection.modelId,
+    }
+  }, [selectedTabForkId, agentStatusState, primaryModel, secondaryModel, browserModel])
+
+  const mainTimelineMessages = useMemo(
+    () => (activeDisplay?.messages ?? []).filter(m => m.type !== 'fork_activity' && m.type !== 'agent_communication'),
+    [activeDisplay?.messages]
+  )
+
   const { visibleItems, hiddenCount, loadMore, hasMore } = usePaginatedTimeline(
-    display?.messages ?? [],
+    mainTimelineMessages,
     bashOutputs,
     systemMessages
   )
@@ -1816,21 +1897,22 @@ function AppInner({
           {chatScrollbox}
           <ChatController
             env={{
-              status: display.status,
+              status: (activeDisplay ?? display)?.status ?? 'idle',
               pendingApproval: pendingApproval != null,
               hasRunningForks,
               bashMode,
               modelsConfigured: !!primaryModel && !!secondaryModel && !!browserModel,
-              modelSummary,
-              tokenEstimate,
+              modelSummary: activeModelSummary,
+              tokenEstimate: selectedTabForkId ? forkTokenEstimate : tokenEstimate,
               contextHardCap,
-              isCompacting,
+              isCompacting: selectedTabForkId ? forkIsCompacting : isCompacting,
               theme,
               modeColor,
               attachmentsMaxWidth,
-              composerCanFocus,
+              composerCanFocus: composerCanFocus && selectedTabForkId === null,
               widgetNavActive,
               nextCtrlCWillExit,
+              isSubagentView: selectedTabForkId !== null,
             }}
             services={{
               submitUserMessage: ({ message, attachments }) => handleSubmitViaClientBoundary({ message, attachments }),
@@ -1855,6 +1937,9 @@ function AppInner({
               exitBashMode: exitBashMode,
             }}
             displayMessages={display.messages}
+            subagentTabs={subagentTabs}
+            selectedForkId={selectedTabForkId}
+            onSubagentTabSelect={setSelectedTabForkId}
             selectedArtifactOpen={selectedArtifact != null}
             onCloseArtifact={() => setSelectedArtifact(null)}
             onApprove={handleApprove}
