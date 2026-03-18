@@ -1,0 +1,9 @@
+[project]
+name = "magnitude-infer"
+version = "0.1.0"
+description = "Local MLX inference server for Magnitude"
+requires-python = ">=3.10"
+dependencies = [
+    "vllm-mlx",
+    "huggingface-hub",
+]
