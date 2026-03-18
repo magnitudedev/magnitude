@@ -1,5 +1,4 @@
 import { memo, useEffect, useState } from 'react'
-import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../button'
 import { TAB_BORDER_CHARS } from '../../utils/ui-constants'
@@ -98,23 +97,22 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
       {tabs.length === 0 ? (
         <box style={{ paddingLeft: 3, paddingRight: 1, flexDirection: 'column', height: 3, minHeight: 3, maxHeight: 3 }}>
           <text style={{ fg: theme.foreground }}> </text>
-          <text style={{ fg: theme.foreground }}>No active subagents.</text>
-          <text style={{ fg: theme.muted }}>Live subagent activity will appear here.</text>
+          <text style={{ fg: theme.foreground }}>No subagents yet.</text>
+          <text style={{ fg: theme.muted }}>Subagent activity will appear here.</text>
         </box>
       ) : tabs.map((tab) => {
-        const exiting = tab.phase === 'exiting'
+        const isIdle = tab.phase === 'idle'
         const isSelected = selectedForkId === tab.forkId
         const isHovered = hoveredId === tab.forkId
-        const attrs = exiting ? TextAttributes.DIM : undefined
 
         const tabBorderColor = isSelected || isHovered ? theme.foreground : theme.border
         const tabTextColor = isSelected || isHovered ? theme.foreground : theme.muted
         const tabIdColor = theme.foreground
         const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
 
-        const timer = formatElapsed(tab.activeSince, now, tab.completedAt)
+        const timer = formatElapsed(tab.activeSince, now, isIdle ? (tab.completedAt ?? tab.activeSince) : tab.completedAt)
         const detailsPart = `• ${tab.toolCount} tools • ${timer}`
-        const line1Prefix = '● '
+        const line1Prefix = isIdle ? '○ ' : '● '
         const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - detailsPart.length - 1
         const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))
         const line1Rest = ` ${detailsPart}`
@@ -122,7 +120,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         const line2 = truncate(tab.statusLine, TAB_INNER_WIDTH)
         const isRunning = tab.phase === 'active'
         const pulseColor = PULSE_SLATE_SHADES[Math.floor(now / 200) % PULSE_SLATE_SHADES.length]
-        const dotColor = isRunning ? pulseColor : tabIdColor
+        const dotColor = isRunning ? pulseColor : slate[500]
 
         return (
           <Button
@@ -143,12 +141,12 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
             >
               <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', width: TAB_INNER_WIDTH + 2, height: 2, minHeight: 2, maxHeight: 2 }}>
                 <box style={{ flexDirection: 'row' }}>
-                  <text style={{ fg: dotColor }} attributes={attrs}>{line1Prefix}</text>
-                  <text style={{ fg: tabIdColor }} attributes={attrs}>{namePart}</text>
-                  <text style={{ fg: tabRestLine1Color }} attributes={attrs}>{line1Rest}</text>
+                  <text style={{ fg: dotColor }}>{line1Prefix}</text>
+                  <text style={{ fg: tabIdColor }}>{namePart}</text>
+                  <text style={{ fg: tabRestLine1Color }}>{line1Rest}</text>
                 </box>
-                {/* <text style={{ fg: tabTextColor }} attributes={attrs}>{line2}</text> */}
-                <text style={{ fg: tabTextColor }} attributes={attrs}>{line2}</text>
+                {/* <text style={{ fg: tabTextColor }}>{line2}</text> */}
+                <text style={{ fg: tabTextColor }}>{line2}</text>
               </box>
             </box>
           </Button>

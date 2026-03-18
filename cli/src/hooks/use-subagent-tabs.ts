@@ -20,7 +20,6 @@ type UseSubagentTabsArgs = {
   client: AgentClientLike | null
   rootDisplayMessages: readonly DisplayMessage[]
   agentStatusState: AgentStatusState | null
-  exitMs?: number
 }
 
 type ForkMeta = {
@@ -30,21 +29,70 @@ type ForkMeta = {
   completedAt?: number
   toolCount: number
   toolCounts: ForkActivityMessage['toolCounts']
-  phase: 'active' | 'exiting'
+  phase: 'active' | 'idle'
 }
 
-const DEFAULT_EXIT_MS = 1000
+const DISMISSED_PRUNE_MS = 1000
+
+export function sortSubagentTabs(a: SubagentTabItem, b: SubagentTabItem): number {
+  if (a.phase !== b.phase) return a.phase === 'active' ? -1 : 1
+  return a.activeSince - b.activeSince
+}
+
+function getAgentByForkId(agentStatusState: AgentStatusState | null, forkId: string) {
+  if (!agentStatusState) return undefined
+  return Array.from(agentStatusState.agents.values()).find(agent => agent.forkId === forkId)
+}
+
+export function reconcileForkMeta(args: {
+  prev: Record<string, ForkMeta>
+  latestByFork: ReadonlyMap<string, ForkActivityMessage>
+  agentStatusState: AgentStatusState | null
+  now: number
+}): { next: Record<string, ForkMeta>; pruneForkIds: string[] } {
+  const { prev, latestByFork, agentStatusState, now } = args
+  const next: Record<string, ForkMeta> = {}
+
+  for (const [forkId, activity] of latestByFork.entries()) {
+    const previous = prev[forkId]
+    const forkAgent = getAgentByForkId(agentStatusState, forkId)
+    const isDismissed = forkAgent?.status === 'dismissed'
+    if (isDismissed) continue
+
+    const isActive = activity.status === 'running' && (!agentStatusState || forkAgent?.status === 'working')
+    const completedAt = activity.completedAt ?? previous?.completedAt ?? (isActive ? undefined : now)
+
+    next[forkId] = {
+      agentId: forkAgent?.agentId ?? previous?.agentId ?? forkId,
+      name: activity.name,
+      activeSince: activity.activeSince,
+      completedAt,
+      toolCount: sumForkToolCounts(activity.toolCounts),
+      toolCounts: activity.toolCounts,
+      phase: isActive ? 'active' : 'idle',
+    }
+  }
+
+  const pruneForkIds: string[] = []
+  for (const [forkId] of Object.entries(prev)) {
+    if (next[forkId]) continue
+    if (!agentStatusState) continue
+    const forkAgent = getAgentByForkId(agentStatusState, forkId)
+    if (!forkAgent || forkAgent.status === 'dismissed') pruneForkIds.push(forkId)
+  }
+
+  return { next, pruneForkIds }
+}
 
 export function useSubagentTabs({
   client,
   rootDisplayMessages,
   agentStatusState,
-  exitMs = DEFAULT_EXIT_MS,
 }: UseSubagentTabsArgs): SubagentTabItem[] {
   const [forkMessages, setForkMessages] = useState<Record<string, readonly DisplayMessage[]>>({})
   const [forkMeta, setForkMeta] = useState<Record<string, ForkMeta>>({})
   const unsubscribesRef = useRef<Map<string, () => void>>(new Map())
-  const exitTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map())
+  const pruneTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map())
 
   const latestByFork = useMemo(() => {
     const map = new Map<string, ForkActivityMessage>()
@@ -56,50 +104,31 @@ export function useSubagentTabs({
   }, [rootDisplayMessages])
 
   useEffect(() => {
-    const activeForkIds = new Set<string>()
-
-    for (const [forkId, activity] of latestByFork.entries()) {
-      if (activity.status !== 'running') continue
-      if (agentStatusState) {
-        const forkAgent = Array.from(agentStatusState.agents.values()).find(a => a.forkId === forkId)
-        if (!forkAgent || forkAgent.status !== 'working') continue
+    const now = Date.now()
+    let pruneForkIds: string[] = []
+    setForkMeta(prev => {
+      const reconciled = reconcileForkMeta({ prev, latestByFork, agentStatusState, now })
+      pruneForkIds = reconciled.pruneForkIds
+      const prevKeys = Object.keys(prev)
+      const nextKeys = Object.keys(reconciled.next)
+      if (prevKeys.length === nextKeys.length) {
+        let changed = false
+        for (const key of nextKeys) {
+          if (prev[key] !== reconciled.next[key]) {
+            changed = true
+            break
+          }
+        }
+        if (!changed) return prev
       }
-      activeForkIds.add(forkId)
-      const forkAgent = agentStatusState
-        ? Array.from(agentStatusState.agents.values()).find(a => a.forkId === forkId)
-        : undefined
-      setForkMeta(prev => {
-        const existing = prev[forkId]
-        const nextMeta: ForkMeta = {
-          agentId: forkAgent?.agentId ?? forkId,
-          name: activity.name,
-          activeSince: activity.activeSince,
-          completedAt: activity.completedAt,
-          toolCount: sumForkToolCounts(activity.toolCounts),
-          toolCounts: activity.toolCounts,
-          phase: 'active',
-        }
-        if (
-          existing
-          && existing.agentId === nextMeta.agentId
-          && existing.name === nextMeta.name
-          && existing.activeSince === nextMeta.activeSince
-          && existing.completedAt === nextMeta.completedAt
-          && existing.toolCount === nextMeta.toolCount
-          && existing.toolCounts === nextMeta.toolCounts
-          && existing.phase === nextMeta.phase
-        ) {
-          return prev
-        }
-        return {
-          ...prev,
-          [forkId]: nextMeta,
-        }
-      })
-      const existingTimer = exitTimersRef.current.get(forkId)
+      return reconciled.next
+    })
+
+    for (const forkId of latestByFork.keys()) {
+      const existingTimer = pruneTimersRef.current.get(forkId)
       if (existingTimer) {
         clearTimeout(existingTimer)
-        exitTimersRef.current.delete(forkId)
+        pruneTimersRef.current.delete(forkId)
       }
 
       if (!client || unsubscribesRef.current.has(forkId)) continue
@@ -109,49 +138,32 @@ export function useSubagentTabs({
       unsubscribesRef.current.set(forkId, unsubscribe)
     }
 
-    for (const [forkId, meta] of Object.entries(forkMeta)) {
-      if (meta.phase !== 'active') continue
-      if (activeForkIds.has(forkId)) continue
-
-      setForkMeta(prev => {
-        const next = prev[forkId]
-        if (!next || next.phase === 'exiting') return prev
-        return {
-          ...prev,
-          [forkId]: { ...next, phase: 'exiting' },
+    for (const forkId of pruneForkIds) {
+      if (pruneTimersRef.current.has(forkId)) continue
+      const timeout = setTimeout(() => {
+        pruneTimersRef.current.delete(forkId)
+        const unsubscribe = unsubscribesRef.current.get(forkId)
+        if (unsubscribe) {
+          unsubscribe()
+          unsubscribesRef.current.delete(forkId)
         }
-      })
-
-      if (!exitTimersRef.current.has(forkId)) {
-        const timeout = setTimeout(() => {
-          const unsubscribe = unsubscribesRef.current.get(forkId)
-          if (unsubscribe) {
-            unsubscribe()
-            unsubscribesRef.current.delete(forkId)
-          }
-          exitTimersRef.current.delete(forkId)
-          setForkMeta(prev => {
-            const next = { ...prev }
-            delete next[forkId]
-            return next
-          })
-          setForkMessages(prev => {
-            const next = { ...prev }
-            delete next[forkId]
-            return next
-          })
-        }, exitMs)
-        exitTimersRef.current.set(forkId, timeout)
-      }
+        setForkMessages(prev => {
+          if (!prev[forkId]) return prev
+          const next = { ...prev }
+          delete next[forkId]
+          return next
+        })
+      }, DISMISSED_PRUNE_MS)
+      pruneTimersRef.current.set(forkId, timeout)
     }
-  }, [latestByFork, client, agentStatusState, forkMeta, exitMs])
+  }, [latestByFork, client, agentStatusState])
 
   useEffect(() => {
     return () => {
       for (const unsubscribe of unsubscribesRef.current.values()) unsubscribe()
       unsubscribesRef.current.clear()
-      for (const timeout of exitTimersRef.current.values()) clearTimeout(timeout)
-      exitTimersRef.current.clear()
+      for (const timeout of pruneTimersRef.current.values()) clearTimeout(timeout)
+      pruneTimersRef.current.clear()
     }
   }, [])
 
@@ -159,7 +171,11 @@ export function useSubagentTabs({
     return Object.entries(forkMeta)
       .map(([forkId, meta]): SubagentTabItem => {
         const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
-        const statusLine = truncateSubagentTabText(selectLatestLiveActivityFromMessages(forkMessages[forkId] ?? []) ?? 'Running…')
+        const statusLine = truncateSubagentTabText(
+          meta.phase === 'idle'
+            ? 'Agent is idle'
+            : (selectLatestLiveActivityFromMessages(forkMessages[forkId] ?? []) ?? 'Running…'),
+        )
         return {
           forkId,
           agentId: meta.agentId,
@@ -172,6 +188,6 @@ export function useSubagentTabs({
           phase: meta.phase,
         }
       })
-      .sort((a, b) => a.activeSince - b.activeSince)
+      .sort(sortSubagentTabs)
   }, [forkMeta, forkMessages])
 }

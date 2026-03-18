@@ -52,7 +52,7 @@ export type SubagentTabItem = {
   toolCount: number
   toolSummaryLine: string
   statusLine: string
-  phase: 'active' | 'exiting'
+  phase: 'active' | 'idle'
 }
 
 export type ChatControllerProps = {
