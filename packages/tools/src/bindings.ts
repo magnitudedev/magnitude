@@ -10,39 +10,43 @@
 // Utility Types
 // =============================================================================
 
-/** Extract string field names from an input type. Falls back to string when T is unknown. */
-export type InputFields<T> = [Extract<keyof T, string>] extends [never] ? string : Extract<keyof T, string>
+/** Extract string field names from an input type. Falls back to string when T is unknown.
+ *  Distributes over unions so that A | B yields keys from both variants. */
+export type InputFields<T> = [T] extends [never] ? string : T extends any ? ([Extract<keyof T, string>] extends [never] ? string : Extract<keyof T, string>) : never
 
-/** Extract fields of T whose values are arrays */
-export type ArrayFields<T> = {
+/** Extract fields of T whose values are arrays. Distributes over unions. */
+export type ArrayFields<T> = T extends any ? {
   [K in keyof T]: T[K] extends ReadonlyArray<unknown> ? K : never
-}[keyof T] & string
+}[keyof T] & string : never
 
 /** Extract element type from an array field */
 export type ArrayElement<T, K extends keyof T> =
   T[K] extends ReadonlyArray<infer E> ? E : never
 
 /** Extract keys of T whose values are plain objects (not arrays, not primitives).
- *  Handles optional fields by stripping undefined before checking. */
-type ObjectFields<T> = {
+ *  Handles optional fields by stripping undefined before checking.
+ *  Distributes over unions. */
+type ObjectFields<T> = T extends any ? {
   [K in keyof T]-?: NonNullable<T[K]> extends ReadonlyArray<unknown>
     ? never
     : NonNullable<T[K]> extends Record<string, unknown>
       ? K
       : never
-}[keyof T] & string
+}[keyof T] & string : never
 
-/** Extract keys of T whose values are Record<string, string> (key-value maps). */
-export type RecordFields<T> = {
+/** Extract keys of T whose values are Record<string, string> (key-value maps).
+ *  Distributes over unions. */
+export type RecordFields<T> = T extends any ? {
   [K in keyof T]-?: NonNullable<T[K]> extends Record<string, string> ? K : never
-}[keyof T] & string
+}[keyof T] & string : never
 
 /** Field paths for XML bindings.
  *  Top-level fields: 'name'. Nested fields: 'options.type'.
- *  Falls back to string when T is unknown. */
-export type FieldPath<T> = InputFields<T> | {
+ *  Falls back to string when T is unknown.
+ *  Distributes over unions so A | B yields paths from both variants. */
+export type FieldPath<T> = InputFields<T> | (T extends any ? {
   [K in ObjectFields<T>]: `${K}.${Extract<keyof NonNullable<T[K]>, string>}`
-}[ObjectFields<T>]
+}[ObjectFields<T>] : never)
 
 /** Backward-compatible alias for childTag bindings. */
 export type ChildTagPath<T> = FieldPath<T>

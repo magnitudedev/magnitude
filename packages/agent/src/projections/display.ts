@@ -180,6 +180,20 @@ export interface AgentCommunicationMessage {
   readonly timestamp: number
 }
 
+export interface BackgroundProcessMessage {
+  readonly id: string
+  readonly type: 'background_process'
+  readonly pid: number
+  readonly command: string
+  readonly status: 'running' | 'exited' | 'killed'
+  readonly stdout: string
+  readonly stderr: string
+  readonly exitCode: number | null
+  readonly signal: string | null
+  readonly timestamp: number
+  readonly updatedAt: number
+}
+
 export interface ApprovalRequestMessage {
   readonly id: string
   readonly type: 'approval_request'
@@ -202,6 +216,7 @@ export type DisplayMessage =
   | ForkResultMessage
   | ForkActivityMessage
   | AgentCommunicationMessage
+  | BackgroundProcessMessage
   | ApprovalRequestMessage
 
 /** Per-fork display state */
@@ -398,6 +413,10 @@ function toPreview(text: string): string {
   const normalized = text.replace(/\s+/g, ' ').trim()
   if (normalized.length <= 120) return normalized
   return normalized.slice(0, 117) + '...'
+}
+
+function shortenShellCommand(command: string, max = 50): string {
+  return command.length > max ? command.slice(0, max - 3) + '...' : command
 }
 
 function isArtifactToolKey(toolKey: string | undefined): toolKey is 'artifactWrite' | 'artifactUpdate' {
@@ -859,13 +878,31 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               fork.messages,
               fork.activeThinkBlockId,
               event.toolCallId,
-              (s) => ({
-                ...s,
-                result,
-                visualState: visual && s.visualState !== undefined
-                  ? visual.reduce(s.visualState, inner)
-                  : s.visualState,
-              })
+              (s) => {
+                let label = s.label
+                if (
+                  event.toolKey === 'shell'
+                  && result.status === 'success'
+                  && result.output
+                  && typeof result.output === 'object'
+                  && 'mode' in result.output
+                  && result.output.mode === 'detached'
+                  && s.input
+                  && typeof s.input === 'object'
+                  && 'command' in s.input
+                ) {
+                  label = `Detached: ${shortenShellCommand((s.input as { command: string }).command)}`
+                }
+
+                return {
+                  ...s,
+                  label,
+                  result,
+                  visualState: visual && s.visualState !== undefined
+                    ? visual.reduce(s.visualState, inner)
+                    : s.visualState,
+                }
+              }
             )
           }
         }
@@ -892,6 +929,84 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             )
           }
         }
+      }
+    },
+
+    background_process_registered: ({ event, fork }) => {
+      const message: BackgroundProcessMessage = {
+        id: `background-process-${event.pid}`,
+        type: 'background_process',
+        pid: event.pid,
+        command: event.command,
+        status: 'running',
+        stdout: event.initialStdout,
+        stderr: event.initialStderr,
+        exitCode: null,
+        signal: null,
+        timestamp: event.startedAt,
+        updatedAt: event.timestamp,
+      }
+
+      return {
+        ...fork,
+        messages: insertBeforeQueuedMessages(
+          fork.messages.filter(m => !(m.type === 'background_process' && m.pid === event.pid)),
+          message
+        )
+      }
+    },
+
+    background_process_output: ({ event, fork }) => {
+      const existing = fork.messages.find(
+        (m): m is BackgroundProcessMessage => m.type === 'background_process' && m.pid === event.pid
+      )
+      if (!existing) return fork
+
+      const stdout = event.mode === 'tail'
+        ? event.stdoutChunk
+        : existing.stdout + event.stdoutChunk
+      const stderr = event.mode === 'tail'
+        ? event.stderrChunk
+        : existing.stderr + event.stderrChunk
+
+      return {
+        ...fork,
+        messages: updateMessageById<BackgroundProcessMessage>(
+          fork.messages,
+          existing.id,
+          (msg) => ({
+            ...msg,
+            stdout,
+            stderr,
+            updatedAt: event.timestamp,
+          })
+        )
+      }
+    },
+
+    background_process_demoted: ({ fork }) => fork,
+
+    background_process_exited: ({ event, fork }) => {
+      const existing = fork.messages.find(
+        (m): m is BackgroundProcessMessage => m.type === 'background_process' && m.pid === event.pid
+      )
+      if (!existing) return fork
+
+      return {
+        ...fork,
+        messages: updateMessageById<BackgroundProcessMessage>(
+          fork.messages,
+          existing.id,
+          (msg) => ({
+            ...msg,
+            status: event.status,
+            exitCode: event.exitCode,
+            signal: event.signal,
+            stdout: event.stdoutTail || msg.stdout,
+            stderr: event.stderrTail || msg.stderr,
+            updatedAt: event.timestamp,
+          })
+        )
       }
     },
 
@@ -1269,8 +1384,7 @@ function generateToolLabel(toolKey: string, input: unknown): string {
   // For shell, show the command
   if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input) {
     const cmd = (input as { command: string }).command
-    const shortCmd = cmd.length > 50 ? cmd.slice(0, 47) + '...' : cmd
-    return `Running: ${shortCmd}`
+    return `Running: ${shortenShellCommand(cmd)}`
   }
 
   // For webSearch, show the query

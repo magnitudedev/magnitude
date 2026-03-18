@@ -15,6 +15,7 @@ import { artifactReadTool } from '../tools/artifact-tools'
 import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
 import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const intentLens = defineThinkingLens({
   name: 'intent',
@@ -58,6 +59,7 @@ export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [intentLens, qualityLens, skepticismLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input, ctx) {

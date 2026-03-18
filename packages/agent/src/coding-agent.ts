@@ -34,6 +34,7 @@ import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
 import { OutboundMessagesProjection } from './projections/outbound-messages'
 import { ArtifactAwarenessProjection } from './projections/artifact-awareness'
+import { BackgroundProcessesProjection } from './projections/background-processes'
 
 // Workers
 import { TurnController } from './workers/turn-controller'
@@ -52,6 +53,7 @@ import { FileMentionResolver } from './workers/file-mention-resolver'
 
 // Execution
 import { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
+import { BackgroundProcessRegistryTag } from './processes/background-process-registry'
 import { BrowserServiceLive } from './services/browser-service'
 import { registerApprovalBridge } from './execution/approval-bridge'
 
@@ -91,6 +93,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     SubagentActivityProjection,
     OutboundMessagesProjection,
     ArtifactAwarenessProjection,
+    BackgroundProcessesProjection,
     MemoryProjection,
     DisplayProjection,
     ChatTitleProjection,
@@ -285,6 +288,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       const executionManager = yield* ExecutionManager
       const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
+      const backgroundProcessesProjection = yield* BackgroundProcessesProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
       yield* executionManager.initFork(null, 'orchestrator')
@@ -320,6 +324,24 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
           type: 'interrupt',
           forkId: null,
         }))
+      }
+
+      const backgroundProcessState = yield* backgroundProcessesProjection.get
+      for (const [forkKey, processes] of backgroundProcessState.entries()) {
+        for (const process of processes.values()) {
+          if (process.status !== 'running') continue
+          const forkId = forkKey === 'root' ? null : forkKey
+          yield* Effect.promise(() => client.send({
+            type: 'background_process_exited',
+            forkId,
+            pid: process.pid,
+            exitCode: null,
+            signal: 'SIGTERM',
+            status: 'killed',
+            stdoutTail: '',
+            stderrTail: '',
+          }))
+        }
       }
 
       // NOTE: AgentStatusProjection is the source of truth for agent identity, metadata, and execution state.
@@ -387,6 +409,13 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // hydration recovery will detect non-stable forks on next startup and emit
       // interrupts to bring them to a clean terminal state.
       await client.runEffect(flushPendingEvents())
+    } catch {}
+
+    try {
+      await client.runEffect(Effect.gen(function* () {
+        const registry = yield* BackgroundProcessRegistryTag
+        yield* registry.shutdownAll()
+      }))
     } catch {}
 
     await originalDispose()

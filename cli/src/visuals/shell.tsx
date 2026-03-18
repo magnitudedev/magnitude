@@ -44,21 +44,26 @@ export const shellRender = render<ShellState>(({ state, isExpanded, onToggle }) 
   const isRejected = done?.kind === 'rejected'
   const isError = done?.kind === 'error'
   const isSuccess = done?.kind === 'success'
+  const isDetached = done?.kind === 'detached'
 
   // Determine failed state and result text for preview
   const isFailed = (isSuccess && done.exitCode !== 0) || isError
   const resultPreview = isSuccess
     ? (isFailed ? (done.stderr || done.stdout) : (done.stdout || done.stderr))
-    : isError
-      ? done.message
-      : ''
+    : isDetached
+      ? (done.stdout || done.stderr)
+      : isError
+        ? done.message
+        : ''
 
   // Full expanded text
   const fullResultText = isSuccess
     ? [done.stdout, isFailed ? done.stderr : ''].filter(Boolean).join('\n').replace(/^\n+/, '').trimEnd()
-    : isError
-      ? done.message
-      : ''
+    : isDetached
+      ? [done.stdout, done.stderr].filter(Boolean).join('\n').replace(/^\n+/, '').trimEnd()
+      : isError
+        ? done.message
+        : ''
 
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -78,6 +83,13 @@ export const shellRender = render<ShellState>(({ state, isExpanded, onToggle }) 
             done.systemReason
               ? <><span style={{ fg: theme.error }}>{' · System Rejected'}</span><span style={{ fg: theme.muted }}>{` (${done.systemReason})`}</span></>
               : <span style={{ fg: theme.error }}>{' · User Rejected'}</span>
+          ) : isDetached ? (
+            <>
+              <span style={{ fg: theme.warning }}>{` · ⇀ Detached (PID ${done.pid})`}</span>
+              <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
+                {isExpanded ? ' · (collapse)' : ' · (expand)'}
+              </span>
+            </>
           ) : (isSuccess || isError) ? (
             <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
               {isExpanded ? ' · (collapse)' : ' · (expand)'}
@@ -94,9 +106,9 @@ export const shellRender = render<ShellState>(({ state, isExpanded, onToggle }) 
       )}
 
       {/* Expanded result */}
-      {isExpanded && (isSuccess || isError) && fullResultText.trim() && (
-        <text style={{ fg: isFailed ? theme.error : theme.muted }} attributes={TextAttributes.DIM}>
-          {isFailed ? '✗ ' : ''}{fullResultText}
+      {isExpanded && (isSuccess || isDetached || isError) && fullResultText.trim() && (
+        <text style={{ fg: isDetached ? theme.warning : isFailed ? theme.error : theme.muted }} attributes={TextAttributes.DIM}>
+          {isDetached ? '' : isFailed ? '✗ ' : ''}{fullResultText}
         </text>
       )}
     </box>

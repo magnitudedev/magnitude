@@ -17,6 +17,7 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
 import { classifyShellCommand } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const ideateLens = defineThinkingLens({
   name: 'ideate',
@@ -68,6 +69,7 @@ export const createPlanner = (systemPrompt: string) => defineAgent<typeof tools,
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [ideateLens, velocityLens, alignmentLens, capacityLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input) {

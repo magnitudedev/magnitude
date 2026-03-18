@@ -8,6 +8,7 @@ import { InlineForkActivity } from './inline-fork-activity'
 import { ApprovalRequest } from './approval-request'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { ErrorMessage } from './error-message'
+import { BackgroundProcessCard } from './background-process-card'
 import { useTheme } from '../hooks/use-theme'
 
 interface MessageViewProps {
@@ -115,6 +116,9 @@ export const MessageView = memo(function MessageView({
 
       case 'agent_communication':
         return <AgentCommunicationCard message={message} />
+
+      case 'background_process':
+        return <BackgroundProcessCard message={message} />
 
     }
   })()

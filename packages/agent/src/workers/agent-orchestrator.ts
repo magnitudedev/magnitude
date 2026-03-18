@@ -36,11 +36,15 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
       yield* execManager.initFork(null, 'orchestrator')
     }).pipe(Effect.orDie),
 
-    // Interrupt just stops the current turn — agent stays alive and goes idle.
-    // The interrupt flows through: WorkingState (clears state, emits turnInterrupted)
-    // → AgentStatusProjection (settles status and emits agentBecameIdle)
-    // → AgentOrchestrator signal handler (publishes synthetic turn_completed)
-    interrupt: (_event, _publish, _read) => Effect.void,
+    // Interrupt stops the current turn and also kills tracked background
+    // processes for that fork. Child process exit listeners publish
+    // background_process_exited events as cleanup completes.
+    interrupt: (event, _publish, _read) => Effect.gen(function* () {
+      const execManager = yield* ExecutionManager
+      yield* execManager.interruptProcesses(event.forkId)
+    }).pipe(Effect.orDie),
+
+    soft_interrupt: () => Effect.void,
 
     // Dispose agent resources
     agent_dismissed: (event, _publish) => Effect.gen(function* () {

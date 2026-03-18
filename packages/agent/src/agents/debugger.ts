@@ -15,6 +15,7 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool } from '../tools/artifact-tools'
 import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const hypothesisLens = defineThinkingLens({
   name: 'hypothesis',
@@ -60,6 +61,7 @@ export const createDebugger = (systemPrompt: string) => defineAgent<typeof tools
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [hypothesisLens, skepticismLens, strategyLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input, ctx) {

@@ -15,6 +15,7 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
 import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const qualityLens = defineThinkingLens({
   name: 'quality',
@@ -49,6 +50,7 @@ export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools,
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [qualityLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input, pctx) {

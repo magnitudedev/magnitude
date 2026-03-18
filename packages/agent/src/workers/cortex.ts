@@ -150,6 +150,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // Run agent observables
         const execManager = yield* ExecutionManager
+        yield* execManager.flushProcesses(forkId)
         const observations: ObservationPart[] = []
         const boundObs = execManager.getObservables(forkId)
         for (const obs of boundObs) {

@@ -15,6 +15,7 @@ import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool } from '../tools/artifact-tools'
 import { classifyShellCommand } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const strategyLens = defineThinkingLens({
   name: 'strategy',
@@ -46,6 +47,7 @@ export const createExplorer = (systemPrompt: string) => defineAgent<typeof tools
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [strategyLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input) {

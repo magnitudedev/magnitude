@@ -9,6 +9,7 @@
 import { toolSet, defineAgent, continue_, yield_, defineThinkingLens } from '@magnitudedev/agent-definition'
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 import { thinkTool } from '../tools/globals'
 import {
   agentCreateTool,
@@ -115,7 +116,7 @@ export const createOrchestrator = (systemPrompt: string) => {
     model: 'primary',
     systemPrompt,
     thinkingLenses: [intentLens, ideateLens, strategyLens, protocolLens, turnLens],
-    observables: [agentsStatusObservable],
+    observables: [agentsStatusObservable, backgroundProcessesObservable],
     permission: (p) => ({
       shell(input, pctx) {
         const result = classifyShellCommand(input.command)
