@@ -59,7 +59,7 @@ class MagnitudeAgent(BaseInstalledAgent):
             )
 
         # Build the command
-        cmd = " ".join([
+        cmd = "set -o pipefail; " + " ".join([
             "magnitude", "--oneshot",
             "--disable-shell-safeguards",
             "--disable-cwd-safeguards",

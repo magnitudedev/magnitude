@@ -23,6 +23,7 @@ type TaskMode = 'specific' | 'all' | 'easy' | 'medium' | 'hard'
 export type RunOptions = {
   concurrency: number
   trials: number
+  env?: string
 }
 
 // Harbor result.json types
@@ -83,7 +84,7 @@ type TaskToml = {
 
 const MODELS = ['anthropic/claude-sonnet-4-6', 'openai/gpt-5.4', 'openai/gpt-5.3-codex', 'openai/gpt-5.3-codex-spark', 'openrouter/qwen/qwen3.5-27b'] as const
 const JOBS_DIR = path.join(process.cwd(), 'jobs')
-const TASKS_ROOT = path.join(os.homedir(), '.cache/harbor/tasks')
+export const TASKS_ROOT = path.join(os.homedir(), '.cache/harbor/tasks')
 const POLL_MS = 500
 const TAIL_POLL_MS = 300
 
@@ -154,7 +155,13 @@ function countByDifficulty(tasks: TaskInfo[]) {
   }
 }
 
-function commandForRun(model: string, selectedTasks: string[], concurrency: number, trials: number) {
+function commandForRun(
+  model: string,
+  selectedTasks: string[],
+  concurrency: number,
+  trials: number,
+  environment?: string,
+) {
   const args = [
     'harbor',
     'run',
@@ -166,18 +173,48 @@ function commandForRun(model: string, selectedTasks: string[], concurrency: numb
     model,
   ]
 
+  if (environment && environment !== 'local') {
+    args.push('--env', environment)
+  }
+
   for (const task of selectedTasks) {
     args.push('-t', task)
   }
 
   args.push('-n', String(concurrency))
   args.push('-k', String(trials))
-  args.push('-q')
+
   return args
 }
 
 function renderCommand(args: string[]) {
   return args.map(arg => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(' ')
+}
+
+const CLOUD_ENV_VAR_NAMES = new Set([
+  'BOUNDARY_API_KEY', // For BAML observability
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENROUTER_API_KEY',
+  'DAYTONA_API_KEY',
+  'HOME',
+  'PATH',
+  'LANG',
+  'LC_ALL',
+  'PYTHONPATH',
+])
+
+function getHarborSpawnEnv(environment?: string) {
+  if (!environment || environment === 'local') {
+    return process.env
+  }
+
+  return Object.fromEntries(
+    Object.entries(process.env).filter(([key, value]) => {
+      if (value == null) return false
+      return CLOUD_ENV_VAR_NAMES.has(key)
+    }),
+  )
 }
 
 async function validateEnvironment() {
@@ -488,6 +525,7 @@ function buildSpecificTaskOptions(tasks: TaskInfo[]) {
 export async function main(options: Partial<RunOptions> = {}) {
   const concurrency = options.concurrency ?? 1
   const trials = options.trials ?? 1
+  const environment = options.env
 
   clack.intro(ansis.bold('Magnitude TB2 Runner'))
 
@@ -572,7 +610,7 @@ export async function main(options: Partial<RunOptions> = {}) {
     process.exit(1)
   }
 
-  const commandArgs = commandForRun(model as string, selectedTasks.map(task => task.name), concurrency, trials)
+  const commandArgs = commandForRun(model as string, selectedTasks.map(task => task.name), concurrency, trials, environment)
 
   console.log()
   console.log(ansis.bold('Ready to run'))
@@ -586,6 +624,7 @@ export async function main(options: Partial<RunOptions> = {}) {
           : `${selectedTasks.length} tasks`
     }`,
   )
+  if (environment) console.log(`  Environment: ${environment}`)
   if (concurrency > 1) console.log(`  Concurrency: ${concurrency}`)
   if (trials > 1) console.log(`  Trials:      ${trials}`)
   console.log()
@@ -621,10 +660,13 @@ export async function main(options: Partial<RunOptions> = {}) {
 
   const runStartedAt = new Date().toISOString()
 
+  const isCloud = environment && environment !== 'local'
+
   child = Bun.spawn(commandArgs, {
-    stdout: 'pipe',
+    stdout: isCloud ? 'inherit' : 'pipe',
     stderr: 'inherit',
     stdin: 'inherit',
+    env: getHarborSpawnEnv(environment),
   })
 
   let jobDir: string | null = null
