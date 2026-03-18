@@ -161,6 +161,7 @@ export interface ForkActivityMessage {
   readonly status: 'running' | 'completed'
   readonly createdAt: number
   readonly activeSince: number
+  readonly accumulatedActiveMs: number
   readonly completedAt?: number
   readonly resumeCount?: number
   readonly toolCounts: ForkActivityToolCounts
@@ -1024,6 +1025,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         status: 'running',
         createdAt: value.timestamp,
         activeSince: value.timestamp,
+        accumulatedActiveMs: 0,
         resumeCount: 0,
         toolCounts: EMPTY_TOOL_COUNTS,
         artifactNames: [],
@@ -1076,8 +1078,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       if (msgIndex === -1) return state
 
       const msg = parentState.messages[msgIndex] as ForkActivityMessage
+      const stintMs = Math.max(0, value.timestamp - msg.activeSince)
       const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = { ...msg, status: 'completed', completedAt: value.timestamp }
+      newMessages[msgIndex] = {
+        ...msg,
+        status: 'completed',
+        completedAt: value.timestamp,
+        accumulatedActiveMs: msg.accumulatedActiveMs + stintMs,
+      }
 
       return {
         ...state,
@@ -1095,8 +1103,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       if (msgIndex === -1) return state
 
       const msg = parentState.messages[msgIndex] as ForkActivityMessage
+      const stintMs = Math.max(0, value.timestamp - msg.activeSince)
       const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = { ...msg, status: 'completed', completedAt: value.timestamp }
+      newMessages[msgIndex] = {
+        ...msg,
+        status: 'completed',
+        completedAt: value.timestamp,
+        accumulatedActiveMs: msg.accumulatedActiveMs + stintMs,
+      }
 
       return {
         ...state,

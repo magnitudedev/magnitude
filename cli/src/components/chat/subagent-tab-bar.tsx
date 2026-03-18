@@ -28,9 +28,8 @@ type Props = {
   onSelect: (forkId: string | null) => void
 }
 
-function formatElapsed(activeSince: number, now: number, completedAt?: number): string {
-  const end = completedAt ?? now
-  const elapsed = Math.max(0, Math.floor((end - activeSince) / 1000))
+function formatElapsedMs(elapsedMs: number): string {
+  const elapsed = Math.max(0, Math.floor(elapsedMs / 1000))
   const m = Math.floor(elapsed / 60)
   const s = elapsed % 60
   return `${m}:${String(s).padStart(2, '0')}`
@@ -110,8 +109,12 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         const tabIdColor = theme.foreground
         const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
 
-        const timer = formatElapsed(tab.activeSince, now, tab.completedAt)
-        const detailsPart = `• ${tab.toolCount} tools • ${timer}`
+        const elapsedMs = tab.phase === 'active'
+          ? tab.accumulatedActiveMs + Math.max(0, now - tab.activeSince)
+          : tab.accumulatedActiveMs
+        const timer = formatElapsedMs(elapsedMs)
+        const resumedMark = tab.resumeCount > 0 ? '↺ ' : ''
+        const detailsPart = `• ${tab.toolCount} tools • ${resumedMark}${timer}`
         const line1Prefix = isIdle ? '○ ' : '● '
         const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - detailsPart.length - 1
         const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))

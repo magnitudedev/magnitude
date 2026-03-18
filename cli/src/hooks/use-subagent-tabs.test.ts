@@ -5,10 +5,10 @@ import { reconcileForkMeta, sortSubagentTabs } from './use-subagent-tabs'
 describe('sortSubagentTabs', () => {
   test('sorts active tabs before idle tabs, then by activeSince', () => {
     const tabs: SubagentTabItem[] = [
-      { forkId: 'idle-older', agentId: 'idle-older', name: 'Idle Older', activeSince: 10, completedAt: 20, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Agent is idle', phase: 'idle' },
-      { forkId: 'active-newer', agentId: 'active-newer', name: 'Active Newer', activeSince: 30, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
-      { forkId: 'active-older', agentId: 'active-older', name: 'Active Older', activeSince: 5, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
-      { forkId: 'idle-newer', agentId: 'idle-newer', name: 'Idle Newer', activeSince: 40, completedAt: 50, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Agent is idle', phase: 'idle' },
+      { forkId: 'idle-older', agentId: 'idle-older', name: 'Idle Older', activeSince: 10, accumulatedActiveMs: 1000, completedAt: 20, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Agent is idle', phase: 'idle' },
+      { forkId: 'active-newer', agentId: 'active-newer', name: 'Active Newer', activeSince: 30, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
+      { forkId: 'active-older', agentId: 'active-older', name: 'Active Older', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
+      { forkId: 'idle-newer', agentId: 'idle-newer', name: 'Idle Newer', activeSince: 40, accumulatedActiveMs: 1000, completedAt: 50, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Agent is idle', phase: 'idle' },
     ]
 
     const sorted = [...tabs].sort(sortSubagentTabs)
@@ -76,7 +76,7 @@ describe('reconcileForkMeta', () => {
 
   test('derives phase from fork activity status (not agent status) and preserves activity completedAt', () => {
     const latestByFork = new Map<string, any>([
-      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, status: 'completed', completedAt: 7000, toolCounts: {} }],
+      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, accumulatedActiveMs: 3000, status: 'completed', completedAt: 7000, toolCounts: {} }],
     ])
     const agentStatusState = {
       agents: new Map([
@@ -93,12 +93,14 @@ describe('reconcileForkMeta', () => {
           toolCount: 0,
           toolCounts: {},
           phase: 'idle' as const,
+          accumulatedActiveMs: 1000,
+          resumeCount: 0,
           completedAt: 6000,
         },
       },
       latestByFork,
       agentStatusState,
-      now: 9000,
+
     })
 
     expect(result.next['fork-1']?.phase).toBe('idle')
@@ -107,7 +109,7 @@ describe('reconcileForkMeta', () => {
 
   test('clears completedAt when status returns to running', () => {
     const latestByFork = new Map<string, any>([
-      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, status: 'running', toolCounts: {} }],
+      ['fork-1', { forkId: 'fork-1', name: 'A', activeSince: 1000, accumulatedActiveMs: 3000, status: 'running', toolCounts: {} }],
     ])
 
     const result = reconcileForkMeta({
@@ -128,6 +130,7 @@ describe('reconcileForkMeta', () => {
 
     expect(result.next['fork-1']?.phase).toBe('active')
     expect(result.next['fork-1']?.completedAt).toBeUndefined()
+    expect(result.next['fork-1']?.accumulatedActiveMs).toBe(3000)
   })
 
   test('marks dismissed or nonexistent prior forks for prune', () => {

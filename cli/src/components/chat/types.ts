@@ -48,7 +48,9 @@ export type SubagentTabItem = {
   agentId: string
   name: string
   activeSince: number
+  accumulatedActiveMs: number
   completedAt?: number
+  resumeCount: number
   toolCount: number
   toolSummaryLine: string
   statusLine: string

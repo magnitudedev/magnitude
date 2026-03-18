@@ -26,7 +26,9 @@ type ForkMeta = {
   agentId: string
   name: string
   activeSince: number
+  accumulatedActiveMs: number
   completedAt?: number
+  resumeCount: number
   toolCount: number
   toolCounts: ForkActivityMessage['toolCounts']
   phase: 'active' | 'idle'
@@ -67,7 +69,9 @@ export function reconcileForkMeta(args: {
       agentId: forkAgent?.agentId ?? previous?.agentId ?? forkId,
       name: activity.name,
       activeSince: activity.activeSince,
+      accumulatedActiveMs: activity.accumulatedActiveMs,
       completedAt,
+      resumeCount: activity.resumeCount ?? 0,
       toolCount: sumForkToolCounts(activity.toolCounts),
       toolCounts: activity.toolCounts,
       phase,
@@ -181,7 +185,9 @@ export function useSubagentTabs({
           agentId: meta.agentId,
           name: meta.name,
           activeSince: meta.activeSince,
+          accumulatedActiveMs: meta.accumulatedActiveMs,
           completedAt: meta.completedAt,
+          resumeCount: meta.resumeCount,
           toolCount: meta.toolCount,
           toolSummaryLine,
           statusLine,
