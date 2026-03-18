@@ -2,7 +2,8 @@ import { memo, useEffect, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../button'
-import { BOX_CHARS } from '../../utils/ui-constants'
+import { TAB_BORDER_CHARS } from '../../utils/ui-constants'
+
 import type { SubagentTabItem } from './types'
 
 const TAB_INNER_WIDTH = 36 // inner content width (chars), excluding border+padding
@@ -41,67 +42,62 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
     return () => clearInterval(interval)
   }, [tabs.length])
 
-  if (tabs.length === 0) return null
-
   const mainSelected = selectedForkId === null
   const mainHovered = hoveredId === 'main'
 
-  const mainBorderColor = mainSelected
-    ? theme.primary
-    : mainHovered
-    ? theme.link
-    : theme.border
-
-  const mainFg = mainSelected
-    ? theme.primary
-    : mainHovered
-    ? theme.link
-    : theme.muted
+  const mainTextColor = mainSelected || mainHovered ? theme.link : theme.primary
+  const mainBorderColor = mainSelected || mainHovered ? theme.link : theme.border
 
   return (
-    <box style={{ paddingLeft: 2, paddingRight: 2, flexDirection: 'row', gap: 1, flexWrap: 'wrap', flexShrink: 0 }}>
-      {/* Main tab */}
+    <box style={{ flexDirection: 'row', flexWrap: 'wrap', flexShrink: 0, alignItems: 'flex-start' }}>
       <Button
+        style={{ alignSelf: 'flex-start' }}
         onClick={() => onSelect(null)}
         onMouseOver={() => setHoveredId('main')}
         onMouseOut={() => setHoveredId(null)}
       >
-        <box style={{
-          borderStyle: 'single',
-          border: true,
-          borderColor: mainBorderColor,
-          customBorderChars: BOX_CHARS,
-          paddingLeft: 1,
-          paddingRight: 1,
-          flexDirection: 'column',
-        }}>
-          <text style={{ fg: mainFg }}>Main</text>
-          <text style={{ fg: mainFg }}>{' '}</text>
+        <box
+          style={{
+            borderStyle: 'single',
+            border: ['left', 'right', 'top', 'bottom'],
+            borderColor: mainBorderColor,
+            customBorderChars: TAB_BORDER_CHARS,
+          }}
+        >
+          <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', height: 2, minHeight: 2, maxHeight: 2 }}>
+            <box style={{ flexDirection: 'row', height: 1 }}>
+              <text style={{ fg: mainTextColor }}>Main Agent</text>
+            </box>
+            <box style={{ flexDirection: 'row', height: 1 }}>
+              <text style={{ fg: mainTextColor }}> </text>
+            </box>
+          </box>
         </box>
       </Button>
 
-      {/* Subagent tabs */}
-      {tabs.map((tab) => {
+      {tabs.length === 0 ? (
+        <box style={{ paddingLeft: 3, paddingRight: 1, flexDirection: 'column', height: 3, minHeight: 3, maxHeight: 3 }}>
+          <text style={{ fg: theme.foreground }}> </text>
+          <text style={{ fg: theme.foreground }}>No active subagents.</text>
+          <text style={{ fg: theme.muted }}>Live subagent activity will appear here.</text>
+        </box>
+      ) : tabs.map((tab) => {
         const exiting = tab.phase === 'exiting'
         const isSelected = selectedForkId === tab.forkId
         const isHovered = hoveredId === tab.forkId
-
-        const active = isSelected || isHovered
-
-        const borderColor = exiting ? theme.border : active ? theme.foreground : theme.border
-        const nameFg = exiting ? theme.muted : active ? theme.foreground : theme.foreground
-        const metaFg = exiting ? theme.muted : active ? theme.foreground : theme.muted
         const attrs = exiting ? TextAttributes.DIM : undefined
 
+        const tabBorderColor = isSelected || isHovered ? theme.foreground : theme.border
+        const tabTextColor = isSelected || isHovered ? theme.foreground : theme.muted
+        const tabIdColor = theme.foreground
+        const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
+
         const timer = formatElapsed(tab.startedAt, now)
-
-        // Line 1: agentId (left) + timer (right), padded to TAB_INNER_WIDTH
-        const rightPart = timer
-        const nameMaxLen = TAB_INNER_WIDTH - rightPart.length - 1
-        const namePart = truncate(tab.agentId, nameMaxLen)
-        const line1 = padRight(namePart, TAB_INNER_WIDTH - rightPart.length) + rightPart
-
-        // Line 2: status line, truncated
+        const detailsPart = `• ${tab.toolCount} tools • ${timer}`
+        const nameMaxLen = TAB_INNER_WIDTH - detailsPart.length - 1
+        const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))
+        const line1Rest = ` ${detailsPart}`
+        // const line2 = truncate(tab.toolSummaryLine, TAB_INNER_WIDTH)
         const line2 = truncate(tab.statusLine, TAB_INNER_WIDTH)
 
         return (
@@ -111,21 +107,24 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
             onMouseOver={() => setHoveredId(tab.forkId)}
             onMouseOut={() => setHoveredId(null)}
           >
-            <box style={{
-              borderStyle: 'single',
-              border: true,
-              borderColor,
-              customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
-              flexDirection: 'column',
-              width: TAB_INNER_WIDTH + 4, // +2 padding +2 border
-            }}>
-              <box style={{ flexDirection: 'row', height: 1 }}>
-                <text style={{ fg: nameFg }} attributes={attrs}>{namePart}</text>
-                <text style={{ fg: metaFg }} attributes={attrs}>{' '.repeat(Math.max(0, TAB_INNER_WIDTH - namePart.length - rightPart.length))}{rightPart}</text>
+            <box
+              style={{
+                flexDirection: 'row',
+                alignItems: 'flex-start',
+                borderStyle: 'single',
+                border: ['left', 'right', 'top', 'bottom'],
+                borderColor: tabBorderColor,
+                customBorderChars: TAB_BORDER_CHARS,
+              }}
+            >
+              <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', width: TAB_INNER_WIDTH + 2, height: 2, minHeight: 2, maxHeight: 2 }}>
+                <box style={{ flexDirection: 'row' }}>
+                  <text style={{ fg: tabIdColor }} attributes={attrs}>{namePart}</text>
+                  <text style={{ fg: tabRestLine1Color }} attributes={attrs}>{line1Rest}</text>
+                </box>
+                {/* <text style={{ fg: tabTextColor }} attributes={attrs}>{line2}</text> */}
+                <text style={{ fg: tabTextColor }} attributes={attrs}>{line2}</text>
               </box>
-              <text style={{ fg: metaFg }} attributes={attrs}>{line2}</text>
             </box>
           </Button>
         )

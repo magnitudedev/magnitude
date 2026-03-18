@@ -410,11 +410,10 @@ export function ChatController(props: ChatControllerProps) {
         onReject={onReject}
       />
 
-      <SubagentTabBar tabs={subagentTabs} selectedForkId={selectedForkId} onSelect={onSubagentTabSelect} />
-
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
-          <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
+          <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 0, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
+            <SubagentTabBar tabs={subagentTabs} selectedForkId={selectedForkId} onSelect={onSubagentTabSelect} />
             {!env.bashMode && fileMentions.isOpen && (
               <FileMentionMenu
                 isOpen={fileMentions.isOpen}
@@ -435,6 +434,7 @@ export function ChatController(props: ChatControllerProps) {
                 onHoverIndex={slashCommands.setSelectedIndex}
               />
             )}
+            <box style={{ height: 1, backgroundColor: env.theme.inputBg }} />
             <box style={{ flexDirection: 'column' }}>
               <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
                 <box style={{ flexGrow: 1, minWidth: 0 }}>

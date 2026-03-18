@@ -49,6 +49,7 @@ export type SubagentTabItem = {
   name: string
   startedAt: number
   toolCount: number
+  toolSummaryLine: string
   statusLine: string
   phase: 'active' | 'exiting'
 }

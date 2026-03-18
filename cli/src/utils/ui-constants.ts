@@ -25,3 +25,7 @@ export const BOX_CHARS: BorderCharacters = {
   ...ROUNDED_CORNERS,
   ...T_JUNCTIONS,
 }
+
+export const TAB_BORDER_CHARS: BorderCharacters = {
+  ...BOX_CHARS,
+}

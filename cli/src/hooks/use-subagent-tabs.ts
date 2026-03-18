@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentStatusState, DisplayMessage, DisplayState, ForkActivityMessage } from '@magnitudedev/agent'
 import type { SubagentTabItem } from '../components/chat/types'
-import { deriveSubagentStatusLine, sumForkToolCounts, truncateSubagentTabText } from '../utils/subagent-tabs'
+import {
+  deriveSubagentStatusLine,
+  formatSubagentToolSummaryLine,
+  sumForkToolCounts,
+  truncateSubagentTabText,
+} from '../utils/subagent-tabs'
 
 type AgentClientLike = {
   state: {
@@ -23,6 +28,7 @@ type ForkMeta = {
   name: string
   startedAt: number
   toolCount: number
+  toolCounts: ForkActivityMessage['toolCounts']
   phase: 'active' | 'exiting'
 }
 
@@ -68,6 +74,7 @@ export function useSubagentTabs({
           name: activity.name,
           startedAt: activity.startedAt,
           toolCount: sumForkToolCounts(activity.toolCounts),
+          toolCounts: activity.toolCounts,
           phase: 'active',
         }
         if (
@@ -76,6 +83,7 @@ export function useSubagentTabs({
           && existing.name === nextMeta.name
           && existing.startedAt === nextMeta.startedAt
           && existing.toolCount === nextMeta.toolCount
+          && existing.toolCounts === nextMeta.toolCounts
           && existing.phase === nextMeta.phase
         ) {
           return prev
@@ -147,6 +155,7 @@ export function useSubagentTabs({
   return useMemo(() => {
     return Object.entries(forkMeta)
       .map(([forkId, meta]): SubagentTabItem => {
+        const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
         const statusLine = truncateSubagentTabText(deriveSubagentStatusLine(forkMessages[forkId] ?? []))
         return {
           forkId,
@@ -154,6 +163,7 @@ export function useSubagentTabs({
           name: meta.name,
           startedAt: meta.startedAt,
           toolCount: meta.toolCount,
+          toolSummaryLine,
           statusLine,
           phase: meta.phase,
         }
