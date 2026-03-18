@@ -197,13 +197,10 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
 export function formatAgentIdleNotification(
   agentId: string,
   agentType: string,
-  reason: 'stable' | 'interrupt' | 'error' | 'paused'
+  reason: 'stable' | 'interrupt' | 'error'
 ): string {
   if (reason === 'interrupt') {
     return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) was interrupted and is now idle. It will not take further action until you message it.</agent_idle>`
-  }
-  if (reason === 'paused') {
-    return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) was paused and is now idle. It will not take further action until you message it.</agent_idle>`
   }
   if (reason === 'error') {
     return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) hit an unexpected error and is now idle. It may no longer be functional.</agent_idle>`

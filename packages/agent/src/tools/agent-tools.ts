@@ -5,7 +5,7 @@
  * Agents are WHO does the work — separate from tasks (WHAT needs doing).
  * Context flows through message-based communication.
  *
- * Tools: create, pause, dismiss
+ * Tools: create, dismiss
  */
 
 import { Effect } from 'effect'
@@ -108,46 +108,6 @@ export const agentCreateTool = createTool({
   execute: executeAgentCreate,
 })
 // =============================================================================
-// agent.pause — Soft interrupt an agent
-// =============================================================================
-
-export const agentPauseTool = createTool({
-  name: 'pause',
-  group: 'agent',
-  description: 'Soft interrupt an agent — current turn completes, then it stops. Partial output is retained.',
-  inputSchema: Schema.Struct({
-    agentId: Schema.String.annotations({ description: 'Agent ID' }),
-  }),
-  outputSchema: Schema.Struct({ agentId: Schema.String }),
-  errorSchema: AgentError,
-  argMapping: ['agentId'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'agentId', attr: 'agentId' }], selfClosing: true },
-    xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }] },
-  } as const,
-  execute: ({ agentId }) =>
-    Effect.gen(function* () {
-      const projection = yield* AgentStatusProjection.Tag
-      const agentState = yield* projection.get
-      const agent = getActiveAgent(agentState, agentId)
-
-      if (!agent) {
-        return yield* Effect.fail({ _tag: 'AgentError' as const, message: `No active agent "${agentId}" found` })
-      }
-
-      const bus = yield* WorkerBusTag<AppEvent>()
-      yield* bus.publish({ type: 'soft_interrupt', forkId: agent.forkId })
-      yield* bus.publish({
-        type: 'agent_paused',
-        forkId: agent.forkId,
-        agentId,
-      })
-
-      return { agentId }
-    }),
-})
-
-// =============================================================================
 // agent.dismiss — Dismiss an agent
 // =============================================================================
 
@@ -196,6 +156,5 @@ export const agentDismissTool = createTool({
 
 export const agentTools = [
   agentCreateTool,
-  agentPauseTool,
   agentDismissTool,
 ]

@@ -61,7 +61,7 @@ export interface AgentBecameIdleSignal {
   readonly forkId: string
   readonly type: string
   readonly parentForkId: string | null
-  readonly reason: 'stable' | 'interrupt' | 'error' | 'paused'
+  readonly reason: 'stable' | 'interrupt' | 'error'
   readonly timestamp: number
 }
 
@@ -191,27 +191,6 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
           result: event.result,
           dismissReason: event.reason,
         }),
-      }
-    },
-
-    agent_paused: ({ event, state, emit }) => {
-      const agent = state.agents.get(event.agentId)
-      if (!agent || agent.status === 'dismissed') return state
-
-      if (agent.status !== 'idle') {
-        emit.agentBecameIdle({
-          agentId: agent.agentId,
-          forkId: agent.forkId,
-          type: agent.role,
-          parentForkId: agent.parentForkId,
-          reason: 'paused',
-          timestamp: event.timestamp,
-        })
-      }
-
-      return {
-        ...state,
-        agents: new Map(state.agents).set(event.agentId, { ...agent, status: 'idle' }),
       }
     },
 

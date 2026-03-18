@@ -24,12 +24,6 @@ export interface ParsedMessage {
   position: number
 }
 
-export interface ParsedAgentPause {
-  agentId: string
-  reason: string
-  position: number
-}
-
 export interface ParsedFsRead {
   path: string
   refName: string
@@ -86,7 +80,7 @@ export interface ParsedOrchestratorResponse {
   artifactCreates: ParsedArtifactCreate[]
   agentCreates: ParsedAgentCreate[]
   messages: ParsedMessage[]
-  agentPauses: ParsedAgentPause[]
+
   agentTypesInOrder: string[]
   directToolUses: string[]
   fsReads: ParsedFsRead[]
@@ -147,7 +141,7 @@ function detectFirstActionKind(raw: string): string | null {
     { re: /<agent-create\b/gi, kind: 'agent:create' },
     { re: /<artifact-create\b/gi, kind: 'artifact:create' },
     { re: /<agent-dismiss\b/gi, kind: 'agent:dismiss' },
-    { re: /<agent-pause\b/gi, kind: 'agent:pause' },
+
     { re: /<(?:fs-)?read\b/gi, kind: 'tool:fs-read' },
     { re: /<(?:fs-)?search\b/gi, kind: 'tool:fs-search' },
     { re: /<(?:fs-)?tree\b/gi, kind: 'tool:fs-tree' },
@@ -172,7 +166,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
   const artifactCreates: ParsedArtifactCreate[] = []
   const agentCreates: ParsedAgentCreate[] = []
   const messages: ParsedMessage[] = []
-  const agentPauses: ParsedAgentPause[] = []
+
   const directToolUses: string[] = []
 
   // artifact-create
@@ -209,18 +203,8 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // agent-pause
-  const agentPauseRe = /<agent-pause\b([^>]*)\s*\/?>/gi
-  while ((m = agentPauseRe.exec(raw)) !== null) {
-    agentPauses.push({
-      agentId: extractAttribute(m[1], 'agentId'),
-      reason: extractAttribute(m[1], 'reason'),
-      position: m.index,
-    })
-  }
-
   // direct tool usage detection
-  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write', 'agent-dismiss', 'agent-pause']
+  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write', 'agent-dismiss']
   for (const tag of directToolTags) {
     const re = new RegExp(`<${tag}\\b`, 'i')
     if (re.test(raw)) directToolUses.push(tag)
@@ -326,6 +310,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     agentDismisses.push({ agentId: m[1] })
   }
 
+
   // inspect refs
   const inspectRefs: ParsedInspectRef[] = []
   const refRe = /<ref\s+tool\s*=\s*"([^"]*)"[^>]*\/>/gi
@@ -358,7 +343,6 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     artifactCreates,
     agentCreates,
     messages,
-    agentPauses,
     agentTypesInOrder,
     directToolUses,
     fsReads,

@@ -588,23 +588,6 @@ export const agentCreateRender = render<AgentCreateState>(({ state }) => {
   )
 })
 
-export function agentPauseLiveText({ state }: { state: AgentIdState }): string {
-  const target = state.id ? `agent "${state.id}"` : 'agent'
-  if (isActive(state.phase)) return `Pausing ${target}`
-  return `Paused ${target}`
-}
-
-export const agentPauseRender = render<AgentIdState>(({ state }) => {
-  const theme = useTheme()
-  const label = state.id ? `Paused agent "${state.id}"` : 'Pausing agent...'
-  return (
-    <text>
-      <span fg={theme.warning}>|| </span>
-      <span fg={theme.foreground}>{label}</span>
-    </text>
-  )
-})
-
 export function agentDismissLiveText({ state }: { state: AgentIdState }): string {
   const target = state.id ? `agent "${state.id}"` : 'agent'
   if (isActive(state.phase)) return `Dismissing ${target}`

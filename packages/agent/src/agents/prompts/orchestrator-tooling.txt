@@ -25,7 +25,6 @@ As such, they should be used freely for any nontrivial work.
 ### Subagent management
 
 The agent create tool is used to spawn a new agent of a specified type.
-The agent pause tool can be used to temporarily pause an agent (making it idle).
 The agent dismiss tool interrupts any ongoing work and removes an agent completley.
 
 The comms block is how you communicate with agents. Sending a message to an idle agent will wake it up. Sending a message to a running agent will notify it without interrupting it.

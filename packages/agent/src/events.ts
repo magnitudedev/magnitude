@@ -347,13 +347,6 @@ export interface AgentCreated {
   readonly outputSchema?: unknown
 }
 
-/** Agent paused (soft interrupt — current turn completes, then stops) */
-export interface AgentPaused {
-  readonly type: 'agent_paused'
-  readonly forkId: string
-  readonly agentId: string
-}
-
 /** Agent dismissed (removed permanently) */
 export interface AgentDismissed {
   readonly type: 'agent_dismissed'
@@ -504,6 +497,5 @@ export type AppEvent =
   | ArtifactSynced
   // Agent events
   | AgentCreated
-  | AgentPaused
   | AgentDismissed
   | UserReturnConfirmed

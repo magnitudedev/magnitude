@@ -15,7 +15,7 @@ import {
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
   artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
-  agentCreateReducer, agentPauseReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
+  agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
 } from '@magnitudedev/agent'
 import type { VisualReducerRegistry, ToolVisualReducer } from '@magnitudedev/agent'
@@ -28,11 +28,11 @@ import {
   clickRender, doubleClickRender, rightClickRender, typeRender, scrollRender, dragRender,
   navigateRender, goBackRender, switchTabRender, newTabRender, screenshotRender, evaluateRender,
   artifactSyncRender, artifactReadRender, artifactWriteRender, artifactUpdateRender,
-  agentCreateRender, agentPauseRender, agentDismissRender, agentMessageRender, parentMessageRender,
+  agentCreateRender, agentDismissRender, agentMessageRender, parentMessageRender,
   skillRender,
   webSearchLiveText, webFetchLiveText, browserLiveText,
   artifactSyncLiveText, artifactReadLiveText, artifactWriteLiveText, artifactUpdateLiveText,
-  agentCreateLiveText, agentPauseLiveText, agentDismissLiveText, agentMessageLiveText, parentMessageLiveText,
+  agentCreateLiveText, agentDismissLiveText, agentMessageLiveText, parentMessageLiveText,
   skillLiveText,
 } from './tools'
 
@@ -67,7 +67,7 @@ export const renderRegistry = createRenderRegistry({
   artifactWrite: artifactWriteRender,
   artifactUpdate: artifactUpdateRender,
   agentCreate: agentCreateRender,
-  agentPause: agentPauseRender,
+
   agentDismiss: agentDismissRender,
   agentMessage: agentMessageRender,
   parentMessage: parentMessageRender,
@@ -86,7 +86,7 @@ const allReducers: readonly ToolVisualReducer[] = [
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
   artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
-  agentCreateReducer, agentPauseReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
+  agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
 ]
 
@@ -130,7 +130,7 @@ export const liveTextRegistry = createLiveTextRegistry({
   artifactWrite: ({ state }) => artifactWriteLiveText({ state: state as any }),
   artifactUpdate: ({ state }) => artifactUpdateLiveText({ state: state as any }),
   agentCreate: ({ state }) => agentCreateLiveText({ state: state as any }),
-  agentPause: ({ state }) => agentPauseLiveText({ state: state as any }),
+
   agentDismiss: ({ state }) => agentDismissLiveText({ state: state as any }),
   agentMessage: ({ state }) => agentMessageLiveText({ state: state as any }),
   parentMessage: ({ state }) => parentMessageLiveText({ state: state as any }),

@@ -12,7 +12,6 @@ import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { thinkTool } from '../tools/globals'
 import {
   agentCreateTool,
-  agentPauseTool,
   agentDismissTool,
 } from '../tools/agent-tools'
 import {
@@ -106,7 +105,6 @@ export const createOrchestrator = (systemPrompt: string) => {
 
     // Agent management
     agentCreate:           agentCreateTool,
-    agentPause:            agentPauseTool,
     agentDismiss:          agentDismissTool,
   })
 
@@ -152,7 +150,6 @@ export const createOrchestrator = (systemPrompt: string) => {
       artifactWrite()      { return d.visible() },
       artifactUpdate()     { return d.visible() },
       agentCreate()        { return d.hidden() },
-      agentPause()         { return d.hidden() },
       agentDismiss()       { return d.hidden() },
 
       // gather()             { return d.visible() },

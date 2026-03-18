@@ -41,7 +41,6 @@ export {
   artifactWriteReducer,
   artifactUpdateReducer,
   agentCreateReducer,
-  agentPauseReducer,
   agentDismissReducer,
   agentMessageReducer,
   parentMessageReducer,

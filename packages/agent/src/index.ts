@@ -145,7 +145,7 @@ export {
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
   artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
-  agentCreateReducer, agentPauseReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
+  agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
   resolveEndPhase, isActive,
 } from './visuals'
@@ -178,7 +178,7 @@ export { readTool, writeTool, editTool, treeTool, searchTool, fsTools } from './
 export { webSearchTool } from './tools/web-search-tool'
 export { webFetchTool } from './tools/web-fetch-tool'
 
-export { agentCreateTool, agentPauseTool, agentDismissTool } from './tools/agent-tools'
+export { agentCreateTool, agentDismissTool } from './tools/agent-tools'
 export { artifactSyncTool, artifactReadTool, artifactWriteTool, artifactUpdateTool } from './tools/artifact-tools'
 export {
   clickTool, doubleClickTool, rightClickTool, typeTool, scrollTool, dragTool,
