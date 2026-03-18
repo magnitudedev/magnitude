@@ -20,18 +20,34 @@ class MagnitudeAgent(BaseInstalledAgent):
     def _install_agent_template_path(self) -> Path:
         return Path(__file__).parent / "install-magnitude.sh.j2"
 
-    async def setup(self, environment) -> None:
-        binary_path = Path(__file__).parent / "bin" / "magnitude"
-        if not binary_path.exists():
-            # No local binary — fall back to bun install via install script
-            await super().setup(environment)
-            return
+    async def _try_install_from_volume(self, environment) -> bool:
+        current_path = "/opt/magnitude-volume/magnitude/current"
+        result = await environment.exec(command=f"test -f {current_path}")
+        if result.return_code != 0:
+            return False
 
-        await environment.upload_file(
-            source_path=binary_path,
-            target_path="/usr/local/bin/magnitude",
+        print("Installing magnitude from mounted volume...")
+        await environment.exec(
+            command="cp /opt/magnitude-volume/magnitude/sha256/$(cat /opt/magnitude-volume/magnitude/current)/magnitude /usr/local/bin/magnitude && chmod +x /usr/local/bin/magnitude"
         )
-        await environment.exec(command="chmod +x /usr/local/bin/magnitude")
+        return True
+
+    async def setup(self, environment) -> None:
+        installed = await self._try_install_from_volume(environment)
+
+        if not installed:
+            print("Volume binary not found, falling back to upload...")
+            binary_path = Path(__file__).parent / "bin" / "magnitude"
+            if not binary_path.exists():
+                # No local binary — fall back to bun install via install script
+                await super().setup(environment)
+                return
+
+            await environment.upload_file(
+                source_path=binary_path,
+                target_path="/usr/local/bin/magnitude",
+            )
+            await environment.exec(command="chmod +x /usr/local/bin/magnitude")
 
         # Ensure CA certificates are available for SSL verification
         await environment.exec(command="apt-get update -qq && apt-get install -y -qq ca-certificates >/dev/null 2>&1 || true")

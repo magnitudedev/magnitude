@@ -93,6 +93,32 @@ async function pullImagesMain() {
   clack.outro('Finished')
 }
 
+async function seedVolumeMain(options: {
+  name?: string
+  binary?: string
+  force?: boolean
+}) {
+  const args = ['evals/tbench/seed_daytona_volume.py']
+
+  if (options.name) {
+    args.push('--name', options.name)
+  }
+  if (options.binary) {
+    args.push('--binary', options.binary)
+  }
+  if (options.force) {
+    args.push('--force')
+  }
+
+  const child = spawn(['python3', ...args], {
+    stdout: 'inherit',
+    stderr: 'inherit',
+    stdin: 'inherit',
+  })
+  const code = await child.exited
+  process.exit(code)
+}
+
 const program = new Command()
   .name('tbench')
   .description('Magnitude Terminal Bench utilities')
@@ -147,6 +173,20 @@ program
   .description('Pre-pull all TB2 task Docker images from the Harbor task cache')
   .action(async () => {
     await pullImagesMain()
+  })
+
+program
+  .command('seed-volume')
+  .description('Seed a Daytona volume with the magnitude binary')
+  .option('--name <name>', 'Daytona volume name')
+  .option('--binary <path>', 'Path to the magnitude binary')
+  .option('--force', 'Overwrite an existing binary for the computed hash', false)
+  .action(async options => {
+    await seedVolumeMain({
+      name: options.name,
+      binary: options.binary,
+      force: Boolean(options.force),
+    })
   })
 
 program
