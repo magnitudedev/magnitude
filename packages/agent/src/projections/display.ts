@@ -1270,7 +1270,7 @@ function generateCompletedToolLabel(toolKey: string, input: unknown): string | n
   return null
 }
 
-function generateToolLabel(toolKey: string, input: unknown): string {
+export function generateToolLabel(toolKey: string, input: unknown): string {
   // Artifact tools
   if (toolKey === 'artifactRead' && input && typeof input === 'object' && 'id' in input) {
     return `Read artifact "${(input as { id: string }).id}"`
@@ -1287,7 +1287,7 @@ function generateToolLabel(toolKey: string, input: unknown): string {
   if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input) {
     const cmd = (input as { command: string }).command
     const shortCmd = cmd.length > 50 ? cmd.slice(0, 47) + '...' : cmd
-    return `Running: ${shortCmd}`
+    return `$ ${shortCmd}`
   }
 
   // For webSearch, show the query

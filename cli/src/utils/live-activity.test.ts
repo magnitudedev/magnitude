@@ -123,4 +123,17 @@ describe('live-activity selector', () => {
     expect(selectLatestLiveActivityFromThinkSteps([steps[1]])).toBe('Evaluate(window.location)')
     expect(selectLatestLiveActivityFromThinkSteps([steps[2]])).toBe('Type value: "hello"')
   })
+
+  it('uses shell fallback labels as provided by the producer', () => {
+    const steps = [
+      {
+        id: '1',
+        type: 'tool',
+        toolKey: 'shell',
+        label: '$ bun test cli/src/utils/live-activity.test.ts',
+      },
+    ] as any as ThinkBlockStep[]
+
+    expect(selectLatestLiveActivityFromThinkSteps(steps)).toBe('$ bun test cli/src/utils/live-activity.test.ts')
+  })
 })
