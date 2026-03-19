@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
-import { useRenderer } from '@opentui/react'
+import { useTerminalDimensions } from '@opentui/react'
 import { useMountedRef } from '../hooks/use-mounted-ref'
 import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
@@ -150,7 +150,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   artifactName, content, scrollToSection, onClose, onOpenArtifact, streaming
 }: ArtifactReaderPanelProps) {
   const theme = useTheme()
-  const renderer = useRenderer()
+  const { width: terminalWidth } = useTerminalDimensions()
   const scrollboxRef = useRef<any>(null)
   const mountedRef = useMountedRef()
   const safeTimeout = useSafeTimeout()
@@ -286,7 +286,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   )
 
   const highlightAnchorId = highlightCharRanges.length > 0 ? 'artifact-highlight-anchor' : undefined
-  const codeBlockWidth = Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 10)
+  const codeBlockWidth = Math.max(20, terminalWidth - 10)
   const targetSectionScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const highlightAnchorScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 

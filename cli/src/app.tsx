@@ -17,6 +17,7 @@ import { useCollapsedBlocks } from './hooks/use-collapsed-blocks'
 
 import { useTheme } from './hooks/use-theme'
 import { ArtifactProvider, SelectedArtifactProvider } from './hooks/use-artifacts'
+
 import { BOX_CHARS } from './utils/ui-constants'
 import { AnimatedLogo } from './components/animated-logo'
 import { RecentChatsWidget } from './components/recent-chats-widget'
@@ -1789,7 +1790,6 @@ function AppInner({
     && expandedForkId === null
 
   const debugVisible = debugMode && debugPanelVisible
-
   return (
     <ArtifactProvider value={artifactState}>
     <SelectedArtifactProvider value={selectedArtifact?.name ?? null}>

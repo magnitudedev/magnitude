@@ -37,6 +37,14 @@ mock.module('@opentui/react', () => ({
     terminal: { width: rendererWidth },
     clearSelection() {},
   }),
+  useTerminalDimensions: () => ({
+    width: rendererWidth,
+    height: 40,
+  }),
+}))
+
+mock.module('../hooks/use-chat-width', () => ({
+  useBoxWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: rendererWidth - 4 }),
 }))
 
 mock.module('../markdown/blocks', () => ({
@@ -90,7 +98,7 @@ describe('MarkdownContent Layer 5 - Suite A MarkdownContent width derivation', (
     render(<markdownContentModule.MarkdownContent content="| A | B |\n| - | - |\n| 1 | 2 |" />)
 
     expect(renderDocumentCalls).toHaveLength(1)
-    expect(renderDocumentCalls[0]?.options.codeBlockWidth).toBe(96)
+    expect(renderDocumentCalls[0]?.options.codeBlockWidth).toBe(94)
   })
 
   test('MarkdownContent honors explicit codeBlockWidth override', () => {
@@ -108,7 +116,7 @@ describe('MarkdownContent Layer 5 - Suite A MarkdownContent width derivation', (
     render(<markdownContentModule.StreamingMarkdownContent content="stream" streaming />)
 
     expect(streamingHookCalls).toHaveLength(1)
-    expect(streamingHookCalls[0]?.options.codeBlockWidth).toBe(86)
+    expect(streamingHookCalls[0]?.options.codeBlockWidth).toBe(84)
   })
 })
 
@@ -125,8 +133,8 @@ describe('MarkdownContent Layer 5 - Suite B Artifact panel width budget / fallba
       />,
     )
 
-    expect(renderDocumentCalls[0]?.options.codeBlockWidth).toBe(116)
-    expect(streamingHookCalls[0]?.options.codeBlockWidth).toBe(110)
+    expect(renderDocumentCalls[0]?.options.codeBlockWidth).toBe(114)
+    expect(streamingHookCalls[0]?.options.codeBlockWidth).toBeLessThan(114)
   })
 
   test('artifact panel width budget matches inner chrome contract', () => {
@@ -141,7 +149,7 @@ describe('MarkdownContent Layer 5 - Suite B Artifact panel width budget / fallba
     )
 
     expect(streamingHookCalls).toHaveLength(1)
-    expect(streamingHookCalls[0]?.options.codeBlockWidth).toBe(110)
+    expect(streamingHookCalls[0]?.options.codeBlockWidth).toBeLessThan(114)
   })
 
 

@@ -25,7 +25,7 @@ describe('markdown/table-layout', () => {
     expect(plan.columnWidths).toEqual(plan.naturalColumnWidths)
   })
 
-  it('shrinks proportionally when over budget', () => {
+  it('does not shrink when over budget and wrapMode is none (proportional)', () => {
     const plan = computeTableLayoutPlan({
       headers: [s('aaaaaaaaaa'), s('bbbbbbbbbbbbbbbbbbbb')],
       rows: [],
@@ -33,10 +33,10 @@ describe('markdown/table-layout', () => {
       fitter: 'proportional',
       wrapMode: 'none',
     })
-    expect(plan.columnWidths[0] + plan.columnWidths[1]).toBe(plan.contentBudget)
+    expect(plan.columnWidths[0] + plan.columnWidths[1]).toBe(plan.naturalColumnWidths[0] + plan.naturalColumnWidths[1])
   })
 
-  it('shrinks with balanced strategy', () => {
+  it('does not shrink when over budget and wrapMode is none (balanced)', () => {
     const plan = computeTableLayoutPlan({
       headers: [s('aaaaaaaaaa'), s('bbbbbbbbbbbbbbbbbbbb')],
       rows: [],
@@ -44,7 +44,7 @@ describe('markdown/table-layout', () => {
       fitter: 'balanced',
       wrapMode: 'none',
     })
-    expect(plan.columnWidths[0] + plan.columnWidths[1]).toBe(plan.contentBudget)
+    expect(plan.columnWidths[0] + plan.columnWidths[1]).toBe(plan.naturalColumnWidths[0] + plan.naturalColumnWidths[1])
   })
 
   it('respects fixed column widths', () => {
@@ -118,7 +118,7 @@ describe('markdown/table-layout', () => {
     expect(plan.rows[0]!.cells[1]!.lines[0]!.spans).toBeArray()
   })
 
-  it('handles very wide content', () => {
+  it('handles very wide content without clipping when wrapMode is none', () => {
     const plan = computeTableLayoutPlan({
       headers: [s('h')],
       rows: [[s('x'.repeat(200))]],
@@ -126,7 +126,8 @@ describe('markdown/table-layout', () => {
       wrapMode: 'none',
     })
     const line = plan.rows[0]!.cells[0]!.lines[0]!.spans.map((sp) => sp.text).join('')
-    expect(line.endsWith('…')).toBeTrue()
+    expect(line.endsWith('…')).toBeFalse()
+    expect(plan.columnWidths[0]).toBe(plan.naturalColumnWidths[0])
   })
 
   it("widthMode 'full' expands columns", () => {

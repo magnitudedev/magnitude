@@ -1,11 +1,11 @@
 import React, { memo } from 'react'
-import { useRenderer } from '@opentui/react'
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { parseMarkdownToMdast } from './parse'
 import { renderDocumentToBlocks, type HighlightRange } from './blocks'
 import { useStreamingMarkdownCache } from './streaming'
 import { useTheme } from '../hooks/use-theme'
 import { BlockRenderer } from './block-renderer'
+import { useBoxWidth } from '../hooks/use-chat-width'
 
 export const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -14,6 +14,7 @@ export const MarkdownContent = memo(function MarkdownContent({
   highlightRanges,
   highlightAnchorId,
   codeBlockWidth,
+  contentWidth: explicitContentWidth,
 }: {
   content: string
   onOpenArtifact?: (name: string, section?: string) => void
@@ -21,12 +22,13 @@ export const MarkdownContent = memo(function MarkdownContent({
   highlightRanges?: HighlightRange[]
   highlightAnchorId?: string
   codeBlockWidth?: number
+  contentWidth?: number
 }) {
   const theme = useTheme()
-  const renderer = useRenderer()
   const palette = buildMarkdownColorPalette(theme)
-  const effectiveCodeBlockWidth =
-    codeBlockWidth ?? Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
+  const box = useBoxWidth()
+  const contentWidth = explicitContentWidth ?? box.width ?? 79
+  const effectiveCodeBlockWidth = codeBlockWidth ?? Math.max(20, contentWidth - 2)
   const blocks = renderDocumentToBlocks(parseMarkdownToMdast(content), {
     palette,
     codeBlockWidth: effectiveCodeBlockWidth,
@@ -34,10 +36,11 @@ export const MarkdownContent = memo(function MarkdownContent({
   })
 
   return (
-    <box style={{ flexDirection: 'column' }}>
+    <box ref={box.ref} onSizeChange={box.onSizeChange} style={{ flexDirection: 'column' }}>
       <BlockRenderer
         blocks={blocks}
         foreground={theme.foreground}
+        contentWidth={contentWidth}
         showCursor={showCursor}
         onOpenArtifact={onOpenArtifact}
         highlights={highlightRanges}
@@ -58,6 +61,7 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
   highlightAnchorId,
   streaming,
   codeBlockWidth,
+  contentWidth: explicitContentWidth,
 }: {
   content: string
   showCursor?: boolean
@@ -66,12 +70,13 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
   highlightAnchorId?: string
   streaming?: boolean
   codeBlockWidth?: number
+  contentWidth?: number
 }) {
   const theme = useTheme()
-  const renderer = useRenderer()
   const palette = buildMarkdownColorPalette(theme)
-  const effectiveCodeBlockWidth =
-    codeBlockWidth ?? Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
+  const box = useBoxWidth()
+  const contentWidth = explicitContentWidth ?? box.width ?? 79
+  const effectiveCodeBlockWidth = codeBlockWidth ?? Math.max(20, contentWidth - 2)
   const { blocks, pendingText } = useStreamingMarkdownCache(content, {
     palette,
     codeBlockWidth: effectiveCodeBlockWidth,
@@ -80,10 +85,11 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
   })
 
   return (
-    <box style={{ flexDirection: 'column' }}>
+    <box ref={box.ref} onSizeChange={box.onSizeChange} style={{ flexDirection: 'column' }}>
       <BlockRenderer
         blocks={blocks}
         foreground={theme.foreground}
+        contentWidth={contentWidth}
         showCursor={showCursor && !pendingText}
         onOpenArtifact={onOpenArtifact}
         highlights={highlightRanges}

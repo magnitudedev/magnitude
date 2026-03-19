@@ -1,10 +1,10 @@
 import React, { memo } from 'react'
-import { useRenderer } from '@opentui/react'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { useTheme } from '../hooks/use-theme'
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { useStreamingMarkdownCache } from '../markdown/streaming'
 import { BlockRenderer } from '../markdown/block-renderer'
+import { useBoxWidth } from '../hooks/use-chat-width'
 
 interface AssistantMessageProps {
   content: string
@@ -20,10 +20,11 @@ export const AssistantMessage = memo(function AssistantMessage({
   onOpenArtifact,
 }: AssistantMessageProps) {
   const theme = useTheme()
-  const renderer = useRenderer()
   const markdownPalette = buildMarkdownColorPalette(theme)
   const { displayedContent, showCursor } = useStreamingReveal(content, isStreaming, isInterrupted)
-  const codeBlockWidth = Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 4)
+  const box = useBoxWidth()
+  const contentWidth = box.width ?? 79
+  const codeBlockWidth = Math.max(20, contentWidth - 2)
   const { blocks, pendingText } = useStreamingMarkdownCache(displayedContent, {
     palette: markdownPalette,
     codeBlockWidth,
@@ -31,12 +32,12 @@ export const AssistantMessage = memo(function AssistantMessage({
   })
 
   return (
-    <box style={{ flexDirection: 'column', marginBottom: 1 }}>
+    <box ref={box.ref} onSizeChange={box.onSizeChange} style={{ flexDirection: 'column', marginBottom: 1 }}>
       <BlockRenderer
         blocks={blocks}
         foreground={theme.foreground}
         palette={markdownPalette}
-        contentWidth={codeBlockWidth}
+        contentWidth={contentWidth}
         showCursor={showCursor && !pendingText}
         onOpenArtifact={onOpenArtifact}
       />

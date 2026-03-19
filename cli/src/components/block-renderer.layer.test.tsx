@@ -28,6 +28,7 @@ mock.module('../utils/clipboard', () => ({
 
 mock.module('@opentui/react', () => ({
   useRenderer: () => ({ clearSelection() {} }),
+  useTerminalDimensions: () => ({ width: 80, height: 40 }),
 }))
 
 const {

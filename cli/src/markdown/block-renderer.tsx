@@ -470,10 +470,10 @@ function TableView({
     headers: block.headers,
     rows: block.rows,
     alignments: block.alignments,
-    availableWidth: Math.max(10, Math.min(contentWidth, 80)),
-    wrapMode: 'none',
-    widthMode: 'content',
-    fitter: 'balanced',
+    availableWidth: Math.max(10, contentWidth),
+    wrapMode: 'word',
+    widthMode: 'full',
+    fitter: 'proportional',
     minColumnWidth: 3,
     cellPadding: 1,
     borders: { outer: true, inner: true },
@@ -523,7 +523,7 @@ export const BlockRenderer = memo(function BlockRenderer({
   blocks,
   foreground,
   palette,
-  contentWidth = 79,
+  contentWidth: explicitContentWidth,
   onOpenArtifact,
   showCursor,
   highlightAnchorId,
@@ -539,6 +539,7 @@ export const BlockRenderer = memo(function BlockRenderer({
   highlights?: HighlightRange[]
 }) {
   const theme = useTheme()
+  const contentWidth = explicitContentWidth ?? 79
   const resolvedPalette = palette ?? buildMarkdownColorPalette(theme)
   let didAssignHighlightAnchor = false
 
@@ -550,9 +551,8 @@ export const BlockRenderer = memo(function BlockRenderer({
     return highlightAnchorId
   }
 
-  return (
-    <>
-      {blocks.map((block, idx) => {
+  // Only attach measurement ref at top level (no explicit width = top level)
+  const content = blocks.map((block, idx) => {
         const isLast = idx === blocks.length - 1
         const anchorId = maybeAnchorId(block)
 
@@ -642,7 +642,7 @@ export const BlockRenderer = memo(function BlockRenderer({
             if (block.lines <= 0) return null
             return <text key={idx}>{block.lines > 1 ? '\n'.repeat(block.lines - 1) : ''}</text>
         }
-      })}
-    </>
-  )
+      })
+
+  return <>{content}</>
 })

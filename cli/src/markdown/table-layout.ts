@@ -136,68 +136,114 @@ function computeGeometry(columns: number, padding: number, border: Required<Tabl
 
 function distributeGrow(base: number[], targetTotal: number): number[] {
   const out = base.slice()
-  let remaining = targetTotal - out.reduce((a, b) => a + b, 0)
-  let i = 0
-  while (remaining > 0 && out.length > 0) {
-    out[i % out.length] += 1
-    remaining--
-    i++
+  const columns = out.length
+  if (columns === 0) return out
+
+  const totalBase = out.reduce((a, b) => a + b, 0)
+  const extraWidth = targetTotal - totalBase
+  if (extraWidth <= 0) return out
+
+  const sharedWidth = Math.floor(extraWidth / columns)
+  const remainder = extraWidth % columns
+
+  for (let i = 0; i < columns; i++) {
+    out[i] += sharedWidth
+    if (i < remainder) out[i] += 1
   }
+
   return out
+}
+
+function allocateShrinkByWeights(shrinkable: number[], targetShrink: number, weights: number[]): number[] {
+  const shrink = new Array(shrinkable.length).fill(0)
+  if (targetShrink <= 0) return shrink
+
+  const totalWeight = weights.reduce((a, b) => a + b, 0)
+  if (totalWeight <= 0) return shrink
+
+  const fractions = new Array(shrinkable.length).fill(0)
+  let usedShrink = 0
+
+  for (let i = 0; i < shrinkable.length; i++) {
+    if (shrinkable[i] <= 0 || weights[i] <= 0) continue
+    const exact = (weights[i] / totalWeight) * targetShrink
+    const whole = Math.min(shrinkable[i], Math.floor(exact))
+    shrink[i] = whole
+    fractions[i] = exact - whole
+    usedShrink += whole
+  }
+
+  let remaining = targetShrink - usedShrink
+  while (remaining > 0) {
+    let best = -1
+    let bestFraction = -1
+    for (let i = 0; i < shrinkable.length; i++) {
+      if (shrinkable[i] - shrink[i] <= 0) continue
+      if (
+        best === -1 ||
+        fractions[i] > bestFraction ||
+        (fractions[i] === bestFraction && shrinkable[i] > shrinkable[best])
+      ) {
+        best = i
+        bestFraction = fractions[i]
+      }
+    }
+    if (best === -1) break
+    shrink[best] += 1
+    fractions[best] = 0
+    remaining--
+  }
+
+  return shrink
 }
 
 function shrinkProportional(widths: number[], mins: number[], targetTotal: number): number[] {
-  const out = widths.slice()
-  let current = out.reduce((a, b) => a + b, 0)
-  if (current <= targetTotal) return out
+  const base = widths.map((w) => Math.max(1, Math.floor(w)))
+  const minFloor = mins.map((m) => Math.max(1, Math.floor(m)))
+  const totalBase = base.reduce((a, b) => a + b, 0)
+  if (totalBase <= targetTotal) return base
 
-  while (current > targetTotal) {
-    const flex = out.map((w, i) => Math.max(0, w - mins[i]))
-    const totalFlex = flex.reduce((a, b) => a + b, 0)
-    if (totalFlex <= 0) break
-    let changed = false
-    for (let i = 0; i < out.length && current > targetTotal; i++) {
-      if (flex[i] <= 0) continue
-      const share = Math.max(1, Math.floor((flex[i] / totalFlex) * (current - targetTotal)))
-      const dec = Math.min(share, out[i] - mins[i], current - targetTotal)
-      if (dec > 0) {
-        out[i] -= dec
-        current -= dec
-        changed = true
-      }
-    }
-    if (!changed) break
-  }
+  const preferredFloors = base.map((w, i) => Math.min(w, minFloor[i] + 1))
+  const preferredTotal = preferredFloors.reduce((a, b) => a + b, 0)
+  const floors = preferredTotal <= targetTotal ? preferredFloors : minFloor
 
-  let idx = 0
-  while (current > targetTotal && idx < out.length * 4) {
-    const i = idx % out.length
-    if (out[i] > mins[i]) {
-      out[i]--
-      current--
-    }
-    idx++
-  }
+  const floorTotal = floors.reduce((a, b) => a + b, 0)
+  const clampedTarget = Math.max(floorTotal, targetTotal)
+  if (totalBase <= clampedTarget) return base
 
-  return out
+  const shrinkable = base.map((w, i) => Math.max(0, w - floors[i]))
+  const totalShrinkable = shrinkable.reduce((a, b) => a + b, 0)
+  if (totalShrinkable <= 0) return floors.slice()
+
+  const targetShrink = totalBase - clampedTarget
+  const shrink = allocateShrinkByWeights(shrinkable, targetShrink, shrinkable)
+  return base.map((w, i) => Math.max(floors[i], w - shrink[i]))
 }
 
 function shrinkBalanced(widths: number[], mins: number[], targetTotal: number): number[] {
-  const out = widths.slice()
-  let current = out.reduce((a, b) => a + b, 0)
-  if (current <= targetTotal) return out
+  const base = widths.map((w) => Math.max(1, Math.floor(w)))
+  const minFloor = mins.map((m) => Math.max(1, Math.floor(m)))
+  const totalBase = base.reduce((a, b) => a + b, 0)
+  const columns = base.length
+  if (columns === 0 || totalBase <= targetTotal) return base
 
-  while (current > targetTotal) {
-    const idx = out
-      .map((w, i) => ({ i, w, flex: w - mins[i] }))
-      .filter((x) => x.flex > 0)
-      .sort((a, b) => b.w - a.w)[0]?.i
-    if (idx == null) break
-    out[idx]--
-    current--
-  }
+  const evenShare = Math.max(...minFloor, Math.floor(targetTotal / columns))
+  const preferredFloors = base.map((w) => Math.min(w, evenShare))
+  const preferredTotal = preferredFloors.reduce((a, b) => a + b, 0)
+  const floors = preferredTotal <= targetTotal ? preferredFloors : minFloor
 
-  return out
+  const floorTotal = floors.reduce((a, b) => a + b, 0)
+  const clampedTarget = Math.max(floorTotal, targetTotal)
+  if (totalBase <= clampedTarget) return base
+
+  const shrinkable = base.map((w, i) => Math.max(0, w - floors[i]))
+  const totalShrinkable = shrinkable.reduce((a, b) => a + b, 0)
+  if (totalShrinkable <= 0) return floors.slice()
+
+  const targetShrink = totalBase - clampedTarget
+  const weights = shrinkable.map((s) => Math.sqrt(Math.max(0, s)))
+  const shrink = allocateShrinkByWeights(shrinkable, targetShrink, weights)
+  return base.map((w, i) => Math.max(floors[i], w - shrink[i]))
 }
 
 function fitColumnWidths(
@@ -206,6 +252,7 @@ function fitColumnWidths(
   minColumnWidth: number,
   widthMode: TableWidthMode,
   fitter: TableFitterMode,
+  wrapMode: TableWrapMode,
 ): number[] {
   const mins = natural.map(() => minColumnWidth)
   const naturalTotal = natural.reduce((a, b) => a + b, 0)
@@ -215,6 +262,8 @@ function fitColumnWidths(
     if (widthMode === 'full') return distributeGrow(natural, availableContentWidth)
     return natural
   }
+
+  if (wrapMode === 'none') return natural
 
   if (fitter === 'balanced') return shrinkBalanced(natural, mins, availableContentWidth)
   return shrinkProportional(natural, mins, availableContentWidth)
@@ -326,6 +375,34 @@ function splitSpansIntoLinesChar(spans: Span[], width: number): Span[][] {
   return lines
 }
 
+function consumeSpanQueueByDisplayWidth(queue: Span[], targetWidth: number): Span[] {
+  if (targetWidth <= 0 || queue.length === 0) return []
+  const out: Span[] = []
+  let remaining = targetWidth
+
+  while (remaining > 0 && queue.length > 0) {
+    const current = queue[0]
+    if (!current.text.length) {
+      queue.shift()
+      continue
+    }
+
+    const { fit, rest } = splitSpanToWidth(current, remaining)
+    if (!fit) break
+
+    out.push(fit)
+    remaining -= stringWidth(fit.text)
+
+    if (rest) {
+      queue[0] = rest
+    } else {
+      queue.shift()
+    }
+  }
+
+  return out
+}
+
 function wrapCellSpans(spans: Span[], width: number, mode: TableWrapMode): Span[][] {
   if (width <= 0) return [[]]
   if (spans.length === 0) return [[]]
@@ -357,27 +434,8 @@ function wrapCellSpans(spans: Span[], width: number, mode: TableWrapMode): Span[
   const lines: Span[][] = []
 
   for (const target of wrappedTextLines) {
-    let remaining = target
-    const line: Span[] = []
-
-    while (remaining.length > 0 && sourceQueue.length > 0) {
-      const current = sourceQueue[0]
-      if (!current.text.length) {
-        sourceQueue.shift()
-        continue
-      }
-
-      if (current.text.length <= remaining.length) {
-        line.push({ ...current })
-        remaining = remaining.slice(current.text.length)
-        sourceQueue.shift()
-      } else {
-        line.push({ ...current, text: current.text.slice(0, remaining.length) })
-        sourceQueue[0] = { ...current, text: current.text.slice(remaining.length) }
-        remaining = ''
-      }
-    }
-
+    const targetWidth = stringWidth(target)
+    const line = consumeSpanQueueByDisplayWidth(sourceQueue, targetWidth)
     lines.push(line)
   }
 
@@ -427,7 +485,7 @@ export function computeTableLayoutPlan(options: TableLayoutOptions): TableLayout
   const contentBudget = Math.max(columnCount * minColumnWidth, totalWidth - geometry.nonContent)
   const columnWidths = options.fixedColumnWidths && options.fixedColumnWidths.length === columnCount
     ? options.fixedColumnWidths.map((w) => Math.max(minColumnWidth, Math.floor(w)))
-    : fitColumnWidths(naturalColumnWidths, contentBudget, minColumnWidth, widthMode, fitter)
+    : fitColumnWidths(naturalColumnWidths, contentBudget, minColumnWidth, widthMode, fitter, wrapMode)
 
   const headers = buildRowLayout(headerRow ?? [], columnWidths, alignments, wrapMode)
   const rows = bodyRows.map((row) => buildRowLayout(row, columnWidths, alignments, wrapMode))

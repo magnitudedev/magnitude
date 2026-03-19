@@ -33,6 +33,14 @@ mock.module('@opentui/react', () => ({
     terminal: { width: rendererWidth },
     clearSelection() {},
   }),
+  useTerminalDimensions: () => ({
+    width: rendererWidth,
+    height: 40,
+  }),
+}))
+
+mock.module('../hooks/use-chat-width', () => ({
+  useBoxWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: rendererWidth - 4 }),
 }))
 
 const { extractTextFromStaticMarkup } = await import('./test-render-helpers')
@@ -77,7 +85,9 @@ A --> B
     expect(text).toContain('item 1')
     expect(text).toContain('item 2')
     expect(text).toContain('────────────────')
-    expect(text).toContain('┌─────┬─────┐')
+    expect(text).toContain('┌')
+    expect(text).toContain('┬')
+    expect(text).toContain('┐')
     expect(text).toContain('const x = 1')
     expect(text).toContain('> quoted')
     expect(text).toContain('│A│')

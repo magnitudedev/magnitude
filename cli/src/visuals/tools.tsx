@@ -7,6 +7,7 @@
 
 import { useState } from 'react'
 import { TextAttributes } from '@opentui/core'
+
 import { useTheme } from '../hooks/use-theme'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { ShimmerText } from '../components/shimmer-text'
@@ -18,6 +19,7 @@ import type { ToolVisualRenderer } from './define'
 
 import { isActive } from '@magnitudedev/agent'
 import { useSelectedArtifact } from '../hooks/use-artifacts'
+
 
 import type {
   WebSearchState,
