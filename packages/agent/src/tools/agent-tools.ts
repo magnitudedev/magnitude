@@ -5,21 +5,19 @@
  * Agents are WHO does the work — separate from tasks (WHAT needs doing).
  * Context flows through message-based communication.
  *
- * Tools: create, dismiss
+ * Tools: create
  */
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
-import type { AppEvent } from '../events'
+import { Fork } from '@magnitudedev/event-core'
 import type { AgentVariant } from '../agents'
 
 
 import { ExecutionManager } from '../execution/execution-manager'
 import { ConversationStateReaderTag } from './memory-reader'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
-import { AgentStatusProjection, getActiveAgent } from '../projections/agent-status'
 
 const { ForkContext } = Fork
 
@@ -109,53 +107,9 @@ export const agentCreateTool = createTool({
   execute: executeAgentCreate,
 })
 // =============================================================================
-// agent.dismiss — Dismiss an agent
-// =============================================================================
-
-export const agentDismissTool = createTool({
-  name: 'dismiss',
-  group: 'agent',
-  description: "Dismiss an agent — stops it and removes it. Use when the agent's work is no longer relevant.",
-  inputSchema: Schema.Struct({
-    agentId: Schema.String.annotations({ description: 'Agent ID' }),
-  }),
-  outputSchema: Schema.Struct({ agentId: Schema.String }),
-  errorSchema: AgentError,
-  argMapping: ['agentId'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'agentId', attr: 'agentId' }], selfClosing: true },
-    xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }] },
-  } as const,
-  execute: ({ agentId }) =>
-    Effect.gen(function* () {
-      const projection = yield* AgentStatusProjection.Tag
-      const agentState = yield* projection.get
-      const agent = getActiveAgent(agentState, agentId)
-
-      if (!agent) {
-        return yield* Effect.fail({ _tag: 'AgentError' as const, message: `No active agent "${agentId}" found` })
-      }
-
-      const bus = yield* WorkerBusTag<AppEvent>()
-
-      yield* bus.publish({
-        type: 'agent_dismissed',
-        forkId: agent.forkId,
-        parentForkId: agent.parentForkId,
-        agentId: agent.agentId,
-        result: { dismissed: true },
-        reason: 'dismissed',
-      })
-
-      return { agentId }
-    }),
-})
-
-// =============================================================================
 // Tool Group Export
 // =============================================================================
 
 export const agentTools = [
   agentCreateTool,
-  agentDismissTool,
 ]

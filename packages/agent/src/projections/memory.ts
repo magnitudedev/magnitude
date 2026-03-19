@@ -416,22 +416,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return { ...state, forks: new Map(state.forks).set(forkId, newForkState) }
     }),
 
-    on(AgentStatusProjection.signals.agentDismissed, ({ value, state }) => {
-      const { parentForkId, name, result, role, taskId } = value
-      const parentState = state.forks.get(parentForkId)
-      if (!parentState) return state
-
-      const entry: SystemEntry = { kind: 'fork_result', taskId: taskId ?? null, role, name, result }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(parentForkId, {
-          ...parentState,
-          queuedMessages: [...parentState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
-        })
-      }
-    }),
-
     on(OutboundMessagesProjection.signals.messageCompleted, ({ value, state, read }) => {
       if (value.dest === 'user') return state
 

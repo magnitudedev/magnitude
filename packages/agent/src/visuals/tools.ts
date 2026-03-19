@@ -550,12 +550,6 @@ function agentIdReducer(state: AgentIdState, event: ToolCallEvent): AgentIdState
   return state
 }
 
-export const agentDismissReducer = reducer<AgentIdState>({
-  toolKey: 'agentDismiss',
-  initial: { phase: 'streaming', id: '' },
-  reduce: agentIdReducer,
-})
-
 export interface AgentMessageState {
   phase: Phase
   id: string

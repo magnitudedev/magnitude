@@ -67,7 +67,13 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
   const mainBorderColor = mainSelected || mainHovered ? theme.link : theme.border
 
   return (
-    <box style={{ flexDirection: 'row', flexWrap: 'wrap', flexShrink: 0, alignItems: 'flex-start' }}>
+    <scrollbox
+      scrollX={true}
+      scrollbarOptions={{ visible: false }}
+      verticalScrollbarOptions={{ visible: false }}
+      style={{ flexShrink: 0, maxHeight: 4 }}
+    >
+      <box style={{ flexDirection: 'row', flexWrap: 'nowrap', flexShrink: 0, alignItems: 'flex-start' }}>
       <Button
         style={{ alignSelf: 'flex-start' }}
         onClick={() => onSelect(null)}
@@ -155,6 +161,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
           </Button>
         )
       })}
-    </box>
+      </box>
+    </scrollbox>
   )
 })

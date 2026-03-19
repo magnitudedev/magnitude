@@ -15,7 +15,7 @@ import {
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
   artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
-  agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
+  agentCreateReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
 } from '@magnitudedev/agent'
 import type { VisualReducerRegistry, ToolVisualReducer } from '@magnitudedev/agent'
@@ -86,7 +86,7 @@ const allReducers: readonly ToolVisualReducer[] = [
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
   artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
-  agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
+  agentCreateReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
 ]
 

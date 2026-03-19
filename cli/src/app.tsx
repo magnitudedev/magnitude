@@ -417,17 +417,6 @@ function AppInner({
           sessionTracker.recordAgentSpawned()
         }
 
-        if (event.type === 'agent_dismissed') {
-          const forkInfo = forkRoles.get(event.forkId)
-          if (forkInfo) {
-            trackAgentCompleted({
-              agentType: forkInfo.role,
-              durationSeconds: Math.round((Date.now() - forkInfo.startTime) / 1000),
-            })
-            forkRoles.delete(event.forkId)
-          }
-        }
-
         if (event.type === 'turn_completed') {
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'orchestrator'

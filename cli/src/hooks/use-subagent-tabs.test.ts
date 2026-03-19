@@ -210,7 +210,7 @@ describe('reconcileForkMeta', () => {
     expect(result.next['fork-1']?.accumulatedActiveMs).toBe(3000)
   })
 
-  test('marks dismissed or nonexistent prior forks for prune', () => {
+  test('keeps prior forks when latest activity map no longer includes them', () => {
     const prev = {
       'fork-dismissed': {
         agentId: 'a',
@@ -244,7 +244,6 @@ describe('reconcileForkMeta', () => {
       agentStatusState,
     })
 
-    expect(result.pruneForkIds.sort()).toEqual(['fork-dismissed', 'fork-missing'])
-    expect(Object.keys(result.next)).toEqual([])
+    expect(Object.keys(result.next).sort()).toEqual(['fork-dismissed', 'fork-missing'])
   })
 })

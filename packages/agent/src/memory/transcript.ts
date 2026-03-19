@@ -3,22 +3,6 @@ import type { AppEvent, ResponsePart } from '../events'
 
 const DEFAULT_TRANSCRIPT_CHAR_BUDGET = 35_000
 
-function summarizeResultValue(value: unknown): string {
-  const RESULT_SLICE = 300
-
-  let text: string
-  try {
-    text = typeof value === 'string' ? value : JSON.stringify(value)
-  } catch {
-    text = String(value)
-  }
-
-  if (text.length <= RESULT_SLICE * 2) return text
-  const head = text.slice(0, RESULT_SLICE)
-  const tail = text.slice(-RESULT_SLICE)
-  return `${head}\n...<truncated ${text.length - RESULT_SLICE * 2} chars>...\n${tail}`
-}
-
 function extractUserMessagesFromXml(xml: string): string[] {
   const matches: string[] = []
   const regex = /<message\b[^>]*\bto\s*=\s*(['"])user\1[^>]*>([\s\S]*?)<\/message>/gi
@@ -77,9 +61,6 @@ function toLine(index: number, event: AppEvent): string | null {
 
     case 'agent_created':
       return `[${index}] ${ts} agent_created role=${event.role} taskId=${event.taskId}`
-
-    case 'agent_dismissed':
-      return `[${index}] ${ts} agent_dismissed reason=${event.reason} result=${summarizeResultValue(event.result)}`
 
     default:
       return null

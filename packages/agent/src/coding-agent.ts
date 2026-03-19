@@ -308,10 +308,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // Create root sandbox (hydration happens lazily in execute())
       yield* executionManager.initFork(null, 'orchestrator')
 
-      // Create execution resources for all non-dismissed agents
+      // Create execution resources for all known agents.
       const agentState = yield* agentStatusProjection.get
       for (const [, agent] of agentState.agents) {
-        if (agent.status === 'dismissed') continue
         yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
       }
 
@@ -320,7 +319,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // a valid settled state. If not stable, emit an interrupt to cleanly
       // terminate it through the normal recovery chain.
       for (const [, agent] of agentState.agents) {
-        if (agent.status === 'dismissed') continue
         const forkWorkingState = yield* workingStateProjection.getFork(agent.forkId)
         if (!isStable(forkWorkingState)) {
           yield* Effect.promise(() => client.send({

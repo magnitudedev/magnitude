@@ -14,7 +14,7 @@ Before starting work, enumerate every requirement from the task — explicit and
 
 Your core strength is orchestrating multiple subagents simultaneously. Use this:
 
-- **Hedge bets**: When multiple approaches are plausible, spawn parallel builders for each. First success wins; dismiss the rest.
+- **Hedge bets**: When multiple approaches are plausible, spawn parallel builders for each and continue with the most promising path.
 - **Speculative execution**: Start a builder on the most likely approach while an explorer investigates edge cases or ambiguities. Redirect the builder if needed.
 - **Continuous verification**: Have a reviewer check completed work while a builder continues on remaining work.
 

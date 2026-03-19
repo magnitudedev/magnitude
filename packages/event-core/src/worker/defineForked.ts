@@ -9,8 +9,9 @@
  *
  * Events must have a `forkId: string | null` field.
  *
- * The consumer specifies which event types represent fork activation and completion
- * via `forkLifecycle.activateOn` and `forkLifecycle.completeOn`.
+ * The consumer specifies which event type represents fork activation via
+ * `forkLifecycle.activateOn`. Optional `forkLifecycle.completeOn` can be provided
+ * to interrupt and remove a fork fiber when a terminal event occurs.
  */
 
 import { Effect, Context, Layer, Stream, PubSub, Queue, Ref, Fiber, Scope, Cause } from 'effect'
@@ -62,8 +63,8 @@ type ExtractHandlerRequirements<THandlers> = THandlers extends ForkedWorkerEvent
 export interface ForkLifecycle<TEvent extends BaseEvent> {
   /** Event type that triggers spawning a new fork fiber */
   readonly activateOn: TEvent['type']
-  /** Event type that triggers interrupting a fork fiber */
-  readonly completeOn: TEvent['type']
+  /** Optional event type that triggers interrupting a fork fiber */
+  readonly completeOn?: TEvent['type']
 }
 
 /**
@@ -221,11 +222,13 @@ export function defineForked<TEvent extends ForkableEvent>() {
       const ignoreInterrupt = config.ignoreInterrupt ?? []
 
       // All event types we need from the bus
-      const allEventTypes = new Set([
+      const allEventTypes = new Set<TEvent['type']>([
         ...handlerEventTypes,
         config.forkLifecycle.activateOn,
-        config.forkLifecycle.completeOn
       ])
+      if (config.forkLifecycle.completeOn !== undefined) {
+        allEventTypes.add(config.forkLifecycle.completeOn)
+      }
 
       // -----------------------------------------------------------------------
       // Per-fork fiber spawner
@@ -385,7 +388,7 @@ export function defineForked<TEvent extends ForkableEvent>() {
             }
 
             // --- Lifecycle: complete ---
-            if (event.type === config.forkLifecycle.completeOn) {
+            if (config.forkLifecycle.completeOn !== undefined && event.type === config.forkLifecycle.completeOn) {
               if (forkId !== null) {
                 const fibers = yield* Ref.get(forkFibers)
                 const forkFiber = fibers.get(forkId)

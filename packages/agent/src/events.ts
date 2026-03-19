@@ -410,16 +410,6 @@ export interface AgentCreated {
   readonly outputSchema?: unknown
 }
 
-/** Agent dismissed (removed permanently) */
-export interface AgentDismissed {
-  readonly type: 'agent_dismissed'
-  readonly forkId: string
-  readonly parentForkId: string | null
-  readonly agentId: string
-  readonly result: unknown
-  readonly reason: 'dismissed' | 'interrupted' | 'completed'
-}
-
 // =============================================================================
 // Compaction Events
 // =============================================================================
@@ -566,5 +556,4 @@ export type AppEvent =
   | ArtifactSynced
   // Agent events
   | AgentCreated
-  | AgentDismissed
   | UserReturnConfirmed

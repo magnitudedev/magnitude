@@ -11,10 +11,7 @@ import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 import { thinkTool } from '../tools/globals'
-import {
-  agentCreateTool,
-  agentDismissTool,
-} from '../tools/agent-tools'
+import { agentCreateTool } from '../tools/agent-tools'
 import {
   artifactSyncTool,
   artifactReadTool,
@@ -45,7 +42,7 @@ const ideateLens = defineThinkingLens({
 const strategyLens = defineThinkingLens({
   name: 'strategy',
   trigger: 'When deciding how to execute work',
-  description: 'Plan your execution approach. Consider parallelism, subagent delegation, and long-horizon sequencing. Which agents to create, reuse, or dismiss? What can run in parallel? What depends on what?',
+  description: 'Plan your execution approach. Consider parallelism, subagent delegation, and long-horizon sequencing. Which subagents to create or reuse? What can run in parallel? What depends on what?',
 })
 
 const protocolLens = defineThinkingLens({
@@ -109,7 +106,6 @@ export const createOrchestrator = (systemPrompt: string) => {
 
     // Agent management
     agentCreate:           agentCreateTool,
-    agentDismiss:          agentDismissTool,
   })
 
   return defineAgent<typeof tools, PolicyContext>(tools, {
@@ -155,7 +151,6 @@ export const createOrchestrator = (systemPrompt: string) => {
       artifactWrite()      { return d.visible() },
       artifactUpdate()     { return d.visible() },
       agentCreate()        { return d.hidden() },
-      agentDismiss()       { return d.hidden() },
 
       // gather()             { return d.visible() },
       shell()              { return d.visible() },

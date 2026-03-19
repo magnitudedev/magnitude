@@ -274,6 +274,5 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     interrupt: ({ fork }) => fork,
 
-    agent_dismissed: ({ fork }) => fork,
   }
 })

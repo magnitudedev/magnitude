@@ -125,7 +125,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
   forkLifecycle: {
     activateOn: 'agent_created',
-    completeOn: 'agent_dismissed'
   },
 
   eventHandlers: {

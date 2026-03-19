@@ -13,7 +13,7 @@ import { shellTool } from '../tools/shell'
 
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool } from '../tools/artifact-tools'
-import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
+import { agentCreateTool } from '../tools/agent-tools'
 import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -52,7 +52,6 @@ const tools = toolSet({
   artifactRead:   artifactReadTool,
 
   agentCreate:    agentCreateTool,
-  agentDismiss:   agentDismissTool,
 
   think:          thinkTool,
 })

@@ -1232,11 +1232,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    agent_dismissed: ({ event, fork }) => {
-      // Keep fork state for display/debug history
-      return fork
-    },
-
 
   },
 
@@ -1301,31 +1296,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
       const { forkId, parentForkId } = value
 
-      const parentState = state.forks.get(parentForkId)
-      if (!parentState) return state
-
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
-      if (msgIndex === -1) return state
-
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
-      const stintMs = Math.max(0, value.timestamp - msg.activeSince)
-      const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = {
-        ...msg,
-        status: 'completed',
-        completedAt: value.timestamp,
-        accumulatedActiveMs: msg.accumulatedActiveMs + stintMs,
-      }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
-      }
-    }),
-
-    on(AgentStatusProjection.signals.agentDismissed, ({ value, state }) => {
-      const { forkId, parentForkId } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) return state
 

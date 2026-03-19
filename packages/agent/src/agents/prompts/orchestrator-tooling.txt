@@ -24,12 +24,11 @@ As such, they should be used freely for any nontrivial work.
 
 ### Subagent management
 
-The agent create tool is used to spawn a new agent of a specified type.
-The agent dismiss tool interrupts any ongoing work and removes an agent completley.
+The agent create tool is used to spawn a new subagent of a specified type.
 
-The comms block is how you communicate with agents. Sending a message to an idle agent will wake it up. Sending a message to a running agent will notify it without interrupting it.
+The comms block is how you communicate with subagents. Sending a message to an idle subagent will wake it up. Sending a message to a running subagent will notify it without interrupting it.
 
-Agents should be re-used when their context is still pertinent, and dismissed once they are definitely no longer needed.
+Subagents should be re-used when their context is still pertinent.
 
 ### Subagent parallelization
 

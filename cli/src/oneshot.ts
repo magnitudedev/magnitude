@@ -274,13 +274,6 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
         break
       }
 
-      case 'agent_dismissed':
-        if (lastForkId === event.forkId) lastForkId = undefined
-        agentNames.delete(event.forkId)
-        agentRoles.delete(event.forkId)
-        shownAgents.delete(event.forkId)
-        break
-
       case 'message_chunk':
         if (event.forkId === null) {
           for (let i = 0; i < event.text.length; i++) {

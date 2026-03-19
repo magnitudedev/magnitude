@@ -111,27 +111,6 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       }
     },
 
-    agent_dismissed: ({ event, state }) => {
-      const resolvedAgentId = state.agents.has(event.agentId)
-        ? event.agentId
-        : state.agentByForkId.get(event.forkId)
-
-      if (!resolvedAgentId) {
-        throw new Error(`[AgentRoutingProjection] Invalid state transition: agent_dismissed for unknown agent ${event.agentId} (forkId: ${event.forkId})`)
-      }
-
-      const existing = state.agents.get(resolvedAgentId)
-      if (!existing) {
-        throw new Error(`[AgentRoutingProjection] Invalid state transition: agent_dismissed for missing indexed agent ${resolvedAgentId}`)
-      }
-
-      const agents = new Map(state.agents)
-      agents.delete(resolvedAgentId)
-      const agentByForkId = new Map(state.agentByForkId)
-      agentByForkId.delete(existing.forkId)
-
-      return { ...state, agents, agentByForkId }
-    },
 
     message_start: ({ event, state, emit }) => {
       const pendingMessages = new Map(state.pendingMessages)

@@ -404,29 +404,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     },
 
 
-    // Stop completed fork from continuing
-    agent_dismissed: ({ event, fork, emit }) => {
-      const newFork: ForkWorkingState = {
-        ...fork,
-        willContinue: false,  // Fork is done, don't continue
-        hasQueuedMessages: false,
-        softInterrupted: false,
-        currentTurnAllowsDirectUserReply: false,
-      }
-
-      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
-        emit.shouldTriggerChanged({
-          forkId: event.forkId,
-          shouldTrigger: false,
-          chainId: null
-        })
-      }
-
-      // TODO: fork cleanup — need to design proper fork completion UX before removing state
-      // return null
-      return newFork
-    },
-
   },
 
   signalHandlers: (on) => [

@@ -211,9 +211,8 @@ export function formatAgentIdleNotification(
 export function formatAgentsStatus(
   agents: readonly { agentId: string; type: string; status: string }[]
 ): string | null {
-  const active = agents.filter(a => a.status !== 'dismissed')
-  if (active.length === 0) return null
-  const lines = active.map(a => `- ${a.agentId} (${a.type}): ${a.status}`)
+  if (agents.length === 0) return null
+  const lines = agents.map(a => `- ${a.agentId} (${a.type}): ${a.status}`)
   return `<agents_status>\n${lines.join('\n')}\n</agents_status>`
 }
 
