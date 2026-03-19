@@ -38,6 +38,13 @@ const DISMISSED_PRUNE_MS = 1000
 
 export function sortSubagentTabs(a: SubagentTabItem, b: SubagentTabItem): number {
   if (a.phase !== b.phase) return a.phase === 'active' ? -1 : 1
+
+  if (a.phase === 'idle' && b.phase === 'idle') {
+    const aCompletedAt = a.completedAt ?? Number.NEGATIVE_INFINITY
+    const bCompletedAt = b.completedAt ?? Number.NEGATIVE_INFINITY
+    if (aCompletedAt !== bCompletedAt) return bCompletedAt - aCompletedAt
+  }
+
   return a.activeSince - b.activeSince
 }
 
@@ -177,7 +184,7 @@ export function useSubagentTabs({
         const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
         const statusLine = truncateSubagentTabText(
           meta.phase === 'idle'
-            ? 'Agent is idle'
+            ? 'Subagent is idle'
             : (selectLatestLiveActivityFromMessages(forkMessages[forkId] ?? []) ?? 'Running…'),
         )
         return {
