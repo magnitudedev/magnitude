@@ -320,9 +320,8 @@ describe('childTags runtime', () => {
     expect(ended[0].result._tag).toBe('Success')
   })
 
-  test('childTags with whitespace are trimmed', async () => {
-    // Only leading/trailing newlines are stripped — interior whitespace is preserved
-    // (important for content like code edits)
+  test('childTags content is literal (no trimming)', async () => {
+    // Content between child tags is preserved exactly — no stripping of newlines or whitespace
     const xml = `<actions><create id="a1">
   <type>
     builder
@@ -336,7 +335,7 @@ describe('childTags runtime', () => {
     expect(ready[0].input).toEqual({
       id: 'a1',
       options: {
-        type: '    builder\n  ',
+        type: '\n    builder\n  ',
         title: '  Build it  ',
         prompt: 'Do the thing',
       },
@@ -367,9 +366,9 @@ describe('buildInput', () => {
     expect(input).toEqual({ path: 'src/index.ts' })
   })
 
-  test('body only', () => {
+  test('body only (literal, no trimming)', () => {
     const input = buildInput(el('shell', {}, '  ls -la  '), { body: 'command' })
-    expect(input).toEqual({ command: 'ls -la' })
+    expect(input).toEqual({ command: '  ls -la  ' })
   })
 
   test('attributes + body', () => {
