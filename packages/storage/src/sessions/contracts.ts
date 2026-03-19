@@ -17,7 +17,7 @@ export interface SessionStorageShape {
     readonly pendingMemoryJobFile: (jobId: string) => string
   }
 
-  readonly createTimestampSessionId: (now?: Date) => string
+  readonly createTimestampSessionId: () => string
 
   readonly listSessionIds: (options?: {
     readonly timestampOnly?: boolean

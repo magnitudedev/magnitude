@@ -1,6 +1,8 @@
 import { lstat, readlink, rm, symlink } from 'node:fs/promises'
 import { basename, extname, join, resolve } from 'node:path'
 
+import { generateSortableId } from '@magnitudedev/generate-id'
+
 import {
   appendJsonLines,
   ensureDir,
@@ -22,12 +24,10 @@ import {
 } from '../types/session'
 
 const TIMESTAMP_SESSION_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$/
+const SORTABLE_SESSION_ID_RE = /^[0-9a-z]{6,12}$/
 
-export function createTimestampSessionId(now?: Date): string {
-  return (now ?? new Date())
-    .toISOString()
-    .replace(/:/g, '-')
-    .replace(/\.\d{3}Z$/, 'Z')
+export function createTimestampSessionId(): string {
+  return generateSortableId()
 }
 
 export async function listSessionIds(
@@ -42,7 +42,7 @@ export async function listSessionIds(
     return entries
       .filter((entry) => entry.isDirectory)
       .map((entry) => entry.name)
-      .filter((name) => !timestampOnly || TIMESTAMP_SESSION_ID_RE.test(name))
+      .filter((name) => !timestampOnly || TIMESTAMP_SESSION_ID_RE.test(name) || SORTABLE_SESSION_ID_RE.test(name))
       .sort()
       .reverse()
   } catch (error) {

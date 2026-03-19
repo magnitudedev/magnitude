@@ -280,9 +280,9 @@ export async function createStorageClient(options?: {
     },
 
     sessions: {
-      createId: (now) =>
+      createId: () =>
         runtime.runSync(
-          Effect.map(SessionStorage, (s) => s.createTimestampSessionId(now))
+          Effect.map(SessionStorage, (s) => s.createTimestampSessionId())
         ),
       list: (opts) =>
         run(Effect.flatMap(SessionStorage, (s) => s.listSessionIds(opts))),
