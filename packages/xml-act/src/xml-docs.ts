@@ -226,14 +226,25 @@ function buildAttrAnnotation(info: FieldInfo | undefined): string {
 type OutputDocShape =
   | { readonly kind: 'void' }
   | { readonly kind: 'string' }
+  | { readonly kind: 'image' }
   | { readonly kind: 'scalar'; readonly type: string }
   | { readonly kind: 'struct'; readonly fields: Map<string, FieldInfo> }
   | { readonly kind: 'array-struct'; readonly fields: Map<string, FieldInfo> }
   | { readonly kind: 'array-scalar'; readonly elementType: string }
   | { readonly kind: 'unknown' }
 
+function isToolImageAst(schemaAst: AST.AST): boolean {
+  const ast = unwrapAst(schemaAst)
+  const identifier = ast.annotations?.[AST.IdentifierAnnotationId]
+  if (identifier === 'ToolImage') return true
+  if (ast._tag === 'Union') return ast.types.some(isToolImageAst)
+  return false
+}
+
 function classifyOutputDoc(schemaAst: AST.AST): OutputDocShape {
   const ast = unwrapAst(schemaAst)
+
+  if (isToolImageAst(ast)) return { kind: 'image' }
 
   if (ast._tag === 'UndefinedKeyword' || ast._tag === 'VoidKeyword' || ast._tag === 'NeverKeyword') {
     return { kind: 'void' }
@@ -461,6 +472,12 @@ function buildAnnotatedOutput(
     return
   }
 
+  if (shape.kind === 'image') {
+    lines.push('Returns: image')
+    lines.push(`  <${tagName}>[image]</${tagName}>`)
+    return
+  }
+
   if (shape.kind === 'scalar') {
     lines.push(`Returns: ${shape.type}`)
     lines.push(`  <${tagName}>...</${tagName}>`)
@@ -484,7 +501,8 @@ function buildAnnotatedOutput(
       if (field.optional) annotations.push('optional')
       if (typeComment) annotations.push(typeComment)
       const comment = annotations.length > 0 ? ` <!-- ${annotations.join('. ')} -->` : ''
-      lines.push(`    <${field.name}>${field.name}</${field.name}>${comment}`)
+      const fieldBody = isToolImageAst(field.ast) ? '[image]' : field.name
+      lines.push(`    <${field.name}>${fieldBody}</${field.name}>${comment}`)
     }
     lines.push(`  </${tagName}>`)
     return
@@ -548,7 +566,9 @@ function buildOutputWithBinding(
   }
 
   if (hasBody && !hasChildTags && !hasChildren && !hasItems) {
-    lines.push(`  <${tagName}${attrs}>${binding.body}</${tagName}>`)
+    const info = fields.get(binding.body!)
+    const body = info?.ast && isToolImageAst(info.ast) ? '[image]' : binding.body
+    lines.push(`  <${tagName}${attrs}>${body}</${tagName}>`)
     return
   }
 
@@ -590,7 +610,8 @@ function buildOutputWithBinding(
       if (info?.optional) annotations.push('optional')
       if (typeComment) annotations.push(typeComment)
       const comment = annotations.length > 0 ? ` <!-- ${annotations.join('. ')} -->` : ''
-      lines.push(`    <${ct.tag}>${ct.tag}</${ct.tag}>${comment}`)
+      const body = info?.ast && isToolImageAst(info.ast) ? '[image]' : ct.tag
+      lines.push(`    <${ct.tag}>${body}</${ct.tag}>${comment}`)
     }
   }
 

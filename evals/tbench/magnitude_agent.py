@@ -20,18 +20,46 @@ class MagnitudeAgent(BaseInstalledAgent):
     def _install_agent_template_path(self) -> Path:
         return Path(__file__).parent / "install-magnitude.sh.j2"
 
-    async def setup(self, environment) -> None:
-        binary_path = Path(__file__).parent / "bin" / "magnitude"
-        if not binary_path.exists():
-            # No local binary — fall back to bun install via install script
-            await super().setup(environment)
-            return
+    async def _try_install_from_volume(self, environment) -> bool:
+        current_path = "/opt/magnitude-volume/magnitude/current"
+        result = await environment.exec(command=f"test -f {current_path}")
+        if result.return_code != 0:
+            return False
 
-        await environment.upload_file(
-            source_path=binary_path,
-            target_path="/usr/local/bin/magnitude",
+        print("Installing magnitude from mounted volume...", flush=True)
+        hash_result = await environment.exec(command=f"cat {current_path} | tr -d '\\n'")
+        if hash_result.return_code != 0 or not hash_result.stdout or not hash_result.stdout.strip():
+            print("Failed to read volume hash pointer", flush=True)
+            return False
+
+        binary_hash = hash_result.stdout.strip()
+        volume_binary = f"/opt/magnitude-volume/magnitude/sha256/{binary_hash}/magnitude"
+
+        copy_result = await environment.exec(
+            command=f"cp {volume_binary} /usr/local/bin/magnitude && chmod +x /usr/local/bin/magnitude"
         )
-        await environment.exec(command="chmod +x /usr/local/bin/magnitude")
+        if copy_result.return_code != 0:
+            print(f"Failed to copy binary from volume: {copy_result.stderr}", flush=True)
+            return False
+
+        return True
+
+    async def setup(self, environment) -> None:
+        installed = await self._try_install_from_volume(environment)
+
+        if not installed:
+            print("Volume binary not found, falling back to upload...")
+            binary_path = Path(__file__).parent / "bin" / "magnitude"
+            if not binary_path.exists():
+                # No local binary — fall back to bun install via install script
+                await super().setup(environment)
+                return
+
+            await environment.upload_file(
+                source_path=binary_path,
+                target_path="/usr/local/bin/magnitude",
+            )
+            await environment.exec(command="chmod +x /usr/local/bin/magnitude")
 
         # Ensure CA certificates are available for SSL verification
         await environment.exec(command="apt-get update -qq && apt-get install -y -qq ca-certificates >/dev/null 2>&1 || true")

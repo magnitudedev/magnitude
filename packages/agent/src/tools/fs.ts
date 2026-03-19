@@ -4,7 +4,7 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { createTool, ToolErrorSchema, ToolImageSchema } from '@magnitudedev/tools'
 import { ToolEmitTag } from '../execution/tool-emit'
 import { join, relative, resolve } from 'path'
 import { resolveRgPath } from '@magnitudedev/ripgrep'
@@ -12,6 +12,8 @@ import { walk } from '../util/walk'
 import { createDefaultIgnore } from '../util/gitignore'
 import { validateAndApply, toEditDiff } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
+import { readImageFileForModel } from '../util/read-image-file'
+import { expandWorkspacePath } from '../workspace'
 
 // =============================================================================
 // Errors
@@ -52,8 +54,9 @@ export const readTool = createTool({
   } as const,
 
   execute: ({ path, offset, limit }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
-    const fullPath = resolve(cwd, path)
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
+    const fullPath = resolve(cwd, expandedPath)
     const file = Bun.file(fullPath)
     const content = yield* Effect.tryPromise({
       try: () => file.text(),
@@ -113,10 +116,11 @@ export const writeTool = createTool({
 
   execute: ({ path, content }) => Effect.gen(function* () {
     const emit = yield* ToolEmitTag
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
     yield* Effect.tryPromise({
       try: async () => {
-        const fullPath = resolve(cwd, path)
+        const fullPath = resolve(cwd, expandedPath)
         await Bun.write(fullPath, content)
       },
       catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
@@ -164,8 +168,9 @@ export const editTool = createTool({
 
   execute: ({ path, oldString, newString, replaceAll }) => Effect.gen(function* () {
     const emit = yield* ToolEmitTag
-    const { cwd } = yield* WorkingDirectoryTag
-    const fullPath = resolve(cwd, path)
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
+    const fullPath = resolve(cwd, expandedPath)
 
     // Read current file
     const content = yield* Effect.tryPromise({
@@ -244,10 +249,11 @@ export const treeTool = createTool({
   } as const,
 
   execute: ({ path, options }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
     return yield* Effect.tryPromise({
       try: async () => {
-        const fullPath = resolve(cwd, path)
+        const fullPath = resolve(cwd, expandedPath)
         const respectGitignore = options?.gitignore ?? true
         const maxDepth = options?.maxDepth
 
@@ -303,13 +309,17 @@ export async function searchFiles(
     stderr: 'pipe',
   })
 
-  const stdout = await new Response(proc.stdout).text()
-  await proc.exited
-
   const matches: SearchMatch[] = []
+  const decoder = new TextDecoder()
+  const reader = proc.stdout.getReader()
 
-  for (const line of stdout.split('\n')) {
-    if (!line.trim()) continue
+  let buffer = ''
+  let timedOut = false
+  let stoppedEarly = false
+
+  const processLine = (line: string) => {
+    if (!line.trim()) return
+
     try {
       const msg = JSON.parse(line)
       if (msg.type === 'match') {
@@ -321,14 +331,59 @@ export async function searchFiles(
           file: filePath,
           match: `${lineNum}|${lineText}`
         })
-        if (matches.length >= limit) break
+        if (matches.length >= limit) {
+          stoppedEarly = true
+          proc.kill()
+        }
       }
     } catch {
-      continue
+      // Ignore malformed lines from rg output
     }
   }
 
-  return matches
+  const timeout = setTimeout(() => {
+    timedOut = true
+    proc.kill()
+  }, 5000)
+
+  try {
+    while (!stoppedEarly) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      let newlineIndex = buffer.indexOf('\n')
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex)
+        buffer = buffer.slice(newlineIndex + 1)
+        processLine(line)
+        if (stoppedEarly) break
+        newlineIndex = buffer.indexOf('\n')
+      }
+    }
+
+    if (!stoppedEarly) {
+      buffer += decoder.decode()
+      if (buffer) {
+        processLine(buffer)
+      }
+    }
+
+    await proc.exited
+
+    if (timedOut) {
+      throw new Error('Search timed out after 5s — try a more specific pattern or glob filter')
+    }
+
+    return matches
+  } finally {
+    clearTimeout(timeout)
+    if (!timedOut && !stoppedEarly) {
+      proc.kill()
+    }
+    reader.releaseLock()
+  }
 }
 
 export const searchTool = createTool({
@@ -364,10 +419,10 @@ export const searchTool = createTool({
   } as const,
 
   execute: ({ pattern, path, glob, limit, options }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
     return yield* Effect.tryPromise({
       try: async () => {
-        const resolvedPath = path ?? options?.path
+        const resolvedPath = expandWorkspacePath(path ?? options?.path ?? '', workspacePath) || undefined
         const resolvedGlob = glob ?? options?.glob
         const resolvedLimit = limit ?? options?.limit ?? 50
 
@@ -383,7 +438,44 @@ export const searchTool = createTool({
 })
 
 // =============================================================================
+// fs.view()
+// =============================================================================
+
+export const viewTool = createTool({
+  name: 'view',
+  group: 'fs',
+  description: 'Read an image file and return it as image output for visual inspection. Supports PNG, JPEG, WebP, GIF, and SVG files.',
+  inputSchema: Schema.Struct({
+    path: Schema.String.annotations({
+      description: 'Relative path to an image file from cwd'
+    }),
+  }),
+  outputSchema: ToolImageSchema,
+  errorSchema: FsError,
+  argMapping: ['path'],
+  bindings: {
+    xmlInput: {
+      type: 'tag',
+      attributes: [{ field: 'path', attr: 'path' }],
+      selfClosing: true,
+    },
+    xmlOutput: { type: 'tag' },
+  } as const,
+
+  execute: ({ path: filePath }) => Effect.gen(function* () {
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(filePath, workspacePath)
+    const fullPath = resolve(cwd, expandedPath)
+
+    return yield* Effect.tryPromise({
+      try: () => readImageFileForModel(fullPath),
+      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to read image: ${filePath}`),
+    })
+  })
+})
+
+// =============================================================================
 // Filesystem Tools Group
 // =============================================================================
 
-export const fsTools = [readTool, writeTool, editTool, treeTool, searchTool]
+export const fsTools = [readTool, writeTool, editTool, treeTool, searchTool, viewTool]

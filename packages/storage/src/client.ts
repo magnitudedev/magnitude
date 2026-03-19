@@ -107,6 +107,8 @@ export interface StorageClient {
       content: string,
       opts?: { extension?: string }
     ): Promise<void>
+    createWorkspace(sessionId: string, cwd: string): Promise<string>
+    getWorkspacePath(sessionId: string): string
   }
 
   memoryJobs: {
@@ -278,9 +280,9 @@ export async function createStorageClient(options?: {
     },
 
     sessions: {
-      createId: (now) =>
+      createId: () =>
         runtime.runSync(
-          Effect.map(SessionStorage, (s) => s.createTimestampSessionId(now))
+          Effect.map(SessionStorage, (s) => s.createTimestampSessionId())
         ),
       list: (opts) =>
         run(Effect.flatMap(SessionStorage, (s) => s.listSessionIds(opts))),
@@ -310,6 +312,14 @@ export async function createStorageClient(options?: {
           )
         )
       },
+      createWorkspace: (sessionId, cwd) =>
+        run(
+          Effect.flatMap(SessionStorage, (s) =>
+            s.createSessionWorkspace(sessionId, cwd)
+          )
+        ),
+      getWorkspacePath: (sessionId) =>
+        runtime.runSync(Effect.map(SessionStorage, (s) => s.paths.sessionWorkspace(sessionId))),
     },
 
     memoryJobs: {

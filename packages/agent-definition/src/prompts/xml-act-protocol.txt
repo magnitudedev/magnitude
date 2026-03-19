@@ -19,11 +19,10 @@ Your response must contain exactly ONE turn, never more than one. You must end y
 
 ## Response parsing
 
-The response is not parsed as true XML. You should not escape HTML entities or special characters as if it were actual XML.
-Do NOT escape any HTML entities in thinking, comms, or action blocks - whether its in an attribute or body - including &, <, ?, ", and ' symbols.
-All characters passed to XML attributes or bodies are treated as literal, raw text and do not require escaping.
-
-The XML response parser only recognizes tags that fit the aforementioned rules.
+This is NOT a standard XML parser. It reads tag structure but treats all content as raw text — no entity processing, no escaping.
+WRONG: `&lt;div&gt;`, `&amp;`, `&quot;`
+RIGHT: `<div>`, `&`, `"`
+This applies everywhere — thinking, comms, action bodies, and action attributes. Escaping will corrupt your output (e.g., a file edit with `&lt;` instead of `<` will fail to match).
 
 ## Turn order
 

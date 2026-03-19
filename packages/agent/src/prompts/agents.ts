@@ -171,7 +171,7 @@ export function formatSystemInbox(entries: readonly SystemEntry[]): ContentPart[
       }
       push('\n')
     } else if (entry.kind === 'reminder') {
-      push(`${entry.text}\n`)
+      push(`<reminder>${entry.text}</reminder>\n`)
     } else if (entry.kind === 'interrupted') {
       push(`${formatInterrupted()}\n`)
     } else if (entry.kind === 'error') {

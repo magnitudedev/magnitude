@@ -54,12 +54,12 @@ export function isGitAllowed(command: string): boolean {
   return true
 }
 
-export function detectsOutsideCwd(command: string, cwd: string): boolean {
+export function writesStayWithin(command: string, ...allowedRoots: string[]): boolean {
   const commands = parseShellCommand(command)
 
   for (const cmd of commands) {
     for (const redir of cmd.redirects) {
-      if (isPathOutsideCwd(redir.target, cwd)) return true
+      if (!isPathWithin(redir.target, ...allowedRoots)) return false
     }
 
     if (cmd.name) {
@@ -67,13 +67,13 @@ export function detectsOutsideCwd(command: string, cwd: string): boolean {
       if (WRITE_PATH_COMMANDS.has(name)) {
         for (const arg of cmd.args) {
           if (arg.startsWith('-')) continue
-          if (isPathOutsideCwd(arg, cwd)) return true
+          if (!isPathWithin(arg, ...allowedRoots)) return false
         }
       }
     }
   }
 
-  return false
+  return true
 }
 
 // ─── Classification ─────────────────────────────────────────
@@ -320,9 +320,11 @@ function baseName(cmd: string): string {
 
 const ALLOWED_OUTSIDE_PREFIXES = ['/tmp/', '/dev/null']
 
-export function isPathOutsideCwd(path: string, cwd: string): boolean {
-  if (!path || path.startsWith('-')) return false
+export function isPathWithin(path: string, ...allowedRoots: string[]): boolean {
+  if (!path || path.startsWith('-')) return true
 
+  const [primaryRoot, ...additionalRoots] = allowedRoots
+  const cwd = primaryRoot ?? process.cwd()
   const normalizedCwd = cwd.endsWith('/') ? cwd : cwd + '/'
   const cwdNoSlash = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd
 
@@ -334,9 +336,17 @@ export function isPathOutsideCwd(path: string, cwd: string): boolean {
     resolved = resolve(cwdNoSlash, path)
   }
 
-  if (resolved === cwdNoSlash || resolved.startsWith(normalizedCwd)) return false
+  if (resolved === cwdNoSlash || resolved.startsWith(normalizedCwd)) return true
 
-  if (ALLOWED_OUTSIDE_PREFIXES.some(p => resolved === p.slice(0, -1) || resolved.startsWith(p))) return false
+  const explicitRoots = [cwd, ...additionalRoots]
+  if (explicitRoots.some(root => {
+    const normalizedRoot = root.endsWith('/') ? root : `${root}/`
+    const rootNoSlash = root.endsWith('/') ? root.slice(0, -1) : root
+    return resolved === rootNoSlash || resolved.startsWith(normalizedRoot)
+  })) return true
 
-  return true
+  const builtInAllowlist = ALLOWED_OUTSIDE_PREFIXES
+  if (builtInAllowlist.some(p => resolved === p.slice(0, -1) || resolved.startsWith(p))) return true
+
+  return false
 }

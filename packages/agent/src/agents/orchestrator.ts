@@ -9,6 +9,7 @@
 import { toolSet, defineAgent, continue_, yield_, defineThinkingLens } from '@magnitudedev/agent-definition'
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 import { thinkTool } from '../tools/globals'
 import {
   agentCreateTool,
@@ -21,12 +22,13 @@ import {
   artifactUpdateTool,
 } from '../tools/artifact-tools'
 // import { gatherTool } from '../tools/gather'
-import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
+import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
+import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webFetchTool } from '../tools/web-fetch-tool'
 import { webSearchTool } from '../tools/web-search-tool'
 
-import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 
 const intentLens = defineThinkingLens({
   name: 'intent',
@@ -93,7 +95,9 @@ export const createOrchestrator = (systemPrompt: string) => {
     fileEdit:              editTool,
     fileTree:              treeTool,
     fileSearch:            searchTool,
+    fileView:              viewTool,
     shell:                 shellTool,
+    shellBg:               shellBgTool,
     webSearch:             webSearchTool,
     webFetch:              webFetchTool,
 
@@ -113,12 +117,13 @@ export const createOrchestrator = (systemPrompt: string) => {
     model: 'primary',
     systemPrompt,
     thinkingLenses: [intentLens, ideateLens, strategyLens, protocolLens, turnLens],
-    observables: [agentsStatusObservable],
+    observables: [agentsStatusObservable, backgroundProcessesObservable],
     permission: (p) => ({
       shell(input, pctx) {
         const result = classifyShellCommand(input.command)
+        const allowedPrefixes = pctx.workspacePath ? [pctx.workspacePath] : undefined
         if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-        if (!pctx.disableCwdSafeguards && detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+        if (!pctx.disableCwdSafeguards && !writesStayWithin(input.command, pctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
         return p.allow()
       },
       _default() { return p.allow() },

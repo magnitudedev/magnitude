@@ -11,12 +11,13 @@ export interface SessionStorageShape {
     readonly sessionMetaFile: (sessionId: string) => string
     readonly sessionEventsFile: (sessionId: string) => string
     readonly sessionLogFile: (sessionId: string) => string
+    readonly sessionWorkspace: (sessionId: string) => string
     readonly sessionArtifactsDir: (sessionId: string) => string
     readonly sessionArtifactFile: (sessionId: string, artifactName: string) => string
     readonly pendingMemoryJobFile: (jobId: string) => string
   }
 
-  readonly createTimestampSessionId: (now?: Date) => string
+  readonly createTimestampSessionId: () => string
 
   readonly listSessionIds: (options?: {
     readonly timestampOnly?: boolean
@@ -67,6 +68,11 @@ export interface SessionStorageShape {
     name: string,
     content: string,
     options?: { readonly extension?: string }
+  ) => Effect.Effect<string>
+
+  readonly createSessionWorkspace: (
+    sessionId: string,
+    cwd: string
   ) => Effect.Effect<string>
 
   readonly createMemoryExtractionJobRecord: (params: {

@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { Schema } from '@effect/schema'
 import { generateXmlToolDoc, generateXmlToolGroupDoc } from './xml-docs'
-import { createTool, type XmlBinding } from '@magnitudedev/tools'
+import { createTool, type XmlBinding, ToolImageSchema } from '@magnitudedev/tools'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -395,6 +395,19 @@ describe('output documentation', () => {
     expect(doc).toContain('<fs-read>...</fs-read>')
   })
 
+  test('image output shows Returns: image', () => {
+    const tool = makeTool({
+      name: 'screenshot',
+      group: 'browser',
+      inputSchema: Schema.Struct({}),
+      outputSchema: ToolImageSchema,
+      bindings: { xmlInput: { type: 'tag' } },
+    })
+    const doc = generateXmlToolDoc(tool)!
+    expect(doc).toContain('Returns: image')
+    expect(doc).toContain('<browser-screenshot>[image]</browser-screenshot>')
+  })
+
   test('struct output shows child tags', () => {
     const tool = makeTool({
       name: 'shell',
@@ -412,6 +425,21 @@ describe('output documentation', () => {
     expect(doc).toContain('<stderr>stderr</stderr>')
     expect(doc).toContain('<exitCode>exitCode</exitCode>')
     expect(doc).toContain('number')
+  })
+
+  test('struct output with image field shows image placeholder', () => {
+    const tool = makeTool({
+      name: 'inspect',
+      inputSchema: Schema.Struct({}),
+      outputSchema: Schema.Struct({
+        screenshot: ToolImageSchema,
+        title: Schema.String,
+      }),
+      bindings: { xmlInput: { type: 'tag' } },
+    })
+    const doc = generateXmlToolDoc(tool)!
+    expect(doc).toContain('<screenshot>[image]</screenshot>')
+    expect(doc).toContain('<title>title</title>')
   })
 
   test('array-struct output shows item with attrs', () => {
@@ -475,6 +503,30 @@ describe('output documentation', () => {
     const doc = generateXmlToolDoc(tool)!
     expect(doc).toContain('Returns:')
     expect(doc).toContain('<fs-read>content</fs-read>')
+  })
+
+  test('explicit output childTags render image placeholder for image fields', () => {
+    const tool = makeTool({
+      name: 'inspect',
+      inputSchema: Schema.Struct({}),
+      outputSchema: Schema.Struct({
+        screenshot: ToolImageSchema,
+        title: Schema.String,
+      }),
+      bindings: {
+        xmlInput: { type: 'tag' },
+        xmlOutput: {
+          type: 'tag',
+          childTags: [
+            { field: 'screenshot', tag: 'screenshot' },
+            { field: 'title', tag: 'title' },
+          ],
+        },
+      },
+    })
+    const doc = generateXmlToolDoc(tool)!
+    expect(doc).toContain('<screenshot>[image]</screenshot>')
+    expect(doc).toContain('<title>title</title>')
   })
 
   test('explicit output items binding renders item attrs without body', () => {

@@ -1,6 +1,6 @@
 import { collectCliEnv } from './env'
 
-import type { MarkdownPalette } from './markdown-content-renderer'
+import type { MarkdownPalette } from '../markdown/theme'
 import type { CliEnv } from '../types/env'
 import type {
   ChatTheme,

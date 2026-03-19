@@ -18,6 +18,7 @@ import { useCollapsedBlocks } from './hooks/use-collapsed-blocks'
 
 import { useTheme } from './hooks/use-theme'
 import { ArtifactProvider, SelectedArtifactProvider } from './hooks/use-artifacts'
+
 import { BOX_CHARS } from './utils/ui-constants'
 import { AnimatedLogo } from './components/animated-logo'
 import { RecentChatsWidget } from './components/recent-chats-widget'
@@ -120,6 +121,7 @@ function AppInner({
   const storage = useStorage()
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const [client, setClient] = useState<AgentClient | null>(null)
+  const [bashWorkspacePath, setBashWorkspacePath] = useState<string | undefined>(undefined)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
   const [artifactState, setArtifactState] = useState<ArtifactState | null>(null)
@@ -348,6 +350,8 @@ function AppInner({
         workingDirectory: process.cwd(),
         sessionId,
       })
+      const activeSessionId = persistence.getSessionId()
+      setBashWorkspacePath(storage.sessions.getWorkspacePath(activeSessionId))
       initLogger(persistence.getSessionId())
       clearSessionLog(persistence.getSessionId())
       logger.info({ logFile: getSessionLogPath(persistence.getSessionId()) }, 'Session logger initialized')
@@ -1884,7 +1888,6 @@ function AppInner({
     && expandedForkId === null
 
   const debugVisible = debugMode && debugPanelVisible
-
   return (
     <ArtifactProvider value={artifactState}>
     <SelectedArtifactProvider value={selectedArtifact?.name ?? null}>
@@ -1931,7 +1934,10 @@ function AppInner({
             services={{
               submitUserMessageToFork: ({ forkId, message, attachments }) => handleSubmitViaClientBoundary({ forkId, message, attachments }),
               runSlashCommand: (commandText: string) => routeSlashCommand(commandText, commandContext),
-              executeBash: executeBashCommand,
+              executeBash: (command: string) => executeBashCommand(command, {
+                workspacePath: bashWorkspacePath,
+                projectRoot: process.cwd(),
+              }),
               appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
               clearSystemBanners: () => {
                 setSystemMessages([])

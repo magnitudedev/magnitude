@@ -176,6 +176,7 @@ export type { Tool } from '@magnitudedev/tools'
 // Tools
 export { thinkTool, globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'
+export { shellBgTool, SHELL_BG_TOOLS } from './tools/shell-bg'
 export { readTool, writeTool, editTool, treeTool, searchTool, fsTools } from './tools/fs'
 export { webSearchTool } from './tools/web-search-tool'
 export { webFetchTool } from './tools/web-fetch-tool'

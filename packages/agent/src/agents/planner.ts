@@ -6,8 +6,10 @@
  * Communicates back via parent.message.
  */
 
+import { resolve } from 'node:path'
 import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
-import { readTool, treeTool, searchTool } from '../tools/fs'
+import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
+import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
@@ -15,8 +17,10 @@ import { webFetchTool } from '../tools/web-fetch-tool'
 import { thinkTool } from '../tools/globals'
 // import { gatherTool } from '../tools/gather'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
-import { classifyShellCommand } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+import { expandWorkspacePath } from '../workspace/workspace-path'
 
 const ideateLens = defineThinkingLens({
   name: 'ideate',
@@ -50,9 +54,12 @@ const turnLens = defineThinkingLens({
 
 const tools = toolSet({
   fileRead:     readTool,
+  fileWrite:    writeTool,
+  fileEdit:     editTool,
   fileTree:     treeTool,
   fileSearch:   searchTool,
   shell:        shellTool,
+  shellBg:      shellBgTool,
   webSearch:    webSearchTool,
   webFetch:     webFetchTool,
   // gather:       gatherTool,
@@ -68,13 +75,27 @@ export const createPlanner = (systemPrompt: string) => defineAgent<typeof tools,
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [ideateLens, velocityLens, alignmentLens, capacityLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
-    shell(input) {
+    shell(input, ctx) {
       const result = classifyShellCommand(input.command)
       if (result.tier === 'readonly') return p.allow()
-      // Planners are read-only — reject anything above readonly
-      return p.reject('Planners can only run read-only shell commands (ls, cat, git log, etc).')
+      if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
+      if (writesStayWithin(input.command, ctx.workspacePath)) return p.allow()
+      return p.reject('Explorers can only run read-only shell commands, or write to the workspace ($M/).')
+    },
+    fileWrite(input, ctx) {
+      const expanded = expandWorkspacePath(input.path, ctx.workspacePath)
+      const resolved = resolve(ctx.cwd, expanded)
+      if (isPathWithin(resolved, ctx.workspacePath)) return p.allow()
+      return p.reject('Explorers can only write to the workspace ($M/).')
+    },
+    fileEdit(input, ctx) {
+      const expanded = expandWorkspacePath(input.path, ctx.workspacePath)
+      const resolved = resolve(ctx.cwd, expanded)
+      if (isPathWithin(resolved, ctx.workspacePath)) return p.allow()
+      return p.reject('Explorers can only edit files in the workspace ($M/).')
     },
     _default() { return p.allow() },
   }),

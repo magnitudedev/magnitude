@@ -7,6 +7,7 @@
 
 import type { ModelSelection } from './types'
 import type { DetectedProvider } from './detect'
+import { compareProviderOrder } from './registry'
 
 /**
  * Browser-compatible models keyed by provider ID.
@@ -111,11 +112,6 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
   ],
 }
 
-/** Provider priority for auto-detection (scans all, but prefers these in order) */
-const BROWSER_PROVIDER_PRIORITY = [
-  'anthropic', 'openai', 'github-copilot', 'openrouter', 'vercel', 'cerebras', 'zai', 'minimax', 'amazon-bedrock', 'google-vertex-anthropic', 'google', 'google-vertex',
-]
-
 /** Check if a provider+model combination is browser-compatible */
 export function isBrowserCompatible(providerId: string, modelId: string): boolean {
   const models = BROWSER_COMPATIBLE_MODELS[providerId]
@@ -138,10 +134,10 @@ export function detectBrowserModel(
   detectedProviders: DetectedProvider[],
   preferredProviderId?: string | null,
 ): ModelSelection | null {
-  // Build scan order: preferred provider first, then static priority (skipping preferred to avoid double-check)
+  const detectedIds = detectedProviders.map(d => d.provider.id).sort(compareProviderOrder)
   const scanOrder = preferredProviderId
-    ? [preferredProviderId, ...BROWSER_PROVIDER_PRIORITY.filter(p => p !== preferredProviderId)]
-    : BROWSER_PROVIDER_PRIORITY
+    ? [preferredProviderId, ...detectedIds.filter(id => id !== preferredProviderId)]
+    : detectedIds
 
   for (const pid of scanOrder) {
     const detected = detectedProviders.find(d => d.provider.id === pid)

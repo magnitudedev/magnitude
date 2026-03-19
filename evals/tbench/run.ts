@@ -175,6 +175,7 @@ function commandForRun(
 
   if (environment && environment !== 'local') {
     args.push('--env', environment)
+    args.push('--environment-kwarg', 'volumes=magnitude-binaries')
   }
 
   for (const task of selectedTasks) {

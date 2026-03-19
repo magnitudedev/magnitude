@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { BlockRenderer } from './block-renderer'
-import type { Block, HighlightRange } from '../utils/render-blocks'
+import { BlockRenderer } from '../markdown/block-renderer'
+import type { Block, HighlightRange } from '../markdown/blocks'
 import { buildMarkdownColorPalette, chatThemes } from '../utils/theme'
 
 export interface RenderTreeNode {
@@ -15,7 +15,10 @@ export type RenderTree = Array<RenderTreeNode | string>
 
 function normalizeType(type: unknown): string {
   if (typeof type === 'string') return type
-  if (typeof type === 'function') return type.displayName || type.name || 'anonymous'
+  if (typeof type === 'function') {
+    const fn = type as ((...args: any[]) => unknown) & { displayName?: string; name?: string }
+    return fn.displayName || fn.name || 'anonymous'
+  }
   if (type && typeof type === 'object') {
     const maybe = type as { displayName?: string; name?: string; $$typeof?: symbol; type?: unknown; render?: (...args: any[]) => any }
     if (maybe.displayName || maybe.name) return maybe.displayName || maybe.name || 'anonymous'

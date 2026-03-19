@@ -1,12 +1,15 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
-import { useRenderer } from '@opentui/react'
+import { useTerminalDimensions } from '@opentui/react'
+import { useMountedRef } from '../hooks/use-mounted-ref'
+import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { useTheme } from '../hooks/use-theme'
+import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
 import { BOX_CHARS } from '../utils/ui-constants'
-import { StreamingMarkdownContent } from './markdown-content'
+import { StreamingMarkdownContent } from '../markdown/markdown-content'
 import { Button } from './button'
-import { slugify } from '../utils/markdown-content-renderer'
+import { slugify } from '../markdown/blocks'
 
 
 
@@ -75,6 +78,7 @@ function CopyButton({ content, theme }: { content: string; theme: any }) {
   const [copied, setCopied] = useState(false)
   const [hovered, setHovered] = useState(false)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const safeTimeout = useSafeTimeout()
 
   const handleCopy = useCallback(() => {
     const proc = require('child_process').spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
@@ -82,15 +86,9 @@ function CopyButton({ content, theme }: { content: string; theme: any }) {
     proc.stdin.end()
 
     setCopied(true)
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => setCopied(false), 2000)
-  }, [content])
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [])
+    safeTimeout.clear(timerRef.current)
+    timerRef.current = safeTimeout.set(() => setCopied(false), 2000)
+  }, [content, safeTimeout])
 
   const color = copied ? theme.success : hovered ? theme.foreground : theme.muted
 
@@ -152,8 +150,10 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   artifactName, content, scrollToSection, onClose, onOpenArtifact, streaming
 }: ArtifactReaderPanelProps) {
   const theme = useTheme()
-  const renderer = useRenderer()
+  const { width: terminalWidth } = useTerminalDimensions()
   const scrollboxRef = useRef<any>(null)
+  const mountedRef = useMountedRef()
+  const safeTimeout = useSafeTimeout()
 
   const isWriteStream = streaming?.toolKey === 'artifactWrite'
   const isUpdateStream = streaming?.toolKey === 'artifactUpdate'
@@ -286,7 +286,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   )
 
   const highlightAnchorId = highlightCharRanges.length > 0 ? 'artifact-highlight-anchor' : undefined
-  const codeBlockWidth = Math.max(20, ((renderer as any)?.terminal?.width ?? (renderer as any)?.screen?.width ?? 80) - 10)
+  const codeBlockWidth = Math.max(20, terminalWidth - 10)
   const targetSectionScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const highlightAnchorScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -296,79 +296,104 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   )
 
   useEffect(() => {
-    if (targetSectionScrollTimeoutRef.current) clearTimeout(targetSectionScrollTimeoutRef.current)
+    safeTimeout.clear(targetSectionScrollTimeoutRef.current)
     if (!targetSectionId) return
 
-    const scrollbox = scrollboxRef.current
-    if (!scrollbox) return
-
-    scrollbox.stickyScroll = false
+    safeRenderableCall(
+      scrollboxRef.current,
+      (scrollbox) => {
+        scrollbox.stickyScroll = false
+      },
+      { mountedRef },
+    )
 
     const doScroll = () => {
-      const scrollbox = scrollboxRef.current
-      if (!scrollbox) return
+      const offsetY = safeRenderableAccess(
+        scrollboxRef.current,
+        (scrollbox) => {
+          const contentNode = scrollbox.content
+          if (!contentNode) return null
 
-      const contentNode = scrollbox.content
-      if (!contentNode) return
+          const targetEl = contentNode.findDescendantById(targetSectionId)
+          if (!targetEl) return null
 
-      const targetEl = contentNode.findDescendantById(targetSectionId)
-      if (!targetEl) return
+          let offsetY = 0
+          let node: any = targetEl
+          while (node && node !== contentNode) {
+            const yogaNode = node.yogaNode || node.getLayoutNode?.()
+            if (yogaNode) {
+              offsetY += yogaNode.getComputedTop()
+            }
+            node = node.parent
+          }
 
-      let offsetY = 0
-      let node: any = targetEl
-      while (node && node !== contentNode) {
-        const yogaNode = node.yogaNode || node.getLayoutNode?.()
-        if (yogaNode) {
-          offsetY += yogaNode.getComputedTop()
-        }
-        node = node.parent
-      }
+          return offsetY
+        },
+        {
+          mountedRef,
+          fallback: null,
+        },
+      )
+      if (offsetY == null) return
 
-      scrollbox.scrollTo(offsetY)
+      safeRenderableCall(
+        scrollboxRef.current,
+        (sb) => sb.scrollTo(offsetY),
+        { mountedRef },
+      )
     }
 
-    targetSectionScrollTimeoutRef.current = setTimeout(doScroll, 50)
+    targetSectionScrollTimeoutRef.current = safeTimeout.set(doScroll, 50)
 
     return () => {
-      if (targetSectionScrollTimeoutRef.current) {
-        clearTimeout(targetSectionScrollTimeoutRef.current)
-        targetSectionScrollTimeoutRef.current = null
-      }
+      safeTimeout.clear(targetSectionScrollTimeoutRef.current)
+      targetSectionScrollTimeoutRef.current = null
     }
-  }, [targetSectionId])
+  }, [targetSectionId, mountedRef, safeTimeout])
 
   useEffect(() => {
-    if (highlightAnchorScrollTimeoutRef.current) clearTimeout(highlightAnchorScrollTimeoutRef.current)
+    safeTimeout.clear(highlightAnchorScrollTimeoutRef.current)
     if (!highlightAnchorId) return
 
-    const scrollbox = scrollboxRef.current
-    if (!scrollbox) return
+    highlightAnchorScrollTimeoutRef.current = safeTimeout.set(() => {
+      const offsetY = safeRenderableAccess(
+        scrollboxRef.current,
+        (scrollbox) => {
+          const contentNode = scrollbox.content
+          if (!contentNode) return null
 
-    highlightAnchorScrollTimeoutRef.current = setTimeout(() => {
-      const contentNode = scrollbox.content
-      if (!contentNode) return
+          const targetEl = contentNode.findDescendantById(highlightAnchorId)
+          if (!targetEl) return null
 
-      const targetEl = contentNode.findDescendantById(highlightAnchorId)
-      if (!targetEl) return
+          let offsetY = 0
+          let node: any = targetEl
+          while (node && node !== contentNode) {
+            const yogaNode = node.yogaNode || node.getLayoutNode?.()
+            if (yogaNode) offsetY += yogaNode.getComputedTop()
+            node = node.parent
+          }
 
-      let offsetY = 0
-      let node: any = targetEl
-      while (node && node !== contentNode) {
-        const yogaNode = node.yogaNode || node.getLayoutNode?.()
-        if (yogaNode) offsetY += yogaNode.getComputedTop()
-        node = node.parent
-      }
+          return offsetY
+        },
+        {
+          mountedRef,
+          fallback: null,
+        },
+      )
+      if (offsetY == null) return
 
-      scrollbox.scrollTo(offsetY)
+      safeRenderableCall(
+        scrollboxRef.current,
+        (sb) => sb.scrollTo(offsetY),
+        { mountedRef },
+      )
     }, 50)
 
     return () => {
-      if (highlightAnchorScrollTimeoutRef.current) {
-        clearTimeout(highlightAnchorScrollTimeoutRef.current)
-        highlightAnchorScrollTimeoutRef.current = null
-      }
+      safeTimeout.clear(highlightAnchorScrollTimeoutRef.current)
+      highlightAnchorScrollTimeoutRef.current = null
     }
-  }, [highlightAnchorId, displayedContent])
+  }, [highlightAnchorId, displayedContent, mountedRef, safeTimeout])
 
   const headerLabel = scrollToSection
     ? `≡  ${artifactName} > ${scrollToSection}`

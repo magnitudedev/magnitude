@@ -1,3 +1,5 @@
+{{WORKSPACE_SECTION}}
+
 ## Communication
 
 You are a subagent.

@@ -7,14 +7,16 @@
  */
 
 import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
-import { readTool, treeTool, searchTool } from '../tools/fs'
+import { readTool, treeTool, searchTool, viewTool } from '../tools/fs'
+import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool } from '../tools/artifact-tools'
 import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
-import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const intentLens = defineThinkingLens({
   name: 'intent',
@@ -44,7 +46,9 @@ const tools = toolSet({
   fileRead:       readTool,
   fileTree:       treeTool,
   fileSearch:     searchTool,
+  fileView:       viewTool,
   shell:          shellTool,
+  shellBg:        shellBgTool,
   artifactRead:   artifactReadTool,
 
   agentCreate:    agentCreateTool,
@@ -58,12 +62,14 @@ export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [intentLens, qualityLens, skepticismLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input, ctx) {
       const result = classifyShellCommand(input.command)
+      const allowedPrefixes = ctx.workspacePath ? [ctx.workspacePath] : undefined
       if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
-      if (detectsOutsideCwd(input.command, ctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+      if (!writesStayWithin(input.command, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
       return p.allow()
     },
     _default() { return p.allow() },

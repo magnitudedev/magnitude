@@ -1,6 +1,7 @@
 import type { ProviderDefinition } from './types'
 import type { ModelSlot } from './state/provider-state'
 import { isBrowserCompatible } from './browser-models'
+import { compareProviderOrder } from './registry'
 
 export interface ModelRecommendationRule {
   provider?: string | RegExp
@@ -103,7 +104,7 @@ export function resolveRecommendedModel(
     const aPreferred = a.id === options?.preferredProviderId ? -1 : 0
     const bPreferred = b.id === options?.preferredProviderId ? -1 : 0
     if (aPreferred !== bPreferred) return aPreferred - bPreferred
-    return a.name.localeCompare(b.name)
+    return compareProviderOrder(a.id, b.id)
   })
 
   for (const rule of MODEL_RECOMMENDATION_RULES) {

@@ -36,9 +36,9 @@ export function buildInput(element: ParsedElement, binding: XmlTagBinding): Reco
     }
   }
 
-  // Body → input field
+  // Body → input field (literal, no trimming)
   if (binding.body) {
-    setNestedValue(input, binding.body, element.body.trim())
+    setNestedValue(input, binding.body, element.body)
   }
 
   // ChildTags → scalar fields (fixed named child elements)
@@ -47,7 +47,7 @@ export function buildInput(element: ParsedElement, binding: XmlTagBinding): Reco
       const xmlTag = ct.tag
       const child = element.children.find(c => c.tagName === xmlTag)
       if (child) {
-        setNestedValue(input, ct.field, child.body.replace(/^\n/, '').replace(/\n$/, ''))
+        setNestedValue(input, ct.field, child.body)
       }
     }
   }
@@ -72,9 +72,9 @@ export function buildInput(element: ParsedElement, binding: XmlTagBinding): Reco
           }
         }
 
-        // Child body
+        // Child body (literal, no trimming)
         if (childBinding.body) {
-          entry[childBinding.body] = child.body.trim()
+          entry[childBinding.body] = child.body
         }
 
         entries.push(entry)
@@ -93,7 +93,7 @@ export function buildInput(element: ParsedElement, binding: XmlTagBinding): Reco
     for (const child of matchingChildren) {
       const key = child.attributes.get(keyAttr)
       if (key !== undefined) {
-        record[String(key)] = child.body.trim()
+        record[String(key)] = child.body
       }
     }
 

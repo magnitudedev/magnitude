@@ -5,6 +5,7 @@ import type {
 import { isBrowserCompatible } from '@magnitudedev/providers'
 import type { ModelSlot, ProviderDefinition } from '@magnitudedev/providers'
 import {
+  compareProviderOrder,
   getModelRecommendation,
   resolveRecommendedModel,
 } from '@magnitudedev/providers'
@@ -50,8 +51,11 @@ function formatLocalModelName(localProviderConfig?: { baseUrl?: string | null; m
   return localProviderConfig?.baseUrl?.trim() || 'Local model'
 }
 
-function normalizeSearch(search: string): string {
-  return search.trim().toLowerCase()
+function normalizeForSearch(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/(\d)[-_.](\d)/g, '$1.$2')  // keep version numbers together: 4-5 → 4.5
+    .replace(/[-_]/g, ' ')                // word separators → space
 }
 
 function compareItemsForSlot(a: ModelPickerItem, b: ModelPickerItem, slot: ModelSlot): number {
@@ -128,8 +132,7 @@ export function buildModelPickerItems({
 
   return items.sort((a, b) => {
     if (a.connected !== b.connected) return Number(b.connected) - Number(a.connected)
-    if (a.providerName !== b.providerName) return a.providerName.localeCompare(b.providerName)
-    if (a.providerId !== b.providerId) return a.providerId.localeCompare(b.providerId)
+    if (a.providerId !== b.providerId) return compareProviderOrder(a.providerId, b.providerId)
     return compareItemsForSlot(a, b, selectingModelFor)
   })
 }
@@ -141,18 +144,17 @@ export function filterModelPickerItems({
   showRecommendedOnly,
   search,
 }: FilterModelPickerItemsArgs): ModelPickerItem[] {
-  const normalized = normalizeSearch(search)
+  const terms = normalizeForSearch(search).trim().split(/\s+/).filter(Boolean)
 
   return items.filter((item) => {
     if (!showAllProviders && !item.connected) return false
     if (showRecommendedOnly && !item.recommended) return false
-    if (!normalized) return true
+    if (terms.length === 0) return true
 
-    return [
-      item.providerName,
-      item.modelName,
-      item.modelId,
-    ].some(value => value.toLowerCase().includes(normalized))
+    const haystack = normalizeForSearch(
+      `${item.providerName} ${item.modelName} ${item.modelId}`
+    )
+    return terms.every(term => haystack.includes(term))
   })
 }
 
@@ -171,7 +173,7 @@ export function resolveSlotDefaultSelection({
     const aPreferred = a.id === preferredProviderId ? -1 : 0
     const bPreferred = b.id === preferredProviderId ? -1 : 0
     if (aPreferred !== bPreferred) return aPreferred - bPreferred
-    return a.name.localeCompare(b.name)
+    return compareProviderOrder(a.id, b.id)
   })
 
   // 1. Try hardcoded per-provider defaults first

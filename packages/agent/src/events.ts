@@ -62,6 +62,7 @@ export interface GitContext {
 
 export interface SessionContext {
   readonly cwd: string
+  readonly workspacePath: string
   readonly platform: 'macos' | 'linux' | 'windows'
   readonly shell: string
   readonly timezone: string
@@ -145,7 +146,7 @@ export interface ObservedResult {
   readonly toolCallId: string
   readonly tagName: string
   readonly query: string
-  readonly content: string
+  readonly content: ContentPart[]
 }
 
 export interface TurnCompleted {
@@ -272,6 +273,68 @@ export type ToolResult =
   | { readonly status: 'error'; readonly message: string }
   | { readonly status: 'rejected'; readonly message: string; readonly reason?: string }
   | { readonly status: 'interrupted' }
+
+export interface BackgroundProcessRegistered {
+  readonly type: 'background_process_registered'
+  readonly forkId: string | null
+  readonly pid: number
+  readonly command: string
+  readonly reason: 'background' | 'timeout_exceeded'
+  readonly sourceTurnId: string
+  readonly startedAt: number
+  readonly initialStdout: string
+  readonly initialStderr: string
+}
+
+export type BackgroundProcessOutput =
+  | {
+      readonly type: 'background_process_output'
+      readonly forkId: string | null
+      readonly pid: number
+      readonly mode: 'inline'
+      readonly stdoutChunk: string
+      readonly stderrChunk: string
+    }
+  | {
+      readonly type: 'background_process_output'
+      readonly forkId: string | null
+      readonly pid: number
+      readonly mode: 'tail'
+      readonly stdoutChunk: string
+      readonly stderrChunk: string
+      readonly stdoutLines: number
+      readonly stderrLines: number
+    }
+
+export interface BackgroundProcessDemoted {
+  readonly type: 'background_process_demoted'
+  readonly forkId: string | null
+  readonly pid: number
+  readonly stdoutFilePath: string
+  readonly stderrFilePath: string
+}
+
+export interface BackgroundProcessExited {
+  readonly type: 'background_process_exited'
+  readonly forkId: string | null
+  readonly pid: number
+  readonly exitCode: number | null
+  readonly signal: string | null
+  readonly status: 'exited' | 'killed'
+}
+
+export interface BackgroundProcessAutoKilled {
+  readonly type: 'background_process_auto_killed'
+  readonly forkId: string | null
+  readonly pid: number
+  readonly command: string
+}
+
+export interface BackgroundProcessPromoted {
+  readonly type: 'background_process_promoted'
+  readonly forkId: string | null
+  readonly pid: number
+}
 
 
 // =============================================================================
@@ -478,6 +541,12 @@ export type AppEvent =
   | LensEnd
   | MessageEnd
   | ToolEvent
+  | BackgroundProcessRegistered
+  | BackgroundProcessOutput
+  | BackgroundProcessDemoted
+  | BackgroundProcessExited
+  | BackgroundProcessAutoKilled
+  | BackgroundProcessPromoted
   | AutopilotMessageGenerated
   | AutopilotToggled
   | Wake

@@ -3,17 +3,18 @@ import { emit, NOOP } from './types'
 import { advancePrefixMatch } from './prefix-match'
 
 export function flushPendingMessageNewline(frame: MessageBodyFrame): ParseEvent[] {
-  if (!frame.pendingNewline) return []
-  frame.pendingNewline = false
-  frame.body += '\n'
-  return [{ _tag: 'MessageBodyChunk', id: frame.id, text: '\n' }]
+  if (frame.pendingNewlines === 0) return []
+  const text = '\n'.repeat(frame.pendingNewlines)
+  frame.pendingNewlines = 0
+  frame.body += text
+  return [{ _tag: 'MessageBodyChunk', id: frame.id, text }]
 }
 
-function toMessageBody(frame: { id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean }): MessageBodyFrame {
-  return { _tag: 'MessageBody', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, pendingLt: false, depth: frame.depth, pendingNewline: frame.pendingNewline }
+function toMessageBody(frame: { id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewlines: number }): MessageBodyFrame {
+  return { _tag: 'MessageBody', id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw, body: frame.body, pendingLt: false, depth: frame.depth, pendingNewlines: frame.pendingNewlines }
 }
 
-function flushLiteralToBody(state: ParseStack, frame: { id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewline: boolean }, literal: string): StepResult {
+function flushLiteralToBody(state: ParseStack, frame: { id: string; dest: string; artifactsRaw: string | null; body: string; depth: number; pendingNewlines: number }, literal: string): StepResult {
   const bodyFrame = toMessageBody(frame)
   state[state.length - 1] = bodyFrame
   const events: ParseEvent[] = []
@@ -31,7 +32,7 @@ export function stepMessageBody({ frame, state, ch }: { frame: MessageBodyFrame;
       state[state.length - 1] = {
         _tag: 'MessageClosePrefixMatch',
         id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw,
-        body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline,
+        body: frame.body, depth: frame.depth, pendingNewlines: frame.pendingNewlines,
         prefix: { candidates: ['message'], matched: '', raw: '</' },
       }
       return NOOP
@@ -40,7 +41,7 @@ export function stepMessageBody({ frame, state, ch }: { frame: MessageBodyFrame;
       state[state.length - 1] = {
         _tag: 'MessageOpenPrefixMatch',
         id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw,
-        body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline,
+        body: frame.body, depth: frame.depth, pendingNewlines: frame.pendingNewlines,
         prefix: { candidates: ['message'], matched: 'm', raw: '<m' },
       }
       return NOOP
@@ -55,7 +56,7 @@ export function stepMessageBody({ frame, state, ch }: { frame: MessageBodyFrame;
   if (ch === '<') { frame.pendingLt = true; return NOOP }
   if (ch === '\n') {
     if (frame.body.length === 0 && frame.depth === 0) return NOOP
-    frame.pendingNewline = true
+    frame.pendingNewlines++
     return NOOP
   }
   events.push(...flushPendingMessageNewline(frame))
@@ -92,7 +93,7 @@ export function stepMessageOpenPrefixMatch({ frame, state, ch }: { frame: Messag
   state[state.length - 1] = {
     _tag: 'MessageOpenTagTail',
     id: frame.id, dest: frame.dest, artifactsRaw: frame.artifactsRaw,
-    body: frame.body, depth: frame.depth, pendingNewline: frame.pendingNewline,
+    body: frame.body, depth: frame.depth, pendingNewlines: frame.pendingNewlines,
     raw: advanced.raw,
     selfClosing: advanced.delimiter === '/',
   }

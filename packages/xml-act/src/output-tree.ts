@@ -7,15 +7,21 @@
  */
 
 import { Document, Node, Element, Text, Attr } from 'slimdom'
-import type { XmlBinding, XmlChildBinding } from '@magnitudedev/tools'
+import { AST } from '@effect/schema'
+import type { Schema } from '@effect/schema'
+import type { XmlBinding, XmlChildBinding, ImageMediaType } from '@magnitudedev/tools'
 
 // =============================================================================
 // AST Type
 // =============================================================================
 
+export type OutputImageNode =
+  { readonly tag: 'image'; readonly base64: string; readonly mediaType: ImageMediaType; readonly width: number; readonly height: number }
+
 export type OutputNode =
   | { readonly tag: 'element'; readonly name: string; readonly attrs: Record<string, string>; readonly children: readonly OutputNode[] }
   | { readonly tag: 'text'; readonly value: string }
+  | OutputImageNode
 
 // =============================================================================
 // Helpers
@@ -29,6 +35,10 @@ function text(value: string): OutputNode {
   return { tag: 'text', value }
 }
 
+function image(base64: string, mediaType: ImageMediaType, width: number, height: number): OutputImageNode {
+  return { tag: 'image', base64, mediaType, width, height }
+}
+
 // =============================================================================
 // Rendering
 // =============================================================================
@@ -40,6 +50,7 @@ function text(value: string): OutputNode {
  */
 export function outputToText(node: OutputNode): string {
   if (node.tag === 'text') return node.value
+  if (node.tag === 'image') return `[image ${node.mediaType} ${node.width}x${node.height}]`
 
   const attrStr = Object.entries(node.attrs)
     .map(([k, v]) => ` ${k}="${v}"`)
@@ -61,16 +72,27 @@ export function outputToText(node: OutputNode): string {
  * Convert OutputNode to slimdom DOM node for fontoxpath XPath evaluation.
  * Returns the document element (root element).
  */
-export function outputToDOM(node: OutputNode): { doc: Document; root: Node } {
+export function outputToDOM(node: OutputNode): { doc: Document; root: Node; imageMap: Map<Node, OutputImageNode> } {
   const doc = new Document()
-  const root = nodeToDOM(node, doc)
+  const imageMap = new Map<Node, OutputImageNode>()
+  const root = nodeToDOM(node, doc, imageMap)
   doc.appendChild(root)
-  return { doc, root }
+  return { doc, root, imageMap }
 }
 
-function nodeToDOM(node: OutputNode, doc: Document): Node {
+function nodeToDOM(node: OutputNode, doc: Document, imageMap: Map<Node, OutputImageNode>): Node {
   if (node.tag === 'text') {
     return doc.createTextNode(node.value)
+  }
+
+  if (node.tag === 'image') {
+    // Images are represented as placeholder DOM nodes for XPath, then recovered via imageMap.
+    const elem = doc.createElement('image')
+    elem.setAttribute('mediaType', node.mediaType)
+    elem.setAttribute('width', String(node.width))
+    elem.setAttribute('height', String(node.height))
+    imageMap.set(elem, node)
+    return elem
   }
 
   const elem = doc.createElement(node.name)
@@ -78,7 +100,7 @@ function nodeToDOM(node: OutputNode, doc: Document): Node {
     elem.setAttribute(k, v)
   }
   for (const child of node.children) {
-    elem.appendChild(nodeToDOM(child, doc))
+    elem.appendChild(nodeToDOM(child, doc, imageMap))
   }
   return elem
 }
@@ -130,8 +152,13 @@ export function buildOutputTree(
   output: unknown,
   binding: XmlBinding<unknown>,
   echoAttrs?: Record<string, string>,
+  options?: { readonly outputSchema?: Schema.Schema<any> },
 ): OutputNode {
   const attrs: Record<string, string> = { ...(echoAttrs ?? {}) }
+
+  if ((isToolImageSchema(options?.outputSchema) || (!options?.outputSchema && hasImageValueShape(output))) && hasImageValueShape(output)) {
+    return el(tagName, attrs, [image(output.base64, output.mediaType, output.width, output.height)])
+  }
 
   // Scalar outputs (string, number, boolean)
   if (typeof output === 'string' || typeof output === 'number' || typeof output === 'boolean') {
@@ -148,7 +175,71 @@ export function buildOutputTree(
     throw new Error(`buildOutputTree: tool output <${tagName}> is missing required xmlOutput binding (type: 'tag')`)
   }
 
-  return buildWithBinding(tagName, output, binding, attrs)
+  return buildWithBinding(tagName, output, binding, attrs, options)
+}
+
+function unwrapAst(ast: AST.AST): AST.AST {
+  if (ast._tag === 'Transformation') return unwrapAst(ast.from)
+  if (ast._tag === 'Refinement') return unwrapAst(ast.from)
+  return ast
+}
+
+function isToolImageAst(ast: AST.AST): boolean {
+  const unwrapped = unwrapAst(ast)
+  const identifier = unwrapped.annotations?.[AST.IdentifierAnnotationId]
+  if (identifier === 'ToolImage') return true
+  if (unwrapped._tag === 'Union') return unwrapped.types.some(isToolImageAst)
+  return false
+}
+
+function isToolImageSchema(schema?: Schema.Schema<any>): boolean {
+  return !!schema && isToolImageAst(schema.ast)
+}
+
+function getFieldAstByPath(ast: AST.AST, path: string): AST.AST | undefined {
+  const segments = path.split('.')
+  let current = unwrapAst(ast)
+
+  for (let i = 0; i < segments.length; i++) {
+    if (current._tag !== 'TypeLiteral') return undefined
+    const prop = current.propertySignatures.find(p => String(p.name) === segments[i])
+    if (!prop) return undefined
+    if (i === segments.length - 1) return prop.type
+    current = unwrapAst(prop.type)
+  }
+
+  return undefined
+}
+
+function getArrayElementAstByField(ast: AST.AST, fieldName: string): AST.AST | undefined {
+  const unwrapped = unwrapAst(ast)
+  if (unwrapped._tag !== 'TypeLiteral') return undefined
+
+  const prop = unwrapped.propertySignatures.find(p => String(p.name) === fieldName)
+  if (!prop) return undefined
+
+  const propAst = unwrapAst(prop.type)
+  if (propAst._tag === 'TupleType' && propAst.rest.length > 0) {
+    return propAst.rest[0].type
+  }
+  return undefined
+}
+
+function isImageMediaType(value: unknown): value is ImageMediaType {
+  return value === 'image/png' || value === 'image/jpeg' || value === 'image/webp' || value === 'image/gif'
+}
+
+function hasImageValueShape(value: unknown): value is { readonly base64: string; readonly mediaType: ImageMediaType; readonly width: number; readonly height: number } {
+  return !!value
+    && typeof value === 'object'
+    && 'base64' in value
+    && 'mediaType' in value
+    && 'width' in value
+    && 'height' in value
+    && typeof (value as Record<string, unknown>).base64 === 'string'
+    && isImageMediaType((value as Record<string, unknown>).mediaType)
+    && typeof (value as Record<string, unknown>).width === 'number'
+    && typeof (value as Record<string, unknown>).height === 'number'
 }
 
 function buildWithBinding(
@@ -156,6 +247,7 @@ function buildWithBinding(
   output: unknown,
   binding: Extract<XmlBinding<unknown>, { type: 'tag' }>,
   attrs: Record<string, string>,
+  options?: { readonly outputSchema?: Schema.Schema<any> },
 ): OutputNode {
   // Array outputs with items binding
   if (Array.isArray(output) && binding.items) {
@@ -189,7 +281,12 @@ function buildWithBinding(
 
   // Body only
   if (hasBody && !hasNested) {
-    return el(tagName, attrs, [text(String(obj[binding.body!]))])
+    const bodyAst = options?.outputSchema ? getFieldAstByPath(options.outputSchema.ast, String(binding.body)) : undefined
+    const bodyValue = obj[binding.body!]
+    if (((bodyAst && isToolImageAst(bodyAst)) || (!bodyAst && hasImageValueShape(bodyValue))) && hasImageValueShape(bodyValue)) {
+      return el(tagName, attrs, [image(bodyValue.base64, bodyValue.mediaType, bodyValue.width, bodyValue.height)])
+    }
+    return el(tagName, attrs, [text(String(bodyValue))])
   }
 
   // Has nested content
@@ -199,7 +296,8 @@ function buildWithBinding(
     for (const ct of binding.childTags!) {
       const val = resolveNestedField(obj, ct.field)
       if (val !== undefined) {
-        children.push(el(ct.tag, {}, [text(String(val))]))
+        const fieldAst = options?.outputSchema ? getFieldAstByPath(options.outputSchema.ast, ct.field) : undefined
+        children.push(buildFieldNode(ct.tag, val, fieldAst, {}, { outputSchema: options?.outputSchema }))
       }
     }
   }
@@ -208,7 +306,8 @@ function buildWithBinding(
     for (const child of binding.children!) {
       const arr = obj[child.field as string]
       if (Array.isArray(arr)) {
-        buildChildArray(children, arr, child)
+        const elementAst = options?.outputSchema ? getArrayElementAstByField(options.outputSchema.ast, String(child.field)) : undefined
+        buildChildArray(children, arr, child, elementAst, options)
       }
     }
   }
@@ -216,15 +315,22 @@ function buildWithBinding(
   if (hasChildRecord) {
     const { field, tag: childTag, keyAttr } = binding.childRecord!
     const record = obj[field as string]
+    const valueAst = options?.outputSchema ? getFieldAstByPath(options.outputSchema.ast, String(field)) : undefined
     if (record && typeof record === 'object') {
       for (const [key, val] of Object.entries(record as Record<string, unknown>)) {
-        children.push(el(childTag, { [keyAttr]: key }, [text(String(val))]))
+        children.push(buildFieldNode(childTag, val, valueAst, { [keyAttr]: key }, { outputSchema: options?.outputSchema }))
       }
     }
   }
 
   if (hasBody) {
-    children.push(text(String(obj[binding.body!])))
+    const bodyValue = obj[binding.body!]
+    const bodyAst = options?.outputSchema ? getFieldAstByPath(options.outputSchema.ast, String(binding.body)) : undefined
+    if (((bodyAst && isToolImageAst(bodyAst)) || (!bodyAst && hasImageValueShape(bodyValue))) && hasImageValueShape(bodyValue)) {
+      children.push(image(bodyValue.base64, bodyValue.mediaType, bodyValue.width, bodyValue.height))
+    } else {
+      children.push(text(String(bodyValue)))
+    }
   }
 
   return el(tagName, attrs, children)
@@ -275,7 +381,26 @@ function buildItem(
   return el(itemTag, itemAttrs, [])
 }
 
-function buildChildArray(children: OutputNode[], arr: unknown[], child: XmlChildBinding): void {
+function buildFieldNode(
+  tagName: string,
+  value: unknown,
+  fieldAst?: AST.AST,
+  attrs: Record<string, string> = {},
+  options?: { readonly outputSchema?: Schema.Schema<any> },
+): OutputNode {
+  if (((fieldAst && isToolImageAst(fieldAst)) || (!fieldAst && hasImageValueShape(value))) && hasImageValueShape(value)) {
+    return el(tagName, attrs, [image(value.base64, value.mediaType, value.width, value.height)])
+  }
+  return el(tagName, attrs, [text(String(value))])
+}
+
+function buildChildArray(
+  children: OutputNode[],
+  arr: unknown[],
+  child: XmlChildBinding,
+  elementAst?: AST.AST,
+  options?: { readonly outputSchema?: Schema.Schema<any> },
+): void {
   const childTag = child.tag ?? child.field
   for (const item of arr) {
     const itemObj = (item && typeof item === 'object') ? item as Record<string, unknown> : {}
@@ -289,7 +414,11 @@ function buildChildArray(children: OutputNode[], arr: unknown[], child: XmlChild
       }
     }
     if (child.body && itemObj[child.body] !== undefined) {
-      children.push(el(childTag, childAttrs, [text(String(itemObj[child.body]))]))
+      const bodyAst =
+        elementAst && unwrapAst(elementAst)._tag === 'TypeLiteral'
+          ? getFieldAstByPath(elementAst, String(child.body))
+          : undefined
+      children.push(buildFieldNode(childTag, itemObj[child.body], bodyAst, childAttrs, options))
     } else {
       children.push(el(childTag, childAttrs, []))
     }

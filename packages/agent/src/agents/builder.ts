@@ -6,15 +6,17 @@
  */
 
 import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
-import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
+import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
+import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
-import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
 const qualityLens = defineThinkingLens({
   name: 'quality',
@@ -34,7 +36,9 @@ const tools = toolSet({
   fileEdit:       editTool,
   fileTree:       treeTool,
   fileSearch:     searchTool,
+  fileView:       viewTool,
   shell:          shellTool,
+  shellBg:        shellBgTool,
   webSearch:      webSearchTool,
   webFetch:       webFetchTool,
   artifactRead:   artifactReadTool,
@@ -49,20 +53,24 @@ export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools,
   model: 'secondary',
   systemPrompt,
   thinkingLenses: [qualityLens, turnLens],
+  observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
     shell(input, pctx) {
       const result = classifyShellCommand(input.command)
+      const allowedPrefixes = [pctx.workspacePath]
       if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-      if (!pctx.disableCwdSafeguards && detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+      if (!pctx.disableCwdSafeguards && !writesStayWithin(input.command, pctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
       return p.allow()
     },
     fileWrite(input, ctx) {
-      if (!ctx.disableCwdSafeguards && isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
+      const allowedPrefixes = [ctx.workspacePath]
+      if (!ctx.disableCwdSafeguards && !isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
       return p.allow()
     },
     fileEdit(input, ctx) {
-      if (!ctx.disableCwdSafeguards && isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
+      const allowedPrefixes = [ctx.workspacePath]
+      if (!ctx.disableCwdSafeguards && !isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
       return p.allow()
     },
     _default() { return p.allow() },

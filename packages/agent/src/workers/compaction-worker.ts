@@ -36,6 +36,7 @@ import { ModelResolver, CodingAgentCompact, ProviderState } from '@magnitudedev/
 import { AppConfig } from '@magnitudedev/storage'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
+import type { SessionContext } from '../events'
 import { withTraceScope } from '../tracing'
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
@@ -174,8 +175,13 @@ function startCompaction(
     const contextEffect = Effect.gen(function* () {
       const config = yield* AppConfig
       const memoryEnabled = yield* config.getMemoryEnabled()
+      const sessionCtx = yield* read(SessionContextProjection)
+      const currentWorkspacePath = sessionCtx.context?.workspacePath ?? ''
       return yield* Effect.tryPromise({
-        try: () => collectSessionContext({ memoryEnabled }),
+        try: async () => {
+          const base = await collectSessionContext({ memoryEnabled })
+          return { ...base, workspacePath: currentWorkspacePath } as SessionContext
+        },
         catch: (error) => error instanceof Error ? error : new Error(String(error))
       })
     }).pipe(

@@ -22,9 +22,14 @@ import {
 
   TAB_WIDTH,
 } from './multiline-input.helpers'
+import { useMountedRef } from '../hooks/use-mounted-ref'
 import { usePasteHandler } from '../hooks/use-paste-handler'
+import { useSafeEvent } from '../hooks/use-safe-event'
+import { useSafeInterval } from '../hooks/use-safe-interval'
+import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { useTheme } from '../hooks/use-theme'
 
+import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
 import { terminalSupportsRgb24 } from '../utils/theme'
 import { stepCursorVertical } from './multiline-input.helpers'
 
@@ -195,15 +200,14 @@ export function InputCursor({
 }: CursorIndicatorProps) {
   // false = normal/visible, true = invisible
   const [isBlinkHidden, setIsInvisible] = useState(false)
-  const blinkIntervalTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const blinkIntervalTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const safeTimeout = useSafeTimeout()
+  const safeInterval = useSafeInterval()
 
   // Handle blinking (toggle visible/invisible) when idle
   useEffect(() => {
-    // Clear any existing interval
-    if (blinkIntervalTimerRef.current) {
-      clearInterval(blinkIntervalTimerRef.current)
-      blinkIntervalTimerRef.current = null
-    }
+    safeInterval.clear(blinkIntervalTimerRef.current)
+    blinkIntervalTimerRef.current = null
 
     // Reset cursor to visible
     setIsInvisible(false)
@@ -211,22 +215,18 @@ export function InputCursor({
     // Only blink if shouldBlink is enabled, focused, and visible
     if (!shouldBlink || !focused || !visible) return
 
-    // Set up idle detection
-    const blinkStartTimer = setTimeout(() => {
-      // Start blinking interval (toggle between visible and invisible)
-      blinkIntervalTimerRef.current = setInterval(() => {
+    const blinkStartTimer = safeTimeout.set(() => {
+      blinkIntervalTimerRef.current = safeInterval.set(() => {
         setIsInvisible((prev) => !prev)
       }, blinkInterval)
     }, blinkDelay)
 
     return () => {
-      clearTimeout(blinkStartTimer)
-      if (blinkIntervalTimerRef.current) {
-        clearInterval(blinkIntervalTimerRef.current)
-        blinkIntervalTimerRef.current = null
-      }
+      safeTimeout.clear(blinkStartTimer)
+      safeInterval.clear(blinkIntervalTimerRef.current)
+      blinkIntervalTimerRef.current = null
     }
-  }, [visible, focused, shouldBlink, blinkDelay, blinkInterval])
+  }, [visible, focused, shouldBlink, blinkDelay, blinkInterval, safeTimeout, safeInterval])
 
   if (!visible || !focused) {
     return null
@@ -313,6 +313,7 @@ export const MultilineInput = forwardRef<
   const effectiveShouldBlinkCursor = shouldBlinkCursor ?? true
 
   const scrollBoxRef = useRef<ScrollBoxRenderable | null>(null)
+  const mountedRef = useMountedRef()
   const [lastActivity, setLastActivity] = useState(Date.now())
 
   const stickyColumnRef = useRef<number | null>(null)
@@ -356,36 +357,54 @@ export const MultilineInput = forwardRef<
 
   const textRef = useRef<TextRenderable | null>(null)
 
-  const lineInfo = textRef.current
-    ? (
-        (textRef.current satisfies TextRenderable as any)
-          .textBufferView as TextBufferView
-      ).lineInfo
-    : null
+  const lineInfo = safeRenderableAccess(
+    textRef.current,
+    (el) => ((el satisfies TextRenderable as any).textBufferView as TextBufferView).lineInfo,
+    {
+      mountedRef,
+      fallback: null,
+    },
+  )
 
   // Focus/blur scrollbox when focused prop changes
   const prevFocusedRef = useRef(false)
   useEffect(() => {
     if (focused && !prevFocusedRef.current) {
-      (scrollBoxRef.current as FocusableScrollBox | null)?.focus?.()
+      safeRenderableCall(
+        scrollBoxRef.current as FocusableScrollBox | null,
+        (sb) => sb.focus?.(),
+        { mountedRef },
+      )
     } else if (!focused && prevFocusedRef.current) {
-      (scrollBoxRef.current as FocusableScrollBox | null)?.blur?.()
+      safeRenderableCall(
+        scrollBoxRef.current as FocusableScrollBox | null,
+        (sb) => sb.blur?.(),
+        { mountedRef },
+      )
     }
     prevFocusedRef.current = focused
-  }, [focused])
+  }, [focused, mountedRef])
 
   // Expose focus/blur for imperative use cases
   useImperativeHandle(
     forwardedRef,
     () => ({
       focus: () => {
-        (scrollBoxRef.current as FocusableScrollBox | null)?.focus?.()
+        safeRenderableCall(
+          scrollBoxRef.current as FocusableScrollBox | null,
+          (sb) => sb.focus?.(),
+          { mountedRef },
+        )
       },
       blur: () => {
-        (scrollBoxRef.current as FocusableScrollBox | null)?.blur?.()
+        safeRenderableCall(
+          scrollBoxRef.current as FocusableScrollBox | null,
+          (sb) => sb.blur?.(),
+          { mountedRef },
+        )
       },
     }),
-    [],
+    [mountedRef],
   )
 
   const cursorRow = lineInfo
@@ -399,19 +418,39 @@ export const MultilineInput = forwardRef<
 
   // Auto-scroll to cursor when content changes
   useEffect(() => {
-    const scrollBox = scrollBoxRef.current
-    if (scrollBox && focused) {
-      const scrollPosition = Math.min(
-        Math.max(
-          scrollBox.verticalScrollBar.scrollPosition,
-          Math.max(0, cursorRow - scrollBox.viewport.height + 1),
-        ),
-        Math.min(scrollBox.scrollHeight - scrollBox.viewport.height, cursorRow),
-      )
+    const scrollMetrics = focused
+      ? safeRenderableAccess(
+          scrollBoxRef.current,
+          (scrollBox) => ({
+            current: scrollBox.verticalScrollBar.scrollPosition,
+            viewportHeight: scrollBox.viewport.height,
+            scrollHeight: scrollBox.scrollHeight,
+          }),
+          {
+            mountedRef,
+            fallback: null,
+          },
+        )
+      : null
 
-      scrollBox.verticalScrollBar.scrollPosition = scrollPosition
-    }
-  }, [scrollBoxRef.current, cursorPosition, focused, cursorRow])
+    if (!scrollMetrics) return
+
+    const scrollPosition = Math.min(
+      Math.max(
+        scrollMetrics.current,
+        Math.max(0, cursorRow - scrollMetrics.viewportHeight + 1),
+      ),
+      Math.min(scrollMetrics.scrollHeight - scrollMetrics.viewportHeight, cursorRow),
+    )
+
+    safeRenderableCall(
+      scrollBoxRef.current,
+      (scrollBox) => {
+        scrollBox.verticalScrollBar.scrollPosition = scrollPosition
+      },
+      { mountedRef },
+    )
+  }, [cursorPosition, focused, cursorRow, mountedRef])
 
   const sortedPasteSegments = sortSegments(pasteSegments)
   const sortedMentionSegments = sortMentionSegments(mentionSegments)
@@ -454,11 +493,20 @@ export const MultilineInput = forwardRef<
 
   // Helper to get current selection in original text coordinates
   const readSelectedRange = useCallback((): { start: number; end: number } | null => {
-    const textBufferView = (textRef.current as any)?.textBufferView
-    if (!textBufferView?.hasSelection?.() || !textBufferView?.getSelection) {
-      return null
-    }
-    const selection = textBufferView.getSelection()
+    const selection = safeRenderableAccess(
+      textRef.current,
+      (el) => {
+        const textBufferView = (el as any)?.textBufferView
+        if (!textBufferView?.hasSelection?.() || !textBufferView?.getSelection) {
+          return null
+        }
+        return textBufferView.getSelection()
+      },
+      {
+        mountedRef,
+        fallback: null,
+      },
+    )
     if (!selection) return null
 
     // Convert from render positions to original text positions
@@ -467,13 +515,16 @@ export const MultilineInput = forwardRef<
 
     if (start === end) return null
     return { start, end }
-  }, [value])
+  }, [value, mountedRef])
 
   // Helper to clear the current selection
   const dismissSelection = useCallback(() => {
-    // Use renderer's clearSelection for proper visual clearing
-    ;(renderer as any)?.clearSelection?.()
-  }, [renderer])
+    safeRenderableCall(
+      renderer as any,
+      (r) => r.clearSelection?.(),
+      { mountedRef },
+    )
+  }, [renderer, mountedRef])
 
   // Helper to delete selected text and return new value and cursor position
   // Helper to handle selection deletion and call onChange if selection existed
@@ -612,133 +663,142 @@ export const MultilineInput = forwardRef<
   )
 
   // Handle mouse clicks to position cursor
-  const handleMouseDown = useCallback(
-    (event: MouseEvent) => {
-      if (!focused) return
+  const handleMouseDown = useSafeEvent(
+    useCallback(
+      (event: MouseEvent) => {
+        if (!focused) return
 
-      // Clear sticky column since this is not up/down navigation
-      stickyColumnRef.current = null
+        // Clear sticky column since this is not up/down navigation
+        stickyColumnRef.current = null
 
-      const scrollBox = scrollBoxRef.current
-      if (!scrollBox) return
+        const renderableData = safeRenderableAccess(
+          scrollBoxRef.current,
+          (scrollBox) => ({
+            viewportTop: Number((scrollBox as any).viewport?.y ?? 0),
+            viewportLeft: Number((scrollBox as any).viewport?.x ?? 0),
+            scrollPosition: scrollBox.verticalScrollBar?.scrollPosition ?? 0,
+          }),
+          {
+            mountedRef,
+            fallback: null,
+          },
+        )
+        if (!renderableData) return
 
-      const lineStarts = lineInfo?.lineStarts ?? [0]
+        const lineStarts = lineInfo?.lineStarts ?? [0]
 
-      const viewport = (scrollBox as any).viewport
-      const viewportTop = Number(viewport?.y ?? 0)
-      const viewportLeft = Number(viewport?.x ?? 0)
+        // Get click position, accounting for scroll
+        const clickRowInViewport = Math.floor(event.y - renderableData.viewportTop)
+        const clickRow = clickRowInViewport + renderableData.scrollPosition
 
-      // Get click position, accounting for scroll
-      const scrollPosition = scrollBox.verticalScrollBar?.scrollPosition ?? 0
-      const clickRowInViewport = Math.floor(event.y - viewportTop)
-      const clickRow = clickRowInViewport + scrollPosition
+        // Find which visual line was clicked
+        const lineIndex = Math.min(
+          Math.max(0, clickRow),
+          lineStarts.length - 1,
+        )
 
-      // Find which visual line was clicked
-      const lineIndex = Math.min(
-        Math.max(0, clickRow),
-        lineStarts.length - 1,
-      )
+        // Get the character range for this line
+        const lineStartChar = lineStarts[lineIndex]
+        const lineEndChar = lineStarts[lineIndex + 1] ?? value.length
 
-      // Get the character range for this line
-      const lineStartChar = lineStarts[lineIndex]
-      const lineEndChar = lineStarts[lineIndex + 1] ?? value.length
+        // Convert click x to character position, accounting for tabs
+        const clickCol = Math.max(0, Math.floor(event.x - renderableData.viewportLeft))
 
-      // Convert click x to character position, accounting for tabs
-      const clickCol = Math.max(0, Math.floor(event.x - viewportLeft))
+        let visualCol = 0
+        let charIndex = lineStartChar
 
-      let visualCol = 0
-      let charIndex = lineStartChar
-
-      while (charIndex < lineEndChar && visualCol < clickCol) {
-        const char = value[charIndex]
-        if (char === '\t') {
-          visualCol += TAB_WIDTH
-        } else if (char === '\n') {
-          break
-        } else {
-          visualCol += 1
+        while (charIndex < lineEndChar && visualCol < clickCol) {
+          const char = value[charIndex]
+          if (char === '\t') {
+            visualCol += TAB_WIDTH
+          } else if (char === '\n') {
+            break
+          } else {
+            visualCol += 1
+          }
+          charIndex++
         }
-        charIndex++
-      }
 
-      const rawClickPosition = Math.min(charIndex, value.length)
+        const rawClickPosition = Math.min(charIndex, value.length)
 
-      const clickedSegment =
-        segmentContainingInterior(sortedPasteSegments, rawClickPosition) ??
-        segmentAtRightEdge(sortedPasteSegments, rawClickPosition) ??
-        segmentAtLeftEdge(sortedPasteSegments, rawClickPosition)
+        const clickedSegment =
+          segmentContainingInterior(sortedPasteSegments, rawClickPosition) ??
+          segmentAtRightEdge(sortedPasteSegments, rawClickPosition) ??
+          segmentAtLeftEdge(sortedPasteSegments, rawClickPosition)
 
-      const clickedMention =
-        mentionContainingInterior(sortedMentionSegments, rawClickPosition) ??
-        mentionAtRightEdge(sortedMentionSegments, rawClickPosition) ??
-        mentionAtLeftEdge(sortedMentionSegments, rawClickPosition)
+        const clickedMention =
+          mentionContainingInterior(sortedMentionSegments, rawClickPosition) ??
+          mentionAtRightEdge(sortedMentionSegments, rawClickPosition) ??
+          mentionAtLeftEdge(sortedMentionSegments, rawClickPosition)
 
-      if (clickedSegment) {
+        if (clickedSegment) {
+          if (
+            cursorPosition !== clickedSegment.end ||
+            selectedPasteSegmentId !== clickedSegment.id ||
+            selectedMentionSegmentId
+          ) {
+            commitInput({
+              text: value,
+              cursorPosition: clickedSegment.end,
+              selectedPasteSegmentId: clickedSegment.id,
+              selectedMentionSegmentId: null,
+              lastEditDueToNav: false,
+            })
+          }
+          return
+        }
+
+        if (clickedMention) {
+          if (
+            cursorPosition !== clickedMention.end ||
+            selectedMentionSegmentId !== clickedMention.id ||
+            selectedPasteSegmentId
+          ) {
+            commitInput({
+              text: value,
+              cursorPosition: clickedMention.end,
+              selectedMentionSegmentId: clickedMention.id,
+              selectedPasteSegmentId: null,
+              lastEditDueToNav: false,
+            })
+          }
+          return
+        }
+
+        const newCursorPosition = normalizeCursorPosition(
+          sortedPasteSegments,
+          sortedMentionSegments,
+          rawClickPosition,
+          value.length,
+        )
+
         if (
-          cursorPosition !== clickedSegment.end ||
-          selectedPasteSegmentId !== clickedSegment.id ||
+          newCursorPosition !== cursorPosition ||
+          selectedPasteSegmentId ||
           selectedMentionSegmentId
         ) {
           commitInput({
             text: value,
-            cursorPosition: clickedSegment.end,
-            selectedPasteSegmentId: clickedSegment.id,
-            selectedMentionSegmentId: null,
+            cursorPosition: newCursorPosition,
             lastEditDueToNav: false,
-          })
-        }
-        return
-      }
-
-      if (clickedMention) {
-        if (
-          cursorPosition !== clickedMention.end ||
-          selectedMentionSegmentId !== clickedMention.id ||
-          selectedPasteSegmentId
-        ) {
-          commitInput({
-            text: value,
-            cursorPosition: clickedMention.end,
-            selectedMentionSegmentId: clickedMention.id,
             selectedPasteSegmentId: null,
-            lastEditDueToNav: false,
+            selectedMentionSegmentId: null,
           })
         }
-        return
-      }
-
-      const newCursorPosition = normalizeCursorPosition(
+      },
+      [
+        focused,
+        lineInfo,
+        value,
+        cursorPosition,
+        selectedPasteSegmentId,
+        selectedMentionSegmentId,
+        commitInput,
         sortedPasteSegments,
         sortedMentionSegments,
-        rawClickPosition,
-        value.length,
-      )
-
-      if (
-        newCursorPosition !== cursorPosition ||
-        selectedPasteSegmentId ||
-        selectedMentionSegmentId
-      ) {
-        commitInput({
-          text: value,
-          cursorPosition: newCursorPosition,
-          lastEditDueToNav: false,
-          selectedPasteSegmentId: null,
-          selectedMentionSegmentId: null,
-        })
-      }
-    },
-    [
-      focused,
-      lineInfo,
-      value,
-      cursorPosition,
-      selectedPasteSegmentId,
-      selectedMentionSegmentId,
-      commitInput,
-      sortedPasteSegments,
-      sortedMentionSegments,
-    ],
+        mountedRef,
+      ],
+    ),
   )
 
   const isPlaceholder = value.length === 0 && placeholder.length > 0
@@ -1231,9 +1291,14 @@ export const MultilineInput = forwardRef<
       const wordEnd = findWordEndAfter(value, cursorPosition)
 
       // Read lineInfo inside the callback to get current value (not stale from closure)
-      const currentLineInfo = textRef.current
-        ? ((textRef.current as any).textBufferView as TextBufferView)?.lineInfo
-        : null
+      const currentLineInfo = safeRenderableAccess(
+        textRef.current,
+        (el) => ((el as any).textBufferView as TextBufferView)?.lineInfo,
+        {
+          mountedRef,
+          fallback: null,
+        },
+      )
 
       // Calculate visual line boundaries from lineInfo (accounts for word wrap)
       // Fall back to logical line boundaries if visual info is unavailable
@@ -1526,6 +1591,7 @@ export const MultilineInput = forwardRef<
       sortedMentionSegments,
       selectedPasteSegmentId,
       selectedMentionSegmentId,
+      mountedRef,
     ],
   )
 
@@ -1573,88 +1639,90 @@ export const MultilineInput = forwardRef<
 
   // Main keyboard handler - delegates to specialized handlers
   useKeyboard(
-    useCallback(
-      (key: KeyEvent) => {
-        if (!focused) return
+    useSafeEvent(
+      useCallback(
+        (key: KeyEvent) => {
+          if (!focused) return
 
-        const selectedSegment = findSegmentById(
-          sortedPasteSegments,
+          const selectedSegment = findSegmentById(
+            sortedPasteSegments,
+            selectedPasteSegmentId,
+          )
+          const selectedMention = findMentionById(
+            sortedMentionSegments,
+            selectedMentionSegmentId,
+          )
+          if (selectedPasteSegmentId && !selectedSegment) {
+            commitInput({
+              text: value,
+              cursorPosition,
+              selectedPasteSegmentId: null,
+              selectedMentionSegmentId: null,
+            })
+            return
+          }
+
+          if (selectedMentionSegmentId && !selectedMention) {
+            commitInput({
+              text: value,
+              cursorPosition,
+              selectedPasteSegmentId: null,
+              selectedMentionSegmentId: null,
+            })
+            return
+          }
+
+          const isPillActionKey =
+            key.name === 'left' ||
+            key.name === 'right' ||
+            key.name === 'backspace' ||
+            key.name === 'delete'
+
+          if ((selectedSegment || selectedMention) && !isPillActionKey) {
+            commitInput({
+              text: value,
+              cursorPosition: (selectedSegment ?? selectedMention)!.end,
+              selectedPasteSegmentId: null,
+              selectedMentionSegmentId: null,
+            })
+          }
+
+          if (onKeyIntercept) {
+            const handled = onKeyIntercept(key)
+            if (handled) return
+          }
+
+          if (handlePasteKey(key)) return
+
+          // Clear sticky column for non-vertical navigation
+          const isVerticalNavKey = key.name === 'up' || key.name === 'down'
+          if (!isVerticalNavKey) {
+            stickyColumnRef.current = null
+          }
+
+          // Delegate to specialized handlers
+          if (processEnterKey(key)) return
+          if (processDeletionKey(key)) return
+          if (processNavigationKey(key)) return
+          if (processCharacterKey(key)) return
+        },
+        [
+          focused,
+          onKeyIntercept,
+          processEnterKey,
+          processDeletionKey,
+          processNavigationKey,
+          processCharacterKey,
           selectedPasteSegmentId,
-        )
-        const selectedMention = findMentionById(
-          sortedMentionSegments,
           selectedMentionSegmentId,
-        )
-        if (selectedPasteSegmentId && !selectedSegment) {
-          commitInput({
-            text: value,
-            cursorPosition,
-            selectedPasteSegmentId: null,
-            selectedMentionSegmentId: null,
-          })
-          return
-        }
-
-        if (selectedMentionSegmentId && !selectedMention) {
-          commitInput({
-            text: value,
-            cursorPosition,
-            selectedPasteSegmentId: null,
-            selectedMentionSegmentId: null,
-          })
-          return
-        }
-
-        const isPillActionKey =
-          key.name === 'left' ||
-          key.name === 'right' ||
-          key.name === 'backspace' ||
-          key.name === 'delete'
-
-        if ((selectedSegment || selectedMention) && !isPillActionKey) {
-          commitInput({
-            text: value,
-            cursorPosition: (selectedSegment ?? selectedMention)!.end,
-            selectedPasteSegmentId: null,
-            selectedMentionSegmentId: null,
-          })
-        }
-
-        if (onKeyIntercept) {
-          const handled = onKeyIntercept(key)
-          if (handled) return
-        }
-
-        if (handlePasteKey(key)) return
-
-        // Clear sticky column for non-vertical navigation
-        const isVerticalNavKey = key.name === 'up' || key.name === 'down'
-        if (!isVerticalNavKey) {
-          stickyColumnRef.current = null
-        }
-
-        // Delegate to specialized handlers
-        if (processEnterKey(key)) return
-        if (processDeletionKey(key)) return
-        if (processNavigationKey(key)) return
-        if (processCharacterKey(key)) return
-      },
-      [
-        focused,
-        onKeyIntercept,
-        processEnterKey,
-        processDeletionKey,
-        processNavigationKey,
-        processCharacterKey,
-        selectedPasteSegmentId,
-        selectedMentionSegmentId,
-        sortedPasteSegments,
-        sortedMentionSegments,
-        cursorPosition,
-        commitInput,
-        value,
-        handlePasteKey,
-      ],
+          sortedPasteSegments,
+          sortedMentionSegments,
+          cursorPosition,
+          commitInput,
+          value,
+          handlePasteKey,
+        ],
+      ),
     ),
   )
 

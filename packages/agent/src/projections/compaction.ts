@@ -201,6 +201,9 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
           addedTokens += estimateContentTokens(output)
         }
       }
+      for (const observed of event.observedResults) {
+        addedTokens += estimateContentTokens([...observed.content])
+      }
 
       const newTokenEstimate = event.inputTokens !== null
         ? event.inputTokens + addedTokens

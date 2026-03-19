@@ -17,6 +17,7 @@ type ShellPhase = 'streaming' | 'executing' | 'done'
 
 type DoneVariant =
   | { readonly kind: 'success'; readonly stdout: string; readonly stderr: string; readonly exitCode: number }
+  | { readonly kind: 'detached'; readonly pid: number; readonly stdout: string; readonly stderr: string }
   | { readonly kind: 'error'; readonly message: string }
   | { readonly kind: 'rejected'; readonly systemReason: string | null }
   | { readonly kind: 'interrupted' }
@@ -33,10 +34,25 @@ export interface ShellState {
 // Helpers
 // =============================================================================
 
-function resolveResult(result: XmlToolResult<{ stdout: string; stderr: string; exitCode: number }>): DoneVariant {
+function resolveResult(
+  result: XmlToolResult<
+    | { mode: 'completed'; stdout: string; stderr: string; exitCode: number }
+    | { mode: 'detached'; pid: number; stdout: string; stderr: string }
+  >
+): DoneVariant {
   switch (result._tag) {
-    case 'Success':
-      return { kind: 'success', ...result.output }
+    case 'Success': {
+      const output = result.output
+      if (output.mode === 'detached') {
+        return { kind: 'detached', pid: output.pid, stdout: output.stdout, stderr: output.stderr }
+      }
+      return {
+        kind: 'success',
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exitCode: output.exitCode,
+      }
+    }
     case 'Error':
       return { kind: 'error', message: result.error }
     case 'Rejected': {

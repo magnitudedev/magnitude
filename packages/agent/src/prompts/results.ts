@@ -13,31 +13,60 @@ import { type ContentPart } from '../content'
 
 /** Format tool results for LLM context */
 export function formatResults(toolCalls: readonly TurnToolCall[], observedResults: readonly ObservedResult[], error?: string): ContentPart[] {
-  const lines: string[] = ['<results>']
+  const parts: ContentPart[] = []
+  let textBuffer = '<results>'
+
+  const pushText = (text: string) => {
+    textBuffer += text
+  }
+  const flushText = () => {
+    if (!textBuffer) return
+    const last = parts[parts.length - 1]
+    if (last?.type === 'text') parts[parts.length - 1] = { type: 'text', text: last.text + textBuffer }
+    else parts.push({ type: 'text', text: textBuffer })
+    textBuffer = ''
+  }
 
   for (const tc of toolCalls) {
     if (tc.result.status === 'interrupted') {
-      lines.push(`<tool name="${tc.toolKey}"><error>Interrupted</error></tool>`)
+      pushText(`\n<tool name="${tc.toolKey}"><error>Interrupted</error></tool>`)
     } else if (tc.result.status !== 'success') {
-      lines.push(`<tool name="${tc.toolKey}"><error>${tc.result.message}</error></tool>`)
+      pushText(`\n<tool name="${tc.toolKey}"><error>${tc.result.message}</error></tool>`)
     }
   }
 
   for (const observed of observedResults) {
-    if (observed.content.length > INSPECT_CHAR_LIMIT) {
-      const approxTokens = Math.ceil(observed.content.length / 4)
-      lines.push(`<${observed.tagName} observe="${observed.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${observed.tagName}>`)
-    } else {
-      lines.push(`<${observed.tagName} observe="${observed.query}">${observed.content}</${observed.tagName}>`)
+    const textChars = observed.content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0)
+    if (textChars > INSPECT_CHAR_LIMIT) {
+      const approxTokens = Math.ceil(textChars / 4)
+      pushText(`\n<${observed.tagName} observe="${observed.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${observed.tagName}>`)
+      for (const part of observed.content) {
+        if (part.type === 'image') {
+          flushText()
+          parts.push(part)
+        }
+      }
+      continue
     }
+
+    pushText(`\n<${observed.tagName} observe="${observed.query}">`)
+    for (const part of observed.content) {
+      if (part.type === 'text') pushText(part.text)
+      else {
+        flushText()
+        parts.push(part)
+      }
+    }
+    pushText(`</${observed.tagName}>`)
   }
 
   if (error) {
-    lines.push(`<error>${error}</error>`)
+    pushText(`\n<error>${error}</error>`)
   }
 
-  lines.push('</results>')
-  return [{ type: 'text' as const, text: lines.join('\n') }]
+  pushText('\n</results>')
+  flushText()
+  return parts
 }
 
 /** Wrap interrupt message */

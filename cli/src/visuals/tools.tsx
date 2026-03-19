@@ -7,17 +7,19 @@
 
 import { useState } from 'react'
 import { TextAttributes } from '@opentui/core'
+
 import { useTheme } from '../hooks/use-theme'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { ShimmerText } from '../components/shimmer-text'
 import { Button } from '../components/button'
-import { MarkdownContent, StreamingMarkdownContent } from '../components/markdown-content'
+import { MarkdownContent, StreamingMarkdownContent } from '../markdown/markdown-content'
 import { BOX_CHARS } from '../utils/ui-constants'
 import { render } from './define'
 import type { ToolVisualRenderer } from './define'
 
 import { isActive } from '@magnitudedev/agent'
 import { useSelectedArtifact } from '../hooks/use-artifacts'
+
 
 import type {
   WebSearchState,

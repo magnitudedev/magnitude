@@ -1,0 +1,17 @@
+# Workspace
+
+You have a workspace directory at `$M/`, shared across all agents in this session. Use it freely for:
+- Scratch files and prototypes
+- Scripts and utilities
+- Notes and working documents
+- Research and findings
+- Any other files you need
+
+Key details:
+- `$M/project/` is a symlink to the project root — you can import from the project in any scripts you write in your workspace
+- Files in `$M/` are ephemeral to this session
+- You do NOT need permission to read or write anything in `$M/`
+- The project directory has normal permission rules
+- Use `$M` in shell commands (it's an env var) and in tool paths like `fs-read`, `fs-write`, `edit`
+
+Use your workspace to externalize your thinking, build utilities, prototype solutions, and keep notes that survive context compaction.

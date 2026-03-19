@@ -20,6 +20,7 @@ import { oneShotsEval } from './evals/one-shots/index'
 import { orchestratorDispatchEval } from './evals/orchestrator-dispatch/index'
 import { behaviorEval } from './evals/behavior/index'
 import { memoryExtractionEval } from './evals/memory-extraction/index'
+import { xmlNewlinesEval } from './evals/xml-newlines/index'
 import { runEval, type RunCallbacks } from './runner'
 import {
   printModelHeader,
@@ -58,6 +59,7 @@ const EVALS: Record<string, Eval> = {
   'orchestrator-dispatch': orchestratorDispatchEval,
   behavior: behaviorEval,
   'memory-extraction': memoryExtractionEval,
+  'xml-newlines': xmlNewlinesEval,
 }
 
 // =============================================================================

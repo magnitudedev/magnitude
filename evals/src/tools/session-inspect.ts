@@ -5,21 +5,17 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { AppEvent } from '@magnitudedev/agent'
 import {
-  ForkProjection,
-  TaskGraphProjection,
   MemoryProjection,
   TurnProjection,
   DisplayProjection,
   CompactionProjection,
   WorkingStateProjection,
   SessionContextProjection,
-  ProposalProjection,
-  AgentRegistryProjection,
   ArtifactProjection,
   ChatTitleProjection,
   ReplayProjection
 } from '@magnitudedev/agent'
-import { SkillModeProjection } from '../../../packages/agent/src/projections/skill-mode'
+
 import { Agent } from '@magnitudedev/event-core'
 
 type AnyRecord = Record<string, any>
@@ -301,29 +297,20 @@ function cmdSearch(args: string[]) {
 const InspectAgent = Agent.define<AppEvent>()({
   name: 'SessionInspect',
   projections: [
-    ForkProjection,
-    TaskGraphProjection,
     SessionContextProjection,
-    ProposalProjection,
-    AgentRegistryProjection,
     ArtifactProjection,
     ChatTitleProjection,
     WorkingStateProjection,
     CompactionProjection,
     TurnProjection,
     MemoryProjection,
-DisplayProjection,
-    ReplayProjection,
-    SkillModeProjection
+    DisplayProjection,
+    ReplayProjection
   ],
   workers: [],
   expose: {
     state: {
-      fork: ForkProjection,
-      taskGraph: TaskGraphProjection,
       sessionContext: SessionContextProjection,
-      proposal: ProposalProjection,
-      agentRegistry: AgentRegistryProjection,
       artifact: ArtifactProjection,
       chatTitle: ChatTitleProjection,
       workingState: WorkingStateProjection,
@@ -331,8 +318,7 @@ DisplayProjection,
       turn: TurnProjection,
       memory: MemoryProjection,
 display: DisplayProjection,
-      replay: ReplayProjection,
-      skillMode: SkillModeProjection
+      replay: ReplayProjection
     }
   }
 })
@@ -423,7 +409,7 @@ async function cmdProjection(args: string[]) {
   const key = projectionKeyMap[projectionName.toLowerCase()]
   if (!key || !(key in allStates)) {
     console.error(`Unknown projection: ${projectionName}`)
-    console.error('Supported: Memory, Fork, TaskGraph, Turn, Display, Compaction, WorkingState, SessionContext, Proposal, AgentRegistry, Artifact, ChatTitle, Replay, SkillMode, all')
+    console.error('Supported: Memory, Fork, TaskGraph, Turn, Display, Compaction, WorkingState, SessionContext, Proposal, AgentRegistry, Artifact, ChatTitle, Replay, all')
     process.exit(1)
   }
 

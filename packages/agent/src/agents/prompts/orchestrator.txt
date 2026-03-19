@@ -30,4 +30,6 @@ Your conversation state determines when you may initiate work that produces obse
 
 {{RESPONSE_PROTOCOL}}
 
+{{WORKSPACE_SECTION}}
+
 {{TOOLING_SECTION}}

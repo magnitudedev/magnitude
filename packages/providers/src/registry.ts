@@ -225,6 +225,15 @@ const STATIC_FALLBACK_MODELS: Record<string, readonly ModelDefinition[]> = Objec
   PROVIDERS.map((provider) => [provider.id, [...provider.models]]),
 )
 
+const providerOrderIndex = new Map(PROVIDERS.map((p, i) => [p.id, i]))
+
+export function compareProviderOrder(a: string, b: string): number {
+  const ai = providerOrderIndex.get(a) ?? Infinity
+  const bi = providerOrderIndex.get(b) ?? Infinity
+  if (ai === bi) return a.localeCompare(b)
+  return ai - bi
+}
+
 export function getProvider(providerId: string): ProviderDefinition | undefined {
   return PROVIDERS.find(p => p.id === providerId)
 }
