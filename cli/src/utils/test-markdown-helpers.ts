@@ -1,11 +1,11 @@
-import { parseMarkdownToMdast } from './markdown-parser'
+import { parseMarkdownToMdast } from '../markdown/parse'
 import {
   renderDocumentToBlocks,
   spansToText,
   type Block,
   type RenderOptions,
   type Span,
-} from './render-blocks'
+} from '../markdown/blocks'
 import { buildMarkdownColorPalette, chatThemes } from './theme'
 
 export const theme = chatThemes.dark
@@ -120,7 +120,7 @@ export function normalizeBlock(block: Block): unknown {
       return {
         type: block.type,
         source: block.source,
-        columnWidths: block.columnWidths,
+        alignments: block.alignments,
         headers: block.headers.map((row) => row.map(normalizeSpan)),
         rows: block.rows.map((row) => row.map((cell) => cell.map(normalizeSpan))),
       }

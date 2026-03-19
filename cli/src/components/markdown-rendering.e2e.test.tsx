@@ -36,10 +36,10 @@ mock.module('@opentui/react', () => ({
 }))
 
 const { extractTextFromStaticMarkup } = await import('./test-render-helpers')
-const { MarkdownContent, StreamingMarkdownContent } = await import('./markdown-content')
+const { MarkdownContent, StreamingMarkdownContent } = await import('../markdown/markdown-content')
 const { ArtifactReaderPanel } = await import('./artifact-reader-panel')
 
-function renderText(node: React.ReactElement): string {
+function renderText(node: React.ReactNode): string {
   return extractTextFromStaticMarkup(renderToStaticMarkup(<div>{node}</div>))
 }
 

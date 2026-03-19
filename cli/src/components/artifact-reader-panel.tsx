@@ -7,9 +7,9 @@ import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { useTheme } from '../hooks/use-theme'
 import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
 import { BOX_CHARS } from '../utils/ui-constants'
-import { StreamingMarkdownContent } from './markdown-content'
+import { StreamingMarkdownContent } from '../markdown/markdown-content'
 import { Button } from './button'
-import { slugify } from '../utils/markdown-content-renderer'
+import { slugify } from '../markdown/blocks'
 
 
 

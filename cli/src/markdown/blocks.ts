@@ -1,11 +1,10 @@
 import { createLowlight, common } from 'lowlight'
 import type { Element, RootContent as HastRootContent, Text as HastText } from 'hast'
 import { renderMermaidAscii } from 'beautiful-mermaid'
-import stringWidth from 'string-width'
 import type {
+  AlignType,
   Blockquote,
   Code,
-  Definition,
   Heading,
   Html,
   Image,
@@ -19,7 +18,7 @@ import type {
   TableCell,
   Text,
 } from 'mdast'
-import type { MarkdownPalette, SyntaxColors } from './markdown-content-renderer'
+import type { MarkdownPalette, SyntaxColors } from './theme'
 
 const lowlight = createLowlight(common)
 
@@ -90,7 +89,7 @@ export interface TableBlock {
   type: 'table'
   headers: Span[][]
   rows: Span[][][]
-  columnWidths: number[]
+  alignments: Array<'left' | 'center' | 'right' | null>
   source: SourceRange
 }
 
@@ -151,11 +150,11 @@ function sourceEnd(node: { position?: { end?: { offset?: number } } }): number {
   return node.position?.end?.offset ?? 0
 }
 
-function lineStart(node: { position?: { start?: { line?: number } } }): number {
+function lineStart(node: { position?: { start?: { line?: number }; end?: { line?: number } } }): number {
   return node.position?.start?.line ?? 1
 }
 
-function lineEnd(node: { position?: { end?: { line?: number } } }): number {
+function lineEnd(node: { position?: { start?: { line?: number }; end?: { line?: number } } }): number {
   return node.position?.end?.line ?? lineStart(node)
 }
 
@@ -237,8 +236,6 @@ function getSourceSlice(sourceText: string | undefined, node: { position?: { sta
   const end = sourceEnd(node)
   return end >= start ? sourceText.slice(start, end) : undefined
 }
-
-
 
 function renderInline(
   nodes: readonly PhrasingNode[] | undefined,
@@ -565,53 +562,20 @@ function renderTableCell(cell: TableCell, options: RenderOptions, sourceText?: s
   return renderInline(cell.children as PhrasingNode[], {}, options.highlights ?? [], options.palette, sourceText)
 }
 
-function computeTableColumnWidths(allRows: Span[][][], availableWidth: number): number[] {
-  const numCols = Math.max(...allRows.map((row) => row.length), 0)
-  if (numCols === 0) return []
-
-  const naturalWidths: number[] = Array(numCols).fill(3)
-  for (const row of allRows) {
-    for (let i = 0; i < row.length; i++) {
-      const cellWidth = stringWidth(spansToText(row[i] ?? []))
-      naturalWidths[i] = Math.max(naturalWidths[i], cellWidth)
-    }
-  }
-
-  const separatorWidth = 3
-  const numSeparators = numCols - 1
-  const totalNatural = naturalWidths.reduce((a, b) => a + b, 0) + numSeparators * separatorWidth
-  const effectiveAvailable = Math.max(20, availableWidth - 2)
-
-  if (totalNatural <= effectiveAvailable) return naturalWidths
-
-  const availableForContent = effectiveAvailable - numSeparators * separatorWidth
-  const totalNaturalContent = naturalWidths.reduce((a, b) => a + b, 0)
-  const scale = availableForContent / totalNaturalContent
-  const columnWidths = naturalWidths.map((w) => Math.max(3, Math.floor(w * scale)))
-
-  let usedWidth = columnWidths.reduce((a, b) => a + b, 0)
-  let remaining = availableForContent - usedWidth
-  for (let i = 0; i < columnWidths.length && remaining > 0; i++) {
-    if (columnWidths[i] < naturalWidths[i]) {
-      const add = Math.min(remaining, naturalWidths[i] - columnWidths[i])
-      columnWidths[i] += add
-      remaining -= add
-    }
-  }
-
-  return columnWidths
+function mapAlignment(align: AlignType | null | undefined): 'left' | 'center' | 'right' | null {
+  if (align === 'left' || align === 'center' || align === 'right') return align
+  return null
 }
 
 function renderTableNode(node: Table, options: RenderOptions, sourceText?: string): TableBlock {
   const rows = node.children.map((row) => row.children.map((cell) => renderTableCell(cell, options, sourceText)))
-  const availableWidth = options.codeBlockWidth ?? 80
-  const columnWidths = computeTableColumnWidths(rows, availableWidth)
+  const alignments = (node.align ?? []).map((a) => mapAlignment(a))
 
   return {
     type: 'table',
     headers: rows[0] ?? [],
     rows: rows.slice(1),
-    columnWidths,
+    alignments,
     source: sourceOf(node),
   }
 }
@@ -646,7 +610,7 @@ function renderListNode(node: List, options: RenderOptions, sourceText?: string)
 }
 
 function renderBlockquoteNode(node: Blockquote, options: RenderOptions, sourceText?: string): BlockquoteBlock {
-  const content = renderNodesToBlocks(node.children as RootContent[], options, sourceText, options.palette.blockquoteTextFg, true).flatMap((block) =>
+  const content = renderNodesToBlocks(node.children as RootContent[], options, sourceText, options.palette.blockquoteTextFg).flatMap((block) =>
     block.type === 'table'
       ? [{
           type: 'paragraph' as const,

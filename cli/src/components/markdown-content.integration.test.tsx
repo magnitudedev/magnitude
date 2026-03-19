@@ -39,7 +39,7 @@ mock.module('@opentui/react', () => ({
   }),
 }))
 
-mock.module('../utils/render-blocks', () => ({
+mock.module('../markdown/blocks', () => ({
   renderDocumentToBlocks: (_doc: any, options: any) => {
     renderDocumentCalls.push({ options })
     return []
@@ -50,21 +50,21 @@ mock.module('../utils/render-blocks', () => ({
   extractHeadingSlugsFromBlocks: () => [],
 }))
 
-mock.module('../hooks/use-streaming-markdown-cache', () => ({
+mock.module('../markdown/streaming', () => ({
   useStreamingMarkdownCache: (content: string, options: any) => {
     streamingHookCalls.push({ content, options })
     return streamingHookResult
   },
 }))
 
-mock.module('./block-renderer', () => ({
+mock.module('../markdown/block-renderer', () => ({
   BlockRenderer: (props: any) => {
     blockRendererCalls.push(props)
     return <block-renderer data-blocks={props.blocks.length} data-show-cursor={String(!!props.showCursor)} />
   },
 }))
 
-const markdownContentModule = await import('./markdown-content')
+const markdownContentModule = await import('../markdown/markdown-content')
 const artifactReaderPanelModule = await import('./artifact-reader-panel')
 
 function resetState() {
@@ -74,8 +74,8 @@ function resetState() {
   streamingHookResult = { blocks: [], pendingText: '' }
 }
 
-function render(node: React.ReactElement) {
-  return renderToStaticMarkup(node)
+function render(node: React.ReactNode) {
+  return renderToStaticMarkup(<>{node}</>)
 }
 
 beforeEach(() => {

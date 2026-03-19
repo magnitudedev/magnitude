@@ -20,7 +20,6 @@
     "@opentui/react": "0.1.77",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/image": "workspace:*",
-    "@magnitude/markdown-cst": "workspace:*",
     "@magnitudedev/ripgrep": "workspace:*",
     "beautiful-mermaid": "^0.1.3",
     "commander": "^14.0.1",

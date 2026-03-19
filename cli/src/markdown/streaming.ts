@@ -1,8 +1,17 @@
 import { useMemo, useRef } from 'react'
-import type { Root } from 'mdast'
-import { hasOddFenceCount } from '../utils/markdown-content-renderer'
-import { parseMarkdownToMdast } from '../utils/markdown-parser'
-import { renderDocumentToBlocks, type Block, type HighlightRange, type MarkdownPalette } from '../utils/render-blocks'
+import type { Block, HighlightRange } from './blocks'
+import type { MarkdownPalette } from './theme'
+import { parseMarkdownToMdast } from './parse'
+import { renderDocumentToBlocks } from './blocks'
+
+export function hasOddFenceCount(content: string): boolean {
+  let fenceCount = 0
+  const fenceRegex = /```/g
+  while (fenceRegex.exec(content)) {
+    fenceCount += 1
+  }
+  return fenceCount % 2 === 1
+}
 
 interface StreamingMarkdownCacheOptions {
   palette: MarkdownPalette
@@ -48,7 +57,6 @@ export function useStreamingMarkdownCache(
 ): StreamingMarkdownCacheResult {
   const cacheRef = useRef<{
     prevContent: string
-    prevDoc: Root | null
     prevBlocks: Block[]
     prevPendingText: string
     prevHighlightRanges: HighlightRange[] | undefined
@@ -57,7 +65,6 @@ export function useStreamingMarkdownCache(
     prevStreaming: boolean
   }>({
     prevContent: '',
-    prevDoc: null,
     prevBlocks: [],
     prevPendingText: '',
     prevHighlightRanges: undefined,
@@ -70,9 +77,6 @@ export function useStreamingMarkdownCache(
     const cache = cacheRef.current
     const { palette, codeBlockWidth, highlightRanges } = options
 
-    if (cache.prevStreaming && !options.streaming) {
-      cache.prevDoc = null
-    }
     cache.prevStreaming = !!options.streaming
 
     let completeSection = content
@@ -88,7 +92,6 @@ export function useStreamingMarkdownCache(
 
     if (!completeSection || completeSection.trim() === '') {
       cache.prevContent = content
-      cache.prevDoc = null
       cache.prevBlocks = []
       cache.prevPendingText = pendingText
       return { blocks: [], pendingText }
@@ -110,7 +113,6 @@ export function useStreamingMarkdownCache(
         : cache.prevBlocks
 
     cache.prevContent = content
-    cache.prevDoc = doc
     cache.prevBlocks = finalBlocks
     cache.prevPendingText = pendingText
     cache.prevHighlightRanges = highlightRanges

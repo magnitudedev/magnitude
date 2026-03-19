@@ -3,8 +3,8 @@ import { useRenderer } from '@opentui/react'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { useTheme } from '../hooks/use-theme'
 import { buildMarkdownColorPalette } from '../utils/theme'
-import { useStreamingMarkdownCache } from '../hooks/use-streaming-markdown-cache'
-import { BlockRenderer } from './block-renderer'
+import { useStreamingMarkdownCache } from '../markdown/streaming'
+import { BlockRenderer } from '../markdown/block-renderer'
 
 interface AssistantMessageProps {
   content: string

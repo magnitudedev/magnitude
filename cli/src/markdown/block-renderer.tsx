@@ -16,15 +16,15 @@ import type {
   BlockquoteBlock,
   TableBlock,
   HighlightRange,
-} from '../utils/render-blocks'
-import { spansToText } from '../utils/render-blocks'
+} from './blocks'
+import { computeTableLayoutPlan } from './table-layout'
 import { useMountedRef } from '../hooks/use-mounted-ref'
 import { useSafeEvent } from '../hooks/use-safe-event'
 import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { useTheme } from '../hooks/use-theme'
 import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
 import { buildMarkdownColorPalette } from '../utils/theme'
-import type { MarkdownPalette } from '../utils/markdown-content-renderer'
+import type { MarkdownPalette } from './theme'
 import { useArtifacts } from '../hooks/use-artifacts'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { BOX_CHARS } from '../utils/ui-constants'
@@ -410,90 +410,14 @@ function BlockquoteView({
   )
 }
 
-function clipSpans(spans: Span[], maxWidth: number): Span[] {
-  if (maxWidth <= 0) return []
-  const totalWidth = stringWidth(spansToText(spans))
-  if (totalWidth <= maxWidth) return spans
-
-  const targetWidth = maxWidth - 1
-  const result: Span[] = []
-  let currentWidth = 0
-
-  for (const span of spans) {
-    const spanWidth = stringWidth(span.text)
-    if (currentWidth + spanWidth <= targetWidth) {
-      result.push(span)
-      currentWidth += spanWidth
-      continue
-    }
-
-    const remaining = targetWidth - currentWidth
-    if (remaining > 0) {
-      let clipped = ''
-      let clippedWidth = 0
-      for (const char of span.text) {
-        const charWidth = stringWidth(char)
-        if (clippedWidth + charWidth > remaining) break
-        clipped += char
-        clippedWidth += charWidth
-      }
-      if (clipped) {
-        result.push({ ...span, text: clipped })
-      }
-    }
-
-    result.push({ text: '…' })
-    return result
-  }
-
-  return result
-}
-
-function padSpans(spans: Span[], targetWidth: number): Span[] {
-  const currentWidth = stringWidth(spansToText(spans))
-  if (currentWidth >= targetWidth) return spans
-  return [...spans, { text: ' '.repeat(targetWidth - currentWidth) }]
-}
-
-function scaleTableWidths(widths: number[], contentWidth: number): number[] {
-  if (widths.length === 0) return widths
-  const maxTableWidth = Math.max(10, Math.min(contentWidth, 80))
-  const naturalTotal = widths.reduce((sum, width) => sum + width, 0) + Math.max(0, widths.length - 1) * 3 + 2
-  if (naturalTotal <= maxTableWidth) return widths
-
-  const availableForContent = Math.max(widths.length * 3, maxTableWidth - Math.max(0, widths.length - 1) * 3 - 2)
-  const totalNaturalContent = widths.reduce((sum, width) => sum + width, 0)
-  const scaled = widths.map((width) => Math.max(3, Math.floor((width / totalNaturalContent) * availableForContent)))
-
-  let used = scaled.reduce((sum, width) => sum + width, 0)
-  let remaining = availableForContent - used
-  while (remaining > 0) {
-    let changed = false
-    for (let i = 0; i < scaled.length && remaining > 0; i++) {
-      if (scaled[i] < widths[i]) {
-        scaled[i] += 1
-        remaining -= 1
-        changed = true
-      }
-    }
-    if (!changed) break
-    used = scaled.reduce((sum, width) => sum + width, 0)
-    remaining = availableForContent - used
-  }
-
-  return scaled
-}
-
 function TableRow({
   cells,
-  widths,
   foreground,
   borderColor,
   headerColor,
   header,
 }: {
-  cells: Span[][]
-  widths: number[]
+  cells: Array<{ spans: Span[] } | undefined>
   foreground: string
   borderColor: string
   headerColor: string
@@ -502,29 +426,25 @@ function TableRow({
   return (
     <text style={{ fg: foreground }}>
       <span fg={borderColor}>│</span>
-      {cells.map((cell, idx) => {
-        const clipped = clipSpans(cell, widths[idx] ?? 0)
-        const padded = padSpans(clipped, widths[idx] ?? 0)
-        return (
-          <React.Fragment key={idx}>
-            <span> </span>
-            {padded.map((span, si) => {
-              const attrs = header ? TextAttributes.BOLD : spanAttributes(span)
-              return (
-                <span
-                  key={si}
-                  fg={header ? paletteOr(headerColor, span.fg ?? foreground) : (span.fg ?? foreground)}
-                  bg={span.bg}
-                  attributes={attrs}
-                >
-                  {span.text}
-                </span>
-              )
-            })}
-            <span fg={borderColor}> │</span>
-          </React.Fragment>
-        )
-      })}
+      {cells.map((cell, idx) => (
+        <React.Fragment key={idx}>
+          <span> </span>
+          {(cell?.spans ?? []).map((span, si) => {
+            const attrs = header ? TextAttributes.BOLD : spanAttributes(span)
+            return (
+              <span
+                key={si}
+                fg={header ? paletteOr(headerColor, span.fg ?? foreground) : (span.fg ?? foreground)}
+                bg={span.bg}
+                attributes={attrs}
+              >
+                {span.text}
+              </span>
+            )
+          })}
+          <span fg={borderColor}> │</span>
+        </React.Fragment>
+      ))}
     </text>
   )
 }
@@ -546,31 +466,48 @@ function TableView({
   contentWidth: number
   id?: string
 }) {
-  const widths = scaleTableWidths(block.columnWidths, contentWidth)
+  const plan = computeTableLayoutPlan({
+    headers: block.headers,
+    rows: block.rows,
+    alignments: block.alignments,
+    availableWidth: Math.max(10, Math.min(contentWidth, 80)),
+    wrapMode: 'none',
+    widthMode: 'content',
+    fitter: 'balanced',
+    minColumnWidth: 3,
+    cellPadding: 1,
+    borders: { outer: true, inner: true },
+  })
+  const widths = plan.columnWidths
   const sep = (left: string, mid: string, right: string) =>
     `${left}${widths.map((w) => '─'.repeat(w + 2)).join(mid)}${right}`
 
   return (
     <box id={id} style={{ flexDirection: 'column' }}>
       <text style={{ fg: palette.dividerFg }}>{sep('┌', '┬', '┐')}</text>
-      <TableRow
-        cells={block.headers}
-        widths={widths}
-        foreground={foreground}
-        borderColor={palette.dividerFg}
-        headerColor={palette.headingFg[3]}
-        header
-      />
-      <text style={{ fg: palette.dividerFg }}>{sep('├', '┼', '┤')}</text>
-      {block.rows.map((row, idx) => (
+      {Array.from({ length: plan.headers.height }).map((_, lineIdx) => (
         <TableRow
-          key={idx}
-          cells={row}
-          widths={widths}
+          key={`h-${lineIdx}`}
+          cells={plan.headers.cells.map((cell) => cell.lines[lineIdx])}
           foreground={foreground}
           borderColor={palette.dividerFg}
           headerColor={palette.headingFg[3]}
+          header
         />
+      ))}
+      <text style={{ fg: palette.dividerFg }}>{sep('├', '┼', '┤')}</text>
+      {plan.rows.map((row, idx) => (
+        <React.Fragment key={idx}>
+          {Array.from({ length: row.height }).map((_, lineIdx) => (
+            <TableRow
+              key={`${idx}-${lineIdx}`}
+              cells={row.cells.map((cell) => cell.lines[lineIdx])}
+              foreground={foreground}
+              borderColor={palette.dividerFg}
+              headerColor={palette.headingFg[3]}
+            />
+          ))}
+        </React.Fragment>
       ))}
       <text style={{ fg: palette.dividerFg }}>{sep('└', '┴', '┘')}</text>
     </box>

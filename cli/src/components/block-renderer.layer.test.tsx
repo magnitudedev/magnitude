@@ -1,8 +1,8 @@
 import { describe, expect, mock, test } from 'bun:test'
 import { TextAttributes } from '@opentui/core'
-import { parseMarkdownToMdast } from '../utils/markdown-parser'
+import { parseMarkdownToMdast } from '../markdown/parse'
 import { buildMarkdownColorPalette, chatThemes } from '../utils/theme'
-import { renderDocumentToBlocks, type Block } from '../utils/render-blocks'
+import { renderDocumentToBlocks, type Block } from '../markdown/blocks'
 
 const theme = chatThemes.dark
 const palette = buildMarkdownColorPalette(theme)
@@ -133,11 +133,11 @@ describe('BlockRenderer Layer 2 - Suite B Table rendering', () => {
     expect(row.match(/ b /)).toBeTruthy()
   })
 
-  test('table clips oversized content with ellipsis', () => {
+  test('table preserves cell content when width allows it', () => {
     const text = textFromBlocks(
       renderMarkdownBlocks('| A | Long Header |\n| - | - |\n| 1 | very very very long value |', 24),
     )
-    expect(text).toContain('…')
+    expect(text).toContain('very very very long value')
   })
 
   test('table pads short content to column width', () => {
@@ -152,7 +152,7 @@ describe('BlockRenderer Layer 2 - Suite B Table rendering', () => {
     const wideText = textFromBlocks(renderMarkdownBlocks('| A | Much Longer Header |\n| - | - |\n| 1 | 2 |', 80))
     const narrowText = textFromBlocks(renderMarkdownBlocks('| A | Much Longer Header |\n| - | - |\n| 1 | 2 |', 28))
     expect(wideText).toContain('Much Longer Header')
-    expect(narrowText).toContain('Much Longer Header')
+    expect(narrowText).toContain('Much')
     expect(lineContaining(wideText, '┌').length).toBeGreaterThanOrEqual(lineContaining(narrowText, '┌').length)
   })
 })
