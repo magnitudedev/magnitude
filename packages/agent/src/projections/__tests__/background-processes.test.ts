@@ -48,6 +48,7 @@ describe('BackgroundProcessesProjection', () => {
       forkId: 'fork-a',
       pid: 123,
       command: 'npm run dev',
+      reason: 'timeout_exceeded',
       sourceTurnId: 'turn-1',
       startedAt: 1000,
       initialStdout: 'boot\n',
@@ -59,6 +60,7 @@ describe('BackgroundProcessesProjection', () => {
     expect(process).toMatchObject({
       pid: 123,
       command: 'npm run dev',
+      reason: 'timeout_exceeded',
       status: 'running',
       startedAt: 1000,
       demoted: false,
@@ -76,6 +78,7 @@ describe('BackgroundProcessesProjection', () => {
         forkId: 'fork-a',
         pid: 123,
         command: 'cmd',
+        reason: 'timeout_exceeded',
         sourceTurnId: 'turn-1',
         startedAt: 1000,
         initialStdout: 'a\n',
@@ -105,6 +108,7 @@ describe('BackgroundProcessesProjection', () => {
         forkId: 'fork-a',
         pid: 123,
         command: 'cmd',
+        reason: 'timeout_exceeded',
         sourceTurnId: 'turn-1',
         startedAt: 1000,
         initialStdout: '',
@@ -144,6 +148,7 @@ describe('BackgroundProcessesProjection', () => {
         forkId: 'fork-a',
         pid: 123,
         command: 'cmd',
+        reason: 'timeout_exceeded',
         sourceTurnId: 'turn-1',
         startedAt: 1000,
         initialStdout: '',
@@ -167,6 +172,38 @@ describe('BackgroundProcessesProjection', () => {
     expect(process.unreadStdout).toBe('')
   })
 
+  test('background_process_promoted updates reason and background_process_auto_killed marks killed', async () => {
+    const state = await makeState([
+      {
+        type: 'background_process_registered',
+        forkId: 'fork-a',
+        pid: 123,
+        command: 'cmd',
+        reason: 'timeout_exceeded',
+        sourceTurnId: 'turn-1',
+        startedAt: 1000,
+        initialStdout: '',
+        initialStderr: '',
+      },
+      {
+        type: 'background_process_promoted',
+        forkId: 'fork-a',
+        pid: 123,
+      },
+      {
+        type: 'background_process_auto_killed',
+        forkId: 'fork-a',
+        pid: 123,
+        command: 'cmd',
+      },
+    ] satisfies AppEvent[])
+
+    const process = getProcessesForFork(state, 'fork-a').get(123)!
+    expect(process.reason).toBe('background')
+    expect(process.status).toBe('killed')
+    expect(process.signal).toBe('SIGTERM')
+  })
+
   test('observations_captured clears unread fields and removes exited processes', async () => {
     const state = await makeState([
       {
@@ -174,6 +211,7 @@ describe('BackgroundProcessesProjection', () => {
         forkId: 'fork-a',
         pid: 1,
         command: 'run',
+        reason: 'timeout_exceeded',
         sourceTurnId: 'turn-1',
         startedAt: 1000,
         initialStdout: 'running',
@@ -184,6 +222,7 @@ describe('BackgroundProcessesProjection', () => {
         forkId: 'fork-a',
         pid: 2,
         command: 'done',
+        reason: 'timeout_exceeded',
         sourceTurnId: 'turn-1',
         startedAt: 1000,
         initialStdout: '',

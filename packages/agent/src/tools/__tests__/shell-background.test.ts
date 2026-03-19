@@ -14,6 +14,7 @@ const makeRegistry = () => ({
   flush: () => Effect.void,
   listByFork: () => Effect.succeed([]),
   getByPid: () => Effect.succeed(undefined),
+  promote: () => Effect.succeed({ success: false as const, reason: 'not_found' as const }),
   cleanupFork: () => Effect.void,
   shutdownAll: () => Effect.void,
 })

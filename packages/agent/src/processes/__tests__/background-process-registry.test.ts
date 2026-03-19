@@ -61,8 +61,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       startedAt,
       child,
+      timeoutSeconds: 1,
       initialStdout: 'hello',
       initialStderr: 'warn',
     }))
@@ -77,6 +79,7 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       pid: child.pid,
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       sourceTurnId: 'turn-1',
       startedAt,
       initialStdout: 'hello',
@@ -92,8 +95,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'sleep 0.1',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -117,8 +122,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'printf one; sleep 0.2; printf two; sleep 0.7',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -153,8 +160,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'large output',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -183,8 +192,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child: childA,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -193,8 +204,10 @@ describe('background process registry', () => {
       forkId: 'fork-b',
       turnId: 'turn-2',
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child: childB,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -211,8 +224,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -221,6 +236,7 @@ describe('background process registry', () => {
     expect(record).toBeDefined()
     expect(record?.forkId).toBe('fork-a')
     expect(record?.command).toBe('sleep 10')
+    expect(record?.reason).toBe('timeout_exceeded')
   })
 
   test('cleanupFork() kills processes owned by that fork', async () => {
@@ -232,8 +248,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child: owned,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -242,8 +260,10 @@ describe('background process registry', () => {
       forkId: 'fork-b',
       turnId: 'turn-2',
       command: 'sleep 10',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child: other,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))
@@ -272,6 +292,7 @@ describe('background process registry', () => {
         forkId,
         turnId: `turn-${forkId}`,
         command: 'sleep 10',
+        reason: 'timeout_exceeded',
         startedAt: Date.now(),
         child,
         initialStdout: '',
@@ -292,8 +313,10 @@ describe('background process registry', () => {
       forkId: 'fork-a',
       turnId: 'turn-1',
       command: 'exit 7',
+      reason: 'timeout_exceeded',
       startedAt: Date.now(),
       child,
+      timeoutSeconds: 1,
       initialStdout: '',
       initialStderr: '',
     }))

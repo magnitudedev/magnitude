@@ -278,6 +278,7 @@ export interface BackgroundProcessRegistered {
   readonly forkId: string | null
   readonly pid: number
   readonly command: string
+  readonly reason: 'background' | 'timeout_exceeded'
   readonly sourceTurnId: string
   readonly startedAt: number
   readonly initialStdout: string
@@ -319,6 +320,19 @@ export interface BackgroundProcessExited {
   readonly exitCode: number | null
   readonly signal: string | null
   readonly status: 'exited' | 'killed'
+}
+
+export interface BackgroundProcessAutoKilled {
+  readonly type: 'background_process_auto_killed'
+  readonly forkId: string | null
+  readonly pid: number
+  readonly command: string
+}
+
+export interface BackgroundProcessPromoted {
+  readonly type: 'background_process_promoted'
+  readonly forkId: string | null
+  readonly pid: number
 }
 
 
@@ -537,6 +551,8 @@ export type AppEvent =
   | BackgroundProcessOutput
   | BackgroundProcessDemoted
   | BackgroundProcessExited
+  | BackgroundProcessAutoKilled
+  | BackgroundProcessPromoted
   | AutopilotMessageGenerated
   | AutopilotToggled
   | Wake

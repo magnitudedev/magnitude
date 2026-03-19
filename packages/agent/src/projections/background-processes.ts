@@ -4,6 +4,7 @@ import type { AppEvent } from '../events'
 export interface BackgroundProcessState {
   readonly pid: number
   readonly command: string
+  readonly reason: 'background' | 'timeout_exceeded'
   readonly status: 'running' | 'exited' | 'killed'
   readonly startedAt: number
   readonly exitCode: number | null
@@ -56,6 +57,7 @@ export const BackgroundProcessesProjection = Projection.define<AppEvent, Backgro
       forkProcesses.set(event.pid, {
         pid: event.pid,
         command: event.command,
+        reason: event.reason,
         status: 'running',
         startedAt: event.startedAt,
         exitCode: null,
@@ -126,6 +128,45 @@ export const BackgroundProcessesProjection = Projection.define<AppEvent, Backgro
         demoted: true,
         stdoutFilePath: event.stdoutFilePath,
         stderrFilePath: event.stderrFilePath,
+      })
+
+      next.set(forkKey, forkProcesses)
+      return next
+    },
+
+    background_process_promoted: ({ event, state }) => {
+      const next = new Map(state)
+      const forkKey = toForkKey(event.forkId)
+      const existingForkProcesses = next.get(forkKey)
+      if (!existingForkProcesses) return state
+
+      const forkProcesses = new Map(existingForkProcesses)
+      const existing = forkProcesses.get(event.pid)
+      if (!existing) return state
+
+      forkProcesses.set(event.pid, {
+        ...existing,
+        reason: 'background',
+      })
+
+      next.set(forkKey, forkProcesses)
+      return next
+    },
+
+    background_process_auto_killed: ({ event, state }) => {
+      const next = new Map(state)
+      const forkKey = toForkKey(event.forkId)
+      const existingForkProcesses = next.get(forkKey)
+      if (!existingForkProcesses) return state
+
+      const forkProcesses = new Map(existingForkProcesses)
+      const existing = forkProcesses.get(event.pid)
+      if (!existing) return state
+
+      forkProcesses.set(event.pid, {
+        ...existing,
+        status: 'killed',
+        signal: 'SIGTERM',
       })
 
       next.set(forkKey, forkProcesses)

@@ -7,6 +7,7 @@
 
 import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
 import { readTool, treeTool, searchTool, viewTool } from '../tools/fs'
+import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
@@ -35,6 +36,7 @@ const tools = toolSet({
   fileSearch:    searchTool,
   fileView:      viewTool,
   shell:         shellTool,
+  shellBg:       shellBgTool,
   webSearch:     webSearchTool,
   webFetch:      webFetchTool,
   artifactRead:  artifactReadTool,

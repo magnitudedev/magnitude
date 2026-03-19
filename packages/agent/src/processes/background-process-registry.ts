@@ -5,9 +5,11 @@ import path from 'path'
 import type { ChildProcess } from 'child_process'
 import type {
   AppEvent,
+  BackgroundProcessAutoKilled,
   BackgroundProcessDemoted,
   BackgroundProcessExited,
   BackgroundProcessOutput,
+  BackgroundProcessPromoted,
   BackgroundProcessRegistered,
 } from '../events'
 import type {
@@ -15,7 +17,7 @@ import type {
   RegisterProcessInput,
 } from './types'
 
-import { DEMOTION_THRESHOLD_CHARS, TAIL_MAX_CHARS, SHUTDOWN_GRACE_MS, OUTPUT_DIR_NAME } from './constants'
+import { AUTO_KILL_BUFFER_S, DEMOTION_THRESHOLD_CHARS, TAIL_MAX_CHARS, SHUTDOWN_GRACE_MS, OUTPUT_DIR_NAME } from './constants'
 
 const OUTPUT_DIR = path.join(os.homedir(), OUTPUT_DIR_NAME)
 
@@ -24,6 +26,7 @@ export interface BackgroundProcessRegistry {
   readonly flush: (forkId: string | null) => Effect.Effect<void>
   readonly listByFork: (forkId: string | null) => Effect.Effect<BackgroundProcessRecord[]>
   readonly getByPid: (pid: number) => Effect.Effect<BackgroundProcessRecord | undefined>
+  readonly promote: (pid: number) => Effect.Effect<{ success: true } | { success: false; reason: 'not_found' | 'already_exited' | 'already_background' }>
   readonly cleanupFork: (forkId: string | null) => Effect.Effect<void>
   readonly shutdownAll: () => Effect.Effect<void>
 }
@@ -69,6 +72,13 @@ export function make(
       record.stdoutBuffer += chunk
     } else {
       record.stderrBuffer += chunk
+    }
+  }
+
+  const clearAutoKillTimer = (record: BackgroundProcessRecord) => {
+    if (record.autoKillTimer) {
+      clearTimeout(record.autoKillTimer)
+      record.autoKillTimer = undefined
     }
   }
 
@@ -164,6 +174,8 @@ export function make(
     if (finalized.has(record.pid)) return
     finalized.add(record.pid)
 
+    clearAutoKillTimer(record)
+
     record.status = 'exited'
     record.exitCode = exitCode
     record.signal = signal
@@ -198,8 +210,10 @@ export function make(
       forkId: input.forkId,
       turnId: input.turnId,
       command: input.command,
+      reason: input.reason,
       startedAt: input.startedAt,
       child: input.child,
+      timeoutSeconds: input.timeoutSeconds,
       status: 'running',
       exitCode: null,
       signal: null,
@@ -212,11 +226,36 @@ export function make(
 
     records.set(record.pid, record)
 
+    if (record.reason === 'timeout_exceeded' && record.timeoutSeconds !== undefined) {
+      record.autoKillTimer = setTimeout(() => {
+        if (record.status !== 'running') {
+          clearAutoKillTimer(record)
+          return
+        }
+
+        try {
+          record.child.kill('SIGTERM')
+        } catch {
+          // ignore
+        }
+
+        const autoKilledEvent: BackgroundProcessAutoKilled = {
+          type: 'background_process_auto_killed',
+          forkId: record.forkId,
+          pid: record.pid,
+          command: record.command,
+        }
+        publish(autoKilledEvent)
+        clearAutoKillTimer(record)
+      }, (record.timeoutSeconds + AUTO_KILL_BUFFER_S) * 1000)
+    }
+
     const registeredEvent: BackgroundProcessRegistered = {
       type: 'background_process_registered',
       forkId: record.forkId,
       pid: record.pid,
       command: record.command,
+      reason: record.reason,
       sourceTurnId: record.turnId,
       startedAt: record.startedAt,
       initialStdout: input.initialStdout,
@@ -246,6 +285,7 @@ export function make(
 
   const terminateRecord = async (record: BackgroundProcessRecord) => {
     if (record.status !== 'running') return
+    clearAutoKillTimer(record)
     try {
       record.child.kill('SIGTERM')
     } catch {
@@ -291,6 +331,30 @@ export function make(
     ),
 
     getByPid: (pid) => Effect.sync(() => records.get(pid)),
+
+    promote: (pid) => Effect.sync(() => {
+      const record = records.get(pid)
+      if (!record) {
+        return { success: false as const, reason: 'not_found' as const }
+      }
+      if (record.status !== 'running') {
+        return { success: false as const, reason: 'already_exited' as const }
+      }
+      if (record.reason === 'background') {
+        return { success: false as const, reason: 'already_background' as const }
+      }
+
+      record.reason = 'background'
+      clearAutoKillTimer(record)
+
+      const promotedEvent: BackgroundProcessPromoted = {
+        type: 'background_process_promoted',
+        forkId: record.forkId,
+        pid: record.pid,
+      }
+      publish(promotedEvent)
+      return { success: true as const }
+    }),
 
     cleanupFork: (forkId) => Effect.promise(async () => {
       const owned = Array.from(records.values()).filter(record => record.forkId === forkId)

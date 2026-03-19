@@ -7,7 +7,7 @@ const truncateCommand = (command: string): string =>
   command.length > 80 ? `${command.slice(0, 77)}...` : command
 
 const formatProcess = (process: BackgroundProcessState): string => {
-  const attrs = [`pid="${process.pid}"`, `status="${process.status}"`, `command="${truncateCommand(process.command)}"`]
+  const attrs = [`pid="${process.pid}"`, `status="${process.status}"`, `reason="${process.reason}"`, `command="${truncateCommand(process.command)}"`]
   if (process.status === 'exited' && process.exitCode !== null) attrs.push(`exitCode="${process.exitCode}"`)
   if (process.status === 'killed' && process.signal) attrs.push(`signal="${process.signal}"`)
 

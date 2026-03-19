@@ -5,8 +5,11 @@ export interface BackgroundProcessRecord {
   forkId: string | null
   turnId: string
   command: string
+  reason: 'background' | 'timeout_exceeded'
   startedAt: number
   child: ChildProcess
+  autoKillTimer?: ReturnType<typeof setTimeout>
+  timeoutSeconds?: number
   status: 'running' | 'exited'
   exitCode: number | null
   signal: string | null
@@ -22,8 +25,10 @@ export interface RegisterProcessInput {
   readonly forkId: string | null
   readonly turnId: string
   readonly command: string
+  readonly reason: 'background' | 'timeout_exceeded'
   readonly startedAt: number
   readonly child: ChildProcess
+  readonly timeoutSeconds?: number
   readonly initialStdout: string
   readonly initialStderr: string
 }
