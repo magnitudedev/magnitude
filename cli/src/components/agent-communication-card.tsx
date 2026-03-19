@@ -40,7 +40,7 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
   )
 
   return (
-    <box style={{ alignSelf: 'flex-start', marginBottom: 1, flexDirection: 'column' }}>
+    <box style={{ alignSelf: 'flex-start', flexDirection: 'column' }}>
       <box>
         <text>
           <span attributes={TextAttributes.BOLD}>✉ </span>

@@ -207,37 +207,30 @@ const ThinkingStep = memo(function ThinkingStep({ content, label, isActive, isIn
 // Cluster container styling
 // =============================================================================
 
-function ClusterContainer({ cluster, children }: { cluster: string | null; children: React.ReactNode }) {
+function ClusterContainer({
+  cluster,
+  isFirstGroup,
+  children,
+}: {
+  cluster: string | null
+  isFirstGroup: boolean
+  children: React.ReactNode
+}) {
   const theme = useTheme()
 
-  // Shell cluster gets terminal-style background
-  if (cluster === 'shell') {
-    return (
-      <box
-        style={{
-          flexDirection: 'column',
-          backgroundColor: theme.terminalBg,
-          marginTop: 1,
-          paddingRight: 1,
-        }}
-      >
-        {children}
-      </box>
-    )
-  }
-
-  // Thinking steps (null cluster) get no extra spacing — just a bare wrapper
-  if (cluster === null) {
-    return (
-      <box style={{ flexDirection: 'column' }}>
-        {children}
-      </box>
-    )
-  }
-
-  // Tool clusters get vertical spacing (top only — bottom margin handled by next group's top)
   return (
-    <box style={{ flexDirection: 'column', marginTop: 1 }}>
+    <box
+      style={{
+        flexDirection: 'column',
+        marginTop: isFirstGroup ? 0 : 1,
+        ...(cluster === 'shell'
+          ? {
+              backgroundColor: theme.terminalBg,
+              paddingRight: 1,
+            }
+          : {}),
+      }}
+    >
       {children}
     </box>
   )
@@ -514,7 +507,7 @@ export const ThinkBlock = memo(function ThinkBlock({
       {!isCollapsed && (
         <box style={{ paddingLeft: 2, flexDirection: 'column' }}>
           {groups.map((group, gi) => (
-            <ClusterContainer key={gi} cluster={group.cluster}>
+            <ClusterContainer key={gi} cluster={group.cluster} isFirstGroup={gi === 0}>
               <StepGroupView
                 group={group}
                 expandedSteps={expandedSteps}

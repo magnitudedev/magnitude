@@ -114,7 +114,11 @@ export const MessageView = memo(function MessageView({
         return <ApprovalRequest message={message} onApprove={onApprove} onReject={onReject} />
 
       case 'agent_communication':
-        return <AgentCommunicationCard message={message} />
+        return (
+          <box style={{ marginBottom: 1 }}>
+            <AgentCommunicationCard message={message} />
+          </box>
+        )
 
     }
   })()
