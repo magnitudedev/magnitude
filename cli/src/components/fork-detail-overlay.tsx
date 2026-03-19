@@ -11,7 +11,6 @@ interface ForkDetailOverlayProps {
   forkId: string
   forkName: string
   forkRole: string
-  initialPrompt?: string | null
   onClose: () => void
   onForkExpand?: (forkId: string) => void
   subscribeForkDisplay: (forkId: string, cb: (state: DisplayState) => void) => () => void
@@ -25,7 +24,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   forkId,
   forkName,
   forkRole,
-  initialPrompt,
+
   onClose,
   onForkExpand,
   subscribeForkDisplay,
@@ -33,8 +32,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
   const [display, setDisplay] = useState<DisplayState | null>(null)
-  const [isPromptCollapsed, setIsPromptCollapsed] = useState(true)
-  const [isPromptHovered, setIsPromptHovered] = useState(false)
+
   const scrollboxRef = useRef<any>(null)
 
   useKeyboard(useCallback((key: KeyEvent) => {
@@ -44,7 +42,6 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
     }
   }, [onClose]))
 
-  useEffect(() => setIsPromptCollapsed(true), [forkId, initialPrompt])
   const { isCollapsed, toggleCollapse } = useCollapsedBlocks()
 
   useEffect(() => {
@@ -56,21 +53,6 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
 
   const messages = display?.messages ?? []
   const isStreaming = display?.status === 'streaming'
-  const normalizedPrompt = initialPrompt?.trim() ?? ''
-  const hasInitialPrompt = normalizedPrompt.length > 0
-  const promptPreview = normalizedPrompt.length > 120 ? `${normalizedPrompt.slice(0, 120)}…` : normalizedPrompt
-
-  const handlePromptToggle = useCallback(() => {
-    const nextCollapsed = !isPromptCollapsed
-    setIsPromptCollapsed(nextCollapsed)
-
-    if (!nextCollapsed) {
-      setTimeout(() => {
-        scrollboxRef.current?.scrollTo(0)
-      }, 0)
-    }
-  }, [isPromptCollapsed])
-
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
       {/* Header */}
@@ -134,44 +116,6 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
           },
         }}
       >
-        {hasInitialPrompt && (
-          <box
-            style={{
-              marginTop: 0,
-              marginLeft: 2,
-              marginRight: 2,
-              marginBottom: 1,
-              paddingLeft: 1,
-              paddingRight: 1,
-              paddingTop: 1,
-              paddingBottom: 1,
-              border: true,
-              borderColor: theme.border,
-              flexDirection: 'column',
-            }}
-          >
-            <box style={{ flexDirection: 'row' }}>
-              <text style={{ flexGrow: 1 }}>
-                <span fg={theme.muted} attributes={TextAttributes.BOLD}>Initial prompt</span>
-              </text>
-              <Button
-                onClick={handlePromptToggle}
-                onMouseOver={() => setIsPromptHovered(true)}
-                onMouseOut={() => setIsPromptHovered(false)}
-              >
-                <text style={{ fg: isPromptHovered ? theme.link : theme.info }}>
-                  {isPromptCollapsed ? 'Show' : 'Hide'}
-                </text>
-              </Button>
-            </box>
-            <box style={{ marginTop: 1 }}>
-              <text style={{ fg: theme.muted }}>
-                {isPromptCollapsed ? promptPreview : normalizedPrompt}
-              </text>
-            </box>
-          </box>
-        )}
-
         {messages.length === 0 ? (
           <box style={{ paddingLeft: 1 }}>
             <text style={{ fg: theme.muted }}>No activity yet.</text>

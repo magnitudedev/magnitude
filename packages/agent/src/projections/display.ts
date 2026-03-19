@@ -172,6 +172,7 @@ export interface ForkActivityMessage {
 export interface AgentCommunicationMessage {
   readonly id: string
   readonly type: 'agent_communication'
+  readonly streamId?: string
   readonly direction: 'to_agent' | 'from_agent'
   readonly agentId: string
   readonly agentName?: string
@@ -226,7 +227,7 @@ const generateId = () => createId()
  * Find the index where new content should be inserted (before queued messages).
  * Returns the index of the first queued message, or messages.length if none.
  */
-function findInsertionIndex(messages: readonly DisplayMessage[]): number {
+export function findInsertionIndex(messages: readonly DisplayMessage[]): number {
   const queuedIndex = messages.findIndex(m => m.type === 'queued_user_message')
   return queuedIndex === -1 ? messages.length : queuedIndex
 }
@@ -235,7 +236,7 @@ function findInsertionIndex(messages: readonly DisplayMessage[]): number {
  * Insert a message before queued messages (or at end if no queued messages).
  * Returns a new array.
  */
-function insertBeforeQueuedMessages(
+export function insertBeforeQueuedMessages(
   messages: readonly DisplayMessage[],
   message: DisplayMessage
 ): DisplayMessage[] {
@@ -383,7 +384,7 @@ function findLastIndex<T>(arr: readonly T[], pred: (item: T) => boolean): number
   return -1
 }
 
-function moveMessageToEndBeforeQueue<T extends DisplayMessage>(
+export function moveMessageToEndBeforeQueue<T extends DisplayMessage>(
   messages: readonly DisplayMessage[],
   id: string,
   updater?: (message: T) => DisplayMessage
@@ -396,10 +397,48 @@ function moveMessageToEndBeforeQueue<T extends DisplayMessage>(
   return insertBeforeQueuedMessages(remaining, updated)
 }
 
-function toPreview(text: string): string {
+export function toPreview(text: string): string {
   const normalized = text.replace(/\s+/g, ' ').trim()
   if (normalized.length <= 120) return normalized
   return normalized.slice(0, 117) + '...'
+}
+
+export function upsertStreamingCommunicationMessage(
+  fork: DisplayState,
+  streamId: string,
+  message: Omit<AgentCommunicationMessage, 'id' | 'type' | 'preview' | 'streamId'>,
+  textDelta: string
+): DisplayState {
+  const existing = fork.messages.find(
+    (m): m is AgentCommunicationMessage => m.type === 'agent_communication' && m.streamId === streamId
+  )
+
+  if (existing) {
+    const content = existing.content + textDelta
+    return {
+      ...fork,
+      messages: updateMessageById<AgentCommunicationMessage>(fork.messages, existing.id, (msg) => ({
+        ...msg,
+        content,
+        preview: toPreview(content),
+      }))
+    }
+  }
+
+  const content = textDelta
+  const comm: AgentCommunicationMessage = {
+    id: generateId(),
+    type: 'agent_communication',
+    streamId,
+    ...message,
+    content,
+    preview: toPreview(content),
+  }
+
+  return {
+    ...fork,
+    messages: insertBeforeQueuedMessages(fork.messages, comm)
+  }
 }
 
 function isArtifactToolKey(toolKey: string | undefined): toolKey is 'artifactWrite' | 'artifactUpdate' {
@@ -1001,6 +1040,29 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
+    agent_created: ({ event, fork }) => {
+      const content = event.message.trim()
+      if (!content) return fork
+
+      const comm: AgentCommunicationMessage = {
+        id: generateId(),
+        type: 'agent_communication',
+        direction: 'from_agent',
+        agentId: event.agentId,
+        agentName: event.name,
+        agentRole: event.role,
+        forkId: event.forkId,
+        content,
+        preview: toPreview(content),
+        timestamp: event.timestamp,
+      }
+
+      return {
+        ...fork,
+        messages: insertBeforeQueuedMessages(fork.messages, comm)
+      }
+    },
+
     agent_dismissed: ({ event, fork }) => {
       // Keep fork state for display/debug history
       return fork
@@ -1145,134 +1207,112 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(AgentRoutingProjection.signals.agentMessage, ({ value, state, read }) => {
-      const { targetForkId, agentId, message, timestamp } = value
-      const content = message.trim()
-      if (!content) return state
+    on(AgentRoutingProjection.signals.communicationStreamStarted, ({ value, state, read }) => {
+      const displayFork = state.forks.get(value.targetForkId)
+      if (!displayFork) return state
 
       const agentState = read(AgentStatusProjection)
-      const targetAgent = getAgentByForkId(agentState, targetForkId)
-      const parentForkId = targetAgent?.parentForkId ?? null
-      let nextState = state
-
-      const parentDisplayFork = state.forks.get(parentForkId)
-      if (parentDisplayFork) {
-        const communication: AgentCommunicationMessage = {
-          id: generateId(),
-          type: 'agent_communication',
-          direction: 'to_agent',
-          agentId,
+      const targetAgent = getAgentByForkId(agentState, value.targetForkId)
+      const nextFork = upsertStreamingCommunicationMessage(
+        displayFork,
+        value.streamId,
+        {
+          direction: value.direction,
+          agentId: value.agentId,
           agentName: targetAgent?.name,
           agentRole: targetAgent?.role,
-          forkId: targetForkId,
-          content,
-          preview: toPreview(content),
-          timestamp
-        }
+          forkId: value.targetForkId,
+          timestamp: value.timestamp,
+        },
+        value.textDelta
+      )
 
-        nextState = {
-          ...nextState,
-          forks: new Map(nextState.forks).set(parentForkId, {
-            ...parentDisplayFork,
-            messages: insertBeforeQueuedMessages(parentDisplayFork.messages, communication)
-          })
-        }
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.targetForkId, nextFork)
       }
-
-      const childDisplayFork = nextState.forks.get(targetForkId)
-      if (!childDisplayFork) return nextState
-
-      const childCommunication: AgentCommunicationMessage = {
-        id: generateId(),
-        type: 'agent_communication',
-        direction: 'from_agent',
-        agentId: 'orchestrator',
-        agentName: 'Orchestrator',
-        agentRole: 'Orchestrator',
-        forkId: targetForkId,
-        content,
-        preview: toPreview(content),
-        timestamp
-      }
-
-      nextState = {
-        ...nextState,
-        forks: new Map(nextState.forks).set(targetForkId, {
-          ...childDisplayFork,
-          messages: insertBeforeQueuedMessages(childDisplayFork.messages, childCommunication)
-        })
-      }
-
-      return nextState
     }),
 
-    on(AgentRoutingProjection.signals.agentResponse, ({ value, state, read }) => {
-      const { targetForkId, agentId, message, timestamp } = value
-      const content = message.trim()
-      if (!content) return state
+    on(AgentRoutingProjection.signals.communicationStreamChunk, ({ value, state, read }) => {
+      const displayFork = state.forks.get(value.targetForkId)
+      if (!displayFork) return state
 
       const agentState = read(AgentStatusProjection)
-      const sourceAgent = agentState.agents.get(agentId)
+      const targetAgent = getAgentByForkId(agentState, value.targetForkId)
+      const nextFork = upsertStreamingCommunicationMessage(
+        displayFork,
+        value.streamId,
+        {
+          direction: value.direction,
+          agentId: value.agentId,
+          agentName: targetAgent?.name,
+          agentRole: targetAgent?.role,
+          forkId: value.targetForkId,
+          timestamp: value.timestamp,
+        },
+        value.textDelta
+      )
 
-      let nextState = state
-
-      const displayFork = state.forks.get(targetForkId)
-      if (displayFork) {
-        const communication: AgentCommunicationMessage = {
-          id: generateId(),
-          type: 'agent_communication',
-          direction: 'from_agent',
-          agentId,
-          agentName: sourceAgent?.name,
-          agentRole: sourceAgent?.role,
-          forkId: targetForkId,
-          content,
-          preview: toPreview(content),
-          timestamp
-        }
-
-        nextState = {
-          ...nextState,
-          forks: new Map(nextState.forks).set(targetForkId, {
-            ...displayFork,
-            messages: insertBeforeQueuedMessages(displayFork.messages, communication)
-          })
-        }
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.targetForkId, nextFork)
       }
+    }),
 
-      if (!sourceAgent) return nextState
-      const sourceDisplayFork = nextState.forks.get(sourceAgent.forkId)
-      if (!sourceDisplayFork) return nextState
+    on(AgentRoutingProjection.signals.communicationStreamCompleted, ({ value, state }) => {
+      const displayFork = state.forks.get(value.targetForkId)
+      if (!displayFork) return state
 
-      const childCommunication: AgentCommunicationMessage = {
-        id: generateId(),
-        type: 'agent_communication',
-        direction: 'to_agent',
-        agentId: 'orchestrator',
-        agentName: 'Orchestrator',
-        agentRole: 'Orchestrator',
-        forkId: sourceAgent.forkId,
-        content,
-        preview: toPreview(content),
-        timestamp
+      return {
+        ...state,
+        forks: new Map(state.forks).set(
+          value.targetForkId,
+          finalizeCommunicationStreamInFork(displayFork, value.streamId)
+        )
       }
-
-      nextState = {
-        ...nextState,
-        forks: new Map(nextState.forks).set(sourceAgent.forkId, {
-          ...sourceDisplayFork,
-          messages: insertBeforeQueuedMessages(sourceDisplayFork.messages, childCommunication)
-        })
-      }
-
-      return nextState
-    })
+    }),
   ]
 })
 
 // =============================================================================
 // Helpers
 // =============================================================================
+
+export function finalizeCommunicationStreamInFork(
+  fork: DisplayState,
+  streamId: string
+): DisplayState {
+  const msg = fork.messages.find(
+    (m): m is AgentCommunicationMessage => m.type === 'agent_communication' && m.streamId === streamId
+  )
+  if (!msg) return fork
+
+  const normalized = msg.content.trim()
+  const duplicateSeed = normalized.length > 0
+    ? fork.messages.find(
+      (m): m is AgentCommunicationMessage =>
+        m.type === 'agent_communication'
+        && !m.streamId
+        && m.id !== msg.id
+        && m.direction === msg.direction
+        && m.agentId === msg.agentId
+        && m.content.trim() === normalized
+    )
+    : undefined
+
+  const messages = duplicateSeed
+    ? fork.messages.filter(m => m.id !== msg.id)
+    : moveMessageToEndBeforeQueue<AgentCommunicationMessage>(
+      fork.messages,
+      msg.id,
+      (existing) => ({
+        ...existing,
+        preview: toPreview(existing.content),
+      })
+    )
+
+  return { ...fork, messages }
+}
 
 function generateCompletedToolLabel(toolKey: string, input: unknown): string | null {
   if (toolKey === 'artifactWrite' && input && typeof input === 'object' && 'id' in input) {

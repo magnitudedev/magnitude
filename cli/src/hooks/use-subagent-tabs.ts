@@ -6,7 +6,7 @@ import {
   sumForkToolCounts,
   truncateSubagentTabText,
 } from '../utils/subagent-tabs'
-import { selectLatestLiveActivityFromMessages } from '../utils/live-activity'
+import { selectLatestLiveActivityForSubagentTab } from '../utils/live-activity'
 
 type AgentClientLike = {
   state: {
@@ -185,7 +185,7 @@ export function useSubagentTabs({
         const statusLine = truncateSubagentTabText(
           meta.phase === 'idle'
             ? 'Subagent is idle'
-            : (selectLatestLiveActivityFromMessages(forkMessages[forkId] ?? []) ?? 'Running…'),
+            : (selectLatestLiveActivityForSubagentTab(forkMessages[forkId] ?? []) ?? 'Running…'),
         )
         return {
           forkId,

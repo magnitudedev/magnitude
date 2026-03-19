@@ -711,8 +711,12 @@ function AppInner({
   }, [selectedTabForkId, agentStatusState, primaryModel, secondaryModel, browserModel])
 
   const mainTimelineMessages = useMemo(
-    () => (activeDisplay?.messages ?? []).filter(m => m.type !== 'fork_activity' && m.type !== 'agent_communication'),
-    [activeDisplay?.messages]
+    () => (activeDisplay?.messages ?? []).filter(m => {
+      if (m.type === 'fork_activity') return false
+      if (selectedTabForkId === null && m.type === 'agent_communication') return false
+      return true
+    }),
+    [activeDisplay?.messages, selectedTabForkId]
   )
 
   const { visibleItems, hiddenCount, loadMore, hasMore } = usePaginatedTimeline(

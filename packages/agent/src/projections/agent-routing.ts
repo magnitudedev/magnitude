@@ -48,6 +48,23 @@ export interface AgentResponseSignal {
   readonly timestamp: number
 }
 
+export interface AgentCommunicationStreamSignal {
+  readonly streamId: string
+  readonly targetForkId: string
+  readonly direction: 'from_agent' | 'to_agent'
+  readonly agentId: string
+  readonly textDelta: string
+  readonly timestamp: number
+}
+
+export interface AgentCommunicationStreamCompletedSignal {
+  readonly streamId: string
+  readonly targetForkId: string
+  readonly direction: 'from_agent' | 'to_agent'
+  readonly agentId: string
+  readonly timestamp: number
+}
+
 export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingState>()(({
   name: 'AgentRouting',
 
@@ -62,6 +79,9 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
     agentRegistered: Signal.create<{ forkId: string; parentForkId: string | null }>('AgentRouting/registered'),
     agentMessage: Signal.create<AgentMessageSignal>('AgentRouting/message'),
     agentResponse: Signal.create<AgentResponseSignal>('AgentRouting/response'),
+    communicationStreamStarted: Signal.create<AgentCommunicationStreamSignal>('AgentRouting/communicationStreamStarted'),
+    communicationStreamChunk: Signal.create<AgentCommunicationStreamSignal>('AgentRouting/communicationStreamChunk'),
+    communicationStreamCompleted: Signal.create<AgentCommunicationStreamCompletedSignal>('AgentRouting/communicationStreamCompleted'),
   },
 
   eventHandlers: {
@@ -113,18 +133,76 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       return { ...state, agents, agentByForkId }
     },
 
-    message_start: ({ event, state }) => {
+    message_start: ({ event, state, emit }) => {
       const pendingMessages = new Map(state.pendingMessages)
       pendingMessages.set(event.id, { forkId: event.forkId, dest: event.dest, text: '' })
+
+      if (event.dest !== 'user') {
+        if (event.dest === 'parent' && event.forkId !== null) {
+          const source = getRoutingEntryByForkId(state, event.forkId)
+          if (source) {
+            emit.communicationStreamStarted({
+              streamId: event.id,
+              targetForkId: source.forkId,
+              direction: 'to_agent',
+              agentId: source.agentId,
+              textDelta: '',
+              timestamp: event.timestamp,
+            })
+          }
+        } else if (isActiveRoute(state, event.dest)) {
+          const target = getRoutingEntry(state, event.dest)
+          if (target) {
+            emit.communicationStreamStarted({
+              streamId: event.id,
+              targetForkId: target.forkId,
+              direction: 'from_agent',
+              agentId: target.agentId,
+              textDelta: '',
+              timestamp: event.timestamp,
+            })
+          }
+        }
+      }
+
       return { ...state, pendingMessages }
     },
 
-    message_chunk: ({ event, state }) => {
+    message_chunk: ({ event, state, emit }) => {
       const entry = state.pendingMessages.get(event.id)
       if (!entry) return state
 
       const pendingMessages = new Map(state.pendingMessages)
       pendingMessages.set(event.id, { ...entry, text: entry.text + event.text })
+
+      if (entry.dest !== 'user' && event.text.length > 0) {
+        if (entry.dest === 'parent' && entry.forkId !== null) {
+          const source = getRoutingEntryByForkId(state, entry.forkId)
+          if (source) {
+            emit.communicationStreamChunk({
+              streamId: event.id,
+              targetForkId: source.forkId,
+              direction: 'to_agent',
+              agentId: source.agentId,
+              textDelta: event.text,
+              timestamp: event.timestamp,
+            })
+          }
+        } else if (isActiveRoute(state, entry.dest)) {
+          const target = getRoutingEntry(state, entry.dest)
+          if (target) {
+            emit.communicationStreamChunk({
+              streamId: event.id,
+              targetForkId: target.forkId,
+              direction: 'from_agent',
+              agentId: target.agentId,
+              textDelta: event.text,
+              timestamp: event.timestamp,
+            })
+          }
+        }
+      }
+
       return { ...state, pendingMessages }
     },
 
@@ -138,6 +216,17 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       let nextState: AgentRoutingState = { ...state, pendingMessages }
 
       if (entry.dest === 'parent' && entry.forkId !== null) {
+        const source = getRoutingEntryByForkId(state, entry.forkId)
+        if (source) {
+          emit.communicationStreamCompleted({
+            streamId: event.id,
+            targetForkId: source.forkId,
+            direction: 'to_agent',
+            agentId: source.agentId,
+            timestamp: event.timestamp,
+          })
+        }
+
         const existing = state.deferredParentMessages.get(entry.forkId) ?? []
         const deferredParentMessages = new Map(state.deferredParentMessages)
         deferredParentMessages.set(entry.forkId, [...existing, { text: entry.text }])
@@ -147,6 +236,14 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       if (entry.dest !== 'user' && entry.dest !== 'parent' && isActiveRoute(state, entry.dest)) {
         const target = getRoutingEntry(state, entry.dest)
         if (target) {
+          emit.communicationStreamCompleted({
+            streamId: event.id,
+            targetForkId: target.forkId,
+            direction: 'from_agent',
+            agentId: target.agentId,
+            timestamp: event.timestamp,
+          })
+
           emit.agentMessage({
             targetForkId: target.forkId,
             agentId: entry.dest,

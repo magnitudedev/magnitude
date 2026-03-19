@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'bun:test'
 import type { DisplayMessage, ThinkBlockStep } from '@magnitudedev/agent'
-import { selectLatestLiveActivityFromMessages, selectLatestLiveActivityFromThinkSteps } from './live-activity'
+import {
+  selectLatestLiveActivityForSubagentTab,
+  selectLatestLiveActivityFromMessages,
+  selectLatestLiveActivityFromThinkSteps,
+} from './live-activity'
 
 describe('live-activity selector', () => {
   it('selects latest displayable activity by recency across message types', () => {
@@ -13,6 +17,30 @@ describe('live-activity selector', () => {
     ] as any as DisplayMessage[]
 
     expect(selectLatestLiveActivityFromMessages(messages)).toBe('latest communication')
+  })
+
+  it('prefers latest think-block activity for subagent tab status over newer communications', () => {
+    const messages = [
+      {
+        type: 'think_block',
+        steps: [{ id: '1', type: 'thinking', content: 'working step' }],
+      },
+      { type: 'agent_communication', preview: 'completed communication' },
+    ] as any as DisplayMessage[]
+
+    expect(selectLatestLiveActivityForSubagentTab(messages)).toBe('working step')
+  })
+
+  it('falls back to latest communication when subagent tab has no think activity', () => {
+    const messages = [
+      {
+        type: 'think_block',
+        steps: [{ id: '1', type: 'thinking', content: '   ' }],
+      },
+      { type: 'agent_communication', preview: 'latest communication' },
+    ] as any as DisplayMessage[]
+
+    expect(selectLatestLiveActivityForSubagentTab(messages)).toBe('latest communication')
   })
 
   it('uses tool live-text semantics before fallback label', () => {

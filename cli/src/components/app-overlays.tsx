@@ -227,14 +227,12 @@ export function AppOverlays({
   if (expandedForkId && client) {
     const agentId = agentStatusState?.agentByForkId.get(expandedForkId)
     const agent = agentId ? agentStatusState?.agents.get(agentId) : undefined
-    const initialPrompt = agent?.message ?? null
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
         <ForkDetailOverlay
           forkId={expandedForkId}
           forkName={agent?.name ?? 'Agent'}
           forkRole={agent?.role ?? 'agent'}
-          initialPrompt={initialPrompt}
           onClose={popForkOverlay}
           onForkExpand={pushForkOverlay}
           subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}

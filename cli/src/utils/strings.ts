@@ -1,3 +1,4 @@
+import stringWidth from 'string-width'
 import type { InputMentionSegment, InputPasteSegment, InputValue } from '../types/store'
 import { readClipboardText } from './clipboard'
 
@@ -8,6 +9,38 @@ export const LIST_BULLET_GLYPH = '• '
 
 /** Max number of lines to show in collapsed previews */
 export const PREVIEW_LINE_CAP = 3
+
+export function wrapTextToVisualLines(text: string, maxWidth: number): string[] {
+  const safeWidth = Math.max(1, Math.floor(maxWidth))
+  const segments = text.split('\n')
+  const lines: string[] = []
+
+  for (const segment of segments) {
+    if (segment.length === 0) {
+      lines.push('')
+      continue
+    }
+
+    let current = ''
+    let currentWidth = 0
+
+    for (const char of segment) {
+      const charWidth = Math.max(1, stringWidth(char))
+      if (currentWidth + charWidth > safeWidth) {
+        lines.push(current)
+        current = char
+        currentWidth = charWidth
+      } else {
+        current += char
+        currentWidth += charWidth
+      }
+    }
+
+    lines.push(current)
+  }
+
+  return lines
+}
 
 export function formatPastePlaceholder(charCount: number): string {
   return `[${charCount.toLocaleString()} characters pasted]`

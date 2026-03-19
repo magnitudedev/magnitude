@@ -40,20 +40,45 @@ export function selectLatestLiveActivityFromThinkSteps(
   return null
 }
 
+function getMessageLiveText(msg: DisplayMessage): string | null {
+  if (msg.type === 'agent_communication') {
+    const text = normalize(msg.preview)
+    return text.length > 0 ? text : null
+  }
+
+  if (msg.type === 'think_block') {
+    return selectLatestLiveActivityFromThinkSteps(msg.steps)
+  }
+
+  return null
+}
+
 export function selectLatestLiveActivityFromMessages(
   messages: readonly DisplayMessage[],
 ): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-    if (msg.type === 'agent_communication') {
-      const text = normalize(msg.preview)
-      if (text.length > 0) return text
-      continue
-    }
-    if (msg.type === 'think_block') {
-      const text = selectLatestLiveActivityFromThinkSteps(msg.steps)
-      if (text) return text
-    }
+    const text = getMessageLiveText(messages[i])
+    if (text) return text
   }
+  return null
+}
+
+export function selectLatestLiveActivityForSubagentTab(
+  messages: readonly DisplayMessage[],
+): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.type !== 'think_block') continue
+    const text = selectLatestLiveActivityFromThinkSteps(msg.steps)
+    if (text) return text
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.type !== 'agent_communication') continue
+    const text = normalize(msg.preview)
+    if (text.length > 0) return text
+  }
+
   return null
 }
