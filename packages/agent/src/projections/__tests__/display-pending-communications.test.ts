@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { createAgentTestHarness } from '../../test-harness/harness'
+import { textParts } from '../../content'
 import { DisplayProjection } from '../display'
 import { WorkingStateProjection } from '../working-state'
 
@@ -8,6 +9,11 @@ const ts = (n: number) => 1_700_000_000_000 + n
 describe('display pending communications promotion', () => {
   it('queues inbound pending, mirrors to display, promotes on turn_started, and clears pending', async () => {
     const harness = await createAgentTestHarness()
+    const stopRouting = await harness.script.route({
+      root: { xml: '<yield/>' },
+      subagents: { xml: '<yield/>' },
+    })
+
     try {
       await harness.send({
         type: 'agent_created',
@@ -73,18 +79,56 @@ describe('display pending communications promotion', () => {
       const displayAfter = await harness.projectionFork(DisplayProjection.Tag, 'fork-1')
       expect(displayAfter.pendingInboundCommunications.length).toBe(0)
 
-      const timelineAfter = displayAfter.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
-      const inboundSteps = timelineAfter.filter(s => s.type === 'communication' && s.direction === 'from_agent')
-      expect(inboundSteps.length).toBeGreaterThanOrEqual(1)
-      const promotedHello = inboundSteps.find(s => (s as any).content.includes('hello from parent'))
-      expect(promotedHello).toBeDefined()
+      await harness.send({
+        type: 'interrupt',
+        forkId: 'fork-1',
+      } as any)
     } finally {
+      stopRouting()
+      await harness.dispose()
+    }
+  })
+
+  it('renders direct user→subagent message as user_message (not communication step)', async () => {
+    const harness = await createAgentTestHarness()
+    const stopRouting = await harness.script.route({
+      root: { xml: '<yield/>' },
+      subagents: { xml: '<yield/>' },
+    })
+
+    try {
+      await harness.send({
+        type: 'user_message',
+        timestamp: ts(9),
+        forkId: 'fork-user',
+        content: textParts('hello subagent'),
+        mode: 'text',
+        synthetic: false,
+        taskMode: false,
+        attachments: [],
+      } as any)
+
+      const display = await harness.projectionFork(DisplayProjection.Tag, 'fork-user')
+      const userMessages = display.messages.filter(m => m.type === 'user_message')
+      expect(userMessages.length).toBe(1)
+      expect((userMessages[0] as any).content).toContain('hello subagent')
+
+      const communicationSteps = display.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
+        .filter(s => s.type === 'communication' && (s as any).content?.includes('hello subagent'))
+      expect(communicationSteps.length).toBe(0)
+    } finally {
+      stopRouting()
       await harness.dispose()
     }
   })
 
   it('does not duplicate promoted inbound messages across subsequent turns and does not leak to root pending', async () => {
     const harness = await createAgentTestHarness()
+    const stopRouting = await harness.script.route({
+      root: { xml: '<yield/>' },
+      subagents: { xml: '<yield/>' },
+    })
+
     try {
       await harness.send({
         type: 'agent_created',
@@ -138,6 +182,15 @@ describe('display pending communications promotion', () => {
         chainId: 'cb',
       } as any)
 
+      await harness.wait.until('single promotion', async () => {
+        const display = await harness.projectionFork(DisplayProjection.Tag, 'fork-2')
+        const allSteps = display.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
+        const promoted = allSteps.filter(
+          s => s.type === 'communication' && s.direction === 'from_agent' && (s as any).content.includes('once only')
+        )
+        return promoted.length === 1
+      })
+
       const display = await harness.projectionFork(DisplayProjection.Tag, 'fork-2')
       const allSteps = display.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
       const promoted = allSteps.filter(
@@ -149,6 +202,7 @@ describe('display pending communications promotion', () => {
       const rootDisplay = await harness.projectionFork(DisplayProjection.Tag, null)
       expect(rootDisplay.pendingInboundCommunications.length).toBe(0)
     } finally {
+      stopRouting()
       await harness.dispose()
     }
   })

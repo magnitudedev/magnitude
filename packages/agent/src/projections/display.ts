@@ -642,37 +642,17 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
     user_message: ({ event, fork }) => {
       const messageId = generateId()
+      const content = textOf(event.content)
+      const messageType = fork.currentTurnId !== null ? 'queued_user_message' : 'user_message'
 
-      // If currently in a turn, queue the message
-      // Queued messages always go at the END
-      if (fork.currentTurnId !== null) {
-        return {
-          ...fork,
-          messages: [
-            ...fork.messages,
-            {
-              id: messageId,
-              type: 'queued_user_message' as const,
-              content: textOf(event.content),
-              timestamp: event.timestamp,
-              taskMode: event.taskMode,
-              attachments: (event.attachments ?? [])
-                .filter((a): a is Extract<typeof a, { type: 'image' }> => a.type === 'image')
-                .map(a => ({ type: a.type, width: a.width, height: a.height, filename: a.filename }))
-            }
-          ]
-        }
-      }
-
-      // Otherwise add as normal user_message
       return {
         ...fork,
         messages: [
           ...fork.messages,
           {
             id: messageId,
-            type: 'user_message' as const,
-            content: textOf(event.content),
+            type: messageType as 'user_message' | 'queued_user_message',
+            content,
             timestamp: event.timestamp,
             taskMode: event.taskMode,
             attachments: (event.attachments ?? [])
@@ -710,7 +690,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         ...newState,
         currentTurnId: event.turnId,  // Track the turn for queuing
         status: 'streaming' as const,
-        showButton: 'stop' as const
+        showButton: 'stop' as const,
+        pendingInboundCommunications: [],
       }
     },
 
@@ -1403,7 +1384,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       let nextFork = { ...displayFork }
 
       if (value.forkId !== null) {
-        for (const pending of value.messages) {
+        for (const pending of value.messages.filter((message) => message.source === 'agent')) {
           const targetAgent = getAgentByForkId(agentState, value.forkId)
           const withBlock = ensureThinkBlock(nextFork, value.timestamp)
           nextFork = {
@@ -1436,6 +1417,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         forks: new Map(state.forks).set(value.forkId, nextFork)
       }
     }),
+
+
   ]
 })
 

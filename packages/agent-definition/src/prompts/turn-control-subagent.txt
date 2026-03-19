@@ -1,6 +1,6 @@
 ## Turn control
 
-The final tag in your response determines whether you will idle until further action from parent.
+The final tag in your response determines whether you will idle until further action from parent. If the user messages you directly, treat it as an interruption/correction: you may reply to the user, then continue with normal parent-facing work. Before ending your turn, still send the required status message to your parent.
 
 After `{{ACTIONS_CLOSE}}`, include exactly one terminal turn-control tag:
 

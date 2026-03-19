@@ -34,6 +34,46 @@ type ForkMeta = {
   phase: 'active' | 'idle'
 }
 
+export function buildSubagentTabItem(args: {
+  forkId: string
+  meta: ForkMeta
+  messages: readonly DisplayMessage[]
+  pendingDirect: { pending: boolean; since: number | null } | undefined
+}): SubagentTabItem {
+  const { forkId, meta, messages, pendingDirect } = args
+  const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
+  const isPendingDirect = pendingDirect?.pending === true
+
+  const phase: SubagentTabItem['phase'] = isPendingDirect ? 'active' : meta.phase
+  const activeSince = phase === 'active'
+    ? (meta.phase === 'active' ? meta.activeSince : (pendingDirect?.since ?? meta.activeSince))
+    : meta.activeSince
+  const completedAt = phase === 'active' ? undefined : meta.completedAt
+  const accumulatedActiveMs = meta.accumulatedActiveMs
+
+  const statusLine = truncateSubagentTabText(
+    isPendingDirect
+      ? 'User sent a message...'
+      : meta.phase === 'idle'
+        ? 'Subagent is idle'
+        : (selectLatestLiveActivityForSubagentTab(messages) ?? 'Running…'),
+  )
+
+  return {
+    forkId,
+    agentId: meta.agentId,
+    name: meta.name,
+    activeSince,
+    accumulatedActiveMs,
+    completedAt,
+    resumeCount: meta.resumeCount,
+    toolCount: meta.toolCount,
+    toolSummaryLine,
+    statusLine,
+    phase,
+  }
+}
+
 const DISMISSED_PRUNE_MS = 1000
 
 export function sortSubagentTabs(a: SubagentTabItem, b: SubagentTabItem): number {
@@ -102,6 +142,7 @@ export function useSubagentTabs({
   agentStatusState,
 }: UseSubagentTabsArgs): SubagentTabItem[] {
   const [forkMessages, setForkMessages] = useState<Record<string, readonly DisplayMessage[]>>({})
+  const [forkPendingDirectUser, setForkPendingDirectUser] = useState<Record<string, { pending: boolean; since: number | null }>>({})
   const [forkMeta, setForkMeta] = useState<Record<string, ForkMeta>>({})
   const unsubscribesRef = useRef<Map<string, () => void>>(new Map())
   const pruneTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map())
@@ -145,6 +186,16 @@ export function useSubagentTabs({
       if (!client || unsubscribesRef.current.has(forkId)) continue
       const unsubscribe = client.state.display.subscribeFork(forkId, (state) => {
         setForkMessages(prev => ({ ...prev, [forkId]: state.messages }))
+        const pendingUser = state.pendingInboundCommunications.filter((message) => message.source === 'user')
+        setForkPendingDirectUser(prev => ({
+          ...prev,
+          [forkId]: {
+            pending: pendingUser.length > 0,
+            since: pendingUser.length > 0
+              ? Math.min(...pendingUser.map(message => message.timestamp))
+              : null,
+          },
+        }))
       })
       unsubscribesRef.current.set(forkId, unsubscribe)
     }
@@ -159,6 +210,12 @@ export function useSubagentTabs({
           unsubscribesRef.current.delete(forkId)
         }
         setForkMessages(prev => {
+          if (!prev[forkId]) return prev
+          const next = { ...prev }
+          delete next[forkId]
+          return next
+        })
+        setForkPendingDirectUser(prev => {
           if (!prev[forkId]) return prev
           const next = { ...prev }
           delete next[forkId]
@@ -180,27 +237,14 @@ export function useSubagentTabs({
 
   return useMemo(() => {
     return Object.entries(forkMeta)
-      .map(([forkId, meta]): SubagentTabItem => {
-        const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
-        const statusLine = truncateSubagentTabText(
-          meta.phase === 'idle'
-            ? 'Subagent is idle'
-            : (selectLatestLiveActivityForSubagentTab(forkMessages[forkId] ?? []) ?? 'Running…'),
-        )
-        return {
+      .map(([forkId, meta]): SubagentTabItem => (
+        buildSubagentTabItem({
           forkId,
-          agentId: meta.agentId,
-          name: meta.name,
-          activeSince: meta.activeSince,
-          accumulatedActiveMs: meta.accumulatedActiveMs,
-          completedAt: meta.completedAt,
-          resumeCount: meta.resumeCount,
-          toolCount: meta.toolCount,
-          toolSummaryLine,
-          statusLine,
-          phase: meta.phase,
-        }
-      })
+          meta,
+          messages: forkMessages[forkId] ?? [],
+          pendingDirect: forkPendingDirectUser[forkId],
+        })
+      ))
       .sort(sortSubagentTabs)
-  }, [forkMeta, forkMessages])
+  }, [forkMeta, forkMessages, forkPendingDirectUser])
 }

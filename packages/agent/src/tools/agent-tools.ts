@@ -99,6 +99,7 @@ export const agentCreateTool = createTool({
         { field: 'options.type', attr: 'type' },
       ],
       childTags: [
+        { field: 'options.type', tag: 'type' },
         { field: 'options.title', tag: 'title' },
         { field: 'options.message', tag: 'message' },
       ],

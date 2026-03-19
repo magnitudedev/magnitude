@@ -58,7 +58,13 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
         const turnStream = createTurnStream((queue) => Effect.gen(function* () {
           const executeResult = yield* execManager.execute(
             xmlStream,
-            { forkId, turnId, chainId },
+            {
+              forkId,
+              turnId,
+              chainId,
+              defaultProseDest: forkId === null ? 'user' : 'parent',
+              allowSingleUserReplyThisTurn: false,
+            },
             queue,
           )
 

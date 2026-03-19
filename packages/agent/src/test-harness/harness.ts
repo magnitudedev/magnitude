@@ -619,9 +619,22 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           )
         },
       },
-      runEffect: client.runEffect,
+      runEffect: <A, E, R>(effect: Effect.Effect<A, E, R>) => client.runEffect(effect),
       dispose: async () => {
         unsubscribeClient()
+        try {
+          const workingState = await client.runEffect(
+            Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.get)
+          )
+
+          for (const [forkId, working] of workingState.forks) {
+            if (working.working || working.willContinue) {
+              await send({ type: 'interrupt', forkId } as AppEvent)
+            }
+          }
+        } catch {
+          // ignore best-effort teardown interrupt failures
+        }
         await client.dispose()
         clearAgentOverrides()
       },

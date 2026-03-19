@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { SubagentTabItem } from '../components/chat/types'
-import { reconcileForkMeta, sortSubagentTabs } from './use-subagent-tabs'
+import { buildSubagentTabItem, reconcileForkMeta, sortSubagentTabs } from './use-subagent-tabs'
 
 describe('sortSubagentTabs', () => {
   test('keeps active tabs first and sorts idle tabs by completedAt descending', () => {
@@ -24,6 +24,72 @@ describe('sortSubagentTabs', () => {
 
     const sorted = [...tabs].sort(sortSubagentTabs)
     expect(sorted.map(tab => tab.forkId)).toEqual(['active', 'idle-with-completed', 'idle-no-completed'])
+  })
+})
+
+describe('buildSubagentTabItem', () => {
+  test('shows exact pending status, forces active phase, and clears completedAt while pending', () => {
+    const tab = buildSubagentTabItem({
+      forkId: 'fork-1',
+      meta: {
+        agentId: 'a',
+        name: 'A',
+        activeSince: 1000,
+        accumulatedActiveMs: 3000,
+        completedAt: 7000,
+        resumeCount: 1,
+        toolCount: 0,
+        toolCounts: {} as any,
+        phase: 'idle',
+      },
+      messages: [],
+      pendingDirect: { pending: true, since: 9000 },
+    })
+
+    expect(tab.statusLine).toBe('User sent a message...')
+    expect(tab.phase).toBe('active')
+    expect(tab.activeSince).toBe(9000)
+    expect(tab.completedAt).toBeUndefined()
+    expect(tab.accumulatedActiveMs).toBe(3000)
+  })
+
+  test('keeps timer continuity across repeated pending updates via latched since', () => {
+    const first = buildSubagentTabItem({
+      forkId: 'fork-1',
+      meta: {
+        agentId: 'a',
+        name: 'A',
+        activeSince: 1000,
+        accumulatedActiveMs: 3000,
+        completedAt: 7000,
+        resumeCount: 1,
+        toolCount: 0,
+        toolCounts: {} as any,
+        phase: 'idle',
+      },
+      messages: [],
+      pendingDirect: { pending: true, since: 9000 },
+    })
+
+    const second = buildSubagentTabItem({
+      forkId: 'fork-1',
+      meta: {
+        agentId: 'a',
+        name: 'A',
+        activeSince: 1000,
+        accumulatedActiveMs: 3000,
+        completedAt: 7000,
+        resumeCount: 1,
+        toolCount: 0,
+        toolCounts: {} as any,
+        phase: 'idle',
+      },
+      messages: [],
+      pendingDirect: { pending: true, since: 9000 },
+    })
+
+    expect(first.activeSince).toBe(9000)
+    expect(second.activeSince).toBe(9000)
   })
 })
 

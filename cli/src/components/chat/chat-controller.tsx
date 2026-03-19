@@ -361,11 +361,6 @@ export function ChatController(props: ChatControllerProps) {
     clearComposer()
 
     for (const event of buildSubmitDispatchEvents(targetForkId)) {
-      if (event.type === 'interrupt') {
-        services.interruptFork(event.forkId)
-        continue
-      }
-
       services.submitUserMessageToFork({
         forkId: event.forkId,
         message,
@@ -466,7 +461,7 @@ export function ChatController(props: ChatControllerProps) {
                     onKeyIntercept={handleKeyIntercept}
                     focused={!env.pendingApproval}
                     highlightColor={env.bashMode ? orange[400] : undefined}
-                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId} (note: this will interrupt it)...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the main agent...'}
+                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the main agent...'}
                     maxHeight={10}
                     minHeight={1}
                   />

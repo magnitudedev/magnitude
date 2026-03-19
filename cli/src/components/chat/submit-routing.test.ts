@@ -8,11 +8,12 @@ describe('buildSubmitDispatchEvents', () => {
     ])
   })
 
-  test('subagent submit interrupts first, then sends targeted user message', () => {
-    expect(buildSubmitDispatchEvents('fork-123')).toEqual([
-      { type: 'interrupt', forkId: 'fork-123' },
+  test('subagent submit sends targeted user message without interrupting', () => {
+    const events = buildSubmitDispatchEvents('fork-123')
+    expect(events).toEqual([
       { type: 'user_message', forkId: 'fork-123' },
     ])
+    expect(events.some(event => event.type === 'interrupt')).toBe(false)
   })
 })
 

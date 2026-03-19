@@ -75,6 +75,8 @@ export interface ExecuteOptions {
   readonly forkId: string | null
   readonly turnId: string
   readonly chainId: string
+  readonly defaultProseDest: 'user' | 'parent'
+  readonly allowSingleUserReplyThisTurn: boolean
 }
 
 export interface ExecuteResult {
@@ -302,11 +304,12 @@ const makeExecutionManager = Effect.gen(function* () {
 
   const service: ExecutionManagerService = {
     execute: (xmlStream: Stream.Stream<string, ModelError>, options, sink) => Effect.gen(function* () {
-      const { forkId, turnId } = options
+      const { forkId, turnId, defaultProseDest, allowSingleUserReplyThisTurn } = options
 
       // Resolve agent definition for this fork
       const agentRoutingProjectionInst = yield* AgentRoutingProjection.Tag
       const agentStatusProjectionInst = yield* AgentStatusProjection.Tag
+      const workingStateProjectionInst = yield* WorkingStateProjection.Tag
       const agentState = yield* agentStatusProjectionInst.get
       let variant: AgentVariant
       if (forkId) {
@@ -333,7 +336,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const runtime = yield* Effect.try({
         try: () => createXmlRuntime({
           tools: registeredTools,
-          defaultProseDest: forkId !== null ? 'parent' : 'user',
+          defaultProseDest,
         }),
         catch: (e) => new XmlRuntimeCrash(`XML binding validation failed: ${e instanceof Error ? e.message : String(e)}`, e),
       })
@@ -381,6 +384,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolCalls: TurnToolCall[] = []
       const messagesSent: Array<{ id: string, dest: string }> = []
       let hasAnyMessage = false
+      let directUserRepliesSent = 0
 
       // Track tool input (ToolInputReady provides the parsed input)
       const toolInputs = new Map<string, unknown>()
@@ -557,21 +561,30 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Messages / Think prose ---
               case 'MessageStart': {
-                messagesSent.push({ id: event.id, dest: event.dest })
+                let resolvedDest = event.dest
+                if (forkId !== null && event.dest === 'user') {
+                  if (!allowSingleUserReplyThisTurn || directUserRepliesSent >= 1) {
+                    resolvedDest = 'parent'
+                  } else {
+                    directUserRepliesSent += 1
+                  }
+                }
+
+                messagesSent.push({ id: event.id, dest: resolvedDest })
                 hasAnyMessage = true
 
                 // Validate agent message destinations inline during execution
-                if (event.dest !== 'user' && event.dest !== 'parent') {
+                if (resolvedDest !== 'user' && resolvedDest !== 'parent') {
                   const currentAgentState = yield* agentRoutingProjectionInst.get
-                  const targetAgent = isActiveRoute(currentAgentState, event.dest)
+                  const targetAgent = isActiveRoute(currentAgentState, resolvedDest)
                   if (!targetAgent) {
                     hasNonexistentAgentDest = true
-                    const destStr = `"${event.dest}"`
+                    const destStr = `"${resolvedDest}"`
                     nonexistentAgentError = `<error>\n${formatNonexistentAgentError(destStr)}\n</error>`
                   }
                 }
 
-                yield* Queue.offer(sink, { _tag: 'MessageStart', id: event.id, dest: event.dest })
+                yield* Queue.offer(sink, { _tag: 'MessageStart', id: event.id, dest: resolvedDest })
                 break
               }
 

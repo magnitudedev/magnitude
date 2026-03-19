@@ -226,7 +226,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const attachments = (event.attachments ?? []).map(toCommsAttachment)
       const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments }
 
-      if (fork.currentTurnId !== null) {
+      if (event.forkId !== null || fork.currentTurnId !== null) {
         return {
           ...fork,
           queuedMessages: [...fork.queuedMessages, { kind: 'comms', entry }],
@@ -375,12 +375,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     },
 
-    interrupt: ({ fork }) => {
-      return {
-        ...fork,
-        queuedMessages: fork.queuedMessages.filter(q => !(q.kind === 'comms' && q.entry.kind === 'user'))
-      }
-    },
+    interrupt: ({ fork }) => fork,
 
     compaction_completed: ({ event, fork }) => {
       const remainingMessages = fork.messages.slice(1 + event.compactedMessageCount)

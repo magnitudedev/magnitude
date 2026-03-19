@@ -52,6 +52,7 @@ import { withTraceScope } from '../tracing'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 
 
+
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
   return parts.map(part => {
     switch (part.type) {
@@ -133,6 +134,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
         const agentState = yield* read(AgentStatusProjection)
+        const workingState = yield* read(WorkingStateProjection)
+        const allowSingleUserReplyThisTurn = forkId !== null && workingState.currentTurnAllowsDirectUserReply
         const agentInstance = forkId ? getAgentByForkId(agentState, forkId) : null
 
         // Determine agent: child forks use their role, root fork is always orchestrator.
@@ -233,7 +236,13 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           const executeResult = yield* execManager.execute(
             xmlStream,
-            { forkId, turnId, chainId },
+            {
+              forkId,
+              turnId,
+              chainId,
+              defaultProseDest: variant === 'orchestrator' ? 'user' : 'parent',
+              allowSingleUserReplyThisTurn,
+            },
             queue,
           )
 

@@ -25,7 +25,7 @@ export function buildCloneContext(taskDescription: string, outputSchema?: JsonSc
   parts.push('You are a background agent cloned from a parent thread.')
   parts.push('You inherited your parent\'s full conversation context.')
   parts.push('Focus solely on completing the task above.')
-  parts.push('Do NOT communicate with the user directly.')
+  parts.push('Default to parent-facing communication unless the user messages you directly.')
   if (outputSchema) {
     const formatInstructions = outputFormatString(outputSchema)
     parts.push('')

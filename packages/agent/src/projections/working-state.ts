@@ -25,6 +25,8 @@ function toPreview(text: string): string {
 /** Per-fork working state */
 export interface PendingInboundCommunication {
   readonly id: string
+  readonly source: 'agent' | 'user'
+  readonly replyPolicy: 'parent_default' | 'user_reply_once'
   readonly direction: 'from_agent' | 'to_agent'
   readonly agentId: string
   readonly agentName?: string
@@ -48,6 +50,7 @@ export interface ForkWorkingState {
   readonly contextLimitBlocked: boolean
   readonly pendingApproval: boolean
   readonly softInterrupted: boolean
+  readonly currentTurnAllowsDirectUserReply: boolean
   readonly pendingMentionTimestamps: readonly number[]
   readonly pendingInboundCommunications: readonly PendingInboundCommunication[]
 }
@@ -80,6 +83,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     contextLimitBlocked: false,
     pendingApproval: false,
     softInterrupted: false,
+    currentTurnAllowsDirectUserReply: false,
     pendingMentionTimestamps: [],
     pendingInboundCommunications: []
   },
@@ -89,7 +93,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     forkBecameStable: Signal.create<{ forkId: string | null; timestamp: number }>('WorkingState/forkBecameStable'),
     softInterruptResolved: Signal.create<{ forkId: string }>('WorkingState/softInterruptResolved'),
     turnInterrupted: Signal.create<{ forkId: string | null; turnId: string; chainId: string | null }>('WorkingState/turnInterrupted'),
-    pendingInboundCommunicationsRead: Signal.create<{ forkId: string | null; turnId: string; messages: readonly PendingInboundCommunication[]; timestamp: number }>('WorkingState/pendingInboundCommunicationsRead')
+    pendingInboundCommunicationsRead: Signal.create<{ forkId: string | null; turnId: string; messages: readonly PendingInboundCommunication[]; timestamp: number }>('WorkingState/pendingInboundCommunicationsRead'),
   },
 
   eventHandlers: {
@@ -111,6 +115,10 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     user_message: ({ event, fork, emit }) => {
       const isQueued = fork.working
       const hasMentions = (event.attachments ?? []).some(attachment => attachment.type === 'mention')
+      const isDirectToSubagent = event.forkId !== null
+      const contentText = typeof event.content === 'string'
+        ? event.content
+        : event.content.map(part => part.type === 'text' ? part.text : '').join('')
 
       const newFork: ForkWorkingState = {
         ...fork,
@@ -118,7 +126,24 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         hasQueuedMessages: fork.hasQueuedMessages || isQueued,
         pendingMentionTimestamps: hasMentions
           ? [...fork.pendingMentionTimestamps, event.timestamp]
-          : fork.pendingMentionTimestamps
+          : fork.pendingMentionTimestamps,
+        pendingInboundCommunications: isDirectToSubagent
+          ? [
+              ...fork.pendingInboundCommunications,
+              {
+                id: createId(),
+                source: 'user',
+                replyPolicy: 'user_reply_once',
+                direction: 'from_agent',
+                agentId: 'user',
+                forkId: event.forkId,
+                content: contentText,
+                preview: toPreview(contentText),
+                timestamp: event.timestamp,
+                arrivedAtTurnId: fork.currentTurnId,
+              }
+            ]
+          : fork.pendingInboundCommunications
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -184,6 +209,9 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         willContinue: false,
         pendingWake: false,
         hasQueuedMessages: false,
+        currentTurnAllowsDirectUserReply: fork.pendingInboundCommunications.some(
+          (message) => message.source === 'user' && message.replyPolicy === 'user_reply_once'
+        ),
         currentTurnId: event.turnId,
         currentChainId: event.chainId,
         pendingInboundCommunications: [],
@@ -212,8 +240,9 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         willContinue,
         hasQueuedMessages: false,
         pendingWake: false,
+        currentTurnAllowsDirectUserReply: false,
         currentTurnId: null,
-        currentChainId: willContinue ? fork.currentChainId : null
+        currentChainId: willContinue ? fork.currentChainId : null,
       }
 
       // Emit stability first so downstream projections (e.g. AgentRegistry) update
@@ -245,8 +274,9 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         working: false,
         willContinue: false,
         hasQueuedMessages: false,
+        currentTurnAllowsDirectUserReply: false,
         currentTurnId: null,
-        currentChainId: null
+        currentChainId: null,
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -274,11 +304,12 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         willContinue: false,
         hasQueuedMessages: false,
         pendingWake: false,
+        currentTurnAllowsDirectUserReply: false,
         currentTurnId: null,
         currentChainId: null,
         compactionPending: false,
         contextLimitBlocked: false,
-        softInterrupted: false
+        softInterrupted: false,
       }
 
       if (isStable(newFork) && !isStable(fork)) {
@@ -345,7 +376,8 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         ...fork,
         willContinue: false,  // Fork is done, don't continue
         hasQueuedMessages: false,
-        softInterrupted: false
+        softInterrupted: false,
+        currentTurnAllowsDirectUserReply: false,
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -448,6 +480,8 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           ...forkState.pendingInboundCommunications,
           {
             id: createId(),
+            source: 'agent',
+            replyPolicy: 'parent_default',
             direction: 'from_agent',
             agentId: value.agentId,
             forkId,
@@ -487,6 +521,8 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           ...forkState.pendingInboundCommunications,
           {
             id: createId(),
+            source: 'agent',
+            replyPolicy: 'parent_default',
             direction: 'from_agent',
             agentId: value.agentId,
             forkId,

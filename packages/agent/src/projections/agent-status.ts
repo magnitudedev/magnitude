@@ -111,6 +111,12 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
 
   eventHandlers: {
     agent_created: ({ event, state, emit }) => {
+      const normalizedMode: 'clone' | 'spawn' = event.mode === 'clone' ? 'clone' : 'spawn'
+      const normalizedContext = typeof event.context === 'string' ? event.context : ''
+      const normalizedTaskId = typeof event.taskId === 'string' && event.taskId.trim().length > 0
+        ? event.taskId
+        : `legacy-${event.agentId}-${event.forkId}`
+
       const existingAgent = state.agents.get(event.agentId)
       if (existingAgent) {
         throw new Error(`[AgentStatusProjection] Invalid state transition: agent_created for already existing agent ${event.agentId} (forkId: ${existingAgent.forkId})`)
@@ -128,9 +134,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         name: event.name,
         role: event.role,
         type: event.role,
-        taskId: event.taskId,
-        mode: event.mode,
-        context: event.context,
+        taskId: normalizedTaskId,
+        mode: normalizedMode,
+        context: normalizedContext,
         timestamp: event.timestamp,
       })
 
@@ -140,9 +146,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         parentForkId: event.parentForkId,
         name: event.name,
         role: event.role,
-        context: event.context,
-        mode: event.mode,
-        taskId: event.taskId,
+        context: normalizedContext,
+        mode: normalizedMode,
+        taskId: normalizedTaskId,
         message: event.message ?? null,
         status: 'starting',
       }

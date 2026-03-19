@@ -10,7 +10,8 @@ interface PendingCommunicationsPanelProps {
 
 export function PendingCommunicationsPanel({ messages }: PendingCommunicationsPanelProps) {
   const theme = useTheme()
-  if (messages.length === 0) return null
+  const agentMessages = messages.filter((message) => message.source === 'agent')
+  if (agentMessages.length === 0) return null
 
   return (
     <box style={{ marginBottom: 1, paddingLeft: 1, paddingRight: 1 }}>
@@ -25,11 +26,11 @@ export function PendingCommunicationsPanel({ messages }: PendingCommunicationsPa
         }}
       >
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>Pending messages</text>
-        {messages.map((message) => {
+        {agentMessages.map((message) => {
           const cardMessage = {
             id: message.id,
             type: 'agent_communication',
-            direction: 'from_agent',
+            direction: message.direction,
             agentId: message.agentId,
             agentName: message.agentName,
             agentRole: message.agentRole,
