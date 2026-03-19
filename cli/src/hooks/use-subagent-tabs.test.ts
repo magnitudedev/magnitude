@@ -212,7 +212,7 @@ describe('reconcileForkMeta', () => {
 
   test('keeps prior forks when latest activity map no longer includes them', () => {
     const prev = {
-      'fork-dismissed': {
+      'fork-idle': {
         agentId: 'a',
         name: 'A',
         activeSince: 1000,
@@ -234,7 +234,7 @@ describe('reconcileForkMeta', () => {
 
     const agentStatusState = {
       agents: new Map([
-        ['a', { agentId: 'a', forkId: 'fork-dismissed', status: 'dismissed' }],
+        ['a', { agentId: 'a', forkId: 'fork-idle', status: 'idle' }],
       ]),
     } as any
 
@@ -244,6 +244,6 @@ describe('reconcileForkMeta', () => {
       agentStatusState,
     })
 
-    expect(Object.keys(result.next).sort()).toEqual(['fork-dismissed', 'fork-missing'])
+    expect(Object.keys(result.next).sort()).toEqual(['fork-idle', 'fork-missing'])
   })
 })

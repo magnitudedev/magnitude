@@ -88,6 +88,8 @@ export type {
   ThinkBlockMessage,
   ThinkBlockStep,
   CommunicationStep,
+  SubagentStartedStep,
+  SubagentFinishedStep,
   InterruptedMessage,
   UnexpectedErrorMessage,
   ForkResultMessage,

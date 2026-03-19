@@ -66,10 +66,6 @@ export interface ParsedArtifactWrite {
   content: string
 }
 
-export interface ParsedAgentDismiss {
-  agentId: string
-}
-
 type TurnControl = 'next' | 'yield' | null
 
 export interface ParsedInspectRef {
@@ -91,7 +87,6 @@ export interface ParsedOrchestratorResponse {
   fsWrites: ParsedFsWrite[]
   artifactReads: ParsedArtifactRead[]
   artifactWrites: ParsedArtifactWrite[]
-  agentDismisses: ParsedAgentDismiss[]
   inspectRefs: ParsedInspectRef[]
   hasThinkBlock: boolean
   hasUserMessage: boolean
@@ -140,8 +135,6 @@ function detectFirstActionKind(raw: string): string | null {
   const actionPatterns: Array<{ re: RegExp; kind: string }> = [
     { re: /<agent-create\b/gi, kind: 'agent:create' },
     { re: /<artifact-create\b/gi, kind: 'artifact:create' },
-    { re: /<agent-dismiss\b/gi, kind: 'agent:dismiss' },
-
     { re: /<(?:fs-)?read\b/gi, kind: 'tool:fs-read' },
     { re: /<(?:fs-)?search\b/gi, kind: 'tool:fs-search' },
     { re: /<(?:fs-)?tree\b/gi, kind: 'tool:fs-tree' },
@@ -204,7 +197,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
   }
 
   // direct tool usage detection
-  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write', 'agent-dismiss']
+  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write']
   for (const tag of directToolTags) {
     const re = new RegExp(`<${tag}\\b`, 'i')
     if (re.test(raw)) directToolUses.push(tag)
@@ -303,14 +296,6 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // agent-dismiss
-  const agentDismisses: ParsedAgentDismiss[] = []
-  const agentDismissRe = /<agent-dismiss\b[^>]*\bagentId\s*=\s*"([^"]*)"[^>]*\/?>/gi
-  while ((m = agentDismissRe.exec(raw)) !== null) {
-    agentDismisses.push({ agentId: m[1] })
-  }
-
-
   // inspect refs
   const inspectRefs: ParsedInspectRef[] = []
   const refRe = /<ref\s+tool\s*=\s*"([^"]*)"[^>]*\/>/gi
@@ -353,7 +338,6 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     fsWrites,
     artifactReads,
     artifactWrites,
-    agentDismisses,
     inspectRefs,
     hasThinkBlock,
     hasUserMessage,
