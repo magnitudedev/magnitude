@@ -1357,7 +1357,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     }),
 
     on(WorkingStateProjection.signals.pendingInboundCommunicationsRead, ({ value, state, read }) => {
-      if (value.forkId === null) return state
       const displayFork = state.forks.get(value.forkId)
       if (!displayFork) return state
 

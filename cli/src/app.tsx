@@ -1857,7 +1857,9 @@ function AppInner({
           }
         })
       })()}
-      <PendingCommunicationsPanel messages={activeDisplay?.pendingInboundCommunications ?? []} />
+      {selectedTabForkId !== null && (
+        <PendingCommunicationsPanel messages={activeDisplay?.pendingInboundCommunications ?? []} />
+      )}
     </scrollbox>
   )
 
