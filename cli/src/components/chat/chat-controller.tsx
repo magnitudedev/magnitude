@@ -26,6 +26,7 @@ import {
 import type { InputValue } from '../../types/store'
 import type { ChatControllerProps } from './types'
 import { SubagentTabBar } from './subagent-tab-bar'
+import { buildSubmitDispatchEvents, shouldHandleSlashCommandInTab } from './submit-routing'
 
 const EMPTY_INPUT: InputValue = {
   text: '',
@@ -228,13 +229,13 @@ export function ChatController(props: ChatControllerProps) {
   )
   const slashCommands = useSlashCommands(inputValue.text, executeSlashCommand)
 
-  const handleInterrupt = useCallback(() => services.interrupt(), [services])
+  const handleInterrupt = useCallback(() => services.interruptFork(selectedForkId), [services, selectedForkId])
   const handleInterruptAll = useCallback(() => services.interruptAll(), [services])
 
   const handleKeyIntercept = useCallback((key: KeyEvent): boolean => {
     if (env.pendingApproval) return true
     if (!env.bashMode && fileMentions.handleKeyIntercept(key)) return true
-    if (!env.bashMode && slashCommands.handleKeyIntercept(key)) return true
+    if (!env.bashMode && shouldHandleSlashCommandInTab(selectedForkId) && slashCommands.handleKeyIntercept(key)) return true
     if (env.widgetNavActive && services.handleWidgetKeyEvent(key)) return true
 
     const isPlainArrow = !key.ctrl && !key.meta && !key.option && !key.shift
@@ -286,7 +287,7 @@ export function ChatController(props: ChatControllerProps) {
     }
 
     return false
-  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText])
+  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId])
 
   const handleInputChange = useCallback((value: InputValue) => {
     if (!env.bashMode && value.text === '!') {
@@ -330,9 +331,9 @@ export function ChatController(props: ChatControllerProps) {
   }, [])
 
   const handleSubmit = useCallback((message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
-    if (env.isSubagentView) return
+    const targetForkId = selectedForkId
     const slashText = visibleMessage ?? message
-    if (!env.bashMode && services.runSlashCommand(slashText)) {
+    if (!env.bashMode && shouldHandleSlashCommandInTab(targetForkId) && services.runSlashCommand(slashText)) {
       clearComposer()
       return
     }
@@ -358,13 +359,22 @@ export function ChatController(props: ChatControllerProps) {
     services.clearSystemBanners()
     const currentAttachments: Attachment[] = [...attachments, ...mentionAttachments]
     clearComposer()
-    services.submitUserMessage({
-      message,
-      visibleMessage,
-      mentionAttachments,
-      attachments: currentAttachments,
-    })
-  }, [env.bashMode, env.modelsConfigured, env.isSubagentView, services, attachments, clearComposer])
+
+    for (const event of buildSubmitDispatchEvents(targetForkId)) {
+      if (event.type === 'interrupt') {
+        services.interruptFork(event.forkId)
+        continue
+      }
+
+      services.submitUserMessageToFork({
+        forkId: event.forkId,
+        message,
+        visibleMessage,
+        mentionAttachments,
+        attachments: currentAttachments,
+      })
+    }
+  }, [env.bashMode, env.modelsConfigured, selectedForkId, services, attachments, clearComposer])
 
   const handleInputSubmit = useCallback(() => {
     setHistoryIndex(null)
@@ -379,6 +389,10 @@ export function ChatController(props: ChatControllerProps) {
       handleSubmit(text, inputValue.text, mentionAttachments)
     }
   }, [inputValue, attachments.length, handleSubmit])
+
+  const selectedSubagentAgentId = selectedForkId == null
+    ? null
+    : (subagentTabs.find((tab) => tab.forkId === selectedForkId)?.agentId ?? selectedForkId)
 
   return (
     <>
@@ -426,7 +440,7 @@ export function ChatController(props: ChatControllerProps) {
                 onHoverIndex={fileMentions.setSelectedIndex}
               />
             )}
-            {!env.bashMode && slashCommands.isSlashMenuOpen && (
+            {!env.bashMode && shouldHandleSlashCommandInTab(selectedForkId) && slashCommands.isSlashMenuOpen && (
               <SlashCommandMenu
                 commands={slashCommands.filteredCommands}
                 selectedIndex={slashCommands.selectedIndex}
@@ -452,7 +466,7 @@ export function ChatController(props: ChatControllerProps) {
                     onKeyIntercept={handleKeyIntercept}
                     focused={!env.pendingApproval}
                     highlightColor={env.bashMode ? orange[400] : undefined}
-                    placeholder={env.isSubagentView ? 'Select Main to return to chat...' : env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.status === 'streaming' ? 'Type to queue a message...' : 'Type a message...'}
+                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId} (note: this will interrupt it)...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the main agent...'}
                     maxHeight={10}
                     minHeight={1}
                   />

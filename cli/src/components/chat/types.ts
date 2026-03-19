@@ -24,7 +24,8 @@ export type ChatControllerEnv = {
 }
 
 export type ChatControllerServices = {
-  submitUserMessage: (payload: {
+  submitUserMessageToFork: (payload: {
+    forkId: string | null
     message: string
     visibleMessage?: string
     mentionAttachments?: Attachment[]
@@ -34,7 +35,7 @@ export type ChatControllerServices = {
   executeBash: (command: string) => BashResult
   appendBashOutput: (result: BashResult) => void
   clearSystemBanners: () => void
-  interrupt: () => void
+  interruptFork: (forkId: string | null) => void
   interruptAll: () => void
   openSettings: (tab: SettingsTab) => void
   toggleTaskPanel: () => void

@@ -1430,11 +1430,15 @@ function AppInner({
 
 
 
-  const handleInterrupt = useCallback(() => {
+  const handleInterruptFork = useCallback((forkId: string | null) => {
     if (!client) return
-    logger.info({ forkId: null }, 'Sending interrupt event')
-    client.send({ type: 'interrupt', forkId: null })
+    logger.info({ forkId }, 'Sending interrupt event')
+    client.send({ type: 'interrupt', forkId })
   }, [client])
+
+  const handleInterrupt = useCallback(() => {
+    handleInterruptFork(null)
+  }, [handleInterruptFork])
 
   const handleInterruptAll = useCallback(() => {
     if (!client) return
@@ -1618,11 +1622,12 @@ function AppInner({
   }, [resetModelPickerState])
 
   const handleSubmitViaClientBoundary = useCallback((payload: {
+    forkId: string | null
     message: string
     attachments: Attachment[]
   }) => {
     const sendMessage = (c: AgentClient) => {
-      c.send({ type: 'user_message', forkId: null, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
+      c.send({ type: 'user_message', forkId: payload.forkId, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
     }
 
     if (client) {
@@ -1918,13 +1923,13 @@ function AppInner({
               theme,
               modeColor,
               attachmentsMaxWidth,
-              composerCanFocus: composerCanFocus && selectedTabForkId === null,
+              composerCanFocus,
               widgetNavActive,
               nextCtrlCWillExit,
               isSubagentView: selectedTabForkId !== null,
             }}
             services={{
-              submitUserMessage: ({ message, attachments }) => handleSubmitViaClientBoundary({ message, attachments }),
+              submitUserMessageToFork: ({ forkId, message, attachments }) => handleSubmitViaClientBoundary({ forkId, message, attachments }),
               runSlashCommand: (commandText: string) => routeSlashCommand(commandText, commandContext),
               executeBash: executeBashCommand,
               appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
@@ -1937,7 +1942,7 @@ function AppInner({
                 if (ephemeralTimerRef.current) clearTimeout(ephemeralTimerRef.current)
                 setEphemeralMessage(null)
               },
-              interrupt: handleInterrupt,
+              interruptFork: handleInterruptFork,
               interruptAll: handleInterruptAll,
               openSettings,
               toggleTaskPanel,
@@ -1945,7 +1950,7 @@ function AppInner({
               enterBashMode: () => setBashMode(true),
               exitBashMode: exitBashMode,
             }}
-            displayMessages={display.messages}
+            displayMessages={(activeDisplay ?? display).messages}
             subagentTabs={subagentTabs}
             selectedForkId={selectedTabForkId}
             onSubagentTabSelect={setSelectedTabForkId}
