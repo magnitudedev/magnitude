@@ -22,6 +22,7 @@ import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
 import { createId } from '../util/id'
 import { isActive, type ArtifactStreamPreview, type ArtifactVisualState, type Phase } from '../visuals/tools'
+import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
 
 /**
  * Resolve display visibility for a tool call using the agent definition's display policy.
@@ -364,6 +365,41 @@ function closeThinkBlock(state: DisplayState, timestamp: number): DisplayState {
       (b) => ({ ...b, status: 'completed', completedAt: timestamp })
     ),
     activeThinkBlockId: null
+  }
+}
+
+export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): DisplayState {
+  if (!state.activeThinkBlockId) return state
+
+  const block = findThinkBlock(state.messages, state.activeThinkBlockId)
+  if (!block) return state
+
+  const registry = getVisualRegistry()
+  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (toolKey, visualState) => {
+    const visual = toolKey ? registry?.get(toolKey) : undefined
+    if (!visual) return visualState
+
+    return visual.reduce(visualState, {
+      _tag: 'ToolExecutionEnded',
+      result: { _tag: 'Interrupted' },
+      output: undefined,
+      error: undefined,
+      timeMs: undefined,
+      metadata: {}
+    })
+  })
+
+  if (nextSteps === block.steps || nextSteps.every((step, i) => step === block.steps[i])) {
+    return state
+  }
+
+  return {
+    ...state,
+    messages: updateMessageById<ThinkBlockMessage>(
+      state.messages,
+      state.activeThinkBlockId,
+      (b) => ({ ...b, steps: nextSteps })
+    )
   }
 }
 
@@ -1047,8 +1083,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         })
       }
 
+      // Finalize any still-open tool steps as interrupted before closing think block
+      const interruptedState = finalizeOpenToolStepsAsInterrupted(fork)
+
       // Close think block and remove queued messages
-      const closedState = closeThinkBlock(fork, event.timestamp)
+      const closedState = closeThinkBlock(interruptedState, event.timestamp)
       const messagesWithoutQueued = closedState.messages.filter(
         m => m.type !== 'queued_user_message'
       )

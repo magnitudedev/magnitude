@@ -52,6 +52,7 @@ export const shellRender = render<ShellState>(({ state, isExpanded, onToggle }) 
   const isRejected = done?.kind === 'rejected'
   const isError = done?.kind === 'error'
   const isSuccess = done?.kind === 'success'
+  const isInterrupted = done?.kind === 'interrupted'
 
   // Determine failed state and result text for preview
   const isFailed = (isSuccess && done.exitCode !== 0) || isError
@@ -70,29 +71,39 @@ export const shellRender = render<ShellState>(({ state, isExpanded, onToggle }) 
 
   return (
     <box style={{ flexDirection: 'column' }}>
-      {/* Command line — clickable row */}
-      <Button onClick={onToggle}>
+      {/* Command line */}
+      {isInterrupted ? (
         <text>
           <span style={{ fg: theme.muted }}>{'$ '}</span>
           <span style={{ fg: theme.foreground }}>
-            {isExpanded ? command : shortenCommandPreview(command, MAX_COMMAND_DISPLAY_LEN)}
+            {shortenCommandPreview(command, MAX_COMMAND_DISPLAY_LEN)}
           </span>
-          {isRunning ? (
-            <>
-              {'  '}
-              <ShimmerText text="running..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-            </>
-          ) : isRejected ? (
-            done.systemReason
-              ? <><span style={{ fg: theme.error }}>{' · System Rejected'}</span><span style={{ fg: theme.muted }}>{` (${done.systemReason})`}</span></>
-              : <span style={{ fg: theme.error }}>{' · User Rejected'}</span>
-          ) : (isSuccess || isError) ? (
-            <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
-              {isExpanded ? ' · (collapse)' : ' · (expand)'}
-            </span>
-          ) : null}
+          <span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{' · Interrupted'}</span>
         </text>
-      </Button>
+      ) : (
+        <Button onClick={onToggle}>
+          <text>
+            <span style={{ fg: theme.muted }}>{'$ '}</span>
+            <span style={{ fg: theme.foreground }}>
+              {isExpanded ? command : shortenCommandPreview(command, MAX_COMMAND_DISPLAY_LEN)}
+            </span>
+            {isRunning ? (
+              <>
+                {'  '}
+                <ShimmerText text="running..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+              </>
+            ) : isRejected ? (
+              done.systemReason
+                ? <><span style={{ fg: theme.error }}>{' · System Rejected'}</span><span style={{ fg: theme.muted }}>{` (${done.systemReason})`}</span></>
+                : <span style={{ fg: theme.error }}>{' · User Rejected'}</span>
+            ) : (isSuccess || isError) ? (
+              <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
+                {isExpanded ? ' · (collapse)' : ' · (expand)'}
+              </span>
+            ) : null}
+          </text>
+        </Button>
+      )}
 
       {/* Error preview — collapsed second line when failed */}
       {isFailed && !isExpanded && resultPreview.trim() && (
