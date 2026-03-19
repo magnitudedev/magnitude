@@ -13,6 +13,7 @@ import { createDefaultIgnore } from '../util/gitignore'
 import { validateAndApply, toEditDiff } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 import { readImageFileForModel } from '../util/read-image-file'
+import { expandWorkspacePath } from '../workspace'
 
 // =============================================================================
 // Errors
@@ -53,8 +54,9 @@ export const readTool = createTool({
   } as const,
 
   execute: ({ path, offset, limit }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
-    const fullPath = resolve(cwd, path)
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
+    const fullPath = resolve(cwd, expandedPath)
     const file = Bun.file(fullPath)
     const content = yield* Effect.tryPromise({
       try: () => file.text(),
@@ -114,10 +116,11 @@ export const writeTool = createTool({
 
   execute: ({ path, content }) => Effect.gen(function* () {
     const emit = yield* ToolEmitTag
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
     yield* Effect.tryPromise({
       try: async () => {
-        const fullPath = resolve(cwd, path)
+        const fullPath = resolve(cwd, expandedPath)
         await Bun.write(fullPath, content)
       },
       catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
@@ -165,8 +168,9 @@ export const editTool = createTool({
 
   execute: ({ path, oldString, newString, replaceAll }) => Effect.gen(function* () {
     const emit = yield* ToolEmitTag
-    const { cwd } = yield* WorkingDirectoryTag
-    const fullPath = resolve(cwd, path)
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
+    const fullPath = resolve(cwd, expandedPath)
 
     // Read current file
     const content = yield* Effect.tryPromise({
@@ -245,10 +249,11 @@ export const treeTool = createTool({
   } as const,
 
   execute: ({ path, options }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(path, workspacePath)
     return yield* Effect.tryPromise({
       try: async () => {
-        const fullPath = resolve(cwd, path)
+        const fullPath = resolve(cwd, expandedPath)
         const respectGitignore = options?.gitignore ?? true
         const maxDepth = options?.maxDepth
 
@@ -414,10 +419,10 @@ export const searchTool = createTool({
   } as const,
 
   execute: ({ pattern, path, glob, limit, options }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
     return yield* Effect.tryPromise({
       try: async () => {
-        const resolvedPath = path ?? options?.path
+        const resolvedPath = expandWorkspacePath(path ?? options?.path ?? '', workspacePath) || undefined
         const resolvedGlob = glob ?? options?.glob
         const resolvedLimit = limit ?? options?.limit ?? 50
 
@@ -458,8 +463,9 @@ export const viewTool = createTool({
   } as const,
 
   execute: ({ path: filePath }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
-    const fullPath = resolve(cwd, filePath)
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const expandedPath = expandWorkspacePath(filePath, workspacePath)
+    const fullPath = resolve(cwd, expandedPath)
 
     return yield* Effect.tryPromise({
       try: () => readImageFileForModel(fullPath),

@@ -62,6 +62,7 @@ export interface GitContext {
 
 export interface SessionContext {
   readonly cwd: string
+  readonly workspacePath: string
   readonly platform: 'macos' | 'linux' | 'windows'
   readonly shell: string
   readonly timezone: string

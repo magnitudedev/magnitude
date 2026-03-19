@@ -193,6 +193,7 @@ function makeForkLayers(
   toolEmitRef: Ref.Ref<ToolDisplay | undefined>,
   toolReminderRef: Ref.Ref<string[]>,
   cwd: string,
+  workspacePath: string,
   ephemeralSessionContext: EphemeralSessionContext,
   backgroundProcessRegistry: ReturnType<typeof makeBackgroundProcessRegistry>,
 ) {
@@ -222,6 +223,7 @@ function makeForkLayers(
   const policyCtxProvider = createPolicyContextProvider(
     forkId,
     cwd,
+    workspacePath,
     ephemeralSessionContext,
     agentStatusProjection,
     workingStateProjection,
@@ -255,7 +257,7 @@ function makeForkLayers(
 
 
     Layer.succeed(ApprovalStateTag, approvalState),
-    Layer.succeed(WorkingDirectoryTag, { cwd }),
+    Layer.succeed(WorkingDirectoryTag, { cwd, workspacePath }),
     Layer.succeed(EphemeralSessionContextTag, ephemeralSessionContext),
     Layer.succeed(PolicyContextProviderTag, policyCtxProvider),
     Layer.succeed(ToolInterceptorTag, providedInterceptor),
@@ -275,6 +277,7 @@ const makeExecutionManager = Effect.gen(function* () {
   // Per-fork cached layers (built during initFork, reused across turns)
   const forkLayers = new Map<string | null, Layer.Layer<never>>()
   const forkCwds = new Map<string | null, string>()
+  const forkWorkspacePaths = new Map<string | null, string | undefined>()
 
   // Per-fork tool emit refs (shared between layers and execute() event handler)
   const toolEmitRefs = new Map<string | null, Ref.Ref<ToolDisplay | undefined>>()
@@ -444,9 +447,12 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
+      const workspacePath = forkWorkspacePaths.get(forkId)!
+
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
         cwd,
+        workspacePath,
         ephemeralSessionContext,
         yield* AgentStatusProjection.Tag,
         yield* WorkingStateProjection.Tag,
@@ -793,6 +799,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       const sessionState = yield* sessionContextProjection.get
       const cwd = sessionState.context?.cwd ?? process.cwd()
+      const workspacePath = sessionState.context!.workspacePath
       if (forkId === null) {
         oneshotEnabled = !!sessionState.context?.oneshot
       }
@@ -803,9 +810,10 @@ const makeExecutionManager = Effect.gen(function* () {
         artifactProjection, workingStateProjection,
         conversationProjection,
         approvalState,
-        persistenceLayer, permissionInterceptor, toolEmitRef, toolReminderRef, cwd, ephemeralSessionContext, backgroundProcessRegistry,
+        persistenceLayer, permissionInterceptor, toolEmitRef, toolReminderRef, cwd, workspacePath, ephemeralSessionContext, backgroundProcessRegistry,
       )
       forkCwds.set(forkId, cwd)
+      forkWorkspacePaths.set(forkId, workspacePath)
 
       // Inject browser harness for browser agent forks
       if (variant === 'browser' && forkId) {
@@ -847,6 +855,7 @@ const makeExecutionManager = Effect.gen(function* () {
       yield* backgroundProcessRegistry.cleanupFork(forkId)
       forkLayers.delete(forkId)
       forkCwds.delete(forkId)
+      forkWorkspacePaths.delete(forkId)
       toolEmitRefs.delete(forkId)
       toolReminderRefs.delete(forkId)
       boundObservables.delete(forkId)

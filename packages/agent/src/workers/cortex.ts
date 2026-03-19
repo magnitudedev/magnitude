@@ -30,6 +30,7 @@ import { Image as BamlImage } from '@boundaryml/baml'
 import type { ObservationPart } from '@magnitudedev/agent-definition'
 import { getXmlActProtocol, buildAckTurn } from '@magnitudedev/agent-definition'
 import subagentBasePrompt from '../agents/prompts/subagent-base.txt' with { type: 'text' }
+import workspacePrompt from '../agents/prompts/workspace.txt' with { type: 'text' }
 import { ContentPart } from '../content'
 import type { AppEvent, ResponsePart } from '../events'
 
@@ -111,6 +112,7 @@ function buildXmlActSystemPrompt(
     .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol(defaultRecipient, lenses, role))
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBasePrompt)
+    .replaceAll('{{WORKSPACE_SECTION}}', workspacePrompt)
 }
 
 // =============================================================================

@@ -175,6 +175,7 @@ function defaultSessionContext(overrides: Partial<SessionContext> = {}): Session
     shell: process.env.SHELL ?? '/bin/zsh',
     timezone: 'UTC',
     username: process.env.USER ?? 'tester',
+    workspacePath: '/tmp/test-workspace',
     fullName: null,
     git: null,
     folderStructure: '.',

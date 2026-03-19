@@ -169,7 +169,7 @@ export interface CollectSessionContextOptions {
   }
 }
 
-export async function collectSessionContext(opts?: CollectSessionContextOptions): Promise<SessionContext> {
+export async function collectSessionContext(opts?: CollectSessionContextOptions): Promise<Omit<SessionContext, 'workspacePath'>> {
   const cwd = opts?.cwd ?? process.cwd()
   const platform = normalizePlatform(process.platform)
   const memoryEnabled = opts?.memoryEnabled ?? true

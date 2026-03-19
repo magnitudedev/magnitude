@@ -14,7 +14,7 @@ import { shellTool } from '../tools/shell'
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool } from '../tools/artifact-tools'
 import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
-import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
@@ -67,8 +67,9 @@ export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools
   permission: (p) => ({
     shell(input, ctx) {
       const result = classifyShellCommand(input.command)
+      const allowedPrefixes = ctx.workspacePath ? [ctx.workspacePath] : undefined
       if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
-      if (detectsOutsideCwd(input.command, ctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+      if (!writesStayWithin(input.command, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
       return p.allow()
     },
     _default() { return p.allow() },

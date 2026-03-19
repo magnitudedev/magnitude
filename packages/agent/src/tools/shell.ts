@@ -80,7 +80,7 @@ export const shellTool = createTool({
   } as const,
 
   execute: ({ command, timeout, background }) => Effect.gen(function* () {
-    const { cwd } = yield* WorkingDirectoryTag
+    const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const { forkId } = yield* ForkContext
     const { turnId } = yield* ToolExecutionContextTag
     const registry = yield* BackgroundProcessRegistryTag
@@ -102,7 +102,12 @@ export const shellTool = createTool({
 
           const child = spawn(shellPath, ['-c', command], {
             cwd,
-            env: { ...process.env, NO_COLOR: '1' }
+            env: {
+              ...process.env,
+              NO_COLOR: '1',
+              PROJECT_ROOT: cwd,
+              M: workspacePath,
+            }
           })
           activeChild = child
 

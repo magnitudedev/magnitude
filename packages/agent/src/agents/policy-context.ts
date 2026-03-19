@@ -16,6 +16,7 @@ import type { EphemeralSessionContext, PolicyContext, PolicyContextProvider } fr
 export function createPolicyContextProvider(
   forkId: string | null,
   cwd: string,
+  workspacePath: string,
   ephemeralSessionContext: EphemeralSessionContext,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
@@ -28,6 +29,7 @@ export function createPolicyContextProvider(
       return {
         forkId,
         cwd,
+        workspacePath,
         activeAgentCount: [...agentStatuses.agents.values()].filter((a: AgentInfo) => a.status === 'working').length,
         userMessagePending: forkWorkingState.hasQueuedMessages,
         disableShellSafeguards: ephemeralSessionContext.disableShellSafeguards,

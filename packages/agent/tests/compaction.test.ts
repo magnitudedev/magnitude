@@ -12,6 +12,7 @@ const root = null
 
 const baseContext = (): SessionContext => ({
   cwd: '/tmp/project',
+  workspacePath: '/tmp/test-workspace',
   platform: 'macos',
   shell: '/bin/zsh',
   timezone: 'UTC',

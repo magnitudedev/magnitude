@@ -17,16 +17,22 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
   '.webp': 'image/webp',
 }
 
-function isPathUnderCwd(absolutePath: string, cwd: string): boolean {
-  const rel = relative(cwd, absolutePath)
+function isPathUnderPrefix(absolutePath: string, prefix: string): boolean {
+  const rel = relative(prefix, absolutePath)
   return rel !== '..' && !rel.startsWith(`..${sep}`) && rel !== ''
     ? true
-    : absolutePath === cwd
+    : absolutePath === prefix
 }
 
-function resolveMentionPath(cwd: string, mentionPath: string): string {
+function isPathAllowed(absolutePath: string, cwd: string, allowedPrefixes?: string[]): boolean {
+  if (isPathUnderPrefix(absolutePath, cwd)) return true
+  if (!allowedPrefixes || allowedPrefixes.length === 0) return false
+  return allowedPrefixes.some(prefix => isPathUnderPrefix(absolutePath, prefix))
+}
+
+function resolveMentionPath(cwd: string, mentionPath: string, allowedPrefixes?: string[]): string {
   const absolutePath = resolve(cwd, mentionPath)
-  if (!isPathUnderCwd(absolutePath, cwd)) {
+  if (!isPathAllowed(absolutePath, cwd, allowedPrefixes)) {
     throw new Error(`Path is outside cwd: ${mentionPath}`)
   }
   return absolutePath
@@ -80,8 +86,8 @@ async function resolveDirectoryMention(path: string, absolutePath: string): Prom
   }
 }
 
-async function resolveMention(cwd: string, attachment: MentionAttachment): Promise<ResolvedMention> {
-  const absolutePath = resolveMentionPath(cwd, attachment.path)
+async function resolveMention(cwd: string, attachment: MentionAttachment, allowedPrefixes?: string[]): Promise<ResolvedMention> {
+  const absolutePath = resolveMentionPath(cwd, attachment.path, allowedPrefixes)
   const fileStat = await stat(absolutePath)
 
   if (attachment.contentType === 'directory') {
@@ -110,6 +116,7 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
 
       const sessionContext = yield* read(SessionContextProjection)
       const cwd = sessionContext.context?.cwd
+      const workspacePath = sessionContext.context?.workspacePath
 
       const resolvedMentions = yield* Effect.promise(async () => {
         const results: ResolvedMention[] = []
@@ -124,7 +131,7 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
           }
 
           try {
-            results.push(await resolveMention(cwd, mention))
+            results.push(await resolveMention(cwd, mention, workspacePath ? [workspacePath] : []))
           } catch (error) {
             results.push({
               path: mention.path,

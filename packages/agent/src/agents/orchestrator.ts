@@ -29,7 +29,7 @@ import { shellTool } from '../tools/shell'
 import { webFetchTool } from '../tools/web-fetch-tool'
 import { webSearchTool } from '../tools/web-search-tool'
 
-import { classifyShellCommand, detectsOutsideCwd } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 
 const intentLens = defineThinkingLens({
   name: 'intent',
@@ -123,8 +123,9 @@ export const createOrchestrator = (systemPrompt: string) => {
     permission: (p) => ({
       shell(input, pctx) {
         const result = classifyShellCommand(input.command)
+        const allowedPrefixes = pctx.workspacePath ? [pctx.workspacePath] : undefined
         if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-        if (!pctx.disableCwdSafeguards && detectsOutsideCwd(input.command, pctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+        if (!pctx.disableCwdSafeguards && !writesStayWithin(input.command, pctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
         return p.allow()
       },
       _default() { return p.allow() },

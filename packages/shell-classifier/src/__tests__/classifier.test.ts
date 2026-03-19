@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { classifyShellCommand, isGitAllowed, detectsOutsideCwd } from '../classifier'
+import { classifyShellCommand, isGitAllowed, writesStayWithin } from '../classifier'
 
 describe('shell-classifier', () => {
 
@@ -253,53 +253,62 @@ describe('shell-classifier', () => {
     })
   })
 
-  describe('detectsOutsideCwd', () => {
-    test('echo foo > /outside/file with cwd /project => true', () => {
-      expect(detectsOutsideCwd('echo foo > /outside/file', '/project')).toBe(true)
+  describe('writesStayWithin', () => {
+    test('echo foo > /outside/file with cwd /project => false', () => {
+      expect(writesStayWithin('echo foo > /outside/file', '/project')).toBe(false)
     })
 
-    test('echo foo >> /outside/file => true', () => {
-      expect(detectsOutsideCwd('echo foo >> /outside/file', '/project')).toBe(true)
+    test('echo foo >> /outside/file => false', () => {
+      expect(writesStayWithin('echo foo >> /outside/file', '/project')).toBe(false)
     })
 
-    test('cmd 2> /tmp/err => false (tmp is allowlisted)', () => {
-      expect(detectsOutsideCwd('cmd 2> /tmp/err', '/project')).toBe(false)
+    test('cmd 2> /tmp/err => true (tmp is allowlisted)', () => {
+      expect(writesStayWithin('cmd 2> /tmp/err', '/project')).toBe(true)
     })
 
-    test('echo foo > ./inside/file with cwd /project => false', () => {
-      expect(detectsOutsideCwd('echo foo > ./inside/file', '/project')).toBe(false)
+    test('echo foo > ./inside/file with cwd /project => true', () => {
+      expect(writesStayWithin('echo foo > ./inside/file', '/project')).toBe(true)
     })
 
-    test('ls | tee /outside/out => true', () => {
-      expect(detectsOutsideCwd('ls | tee /outside/out', '/project')).toBe(true)
+    test('ls | tee /outside/out => false', () => {
+      expect(writesStayWithin('ls | tee /outside/out', '/project')).toBe(false)
     })
 
-    test('cat file && rm /etc/foo => true', () => {
-      expect(detectsOutsideCwd('cat file && rm /etc/foo', '/project')).toBe(true)
+    test('cat file && rm /etc/foo => false', () => {
+      expect(writesStayWithin('cat file && rm /etc/foo', '/project')).toBe(false)
     })
 
-    test('rm ../outside with cwd /project/sub => true', () => {
-      expect(detectsOutsideCwd('rm ../outside', '/project/sub')).toBe(true)
+    test('rm ../outside with cwd /project/sub => false', () => {
+      expect(writesStayWithin('rm ../outside', '/project/sub')).toBe(false)
     })
 
-    test('rm ./inside => false', () => {
-      expect(detectsOutsideCwd('rm ./inside', '/project')).toBe(false)
+    test('rm ./inside => true', () => {
+      expect(writesStayWithin('rm ./inside', '/project')).toBe(true)
     })
 
-    test('npm install => false', () => {
-      expect(detectsOutsideCwd('npm install', '/project')).toBe(false)
+    test('npm install => true', () => {
+      expect(writesStayWithin('npm install', '/project')).toBe(true)
     })
 
-    test('tee /tmp/out => false (tmp is allowlisted)', () => {
-      expect(detectsOutsideCwd('ls | tee /tmp/out', '/project')).toBe(false)
+    test('tee /tmp/out => true (tmp is allowlisted)', () => {
+      expect(writesStayWithin('ls | tee /tmp/out', '/project')).toBe(true)
     })
 
-    test('echo foo > /dev/null => false (dev/null is allowlisted)', () => {
-      expect(detectsOutsideCwd('echo foo > /dev/null', '/project')).toBe(false)
+    test('echo foo > /dev/null => true (dev/null is allowlisted)', () => {
+      expect(writesStayWithin('echo foo > /dev/null', '/project')).toBe(true)
     })
 
-    test('cp file /dev/sda => true (only /dev/null is allowlisted)', () => {
-      expect(detectsOutsideCwd('cp file /dev/sda', '/project')).toBe(true)
+    test('cp file /dev/sda => false (only /dev/null is allowlisted)', () => {
+      expect(writesStayWithin('cp file /dev/sda', '/project')).toBe(false)
+    })
+
+    test('workspace path is allowed when passed as additional root', () => {
+      expect(writesStayWithin('echo foo > /Users/alice/.magnitude/sessions/123/workspace/note.txt', '/project', '/Users/alice/.magnitude/sessions/123/workspace/')).toBe(true)
+      expect(writesStayWithin('mkdir -p /Users/alice/.magnitude/sessions/123/workspace/tmp', '/project', '/Users/alice/.magnitude/sessions/123/workspace')).toBe(true)
+    })
+
+    test('outside paths remain blocked even with workspace allowlist', () => {
+      expect(writesStayWithin('echo foo > /Users/alice/.ssh/config', '/project', '/Users/alice/.magnitude/sessions/123/workspace/')).toBe(false)
     })
   })
 

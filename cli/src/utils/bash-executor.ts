@@ -26,9 +26,13 @@ const truncate = (text: string): string => {
   return text.slice(0, MAX_OUTPUT_LENGTH) + '\n... (output truncated)'
 }
 
-export function executeBashCommand(command: string): BashResult {
+export function executeBashCommand(
+  command: string,
+  options?: { workspacePath?: string; projectRoot?: string },
+): BashResult {
   const cwd = process.cwd()
   const shell = process.env.SHELL || '/bin/sh'
+  const projectRoot = options?.projectRoot ?? cwd
 
   try {
     const result = Bun.spawnSync({
@@ -36,7 +40,11 @@ export function executeBashCommand(command: string): BashResult {
       cwd,
       stdout: 'pipe',
       stderr: 'pipe',
-      env: process.env,
+      env: {
+        ...process.env,
+        PROJECT_ROOT: projectRoot,
+        ...(options?.workspacePath ? { M: options.workspacePath } : {}),
+      },
     })
 
     const stdout = truncate(readOutput(result.stdout).trimEnd())

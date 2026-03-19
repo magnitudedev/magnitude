@@ -21,7 +21,7 @@ const makeRegistry = () => ({
 
 const makeTestLayer = (remindersRef: Ref.Ref<string[]>) =>
   Layer.mergeAll(
-    Layer.succeed(WorkingDirectoryTag, { cwd: '/tmp' }),
+    Layer.succeed(WorkingDirectoryTag, { cwd: '/tmp', workspacePath: '/tmp/workspace' }),
     Layer.succeed(ForkContext, { forkId: 'fork-test' }),
     Layer.succeed(ToolExecutionContextTag, { turnId: 'turn-test' }),
     Layer.succeed(BackgroundProcessRegistryTag, makeRegistry()),

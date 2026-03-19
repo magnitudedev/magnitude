@@ -14,7 +14,7 @@ import { webFetchTool } from '../tools/web-fetch-tool'
 
 import { thinkTool } from '../tools/globals'
 import { artifactReadTool, artifactWriteTool } from '../tools/artifact-tools'
-import { classifyShellCommand, detectsOutsideCwd, isPathOutsideCwd } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
@@ -69,16 +69,19 @@ export const createDebugger = (systemPrompt: string) => defineAgent<typeof tools
   permission: (p) => ({
     shell(input, ctx) {
       const result = classifyShellCommand(input.command)
+      const allowedPrefixes = [ctx.workspacePath]
       if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
-      if (detectsOutsideCwd(input.command, ctx.cwd)) return p.reject('This command targets paths outside the working directory.')
+      if (!writesStayWithin(input.command, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
       return p.allow()
     },
     fileWrite(input, ctx) {
-      if (isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
+      const allowedPrefixes = [ctx.workspacePath]
+      if (!isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
       return p.allow()
     },
     fileEdit(input, ctx) {
-      if (isPathOutsideCwd(input.path, ctx.cwd)) return p.reject('Cannot write to files outside the working directory')
+      const allowedPrefixes = [ctx.workspacePath]
+      if (!isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
       return p.allow()
     },
     _default() { return p.allow() },

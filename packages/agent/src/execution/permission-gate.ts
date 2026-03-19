@@ -15,7 +15,7 @@ import { join } from 'path'
 import type { InterceptorContext, InterceptorDecision } from '@magnitudedev/xml-act'
 import { ApprovalStateTag } from './approval-state'
 import { PermissionRejection } from './permission-rejection'
-import { classifyShellCommand, detectsOutsideCwd, isGitAllowed } from '@magnitudedev/shell-classifier'
+import { classifyShellCommand, writesStayWithin, isGitAllowed } from '@magnitudedev/shell-classifier'
 import { validateAndApply, toEditDiff } from '../util/edit'
 import type { ToolDisplay } from '../events'
 import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
@@ -55,7 +55,8 @@ export function buildPermissionInterceptor(
             const result = classifyShellCommand(input.command)
 
             if (result.tier === 'normal') {
-              if (!policyCtx.disableCwdSafeguards && detectsOutsideCwd(input.command, policyCtx.cwd)) {
+              const allowedPrefixes = [policyCtx.workspacePath]
+              if (!policyCtx.disableCwdSafeguards && !writesStayWithin(input.command, policyCtx.cwd, ...(allowedPrefixes ?? []))) {
                 return reject(PermissionRejection.Forbidden({
                   reason: 'Non read-only shell commands outside the working directory are not allowed.'
                 }))

@@ -36,4 +36,6 @@ Before finishing, test your complete solution end-to-end. Check for leftover art
 
 {{RESPONSE_PROTOCOL}}
 
+{{WORKSPACE_SECTION}}
+
 {{TOOLING_SECTION}}

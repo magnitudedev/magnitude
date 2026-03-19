@@ -257,11 +257,20 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
     if (events.length === 0) {
       // New session
-      const context = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext({
+      const baseContext = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext({
         cwd: process.cwd(),
         memoryEnabled,
         storage: options.storage,
       })))
+
+      const sessionMetadata = yield* persistence.getSessionMetadata()
+      const workspacePath = yield* Effect.promise(() =>
+        options.storage.sessions.createWorkspace(sessionMetadata.sessionId, baseContext.cwd)
+      )
+      const context: SessionContext = {
+        ...baseContext,
+        workspacePath,
+      }
 
       yield* Effect.promise(() => client.send({
         type: 'session_initialized',
@@ -276,6 +285,12 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       }
     } else {
       // Existing session — hydrate
+      // Ensure workspace exists and symlink is up-to-date
+      const sessionMetadata = yield* persistence.getSessionMetadata()
+      yield* Effect.promise(() =>
+        options.storage.sessions.createWorkspace(sessionMetadata.sessionId, process.cwd())
+      )
+
       yield* hydrationContext.setHydrating(true)
 
       for (const event of events) {
