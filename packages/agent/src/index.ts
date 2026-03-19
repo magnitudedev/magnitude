@@ -64,7 +64,7 @@ export type { FrontmatterResult } from './util/frontmatter'
 
 // Projections
 export { WorkingStateProjection, shouldTrigger, isStable } from './projections/working-state'
-export type { ForkWorkingState } from './projections/working-state'
+export type { ForkWorkingState, PendingInboundCommunication } from './projections/working-state'
 
 export { MemoryProjection } from './projections/memory'
 export { getView } from './projections/memory'
@@ -87,6 +87,7 @@ export type {
   AssistantMessageDisplay,
   ThinkBlockMessage,
   ThinkBlockStep,
+  CommunicationStep,
   InterruptedMessage,
   UnexpectedErrorMessage,
   ForkResultMessage,
@@ -94,6 +95,7 @@ export type {
   ForkActivityToolCounts,
   ApprovalRequestMessage,
   InProgressArtifactView,
+  PendingInboundCommunicationDisplay,
 } from './projections/display'
 
 export { TurnProjection } from './projections/turn'

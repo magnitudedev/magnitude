@@ -16,7 +16,7 @@ import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { getVisualRegistry } from '../visuals/registry'
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection, type AgentStatusState, getAgentByForkId } from './agent-status'
-import { WorkingStateProjection } from './working-state'
+import { WorkingStateProjection, type PendingInboundCommunication } from './working-state'
 
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
@@ -89,17 +89,40 @@ export interface AssistantMessageDisplay {
   readonly timestamp: number
 }
 
-export interface ThinkBlockStep {
+export interface ThinkingStep {
   readonly id: string
-  readonly type: 'thinking' | 'tool'
-  readonly content?: string  // For thinking
-  readonly toolKey?: string  // For tool
-  readonly cluster?: string  // Visual cluster key for grouping consecutive steps
+  readonly type: 'thinking'
+  readonly content?: string
+  readonly label?: string
+}
+
+export interface ToolStep {
+  readonly id: string
+  readonly type: 'tool'
+  readonly toolKey?: string
+  readonly cluster?: string
   readonly input?: unknown
   readonly result?: ToolResult
   readonly label?: string
-  readonly visualState?: unknown  // Managed by visual reducer registry
+  readonly visualState?: unknown
 }
+
+export interface CommunicationStep {
+  readonly id: string
+  readonly type: 'communication'
+  readonly streamId?: string
+  readonly direction: 'to_agent' | 'from_agent'
+  readonly agentId: string
+  readonly agentName?: string
+  readonly agentRole?: string
+  readonly forkId: string | null
+  readonly content: string
+  readonly preview: string
+  readonly timestamp: number
+  readonly status?: 'streaming' | 'completed'
+}
+
+export type ThinkBlockStep = ThinkingStep | ToolStep | CommunicationStep
 
 export interface ThinkBlockMessage {
   readonly id: string
@@ -208,9 +231,12 @@ export type DisplayMessage =
   | ApprovalRequestMessage
 
 /** Per-fork display state */
+export interface PendingInboundCommunicationDisplay extends PendingInboundCommunication {}
+
 export interface DisplayState {
   readonly status: 'idle' | 'streaming'
   readonly messages: readonly DisplayMessage[]
+  readonly pendingInboundCommunications: readonly PendingInboundCommunicationDisplay[]
   readonly currentTurnId: string | null  // Tracks active turn for queuing decision
   readonly streamingMessageId: string | null  // Tracks streaming assistant message
   readonly activeThinkBlockId: string | null
@@ -403,41 +429,46 @@ export function toPreview(text: string): string {
   return normalized.slice(0, 117) + '...'
 }
 
-export function upsertStreamingCommunicationMessage(
+export function upsertStreamingCommunicationStep(
   fork: DisplayState,
   streamId: string,
-  message: Omit<AgentCommunicationMessage, 'id' | 'type' | 'preview' | 'streamId'>,
+  message: Omit<CommunicationStep, 'id' | 'type' | 'preview' | 'streamId' | 'status' | 'content'>,
   textDelta: string
 ): DisplayState {
-  const existing = fork.messages.find(
-    (m): m is AgentCommunicationMessage => m.type === 'agent_communication' && m.streamId === streamId
-  )
+  if (message.forkId === null) return fork
+  const { fork: stateWithBlock, thinkBlockId } = ensureThinkBlock(fork, message.timestamp)
+  const block = findThinkBlock(stateWithBlock.messages, thinkBlockId)
+  const last = block?.steps[block.steps.length - 1]
 
-  if (existing) {
-    const content = existing.content + textDelta
+  if (last?.type === 'communication' && last.streamId === streamId) {
+    const content = last.content + textDelta
     return {
-      ...fork,
-      messages: updateMessageById<AgentCommunicationMessage>(fork.messages, existing.id, (msg) => ({
-        ...msg,
-        content,
-        preview: toPreview(content),
-      }))
+      ...stateWithBlock,
+      messages: updateStepInThinkBlock(
+        stateWithBlock.messages,
+        thinkBlockId,
+        last.id,
+        (s) => s.type === 'communication'
+          ? { ...s, content, preview: toPreview(content), status: 'streaming' }
+          : s
+      )
     }
   }
 
   const content = textDelta
-  const comm: AgentCommunicationMessage = {
+  const step: CommunicationStep = {
     id: generateId(),
-    type: 'agent_communication',
+    type: 'communication',
     streamId,
     ...message,
     content,
     preview: toPreview(content),
+    status: 'streaming',
   }
 
   return {
-    ...fork,
-    messages: insertBeforeQueuedMessages(fork.messages, comm)
+    ...stateWithBlock,
+    messages: addStepToThinkBlock(stateWithBlock.messages, thinkBlockId, step)
   }
 }
 
@@ -541,6 +572,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
   initialFork: {
     status: 'idle',
     messages: [],
+    pendingInboundCommunications: [],
     currentTurnId: null,
     streamingMessageId: null,
     activeThinkBlockId: null,
@@ -1043,23 +1075,24 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     agent_created: ({ event, fork }) => {
       const content = event.message.trim()
       if (!content) return fork
+      if (event.forkId === null) return fork
 
-      const comm: AgentCommunicationMessage = {
-        id: generateId(),
-        type: 'agent_communication',
-        direction: 'from_agent',
-        agentId: event.agentId,
-        agentName: event.name,
-        agentRole: event.role,
-        forkId: event.forkId,
-        content,
-        preview: toPreview(content),
-        timestamp: event.timestamp,
-      }
-
+      const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
       return {
-        ...fork,
-        messages: insertBeforeQueuedMessages(fork.messages, comm)
+        ...newState,
+        messages: addStepToThinkBlock(newState.messages, thinkBlockId, {
+          id: generateId(),
+          type: 'communication',
+          direction: 'from_agent',
+          agentId: event.agentId,
+          agentName: event.name,
+          agentRole: event.role,
+          forkId: event.forkId,
+          content,
+          preview: toPreview(content),
+          timestamp: event.timestamp,
+          status: 'completed',
+        })
       }
     },
 
@@ -1211,9 +1244,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const displayFork = state.forks.get(value.targetForkId)
       if (!displayFork) return state
 
+      if (value.direction === 'from_agent') return state
+
       const agentState = read(AgentStatusProjection)
       const targetAgent = getAgentByForkId(agentState, value.targetForkId)
-      const nextFork = upsertStreamingCommunicationMessage(
+      const nextFork = upsertStreamingCommunicationStep(
         displayFork,
         value.streamId,
         {
@@ -1237,9 +1272,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const displayFork = state.forks.get(value.targetForkId)
       if (!displayFork) return state
 
+      if (value.direction === 'from_agent') return state
+
       const agentState = read(AgentStatusProjection)
       const targetAgent = getAgentByForkId(agentState, value.targetForkId)
-      const nextFork = upsertStreamingCommunicationMessage(
+      const nextFork = upsertStreamingCommunicationStep(
         displayFork,
         value.streamId,
         {
@@ -1262,6 +1299,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     on(AgentRoutingProjection.signals.communicationStreamCompleted, ({ value, state }) => {
       const displayFork = state.forks.get(value.targetForkId)
       if (!displayFork) return state
+      if (value.direction === 'from_agent') return state
 
       return {
         ...state,
@@ -1269,6 +1307,93 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           value.targetForkId,
           finalizeCommunicationStreamInFork(displayFork, value.streamId)
         )
+      }
+    }),
+
+    on(AgentRoutingProjection.signals.agentMessage, ({ value, state, read }) => {
+      const displayFork = state.forks.get(value.targetForkId)
+      if (!displayFork) return state
+      const agentState = read(AgentStatusProjection)
+      const workingState = read(WorkingStateProjection)
+      const workingFork = workingState.forks.get(value.targetForkId)
+      const targetAgent = getAgentByForkId(agentState, value.targetForkId)
+
+      const pending = (workingFork?.pendingInboundCommunications ?? []).map((message): PendingInboundCommunicationDisplay => ({
+        ...message,
+        agentName: message.agentName ?? targetAgent?.name,
+        agentRole: message.agentRole ?? targetAgent?.role,
+      }))
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.targetForkId, {
+          ...displayFork,
+          pendingInboundCommunications: pending,
+        })
+      }
+    }),
+
+    on(AgentRoutingProjection.signals.agentResponse, ({ value, state, read }) => {
+      const displayFork = state.forks.get(value.targetForkId)
+      if (!displayFork) return state
+      const agentState = read(AgentStatusProjection)
+      const workingState = read(WorkingStateProjection)
+      const workingFork = workingState.forks.get(value.targetForkId)
+      const targetAgent = value.targetForkId ? getAgentByForkId(agentState, value.targetForkId) : undefined
+
+      const pending = (workingFork?.pendingInboundCommunications ?? []).map((message): PendingInboundCommunicationDisplay => ({
+        ...message,
+        agentName: message.agentName ?? targetAgent?.name,
+        agentRole: message.agentRole ?? targetAgent?.role,
+      }))
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.targetForkId, {
+          ...displayFork,
+          pendingInboundCommunications: pending,
+        })
+      }
+    }),
+
+    on(WorkingStateProjection.signals.pendingInboundCommunicationsRead, ({ value, state, read }) => {
+      if (value.forkId === null) return state
+      const displayFork = state.forks.get(value.forkId)
+      if (!displayFork) return state
+
+      const agentState = read(AgentStatusProjection)
+      let nextFork = { ...displayFork }
+
+      for (const pending of value.messages) {
+        const targetAgent = value.forkId ? getAgentByForkId(agentState, value.forkId) : undefined
+        const withBlock = ensureThinkBlock(nextFork, value.timestamp)
+        nextFork = {
+          ...withBlock.fork,
+          messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, {
+            id: pending.id,
+            type: 'communication',
+            direction: 'from_agent',
+            agentId: pending.agentId,
+            agentName: pending.agentName ?? targetAgent?.name,
+            agentRole: pending.agentRole ?? targetAgent?.role,
+            forkId: pending.forkId,
+            content: pending.content,
+            preview: pending.preview,
+            timestamp: pending.timestamp,
+            status: 'completed',
+          })
+        }
+      }
+
+      const pendingIds = new Set(value.messages.map(m => m.id))
+      nextFork = {
+        ...nextFork,
+        pendingInboundCommunications: nextFork.pendingInboundCommunications.filter(m => !pendingIds.has(m.id))
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.forkId, nextFork)
       }
     }),
   ]
@@ -1282,36 +1407,23 @@ export function finalizeCommunicationStreamInFork(
   fork: DisplayState,
   streamId: string
 ): DisplayState {
-  const msg = fork.messages.find(
-    (m): m is AgentCommunicationMessage => m.type === 'agent_communication' && m.streamId === streamId
-  )
-  if (!msg) return fork
+  if (!fork.activeThinkBlockId) return fork
+  const block = findThinkBlock(fork.messages, fork.activeThinkBlockId)
+  if (!block) return fork
+  const step = block.steps.find((s): s is CommunicationStep => s.type === 'communication' && s.streamId === streamId)
+  if (!step) return fork
 
-  const normalized = msg.content.trim()
-  const duplicateSeed = normalized.length > 0
-    ? fork.messages.find(
-      (m): m is AgentCommunicationMessage =>
-        m.type === 'agent_communication'
-        && !m.streamId
-        && m.id !== msg.id
-        && m.direction === msg.direction
-        && m.agentId === msg.agentId
-        && m.content.trim() === normalized
-    )
-    : undefined
-
-  const messages = duplicateSeed
-    ? fork.messages.filter(m => m.id !== msg.id)
-    : moveMessageToEndBeforeQueue<AgentCommunicationMessage>(
+  return {
+    ...fork,
+    messages: updateStepInThinkBlock(
       fork.messages,
-      msg.id,
-      (existing) => ({
-        ...existing,
-        preview: toPreview(existing.content),
-      })
+      fork.activeThinkBlockId,
+      step.id,
+      (s) => s.type === 'communication'
+        ? { ...s, preview: toPreview(s.content), status: 'completed' }
+        : s
     )
-
-  return { ...fork, messages }
+  }
 }
 
 function generateCompletedToolLabel(toolKey: string, input: unknown): string | null {

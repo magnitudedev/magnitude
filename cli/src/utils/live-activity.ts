@@ -32,6 +32,13 @@ export function selectLatestLiveActivityFromThinkSteps(
       if (text) return text
       continue
     }
+    if (step.type === 'communication') {
+      const text = normalize(step.preview)
+      if (text.length > 0) return text
+      const fallback = normalize(step.content)
+      if (fallback.length > 0) return fallback
+      continue
+    }
     if (step.type === 'thinking' && typeof step.content === 'string') {
       const text = normalize(step.content)
       if (text.length > 0) return text
@@ -66,19 +73,5 @@ export function selectLatestLiveActivityFromMessages(
 export function selectLatestLiveActivityForSubagentTab(
   messages: readonly DisplayMessage[],
 ): string | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-    if (msg.type !== 'think_block') continue
-    const text = selectLatestLiveActivityFromThinkSteps(msg.steps)
-    if (text) return text
-  }
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-    if (msg.type !== 'agent_communication') continue
-    const text = normalize(msg.preview)
-    if (text.length > 0) return text
-  }
-
-  return null
+  return selectLatestLiveActivityFromMessages(messages)
 }

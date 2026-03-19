@@ -19,16 +19,23 @@ describe('live-activity selector', () => {
     expect(selectLatestLiveActivityFromMessages(messages)).toBe('latest communication')
   })
 
-  it('prefers latest think-block activity for subagent tab status over newer communications', () => {
+  it('uses communication think step preview in live activity', () => {
+    const steps = [
+      { id: '1', type: 'communication', preview: 'pending inbound', content: 'pending inbound full' },
+    ] as any as ThinkBlockStep[]
+    expect(selectLatestLiveActivityFromThinkSteps(steps)).toBe('pending inbound')
+  })
+
+  it('uses most recent producible activity for subagent tab status', () => {
     const messages = [
       {
         type: 'think_block',
-        steps: [{ id: '1', type: 'thinking', content: 'working step' }],
+        steps: [{ id: '1', type: 'thinking', content: 'older think activity' }],
       },
-      { type: 'agent_communication', preview: 'completed communication' },
+      { type: 'agent_communication', preview: 'newer communication activity' },
     ] as any as DisplayMessage[]
 
-    expect(selectLatestLiveActivityForSubagentTab(messages)).toBe('working step')
+    expect(selectLatestLiveActivityForSubagentTab(messages)).toBe('newer communication activity')
   })
 
   it('falls back to latest communication when subagent tab has no think activity', () => {

@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState, useCallback } from 'react'
 import { TextAttributes } from '@opentui/core'
 import type { ThinkBlockMessage, ThinkBlockStep } from '@magnitudedev/agent'
 import { Button } from './button'
+import { AgentCommunicationCard } from './agent-communication-card'
 import { useTheme } from '../hooks/use-theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
@@ -294,6 +295,23 @@ const StepGroupView = memo(function StepGroupView({
               <ThinkingStep content={step.content ?? ''} label={step.label} isActive={(isActive ?? false) && isLastThinkingStep} isInterrupted={isInterrupted} />
             </box>
           )
+        }
+
+        if (step.type === 'communication') {
+          const message = {
+            id: step.id,
+            type: 'agent_communication',
+            direction: step.direction,
+            agentId: step.agentId,
+            agentName: step.agentName,
+            agentRole: step.agentRole,
+            forkId: step.forkId ?? null,
+            content: step.content,
+            preview: step.preview || step.content,
+            timestamp: step.timestamp,
+          }
+
+          return <AgentCommunicationCard key={step.id} message={message} widthAdjustment={2} />
         }
 
         return (

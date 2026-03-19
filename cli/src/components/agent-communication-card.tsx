@@ -21,14 +21,18 @@ export function getCommunicationPreview(
 
 interface AgentCommunicationCardProps {
   message: AgentCommunicationMessage
+  widthAdjustment?: number
 }
 
-export const AgentCommunicationCard = memo(function AgentCommunicationCard({ message }: AgentCommunicationCardProps) {
+export const AgentCommunicationCard = memo(function AgentCommunicationCard({
+  message,
+  widthAdjustment = 0,
+}: AgentCommunicationCardProps) {
   const theme = useTheme()
   const [expanded, setExpanded] = useState(false)
   const [hovered, setHovered] = useState(false)
   const terminalWidth = useTerminalWidth()
-  const contentWidth = Math.max(1, terminalWidth - 6)
+  const contentWidth = Math.max(1, terminalWidth - 6 - widthAdjustment)
 
   const { previewLines, hasOverflow } = useMemo(
     () => getCommunicationPreview(message.content, contentWidth),

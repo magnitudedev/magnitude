@@ -8,7 +8,14 @@
 import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
+import { createId } from '../util/id'
 import { CompactionProjection } from './compaction'
+
+function toPreview(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  if (normalized.length <= 120) return normalized
+  return normalized.slice(0, 117) + '...'
+}
 
 
 // =============================================================================
@@ -16,6 +23,20 @@ import { CompactionProjection } from './compaction'
 // =============================================================================
 
 /** Per-fork working state */
+export interface PendingInboundCommunication {
+  readonly id: string
+  readonly direction: 'from_agent' | 'to_agent'
+  readonly agentId: string
+  readonly agentName?: string
+  readonly agentRole?: string
+  readonly forkId: string | null
+  readonly content: string
+  readonly preview: string
+  readonly timestamp: number
+  readonly arrivedAtTurnId: string | null
+  readonly readAtTurnId?: string
+}
+
 export interface ForkWorkingState {
   readonly working: boolean
   readonly willContinue: boolean
@@ -28,6 +49,7 @@ export interface ForkWorkingState {
   readonly pendingApproval: boolean
   readonly softInterrupted: boolean
   readonly pendingMentionTimestamps: readonly number[]
+  readonly pendingInboundCommunications: readonly PendingInboundCommunication[]
 }
 
 // =============================================================================
@@ -58,14 +80,16 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     contextLimitBlocked: false,
     pendingApproval: false,
     softInterrupted: false,
-    pendingMentionTimestamps: []
+    pendingMentionTimestamps: [],
+    pendingInboundCommunications: []
   },
 
   signals: {
     shouldTriggerChanged: Signal.create<{ forkId: string | null; shouldTrigger: boolean; chainId: string | null }>('WorkingState/shouldTriggerChanged'),
     forkBecameStable: Signal.create<{ forkId: string | null; timestamp: number }>('WorkingState/forkBecameStable'),
     softInterruptResolved: Signal.create<{ forkId: string }>('WorkingState/softInterruptResolved'),
-    turnInterrupted: Signal.create<{ forkId: string | null; turnId: string; chainId: string | null }>('WorkingState/turnInterrupted')
+    turnInterrupted: Signal.create<{ forkId: string | null; turnId: string; chainId: string | null }>('WorkingState/turnInterrupted'),
+    pendingInboundCommunicationsRead: Signal.create<{ forkId: string | null; turnId: string; messages: readonly PendingInboundCommunication[]; timestamp: number }>('WorkingState/pendingInboundCommunicationsRead')
   },
 
   eventHandlers: {
@@ -144,15 +168,27 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       return newFork
     },
 
-    turn_started: ({ event, fork }) => ({
-      ...fork,
-      working: true,
-      willContinue: false,
-      pendingWake: false,
-      hasQueuedMessages: false,
-      currentTurnId: event.turnId,
-      currentChainId: event.chainId
-    }),
+    turn_started: ({ event, fork, emit }) => {
+      if (fork.pendingInboundCommunications.length > 0) {
+        emit.pendingInboundCommunicationsRead({
+          forkId: event.forkId,
+          turnId: event.turnId,
+          messages: fork.pendingInboundCommunications,
+          timestamp: event.timestamp,
+        })
+      }
+
+      return {
+        ...fork,
+        working: true,
+        willContinue: false,
+        pendingWake: false,
+        hasQueuedMessages: false,
+        currentTurnId: event.turnId,
+        currentChainId: event.chainId,
+        pendingInboundCommunications: [],
+      }
+    },
 
     turn_completed: ({ event, fork, emit }) => {
       let turnWantsContinue: boolean
@@ -407,7 +443,20 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       const newForkState: ForkWorkingState = {
         ...forkState,
         willContinue: true,
-        hasQueuedMessages: forkState.hasQueuedMessages || forkState.working
+        hasQueuedMessages: forkState.hasQueuedMessages || forkState.working,
+        pendingInboundCommunications: [
+          ...forkState.pendingInboundCommunications,
+          {
+            id: createId(),
+            direction: 'from_agent',
+            agentId: value.agentId,
+            forkId,
+            content: value.message,
+            preview: toPreview(value.message),
+            timestamp: value.timestamp,
+            arrivedAtTurnId: forkState.currentTurnId,
+          }
+        ]
       }
 
       if (shouldTrigger(newForkState) && !shouldTrigger(forkState)) {
@@ -433,7 +482,20 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       const newForkState: ForkWorkingState = {
         ...forkState,
         willContinue: true,
-        hasQueuedMessages: forkState.hasQueuedMessages || forkState.working
+        hasQueuedMessages: forkState.hasQueuedMessages || forkState.working,
+        pendingInboundCommunications: [
+          ...forkState.pendingInboundCommunications,
+          {
+            id: createId(),
+            direction: 'from_agent',
+            agentId: value.agentId,
+            forkId,
+            content: value.message,
+            preview: toPreview(value.message),
+            timestamp: value.timestamp,
+            arrivedAtTurnId: forkState.currentTurnId,
+          }
+        ]
       }
 
       if (shouldTrigger(newForkState) && !shouldTrigger(forkState)) {

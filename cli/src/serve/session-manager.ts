@@ -88,6 +88,7 @@ const DEFAULT_WORKING_STATE: ForkWorkingState = {
   pendingApproval: false,
   softInterrupted: false,
   pendingMentionTimestamps: [],
+  pendingInboundCommunications: [],
 }
 
 const DEFAULT_ARTIFACT_STATE: ArtifactState = {

@@ -9,6 +9,7 @@ import { JsonChatPersistence } from './persistence'
 import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
 import { StickyWorkingHeader } from './components/think-block'
+import { PendingCommunicationsPanel } from './components/pending-communications-panel'
 import { LoadPreviousButton } from './components/chat-controls'
 
 
@@ -552,6 +553,7 @@ function AppInner({
       setDisplay({
         status: 'idle',
         messages: [],
+        pendingInboundCommunications: [],
         currentTurnId: null,
         streamingMessageId: null,
         activeThinkBlockId: null,
@@ -1855,6 +1857,7 @@ function AppInner({
           }
         })
       })()}
+      <PendingCommunicationsPanel messages={activeDisplay?.pendingInboundCommunications ?? []} />
     </scrollbox>
   )
 
