@@ -1363,24 +1363,26 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const agentState = read(AgentStatusProjection)
       let nextFork = { ...displayFork }
 
-      for (const pending of value.messages) {
-        const targetAgent = value.forkId ? getAgentByForkId(agentState, value.forkId) : undefined
-        const withBlock = ensureThinkBlock(nextFork, value.timestamp)
-        nextFork = {
-          ...withBlock.fork,
-          messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, {
-            id: pending.id,
-            type: 'communication',
-            direction: 'from_agent',
-            agentId: pending.agentId,
-            agentName: pending.agentName ?? targetAgent?.name,
-            agentRole: pending.agentRole ?? targetAgent?.role,
-            forkId: pending.forkId,
-            content: pending.content,
-            preview: pending.preview,
-            timestamp: pending.timestamp,
-            status: 'completed',
-          })
+      if (value.forkId !== null) {
+        for (const pending of value.messages) {
+          const targetAgent = getAgentByForkId(agentState, value.forkId)
+          const withBlock = ensureThinkBlock(nextFork, value.timestamp)
+          nextFork = {
+            ...withBlock.fork,
+            messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, {
+              id: pending.id,
+              type: 'communication',
+              direction: 'from_agent',
+              agentId: pending.agentId,
+              agentName: pending.agentName ?? targetAgent?.name,
+              agentRole: pending.agentRole ?? targetAgent?.role,
+              forkId: pending.forkId,
+              content: pending.content,
+              preview: pending.preview,
+              timestamp: pending.timestamp,
+              status: 'completed',
+            })
+          }
         }
       }
 
