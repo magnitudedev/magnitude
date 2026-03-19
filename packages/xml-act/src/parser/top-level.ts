@@ -103,7 +103,7 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     const artifactsRaw = typeof attrs.get('artifacts') === 'string' ? String(attrs.get('artifacts')) : null
     const id = config.generateId()
     events.push({ _tag: 'MessageTagOpen', id, dest, artifactsRaw })
-    state.push({ _tag: 'MessageBody', id, dest, artifactsRaw, body: '', pendingLt: false, depth: 0, pendingNewline: false })
+    state.push({ _tag: 'MessageBody', id, dest, artifactsRaw, body: '', pendingLt: false, depth: 0, pendingNewlines: 0 })
     return events
   }
   if (config.knownTags.has(tagName)) {
