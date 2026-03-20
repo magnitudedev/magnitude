@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type ArtifactState, getLatestInProgressArtifactStream } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -17,7 +17,7 @@ import { usePaginatedTimeline } from './hooks/use-paginated-timeline'
 import { useCollapsedBlocks } from './hooks/use-collapsed-blocks'
 
 import { useTheme } from './hooks/use-theme'
-import { ArtifactProvider, SelectedArtifactProvider } from './hooks/use-artifacts'
+import { SelectedFileProvider } from './hooks/use-file-viewer'
 
 import { BOX_CHARS } from './utils/ui-constants'
 import { AnimatedLogo } from './components/animated-logo'
@@ -38,7 +38,8 @@ import { AppOverlays } from './components/app-overlays'
 import { buildModelPickerItems, filterModelPickerItems, resolveSlotDefaultSelection } from './utils/model-picker'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
-import { readFileSync } from 'fs'
+import { readFileSync } from 'node:fs'
+
 import path from 'path'
 import { executeBashCommand, type BashResult } from './utils/bash-executor'
 
@@ -46,7 +47,7 @@ import { executeBashCommand, type BashResult } from './utils/bash-executor'
 import { BashOutput } from './components/bash-output'
 
 
-import { ArtifactReaderPanel } from './components/artifact-reader-panel'
+import { FileViewerPanel } from './components/file-viewer-panel'
 import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
@@ -62,6 +63,7 @@ import { createId } from '@magnitudedev/generate-id'
 import { useProviderRuntime } from './providers/provider-runtime'
 import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
+import { useFilePanel } from './hooks/use-file-panel'
 
 const roleToSlot = (role: string): 'primary' | 'secondary' | 'browser' => {
   if (role === 'browser') return 'browser'
@@ -121,11 +123,9 @@ function AppInner({
   const storage = useStorage()
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const [client, setClient] = useState<AgentClient | null>(null)
-  const [bashWorkspacePath, setBashWorkspacePath] = useState<string | undefined>(undefined)
+  const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
-  const [artifactState, setArtifactState] = useState<ArtifactState | null>(null)
-  const [selectedArtifact, setSelectedArtifact] = useState<{ name: string; section?: string } | null>(null)
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
@@ -351,7 +351,7 @@ function AppInner({
         sessionId,
       })
       const activeSessionId = persistence.getSessionId()
-      setBashWorkspacePath(storage.sessions.getWorkspacePath(activeSessionId))
+      setWorkspacePath(storage.sessions.getWorkspacePath(activeSessionId) ?? null)
       initLogger(persistence.getSessionId())
       clearSessionLog(persistence.getSessionId())
       logger.info({ logFile: getSessionLogPath(persistence.getSessionId()) }, 'Session logger initialized')
@@ -523,13 +523,6 @@ function AppInner({
       client.state.agentStatus.subscribe((state) => {
         if (mounted) {
           setAgentStatusState(state)
-        }
-      })
-
-      // Subscribe to artifact state (global projection)
-      client.state.artifacts.subscribe((state) => {
-        if (mounted) {
-          setArtifactState(state)
         }
       })
 
@@ -1497,54 +1490,19 @@ function AppInner({
   )
 
 
-
-  const selectedArtifactContent = useMemo(() => {
-    if (!selectedArtifact || !artifactState) return null
-    const artifact = artifactState.artifacts.get(selectedArtifact.name)
-    return artifact?.content ?? null
-  }, [selectedArtifact, artifactState])
-
-  // Freeze baseContent when a stream starts — don't let it update
-  // as the artifact content changes during executing/saving phase.
-  const frozenBaseContentRef = useRef<{ toolCallId: string; content: string | null } | null>(null)
-
-  const selectedArtifactStreaming = useMemo(() => {
-    if (!selectedArtifact || !display) return null
-    const stream = getLatestInProgressArtifactStream(display, selectedArtifact.name, true)
-    if (!stream) {
-      frozenBaseContentRef.current = null
-      return null
-    }
-
-    // Freeze base content on first sight of this stream
-    if (!frozenBaseContentRef.current || frozenBaseContentRef.current.toolCallId !== stream.toolCallId) {
-      frozenBaseContentRef.current = {
-        toolCallId: stream.toolCallId,
-        content: selectedArtifactContent,
-      }
-    }
-
-    return {
-      active: stream.phase === 'streaming',
-      toolKey: stream.toolKey,
-      phase: stream.phase,
-      toolCallId: stream.toolCallId,
-      ...(stream.preview.mode === 'write'
-        ? {
-            contentSoFar: stream.preview.contentSoFar,
-          }
-        : {
-            oldStringSoFar: stream.preview.oldStringSoFar,
-            newStringSoFar: stream.preview.newStringSoFar,
-            replaceAll: stream.preview.replaceAll,
-          }),
-      baseContent: frozenBaseContentRef.current.content,
-    }
-  }, [selectedArtifact, display, selectedArtifactContent])
-
-  const handleArtifactClick = useCallback((name: string, section?: string) => {
-    setSelectedArtifact(prev => prev?.name === name && prev?.section === section ? null : { name, section })
-  }, [])
+  const {
+    selectedFile,
+    selectedFileContent,
+    selectedFileStreaming,
+    isOpen: isFilePanelOpen,
+    canRenderPanel,
+    openFile,
+    closeFilePanel,
+  } = useFilePanel({
+    display: activeDisplay ?? display,
+    workspacePath,
+    projectRoot: process.cwd(),
+  })
 
   // Find active expanded think block for sticky header
   const activeThinkBlock = useMemo(() => {
@@ -1845,7 +1803,7 @@ function AppInner({
                     onReject={handleReject}
 
                     inputHasText={inputHasText}
-                    onArtifactClick={handleArtifactClick}
+                    onFileClick={openFile}
                     onForkExpand={pushForkOverlay}
                   />
                 </ErrorBoundary>
@@ -1889,8 +1847,7 @@ function AppInner({
 
   const debugVisible = debugMode && debugPanelVisible
   return (
-    <ArtifactProvider value={artifactState}>
-    <SelectedArtifactProvider value={selectedArtifact?.name ?? null}>
+    <SelectedFileProvider value={selectedFile}>
     <box style={{ flexDirection: 'row', height: '100%', paddingBottom: 0, marginBottom: 0 }}>
       {/* Left column — debug panel (only when enabled and visible) */}
       {debugVisible && (
@@ -1934,10 +1891,13 @@ function AppInner({
             services={{
               submitUserMessageToFork: ({ forkId, message, attachments }) => handleSubmitViaClientBoundary({ forkId, message, attachments }),
               runSlashCommand: (commandText: string) => routeSlashCommand(commandText, commandContext),
-              executeBash: (command: string) => executeBashCommand(command, {
-                workspacePath: bashWorkspacePath,
-                projectRoot: process.cwd(),
-              }),
+              executeBash: (command: string) => {
+                if (!workspacePath) throw new Error('workspacePath not available for bash execution')
+                return executeBashCommand(command, {
+                  workspacePath,
+                  projectRoot: process.cwd(),
+                })
+              },
               appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
               clearSystemBanners: () => {
                 setSystemMessages([])
@@ -1960,8 +1920,8 @@ function AppInner({
             subagentTabs={subagentTabs}
             selectedForkId={selectedTabForkId}
             onSubagentTabSelect={setSelectedTabForkId}
-            selectedArtifactOpen={selectedArtifact != null}
-            onCloseArtifact={() => setSelectedArtifact(null)}
+            selectedFileOpen={isFilePanelOpen}
+            onCloseFilePanel={closeFilePanel}
             onApprove={handleApprove}
             onReject={handleReject}
             onInputHasTextChange={setInputHasText}
@@ -2025,22 +1985,21 @@ function AppInner({
         )}
       </box>
 
-      {selectedArtifact && (selectedArtifactContent !== null || selectedArtifactStreaming !== null) && (
+      {canRenderPanel && selectedFile && (
         <box style={{ width: '45%', flexShrink: 0, paddingRight: 1, paddingBottom: 1 }}>
-          <ArtifactReaderPanel
-            key={selectedArtifact.name}
-            artifactName={selectedArtifact.name}
-            content={selectedArtifactContent}
-            streaming={selectedArtifactStreaming ?? undefined}
-            scrollToSection={selectedArtifact.section}
-            onClose={() => setSelectedArtifact(null)}
-            onOpenArtifact={handleArtifactClick}
+          <FileViewerPanel
+            key={selectedFile.path}
+            filePath={selectedFile.path}
+            content={selectedFileContent}
+            streaming={selectedFileStreaming ?? undefined}
+            scrollToSection={selectedFile.section}
+            onClose={closeFilePanel}
+            onOpenFile={openFile}
           />
         </box>
       )}
 
     </box>
-    </SelectedArtifactProvider>
-    </ArtifactProvider>
+    </SelectedFileProvider>
   )
 }

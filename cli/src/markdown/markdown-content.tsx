@@ -10,6 +10,7 @@ import { useBoxWidth } from '../hooks/use-chat-width'
 export const MarkdownContent = memo(function MarkdownContent({
   content,
   onOpenArtifact,
+  onOpenFile,
   showCursor,
   highlightRanges,
   highlightAnchorId,
@@ -18,6 +19,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 }: {
   content: string
   onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
   showCursor?: boolean
   highlightRanges?: HighlightRange[]
   highlightAnchorId?: string
@@ -43,6 +45,7 @@ export const MarkdownContent = memo(function MarkdownContent({
         contentWidth={contentWidth}
         showCursor={showCursor}
         onOpenArtifact={onOpenArtifact}
+        onOpenFile={onOpenFile}
         highlights={highlightRanges}
         highlightAnchorId={highlightAnchorId}
       />
@@ -57,6 +60,7 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
   content,
   showCursor,
   onOpenArtifact,
+  onOpenFile,
   highlightRanges,
   highlightAnchorId,
   streaming,
@@ -66,6 +70,7 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
   content: string
   showCursor?: boolean
   onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
   highlightRanges?: HighlightRange[]
   highlightAnchorId?: string
   streaming?: boolean
@@ -92,6 +97,7 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
         contentWidth={contentWidth}
         showCursor={showCursor && !pendingText}
         onOpenArtifact={onOpenArtifact}
+        onOpenFile={onOpenFile}
         highlights={highlightRanges}
         highlightAnchorId={highlightAnchorId}
       />

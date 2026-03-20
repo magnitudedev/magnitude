@@ -21,7 +21,7 @@ import { WorkingStateProjection, type PendingInboundCommunication } from './work
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
 import { createId } from '../util/id'
-import { isActive, type ArtifactStreamPreview, type ArtifactVisualState, type Phase } from '../visuals/tools'
+import type { EditState, WriteState } from '../visuals/fs'
 import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
 
 /**
@@ -167,8 +167,6 @@ export interface ForkActivityToolCounts {
   readonly searches: number
   readonly webSearches: number
   readonly webFetches: number
-  readonly artifactWrites: number
-  readonly artifactUpdates: number
   readonly clicks: number
   readonly navigations: number
   readonly inputs: number
@@ -189,7 +187,6 @@ export interface ForkActivityMessage {
   readonly completedAt?: number
   readonly resumeCount?: number
   readonly toolCounts: ForkActivityToolCounts
-  readonly artifactNames: readonly string[]
   readonly timestamp: number
 }
 
@@ -424,7 +421,7 @@ const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: st
 const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: string }, unknown>(forkToolStepSignalDef, 'Display')
 
 const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
-  commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
+  commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
 }
 
 function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
@@ -438,8 +435,6 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): Fo
     case 'gather': return { ...counts, searches: counts.searches + 1 }
     case 'webSearch': return { ...counts, webSearches: counts.webSearches + 1 }
     case 'webFetch': return { ...counts, webFetches: counts.webFetches + 1 }
-    case 'artifactWrite': return { ...counts, artifactWrites: counts.artifactWrites + 1 }
-    case 'artifactUpdate': return { ...counts, artifactUpdates: counts.artifactUpdates + 1 }
     case 'click':
     case 'doubleClick':
     case 'rightClick':
@@ -527,92 +522,120 @@ function shortenShellCommand(command: string, max = 50): string {
   return command.length > max ? command.slice(0, max - 3) + '...' : command
 }
 
-function isArtifactToolKey(toolKey: string | undefined): toolKey is 'artifactWrite' | 'artifactUpdate' {
-  return toolKey === 'artifactWrite' || toolKey === 'artifactUpdate'
+
+function isFileStreamToolKey(toolKey: string | undefined): toolKey is 'fileWrite' | 'fileEdit' {
+  return toolKey === 'fileWrite' || toolKey === 'fileEdit'
 }
 
-function hasArtifactPreview(
+function hasFsWritePreview(
   visualState: unknown,
-  includeTerminal: boolean
-): visualState is ArtifactVisualState & { preview: ArtifactStreamPreview } {
+): visualState is WriteState {
   if (!visualState || typeof visualState !== 'object') return false
-  const state = visualState as ArtifactVisualState
-  const allowedPhase = includeTerminal
-    ? state.phase === 'streaming'
-      || state.phase === 'executing'
-      || state.phase === 'error'
-      || state.phase === 'rejected'
-      || state.phase === 'interrupted'
-    : isActive(state.phase)
-
-  return (
-    typeof state.name === 'string'
-    && state.name.length > 0
-    && allowedPhase
-    && state.preview !== undefined
-    && (state.preview.mode === 'write' || state.preview.mode === 'update')
-  )
+  const state = visualState as WriteState
+  return typeof state.path === 'string'
+    && state.path.length > 0
+    && state.contentSoFar !== undefined
+    && state.phase !== 'done'
 }
 
-export interface InProgressArtifactView {
-  artifactId: string
+function hasEditPreview(
+  visualState: unknown,
+): visualState is EditState {
+  if (!visualState || typeof visualState !== 'object') return false
+  const state = visualState as EditState
+  return typeof state.path === 'string'
+    && state.path.length > 0
+    && state.oldStringSoFar !== undefined
+    && state.phase !== 'done'
+}
+
+export interface InProgressFileView {
+  filePath: string
   toolCallId: string
-  toolKey: 'artifactWrite' | 'artifactUpdate'
+  toolKey: 'fileWrite' | 'fileEdit'
   forkId: string | null
-  phase: Phase
-  preview: ArtifactStreamPreview
+  phase: WriteState['phase'] | EditState['phase']
+  preview: {
+    mode: 'write'
+    contentSoFar: string
+    charCount: number
+    lineCount: number
+  } | {
+    mode: 'edit'
+    oldStringSoFar: string
+    newStringSoFar: string
+    replaceAll: boolean
+    childParsePhase: 'idle' | 'streaming_old' | 'streaming_new'
+  }
 }
 
-function collectArtifactStreams(
+function collectFileStreams(
   state: DisplayState,
-  includeTerminal: boolean
-): InProgressArtifactView[] {
-  const streams: InProgressArtifactView[] = []
+): InProgressFileView[] {
+  const streams: InProgressFileView[] = []
 
   for (const message of state.messages) {
     if (message.type !== 'think_block') continue
 
     for (const step of message.steps) {
-      if (step.type !== 'tool' || !isArtifactToolKey(step.toolKey)) continue
-      if (!hasArtifactPreview(step.visualState, includeTerminal)) continue
+      if (step.type !== 'tool' || !isFileStreamToolKey(step.toolKey)) continue
 
-      streams.push({
-        artifactId: step.visualState.name,
-        toolCallId: step.id,
-        toolKey: step.toolKey,
-        forkId: null,
-        phase: step.visualState.phase,
-        preview: step.visualState.preview,
-      })
+      if (step.toolKey === 'fileWrite' && hasFsWritePreview(step.visualState)) {
+        streams.push({
+          filePath: step.visualState.path,
+          toolCallId: step.id,
+          toolKey: step.toolKey,
+          forkId: null,
+          phase: step.visualState.phase,
+          preview: {
+            mode: 'write',
+            contentSoFar: step.visualState.contentSoFar,
+            charCount: step.visualState.charCount,
+            lineCount: step.visualState.lineCount,
+          },
+        })
+      }
+
+      if (step.toolKey === 'fileEdit' && hasEditPreview(step.visualState)) {
+        streams.push({
+          filePath: step.visualState.path,
+          toolCallId: step.id,
+          toolKey: step.toolKey,
+          forkId: null,
+          phase: step.visualState.phase,
+          preview: {
+            mode: 'edit',
+            oldStringSoFar: step.visualState.oldStringSoFar,
+            newStringSoFar: step.visualState.newStringSoFar,
+            replaceAll: step.visualState.replaceAll,
+            childParsePhase: step.visualState.childParsePhase,
+          },
+        })
+      }
     }
   }
 
   return streams
 }
 
-export function getInProgressArtifactStreams(state: DisplayState): InProgressArtifactView[] {
-  return collectArtifactStreams(state, false)
+export function getInProgressFileStreams(
+  state: DisplayState,
+  resolvedPath?: string
+): InProgressFileView[] {
+  const streams = collectFileStreams(state)
+  if (!resolvedPath) return streams
+  return streams.filter(s => s.filePath === resolvedPath)
 }
 
-export function getLatestInProgressArtifactStream(
+export function getLatestInProgressFileStream(
   state: DisplayState,
-  artifactId: string,
-  includeTerminal = false
-): InProgressArtifactView | null {
-  const streams = collectArtifactStreams(state, includeTerminal)
+  resolvedPath: string,
+): InProgressFileView | null {
+  const streams = collectFileStreams(state)
   for (let i = streams.length - 1; i >= 0; i--) {
-    if (streams[i]?.artifactId === artifactId) {
-      return streams[i] ?? null
-    }
+    if (streams[i]?.filePath === resolvedPath) return streams[i] ?? null
   }
   return null
-}
-
-export function getArtifactStreamForPanel(
-  state: DisplayState,
-  artifactId: string
-): InProgressArtifactView | null {
-  return getLatestInProgressArtifactStream(state, artifactId, true)
 }
 
 // =============================================================================
@@ -970,10 +993,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               event.toolCallId,
               (s) => {
                 let label = s.label
-                const completedLabel = generateCompletedToolLabel(event.toolKey, s.input)
-                if (completedLabel) {
-                  label = completedLabel
-                }
 
                 if (
                   event.toolKey === 'shell'
@@ -1259,7 +1278,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         accumulatedActiveMs: 0,
         resumeCount: 0,
         toolCounts: EMPTY_TOOL_COUNTS,
-        artifactNames: [],
         timestamp: value.timestamp
       }
 
@@ -1565,29 +1583,7 @@ export function finalizeCommunicationStreamInFork(
   }
 }
 
-function generateCompletedToolLabel(toolKey: string, input: unknown): string | null {
-  if (toolKey === 'artifactWrite' && input && typeof input === 'object' && 'id' in input) {
-    return `Wrote artifact "${(input as { id: string }).id}"`
-  }
-  if (toolKey === 'artifactUpdate' && input && typeof input === 'object' && 'id' in input) {
-    return `Updated artifact "${(input as { id: string }).id}"`
-  }
-  return null
-}
-
 export function generateToolLabel(toolKey: string, input: unknown): string {
-  // Artifact tools
-  if (toolKey === 'artifactRead' && input && typeof input === 'object' && 'id' in input) {
-    return `Read artifact "${(input as { id: string }).id}"`
-  }
-  if (toolKey === 'artifactWrite' && input && typeof input === 'object' && 'id' in input) {
-    return `Writing artifact "${(input as { id: string }).id}"`
-  }
-  if (toolKey === 'artifactUpdate' && input && typeof input === 'object' && 'id' in input) {
-    return `Updating artifact "${(input as { id: string }).id}"`
-  }
-
-
   // For shell, show the command
   if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input) {
     const cmd = (input as { command: string }).command

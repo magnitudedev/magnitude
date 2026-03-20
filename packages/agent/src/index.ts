@@ -61,6 +61,8 @@ export type { SkillMetadata } from './util/skill-scanner'
 export { parseFrontmatter, serializeFrontmatter } from './util/frontmatter'
 export type { FrontmatterResult } from './util/frontmatter'
 
+// Workspace
+export * from './workspace'
 
 // Projections
 export { WorkingStateProjection, shouldTrigger, isStable } from './projections/working-state'
@@ -75,9 +77,9 @@ export type { ForkCompactionState } from './projections/compaction'
 
 export {
   DisplayProjection,
-  getInProgressArtifactStreams,
-  getLatestInProgressArtifactStream,
-  getArtifactStreamForPanel,
+  getInProgressFileStreams,
+  getLatestInProgressFileStream,
+
 } from './projections/display'
 export type {
   DisplayState,
@@ -94,7 +96,6 @@ export type {
   ForkActivityMessage,
   ForkActivityToolCounts,
   ApprovalRequestMessage,
-  InProgressArtifactView,
   PendingInboundCommunicationDisplay,
 } from './projections/display'
 
@@ -119,10 +120,6 @@ export type {
   AgentBecameWorkingSignal,
 } from './projections/agent-status'
 
-export { ArtifactProjection } from './projections/artifact'
-export type { ArtifactState, ArtifactItem } from './projections/artifact'
-export { ArtifactAwarenessProjection } from './projections/artifact-awareness'
-export type { ForkArtifactAwarenessState } from './projections/artifact-awareness'
 export { OutboundMessagesProjection } from './projections/outbound-messages'
 export type { OutboundMessagesState, OutboundMessageCompletedSignal } from './projections/outbound-messages'
 
@@ -146,7 +143,6 @@ export {
   webSearchReducer, webFetchReducer,
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
-  artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
   agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
   resolveEndPhase, isActive,
@@ -156,8 +152,7 @@ export type {
   ShellState,
   ReadState, WriteState, EditState, TreeState, TreeEntry, SearchState, SearchMatch,
   Phase, WebSearchState, WebFetchState, BrowserState,
-  ArtifactStreamPreview, ArtifactWriteStreamPreview, ArtifactUpdateStreamPreview,
-  ArtifactVisualState, ArtifactSyncState, AgentCreateState, AgentIdState, AgentMessageState,
+  AgentCreateState, AgentIdState, AgentMessageState,
   ParentMessageState, SkillState,
 } from './visuals'
 
@@ -182,7 +177,6 @@ export { webSearchTool } from './tools/web-search-tool'
 export { webFetchTool } from './tools/web-fetch-tool'
 
 export { agentCreateTool, agentDismissTool } from './tools/agent-tools'
-export { artifactSyncTool, artifactReadTool, artifactWriteTool, artifactUpdateTool } from './tools/artifact-tools'
 export {
   clickTool, doubleClickTool, rightClickTool, typeTool, scrollTool, dragTool,
   navigateTool, goBackTool, switchTabTool, newTabTool, screenshotTool, evaluateTool,
@@ -203,7 +197,6 @@ export { AgentOrchestrator } from './workers/agent-orchestrator'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'
-export { ArtifactSyncWorker } from './workers/artifact-sync-worker'
 
 // Persistence
 export { ChatPersistence, PersistenceError } from './persistence/chat-persistence-service'

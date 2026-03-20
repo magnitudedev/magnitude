@@ -12,8 +12,6 @@ export interface SessionStorageShape {
     readonly sessionEventsFile: (sessionId: string) => string
     readonly sessionLogFile: (sessionId: string) => string
     readonly sessionWorkspace: (sessionId: string) => string
-    readonly sessionArtifactsDir: (sessionId: string) => string
-    readonly sessionArtifactFile: (sessionId: string, artifactName: string) => string
     readonly pendingMemoryJobFile: (jobId: string) => string
   }
 
@@ -62,13 +60,6 @@ export interface SessionStorageShape {
   readonly clearLog: (
     sessionId: string
   ) => Effect.Effect<void>
-
-  readonly writeArtifact: (
-    sessionId: string,
-    name: string,
-    content: string,
-    options?: { readonly extension?: string }
-  ) => Effect.Effect<string>
 
   readonly createSessionWorkspace: (
     sessionId: string,

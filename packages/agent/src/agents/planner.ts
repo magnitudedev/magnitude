@@ -16,7 +16,6 @@ import { webFetchTool } from '../tools/web-fetch-tool'
 
 import { thinkTool } from '../tools/globals'
 // import { gatherTool } from '../tools/gather'
-import { artifactReadTool, artifactWriteTool, artifactUpdateTool } from '../tools/artifact-tools'
 import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -63,9 +62,6 @@ const tools = toolSet({
   webSearch:    webSearchTool,
   webFetch:     webFetchTool,
   // gather:       gatherTool,
-  artifactRead: artifactReadTool,
-  artifactWrite: artifactWriteTool,
-  artifactUpdate: artifactUpdateTool,
 
   think:         thinkTool,
 })

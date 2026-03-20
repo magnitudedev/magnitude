@@ -2,6 +2,8 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 import { WorkingStateProjection } from './working-state'
+import { SessionContextProjection } from './session-context'
+import { extractWrittenFilePathFromToolEvent, isWorkspacePath } from '../workspace/file-tracking'
 
 export interface TurnEntry {
   readonly forkId: string
@@ -9,7 +11,7 @@ export interface TurnEntry {
   readonly turnId: string
   readonly prose: string | null
   readonly toolsCalled: readonly string[]
-  readonly artifactsWritten: readonly string[]
+  readonly filesWritten: readonly string[]
 }
 
 export interface SubagentActivityState {
@@ -19,21 +21,21 @@ export interface SubagentActivityState {
   readonly pendingProse: ReadonlyMap<string, string>
   // Track user-destination message ids by fork
   readonly userMessageIdsByFork: ReadonlyMap<string, ReadonlySet<string>>
-  // Buffer artifact events that arrive during a turn
-  readonly pendingArtifacts: ReadonlyMap<string, { written: readonly string[] }>
+  // Buffer workspace file writes that arrive during a turn
+  readonly pendingFiles: ReadonlyMap<string, { written: readonly string[] }>
 }
 
 export const SubagentActivityProjection = Projection.define<AppEvent, SubagentActivityState>()({
   name: 'SubagentActivity',
 
-  reads: [AgentStatusProjection] as const,
+  reads: [AgentStatusProjection, SessionContextProjection] as const,
 
   initial: {
     entriesByParent: new Map(),
     seenCursorByParent: new Map(),
     pendingProse: new Map(),
     userMessageIdsByFork: new Map(),
-    pendingArtifacts: new Map(),
+    pendingFiles: new Map(),
   },
 
   signals: {
@@ -66,16 +68,23 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       }
     },
 
-    artifact_changed: ({ event, state }) => {
+    tool_event: ({ event, state, read }) => {
       if (event.forkId === null) return state
+      if (event.event._tag !== 'ToolExecutionEnded') return state
+      if (event.event.result._tag !== 'Success') return state
+
+      const writtenPath = extractWrittenFilePathFromToolEvent(event)
+      const workspacePath = read(SessionContextProjection).context?.workspacePath
+      if (!workspacePath) return state // Session not yet initialized
+      if (!writtenPath || !isWorkspacePath(writtenPath, workspacePath)) return state
 
       const forkId = event.forkId
-      const existing = state.pendingArtifacts.get(forkId) ?? { written: [] }
+      const existing = state.pendingFiles.get(forkId) ?? { written: [] }
       return {
         ...state,
-        pendingArtifacts: new Map(state.pendingArtifacts).set(forkId, {
+        pendingFiles: new Map(state.pendingFiles).set(forkId, {
           ...existing,
-          written: [...existing.written, event.id],
+          written: [...existing.written, writtenPath],
         }),
       }
     },
@@ -92,8 +101,8 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       const prose = rawProse.trim() || null
       const toolsCalled = event.toolCalls.map(tc => tc.toolName)
 
-      // Collect pending artifact activity for this fork
-      const pendingArtifact = state.pendingArtifacts.get(event.forkId) ?? { written: [] }
+      // Collect pending file activity for this fork
+      const pendingFile = state.pendingFiles.get(event.forkId) ?? { written: [] }
 
       const entry: TurnEntry = {
         forkId: event.forkId,
@@ -101,7 +110,7 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
         turnId: event.turnId,
         prose,
         toolsCalled,
-        artifactsWritten: pendingArtifact.written,
+        filesWritten: pendingFile.written,
       }
 
       const parentForkId = agent.parentForkId
@@ -110,8 +119,8 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       // Clear pending state for this fork
       const newPendingProse = new Map(state.pendingProse)
       newPendingProse.delete(event.forkId)
-      const newPendingArtifacts = new Map(state.pendingArtifacts)
-      newPendingArtifacts.delete(event.forkId)
+      const newPendingFiles = new Map(state.pendingFiles)
+      newPendingFiles.delete(event.forkId)
 
       const newUserMessageIdsByFork = new Map(state.userMessageIdsByFork)
       newUserMessageIdsByFork.delete(event.forkId)
@@ -121,7 +130,7 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
         entriesByParent: new Map(state.entriesByParent).set(parentForkId, [...existing, entry]),
         pendingProse: newPendingProse,
         userMessageIdsByFork: newUserMessageIdsByFork,
-        pendingArtifacts: newPendingArtifacts,
+        pendingFiles: newPendingFiles,
       }
     },
   },

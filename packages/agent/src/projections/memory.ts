@@ -25,7 +25,7 @@ import { UserPresenceProjection } from './user-presence'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { ContentPart, textParts, wrapTextParts } from '../content'
 import { formatAgentIdleNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
-import { ArtifactAwarenessProjection } from './artifact-awareness'
+import { FileAwarenessProjection } from './file-awareness'
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -187,7 +187,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
-  reads: [AgentStatusProjection, ArtifactAwarenessProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
+  reads: [AgentStatusProjection, FileAwarenessProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -456,10 +456,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(ArtifactAwarenessProjection.signals.artifactFirstMentioned, ({ value, state }) => {
+
+    on(FileAwarenessProjection.signals.fileFirstMentioned, ({ value, state }) => {
       const forkState = state.forks.get(value.forkId)
       if (!forkState) return state
-      const entry: SystemEntry = { kind: 'reminder', text: `<artifact id="${value.artifactId}">\n${value.content}\n</artifact>` }
+      const entry: SystemEntry = { kind: 'reminder', text: `<file path="${value.path}">\n${value.content}\n</file>` }
       return {
         ...state,
         forks: new Map(state.forks).set(value.forkId, {
@@ -469,11 +470,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(ArtifactAwarenessProjection.signals.artifactUpdateNotification, ({ value, state }) => {
+    on(FileAwarenessProjection.signals.fileUpdateNotification, ({ value, state }) => {
       const forkState = state.forks.get(value.forkId)
       if (!forkState) return state
-      const entry: SystemEntry = { kind: 'reminder', text: value.text }
-      const coalesceKey = `artifact-update:${value.artifactId}`
+      const entry: SystemEntry = { kind: 'reminder', text: value.notificationText }
+      const coalesceKey = `file-update:${value.path}`
       return {
         ...state,
         forks: new Map(state.forks).set(value.forkId, {
@@ -496,7 +497,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           agentId: item.agentId,
           prose: item.prose,
           toolsCalled: item.toolsCalled,
-          artifactsWritten: item.artifactsWritten,
+          filesWritten: item.filesWritten,
         }))
       }
 

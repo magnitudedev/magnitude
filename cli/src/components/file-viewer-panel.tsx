@@ -9,9 +9,9 @@ import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderab
 import { BOX_CHARS } from '../utils/ui-constants'
 import { StreamingMarkdownContent } from '../markdown/markdown-content'
 import { Button } from './button'
-import { slugify } from '../markdown/blocks'
-
-
+import { slugify, type Span } from '../markdown/blocks'
+import { highlightFile } from '../markdown/highlight-file'
+import type { FilePanelStream } from '../hooks/use-file-panel'
 
 interface ChangedRange {
   start: number
@@ -23,8 +23,6 @@ interface OptimisticUpdatePreview {
   changedRanges: ChangedRange[]
 }
 
-
-
 function findUniqueMatchRange(content: string | null | undefined, needle: string | undefined): ChangedRange | null {
   if (!content || !needle) return null
   const first = content.indexOf(needle)
@@ -33,8 +31,6 @@ function findUniqueMatchRange(content: string | null | undefined, needle: string
   if (second !== -1) return null
   return { start: first, end: first + needle.length }
 }
-
-
 
 function computeOptimisticUpdatePreview(
   baseContent: string | null | undefined,
@@ -120,82 +116,79 @@ function CloseButton({ theme, onClose }: { theme: any; onClose: () => void }) {
   )
 }
 
-interface ArtifactReaderPanelProps {
-  artifactName: string
+interface FileViewerPanelProps {
+  filePath: string
   content: string | null
   scrollToSection?: string
   onClose: () => void
-  onOpenArtifact?: (name: string, section?: string) => void
-  streaming?: {
-    active: boolean
-    toolKey: 'artifactWrite' | 'artifactUpdate'
-    phase: 'streaming' | 'executing' | 'error' | 'success' | 'rejected' | 'interrupted'
-    contentSoFar?: string
-    oldStringSoFar?: string
-    newStringSoFar?: string
-    replaceAll?: boolean
-    baseContent?: string | null
-  }
+  onOpenFile?: (path: string, section?: string) => void
+  streaming?: FilePanelStream | null
 }
 
-function HeaderBadge({ label, color }: { label: string; color: string }) {
+
+
+
+
+function isMarkdownFile(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith('.md')
+}
+
+function renderCodeLines(lines: Span[], idx: number, fallbackFg: string) {
   return (
-    <text style={{ fg: color }} attributes={TextAttributes.BOLD}>
-      [{label}]
+    <text key={idx} style={{ fg: fallbackFg }}>
+      {lines.map((span, i) => (
+        <span key={i} fg={span.fg ?? fallbackFg}>{span.text}</span>
+      ))}
     </text>
   )
 }
 
-export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
-  artifactName, content, scrollToSection, onClose, onOpenArtifact, streaming
-}: ArtifactReaderPanelProps) {
+export const FileViewerPanel = memo(function FileViewerPanel({
+  filePath, content, scrollToSection, onClose, onOpenFile, streaming
+}: FileViewerPanelProps) {
   const theme = useTheme()
   const { width: terminalWidth } = useTerminalDimensions()
   const scrollboxRef = useRef<any>(null)
   const mountedRef = useMountedRef()
   const safeTimeout = useSafeTimeout()
+  const markdown = isMarkdownFile(filePath)
 
-  const isWriteStream = streaming?.toolKey === 'artifactWrite'
-  const isUpdateStream = streaming?.toolKey === 'artifactUpdate'
-  const isStreamingPhase = streaming?.phase === 'streaming'
-  const failedStream = streaming?.phase === 'error' || streaming?.phase === 'interrupted' || streaming?.phase === 'rejected'
+  const isWriteStream = streaming?.mode === 'write'
+  const isReplaceStream = streaming?.mode === 'replace'
   const optimisticUpdatePreview = useMemo(
-    () => computeOptimisticUpdatePreview(
-      streaming?.baseContent,
-      streaming?.oldStringSoFar,
-      streaming?.newStringSoFar,
-      streaming?.replaceAll,
+    () => (
+      isReplaceStream
+        ? computeOptimisticUpdatePreview(
+            streaming.baseContent,
+            streaming.oldStringSoFar,
+            streaming.newStringSoFar,
+            streaming.replaceAll,
+          )
+        : null
     ),
-    [streaming],
+    [isReplaceStream, streaming],
   )
   const locatingRange = useMemo(
     () => (
-      isUpdateStream && streaming?.phase === 'streaming' && !streaming?.newStringSoFar
+      isReplaceStream && streaming.status === 'receiving' && !streaming.newStringSoFar
         ? findUniqueMatchRange(streaming.baseContent, streaming.oldStringSoFar)
         : null
     ),
-    [isUpdateStream, streaming],
+    [isReplaceStream, streaming],
   )
 
-  const baseDisplayContent = useMemo(() => {
-    if (failedStream && isWriteStream && content) return content
-    if (failedStream && isWriteStream) return streaming?.contentSoFar ?? ''
-    if ((failedStream || streaming?.phase === 'success') && isUpdateStream) {
-      return content ?? streaming?.baseContent ?? ''
-    }
-    return content ?? ''
-  }, [streaming, isWriteStream, isUpdateStream, content, failedStream])
+  const baseDisplayContent = useMemo(() => content ?? '', [content])
 
-  const isActivelyStreaming = !!streaming && streaming.phase === 'streaming'
+  const isActivelyStreaming = streaming?.status === 'receiving'
 
-  const writeContent = isWriteStream && (streaming?.phase === 'streaming' || streaming?.phase === 'executing')
+  const writeContent = isWriteStream && (streaming?.status === 'receiving' || streaming?.status === 'applying')
     ? (streaming?.contentSoFar ?? '')
     : ''
-  const isWriteStreaming = isWriteStream && isActivelyStreaming
+  const isWriteStreaming = !!(isWriteStream && streaming?.status === 'receiving')
   const { displayedContent: revealedWrite, showCursor: writeCursor } = useStreamingReveal(writeContent, isWriteStreaming)
 
-  const newStrContent = streaming?.newStringSoFar ?? ''
-  const isNewStreaming = isUpdateStream && isActivelyStreaming && !!streaming?.newStringSoFar
+  const newStrContent = isReplaceStream ? streaming.newStringSoFar : ''
+  const isNewStreaming = isReplaceStream && isActivelyStreaming && !!streaming.newStringSoFar
   const { displayedContent: revealedNew, showCursor: editCursor } = useStreamingReveal(
     newStrContent,
     isNewStreaming,
@@ -204,14 +197,14 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   )
 
   const oldHighlightContent = useMemo(() => {
-    if (!isUpdateStream || streaming?.phase !== 'streaming' || streaming?.newStringSoFar) return ''
-    const base = streaming?.baseContent ?? content ?? ''
-    const match = findUniqueMatchRange(base, streaming?.oldStringSoFar)
+    if (!isReplaceStream || streaming.status !== 'receiving' || streaming.newStringSoFar) return ''
+    const base = streaming.baseContent ?? content ?? ''
+    const match = findUniqueMatchRange(base, streaming.oldStringSoFar)
     if (!match) return ''
-    return streaming?.oldStringSoFar ?? ''
-  }, [isUpdateStream, streaming, content])
+    return streaming.oldStringSoFar
+  }, [isReplaceStream, streaming, content])
 
-  const isOldHighlightStreaming = isUpdateStream && isActivelyStreaming && !streaming?.newStringSoFar && oldHighlightContent.length > 0
+  const isOldHighlightStreaming = isReplaceStream && isActivelyStreaming && !streaming.newStringSoFar && oldHighlightContent.length > 0
 
   const { displayedContent: revealedOldHighlight } = useStreamingReveal(
     oldHighlightContent,
@@ -220,15 +213,15 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
 
   const displayedContent = useMemo(() => {
     if (isWriteStreaming) return revealedWrite
-    if (isUpdateStream && (streaming?.phase === 'streaming' || streaming?.phase === 'executing')) {
-      const base = streaming?.baseContent ?? content ?? ''
-      if (streaming?.replaceAll) {
+    if (isReplaceStream && (streaming.status === 'receiving' || streaming.status === 'applying')) {
+      const base = streaming.baseContent ?? content ?? ''
+      if (streaming.replaceAll) {
         return optimisticUpdatePreview?.content ?? base
       }
 
-      const match = findUniqueMatchRange(base, streaming?.oldStringSoFar)
+      const match = findUniqueMatchRange(base, streaming.oldStringSoFar)
       if (!match) return base
-      if (!streaming?.newStringSoFar) return base
+      if (!streaming.newStringSoFar) return base
 
       return base.slice(0, match.start) + revealedNew + base.slice(match.end)
     }
@@ -236,7 +229,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   }, [
     isWriteStreaming,
     revealedWrite,
-    isUpdateStream,
+    isReplaceStream,
     streaming,
     optimisticUpdatePreview,
     content,
@@ -247,34 +240,32 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
   const showCursor = isWriteStreaming ? writeCursor : isNewStreaming ? editCursor : false
 
   const previewChangedRanges = useMemo(() => {
-    if (!isUpdateStream) return []
-    if (streaming?.phase !== 'streaming' && streaming?.phase !== 'executing') return []
-    if (streaming?.replaceAll) return optimisticUpdatePreview?.changedRanges ?? []
+    if (!isReplaceStream) return []
+    if (streaming.status !== 'receiving' && streaming.status !== 'applying') return []
+    if (streaming.replaceAll) return optimisticUpdatePreview?.changedRanges ?? []
 
-    const base = streaming?.baseContent ?? content ?? ''
-    const match = findUniqueMatchRange(base, streaming?.oldStringSoFar)
-    if (!match || !streaming?.newStringSoFar) return []
+    const base = streaming.baseContent ?? content ?? ''
+    const match = findUniqueMatchRange(base, streaming.oldStringSoFar)
+    if (!match || !streaming.newStringSoFar) return []
     return [{ start: match.start, end: match.start + revealedNew.length }]
-  }, [isUpdateStream, streaming?.phase, streaming?.replaceAll, optimisticUpdatePreview, streaming?.baseContent, content, streaming?.oldStringSoFar, streaming?.newStringSoFar, revealedNew])
+  }, [isReplaceStream, streaming, optimisticUpdatePreview, content, revealedNew])
 
   const progressiveOldHighlightRanges = useMemo(() => {
-    if (!locatingRange || !isUpdateStream || streaming?.phase !== 'streaming' || streaming?.newStringSoFar) return []
-    const base = streaming?.baseContent ?? content ?? ''
+    if (!locatingRange || !isReplaceStream || streaming.status !== 'receiving' || streaming.newStringSoFar) return []
+    const base = streaming.baseContent ?? content ?? ''
     if (displayedContent !== base) return []
     const revealedLen = revealedOldHighlight.length
     if (revealedLen === 0) return []
     return [{ start: locatingRange.start, end: locatingRange.start + revealedLen }]
-  }, [locatingRange, isUpdateStream, streaming, content, displayedContent, revealedOldHighlight])
+  }, [locatingRange, isReplaceStream, streaming, content, displayedContent, revealedOldHighlight])
   const activeHighlightRanges = previewChangedRanges.length > 0 ? previewChangedRanges : progressiveOldHighlightRanges
 
   const copyContent = useMemo(() => {
-    if (isWriteStream && streaming?.contentSoFar) return streaming.contentSoFar
-    if (isUpdateStream && optimisticUpdatePreview) return optimisticUpdatePreview.content
+    if (isWriteStream && streaming.contentSoFar) return streaming.contentSoFar
+    if (isReplaceStream && optimisticUpdatePreview) return optimisticUpdatePreview.content
     if (displayedContent) return displayedContent
-    return streaming?.newStringSoFar ?? ''
-  }, [isWriteStream, isUpdateStream, streaming, optimisticUpdatePreview, displayedContent])
-
-
+    return isReplaceStream ? streaming.newStringSoFar : ''
+  }, [isWriteStream, isReplaceStream, streaming, optimisticUpdatePreview, displayedContent])
 
   const highlightCharRanges = useMemo(
     () => activeHighlightRanges.map((range) => ({
@@ -285,14 +276,14 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
     [activeHighlightRanges, previewChangedRanges.length, theme.success, theme.error],
   )
 
-  const highlightAnchorId = highlightCharRanges.length > 0 ? 'artifact-highlight-anchor' : undefined
+  const highlightAnchorId = highlightCharRanges.length > 0 ? 'file-highlight-anchor' : undefined
   const codeBlockWidth = Math.max(20, terminalWidth - 10)
   const targetSectionScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const highlightAnchorScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const targetSectionId = useMemo(
-    () => scrollToSection ? `section-${slugify(scrollToSection)}` : null,
-    [scrollToSection],
+    () => markdown && scrollToSection ? `section-${slugify(scrollToSection)}` : null,
+    [markdown, scrollToSection],
   )
 
   useEffect(() => {
@@ -395,42 +386,13 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
     }
   }, [highlightAnchorId, displayedContent, mountedRef, safeTimeout])
 
-  const headerLabel = scrollToSection
-    ? `≡  ${artifactName} > ${scrollToSection}`
-    : `≡  ${artifactName}`
+  const headerLabel = scrollToSection && markdown
+    ? `≡  ${filePath} > ${scrollToSection}`
+    : `≡  ${filePath}`
 
-  const headerBadge = useMemo(() => {
-    if (!streaming) return null
-    if (streaming.phase === 'executing') {
-      return <HeaderBadge label="Saving…" color={theme.info} />
-    }
-    if (streaming.phase === 'streaming') {
-      if (isUpdateStream && !streaming?.newStringSoFar) {
-        return <HeaderBadge label={locatingRange ? 'Preparing update…' : 'Locating target…'} color={theme.warning} />
-      }
-      return <HeaderBadge label={isWriteStream ? 'Writing…' : 'Updating…'} color={theme.info} />
-    }
-    if (streaming.phase === 'error' || streaming.phase === 'rejected' || streaming.phase === 'interrupted') {
-      return <HeaderBadge label="Error" color={theme.error} />
-    }
-    return null
-  }, [streaming, theme, isWriteStream, isUpdateStream, locatingRange])
 
-  const updateSummary = isUpdateStream
-    ? (
-        optimisticUpdatePreview
-          ? `${streaming?.replaceAll ? 'Updating all matches…' : 'Updating 1 region…'}${showCursor ? ' ▍' : ''}`
-          : streaming?.newStringSoFar
-            ? `new: ${streaming.newStringSoFar}${isStreamingPhase ? '▍' : ''}`
-            : null
-      )
-    : null
 
-  const showNotSavedWarning = !!streaming && failedStream && (
-    (streaming.baseContent ?? null) !== content || !!streaming.contentSoFar || !!streaming.newStringSoFar
-  )
-
-  const failedDraftForExistingArtifact = failedStream && isWriteStream && !!content && !!streaming?.contentSoFar
+  const codeLines = useMemo(() => highlightFile(displayedContent, filePath), [displayedContent, filePath])
 
   return (
     <box style={{
@@ -447,6 +409,7 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
           <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>
             {headerLabel}
           </text>
+
         </box>
         <box style={{ flexDirection: 'row', gap: 2 }}>
           <CopyButton content={copyContent} theme={theme} />
@@ -476,15 +439,22 @@ export const ArtifactReaderPanel = memo(function ArtifactReaderPanel({
           },
         }}
       >
-        <StreamingMarkdownContent
+        {markdown ? (
+          <StreamingMarkdownContent
             content={displayedContent}
-            onOpenArtifact={onOpenArtifact}
+            onOpenFile={onOpenFile}
             showCursor={showCursor}
             highlightRanges={highlightCharRanges}
             highlightAnchorId={highlightAnchorId}
             streaming={isActivelyStreaming}
             codeBlockWidth={codeBlockWidth}
           />
+        ) : (
+          <box style={{ flexDirection: 'column' }}>
+            {codeLines.map((line, idx) => renderCodeLines(line, idx, theme.foreground))}
+            {showCursor && <text style={{ fg: theme.foreground }}>▍</text>}
+          </box>
+        )}
       </scrollbox>
     </box>
   )

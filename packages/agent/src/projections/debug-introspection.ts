@@ -14,7 +14,6 @@ import { MemoryProjection } from './memory'
 import { CompactionProjection } from './compaction'
 import { WorkingStateProjection } from './working-state'
 import { SessionContextProjection } from './session-context'
-import { ArtifactProjection } from './artifact'
 import { ChatTitleProjection } from './chat-title'
 import { ReplayProjection } from './replay'
 import { getContextLimits } from '../constants'
@@ -54,7 +53,6 @@ interface ResolvedProjections {
   compactionProj: Effect.Effect.Success<typeof CompactionProjection.Tag>
   workingProj: Effect.Effect.Success<typeof WorkingStateProjection.Tag>
   sessionProj: Effect.Effect.Success<typeof SessionContextProjection.Tag>
-  artifactProj: Effect.Effect.Success<typeof ArtifactProjection.Tag>
   chatTitleProj: Effect.Effect.Success<typeof ChatTitleProjection.Tag>
   replayProj: Effect.Effect.Success<typeof ReplayProjection.Tag>
 }
@@ -70,7 +68,6 @@ function resolveProjections() {
       compactionProj: yield* CompactionProjection.Tag,
       workingProj: yield* WorkingStateProjection.Tag,
       sessionProj: yield* SessionContextProjection.Tag,
-      artifactProj: yield* ArtifactProjection.Tag,
       chatTitleProj: yield* ChatTitleProjection.Tag,
       replayProj: yield* ReplayProjection.Tag,
     } satisfies ResolvedProjections
@@ -92,7 +89,6 @@ function buildSnapshot(
     const compactionRaw = yield* SubscriptionRef.get(projs.compactionProj.state)
     const workingRaw = yield* SubscriptionRef.get(projs.workingProj.state)
     const sessionState = yield* SubscriptionRef.get(projs.sessionProj.state)
-    const artifactState = yield* SubscriptionRef.get(projs.artifactProj.state)
     const chatTitleState = yield* SubscriptionRef.get(projs.chatTitleProj.state)
     const replayRaw = yield* SubscriptionRef.get(projs.replayProj.state)
 
@@ -111,7 +107,6 @@ function buildSnapshot(
       { name: 'MemoryProjection', state: memoryForkState, timestamp },
       { name: 'CompactionProjection', state: compactionForkState, timestamp },
       { name: 'DisplayProjection', state: displayForkState, timestamp },
-      { name: 'ArtifactProjection', state: artifactState, timestamp },
       { name: 'SessionContextProjection', state: sessionState, timestamp },
       { name: 'ChatTitleProjection', state: chatTitleState, timestamp },
       { name: 'ReplayProjection', state: replayForkState, timestamp },
@@ -149,7 +144,6 @@ export function createDebugStream(forkId: string | null) {
       toTrigger(projs.compactionProj.state.changes),
       toTrigger(projs.workingProj.state.changes),
       toTrigger(projs.sessionProj.state.changes),
-      toTrigger(projs.artifactProj.state.changes),
       toTrigger(projs.chatTitleProj.state.changes),
       toTrigger(projs.replayProj.state.changes),
     ], { concurrency: 'unbounded' })

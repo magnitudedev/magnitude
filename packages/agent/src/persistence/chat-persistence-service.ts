@@ -52,8 +52,6 @@ export interface ChatPersistenceService {
   readonly saveSessionMetadata: (
     update: Partial<Omit<SessionMetadata, 'sessionId' | 'created'>>
   ) => Effect.Effect<void, PersistenceError>
- 
-  readonly saveArtifact: (name: string, content: string) => Effect.Effect<void, PersistenceError>
 }
 
 export class ChatPersistence extends Context.Tag('ChatPersistence')<

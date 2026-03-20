@@ -17,21 +17,19 @@ import { DisplayProjection } from '../projections/display'
 import { AgentRoutingProjection } from '../projections/agent-routing'
 import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
-import { ArtifactProjection } from '../projections/artifact'
 
 import { ReplayProjection } from '../projections/replay'
 import { ChatTitleProjection } from '../projections/chat-title'
 import { ConversationProjection } from '../projections/conversation'
 import { UserPresenceProjection } from '../projections/user-presence'
 import { OutboundMessagesProjection } from '../projections/outbound-messages'
-import { ArtifactAwarenessProjection } from '../projections/artifact-awareness'
+import { FileAwarenessProjection } from '../projections/file-awareness'
 
 // Workers
 import { TurnController } from '../workers/turn-controller'
 import { AgentOrchestrator } from '../workers/agent-orchestrator'
 import { LifecycleCoordinator } from '../workers/lifecycle-coordinator'
 import { ApprovalWorker } from '../workers/approval-worker'
-import { ArtifactSyncWorker } from '../workers/artifact-sync-worker'
 import { Autopilot } from '../workers/autopilot'
 import { CompactionWorker } from '../workers/compaction-worker'
 import { ChatTitleWorker } from '../workers/chat-title-worker'
@@ -74,7 +72,6 @@ export interface HarnessSnapshot {
 
 export interface PersistenceSnapshot {
   events: readonly AppEvent[]
-  artifacts: Record<string, unknown>
   metadata: Record<string, unknown>
 }
 
@@ -209,7 +206,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       AgentOrchestrator,
       LifecycleCoordinator,
       ApprovalWorker,
-      ArtifactSyncWorker,
       ...(options.workers?.autopilot ? [Autopilot] : []),
       ...(options.workers?.compaction ? [CompactionWorker] : []),
       ...(options.workers?.chatTitle ? [ChatTitleWorker] : []),
@@ -226,12 +222,11 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         WorkingStateProjection,
         TurnProjection,
         CanonicalTurnProjection,
-        ArtifactProjection,
 
         ReplayProjection,
         SubagentActivityProjection,
         OutboundMessagesProjection,
-        ArtifactAwarenessProjection,
+        FileAwarenessProjection,
         MemoryProjection,
         DisplayProjection,
         ChatTitleProjection,
@@ -251,7 +246,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           compaction: CompactionProjection,
           agentRouting: AgentRoutingProjection,
           agentStatus: AgentStatusProjection,
-          artifacts: ArtifactProjection,
 
         },
       },
@@ -508,7 +502,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         },
         projections: async (): Promise<Record<string, unknown>> => {
           const [
-            artifact,
             compaction,
             working,
             memory,
@@ -516,7 +509,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
             agentStatus,
             sessionContext,
           ] = await Promise.all([
-            client.runEffect(Effect.flatMap(ArtifactProjection.Tag, (projection) => projection.get)),
             client.runEffect(Effect.flatMap(CompactionProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(MemoryProjection.Tag, (projection) => projection.getFork(null))),
@@ -526,7 +518,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           ])
 
           return {
-            ArtifactProjection: artifact,
             CompactionProjection: compaction,
             WorkingStateProjection: working,
             MemoryProjection: memory,
@@ -545,7 +536,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           )
           return {
             events: state.events,
-            artifacts: { ...state.artifacts },
             metadata: { ...state.metadata },
           }
         },

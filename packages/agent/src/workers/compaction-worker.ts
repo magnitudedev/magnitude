@@ -176,11 +176,12 @@ function startCompaction(
       const config = yield* AppConfig
       const memoryEnabled = yield* config.getMemoryEnabled()
       const sessionCtx = yield* read(SessionContextProjection)
-      const currentWorkspacePath = sessionCtx.context?.workspacePath ?? ''
+      const workspacePath = sessionCtx.context?.workspacePath
+      if (!workspacePath) throw new Error('workspacePath not available during compaction')
       return yield* Effect.tryPromise({
         try: async () => {
           const base = await collectSessionContext({ memoryEnabled })
-          return { ...base, workspacePath: currentWorkspacePath } as SessionContext
+          return { ...base, workspacePath } as SessionContext
         },
         catch: (error) => error instanceof Error ? error : new Error(String(error))
       })

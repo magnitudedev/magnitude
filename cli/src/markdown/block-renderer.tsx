@@ -25,7 +25,6 @@ import { useTheme } from '../hooks/use-theme'
 import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
 import { buildMarkdownColorPalette } from '../utils/theme'
 import type { MarkdownPalette } from './theme'
-import { useArtifacts } from '../hooks/use-artifacts'
 import { writeTextToClipboard } from '../utils/clipboard'
 import { BOX_CHARS } from '../utils/ui-constants'
 
@@ -43,24 +42,28 @@ const SpanRenderer = memo(function SpanRenderer({
   spans,
   foreground,
   onOpenArtifact,
+  onOpenFile,
   showCursor,
   id,
 }: {
   spans: Span[]
   foreground: string
   onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
   showCursor?: boolean
   id?: string
 }) {
   const theme = useTheme()
   const renderer = useRenderer()
-  const artifactState = useArtifacts()
   const mountedRef = useMountedRef()
   const textRef = useRef<TextRenderable | null>(null)
   const pressStartedRef = useRef<number | null>(null)
   const [hoveredZone, setHoveredZone] = useState<number | null>(null)
 
-  const hitZones: Array<{ charStart: number; charEnd: number; name: string; section?: string }> = []
+  const hitZones: Array<
+    | { kind: 'artifact'; charStart: number; charEnd: number; name: string; section?: string }
+    | { kind: 'file'; charStart: number; charEnd: number; path: string; section?: string }
+  > = []
   let charOffset = 0
   const elements: React.ReactNode[] = []
 
@@ -68,33 +71,57 @@ const SpanRenderer = memo(function SpanRenderer({
     const span = spans[i]
     const attrs = spanAttributes(span)
 
+    if (span.fileRef) {
+      const zoneIdx = hitZones.length
+      hitZones.push({
+        kind: 'file',
+        charStart: charOffset,
+        charEnd: charOffset + span.text.length,
+        path: span.fileRef.path,
+        section: span.fileRef.section,
+      })
+
+      const isHovered = hoveredZone === zoneIdx
+      elements.push(
+        <span key={i} fg={isHovered ? theme.primary : (span.fg ?? theme.link)} bg={span.bg} attributes={attrs ?? TextAttributes.BOLD}>
+          {span.text}
+        </span>,
+      )
+      charOffset += span.text.length
+      continue
+    }
+
+    if (span.url) {
+      elements.push(
+        <a key={i} href={span.url}>
+          <span fg={span.fg ?? theme.link} bg={span.bg} attributes={attrs ?? TextAttributes.BOLD}>
+            {span.text}
+          </span>
+        </a>,
+      )
+      charOffset += span.text.length
+      continue
+    }
+
     if (span.ref) {
-      const exists = !!artifactState?.artifacts.get(span.ref.name)
       const displayLabel = span.ref.label ?? (span.ref.section ? `${span.ref.name}#${span.ref.section}` : span.ref.name)
-      const displayText = exists ? `[≡ ${displayLabel}]` : `[≡ ${displayLabel} (not found)]`
+      const displayText = `[≡ ${displayLabel}]`
 
-      if (exists) {
-        const zoneIdx = hitZones.length
-        hitZones.push({
-          charStart: charOffset,
-          charEnd: charOffset + displayText.length,
-          name: span.ref.name,
-          section: span.ref.section,
-        })
+      const zoneIdx = hitZones.length
+      hitZones.push({
+        kind: 'artifact',
+        charStart: charOffset,
+        charEnd: charOffset + displayText.length,
+        name: span.ref.name,
+        section: span.ref.section,
+      })
 
-        const isHovered = hoveredZone === zoneIdx
-        elements.push(
-          <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.BOLD}>
-            {displayText}
-          </span>,
-        )
-      } else {
-        elements.push(
-          <span key={i} fg={theme.muted} attributes={TextAttributes.DIM}>
-            {displayText}
-          </span>,
-        )
-      }
+      const isHovered = hoveredZone === zoneIdx
+      elements.push(
+        <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.BOLD}>
+          {displayText}
+        </span>,
+      )
       charOffset += displayText.length
       continue
     }
@@ -151,7 +178,9 @@ const SpanRenderer = memo(function SpanRenderer({
         (r) => r.clearSelection(),
         { mountedRef },
       )
-      onOpenArtifact?.(hitZones[hit].name, hitZones[hit].section)
+      const zone = hitZones[hit]
+      if (zone.kind === 'file') onOpenFile?.(zone.path, zone.section)
+      else onOpenArtifact?.(zone.name, zone.section)
     }
     pressStartedRef.current = null
   })
@@ -340,12 +369,14 @@ function ListBlockView({
   palette,
   contentWidth,
   onOpenArtifact,
+  onOpenFile,
 }: {
   block: ListBlock
   foreground: string
   palette: MarkdownPalette
   contentWidth: number
   onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
 }) {
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -361,6 +392,7 @@ function ListBlockView({
                 palette={palette}
                 contentWidth={contentWidth}
                 onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
               />
             )}
             {rest.length > 0 && (
@@ -371,6 +403,7 @@ function ListBlockView({
                   palette={palette}
                   contentWidth={Math.max(10, contentWidth - markerWidth)}
                   onOpenArtifact={onOpenArtifact}
+                  onOpenFile={onOpenFile}
                 />
               </box>
             )}
@@ -387,12 +420,14 @@ function BlockquoteView({
   palette,
   contentWidth,
   onOpenArtifact,
+  onOpenFile,
 }: {
   block: BlockquoteBlock
   foreground: string
   palette: MarkdownPalette
   contentWidth: number
   onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
 }) {
   return (
     <box style={{ flexDirection: 'row' }}>
@@ -404,6 +439,7 @@ function BlockquoteView({
           palette={palette}
           contentWidth={Math.max(10, contentWidth - 2)}
           onOpenArtifact={onOpenArtifact}
+          onOpenFile={onOpenFile}
         />
       </box>
     </box>
@@ -525,6 +561,7 @@ export const BlockRenderer = memo(function BlockRenderer({
   palette,
   contentWidth: explicitContentWidth,
   onOpenArtifact,
+  onOpenFile,
   showCursor,
   highlightAnchorId,
   highlights,
@@ -534,6 +571,7 @@ export const BlockRenderer = memo(function BlockRenderer({
   palette?: MarkdownPalette
   contentWidth?: number
   onOpenArtifact?: (name: string, section?: string) => void
+  onOpenFile?: (path: string, section?: string) => void
   showCursor?: boolean
   highlightAnchorId?: string
   highlights?: HighlightRange[]
@@ -564,6 +602,7 @@ export const BlockRenderer = memo(function BlockRenderer({
                 spans={block.content}
                 foreground={foreground}
                 onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
                 showCursor={showCursor && isLast}
                 id={anchorId}
               />
@@ -575,6 +614,7 @@ export const BlockRenderer = memo(function BlockRenderer({
                 spans={block.content}
                 foreground={foreground}
                 onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
                 id={block.slug ? `section-${block.slug}` : anchorId}
                 showCursor={showCursor && isLast}
               />
@@ -598,6 +638,7 @@ export const BlockRenderer = memo(function BlockRenderer({
                 palette={resolvedPalette}
                 contentWidth={contentWidth}
                 onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
               />
             )
           case 'blockquote':
@@ -609,6 +650,7 @@ export const BlockRenderer = memo(function BlockRenderer({
                 palette={resolvedPalette}
                 contentWidth={contentWidth}
                 onOpenArtifact={onOpenArtifact}
+                onOpenFile={onOpenFile}
               />
             )
           case 'table':

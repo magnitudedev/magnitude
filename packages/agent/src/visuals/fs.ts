@@ -8,7 +8,7 @@
 import type { ToolImageValue } from '@magnitudedev/tools'
 import type { ToolCallEvent, XmlToolResult } from '@magnitudedev/xml-act'
 import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
-import { defineToolReducer, defineCluster } from './define'
+import { defineToolReducer } from './define'
 
 // =============================================================================
 // Shared
@@ -75,13 +75,29 @@ export interface WriteState {
   readonly phase: Phase
   readonly path: string
   readonly contentChunks: readonly string[]
+  readonly contentSoFar: string
+  readonly charCount: number
+  readonly lineCount: number
   readonly result: XmlToolResult<void> | null
+}
+
+function countLines(text: string): number {
+  if (text.length === 0) return 0
+  return text.split('\n').length
 }
 
 export const writeReducer = defineToolReducer({
   tool: writeTool,
   toolKey: 'fileWrite',
-  initial: { phase: 'streaming', path: '', contentChunks: [], result: null } satisfies WriteState,
+  initial: {
+    phase: 'streaming',
+    path: '',
+    contentChunks: [],
+    contentSoFar: '',
+    charCount: 0,
+    lineCount: 0,
+    result: null
+  } satisfies WriteState,
 
   reduce(state: WriteState, event): WriteState {
     const phase = phaseFromEvent(event._tag) ?? state.phase
@@ -90,8 +106,17 @@ export const writeReducer = defineToolReducer({
       case 'ToolInputFieldValue':
         if (event.field === 'path') return { ...state, phase, path: String(event.value) }
         return phase !== state.phase ? { ...state, phase } : state
-      case 'ToolInputBodyChunk':
-        return { ...state, phase, contentChunks: [...state.contentChunks, event.text] }
+      case 'ToolInputBodyChunk': {
+        const contentSoFar = state.contentSoFar + event.text
+        return {
+          ...state,
+          phase,
+          contentChunks: [...state.contentChunks, event.text],
+          contentSoFar,
+          charCount: contentSoFar.length,
+          lineCount: countLines(contentSoFar),
+        }
+      }
       case 'ToolExecutionEnded':
         return { ...state, phase: 'done', result: event.result }
       case 'ToolInputParseError':
@@ -103,26 +128,50 @@ export const writeReducer = defineToolReducer({
 })
 
 // =============================================================================
-// editReducer — cluster-based (shared state across consecutive edit calls)
+// editReducer
 // =============================================================================
 
 export interface EditState {
   readonly phase: Phase
   readonly path: string
+  readonly oldStringSoFar: string
+  readonly newStringSoFar: string
+  readonly replaceAll: boolean
+  readonly childParsePhase: 'idle' | 'streaming_old' | 'streaming_new'
   readonly result: XmlToolResult<string> | null
 }
 
-const editCluster = defineCluster<EditState>({
-  cluster: 'edit',
-  initial: { phase: 'streaming', path: '', result: null },
-})
+export const editReducer = defineToolReducer({
+  tool: editTool,
+  toolKey: 'fileEdit',
+  initial: {
+    phase: 'streaming',
+    path: '',
+    oldStringSoFar: '',
+    newStringSoFar: '',
+    replaceAll: false,
+    childParsePhase: 'idle',
+    result: null,
+  } satisfies EditState,
 
-export const editReducer = editCluster.tool(editTool, 'fileEdit', (state, event) => {
+  reduce(state: EditState, event): EditState {
   const phase = phaseFromEvent(event._tag) ?? state.phase
 
   switch (event._tag) {
     case 'ToolInputFieldValue':
       if (event.field === 'path') return { ...state, phase, path: String(event.value) }
+      if (event.field === 'replaceAll') return { ...state, phase, replaceAll: Boolean(event.value) }
+      return phase !== state.phase ? { ...state, phase } : state
+    case 'ToolInputChildStarted':
+      if (event.field === 'oldString') return { ...state, phase, childParsePhase: 'streaming_old' }
+      if (event.field === 'newString') return { ...state, phase, childParsePhase: 'streaming_new' }
+      return phase !== state.phase ? { ...state, phase } : state
+    case 'ToolInputBodyChunk':
+      if (event.field === 'oldString') return { ...state, phase, oldStringSoFar: state.oldStringSoFar + event.text }
+      if (event.field === 'newString') return { ...state, phase, newStringSoFar: state.newStringSoFar + event.text }
+      return phase !== state.phase ? { ...state, phase } : state
+    case 'ToolInputChildComplete':
+      if (event.field === 'oldString' || event.field === 'newString') return { ...state, phase, childParsePhase: 'idle' }
       return phase !== state.phase ? { ...state, phase } : state
     case 'ToolExecutionEnded':
       return { ...state, phase: 'done', result: event.result }
@@ -131,6 +180,7 @@ export const editReducer = editCluster.tool(editTool, 'fileEdit', (state, event)
     default:
       return phase !== state.phase ? { ...state, phase } : state
   }
+  },
 })
 
 // =============================================================================

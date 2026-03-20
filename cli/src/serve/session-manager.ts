@@ -135,7 +135,11 @@ export class SessionManager {
     })
     const layer = Layer.succeed(ChatPersistence, persistence)
 
-    const sessionContext = await collectSessionContext({ cwd: requestedCwd, storage: this.storage })
+    const baseSessionContext = await collectSessionContext({
+      cwd: requestedCwd,
+      storage: this.storage,
+    })
+    const sessionContext = { ...baseSessionContext, workspacePath: requestedCwd }
     const client = await createCodingAgentClient({ persistence: layer, storage: this.storage, debug: this.debug, sessionContext })
     const createdAt = new Date().toISOString()
 

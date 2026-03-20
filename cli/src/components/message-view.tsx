@@ -25,7 +25,7 @@ interface MessageViewProps {
   onWorkApprove?: () => void
   onWorkReject?: () => void
   inputHasText?: boolean
-  onArtifactClick?: (name: string, section?: string) => void
+  onFileClick?: (path: string, section?: string) => void
   onForkExpand?: (forkId: string) => void
 }
 
@@ -43,7 +43,7 @@ export const MessageView = memo(function MessageView({
   onWorkApprove,
   onWorkReject,
   inputHasText,
-  onArtifactClick,
+  onFileClick,
   onForkExpand
 }: MessageViewProps) {
   const theme = useTheme()
@@ -64,7 +64,7 @@ export const MessageView = memo(function MessageView({
             content={message.content}
             isStreaming={isStreaming}
             isInterrupted={isInterrupted}
-            onOpenArtifact={onArtifactClick}
+            onFileClick={onFileClick}
           />
         )
 
@@ -78,7 +78,7 @@ export const MessageView = memo(function MessageView({
             hideHeader={hideThinkBlockHeader}
             onHeaderRef={onThinkBlockHeaderRef}
             pendingApproval={pendingApproval}
-            onArtifactClick={onArtifactClick}
+            onFileClick={onFileClick}
             isInterrupted={isInterrupted}
           />
         )
@@ -107,7 +107,6 @@ export const MessageView = memo(function MessageView({
           <InlineForkActivity
             message={message}
             onExpand={onForkExpand ?? (() => {})}
-            onArtifactClick={onArtifactClick}
           />
         )
 

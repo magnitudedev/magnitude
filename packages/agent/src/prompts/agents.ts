@@ -15,7 +15,6 @@ import { formatResults, formatInterrupted, formatError, formatNoop } from './res
 
 export type CommsAttachment =
   | { readonly kind: 'image'; readonly base64: string; readonly mediaType: ImageMediaType; readonly width: number; readonly height: number }
-  | { readonly kind: 'artifact'; readonly id: string; readonly content: string }
   | {
     readonly kind: 'mention'
     readonly path: string
@@ -30,7 +29,7 @@ export interface AgentActivityEntry {
   readonly agentId: string
   readonly prose: string | null
   readonly toolsCalled: readonly string[]
-  readonly artifactsWritten: readonly string[]
+  readonly filesWritten: readonly string[]
 }
 
 export type CommsEntry =
@@ -120,8 +119,6 @@ export function formatCommsInbox(entries: readonly CommsEntry[], timezone: strin
         if (attachment.kind === 'image') {
           push('\n')
           parts.push({ type: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height })
-        } else if (attachment.kind === 'artifact') {
-          push(`\n<artifact id="${attachment.id}">${attachment.content}</artifact>`)
         } else if (attachment.kind === 'mention') {
           if (attachment.error) {
             push(`\n<mention path="${attachment.path}" error="${attachment.error}"/>`)
@@ -218,16 +215,16 @@ export function formatAgentsStatus(
 }
 
 export function formatSubagentActivity(
-  entries: Array<{ agentId: string; prose: string | null; toolsCalled: readonly string[]; artifactsWritten?: readonly string[] }>
+  entries: Array<{ agentId: string; prose: string | null; toolsCalled: readonly string[]; filesWritten?: readonly string[] }>
 ): string {
-  const grouped = new Map<string, Array<{ prose: string | null; toolsCalled: readonly string[]; artifactsWritten: readonly string[] }>>()
+  const grouped = new Map<string, Array<{ prose: string | null; toolsCalled: readonly string[]; filesWritten: readonly string[] }>>()
 
   for (const entry of entries) {
     const current = grouped.get(entry.agentId) ?? []
     grouped.set(entry.agentId, [...current, {
       prose: entry.prose,
       toolsCalled: entry.toolsCalled,
-      artifactsWritten: entry.artifactsWritten ?? [],
+      filesWritten: entry.filesWritten ?? [],
     }])
   }
 
@@ -238,7 +235,7 @@ export function formatSubagentActivity(
     for (const turn of turns) {
       const attrs: string[] = []
       if (turn.toolsCalled.length > 0) attrs.push(`tools="${turn.toolsCalled.join(', ')}"`)
-      if (turn.artifactsWritten.length > 0) attrs.push(`artifacts_written="${turn.artifactsWritten.join(', ')}"`)
+      if (turn.filesWritten.length > 0) attrs.push(`files_written="${turn.filesWritten.join(', ')}"`)
       const attrStr = attrs.join(' ')
       if (turn.prose === null) {
         lines.push(`  <turn ${attrStr} />`)

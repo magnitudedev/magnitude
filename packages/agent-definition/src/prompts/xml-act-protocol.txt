@@ -64,6 +64,12 @@ You can send multiple messages in one comms block.
 
 If the {{DEFAULT_RECIPIENT}} has just messaged you, you should message them back immediately, even if you are also taking actions, to keep them in the loop.
 
+### Message format
+
+Messages support GFM-style markdown syntax. Messages also support inline links to local file content or URLs. You can also link directly to your workspace e.g. [foo]($M/foo.md).
+
+When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
+
 ## Actions
 
 Take 0 or more actions using tools.

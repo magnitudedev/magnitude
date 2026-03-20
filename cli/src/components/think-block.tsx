@@ -19,7 +19,7 @@ interface ThinkBlockProps {
   hideHeader?: boolean
   onHeaderRef?: (ref: any) => void
   pendingApproval?: boolean
-  onArtifactClick?: (name: string, section?: string) => void
+  onFileClick?: (path: string, section?: string) => void
   isInterrupted?: boolean
 }
 
@@ -114,18 +114,18 @@ const ToolStepView = memo(function ToolStepView({
   step,
   isExpanded,
   onToggle,
-  onArtifactClick,
+  onFileClick,
 }: {
   step: ThinkBlockStep
   isExpanded: boolean
   onToggle: () => void
-  onArtifactClick?: (name: string, section?: string) => void
+  onFileClick?: (name: string, section?: string) => void
 }) {
   const theme = useTheme()
   const render = step.toolKey ? renderRegistry.get(step.toolKey) : undefined
 
   if (render && step.visualState !== undefined) {
-    return <>{render({ state: step.visualState, isExpanded, onToggle, stepResult: step.result, onArtifactClick })}</>
+    return <>{render({ state: step.visualState, isExpanded, onToggle, stepResult: step.result, onFileClick })}</>
   }
 
   // Fallback for tools without a visual definition
@@ -244,7 +244,7 @@ const StepGroupView = memo(function StepGroupView({
   group,
   expandedSteps,
   toggleStep,
-  onArtifactClick,
+  onFileClick,
   isActive,
   isInterrupted,
   lastThinkingStepId,
@@ -252,7 +252,7 @@ const StepGroupView = memo(function StepGroupView({
   group: StepGroup
   expandedSteps: Set<string>
   toggleStep: (id: string) => void
-  onArtifactClick?: (name: string, section?: string) => void
+  onFileClick?: (path: string, section?: string) => void
   isActive?: boolean
   isInterrupted?: boolean
   lastThinkingStepId?: string
@@ -272,7 +272,7 @@ const StepGroupView = memo(function StepGroupView({
           steps: clusterSteps,
           expandedSteps,
           onToggleStep: toggleStep,
-          onArtifactClick,
+          onFileClick: onFileClick,
         })}
       </>
     )
@@ -313,7 +313,7 @@ const StepGroupView = memo(function StepGroupView({
             step={step}
             isExpanded={expandedSteps.has(step.id)}
             onToggle={() => toggleStep(step.id)}
-            onArtifactClick={onArtifactClick}
+            onFileClick={onFileClick}
           />
         )
       })}
@@ -406,7 +406,7 @@ export const ThinkBlock = memo(function ThinkBlock({
   hideHeader,
   onHeaderRef,
   pendingApproval,
-  onArtifactClick,
+  onFileClick,
   isInterrupted
 }: ThinkBlockProps) {
   const theme = useTheme()
@@ -512,7 +512,7 @@ export const ThinkBlock = memo(function ThinkBlock({
                 group={group}
                 expandedSteps={expandedSteps}
                 toggleStep={toggleStep}
-                onArtifactClick={onArtifactClick}
+                onFileClick={onFileClick}
                 isActive={isActive}
                 isInterrupted={isInterrupted}
                 lastThinkingStepId={lastStepId}

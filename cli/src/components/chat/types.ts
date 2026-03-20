@@ -65,8 +65,8 @@ export type ChatControllerProps = {
   subagentTabs: SubagentTabItem[]
   selectedForkId: string | null
   onSubagentTabSelect: (forkId: string | null) => void
-  selectedArtifactOpen: boolean
-  onCloseArtifact: () => void
+  selectedFileOpen: boolean
+  onCloseFilePanel: () => void
   onApprove: () => void
   onReject: () => void
   onInputHasTextChange?: (hasText: boolean) => void

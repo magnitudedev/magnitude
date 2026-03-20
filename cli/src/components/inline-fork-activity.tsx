@@ -8,7 +8,6 @@ import { BOX_CHARS } from '../utils/ui-constants'
 interface InlineForkActivityProps {
   message: ForkActivityMessage
   onExpand: (forkId: string) => void
-  onArtifactClick?: (name: string, section?: string) => void
 }
 
 function formatElapsedTime(seconds: number): string {
@@ -26,7 +25,7 @@ function formatDuration(seconds: number): string {
 
 function getTotalToolCount(counts: ForkActivityToolCounts): number {
   return counts.reads + counts.writes + counts.edits + counts.commands
-    + counts.webSearches + counts.webFetches + counts.artifactWrites + counts.artifactUpdates
+    + counts.webSearches + counts.webFetches
     + counts.searches + counts.clicks + counts.navigations + counts.inputs
     + counts.evaluations + counts.other
 }
@@ -56,31 +55,9 @@ const TOOL_DISPLAY: { key: keyof ForkActivityToolCounts; verb: string; noun: str
   { key: 'evaluations', verb: 'Ran', noun: 'script', nounPlural: 'scripts' },
 ]
 
-const ArtifactChip = memo(function ArtifactChip({
-  name,
-  onClick,
-}: {
-  name: string
-  onClick?: () => void
-}) {
-  const theme = useTheme()
-  const [isHovered, setIsHovered] = useState(false)
-
-  return (
-    <Button
-      onClick={onClick}
-      onMouseOver={() => setIsHovered(true)}
-      onMouseOut={() => setIsHovered(false)}
-    >
-      <text style={{ fg: isHovered ? theme.link : theme.primary, wrapMode: 'none' }}>{'[≡ '}{name}{']'}</text>
-    </Button>
-  )
-})
-
 export const InlineForkActivity = memo(function InlineForkActivity({
   message,
   onExpand,
-  onArtifactClick,
 }: InlineForkActivityProps) {
   const theme = useTheme()
   const [isDetailsHovered, setIsDetailsHovered] = useState(false)
@@ -199,20 +176,6 @@ export const InlineForkActivity = memo(function InlineForkActivity({
           )}
         </text>
       </box>
-
-      {/* Line 3: artifact chips */}
-      {message.artifactNames.length > 0 && (
-        <box style={{ flexDirection: 'row', gap: 1 }}>
-          <text style={{ fg: theme.muted, wrapMode: 'none' }}>Artifacts:</text>
-          {message.artifactNames.map((name) => (
-            <ArtifactChip
-              key={name}
-              name={name}
-              onClick={onArtifactClick ? () => onArtifactClick(name) : undefined}
-            />
-          ))}
-        </box>
-      )}
 
       {/* Clickable details link */}
       <Button

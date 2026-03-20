@@ -20,7 +20,7 @@ export interface ToolRenderProps<TState = unknown> {
   /** The tool result from the ThinkBlockStep (includes display data, rejection reason, etc.) */
   readonly stepResult?: import('@magnitudedev/agent').ToolResult
   /** Callback to open artifact panel (artifact tools only) */
-  readonly onArtifactClick?: (name: string, section?: string) => void
+  readonly onFileClick?: (name: string, section?: string) => void
 }
 
 /** A render function for a specific tool's visual state.
@@ -91,7 +91,7 @@ export interface ClusterRenderProps<TState = unknown> {
   readonly steps: readonly ClusterStepData<TState>[]
   readonly expandedSteps: ReadonlySet<string>
   readonly onToggleStep: (id: string) => void
-  readonly onArtifactClick?: (name: string, section?: string) => void
+  readonly onFileClick?: (name: string, section?: string) => void
 }
 
 /** A render function for a cluster group.

@@ -4,6 +4,7 @@ import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 import type { AppEvent, MentionAttachment, ResolvedMention } from '../events'
+import { resolveFileRef } from '../workspace/file-ref-resolution'
 import { SessionContextProjection } from '../projections/session-context'
 import { walk } from '../util/walk'
 
@@ -30,8 +31,13 @@ function isPathAllowed(absolutePath: string, cwd: string, allowedPrefixes?: stri
   return allowedPrefixes.some(prefix => isPathUnderPrefix(absolutePath, prefix))
 }
 
-function resolveMentionPath(cwd: string, mentionPath: string, allowedPrefixes?: string[]): string {
-  const absolutePath = resolve(cwd, mentionPath)
+function resolveMentionPath(cwd: string, workspacePath: string, mentionPath: string, allowedPrefixes?: string[]): string {
+  const resolved = resolveFileRef(mentionPath, cwd, workspacePath)
+  if (!resolved?.resolvedPath) {
+    throw new Error(`Path not found: ${mentionPath}`)
+  }
+
+  const absolutePath = resolved.resolvedPath
   if (!isPathAllowed(absolutePath, cwd, allowedPrefixes)) {
     throw new Error(`Path is outside cwd: ${mentionPath}`)
   }
@@ -86,8 +92,8 @@ async function resolveDirectoryMention(path: string, absolutePath: string): Prom
   }
 }
 
-async function resolveMention(cwd: string, attachment: MentionAttachment, allowedPrefixes?: string[]): Promise<ResolvedMention> {
-  const absolutePath = resolveMentionPath(cwd, attachment.path, allowedPrefixes)
+async function resolveMention(cwd: string, workspacePath: string, attachment: MentionAttachment, allowedPrefixes?: string[]): Promise<ResolvedMention> {
+  const absolutePath = resolveMentionPath(cwd, workspacePath, attachment.path, allowedPrefixes)
   const fileStat = await stat(absolutePath)
 
   if (attachment.contentType === 'directory') {
@@ -117,6 +123,7 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
       const sessionContext = yield* read(SessionContextProjection)
       const cwd = sessionContext.context?.cwd
       const workspacePath = sessionContext.context?.workspacePath
+      if (!workspacePath) throw new Error('workspacePath not available in session context')
 
       const resolvedMentions = yield* Effect.promise(async () => {
         const results: ResolvedMention[] = []
@@ -131,7 +138,7 @@ export const FileMentionResolver = Worker.define<AppEvent>()({
           }
 
           try {
-            results.push(await resolveMention(cwd, mention, workspacePath ? [workspacePath] : []))
+            results.push(await resolveMention(cwd, workspacePath, mention, [workspacePath]))
           } catch (error) {
             results.push({
               path: mention.path,

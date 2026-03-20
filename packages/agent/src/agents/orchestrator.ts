@@ -15,12 +15,6 @@ import {
   agentCreateTool,
   agentDismissTool,
 } from '../tools/agent-tools'
-import {
-  artifactSyncTool,
-  artifactReadTool,
-  artifactWriteTool,
-  artifactUpdateTool,
-} from '../tools/artifact-tools'
 // import { gatherTool } from '../tools/gather'
 import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
 import { shellBgTool } from '../tools/shell-bg'
@@ -101,12 +95,6 @@ export const createOrchestrator = (systemPrompt: string) => {
     webSearch:             webSearchTool,
     webFetch:              webFetchTool,
 
-    // Artifact management
-    artifactSync:          artifactSyncTool,
-    artifactRead:          artifactReadTool,
-    artifactWrite:         artifactWriteTool,
-    artifactUpdate:        artifactUpdateTool,
-
     // Agent management
     agentCreate:           agentCreateTool,
     agentDismiss:          agentDismissTool,
@@ -150,10 +138,6 @@ export const createOrchestrator = (systemPrompt: string) => {
     display: (d) => ({
       think()              { return d.hidden() },
       inspect()            { return d.hidden() },
-      artifactSync()       { return d.hidden() },
-      artifactRead()       { return d.visible() },
-      artifactWrite()      { return d.visible() },
-      artifactUpdate()     { return d.visible() },
       agentCreate()        { return d.hidden() },
       agentDismiss()       { return d.hidden() },
 

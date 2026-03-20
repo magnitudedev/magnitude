@@ -49,8 +49,8 @@ export function ChatController(props: ChatControllerProps) {
     subagentTabs,
     selectedForkId,
     onSubagentTabSelect,
-    selectedArtifactOpen,
-    onCloseArtifact,
+    selectedFileOpen,
+    onCloseFilePanel,
     onApprove,
     onReject,
     onInputHasTextChange,
@@ -404,8 +404,8 @@ export function ChatController(props: ChatControllerProps) {
         setNextEscWillClearInput={setNextEscWillClearInput}
         clearInputTimeoutRef={clearInputTimeoutRef}
         onClearInput={clearComposer}
-        selectedArtifactOpen={selectedArtifactOpen}
-        onCloseArtifact={onCloseArtifact}
+        selectedFileOpen={selectedFileOpen}
+        onCloseFilePanel={onCloseFilePanel}
         bashMode={env.bashMode}
         onExitBashMode={() => {
           services.exitBashMode()

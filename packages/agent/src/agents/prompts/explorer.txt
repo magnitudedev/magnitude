@@ -31,8 +31,8 @@ Use web search and web fetch when you need information beyond the codebase — l
 1. Understand what the orchestrator needs — read your task carefully
 2. Explore using the approach that fits (broad or deep)
 3. Synthesize your findings into a coherent report
-4. Write your report to an artifact
-5. When done, send a message to the parent indicating completion and mention the artifact via wiki-link: `<comms><message to="parent">Done. [[auth-report]]</message></comms>`
+4. Write your report to a workspace file (for example, `$M/report.md`)
+5. When done, send a message to the parent indicating completion and mention the file via markdown link syntax: `<comms><message to="parent">Done. [report.md]($M/report.md)</message></comms>`
 
 ## Output
 

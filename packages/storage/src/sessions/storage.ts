@@ -12,7 +12,6 @@ import {
   readJsonLines,
   removeFileIfExists,
   writeJsonFile,
-  writeTextFile,
 } from '../io'
 import type { GlobalStoragePaths } from '../paths/global-paths'
 import {
@@ -111,20 +110,6 @@ export async function readSessionEventsFromPath<T>(
   eventsPath: string
 ): Promise<T[]> {
   return readJsonLines<T>(eventsPath)
-}
-
-export async function writeSessionArtifact(
-  paths: GlobalStoragePaths,
-  sessionId: string,
-  name: string,
-  content: string,
-  options?: { readonly extension?: string }
-): Promise<string> {
-  const extension = options?.extension ?? '.md'
-  const artifactPath = paths.sessionArtifactFile(sessionId, `${name}${extension}`)
-  await ensureDir(paths.sessionArtifactsDir(sessionId))
-  await writeTextFile(artifactPath, content)
-  return artifactPath
 }
 
 export async function createSessionWorkspace(

@@ -80,19 +80,6 @@ const makeService = (stateRef: Ref.Ref<InternalState>): InMemoryChatPersistence 
       },
     })),
 
-  saveArtifact: (name, content) =>
-    Ref.update(stateRef, (state) => ({
-      ...state,
-      artifacts: {
-        ...state.artifacts,
-        [name]: content,
-      },
-      metadata: {
-        ...state.metadata,
-        updated: nowIso(),
-      },
-    })),
-
   inspectEvents: () =>
     Ref.get(stateRef).pipe(Effect.map((state) => [...state.events])),
 

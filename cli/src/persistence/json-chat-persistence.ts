@@ -139,14 +139,6 @@ export class JsonChatPersistence implements ChatPersistenceService {
       catch: (error) => new PersistenceError({ reason: 'SaveFailed', message: error instanceof Error ? error.message : String(error) })
     })
 
-  readonly saveArtifact = (name: string, content: string): Effect.Effect<void, PersistenceError> =>
-    Effect.tryPromise({
-      try: async () => {
-        await this.storage.sessions.writeArtifact(this.sessionId, name, content)
-      },
-      catch: (error) => new PersistenceError({ reason: 'SaveFailed', message: `Failed to save artifact "${name}": ${error}` })
-    })
-
   /**
    * Update summary fields on metadata from new events
    */

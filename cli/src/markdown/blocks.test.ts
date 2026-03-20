@@ -11,13 +11,13 @@ import { baseOptions, blockTypes, collectText, findBlocks, getSingleBlock, norma
 
 describe('markdown/blocks', () => {
   describe('paragraphs', () => {
-    it('renders basic text', () => {
+    it('renders basic text', async () => {
       const block = getSingleBlock('hello world')
       expect(block.type).toBe('paragraph')
       if (block.type === 'paragraph') expect(spansToText(block.content)).toBe('hello world')
     })
 
-    it('renders inline formatting and links', () => {
+    it('renders inline formatting and links', async () => {
       const block = getSingleBlock('**bold** *italic* ~~gone~~ `code` [link](https://example.com)')
       expect(block.type).toBe('paragraph')
       if (block.type !== 'paragraph') return
@@ -31,7 +31,7 @@ describe('markdown/blocks', () => {
   })
 
   describe('headings', () => {
-    it('renders levels 1-6 with slugs', () => {
+    it('renders levels 1-6 with slugs', async () => {
       const md = '# h1\n## h2\n### h3\n#### h4\n##### h5\n###### h6'
       const blocks = renderBlocks(md).filter((b) => b.type === 'heading')
       expect(blocks).toHaveLength(6)
@@ -40,7 +40,7 @@ describe('markdown/blocks', () => {
       expect(extractHeadingSlugsFromBlocks(blocks)).toEqual(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
     })
 
-    it('supports inline formatting in heading content', () => {
+    it('supports inline formatting in heading content', async () => {
       const block = getSingleBlock('# **Hello** *World*')
       expect(block.type).toBe('heading')
       if (block.type !== 'heading') return
@@ -51,7 +51,7 @@ describe('markdown/blocks', () => {
   })
 
   describe('code blocks', () => {
-    it('renders language and multiline code', () => {
+    it('renders language and multiline code', async () => {
       const block = getSingleBlock('```ts\nconst a = 1\nconsole.log(a)\n```')
       expect(block.type).toBe('code')
       if (block.type !== 'code') return
@@ -60,7 +60,7 @@ describe('markdown/blocks', () => {
       expect(block.lines.length).toBe(2)
     })
 
-    it('renders code block without language', () => {
+    it('renders code block without language', async () => {
       const block = getSingleBlock('```\njust text\n```')
       expect(block.type).toBe('code')
       if (block.type !== 'code') return
@@ -70,7 +70,7 @@ describe('markdown/blocks', () => {
   })
 
   describe('lists', () => {
-    it('renders bullet, ordered, task, and nested lists', () => {
+    it('renders bullet, ordered, task, and nested lists', async () => {
       const md = '- a\n  - nested\n1. first\n- [x] done\n- [ ] todo'
       const lists = findBlocks(md, 'list')
       expect(lists.length).toBeGreaterThanOrEqual(3)
@@ -85,7 +85,7 @@ describe('markdown/blocks', () => {
   })
 
   describe('tables', () => {
-    it('renders headers, rows, and alignments without width fields', () => {
+    it('renders headers, rows, and alignments without width fields', async () => {
       const block = getSingleBlock('| a | b |\n| :-- | :-: |\n| 1 | 2 |')
       expect(block.type).toBe('table')
       if (block.type !== 'table') return
@@ -97,7 +97,7 @@ describe('markdown/blocks', () => {
   })
 
   describe('blockquotes', () => {
-    it('renders simple, nested, and mixed content', () => {
+    it('renders simple, nested, and mixed content', async () => {
       const block = getSingleBlock('> quote\n>\n> - item\n> > nested')
       expect(block.type).toBe('blockquote')
       if (block.type !== 'blockquote') return
@@ -108,58 +108,70 @@ describe('markdown/blocks', () => {
   })
 
   describe('dividers', () => {
-    it('renders ---, ***, ___ as dividers', () => {
+    it('renders ---, ***, ___ as dividers', async () => {
       const blocks = renderBlocks('---\n***\n___').filter((b) => b.type === 'divider')
       expect(blocks).toHaveLength(3)
     })
   })
 
   describe('mermaid', () => {
-    it('renders mermaid code fence as mermaid block', () => {
+    it('renders mermaid code fence as mermaid block', async () => {
       const block = getSingleBlock('```mermaid\ngraph TD\nA-->B\n```')
       expect(['mermaid', 'code']).toContain(block.type)
     })
   })
 
   describe('spacers', () => {
-    it('inserts spacer blocks between document blocks', () => {
+    it('inserts spacer blocks between document blocks', async () => {
       const blocks = renderBlocks('one\n\ntwo')
       expect(blockTypes(blocks)).toEqual(['paragraph', 'spacer', 'paragraph'])
     })
   })
 
   describe('helpers', () => {
-    it('slugify handles various heading text', () => {
+    it('slugify handles various heading text', async () => {
       expect(slugify('Hello, World!')).toBe('hello-world')
       expect(slugify('  A__B  ')).toBe('a-b')
       expect(slugify('123 Title')).toBe('123-title')
     })
 
-    it('spansToText concatenates span text', () => {
+    it('spansToText concatenates span text', async () => {
       const spans: Span[] = [{ text: 'a' }, { text: 'b' }, { text: 'c' }]
       expect(spansToText(spans)).toBe('abc')
     })
 
-    it('extractHeadingSlugsFromBlocks returns only heading slugs', () => {
+    it('extractHeadingSlugsFromBlocks returns only heading slugs', async () => {
       const blocks = renderBlocks('# A\ntext\n## B')
       expect(extractHeadingSlugsFromBlocks(blocks)).toEqual(['a', 'b'])
     })
   })
 
-  describe('wiki links and source ranges', () => {
-    it('maps wiki links to span.ref with name/section/label', () => {
-      const block = getSingleBlock('[[artifact-name]] [[name#section]] [[name|label]]')
+  describe('link refs and source ranges', () => {
+    it('maps local markdown links to span.fileRef', async () => {
+      const block = getSingleBlock('[plan](plan.md)')
       expect(block.type).toBe('paragraph')
       if (block.type !== 'paragraph') return
-      const refs = block.content.filter((s) => s.ref).map((s) => s.ref)
-      expect(refs).toEqual([
-        { name: 'artifact-name', section: undefined, label: undefined },
-        { name: 'name', section: 'section', label: undefined },
-        { name: 'name', section: undefined, label: 'label' },
-      ])
+      const ref = block.content.find((s) => s.fileRef)?.fileRef
+      expect(ref).toEqual({ path: 'plan.md', section: undefined })
     })
 
-    it('includes source start/end for blocks', () => {
+    it('maps url markdown links to span.url', async () => {
+      const block = getSingleBlock('[docs](https://example.com)')
+      expect(block.type).toBe('paragraph')
+      if (block.type !== 'paragraph') return
+      const url = block.content.find((s) => s.url)?.url
+      expect(url).toBe('https://example.com')
+    })
+
+    it('maps local markdown links with section to span.fileRef', async () => {
+      const block = getSingleBlock('[plan](plan.md#Approach)')
+      expect(block.type).toBe('paragraph')
+      if (block.type !== 'paragraph') return
+      const ref = block.content.find((s) => s.fileRef)?.fileRef
+      expect(ref).toEqual({ path: 'plan.md', section: 'Approach' })
+    })
+
+    it('includes source start/end for blocks', async () => {
       const doc = parseMarkdownToMdast('# head\n\npara')
       const blocks = renderDocumentToBlocks(doc, baseOptions)
       const concrete = blocks.filter((b) => b.type !== 'spacer') as Array<{ source: { start: number; end: number } }>
@@ -168,7 +180,7 @@ describe('markdown/blocks', () => {
   })
 
   describe('inline html', () => {
-    it('renders inline html as text spans', () => {
+    it('renders inline html as text spans', async () => {
       const block = getSingleBlock('before <span>mid</span> after')
       expect(collectText(block)).toContain('<span>mid</span>')
       expect(normalizeBlock(block)).toBeDefined()

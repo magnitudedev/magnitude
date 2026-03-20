@@ -101,12 +101,6 @@ export interface StorageClient {
     readEvents<T>(sessionId: string): Promise<T[]>
     appendEvents<T>(sessionId: string, events: T[]): Promise<void>
     getEventsPath(sessionId: string): string
-    writeArtifact(
-      sessionId: string,
-      name: string,
-      content: string,
-      opts?: { extension?: string }
-    ): Promise<void>
     createWorkspace(sessionId: string, cwd: string): Promise<string>
     getWorkspacePath(sessionId: string): string
   }
@@ -305,13 +299,6 @@ export async function createStorageClient(options?: {
         run(Effect.flatMap(SessionStorage, (s) => s.appendEvents<T>(sessionId, events))),
       getEventsPath: (sessionId: string) =>
         runtime.runSync(Effect.map(SessionStorage, (s) => s.paths.sessionEventsFile(sessionId))),
-      writeArtifact: async (sessionId, name, content, opts) => {
-        await run(
-          Effect.flatMap(SessionStorage, (s) =>
-            s.writeArtifact(sessionId, name, content, opts)
-          )
-        )
-      },
       createWorkspace: (sessionId, cwd) =>
         run(
           Effect.flatMap(SessionStorage, (s) =>

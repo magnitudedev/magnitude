@@ -76,6 +76,5 @@ export { shellBgTool } from './shell-bg'
 export { fsTools } from './fs'
 
 export { agentTools } from './agent-tools'
-export { artifactOrchestratorTools, artifactAgentTools } from './artifact-tools'
 export { webFetchTool } from './web-fetch-tool'
 

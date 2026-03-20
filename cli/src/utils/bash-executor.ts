@@ -28,7 +28,7 @@ const truncate = (text: string): string => {
 
 export function executeBashCommand(
   command: string,
-  options?: { workspacePath?: string; projectRoot?: string },
+  options?: { workspacePath: string; projectRoot?: string },
 ): BashResult {
   const cwd = process.cwd()
   const shell = process.env.SHELL || '/bin/sh'
@@ -43,7 +43,7 @@ export function executeBashCommand(
       env: {
         ...process.env,
         PROJECT_ROOT: projectRoot,
-        ...(options?.workspacePath ? { M: options.workspacePath } : {}),
+        M: options.workspacePath,
       },
     })
 

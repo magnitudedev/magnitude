@@ -23,8 +23,6 @@ export interface GlobalStoragePaths {
   readonly sessionEventsFile: (sessionId: string) => string
   readonly sessionLogFile: (sessionId: string) => string
   readonly sessionWorkspace: (sessionId: string) => string
-  readonly sessionArtifactsDir: (sessionId: string) => string
-  readonly sessionArtifactFile: (sessionId: string, artifactName: string) => string
 
   readonly pendingMemoryJobFile: (jobId: string) => string
 
@@ -76,10 +74,6 @@ export function makeGlobalStoragePaths(root: string): GlobalStoragePaths {
       join(sessionsRoot, sessionId, 'logs.jsonl'),
     sessionWorkspace: (sessionId: string) =>
       join(sessionsRoot, sessionId, 'workspace'),
-    sessionArtifactsDir: (sessionId: string) =>
-      join(sessionsRoot, sessionId, 'artifacts'),
-    sessionArtifactFile: (sessionId: string, artifactName: string) =>
-      join(sessionsRoot, sessionId, 'artifacts', artifactName),
 
     pendingMemoryJobFile: (jobId: string) =>
       join(pendingMemoryExtractionRoot, `${jobId}.json`),

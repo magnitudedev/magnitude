@@ -371,27 +371,6 @@ export interface SoftInterrupt {
 }
 
 // =============================================================================
-// Artifact Events
-// =============================================================================
-
-/** Artifact content changed (written or edited) */
-export interface ArtifactChanged {
-  readonly type: 'artifact_changed'
-  readonly forkId: string | null
-  readonly id: string
-  readonly previousContent: string | null
-  readonly content: string
-}
-
-/** Artifact synced to a file on disk */
-export interface ArtifactSynced {
-  readonly type: 'artifact_synced'
-  readonly forkId: string | null
-  readonly id: string
-  readonly path: string
-}
-
-// =============================================================================
 // Agent Events
 // =============================================================================
 
@@ -561,9 +540,6 @@ export type AppEvent =
   | ToolApproved
   | ToolRejected
   | ChatTitleGenerated
-  // Artifact events
-  | ArtifactChanged
-  | ArtifactSynced
   // Agent events
   | AgentCreated
   | AgentDismissed

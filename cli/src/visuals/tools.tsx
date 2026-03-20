@@ -13,20 +13,22 @@ import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { ShimmerText } from '../components/shimmer-text'
 import { Button } from '../components/button'
 import { MarkdownContent, StreamingMarkdownContent } from '../markdown/markdown-content'
+import { highlightFile } from '../markdown/highlight-file'
+import type { Span } from '../markdown/blocks'
 import { BOX_CHARS } from '../utils/ui-constants'
 import { render } from './define'
 import type { ToolVisualRenderer } from './define'
 
 import { isActive } from '@magnitudedev/agent'
-import { useSelectedArtifact } from '../hooks/use-artifacts'
+import { useSelectedFile } from '../hooks/use-file-viewer'
 
 
 import type {
   WebSearchState,
   WebFetchState,
   BrowserState,
-  ArtifactVisualState,
-  ArtifactSyncState,
+  WriteState,
+  EditState,
   AgentCreateState,
   AgentIdState,
   AgentMessageState,
@@ -248,168 +250,56 @@ export const newTabRender = browserRender({ icon: '+' })
 export const screenshotRender = browserRender({ icon: '◻' })
 export const evaluateRender = browserRender({ icon: '▶' })
 
-// =============================================================================
-// Artifact Tools — restored interactivity, styling, and shimmer
-// =============================================================================
-
-export function artifactCreateLiveText({ state }: { state: ArtifactVisualState }): string {
-  const target = state.name ? `artifact ${state.name}` : 'artifact'
-  if (isActive(state.phase)) return `Creating ${target}`
-  return state.phase === 'error' ? `Create ${target}` : `Created ${target}`
+export function fsWriteLiveText({ state }: { state: WriteState }): string {
+  const target = state.path || 'file'
+  return state.phase === 'done' ? `Wrote ${target}` : `Writing ${target}`
 }
 
-export const artifactCreateRender = render<ArtifactVisualState>(({ state }) => {
+export const fsWriteRender = render<WriteState>(({ state, onFileClick }) => {
   const theme = useTheme()
-  const done = !isActive(state.phase)
-  const label = state.name ? `Created artifact "${state.name}"` : 'Creating artifact...'
-
-  if (!done) {
-    return (
-      <text>
-        <span fg={theme.info}>{'≡ + '}</span>
-        <ShimmerText text={label} interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-      </text>
-    )
-  }
-
-  return (
-    <text>
-      <span fg={state.phase === 'error' ? theme.error : theme.success}>{'≡ + '}</span>
-      <span fg={theme.foreground}>{label}</span>
-    </text>
-  )
-})
-
-export function artifactSyncLiveText({ state }: { state: ArtifactSyncState }): string {
-  const target = state.name ? `artifact ${state.name}` : 'artifact'
-  if (isActive(state.phase)) return `Syncing ${target}`
-  return state.phase === 'error' ? `Sync ${target}` : `Synced ${target}`
-}
-
-export const artifactSyncRender = render<ArtifactSyncState>(({ state }) => {
-  const theme = useTheme()
-  const done = !isActive(state.phase)
-  const label = state.name
-    ? `Synced artifact "${state.name}" → ${state.path || '...'}`
-    : 'Syncing artifact...'
-
-  if (!done) {
-    return (
-      <text>
-        <span fg={theme.info}>{'≡ ✎ '}</span>
-        <ShimmerText text={label} interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-      </text>
-    )
-  }
-
-  return (
-    <text>
-      <span fg={state.phase === 'error' ? theme.error : theme.success}>{'≡ ✎ '}</span>
-      <span fg={theme.foreground}>{label}</span>
-    </text>
-  )
-})
-
-export function artifactReadLiveText({ state }: { state: ArtifactVisualState }): string {
-  const target = state.name ? `artifact ${state.name}` : 'artifact'
-  if (isActive(state.phase)) return `Reading ${target}`
-  return `Read ${target}`
-}
-
-export const artifactReadRender = render<ArtifactVisualState>(({ state, onArtifactClick }) => {
-  const theme = useTheme()
-  const done = !isActive(state.phase)
-  const isError = state.phase === 'error'
+  const done = state.phase === 'done'
+  const isError = state.result?._tag === 'Error'
   const [isHovered, setIsHovered] = useState(false)
-  const name = state.name
+  const path = state.path
+  const selectedFile = useSelectedFile()
+  const isOpenInPanel = selectedFile?.path === path
+  const { displayedContent: revealedFull, showCursor } = useStreamingReveal(state.contentSoFar, !done)
 
   return (
     <box style={{ flexDirection: 'column' }}>
       <Button
-        onClick={() => { if (name) onArtifactClick?.(name) }}
-        onMouseOver={() => setIsHovered(true)}
-        onMouseOut={() => setIsHovered(false)}
-      >
-        <text style={{ wrapMode: 'word' }}>
-          <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ → '}</span>
-          {!done ? (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Reading artifact '}</span>
-              <span style={{ fg: theme.muted }}>{name || '...'}</span>
-              <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-            </>
-          ) : isError ? (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Read artifact '}</span>
-              <span style={{ fg: theme.muted }}>{name}</span>
-              <span style={{ fg: theme.error }}>{' · Error'}</span>
-            </>
-          ) : (
-            <>
-              <span style={{ fg: theme.foreground }}>{'Read artifact '}</span>
-              <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
-            </>
-          )}
-        </text>
-      </Button>
-    </box>
-  )
-})
-
-export function artifactWriteLiveText({ state }: { state: ArtifactVisualState }): string {
-  const target = state.name ? `artifact ${state.name}` : 'artifact'
-  if (isActive(state.phase)) return `Writing ${target}`
-  return state.phase === 'error' ? `Write ${target}` : `Wrote ${target}`
-}
-
-export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtifactClick }) => {
-  const theme = useTheme()
-  const done = !isActive(state.phase)
-  const isError = state.phase === 'error'
-  const [isHovered, setIsHovered] = useState(false)
-  const name = state.name
-  const preview = state.preview?.mode === 'write' ? state.preview : null
-  const selectedArtifact = useSelectedArtifact()
-  const isOpenInPanel = selectedArtifact === name
-  const fullPreviewContent = preview?.contentSoFar ?? ''
-  const { displayedContent: revealedFull, showCursor: previewCursor } = useStreamingReveal(fullPreviewContent, !done)
-
-
-  return (
-    <box style={{ flexDirection: 'column' }}>
-      <Button
-        onClick={() => { if (name) onArtifactClick?.(name) }}
+        onClick={() => { if (path) onFileClick?.(path) }}
         onMouseOver={() => setIsHovered(true)}
         onMouseOut={() => setIsHovered(false)}
       >
         <box style={{ flexDirection: 'column' }}>
           <text style={{ wrapMode: 'word' }}>
-            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ ✎ '}</span>
+            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '✎ '}</span>
             {!done ? (
               <>
-                <span style={{ fg: theme.foreground }}>{'Writing artifact '}</span>
-                <span style={{ fg: theme.muted }}>{name || '...'}</span>
+                <span style={{ fg: theme.foreground }}>{'Writing '}</span>
+                <span style={{ fg: theme.muted }}>{path || '...'}</span>
                 <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
               </>
             ) : isError ? (
               <>
-                <span style={{ fg: theme.foreground }}>{'Write artifact '}</span>
-                <span style={{ fg: theme.muted }}>{name}</span>
+                <span style={{ fg: theme.foreground }}>{'Write '}</span>
+                <span style={{ fg: theme.muted }}>{path}</span>
                 <span style={{ fg: theme.error }}>{' · Error'}</span>
               </>
             ) : (
               <>
-                <span style={{ fg: theme.foreground }}>{'Wrote artifact '}</span>
-                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
+                <span style={{ fg: theme.foreground }}>{'Wrote '}</span>
+                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{path}</span>
               </>
             )}
           </text>
-          {!done && preview && (
+          {!done && (
             <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
-              {`${preview.charCount} chars · ${preview.lineCount} lines`}
+              {`${state.charCount} chars · ${state.lineCount} lines`}
             </text>
           )}
-          {!done && preview && preview.contentSoFar.length > 0 && !isOpenInPanel && (
+          {!done && state.contentSoFar.length > 0 && !isOpenInPanel && (
             <box style={{
               borderStyle: 'single',
               borderColor: isHovered ? theme.link : theme.border || theme.muted,
@@ -429,7 +319,7 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
                   contentOptions: { justifyContent: 'flex-start' },
                 }}
               >
-                <StreamingMarkdownContent content={revealedFull} showCursor={previewCursor} />
+                <StreamingMarkdownContent content={revealedFull} showCursor={showCursor} />
               </scrollbox>
             </box>
           )}
@@ -439,119 +329,96 @@ export const artifactWriteRender = render<ArtifactVisualState>(({ state, onArtif
   )
 })
 
-export function artifactUpdateLiveText({ state }: { state: ArtifactVisualState }): string {
-  const target = state.name ? `artifact ${state.name}` : 'artifact'
-  if (isActive(state.phase)) return `Updating ${target}`
-  return state.phase === 'error' ? `Update ${target}` : `Updated ${target}`
+export function editStreamLiveText({ state }: { state: EditState }): string {
+  const target = state.path || 'file'
+  return state.phase === 'done' ? `Edited ${target}` : `Editing ${target}`
 }
 
-export const artifactUpdateRender = render<ArtifactVisualState>(({ state, onArtifactClick }) => {
+export const editStreamRender = render<EditState>(({ state, onFileClick }) => {
   const theme = useTheme()
-  const done = !isActive(state.phase)
-  const isError = state.phase === 'error'
+  const done = state.phase === 'done'
+  const isError = state.result?._tag === 'Error'
   const [isHovered, setIsHovered] = useState(false)
-  const name = state.name
-  const preview = state.preview?.mode === 'update' ? state.preview : null
-  const selectedArtifact = useSelectedArtifact()
-  const isOpenInPanel = selectedArtifact === name
-  const fullUpdateContent = preview?.newStringSoFar ?? ''
-  const { displayedContent: revealedUpdateFull, showCursor: updatePreviewCursor } = useStreamingReveal(fullUpdateContent, !done)
+  const path = state.path
+  const selectedFile = useSelectedFile()
+  const isOpenInPanel = selectedFile?.path === path
+  const { displayedContent: revealedUpdateFull, showCursor } = useStreamingReveal(state.newStringSoFar, !done)
 
-  const showOldPreview = !done
-    && !!preview
-    && preview.childPhase === 'streaming_old'
-    && preview.oldStringSoFar.length > 0
-    && !isOpenInPanel
-  const showNewPreview = !done
-    && !!preview
-    && preview.childPhase === 'streaming_new'
-    && preview.newStringSoFar.length > 0
-    && !isOpenInPanel
+  const showOldPreview = !done && state.childParsePhase === 'streaming_old' && state.oldStringSoFar.length > 0 && !isOpenInPanel
+  const showNewPreview = !done && state.childParsePhase === 'streaming_new' && state.newStringSoFar.length > 0 && !isOpenInPanel
 
   return (
     <box style={{ flexDirection: 'column' }}>
       <Button
-        onClick={() => { if (name) onArtifactClick?.(name) }}
+        onClick={() => { if (path) onFileClick?.(path) }}
         onMouseOver={() => setIsHovered(true)}
         onMouseOut={() => setIsHovered(false)}
       >
         <box style={{ flexDirection: 'column' }}>
           <text style={{ wrapMode: 'word' }}>
-            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '≡ ✎ '}</span>
+            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '✎ '}</span>
             {!done ? (
               <>
-                <span style={{ fg: theme.foreground }}>{'Updating artifact '}</span>
-                <span style={{ fg: theme.muted }}>{name || '...'}</span>
+                <span style={{ fg: theme.foreground }}>{'Editing '}</span>
+                <span style={{ fg: theme.muted }}>{path || '...'}</span>
                 <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
               </>
             ) : isError ? (
               <>
-                <span style={{ fg: theme.foreground }}>{'Update artifact '}</span>
-                <span style={{ fg: theme.muted }}>{name}</span>
+                <span style={{ fg: theme.foreground }}>{'Edit '}</span>
+                <span style={{ fg: theme.muted }}>{path}</span>
                 <span style={{ fg: theme.error }}>{' · Error'}</span>
               </>
             ) : (
               <>
-                <span style={{ fg: theme.foreground }}>{'Updated artifact '}</span>
-                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{name}</span>
+                <span style={{ fg: theme.foreground }}>{'Edited '}</span>
+                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{path}</span>
               </>
             )}
           </text>
-          {!done && preview && (
-            <>
-              <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
-                {`old: ${preview.oldStringSoFar.length} chars → new: ${preview.newStringSoFar.length} chars`}
-                {preview.replaceAll ? ' · replace all' : ''}
-              </text>
-              {showOldPreview && (
-                <box style={{
-                  borderStyle: 'single',
-                  borderColor: theme.warning,
-                  customBorderChars: BOX_CHARS,
-                  height: 12,
-                }}>
-                  <scrollbox
-                    stickyScroll
-                    stickyStart="bottom"
-                    scrollX={false}
-                    scrollbarOptions={{ visible: false }}
-                    verticalScrollbarOptions={{ visible: false }}
-                    style={{
-                      flexGrow: 1,
-                      rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
-                      wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
-                      contentOptions: { justifyContent: 'flex-start' },
-                    }}
-                  >
-                    <StreamingMarkdownContent content={preview?.oldStringSoFar ?? ''} />
-                  </scrollbox>
-                </box>
-              )}
-              {showNewPreview && (
-                <box style={{
-                  borderStyle: 'single',
-                  borderColor: theme.success,
-                  customBorderChars: BOX_CHARS,
-                  height: 12,
-                }}>
-                  <scrollbox
-                    stickyScroll
-                    stickyStart="bottom"
-                    scrollX={false}
-                    scrollbarOptions={{ visible: false }}
-                    verticalScrollbarOptions={{ visible: false }}
-                    style={{
-                      flexGrow: 1,
-                      rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
-                      wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
-                      contentOptions: { justifyContent: 'flex-start' },
-                    }}
-                  >
-                    <StreamingMarkdownContent content={revealedUpdateFull} showCursor={updatePreviewCursor} />
-                  </scrollbox>
-                </box>
-              )}
-            </>
+          {!done && (
+            <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
+              {`old: ${state.oldStringSoFar.length} chars → new: ${state.newStringSoFar.length} chars`}
+              {state.replaceAll ? ' · replace all' : ''}
+            </text>
+          )}
+          {showOldPreview && (
+            <box style={{ borderStyle: 'single', borderColor: theme.warning, customBorderChars: BOX_CHARS, height: 12 }}>
+              <scrollbox
+                stickyScroll
+                stickyStart="bottom"
+                scrollX={false}
+                scrollbarOptions={{ visible: false }}
+                verticalScrollbarOptions={{ visible: false }}
+                style={{
+                  flexGrow: 1,
+                  rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+                  wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
+                  contentOptions: { justifyContent: 'flex-start' },
+                }}
+              >
+                <StreamingMarkdownContent content={state.oldStringSoFar} />
+              </scrollbox>
+            </box>
+          )}
+          {showNewPreview && (
+            <box style={{ borderStyle: 'single', borderColor: theme.success, customBorderChars: BOX_CHARS, height: 12 }}>
+              <scrollbox
+                stickyScroll
+                stickyStart="bottom"
+                scrollX={false}
+                scrollbarOptions={{ visible: false }}
+                verticalScrollbarOptions={{ visible: false }}
+                style={{
+                  flexGrow: 1,
+                  rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
+                  wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
+                  contentOptions: { justifyContent: 'flex-start' },
+                }}
+              >
+                <StreamingMarkdownContent content={revealedUpdateFull} showCursor={showCursor} />
+              </scrollbox>
+            </box>
           )}
         </box>
       </Button>

@@ -6,9 +6,8 @@ You are a subagent.
 Default to messaging your parent using `<comms><message to="parent">...</message></comms>`.
 If this turn includes a direct user message in your inbound communications, you may send one explicit reply with `<message to="user">...</message>`, then continue parent-facing communication.
 
-## Artifacts
+## Markdown documents
 
-You can create artifacts with `artifact-write` using a descriptive ID (e.g. `auth-report`), and read or update artifacts shared with you via `[[artifact-id]]`.
-When messaging parent, always mention artifacts using `[[artifact-id]]` so your parent gains access to it.
-
+You parent may request plans, research, or other information. By default you should prefer to capture such information as documents in an appropriate part of the workspace ($M).
+Ensure that you tell the parents about these files AFTER you write them.
 

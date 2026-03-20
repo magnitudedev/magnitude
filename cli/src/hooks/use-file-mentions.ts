@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import path from 'node:path'
 import { statSync } from 'node:fs'
 
 import { resolveRgPath } from '@magnitudedev/ripgrep'
@@ -201,17 +202,28 @@ function detectQuery(inputText: string, cursorPosition: number): string | null {
   return match[1] ?? ''
 }
 
-function toFileItem(path: string): MentionFileItem {
-  const ext = getExt(path)
+function toFileItem(pathValue: string, workspacePath: string): MentionFileItem {
+  const ext = getExt(pathValue)
   const contentType: MentionFileItem['contentType'] = IMAGE_EXTENSIONS.has(ext) ? 'image' : 'text'
   let warning = false
   try {
-    const s = statSync(path)
-    warning = s.size > LARGE_FILE_WARNING_BYTES
+    const candidates = workspacePath
+      ? [path.resolve(workspacePath, pathValue), pathValue]
+      : [pathValue]
+    let size = 0
+    for (const candidate of candidates) {
+      try {
+        size = statSync(candidate).size
+        break
+      } catch {
+        continue
+      }
+    }
+    warning = size > LARGE_FILE_WARNING_BYTES
   } catch {
     warning = false
   }
-  return { path, kind: 'file', contentType, warning }
+  return { path: pathValue, kind: 'file', contentType, warning }
 }
 
 function toDirectoryItem(path: string): MentionFileItem {
@@ -259,17 +271,22 @@ export function useFileMentions(
     return () => { cancelled = true }
   }, [isOpen])
 
+  const workspacePath = process.env.M || process.env.MAGNITUDE_WORKSPACE_PATH
+  if (!workspacePath) {
+    console.error('[use-file-mentions] Missing workspace path env var (M or MAGNITUDE_WORKSPACE_PATH)')
+  }
+
   const { items, recentItems, overflowCount } = useMemo(() => {
     if (!isOpen) return { items: [], recentItems: [], overflowCount: 0 }
 
     const directories = collectDirectories(indexedFiles)
     const allCandidates: MentionFileItem[] = [
-      ...indexedFiles.map(toFileItem),
+      ...indexedFiles.map((filePath) => toFileItem(filePath, workspacePath!)),
       ...directories.map(toDirectoryItem),
     ]
 
     if (!queryLower) {
-      const recent = recentFiles.map(toFileItem)
+      const recent = recentFiles.map((filePath) => toFileItem(filePath, workspacePath!))
       const recentSet = new Set(recent.map((item) => item.path))
       const rest = allCandidates
         .filter((item) => !(item.kind === 'file' && recentSet.has(item.path)))
@@ -298,7 +315,7 @@ export function useFileMentions(
       recentItems: [],
       overflowCount: Math.max(0, ranked.length - MAX_VISIBLE_RESULTS),
     }
-  }, [isOpen, indexedFiles, recentFiles, queryLower])
+  }, [isOpen, indexedFiles, recentFiles, queryLower, workspacePath])
 
   const prevSignatureRef = useRef<string>('')
   useEffect(() => {

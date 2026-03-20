@@ -26,14 +26,12 @@ import { AgentRoutingProjection } from './projections/agent-routing'
 import { AgentStatusProjection } from './projections/agent-status'
 import { CompactionProjection } from './projections/compaction'
 
-import { ArtifactProjection } from './projections/artifact'
-
 import { ReplayProjection } from './projections/replay'
 import { ChatTitleProjection } from './projections/chat-title'
 import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
 import { OutboundMessagesProjection } from './projections/outbound-messages'
-import { ArtifactAwarenessProjection } from './projections/artifact-awareness'
+import { FileAwarenessProjection } from './projections/file-awareness'
 import { BackgroundProcessesProjection } from './projections/background-processes'
 
 // Workers
@@ -48,7 +46,6 @@ import { ApprovalWorker } from './workers/approval-worker'
 import type { AgentVariant } from './agents'
 import { ChatTitleWorker } from './workers/chat-title-worker'
 import { UserPresenceWorker } from './workers/user-presence-worker'
-import { ArtifactSyncWorker } from './workers/artifact-sync-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
 
 // Execution
@@ -87,12 +84,10 @@ export const CodingAgent = Agent.define<AppEvent>()({
     TurnProjection,
     CanonicalTurnProjection,
 
-    ArtifactProjection,
-
     ReplayProjection,
     SubagentActivityProjection,
     OutboundMessagesProjection,
-    ArtifactAwarenessProjection,
+    FileAwarenessProjection,
     BackgroundProcessesProjection,
     MemoryProjection,
     DisplayProjection,
@@ -110,7 +105,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     CompactionWorker,
     ApprovalWorker,
 
-    ArtifactSyncWorker,
     FileMentionResolver,
 
     ChatTitleWorker,
@@ -130,8 +124,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
       compaction: CompactionProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
-
-      artifacts: ArtifactProjection,
     }
   }
 })

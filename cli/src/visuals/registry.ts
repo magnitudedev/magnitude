@@ -14,7 +14,7 @@ import {
   webSearchReducer, webFetchReducer,
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
-  artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
+
   agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
 } from '@magnitudedev/agent'
@@ -22,16 +22,15 @@ import type { VisualReducerRegistry, ToolVisualReducer } from '@magnitudedev/age
 
 // Renderers
 import { shellRender, shellLiveText } from './shell'
-import { readRender, writeRender, editRender, editClusterRender, treeRender, searchRender, readLiveText, writeLiveText, editLiveText, treeLiveText, searchLiveText } from './fs'
+import { readRender, treeRender, searchRender, readLiveText, treeLiveText, searchLiveText } from './fs'
 import {
   webSearchRender, webFetchRender,
   clickRender, doubleClickRender, rightClickRender, typeRender, scrollRender, dragRender,
   navigateRender, goBackRender, switchTabRender, newTabRender, screenshotRender, evaluateRender,
-  artifactSyncRender, artifactReadRender, artifactWriteRender, artifactUpdateRender,
+  fsWriteRender, editStreamRender, fsWriteLiveText, editStreamLiveText,
   agentCreateRender, agentDismissRender, agentMessageRender, parentMessageRender,
   skillRender,
   webSearchLiveText, webFetchLiveText, browserLiveText,
-  artifactSyncLiveText, artifactReadLiveText, artifactWriteLiveText, artifactUpdateLiveText,
   agentCreateLiveText, agentDismissLiveText, agentMessageLiveText, parentMessageLiveText,
   skillLiveText,
 } from './tools'
@@ -43,8 +42,8 @@ import {
 export const renderRegistry = createRenderRegistry({
   shell: shellRender,
   fileRead: readRender,
-  fileWrite: writeRender,
-  fileEdit: editRender,
+  fileWrite: fsWriteRender,
+  fileEdit: editStreamRender,
   fileTree: treeRender,
   fileSearch: searchRender,
   webSearch: webSearchRender,
@@ -62,10 +61,7 @@ export const renderRegistry = createRenderRegistry({
   newTab: newTabRender,
   screenshot: screenshotRender,
   evaluate: evaluateRender,
-  artifactSync: artifactSyncRender,
-  artifactRead: artifactReadRender,
-  artifactWrite: artifactWriteRender,
-  artifactUpdate: artifactUpdateRender,
+
   agentCreate: agentCreateRender,
 
   agentDismiss: agentDismissRender,
@@ -85,7 +81,7 @@ const allReducers: readonly ToolVisualReducer[] = [
   webSearchReducer, webFetchReducer,
   clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
   navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
-  artifactSyncReducer, artifactReadReducer, artifactWriteReducer, artifactUpdateReducer,
+
   agentCreateReducer, agentDismissReducer, agentMessageReducer, parentMessageReducer,
   skillReducer,
 ]
@@ -105,8 +101,8 @@ setVisualRegistry(reducerRegistry)
 export const liveTextRegistry = createLiveTextRegistry({
   shell: ({ state }) => shellLiveText({ state: state as any }),
   fileRead: ({ state }) => readLiveText({ state: state as any }),
-  fileWrite: ({ state }) => writeLiveText({ state: state as any }),
-  fileEdit: ({ state }) => editLiveText({ state: state as any }),
+  fileWrite: ({ state }) => fsWriteLiveText({ state: state as any }),
+  fileEdit: ({ state }) => editStreamLiveText({ state: state as any }),
   fileTree: ({ state }) => treeLiveText({ state: state as any }),
   fileSearch: ({ state }) => searchLiveText({ state: state as any }),
   webSearch: ({ state }) => webSearchLiveText({ state: state as any }),
@@ -125,10 +121,6 @@ export const liveTextRegistry = createLiveTextRegistry({
   screenshot: ({ state }) => browserLiveText({ state: state as any }),
   evaluate: ({ state }) => browserLiveText({ state: state as any }),
 
-  artifactSync: ({ state }) => artifactSyncLiveText({ state: state as any }),
-  artifactRead: ({ state }) => artifactReadLiveText({ state: state as any }),
-  artifactWrite: ({ state }) => artifactWriteLiveText({ state: state as any }),
-  artifactUpdate: ({ state }) => artifactUpdateLiveText({ state: state as any }),
   agentCreate: ({ state }) => agentCreateLiveText({ state: state as any }),
 
   agentDismiss: ({ state }) => agentDismissLiveText({ state: state as any }),
@@ -138,5 +130,4 @@ export const liveTextRegistry = createLiveTextRegistry({
 })
 
 export const clusterRenderRegistry = createClusterRenderRegistry({
-  edit: editClusterRender,
 })

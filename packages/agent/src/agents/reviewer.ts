@@ -12,7 +12,6 @@ import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 
 import { thinkTool } from '../tools/globals'
-import { artifactReadTool } from '../tools/artifact-tools'
 import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
 import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
@@ -49,7 +48,6 @@ const tools = toolSet({
   fileView:       viewTool,
   shell:          shellTool,
   shellBg:        shellBgTool,
-  artifactRead:   artifactReadTool,
 
   agentCreate:    agentCreateTool,
   agentDismiss:   agentDismissTool,

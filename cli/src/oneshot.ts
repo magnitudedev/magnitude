@@ -106,12 +106,14 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
 
   initLogger(persistence.getSessionId())
 
-  const sessionContext = await collectSessionContext({
-    cwd: process.cwd(),
+  const cwd = process.cwd()
+  const baseSessionContext = await collectSessionContext({
+    cwd,
     memoryEnabled: false,
     storage,
     oneshot: { prompt },
   })
+  const sessionContext = { ...baseSessionContext, workspacePath: cwd }
 
   const persistenceLayer = Layer.succeed(ChatPersistence, persistence)
 

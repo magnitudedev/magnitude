@@ -15,8 +15,8 @@ interface ChatSurfaceKeyboardProps {
   setNextEscWillClearInput: (next: boolean) => void
   clearInputTimeoutRef: RefObject<NodeJS.Timeout | null>
   onClearInput: () => void
-  selectedArtifactOpen: boolean
-  onCloseArtifact: () => void
+  selectedFileOpen: boolean
+  onCloseFilePanel: () => void
   bashMode: boolean
   onExitBashMode: () => void
   fileMentionOpen: boolean
@@ -40,8 +40,8 @@ export function ChatSurfaceKeyboard({
   setNextEscWillClearInput,
   clearInputTimeoutRef,
   onClearInput,
-  selectedArtifactOpen,
-  onCloseArtifact,
+  selectedFileOpen,
+  onCloseFilePanel,
   bashMode,
   onExitBashMode,
   fileMentionOpen,
@@ -64,9 +64,9 @@ export function ChatSurfaceKeyboard({
         return
       }
 
-      if (isEscape && selectedArtifactOpen) {
+      if (isEscape && selectedFileOpen) {
         key.preventDefault()
-        onCloseArtifact()
+        onCloseFilePanel()
         return
       }
 
@@ -155,8 +155,8 @@ export function ChatSurfaceKeyboard({
       setNextEscWillClearInput,
       clearInputTimeoutRef,
       onClearInput,
-      selectedArtifactOpen,
-      onCloseArtifact,
+      selectedFileOpen,
+      onCloseFilePanel,
       bashMode,
       onExitBashMode,
       fileMentionOpen,

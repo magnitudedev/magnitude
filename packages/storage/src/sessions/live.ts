@@ -18,7 +18,6 @@ import {
   removePendingMemoryJob,
   resolvePendingMemoryJobPath,
   writePendingMemoryJob,
-  writeSessionArtifact,
   writeSessionMeta,
   createSessionWorkspace,
   updateSessionMeta,
@@ -42,8 +41,6 @@ export const SessionStorageLive = Layer.effect(
         sessionEventsFile: globalStorage.paths.sessionEventsFile,
         sessionLogFile: globalStorage.paths.sessionLogFile,
         sessionWorkspace: globalStorage.paths.sessionWorkspace,
-        sessionArtifactsDir: globalStorage.paths.sessionArtifactsDir,
-        sessionArtifactFile: globalStorage.paths.sessionArtifactFile,
         pendingMemoryJobFile: globalStorage.paths.pendingMemoryJobFile,
       },
 
@@ -81,11 +78,6 @@ export const SessionStorageLive = Layer.effect(
       clearLog: (sessionId) =>
         Effect.promise(() =>
           clearSessionLog(globalStorage.paths, sessionId)
-        ),
-
-      writeArtifact: (sessionId, name, content, options) =>
-        Effect.promise(() =>
-          writeSessionArtifact(globalStorage.paths, sessionId, name, content, options)
         ),
 
       createSessionWorkspace: (sessionId, cwd) =>

@@ -1,5 +1,3 @@
-import { createLowlight, common } from 'lowlight'
-import type { Element, RootContent as HastRootContent, Text as HastText } from 'hast'
 import { renderMermaidAscii } from 'beautiful-mermaid'
 import type {
   AlignType,
@@ -18,9 +16,10 @@ import type {
   TableCell,
   Text,
 } from 'mdast'
-import type { MarkdownPalette, SyntaxColors } from './theme'
+import { normalizeReferencedPath } from '@magnitudedev/agent'
+import type { MarkdownPalette } from './theme'
 
-const lowlight = createLowlight(common)
+import { tryHighlight } from './highlight-file'
 
 export interface SourceRange {
   start: number
@@ -34,7 +33,9 @@ export interface Span {
   bold?: boolean
   italic?: boolean
   dim?: boolean
+  url?: string
   ref?: { name: string; section?: string; label?: string }
+  fileRef?: { path: string; section?: string }
 }
 
 export interface HighlightRange {
@@ -133,7 +134,7 @@ interface InlineStyle {
   dim?: boolean
 }
 
-type PhrasingNode = Text | Link | Image | Html | import('mdast').WikiLink | { type: 'strong' | 'emphasis' | 'delete'; children: PhrasingNode[] } | { type: 'inlineCode'; value: string; position?: any } | { type: 'break' }
+type PhrasingNode = Text | Link | Image | Html | { type: 'strong' | 'emphasis' | 'delete'; children: PhrasingNode[] } | { type: 'inlineCode'; value: string; position?: any } | { type: 'break' }
 
 function sourceOf(node: { position?: { start?: { offset?: number }; end?: { offset?: number } } }): SourceRange {
   return {
@@ -177,9 +178,12 @@ function mergeAdjacentSpans(spans: Span[]): Span[] {
       prev.bold === span.bold &&
       prev.italic === span.italic &&
       prev.dim === span.dim &&
+      prev.url === span.url &&
       prev.ref?.name === span.ref?.name &&
       prev.ref?.section === span.ref?.section &&
-      prev.ref?.label === span.ref?.label
+      prev.ref?.label === span.ref?.label &&
+      prev.fileRef?.path === span.fileRef?.path &&
+      prev.fileRef?.section === span.fileRef?.section
     ) {
       prev.text += span.text
     } else {
@@ -237,6 +241,7 @@ function getSourceSlice(sourceText: string | undefined, node: { position?: { sta
   return end >= start ? sourceText.slice(start, end) : undefined
 }
 
+
 function renderInline(
   nodes: readonly PhrasingNode[] | undefined,
   style: InlineStyle,
@@ -274,9 +279,32 @@ function renderInline(
           ),
         )
         break
-      case 'link':
-        spans.push(...renderInline(node.children as PhrasingNode[], { ...style, fg: style.fg ?? palette.linkFg }, highlights, palette, sourceText))
+      case 'link': {
+        const linkStyle = { ...style, fg: style.fg ?? palette.linkFg }
+        const childSpans = renderInline(node.children as PhrasingNode[], linkStyle, highlights, palette, sourceText)
+        if (node.url.includes('://') || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(node.url)) {
+          spans.push(...childSpans.map((span) => ({ ...span, url: node.url })))
+          break
+        }
+
+        const hashIndex = node.url.indexOf('#')
+        const rawPath = hashIndex >= 0 ? node.url.slice(0, hashIndex) : node.url
+        const rawSection = hashIndex >= 0 ? node.url.slice(hashIndex + 1) : undefined
+        const section = rawSection ? rawSection : undefined
+        const workspacePrefix = '$M/'
+        const normalizedPath = rawPath.startsWith(workspacePrefix)
+          ? normalizeReferencedPath(rawPath.slice(workspacePrefix.length))
+          : normalizeReferencedPath(rawPath)
+
+        if (normalizedPath) {
+          const resolvedPath = rawPath.startsWith(workspacePrefix) ? `${workspacePrefix}${normalizedPath}` : normalizedPath
+          spans.push(...childSpans.map((span) => ({ ...span, fileRef: { path: resolvedPath, section } })))
+          break
+        }
+
+        spans.push(...childSpans)
         break
+      }
       case 'image':
         spans.push(
           ...splitByHighlights(
@@ -291,18 +319,7 @@ function renderInline(
       case 'break':
         spans.push({ text: '\n', ...style })
         break
-      case 'wikiLink': {
-        const target = (node as any).value ?? ''
-        const alias = (node as any).data?.alias as string | undefined
-        const [name, section] = target.split('#', 2)
-        const hasExplicitLabel = alias != null && alias !== target
-        const displayText = hasExplicitLabel ? alias : (getSourceSlice(sourceText, node) ?? `[[${target}]]`)
-        const ref = { name, section: section || undefined, label: hasExplicitLabel ? alias : undefined }
-        spans.push(
-          ...splitByHighlights(displayText, sourceStart(node), sourceEnd(node), { ...style, ref }, highlights),
-        )
-        break
-      }
+
     }
   }
 
@@ -328,8 +345,7 @@ function extractInlinePlainText(nodes: readonly PhrasingNode[] | undefined, sour
         case 'delete':
         case 'link':
           return extractInlinePlainText((node as any).children, sourceText)
-        case 'wikiLink':
-          return getSourceSlice(sourceText, node) ?? `[[${node.value ?? ''}]]`
+
         default:
           return ''
       }
@@ -337,93 +353,6 @@ function extractInlinePlainText(nodes: readonly PhrasingNode[] | undefined, sour
     .join('')
 }
 
-function hljsClassToColor(classNames: string[], syntax: SyntaxColors): string {
-  for (const cls of classNames) {
-    switch (cls) {
-      case 'hljs-keyword':
-        return syntax.keyword
-      case 'hljs-string':
-      case 'hljs-template-string':
-      case 'hljs-regexp':
-        return syntax.string
-      case 'hljs-number':
-        return syntax.number
-      case 'hljs-comment':
-        return syntax.comment
-      case 'hljs-title':
-      case 'hljs-function':
-        return syntax.function
-      case 'hljs-variable':
-      case 'hljs-attr':
-      case 'hljs-params':
-        return syntax.variable
-      case 'hljs-type':
-      case 'hljs-built_in':
-      case 'hljs-class':
-        return syntax.type
-      case 'hljs-operator':
-        return syntax.operator
-      case 'hljs-property':
-        return syntax.property
-      case 'hljs-punctuation':
-        return syntax.punctuation
-      case 'hljs-literal':
-        return syntax.literal
-    }
-  }
-  return syntax.default
-}
-
-function highlightToLines(nodes: HastRootContent[], syntax: SyntaxColors): Span[][] {
-  const lines: Span[][] = [[]]
-
-  const walk = (node: HastRootContent, inheritedColor?: string): void => {
-    if (node.type === 'text') {
-      const textNode = node as HastText
-      const parts = textNode.value.split('\n')
-      parts.forEach((part, idx) => {
-        if (idx > 0) lines.push([])
-        if (part) lines[lines.length - 1].push({ text: part, fg: inheritedColor ?? syntax.default })
-      })
-      return
-    }
-
-    if (node.type === 'element') {
-      const el = node as Element
-      const classNames = (el.properties?.className as string[]) ?? []
-      const color = hljsClassToColor(classNames, syntax)
-      for (const child of el.children) walk(child as HastRootContent, color)
-    }
-  }
-
-  for (const node of nodes) walk(node)
-  return lines
-}
-
-function tryHighlight(code: string, lang: string, syntax: SyntaxColors): Span[][] | null {
-  const langMap: Record<string, string> = {
-    ts: 'typescript',
-    js: 'javascript',
-    py: 'python',
-    rb: 'ruby',
-    rs: 'rust',
-    sh: 'bash',
-    zsh: 'bash',
-    yml: 'yaml',
-    jsx: 'javascript',
-    tsx: 'typescript',
-  }
-
-  const normalizedLang = langMap[lang] ?? lang
-  if (!lowlight.registered(normalizedLang)) return null
-
-  try {
-    const result = lowlight.highlight(normalizedLang, code)
-    return highlightToLines(result.children as HastRootContent[], syntax)
-  } catch {
-    return null
-  }
-}
 
 function applyHighlightsToCodeLine(
   line: Span[],

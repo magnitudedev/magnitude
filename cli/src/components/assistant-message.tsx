@@ -10,14 +10,14 @@ interface AssistantMessageProps {
   content: string
   isStreaming: boolean
   isInterrupted?: boolean
-  onOpenArtifact?: (name: string, section?: string) => void
+  onFileClick?: (path: string, section?: string) => void
 }
 
 export const AssistantMessage = memo(function AssistantMessage({
   content,
   isStreaming,
   isInterrupted,
-  onOpenArtifact,
+  onFileClick,
 }: AssistantMessageProps) {
   const theme = useTheme()
   const markdownPalette = buildMarkdownColorPalette(theme)
@@ -39,7 +39,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         palette={markdownPalette}
         contentWidth={contentWidth}
         showCursor={showCursor && !pendingText}
-        onOpenArtifact={onOpenArtifact}
+        onOpenFile={onFileClick}
       />
       {pendingText && (
         <text style={{ fg: theme.foreground, wrapMode: 'word' }}>

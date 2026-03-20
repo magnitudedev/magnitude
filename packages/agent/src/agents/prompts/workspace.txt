@@ -13,5 +13,6 @@ Key details:
 - You do NOT need permission to read or write anything in `$M/`
 - The project directory has normal permission rules
 - Use `$M` in shell commands (it's an env var) and in tool paths like `fs-read`, `fs-write`, `edit`
+- Share workspace files with other agents by linking to files in messages using markdown link syntax (e.g., [plan.md]($M/plan.md))
 
 Use your workspace to externalize your thinking, build utilities, prototype solutions, and keep notes that survive context compaction.
