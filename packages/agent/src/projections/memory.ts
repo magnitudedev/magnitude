@@ -24,7 +24,7 @@ import {
 import { UserPresenceProjection } from './user-presence'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { ContentPart, textParts, wrapTextParts } from '../content'
-import { formatAgentIdleNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
+import { formatAgentIdleNotification, formatSubagentUserKilledNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
 import { FileAwarenessProjection } from './file-awareness'
 
 export type MessageSource = 'user' | 'agent' | 'system'
@@ -500,6 +500,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       const text = formatAgentIdleNotification(value.agentId, value.type, value.reason)
 
+      const entry: SystemEntry = { kind: 'reminder', text }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.parentForkId, {
+          ...parentState,
+          queuedMessages: [...parentState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
+        })
+      }
+    }),
+
+    on(AgentStatusProjection.signals.subagentUserKilled, ({ value, state }) => {
+      const parentState = state.forks.get(value.parentForkId)
+      if (!parentState) return state
+
+      const text = formatSubagentUserKilledNotification(value.agentId, value.type)
       const entry: SystemEntry = { kind: 'reminder', text }
 
       return {

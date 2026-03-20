@@ -229,6 +229,36 @@ test('ThinkBlock summary includes killed subagent counts', () => {
   expect(text).toContain('Completed in 8s (1 subagent started, 1 subagent killed) · Show')
 })
 
+test('ThinkBlock renders user-killed subagent row with dedicated text', () => {
+  const now = Date.now()
+  const markup = render(
+    <ThinkBlock
+      block={{
+        id: 't-user-killed',
+        type: 'think',
+        timestamp: now,
+        status: 'completed',
+        completedAt: now + 1000,
+        steps: [
+          {
+            id: 's1',
+            type: 'subagent_user_killed',
+            subagentId: 'researcher',
+            title: 'gather evidence',
+            timestamp: now + 500,
+            label: '',
+          },
+        ],
+      }}
+      isCollapsed={false}
+      onToggle={() => {}}
+    />,
+  )
+
+  const text = htmlToText(markup)
+  expect(text).toContain('■ Subagent killed by user: researcher - gather evidence')
+})
+
 test('ThinkBlock applies spacing around consecutive subagent lifecycle rows, not between each row', () => {
   const html = render(
     <ThinkBlock

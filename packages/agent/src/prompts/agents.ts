@@ -205,6 +205,10 @@ export function formatAgentIdleNotification(
   return `<agent_idle agentId="${agentId}">Agent ${agentId} (${agentType}) has gone idle and will not take further action until you message it.</agent_idle>`
 }
 
+export function formatSubagentUserKilledNotification(agentId: string, agentType: string): string {
+  return `<subagent_user_killed agentId="${agentId}" agentType="${agentType}">Subagent ${agentId} (${agentType}) was killed by the user.</subagent_user_killed>`
+}
+
 export function formatAgentsStatus(
   agents: readonly { agentId: string; type: string; status: string }[]
 ): string | null {

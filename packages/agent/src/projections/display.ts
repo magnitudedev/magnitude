@@ -148,6 +148,13 @@ export interface SubagentKilledStep {
   readonly title: string
 }
 
+export interface SubagentUserKilledStep {
+  readonly id: string
+  readonly type: 'subagent_user_killed'
+  readonly subagentId: string
+  readonly title: string
+}
+
 export type ThinkBlockStep =
   | ThinkingStep
   | ToolStep
@@ -155,6 +162,7 @@ export type ThinkBlockStep =
   | SubagentStartedStep
   | SubagentFinishedStep
   | SubagentKilledStep
+  | SubagentUserKilledStep
 
 export interface ThinkBlockMessage {
   readonly id: string
@@ -1522,9 +1530,23 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       if (!parentState) return state
 
       const messages = parentState.messages.filter((m) => !(m.type === 'fork_activity' && m.forkId === value.forkId))
+      let nextParentState: DisplayState = { ...parentState, messages }
+
+      const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
+      const step: SubagentUserKilledStep = {
+        id: generateId(),
+        type: 'subagent_user_killed',
+        subagentId: value.agentId,
+        title: value.title,
+      }
+      nextParentState = {
+        ...withBlock.fork,
+        messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
+      }
+
       return {
         ...state,
-        forks: new Map(state.forks).set(value.parentForkId, { ...parentState, messages })
+        forks: new Map(state.forks).set(value.parentForkId, nextParentState)
       }
     }),
 

@@ -192,7 +192,7 @@ describe('display subagent lifecycle think steps', () => {
     })
   })
 
-  it('removes fork activity but does not add think step for subagent_user_killed', async () => {
+  it('removes fork activity and adds subagent_user_killed think step for subagent_user_killed', async () => {
     const rootDisplay = await makeRootDisplay([
       {
         type: 'agent_created',
@@ -221,7 +221,11 @@ describe('display subagent lifecycle think steps', () => {
     expect(forkActivity.length).toBe(0)
 
     const allSteps = rootDisplay.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
-    const killed = allSteps.filter((s: any) => s.type === 'subagent_killed')
-    expect(killed.length).toBe(0)
+    const userKilled = allSteps.filter((s: any) => s.type === 'subagent_user_killed')
+    expect(userKilled.length).toBe(1)
+    expect(userKilled[0]).toMatchObject({
+      subagentId: 'agent-sub',
+      title: 'Builder',
+    })
   })
 })

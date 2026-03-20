@@ -71,12 +71,13 @@ const SubagentFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: '
   )
 }
 
-const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_killed' }> }) => {
+const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_killed' | 'subagent_user_killed' }> }) => {
   const theme = useTheme()
+  const message = step.type === 'subagent_user_killed' ? 'Subagent killed by user: ' : 'Subagent killed: '
   return (
     <text>
       <span style={{ fg: theme.error }}>■ </span>
-      <span style={{ fg: theme.muted }}>Subagent killed: </span>
+      <span style={{ fg: theme.muted }}>{message}</span>
       <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
       <span style={{ fg: theme.muted }}> - {step.title}</span>
     </text>
@@ -161,7 +162,7 @@ function groupByCluster(steps: readonly ThinkBlockStep[]): StepGroup[] {
   const groups: StepGroup[] = []
   for (const step of steps) {
     const cluster = step.cluster ?? null
-    const syntheticCluster = step.type === 'subagent_started' || step.type === 'subagent_finished' || step.type === 'subagent_killed'
+    const syntheticCluster = step.type === 'subagent_started' || step.type === 'subagent_finished' || step.type === 'subagent_killed' || step.type === 'subagent_user_killed'
       ? '__subagent_lifecycle__'
       : cluster
     const last = groups[groups.length - 1]
@@ -367,7 +368,7 @@ const StepGroupView = memo(function StepGroupView({
           return <SubagentFinishedRow key={step.id} step={step} />
         }
 
-        if (step.type === 'subagent_killed') {
+        if (step.type === 'subagent_killed' || step.type === 'subagent_user_killed') {
           return <SubagentKilledRow key={step.id} step={step} />
         }
 

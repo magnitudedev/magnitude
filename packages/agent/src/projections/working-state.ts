@@ -403,7 +403,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       return newFork
     },
 
-
   },
 
   signalHandlers: (on) => [
