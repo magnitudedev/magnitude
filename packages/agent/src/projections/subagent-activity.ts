@@ -141,14 +141,32 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       const userMessageIdsByFork = new Map(state.userMessageIdsByFork)
       userMessageIdsByFork.delete(event.forkId)
 
-      const pendingArtifacts = new Map(state.pendingArtifacts)
-      pendingArtifacts.delete(event.forkId)
+      const pendingFiles = new Map(state.pendingFiles)
+      pendingFiles.delete(event.forkId)
 
       return {
         ...state,
         pendingProse,
         userMessageIdsByFork,
-        pendingArtifacts,
+        pendingFiles,
+      }
+    },
+
+    subagent_user_killed: ({ event, state }) => {
+      const pendingProse = new Map(state.pendingProse)
+      pendingProse.delete(event.forkId)
+
+      const userMessageIdsByFork = new Map(state.userMessageIdsByFork)
+      userMessageIdsByFork.delete(event.forkId)
+
+      const pendingFiles = new Map(state.pendingFiles)
+      pendingFiles.delete(event.forkId)
+
+      return {
+        ...state,
+        pendingProse,
+        userMessageIdsByFork,
+        pendingFiles,
       }
     },
   },

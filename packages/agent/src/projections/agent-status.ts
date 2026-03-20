@@ -68,6 +68,42 @@ export interface AgentKilledSignal {
   readonly timestamp: number
 }
 
+export interface SubagentUserKilledSignal {
+  readonly agentId: string
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly type: string
+  readonly title: string
+  readonly source: 'tab_close_confirm'
+  readonly timestamp: number
+}
+
+function removeKilledAgent(args: {
+  forkId: string
+  agentId: string
+  timestamp: number
+  state: AgentStatusState
+}): { state: AgentStatusState; agent: AgentInfo | null } {
+  const { forkId, agentId, timestamp, state } = args
+  const agent = getAgentByForkId(state, forkId)
+  if (!agent) return { state, agent: null }
+  if (agent.agentId !== agentId) return { state, agent: null }
+
+  const nextAgents = new Map(state.agents)
+  nextAgents.delete(agent.agentId)
+  const nextByFork = new Map(state.agentByForkId)
+  nextByFork.delete(forkId)
+
+  return {
+    state: {
+      ...state,
+      agents: nextAgents,
+      agentByForkId: nextByFork,
+    },
+    agent,
+  }
+}
+
 export function getAgentByForkId(state: AgentStatusState, forkId: string): AgentInfo | undefined {
   const agentId = state.agentByForkId.get(forkId)
   if (!agentId) return undefined
@@ -92,6 +128,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     agentBecameIdle: Signal.create<AgentBecameIdleSignal>('AgentStatus/agentBecameIdle'),
     agentBecameWorking: Signal.create<AgentBecameWorkingSignal>('AgentStatus/agentBecameWorking'),
     agentKilled: Signal.create<AgentKilledSignal>('AgentStatus/agentKilled'),
+    subagentUserKilled: Signal.create<SubagentUserKilledSignal>('AgentStatus/subagentUserKilled'),
   },
 
   eventHandlers: {
@@ -215,30 +252,47 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     },
 
     agent_killed: ({ event, state, emit }) => {
-      const agent = getAgentByForkId(state, event.forkId)
-      if (!agent) return state
-      if (agent.agentId !== event.agentId) return state
+      const removed = removeKilledAgent({
+        forkId: event.forkId,
+        agentId: event.agentId,
+        timestamp: event.timestamp,
+        state,
+      })
+      if (!removed.agent) return state
 
       emit.agentKilled({
-        agentId: agent.agentId,
-        forkId: agent.forkId,
-        parentForkId: agent.parentForkId,
-        type: agent.role,
-        title: agent.name,
+        agentId: removed.agent.agentId,
+        forkId: removed.agent.forkId,
+        parentForkId: removed.agent.parentForkId,
+        type: removed.agent.role,
+        title: removed.agent.name,
         reason: event.reason,
         timestamp: event.timestamp,
       })
 
-      const nextAgents = new Map(state.agents)
-      nextAgents.delete(agent.agentId)
-      const nextByFork = new Map(state.agentByForkId)
-      nextByFork.delete(event.forkId)
+      return removed.state
+    },
 
-      return {
-        ...state,
-        agents: nextAgents,
-        agentByForkId: nextByFork,
-      }
+    subagent_user_killed: ({ event, state, emit }) => {
+      const removed = removeKilledAgent({
+        forkId: event.forkId,
+        agentId: event.agentId,
+        timestamp: event.timestamp,
+        state,
+      })
+      if (!removed.agent) return state
+
+      emit.subagentUserKilled({
+        agentId: removed.agent.agentId,
+        forkId: removed.agent.forkId,
+        parentForkId: removed.agent.parentForkId,
+        type: removed.agent.role,
+        title: removed.agent.name,
+        source: event.source,
+        timestamp: event.timestamp,
+      })
+
+      return removed.state
     },
   },
 

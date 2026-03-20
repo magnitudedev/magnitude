@@ -138,6 +138,7 @@ function AppInner({
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
   const [selectedTabForkId, setSelectedTabForkId] = useState<string | null>(null)
+  const [dismissedIdleForkIds, setDismissedIdleForkIds] = useState<Set<string>>(new Set())
   const popForkOverlay = () => {
     setExpandedForkStack(s => s.slice(0, -1))
     setSelectedTabForkId(null)
@@ -637,6 +638,7 @@ function AppInner({
     client,
     rootDisplayMessages: display?.messages ?? [],
     agentStatusState,
+    dismissedIdleForkIds,
   })
 
   const selectedForkId = useMemo(
@@ -687,6 +689,27 @@ function AppInner({
       setSelectedTabForkId(null)
     }
   }, [selectedTabForkId, selectedForkId])
+
+  useEffect(() => {
+    if (!display) return
+    const latestByFork = new Map(
+      display.messages
+        .filter((message): message is Extract<typeof message, { type: 'fork_activity' }> => message.type === 'fork_activity')
+        .map((message) => [message.forkId, message] as const)
+    )
+
+    setDismissedIdleForkIds((prev) => {
+      if (prev.size === 0) return prev
+      const next = new Set<string>()
+      for (const forkId of prev) {
+        const activity = latestByFork.get(forkId)
+        if (!activity) continue
+        if (activity.status === 'running') continue
+        next.add(forkId)
+      }
+      return next.size === prev.size ? prev : next
+    })
+  }, [display])
 
   const activeDisplay = selectedForkId ? forkDisplay : display
 
@@ -1930,6 +1953,22 @@ function AppInner({
               handleWidgetKeyEvent: widgetNavigation.handleKeyEvent,
               enterBashMode: () => setBashMode(true),
               exitBashMode: exitBashMode,
+              dismissIdleSubagentTab: (forkId) => {
+                setDismissedIdleForkIds((prev) => new Set(prev).add(forkId))
+              },
+              requestActiveSubagentKill: ({ forkId, agentId }) => {
+                const agent = agentStatusState
+                  ? Array.from(agentStatusState.agents.values()).find((a) => a.forkId === forkId && a.agentId === agentId)
+                  : undefined
+                const parentForkId = agent?.parentForkId ?? null
+                client?.send({
+                  type: 'subagent_user_killed',
+                  forkId,
+                  parentForkId,
+                  agentId,
+                  source: 'tab_close_confirm',
+                })
+              },
             }}
             displayMessages={(activeDisplay ?? display).messages}
             subagentTabs={subagentTabs}

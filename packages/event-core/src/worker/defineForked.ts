@@ -63,8 +63,8 @@ type ExtractHandlerRequirements<THandlers> = THandlers extends ForkedWorkerEvent
 export interface ForkLifecycle<TEvent extends BaseEvent> {
   /** Event type that triggers spawning a new fork fiber */
   readonly activateOn: TEvent['type']
-  /** Optional event type that triggers interrupting a fork fiber */
-  readonly completeOn?: TEvent['type']
+  /** Optional event type(s) that trigger interrupting a fork fiber */
+  readonly completeOn?: TEvent['type'] | readonly TEvent['type'][]
 }
 
 /**
@@ -226,8 +226,13 @@ export function defineForked<TEvent extends ForkableEvent>() {
         ...handlerEventTypes,
         config.forkLifecycle.activateOn,
       ])
-      if (config.forkLifecycle.completeOn !== undefined) {
-        allEventTypes.add(config.forkLifecycle.completeOn)
+      const completeOnTypes = config.forkLifecycle.completeOn === undefined
+        ? []
+        : Array.isArray(config.forkLifecycle.completeOn)
+          ? config.forkLifecycle.completeOn
+          : [config.forkLifecycle.completeOn]
+      for (const completeType of completeOnTypes) {
+        allEventTypes.add(completeType)
       }
 
       // -----------------------------------------------------------------------
@@ -388,7 +393,7 @@ export function defineForked<TEvent extends ForkableEvent>() {
             }
 
             // --- Lifecycle: complete ---
-            if (config.forkLifecycle.completeOn !== undefined && event.type === config.forkLifecycle.completeOn) {
+            if (completeOnTypes.includes(event.type as TEvent['type'])) {
               if (forkId !== null) {
                 const fibers = yield* Ref.get(forkFibers)
                 const forkFiber = fibers.get(forkId)

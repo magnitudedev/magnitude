@@ -48,6 +48,11 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
       const execManager = yield* ExecutionManager
       yield* execManager.disposeFork(event.forkId)
     }).pipe(Effect.orDie),
+
+    subagent_user_killed: (event) => Effect.gen(function* () {
+      const execManager = yield* ExecutionManager
+      yield* execManager.disposeFork(event.forkId)
+    }).pipe(Effect.orDie),
   },
 
   signalHandlers: (on) => [

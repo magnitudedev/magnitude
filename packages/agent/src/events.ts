@@ -398,6 +398,15 @@ export interface AgentKilled {
   readonly reason: string
 }
 
+/** Active subagent explicitly killed by user from subagent tab close confirmation */
+export interface SubagentUserKilled {
+  readonly type: 'subagent_user_killed'
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly agentId: string
+  readonly source: 'tab_close_confirm'
+}
+
 // =============================================================================
 // Compaction Events
 // =============================================================================
@@ -542,4 +551,5 @@ export type AppEvent =
   // Agent events
   | AgentCreated
   | AgentKilled
+  | SubagentUserKilled
   | UserReturnConfirmed

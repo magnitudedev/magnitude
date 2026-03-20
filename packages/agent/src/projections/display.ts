@@ -452,7 +452,20 @@ const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: st
 const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: string }, unknown>(forkToolStepSignalDef, 'Display')
 
 const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
-  commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
+  commands: 0,
+  reads: 0,
+  writes: 0,
+  edits: 0,
+  searches: 0,
+  webSearches: 0,
+  webFetches: 0,
+  artifactWrites: 0,
+  artifactUpdates: 0,
+  clicks: 0,
+  navigations: 0,
+  inputs: 0,
+  evaluations: 0,
+  other: 0
 }
 
 function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
@@ -1290,6 +1303,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     },
 
     agent_killed: ({ fork }) => fork,
+    subagent_user_killed: ({ fork }) => fork,
 
 
   },
@@ -1500,6 +1514,17 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       return {
         ...state,
         forks: new Map(state.forks).set(value.parentForkId, nextParentState)
+      }
+    }),
+
+    on(AgentStatusProjection.signals.subagentUserKilled, ({ value, state }) => {
+      const parentState = state.forks.get(value.parentForkId)
+      if (!parentState) return state
+
+      const messages = parentState.messages.filter((m) => !(m.type === 'fork_activity' && m.forkId === value.forkId))
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.parentForkId, { ...parentState, messages })
       }
     }),
 

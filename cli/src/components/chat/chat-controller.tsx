@@ -1,4 +1,4 @@
-import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Attachment, ImageAttachment, ImageMediaType } from '@magnitudedev/agent'
 import { createId } from '@magnitudedev/generate-id'
@@ -70,6 +70,9 @@ export function ChatController(props: ChatControllerProps) {
   const clearInputTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const [isProviderHovered, setIsProviderHovered] = useState(false)
   const [isModelHovered, setIsModelHovered] = useState(false)
+  const [pendingKillForkId, setPendingKillForkId] = useState<string | null>(null)
+  const [isKillCancelHovered, setIsKillCancelHovered] = useState(false)
+  const [isKillConfirmHovered, setIsKillConfirmHovered] = useState(false)
   const multilineInputRef = useRef<MultilineInputHandle | null>(null)
 
   useEffect(() => {
@@ -389,6 +392,10 @@ export function ChatController(props: ChatControllerProps) {
     ? null
     : (subagentTabs.find((tab) => tab.forkId === selectedForkId)?.agentId ?? selectedForkId)
 
+  const pendingKillTab = pendingKillForkId == null
+    ? null
+    : (subagentTabs.find((tab) => tab.forkId === pendingKillForkId) ?? null)
+
   return (
     <>
       <ChatSurfaceKeyboard
@@ -422,7 +429,18 @@ export function ChatController(props: ChatControllerProps) {
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
           <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 0, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
-            <SubagentTabBar tabs={subagentTabs} selectedForkId={selectedForkId} onSelect={onSubagentTabSelect} />
+            <SubagentTabBar
+              tabs={subagentTabs}
+              selectedForkId={selectedForkId}
+              onSelect={onSubagentTabSelect}
+              onCloseTab={(forkId, phase) => {
+                if (phase === 'idle') {
+                  services.dismissIdleSubagentTab(forkId)
+                  return
+                }
+                setPendingKillForkId(forkId)
+              }}
+            />
             {!env.bashMode && fileMentions.isOpen && (
               <FileMentionMenu
                 isOpen={fileMentions.isOpen}
@@ -529,6 +547,37 @@ export function ChatController(props: ChatControllerProps) {
           )}
         </box>
       </box>
+
+      {pendingKillTab && (
+        <box style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: RGBA.fromInts(0, 0, 0, 153) }}>
+          <box style={{ borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: env.theme.border, backgroundColor: env.theme.surface, customBorderChars: BOX_CHARS, minWidth: 52, maxWidth: 72, paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0 }}>
+            <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
+              <text style={{ fg: env.theme.foreground }}>Kill active subagent {pendingKillTab.agentId}?</text>
+              <text style={{ fg: env.theme.muted }}>This removes all subagent progress.</text>
+              <box style={{ height: 1 }} />
+              <box style={{ flexDirection: 'row', justifyContent: 'flex-end', gap: 1 }}>
+                <Button onClick={() => setPendingKillForkId(null)} onMouseOver={() => setIsKillCancelHovered(true)} onMouseOut={() => setIsKillCancelHovered(false)}>
+                  <box style={{ borderStyle: 'single', borderColor: isKillCancelHovered ? env.theme.foreground : env.theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+                    <text style={{ fg: isKillCancelHovered ? env.theme.foreground : env.theme.muted }}>Cancel</text>
+                  </box>
+                </Button>
+                <Button
+                  onClick={() => {
+                    services.requestActiveSubagentKill({ forkId: pendingKillTab.forkId, agentId: pendingKillTab.agentId })
+                    setPendingKillForkId(null)
+                  }}
+                  onMouseOver={() => setIsKillConfirmHovered(true)}
+                  onMouseOut={() => setIsKillConfirmHovered(false)}
+                >
+                  <box style={{ borderStyle: 'single', borderColor: isKillConfirmHovered ? env.theme.error : env.theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
+                    <text style={{ fg: isKillConfirmHovered ? env.theme.error : env.theme.foreground }}>Kill subagent</text>
+                  </box>
+                </Button>
+              </box>
+            </box>
+          </box>
+        </box>
+      )}
     </>
   )
 }
