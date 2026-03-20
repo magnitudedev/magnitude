@@ -4,6 +4,7 @@ import { useTheme } from '../../hooks/use-theme'
 import { Button } from '../button'
 import { TAB_BORDER_CHARS } from '../../utils/ui-constants'
 import { slate } from '../../utils/palette'
+import { getDisplayWidth, padEndToDisplayWidth, truncateToDisplayWidth } from '../../utils/strings'
 
 import type { SubagentTabItem } from './types'
 
@@ -46,16 +47,6 @@ function formatElapsedMs(elapsedMs: number): string {
   const m = Math.floor(elapsed / 60)
   const s = elapsed % 60
   return `${m}:${String(s).padStart(2, '0')}`
-}
-
-function truncate(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str
-  return str.slice(0, maxLen - 1) + '…'
-}
-
-function padRight(str: string, len: number): string {
-  if (str.length >= len) return str
-  return str + ' '.repeat(len - str.length)
 }
 
 export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkId, onSelect, onCloseTab }: Props) {
@@ -150,11 +141,20 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
             const detailsPart = `• ${resumedMark}${timer}`
             const line1Prefix = isIdle ? '○ ' : '● '
             const line1Suffix = ` ${detailsPart}`
-            const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - line1Suffix.length - 2
-            const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))
-            const line1Rest = padRight(line1Suffix, line1Suffix.length + 1)
+            const prefixWidth = getDisplayWidth(line1Prefix)
+            const suffixWidth = getDisplayWidth(line1Suffix)
+            const nameBudget = Math.max(1, TAB_INNER_WIDTH - prefixWidth - suffixWidth)
+            const namePart = truncateToDisplayWidth(tab.agentId, nameBudget)
+            const line1RestWidth = Math.max(0, TAB_INNER_WIDTH - prefixWidth - getDisplayWidth(namePart))
+            const line1Rest = padEndToDisplayWidth(
+              truncateToDisplayWidth(line1Suffix, line1RestWidth),
+              line1RestWidth,
+            )
             // const line2 = truncate(tab.toolSummaryLine, TAB_INNER_WIDTH)
-            const line2 = truncate(tab.statusLine, TAB_INNER_WIDTH)
+            const line2 = padEndToDisplayWidth(
+              truncateToDisplayWidth(tab.statusLine, TAB_INNER_WIDTH),
+              TAB_INNER_WIDTH,
+            )
             const isRunning = tab.phase === 'active'
             const pulseColor = PULSE_SLATE_SHADES[Math.floor(now / 200) % PULSE_SLATE_SHADES.length]
             const dotColor = isRunning ? pulseColor : slate[500]
@@ -165,6 +165,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
                 style={{
                   flexDirection: 'row',
                   alignItems: 'flex-start',
+                  flexShrink: 0,
                   borderStyle: 'single',
                   border: ['left', 'right', 'top', 'bottom'],
                   borderColor: tabBorderColor,
@@ -172,12 +173,24 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
                 }}
               >
                 <Button
+                  style={{ flexShrink: 0 }}
                   onClick={() => onSelect(tab.forkId)}
                   onMouseOver={() => setHoveredId(tab.forkId)}
                   onMouseOut={() => setHoveredId(null)}
                 >
-                  <box style={{ paddingLeft: 1, flexDirection: 'column', width: TAB_INNER_WIDTH, height: 2, minHeight: 2, maxHeight: 2 }}>
-                    <box style={{ flexDirection: 'row' }}>
+                  <box style={{
+                    paddingLeft: 1,
+                    paddingRight: 1,
+                    flexDirection: 'column',
+                    flexShrink: 0,
+                    width: TAB_INNER_WIDTH + 2,
+                    minWidth: TAB_INNER_WIDTH + 2,
+                    maxWidth: TAB_INNER_WIDTH + 2,
+                    height: 2,
+                    minHeight: 2,
+                    maxHeight: 2,
+                  }}>
+                    <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
                       <text style={{ fg: dotColor }}>{line1Prefix}</text>
                       <text style={{ fg: tabIdColor }}>{namePart}</text>
                       <text style={{ fg: tabRestLine1Color }}>{line1Rest}</text>
@@ -185,7 +198,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
                     <text style={{ fg: tabTextColor }}>{line2}</text>
                   </box>
                 </Button>
-                <box style={{ width: 2, height: 2, minHeight: 2, maxHeight: 2, justifyContent: 'flex-start' }}>
+                <box style={{ width: 2, minWidth: 2, maxWidth: 2, flexShrink: 0, height: 2, minHeight: 2, maxHeight: 2, justifyContent: 'flex-start' }}>
                   <Button
                     onClick={() => onCloseTab(tab.forkId, tab.phase)}
                     onMouseOver={() => setCloseHoveredId(tab.forkId)}

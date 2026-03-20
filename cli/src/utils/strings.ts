@@ -42,6 +42,54 @@ export function wrapTextToVisualLines(text: string, maxWidth: number): string[] 
   return lines
 }
 
+export function getDisplayWidth(text: string): number {
+  return stringWidth(text)
+}
+
+export function truncateToDisplayWidth(
+  text: string,
+  maxWidth: number,
+  ellipsis = '…',
+): string {
+  const safeWidth = Math.max(0, Math.floor(maxWidth))
+  if (safeWidth === 0) return ''
+  if (getDisplayWidth(text) <= safeWidth) return text
+
+  const ellipsisWidth = getDisplayWidth(ellipsis)
+  if (safeWidth <= ellipsisWidth) {
+    let clippedEllipsis = ''
+    let width = 0
+    for (const char of ellipsis) {
+      const charWidth = Math.max(1, stringWidth(char))
+      if (width + charWidth > safeWidth) break
+      clippedEllipsis += char
+      width += charWidth
+    }
+    return clippedEllipsis
+  }
+
+  const contentWidth = safeWidth - ellipsisWidth
+  let output = ''
+  let width = 0
+  for (const char of text) {
+    const charWidth = Math.max(1, stringWidth(char))
+    if (width + charWidth > contentWidth) break
+    output += char
+    width += charWidth
+  }
+
+  return output + ellipsis
+}
+
+export function padEndToDisplayWidth(text: string, targetWidth: number): string {
+  const safeWidth = Math.max(0, Math.floor(targetWidth))
+  let output = text
+  while (getDisplayWidth(output) < safeWidth) {
+    output += ' '
+  }
+  return output
+}
+
 export function formatPastePlaceholder(charCount: number): string {
   return `[${charCount.toLocaleString()} characters pasted]`
 }
