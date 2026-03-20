@@ -108,7 +108,7 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
       subagentFinished++
       continue
     }
-    if (step.type === 'subagent_killed') {
+    if (step.type === 'subagent_killed' || step.type === 'subagent_user_killed') {
       subagentKilled++
       continue
     }

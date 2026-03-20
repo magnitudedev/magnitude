@@ -190,7 +190,7 @@ test('ThinkBlock completed summary includes plural subagent lifecycle counts', (
   expect(text).toContain('Completed in 8s (2 subagents started, 2 subagents finished) · Show')
 })
 
-test('ThinkBlock summary includes killed subagent counts', () => {
+test('ThinkBlock summary includes killed subagent counts from both kill sources', () => {
   const now = Date.now()
   const markup = render(
     <ThinkBlock
@@ -218,6 +218,14 @@ test('ThinkBlock summary includes killed subagent counts', () => {
             timestamp: now + 2000,
             label: '',
           },
+          {
+            id: 's3',
+            type: 'subagent_user_killed',
+            subagentId: 'builder',
+            title: 'fix tests',
+            timestamp: now + 3000,
+            label: '',
+          },
         ],
       }}
       isCollapsed={true}
@@ -226,7 +234,7 @@ test('ThinkBlock summary includes killed subagent counts', () => {
   )
 
   const text = htmlToText(markup)
-  expect(text).toContain('Completed in 8s (1 subagent started, 1 subagent killed) · Show')
+  expect(text).toContain('Completed in 8s (1 subagent started, 2 subagents killed) · Show')
 })
 
 test('ThinkBlock renders user-killed subagent row with dedicated text', () => {
