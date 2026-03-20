@@ -59,4 +59,52 @@ describe('AgentStatusProjection user kill semantics', () => {
     expect(state.agents.size).toBe(0)
     expect(state.agentByForkId.size).toBe(0)
   })
+
+  it('removes agent on subagent_idle_closed without requiring agent_killed', async () => {
+    const projectionBusLayer = Layer.provideMerge(
+      makeProjectionBusLayer<AppEvent>(),
+      Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
+    )
+
+    const runtimeLayer = Layer.mergeAll(
+      FrameworkErrorPubSubLive,
+      Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
+      projectionBusLayer,
+      Layer.provide(AgentStatusProjection.Layer, projectionBusLayer),
+    )
+
+    const program = Effect.gen(function* () {
+      const bus = yield* ProjectionBusTag<AppEvent>()
+      const projection = yield* AgentStatusProjection.Tag
+
+      yield* bus.processEvent({
+        type: 'agent_created',
+        timestamp: ts(1),
+        forkId: 'fork-sub',
+        parentForkId: null,
+        agentId: 'agent-sub',
+        role: 'builder',
+        name: 'Builder',
+        context: 'ctx',
+        mode: 'spawn',
+        taskId: 'task-1',
+        message: '',
+      } as any)
+
+      yield* bus.processEvent({
+        type: 'subagent_idle_closed',
+        timestamp: ts(2),
+        forkId: 'fork-sub',
+        parentForkId: null,
+        agentId: 'agent-sub',
+        source: 'idle_tab_close',
+      } as any)
+
+      return yield* projection.get
+    })
+
+    const state = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any)
+    expect(state.agents.size).toBe(0)
+    expect(state.agentByForkId.size).toBe(0)
+  })
 })

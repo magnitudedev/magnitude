@@ -407,6 +407,15 @@ export interface SubagentUserKilled {
   readonly source: 'tab_close_confirm'
 }
 
+/** Idle subagent tab explicitly closed by user from tab close (silent durable close) */
+export interface SubagentIdleClosed {
+  readonly type: 'subagent_idle_closed'
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly agentId: string
+  readonly source: 'idle_tab_close'
+}
+
 // =============================================================================
 // Compaction Events
 // =============================================================================
@@ -552,4 +561,5 @@ export type AppEvent =
   | AgentCreated
   | AgentKilled
   | SubagentUserKilled
+  | SubagentIdleClosed
   | UserReturnConfirmed

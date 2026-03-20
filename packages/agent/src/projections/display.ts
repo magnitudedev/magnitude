@@ -1312,6 +1312,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
     agent_killed: ({ fork }) => fork,
     subagent_user_killed: ({ fork }) => fork,
+    subagent_idle_closed: ({ fork }) => fork,
 
 
   },
@@ -1547,6 +1548,17 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       return {
         ...state,
         forks: new Map(state.forks).set(value.parentForkId, nextParentState)
+      }
+    }),
+
+    on(AgentStatusProjection.signals.subagentIdleClosed, ({ value, state }) => {
+      const parentState = state.forks.get(value.parentForkId)
+      if (!parentState) return state
+
+      const messages = parentState.messages.filter((m) => !(m.type === 'fork_activity' && m.forkId === value.forkId))
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.parentForkId, { ...parentState, messages }),
       }
     }),
 

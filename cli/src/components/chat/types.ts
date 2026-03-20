@@ -41,7 +41,7 @@ export type ChatControllerServices = {
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
   enterBashMode: () => void
   exitBashMode: () => void
-  dismissIdleSubagentTab: (forkId: string) => void
+  requestIdleSubagentClose: (payload: { forkId: string; agentId: string }) => void
   requestActiveSubagentKill: (payload: { forkId: string; agentId: string }) => void
 }
 

@@ -169,6 +169,24 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
         pendingFiles,
       }
     },
+
+    subagent_idle_closed: ({ event, state }) => {
+      const pendingProse = new Map(state.pendingProse)
+      pendingProse.delete(event.forkId)
+
+      const userMessageIdsByFork = new Map(state.userMessageIdsByFork)
+      userMessageIdsByFork.delete(event.forkId)
+
+      const pendingFiles = new Map(state.pendingFiles)
+      pendingFiles.delete(event.forkId)
+
+      return {
+        ...state,
+        pendingProse,
+        userMessageIdsByFork,
+        pendingFiles,
+      }
+    },
   },
 
   signalHandlers: (on) => [

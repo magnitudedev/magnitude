@@ -20,7 +20,6 @@ type UseSubagentTabsArgs = {
   client: AgentClientLike | null
   rootDisplayMessages: readonly DisplayMessage[]
   agentStatusState: AgentStatusState | null
-  dismissedIdleForkIds?: ReadonlySet<string>
 }
 
 type ForkMeta = {
@@ -129,7 +128,6 @@ export function useSubagentTabs({
   client,
   rootDisplayMessages,
   agentStatusState,
-  dismissedIdleForkIds,
 }: UseSubagentTabsArgs): SubagentTabItem[] {
   const [forkMessages, setForkMessages] = useState<Record<string, readonly DisplayMessage[]>>({})
   const [forkPendingDirectUser, setForkPendingDirectUser] = useState<Record<string, { pending: boolean; since: number | null }>>({})
@@ -218,7 +216,6 @@ export function useSubagentTabs({
           pendingDirect: forkPendingDirectUser[forkId],
         })
       ))
-      .filter((tab) => !(tab.phase === 'idle' && dismissedIdleForkIds?.has(tab.forkId)))
       .sort(sortSubagentTabs)
-  }, [forkMeta, forkMessages, forkPendingDirectUser, dismissedIdleForkIds])
+  }, [forkMeta, forkMessages, forkPendingDirectUser])
 }

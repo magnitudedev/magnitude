@@ -54,6 +54,11 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
       yield* execManager.disposeFork(event.forkId)
       yield* publish({ type: 'wake', forkId: event.parentForkId })
     }).pipe(Effect.orDie),
+
+    subagent_idle_closed: (event) => Effect.gen(function* () {
+      const execManager = yield* ExecutionManager
+      yield* execManager.disposeFork(event.forkId)
+    }).pipe(Effect.orDie),
   },
 
   signalHandlers: (on) => [

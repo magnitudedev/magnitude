@@ -324,5 +324,35 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         deferredParentMessages,
       }
     },
+
+    subagent_idle_closed: ({ event, state }) => {
+      const routedAgentId = state.agentByForkId.get(event.forkId)
+      if (!routedAgentId) return state
+      if (routedAgentId !== event.agentId) return state
+
+      const agents = new Map(state.agents)
+      agents.delete(event.agentId)
+
+      const agentByForkId = new Map(state.agentByForkId)
+      agentByForkId.delete(event.forkId)
+
+      const pendingMessages = new Map(state.pendingMessages)
+      for (const [id, pending] of pendingMessages.entries()) {
+        if (pending.forkId === event.forkId || pending.dest === event.agentId) {
+          pendingMessages.delete(id)
+        }
+      }
+
+      const deferredParentMessages = new Map(state.deferredParentMessages)
+      deferredParentMessages.delete(event.forkId)
+
+      return {
+        ...state,
+        agents,
+        agentByForkId,
+        pendingMessages,
+        deferredParentMessages,
+      }
+    },
   },
 }))

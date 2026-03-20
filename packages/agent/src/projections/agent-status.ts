@@ -78,6 +78,16 @@ export interface SubagentUserKilledSignal {
   readonly timestamp: number
 }
 
+export interface SubagentIdleClosedSignal {
+  readonly agentId: string
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly type: string
+  readonly title: string
+  readonly source: 'idle_tab_close'
+  readonly timestamp: number
+}
+
 function removeKilledAgent(args: {
   forkId: string
   agentId: string
@@ -129,6 +139,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     agentBecameWorking: Signal.create<AgentBecameWorkingSignal>('AgentStatus/agentBecameWorking'),
     agentKilled: Signal.create<AgentKilledSignal>('AgentStatus/agentKilled'),
     subagentUserKilled: Signal.create<SubagentUserKilledSignal>('AgentStatus/subagentUserKilled'),
+    subagentIdleClosed: Signal.create<SubagentIdleClosedSignal>('AgentStatus/subagentIdleClosed'),
   },
 
   eventHandlers: {
@@ -283,6 +294,28 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       if (!removed.agent) return state
 
       emit.subagentUserKilled({
+        agentId: removed.agent.agentId,
+        forkId: removed.agent.forkId,
+        parentForkId: removed.agent.parentForkId,
+        type: removed.agent.role,
+        title: removed.agent.name,
+        source: event.source,
+        timestamp: event.timestamp,
+      })
+
+      return removed.state
+    },
+
+    subagent_idle_closed: ({ event, state, emit }) => {
+      const removed = removeKilledAgent({
+        forkId: event.forkId,
+        agentId: event.agentId,
+        timestamp: event.timestamp,
+        state,
+      })
+      if (!removed.agent) return state
+
+      emit.subagentIdleClosed({
         agentId: removed.agent.agentId,
         forkId: removed.agent.forkId,
         parentForkId: removed.agent.parentForkId,

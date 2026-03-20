@@ -528,7 +528,11 @@ export function ChatController(props: ChatControllerProps) {
               onSelect={onSubagentTabSelect}
               onCloseTab={(forkId, phase) => {
                 if (phase === 'idle') {
-                  services.dismissIdleSubagentTab(forkId)
+                  const idleTab = subagentTabs.find((tab) => tab.forkId === forkId)
+                  services.requestIdleSubagentClose({
+                    forkId,
+                    agentId: idleTab?.agentId ?? forkId,
+                  })
                   return
                 }
                 setPendingKillForkId(forkId)

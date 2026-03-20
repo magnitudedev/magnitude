@@ -228,4 +228,39 @@ describe('display subagent lifecycle think steps', () => {
       title: 'Builder',
     })
   })
+
+  it('removes fork activity and does not add subagent_user_killed/subagent_killed think steps for subagent_idle_closed', async () => {
+    const rootDisplay = await makeRootDisplay([
+      {
+        type: 'agent_created',
+        timestamp: ts(1),
+        forkId: 'fork-sub',
+        parentForkId: null,
+        agentId: 'agent-sub',
+        role: 'builder',
+        name: 'Builder',
+        context: 'ctx',
+        mode: 'spawn',
+        taskId: 'task-1',
+        message: '',
+      } as any,
+      {
+        type: 'subagent_idle_closed',
+        timestamp: ts(2),
+        forkId: 'fork-sub',
+        parentForkId: null,
+        agentId: 'agent-sub',
+        source: 'idle_tab_close',
+      } as any,
+    ])
+
+    const forkActivity = rootDisplay.messages.filter((m: any) => m.type === 'fork_activity' && m.forkId === 'fork-sub')
+    expect(forkActivity.length).toBe(0)
+
+    const allSteps = rootDisplay.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
+    const userKilled = allSteps.filter((s: any) => s.type === 'subagent_user_killed')
+    const killed = allSteps.filter((s: any) => s.type === 'subagent_killed')
+    expect(userKilled.length).toBe(0)
+    expect(killed.length).toBe(0)
+  })
 })
