@@ -16,8 +16,8 @@
   },
   "dependencies": {
     "@commander-js/extra-typings": "^14.0.0",
-    "@opentui/core": "0.1.77",
-    "@opentui/react": "0.1.77",
+    "@opentui/core": "0.1.88",
+    "@opentui/react": "0.1.88",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/image": "workspace:*",
     "@magnitudedev/ripgrep": "workspace:*",

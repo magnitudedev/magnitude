@@ -4,6 +4,7 @@ import { InputCursor } from './multiline-input'
 import { BOX_CHARS } from '../utils/ui-constants'
 import { useTheme } from '../hooks/use-theme'
 import type { InputValue } from '../utils/strings'
+import { decodePasteBytes } from '@opentui/core'
 import type { ScrollBoxRenderable } from '@opentui/core'
 
 interface ChatInputProps {
@@ -229,7 +230,7 @@ export const ChatInput = memo(function ChatInput({
         stickyStart="bottom"
         scrollbarOptions={{ visible: false }}
         verticalScrollbarOptions={{ visible: false }}
-        onPaste={(event) => onPaste(event.text)}
+        onPaste={(event) => onPaste(decodePasteBytes(event.bytes))}
         style={{
           flexGrow: 1,
           flexShrink: 0,

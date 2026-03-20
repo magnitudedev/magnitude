@@ -1,4 +1,4 @@
-import { TextAttributes } from '@opentui/core'
+import { TextAttributes, decodePasteBytes } from '@opentui/core'
 import { logger } from '@magnitudedev/logger'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import {
@@ -41,6 +41,7 @@ import type {
 import { applyTextEditWithPastesAndMentions } from '../utils/strings'
 import type {
   KeyEvent,
+  LineInfo,
   MouseEvent,
   ScrollBoxRenderable,
   TextBufferView,
@@ -68,6 +69,78 @@ function renderIndexToSourceIndex(text: string, renderPos: number): number {
   }
 
   return Math.min(sourcePos, text.length)
+}
+
+function computeLogicalLineStarts(text: string): number[] {
+  const starts = [0]
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\n') {
+      starts.push(i + 1)
+    }
+  }
+  return starts
+}
+
+function columnToCharOffsetInLine(
+  text: string,
+  lineStartOffset: number,
+  lineEndOffsetExclusive: number,
+  targetCol: number,
+): number {
+  let charOffset = lineStartOffset
+  let currentCol = 0
+  const clampedTargetCol = Math.max(0, targetCol)
+
+  while (charOffset < lineEndOffsetExclusive && currentCol < clampedTargetCol) {
+    currentCol += text[charOffset] === '\t' ? TAB_WIDTH : 1
+    charOffset++
+  }
+
+  return Math.min(charOffset, lineEndOffsetExclusive)
+}
+
+function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null): number[] {
+  if (
+    !lineInfo ||
+    !Array.isArray(lineInfo.lineSources) ||
+    !Array.isArray(lineInfo.lineStartCols) ||
+    lineInfo.lineSources.length === 0 ||
+    lineInfo.lineStartCols.length === 0
+  ) {
+    return [0]
+  }
+
+  const logicalLineStarts = computeLogicalLineStarts(text)
+  const visualLineCount = Math.min(lineInfo.lineSources.length, lineInfo.lineStartCols.length)
+  const visualLineStarts: number[] = []
+
+  for (let i = 0; i < visualLineCount; i++) {
+    const rawSourceLineIndex = lineInfo.lineSources[i]
+    const sourceLineIndex = Number.isFinite(rawSourceLineIndex)
+      ? Math.max(0, Math.min(logicalLineStarts.length - 1, rawSourceLineIndex))
+      : 0
+    const rawStartCol = lineInfo.lineStartCols[i]
+    const startCol = Number.isFinite(rawStartCol) ? Math.max(0, rawStartCol) : 0
+
+    const lineStart = logicalLineStarts[sourceLineIndex] ?? 0
+    const nextLogicalLineStart = logicalLineStarts[sourceLineIndex + 1] ?? text.length + 1
+    const lineEndExclusive = text[nextLogicalLineStart - 1] === '\n'
+      ? nextLogicalLineStart - 1
+      : Math.min(nextLogicalLineStart, text.length)
+
+    const derivedStart = columnToCharOffsetInLine(
+      text,
+      lineStart,
+      lineEndExclusive,
+      startCol,
+    )
+
+    const prev = visualLineStarts[i - 1]
+    const nonDecreasingStart = prev === undefined ? derivedStart : Math.max(prev, derivedStart)
+    visualLineStarts.push(Math.max(0, Math.min(text.length, nonDecreasingStart)))
+  }
+
+  return visualLineStarts.length > 0 ? visualLineStarts : [0]
 }
 
 function sortSegments(segments: InputPasteSegment[]): InputPasteSegment[] {
@@ -366,6 +439,8 @@ export const MultilineInput = forwardRef<
     },
   )
 
+  const visualLineStarts = deriveVisualLineStarts(value, lineInfo)
+
   // Focus/blur scrollbox when focused prop changes
   const prevFocusedRef = useRef(false)
   useEffect(() => {
@@ -407,14 +482,12 @@ export const MultilineInput = forwardRef<
     [mountedRef],
   )
 
-  const cursorRow = lineInfo
-    ? Math.max(
-        0,
-        lineInfo.lineStarts.findLastIndex(
-          (lineStart) => lineStart <= cursorPosition,
-        ),
-      )
-    : 0
+  const cursorRow = Math.max(
+    0,
+    visualLineStarts.findLastIndex(
+      (lineStart) => lineStart <= cursorPosition,
+    ),
+  )
 
   // Auto-scroll to cursor when content changes
   useEffect(() => {
@@ -685,7 +758,7 @@ export const MultilineInput = forwardRef<
         )
         if (!renderableData) return
 
-        const lineStarts = lineInfo?.lineStarts ?? [0]
+        const lineStarts = visualLineStarts
 
         // Get click position, accounting for scroll
         const clickRowInViewport = Math.floor(event.y - renderableData.viewportTop)
@@ -1302,7 +1375,7 @@ export const MultilineInput = forwardRef<
 
       // Calculate visual line boundaries from lineInfo (accounts for word wrap)
       // Fall back to logical line boundaries if visual info is unavailable
-      const lineStarts = currentLineInfo?.lineStarts ?? []
+      const lineStarts = deriveVisualLineStarts(value, currentLineInfo)
       const visualLineIndex = lineStarts.findLastIndex(
         (start) => start <= cursorPosition,
       )
@@ -1730,8 +1803,7 @@ export const MultilineInput = forwardRef<
     const safeMaxHeight = Math.max(1, maxHeight)
     const effectiveMinHeight = Math.max(1, Math.min(minHeight, safeMaxHeight))
 
-    const totalLines =
-      lineInfo === null ? 0 : lineInfo.lineStarts.length
+    const totalLines = visualLineStarts.length
 
     // Add bottom gutter when cursor is on line 2 of exactly 2 lines
     const gutterEnabled =
@@ -1775,8 +1847,9 @@ export const MultilineInput = forwardRef<
         trackOptions: { width: 1 },
       }}
       onPaste={(event) => {
-        logger.debug({ text: event.text?.substring(0, 50) }, 'SCROLLBOX PASTE EVENT')
-        handlePasteEvent(event)
+        const text = decodePasteBytes(event.bytes)
+        logger.debug({ text: text?.substring(0, 50) }, 'SCROLLBOX PASTE EVENT')
+        handlePasteEvent({ text })
       }}
       onMouseDown={handleMouseDown}
       style={{

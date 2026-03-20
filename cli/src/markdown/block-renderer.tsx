@@ -151,8 +151,8 @@ const SpanRenderer = memo(function SpanRenderer({
         const localY = event.y - el.y
         const view = (el as unknown as Record<string, unknown>).textBufferView as TextBufferView
         const info: LineInfo = view.lineInfo
-        if (localY < 0 || localY >= info.lineStarts.length) return null
-        const charIndex = info.lineStarts[localY] + localX
+        if (localY < 0 || localY >= info.lineStartCols.length) return null
+        const charIndex = info.lineStartCols[localY] + localX
         for (let i = 0; i < hitZones.length; i++) {
           if (charIndex >= hitZones[i].charStart && charIndex < hitZones[i].charEnd) return i
         }

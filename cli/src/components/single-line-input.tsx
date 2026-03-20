@@ -1,4 +1,4 @@
-import { type KeyEvent } from '@opentui/core'
+import { type KeyEvent, decodePasteBytes } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -167,7 +167,7 @@ export function SingleLineInput({
     <box
       focusable={focused}
       focused={focused}
-      onPaste={handlePasteEvent}
+      onPaste={(event) => handlePasteEvent({ text: decodePasteBytes(event.bytes) })}
     >
       <text style={{ fg: isPlaceholder ? theme.muted : theme.foreground }}>
         {isPlaceholder ? (
