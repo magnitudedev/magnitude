@@ -89,17 +89,9 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
   const mainBorderColor = mainSelected || mainHovered ? theme.link : theme.border
 
   return (
-    <scrollbox
-      ref={scrollBoxRef}
-      scrollX={true}
-      scrollbarOptions={{ visible: false }}
-      horizontalScrollbarOptions={{ visible: false }}
-      verticalScrollbarOptions={{ visible: false }}
-      style={{ flexShrink: 0, maxHeight: 4 }}
-    >
-      <box style={{ flexDirection: 'row', flexWrap: 'no-wrap', flexShrink: 0, alignItems: 'flex-start' }}>
+    <box style={{ flexDirection: 'row', flexWrap: 'no-wrap', flexShrink: 0, alignItems: 'flex-start' }}>
       <Button
-        style={{ alignSelf: 'flex-start' }}
+        style={{ alignSelf: 'flex-start', flexShrink: 0 }}
         onClick={() => onSelect(null)}
         onMouseOver={() => setHoveredId('main')}
         onMouseOut={() => setHoveredId(null)}
@@ -123,69 +115,79 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         </box>
       </Button>
 
-      {tabs.length === 0 ? (
-        <box style={{ paddingLeft: 3, paddingRight: 1, flexDirection: 'column', height: 3, minHeight: 3, maxHeight: 3 }}>
-          <text style={{ fg: theme.foreground }}> </text>
-          <text style={{ fg: theme.foreground }}>No subagents yet.</text>
-          <text style={{ fg: theme.muted }}>Subagent activity will appear here.</text>
-        </box>
-      ) : tabs.map((tab) => {
-        const isIdle = tab.phase === 'idle'
-        const isSelected = selectedForkId === tab.forkId
-        const isHovered = hoveredId === tab.forkId
-
-        const tabBorderColor = isSelected || isHovered ? theme.foreground : theme.border
-        const tabTextColor = isSelected || isHovered ? theme.foreground : theme.muted
-        const tabIdColor = theme.foreground
-        const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
-
-        const elapsedMs = tab.phase === 'active'
-          ? tab.accumulatedActiveMs + Math.max(0, now - tab.activeSince)
-          : tab.accumulatedActiveMs
-        const timer = formatElapsedMs(elapsedMs)
-        const resumedMark = tab.resumeCount > 0 ? '↺ ' : ''
-        const detailsPart = `• ${tab.toolCount} tools • ${resumedMark}${timer}`
-        const line1Prefix = isIdle ? '○ ' : '● '
-        const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - detailsPart.length - 1
-        const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))
-        const line1Rest = ` ${detailsPart}`
-        // const line2 = truncate(tab.toolSummaryLine, TAB_INNER_WIDTH)
-        const line2 = truncate(tab.statusLine, TAB_INNER_WIDTH)
-        const isRunning = tab.phase === 'active'
-        const pulseColor = PULSE_SLATE_SHADES[Math.floor(now / 200) % PULSE_SLATE_SHADES.length]
-        const dotColor = isRunning ? pulseColor : slate[500]
-
-        return (
-          <Button
-            key={tab.forkId}
-            onClick={() => onSelect(tab.forkId)}
-            onMouseOver={() => setHoveredId(tab.forkId)}
-            onMouseOut={() => setHoveredId(null)}
-          >
-            <box
-              style={{
-                flexDirection: 'row',
-                alignItems: 'flex-start',
-                borderStyle: 'single',
-                border: ['left', 'right', 'top', 'bottom'],
-                borderColor: tabBorderColor,
-                customBorderChars: TAB_BORDER_CHARS,
-              }}
-            >
-              <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', width: TAB_INNER_WIDTH + 2, height: 2, minHeight: 2, maxHeight: 2 }}>
-                <box style={{ flexDirection: 'row' }}>
-                  <text style={{ fg: dotColor }}>{line1Prefix}</text>
-                  <text style={{ fg: tabIdColor }}>{namePart}</text>
-                  <text style={{ fg: tabRestLine1Color }}>{line1Rest}</text>
-                </box>
-                {/* <text style={{ fg: tabTextColor }}>{line2}</text> */}
-                <text style={{ fg: tabTextColor }}>{line2}</text>
-              </box>
+      <scrollbox
+        ref={scrollBoxRef}
+        scrollX={true}
+        scrollbarOptions={{ visible: false }}
+        horizontalScrollbarOptions={{ visible: false }}
+        verticalScrollbarOptions={{ visible: false }}
+        style={{ flexGrow: 1, flexShrink: 1, minWidth: 0, maxHeight: 4 }}
+      >
+        <box style={{ flexDirection: 'row', flexWrap: 'no-wrap', flexShrink: 0, alignItems: 'flex-start' }}>
+          {tabs.length === 0 ? (
+            <box style={{ paddingLeft: 3, paddingRight: 1, flexDirection: 'column', height: 3, minHeight: 3, maxHeight: 3 }}>
+              <text style={{ fg: theme.foreground }}> </text>
+              <text style={{ fg: theme.foreground }}>No subagents yet.</text>
+              <text style={{ fg: theme.muted }}>Subagent activity will appear here.</text>
             </box>
-          </Button>
-        )
-      })}
-      </box>
-    </scrollbox>
+          ) : tabs.map((tab) => {
+            const isIdle = tab.phase === 'idle'
+            const isSelected = selectedForkId === tab.forkId
+            const isHovered = hoveredId === tab.forkId
+
+            const tabBorderColor = isSelected || isHovered ? theme.foreground : theme.border
+            const tabTextColor = isSelected || isHovered ? theme.foreground : theme.muted
+            const tabIdColor = theme.foreground
+            const tabRestLine1Color = isSelected || isHovered ? theme.foreground : theme.muted
+
+            const elapsedMs = tab.phase === 'active'
+              ? tab.accumulatedActiveMs + Math.max(0, now - tab.activeSince)
+              : tab.accumulatedActiveMs
+            const timer = formatElapsedMs(elapsedMs)
+            const resumedMark = tab.resumeCount > 0 ? '↺ ' : ''
+            const detailsPart = `• ${tab.toolCount} tools • ${resumedMark}${timer}`
+            const line1Prefix = isIdle ? '○ ' : '● '
+            const nameMaxLen = TAB_INNER_WIDTH - line1Prefix.length - detailsPart.length - 1
+            const namePart = truncate(tab.agentId, Math.max(1, nameMaxLen))
+            const line1Rest = ` ${detailsPart}`
+            // const line2 = truncate(tab.toolSummaryLine, TAB_INNER_WIDTH)
+            const line2 = truncate(tab.statusLine, TAB_INNER_WIDTH)
+            const isRunning = tab.phase === 'active'
+            const pulseColor = PULSE_SLATE_SHADES[Math.floor(now / 200) % PULSE_SLATE_SHADES.length]
+            const dotColor = isRunning ? pulseColor : slate[500]
+
+            return (
+              <Button
+                key={tab.forkId}
+                onClick={() => onSelect(tab.forkId)}
+                onMouseOver={() => setHoveredId(tab.forkId)}
+                onMouseOut={() => setHoveredId(null)}
+              >
+                <box
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'flex-start',
+                    borderStyle: 'single',
+                    border: ['left', 'right', 'top', 'bottom'],
+                    borderColor: tabBorderColor,
+                    customBorderChars: TAB_BORDER_CHARS,
+                  }}
+                >
+                  <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', width: TAB_INNER_WIDTH + 2, height: 2, minHeight: 2, maxHeight: 2 }}>
+                    <box style={{ flexDirection: 'row' }}>
+                      <text style={{ fg: dotColor }}>{line1Prefix}</text>
+                      <text style={{ fg: tabIdColor }}>{namePart}</text>
+                      <text style={{ fg: tabRestLine1Color }}>{line1Rest}</text>
+                    </box>
+                    {/* <text style={{ fg: tabTextColor }}>{line2}</text> */}
+                    <text style={{ fg: tabTextColor }}>{line2}</text>
+                  </box>
+                </box>
+              </Button>
+            )
+          })}
+        </box>
+      </scrollbox>
+    </box>
   )
 })
