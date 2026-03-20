@@ -1,5 +1,5 @@
-import { TextAttributes, decodePasteBytes } from '@opentui/core'
-import { logger } from '@magnitudedev/logger'
+import { TextAttributes } from '@opentui/core'
+
 import { useKeyboard, useRenderer } from '@opentui/react'
 import {
   forwardRef,
@@ -39,6 +39,7 @@ import type {
   InputValue,
 } from '../types/store'
 import { applyTextEditWithPastesAndMentions } from '../utils/strings'
+import { decodeNativePasteText } from './paste-events'
 import type {
   KeyEvent,
   LineInfo,
@@ -1847,9 +1848,7 @@ export const MultilineInput = forwardRef<
         trackOptions: { width: 1 },
       }}
       onPaste={(event) => {
-        const text = decodePasteBytes(event.bytes)
-        logger.debug({ text: text?.substring(0, 50) }, 'SCROLLBOX PASTE EVENT')
-        handlePasteEvent({ text })
+        handlePasteEvent({ text: decodeNativePasteText(event) })
       }}
       onMouseDown={handleMouseDown}
       style={{

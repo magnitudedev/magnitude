@@ -41,6 +41,62 @@ const EMPTY_INPUT: InputValue = {
 const INLINE_PASTE_PILL_CHAR_LIMIT = 1000
 const MAX_HISTORY = 200
 
+export type PasteFlowOutcome = 'clipboard-image' | 'empty' | 'pasted-image-path' | 'text-inline' | 'text-segment'
+
+export async function runChatPasteFlow(args: {
+  eventText?: string
+  readClipboardText: () => string
+  addClipboardImage: () => Promise<boolean>
+  addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
+  inlinePastePillCharLimit: number
+  insertText: (pasteText: string) => void
+  insertPasteSegment: (pasteText: string) => void
+}): Promise<PasteFlowOutcome> {
+  const eventText = args.eventText ?? ''
+  const hasNativeEventText = eventText.length > 0
+  const pasteText = hasNativeEventText ? eventText : args.readClipboardText()
+
+  if (!pasteText) {
+    const wasClipboardImage = await args.addClipboardImage()
+    if (wasClipboardImage) return 'clipboard-image'
+    return 'empty'
+  }
+
+  const wasImagePath = await args.addImageFromFilePath(pasteText)
+  if (wasImagePath) return 'pasted-image-path'
+
+  if (pasteText.length > args.inlinePastePillCharLimit) {
+    args.insertPasteSegment(pasteText)
+    return 'text-segment'
+  }
+
+  args.insertText(pasteText)
+  return 'text-inline'
+}
+
+export async function handleChatControllerPaste(args: {
+  eventText?: string
+  addClipboardImage: () => Promise<boolean>
+  addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
+  setInputValue: (updater: (prev: InputValue) => InputValue) => void
+}) {
+  await runChatPasteFlow({
+    eventText: args.eventText,
+    readClipboardText,
+    addClipboardImage: args.addClipboardImage,
+    addImageFromFilePath: args.addImageFromFilePath,
+    inlinePastePillCharLimit: INLINE_PASTE_PILL_CHAR_LIMIT,
+    insertText: (pasteText) => {
+      args.setInputValue((prev) =>
+        applyTextEditWithPastesAndMentions(prev, prev.cursorPosition, prev.cursorPosition, pasteText),
+      )
+    },
+    insertPasteSegment: (pasteText) => {
+      args.setInputValue((prev) => insertPasteSegment(prev, pasteText, createId()))
+    },
+  })
+}
+
 export function ChatController(props: ChatControllerProps) {
   const {
     env,
@@ -314,15 +370,11 @@ export function ChatController(props: ChatControllerProps) {
   }, [env.bashMode, nextEscWillClearInput, historyIndex, history])
 
   const handlePaste = useCallback(async (eventText?: string) => {
-    const wasClipboardImage = await addImageAttachment()
-    if (wasClipboardImage) return
-    const pasteText = eventText || readClipboardText()
-    if (!pasteText) return
-    const wasImagePath = await addImageAttachmentFromFilePath(pasteText)
-    if (wasImagePath) return
-    setInputValue(prev => {
-      if (pasteText.length > INLINE_PASTE_PILL_CHAR_LIMIT) return insertPasteSegment(prev, pasteText, createId())
-      return applyTextEditWithPastesAndMentions(prev, prev.cursorPosition, prev.cursorPosition, pasteText)
+    await handleChatControllerPaste({
+      eventText,
+      addClipboardImage: addImageAttachment,
+      addImageFromFilePath: addImageAttachmentFromFilePath,
+      setInputValue,
     })
   }, [addImageAttachment, addImageAttachmentFromFilePath])
 

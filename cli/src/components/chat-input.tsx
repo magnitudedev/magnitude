@@ -3,9 +3,10 @@ import { useState, useCallback, memo, useEffect, useRef } from 'react'
 import { InputCursor } from './multiline-input'
 import { BOX_CHARS } from '../utils/ui-constants'
 import { useTheme } from '../hooks/use-theme'
+import { usePasteHandler } from '../hooks/use-paste-handler'
 import type { InputValue } from '../utils/strings'
-import { decodePasteBytes } from '@opentui/core'
 import type { ScrollBoxRenderable } from '@opentui/core'
+import { decodeNativePasteText } from './paste-events'
 
 interface ChatInputProps {
   value?: string
@@ -61,6 +62,11 @@ export const ChatInput = memo(function ChatInput({
     const newCursor = cursorPosition + text.length
     updateValue(newValue, newCursor)
   }, [value, cursorPosition, updateValue])
+
+  const { handlePasteKey, handlePasteEvent } = usePasteHandler({
+    enabled: !disabled,
+    onPaste,
+  })
 
   useKeyboard(
     useCallback(
@@ -180,12 +186,7 @@ export const ChatInput = memo(function ChatInput({
           return
         }
 
-        // Paste with Ctrl+V (Cmd+V triggers bracketed paste via onPaste event)
-        if (key.ctrl && key.name === 'v') {
-          // Call onPaste with no argument - it will read from clipboard
-          onPaste()
-          return
-        }
+        if (handlePasteKey(key)) return
 
         // Regular character input
         if (
@@ -198,7 +199,7 @@ export const ChatInput = memo(function ChatInput({
           insertTextAtCursor(key.sequence)
         }
       },
-      [value, cursorPosition, onSubmit, onPaste, disabled, insertTextAtCursor, updateValue, onChange]
+      [value, cursorPosition, onSubmit, disabled, insertTextAtCursor, updateValue, onChange, handlePasteKey]
     )
   )
 
@@ -230,7 +231,7 @@ export const ChatInput = memo(function ChatInput({
         stickyStart="bottom"
         scrollbarOptions={{ visible: false }}
         verticalScrollbarOptions={{ visible: false }}
-        onPaste={(event) => onPaste(decodePasteBytes(event.bytes))}
+        onPaste={(event) => handlePasteEvent({ text: decodeNativePasteText(event) })}
         style={{
           flexGrow: 1,
           flexShrink: 0,
