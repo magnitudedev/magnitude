@@ -128,7 +128,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
   const editStats = editDisplay ? computeDiffStats(editDisplay.diffs) : null
   const writeContent = getWriteContent(message)
   const writeDiffs = writeContent
-    ? [{ startLine: 1, removedLines: [] as string[], addedLines: writeContent.split('\n') }]
+    ? [{ startLine: 1, removedLines: [] as string[], addedLines: writeContent.split('\n'), contextBefore: [] as string[], contextAfter: [] as string[] }]
     : null
   const hasContentPreview = !!(editDisplay || writeDiffs)
 

@@ -93,7 +93,7 @@ export function buildPermissionInterceptor(
             const fullPath = join(policyCtx.cwd, input.path)
             const content = yield* Effect.promise(() => Bun.file(fullPath).text())
             const applied = validateAndApply(content, input.oldString, input.newString, input.replaceAll ?? false)
-            display = { type: 'edit_diff' as const, path: input.path, diffs: [toEditDiff(applied)] }
+            display = { type: 'edit_diff' as const, path: input.path, diffs: [toEditDiff(applied, applied.result)] }
           } catch {
             // Fail silently — approval card shows without diff
           }

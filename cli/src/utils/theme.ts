@@ -259,6 +259,21 @@ const DEFAULT_CHAT_THEME: ChatTheme = {
     dividerFg: slate[800],
     codeMonochrome: false,
   },
+
+  syntax: {
+    keyword: violet[300],
+    string: green[400],
+    number: blue[300],
+    comment: slate[500],
+    function: blue[400],
+    variable: slate[200],
+    type: green[400],
+    operator: slate[400],
+    property: slate[200],
+    punctuation: slate[400],
+    literal: blue[300],
+    default: slate[100],
+  },
 }
 
 const DEFAULT_LIGHT_THEME: ChatTheme = {
@@ -317,6 +332,21 @@ const DEFAULT_LIGHT_THEME: ChatTheme = {
     dividerFg: slate[200],
     codeMonochrome: false,
   },
+
+  syntax: {
+    keyword: violet[600],
+    string: green[700],
+    number: blue[600],
+    comment: slate[500],
+    function: blue[600],
+    variable: slate[700],
+    type: green[700],
+    operator: blue[600],
+    property: blue[600],
+    punctuation: slate[500],
+    literal: blue[600],
+    default: slate[900],
+  },
 }
 
 export const chatThemes = {
@@ -340,36 +370,6 @@ export const buildMarkdownColorPalette = (theme: ChatTheme): MarkdownPalette => 
 
   const overrides = theme.markdown?.headingFg ?? {}
 
-  const syntaxColors = theme.name === 'light'
-    ? {
-        keyword: violet[600],
-        string: green[700],
-        number: blue[600],
-        comment: slate[500],
-        function: blue[600],
-        variable: slate[700],
-        type: green[700],
-        operator: blue[600],
-        property: blue[600],
-        punctuation: slate[500],
-        literal: blue[600],
-        default: slate[900],
-      }
-    : {
-        keyword: violet[300],
-        string: green[400],
-        number: blue[300],
-        comment: slate[500],
-        function: blue[400],
-        variable: slate[200],
-        type: green[400],
-        operator: slate[400],
-        property: slate[200],
-        punctuation: slate[400],
-        literal: blue[300],
-        default: slate[100],
-      }
-
   return {
     inlineCodeFg: theme.markdown?.inlineCodeFg ?? theme.foreground,
     codeBackground: theme.markdown?.codeBackground ?? 'transparent',
@@ -386,7 +386,7 @@ export const buildMarkdownColorPalette = (theme: ChatTheme): MarkdownPalette => 
     codeTextFg: theme.markdown?.codeTextFg ?? theme.foreground,
     codeMonochrome: theme.markdown?.codeMonochrome ?? false,
     linkFg: theme.markdown?.linkFg ?? theme.link,
-    syntax: syntaxColors,
+    syntax: theme.syntax,
   }
 }
 

@@ -123,30 +123,15 @@ export function tryHighlight(code: string, lang: string, syntax: SyntaxColors): 
   }
 }
 
-const defaultSyntaxColors: SyntaxColors = {
-  keyword: '#a78bfa',
-  string: '#86efac',
-  number: '#93c5fd',
-  comment: '#64748b',
-  function: '#60a5fa',
-  variable: '#e2e8f0',
-  type: '#86efac',
-  operator: '#94a3b8',
-  property: '#e2e8f0',
-  punctuation: '#64748b',
-  literal: '#93c5fd',
-  default: '#f1f5f9',
-}
-
 function plainTextLines(content: string): Span[][] {
   const lines = content.split('\n')
   return lines.map((line) => [{ text: line || ' ' }])
 }
 
-export function highlightFile(content: string, filename: string): Span[][] {
+export function highlightFile(content: string, filename: string, syntax: SyntaxColors): Span[][] {
   const language = inferLanguageFromFilename(filename)
   if (!language) return plainTextLines(content)
-  const highlighted = tryHighlight(content, language, defaultSyntaxColors)
+  const highlighted = tryHighlight(content, language, syntax)
   if (!highlighted) return plainTextLines(content)
   const rawLines = content.split('\n')
   return rawLines.map((lineText, idx) => highlighted[idx] ?? [{ text: lineText || ' ' }])

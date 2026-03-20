@@ -187,10 +187,23 @@ function tryVirtualMatch(
 /**
  * Convert an AppliedEdit to an EditDiff for UI display.
  */
-export function toEditDiff(applied: AppliedEdit): EditDiff {
+export function toEditDiff(
+  applied: AppliedEdit,
+  postEditContent: string,
+  contextRadius = 5,
+): EditDiff {
+  const postLines = postEditContent.split('\n')
+  const startIdx = Math.max(0, applied.startLine - 1)
+  const beforeStart = Math.max(0, startIdx - contextRadius)
+  const contextBefore = postLines.slice(beforeStart, startIdx)
+  const afterStart = startIdx + applied.addedLines.length
+  const contextAfter = postLines.slice(afterStart, afterStart + contextRadius)
+
   return {
     startLine: applied.startLine,
     removedLines: applied.removedLines,
     addedLines: applied.addedLines,
+    contextBefore,
+    contextAfter,
   }
 }

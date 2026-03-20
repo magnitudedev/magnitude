@@ -5,22 +5,24 @@
  * State is pre-reduced by DisplayProjection.
  */
 
-import { useState } from 'react'
+import { readFileSync } from 'node:fs'
+import { useMemo, useState } from 'react'
 import { TextAttributes } from '@opentui/core'
 
 import { useTheme } from '../hooks/use-theme'
 import { useStreamingReveal } from '../hooks/use-streaming-reveal'
 import { ShimmerText } from '../components/shimmer-text'
 import { Button } from '../components/button'
+import { DiffHunk } from '../components/diff-hunk'
 import { MarkdownContent, StreamingMarkdownContent } from '../markdown/markdown-content'
 import { highlightFile } from '../markdown/highlight-file'
-import type { Span } from '../markdown/blocks'
+import { findUniqueMatchRange } from '../utils/diff-utils'
+import { isMarkdownFile, renderCodeLines } from '../utils/file-lang'
 import { BOX_CHARS } from '../utils/ui-constants'
 import { render } from './define'
 import type { ToolVisualRenderer } from './define'
 
 import { isActive } from '@magnitudedev/agent'
-import { useSelectedFile } from '../hooks/use-file-viewer'
 
 
 import type {
@@ -261,9 +263,11 @@ export const fsWriteRender = render<WriteState>(({ state, onFileClick }) => {
   const isError = state.result?._tag === 'Error'
   const [isHovered, setIsHovered] = useState(false)
   const path = state.path
-  const selectedFile = useSelectedFile()
-  const isOpenInPanel = selectedFile?.path === path
   const { displayedContent: revealedFull, showCursor } = useStreamingReveal(state.contentSoFar, !done)
+  const codeLines = useMemo(
+    () => isMarkdownFile(state.path) ? null : highlightFile(revealedFull, state.path, theme.syntax),
+    [revealedFull, state.path, theme.syntax],
+  )
 
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -291,6 +295,7 @@ export const fsWriteRender = render<WriteState>(({ state, onFileClick }) => {
               <>
                 <span style={{ fg: theme.foreground }}>{'Wrote '}</span>
                 <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{path}</span>
+                <span style={{ fg: theme.muted }}>{` (${state.lineCount} lines)`}</span>
               </>
             )}
           </text>
@@ -299,7 +304,7 @@ export const fsWriteRender = render<WriteState>(({ state, onFileClick }) => {
               {`${state.charCount} chars · ${state.lineCount} lines`}
             </text>
           )}
-          {!done && state.contentSoFar.length > 0 && !isOpenInPanel && (
+          {!done && state.contentSoFar.length > 0 && (
             <box style={{
               borderStyle: 'single',
               borderColor: isHovered ? theme.link : theme.border || theme.muted,
@@ -319,7 +324,13 @@ export const fsWriteRender = render<WriteState>(({ state, onFileClick }) => {
                   contentOptions: { justifyContent: 'flex-start' },
                 }}
               >
-                <StreamingMarkdownContent content={revealedFull} showCursor={showCursor} />
+                {codeLines === null ? (
+                  <StreamingMarkdownContent content={revealedFull} showCursor={showCursor} />
+                ) : (
+                  <box style={{ flexDirection: 'column' }}>
+                    {codeLines.map((line, idx) => renderCodeLines(line, idx, theme.foreground))}
+                  </box>
+                )}
               </scrollbox>
             </box>
           )}
@@ -334,18 +345,118 @@ export function editStreamLiveText({ state }: { state: EditState }): string {
   return state.phase === 'done' ? `Edited ${target}` : `Editing ${target}`
 }
 
-export const editStreamRender = render<EditState>(({ state, onFileClick }) => {
+export const editStreamRender = render<EditState>(({ state, onFileClick, isExpanded, onToggle, stepResult }) => {
   const theme = useTheme()
   const done = state.phase === 'done'
   const isError = state.result?._tag === 'Error'
   const [isHovered, setIsHovered] = useState(false)
+  const [isExpandHovered, setIsExpandHovered] = useState(false)
   const path = state.path
-  const selectedFile = useSelectedFile()
-  const isOpenInPanel = selectedFile?.path === path
-  const { displayedContent: revealedUpdateFull, showCursor } = useStreamingReveal(state.newStringSoFar, !done)
+  const { displayedContent: revealedUpdateFull } = useStreamingReveal(state.newStringSoFar, true)
 
-  const showOldPreview = !done && state.childParsePhase === 'streaming_old' && state.oldStringSoFar.length > 0 && !isOpenInPanel
-  const showNewPreview = !done && state.childParsePhase === 'streaming_new' && state.newStringSoFar.length > 0 && !isOpenInPanel
+  const fileContent = useMemo(() => {
+    if (!state.path || done) return null
+    try {
+      return readFileSync(state.path, 'utf8')
+    } catch {
+      return null
+    }
+  }, [state.path, done])
+
+  const removedLines = state.oldStringSoFar.length > 0 ? state.oldStringSoFar.split('\n') : []
+  const addedLines = !done && state.childParsePhase === 'streaming_new' ? revealedUpdateFull.split('\n') : []
+
+  const streamingContext = useMemo(() => {
+    if (!fileContent || state.oldStringSoFar.length === 0) return { contextBefore: undefined, contextAfter: undefined }
+    const match = findUniqueMatchRange(fileContent, state.oldStringSoFar)
+    if (!match) return { contextBefore: undefined, contextAfter: undefined }
+
+    const fileLines = fileContent.split('\n')
+    const startLine = fileContent.slice(0, match.start).split('\n').length - 1
+    const endLine = fileContent.slice(0, match.end).split('\n').length - 1
+
+    return {
+      contextBefore: fileLines.slice(Math.max(0, startLine - 5), startLine),
+      contextAfter: fileLines.slice(endLine + 1, endLine + 6),
+    }
+  }, [fileContent, state.oldStringSoFar])
+
+  const showStreamingDiff = !done && removedLines.length > 0
+
+  const editDiffDisplay =
+    stepResult?.status === 'success' && stepResult.display?.type === 'edit_diff'
+      ? stepResult.display
+      : null
+
+  const totals = editDiffDisplay
+    ? editDiffDisplay.diffs.reduce(
+        (acc: { added: number; removed: number }, diff: { addedLines: string[]; removedLines: string[] }) => ({
+          added: acc.added + diff.addedLines.length,
+          removed: acc.removed + diff.removedLines.length,
+        }),
+        { added: 0, removed: 0 },
+      )
+    : null
+
+  if (done && !isError) {
+    return (
+      <box style={{ flexDirection: 'column' }}>
+        <box style={{ flexDirection: 'row' }}>
+          <text>
+            <span style={{ fg: theme.info }}>{'✎ '}</span>
+            <span style={{ fg: theme.foreground }}>{'Edited '}</span>
+          </text>
+          <Button
+            onClick={() => { if (path) onFileClick?.(path) }}
+            onMouseOver={() => setIsHovered(true)}
+            onMouseOut={() => setIsHovered(false)}
+          >
+            <text>
+              <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{path}</span>
+            </text>
+          </Button>
+          {editDiffDisplay && (
+            <Button
+              onClick={() => onToggle?.()}
+              onMouseOver={() => setIsExpandHovered(true)}
+              onMouseOut={() => setIsExpandHovered(false)}
+            >
+              <text>
+                {totals && (
+                  <>
+                    <span style={{ fg: theme.syntax.string }} attributes={isExpandHovered ? undefined : TextAttributes.DIM}>{` +${totals.added}`}</span>
+                    <span style={{ fg: isExpandHovered ? theme.foreground : theme.secondary }} attributes={TextAttributes.DIM}>/</span>
+                    <span style={{ fg: theme.error }} attributes={isExpandHovered ? undefined : TextAttributes.DIM}>{`-${totals.removed}`}</span>
+                  </>
+                )}
+                <span style={{ fg: isExpandHovered ? theme.foreground : theme.secondary }} attributes={TextAttributes.DIM}>
+                  {isExpanded ? ' (collapse)' : ' (expand)'}
+                </span>
+              </text>
+            </Button>
+          )}
+        </box>
+        {editDiffDisplay && isExpanded && (
+          <box style={{ flexDirection: 'column', paddingLeft: 2 }}>
+            {editDiffDisplay.diffs.map((diff: {
+              contextBefore?: string[]
+              removedLines: string[]
+              addedLines: string[]
+              contextAfter?: string[]
+            }, index: number) => (
+              <DiffHunk
+                key={`${editDiffDisplay.path}-${index}`}
+                contextBefore={diff.contextBefore}
+                removedLines={diff.removedLines}
+                addedLines={diff.addedLines}
+                contextAfter={diff.contextAfter}
+              />
+            ))}
+          </box>
+        )}
+      </box>
+    )
+  }
 
   return (
     <box style={{ flexDirection: 'column' }}>
@@ -357,13 +468,7 @@ export const editStreamRender = render<EditState>(({ state, onFileClick }) => {
         <box style={{ flexDirection: 'column' }}>
           <text style={{ wrapMode: 'word' }}>
             <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '✎ '}</span>
-            {!done ? (
-              <>
-                <span style={{ fg: theme.foreground }}>{'Editing '}</span>
-                <span style={{ fg: theme.muted }}>{path || '...'}</span>
-                <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-              </>
-            ) : isError ? (
+            {isError ? (
               <>
                 <span style={{ fg: theme.foreground }}>{'Edit '}</span>
                 <span style={{ fg: theme.muted }}>{path}</span>
@@ -371,54 +476,20 @@ export const editStreamRender = render<EditState>(({ state, onFileClick }) => {
               </>
             ) : (
               <>
-                <span style={{ fg: theme.foreground }}>{'Edited '}</span>
-                <span style={{ fg: isHovered ? theme.link : theme.primary }} attributes={TextAttributes.UNDERLINE}>{path}</span>
+                <span style={{ fg: theme.foreground }}>{'Editing '}</span>
+                <span style={{ fg: theme.muted }}>{path || '...'}</span>
+                <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
               </>
             )}
           </text>
-          {!done && (
-            <text style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>
-              {`old: ${state.oldStringSoFar.length} chars → new: ${state.newStringSoFar.length} chars`}
-              {state.replaceAll ? ' · replace all' : ''}
-            </text>
-          )}
-          {showOldPreview && (
-            <box style={{ borderStyle: 'single', borderColor: theme.warning, customBorderChars: BOX_CHARS, height: 12 }}>
-              <scrollbox
-                stickyScroll
-                stickyStart="bottom"
-                scrollX={false}
-                scrollbarOptions={{ visible: false }}
-                verticalScrollbarOptions={{ visible: false }}
-                style={{
-                  flexGrow: 1,
-                  rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
-                  wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
-                  contentOptions: { justifyContent: 'flex-start' },
-                }}
-              >
-                <StreamingMarkdownContent content={state.oldStringSoFar} />
-              </scrollbox>
-            </box>
-          )}
-          {showNewPreview && (
-            <box style={{ borderStyle: 'single', borderColor: theme.success, customBorderChars: BOX_CHARS, height: 12 }}>
-              <scrollbox
-                stickyScroll
-                stickyStart="bottom"
-                scrollX={false}
-                scrollbarOptions={{ visible: false }}
-                verticalScrollbarOptions={{ visible: false }}
-                style={{
-                  flexGrow: 1,
-                  rootOptions: { flexGrow: 1, backgroundColor: 'transparent' },
-                  wrapperOptions: { border: false, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 },
-                  contentOptions: { justifyContent: 'flex-start' },
-                }}
-              >
-                <StreamingMarkdownContent content={revealedUpdateFull} showCursor={showCursor} />
-              </scrollbox>
-            </box>
+          {showStreamingDiff && (
+            <DiffHunk
+              contextBefore={streamingContext.contextBefore}
+              removedLines={removedLines}
+              addedLines={addedLines}
+              contextAfter={streamingContext.contextAfter}
+              streamingCursor={state.childParsePhase === 'streaming_new'}
+            />
           )}
         </box>
       </Button>

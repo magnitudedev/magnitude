@@ -39,6 +39,8 @@ export interface EditDiff {
   startLine: number      // 1-based line where edit starts
   removedLines: string[] // original lines that were removed/replaced
   addedLines: string[]   // new lines that replaced them
+  contextBefore: string[] // nearby post-edit lines before the edit
+  contextAfter: string[] // nearby post-edit lines after the edit
 }
 
 // =============================================================================
@@ -221,18 +223,35 @@ export function applyOps(content: string, ops: ParsedOp[]): { content: string; s
       const removedLines = resultLines.slice(op.from - 1, op.to)
       const newLines = op.content.split('\n')
       resultLines.splice(op.from - 1, removeCount, ...newLines)
-      diffs.push({ startLine: op.from, removedLines, addedLines: newLines })
+
+      const startIdx = Math.max(0, op.from - 1)
+      const contextBefore = resultLines.slice(Math.max(0, startIdx - 5), startIdx)
+      const afterStart = startIdx + newLines.length
+      const contextAfter = resultLines.slice(afterStart, afterStart + 5)
+
+      diffs.push({ startLine: op.from, removedLines, addedLines: newLines, contextBefore, contextAfter })
       summary.push(`replaced lines ${op.from}-${op.to} (${removeCount} lines) with ${newLines.length} line(s)`)
     } else if (op.type === 'remove') {
       const removeCount = op.to - op.from + 1
       const removedLines = resultLines.slice(op.from - 1, op.to)
       resultLines.splice(op.from - 1, removeCount)
-      diffs.push({ startLine: op.from, removedLines, addedLines: [] })
+
+      const startIdx = Math.max(0, op.from - 1)
+      const contextBefore = resultLines.slice(Math.max(0, startIdx - 5), startIdx)
+      const contextAfter = resultLines.slice(startIdx, startIdx + 5)
+
+      diffs.push({ startLine: op.from, removedLines, addedLines: [], contextBefore, contextAfter })
       summary.push(`deleted lines ${op.from}-${op.to} (${removeCount} lines)`)
     } else if (op.type === 'insert') {
       const newLines = op.content.split('\n')
       resultLines.splice(op.after, 0, ...newLines)
-      diffs.push({ startLine: op.after + 1, removedLines: [], addedLines: newLines })
+
+      const startIdx = Math.max(0, op.after)
+      const contextBefore = resultLines.slice(Math.max(0, startIdx - 5), startIdx)
+      const afterStart = startIdx + newLines.length
+      const contextAfter = resultLines.slice(afterStart, afterStart + 5)
+
+      diffs.push({ startLine: op.after + 1, removedLines: [], addedLines: newLines, contextBefore, contextAfter })
       summary.push(`inserted ${newLines.length} line(s) after line ${op.after}`)
     }
   }

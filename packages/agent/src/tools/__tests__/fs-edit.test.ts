@@ -148,15 +148,17 @@ describe('string find-replace edit', () => {
   describe('toEditDiff', () => {
     test('converts applied edit to diff', () => {
       const applied = validateAndApply(sampleContent, '  const x = 1;', '  const x = 10;', false)
-      const diff = toEditDiff(applied)
+      const diff = toEditDiff(applied, applied.result)
       expect(diff.startLine).toBe(5)
       expect(diff.removedLines).toEqual(['  const x = 1;'])
       expect(diff.addedLines).toEqual(['  const x = 10;'])
+      expect(diff.contextBefore).toBeDefined()
+      expect(diff.contextAfter).toBeDefined()
     })
 
     test('startLine is correct for later lines', () => {
       const applied = validateAndApply(sampleContent, '  return x + y + z;', '  return 0;', false)
-      const diff = toEditDiff(applied)
+      const diff = toEditDiff(applied, applied.result)
       expect(diff.startLine).toBe(8)
     })
   })

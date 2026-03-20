@@ -192,9 +192,42 @@ export const editTool = createTool({
       catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
     })
 
-    // Emit diff for UI
-    const diff = toEditDiff(applied)
-    yield* emit.emit({ type: 'edit_diff', path, diffs: [diff] })
+    // Emit diff(s) for UI
+    const diffs = (replaceAll ?? false)
+      ? (() => {
+          if (oldString.length === 0) return [toEditDiff(applied, applied.result)]
+          const oldLines = oldString.split('\n')
+          const newLines = newString.split('\n')
+          const perDiff: ReturnType<typeof toEditDiff>[] = []
+
+          let originalCursor = 0
+          let lineDelta = 0
+          while (true) {
+            const originalIdx = content.indexOf(oldString, originalCursor)
+            if (originalIdx === -1) break
+
+            const originalPrefix = content.slice(0, originalIdx)
+            const originalLine = originalPrefix.split('\n').length
+            const adjustedStartLine = originalLine + lineDelta
+
+            const perApplied = {
+              result: applied.result,
+              startLine: adjustedStartLine,
+              removedLines: oldLines,
+              addedLines: newLines,
+              replaceCount: 1,
+            }
+
+            perDiff.push(toEditDiff(perApplied, applied.result))
+
+            lineDelta += newLines.length - oldLines.length
+            originalCursor = originalIdx + oldString.length
+          }
+
+          return perDiff.length > 0 ? perDiff : [toEditDiff(applied, applied.result)]
+        })()
+      : [toEditDiff(applied, applied.result)]
+    yield* emit.emit({ type: 'edit_diff', path, diffs })
 
     // Build summary
     if (applied.replaceCount > 1) {

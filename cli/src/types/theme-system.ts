@@ -1,3 +1,5 @@
+import type { SyntaxColors } from '../markdown/theme'
+
 export type ThemeName = 'dark' | 'light'
 
 export type MarkdownHeadingLevel = 1 | 2 | 3 | 4 | 5 | 6
@@ -140,6 +142,9 @@ export interface ChatTheme {
 
   /** Markdown-specific styling */
   markdown?: MarkdownThemeOverrides
+
+  /** Syntax highlighting colors */
+  syntax: SyntaxColors
 
   /** Text attributes (bold, dim, etc.) */
   messageTextAttributes?: number

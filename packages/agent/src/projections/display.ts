@@ -675,16 +675,6 @@ export function getInProgressFileStreams(
   return streams.filter(s => s.filePath === resolvedPath)
 }
 
-export function getLatestInProgressFileStream(
-  state: DisplayState,
-  resolvedPath: string,
-): InProgressFileView | null {
-  const streams = collectFileStreams(state)
-  for (let i = streams.length - 1; i >= 0; i--) {
-    if (streams[i]?.filePath === resolvedPath) return streams[i] ?? null
-  }
-  return null
-}
 
 // =============================================================================
 // Projection

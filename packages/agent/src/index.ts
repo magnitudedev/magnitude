@@ -78,7 +78,6 @@ export type { ForkCompactionState } from './projections/compaction'
 export {
   DisplayProjection,
   getInProgressFileStreams,
-  getLatestInProgressFileStream,
 
 } from './projections/display'
 export type {

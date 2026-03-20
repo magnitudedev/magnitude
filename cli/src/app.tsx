@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, getInProgressFileStreams, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -1492,16 +1492,32 @@ function AppInner({
   const {
     selectedFile,
     selectedFileContent,
-    selectedFileStreaming,
+    selectedFileResolvedPath,
     isOpen: isFilePanelOpen,
-    canRenderPanel,
     openFile,
     closeFilePanel,
   } = useFilePanel({
-    display: activeDisplay ?? display,
     workspacePath,
     projectRoot: process.cwd(),
   })
+
+  const inProgressStreams = useMemo(() => {
+    const state = activeDisplay ?? display
+    if (!state) return []
+    return getInProgressFileStreams(state, selectedFileResolvedPath ?? undefined)
+  }, [activeDisplay, display, selectedFileResolvedPath])
+
+  const inProgressFileContent = useMemo(() => {
+    if (inProgressStreams.length === 0) return null
+    const latest = inProgressStreams[inProgressStreams.length - 1]
+    if (!latest) return null
+    if (latest.preview.mode === 'write') return latest.preview.contentSoFar
+    if (latest.preview.mode === 'edit') return latest.preview.newStringSoFar
+    return null
+  }, [inProgressStreams])
+
+  const filePanelContent = inProgressFileContent ?? selectedFileContent
+  const canRenderPanel = selectedFile != null && filePanelContent !== null
 
   // Find active expanded think block for sticky header
   const activeThinkBlock = useMemo(() => {
@@ -1989,8 +2005,7 @@ function AppInner({
           <FileViewerPanel
             key={selectedFile.path}
             filePath={selectedFile.path}
-            content={selectedFileContent}
-            streaming={selectedFileStreaming ?? undefined}
+            content={filePanelContent}
             scrollToSection={selectedFile.section}
             onClose={closeFilePanel}
             onOpenFile={openFile}
