@@ -9,6 +9,9 @@ import { getDisplayWidth, padEndToDisplayWidth, truncateToDisplayWidth } from '.
 import type { SubagentTabItem } from './types'
 
 const TAB_INNER_WIDTH = 32 // inner content width (chars), excluding border+padding
+const TAB_CLOSE_CELL_WIDTH = 2
+const TAB_BORDER_WIDTH_TOTAL = 2
+const TAB_TOTAL_WIDTH = (TAB_INNER_WIDTH + 2) + TAB_CLOSE_CELL_WIDTH + TAB_BORDER_WIDTH_TOTAL
 const HORIZONTAL_SCROLL_STEP = 12
 const HORIZONTAL_SCROLL_ACCELERATION = 1.4
 
@@ -17,8 +20,9 @@ type HorizontalScrollable = ScrollBoxRenderable & {
   viewport?: { width: number }
   scrollWidth?: number
   scrollLeft?: number
-  scrollTo?: (position: { x?: number; y?: number }) => void
-  scrollBy?: (offset: { x?: number; y?: number }) => void
+  scrollTop?: number
+  scrollTo?: (position: { x: number; y: number }) => void
+  scrollBy?: (offset: { x: number; y: number }) => void
 }
 
 const PULSE_SLATE_SHADES = [
@@ -54,6 +58,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
   const [now, setNow] = useState(() => Date.now())
   const [hoveredId, setHoveredId] = useState<null | string | 'main'>(null)
   const [closeHoveredId, setCloseHoveredId] = useState<null | string>(null)
+  const [scrollViewportWidth, setScrollViewportWidth] = useState(0)
 
   const hasActiveTabs = tabs.some((tab) => tab.phase === 'active')
   const scrollBoxRef = useRef<ScrollBoxRenderable | null>(null)
@@ -74,6 +79,56 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
     scrollBox.horizontalScrollBar.scrollStep = HORIZONTAL_SCROLL_STEP
     scrollBox.horizontalScrollBar.scrollAcceleration = HORIZONTAL_SCROLL_ACCELERATION
   }, [])
+
+  const ensureSelectedTabVisible = () => {
+    if (selectedForkId === null) return
+
+    const selectedIndex = tabs.findIndex((tab) => tab.forkId === selectedForkId)
+    if (selectedIndex === -1) return
+
+    const scrollBox = scrollBoxRef.current as HorizontalScrollable | null
+    if (!scrollBox) return
+
+    const left = scrollBox.scrollLeft ?? scrollBox.horizontalScrollBar?.scrollPosition ?? 0
+    const top = scrollBox.scrollTop ?? 0
+    const viewportWidth = scrollBox.viewport?.width
+    if (!viewportWidth || viewportWidth <= 0) return
+
+    const tabLeft = selectedIndex * TAB_TOTAL_WIDTH
+    const tabRight = tabLeft + TAB_TOTAL_WIDTH
+
+    let targetX: number | null = null
+    if (tabLeft < left) {
+      targetX = tabLeft
+    } else if (tabRight > left + viewportWidth) {
+      targetX = tabRight - viewportWidth
+    } else {
+      return
+    }
+
+    if (scrollBox.scrollWidth !== undefined) {
+      const maxLeft = Math.max(0, scrollBox.scrollWidth - viewportWidth)
+      targetX = Math.min(Math.max(0, targetX), maxLeft)
+    } else {
+      targetX = Math.max(0, targetX)
+    }
+
+    if (scrollBox.scrollTo) {
+      scrollBox.scrollTo({ x: targetX, y: top })
+      return
+    }
+
+    if (scrollBox.scrollBy) {
+      const delta = targetX - left
+      if (delta !== 0) {
+        scrollBox.scrollBy({ x: delta, y: 0 })
+      }
+    }
+  }
+
+  useEffect(() => {
+    ensureSelectedTabVisible()
+  }, [selectedForkId, tabs, scrollViewportWidth])
 
   const mainSelected = selectedForkId === null
   const mainHovered = hoveredId === 'main'
@@ -114,6 +169,10 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         scrollbarOptions={{ visible: false }}
         horizontalScrollbarOptions={{ visible: false }}
         verticalScrollbarOptions={{ visible: false }}
+        onSizeChange={() => {
+          const scrollBox = scrollBoxRef.current as HorizontalScrollable | null
+          setScrollViewportWidth(scrollBox?.viewport?.width ?? 0)
+        }}
         style={{ flexGrow: 1, flexShrink: 1, minWidth: 0, maxHeight: 4 }}
       >
         <box style={{ flexDirection: 'row', flexWrap: 'no-wrap', flexShrink: 0, alignItems: 'flex-start' }}>
