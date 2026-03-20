@@ -141,12 +141,20 @@ export interface SubagentFinishedStep {
   readonly resumed: boolean
 }
 
+export interface SubagentKilledStep {
+  readonly id: string
+  readonly type: 'subagent_killed'
+  readonly subagentId: string
+  readonly title: string
+}
+
 export type ThinkBlockStep =
   | ThinkingStep
   | ToolStep
   | CommunicationStep
   | SubagentStartedStep
   | SubagentFinishedStep
+  | SubagentKilledStep
 
 export interface ThinkBlockMessage {
   readonly id: string
@@ -1272,6 +1280,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
+    agent_killed: ({ fork }) => fork,
+
 
   },
 
@@ -1376,7 +1386,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       let nextParentState: DisplayState = { ...parentState, messages: newMessages }
 
-      if (parentForkId === null) {
+      if (parentForkId === null && value.reason !== 'interrupt') {
         const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
         const step: SubagentFinishedStep = {
           id: generateId(),
@@ -1457,6 +1467,31 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       return {
         ...state,
         forks: new Map(state.forks).set(parentForkId, nextParentState)
+      }
+    }),
+
+    on(AgentStatusProjection.signals.agentKilled, ({ value, state }) => {
+      const parentState = state.forks.get(value.parentForkId)
+      if (!parentState) return state
+
+      const messages = parentState.messages.filter((m) => !(m.type === 'fork_activity' && m.forkId === value.forkId))
+      let nextParentState: DisplayState = { ...parentState, messages }
+
+      const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
+      const step: SubagentKilledStep = {
+        id: generateId(),
+        type: 'subagent_killed',
+        subagentId: value.agentId,
+        title: value.title,
+      }
+      nextParentState = {
+        ...withBlock.fork,
+        messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.parentForkId, nextParentState)
       }
     }),
 

@@ -71,6 +71,18 @@ const SubagentFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: '
   )
 }
 
+const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_killed' }> }) => {
+  const theme = useTheme()
+  return (
+    <text>
+      <span style={{ fg: theme.error }}>■ </span>
+      <span style={{ fg: theme.muted }}>Subagent killed: </span>
+      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      <span style={{ fg: theme.muted }}> - {step.title}</span>
+    </text>
+  )
+}
+
 function buildSummary(steps: readonly { type: string; toolKey?: string }[]): string {
   let webSearches = 0
   let commands = 0
@@ -85,6 +97,7 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
   let evaluations = 0
   let subagentStarted = 0
   let subagentFinished = 0
+  let subagentKilled = 0
   for (const step of steps) {
     if (step.type === 'subagent_started') {
       subagentStarted++
@@ -92,6 +105,10 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
     }
     if (step.type === 'subagent_finished') {
       subagentFinished++
+      continue
+    }
+    if (step.type === 'subagent_killed') {
+      subagentKilled++
       continue
     }
     if (step.type !== 'tool') continue
@@ -121,6 +138,7 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
   if (evaluations > 0) parts.push(`${evaluations} ${evaluations === 1 ? 'eval' : 'evals'}`)
   if (subagentStarted > 0) parts.push(`${subagentStarted} ${subagentStarted === 1 ? 'subagent started' : 'subagents started'}`)
   if (subagentFinished > 0) parts.push(`${subagentFinished} ${subagentFinished === 1 ? 'subagent finished' : 'subagents finished'}`)
+  if (subagentKilled > 0) parts.push(`${subagentKilled} ${subagentKilled === 1 ? 'subagent killed' : 'subagents killed'}`)
   return parts.length > 0 ? ` (${parts.join(', ')})` : ''
 }
 
@@ -143,7 +161,7 @@ function groupByCluster(steps: readonly ThinkBlockStep[]): StepGroup[] {
   const groups: StepGroup[] = []
   for (const step of steps) {
     const cluster = step.cluster ?? null
-    const syntheticCluster = step.type === 'subagent_started' || step.type === 'subagent_finished'
+    const syntheticCluster = step.type === 'subagent_started' || step.type === 'subagent_finished' || step.type === 'subagent_killed'
       ? '__subagent_lifecycle__'
       : cluster
     const last = groups[groups.length - 1]
@@ -347,6 +365,10 @@ const StepGroupView = memo(function StepGroupView({
 
         if (step.type === 'subagent_finished') {
           return <SubagentFinishedRow key={step.id} step={step} />
+        }
+
+        if (step.type === 'subagent_killed') {
+          return <SubagentKilledRow key={step.id} step={step} />
         }
 
         if (step.type === 'communication') {

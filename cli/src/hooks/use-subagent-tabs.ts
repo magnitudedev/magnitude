@@ -97,7 +97,7 @@ export function reconcileForkMeta(args: {
   agentStatusState: AgentStatusState | null
 }): { next: Record<string, ForkMeta> } {
   const { prev, latestByFork, agentStatusState } = args
-  const next: Record<string, ForkMeta> = { ...prev }
+  const next: Record<string, ForkMeta> = {}
 
   for (const [forkId, activity] of latestByFork.entries()) {
     const previous = prev[forkId]
@@ -161,7 +161,26 @@ export function useSubagentTabs({
       return reconciled.next
     })
 
-    for (const forkId of latestByFork.keys()) {
+    const activeForkIds = new Set(latestByFork.keys())
+
+    for (const [forkId, unsubscribe] of unsubscribesRef.current.entries()) {
+      if (activeForkIds.has(forkId)) continue
+      unsubscribe()
+      unsubscribesRef.current.delete(forkId)
+
+      setForkMessages(prev => {
+        if (!(forkId in prev)) return prev
+        const { [forkId]: _removed, ...rest } = prev
+        return rest
+      })
+      setForkPendingDirectUser(prev => {
+        if (!(forkId in prev)) return prev
+        const { [forkId]: _removed, ...rest } = prev
+        return rest
+      })
+    }
+
+    for (const forkId of activeForkIds) {
       if (!client || unsubscribesRef.current.has(forkId)) continue
       const unsubscribe = client.state.display.subscribeFork(forkId, (state) => {
         setForkMessages(prev => ({ ...prev, [forkId]: state.messages }))

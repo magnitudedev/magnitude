@@ -24,7 +24,7 @@ function render(node: React.ReactNode) {
   return renderToStaticMarkup(<>{node}</>)
 }
 
-test('ThinkBlock renders subagent started/finished rows with structured fields', () => {
+test('ThinkBlock renders subagent started/finished/killed rows with structured fields', () => {
   const html = render(
     <ThinkBlock
       block={{
@@ -188,6 +188,45 @@ test('ThinkBlock completed summary includes plural subagent lifecycle counts', (
 
   const text = htmlToText(html)
   expect(text).toContain('Completed in 8s (2 subagents started, 2 subagents finished) · Show')
+})
+
+test('ThinkBlock summary includes killed subagent counts', () => {
+  const now = Date.now()
+  const markup = render(
+    <ThinkBlock
+      block={{
+        id: 't5',
+        type: 'think',
+        timestamp: now,
+        status: 'completed',
+        completedAt: now + 8000,
+        steps: [
+          {
+            id: 's1',
+            type: 'subagent_started',
+            subagentId: 'researcher',
+            title: 'gather evidence',
+            resumed: false,
+            timestamp: now + 1000,
+            label: '',
+          },
+          {
+            id: 's2',
+            type: 'subagent_killed',
+            subagentId: 'researcher',
+            title: 'gather evidence',
+            timestamp: now + 2000,
+            label: '',
+          },
+        ],
+      }}
+      isCollapsed={true}
+      onToggle={() => {}}
+    />,
+  )
+
+  const text = htmlToText(markup)
+  expect(text).toContain('Completed in 8s (1 subagent started, 1 subagent killed) · Show')
 })
 
 test('ThinkBlock applies spacing around consecutive subagent lifecycle rows, not between each row', () => {

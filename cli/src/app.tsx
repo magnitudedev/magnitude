@@ -69,6 +69,14 @@ const roleToSlot = (role: string): 'primary' | 'secondary' | 'browser' => {
   return 'secondary'
 }
 
+export const getEffectiveSelectedForkId = (
+  selectedTabForkId: string | null,
+  subagentTabs: ReadonlyArray<{ forkId: string }>
+): string | null => {
+  if (!selectedTabForkId) return null
+  return subagentTabs.some((tab) => tab.forkId === selectedTabForkId) ? selectedTabForkId : null
+}
+
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
 export function App({ resume, debug, onClientReady }: { resume: boolean; debug: boolean; onClientReady?: (client: AgentClient | null) => void }) {
@@ -632,31 +640,42 @@ function AppInner({
     return unsubscribe
   }, [client])
 
+  const subagentTabs = useSubagentTabs({
+    client,
+    rootDisplayMessages: display?.messages ?? [],
+    agentStatusState,
+  })
+
+  const selectedForkId = useMemo(
+    () => getEffectiveSelectedForkId(selectedTabForkId, subagentTabs),
+    [selectedTabForkId, subagentTabs]
+  )
+
   // Subscribe to selected fork's display
   useEffect(() => {
-    if (!client || !selectedTabForkId) {
+    if (!client || !selectedForkId) {
       setForkDisplay(null)
       return
     }
-    const unsubscribe = client.state.display.subscribeFork(selectedTabForkId, (state) => {
+    const unsubscribe = client.state.display.subscribeFork(selectedForkId, (state) => {
       setForkDisplay(state)
     })
     return unsubscribe
-  }, [client, selectedTabForkId])
+  }, [client, selectedForkId])
 
   // Subscribe to selected fork's compaction state
   useEffect(() => {
-    if (!client || !selectedTabForkId) {
+    if (!client || !selectedForkId) {
       setForkTokenEstimate(0)
       setForkIsCompacting(false)
       return
     }
-    const unsubscribe = client.state.compaction.subscribeFork(selectedTabForkId, (state: ForkCompactionState) => {
+    const unsubscribe = client.state.compaction.subscribeFork(selectedForkId, (state: ForkCompactionState) => {
       setForkTokenEstimate(state.tokenEstimate)
       setForkIsCompacting(state.isCompacting)
     })
     return unsubscribe
-  }, [client, selectedTabForkId])
+  }, [client, selectedForkId])
 
   // Subscribe to debug stream when debug mode is enabled and panel is visible
   useEffect(() => {
@@ -669,31 +688,22 @@ function AppInner({
     return unsubscribe
   }, [client, debugMode, debugPanelVisible])
 
-
-  const subagentTabs = useSubagentTabs({
-    client,
-    rootDisplayMessages: display?.messages ?? [],
-    agentStatusState,
-  })
-
   // Auto-deselect fork tab when fork is gone
   useEffect(() => {
-    if (!selectedTabForkId) return
-    const tab = subagentTabs.find(t => t.forkId === selectedTabForkId)
-    if (!tab) {
+    if (selectedTabForkId !== null && selectedForkId === null) {
       setSelectedTabForkId(null)
     }
-  }, [subagentTabs, selectedTabForkId])
+  }, [selectedTabForkId, selectedForkId])
 
-  const activeDisplay = selectedTabForkId ? forkDisplay : display
+  const activeDisplay = selectedForkId ? forkDisplay : display
 
   const activeModelSummary = useMemo(() => {
     const rootModelSummary = primaryModel ? {
       provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
       model: getProvider(primaryModel.providerId)?.models.find(m => m.id === primaryModel.modelId)?.name ?? primaryModel.modelId,
     } : null
-    if (!selectedTabForkId || !agentStatusState) return rootModelSummary
-    const agentId = agentStatusState.agentByForkId.get(selectedTabForkId)
+    if (!selectedForkId || !agentStatusState) return rootModelSummary
+    const agentId = agentStatusState.agentByForkId.get(selectedForkId)
     const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
     if (!agent) return rootModelSummary
     const slot = roleToSlot(agent.role)
@@ -703,15 +713,15 @@ function AppInner({
       provider: getProvider(selection.providerId)?.name ?? selection.providerId,
       model: getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)?.name ?? selection.modelId,
     }
-  }, [selectedTabForkId, agentStatusState, primaryModel, secondaryModel, browserModel])
+  }, [selectedForkId, agentStatusState, primaryModel, secondaryModel, browserModel])
 
   const mainTimelineMessages = useMemo(
     () => (activeDisplay?.messages ?? []).filter(m => {
       if (m.type === 'fork_activity') return false
-      if (selectedTabForkId === null && m.type === 'agent_communication') return false
+      if (selectedForkId === null && m.type === 'agent_communication') return false
       return true
     }),
-    [activeDisplay?.messages, selectedTabForkId]
+    [activeDisplay?.messages, selectedForkId]
   )
 
   const { visibleItems, hiddenCount, loadMore, hasMore } = usePaginatedTimeline(
@@ -1855,7 +1865,7 @@ function AppInner({
           }
         })
       })()}
-      {selectedTabForkId !== null && (
+      {selectedForkId !== null && (
         <PendingCommunicationsPanel messages={activeDisplay?.pendingInboundCommunications ?? []} />
       )}
     </scrollbox>
@@ -1909,16 +1919,16 @@ function AppInner({
               bashMode,
               modelsConfigured: !!primaryModel && !!secondaryModel && !!browserModel,
               modelSummary: activeModelSummary,
-              tokenEstimate: selectedTabForkId ? forkTokenEstimate : tokenEstimate,
+              tokenEstimate: selectedForkId ? forkTokenEstimate : tokenEstimate,
               contextHardCap,
-              isCompacting: selectedTabForkId ? forkIsCompacting : isCompacting,
+              isCompacting: selectedForkId ? forkIsCompacting : isCompacting,
               theme,
               modeColor,
               attachmentsMaxWidth,
               composerCanFocus,
               widgetNavActive,
               nextCtrlCWillExit,
-              isSubagentView: selectedTabForkId !== null,
+              isSubagentView: selectedForkId !== null,
             }}
             services={{
               submitUserMessageToFork: ({ forkId, message, attachments }) => handleSubmitViaClientBoundary({ forkId, message, attachments }),
@@ -1947,7 +1957,7 @@ function AppInner({
             }}
             displayMessages={(activeDisplay ?? display).messages}
             subagentTabs={subagentTabs}
-            selectedForkId={selectedTabForkId}
+            selectedForkId={selectedForkId}
             onSubagentTabSelect={setSelectedTabForkId}
             selectedArtifactOpen={selectedArtifact != null}
             onCloseArtifact={() => setSelectedArtifact(null)}

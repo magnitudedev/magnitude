@@ -43,6 +43,11 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
     }).pipe(Effect.orDie),
 
     soft_interrupt: () => Effect.void,
+
+    agent_killed: (event) => Effect.gen(function* () {
+      const execManager = yield* ExecutionManager
+      yield* execManager.disposeFork(event.forkId)
+    }).pipe(Effect.orDie),
   },
 
   signalHandlers: (on) => [

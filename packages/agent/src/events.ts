@@ -410,6 +410,15 @@ export interface AgentCreated {
   readonly outputSchema?: unknown
 }
 
+/** Agent killed by its parent while active */
+export interface AgentKilled {
+  readonly type: 'agent_killed'
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly agentId: string
+  readonly reason: string
+}
+
 // =============================================================================
 // Compaction Events
 // =============================================================================
@@ -556,4 +565,5 @@ export type AppEvent =
   | ArtifactSynced
   // Agent events
   | AgentCreated
+  | AgentKilled
   | UserReturnConfirmed

@@ -8,7 +8,7 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { WorkingStateProjection } from './working-state'
 
-export type AgentStatus = 'starting' | 'working' | 'idle'
+export type AgentStatus = 'starting' | 'working' | 'idle' | 'killed'
 
 export interface AgentInfo {
   readonly agentId: string
@@ -58,6 +58,16 @@ export interface AgentBecameWorkingSignal {
   readonly timestamp: number
 }
 
+export interface AgentKilledSignal {
+  readonly agentId: string
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly type: string
+  readonly title: string
+  readonly reason: string
+  readonly timestamp: number
+}
+
 export function getAgentByForkId(state: AgentStatusState, forkId: string): AgentInfo | undefined {
   const agentId = state.agentByForkId.get(forkId)
   if (!agentId) return undefined
@@ -81,6 +91,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     agentCreated: Signal.create<AgentCreatedSignal>('AgentStatus/created'),
     agentBecameIdle: Signal.create<AgentBecameIdleSignal>('AgentStatus/agentBecameIdle'),
     agentBecameWorking: Signal.create<AgentBecameWorkingSignal>('AgentStatus/agentBecameWorking'),
+    agentKilled: Signal.create<AgentKilledSignal>('AgentStatus/agentKilled'),
   },
 
   eventHandlers: {
@@ -200,6 +211,33 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       return {
         ...state,
         agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
+      }
+    },
+
+    agent_killed: ({ event, state, emit }) => {
+      const agent = getAgentByForkId(state, event.forkId)
+      if (!agent) return state
+      if (agent.agentId !== event.agentId) return state
+
+      emit.agentKilled({
+        agentId: agent.agentId,
+        forkId: agent.forkId,
+        parentForkId: agent.parentForkId,
+        type: agent.role,
+        title: agent.name,
+        reason: event.reason,
+        timestamp: event.timestamp,
+      })
+
+      const nextAgents = new Map(state.agents)
+      nextAgents.delete(agent.agentId)
+      const nextByFork = new Map(state.agentByForkId)
+      nextByFork.delete(event.forkId)
+
+      return {
+        ...state,
+        agents: nextAgents,
+        agentByForkId: nextByFork,
       }
     },
   },
