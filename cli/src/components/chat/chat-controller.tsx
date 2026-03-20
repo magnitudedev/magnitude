@@ -45,7 +45,7 @@ export type PasteFlowOutcome = 'clipboard-image' | 'empty' | 'pasted-image-path'
 
 export async function runChatPasteFlow(args: {
   eventText?: string
-  readClipboardText: () => string
+  readClipboardText: () => string | null
   addClipboardImage: () => Promise<boolean>
   addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
   inlinePastePillCharLimit: number
@@ -95,6 +95,33 @@ export async function handleChatControllerPaste(args: {
       args.setInputValue((prev) => insertPasteSegment(prev, pasteText, createId()))
     },
   })
+}
+
+export function shouldCycleSubagentTabs(args: {
+  keyName: string
+  ctrl: boolean
+  meta: boolean
+  option: boolean
+  fileMentionOpen: boolean
+  slashMenuOpen: boolean
+}): boolean {
+  if (args.keyName !== 'tab') return false
+  if (args.ctrl || args.meta || args.option) return false
+  if (args.fileMentionOpen || args.slashMenuOpen) return false
+  return true
+}
+
+export function getCycledTabSelection(args: {
+  selectedForkId: string | null
+  subagentTabs: Array<{ forkId: string }>
+  shift: boolean
+}): string | null {
+  const tabIds: Array<string | null> = [null, ...args.subagentTabs.map((tab) => tab.forkId)]
+  if (tabIds.length === 0) return null
+  const currentIndex = Math.max(0, tabIds.indexOf(args.selectedForkId))
+  const delta = args.shift ? -1 : 1
+  const nextIndex = (currentIndex + delta + tabIds.length) % tabIds.length
+  return tabIds[nextIndex] ?? null
 }
 
 export function ChatController(props: ChatControllerProps) {
@@ -297,6 +324,23 @@ export function ChatController(props: ChatControllerProps) {
     if (!env.bashMode && shouldHandleSlashCommandInTab(selectedForkId) && slashCommands.handleKeyIntercept(key)) return true
     if (env.widgetNavActive && services.handleWidgetKeyEvent(key)) return true
 
+    if (shouldCycleSubagentTabs({
+      keyName: key.name,
+      ctrl: key.ctrl,
+      meta: key.meta,
+      option: key.option,
+      fileMentionOpen: fileMentions.isOpen,
+      slashMenuOpen: slashCommands.isSlashMenuOpen,
+    })) {
+      const nextTabId = getCycledTabSelection({
+        selectedForkId,
+        subagentTabs,
+        shift: key.shift,
+      })
+      onSubagentTabSelect(nextTabId)
+      return true
+    }
+
     const isPlainArrow = !key.ctrl && !key.meta && !key.option && !key.shift
     if (!isPlainArrow) return false
 
@@ -346,7 +390,7 @@ export function ChatController(props: ChatControllerProps) {
     }
 
     return false
-  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId])
+  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId, subagentTabs, onSubagentTabSelect])
 
   const handleInputChange = useCallback((value: InputValue) => {
     if (!env.bashMode && value.text === '!') {
@@ -470,9 +514,6 @@ export function ChatController(props: ChatControllerProps) {
           services.exitBashMode()
           clearComposer()
         }}
-        fileMentionOpen={fileMentions.isOpen}
-        slashMenuOpen={slashCommands.isSlashMenuOpen}
-        onToggleTaskPanel={services.toggleTaskPanel}
         pendingApproval={env.pendingApproval}
         onApprove={onApprove}
         onReject={onReject}

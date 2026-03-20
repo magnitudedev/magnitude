@@ -38,7 +38,6 @@ export type ChatControllerServices = {
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
   openSettings: (tab: SettingsTab) => void
-  toggleTaskPanel: () => void
   handleWidgetKeyEvent: (key: KeyEvent) => boolean
   enterBashMode: () => void
   exitBashMode: () => void

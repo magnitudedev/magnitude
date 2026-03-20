@@ -19,9 +19,6 @@ interface ChatSurfaceKeyboardProps {
   onCloseFilePanel: () => void
   bashMode: boolean
   onExitBashMode: () => void
-  fileMentionOpen: boolean
-  slashMenuOpen: boolean
-  onToggleTaskPanel: () => void
   pendingApproval: boolean
   onApprove: () => void
   onReject: () => void
@@ -44,9 +41,6 @@ export function ChatSurfaceKeyboard({
   onCloseFilePanel,
   bashMode,
   onExitBashMode,
-  fileMentionOpen,
-  slashMenuOpen,
-  onToggleTaskPanel,
   pendingApproval,
   onApprove,
   onReject,
@@ -73,12 +67,6 @@ export function ChatSurfaceKeyboard({
       if (isEscape && bashMode) {
         key.preventDefault()
         onExitBashMode()
-        return
-      }
-
-      if (key.name === 'tab' && !key.shift && !key.ctrl && !key.meta && !key.option && !fileMentionOpen && !slashMenuOpen) {
-        key.preventDefault()
-        onToggleTaskPanel()
         return
       }
 
@@ -159,9 +147,6 @@ export function ChatSurfaceKeyboard({
       onCloseFilePanel,
       bashMode,
       onExitBashMode,
-      fileMentionOpen,
-      slashMenuOpen,
-      onToggleTaskPanel,
       pendingApproval,
       onApprove,
       onReject,

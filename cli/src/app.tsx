@@ -854,10 +854,6 @@ function AppInner({
     setShowRecentChatsOverlay(true)
   }, [refreshRecentChats])
 
-  const toggleTaskPanel = useCallback(() => {
-    // Task panel removed — work graph visualization TODO
-  }, [])
-
   const modeColor = theme.modeDefault
   const modeLabel = 'Default'
 
@@ -1949,7 +1945,7 @@ function AppInner({
               interruptFork: handleInterruptFork,
               interruptAll: handleInterruptAll,
               openSettings,
-              toggleTaskPanel,
+
               handleWidgetKeyEvent: widgetNavigation.handleKeyEvent,
               enterBashMode: () => setBashMode(true),
               exitBashMode: exitBashMode,
