@@ -12,7 +12,7 @@ import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 
 import { thinkTool } from '../tools/globals'
-import { agentCreateTool, agentDismissTool } from '../tools/agent-tools'
+import { agentCreateTool } from '../tools/agent-tools'
 import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -50,7 +50,6 @@ const tools = toolSet({
   shellBg:        shellBgTool,
 
   agentCreate:    agentCreateTool,
-  agentDismiss:   agentDismissTool,
 
   think:          thinkTool,
 })

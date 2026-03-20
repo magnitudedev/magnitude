@@ -210,9 +210,44 @@ describe('reconcileForkMeta', () => {
     expect(result.next['fork-1']?.accumulatedActiveMs).toBe(3000)
   })
 
-  test('marks dismissed or nonexistent prior forks for prune', () => {
+  test('removes killed forks when fork_activity is removed from display', () => {
     const prev = {
-      'fork-dismissed': {
+      'fork-killed': {
+        agentId: 'a',
+        name: 'A',
+        activeSince: 1000,
+        toolCount: 0,
+        toolCounts: {},
+        phase: 'idle' as const,
+        completedAt: 2000,
+      },
+      'fork-idle': {
+        agentId: 'b',
+        name: 'B',
+        activeSince: 1000,
+        toolCount: 0,
+        toolCounts: {},
+        phase: 'idle' as const,
+        completedAt: 2000,
+      },
+    }
+
+    const latestByFork = new Map<string, any>([
+      ['fork-idle', { forkId: 'fork-idle', name: 'B', activeSince: 1000, status: 'completed', toolCounts: {} }],
+    ])
+
+    const result = reconcileForkMeta({
+      prev,
+      latestByFork,
+      agentStatusState: null,
+    })
+
+    expect(Object.keys(result.next).sort()).toEqual(['fork-idle'])
+  })
+
+  test('rebuilds from latest fork_activity map and drops missing prior forks', () => {
+    const prev = {
+      'fork-idle': {
         agentId: 'a',
         name: 'A',
         activeSince: 1000,
@@ -232,19 +267,16 @@ describe('reconcileForkMeta', () => {
       },
     }
 
-    const agentStatusState = {
-      agents: new Map([
-        ['a', { agentId: 'a', forkId: 'fork-dismissed', status: 'dismissed' }],
-      ]),
-    } as any
+    const latestByFork = new Map<string, any>([
+      ['fork-idle', { forkId: 'fork-idle', name: 'A', activeSince: 1000, status: 'completed', toolCounts: {} }],
+    ])
 
     const result = reconcileForkMeta({
       prev,
-      latestByFork: new Map(),
-      agentStatusState,
+      latestByFork,
+      agentStatusState: null,
     })
 
-    expect(result.pruneForkIds.sort()).toEqual(['fork-dismissed', 'fork-missing'])
-    expect(Object.keys(result.next)).toEqual([])
+    expect(Object.keys(result.next).sort()).toEqual(['fork-idle'])
   })
 })

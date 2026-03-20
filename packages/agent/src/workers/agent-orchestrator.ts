@@ -3,8 +3,7 @@
  *
  * Handles agent infrastructure that tools can't own:
  * - Root fork init on session start
- * - Disposing fork layers + browser harness on agent dismissal
- * - Auto-dismissing interrupted child agents
+ * - Interrupt process cleanup for active forks
  *
  * fork() and task.validate handle their own lifecycle directly.
  */
@@ -15,7 +14,6 @@ import type { AppEvent } from '../events'
 import { ExecutionManager } from '../execution/execution-manager'
 import { WorkingStateProjection } from '../projections/working-state'
 
-import { BrowserService } from '../services/browser-service'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 
 // =============================================================================
@@ -25,7 +23,7 @@ import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 export const AgentOrchestrator = Worker.define<AppEvent>()({
   name: 'AgentOrchestrator',
 
-  // interrupt handler must not be interrupted itself (it auto-dismisses interrupted child agents)
+  // interrupt handler must not be interrupted itself
   ignoreInterrupt: ['interrupt'] as const,
 
   eventHandlers: {
@@ -46,14 +44,10 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
 
     soft_interrupt: () => Effect.void,
 
-    // Dispose agent resources
-    agent_dismissed: (event, _publish) => Effect.gen(function* () {
-      const browserService = yield* BrowserService
-      yield* browserService.release(event.forkId)
-
+    agent_killed: (event) => Effect.gen(function* () {
       const execManager = yield* ExecutionManager
       yield* execManager.disposeFork(event.forkId)
-    }).pipe(Effect.orDie)
+    }).pipe(Effect.orDie),
   },
 
   signalHandlers: (on) => [

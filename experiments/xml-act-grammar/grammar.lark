@@ -96,7 +96,7 @@ TOOL_ATTR: "tool"
 QUERY_ATTR: "query"
 
 // Tool tag names — add more as needed for your tool set
-TOOL_TAG_NAME: "shell" | "fs-read" | "fs-write" | "fs-tree" | "fs-search" | "edit" | "web-fetch" | "web-search" | "artifact-read" | "artifact-write" | "artifact-update" | "artifact-sync" | "agent-create" | "agent-dismiss"
+TOOL_TAG_NAME: "shell" | "fs-read" | "fs-write" | "fs-tree" | "fs-search" | "edit" | "web-fetch" | "web-search" | "artifact-read" | "artifact-write" | "artifact-update" | "artifact-sync" | "agent-create"
 ATTR_NAME: /[A-Za-z_][A-Za-z0-9_:-]*/
 
 TAG_END: ">"

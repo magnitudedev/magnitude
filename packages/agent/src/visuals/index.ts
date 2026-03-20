@@ -37,7 +37,7 @@ export {
   screenshotReducer,
   evaluateReducer,
   agentCreateReducer,
-  agentDismissReducer,
+
   agentMessageReducer,
   parentMessageReducer,
 

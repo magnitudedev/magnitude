@@ -803,7 +803,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       const sessionState = yield* sessionContextProjection.get
       const cwd = sessionState.context?.cwd ?? process.cwd()
-      const workspacePath = sessionState.context!.workspacePath
+      const workspacePath = sessionState.context?.workspacePath ?? cwd
       if (forkId === null) {
         oneshotEnabled = !!sessionState.context?.oneshot
       }
@@ -831,15 +831,14 @@ const makeExecutionManager = Effect.gen(function* () {
         forkAgentVariants.set(forkId, variant)
       }
 
-      const backgroundProcessesProjection = yield* BackgroundProcessesProjection.Tag
+      const backgroundProcessesProjection = yield* Effect.serviceOption(BackgroundProcessesProjection.Tag)
 
       const projectionReader: ProjectionReader = {
         getAgentRouting: () => agentProjection.get,
         getAgentStatus: () => agentStatusProjection.get,
-        getBackgroundProcesses: () => Effect.map(
-          backgroundProcessesProjection.get,
-          (state) => getProcessesForFork(state, forkId)
-        ),
+        getBackgroundProcesses: () => backgroundProcessesProjection._tag === 'Some'
+          ? Effect.map(backgroundProcessesProjection.value.get, (state) => getProcessesForFork(state, forkId))
+          : Effect.succeed(new Map()),
       }
       const projectionReaderLayer = Layer.succeed(ProjectionReaderTag, projectionReader)
       layers = Layer.merge(layers, projectionReaderLayer)

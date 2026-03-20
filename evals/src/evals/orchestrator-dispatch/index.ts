@@ -231,7 +231,6 @@ function hasAction(parsed: ParsedOrchestratorResponse): boolean {
     parsed.shells.length > 0 ||
     parsed.fsEdits.length > 0 ||
     parsed.fsWrites.length > 0 ||
-    parsed.agentDismisses.length > 0 ||
 
     parsed.artifactCreates.length > 0 ||
     parsed.artifactWrites.length > 0 ||

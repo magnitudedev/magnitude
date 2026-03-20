@@ -48,7 +48,7 @@ describe('memory transcript', () => {
     expect(t).not.toContain('<actions>')
   })
 
-  test('includes delegation lifecycle but excludes unrelated events', () => {
+  test('includes agent creation lifecycle but excludes unrelated events', () => {
     const events = [
       {
         type: 'agent_created',
@@ -63,14 +63,6 @@ describe('memory transcript', () => {
         message: 'scan',
       },
       {
-        type: 'agent_dismissed',
-        forkId: 'f1',
-        parentForkId: null,
-        agentId: 'a1',
-        result: { summary: 'done' },
-        reason: 'completed',
-      },
-      {
         type: 'chat_title_generated',
         forkId: null,
         title: 'Implement feature',
@@ -79,7 +71,6 @@ describe('memory transcript', () => {
 
     const t = buildExtractionTranscript(events)
     expect(t).toContain('agent_created')
-    expect(t).toContain('agent_dismissed')
     expect(t).not.toContain('chat_title_generated')
   })
 

@@ -389,14 +389,13 @@ export interface AgentCreated {
   readonly outputSchema?: unknown
 }
 
-/** Agent dismissed (removed permanently) */
-export interface AgentDismissed {
-  readonly type: 'agent_dismissed'
+/** Agent killed by its parent while active */
+export interface AgentKilled {
+  readonly type: 'agent_killed'
   readonly forkId: string
   readonly parentForkId: string | null
   readonly agentId: string
-  readonly result: unknown
-  readonly reason: 'dismissed' | 'interrupted' | 'completed'
+  readonly reason: string
 }
 
 // =============================================================================
@@ -542,5 +541,5 @@ export type AppEvent =
   | ChatTitleGenerated
   // Agent events
   | AgentCreated
-  | AgentDismissed
+  | AgentKilled
   | UserReturnConfirmed

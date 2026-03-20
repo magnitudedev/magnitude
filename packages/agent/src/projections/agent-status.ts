@@ -8,7 +8,7 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { WorkingStateProjection } from './working-state'
 
-export type AgentStatus = 'starting' | 'working' | 'idle' | 'dismissed'
+export type AgentStatus = 'starting' | 'working' | 'idle' | 'killed'
 
 export interface AgentInfo {
   readonly agentId: string
@@ -21,8 +21,6 @@ export interface AgentInfo {
   readonly taskId: string
   readonly message: string | null
   readonly status: AgentStatus
-  readonly result?: unknown
-  readonly dismissReason?: 'dismissed' | 'interrupted' | 'completed'
 }
 
 export interface AgentStatusState {
@@ -43,19 +41,6 @@ export interface AgentCreatedSignal {
   readonly timestamp: number
 }
 
-export interface AgentDismissedSignal {
-  readonly forkId: string
-  readonly parentForkId: string | null
-  readonly agentId: string
-  readonly name: string
-  readonly role: string
-  readonly type: string
-  readonly taskId: string
-  readonly result: unknown
-  readonly reason: 'dismissed' | 'interrupted' | 'completed'
-  readonly timestamp: number
-}
-
 export interface AgentBecameIdleSignal {
   readonly agentId: string
   readonly forkId: string
@@ -73,8 +58,14 @@ export interface AgentBecameWorkingSignal {
   readonly timestamp: number
 }
 
-function getStatus(state: AgentStatusState, agentId: string): AgentStatus | undefined {
-  return state.agents.get(agentId)?.status
+export interface AgentKilledSignal {
+  readonly agentId: string
+  readonly forkId: string
+  readonly parentForkId: string | null
+  readonly type: string
+  readonly title: string
+  readonly reason: string
+  readonly timestamp: number
 }
 
 export function getAgentByForkId(state: AgentStatusState, forkId: string): AgentInfo | undefined {
@@ -84,13 +75,7 @@ export function getAgentByForkId(state: AgentStatusState, forkId: string): Agent
 }
 
 export function getActiveAgent(state: AgentStatusState, agentId: string): AgentInfo | undefined {
-  const agent = state.agents.get(agentId)
-  if (!agent || agent.status === 'dismissed') return undefined
-  return agent
-}
-
-function isDismissed(state: AgentStatusState, agentId: string): boolean {
-  return getStatus(state, agentId) === 'dismissed'
+  return state.agents.get(agentId)
 }
 
 export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusState>()(({
@@ -104,9 +89,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
 
   signals: {
     agentCreated: Signal.create<AgentCreatedSignal>('AgentStatus/created'),
-    agentDismissed: Signal.create<AgentDismissedSignal>('AgentStatus/dismissed'),
     agentBecameIdle: Signal.create<AgentBecameIdleSignal>('AgentStatus/agentBecameIdle'),
     agentBecameWorking: Signal.create<AgentBecameWorkingSignal>('AgentStatus/agentBecameWorking'),
+    agentKilled: Signal.create<AgentKilledSignal>('AgentStatus/agentKilled'),
   },
 
   eventHandlers: {
@@ -160,51 +145,12 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       }
     },
 
-    agent_dismissed: ({ event, state, emit }) => {
-      const resolvedAgentId = state.agents.has(event.agentId)
-        ? event.agentId
-        : state.agentByForkId.get(event.forkId)
-
-      if (!resolvedAgentId) {
-        throw new Error(`[AgentStatusProjection] Invalid state transition: agent_dismissed for unknown agent ${event.agentId} (forkId: ${event.forkId})`)
-      }
-
-      const existing = state.agents.get(resolvedAgentId)
-      if (!existing) {
-        throw new Error(`[AgentStatusProjection] Invalid state transition: agent_dismissed for missing indexed agent ${resolvedAgentId}`)
-      }
-
-      if (existing.status === 'dismissed') return state
-
-      emit.agentDismissed({
-        forkId: existing.forkId,
-        parentForkId: existing.parentForkId,
-        agentId: existing.agentId,
-        name: existing.name,
-        role: existing.role,
-        type: existing.role,
-        taskId: existing.taskId,
-        result: event.result,
-        reason: event.reason,
-        timestamp: event.timestamp,
-      })
-
-      return {
-        ...state,
-        agents: new Map(state.agents).set(resolvedAgentId, {
-          ...existing,
-          status: 'dismissed',
-          result: event.result,
-          dismissReason: event.reason,
-        }),
-      }
-    },
 
     turn_started: ({ event, state, emit }) => {
       if (event.forkId === null) return state
 
       const agent = getAgentByForkId(state, event.forkId)
-      if (!agent || isDismissed(state, agent.agentId)) return state
+      if (!agent) return state
 
       if (agent.status !== 'working') {
         emit.agentBecameWorking({
@@ -226,7 +172,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       if (event.forkId === null) return state
 
       const agent = getAgentByForkId(state, event.forkId)
-      if (!agent || isDismissed(state, agent.agentId)) return state
+      if (!agent) return state
 
       if (agent.status !== 'idle') {
         emit.agentBecameIdle({
@@ -249,7 +195,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       if (event.forkId === null) return state
 
       const agent = getAgentByForkId(state, event.forkId)
-      if (!agent || isDismissed(state, agent.agentId)) return state
+      if (!agent) return state
 
       if (agent.status !== 'idle') {
         emit.agentBecameIdle({
@@ -267,6 +213,33 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
       }
     },
+
+    agent_killed: ({ event, state, emit }) => {
+      const agent = getAgentByForkId(state, event.forkId)
+      if (!agent) return state
+      if (agent.agentId !== event.agentId) return state
+
+      emit.agentKilled({
+        agentId: agent.agentId,
+        forkId: agent.forkId,
+        parentForkId: agent.parentForkId,
+        type: agent.role,
+        title: agent.name,
+        reason: event.reason,
+        timestamp: event.timestamp,
+      })
+
+      const nextAgents = new Map(state.agents)
+      nextAgents.delete(agent.agentId)
+      const nextByFork = new Map(state.agentByForkId)
+      nextByFork.delete(event.forkId)
+
+      return {
+        ...state,
+        agents: nextAgents,
+        agentByForkId: nextByFork,
+      }
+    },
   },
 
   signalHandlers: (on) => [
@@ -274,7 +247,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       if (value.forkId === null) return state
 
       const agent = getAgentByForkId(state, value.forkId)
-      if (!agent || isDismissed(state, agent.agentId)) return state
+      if (!agent) return state
 
       if (agent.status !== 'idle') {
         emit.agentBecameIdle({

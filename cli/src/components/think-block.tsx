@@ -4,6 +4,7 @@ import type { ThinkBlockMessage, ThinkBlockStep } from '@magnitudedev/agent'
 import { Button } from './button'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { useTheme } from '../hooks/use-theme'
+import { orange } from '../utils/theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
 import { renderRegistry, clusterRenderRegistry } from '../visuals/registry'
@@ -36,6 +37,52 @@ const formatDuration = (seconds: number): string => {
   return s > 0 ? `${m}m ${s}s` : `${m}m`
 }
 
+const SubagentStartedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_started' }> }) => {
+  const theme = useTheme()
+  return (
+    <text>
+      <span style={{ fg: orange[400] }}>▶ </span>
+      <span style={{ fg: theme.muted }}>Subagent </span>
+      <span style={{ fg: theme.muted }}>started</span>
+      <span style={{ fg: theme.muted }}>: </span>
+      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      {step.resumed && <span style={{ fg: theme.muted }}> (resumed)</span>}
+      <span style={{ fg: theme.muted }}> — {step.title}</span>
+    </text>
+  )
+}
+
+const SubagentFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_finished' }> }) => {
+  const theme = useTheme()
+  const duration = formatDuration(Math.floor(step.cumulativeTotalTimeMs / 1000))
+  const tools = step.cumulativeTotalToolsUsed
+  return (
+    <text>
+      <span style={{ fg: theme.success }}>✓ </span>
+      <span style={{ fg: theme.muted }}>Subagent </span>
+      <span style={{ fg: theme.muted }}>finished</span>
+      <span style={{ fg: theme.muted }}>: </span>
+      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      {step.resumed && <span style={{ fg: theme.muted }}> (resumed)</span>}
+      <span style={{ fg: theme.muted }}> · {step.resumed ? '↺ ' : ''}{duration} · </span>
+      <span style={{ fg: theme.primary }}>{tools}</span>
+      <span style={{ fg: theme.muted }}> {tools === 1 ? 'tool' : 'tools'}</span>
+    </text>
+  )
+}
+
+const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_killed' }> }) => {
+  const theme = useTheme()
+  return (
+    <text>
+      <span style={{ fg: theme.error }}>■ </span>
+      <span style={{ fg: theme.muted }}>Subagent killed: </span>
+      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      <span style={{ fg: theme.muted }}> - {step.title}</span>
+    </text>
+  )
+}
+
 function buildSummary(steps: readonly { type: string; toolKey?: string }[]): string {
   let webSearches = 0
   let commands = 0
@@ -48,7 +95,22 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
   let navigations = 0
   let inputs = 0
   let evaluations = 0
+  let subagentStarted = 0
+  let subagentFinished = 0
+  let subagentKilled = 0
   for (const step of steps) {
+    if (step.type === 'subagent_started') {
+      subagentStarted++
+      continue
+    }
+    if (step.type === 'subagent_finished') {
+      subagentFinished++
+      continue
+    }
+    if (step.type === 'subagent_killed') {
+      subagentKilled++
+      continue
+    }
     if (step.type !== 'tool') continue
     if (step.toolKey === 'webSearch' || step.toolKey === 'webFetch') webSearches++
     else if (step.toolKey === 'shell') commands++
@@ -74,6 +136,9 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
   if (navigations > 0) parts.push(`${navigations} ${navigations === 1 ? 'navigation' : 'navigations'}`)
   if (inputs > 0) parts.push(`${inputs} ${inputs === 1 ? 'input' : 'inputs'}`)
   if (evaluations > 0) parts.push(`${evaluations} ${evaluations === 1 ? 'eval' : 'evals'}`)
+  if (subagentStarted > 0) parts.push(`${subagentStarted} ${subagentStarted === 1 ? 'subagent started' : 'subagents started'}`)
+  if (subagentFinished > 0) parts.push(`${subagentFinished} ${subagentFinished === 1 ? 'subagent finished' : 'subagents finished'}`)
+  if (subagentKilled > 0) parts.push(`${subagentKilled} ${subagentKilled === 1 ? 'subagent killed' : 'subagents killed'}`)
   return parts.length > 0 ? ` (${parts.join(', ')})` : ''
 }
 
@@ -96,11 +161,14 @@ function groupByCluster(steps: readonly ThinkBlockStep[]): StepGroup[] {
   const groups: StepGroup[] = []
   for (const step of steps) {
     const cluster = step.cluster ?? null
+    const syntheticCluster = step.type === 'subagent_started' || step.type === 'subagent_finished' || step.type === 'subagent_killed'
+      ? '__subagent_lifecycle__'
+      : cluster
     const last = groups[groups.length - 1]
-    if (last && cluster !== null && last.cluster === cluster) {
+    if (last && syntheticCluster !== null && last.cluster === syntheticCluster) {
       last.steps.push(step)
     } else {
-      groups.push({ cluster, steps: [step] })
+      groups.push({ cluster: syntheticCluster, steps: [step] })
     }
   }
   return groups
@@ -257,6 +325,7 @@ const StepGroupView = memo(function StepGroupView({
   isInterrupted?: boolean
   lastThinkingStepId?: string
 }) {
+  const theme = useTheme()
   const clusterRenderer = group.cluster
     ? clusterRenderRegistry.get(group.cluster)
     : undefined
@@ -288,6 +357,18 @@ const StepGroupView = memo(function StepGroupView({
               <ThinkingStep content={step.content ?? ''} label={step.label} isActive={(isActive ?? false) && isLastThinkingStep} isInterrupted={isInterrupted} />
             </box>
           )
+        }
+
+        if (step.type === 'subagent_started') {
+          return <SubagentStartedRow key={step.id} step={step} />
+        }
+
+        if (step.type === 'subagent_finished') {
+          return <SubagentFinishedRow key={step.id} step={step} />
+        }
+
+        if (step.type === 'subagent_killed') {
+          return <SubagentKilledRow key={step.id} step={step} />
         }
 
         if (step.type === 'communication') {

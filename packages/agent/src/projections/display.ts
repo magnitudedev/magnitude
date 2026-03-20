@@ -123,7 +123,38 @@ export interface CommunicationStep {
   readonly status?: 'streaming' | 'completed'
 }
 
-export type ThinkBlockStep = ThinkingStep | ToolStep | CommunicationStep
+export interface SubagentStartedStep {
+  readonly id: string
+  readonly type: 'subagent_started'
+  readonly subagentType: string
+  readonly subagentId: string
+  readonly title: string
+  readonly resumed: boolean
+}
+
+export interface SubagentFinishedStep {
+  readonly id: string
+  readonly type: 'subagent_finished'
+  readonly subagentId: string
+  readonly cumulativeTotalTimeMs: number
+  readonly cumulativeTotalToolsUsed: number
+  readonly resumed: boolean
+}
+
+export interface SubagentKilledStep {
+  readonly id: string
+  readonly type: 'subagent_killed'
+  readonly subagentId: string
+  readonly title: string
+}
+
+export type ThinkBlockStep =
+  | ThinkingStep
+  | ToolStep
+  | CommunicationStep
+  | SubagentStartedStep
+  | SubagentFinishedStep
+  | SubagentKilledStep
 
 export interface ThinkBlockMessage {
   readonly id: string
@@ -454,6 +485,23 @@ function findLastIndex<T>(arr: readonly T[], pred: (item: T) => boolean): number
     if (pred(arr[i])) return i
   }
   return -1
+}
+
+function totalToolsUsed(counts: ForkActivityToolCounts): number {
+  return counts.commands
+    + counts.reads
+    + counts.writes
+    + counts.edits
+    + counts.searches
+    + counts.webSearches
+    + counts.webFetches
+    + counts.artifactWrites
+    + counts.artifactUpdates
+    + counts.clicks
+    + counts.navigations
+    + counts.inputs
+    + counts.evaluations
+    + counts.other
 }
 
 export function moveMessageToEndBeforeQueue<T extends DisplayMessage>(
@@ -1251,10 +1299,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    agent_dismissed: ({ event, fork }) => {
-      // Keep fork state for display/debug history
-      return fork
-    },
+    agent_killed: ({ fork }) => fork,
 
 
   },
@@ -1281,10 +1326,30 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         timestamp: value.timestamp
       }
 
-      const newMessages = insertBeforeQueuedMessages(parentState.messages, msg)
+      let nextParentState: DisplayState = {
+        ...parentState,
+        messages: insertBeforeQueuedMessages(parentState.messages, msg)
+      }
+
+      if (parentForkId === null) {
+        const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
+        const step: SubagentStartedStep = {
+          id: generateId(),
+          type: 'subagent_started',
+          subagentType: value.type,
+          subagentId: value.agentId,
+          title: value.name,
+          resumed: false,
+        }
+        nextParentState = {
+          ...withBlock.fork,
+          messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
+        }
+      }
+
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(parentForkId, nextParentState)
       }
     }),
 
@@ -1328,42 +1393,36 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       const msg = parentState.messages[msgIndex] as ForkActivityMessage
       const stintMs = Math.max(0, value.timestamp - msg.activeSince)
+      const cumulativeTotalTimeMs = msg.accumulatedActiveMs + stintMs
       const newMessages = [...parentState.messages]
       newMessages[msgIndex] = {
         ...msg,
         status: 'completed',
         completedAt: value.timestamp,
-        accumulatedActiveMs: msg.accumulatedActiveMs + stintMs,
+        accumulatedActiveMs: cumulativeTotalTimeMs,
+      }
+
+      let nextParentState: DisplayState = { ...parentState, messages: newMessages }
+
+      if (parentForkId === null && value.reason !== 'interrupt') {
+        const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
+        const step: SubagentFinishedStep = {
+          id: generateId(),
+          type: 'subagent_finished',
+          subagentId: value.agentId,
+          cumulativeTotalTimeMs,
+          cumulativeTotalToolsUsed: totalToolsUsed(msg.toolCounts),
+          resumed: (msg.resumeCount ?? 0) > 0,
+        }
+        nextParentState = {
+          ...withBlock.fork,
+          messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
+        }
       }
 
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
-      }
-    }),
-
-    on(AgentStatusProjection.signals.agentDismissed, ({ value, state }) => {
-      const { forkId, parentForkId } = value
-      const parentState = state.forks.get(parentForkId)
-      if (!parentState) return state
-
-      const msgIndex = findLastIndex(parentState.messages, (m: DisplayMessage) =>
-        m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
-      if (msgIndex === -1) return state
-
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
-      const stintMs = Math.max(0, value.timestamp - msg.activeSince)
-      const newMessages = [...parentState.messages]
-      newMessages[msgIndex] = {
-        ...msg,
-        status: 'completed',
-        completedAt: value.timestamp,
-        accumulatedActiveMs: msg.accumulatedActiveMs + stintMs,
-      }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+        forks: new Map(state.forks).set(parentForkId, nextParentState)
       }
     }),
 
@@ -1377,20 +1436,80 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       if (msgIndex === -1) return state
 
       const message = parentState.messages[msgIndex] as ForkActivityMessage
-      if (!message.completedAt) return state  // never went idle — first run, not a resume
+      if (!message.completedAt) {
+        // First transition into working (post-create): start active stint clock here.
+        if ((message.resumeCount ?? 0) === 0) {
+          const newMessages = [...parentState.messages]
+          newMessages[msgIndex] = {
+            ...message,
+            activeSince: value.timestamp,
+            timestamp: value.timestamp,
+          }
 
+          return {
+            ...state,
+            forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: newMessages })
+          }
+        }
+        return state
+      }
+
+      const nextResumeCount = (message.resumeCount ?? 0) + 1
       const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
         ...msg,
         status: 'running',
         activeSince: value.timestamp,
         completedAt: undefined,
-        resumeCount: (msg.resumeCount ?? 0) + 1,
+        resumeCount: nextResumeCount,
         timestamp: value.timestamp,
       }))
 
+      let nextParentState: DisplayState = { ...parentState, messages: moved }
+
+      if (parentForkId === null) {
+        const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
+        const step: SubagentStartedStep = {
+          id: generateId(),
+          type: 'subagent_started',
+          subagentType: value.type,
+          subagentId: value.agentId,
+          title: message.name,
+          resumed: nextResumeCount > 0,
+        }
+        nextParentState = {
+          ...withBlock.fork,
+          messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
+        }
+      }
+
       return {
         ...state,
-        forks: new Map(state.forks).set(parentForkId, { ...parentState, messages: moved })
+        forks: new Map(state.forks).set(parentForkId, nextParentState)
+      }
+    }),
+
+    on(AgentStatusProjection.signals.agentKilled, ({ value, state }) => {
+      const parentState = state.forks.get(value.parentForkId)
+      if (!parentState) return state
+
+      const messages = parentState.messages.filter((m) => !(m.type === 'fork_activity' && m.forkId === value.forkId))
+      let nextParentState: DisplayState = { ...parentState, messages }
+
+      const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
+      const step: SubagentKilledStep = {
+        id: generateId(),
+        type: 'subagent_killed',
+        subagentId: value.agentId,
+        title: value.title,
+      }
+      nextParentState = {
+        ...withBlock.fork,
+        messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.parentForkId, nextParentState)
       }
     }),
 

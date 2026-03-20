@@ -19,7 +19,7 @@ export const TurnController = Worker.define<AppEvent>()({
   name: 'TurnController',
 
   signalHandlers: (on) => [
-    on(WorkingStateProjection.signals.shouldTriggerChanged, ({ forkId, shouldTrigger, chainId }, publish) => Effect.gen(function* () {
+    on(WorkingStateProjection.signals.shouldTriggerChanged, ({ forkId, shouldTrigger, chainId }, publish, read) => Effect.gen(function* () {
       // Only proceed if shouldTrigger is true
       if (!shouldTrigger) return
 

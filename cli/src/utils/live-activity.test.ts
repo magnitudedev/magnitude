@@ -171,4 +171,14 @@ describe('live-activity selector', () => {
 
     expect(selectLatestLiveActivityFromThinkSteps(steps)).toBe('$ bun test cli/src/utils/live-activity.test.ts')
   })
+
+  it('ignores lifecycle-style started/finished step types in think steps', () => {
+    const steps = [
+      { id: '1', type: 'thinking', content: 'active thought' },
+      { id: '2', type: 'subagent_started', label: 'Started researcher' },
+      { id: '3', type: 'subagent_finished', label: 'Finished researcher' },
+    ] as any as ThinkBlockStep[]
+
+    expect(selectLatestLiveActivityFromThinkSteps(steps)).toBe('active thought')
+  })
 })
