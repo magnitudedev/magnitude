@@ -441,6 +441,7 @@ export function ChatController(props: ChatControllerProps) {
       if (!trimmed) return
       const result = services.executeBash(trimmed)
       services.appendBashOutput(result)
+      services.exitBashMode()
       setInputValue(EMPTY_INPUT)
       setHistoryIndex(null)
       setSavedDraft('')
