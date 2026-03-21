@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getActiveCoreSkills, getInProgressFileStreams, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getInProgressFileStreams, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -313,18 +313,6 @@ function AppInner({
     scanSkills(process.cwd()).then((skills) => {
       const commands: SlashCommandDefinition[] = []
 
-      // Register core skills that aren't overridden by user skills
-      const activeCoreSkills = getActiveCoreSkills(skills)
-      for (const core of activeCoreSkills) {
-        commands.push({
-          id: core.name,
-          label: core.name,
-          description: core.description,
-          source: 'skill' as const,
-        })
-      }
-
-      // Register user skills
       for (const s of skills) {
         commands.push({
           id: s.name,

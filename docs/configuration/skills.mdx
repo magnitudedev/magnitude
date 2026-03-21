@@ -24,7 +24,6 @@ Create a `SKILL.md` file in one of the scan directories:
 ---
 name: my-skill
 description: A brief description of what this skill does
-trigger: When the user asks for X or wants Y
 ---
 
 # My Skill
@@ -41,7 +40,6 @@ Instructions for the agent when this skill is active.
 The YAML frontmatter requires:
 - **name** — skill identifier (used as the slash command)
 - **description** — what the skill does
-- **trigger** — when the skill should be activated
 
 ## Activating a skill
 
@@ -66,7 +64,6 @@ Project-local skills override global skills with the same name. Magnitude-specif
 ---
 name: debug
 description: Take a scientific approach to debugging a problem
-trigger: User asks to debug an issue or track down a bug
 ---
 
 # Debug

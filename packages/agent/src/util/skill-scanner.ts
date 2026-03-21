@@ -23,7 +23,6 @@ import { parseFrontmatter } from './frontmatter'
 export interface SkillMetadata {
   readonly name: string
   readonly description: string
-  readonly trigger: string
   readonly path: string  // absolute path to SKILL.md
 }
 
@@ -48,13 +47,13 @@ async function scanDirectory(directory: string): Promise<SkillMetadata[]> {
     })) {
       try {
         const content = await Bun.file(match).text()
-        const result = parseFrontmatter<{ name: string; description: string; trigger: string }>(content)
+        const result = parseFrontmatter<{ name: string; description: string }>(content)
         if (!result) continue
 
-        const { name, description, trigger } = result.frontmatter
-        if (!name || !description || !trigger) continue
+        const { name, description } = result.frontmatter
+        if (!name || !description) continue
 
-        skills.push({ name, description, trigger, path: match })
+        skills.push({ name, description, path: match })
       } catch {
         // Skip files that can't be read
         continue

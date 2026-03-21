@@ -169,8 +169,8 @@ export { skillTool } from './tools/skill'
 export type { SkillStateReader } from './tools/skill'
 
 // Skills
-export { resolveSkill, getActiveCoreSkills, getUserSkills, CORE_SKILL_NAMES } from './skills'
-export type { CoreSkillEntry, ResolvedSkill, CoreSkillName } from './skills'
+export { resolveSkill, getUserSkills } from './skills'
+export type { ResolvedSkill } from './skills'
 
 // Workers
 export { TurnController } from './workers/turn-controller'
