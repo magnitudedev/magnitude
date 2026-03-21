@@ -1,15 +1,16 @@
 import { describe, expect, test } from 'bun:test'
 import { Effect, Layer, Ref } from 'effect'
 import { Fork } from '@magnitudedev/event-core'
+import { noopToolContext } from '@magnitudedev/tools'
 import { shellTool } from '../shell'
 import { WorkingDirectoryTag } from '../../execution/working-directory'
 import { ToolReminderTag } from '../../execution/tool-reminder'
 import { ToolExecutionContextTag } from '../../execution/tool-execution-context'
-import { BackgroundProcessRegistryTag } from '../../processes/background-process-registry'
+import { BackgroundProcessRegistryTag, type BackgroundProcessRegistry } from '../../processes/background-process-registry'
 
 const { ForkContext } = Fork
 
-const makeRegistry = () => ({
+const makeRegistry = (): BackgroundProcessRegistry => ({
   register: () => Effect.void,
   flush: () => Effect.void,
   listByFork: () => Effect.succeed([]),
@@ -30,14 +31,23 @@ const makeTestLayer = (remindersRef: Ref.Ref<string[]>) =>
     }),
   )
 
+function runPromise<A, E, R>(effect: Effect.Effect<A, E, R>) {
+  return Effect.runPromise(effect as unknown as Effect.Effect<A, E, never>)
+}
+
 describe('shell background behavior', () => {
   test('fast command returns mode completed with stdout, exitCode=0', async () => {
     const remindersRef = await Effect.runPromise(Ref.make<string[]>([]))
 
     const result = await Effect.runPromise(
-      shellTool.execute({ command: 'echo hello' }).pipe(
+      shellTool.execute({ command: 'echo hello' }, noopToolContext).pipe(
         Effect.provide(makeTestLayer(remindersRef)),
-      ),
+      ) as unknown as Effect.Effect<
+        { readonly stdout: string; readonly stderr: string; readonly mode: 'completed'; readonly exitCode: number } |
+        { readonly stdout: string; readonly stderr: string; readonly mode: 'detached'; readonly pid: number; readonly reason: 'background' | 'timeout_exceeded' },
+        unknown,
+        never
+      >,
     )
 
     expect(result.mode).toBe('completed')
@@ -51,9 +61,14 @@ describe('shell background behavior', () => {
     const remindersRef = await Effect.runPromise(Ref.make<string[]>([]))
 
     const result = await Effect.runPromise(
-      shellTool.execute({ command: 'exit 1' }).pipe(
+      shellTool.execute({ command: 'exit 1' }, noopToolContext).pipe(
         Effect.provide(makeTestLayer(remindersRef)),
-      ),
+      ) as unknown as Effect.Effect<
+        { readonly stdout: string; readonly stderr: string; readonly mode: 'completed'; readonly exitCode: number } |
+        { readonly stdout: string; readonly stderr: string; readonly mode: 'detached'; readonly pid: number; readonly reason: 'background' | 'timeout_exceeded' },
+        unknown,
+        never
+      >,
     )
 
     expect(result.mode).toBe('completed')

@@ -3,6 +3,7 @@ import { mkdtempSync } from 'fs'
 import { rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { createStorageClient } from '@magnitudedev/storage'
 import {
   MEMORY_RELATIVE_PATH,
   MEMORY_TEMPLATE,
@@ -15,11 +16,15 @@ import {
 
 describe('memory-file', () => {
   test('ensureMemoryFile creates template if missing', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'mem-file-home-'))
+    process.env.HOME = home
     const cwd = mkdtempSync(join(tmpdir(), 'mem-file-'))
-    const p = await ensureMemoryFile(cwd)
-    const text = await readMemory(cwd)
+    const storage = await createStorageClient({ cwd })
+    const p = await ensureMemoryFile(storage)
+    const text = await readMemory(storage)
     expect(p.endsWith(MEMORY_RELATIVE_PATH)).toBe(true)
     expect(text).toBe(MEMORY_TEMPLATE)
+    await rm(home, { recursive: true, force: true })
     await rm(cwd, { recursive: true, force: true })
   })
 

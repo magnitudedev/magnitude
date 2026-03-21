@@ -18,9 +18,13 @@ export type {
   XmlArrayChildBinding,
   CustomToolFormat,
   InputFields,
+  FieldPath,
   ArrayFields,
   ArrayElement,
   ChildTagPath,
+  AttrNames,
+  ChildTagNames,
+  DeriveStreamingShape,
 } from './bindings'
 
 export { ToolErrorSchema } from './errors'
@@ -40,4 +44,31 @@ export {
   buildKnownEntities,
 } from './ets'
 export type { ToolInterfaceResult, ToolInterfaceOptions, ToolGroupInterfaceOptions, AstGenOptions, KnownEntityInfo } from './ets'
+
+// New tool system contracts
+export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type AnyTool, type AnyToolDefinition } from './tool-definition'
+export * from './tool-context'
+export * from './tool-state-event'
+export * from './tool-binding'
+export * from './streaming-input'
+export * from './state-model'
+export {
+  defineDisplay,
+  createBinding,
+  type Display,
+  type DisplayConfig,
+  type DisplayProps,
+  type ToolDisplayBinding,
+  type ToolResult,
+  type CallState,
+  type BindingState,
+  type BindingStreaming,
+  type BindingInput,
+  type BindingOutput,
+  type BindingEmission,
+} from './display'
+export * from './composition'
+export * from './models'
+
+export * from './registry'
 

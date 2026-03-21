@@ -1,131 +1,80 @@
 /**
- * Visual Registries
+ * Visual Registry
  *
- * 1. Render registry (CLI) — maps toolKey → render function for think-block rendering.
- * 2. Reducer registry (agent) — set via setVisualRegistry() so DisplayProjection
- *    can reduce visual state as events stream in.
+ * Display binding registry (CLI) — maps tool keys to model/display bindings.
  */
 
-import { createRenderRegistry, createClusterRenderRegistry, createLiveTextRegistry } from './define'
+
+import { defaultModel, createBinding, type DisplayBindingRegistry, emptyStreamingInput } from '@magnitudedev/tools'
 import {
-  setVisualRegistry,
-  shellReducer,
-  readReducer, writeReducer, editReducer, treeReducer, searchReducer,
-  webSearchReducer, webFetchReducer,
-  clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
-  navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
-  agentCreateReducer, agentMessageReducer, parentMessageReducer,
-  skillReducer,
-} from '@magnitudedev/agent'
-import type { VisualReducerRegistry, ToolVisualReducer } from '@magnitudedev/agent'
-
-// Renderers
-import { shellRender, shellLiveText } from './shell'
-import { readRender, treeRender, searchRender, readLiveText, treeLiveText, searchLiveText } from './fs'
+  diffModel, contentModel, shellModel,
+  fileReadModel, fileTreeModel, fileSearchModel, webSearchModel, webFetchModel,
+  agentCreateModel, agentKillModel,
+  skillModel, browserActionModel,
+} from '@magnitudedev/agent/src/models'
 import {
-  webSearchRender, webFetchRender,
-  clickRender, doubleClickRender, rightClickRender, typeRender, scrollRender, dragRender,
-  navigateRender, goBackRender, switchTabRender, newTabRender, screenshotRender, evaluateRender,
-  fsWriteRender, editStreamRender, fsWriteLiveText, editStreamLiveText,
-  agentCreateRender, agentDismissRender, agentMessageRender, parentMessageRender,
-  skillRender,
-  webSearchLiveText, webFetchLiveText, browserLiveText,
-  agentCreateLiveText, agentDismissLiveText, agentMessageLiveText, parentMessageLiveText,
-  skillLiveText,
-} from './tools'
+  defaultDisplay, diffDisplay, contentDisplay, shellDisplay,
+  fileReadDisplay, fileTreeDisplay, fileSearchDisplay, webSearchDisplay, webFetchDisplay,
+  agentCreateDisplay, agentKillDisplay,
+  skillDisplay, browserActionDisplay,
+} from './displays'
 
-// =============================================================================
-// Render registry — toolKey → render function
-// =============================================================================
+// === Tool display binding composition root ===
 
-export const renderRegistry = createRenderRegistry({
-  shell: shellRender,
-  fileRead: readRender,
-  fileWrite: fsWriteRender,
-  fileEdit: editStreamRender,
-  fileTree: treeRender,
-  fileSearch: searchRender,
-  webSearch: webSearchRender,
-  webFetch: webFetchRender,
+// Display binding composition root.
+// Uses createBinding(model, display, initialStreaming) which verifies model↔display type compatibility.
+// Full chain verification (tool→xml→model→display) via composeToolChain() is done
+// at the agent package level where tool definitions and XML bindings are available.
+const newBindings = {
+  default: createBinding(defaultModel, defaultDisplay, emptyStreamingInput()),
+  diff: createBinding(diffModel, diffDisplay, emptyStreamingInput()),
+  content: createBinding(contentModel, contentDisplay, emptyStreamingInput()),
+  shell: createBinding(shellModel, shellDisplay, emptyStreamingInput()),
+  fileRead: createBinding(fileReadModel, fileReadDisplay, emptyStreamingInput()),
+  fileTree: createBinding(fileTreeModel, fileTreeDisplay, emptyStreamingInput()),
+  fileSearch: createBinding(fileSearchModel, fileSearchDisplay, emptyStreamingInput()),
+  webSearch: createBinding(webSearchModel, webSearchDisplay, emptyStreamingInput()),
+  webFetch: createBinding(webFetchModel, webFetchDisplay, emptyStreamingInput()),
+  agentCreate: createBinding(agentCreateModel, agentCreateDisplay, emptyStreamingInput()),
+  agentKill: createBinding(agentKillModel, agentKillDisplay, emptyStreamingInput()),
+  skill: createBinding(skillModel, skillDisplay, emptyStreamingInput()),
+  browserAction: createBinding(browserActionModel, browserActionDisplay, emptyStreamingInput()),
+} as const;
 
-  click: clickRender,
-  doubleClick: doubleClickRender,
-  rightClick: rightClickRender,
-  type: typeRender,
-  scroll: scrollRender,
-  drag: dragRender,
-  navigate: navigateRender,
-  goBack: goBackRender,
-  switchTab: switchTabRender,
-  newTab: newTabRender,
-  screenshot: screenshotRender,
-  evaluate: evaluateRender,
+type CliDisplayContracts = typeof newBindings;
 
-  agentCreate: agentCreateRender,
-
-  agentDismiss: agentDismissRender,
-  agentMessage: agentMessageRender,
-  parentMessage: parentMessageRender,
-
-  skill: skillRender,
-})
-
-// =============================================================================
-// Reducer registry — set on agent package for DisplayProjection
-// =============================================================================
-
-const allReducers: readonly ToolVisualReducer[] = [
-  shellReducer,
-  readReducer, writeReducer, editReducer, treeReducer, searchReducer,
-  webSearchReducer, webFetchReducer,
-  clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
-  navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
-  agentCreateReducer, agentMessageReducer, parentMessageReducer,
-  skillReducer,
-]
-
-const reducerMap = new Map<string, ToolVisualReducer>(
-  allReducers.map(r => [r.toolKey, r])
-)
-const reducerRegistry: VisualReducerRegistry = {
-  get: (toolKey: string) => reducerMap.get(toolKey),
-}
-setVisualRegistry(reducerRegistry)
-
-// =============================================================================
-// Cluster render registry — cluster key → cluster render function
-// =============================================================================
-
-export const liveTextRegistry = createLiveTextRegistry({
-  shell: ({ state }) => shellLiveText({ state: state as any }),
-  fileRead: ({ state }) => readLiveText({ state: state as any }),
-  fileWrite: ({ state }) => fsWriteLiveText({ state: state as any }),
-  fileEdit: ({ state }) => editStreamLiveText({ state: state as any }),
-  fileTree: ({ state }) => treeLiveText({ state: state as any }),
-  fileSearch: ({ state }) => searchLiveText({ state: state as any }),
-  webSearch: ({ state }) => webSearchLiveText({ state: state as any }),
-  webFetch: ({ state }) => webFetchLiveText({ state: state as any }),
-
-  click: ({ state }) => browserLiveText({ state: state as any }),
-  doubleClick: ({ state }) => browserLiveText({ state: state as any }),
-  rightClick: ({ state }) => browserLiveText({ state: state as any }),
-  type: ({ state }) => browserLiveText({ state: state as any }),
-  scroll: ({ state }) => browserLiveText({ state: state as any }),
-  drag: ({ state }) => browserLiveText({ state: state as any }),
-  navigate: ({ state }) => browserLiveText({ state: state as any }),
-  goBack: ({ state }) => browserLiveText({ state: state as any }),
-  switchTab: ({ state }) => browserLiveText({ state: state as any }),
-  newTab: ({ state }) => browserLiveText({ state: state as any }),
-  screenshot: ({ state }) => browserLiveText({ state: state as any }),
-  evaluate: ({ state }) => browserLiveText({ state: state as any }),
-
-  agentCreate: ({ state }) => agentCreateLiveText({ state: state as any }),
-
-  agentDismiss: ({ state }) => agentDismissLiveText({ state: state as any }),
-  agentMessage: ({ state }) => agentMessageLiveText({ state: state as any }),
-  parentMessage: ({ state }) => parentMessageLiveText({ state: state as any }),
-  skill: ({ state }) => skillLiveText({ state: state as any }),
-})
-
-export const clusterRenderRegistry = createClusterRenderRegistry({
-})
+export const displayBindingRegistry: DisplayBindingRegistry<CliDisplayContracts> = {
+  get(toolKey) {
+    if (
+      toolKey === 'default' || toolKey === 'diff' || toolKey === 'content' || toolKey === 'shell'
+      || toolKey === 'fileRead' || toolKey === 'fileTree' || toolKey === 'fileSearch'
+      || toolKey === 'webSearch' || toolKey === 'webFetch'
+      || toolKey === 'agentCreate' || toolKey === 'agentKill'
+      || toolKey === 'skill' || toolKey === 'browserAction'
+    ) {
+      return newBindings[toolKey];
+    }
+    return undefined;
+  },
+  getAny(toolKey: string) {
+    switch (toolKey) {
+      case 'fileEdit': return newBindings.diff;
+      case 'fileWrite': return newBindings.content;
+      case 'shell': return newBindings.shell;
+      case 'fileRead': return newBindings.fileRead;
+      case 'fileTree': return newBindings.fileTree;
+      case 'fileSearch': return newBindings.fileSearch;
+      case 'webSearch': return newBindings.webSearch;
+      case 'webFetch': return newBindings.webFetch;
+      case 'agentCreate': return newBindings.agentCreate;
+      case 'agentKill': return newBindings.agentKill;
+      case 'skill': return newBindings.skill;
+      case 'click': case 'doubleClick': case 'rightClick': case 'type':
+      case 'scroll': case 'drag': case 'navigate': case 'goBack':
+      case 'switchTab': case 'newTab': case 'screenshot': case 'evaluate':
+        return newBindings.browserAction;
+      default: return newBindings.default;
+    }
+  },
+  getDefault() { return newBindings.default; },
+};

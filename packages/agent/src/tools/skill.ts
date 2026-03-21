@@ -7,7 +7,8 @@
 
 import { Effect, Context } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { resolveSkill } from '../skills'
 import type { SkillMetadata } from '../util/skill-scanner'
 
@@ -24,17 +25,13 @@ export class SkillStateReaderTag extends Context.Tag('SkillStateReader')<
   SkillStateReader
 >() {}
 
-// =============================================================================
-// Errors
-// =============================================================================
-
-const SkillError = ToolErrorSchema('SkillError', {})
+const SkillErrorSchema = ToolErrorSchema('SkillError', {})
 
 // =============================================================================
 // skill() - Activate a skill by name
 // =============================================================================
 
-export const skillTool = createTool({
+export const skillTool = defineTool({
   name: 'skill',
   group: 'default',
   description: 'Activate a skill by name to load its full methodology into context. Use when a task clearly matches a skill type (feature, bug, refactor) or a project-specific skill.',
@@ -44,14 +41,9 @@ export const skillTool = createTool({
     })
   }),
   outputSchema: Schema.String,
-  errorSchema: SkillError,
-  argMapping: ['name'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'name', attr: 'name' }], selfClosing: true },
-    xmlOutput: { type: 'tag' as const },
-  } as const,
+  errorSchema: SkillErrorSchema,
 
-  execute: (input) => Effect.gen(function* () {
+  execute: (input, _ctx) => Effect.gen(function* () {
     const skillReader = yield* SkillStateReaderTag
     const userSkills = yield* skillReader.getUserSkills()
 
@@ -69,6 +61,12 @@ export const skillTool = createTool({
 
     return `<skill_activated name="${resolved.name}">\n${resolved.content}\n</skill_activated>`
   }),
+  label: (input) => input.name ? `Activating ${input.name}` : 'Activating skill…',
 })
+
+export const skillXmlBinding = defineXmlBinding(skillTool, {
+  input: { attributes: [{ field: 'name', attr: 'name' }] },
+  output: {},
+} as const)
 
 export const SKILL_TOOLS = ['skill'] as const

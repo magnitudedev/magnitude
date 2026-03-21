@@ -8,8 +8,11 @@ export function extractWrittenFilePathFromToolEvent(event: ToolEvent): string | 
   if (event.toolKey !== 'fileWrite' && event.toolKey !== 'fileEdit') return null
   if (event.event.result._tag !== 'Success') return null
 
-  if (event.display?.type === 'write_stats') return event.display.path
-  if (event.display?.type === 'edit_diff') return event.display.path
+  const output: unknown = event.event.result.output
+  if (output && typeof output === 'object' && 'path' in output) {
+    const { path: filePath } = output as Record<string, unknown>
+    if (typeof filePath === 'string') return filePath
+  }
   return null
 }
 

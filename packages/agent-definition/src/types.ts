@@ -5,8 +5,9 @@
  * Framework-agnostic: depends on @magnitudedev/tools for tool types.
  */
 
-import type { Tool } from '@magnitudedev/tools'
+import type { AnyTool, Tool } from '@magnitudedev/tools'
 import type { Effect } from 'effect'
+import type { Schema } from '@effect/schema'
 import type { ThinkingLens } from './thinking-lens'
 
 // =============================================================================
@@ -14,16 +15,26 @@ import type { ThinkingLens } from './thinking-lens'
 // =============================================================================
 
 /** A named collection of tools. Keys are definition keys used in policies. */
-export type ToolSet = Record<string, Tool.Any>
+export type ToolSet = Record<string, AnyTool>
 
 /** Extract definition key names from a tool set */
 export type ToolNames<T extends ToolSet> = Extract<keyof T, string>
 
+type ExtractToolInput<TTool> =
+  TTool extends Tool.Any ? Tool.Input<TTool> :
+  TTool extends { readonly inputSchema: Schema.Schema<infer I, infer _E, infer _R> } ? I :
+  never
+
+type ExtractToolOutput<TTool> =
+  TTool extends Tool.Any ? Tool.Output<TTool> :
+  TTool extends { readonly outputSchema: Schema.Schema<infer O, infer _E, infer _R> } ? O :
+  never
+
 /** Extract the input type for a specific tool in a set */
-export type ToolInput<T extends ToolSet, K extends ToolNames<T>> = Tool.Input<T[K]>
+export type ToolInput<T extends ToolSet, K extends ToolNames<T>> = ExtractToolInput<T[K]>
 
 /** Extract the output type for a specific tool in a set */
-export type ToolOutput<T extends ToolSet, K extends ToolNames<T>> = Tool.Output<T[K]>
+export type ToolOutput<T extends ToolSet, K extends ToolNames<T>> = ExtractToolOutput<T[K]>
 
 // =============================================================================
 // Permission Policy

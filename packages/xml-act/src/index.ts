@@ -27,6 +27,7 @@ export type {
   ProseEnd,
   ToolExecutionStarted,
   ToolExecutionEnded,
+  ToolEmission,
   ToolObservation,
   StructuralParseError,
   TurnEnd,
@@ -95,6 +96,7 @@ export type { TagSchema, ChildTagSchema, AttributeSchema } from './execution/bin
 
 // XML documentation generation
 export { generateXmlToolDoc, generateXmlToolGroupDoc, defaultXmlTagName } from './xml-docs'
+export type { XmlToolDocEntry } from './xml-docs'
 
 // Output serializer
 export { serializeOutput } from './output-serializer'
@@ -117,3 +119,7 @@ export type { KeywordSet } from './constants'
 export { createStreamingXmlParser, defaultIdGenerator } from './parser/streaming-xml-parser'
 export type { StreamingXmlParser, IdGenerator } from './parser/streaming-xml-parser'
 export type { ParseEvent, ParsedElement, ParsedChild, AttributeValue } from './parser/types'
+
+export { SchemaAccumulator } from './schema-accumulator'
+export { defineXmlBinding, type XmlBindingResult, type XmlMappingConfig, type XmlInputMappingConfig, type XmlOutputBinding } from './xml-binding'
+export type { DeriveStreamingShape, DeriveFields, DeriveChildren, AttrNames, ChildTagNames, ChildrenTagNames } from './type-chain'

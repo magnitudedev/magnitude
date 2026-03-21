@@ -7,44 +7,37 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { schemaAlignedParse, outputFormatString } from '@magnitudedev/llm-core'
 import { webSearch } from './web-search'
+
+const WebSearchErrorSchema = ToolErrorSchema('WebSearchError', {})
 
 // =============================================================================
 // Tool Definition
 // =============================================================================
 
-const WebSearchError = ToolErrorSchema('WebSearchError', {})
-
-export const webSearchTool = createTool({
+export const webSearchTool = defineTool({
   name: 'web-search',
   group: 'default',
   description: 'Search the web and optionally extract structured data',
 
   inputSchema: Schema.Struct({
     query: Schema.String,
+    // User-provided schema values are intentionally dynamic JSON-like payloads.
     schema: Schema.optional(Schema.Record({ key: Schema.String, value: Schema.Unknown }))
   }),
 
-  outputSchema: Schema.Unknown,
-  errorSchema: WebSearchError,
+  outputSchema: Schema.Struct({
+    text: Schema.String,
+    sources: Schema.Array(Schema.Struct({ title: Schema.String, url: Schema.String })),
+    // Parsed data shape depends on caller-provided schema, so this remains intentionally unknown.
+    data: Schema.optional(Schema.Unknown),
+  }),
+  errorSchema: WebSearchErrorSchema,
 
-  argMapping: ['query', 'schema'],
-  bindings: {
-    xmlInput: { type: 'tag', body: 'query' },
-    xmlOutput: {
-      type: 'tag' as const,
-      body: 'text',
-      children: [{
-        field: 'sources',
-        tag: 'source',
-        attributes: [{ field: 'title', attr: 'title' }, { field: 'url', attr: 'url' }],
-      }],
-    },
-  } as const,
-
-  execute: ({ query, schema }) =>
+  execute: ({ query, schema }, _ctx) =>
     Effect.gen(function* () {
       const system = schema ? outputFormatString(schema) : undefined
       const response = yield* webSearch(query, { system }).pipe(
@@ -71,4 +64,17 @@ export const webSearchTool = createTool({
 
       return result
     }),
+  label: (input) => input.query ? `Searching: ${input.query.slice(0, 50)}` : 'Searching…',
 })
+
+export const webSearchXmlBinding = defineXmlBinding(webSearchTool, {
+  input: { body: 'query' },
+  output: {
+    body: 'text',
+    children: [{
+      field: 'sources',
+      tag: 'source',
+      attributes: [{ field: 'title', attr: 'title' }, { field: 'url', attr: 'url' }],
+    }],
+  },
+} as const)

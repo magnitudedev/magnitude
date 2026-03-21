@@ -8,29 +8,30 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool } from '@magnitudedev/tools'
-import { webSearchTool } from './web-search-tool'
-import { webFetchTool } from './web-fetch-tool'
-import { skillTool } from './skill'
+import { defineTool } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
+import { webSearchTool, webSearchXmlBinding } from './web-search-tool'
+import { webFetchTool, webFetchXmlBinding } from './web-fetch-tool'
+import { skillTool, skillXmlBinding } from './skill'
 
 // =============================================================================
 // think() - Internal reasoning
 // =============================================================================
 
-export const thinkTool = createTool({
+export const thinkTool = defineTool({
   name: 'think',
   group: 'default',
   description: 'Record internal reasoning (not shown to user)',
   inputSchema: Schema.Struct({ thought: Schema.String }),
   outputSchema: Schema.String,
-  argMapping: ['thought'],
-  bindings: {
-    openai: { type: 'native', mechanism: 'reasoning' },
-    xmlInput: { type: 'tag', body: 'thought' },
-    xmlOutput: { type: 'tag' as const },
-  } as const,
-  execute: ({ thought }) => Effect.succeed(thought),
+  execute: ({ thought }, _ctx) => Effect.succeed(thought),
+  label: (_input) => 'Thinking…',
 })
+
+export const thinkXmlBinding = defineXmlBinding(thinkTool, {
+  input: { body: 'thought' },
+  output: {},
+} as const)
 
 
 // =============================================================================
@@ -38,6 +39,8 @@ export const thinkTool = createTool({
 // =============================================================================
 
 export const globalTools = [thinkTool, webSearchTool, webFetchTool, skillTool]
+
+export const globalXmlBindings = [thinkXmlBinding, webSearchXmlBinding, webFetchXmlBinding, skillXmlBinding]
 
 
 

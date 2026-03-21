@@ -10,7 +10,7 @@ import type { AppEvent } from '../../events'
 import { WorkingStateProjection } from '../working-state'
 import { AgentRoutingProjection } from '../agent-routing'
 import { AgentStatusProjection } from '../agent-status'
-import { DisplayProjection } from '../display'
+import { DisplayProjection, type DisplayState, type DisplayMessage } from '../display'
 
 const ts = (n: number) => 1_700_100_000_000 + n
 
@@ -35,13 +35,13 @@ const makeRootDisplay = async (events: AppEvent[]) => {
     const projection = yield* DisplayProjection.Tag
 
     for (const event of events) {
-      yield* bus.processEvent(event)
+      yield* bus.processEvent(event as any)
     }
 
     return yield* projection.getFork(null)
   })
 
-  return Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any)
+  return Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as Effect.Effect<DisplayState>)
 }
 
 describe('display subagent lifecycle think steps', () => {

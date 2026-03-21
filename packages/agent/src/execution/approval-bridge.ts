@@ -45,6 +45,7 @@ export const registerApprovalBridge = Effect.gen(function* () {
         const forkState = state.forks.get(forkId) ?? {
           status: 'idle' as const,
           messages: [],
+          pendingInboundCommunications: [],
           currentTurnId: null,
           streamingMessageId: null,
           activeThinkBlockId: null,

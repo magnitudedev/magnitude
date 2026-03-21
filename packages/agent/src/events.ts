@@ -259,8 +259,6 @@ export interface ToolEvent {
   readonly toolCallId: string
   readonly toolKey: string
   readonly event: ToolCallEvent
-  /** Tool-emitted display data (diffs, etc.), only present on ToolExecutionEnded events */
-  readonly display?: ToolDisplay
 }
 
 export type ToolDisplay =

@@ -28,10 +28,7 @@ export interface ToolRenderProps<TState = unknown> {
  * definition time via `render()`. */
 export type ToolVisualRenderer = (props: ToolRenderProps) => ReactNode
 
-/** Registry mapping toolKey → render function */
-export interface RenderRegistry {
-  readonly get: (toolKey: string) => ToolVisualRenderer | undefined
-}
+
 
 export type ToolLiveTextGetter = (args: {
   readonly state: unknown
@@ -55,16 +52,6 @@ export function render<TState>(fn: (props: ToolRenderProps<TState>) => ReactNode
 // =============================================================================
 // Registry builder
 // =============================================================================
-
-/** Build a render registry from a record of toolKey → render function. */
-export function createRenderRegistry(
-  renderers: Record<string, ToolVisualRenderer>,
-): RenderRegistry {
-  const map = new Map(Object.entries(renderers))
-  return {
-    get: (toolKey: string) => map.get(toolKey),
-  }
-}
 
 export function createLiveTextRegistry(
   getters: Record<string, ToolLiveTextGetter>,
@@ -106,17 +93,4 @@ export function clusterRender<TState>(
   return fn as ClusterRenderer
 }
 
-/** Registry mapping cluster key → cluster render function */
-export interface ClusterRenderRegistry {
-  readonly get: (cluster: string) => ClusterRenderer | undefined
-}
 
-/** Build a cluster render registry from a record of cluster → render function. */
-export function createClusterRenderRegistry(
-  renderers: Record<string, ClusterRenderer>,
-): ClusterRenderRegistry {
-  const map = new Map(Object.entries(renderers))
-  return {
-    get: (cluster: string) => map.get(cluster),
-  }
-}

@@ -1,6 +1,7 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { BackgroundProcessRegistryTag } from '../processes/background-process-registry'
 
 const ShellBgOutput = Schema.Struct({
@@ -8,9 +9,9 @@ const ShellBgOutput = Schema.Struct({
   pid: Schema.Number,
 })
 
-const ShellBgError = ToolErrorSchema('ShellBgError', {})
+const ShellBgErrorSchema = ToolErrorSchema('ShellBgError', {})
 
-export const shellBgTool = createTool({
+export const shellBgTool = defineTool({
   name: 'shell-bg',
   group: 'default',
   description: 'Promote a detached process to a background process. Use this when a command exceeded its timeout but is still working correctly and you want it to keep running. This cancels the automatic termination deadline.',
@@ -18,19 +19,8 @@ export const shellBgTool = createTool({
     pid: Schema.Number,
   }),
   outputSchema: ShellBgOutput,
-  errorSchema: ShellBgError,
-  argMapping: ['pid'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'pid', attr: 'pid' }] },
-    xmlOutput: {
-      type: 'tag',
-      childTags: [
-        { tag: 'status', field: 'status' },
-        { tag: 'pid', field: 'pid' },
-      ]
-    } as const,
-  } as const,
-  execute: ({ pid }) => Effect.gen(function* () {
+  errorSchema: ShellBgErrorSchema,
+  execute: ({ pid }, _ctx) => Effect.gen(function* () {
     const registry = yield* BackgroundProcessRegistryTag
     const promoted = yield* registry.promote(pid)
 
@@ -48,6 +38,19 @@ export const shellBgTool = createTool({
       pid,
     }
   }),
+  label: (input) => `Promoting process ${input.pid ?? '...'}`,
 })
+
+export const shellBgXmlBinding = defineXmlBinding(shellBgTool, {
+  input: {
+    attributes: [{ attr: 'pid', field: 'pid' }],
+  },
+  output: {
+    childTags: [
+      { tag: 'status', field: 'status' },
+      { tag: 'pid', field: 'pid' },
+    ],
+  },
+} as const)
 
 export const SHELL_BG_TOOLS = ['default.shell-bg'] as const

@@ -8,8 +8,29 @@
 
 import { Option } from 'effect'
 import { AST } from '@effect/schema'
-import type { Tool, XmlBinding } from '@magnitudedev/tools'
 import type { XmlTagBinding } from './types'
+import type { XmlOutputBinding } from './xml-binding'
+
+/** Minimal input for generating XML tool documentation. */
+export interface XmlToolDocEntry {
+  readonly name: string
+  readonly group?: string
+  readonly description?: string
+  readonly inputSchema: { readonly ast: AST.AST }
+  readonly outputSchema: { readonly ast: AST.AST }
+  readonly xmlInput: XmlTagBinding
+  readonly xmlOutput?: XmlOutputTagBinding
+}
+
+type XmlOutputItemBinding = {
+  readonly tag?: string
+  readonly attributes?: readonly string[] | readonly { readonly attr: string; readonly field: string }[]
+  readonly body?: string
+}
+
+type XmlOutputTagBinding = Omit<XmlOutputBinding<unknown>, 'items'> & {
+  readonly items?: XmlOutputItemBinding
+}
 
 // =============================================================================
 // Schema Introspection Helpers
@@ -284,13 +305,9 @@ export function defaultXmlTagName(tool: { name: string; group?: string }): strin
 
 /**
  * Generate unified annotated XML documentation for a single tool.
- * Returns null if the tool has no XML input binding or is omitted.
  */
-export function generateXmlToolDoc(tool: Tool.Any): string | null {
-  const binding = tool.bindings?.xmlInput as XmlBinding<unknown> | undefined
-  if (!binding) return null
-
-  const tagName = binding.tag ?? defaultXmlTagName(tool)
+export function generateXmlToolDoc(tool: XmlToolDocEntry): string {
+  const tagName = tool.xmlInput.tag ?? defaultXmlTagName(tool)
   const fields = getFieldInfos(tool.inputSchema.ast)
   const lines: string[] = []
 
@@ -301,11 +318,10 @@ export function generateXmlToolDoc(tool: Tool.Any): string | null {
   }
 
   // 2. Annotated input example
-  buildAnnotatedInput(lines, tagName, binding, fields, tool.inputSchema.ast)
+  buildAnnotatedInput(lines, tagName, tool.xmlInput, fields, tool.inputSchema.ast)
 
   // 3. Output documentation
-  const outputBinding = tool.bindings?.xmlOutput as XmlBinding<unknown> | undefined
-  buildAnnotatedOutput(lines, tagName, tool.outputSchema.ast, outputBinding)
+  buildAnnotatedOutput(lines, tagName, tool.outputSchema.ast, tool.xmlOutput)
 
   return lines.join('\n')
 }
@@ -457,7 +473,7 @@ function buildAnnotatedOutput(
   lines: string[],
   tagName: string,
   outputSchemaAst: AST.AST,
-  outputBinding?: XmlBinding<unknown>,
+  outputBinding?: XmlOutputTagBinding,
 ): void {
   const shape = classifyOutputDoc(outputSchemaAst)
 
@@ -485,7 +501,7 @@ function buildAnnotatedOutput(
   }
 
   // If explicit output binding exists
-  if (outputBinding && outputBinding.type === 'tag') {
+  if (outputBinding) {
     lines.push('Returns:')
     buildOutputWithBinding(lines, tagName, outputBinding, outputSchemaAst)
     return
@@ -543,7 +559,7 @@ function buildAnnotatedOutput(
 function buildOutputWithBinding(
   lines: string[],
   tagName: string,
-  binding: Extract<XmlBinding<unknown>, { type: 'tag' }>,
+  binding: XmlOutputTagBinding,
   schemaAst: AST.AST,
 ): void {
   const fields = getFieldInfos(schemaAst)
@@ -557,15 +573,14 @@ function buildOutputWithBinding(
 
   const hasBody = !!binding.body
   const hasChildTags = binding.childTags && binding.childTags.length > 0
-  const hasChildren = binding.children && binding.children.length > 0
   const hasItems = !!binding.items
 
-  if (!hasBody && !hasChildTags && !hasChildren && !hasItems) {
+  if (!hasBody && !hasChildTags && !hasItems) {
     lines.push(`  <${tagName}${attrs} />`)
     return
   }
 
-  if (hasBody && !hasChildTags && !hasChildren && !hasItems) {
+  if (hasBody && !hasChildTags && !hasItems) {
     const info = fields.get(binding.body!)
     const body = info?.ast && isToolImageAst(info.ast) ? '[image]' : binding.body
     lines.push(`  <${tagName}${attrs}>${body}</${tagName}>`)
@@ -580,7 +595,8 @@ function buildOutputWithBinding(
     let itemAttrs = ''
     if (itemsBinding.attributes) {
       for (const attr of itemsBinding.attributes) {
-        itemAttrs += ` ${String(attr)}="..."`
+        if (typeof attr === 'string') itemAttrs += ` ${attr}="..."`
+        else itemAttrs += ` ${attr.attr}="..."`
       }
     }
 
@@ -604,6 +620,10 @@ function buildOutputWithBinding(
 
   if (hasChildTags) {
     for (const ct of binding.childTags!) {
+      if (typeof ct === 'string') {
+        lines.push(`    <${ct}>${ct}</${ct}>`)
+        continue
+      }
       const info = resolveFieldInfoByPath(schemaAst, ct.field)
       const typeComment = info?.ast ? needsTypeComment(info.ast) : null
       const annotations: string[] = []
@@ -612,24 +632,6 @@ function buildOutputWithBinding(
       const comment = annotations.length > 0 ? ` <!-- ${annotations.join('. ')} -->` : ''
       const body = info?.ast && isToolImageAst(info.ast) ? '[image]' : ct.tag
       lines.push(`    <${ct.tag}>${body}</${ct.tag}>${comment}`)
-    }
-  }
-
-  if (hasChildren) {
-    for (const child of binding.children!) {
-      const childTag = child.tag ?? child.field
-      let childAttrs = ''
-      if (child.attributes) {
-        for (const attr of child.attributes) {
-          childAttrs += ` ${attr.attr}="..."`
-        }
-      }
-      if (child.body) {
-        lines.push(`    <${childTag}${childAttrs}>${child.body}</${childTag}>`)
-      } else {
-        lines.push(`    <${childTag}${childAttrs} />`)
-      }
-      lines.push(`    <!-- ...more ${childTag}s -->`)
     }
   }
 
@@ -648,9 +650,9 @@ function buildOutputWithBinding(
  */
 export function generateXmlToolGroupDoc(
   groupName: string,
-  tools: ReadonlyArray<Tool.Any>,
+  tools: ReadonlyArray<XmlToolDocEntry>,
   implicitDefKeys?: ReadonlyArray<string>,
-  defKeyLookup?: ReadonlyMap<Tool.Any, string>,
+  defKeyLookup?: ReadonlyMap<XmlToolDocEntry, string>,
 ): string {
   const docs: string[] = []
 
@@ -661,7 +663,6 @@ export function generateXmlToolGroupDoc(
     }
 
     const doc = generateXmlToolDoc(tool)
-    if (!doc) continue
     docs.push(doc)
   }
 

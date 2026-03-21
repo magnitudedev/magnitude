@@ -1,7 +1,7 @@
 /**
  * ToolReminderTag — Effect service for tools to push contextual reminders during execution.
  *
- * Mirrors ToolEmitTag's Ref-backed pattern. Tools call
+ * Uses a Ref-backed pattern. Tools call
  * `yield* (yield* ToolReminderTag).add(text)` to enqueue reminder text that the
  * execution manager consumes after ToolExecutionEnded and surfaces in the next
  * turn's system inbox.

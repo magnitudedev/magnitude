@@ -6,16 +6,22 @@
  * (OpenAI function calling, codegen/JS-ACT, XML-ACT).
  */
 
+import type { ChildAcc } from './streaming-input';
+
 // =============================================================================
 // Utility Types
 // =============================================================================
 
 /** Extract string field names from an input type. Falls back to string when T is unknown.
  *  Distributes over unions so that A | B yields keys from both variants. */
-export type InputFields<T> = [T] extends [never] ? string : T extends any ? ([Extract<keyof T, string>] extends [never] ? string : Extract<keyof T, string>) : never
+export type InputFields<T> = [T] extends [never]
+  ? string
+  : T extends unknown
+    ? ([Extract<keyof T, string>] extends [never] ? string : Extract<keyof T, string>)
+    : never
 
 /** Extract fields of T whose values are arrays. Distributes over unions. */
-export type ArrayFields<T> = T extends any ? {
+export type ArrayFields<T> = T extends unknown ? {
   [K in keyof T]: T[K] extends ReadonlyArray<unknown> ? K : never
 }[keyof T] & string : never
 
@@ -26,7 +32,7 @@ export type ArrayElement<T, K extends keyof T> =
 /** Extract keys of T whose values are plain objects (not arrays, not primitives).
  *  Handles optional fields by stripping undefined before checking.
  *  Distributes over unions. */
-type ObjectFields<T> = T extends any ? {
+type ObjectFields<T> = T extends unknown ? {
   [K in keyof T]-?: NonNullable<T[K]> extends ReadonlyArray<unknown>
     ? never
     : NonNullable<T[K]> extends Record<string, unknown>
@@ -36,7 +42,7 @@ type ObjectFields<T> = T extends any ? {
 
 /** Extract keys of T whose values are Record<string, string> (key-value maps).
  *  Distributes over unions. */
-export type RecordFields<T> = T extends any ? {
+export type RecordFields<T> = T extends unknown ? {
   [K in keyof T]-?: NonNullable<T[K]> extends Record<string, string> ? K : never
 }[keyof T] & string : never
 
@@ -44,7 +50,7 @@ export type RecordFields<T> = T extends any ? {
  *  Top-level fields: 'name'. Nested fields: 'options.type'.
  *  Falls back to string when T is unknown.
  *  Distributes over unions so A | B yields paths from both variants. */
-export type FieldPath<T> = InputFields<T> | (T extends any ? {
+export type FieldPath<T> = InputFields<T> | (T extends unknown ? {
   [K in ObjectFields<T>]: `${K}.${Extract<keyof NonNullable<T[K]>, string>}`
 }[ObjectFields<T>] : never)
 
@@ -143,8 +149,8 @@ export interface XmlChildBinding {
  * `field` is a path: top-level ('name') or dotted ('options.type').
  * `tag` is the XML element name the model writes.
  */
-export interface XmlChildTagBinding {
-  readonly field: string
+export interface XmlChildTagBinding<T = unknown> {
+  readonly field: FieldPath<T>
   readonly tag: string
 }
 
@@ -157,7 +163,7 @@ export interface XmlChildTagBinding {
 export type XmlArrayChildBinding<T> = [ArrayFields<T>] extends [never]
   ? XmlChildBinding
   : {
-      [K in ArrayFields<T>]: XmlChildBinding & {
+      [K in ArrayFields<T>]: Omit<XmlChildBinding, 'field' | 'attributes' | 'body'> & {
         readonly field: K
         readonly attributes?: ReadonlyArray<{
           readonly field: InputFields<ArrayElement<T, K>>
@@ -190,7 +196,7 @@ export type XmlBinding<T> = {
   readonly selfClosing?: boolean
   /** Scalar fields rendered as child tags: <tag>value</tag>.
    *  Each entry specifies a field path and optional XML tag name override. */
-  readonly childTags?: ReadonlyArray<XmlChildTagBinding & { readonly field: FieldPath<T> }>
+  readonly childTags?: ReadonlyArray<XmlChildTagBinding<T>>
   /** Array fields rendered as repeated child tags with their own structure. */
   readonly children?: ReadonlyArray<XmlArrayChildBinding<T>>
   /** Record field rendered as repeated child elements with key attr + body value. */
@@ -214,6 +220,29 @@ export type XmlBinding<T> = {
 // =============================================================================
 
 export interface ToolBindings<TInput, TOutput = unknown> {
-  readonly xmlInput: XmlBinding<TInput>
-  readonly xmlOutput: XmlBinding<TOutput>
+  readonly xmlInput?: XmlBinding<TInput>
+  readonly xmlOutput?: XmlBinding<TOutput>
 }
+
+// Streaming shape derivation from XML binding mapping
+export type AttrNames<TMapping> =
+  TMapping extends { attributes: readonly (infer A)[] }
+    ? A extends { attr: infer N extends string } ? N : never
+    : never;
+
+export type ChildTagNames<TMapping> =
+  TMapping extends { childTags: readonly (infer C)[] }
+    ? C extends { tag: infer N extends string } ? N : never
+    : never;
+
+export type DeriveStreamingShape<TMapping> = {
+  fields: { [K in AttrNames<TMapping>]?: string };
+  body: TMapping extends { body: string } ? string : '';
+  children: (
+    { [K in ChildTagNames<TMapping>]?: ChildAcc[] }
+  ) & (
+    TMapping extends { childRecord: { tag: infer N extends string } }
+      ? { [K in N]?: ChildAcc[] }
+      : {}
+  );
+};

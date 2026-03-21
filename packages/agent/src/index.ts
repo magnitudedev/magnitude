@@ -54,6 +54,9 @@ export { DEFAULT_CONTEXT_WINDOW, COMPACT_TRIGGER_RATIO, PROSE_DELIM_OPEN, PROSE_
 export { collectSessionContext } from './util/collect-session-context'
 export type { CollectSessionContextOptions } from './util/collect-session-context'
 
+// Tool normalizer
+export { ToolEventNormalizer } from './normalizer'
+
 // Skill Scanner
 export { scanSkills } from './util/skill-scanner'
 export type { SkillMetadata } from './util/skill-scanner'
@@ -134,28 +137,6 @@ export { ReplayProjection } from './projections/replay'
 // Line-edit types
 export type { EditDiff } from './util/line-edit'
 
-// Visual Reducers
-export {
-  setVisualRegistry, getVisualRegistry,
-  defineToolReducer, reducer, defineCluster,
-  shellReducer,
-  readReducer, writeReducer, editReducer, treeReducer, searchReducer,
-  webSearchReducer, webFetchReducer,
-  clickReducer, doubleClickReducer, rightClickReducer, typeReducer, scrollReducer, dragReducer,
-  navigateReducer, goBackReducer, switchTabReducer, newTabReducer, screenshotReducer, evaluateReducer,
-  agentCreateReducer, agentMessageReducer, parentMessageReducer,
-  skillReducer,
-  resolveEndPhase, isActive,
-} from './visuals'
-export type {
-  ToolVisualReducer, VisualReducerRegistry, ToolReducerConfig, SimpleReducerConfig, ClusterFactory,
-  ShellState,
-  ReadState, WriteState, EditState, TreeState, TreeEntry, SearchState, SearchMatch,
-  Phase, WebSearchState, WebFetchState, BrowserState,
-  AgentCreateState, AgentIdState, AgentMessageState,
-  ParentMessageState, SkillState,
-} from './visuals'
-
 // Execution
 export { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
 export type { ExecutionManagerService, ExecuteOptions, ExecuteResult } from './execution/execution-manager'
@@ -169,6 +150,7 @@ export type { ToolCallEvent } from '@magnitudedev/xml-act'
 export type { Tool } from '@magnitudedev/tools'
 
 // Tools
+export { getModelForToolKey } from './models/registry'
 export { thinkTool, globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'
 export { shellBgTool, SHELL_BG_TOOLS } from './tools/shell-bg'

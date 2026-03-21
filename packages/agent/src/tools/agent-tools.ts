@@ -10,7 +10,8 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
 import type { AgentVariant } from '../agents'
 
@@ -23,11 +24,7 @@ import { getActiveAgent } from '../projections/agent-status'
 
 const { ForkContext } = Fork
 
-// =============================================================================
-// Errors
-// =============================================================================
-
-const AgentError = ToolErrorSchema('AgentError', {})
+const AgentErrorSchema = ToolErrorSchema('AgentError', {})
 
 // =============================================================================
 // agent.create — Create and dispatch an agent
@@ -83,7 +80,7 @@ function executeAgentCreate({ agentId, options }: {
 }
 
 
-export const agentCreateTool = createTool({
+export const agentCreateTool = defineTool({
   name: 'create' as const,
   group: 'agent' as const,
   description: 'Create a new agent and dispatch it with a title and message.',
@@ -96,27 +93,12 @@ export const agentCreateTool = createTool({
     }),
   }),
   outputSchema: Schema.Struct({ agentId: Schema.String, forkId: Schema.String }),
-  errorSchema: AgentError,
-  argMapping: ['agentId', 'options'] as const,
-  bindings: {
-    xmlInput: {
-      type: 'tag' as const,
-      attributes: [
-        { field: 'agentId', attr: 'agentId' },
-        { field: 'options.type', attr: 'type' },
-      ],
-      childTags: [
-        { field: 'options.type', tag: 'type' },
-        { field: 'options.title', tag: 'title' },
-        { field: 'options.message', tag: 'message' },
-      ],
-    },
-    xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
-  } as const,
-  execute: executeAgentCreate,
+  errorSchema: AgentErrorSchema,
+  execute: (input, _ctx) => executeAgentCreate(input),
+  label: (input) => input.agentId ? `Starting agent ${input.agentId}` : 'Starting agent…',
 })
 
-export const agentKillTool = createTool({
+export const agentKillTool = defineTool({
   name: 'kill' as const,
   group: 'agent' as const,
   description: 'Kill an active subagent that was started accidentally or no longer needed. Not meant for idle subagents.',
@@ -125,17 +107,8 @@ export const agentKillTool = createTool({
     reason: Schema.optional(Schema.String.annotations({ description: 'Optional reason for the kill event record' })),
   }),
   outputSchema: Schema.Struct({ agentId: Schema.String, forkId: Schema.String }),
-  errorSchema: AgentError,
-  argMapping: ['agentId', 'reason'] as const,
-  bindings: {
-    xmlInput: {
-      type: 'tag' as const,
-      attributes: [{ field: 'agentId', attr: 'agentId' }],
-      childTags: [{ field: 'reason', tag: 'reason' }],
-    },
-    xmlOutput: { type: 'tag' as const, childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
-  } as const,
-  execute: ({ agentId, reason }) => Effect.gen(function* () {
+  errorSchema: AgentErrorSchema,
+  execute: ({ agentId, reason }, _ctx) => Effect.gen(function* () {
     const { forkId: parentForkId } = yield* ForkContext
     const agentStateReader = yield* AgentStateReaderTag
     const agentState = yield* agentStateReader.getAgentState()
@@ -173,7 +146,31 @@ export const agentKillTool = createTool({
 
     return { agentId: target.agentId, forkId: target.forkId }
   }),
+  label: (input) => input.agentId ? `Killing agent ${input.agentId}` : 'Killing agent…',
 })
+
+export const agentCreateXmlBinding = defineXmlBinding(agentCreateTool, {
+  input: {
+    attributes: [
+      { field: 'agentId', attr: 'agentId' },
+      { field: 'options.type', attr: 'type' },
+    ],
+    childTags: [
+      { field: 'options.type', tag: 'type' },
+      { field: 'options.title', tag: 'title' },
+      { field: 'options.message', tag: 'message' },
+    ],
+  },
+  output: { childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
+} as const)
+
+export const agentKillXmlBinding = defineXmlBinding(agentKillTool, {
+  input: {
+    attributes: [{ field: 'agentId', attr: 'agentId' }],
+    childTags: [{ field: 'reason', tag: 'reason' }],
+  },
+  output: { childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
+} as const)
 // =============================================================================
 // Tool Group Export
 // =============================================================================

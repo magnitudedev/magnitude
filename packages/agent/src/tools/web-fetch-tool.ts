@@ -9,7 +9,8 @@
 
 import { Effect, Schedule } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { extractHtml } from '@magnitudedev/dom-extract'
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
@@ -19,11 +20,13 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
 const ACCEPT_LANG = 'en-US,en;q=0.9'
 
-const WebFetchError = ToolErrorSchema('WebFetchError', {})
+
 
 const retryPolicy = Schedule.exponential('500 millis').pipe(
   Schedule.compose(Schedule.recurs(2)),
 )
+
+const WebFetchErrorSchema = ToolErrorSchema('WebFetchError', {})
 
 const fetchPage = (url: string) =>
   Effect.tryPromise({
@@ -70,7 +73,7 @@ const fetchPage = (url: string) =>
 // Tool Definition
 // =============================================================================
 
-export const webFetchTool = createTool({
+export const webFetchTool = defineTool({
   name: 'web-fetch',
   group: 'default',
   description: 'Fetch the content of a URL. Returns the page content as cleaned markdown for you to read directly. Use this instead of running curl or wget in the shell.',
@@ -79,19 +82,13 @@ export const webFetchTool = createTool({
     url: Schema.String,
   }),
 
-  outputSchema: Schema.Unknown,
-  errorSchema: WebFetchError,
+  outputSchema: Schema.Struct({
+    url: Schema.String,
+    content: Schema.String,
+  }),
+  errorSchema: WebFetchErrorSchema,
 
-  argMapping: ['url'],
-  bindings: {
-    xmlInput: { type: 'tag', body: 'url' },
-    xmlOutput: {
-      type: 'tag' as const,
-      childTags: [{ field: 'url', tag: 'url' }, { field: 'content', tag: 'content' }],
-    },
-  } as const,
-
-  execute: ({ url }) => {
+  execute: ({ url }, _ctx) => {
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       return Effect.fail({
         _tag: 'WebFetchError' as const,
@@ -101,4 +98,12 @@ export const webFetchTool = createTool({
 
     return fetchPage(url).pipe(Effect.retry(retryPolicy))
   },
+  label: (input) => input.url ? `Fetching ${input.url}` : 'Fetching…',
 })
+
+export const webFetchXmlBinding = defineXmlBinding(webFetchTool, {
+  input: { body: 'url' },
+  output: {
+    childTags: [{ field: 'url', tag: 'url' }, { field: 'content', tag: 'content' }],
+  },
+} as const)

@@ -1,5 +1,5 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
-import { createTool, type Tool } from '@magnitudedev/tools'
+import type { Tool, AnyTool } from '@magnitudedev/tools'
 import { Context, Effect, Layer } from 'effect'
 import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
 import type { AppEvent, SessionContext } from '../events'
@@ -114,8 +114,12 @@ const ALL_VARIANTS: AgentVariant[] = [
 
 type MagnitudeAgentDef = AgentDefinition<ToolSet, PolicyContext>
 
-function makeOverrideTool(source: Tool.Any, handler: ToolOverrideHandler): Tool.Any {
-  const execute: Tool.Any['execute'] = (input) =>
+function makeOverrideTool(source: AnyTool, handler: ToolOverrideHandler): AnyTool {
+  if (!('execute' in source) || typeof source.execute !== 'function') {
+    return source
+  }
+
+  const execute = (input: unknown) =>
     Effect.tryPromise({
       try: () => Promise.resolve(handler(input)),
       catch: (error) => (error instanceof Error ? error : new Error(String(error))),
@@ -133,14 +137,14 @@ function applyToolOverrides(
 ): void {
   for (const variant of ALL_VARIANTS) {
     const def = getAgentDefinition(variant)
-    const tools: Partial<Record<keyof typeof def.tools, Tool.Any>> = {}
+    const tools: Partial<Record<keyof typeof def.tools, AnyTool>> = {}
 
     for (const key of Object.keys(def.tools) as Array<keyof typeof def.tools>) {
       const concreteTool = def.tools[key]
       if (!concreteTool) {
         continue
       }
-      const tagName = defaultXmlTagName(concreteTool)
+      const tagName = defaultXmlTagName(concreteTool as Tool.Any)
       const override = handlers[tagName]
       const wrappedOverride = override
         ? async (input: unknown) => {
@@ -615,13 +619,11 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         unsubscribeClient()
         try {
           const workingState = await client.runEffect(
-            Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.get)
+            Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))
           )
 
-          for (const [forkId, working] of workingState.forks) {
-            if (working.working || working.willContinue) {
-              await send({ type: 'interrupt', forkId } as AppEvent)
-            }
+          if (workingState.working || workingState.willContinue) {
+            await send({ type: 'interrupt', forkId: null } as AppEvent)
           }
         } catch {
           // ignore best-effort teardown interrupt failures

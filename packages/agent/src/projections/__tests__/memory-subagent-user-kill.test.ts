@@ -8,7 +8,7 @@ import {
 } from '@magnitudedev/event-core'
 import type { AppEvent } from '../../events'
 import { AgentStatusProjection } from '../agent-status'
-import { MemoryProjection } from '../memory'
+import { MemoryProjection, type ForkMemoryState } from '../memory'
 import { FileAwarenessProjection } from '../file-awareness'
 import { SubagentActivityProjection } from '../subagent-activity'
 import { CanonicalTurnProjection } from '../canonical-turn'
@@ -86,7 +86,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
       return yield* projection.getFork(null)
     })
 
-    const rootFork = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any)
+    const rootFork = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any) as ForkMemoryState
     expect(rootFork).toBeTruthy()
 
     const systemInbox = rootFork!.messages.findLast((m: any) => m.type === 'system_inbox') as any
@@ -168,7 +168,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
       return yield* projection.getFork(null)
     })
 
-    const rootFork = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any)
+    const rootFork = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any) as ForkMemoryState
     expect(rootFork).toBeTruthy()
 
     const systemInbox = rootFork!.messages.findLast((m: any) => m.type === 'system_inbox') as any

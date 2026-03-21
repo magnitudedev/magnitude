@@ -7,7 +7,7 @@
 
 import { Effect, Stream, Queue, Deferred, Scope, Data } from 'effect'
 import type { XmlRuntimeCrash, ToolCallEvent } from '@magnitudedev/xml-act'
-import type { ResponsePart, ToolDisplay } from '../events'
+import type { ResponsePart } from '../events'
 import type { ExecuteResult } from './execution-manager'
 import type { CallUsage } from '@magnitudedev/providers'
 
@@ -35,7 +35,7 @@ export type TurnEvent =
   | { readonly _tag: 'LensEnded'; readonly name: string }
 
   // --- Tool events (forwarded xml-act ToolCallEvent with agent metadata) ---
-  | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: string; readonly event: ToolCallEvent; readonly display?: ToolDisplay }
+  | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: string; readonly event: ToolCallEvent }
 
   // --- Terminal (always last event in the stream) ---
   | { readonly _tag: 'TurnResult'; readonly value: TurnStrategyResult }

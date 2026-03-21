@@ -1,0 +1,164 @@
+import type { FieldPath, StreamingInput, ToolBinding } from '@magnitudedev/tools'
+import type { DeriveChildren, DeriveFields } from './type-chain'
+import type { XmlTagBinding } from './types'
+
+type ArrayElement<T> = T extends ReadonlyArray<infer E> ? E : never
+type ArrayFieldKeys<T> = {
+  [K in keyof T]-?: T[K] extends ReadonlyArray<unknown> ? K : never
+}[keyof T] & string
+type ArrayFieldElement<T, K extends keyof T> = T[K] extends ReadonlyArray<infer E> ? E : never
+type XmlOutputChildrenBinding<TOutput> = readonly {
+  [K in ArrayFieldKeys<TOutput>]: {
+    field: K
+    tag?: string
+    attributes?: readonly { attr: string; field: keyof ArrayFieldElement<TOutput, K> & string }[]
+    body?: keyof ArrayFieldElement<TOutput, K> & string
+  }
+}[ArrayFieldKeys<TOutput>][]
+
+// The mapping config for XML input bindings
+export interface XmlInputMappingConfig<TInput> {
+  attributes?: readonly { attr: string; field: FieldPath<TInput> }[]
+  body?: FieldPath<TInput>
+  childTags?: readonly { tag: string; field: FieldPath<TInput> }[]
+  children?: readonly {
+    field: keyof TInput & string
+    tag?: string
+    attributes?: readonly { attr: string; field: string }[]
+    body?: string
+  }[]
+  childRecord?: {
+    field: keyof TInput & string
+    tag: string
+    keyAttr: string
+  }
+}
+
+export interface XmlOutputBinding<TOutput> {
+  tag?: string
+  attributes?: readonly { attr: string; field: FieldPath<TOutput> }[]
+  body?: FieldPath<TOutput>
+  childTags?: readonly { tag: string; field: FieldPath<TOutput> }[]
+  children?: XmlOutputChildrenBinding<TOutput>
+  childRecord?: {
+    field: FieldPath<TOutput>
+    tag: string
+    keyAttr: string
+  }
+  items?: TOutput extends ReadonlyArray<unknown> ? {
+    tag?: string
+    attributes?: readonly { attr: string; field: keyof ArrayElement<TOutput> & string }[]
+    body?: keyof ArrayElement<TOutput> & string
+  } : never
+}
+
+// Full mapping config including output
+export interface XmlMappingConfig<TInput, TOutput = unknown> {
+  group?: string
+  tag?: string
+  input: XmlInputMappingConfig<TInput>
+  output?: XmlOutputBinding<TOutput>
+}
+
+export interface XmlBindingResult<TInput, TOutput, TMapping>
+  extends ToolBinding<TInput, StreamingInput<DeriveFields<TMapping>, DeriveChildren<TMapping>>> {
+  readonly tool: { name: string; group?: string }
+  readonly config: TMapping
+
+  /**
+   * Convert to the runtime XmlTagBinding format that xml-act's
+   * buildInput and dispatcher consume.
+   */
+  toXmlTagBinding(): XmlTagBinding
+
+  /**
+   * Convert to the runtime output binding format.
+   */
+  toXmlOutputBinding(): XmlOutputBinding<TOutput>
+}
+
+/**
+ * Define an XML binding for a tool. The `field` values in the input mapping
+ * are constrained to `keyof TInput` for compile-time safety.
+ *
+ * Use `as const` on the config to preserve literal types for streaming shape derivation.
+ */
+export function defineXmlBinding<
+  TInput,
+  TOutput,
+  const TMapping extends XmlMappingConfig<TInput, TOutput>
+>(
+  tool: {
+    readonly name: string
+    readonly group?: string
+    readonly inputSchema: { readonly Type: TInput }
+    readonly outputSchema: { readonly Type: TOutput }
+  },
+  config: TMapping,
+): XmlBindingResult<TInput, TOutput, TMapping> {
+  return {
+    _tool: undefined,
+    _streaming: undefined,
+    tool: { name: tool.name, group: config.group ?? tool.group },
+    config,
+    toXmlTagBinding() {
+      const input = config.input
+      const binding: {
+        tag?: string
+        attributes?: { attr: string; field: string }[]
+        body?: string
+        childTags?: { tag: string; field: string }[]
+        children?: {
+          field: string
+          tag?: string
+          attributes?: { attr: string; field: string }[]
+          body?: string
+        }[]
+        childRecord?: {
+          field: string
+          tag: string
+          keyAttr: string
+        }
+      } = {}
+
+      if (config.tag) {
+        binding.tag = config.tag
+      }
+      if (input.attributes) {
+        const attributes: { attr: string; field: string }[] = input.attributes.map((a) => ({ attr: a.attr, field: a.field }))
+        binding.attributes = attributes
+      }
+      if (input.body) {
+        const body: string = input.body
+        binding.body = body
+      }
+      if (input.childTags) {
+        const childTags: { tag: string; field: string }[] = input.childTags.map((ct) => ({ tag: ct.tag, field: ct.field }))
+        binding.childTags = childTags
+      }
+      if (input.children) {
+        const children: NonNullable<typeof binding.children> = input.children.map((ch) => ({
+          field: ch.field,
+          tag: ch.tag,
+          attributes: ch.attributes ? ch.attributes.map((a) => ({ attr: a.attr, field: a.field })) : undefined,
+          body: ch.body,
+        }))
+        binding.children = children
+      }
+      if (input.childRecord) {
+        const childRecord: NonNullable<typeof binding.childRecord> = {
+          field: input.childRecord.field,
+          tag: input.childRecord.tag,
+          keyAttr: input.childRecord.keyAttr,
+        }
+        binding.childRecord = childRecord
+      }
+
+      return binding
+    },
+    toXmlOutputBinding() {
+      const output: XmlOutputBinding<TOutput> = config.output ?? {}
+      return output
+    },
+  }
+}

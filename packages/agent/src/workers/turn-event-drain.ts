@@ -46,7 +46,7 @@ export function drainTurnEventStream<R>(
             yield* publish({ type: 'lens_end', forkId, turnId, name: event.name })
             break
           case 'ToolEvent':
-            yield* publish({ type: 'tool_event', forkId, turnId, toolCallId: event.toolCallId, toolKey: event.toolKey, event: event.event, display: event.display })
+            yield* publish({ type: 'tool_event', forkId, turnId, toolCallId: event.toolCallId, toolKey: event.toolKey, event: event.event })
             break
           case 'TurnResult':
             finalResult = event.value

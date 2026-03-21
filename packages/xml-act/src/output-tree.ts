@@ -348,7 +348,7 @@ function resolveNestedField(obj: Record<string, unknown>, path: string): unknown
 
 function buildItem(
   item: unknown,
-  itemBinding: { tag: string; attributes?: readonly (string | number | symbol)[]; body?: string | number | symbol },
+  itemBinding: { tag: string; attributes?: readonly { attr: string; field: string }[]; body?: string | number | symbol },
 ): OutputNode {
   const itemTag = itemBinding.tag
 
@@ -362,11 +362,10 @@ function buildItem(
   // Build attributes
   const itemAttrs: Record<string, string> = {}
   if (itemBinding.attributes) {
-    for (const attr of itemBinding.attributes) {
-      const attrKey = String(attr)
-      const val = itemObj[attrKey]
+    for (const attrSpec of itemBinding.attributes) {
+      const val = itemObj[attrSpec.field]
       if (val !== undefined && val !== null) {
-        itemAttrs[attrKey] = String(val)
+        itemAttrs[attrSpec.attr] = String(val)
       }
     }
   }

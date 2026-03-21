@@ -259,6 +259,12 @@ export interface ToolExecutionEnded<TOutput = unknown> {
   readonly result: XmlToolResult<TOutput>
 }
 
+export interface ToolEmission<TEmission = unknown> {
+  readonly _tag: 'ToolEmission'
+  readonly toolCallId: string
+  readonly value: TEmission
+}
+
 /** Entire XML stream processed */
 export interface TurnEnd {
   readonly _tag: 'TurnEnd'
@@ -270,7 +276,7 @@ export interface TurnEnd {
 // =============================================================================
 
 /** Events scoped to a specific tool call. Excludes prose and terminal events. */
-export type ToolCallEvent<TInput = unknown, TOutput = unknown, B = unknown> =
+export type ToolCallEvent<TInput = unknown, TOutput = unknown, B = unknown, TEmission = unknown> =
   | ToolInputStarted
   | ToolInputFieldValue<TInput, B>
   | ToolInputBodyChunk<TInput, B>
@@ -280,6 +286,7 @@ export type ToolCallEvent<TInput = unknown, TOutput = unknown, B = unknown> =
   | ToolInputParseError
   | ToolExecutionStarted<TInput>
   | ToolExecutionEnded<TOutput>
+  | ToolEmission<TEmission>
   | ToolObservation
 
 // =============================================================================
@@ -301,8 +308,8 @@ export interface StructuralParseError {
 
 
 /** Full event stream — composes ToolCallEvent with prose and terminal events. */
-export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown> =
-  | ToolCallEvent<TInput, TOutput, B>
+export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown, TEmission = unknown> =
+  | ToolCallEvent<TInput, TOutput, B, TEmission>
   | ProseChunk | ProseEnd | LensStart | LensChunk | LensEnd
   | MessageStart | MessageChunk | MessageEnd
   | StructuralParseError

@@ -9,6 +9,7 @@
  */
 
 import { Effect, Stream, Ref, Option, Queue, Scope, Cause } from "effect"
+import type { ToolContext } from '@magnitudedev/tools'
 
 import { createStreamingXmlParser, defaultIdGenerator } from '../parser/streaming-xml-parser'
 import { createShortId } from '../util'
@@ -232,7 +233,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             return reactImpl(
               state, parseEvent, emitAndFold,
               config, tagSchemas, Option.getOrUndefined(interceptor),
-              priorToolCallIds, priorOutcomes,
+              priorToolCallIds, priorOutcomes, queue,
               {
                 get: () => activeProseMessageId,
                 set: (id) => { activeProseMessageId = id },
@@ -363,6 +364,7 @@ function reactImpl(
   interceptor: ToolInterceptor | undefined,
   priorToolCallIds: ReadonlySet<string>,
   priorOutcomes: ReadonlyMap<string, unknown>,
+  queue: Queue.Queue<QueueItem>,
   proseMessage: {
     readonly get: () => string | null
     readonly set: (id: string | null) => void
@@ -530,6 +532,13 @@ function reactImpl(
         const dispatchCtx: DispatchContext = {
           tools: config.tools,
           interceptor,
+          toolContext: {
+            emit: (value: unknown) => Queue.offer(queue, {
+              _tag: 'ToolEmission',
+              toolCallId: parseEvent.toolCallId,
+              value,
+            } as XmlRuntimeEvent),
+          } satisfies ToolContext<unknown>,
           emit: (event) => Effect.gen(function* () {
             currentState = yield* emitAndFold(currentState, event)
             if (event._tag === 'ToolExecutionEnded' && event.result._tag === 'Success') {

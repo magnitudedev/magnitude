@@ -539,7 +539,27 @@ describe('xml-docs childRecord.field integration', () => {
       },
       execute: () => Effect.succeed(undefined),
     })
-    const doc = generateXmlToolDoc(tool)!
+    const xmlInput = tool.bindings.xmlInput
+    if (xmlInput.type !== 'tag') throw new Error('expected tag xmlInput binding')
+
+    const xmlOutput = tool.bindings.xmlOutput
+    const doc = generateXmlToolDoc({
+      name: tool.name,
+      group: tool.group,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      outputSchema: tool.outputSchema,
+      xmlInput: (() => {
+        const { type: _type, ...binding } = xmlInput
+        return binding
+      })(),
+      xmlOutput: xmlOutput && xmlOutput.type === 'tag'
+        ? (() => {
+            const { type: _type, ...binding } = xmlOutput
+            return binding
+          })()
+        : undefined,
+    })!
     expect(doc).toContain('<criterion id="...">value</criterion>')
     expect(doc).toContain('Acceptance criteria map')
     expect(doc).toContain('<!-- ...more')

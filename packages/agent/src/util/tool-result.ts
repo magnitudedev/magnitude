@@ -1,15 +1,15 @@
 import type { XmlToolResult } from '@magnitudedev/xml-act'
-import type { ToolDisplay, ToolResult } from '../events'
+import type { ToolResult } from '../events'
 
 /**
  * Maps xml-act's internal XmlToolResult to the app-level ToolResult.
  * Used by both ExecutionManager (live tool completion) and interrupt
  * recovery (reconstructing tool results from replay state).
  */
-export function mapXmlToolResult(result: XmlToolResult, display?: ToolDisplay): ToolResult {
+export function mapXmlToolResult(result: XmlToolResult): ToolResult {
   switch (result._tag) {
     case 'Success':
-      return { status: 'success', output: result.output, ...(display ? { display } : {}) }
+      return { status: 'success', output: result.output }
     case 'Error':
       return { status: 'error', message: result.error }
     case 'Rejected': {

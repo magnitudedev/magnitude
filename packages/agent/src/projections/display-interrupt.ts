@@ -3,27 +3,29 @@ export interface InterruptResultLike {
 }
 
 export interface InterruptToolStepLike {
+  readonly id?: string
   readonly type: 'tool'
   readonly toolKey?: string
   readonly result?: InterruptResultLike
   readonly visualState?: unknown
 }
 
-export type InterruptStepLike = InterruptToolStepLike | { readonly type: string; readonly [key: string]: unknown }
-
-export function finalizeOpenToolStepsAsInterruptedInSteps<TStep extends InterruptStepLike>(
+export function finalizeOpenToolStepsAsInterruptedInSteps<TStep extends { readonly type: string }>(
   steps: readonly TStep[],
-  reduceVisual: (toolKey: string | undefined, visualState: unknown) => unknown
+  reduceVisual: (toolKey: string | undefined, visualState: unknown, stepId: string | undefined) => unknown
 ): readonly TStep[] {
   return steps.map((step): TStep => {
-    if (step.type !== 'tool' || step.result) return step
+    if (step.type !== 'tool') return step
 
+    const toolStep = step as TStep & InterruptToolStepLike
+    if (toolStep.result) return step
+
+    const toolKey = typeof toolStep.toolKey === 'string' ? toolStep.toolKey : undefined
+    const stepId = typeof toolStep.id === 'string' ? toolStep.id : undefined
     return {
-      ...step,
+      ...toolStep,
       result: { status: 'interrupted' as const },
-      visualState: step.visualState !== undefined
-        ? reduceVisual(step.toolKey, step.visualState)
-        : step.visualState,
+      visualState: reduceVisual(toolKey, toolStep.visualState, stepId),
     } as TStep
   })
 }

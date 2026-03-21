@@ -7,11 +7,10 @@
  * Relocated from strategies/prompt-utils.ts after strategy abstraction removal.
  */
 
-import type { Tool } from '@magnitudedev/tools'
 import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
-import { generateXmlToolGroupDoc } from '@magnitudedev/xml-act'
+import { generateXmlToolGroupDoc, type XmlToolDocEntry } from '@magnitudedev/xml-act'
 import type { PolicyContext } from '../agents/types'
-import { buildRegisteredTools } from './index'
+import { defaultXmlTagName, getXmlBindingMap } from './index'
 
 // =============================================================================
 // Tool Presentation (strategy-agnostic tool metadata)
@@ -43,15 +42,14 @@ export function buildToolPresentation(
     if (implicitTools.includes(defKey)) continue
     if (!tool) continue
 
-    const t = tool as Tool.Any
-    const slug = agentDef.getSlug(defKey) ?? t.name
+    const slug = agentDef.getSlug(defKey) ?? tool.name
 
     presentations.push({
       slug,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      outputSchema: t.outputSchema,
-      argMapping: t.argMapping ?? [],
+      description: 'description' in tool && typeof tool.description === 'string' ? tool.description : '',
+      inputSchema: tool.inputSchema,
+      outputSchema: tool.outputSchema,
+      argMapping: 'argMapping' in tool && Array.isArray(tool.argMapping) ? tool.argMapping : [],
     })
   }
 
@@ -70,25 +68,37 @@ export function generateXmlActToolDocs(
   agentDef: AgentDefinition<ToolSet, PolicyContext>,
   implicitTools: readonly string[] = []
 ): string {
-  // Build defKey lookup: tool instance → defKey (for implicit filtering)
-  const defKeyLookup = new Map<Tool.Any, string>()
-  for (const [defKey, tool] of Object.entries(agentDef.tools)) {
-    if (tool) defKeyLookup.set(tool as Tool.Any, defKey)
-  }
+  const xmlBindingMap = getXmlBindingMap()
+
+  // Build defKey lookup: entry instance → defKey (for implicit filtering)
+  const defKeyLookup = new Map<XmlToolDocEntry, string>()
 
   // Group tools by group name for documentation
-  const groups = new Map<string, { tools: Tool.Any[]; global: boolean }>()
+  const groups = new Map<string, { tools: XmlToolDocEntry[]; global: boolean }>()
 
-  for (const tool of Object.values(agentDef.tools)) {
+  for (const [defKey, tool] of Object.entries(agentDef.tools)) {
     if (!tool) continue
-    const t = tool as Tool.Any
-    const groupName = t.group ?? 'default'
-    const isGlobal = !t.group || t.group === 'default'
 
-    if (!groups.has(groupName)) {
-      groups.set(groupName, { tools: [], global: isGlobal })
+    const tagName = defaultXmlTagName(tool)
+    const xmlBinding = xmlBindingMap.get(tagName)
+    if (!xmlBinding) continue
+
+    const entry: XmlToolDocEntry = {
+      name: tool.name,
+      group: tool.group,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      outputSchema: tool.outputSchema,
+      xmlInput: xmlBinding.toXmlTagBinding(),
+      xmlOutput: xmlBinding.toXmlOutputBinding(),
     }
-    groups.get(groupName)!.tools.push(t)
+
+    defKeyLookup.set(entry, defKey)
+
+    const groupName = tool.group ?? 'default'
+    const isGlobal = !tool.group || tool.group === 'default'
+    if (!groups.has(groupName)) groups.set(groupName, { tools: [], global: isGlobal })
+    groups.get(groupName)!.tools.push(entry)
   }
 
   const parts: string[] = []

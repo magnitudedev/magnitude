@@ -4,13 +4,14 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema, ToolImageSchema } from '@magnitudedev/tools'
-import { ToolEmitTag } from '../execution/tool-emit'
-import { join, relative, resolve } from 'path'
+import { defineTool, ToolErrorSchema, ToolImageSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
+import { relative, resolve } from 'path'
 import { resolveRgPath } from '@magnitudedev/ripgrep'
 import { walk } from '../util/walk'
 import { createDefaultIgnore } from '../util/gitignore'
 import { validateAndApply, toEditDiff } from '../util/edit'
+import type { EditDiff } from '@magnitudedev/tools'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 import { readImageFileForModel } from '../util/read-image-file'
 import { expandWorkspacePath } from '../workspace'
@@ -19,18 +20,27 @@ import { expandWorkspacePath } from '../workspace'
 // Errors
 // =============================================================================
 
-const FsError = ToolErrorSchema('FsError', {})
 type FsError = { readonly _tag: 'FsError'; readonly message: string }
 
 function fsError(message: string): FsError {
   return { _tag: 'FsError', message }
 }
 
+const FsErrorSchema = ToolErrorSchema('FsError', {})
+
+const EditDiffSchema = Schema.Struct({
+  startLine: Schema.Number,
+  removedLines: Schema.Array(Schema.String),
+  addedLines: Schema.Array(Schema.String),
+  contextBefore: Schema.Array(Schema.String),
+  contextAfter: Schema.Array(Schema.String),
+})
+
 // =============================================================================
 // fs.read()
 // =============================================================================
 
-export const readTool = createTool({
+export const readTool = defineTool({
   name: 'read',
   group: 'fs',
   description: 'Read file content as string. Supports line-range reads via optional offset (1-indexed start line) and limit (max lines, default 2000). Use this instead of running cat, head, tail, or less in the shell.',
@@ -46,14 +56,9 @@ export const readTool = createTool({
     }),
   }),
   outputSchema: Schema.String,
-  errorSchema: FsError,
-  argMapping: ['path', 'offset', 'limit'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }, { field: 'offset', attr: 'offset' }, { field: 'limit', attr: 'limit' }], selfClosing: true },
-    xmlOutput: { type: 'tag' },
-  } as const,
-
-  execute: ({ path, offset, limit }) => Effect.gen(function* () {
+  errorSchema: FsErrorSchema,
+  label: (input) => input.path ? `Reading ${input.path}` : 'Reading file...',
+  execute: ({ path, offset, limit }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
@@ -90,11 +95,22 @@ export const readTool = createTool({
   })
 })
 
+export const readXmlBinding = defineXmlBinding(readTool, {
+  input: {
+    attributes: [
+      { field: 'path', attr: 'path' },
+      { field: 'offset', attr: 'offset' },
+      { field: 'limit', attr: 'limit' },
+    ],
+  },
+  output: {},
+} as const)
+
 // =============================================================================
 // fs.write()
 // =============================================================================
 
-export const writeTool = createTool({
+export const writeTool = defineTool({
   name: 'write',
   group: 'fs',
   description: 'Write content to file. Use this instead of running echo, tee, or heredocs in the shell.',
@@ -107,15 +123,14 @@ export const writeTool = createTool({
     })
   }),
   outputSchema: Schema.Void,
-  errorSchema: FsError,
-  argMapping: ['path', 'content'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' },
-    xmlOutput: { type: 'tag' },
-  } as const,
-
-  execute: ({ path, content }) => Effect.gen(function* () {
-    const emit = yield* ToolEmitTag
+  errorSchema: FsErrorSchema,
+  emissionSchema: Schema.Struct({
+    type: Schema.Literal('write_stats'),
+    path: Schema.String,
+    linesWritten: Schema.Number,
+  }),
+  label: (input) => input.path ? `Writing ${input.path}` : 'Writing file...',
+  execute: ({ path, content }, ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const expandedPath = expandWorkspacePath(path, workspacePath)
     yield* Effect.tryPromise({
@@ -126,15 +141,23 @@ export const writeTool = createTool({
       catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
     })
     const linesWritten = content.split('\n').length
-    yield* emit.emit({ type: 'write_stats', path, linesWritten })
+    yield* ctx.emit({ type: 'write_stats', path, linesWritten })
   })
 })
+
+export const writeXmlBinding = defineXmlBinding(writeTool, {
+  input: {
+    attributes: [{ field: 'path', attr: 'path' }],
+    body: 'content',
+  },
+  output: {},
+} as const)
 
 // =============================================================================
 // edit() — string find-replace using <old>/<new> child tags
 // =============================================================================
 
-export const editTool = createTool({
+export const editTool = defineTool({
   name: 'edit',
   description: 'Edit a file by replacing exact text. The <old> content must match the file exactly. Read the file first. Use this instead of running sed, perl, or awk in the shell.',
   inputSchema: Schema.Struct({
@@ -152,22 +175,14 @@ export const editTool = createTool({
     })),
   }),
   outputSchema: Schema.String,
-  errorSchema: FsError,
-  argMapping: ['path', 'oldString', 'newString', 'replaceAll'],
-  bindings: {
-    xmlInput: {
-      type: 'tag',
-      attributes: [{ field: 'path', attr: 'path' }, { field: 'replaceAll', attr: 'replaceAll' }],
-      childTags: [
-        { tag: 'old', field: 'oldString' },
-        { tag: 'new', field: 'newString' },
-      ],
-    },
-    xmlOutput: { type: 'tag' },
-  } as const,
-
-  execute: ({ path, oldString, newString, replaceAll }) => Effect.gen(function* () {
-    const emit = yield* ToolEmitTag
+  errorSchema: FsErrorSchema,
+  emissionSchema: Schema.Struct({
+    type: Schema.Literal('edit_diff'),
+    path: Schema.String,
+    diffs: Schema.Array(EditDiffSchema),
+  }),
+  label: (input) => input.path ? `Editing ${input.path}` : 'Editing file...',
+  execute: ({ path, oldString, newString, replaceAll }, ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
@@ -227,7 +242,7 @@ export const editTool = createTool({
           return perDiff.length > 0 ? perDiff : [toEditDiff(applied, applied.result)]
         })()
       : [toEditDiff(applied, applied.result)]
-    yield* emit.emit({ type: 'edit_diff', path, diffs })
+    yield* ctx.emit({ type: 'edit_diff', path, diffs })
 
     // Build summary
     if (applied.replaceCount > 1) {
@@ -239,6 +254,20 @@ export const editTool = createTool({
     return `Replaced ${applied.removedLines.length} line(s) with ${applied.addedLines.length} line(s) in ${path}`
   }),
 })
+
+export const editXmlBinding = defineXmlBinding(editTool, {
+  input: {
+    attributes: [
+      { field: 'path', attr: 'path' },
+      { field: 'replaceAll', attr: 'replaceAll' },
+    ],
+    childTags: [
+      { tag: 'old', field: 'oldString' },
+      { tag: 'new', field: 'newString' },
+    ],
+  },
+  output: {},
+} as const)
 
 // =============================================================================
 // fs.tree()
@@ -253,7 +282,7 @@ const TreeEntry = Schema.Struct({
 
 type TreeEntry = Schema.Schema.Type<typeof TreeEntry>
 
-export const treeTool = createTool({
+export const treeTool = defineTool({
   name: 'tree',
   group: 'fs',
   description: 'List directory structure with optional gitignore filtering. Use this instead of running ls, find, or tree in the shell.',
@@ -274,14 +303,9 @@ export const treeTool = createTool({
     }))
   }),
   outputSchema: Schema.Array(TreeEntry),
-  errorSchema: FsError,
-  argMapping: ['path', 'options'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true },
-    xmlOutput: { type: 'tag', items: { tag: 'entry', attributes: ['path', 'name', 'type', 'depth'] } },
-  } as const,
-
-  execute: ({ path, options }) => Effect.gen(function* () {
+  errorSchema: FsErrorSchema,
+  label: (input) => input.path ? `Listing ${input.path}` : 'Listing directory...',
+  execute: ({ path, options }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const expandedPath = expandWorkspacePath(path, workspacePath)
     return yield* Effect.tryPromise({
@@ -304,6 +328,23 @@ export const treeTool = createTool({
     })
   })
 })
+
+export const treeXmlBinding = defineXmlBinding(treeTool, {
+  input: {
+    attributes: [{ field: 'path', attr: 'path' }],
+  },
+  output: {
+    items: {
+      tag: 'entry',
+      attributes: [
+        { attr: 'path', field: 'path' },
+        { attr: 'name', field: 'name' },
+        { attr: 'type', field: 'type' },
+        { attr: 'depth', field: 'depth' },
+      ],
+    },
+  },
+} as const)
 
 // =============================================================================
 // fs.search()
@@ -419,7 +460,7 @@ export async function searchFiles(
   }
 }
 
-export const searchTool = createTool({
+export const searchTool = defineTool({
   name: 'search',
   group: 'fs',
   description: 'Search file contents with regex. Use this instead of running grep, rg, or ag in the shell — it uses ripgrep under the hood.',
@@ -444,14 +485,9 @@ export const searchTool = createTool({
     })),
   }),
   outputSchema: Schema.Array(SearchMatch),
-  errorSchema: FsError,
-  argMapping: ['pattern', 'path', 'glob', 'limit', 'options'],
-  bindings: {
-    xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }, { field: 'path', attr: 'path' }, { field: 'glob', attr: 'glob' }, { field: 'limit', attr: 'limit' }], selfClosing: true },
-    xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['file'], body: 'match' } },
-  } as const,
-
-  execute: ({ pattern, path, glob, limit, options }) => Effect.gen(function* () {
+  errorSchema: FsErrorSchema,
+  label: (input) => input.pattern ? `Searching for ${input.pattern}` : 'Searching files...',
+  execute: ({ pattern, path, glob, limit, options }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     return yield* Effect.tryPromise({
       try: async () => {
@@ -470,11 +506,29 @@ export const searchTool = createTool({
   })
 })
 
+export const searchXmlBinding = defineXmlBinding(searchTool, {
+  input: {
+    attributes: [
+      { field: 'pattern', attr: 'pattern' },
+      { field: 'path', attr: 'path' },
+      { field: 'glob', attr: 'glob' },
+      { field: 'limit', attr: 'limit' },
+    ],
+  },
+  output: {
+    items: {
+      tag: 'item',
+      attributes: [{ attr: 'file', field: 'file' }],
+      body: 'match',
+    },
+  },
+} as const)
+
 // =============================================================================
 // fs.view()
 // =============================================================================
 
-export const viewTool = createTool({
+export const viewTool = defineTool({
   name: 'view',
   group: 'fs',
   description: 'Read an image file and return it as image output for visual inspection. Supports PNG, JPEG, WebP, GIF, and SVG files.',
@@ -484,18 +538,9 @@ export const viewTool = createTool({
     }),
   }),
   outputSchema: ToolImageSchema,
-  errorSchema: FsError,
-  argMapping: ['path'],
-  bindings: {
-    xmlInput: {
-      type: 'tag',
-      attributes: [{ field: 'path', attr: 'path' }],
-      selfClosing: true,
-    },
-    xmlOutput: { type: 'tag' },
-  } as const,
-
-  execute: ({ path: filePath }) => Effect.gen(function* () {
+  errorSchema: FsErrorSchema,
+  label: (input) => input.path ? `Viewing ${input.path}` : 'Viewing image...',
+  execute: ({ path: filePath }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const expandedPath = expandWorkspacePath(filePath, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
@@ -507,8 +552,24 @@ export const viewTool = createTool({
   })
 })
 
+export const viewXmlBinding = defineXmlBinding(viewTool, {
+  input: {
+    attributes: [{ field: 'path', attr: 'path' }],
+  },
+  output: {},
+} as const)
+
 // =============================================================================
 // Filesystem Tools Group
 // =============================================================================
 
 export const fsTools = [readTool, writeTool, editTool, treeTool, searchTool, viewTool]
+
+export const fsXmlBindings = [
+  readXmlBinding,
+  writeXmlBinding,
+  editXmlBinding,
+  treeXmlBinding,
+  searchXmlBinding,
+  viewXmlBinding,
+]

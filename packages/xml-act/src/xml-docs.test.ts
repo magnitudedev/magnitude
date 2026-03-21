@@ -1,7 +1,9 @@
 import { describe, test, expect } from 'bun:test'
 import { Schema } from '@effect/schema'
-import { generateXmlToolDoc, generateXmlToolGroupDoc } from './xml-docs'
-import { createTool, type XmlBinding, ToolImageSchema } from '@magnitudedev/tools'
+import { generateXmlToolDoc, generateXmlToolGroupDoc, type XmlToolDocEntry } from './xml-docs'
+import { ToolImageSchema } from '@magnitudedev/tools'
+import type { XmlTagBinding } from './types'
+import type { XmlOutputBinding } from './xml-binding'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -16,25 +18,45 @@ function makeTool<
   description?: string
   inputSchema: I
   outputSchema?: O
-  argMapping?: string[]
+  argMapping?: readonly string[]
+  xmlInput?: XmlTagBinding
+  xmlOutput?: XmlOutputBinding<unknown>
   bindings?: {
-    xmlInput: XmlBinding<Schema.Schema.Type<I>>
-    xmlOutput?: XmlBinding<Schema.Schema.Type<O>>
+    xmlInput: ({ readonly type: 'tag' } & XmlTagBinding)
+    xmlOutput?: { readonly type: 'tag'; readonly [k: string]: unknown }
   }
-}) {
-  return createTool({
+}): XmlToolDocEntry | null {
+  const xmlInputWithType = config.bindings?.xmlInput
+  const xmlInput = config.xmlInput ?? (xmlInputWithType
+    ? (() => {
+        const { type: _type, ...binding } = xmlInputWithType
+        return binding
+      })()
+    : undefined)
+  if (!xmlInput) return null
+
+  const xmlOutputWithType = config.bindings?.xmlOutput
+  const xmlOutput = config.xmlOutput ?? (xmlOutputWithType
+    ? (() => {
+        const { type: _type, ...binding } = xmlOutputWithType
+        return binding as XmlOutputBinding<unknown>
+      })()
+    : undefined)
+
+  return {
     name: config.name,
     group: config.group,
     description: config.description ?? '',
     inputSchema: config.inputSchema,
     outputSchema: (config.outputSchema ?? Schema.Void) as O,
-    argMapping: config.argMapping,
-    bindings: config.bindings ? {
-      xmlInput: config.bindings.xmlInput,
-      ...(config.bindings.xmlOutput ? { xmlOutput: config.bindings.xmlOutput } : {}),
-    } : undefined as any,
-    execute: () => { throw new Error('not used') },
-  })
+    xmlInput,
+    xmlOutput,
+  }
+}
+
+function expectTool(tool: XmlToolDocEntry | null): XmlToolDocEntry {
+  if (!tool) throw new Error('expected xml-bound test tool')
+  return tool
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +69,7 @@ describe('no binding or omit', () => {
       name: 'tree',
       inputSchema: Schema.Struct({ path: Schema.String }),
     })
-    expect(generateXmlToolDoc(tool)).toBeNull()
+    expect(tool).toBeNull()
   })
 
 
@@ -69,7 +91,7 @@ describe('self-closing tags', () => {
       argMapping: ['path'],
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Read file content')
     expect(doc).toContain('<fs-read')
     expect(doc).toContain('path="..."')
@@ -88,7 +110,7 @@ describe('self-closing tags', () => {
       argMapping: ['pattern', 'path'],
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }, { field: 'path', attr: 'path' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('<search')
     expect(doc).toContain('pattern="..."')
     expect(doc).toContain('path="..."')
@@ -110,7 +132,7 @@ describe('body tags', () => {
       argMapping: ['command'],
       bindings: { xmlInput: { type: 'tag', body: 'command' } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('<shell>command</shell>')
   })
 
@@ -125,7 +147,7 @@ describe('body tags', () => {
       argMapping: ['path', 'content'],
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('path="..."')
     expect(doc).toContain('>content</write>')
     expect(doc).toContain('File path')
@@ -165,7 +187,7 @@ describe('children tags', () => {
         },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Edit a file')
     expect(doc).toContain('path="..."')
     expect(doc).toContain('File path')
@@ -192,7 +214,7 @@ describe('tag name override', () => {
       argMapping: ['path'],
       bindings: { xmlInput: { type: 'tag', tag: 'read', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('<read')
     expect(doc).not.toContain('fileRead')
   })
@@ -232,6 +254,7 @@ describe('group documentation', () => {
   })
 
   test('generates group header with tool docs', () => {
+    if (!readTool || !writeTool) throw new Error('expected tools with xml bindings')
     const doc = generateXmlToolGroupDoc('fs', [readTool, writeTool])
     expect(doc).toContain('### fs')
     expect(doc).toContain('Read file')
@@ -239,13 +262,16 @@ describe('group documentation', () => {
   })
 
   test('skips tools with no XML binding', () => {
-    const doc = generateXmlToolGroupDoc('fs', [readTool, noBindingTool])
+    if (!readTool) throw new Error('expected readTool with xml binding')
+    const tools = [readTool, noBindingTool].filter((tool): tool is XmlToolDocEntry => tool !== null)
+    const doc = generateXmlToolGroupDoc('fs', tools)
     expect(doc).toContain('Read file')
     expect(doc).not.toContain('List directory')
   })
 
   test('filters implicit tools via defKey lookup', () => {
-    const defKeyLookup = new Map<ReturnType<typeof makeTool>, string>([
+    if (!readTool || !writeTool) throw new Error('expected tools with xml bindings')
+    const defKeyLookup = new Map<XmlToolDocEntry, string>([
       [readTool, 'fileRead'],
       [writeTool, 'fileWrite'],
     ])
@@ -255,7 +281,8 @@ describe('group documentation', () => {
   })
 
   test('returns empty string when all tools filtered', () => {
-    const doc = generateXmlToolGroupDoc('fs', [noBindingTool])
+    const tools = [noBindingTool].filter((tool): tool is XmlToolDocEntry => tool !== null)
+    const doc = generateXmlToolGroupDoc('fs', tools)
     expect(doc).toBe('')
   })
 })
@@ -291,7 +318,7 @@ describe('childTags', () => {
         },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Create a new agent')
     expect(doc).toContain('<agent-create')
     expect(doc).toContain('<type>type</type>')
@@ -321,7 +348,7 @@ describe('childTags', () => {
         },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('<host>host</host>')
     expect(doc).toContain('Server host')
     expect(doc).toContain('<port>port</port>')
@@ -356,7 +383,7 @@ describe('childRecord', () => {
         },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Propose a plan')
     expect(doc).toContain('title="..."')
     expect(doc).toContain('description="..."')
@@ -378,7 +405,7 @@ describe('output documentation', () => {
       outputSchema: Schema.Void,
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], body: 'content' } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).not.toContain('Returns')
   })
 
@@ -390,7 +417,7 @@ describe('output documentation', () => {
       outputSchema: Schema.String,
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns: string')
     expect(doc).toContain('<fs-read>...</fs-read>')
   })
@@ -403,7 +430,7 @@ describe('output documentation', () => {
       outputSchema: ToolImageSchema,
       bindings: { xmlInput: { type: 'tag' } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns: image')
     expect(doc).toContain('<browser-screenshot>[image]</browser-screenshot>')
   })
@@ -419,7 +446,7 @@ describe('output documentation', () => {
       }),
       bindings: { xmlInput: { type: 'tag', body: 'command' } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
     expect(doc).toContain('<stdout>stdout</stdout>')
     expect(doc).toContain('<stderr>stderr</stderr>')
@@ -437,7 +464,7 @@ describe('output documentation', () => {
       }),
       bindings: { xmlInput: { type: 'tag' } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('<screenshot>[image]</screenshot>')
     expect(doc).toContain('<title>title</title>')
   })
@@ -454,7 +481,7 @@ describe('output documentation', () => {
       })),
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
     expect(doc).toContain('<item')
     expect(doc).toContain('path="..."')
@@ -482,7 +509,7 @@ describe('output documentation', () => {
         },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
     expect(doc).toContain('exitCode="..."')
     expect(doc).toContain('<stdout>stdout</stdout>')
@@ -500,7 +527,7 @@ describe('output documentation', () => {
         xmlOutput: { type: 'tag', body: 'content' },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
     expect(doc).toContain('<fs-read>content</fs-read>')
   })
@@ -524,7 +551,7 @@ describe('output documentation', () => {
         },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('<screenshot>[image]</screenshot>')
     expect(doc).toContain('<title>title</title>')
   })
@@ -542,10 +569,21 @@ describe('output documentation', () => {
       })),
       bindings: {
         xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }], selfClosing: true },
-        xmlOutput: { type: 'tag', items: { tag: 'entry', attributes: ['path', 'name', 'type', 'depth'] } },
+        xmlOutput: {
+          type: 'tag',
+          items: {
+            tag: 'entry',
+            attributes: [
+              { attr: 'path', field: 'path' },
+              { attr: 'name', field: 'name' },
+              { attr: 'type', field: 'type' },
+              { attr: 'depth', field: 'depth' },
+            ],
+          },
+        },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
     expect(doc).toContain('<fs-tree>')
     expect(doc).toContain('<entry path="..." name="..." type="..." depth="..." />')
@@ -563,10 +601,10 @@ describe('output documentation', () => {
       })),
       bindings: {
         xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }], selfClosing: true },
-        xmlOutput: { type: 'tag', items: { tag: 'item', attributes: ['file'], body: 'match' } },
+        xmlOutput: { type: 'tag', items: { tag: 'item', attributes: [{ attr: 'file', field: 'file' }], body: 'match' } },
       },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
     expect(doc).toContain('<fs-search>')
     expect(doc).toContain('<item file="...">a string</item>')
@@ -587,7 +625,7 @@ describe('type annotations', () => {
       }),
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'count', attr: 'count' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('number')
     expect(doc).toContain('Item count')
   })
@@ -600,7 +638,7 @@ describe('type annotations', () => {
       }),
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'verbose', attr: 'verbose' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('boolean')
   })
 
@@ -612,7 +650,7 @@ describe('type annotations', () => {
       }),
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'mode', attr: 'mode' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('"fast" | "slow"')
   })
 
@@ -625,7 +663,7 @@ describe('type annotations', () => {
       }),
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'path', attr: 'path' }, { field: 'glob', attr: 'glob' }], selfClosing: true } },
     })
-    const doc = generateXmlToolDoc(tool)!
+    const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('optional')
     expect(doc).toContain('Glob filter')
   })

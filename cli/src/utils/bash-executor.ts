@@ -43,7 +43,7 @@ export function executeBashCommand(
       env: {
         ...process.env,
         PROJECT_ROOT: projectRoot,
-        M: options.workspacePath,
+        ...(options?.workspacePath ? { M: options.workspacePath } : {}),
       },
     })
 

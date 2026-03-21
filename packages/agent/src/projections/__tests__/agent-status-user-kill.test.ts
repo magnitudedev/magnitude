@@ -7,7 +7,7 @@ import {
   FrameworkErrorReporterLive,
 } from '@magnitudedev/event-core'
 import type { AppEvent } from '../../events'
-import { AgentStatusProjection } from '../agent-status'
+import { AgentStatusProjection, type AgentStatusState } from '../agent-status'
 
 const ts = (n: number) => 1_700_100_000_000 + n
 
@@ -55,7 +55,7 @@ describe('AgentStatusProjection user kill semantics', () => {
       return yield* projection.get
     })
 
-    const state = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any)
+    const state = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any) as AgentStatusState
     expect(state.agents.size).toBe(0)
     expect(state.agentByForkId.size).toBe(0)
   })
@@ -103,7 +103,7 @@ describe('AgentStatusProjection user kill semantics', () => {
       return yield* projection.get
     })
 
-    const state = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any)
+    const state = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any) as AgentStatusState
     expect(state.agents.size).toBe(0)
     expect(state.agentByForkId.size).toBe(0)
   })

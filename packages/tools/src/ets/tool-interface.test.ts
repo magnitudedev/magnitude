@@ -22,6 +22,7 @@ function makeTool(config: {
     outputSchema: config.outputSchema ?? Schema.Void,
     errorSchema: config.errorSchema,
     argMapping: config.argMapping,
+    bindings: {},
     execute: () => { throw new Error('not used') },
   })
 }

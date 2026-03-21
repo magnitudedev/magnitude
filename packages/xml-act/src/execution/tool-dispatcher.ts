@@ -13,6 +13,7 @@
 import { Effect, Either } from "effect"
 import { AST } from "@effect/schema"
 import { Schema } from "@effect/schema"
+import type { ToolContext } from '@magnitudedev/tools'
 import type { ParsedElement } from '../parser/types'
 import type { BaseToolParseErrorDetail } from '../parser/types'
 import type {
@@ -65,6 +66,7 @@ export interface DispatchContext {
   readonly tools: ReadonlyMap<string, RegisteredTool>
   readonly interceptor: ToolInterceptor | undefined
   readonly emit: (event: XmlRuntimeEvent) => Effect.Effect<void>
+  readonly toolContext?: ToolContext<unknown>
 }
 
 // =============================================================================
@@ -74,9 +76,10 @@ export interface DispatchContext {
 function executeToolEffect(
   registered: RegisteredTool,
   input: unknown,
+  toolContext?: ToolContext<unknown>,
 ): Effect.Effect<Either.Either<unknown, unknown>> {
   return Effect.suspend(() => {
-    const exec = (registered.tool.execute as (i: unknown) => Effect.Effect<unknown, unknown, unknown>)(input)
+    const exec = (registered.tool.execute as (i: unknown, ctx?: ToolContext<unknown>) => Effect.Effect<unknown, unknown, unknown>)(input, toolContext)
 
     if (registered.layerProvider) {
       return registered.layerProvider().pipe(
@@ -186,7 +189,7 @@ export function dispatchTool(
     })
 
     // 6. Execute tool
-    const executionResult = yield* executeToolEffect(registered, input)
+    const executionResult = yield* executeToolEffect(registered, input, ctx.toolContext)
 
     let result: XmlToolResult
 

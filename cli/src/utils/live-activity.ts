@@ -1,5 +1,5 @@
 import type { DisplayMessage, ThinkBlockStep } from '@magnitudedev/agent'
-import { liveTextRegistry } from '../visuals/registry'
+import { displayBindingRegistry } from '../visuals/registry'
 
 function normalize(text: string): string {
   return text.trim().replace(/\s+/g, ' ')
@@ -7,9 +7,9 @@ function normalize(text: string): string {
 
 function getToolLiveText(step: ThinkBlockStep): string | null {
   if (step.type !== 'tool') return null
-  if (step.toolKey && step.visualState !== undefined) {
-    const getter = liveTextRegistry.get(step.toolKey)
-    const value = getter?.({ state: step.visualState, step })
+  if (step.toolKey && typeof step.visualState === 'object' && step.visualState !== null) {
+    const binding = displayBindingRegistry.getAny(step.toolKey)
+    const value = binding?.summary(step.visualState as { state: object; streaming: unknown })
     if (typeof value === 'string') {
       const normalized = normalize(value)
       if (normalized.length > 0) return normalized

@@ -3,22 +3,18 @@ import { mkdtempSync } from 'fs'
 import { rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import {
-  createMemoryExtractionJob,
-  writePendingJobSync,
-  listPendingJobs,
-  readJob,
-  removeJob,
-  getPendingDir,
-} from '../job-queue'
+import { createStorageClient, type StorageClient } from '@magnitudedev/storage'
+import { createMemoryExtractionJob, writePendingJob } from '../job-queue'
 
 describe('memory job queue', () => {
   const origHome = process.env.HOME
   let homeDir = ''
+  let storage: StorageClient
 
-  beforeEach(() => {
+  beforeEach(async () => {
     homeDir = mkdtempSync(join(tmpdir(), 'mem-queue-home-'))
     process.env.HOME = homeDir
+    storage = await createStorageClient()
   })
 
   afterEach(async () => {
@@ -26,7 +22,7 @@ describe('memory job queue', () => {
     process.env.HOME = origHome
   })
 
-  test('sync marker write + list/read/remove', async () => {
+  test('write + list/read/remove', async () => {
     const job = createMemoryExtractionJob({
       sessionId: 's1',
       cwd: '/tmp/project',
@@ -34,17 +30,17 @@ describe('memory job queue', () => {
       memoryPath: '/tmp/project/.magnitude/memory.md',
     })
 
-    const jobPath = writePendingJobSync(job)
-    expect(jobPath.startsWith(getPendingDir())).toBe(true)
+    const jobPath = await writePendingJob(storage, job)
+    expect(jobPath.length).toBeGreaterThan(0)
 
-    const files = await listPendingJobs()
+    const files = await storage.memoryJobs.list()
     expect(files.length).toBe(1)
 
-    const roundTrip = await readJob(files[0]!)
+    const roundTrip = await storage.memoryJobs.read({ filePath: files[0]! })
     expect(roundTrip.sessionId).toBe('s1')
     expect(roundTrip.status).toBe('pending')
 
-    await removeJob(files[0]!)
-    expect((await listPendingJobs()).length).toBe(0)
+    await storage.memoryJobs.remove(roundTrip.jobId)
+    expect((await storage.memoryJobs.list()).length).toBe(0)
   })
 })

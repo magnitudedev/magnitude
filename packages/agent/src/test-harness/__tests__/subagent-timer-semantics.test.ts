@@ -33,7 +33,7 @@ describe('subagent timer semantics', () => {
         commands: 0, reads: 0, writes: 0, edits: 0, searches: 0, webSearches: 0, webFetches: 0,
         artifactWrites: 0, artifactUpdates: 0, clicks: 0, navigations: 0, inputs: 0, evaluations: 0, other: 0
       },
-      artifactNames: [],
+
       timestamp: 1000,
     }
 

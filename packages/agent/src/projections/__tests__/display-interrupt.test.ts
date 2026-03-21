@@ -3,7 +3,7 @@ import { finalizeOpenToolStepsAsInterruptedInSteps } from '../display-interrupt'
 
 describe('display interrupt finalization helper used by display projection', () => {
   test('marks unfinished tool steps as interrupted and leaves finished/non-tool steps unchanged', () => {
-    const original = [
+    const original: Array<{ id: string; type: string; toolKey?: string; visualState?: unknown; result?: { status: 'success' | 'interrupted'; output?: string }; content?: string }> = [
       { id: 'open-no-visual', type: 'tool' as const, toolKey: 'shell' },
       { id: 'open-with-visual', type: 'tool' as const, toolKey: 'shell', visualState: { phase: 'executing' } },
       { id: 'done', type: 'tool' as const, toolKey: 'shell', result: { status: 'success' as const, output: 'ok' } },
@@ -12,7 +12,7 @@ describe('display interrupt finalization helper used by display projection', () 
 
     const next = finalizeOpenToolStepsAsInterruptedInSteps(
       original,
-      (_toolKey, visualState) => ({ ...(visualState as object), phase: 'done', done: { kind: 'interrupted' } })
+      (_toolKey, visualState) => ({ ...(visualState as Record<string, unknown>), phase: 'done', done: { kind: 'interrupted' } })
     )
 
     const openNoVisual = next.find((s: any) => s.id === 'open-no-visual')

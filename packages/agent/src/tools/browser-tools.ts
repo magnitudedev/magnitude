@@ -7,7 +7,8 @@
 
 import { Context, Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import type { WebHarness } from '@magnitudedev/browser-harness'
 
 export class BrowserHarnessTag extends Context.Tag('BrowserHarness')<
@@ -26,7 +27,7 @@ function browserError(e: unknown): BrowserError {
 // click
 // =============================================================================
 
-export const clickTool = createTool({
+export const clickTool = defineTool({
   name: 'click',
   group: 'browser',
   description: 'Click at coordinates (x, y) on the page',
@@ -36,8 +37,9 @@ export const clickTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['x', 'y'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -46,11 +48,16 @@ export const clickTool = createTool({
     }),
 })
 
+export const clickXmlBinding = defineXmlBinding(clickTool, {
+  input: { attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }] },
+  output: {},
+} as const)
+
 // =============================================================================
 // doubleClick
 // =============================================================================
 
-export const doubleClickTool = createTool({
+export const doubleClickTool = defineTool({
   name: 'doubleClick',
   group: 'browser',
   description: 'Double-click at coordinates (x, y) on the page',
@@ -60,8 +67,9 @@ export const doubleClickTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['x', 'y'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -70,11 +78,16 @@ export const doubleClickTool = createTool({
     }),
 })
 
+export const doubleClickXmlBinding = defineXmlBinding(doubleClickTool, {
+  input: { attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }] },
+  output: {},
+} as const)
+
 // =============================================================================
 // rightClick
 // =============================================================================
 
-export const rightClickTool = createTool({
+export const rightClickTool = defineTool({
   name: 'rightClick',
   group: 'browser',
   description: 'Right-click at coordinates (x, y) on the page',
@@ -84,8 +97,9 @@ export const rightClickTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['x', 'y'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -94,11 +108,16 @@ export const rightClickTool = createTool({
     }),
 })
 
+export const rightClickXmlBinding = defineXmlBinding(rightClickTool, {
+  input: { attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }] },
+  output: {},
+} as const)
+
 // =============================================================================
 // type
 // =============================================================================
 
-export const typeTool = createTool({
+export const typeTool = defineTool({
   name: 'type',
   group: 'browser',
   description: 'Type text content. Use after clicking on an input field. Supports <enter> and <tab> special keys.',
@@ -107,8 +126,9 @@ export const typeTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['content'],
-  bindings: { xmlInput: { type: 'tag', body: 'content' }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ content }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -117,11 +137,16 @@ export const typeTool = createTool({
     }),
 })
 
+export const typeXmlBinding = defineXmlBinding(typeTool, {
+  input: { body: 'content' },
+  output: {},
+} as const)
+
 // =============================================================================
 // scroll
 // =============================================================================
 
-export const scrollTool = createTool({
+export const scrollTool = defineTool({
   name: 'scroll',
   group: 'browser',
   description: 'Scroll at coordinates (x, y) by delta amounts. Use positive deltaY to scroll down, negative to scroll up.',
@@ -133,8 +158,9 @@ export const scrollTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['x', 'y', 'deltaX', 'deltaY'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }, { field: 'deltaX', attr: 'deltaX' }, { field: 'deltaY', attr: 'deltaY' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ x, y, deltaX, deltaY }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -143,11 +169,23 @@ export const scrollTool = createTool({
     }),
 })
 
+export const scrollXmlBinding = defineXmlBinding(scrollTool, {
+  input: {
+    attributes: [
+      { field: 'x', attr: 'x' },
+      { field: 'y', attr: 'y' },
+      { field: 'deltaX', attr: 'deltaX' },
+      { field: 'deltaY', attr: 'deltaY' },
+    ],
+  },
+  output: {},
+} as const)
+
 // =============================================================================
 // drag
 // =============================================================================
 
-export const dragTool = createTool({
+export const dragTool = defineTool({
   name: 'drag',
   group: 'browser',
   description: 'Drag from (x1, y1) to (x2, y2)',
@@ -159,8 +197,9 @@ export const dragTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['x1', 'y1', 'x2', 'y2'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'x1', attr: 'x1' }, { field: 'y1', attr: 'y1' }, { field: 'x2', attr: 'x2' }, { field: 'y2', attr: 'y2' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ x1, y1, x2, y2 }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -169,11 +208,23 @@ export const dragTool = createTool({
     }),
 })
 
+export const dragXmlBinding = defineXmlBinding(dragTool, {
+  input: {
+    attributes: [
+      { field: 'x1', attr: 'x1' },
+      { field: 'y1', attr: 'y1' },
+      { field: 'x2', attr: 'x2' },
+      { field: 'y2', attr: 'y2' },
+    ],
+  },
+  output: {},
+} as const)
+
 // =============================================================================
 // navigate
 // =============================================================================
 
-export const navigateTool = createTool({
+export const navigateTool = defineTool({
   name: 'navigate',
   group: 'browser',
   description: 'Navigate to a URL',
@@ -182,8 +233,9 @@ export const navigateTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['url'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'url', attr: 'url' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ url }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -192,18 +244,24 @@ export const navigateTool = createTool({
     }),
 })
 
+export const navigateXmlBinding = defineXmlBinding(navigateTool, {
+  input: { attributes: [{ field: 'url', attr: 'url' }] },
+  output: {},
+} as const)
+
 // =============================================================================
 // goBack
 // =============================================================================
 
-export const goBackTool = createTool({
+export const goBackTool = defineTool({
   name: 'goBack',
   group: 'browser',
   description: 'Go back to the previous page',
   inputSchema: Schema.Struct({}),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  bindings: { xmlInput: { type: 'tag', selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+  label: () => 'Browser action',
   execute: () =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -212,11 +270,16 @@ export const goBackTool = createTool({
     }),
 })
 
+export const goBackXmlBinding = defineXmlBinding(goBackTool, {
+  input: {},
+  output: {},
+} as const)
+
 // =============================================================================
 // switchTab
 // =============================================================================
 
-export const switchTabTool = createTool({
+export const switchTabTool = defineTool({
   name: 'switchTab',
   group: 'browser',
   description: 'Switch to a browser tab by index',
@@ -225,8 +288,9 @@ export const switchTabTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['index'],
-  bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'index', attr: 'index' }], selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ index }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -235,18 +299,24 @@ export const switchTabTool = createTool({
     }),
 })
 
+export const switchTabXmlBinding = defineXmlBinding(switchTabTool, {
+  input: { attributes: [{ field: 'index', attr: 'index' }] },
+  output: {},
+} as const)
+
 // =============================================================================
 // newTab
 // =============================================================================
 
-export const newTabTool = createTool({
+export const newTabTool = defineTool({
   name: 'newTab',
   group: 'browser',
   description: 'Open a new browser tab',
   inputSchema: Schema.Struct({}),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  bindings: { xmlInput: { type: 'tag', selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+  label: () => 'Browser action',
   execute: () =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -255,18 +325,24 @@ export const newTabTool = createTool({
     }),
 })
 
+export const newTabXmlBinding = defineXmlBinding(newTabTool, {
+  input: {},
+  output: {},
+} as const)
+
 // =============================================================================
 // screenshot
 // =============================================================================
 
-export const screenshotTool = createTool({
+export const screenshotTool = defineTool({
   name: 'screenshot',
   group: 'browser',
   description: 'Take a screenshot of the current page. You automatically receive screenshots, but use this to see the result of your actions.',
   inputSchema: Schema.Struct({}),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  bindings: { xmlInput: { type: 'tag', selfClosing: true }, xmlOutput: { type: 'tag' as const } } as const,
+
+  label: () => 'Browser action',
   execute: () =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -279,11 +355,16 @@ export const screenshotTool = createTool({
     }),
 })
 
+export const screenshotXmlBinding = defineXmlBinding(screenshotTool, {
+  input: {},
+  output: {},
+} as const)
+
 // =============================================================================
 // evaluate
 // =============================================================================
 
-export const evaluateTool = createTool({
+export const evaluateTool = defineTool({
   name: 'evaluate',
   group: 'browser',
   description: 'Execute JavaScript code in the browser page context. Returns the stringified result.',
@@ -292,8 +373,9 @@ export const evaluateTool = createTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-  argMapping: ['code'],
-  bindings: { xmlInput: { type: 'tag', body: 'code' }, xmlOutput: { type: 'tag' as const } } as const,
+
+
+  label: () => 'Browser action',
   execute: ({ code }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -305,6 +387,11 @@ export const evaluateTool = createTool({
       }
     }),
 })
+
+export const evaluateXmlBinding = defineXmlBinding(evaluateTool, {
+  input: { body: 'code' },
+  output: {},
+} as const)
 
 // =============================================================================
 // Tool Group
@@ -323,4 +410,19 @@ export const browserTools = [
   newTabTool,
   screenshotTool,
   evaluateTool,
+]
+
+export const browserXmlBindings = [
+  clickXmlBinding,
+  doubleClickXmlBinding,
+  rightClickXmlBinding,
+  typeXmlBinding,
+  scrollXmlBinding,
+  dragXmlBinding,
+  navigateXmlBinding,
+  goBackXmlBinding,
+  switchTabXmlBinding,
+  newTabXmlBinding,
+  screenshotXmlBinding,
+  evaluateXmlBinding,
 ]

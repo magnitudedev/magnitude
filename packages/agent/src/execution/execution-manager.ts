@@ -19,7 +19,7 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ToolDisplay, ObservedResult } from '../events'
+import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult } from '../events'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
 import { defaultXmlTagName } from '../tools'
@@ -53,11 +53,10 @@ import { ProjectionReaderTag, type ProjectionReader } from '../observables/proje
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
 import type { TurnEvent } from './types'
-import { ToolEmitTag } from './tool-emit'
 import { ToolReminderTag } from './tool-reminder'
 import { WorkingDirectoryTag } from './working-directory'
 import { ToolExecutionContextTag } from './tool-execution-context'
-import type { Tool } from '@magnitudedev/tools'
+import type { Tool, AnyTool } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -83,7 +82,6 @@ export interface ExecuteOptions {
 
 export interface ExecuteResult {
   readonly result: TurnResult
-  readonly code: string
   readonly toolCalls: readonly TurnToolCall[]
   readonly observedResults: readonly ObservedResult[]
 }
@@ -145,7 +143,7 @@ export interface ExecutionManagerService {
     agentId: string
     prompt: string
     message?: string
-    outputSchema?: unknown
+    outputSchema?: JsonSchema | undefined
     mode: 'clone' | 'spawn'
     role: AgentVariant
     taskId: string
@@ -189,7 +187,6 @@ function makeForkLayers(
   approvalState: ApprovalStateService,
   persistenceLayer: Layer.Layer<ChatPersistence, never, never>,
   permissionInterceptor: ReturnType<typeof buildPermissionInterceptor>,
-  toolEmitRef: Ref.Ref<ToolDisplay | undefined>,
   toolReminderRef: Ref.Ref<string[]>,
   cwd: string,
   workspacePath: string,
@@ -224,10 +221,6 @@ function makeForkLayers(
     workingStateProjection,
   )
 
-  const toolEmitLayer = Layer.succeed(ToolEmitTag, {
-    emit: (value: ToolDisplay) => Ref.set(toolEmitRef, value)
-  })
-
   const toolReminderLayer = Layer.succeed(ToolReminderTag, {
     add: (text: string) => Ref.update(toolReminderRef, (arr) => [...arr, text])
   })
@@ -256,7 +249,6 @@ function makeForkLayers(
     Layer.succeed(PolicyContextProviderTag, policyCtxProvider),
     Layer.succeed(ToolInterceptorTag, providedInterceptor),
     Layer.succeed(BackgroundProcessRegistryTag, backgroundProcessRegistry),
-    toolEmitLayer,
     toolReminderLayer,
     persistenceLayer,
   )
@@ -272,9 +264,6 @@ const makeExecutionManager = Effect.gen(function* () {
   const forkLayers = new Map<string | null, Layer.Layer<never>>()
   const forkCwds = new Map<string | null, string>()
   const forkWorkspacePaths = new Map<string | null, string | undefined>()
-
-  // Per-fork tool emit refs (shared between layers and execute() event handler)
-  const toolEmitRefs = new Map<string | null, Ref.Ref<ToolDisplay | undefined>>()
 
   // Per-fork tool reminder refs (shared between layers and execute() event handler)
   const toolReminderRefs = new Map<string | null, Ref.Ref<string[]>>()
@@ -296,6 +285,19 @@ const makeExecutionManager = Effect.gen(function* () {
   // Maps forkId → variant, populated when forks are created.
   const forkAgentVariants = new Map<string, AgentVariant>()
 
+  function isAgentVariant(value: unknown): value is AgentVariant {
+    return typeof value === 'string'
+      && ['builder', 'debugger', 'explorer', 'planner', 'reviewer', 'orchestrator', 'browser'].includes(value)
+  }
+
+  function isToolAny(value: AnyTool): value is Tool.Any {
+    return 'bindings' in value
+  }
+
+  function hasNameAndOptionalGroup(value: AnyTool): value is Extract<AnyTool, { name: string; group?: string }> {
+    return typeof value.name === 'string'
+  }
+
   /**
    * Resolve the active agent definition for a fork.
    * Child forks use their fixed role. Root fork uses the orchestrator definition.
@@ -311,14 +313,14 @@ const makeExecutionManager = Effect.gen(function* () {
   // Build the permission interceptor (shared across all forks, resolves agent dynamically)
   const permissionInterceptor = buildPermissionInterceptor(resolveAgent)
 
-  function buildForkContext(params: { mode: string; prompt: string; outputSchema?: unknown }) {
+  function buildForkContext(params: { mode: string; prompt: string; outputSchema?: JsonSchema | undefined }) {
     return Effect.gen(function* () {
       if (params.mode === 'clone') {
-        return buildCloneContext(params.prompt, params.outputSchema as JsonSchema | undefined)
+        return buildCloneContext(params.prompt, params.outputSchema)
       }
       const proj = yield* SessionContextProjection.Tag
       const ctx = yield* Effect.map(proj.get, s => s.context)
-      return buildSpawnContext(params.prompt, ctx, params.outputSchema as JsonSchema | undefined)
+      return buildSpawnContext(params.prompt, ctx, params.outputSchema)
     })
   }
 
@@ -334,7 +336,8 @@ const makeExecutionManager = Effect.gen(function* () {
       let variant: AgentVariant
       if (forkId) {
         const agentInstance = getAgentByForkId(agentState, forkId)
-        variant = (agentInstance?.role ?? 'builder') as AgentVariant
+        const role = agentInstance?.role
+        variant = isAgentVariant(role) ? role : 'builder'
       } else {
         variant = 'orchestrator'
       }
@@ -370,8 +373,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const replayProjection = yield* ReplayProjection.Tag
       const replayState: ReactorState = yield* replayProjection.getFork(forkId)
 
-      // ToolEmit/ToolReminder: use the refs from layers (shared with tool services)
-      const toolEmitRef = toolEmitRefs.get(forkId)!
+      // ToolReminder ref shared with tool services
       const toolReminderRef = toolReminderRefs.get(forkId)!
 
 
@@ -380,10 +382,11 @@ const makeExecutionManager = Effect.gen(function* () {
       const tagToTool = new Map<string, Tool.Any>()
       for (const [defKey, tool] of Object.entries(agentDef.tools)) {
         if (!tool) continue
-        const t = tool as Tool.Any
-        const tagName = defaultXmlTagName(t)
-        tagToDefKey.set(tagName, defKey)
-        tagToTool.set(tagName, t)
+        if (isToolAny(tool)) {
+          const tagName = defaultXmlTagName(tool)
+          tagToDefKey.set(tagName, defKey)
+          tagToTool.set(tagName, tool)
+        }
       }
 
       /** Resolve a xml-act event's tagName to the definition key. */
@@ -394,9 +397,9 @@ const makeExecutionManager = Effect.gen(function* () {
       // Also build callable-based lookup for resolveKey from group+toolName
       const callableToKey = new Map<string, string>()
       for (const [key, tool] of Object.entries(agentDef.tools)) {
-        const t = tool as { name: string; group?: string }
-        const group = t.group
-        const callable = (group && group !== 'default') ? `${group}.${t.name}` : t.name
+        if (!tool || !hasNameAndOptionalGroup(tool)) continue
+        const group = tool.group
+        const callable = (group && group !== 'default') ? `${group}.${tool.name}` : tool.name
         callableToKey.set(callable, key)
       }
       const resolveKeyFromCallable = (group: string, toolName: string): string => {
@@ -434,9 +437,6 @@ const makeExecutionManager = Effect.gen(function* () {
       // Track messages to nonexistent agent IDs
       let hasNonexistentAgentDest = false
       let nonexistentAgentError: string | null = null
-
-      // Accumulate raw XML
-      let accumulatedCode = ''
 
       // Store execution result
       let executionResult: TurnResult = { success: true, turnDecision: 'yield' }
@@ -521,11 +521,21 @@ const makeExecutionManager = Effect.gen(function* () {
                 if (event.cached) {
                   cachedToolCallIds.add(event.toolCallId)
                 }
-                // Reset tool emit/reminder refs for the new tool execution
-                yield* Ref.set(toolEmitRef, undefined)
+                // Reset tool reminders for the new tool execution
                 yield* Ref.set(toolReminderRef, [])
 
                 const toolKey = toolCallKeys.get(event.toolCallId) ?? resolveKeyFromCallable(event.group, event.toolName)
+                yield* Queue.offer(sink, {
+                  _tag: 'ToolEvent',
+                  toolCallId: event.toolCallId,
+                  toolKey,
+                  event,
+                })
+                break
+              }
+
+              case 'ToolEmission': {
+                const toolKey = toolCallKeys.get(event.toolCallId) ?? event.toolCallId
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -551,12 +561,11 @@ const makeExecutionManager = Effect.gen(function* () {
 
                 toolInputs.delete(event.toolCallId)
 
-                // Read and clear tool emit/reminders
-                const emittedValue = yield* Ref.getAndSet(toolEmitRef, undefined)
+                // Read and clear tool reminders
                 const reminders = yield* Ref.getAndSet(toolReminderRef, [])
 
                 // Map XmlToolResult → ToolResult for TurnToolCall accumulation
-                const toolResult: ToolResult = mapXmlToolResult(event.result, emittedValue)
+                const toolResult: ToolResult = mapXmlToolResult(event.result)
 
                 toolCalls.push({
                   toolKey,
@@ -566,13 +575,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 })
                 collectedToolReminders.push(...reminders)
 
-                // Forward event (attach display data if emitted by tool)
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
                   event,
-                  ...(emittedValue ? { display: emittedValue } : {}),
                 })
                 break
               }
@@ -734,11 +741,12 @@ const makeExecutionManager = Effect.gen(function* () {
                   executionResult = { success: false, error: endResult.error, cancelled: false }
                 } else if (endResult._tag === 'GateRejected') {
                   const rejection = endResult.rejection
-                  const isPermissionRejection = rejection && typeof rejection === 'object' && '_tag' in rejection
-                  if (isPermissionRejection) {
-                    const r = rejection as { _tag: string; reason: string }
-                    const cancelled = r._tag === 'UserRejection'
-                    executionResult = { success: false, error: r.reason || 'Gate rejected', cancelled }
+                  if (rejection && typeof rejection === 'object' && '_tag' in rejection) {
+                    const reason = 'reason' in rejection && typeof rejection.reason === 'string'
+                      ? rejection.reason
+                      : 'Gate rejected'
+                    const cancelled = rejection._tag === 'UserRejection'
+                    executionResult = { success: false, error: reason, cancelled }
                   } else {
                     executionResult = { success: false, error: String(rejection) || 'Gate rejected', cancelled: true }
                   }
@@ -774,7 +782,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       return {
         result: executionResult,
-        code: accumulatedCode,
         toolCalls,
         observedResults,
       }
@@ -795,10 +802,8 @@ const makeExecutionManager = Effect.gen(function* () {
       const persistence = yield* ChatPersistence
       const persistenceLayer = Layer.succeed(ChatPersistence, persistence)
 
-      // Create ToolEmit/ToolReminder refs (shared with execute() event handler via maps)
-      const toolEmitRef = yield* Ref.make<ToolDisplay | undefined>(undefined)
+      // Create ToolReminder refs (shared with execute() event handler via maps)
       const toolReminderRef = yield* Ref.make<string[]>([])
-      toolEmitRefs.set(forkId, toolEmitRef)
       toolReminderRefs.set(forkId, toolReminderRef)
 
       const sessionState = yield* sessionContextProjection.get
@@ -814,7 +819,7 @@ const makeExecutionManager = Effect.gen(function* () {
         workingStateProjection,
         conversationProjection,
         approvalState,
-        persistenceLayer, permissionInterceptor, toolEmitRef, toolReminderRef, cwd, workspacePath, ephemeralSessionContext, backgroundProcessRegistry,
+        persistenceLayer, permissionInterceptor, toolReminderRef, cwd, workspacePath, ephemeralSessionContext, backgroundProcessRegistry,
       )
       forkCwds.set(forkId, cwd)
       forkWorkspacePaths.set(forkId, workspacePath)
@@ -848,7 +853,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Bind observables
       const agentDef = getAgentDefinition(variant)
-      const agentObservables = agentDef.observables.map(obs =>
+      const agentObservables = agentDef.observables.map((obs) =>
         bindObservable(obs, () => Effect.succeed(layers))
       )
       boundObservables.set(forkId, agentObservables)
@@ -859,7 +864,6 @@ const makeExecutionManager = Effect.gen(function* () {
       forkLayers.delete(forkId)
       forkCwds.delete(forkId)
       forkWorkspacePaths.delete(forkId)
-      toolEmitRefs.delete(forkId)
       toolReminderRefs.delete(forkId)
       boundObservables.delete(forkId)
     }),
@@ -870,7 +874,17 @@ const makeExecutionManager = Effect.gen(function* () {
         : backgroundProcessRegistry.cleanupFork(forkId)
     ),
 
-    fork: (params) => Effect.gen(function* () {
+    fork: (params: {
+      parentForkId: string | null
+      name: string
+      agentId: string
+      prompt: string
+      message?: string
+      outputSchema?: JsonSchema | undefined
+      mode: 'clone' | 'spawn'
+      role: AgentVariant
+      taskId: string
+    }) => Effect.gen(function* () {
       const forkId = createId()
       forkAgentVariants.set(forkId, params.role)
       const workerBus = yield* WorkerBusTag<AppEvent>()

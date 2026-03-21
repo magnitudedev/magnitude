@@ -3,7 +3,8 @@ import { mkdtempSync } from 'fs'
 import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { createMemoryExtractionJob, drainPendingJobsOnStartup, getPendingDir, readJob, writePendingJobSync } from '../job-queue'
+import { createStorageClient, type StorageClient } from '@magnitudedev/storage'
+import { createMemoryExtractionJob, drainPendingJobsOnStartup, writePendingJob } from '../job-queue'
 import { MEMORY_RELATIVE_PATH, ensureMemoryFile, readMemory } from '../memory-file'
 
 type MockDiffResult = {
@@ -62,6 +63,7 @@ describe('memory extraction integration', () => {
   const originalHome = process.env.HOME
   let homeDir = ''
   let cwd = ''
+  let storage: StorageClient
 
   beforeEach(async () => {
     homeDir = mkdtempSync(join(tmpdir(), 'mem-extract-home-'))
@@ -73,12 +75,15 @@ describe('memory extraction integration', () => {
     providerState.throwOnExtract = null
     providerState.nextResult = { result: { additions: [], updates: [], deletions: [] } }
 
-    await rm(getPendingDir(), { recursive: true, force: true })
-    await ensureMemoryFile(cwd)
+    storage = await createStorageClient({ cwd })
+    const jobs = await storage.memoryJobs.list()
+    await Promise.all(jobs.map((filePath) => storage.memoryJobs.read({ filePath }).then((job) => storage.memoryJobs.remove(job.jobId))))
+    await ensureMemoryFile(storage)
   })
 
   afterEach(async () => {
-    await rm(getPendingDir(), { recursive: true, force: true })
+    const jobs = await storage.memoryJobs.list()
+    await Promise.all(jobs.map((filePath) => storage.memoryJobs.read({ filePath }).then((job) => storage.memoryJobs.remove(job.jobId))))
     await rm(homeDir, { recursive: true, force: true })
     await rm(cwd, { recursive: true, force: true })
     process.env.HOME = originalHome
@@ -86,35 +91,35 @@ describe('memory extraction integration', () => {
 
   test('1) dispose wrapper writes marker correctly and synchronously', async () => {
     const sessionId = 'dispose-sync-session'
-    let resolveDispose: (() => void) | null = null
+    let finishDispose: () => void = () => {}
     const originalDispose = new Promise<void>((resolve) => {
-      resolveDispose = resolve
+      finishDispose = resolve
     })
 
     const wrappedDisposeLikeCodingAgent = async () => {
       const eventsPath = join(process.env.HOME || '', '.magnitude', 'sessions', sessionId, 'events.jsonl')
       const memoryPath = join(cwd, MEMORY_RELATIVE_PATH)
       const job = createMemoryExtractionJob({ sessionId, cwd, eventsPath, memoryPath })
-      const jobPath = writePendingJobSync(job)
+      const jobPath = await writePendingJob(storage, job)
 
       await originalDispose
       return jobPath
     }
 
     const disposing = wrappedDisposeLikeCodingAgent()
-    const filesWhileDisposeBlocked = await (await import('../job-queue')).listPendingJobs()
+    const filesWhileDisposeBlocked = await storage.memoryJobs.list()
 
     expect(filesWhileDisposeBlocked.length).toBeGreaterThanOrEqual(1)
-    const jobs = await Promise.all(filesWhileDisposeBlocked.map((f) => readJob(f)))
-    const job = jobs.find((j) => j.sessionId === sessionId)
+    const jobs = await Promise.all(filesWhileDisposeBlocked.map((filePath: string) => storage.memoryJobs.read({ filePath })))
+    const job = jobs.find((j: { sessionId: string }) => j.sessionId === sessionId)
     expect(job).toBeTruthy()
     expect(job!.sessionId).toBe(sessionId)
-    expect(job.cwd).toBe(cwd)
-    expect(job.eventsPath).toBe(join(homeDir, '.magnitude', 'sessions', sessionId, 'events.jsonl'))
-    expect(job.memoryPath).toBe(join(cwd, MEMORY_RELATIVE_PATH))
-    expect(job.status).toBe('pending')
+    expect(job!.cwd).toBe(cwd)
+    expect(job!.eventsPath).toBe(join(homeDir, '.magnitude', 'sessions', sessionId, 'events.jsonl'))
+    expect(job!.memoryPath).toBe(join(cwd, MEMORY_RELATIVE_PATH))
+    expect(job!.status).toBe('pending')
 
-    resolveDispose?.()
+    finishDispose()
     await disposing
   })
 
@@ -133,11 +138,11 @@ describe('memory extraction integration', () => {
     }
 
     const memoryPath = join(cwd, MEMORY_RELATIVE_PATH)
-    const jobPath = writePendingJobSync(createMemoryExtractionJob({ sessionId, cwd, eventsPath, memoryPath }))
+    const jobPath = await writePendingJob(storage, createMemoryExtractionJob({ sessionId, cwd, eventsPath, memoryPath }))
 
-    await drainPendingJobsOnStartup()
+    await drainPendingJobsOnStartup(storage)
 
-    const updated = await readMemory(cwd)
+    const updated = await readMemory(storage)
     expect(updated).toContain('always use named exports')
     await expect(readFile(jobPath, 'utf8')).rejects.toThrow()
   })
@@ -163,7 +168,7 @@ describe('memory extraction integration', () => {
       },
     }
 
-    const jobPath = writePendingJobSync(createMemoryExtractionJob({
+    const jobPath = await writePendingJob(storage, createMemoryExtractionJob({
       sessionId,
       cwd,
       eventsPath,
@@ -172,7 +177,7 @@ describe('memory extraction integration', () => {
 
     await runExtractionJobFromFile(jobPath)
 
-    const updated = await readMemory(cwd)
+    const updated = await readMemory(storage)
     expect(updated).toContain('always use named exports')
     expect(updated).toContain('always use an explorer before planning')
     expect(updated).toContain('# Codebase')
@@ -186,9 +191,9 @@ describe('memory extraction integration', () => {
     await writeFile(eventsPath, toJsonl([userEvent('implement this small refactor')]), 'utf8')
 
     providerState.nextResult = { result: { additions: [], updates: [], deletions: [] } }
-    const before = await readMemory(cwd)
+    const before = await readMemory(storage)
 
-    const jobPath = writePendingJobSync(createMemoryExtractionJob({
+    const jobPath = await writePendingJob(storage, createMemoryExtractionJob({
       sessionId,
       cwd,
       eventsPath,
@@ -197,7 +202,7 @@ describe('memory extraction integration', () => {
 
     await runExtractionJobFromFile(jobPath)
 
-    const after = await readMemory(cwd)
+    const after = await readMemory(storage)
     expect(after).toBe(before)
   })
 
@@ -208,9 +213,9 @@ describe('memory extraction integration', () => {
     await writeFile(eventsPath, toJsonl([userEvent('routine coding')]), 'utf8')
 
     providerState.nextResult = { result: 'not-json-object' as unknown }
-    const before = await readMemory(cwd)
+    const before = await readMemory(storage)
 
-    const jobPath = writePendingJobSync(createMemoryExtractionJob({
+    const jobPath = await writePendingJob(storage, createMemoryExtractionJob({
       sessionId,
       cwd,
       eventsPath,
@@ -218,10 +223,10 @@ describe('memory extraction integration', () => {
     }))
 
     await expect(runExtractionJobFromFile(jobPath)).resolves.toBeUndefined()
-    const after = await readMemory(cwd)
+    const after = await readMemory(storage)
     expect(after).toBe(before)
 
-    const pendingJob = await readJob(jobPath)
+    const pendingJob = await storage.memoryJobs.read({ filePath: jobPath })
     expect(pendingJob.status).toBe('pending')
   })
 
@@ -232,9 +237,9 @@ describe('memory extraction integration', () => {
     await writeFile(eventsPath, toJsonl([userEvent('routine coding')]), 'utf8')
 
     providerState.throwOnExtract = new Error('model unavailable')
-    const before = await readMemory(cwd)
+    const before = await readMemory(storage)
 
-    const jobPath = writePendingJobSync(createMemoryExtractionJob({
+    const jobPath = await writePendingJob(storage, createMemoryExtractionJob({
       sessionId,
       cwd,
       eventsPath,
@@ -243,10 +248,10 @@ describe('memory extraction integration', () => {
 
     await expect(runExtractionJobFromFile(jobPath)).resolves.toBeUndefined()
 
-    const after = await readMemory(cwd)
+    const after = await readMemory(storage)
     expect(after).toBe(before)
 
-    const pendingJob = await readJob(jobPath)
+    const pendingJob = await storage.memoryJobs.read({ filePath: jobPath })
     expect(pendingJob.status).toBe('pending')
   })
 
@@ -264,23 +269,23 @@ describe('memory extraction integration', () => {
       },
     }
 
-    const job1 = writePendingJobSync(createMemoryExtractionJob({
+    const job1 = await writePendingJob(storage, createMemoryExtractionJob({
       sessionId,
       cwd,
       eventsPath,
       memoryPath: join(cwd, MEMORY_RELATIVE_PATH),
     }))
     await runExtractionJobFromFile(job1)
-    const first = await readMemory(cwd)
+    const first = await readMemory(storage)
 
-    const job2 = writePendingJobSync(createMemoryExtractionJob({
+    const job2 = await writePendingJob(storage, createMemoryExtractionJob({
       sessionId,
       cwd,
       eventsPath,
       memoryPath: join(cwd, MEMORY_RELATIVE_PATH),
     }))
     await runExtractionJobFromFile(job2)
-    const second = await readMemory(cwd)
+    const second = await readMemory(storage)
 
     expect(second).toBe(first)
     const count = second.split('\n').filter((l) => l.includes('always use named exports')).length

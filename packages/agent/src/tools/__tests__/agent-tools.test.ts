@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { Effect, Layer, Ref } from 'effect'
-import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
+import { Effect, Layer, Ref, Stream } from 'effect'
+import { Fork, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
+import { noopToolContext } from '@magnitudedev/tools'
 import { agentKillTool } from '../agent-tools'
 import { AgentStateReaderTag } from '../fork'
 import type { AgentStatusState } from '../../projections/agent-status'
@@ -36,8 +37,19 @@ function makeLayer(state: AgentStatusState, eventsRef: Ref.Ref<AppEvent[]>) {
     }),
     Layer.succeed(WorkerBusTag<AppEvent>(), {
       publish: (event: AppEvent) => Ref.update(eventsRef, (events) => [...events, event]),
-    } as any),
+      subscribeToTypes: () => Stream.empty,
+      stream: Stream.empty,
+      subscribe: () => Effect.succeed(Stream.empty),
+    } satisfies WorkerBusService<AppEvent>),
   )
+}
+
+function runPromise<A, E, R>(effect: Effect.Effect<A, E, R>) {
+  return Effect.runPromise(effect as unknown as Effect.Effect<A, E, never>)
+}
+
+function runPromiseExit<A, E, R>(effect: Effect.Effect<A, E, R>) {
+  return Effect.runPromiseExit(effect as unknown as Effect.Effect<A, E, never>)
 }
 
 describe('agent.kill tool validation matrix', () => {
@@ -46,9 +58,9 @@ describe('agent.kill tool validation matrix', () => {
     const state: AgentStatusState = { agents: new Map(), agentByForkId: new Map() }
 
     const exit = await Effect.runPromiseExit(
-      agentKillTool.execute({ agentId: 'missing', reason: undefined }).pipe(
+      agentKillTool.execute({ agentId: 'missing', reason: undefined }, noopToolContext).pipe(
         Effect.provide(makeLayer(state, eventsRef)),
-      ),
+      ) as unknown as Effect.Effect<{ readonly forkId: string; readonly agentId: string }, unknown, never>,
     )
 
     expect(exit._tag).toBe('Failure')
@@ -58,9 +70,9 @@ describe('agent.kill tool validation matrix', () => {
   test('rejects non-child target', async () => {
     const eventsRef = await Effect.runPromise(Ref.make<AppEvent[]>([]))
     const exit = await Effect.runPromiseExit(
-      agentKillTool.execute({ agentId: 'agent-sub', reason: undefined }).pipe(
+      agentKillTool.execute({ agentId: 'agent-sub', reason: undefined }, noopToolContext).pipe(
         Effect.provide(makeLayer(makeAgentState('working', 'other-parent'), eventsRef)),
-      ),
+      ) as unknown as Effect.Effect<{ readonly forkId: string; readonly agentId: string }, unknown, never>,
     )
 
     expect(exit._tag).toBe('Failure')
@@ -70,9 +82,9 @@ describe('agent.kill tool validation matrix', () => {
   test('rejects idle target', async () => {
     const eventsRef = await Effect.runPromise(Ref.make<AppEvent[]>([]))
     const exit = await Effect.runPromiseExit(
-      agentKillTool.execute({ agentId: 'agent-sub', reason: undefined }).pipe(
+      agentKillTool.execute({ agentId: 'agent-sub', reason: undefined }, noopToolContext).pipe(
         Effect.provide(makeLayer(makeAgentState('idle', 'parent-1'), eventsRef)),
-      ),
+      ) as unknown as Effect.Effect<{ readonly forkId: string; readonly agentId: string }, unknown, never>,
     )
 
     expect(exit._tag).toBe('Failure')
@@ -82,9 +94,9 @@ describe('agent.kill tool validation matrix', () => {
   test('accepts starting target', async () => {
     const eventsRef = await Effect.runPromise(Ref.make<AppEvent[]>([]))
     const result = await Effect.runPromise(
-      agentKillTool.execute({ agentId: 'agent-sub', reason: 'cleanup' }).pipe(
+      agentKillTool.execute({ agentId: 'agent-sub', reason: 'cleanup' }, noopToolContext).pipe(
         Effect.provide(makeLayer(makeAgentState('starting', 'parent-1'), eventsRef)),
-      ),
+      ) as unknown as Effect.Effect<{ readonly forkId: string; readonly agentId: string }, unknown, never>,
     )
 
     expect(result).toEqual({ agentId: 'agent-sub', forkId: 'fork-sub' })
@@ -95,9 +107,9 @@ describe('agent.kill tool validation matrix', () => {
   test('accepts working target', async () => {
     const eventsRef = await Effect.runPromise(Ref.make<AppEvent[]>([]))
     const result = await Effect.runPromise(
-      agentKillTool.execute({ agentId: 'agent-sub', reason: undefined }).pipe(
+      agentKillTool.execute({ agentId: 'agent-sub', reason: undefined }, noopToolContext).pipe(
         Effect.provide(makeLayer(makeAgentState('working', 'parent-1'), eventsRef)),
-      ),
+      ) as unknown as Effect.Effect<{ readonly forkId: string; readonly agentId: string }, unknown, never>,
     )
 
     expect(result).toEqual({ agentId: 'agent-sub', forkId: 'fork-sub' })

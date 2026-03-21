@@ -1,0 +1,57 @@
+import { defineStateModel, type BaseState } from '@magnitudedev/tools'
+import { treeTool, treeXmlBinding } from '../tools/fs'
+
+type TreeEntry = { path: string; name: string; type: 'file' | 'dir'; depth: number }
+
+export interface FileTreeState extends BaseState {
+  path?: string
+  entries: TreeEntry[]
+  fileCount: number
+  dirCount: number
+}
+
+const initial: Omit<FileTreeState, 'phase'> = {
+  path: undefined,
+  entries: [],
+  fileCount: 0,
+  dirCount: 0,
+}
+
+export const fileTreeModel = defineStateModel({
+  tool: treeTool,
+  binding: treeXmlBinding,
+})({
+  initial,
+  reduce: (state, event): FileTreeState => {
+    switch (event.type) {
+      case 'started':
+        return { ...state, phase: 'streaming' }
+      case 'inputUpdated':
+      case 'inputReady':
+        return { ...state, phase: 'streaming', path: event.streaming.fields.path ?? state.path }
+      case 'executionStarted':
+      case 'emission':
+      case 'awaitingApproval':
+      case 'approvalGranted':
+      case 'approvalRejected':
+      case 'parseError':
+        return { ...state, phase: 'executing' }
+      case 'completed': {
+        const entries = event.output as TreeEntry[]
+        return {
+          ...state,
+          phase: 'completed',
+          entries: [...entries],
+          fileCount: entries.filter((entry) => entry.type === 'file').length,
+          dirCount: entries.filter((entry) => entry.type === 'dir').length,
+        }
+      }
+      case 'error':
+        return { ...state, phase: 'error' }
+      case 'rejected':
+        return { ...state, phase: 'rejected' }
+      case 'interrupted':
+        return { ...state, phase: 'interrupted' }
+    }
+  },
+})

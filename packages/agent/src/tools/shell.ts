@@ -6,7 +6,8 @@
 
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
-import { createTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork } from '@magnitudedev/event-core'
 import { spawn } from 'child_process'
 import { WorkingDirectoryTag } from '../execution/working-directory'
@@ -41,17 +42,23 @@ const ShellOutput = Schema.Union(ShellCompletedOutput, ShellDetachedOutput)
 
 type ShellOutput = Schema.Schema.Type<typeof ShellOutput>
 
+const ShellErrorSchema = ToolErrorSchema('ShellError', {})
+
 // =============================================================================
 // Shell Tool
 // =============================================================================
-
-const ShellError = ToolErrorSchema('ShellError', {})
 
 
 // TODO: If the normal tool result truncation triggers on a detached command's initial output,
 // that output is lost to the agent. This should eventually be handled by a generic system
 // that demotes large tool results to files automatically.
-export const shellTool = createTool({
+const shortenCommandPreview = (command: string, maxLength = 80): string => {
+  const normalized = command.replace(/\s+/g, ' ').trim()
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`
+}
+
+export const shellTool = defineTool({
   name: 'shell',
   group: 'default',
   description: 'Execute a shell command. Long-running commands are automatically detached after the timeout with output tracking. Do NOT use &, nohup, disown, or other explicit backgrounding; these bypass tracking. Use kill <pid> to stop background processes. Do not use this for operations covered by built-in tools like fs-read, fs-search, fs-tree, fs-write, edit, and web-fetch.',
@@ -61,25 +68,8 @@ export const shellTool = createTool({
     background: Schema.optional(Schema.Boolean.annotations({ description: "For commands that won't terminate on their own (servers, watchers). Detaches immediately." })),
   }),
   outputSchema: ShellOutput,
-  errorSchema: ShellError,
-  argMapping: ['command', 'timeout', 'background'],
-  bindings: {
-    openai: { type: 'custom', format: { type: 'grammar', syntax: 'regex', definition: '[\\s\\S]*' }, inputField: 'command' },
-    xmlInput: { type: 'tag', attributes: [{ field: 'timeout', attr: 'timeout' }, { field: 'background', attr: 'background' }], body: 'command' },
-    xmlOutput: {
-      type: 'tag',
-      childTags: [
-        { tag: 'mode', field: 'mode' },
-        { tag: 'reason', field: 'reason' },
-        { tag: 'pid', field: 'pid' },
-        { tag: 'stdout', field: 'stdout' },
-        { tag: 'stderr', field: 'stderr' },
-        { tag: 'exitCode', field: 'exitCode' },
-      ]
-    } as const,
-  } as const,
-
-  execute: ({ command, timeout, background }) => Effect.gen(function* () {
+  errorSchema: ShellErrorSchema,
+  execute: ({ command, timeout, background }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const { forkId } = yield* ForkContext
     const { turnId } = yield* ToolExecutionContextTag
@@ -208,7 +198,28 @@ export const shellTool = createTool({
 
     return result
   }),
+  label: (input) => input.command ? `$ ${shortenCommandPreview(input.command)}` : 'Running command…',
 })
+
+export const shellXmlBinding = defineXmlBinding(shellTool, {
+  input: {
+    attributes: [
+      { attr: 'timeout', field: 'timeout' },
+      { attr: 'background', field: 'background' },
+    ],
+    body: 'command',
+  },
+  output: {
+    childTags: [
+      { tag: 'mode', field: 'mode' },
+      { tag: 'reason', field: 'reason' },
+      { tag: 'pid', field: 'pid' },
+      { tag: 'stdout', field: 'stdout' },
+      { tag: 'stderr', field: 'stderr' },
+      { tag: 'exitCode', field: 'exitCode' },
+    ],
+  },
+} as const)
 
 // Tool slugs
 export const SHELL_TOOLS = ['default.shell'] as const

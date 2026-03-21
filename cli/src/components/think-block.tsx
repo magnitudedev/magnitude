@@ -1,16 +1,18 @@
 import { memo, useEffect, useRef, useState, useCallback } from 'react'
 import { TextAttributes } from '@opentui/core'
-import type { ThinkBlockMessage, ThinkBlockStep } from '@magnitudedev/agent'
+import type { ThinkBlockMessage, ThinkBlockStep, DisplayMessage } from '@magnitudedev/agent'
 import { Button } from './button'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { useTheme } from '../hooks/use-theme'
 import { orange } from '../utils/theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
-import { renderRegistry, clusterRenderRegistry } from '../visuals/registry'
+import { displayBindingRegistry } from '../visuals/registry'
 import { selectLatestLiveActivityFromThinkSteps } from '../utils/live-activity'
 
 const SHIMMER_INTERVAL_MS = 160
+
+type AgentCommunicationMessage = Extract<DisplayMessage, { type: 'agent_communication' }>
 
 interface ThinkBlockProps {
   block: ThinkBlockMessage
@@ -161,7 +163,7 @@ interface StepGroup {
 function groupByCluster(steps: readonly ThinkBlockStep[]): StepGroup[] {
   const groups: StepGroup[] = []
   for (const step of steps) {
-    const cluster = step.cluster ?? null
+    const cluster = step.type === 'tool' ? (step.cluster ?? null) : null
     const syntheticCluster = step.type === 'subagent_started' || step.type === 'subagent_finished' || step.type === 'subagent_killed' || step.type === 'subagent_user_killed'
       ? '__subagent_lifecycle__'
       : cluster
@@ -185,16 +187,23 @@ const ToolStepView = memo(function ToolStepView({
   onToggle,
   onFileClick,
 }: {
-  step: ThinkBlockStep
+  step: Extract<ThinkBlockStep, { type: 'tool' }>
   isExpanded: boolean
   onToggle: () => void
   onFileClick?: (name: string, section?: string) => void
 }) {
   const theme = useTheme()
-  const render = step.toolKey ? renderRegistry.get(step.toolKey) : undefined
+  const binding = step.toolKey ? displayBindingRegistry.getAny(step.toolKey) : undefined
 
-  if (render && step.visualState !== undefined) {
-    return <>{render({ state: step.visualState, isExpanded, onToggle, stepResult: step.result, onFileClick })}</>
+  if (binding && step.visualState && typeof step.visualState === 'object' && 'state' in step.visualState && 'streaming' in step.visualState) {
+    const cs = step.visualState as { state: object; streaming: unknown }
+    return <>{binding.render(cs, {
+      label: step.label ?? step.toolKey ?? '',
+      result: step.result,
+      isExpanded,
+      onToggle,
+      onFileClick,
+    })}</>
   }
 
   // Fallback for tools without a visual definition
@@ -327,26 +336,6 @@ const StepGroupView = memo(function StepGroupView({
   lastThinkingStepId?: string
 }) {
   const theme = useTheme()
-  const clusterRenderer = group.cluster
-    ? clusterRenderRegistry.get(group.cluster)
-    : undefined
-
-  if (clusterRenderer) {
-    const clusterSteps = group.steps
-      .filter(s => s.type === 'tool' && s.visualState !== undefined)
-      .map(s => ({ id: s.id, visualState: s.visualState!, result: s.result }))
-
-    return (
-      <>
-        {clusterRenderer({
-          steps: clusterSteps,
-          expandedSteps,
-          onToggleStep: toggleStep,
-          onFileClick: onFileClick,
-        })}
-      </>
-    )
-  }
 
   return (
     <>
@@ -373,7 +362,7 @@ const StepGroupView = memo(function StepGroupView({
         }
 
         if (step.type === 'communication') {
-          const message = {
+          const message: AgentCommunicationMessage = {
             id: step.id,
             type: 'agent_communication',
             direction: step.direction,
@@ -388,6 +377,8 @@ const StepGroupView = memo(function StepGroupView({
 
           return <AgentCommunicationCard key={step.id} message={message} widthAdjustment={2} />
         }
+
+        if (step.type !== 'tool') return null
 
         return (
           <ToolStepView

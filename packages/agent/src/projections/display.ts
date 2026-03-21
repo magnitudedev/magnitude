@@ -13,7 +13,7 @@
 import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent, ToolResult, ToolDisplay } from '../events'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
-import { getVisualRegistry } from '../visuals/registry'
+
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection, type AgentStatusState, getAgentByForkId } from './agent-status'
 import { WorkingStateProjection, type PendingInboundCommunication } from './working-state'
@@ -21,8 +21,11 @@ import { WorkingStateProjection, type PendingInboundCommunication } from './work
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { textOf } from '../content'
 import { createId } from '../util/id'
-import type { EditState, WriteState } from '../visuals/fs'
+
 import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
+import { ToolEventNormalizer } from '../normalizer'
+import { getModelForToolKey } from '../models/registry'
+import { emptyStreamingInput } from '@magnitudedev/tools'
 
 /**
  * Resolve display visibility for a tool call using the agent definition's display policy.
@@ -37,13 +40,12 @@ function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay
       return { status: 'error', message: result.error }
     case 'Rejected': {
       const rej = result.rejection
-      const isPerm = rej && typeof rej === 'object' && '_tag' in rej
-      if (isPerm) {
-        const r = rej as { _tag: string; reason: string }
-        if (r._tag === 'UserRejection') {
+      if (rej && typeof rej === 'object' && '_tag' in rej) {
+        if (rej._tag === 'UserRejection') {
           return { status: 'rejected', message: 'User rejected the action' }
         }
-        return { status: 'rejected', message: 'System rejected', reason: r.reason }
+        const reason = 'reason' in rej && typeof rej.reason === 'string' ? rej.reason : 'Unknown reason'
+        return { status: 'rejected', message: 'System rejected', reason }
       }
       return { status: 'rejected', message: String(rej) }
     }
@@ -52,10 +54,14 @@ function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay
   }
 }
 
+function isAgentVariant(value: unknown): value is AgentVariant {
+  return typeof value === 'string'
+    && ['builder', 'debugger', 'explorer', 'planner', 'reviewer', 'orchestrator', 'browser'].includes(value)
+}
+
 function isToolHidden(toolKey: string, forkId: string | null, input: unknown, agentState: AgentStatusState): boolean {
-  const variant: AgentVariant = forkId
-    ? (getAgentByForkId(agentState, forkId)?.role ?? 'builder') as AgentVariant
-    : 'orchestrator'
+  const role = forkId ? getAgentByForkId(agentState, forkId)?.role : undefined
+  const variant: AgentVariant = isAgentVariant(role) ? role : (forkId ? 'builder' : 'orchestrator')
   const agentDef = getAgentDefinition(variant)
   const result = agentDef.getDisplay(toolKey, input, undefined)
   return result.action === 'hidden'
@@ -206,6 +212,8 @@ export interface ForkActivityToolCounts {
   readonly searches: number
   readonly webSearches: number
   readonly webFetches: number
+  readonly artifactWrites: number
+  readonly artifactUpdates: number
   readonly clicks: number
   readonly navigations: number
   readonly inputs: number
@@ -301,6 +309,15 @@ export interface DisplayState {
 
 const generateId = () => createId()
 
+const normalizer = new ToolEventNormalizer()
+const callStates = new Map<string, { toolKey: string; state: object }>()
+
+function getVisualState(callId: string): { state: object; streaming: unknown } | undefined {
+  const entry = callStates.get(callId)
+  if (!entry) return undefined
+  return { state: entry.state, streaming: normalizer.getStreaming(callId) ?? emptyStreamingInput() }
+}
+
 /**
  * Find the index where new content should be inserted (before queued messages).
  * Returns the index of the first queued message, or messages.length if none.
@@ -332,6 +349,7 @@ const updateMessageById = <T extends DisplayMessage>(
   id: string,
   updater: (msg: T) => T
 ): DisplayMessage[] =>
+  // NOTE: This generic cast is intentionally retained; TS cannot infer T inside map callback.
   messages.map(m => m.id === id ? updater(m as T) : m)
 
 /**
@@ -421,23 +439,19 @@ function closeThinkBlock(state: DisplayState, timestamp: number): DisplayState {
 
 export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): DisplayState {
   if (!state.activeThinkBlockId) return state
-
   const block = findThinkBlock(state.messages, state.activeThinkBlockId)
   if (!block) return state
 
-  const registry = getVisualRegistry()
-  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (toolKey, visualState) => {
-    const visual = toolKey ? registry?.get(toolKey) : undefined
-    if (!visual) return visualState
-
-    return visual.reduce(visualState, {
-      _tag: 'ToolExecutionEnded',
-      result: { _tag: 'Interrupted' },
-      output: undefined,
-      error: undefined,
-      timeMs: undefined,
-      metadata: {}
-    })
+  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (toolKey, visualState, stepId) => {
+    if (stepId) {
+      const entry = callStates.get(stepId)
+      if (entry) {
+        const model = getModelForToolKey(entry.toolKey)
+        entry.state = model.reduce(entry.state, { type: 'interrupted' })
+        return getVisualState(stepId) ?? visualState
+      }
+    }
+    return visualState
   })
 
   if (nextSteps === block.steps || nextSteps.every((step, i) => step === block.steps[i])) {
@@ -447,8 +461,7 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
   return {
     ...state,
     messages: updateMessageById<ThinkBlockMessage>(
-      state.messages,
-      state.activeThinkBlockId,
+      state.messages, state.activeThinkBlockId,
       (b) => ({ ...b, steps: nextSteps })
     )
   }
@@ -591,31 +604,52 @@ function shortenShellCommand(command: string, max = 50): string {
   return command.length > max ? command.slice(0, max - 3) + '...' : command
 }
 
+function hasEdits(input: object): input is { edits: readonly unknown[] } {
+  return 'edits' in input && Array.isArray(input.edits)
+}
+
 
 function isFileStreamToolKey(toolKey: string | undefined): toolKey is 'fileWrite' | 'fileEdit' {
   return toolKey === 'fileWrite' || toolKey === 'fileEdit'
 }
 
+interface WritePreviewState {
+  path: string
+  phase: string
+  contentSoFar: string
+  charCount: number
+  lineCount: number
+}
+
+interface EditPreviewState {
+  path: string
+  phase: string
+  oldStringSoFar: string
+  newStringSoFar: string
+  replaceAll: boolean
+  childParsePhase: 'idle' | 'streaming_old' | 'streaming_new'
+}
+
 function hasFsWritePreview(
   visualState: unknown,
-): visualState is WriteState {
+): visualState is WritePreviewState {
   if (!visualState || typeof visualState !== 'object') return false
-  const state = visualState as WriteState
-  return typeof state.path === 'string'
-    && state.path.length > 0
-    && state.contentSoFar !== undefined
-    && state.phase !== 'done'
+  return 'path' in visualState
+    && typeof visualState.path === 'string'
+    && visualState.path.length > 0
+    && 'contentSoFar' in visualState
+    && typeof visualState.contentSoFar === 'string'
 }
 
 function hasEditPreview(
   visualState: unknown,
-): visualState is EditState {
+): visualState is EditPreviewState {
   if (!visualState || typeof visualState !== 'object') return false
-  const state = visualState as EditState
-  return typeof state.path === 'string'
-    && state.path.length > 0
-    && state.oldStringSoFar !== undefined
-    && state.phase !== 'done'
+  return 'path' in visualState
+    && typeof visualState.path === 'string'
+    && visualState.path.length > 0
+    && 'oldStringSoFar' in visualState
+    && typeof visualState.oldStringSoFar === 'string'
 }
 
 export interface InProgressFileView {
@@ -623,7 +657,7 @@ export interface InProgressFileView {
   toolCallId: string
   toolKey: 'fileWrite' | 'fileEdit'
   forkId: string | null
-  phase: WriteState['phase'] | EditState['phase']
+  phase: string
   preview: {
     mode: 'write'
     contentSoFar: string
@@ -744,7 +778,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     user_message: ({ event, fork }) => {
       const messageId = generateId()
       const content = textOf(event.content)
-      const messageType = fork.currentTurnId !== null ? 'queued_user_message' : 'user_message'
+      const messageType: 'user_message' | 'queued_user_message' =
+        fork.currentTurnId !== null ? 'queued_user_message' : 'user_message'
 
       return {
         ...fork,
@@ -752,7 +787,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           ...fork.messages,
           {
             id: messageId,
-            type: messageType as 'user_message' | 'queued_user_message',
+            type: messageType,
             content,
             timestamp: event.timestamp,
             taskMode: event.taskMode,
@@ -892,7 +927,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             newState.messages,
             thinkBlockId,
             lastStep.id,
-            (s) => ({ ...s, content: (s.content ?? '') + event.text })
+            (s) => s.type === 'thinking'
+              ? { ...s, content: (s.content ?? '') + event.text }
+              : s
           )
         }
       }
@@ -923,7 +960,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               newState.messages,
               thinkBlockId,
               lastStep.id,
-              (s) => ({ ...s, content: (s.content ?? '') + ' ' })
+              (s) => s.type === 'thinking'
+                ? { ...s, content: (s.content ?? '') + ' ' }
+                : s
             )
           }
         }
@@ -952,7 +991,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           newState.messages,
           thinkBlockId,
           lastStep.id,
-          (s) => ({ ...s, content: (s.content ?? '') + event.text })
+          (s) => s.type === 'thinking'
+            ? { ...s, content: (s.content ?? '') + event.text }
+            : s
         )
       }
     },
@@ -963,8 +1004,21 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
     tool_event: ({ event, fork, read, emit }) => {
       const inner = event.event
-      const registry = getVisualRegistry()
-      const visual = registry?.get(event.toolKey)
+
+      const normalized = normalizer.normalize(event.toolKey, event.toolCallId, inner)
+
+      if (normalized?.type === 'started') {
+        const model = getModelForToolKey(event.toolKey)
+        callStates.set(event.toolCallId, { toolKey: event.toolKey, state: model.initial })
+      }
+
+      if (normalized) {
+        const entry = callStates.get(event.toolCallId)
+        if (entry) {
+          const model = getModelForToolKey(entry.toolKey)
+          entry.state = model.reduce(entry.state, normalized)
+        }
+      }
 
       switch (inner._tag) {
         case 'ToolInputStarted': {
@@ -983,22 +1037,15 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
-
-          // Initialize visual state from registry, then reduce the ToolInputStarted event
-          const initialVisualState = visual
-            ? visual.reduce(visual.initial, inner)
-            : undefined
-
           return {
             ...newState,
             messages: addStepToThinkBlock(newState.messages, thinkBlockId, {
               id: event.toolCallId,
               type: 'tool',
               toolKey: event.toolKey,
-              cluster: visual?.cluster,
               input: undefined,
-              label: ({ artifactWrite: 'Writing artifact…', fileEdit: 'Editing file…' } as Record<string, string>)[event.toolKey] ?? event.toolKey + '()',
-              visualState: initialVisualState,
+              label: ({ artifactWrite: 'Writing artifact…', fileEdit: 'Editing file…' } satisfies Record<string, string>)[event.toolKey] ?? event.toolKey + '()',
+              visualState: getVisualState(event.toolCallId),
             })
           }
         }
@@ -1015,14 +1062,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               fork.messages,
               fork.activeThinkBlockId,
               event.toolCallId,
-              (s) => ({
-                ...s,
-                input: inner.input,
-                label,
-                visualState: visual && s.visualState !== undefined
-                  ? visual.reduce(s.visualState, inner)
-                  : s.visualState,
-              })
+              (s) => s.type === 'tool'
+                ? {
+                    ...s,
+                    input: inner.input,
+                    label,
+                    visualState: getVisualState(event.toolCallId) ?? s.visualState,
+                  }
+                : s
             )
           }
         }
@@ -1041,8 +1088,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
           if (!fork.activeThinkBlockId) return fork
 
-          // Map XmlToolResult → ToolResult for display (include tool-emitted display data)
-          const result = mapXmlToolResultForDisplay(inner.result, event.display)
+          // Map XmlToolResult → ToolResult for display
+          const result = mapXmlToolResultForDisplay(inner.result)
 
           return {
             ...fork,
@@ -1051,6 +1098,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               fork.activeThinkBlockId,
               event.toolCallId,
               (s) => {
+                if (s.type !== 'tool') return s
+
                 let label = s.label
 
                 if (
@@ -1063,29 +1112,31 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
                   && s.input
                   && typeof s.input === 'object'
                   && 'command' in s.input
+                  && typeof s.input.command === 'string'
                 ) {
-                  label = `$ (detached) ${shortenShellCommand((s.input as { command: string }).command)}`
+                  label = `$ (detached) ${shortenShellCommand(s.input.command)}`
                 }
 
                 return {
                   ...s,
                   label,
                   result,
-                  visualState: visual && s.visualState !== undefined
-                    ? visual.reduce(s.visualState, inner)
-                    : s.visualState,
+                  visualState: getVisualState(event.toolCallId) ?? s.visualState,
                 }
               }
             )
           }
         }
 
+        case 'ToolObservation':
+          return fork
+
         default: {
-          // All other streaming events: reduce visual state only
-          if (inner._tag === 'ToolObservation') return fork
           if (fork.currentTurnId !== event.turnId) return fork
           if (!fork.activeThinkBlockId) return fork
-          if (!visual) return fork
+
+          const vs = getVisualState(event.toolCallId)
+          if (!vs) return fork
 
           return {
             ...fork,
@@ -1093,12 +1144,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               fork.messages,
               fork.activeThinkBlockId,
               event.toolCallId,
-              (s) => ({
-                ...s,
-                visualState: s.visualState !== undefined
-                  ? visual.reduce(s.visualState, inner)
-                  : s.visualState,
-              })
+              (s) => s.type === 'tool'
+                ? { ...s, visualState: vs }
+                : s
             )
           }
         }
@@ -1120,12 +1168,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         updatedAt: event.timestamp,
       }
 
+      const messages = insertBeforeQueuedMessages(
+        fork.messages.filter(m => !(m.type === 'background_process' && m.pid === event.pid)),
+        message
+      )
+
       return {
         ...fork,
-        messages: insertBeforeQueuedMessages(
-          fork.messages.filter(m => !(m.type === 'background_process' && m.pid === event.pid)),
-          message
-        )
+        messages
       }
     },
 
@@ -1142,18 +1192,20 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         ? event.stderrChunk
         : existing.stderr + event.stderrChunk
 
+      const messages = updateMessageById<BackgroundProcessMessage>(
+        fork.messages,
+        existing.id,
+        (msg) => ({
+          ...msg,
+          stdout,
+          stderr,
+          updatedAt: event.timestamp,
+        })
+      )
+
       return {
         ...fork,
-        messages: updateMessageById<BackgroundProcessMessage>(
-          fork.messages,
-          existing.id,
-          (msg) => ({
-            ...msg,
-            stdout,
-            stderr,
-            updatedAt: event.timestamp,
-          })
-        )
+        messages
       }
     },
 
@@ -1165,21 +1217,23 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       )
       if (!existing) return fork
 
+      const messages = updateMessageById<BackgroundProcessMessage>(
+        fork.messages,
+        existing.id,
+        (msg) => ({
+          ...msg,
+          status: event.status,
+          exitCode: event.exitCode,
+          signal: event.signal,
+          stdout: msg.stdout,
+          stderr: msg.stderr,
+          updatedAt: event.timestamp,
+        })
+      )
+
       return {
         ...fork,
-        messages: updateMessageById<BackgroundProcessMessage>(
-          fork.messages,
-          existing.id,
-          (msg) => ({
-            ...msg,
-            status: event.status,
-            exitCode: event.exitCode,
-            signal: event.signal,
-            stdout: msg.stdout,
-            stderr: msg.stderr,
-            updatedAt: event.timestamp,
-          })
-        )
+        messages
       }
     },
 
@@ -1382,7 +1436,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
       if (msgIndex === -1) return state
 
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
+      const msg = parentState.messages[msgIndex]
+      if (msg?.type !== 'fork_activity') return state
       const newCounts = incrementToolCount(msg.toolCounts, toolKey)
       const newMessages = [...parentState.messages]
       newMessages[msgIndex] = { ...msg, toolCounts: newCounts }
@@ -1404,7 +1459,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         m.type === 'fork_activity' && m.forkId === forkId && m.status === 'running')
       if (msgIndex === -1) return state
 
-      const msg = parentState.messages[msgIndex] as ForkActivityMessage
+      const msg = parentState.messages[msgIndex]
+      if (msg?.type !== 'fork_activity') return state
       const stintMs = Math.max(0, value.timestamp - msg.activeSince)
       const cumulativeTotalTimeMs = msg.accumulatedActiveMs + stintMs
       const newMessages = [...parentState.messages]
@@ -1448,7 +1504,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         m.type === 'fork_activity' && m.forkId === forkId)
       if (msgIndex === -1) return state
 
-      const message = parentState.messages[msgIndex] as ForkActivityMessage
+      const message = parentState.messages[msgIndex]
+      if (message?.type !== 'fork_activity') return state
       if (!message.completedAt) {
         // First transition into working (post-create): start active stint clock here.
         if ((message.resumeCount ?? 0) === 0) {
@@ -1753,15 +1810,13 @@ export function finalizeCommunicationStreamInFork(
 
 export function generateToolLabel(toolKey: string, input: unknown): string {
   // For shell, show the command
-  if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input) {
-    const cmd = (input as { command: string }).command
-    return `$ ${shortenShellCommand(cmd)}`
+  if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input && typeof input.command === 'string') {
+    return `$ ${shortenShellCommand(input.command)}`
   }
 
   // For webSearch, show the query
-  if (toolKey === 'webSearch' && input && typeof input === 'object' && 'query' in input) {
-    const query = (input as { query: string }).query
-    const shortQuery = query.length > 60 ? query.slice(0, 57) + '...' : query
+  if (toolKey === 'webSearch' && input && typeof input === 'object' && 'query' in input && typeof input.query === 'string') {
+    const shortQuery = input.query.length > 60 ? input.query.slice(0, 57) + '...' : input.query
     return `Searching web for "${shortQuery}"`
   }
 
@@ -1772,36 +1827,35 @@ export function generateToolLabel(toolKey: string, input: unknown): string {
   }
 
   // For fileRead, show the path
-  if (toolKey === 'fileRead' && input && typeof input === 'object' && 'path' in input) {
-    return `Read ${(input as { path: string }).path}`
+  if (toolKey === 'fileRead' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
+    return `Read ${input.path}`
   }
 
   // For fileWrite, show the path
-  if (toolKey === 'fileWrite' && input && typeof input === 'object' && 'path' in input) {
-    return `Wrote ${(input as { path: string }).path}`
+  if (toolKey === 'fileWrite' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
+    return `Wrote ${input.path}`
   }
 
   // For fileEdit, show the path
-  if (toolKey === 'fileEdit' && input && typeof input === 'object' && 'path' in input) {
-    const edits = 'edits' in input && Array.isArray((input as any).edits) ? (input as any).edits.length : 0
-    return 'Edited ' + (input as { path: string }).path + (edits > 0 ? ' (' + edits + (edits === 1 ? ' change' : ' changes') + ')' : '')
+  if (toolKey === 'fileEdit' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
+    const edits = hasEdits(input) ? input.edits.length : 0
+    return `Edited ${input.path}${edits > 0 ? ` (${edits}${edits === 1 ? ' change' : ' changes'})` : ''}`
   }
 
   // For fileSearch, show the pattern
-  if (toolKey === 'fileSearch' && input && typeof input === 'object' && 'pattern' in input) {
-    const pattern = (input as { pattern: string }).pattern
-    const shortPattern = pattern.length > 40 ? pattern.slice(0, 37) + '...' : pattern
+  if (toolKey === 'fileSearch' && input && typeof input === 'object' && 'pattern' in input && typeof input.pattern === 'string') {
+    const shortPattern = input.pattern.length > 40 ? input.pattern.slice(0, 37) + '...' : input.pattern
     return `Searched for "${shortPattern}"`
   }
 
   // For fileTree, show the path
-  if (toolKey === 'fileTree' && input && typeof input === 'object' && 'path' in input) {
-    return `Listed ${(input as { path: string }).path}`
+  if (toolKey === 'fileTree' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
+    return `Listed ${input.path}`
   }
 
   // For agent creation
-  if (toolKey === 'agentCreate' && input && typeof input === 'object' && 'name' in input) {
-    return `Started agent "${(input as { name: string }).name}"`
+  if (toolKey === 'agentCreate' && input && typeof input === 'object' && 'name' in input && typeof input.name === 'string') {
+    return `Started agent "${input.name}"`
   }
 
   // Default: just the tool key
