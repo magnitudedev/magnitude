@@ -7,7 +7,7 @@ import { useTheme } from '../hooks/use-theme'
 import { orange } from '../utils/theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
-import { displayBindingRegistry } from '../visuals/registry'
+import { displayRegistry } from '../visuals/registry'
 import { selectLatestLiveActivityFromThinkSteps } from '../utils/live-activity'
 
 const SHIMMER_INTERVAL_MS = 160
@@ -193,11 +193,11 @@ const ToolStepView = memo(function ToolStepView({
   onFileClick?: (name: string, section?: string) => void
 }) {
   const theme = useTheme()
-  const binding = step.toolKey ? displayBindingRegistry.getAny(step.toolKey) : undefined
+  const display = step.toolKey ? displayRegistry.get(step.toolKey) : undefined
 
-  if (binding && step.visualState && typeof step.visualState === 'object' && 'state' in step.visualState && 'streaming' in step.visualState) {
-    const cs = step.visualState as { state: object; streaming: unknown }
-    return <>{binding.render(cs, {
+  if (display && step.visualState && typeof step.visualState === 'object' && 'state' in step.visualState) {
+    return <>{display.render({
+      state: (step.visualState as any).state,
       label: step.label ?? step.toolKey ?? '',
       result: step.result,
       isExpanded,

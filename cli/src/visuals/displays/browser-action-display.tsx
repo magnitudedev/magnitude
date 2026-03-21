@@ -1,5 +1,5 @@
-import { defineDisplay } from '@magnitudedev/tools';
-import { browserActionModel, type BrowserActionState } from '@magnitudedev/agent/src/models';
+import { type BrowserActionState } from '@magnitudedev/agent/src/models';
+import { createToolDisplay } from '../display-types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
@@ -22,41 +22,47 @@ function getIcon(label?: string): string {
   return '◎';
 }
 
-export const browserActionDisplay = defineDisplay(browserActionModel, {
+export const browserActionDisplay = createToolDisplay<BrowserActionState>(
+  ['click', 'doubleClick', 'rightClick', 'type', 'scroll', 'drag', 'navigate', 'goBack', 'switchTab', 'newTab', 'screenshot', 'evaluate'],
+  {
   render: ({ state }) => {
     const theme = useTheme();
-    const label = state.label ?? 'Browser action';
-    const detail = state.detail ? ` ${state.detail}` : '';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
-    const icon = getIcon(label);
+    const icon = getIcon(state.label);
+
+    if (isRunning) {
+      return (
+        <box style={{ flexDirection: 'column' }}>
+          <text style={{ wrapMode: 'word' }}>
+            <span style={{ fg: theme.info }}>{icon} </span>
+            <span style={{ fg: theme.foreground }}>{state.label}</span>
+            {state.detail ? <span style={{ fg: theme.muted }}>{state.detail}</span> : null}
+            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+          </text>
+        </box>
+      );
+    }
 
     return (
-      <text style={{ wrapMode: 'word' }}>
-        <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : `${icon} `}</span>
-        {isRunning ? (
-          <>
-            <span>{`${label}${detail}`}</span>
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-          </>
-        ) : isError ? (
-          <span style={{ fg: theme.error }}>{`${label}${detail} · Error`}</span>
-        ) : state.phase === 'rejected' ? (
-          <span>{`${label}${detail} · Rejected`}</span>
-        ) : state.phase === 'interrupted' ? (
-          <span>{`${label}${detail} · Interrupted`}</span>
-        ) : (
-          <span>{`${label}${detail}`}</span>
-        )}
-      </text>
+      <box style={{ flexDirection: 'column' }}>
+        <text style={{ wrapMode: 'word' }}>
+          <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : `${icon} `}</span>
+          <span style={{ fg: theme.foreground }}>{state.label}</span>
+          {state.detail ? <span style={{ fg: theme.muted }}>{state.detail}</span> : null}
+          {isError && <span style={{ fg: theme.error }}>{' · Error'}</span>}
+        </text>
+      </box>
     );
   },
   summary: (state) => {
-    const label = state.label ?? 'Browser action';
-    if (state.phase === 'streaming' || state.phase === 'executing') return label;
-    if (state.phase === 'completed') return label;
-    if (state.phase === 'error') return `${label} error`;
-    if (state.phase === 'rejected') return `${label} rejected`;
-    return `${label} interrupted`;
+    const label = (state.label ?? '').trim().replace(/\s+/g, ' ');
+    const detail = (state.detail ?? '').trim().replace(/\s+/g, ' ');
+    if (label.length === 0) return 'Browser action';
+    if (detail.length === 0) return label;
+    const noSpaceBeforeDetail = /^[,.;:!?)]/.test(detail);
+    const noSpaceAfterLabel = /[([]$/.test(label);
+    const separator = (noSpaceBeforeDetail || noSpaceAfterLabel) ? '' : ' ';
+    return `${label}${separator}${detail}`;
   },
 });

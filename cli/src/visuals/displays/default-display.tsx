@@ -1,13 +1,13 @@
 import { TextAttributes } from '@opentui/core';
-import { defineDisplay } from '@magnitudedev/tools';
-import { defaultModel } from '@magnitudedev/tools';
+import type { BaseState } from '@magnitudedev/tools';
+import { createToolDisplay } from '../display-types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const defaultDisplay = defineDisplay(defaultModel, {
+export const defaultDisplay = createToolDisplay<BaseState>('default', {
   render: ({ state, label, result, isExpanded, onToggle }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';

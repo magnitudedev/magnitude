@@ -552,6 +552,7 @@ function AppInner({
         streamingMessageId: null,
         activeThinkBlockId: null,
         showButton: 'send',
+        toolModelStates: {},
       })
       // Store factory so handleSubmit can create client lazily
       initClientRef.current = async () => {

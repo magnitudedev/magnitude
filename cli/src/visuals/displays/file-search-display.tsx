@@ -1,6 +1,6 @@
 import { TextAttributes } from '@opentui/core';
-import { defineDisplay } from '@magnitudedev/tools';
-import { fileSearchModel, type FileSearchState } from '@magnitudedev/agent/src/models';
+import { createToolDisplay } from '../display-types';
+import { type FileSearchState } from '@magnitudedev/agent/src/models';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
@@ -12,24 +12,34 @@ function summarizeInputs(state: FileSearchState): string {
   if (state.pattern) parts.push(`pattern="${state.pattern}"`);
   if (state.path) parts.push(`path="${state.path}"`);
   if (state.glob) parts.push(`glob="${state.glob}"`);
+  if (state.limit !== undefined) parts.push(`limit=${state.limit}`);
   return parts.join(' ');
 }
 
-function parseMatch(match: string): { line: string; snippet: string } {
-  const sep = match.indexOf('|');
-  if (sep === -1) return { line: '?', snippet: match };
-  return {
-    line: match.slice(0, sep) || '?',
-    snippet: match.slice(sep + 1),
-  };
+function parseMatch(match: string): { line: number; text: string } {
+  const pipeIdx = match.indexOf('|');
+  if (pipeIdx === -1) return { line: 0, text: match };
+  const prefix = match.slice(0, pipeIdx);
+  const text = match.slice(pipeIdx + 1);
+  const colonIdx = prefix.indexOf(':');
+  const line = colonIdx !== -1 ? parseInt(prefix.slice(0, colonIdx), 10) || 0 : 0;
+  return { line, text };
 }
 
-export const fileSearchDisplay = defineDisplay(fileSearchModel, {
+function truncateLine(text: string, max: number): string {
+  if (!text) return '';
+  const firstLine = text.split('\n').find(l => l.trim() !== '') ?? '';
+  if (firstLine.length > max) return firstLine.slice(0, max - 3) + '...';
+  return firstLine;
+}
+
+export const fileSearchDisplay = createToolDisplay<FileSearchState>('fileSearch', {
   render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
-    const inputSummary = summarizeInputs(state) || 'pattern="..."';
+    const inputSummary = summarizeInputs(state);
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
+    const uniqueFiles = state.fileCount;
 
     return (
       <box style={{ flexDirection: 'column' }}>
@@ -38,37 +48,45 @@ export const fileSearchDisplay = defineDisplay(fileSearchModel, {
             <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '/ '}</span>
             {isRunning ? (
               <>
-                <span>{`Searching ${inputSummary}`}</span>
+                <span style={{ fg: theme.foreground }}>{'Searching '}</span>
+                <span style={{ fg: theme.muted }}>{inputSummary || '...'}</span>
                 <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
               </>
-            ) : state.phase === 'completed' ? (
+            ) : isError ? (
               <>
-                <span>{`Searched ${inputSummary} · ${state.matchCount} matches in ${state.fileCount} files`}</span>
-                <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
-                  {isExpanded ? ' (collapse)' : ' (expand)'}
-                </span>
+                <span style={{ fg: theme.foreground }}>{'Searched '}</span>
+                <span style={{ fg: theme.muted }}>{inputSummary}</span>
+                <span style={{ fg: theme.error }}>{' · Error'}</span>
+                <span style={{ fg: theme.muted }}>{` (${state.errorDetail || ''})`}</span>
               </>
-            ) : state.phase === 'rejected' ? (
-              <span>{`Search ${inputSummary} · Rejected`}</span>
-            ) : state.phase === 'interrupted' ? (
-              <span>{`Search ${inputSummary} · Interrupted`}</span>
             ) : (
-              <span style={{ fg: theme.error }}>{`Search ${inputSummary} · Error`}</span>
+              <>
+                <span style={{ fg: theme.foreground }}>{'Searched '}</span>
+                <span style={{ fg: theme.muted }}>{inputSummary}</span>
+                {state.matchCount > 0 ? (
+                  <>
+                    <span style={{ fg: theme.info }}>{` · ${state.matchCount} ${state.matchCount === 1 ? 'match' : 'matches'} in ${uniqueFiles} ${uniqueFiles === 1 ? 'file' : 'files'}`}</span>
+                    <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
+                      {isExpanded ? ' (collapse)' : ' (expand)'}
+                    </span>
+                  </>
+                ) : (
+                  <span style={{ fg: theme.muted }}>{' · no matches'}</span>
+                )}
+              </>
             )}
           </text>
         </Button>
 
-        {state.phase === 'completed' && isExpanded && (
+        {isExpanded && state.matchCount > 0 && (
           <box style={{ flexDirection: 'column', paddingLeft: 2 }}>
-            {state.matches.map((match, idx) => {
+            {state.matches.map((match, i) => {
               const parsed = parseMatch(match.match);
               return (
-                <text key={`${match.file}-${idx}`} style={{ wrapMode: 'word' }}>
-                  <span style={{ fg: theme.foreground }}>{match.file}</span>
-                  <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
-                    {`:${parsed.line} `}
-                  </span>
-                  <span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{parsed.snippet}</span>
+                <text key={i}>
+                  <span style={{ fg: theme.foreground }}>{'- '}{match.file}</span>
+                  <span style={{ fg: theme.muted }}>{`:${parsed.line}`}</span>
+                  <span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{`  ${truncateLine(parsed.text, 60)}`}</span>
                 </text>
               );
             })}
@@ -78,11 +96,9 @@ export const fileSearchDisplay = defineDisplay(fileSearchModel, {
     );
   },
   summary: (state) => {
-    const inputSummary = summarizeInputs(state) || 'pattern';
-    if (state.phase === 'streaming' || state.phase === 'executing') return `Searching ${inputSummary}`;
-    if (state.phase === 'completed') return `Searched ${inputSummary}`;
-    if (state.phase === 'error') return `Search ${inputSummary} error`;
-    if (state.phase === 'rejected') return `Search ${inputSummary} rejected`;
-    return `Search ${inputSummary} interrupted`;
+    const summary = summarizeInputs(state);
+    const target = summary.length > 0 ? summary : 'files';
+    if (state.phase === 'streaming' || state.phase === 'executing') return `Searching ${target}`;
+    return `Searched ${target}`;
   },
 });

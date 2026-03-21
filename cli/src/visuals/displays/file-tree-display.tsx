@@ -1,18 +1,19 @@
 import { TextAttributes } from '@opentui/core';
-import { defineDisplay } from '@magnitudedev/tools';
-import { fileTreeModel, type FileTreeState } from '@magnitudedev/agent/src/models';
+import { type FileTreeState } from '@magnitudedev/agent/src/models';
+import { createToolDisplay } from '../display-types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const fileTreeDisplay = defineDisplay(fileTreeModel, {
+export const fileTreeDisplay = createToolDisplay<FileTreeState>('fileTree', {
   render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
-    const path = state.path ?? '.';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
+    const fileCount = state.fileCount;
+    const dirCount = state.dirCount;
 
     return (
       <box style={{ flexDirection: 'column' }}>
@@ -21,35 +22,48 @@ export const fileTreeDisplay = defineDisplay(fileTreeModel, {
             <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '◫ '}</span>
             {isRunning ? (
               <>
-                <span>{`Listing ${path}`}</span>
+                <span style={{ fg: theme.foreground }}>{'Listing '}</span>
+                <span style={{ fg: theme.muted }}>{state.path || '...'}</span>
                 <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
               </>
-            ) : state.phase === 'completed' ? (
+            ) : isError ? (
               <>
-                <span>{`Listed ${path} · ${state.fileCount} files, ${state.dirCount} dirs`}</span>
-                <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
-                  {isExpanded ? ' (collapse)' : ' (expand)'}
-                </span>
+                <span style={{ fg: theme.foreground }}>{'List '}</span>
+                <span style={{ fg: theme.muted }}>{state.path}</span>
+                <span style={{ fg: theme.error }}>{' · Error'}</span>
+                <span style={{ fg: theme.muted }}>{` (${state.errorDetail || ''})`}</span>
               </>
-            ) : state.phase === 'rejected' ? (
-              <span>{`List ${path} · Rejected`}</span>
-            ) : state.phase === 'interrupted' ? (
-              <span>{`List ${path} · Interrupted`}</span>
             ) : (
-              <span style={{ fg: theme.error }}>{`List ${path} · Error`}</span>
+              <>
+                <span style={{ fg: theme.foreground }}>{'Listed '}</span>
+                <span style={{ fg: theme.muted }}>{state.path}</span>
+                {state.entries.length > 0 ? (
+                  <>
+                    <span style={{ fg: theme.info }}>
+                      {` · ${fileCount} ${fileCount === 1 ? 'file' : 'files'}`}
+                      {dirCount > 0 ? `, ${dirCount} ${dirCount === 1 ? 'dir' : 'dirs'}` : ''}
+                    </span>
+                    <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
+                      {isExpanded ? ' (collapse)' : ' (expand)'}
+                    </span>
+                  </>
+                ) : (
+                  <span style={{ fg: theme.muted }}>{' · empty'}</span>
+                )}
+              </>
             )}
           </text>
         </Button>
 
-        {state.phase === 'completed' && isExpanded && (
+        {isExpanded && state.entries.length > 0 && (
           <box style={{ flexDirection: 'column', paddingLeft: 2 }}>
-            {state.entries.map((entry, idx) => (
-              <text key={`${entry.name}-${idx}`} style={{ wrapMode: 'word' }}>
-                <span>{`${'  '.repeat(entry.depth)}`}</span>
+            {state.entries.map((entry, i) => (
+              <text key={i}>
+                <span style={{ fg: theme.muted }}>{'  '.repeat(entry.depth)}</span>
                 {entry.type === 'dir' ? (
-                  <span style={{ fg: theme.primary }}>{`${entry.name}/`}</span>
+                  <span style={{ fg: theme.directory }}>{entry.name}/</span>
                 ) : (
-                  <span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{entry.name}</span>
+                  <span style={{ fg: theme.muted }}>{entry.name}</span>
                 )}
               </text>
             ))}
@@ -59,11 +73,9 @@ export const fileTreeDisplay = defineDisplay(fileTreeModel, {
     );
   },
   summary: (state) => {
-    const path = state.path ?? '.';
+    const path = state.path || 'files';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Listing ${path}`;
     if (state.phase === 'completed') return `Listed ${path}`;
-    if (state.phase === 'error') return `List ${path} error`;
-    if (state.phase === 'rejected') return `List ${path} rejected`;
-    return `List ${path} interrupted`;
+    return `List ${path}`;
   },
 });

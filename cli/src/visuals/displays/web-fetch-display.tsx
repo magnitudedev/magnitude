@@ -1,45 +1,56 @@
-import { defineDisplay } from '@magnitudedev/tools';
-import { webFetchModel, type WebFetchState } from '@magnitudedev/agent/src/models';
+import { type WebFetchState } from '@magnitudedev/agent/src/models';
+import { createToolDisplay } from '../display-types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
-const SHIMMER_INTERVAL_MS = 160;
+const WEB_SEARCH_SHIMMER_MS = 450;
 
-export const webFetchDisplay = defineDisplay(webFetchModel, {
-  render: ({ state }) => {
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
+export const webFetchDisplay = createToolDisplay<WebFetchState>('webFetch', {
+  render: ({ state, result }) => {
     const theme = useTheme();
-    const url = state.url ?? 'url';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
-    const isRejected = state.phase === 'rejected';
-    const isInterrupted = state.phase === 'interrupted';
+
+    if (isRunning) {
+      return (
+        <text style={{ wrapMode: 'word' }}>
+          <span style={{ fg: theme.info }}>[↓] </span>
+          <span style={{ fg: theme.foreground }}>{'Fetching '}</span>
+          <span style={{ fg: theme.muted }}>{state.url ? truncate(state.url, 60) : '...'}</span>
+          <ShimmerText text=" ..." interval={WEB_SEARCH_SHIMMER_MS} primaryColor={theme.info} />
+        </text>
+      );
+    }
+
+    if (isError) {
+      const errorMsg = result?.status === 'error' ? (result as any).message : '';
+      return (
+        <text style={{ wrapMode: 'word' }}>
+          <span style={{ fg: theme.error }}>{'✗  '}</span>
+          <span style={{ fg: theme.foreground }}>{'Fetch '}</span>
+          <span style={{ fg: theme.muted }}>{truncate(state.url ?? '', 60)}</span>
+          <span style={{ fg: theme.error }}>{` · Error${errorMsg ? ` (${truncate(errorMsg, 80)})` : ''}`}</span>
+        </text>
+      );
+    }
 
     return (
       <text style={{ wrapMode: 'word' }}>
-        <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '↓ '}</span>
-        {isRunning ? (
-          <>
-            <span>{`Fetching ${url}`}</span>
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-          </>
-        ) : isError ? (
-          <span style={{ fg: theme.error }}>{`Fetch ${url} · Error${state.errorDetail ? ` (${state.errorDetail})` : ''}`}</span>
-        ) : isRejected ? (
-          <span>{`Fetch ${url} · Rejected`}</span>
-        ) : isInterrupted ? (
-          <span>{`Fetch ${url} · Interrupted`}</span>
-        ) : (
-          <span>{`Fetched ${url}`}</span>
-        )}
+        <span style={{ fg: theme.info }}>[↓] </span>
+        <span style={{ fg: theme.foreground }}>{'Fetched '}</span>
+        <span style={{ fg: theme.muted }}>{truncate(state.url ?? '', 60)}</span>
       </text>
     );
   },
   summary: (state) => {
-    const url = state.url ?? 'url';
+    const url = state.url || 'URL';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Fetching ${url}`;
-    if (state.phase === 'completed') return `Fetched ${url}`;
-    if (state.phase === 'error') return `Fetch ${url} error`;
-    if (state.phase === 'rejected') return `Fetch ${url} rejected`;
-    return `Fetch ${url} interrupted`;
+    if (state.phase === 'error') return `Fetch ${url}`;
+    return `Fetched ${url}`;
   },
 });

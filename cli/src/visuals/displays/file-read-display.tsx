@@ -1,45 +1,50 @@
-import { defineDisplay } from '@magnitudedev/tools';
-import { fileReadModel } from '@magnitudedev/agent/src/models';
+import { type FileReadState } from '@magnitudedev/agent/src/models';
+import { createToolDisplay } from '../display-types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const fileReadDisplay = defineDisplay(fileReadModel, {
+export const fileReadDisplay = createToolDisplay<FileReadState>('fileRead', {
   render: ({ state }) => {
     const theme = useTheme();
-    const path = state.path ?? 'file';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
-    const isRejected = state.phase === 'rejected';
-    const isInterrupted = state.phase === 'interrupted';
+    const lineCount = state.lineCount ?? 0;
 
     return (
-      <text style={{ wrapMode: 'word' }}>
-        <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '→ '}</span>
-        {isRunning ? (
-          <>
-            <span>{`Reading ${path}`}</span>
-            <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-          </>
-        ) : isError ? (
-          <span style={{ fg: theme.error }}>{`Read ${path} · Error${state.errorDetail ? ` (${state.errorDetail})` : ''}`}</span>
-        ) : isRejected ? (
-          <span>{`Read ${path} · Rejected`}</span>
-        ) : isInterrupted ? (
-          <span>{`Read ${path} · Interrupted`}</span>
-        ) : (
-          <span>{`Read ${path} · ${state.lineCount ?? 0} lines`}</span>
-        )}
-      </text>
+      <box style={{ flexDirection: 'column' }}>
+        <text style={{ wrapMode: 'word' }}>
+          <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '→ '}</span>
+          {isRunning ? (
+            <>
+              <span style={{ fg: theme.foreground }}>{'Reading '}</span>
+              <span style={{ fg: theme.muted }}>{state.path || '...'}</span>
+              <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+            </>
+          ) : isError ? (
+            <>
+              <span style={{ fg: theme.foreground }}>{'Read '}</span>
+              <span style={{ fg: theme.muted }}>{state.path}</span>
+              <span style={{ fg: theme.error }}>{' · Error'}</span>
+              <span style={{ fg: theme.muted }}>{` (${state.errorDetail || ''})`}</span>
+            </>
+          ) : (
+            <>
+              <span style={{ fg: theme.foreground }}>{'Read '}</span>
+              <span style={{ fg: theme.muted }}>{state.path}</span>
+              {lineCount > 0 && (
+                <span style={{ fg: theme.info }}>{` · ${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`}</span>
+              )}
+            </>
+          )}
+        </text>
+      </box>
     );
   },
   summary: (state) => {
-    const path = state.path ?? 'file';
+    const path = state.path || 'file';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Reading ${path}`;
-    if (state.phase === 'completed') return `Read ${path}`;
-    if (state.phase === 'error') return `Read ${path} error`;
-    if (state.phase === 'rejected') return `Read ${path} rejected`;
-    return `Read ${path} interrupted`;
+    return `Read ${path}`;
   },
 });

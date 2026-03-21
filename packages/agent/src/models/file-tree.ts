@@ -8,6 +8,7 @@ export interface FileTreeState extends BaseState {
   entries: TreeEntry[]
   fileCount: number
   dirCount: number
+  errorDetail?: string
 }
 
 const initial: Omit<FileTreeState, 'phase'> = {
@@ -15,6 +16,7 @@ const initial: Omit<FileTreeState, 'phase'> = {
   entries: [],
   fileCount: 0,
   dirCount: 0,
+  errorDetail: undefined,
 }
 
 export const fileTreeModel = defineStateModel({
@@ -47,7 +49,7 @@ export const fileTreeModel = defineStateModel({
         }
       }
       case 'error':
-        return { ...state, phase: 'error' }
+        return { ...state, phase: 'error', errorDetail: event.error.message }
       case 'rejected':
         return { ...state, phase: 'rejected' }
       case 'interrupted':

@@ -301,6 +301,7 @@ export interface DisplayState {
   readonly streamingMessageId: string | null  // Tracks streaming assistant message
   readonly activeThinkBlockId: string | null
   readonly showButton: 'send' | 'stop'
+  readonly toolModelStates: { readonly [callId: string]: { readonly toolKey: string; readonly modelState: object; readonly streaming: unknown } }
 }
 
 // =============================================================================
@@ -310,12 +311,11 @@ export interface DisplayState {
 const generateId = () => createId()
 
 const normalizer = new ToolEventNormalizer()
-const callStates = new Map<string, { toolKey: string; state: object }>()
 
-function getVisualState(callId: string): { state: object; streaming: unknown } | undefined {
-  const entry = callStates.get(callId)
+function getVisualState(fork: DisplayState, callId: string): { state: object; streaming: unknown } | undefined {
+  const entry = fork.toolModelStates[callId]
   if (!entry) return undefined
-  return { state: entry.state, streaming: normalizer.getStreaming(callId) ?? emptyStreamingInput() }
+  return { state: entry.modelState, streaming: entry.streaming }
 }
 
 /**
@@ -442,13 +442,19 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
   const block = findThinkBlock(state.messages, state.activeThinkBlockId)
   if (!block) return state
 
+  let updatedModelStates = state.toolModelStates
+
   const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (toolKey, visualState, stepId) => {
     if (stepId) {
-      const entry = callStates.get(stepId)
+      const entry = updatedModelStates[stepId]
       if (entry) {
         const model = getModelForToolKey(entry.toolKey)
-        entry.state = model.reduce(entry.state, { type: 'interrupted' })
-        return getVisualState(stepId) ?? visualState
+        const newModelState = model.reduce(entry.modelState, { type: 'interrupted' })
+        updatedModelStates = {
+          ...updatedModelStates,
+          [stepId]: { ...entry, modelState: newModelState },
+        }
+        return { state: newModelState, streaming: entry.streaming }
       }
     }
     return visualState
@@ -460,6 +466,7 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
 
   return {
     ...state,
+    toolModelStates: updatedModelStates,
     messages: updateMessageById<ThinkBlockMessage>(
       state.messages, state.activeThinkBlockId,
       (b) => ({ ...b, steps: nextSteps })
@@ -748,7 +755,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     streamingMessageId: null,
     activeThinkBlockId: null,
     showButton: 'send',
-
+    toolModelStates: {},
   },
 
   signals: {
@@ -1007,16 +1014,37 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       const normalized = normalizer.normalize(event.toolKey, event.toolCallId, inner)
 
+      // Update model state immutably on the fork
+      let currentFork = fork
       if (normalized?.type === 'started') {
         const model = getModelForToolKey(event.toolKey)
-        callStates.set(event.toolCallId, { toolKey: event.toolKey, state: model.initial })
-      }
-
-      if (normalized) {
-        const entry = callStates.get(event.toolCallId)
+        const initialState = model.reduce(model.initial, normalized)
+        currentFork = {
+          ...currentFork,
+          toolModelStates: {
+            ...currentFork.toolModelStates,
+            [event.toolCallId]: {
+              toolKey: event.toolKey,
+              modelState: initialState,
+              streaming: normalizer.getStreaming(event.toolCallId) ?? emptyStreamingInput(),
+            },
+          },
+        }
+      } else if (normalized) {
+        const entry = currentFork.toolModelStates[event.toolCallId]
         if (entry) {
           const model = getModelForToolKey(entry.toolKey)
-          entry.state = model.reduce(entry.state, normalized)
+          currentFork = {
+            ...currentFork,
+            toolModelStates: {
+              ...currentFork.toolModelStates,
+              [event.toolCallId]: {
+                ...entry,
+                modelState: model.reduce(entry.modelState, normalized),
+                streaming: normalizer.getStreaming(event.toolCallId) ?? entry.streaming,
+              },
+            },
+          }
         }
       }
 
@@ -1026,17 +1054,17 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           emit.forkToolStep({ forkId: event.forkId, toolKey: event.toolKey })
 
           // Ignore if not for current turn
-          if (fork.currentTurnId !== event.turnId) {
-            return fork
+          if (currentFork.currentTurnId !== event.turnId) {
+            return currentFork
           }
 
           // Consult agent definition's display policy
           const agentState = read(AgentStatusProjection)
           if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
-            return fork
+            return currentFork
           }
 
-          const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
+          const { fork: newState, thinkBlockId } = ensureThinkBlock(currentFork, event.timestamp)
           return {
             ...newState,
             messages: addStepToThinkBlock(newState.messages, thinkBlockId, {
@@ -1045,29 +1073,29 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               toolKey: event.toolKey,
               input: undefined,
               label: ({ artifactWrite: 'Writing artifact…', fileEdit: 'Editing file…' } satisfies Record<string, string>)[event.toolKey] ?? event.toolKey + '()',
-              visualState: getVisualState(event.toolCallId),
+              visualState: getVisualState(newState, event.toolCallId),
             })
           }
         }
 
         case 'ToolInputReady': {
-          if (fork.currentTurnId !== event.turnId) return fork
-          if (!fork.activeThinkBlockId) return fork
+          if (currentFork.currentTurnId !== event.turnId) return currentFork
+          if (!currentFork.activeThinkBlockId) return currentFork
 
           // Update the step with the full parsed input and regenerate label
           const label = generateToolLabel(event.toolKey, inner.input)
           return {
-            ...fork,
+            ...currentFork,
             messages: updateStepInThinkBlock(
-              fork.messages,
-              fork.activeThinkBlockId,
+              currentFork.messages,
+              currentFork.activeThinkBlockId,
               event.toolCallId,
               (s) => s.type === 'tool'
                 ? {
                     ...s,
                     input: inner.input,
                     label,
-                    visualState: getVisualState(event.toolCallId) ?? s.visualState,
+                    visualState: getVisualState(currentFork, event.toolCallId) ?? s.visualState,
                   }
                 : s
             )
@@ -1076,26 +1104,26 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
         case 'ToolExecutionEnded': {
           // Ignore if not for current turn
-          if (fork.currentTurnId !== event.turnId) {
-            return fork
+          if (currentFork.currentTurnId !== event.turnId) {
+            return currentFork
           }
 
           // Consult agent definition's display policy
           const agentState = read(AgentStatusProjection)
           if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
-            return fork
+            return currentFork
           }
 
-          if (!fork.activeThinkBlockId) return fork
+          if (!currentFork.activeThinkBlockId) return currentFork
 
           // Map XmlToolResult → ToolResult for display
           const result = mapXmlToolResultForDisplay(inner.result)
 
           return {
-            ...fork,
+            ...currentFork,
             messages: updateStepInThinkBlock(
-              fork.messages,
-              fork.activeThinkBlockId,
+              currentFork.messages,
+              currentFork.activeThinkBlockId,
               event.toolCallId,
               (s) => {
                 if (s.type !== 'tool') return s
@@ -1121,7 +1149,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
                   ...s,
                   label,
                   result,
-                  visualState: getVisualState(event.toolCallId) ?? s.visualState,
+                  visualState: getVisualState(currentFork, event.toolCallId) ?? s.visualState,
                 }
               }
             )
@@ -1129,20 +1157,20 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
 
         case 'ToolObservation':
-          return fork
+          return currentFork
 
         default: {
-          if (fork.currentTurnId !== event.turnId) return fork
-          if (!fork.activeThinkBlockId) return fork
+          if (currentFork.currentTurnId !== event.turnId) return currentFork
+          if (!currentFork.activeThinkBlockId) return currentFork
 
-          const vs = getVisualState(event.toolCallId)
-          if (!vs) return fork
+          const vs = getVisualState(currentFork, event.toolCallId)
+          if (!vs) return currentFork
 
           return {
-            ...fork,
+            ...currentFork,
             messages: updateStepInThinkBlock(
-              fork.messages,
-              fork.activeThinkBlockId,
+              currentFork.messages,
+              currentFork.activeThinkBlockId,
               event.toolCallId,
               (s) => s.type === 'tool'
                 ? { ...s, visualState: vs }

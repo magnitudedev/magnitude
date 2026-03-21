@@ -52,23 +52,8 @@ export * from './tool-state-event'
 export * from './tool-binding'
 export * from './streaming-input'
 export * from './state-model'
-export {
-  defineDisplay,
-  createBinding,
-  type Display,
-  type DisplayConfig,
-  type DisplayProps,
-  type ToolDisplayBinding,
-  type ToolResult,
-  type CallState,
-  type BindingState,
-  type BindingStreaming,
-  type BindingInput,
-  type BindingOutput,
-  type BindingEmission,
-} from './display'
+export { ToolCallState, createToolCallState } from './tool-call-state'
 export * from './composition'
 export * from './models'
 
-export * from './registry'
 

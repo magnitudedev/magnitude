@@ -1,67 +1,86 @@
 import { TextAttributes } from '@opentui/core';
-import { defineDisplay } from '@magnitudedev/tools';
-import { webSearchModel, type WebSearchState } from '@magnitudedev/agent/src/models';
+import { type WebSearchState } from '@magnitudedev/agent/src/models';
+import { createToolDisplay } from '../display-types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
-const SHIMMER_INTERVAL_MS = 160;
+const WEB_SEARCH_SHIMMER_MS = 450;
 
-export const webSearchDisplay = defineDisplay(webSearchModel, {
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
+export const webSearchDisplay = createToolDisplay<WebSearchState>('webSearch', {
   render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
-    const query = state.query ?? '';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
+    const sources = state.sources;
 
-    return (
-      <box style={{ flexDirection: 'column' }}>
+    if (isRunning) {
+      return (
         <Button onClick={onToggle}>
           <text style={{ wrapMode: 'word' }}>
-            <span style={{ fg: isError ? theme.error : theme.info }}>{isError ? '✗ ' : '⌕ '}</span>
-            {isRunning ? (
-              <>
-                <span>{`Searching web for "${query}"`}</span>
-                <ShimmerText text="..." interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
-              </>
-            ) : state.phase === 'completed' ? (
-              <>
-                <span>{`Searched web for "${query}" · ${state.sources.length} source(s)`}</span>
-                <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
-                  {isExpanded ? ' (collapse)' : ' (expand)'}
-                </span>
-              </>
-            ) : state.phase === 'rejected' ? (
-              <span>{`Search web for "${query}" · Rejected`}</span>
-            ) : state.phase === 'interrupted' ? (
-              <span>{`Search web for "${query}" · Interrupted`}</span>
-            ) : (
-              <span style={{ fg: theme.error }}>{`Search web for "${query}" · Error`}</span>
-            )}
+            <span style={{ fg: theme.info }}>[⌕] </span>
+            <span style={{ fg: theme.foreground }}>{'Searching web for '}</span>
+            <span style={{ fg: theme.muted }}>{`"${state.query ? truncate(state.query, 50) : '...'}"`}</span>
+            <ShimmerText text=" ..." interval={WEB_SEARCH_SHIMMER_MS} primaryColor={theme.info} />
           </text>
         </Button>
+      );
+    }
 
-        {state.phase === 'completed' && isExpanded && (
-          <box style={{ flexDirection: 'column', paddingLeft: 2 }}>
-            {state.sources.map((source, idx) => (
-              <text key={`${source.url}-${idx}`} style={{ wrapMode: 'word' }}>
-                <span>{'• '}</span>
-                <span style={{ fg: theme.foreground }}>{source.title}</span>
-                <span>{' - '}</span>
-                <span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{source.url}</span>
-              </text>
-            ))}
-          </box>
-        )}
-      </box>
+    if (isError) {
+      return (
+        <text style={{ wrapMode: 'word' }}>
+          <span style={{ fg: theme.error }}>{'✗  '}</span>
+          <span style={{ fg: theme.foreground }}>{'Searched web for '}</span>
+          <span style={{ fg: theme.muted }}>{`"${state.query ? truncate(state.query, 50) : ''}"`}</span>
+          <span style={{ fg: theme.error }}>{' · Error'}</span>
+        </text>
+      );
+    }
+
+    if (sources.length > 0) {
+      return (
+        <box style={{ flexDirection: 'column' }}>
+          <Button onClick={onToggle}>
+            <text style={{ wrapMode: 'word' }}>
+              <span style={{ fg: theme.info }}>[⌕] </span>
+              <span style={{ fg: theme.foreground }}>{'Searched web for '}</span>
+              <span style={{ fg: theme.muted }}>{`"${truncate(state.query ?? '', 50)}"`}</span>
+              <span style={{ fg: theme.info }}>{` · ${sources.length} ${sources.length === 1 ? 'source' : 'sources'}`}</span>
+              <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>{isExpanded ? ' (collapse)' : ' (expand)'}</span>
+            </text>
+          </Button>
+          {isExpanded && (
+            <box style={{ flexDirection: 'column', paddingLeft: 2 }}>
+              {sources.map((src, i) => (
+                <text key={i}>
+                  <span style={{ fg: theme.foreground }}>{'- '}{src.title}</span>
+                  <span style={{ fg: theme.muted }} attributes={TextAttributes.DIM}>{`: ${truncate(src.url, 60)}`}</span>
+                </text>
+              ))}
+            </box>
+          )}
+        </box>
+      );
+    }
+
+    return (
+      <text style={{ wrapMode: 'word' }}>
+        <span style={{ fg: theme.info }}>[⌕] </span>
+        <span style={{ fg: theme.foreground }}>{'Searched web for '}</span>
+        <span style={{ fg: theme.muted }}>{`"${truncate(state.query ?? '', 50)}"`}</span>
+        <span style={{ fg: theme.muted }}>{' · No Sources Found'}</span>
+      </text>
     );
   },
   summary: (state) => {
-    const query = state.query ?? '';
-    if (state.phase === 'streaming' || state.phase === 'executing') return `Searching web for "${query}"`;
-    if (state.phase === 'completed') return `Searched web for "${query}"`;
-    if (state.phase === 'error') return `Search web for "${query}" error`;
-    if (state.phase === 'rejected') return `Search web for "${query}" rejected`;
-    return `Search web for "${query}" interrupted`;
+    const target = state.query ? `"${state.query}"` : 'the web';
+    if (state.phase === 'streaming' || state.phase === 'executing') return `Searching web for ${target}`;
+    return `Searched web for ${target}`;
   },
 });

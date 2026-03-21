@@ -7,18 +7,22 @@ export interface FileSearchState extends BaseState {
   pattern?: string
   path?: string
   glob?: string
+  limit?: number
   matches: SearchMatch[]
   matchCount: number
   fileCount: number
+  errorDetail?: string
 }
 
 const initial: Omit<FileSearchState, 'phase'> = {
   pattern: undefined,
   path: undefined,
   glob: undefined,
+  limit: undefined,
   matches: [],
   matchCount: 0,
   fileCount: 0,
+  errorDetail: undefined,
 }
 
 export const fileSearchModel = defineStateModel({
@@ -31,14 +35,17 @@ export const fileSearchModel = defineStateModel({
       case 'started':
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
-      case 'inputReady':
+      case 'inputReady': {
+        const limitStr = event.streaming.fields.limit
         return {
           ...state,
           phase: 'streaming',
           pattern: event.streaming.fields.pattern ?? state.pattern,
           path: event.streaming.fields.path ?? state.path,
           glob: event.streaming.fields.glob ?? state.glob,
+          limit: limitStr ? parseInt(limitStr, 10) || undefined : state.limit,
         }
+      }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':
@@ -57,7 +64,7 @@ export const fileSearchModel = defineStateModel({
         }
       }
       case 'error':
-        return { ...state, phase: 'error' }
+        return { ...state, phase: 'error', errorDetail: event.error.message }
       case 'rejected':
         return { ...state, phase: 'rejected' }
       case 'interrupted':
