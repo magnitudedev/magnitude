@@ -1,5 +1,5 @@
 import { type AgentKillState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../display-types';
+import { createToolDisplay } from '../types';
 import { useTheme } from '../../hooks/use-theme';
 
 export const agentKillDisplay = createToolDisplay<AgentKillState>('agentKill', {

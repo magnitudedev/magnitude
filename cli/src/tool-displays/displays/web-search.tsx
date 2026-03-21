@@ -1,6 +1,6 @@
 import { TextAttributes } from '@opentui/core';
 import { type WebSearchState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../display-types';
+import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';

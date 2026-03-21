@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { TextAttributes } from '@opentui/core';
 import { type DiffState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../display-types';
+import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { DiffHunk } from '../../components/diff-hunk';

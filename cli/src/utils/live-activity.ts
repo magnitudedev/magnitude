@@ -1,5 +1,5 @@
 import type { DisplayMessage, ThinkBlockStep } from '@magnitudedev/agent'
-import { displayRegistry } from '../visuals/registry'
+import { displayRegistry } from '../tool-displays/registry'
 
 function normalize(text: string): string {
   return text.trim().replace(/\s+/g, ' ')

@@ -1,6 +1,6 @@
 import { TextAttributes } from '@opentui/core';
 import type { BaseState } from '@magnitudedev/tools';
-import { createToolDisplay } from '../display-types';
+import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';

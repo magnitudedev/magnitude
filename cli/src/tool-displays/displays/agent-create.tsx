@@ -1,5 +1,5 @@
 import { type AgentCreateState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../display-types';
+import { createToolDisplay } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 

@@ -1,5 +1,5 @@
 import { TextAttributes } from '@opentui/core';
-import { createToolDisplay } from '../display-types';
+import { createToolDisplay } from '../types';
 import { type FileSearchState } from '@magnitudedev/agent/src/models';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';

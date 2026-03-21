@@ -7,7 +7,7 @@ import { useTheme } from '../hooks/use-theme'
 import { orange } from '../utils/theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
-import { displayRegistry } from '../visuals/registry'
+import { displayRegistry } from '../tool-displays/registry'
 import { selectLatestLiveActivityFromThinkSteps } from '../utils/live-activity'
 
 const SHIMMER_INTERVAL_MS = 160
