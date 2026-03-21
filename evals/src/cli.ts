@@ -21,6 +21,7 @@ import { orchestratorDispatchEval } from './evals/orchestrator-dispatch/index'
 import { behaviorEval } from './evals/behavior/index'
 import { memoryExtractionEval } from './evals/memory-extraction/index'
 import { xmlNewlinesEval } from './evals/xml-newlines/index'
+import { entityEscapingEval } from './evals/entity-escaping/index'
 import { runEval, type RunCallbacks } from './runner'
 import {
   printModelHeader,
@@ -60,6 +61,7 @@ const EVALS: Record<string, Eval> = {
   behavior: behaviorEval,
   'memory-extraction': memoryExtractionEval,
   'xml-newlines': xmlNewlinesEval,
+  'entity-escaping': entityEscapingEval,
 }
 
 // =============================================================================
@@ -545,9 +547,15 @@ program
             const progress = ansis.dim(`[${completedCount}/${total}]`)
             process.stdout.write(`  ${progress} ${icon} ${scenario.id}`)
             if (failedChecks.length > 0) {
-              process.stdout.write(ansis.dim(` — ${failedChecks[0]}`))
+              const [firstLine, ...rest] = failedChecks[0].split('\n')
+              process.stdout.write(ansis.dim(` — ${firstLine}`))
+              console.log()
+              for (const line of rest.slice(0, 5)) {
+                console.log(ansis.dim(`         ${line}`))
+              }
+            } else {
+              console.log()
             }
-            console.log()
           } else {
             const progress = ansis.dim(`[${completedCount}/${total}]`)
             console.log(`${progress}`)
