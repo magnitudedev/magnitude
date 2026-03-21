@@ -15,8 +15,6 @@ interface ChatSurfaceKeyboardProps {
   setNextEscWillClearInput: (next: boolean) => void
   clearInputTimeoutRef: RefObject<NodeJS.Timeout | null>
   onClearInput: () => void
-  selectedFileOpen: boolean
-  onCloseFilePanel: () => void
   bashMode: boolean
   onExitBashMode: () => void
   pendingApproval: boolean
@@ -37,8 +35,6 @@ export function ChatSurfaceKeyboard({
   setNextEscWillClearInput,
   clearInputTimeoutRef,
   onClearInput,
-  selectedFileOpen,
-  onCloseFilePanel,
   bashMode,
   onExitBashMode,
   pendingApproval,
@@ -55,12 +51,6 @@ export function ChatSurfaceKeyboard({
       if (isCtrlC && inputText.trim().length > 0) {
         key.preventDefault()
         onClearInput()
-        return
-      }
-
-      if (isEscape && selectedFileOpen) {
-        key.preventDefault()
-        onCloseFilePanel()
         return
       }
 
@@ -143,8 +133,6 @@ export function ChatSurfaceKeyboard({
       setNextEscWillClearInput,
       clearInputTimeoutRef,
       onClearInput,
-      selectedFileOpen,
-      onCloseFilePanel,
       bashMode,
       onExitBashMode,
       pendingApproval,

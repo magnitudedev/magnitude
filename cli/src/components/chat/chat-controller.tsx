@@ -507,8 +507,6 @@ export function ChatController(props: ChatControllerProps) {
         setNextEscWillClearInput={setNextEscWillClearInput}
         clearInputTimeoutRef={clearInputTimeoutRef}
         onClearInput={clearComposer}
-        selectedFileOpen={selectedFileOpen}
-        onCloseFilePanel={onCloseFilePanel}
         bashMode={env.bashMode}
         onExitBashMode={() => {
           services.exitBashMode()
