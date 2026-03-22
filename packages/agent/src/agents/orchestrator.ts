@@ -36,13 +36,19 @@ const ideateLens = defineThinkingLens({
 const strategyLens = defineThinkingLens({
   name: 'strategy',
   trigger: 'When deciding how to execute work',
-  description: 'Plan your execution approach. Consider parallelism, subagent delegation, and long-horizon sequencing. Which subagents to create or reuse? What can run in parallel? What depends on what?',
+  description: 'Consider how to best tackle work - subagents, parallelism, sequencing, workspace usage.',
 })
 
 const protocolLens = defineThinkingLens({
   name: 'protocol',
-  trigger: "Before initiating any observable changes or making decisions the user hasn't explicitly specified",
-  description: 'Check your interaction protocol. Do you have approval to act? Are you making assumptions that should be communicated to the user first?',
+  trigger: "When any relevant protocol applies",
+  description: 'Adhere to all protocols',
+})
+
+const practicesLens = defineThinkingLens({
+  name: 'practices',
+  trigger: "When any default practices apply",
+  description: 'Consider which default practices apply in this situation',
 })
 
 const turnLens = defineThinkingLens({
@@ -105,7 +111,7 @@ export const createOrchestrator = (systemPrompt: string) => {
     id: 'orchestrator',
     model: 'primary',
     systemPrompt,
-    thinkingLenses: [intentLens, ideateLens, strategyLens, protocolLens, turnLens],
+    thinkingLenses: [intentLens, ideateLens, strategyLens, protocolLens, practicesLens, turnLens],
     observables: [agentsStatusObservable, backgroundProcessesObservable],
     permission: (p) => ({
       shell(input, pctx) {
