@@ -8,7 +8,7 @@
  * Any git with -c config override is forbidden (can override hooks, aliases, etc).
  */
 
-const READONLY_SUBCOMMANDS = ['status', 'log', 'diff', 'show', 'branch'] as const
+const READONLY_SUBCOMMANDS = ['status', 'log', 'diff', 'show', 'branch', 'rev-parse'] as const
 
 /**
  * Returns true if the git args represent a read-only invocation.
@@ -25,6 +25,7 @@ export function isGitReadOnly(args: string[]): boolean {
     case 'log':
     case 'diff':
     case 'show':
+    case 'rev-parse':
       return subcommandArgsReadOnly(sub.argsAfter)
     case 'branch':
       return subcommandArgsReadOnly(sub.argsAfter) && branchIsReadOnly(sub.argsAfter)
