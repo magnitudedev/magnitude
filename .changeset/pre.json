@@ -22,7 +22,8 @@
     "@magnitudedev/tracing": "0.0.1",
     "@magnitudedev/xml-act": "0.0.1",
     "@magnitude/markdown-cst": "0.0.1",
-    "@magnitudedev/storage": "0.0.1"
+    "@magnitudedev/storage": "0.0.1",
+    "@magnitudedev/skills": "0.0.1"
   },
   "changesets": [
     "fair-deserts-strive",
@@ -30,6 +31,7 @@
     "hip-ads-sleep",
     "neat-seals-try",
     "purple-sails-cheer",
+    "shiny-baths-design",
     "six-pandas-smile",
     "sparkly-boats-live",
     "tired-wasps-strive"
