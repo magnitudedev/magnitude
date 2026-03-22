@@ -6,7 +6,7 @@
   <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-232f41?style=flat-square&labelColor=232f41&color=gray" alt="Documentation" /></a> <img src="https://img.shields.io/badge/License-Apache%202.0-232f41?style=flat-square&labelColor=232f41&color=gray" alt="License" /> <a href="https://discord.gg/VcdpMh9tTy" target="_blank"><img src="https://img.shields.io/discord/1305570963206836295?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=5865F2&color=gray" alt="Discord" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/-Follow%20Magnitude-000000?style=flat-square&labelColor=000000&color=gray&logo=x&logoColor=white" alt="Follow Magnitude" /></a>
 </p>
 
-Magnitude is an **open source coding agent** that engineers its own context with specialized subagents. You can work for hours on the same task with no performance degradation. 
+Magnitude is an **open source coding agent** with subagent-native architecture. You can work for hours on the same task with no performance degradation. 
 
 <p align="center">
   <img src="interface.png" alt="Magnitude Interface" width="100%" />
