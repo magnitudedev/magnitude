@@ -23,6 +23,7 @@ import {
 } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
+import { formatSkillInitialPrompt } from '../prompts/skills'
 import { ContentPart, textParts, wrapTextParts } from '../content'
 import { formatAgentIdleNotification, formatSubagentUserKilledNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
 import { FileAwarenessProjection } from './file-awareness'
@@ -239,6 +240,26 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     },
 
+    skill_activated: ({ event, fork }) => {
+      // Only add to memory as user message when activated by user
+      if (event.source !== 'user') return fork
+
+      const text = event.message ? `/${event.skillName} ${event.message}` : `/${event.skillName}`
+      const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments: [] }
+
+      if (event.forkId !== null || fork.currentTurnId !== null) {
+        return {
+          ...fork,
+          queuedMessages: [...fork.queuedMessages, { kind: 'comms', entry }],
+        }
+      }
+
+      return {
+        ...fork,
+        messages: [...fork.messages, { type: 'comms_inbox', source: 'system', entries: [entry] }],
+      }
+    },
+
     file_mention_resolved: ({ event, fork }) => {
       const patched = patchCommsCollections(
         fork.messages,
@@ -372,6 +393,90 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         messages: appendSystemEntries(fork.messages, [{ kind: 'error', message: event.message }]),
         currentTurnId: null,
         currentTurnToolCalls: []
+      }
+    },
+
+    skill_started: ({ event, fork }) => {
+      const firstPhase = event.skill.phases[0]
+      const skillAttr = firstPhase
+        ? ` name="${event.skill.name}" phase="${firstPhase.name}"`
+        : ` name="${event.skill.name}"`
+      const prompt = formatSkillInitialPrompt(event.skill)
+      const entry: SystemEntry = {
+        kind: 'reminder',
+        text: `<skill${skillAttr}>\n${prompt}\n</skill>`,
+      }
+
+      return {
+        ...fork,
+        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
+      }
+    },
+
+    phase_criteria_verdict: ({ event, fork }) => {
+      const attrs: string[] = [
+        `name="${event.criteriaName}"`,
+        `status="${event.status}"`,
+        `type="${event.criteriaType}"`,
+      ]
+      if (event.criteriaType === 'shell') {
+        if ('command' in event) attrs.push(`command="${event.command}"`)
+        if ('pid' in event) attrs.push(`pid="${event.pid}"`)
+        if ('reason' in event) attrs.push(`reason="${event.reason}"`)
+      }
+      if (event.criteriaType === 'agent') {
+        if ('agentId' in event) attrs.push(`agent="${event.agentId}"`)
+        if ('reason' in event) attrs.push(`reason="${event.reason}"`)
+      }
+      if (event.criteriaType === 'user' && 'reason' in event) {
+        attrs.push(`reason="${event.reason}"`)
+      }
+
+      const entry: SystemEntry = {
+        kind: 'reminder',
+        text: `<phase_criteria ${attrs.join(' ')}/>`,
+      }
+
+      return {
+        ...fork,
+        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
+      }
+    },
+
+    phase_verdict: ({ event, fork }) => {
+      const verdictRows = event.verdicts
+        .map((v) => `  <verdict name="${v.criteriaName}" passed="${v.passed}" reason="${v.reason}"/>`)
+        .join('\n')
+      const verdictBlock = `<phase_verdict passed="${event.passed}">\n${verdictRows}\n</phase_verdict>`
+
+      const suffix = event.passed
+        ? event.workflowCompleted
+          ? `\n<workflow_completed/>`
+          : event.nextPhasePrompt
+            ? `\n<workflow_phase>\n${event.nextPhasePrompt}\n</workflow_phase>`
+            : ''
+        : ''
+
+      const entry: SystemEntry = {
+        kind: 'reminder',
+        text: `${verdictBlock}${suffix}`,
+      }
+
+      return {
+        ...fork,
+        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
+      }
+    },
+
+    skill_completed: ({ event, fork }) => {
+      const entry: SystemEntry = {
+        kind: 'reminder',
+        text: `<skill_completed name="${event.skillName}"/>`,
+      }
+
+      return {
+        ...fork,
+        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
       }
     },
 

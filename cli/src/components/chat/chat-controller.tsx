@@ -429,7 +429,7 @@ export function ChatController(props: ChatControllerProps) {
     setSavedDraft('')
   }, [])
 
-  const handleSubmit = useCallback((message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
+  const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
     const targetForkId = selectedForkId
     const slashText = visibleMessage ?? message
     if (!env.bashMode && shouldHandleSlashCommandInTab(targetForkId) && services.runSlashCommand(slashText)) {
@@ -439,7 +439,7 @@ export function ChatController(props: ChatControllerProps) {
     if (env.bashMode) {
       const trimmed = message.trim()
       if (!trimmed) return
-      const result = services.executeBash(trimmed)
+      const result = await Promise.resolve(services.executeBash(trimmed))
       services.appendBashOutput(result)
       services.exitBashMode()
       setInputValue(EMPTY_INPUT)

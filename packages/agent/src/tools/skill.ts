@@ -9,8 +9,13 @@ import { Effect, Context } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
+import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
+import type { AppEvent } from '../events'
 import { resolveSkill } from '../skills'
+import { parseSkill } from '@magnitudedev/skills'
 import type { SkillMetadata } from '../util/skill-scanner'
+
+const { ForkContext } = Fork
 
 // =============================================================================
 // Skill State Reader Service
@@ -44,6 +49,8 @@ export const skillTool = defineTool({
   errorSchema: SkillErrorSchema,
 
   execute: (input, _ctx) => Effect.gen(function* () {
+    const workerBus = yield* WorkerBusTag<AppEvent>()
+    const { forkId } = yield* ForkContext
     const skillReader = yield* SkillStateReaderTag
     const userSkills = yield* skillReader.getUserSkills()
 
@@ -59,7 +66,24 @@ export const skillTool = defineTool({
       })
     }
 
-    return `<skill_activated name="${resolved.name}">\n${resolved.content}\n</skill_activated>`
+    yield* workerBus.publish({
+      type: 'skill_activated',
+      forkId,
+      skillName: resolved.name,
+      skillPath: resolved.path ?? '',
+      source: 'assistant',
+    })
+
+    const parsed = parseSkill(resolved.content)
+
+    yield* workerBus.publish({
+      type: 'skill_started',
+      forkId,
+      source: 'assistant',
+      skill: parsed,
+    })
+
+    return `Skill "${resolved.name}" activated.`
   }),
   label: (input) => input.name ? `Activating ${input.name}` : 'Activating skill…',
 })

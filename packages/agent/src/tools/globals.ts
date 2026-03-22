@@ -13,6 +13,7 @@ import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { webSearchTool, webSearchXmlBinding } from './web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './web-fetch-tool'
 import { skillTool, skillXmlBinding } from './skill'
+import { phaseSubmitTool, phaseSubmitXmlBinding } from './phase-submit'
 
 // =============================================================================
 // think() - Internal reasoning
@@ -38,9 +39,11 @@ export const thinkXmlBinding = defineXmlBinding(thinkTool, {
 // Global Tools
 // =============================================================================
 
-export const globalTools = [thinkTool, webSearchTool, webFetchTool, skillTool]
+export { skillTool, phaseSubmitTool }
 
-export const globalXmlBindings = [thinkXmlBinding, webSearchXmlBinding, webFetchXmlBinding, skillXmlBinding]
+export const globalTools = [thinkTool, webSearchTool, webFetchTool, skillTool, phaseSubmitTool]
+
+export const globalXmlBindings = [thinkXmlBinding, webSearchXmlBinding, webFetchXmlBinding, skillXmlBinding, phaseSubmitXmlBinding]
 
 
 

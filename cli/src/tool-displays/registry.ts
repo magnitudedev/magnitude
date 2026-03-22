@@ -15,6 +15,8 @@ import './displays/browser-action'
 import './displays/agent-create'
 import './displays/agent-kill'
 import './displays/skill'
+import './displays/phase-submit'
+import './displays/phase-verdict'
 
 export const displayRegistry = {
   get(toolKey: string): Display<any, any> {

@@ -17,6 +17,7 @@
     "@magnitudedev/agent-definition": "workspace:*",
     "@magnitudedev/browser-harness": "workspace:*",
     "@magnitudedev/shell-classifier": "workspace:*",
+    "@magnitudedev/skills": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/tools": "workspace:*",
     "@magnitudedev/xml-act": "workspace:*",

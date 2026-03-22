@@ -13,6 +13,7 @@ import { shellTool } from '../tools/shell'
 
 import { thinkTool } from '../tools/globals'
 import { agentCreateTool } from '../tools/agent-tools'
+import { phaseVerdictTool } from '../tools/phase-verdict'
 import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -52,6 +53,7 @@ const tools = toolSet({
   agentCreate:    agentCreateTool,
 
   think:          thinkTool,
+  phaseVerdict:    phaseVerdictTool,
 })
 
 export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {

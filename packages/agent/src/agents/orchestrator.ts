@@ -10,7 +10,7 @@ import { toolSet, defineAgent, continue_, yield_, defineThinkingLens } from '@ma
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
-import { thinkTool } from '../tools/globals'
+import { thinkTool, skillTool, phaseSubmitTool } from '../tools/globals'
 import { agentCreateTool, agentKillTool } from '../tools/agent-tools'
 // import { gatherTool } from '../tools/gather'
 import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
@@ -95,6 +95,10 @@ export const createOrchestrator = (systemPrompt: string) => {
     // Agent management
     agentCreate:           agentCreateTool,
     agentKill:             agentKillTool,
+
+    // Skills & workflows
+    skill:                 skillTool,
+    phaseSubmit:           phaseSubmitTool,
   })
 
   return defineAgent<typeof tools, PolicyContext>(tools, {

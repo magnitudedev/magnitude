@@ -32,7 +32,7 @@ export type ChatControllerServices = {
     attachments: Attachment[]
   }) => Promise<void> | void
   runSlashCommand: (commandText: string) => boolean | void
-  executeBash: (command: string) => BashResult
+  executeBash: (command: string) => BashResult | Promise<BashResult>
   appendBashOutput: (result: BashResult) => void
   clearSystemBanners: () => void
   interruptFork: (forkId: string | null) => void

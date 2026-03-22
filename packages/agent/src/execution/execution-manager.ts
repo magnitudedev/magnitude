@@ -268,6 +268,7 @@ const makeExecutionManager = Effect.gen(function* () {
   // Per-fork tool reminder refs (shared between layers and execute() event handler)
   const toolReminderRefs = new Map<string | null, Ref.Ref<string[]>>()
 
+
   // Bound observables map
   const boundObservables = new Map<string | null, BoundObservable[]>()
 
@@ -805,7 +806,6 @@ const makeExecutionManager = Effect.gen(function* () {
       // Create ToolReminder refs (shared with execute() event handler via maps)
       const toolReminderRef = yield* Ref.make<string[]>([])
       toolReminderRefs.set(forkId, toolReminderRef)
-
       const sessionState = yield* sessionContextProjection.get
       const cwd = sessionState.context?.cwd ?? process.cwd()
       const workspacePath = sessionState.context?.workspacePath ?? cwd

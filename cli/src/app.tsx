@@ -2,13 +2,14 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getInProgressFileStreams, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, getInProgressFileStreams, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
 import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
 import { StickyWorkingHeader } from './components/think-block'
+import { WorkflowPhaseBar } from './components/workflow-phase-bar'
 import { PendingCommunicationsPanel } from './components/pending-communications-panel'
 import { LoadPreviousButton } from './components/chat-controls'
 
@@ -38,7 +39,7 @@ import { AppOverlays } from './components/app-overlays'
 import { buildModelPickerItems, filterModelPickerItems, resolveSlotDefaultSelection } from './utils/model-picker'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
-import { readFileSync } from 'node:fs'
+
 
 import path from 'path'
 import { executeBashCommand, type BashResult } from './utils/bash-executor'
@@ -64,6 +65,7 @@ import { useProviderRuntime } from './providers/provider-runtime'
 import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
 import { useFilePanel } from './hooks/use-file-panel'
+import { useLazyClient } from './hooks/use-lazy-client'
 
 const roleToSlot = (role: string): 'primary' | 'secondary' | 'browser' => {
   if (role === 'browser') return 'browser'
@@ -130,8 +132,7 @@ function AppInner({
   const providerRuntime = useProviderRuntime()
   const storage = useStorage()
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
-  const [client, setClient] = useState<AgentClient | null>(null)
-  const [workspacePath, setWorkspacePath] = useState<string | null>(null)
+  const { client, workspacePath, send: clientSend, ensureReady: ensureClientReady, setFactory: setClientFactory, setClient: setLazyClient } = useLazyClient()
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
@@ -179,10 +180,11 @@ function AppInner({
   const [restoredQueuedInputText, setRestoredQueuedInputText] = useState<string | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
   const [isCompacting, setIsCompacting] = useState(false)
+  const [workflowState, setWorkflowState] = useState<WorkflowCriteriaState | null>(null)
   const returnToProviderDetailRef = useRef<string | null>(null)
   const turnStartTimeRef = useRef<number | null>(null)
   const hasAnimatedRef = useRef(skipAnimation)
-  const initClientRef = useRef<(() => Promise<AgentClient>) | null>(null)
+
 
   const resetModelPickerState = useCallback(() => {
     setModelSearch('')
@@ -331,6 +333,8 @@ function AppInner({
       logger.warn({ error: err.message }, 'Failed to scan skills')
     })
 
+    let resolvedWorkspacePath: string | null = null
+
     const createClient = async () => {
       let sessionId: string | undefined
       if (sessionSelection === undefined) {
@@ -347,7 +351,7 @@ function AppInner({
         sessionId,
       })
       const activeSessionId = persistence.getSessionId()
-      setWorkspacePath(storage.sessions.getWorkspacePath(activeSessionId) ?? null)
+      resolvedWorkspacePath = storage.sessions.getWorkspacePath(activeSessionId) ?? null
       initLogger(persistence.getSessionId())
       clearSessionLog(persistence.getSessionId())
       logger.info({ logFile: getSessionLogPath(persistence.getSessionId()) }, 'Session logger initialized')
@@ -365,7 +369,7 @@ function AppInner({
         return
       }
       c = client
-      setClient(client)
+      setLazyClient(client, resolvedWorkspacePath)
       onClientReady?.(client)
       renderer.setTerminalTitle("Magnitude")
 
@@ -542,15 +546,14 @@ function AppInner({
         showButton: 'send',
         toolModelStates: {},
       })
-      // Store factory so handleSubmit can create client lazily
-      initClientRef.current = async () => {
+      setClientFactory(async () => {
         const client = await createClient()
         setupClient(client)
         return client
-      }
+      })
     } else {
       // RESUMED SESSION: create client immediately (existing behavior)
-      initClientRef.current = null
+      setClientFactory(null)
       createClient().catch((err) => {
         logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client');
         throw err;
@@ -562,11 +565,11 @@ function AppInner({
 
     return () => {
       mounted = false
-      initClientRef.current = null
+      setClientFactory(null)
       onClientReady?.(null)
       c?.dispose()
     }
-  }, [debugMode, onClientReady, renderer, sessionSelection, storage])
+  }, [debugMode, onClientReady, renderer, sessionSelection, setClientFactory, setLazyClient, storage])
 
   // Subscribe to display state for selected fork
   useEffect(() => {
@@ -620,6 +623,13 @@ function AppInner({
     })
 
     return unsubscribe
+  }, [client])
+
+  useEffect(() => {
+    if (!client) return
+    return client.state.workflow.subscribeFork(null, (state: WorkflowCriteriaState) => {
+      setWorkflowState(state)
+    })
   }, [client])
 
   const subagentTabs = useSubagentTabs({
@@ -830,39 +840,25 @@ function AppInner({
   }, [])
 
   const activateSkill = useCallback((skillName: string, skillPath: string | undefined, args: string) => {
-    if (!client) return
-    try {
-      if (skillPath) {
-        // User skill — read from disk
-        const raw = readFileSync(skillPath, 'utf-8')
-        const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim()
-
-        let message = `[User activated skill: ${skillName}]\n\n${body}`
-        if (args.trim()) {
-          message += `\n\n${args.trim()}`
-        }
-
-        client.send({ type: 'user_message', forkId: null, content: textParts(message), attachments: [], mode: 'text', synthetic: false, taskMode: false })
-      } else {
-        // Core skill — tell agent to activate via tool
-        let message = `[User activated skill: ${skillName}]`
-        if (args.trim()) {
-          message += `\n\n${args.trim()}`
-        }
-
-        client.send({ type: 'user_message', forkId: null, content: textParts(message), attachments: [], mode: 'text', synthetic: false, taskMode: false })
-      }
-      logger.info({ skillName, skillPath, hasArgs: !!args.trim() }, 'Skill activated')
-    } catch (err: any) {
-      showEphemeral(`Failed to load skill: ${err.message}`, theme.error, 8000)
+    if (!skillPath) {
+      showEphemeral(`Failed to activate /${skillName}: missing skill path`, theme.error, 8000)
+      return
     }
-  }, [client, showEphemeral, theme.error])
+    clientSend({
+      type: 'skill_activated',
+      forkId: null,
+      skillName,
+      skillPath,
+      message: args.trim() || null,
+      source: 'user',
+    })
+    logger.info({ skillName, skillPath, hasArgs: !!args.trim() }, 'Skill activated')
+  }, [clientSend, showEphemeral, theme.error])
 
   const initProject = useCallback(() => {
-    if (!client) return
-    client.send({ type: 'user_message', forkId: null, content: textParts(INIT_PROMPT), attachments: [], mode: 'text', synthetic: false, taskMode: false })
+    clientSend({ type: 'user_message', forkId: null, content: textParts(INIT_PROMPT), attachments: [], mode: 'text', synthetic: false, taskMode: false })
     logger.info('Init project activated')
-  }, [client])
+  }, [clientSend])
 
   const openSettings = useCallback((tab: SettingsTab = 'provider') => {
     setSettingsTab(tab)
@@ -1590,22 +1586,8 @@ function AppInner({
     message: string
     attachments: Attachment[]
   }) => {
-    const sendMessage = (c: AgentClient) => {
-      c.send({ type: 'user_message', forkId: payload.forkId, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
-    }
-
-    if (client) {
-      sendMessage(client)
-    } else if (initClientRef.current) {
-      const initFn = initClientRef.current
-      initClientRef.current = null
-      initFn().then((newClient) => {
-        sendMessage(newClient)
-      }).catch((err) => {
-        logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client')
-      })
-    }
-  }, [client])
+    clientSend({ type: 'user_message', forkId: payload.forkId, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
+  }, [clientSend])
 
   if (!display) {
     return (
@@ -1871,6 +1853,13 @@ function AppInner({
             </box>
           )}
           {chatScrollbox}
+          {workflowState && workflowState.skillName && workflowState.phases.length > 0 ? (
+            <WorkflowPhaseBar state={{
+              skillName: workflowState.skillName,
+              phases: workflowState.phases,
+              criteria: workflowState.criteria.length > 0 ? workflowState.criteria : null,
+            }} />
+          ) : null}
           <ChatController
             env={{
               status: (activeDisplay ?? display)?.status ?? 'idle',
@@ -1893,10 +1882,10 @@ function AppInner({
             services={{
               submitUserMessageToFork: ({ forkId, message, attachments }) => handleSubmitViaClientBoundary({ forkId, message, attachments }),
               runSlashCommand: (commandText: string) => routeSlashCommand(commandText, commandContext),
-              executeBash: (command: string) => {
-                if (!workspacePath) throw new Error('workspacePath not available for bash execution')
+              executeBash: async (command: string) => {
+                const { workspacePath: wp } = await ensureClientReady()
                 return executeBashCommand(command, {
-                  workspacePath,
+                  workspacePath: wp,
                   projectRoot: process.cwd(),
                 })
               },

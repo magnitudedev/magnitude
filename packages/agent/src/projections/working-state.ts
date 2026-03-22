@@ -51,6 +51,7 @@ export interface ForkWorkingState {
   readonly pendingApproval: boolean
   readonly softInterrupted: boolean
   readonly currentTurnAllowsDirectUserReply: boolean
+  readonly pendingSeeVerdict: boolean
   readonly pendingMentionTimestamps: readonly number[]
   readonly pendingInboundCommunications: readonly PendingInboundCommunication[]
 }
@@ -83,6 +84,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     contextLimitBlocked: false,
     pendingApproval: false,
     softInterrupted: false,
+    pendingSeeVerdict: false,
     currentTurnAllowsDirectUserReply: false,
     pendingMentionTimestamps: [],
     pendingInboundCommunications: []
@@ -156,12 +158,59 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       return newFork
     },
 
+    skill_activated: ({ event, fork }) => {
+      return fork
+    },
+
+    skill_started: ({ event, fork, emit }) => {
+      // Assistant-sourced skill_started happens mid-turn, no trigger needed
+      if (event.source !== 'user') return fork
+
+      const isQueued = fork.working
+      const newFork: ForkWorkingState = {
+        ...fork,
+        willContinue: true,
+        hasQueuedMessages: fork.hasQueuedMessages || isQueued,
+      }
+
+      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
+        emit.shouldTriggerChanged({
+          forkId: event.forkId,
+          shouldTrigger: shouldTrigger(newFork),
+          chainId: newFork.currentChainId
+        })
+      }
+      return newFork
+    },
+
     file_mention_resolved: ({ event, fork, emit }) => {
       const newFork: ForkWorkingState = {
         ...fork,
         pendingMentionTimestamps: fork.pendingMentionTimestamps.filter(
           timestamp => timestamp !== event.sourceMessageTimestamp
         )
+      }
+
+      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
+        emit.shouldTriggerChanged({
+          forkId: event.forkId,
+          shouldTrigger: shouldTrigger(newFork),
+          chainId: newFork.currentChainId
+        })
+      }
+
+      return newFork
+    },
+
+    phase_verdict: ({ event, fork, emit }) => {
+      if (fork.working) {
+        // Verdict arrived mid-turn — defer until turn completes
+        return { ...fork, pendingSeeVerdict: true }
+      }
+
+      const newFork: ForkWorkingState = {
+        ...fork,
+        willContinue: true,
       }
 
       if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
@@ -266,7 +315,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       const isFinished = event.result.success && event.result.turnDecision === 'finish'
 
       // If soft-interrupted, override willContinue to false
-      let willContinue = isFinished ? false : (fork.softInterrupted ? false : (fork.hasQueuedMessages || fork.pendingWake || turnWantsContinue))
+      let willContinue = isFinished ? false : (fork.softInterrupted ? false : (fork.hasQueuedMessages || fork.pendingWake || fork.pendingSeeVerdict || turnWantsContinue))
 
       const newFork: ForkWorkingState = {
         ...fork,
@@ -277,6 +326,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
         currentTurnAllowsDirectUserReply: false,
         currentTurnId: null,
         currentChainId: willContinue ? fork.currentChainId : null,
+        pendingSeeVerdict: false,
       }
 
       // Emit stability first so downstream projections (e.g. AgentRegistry) update

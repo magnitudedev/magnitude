@@ -37,6 +37,11 @@ export type {
   ToolApproved,
   ToolRejected,
   ChatTitleGenerated,
+  PhaseCriteriaVerdict,
+  PhaseVerdict,
+  PhaseVerdictEntry,
+  SkillActivated,
+  SkillStarted,
 
   Attachment,
   ImageAttachment,
@@ -133,6 +138,8 @@ export { SessionContextProjection } from './projections/session-context'
 export type { SessionContextState } from './projections/session-context'
 
 export { ReplayProjection } from './projections/replay'
+export { WorkflowProjection } from './projections/workflow'
+export type { WorkflowCriteriaState } from './projections/workflow'
 
 // Line-edit types
 export type { EditDiff } from './util/line-edit'
@@ -167,6 +174,9 @@ export {
 export type { AgentStateReader } from './tools/fork'
 export { skillTool } from './tools/skill'
 export type { SkillStateReader } from './tools/skill'
+export { phaseSubmitTool } from './tools/phase-submit'
+export { phaseVerdictTool, PhaseVerdictContextTag } from './tools/phase-verdict'
+
 
 // Skills
 export { resolveSkill, getUserSkills } from './skills'
@@ -179,6 +189,7 @@ export { AgentOrchestrator } from './workers/agent-orchestrator'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'
+export { WorkflowWorker } from './workers/workflow-worker'
 
 // Persistence
 export { ChatPersistence, PersistenceError } from './persistence/chat-persistence-service'

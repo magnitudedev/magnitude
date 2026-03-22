@@ -25,6 +25,7 @@ import { DisplayProjection } from './projections/display'
 import { AgentRoutingProjection } from './projections/agent-routing'
 import { AgentStatusProjection } from './projections/agent-status'
 import { CompactionProjection } from './projections/compaction'
+import { WorkflowProjection } from './projections/workflow'
 
 import { ReplayProjection } from './projections/replay'
 import { ChatTitleProjection } from './projections/chat-title'
@@ -43,6 +44,7 @@ import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 import { Autopilot } from './workers/autopilot'
 import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
+import { WorkflowWorker } from './workers/workflow-worker'
 import type { AgentVariant } from './agents'
 import { ChatTitleWorker } from './workers/chat-title-worker'
 import { UserPresenceWorker } from './workers/user-presence-worker'
@@ -80,6 +82,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     AgentRoutingProjection,
     AgentStatusProjection,
     CompactionProjection,
+    WorkflowProjection,
     WorkingStateProjection,
     TurnProjection,
     CanonicalTurnProjection,
@@ -104,6 +107,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     Autopilot,
     CompactionWorker,
     ApprovalWorker,
+    WorkflowWorker,
 
     FileMentionResolver,
 
@@ -122,6 +126,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
       working: WorkingStateProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
+      workflow: WorkflowProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
     }

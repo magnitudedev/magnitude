@@ -806,6 +806,44 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
+    skill_activated: ({ event, fork }) => {
+      // Only show as user message when activated by user slash command
+      if (event.source !== 'user') return fork
+
+      const messageId = generateId()
+      const content = event.message ? `/${event.skillName} ${event.message}` : `/${event.skillName}`
+      return {
+        ...fork,
+        messages: [
+          ...fork.messages,
+          {
+            id: messageId,
+            type: 'user_message' as const,
+            content,
+            timestamp: event.timestamp,
+            taskMode: false,
+            attachments: [],
+          }
+        ]
+      }
+    },
+
+    skill_completed: ({ event, fork }) => {
+      const messageId = generateId()
+      return {
+        ...fork,
+        messages: [
+          ...fork.messages,
+          {
+            id: messageId,
+            type: 'assistant_message' as const,
+            content: `✓ Skill "${event.skillName}" completed`,
+            timestamp: event.timestamp,
+          }
+        ]
+      }
+    },
+
     turn_started: ({ event, fork }) => {
       // Check if there are queued messages to promote
       const hasQueuedMessages = fork.messages.some(m => m.type === 'queued_user_message')

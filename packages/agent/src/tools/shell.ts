@@ -11,6 +11,7 @@ import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork } from '@magnitudedev/event-core'
 import { spawn } from 'child_process'
 import { WorkingDirectoryTag } from '../execution/working-directory'
+import { agentEnv } from '../util/agent-env'
 import { ToolReminderTag } from '../execution/tool-reminder'
 import { ToolExecutionContextTag } from '../execution/tool-execution-context'
 import { BackgroundProcessRegistryTag } from '../processes/background-process-registry'
@@ -92,12 +93,7 @@ export const shellTool = defineTool({
 
           const child = spawn(shellPath, ['-c', command], {
             cwd,
-            env: {
-              ...process.env,
-              NO_COLOR: '1',
-              PROJECT_ROOT: cwd,
-              M: workspacePath,
-            }
+            env: agentEnv(cwd, workspacePath),
           })
           activeChild = child
 

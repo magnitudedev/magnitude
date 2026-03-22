@@ -7,7 +7,7 @@
 import { copyFile, mkdir, readdir } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import type { SkillMetadata } from '../util/skill-scanner'
-import { parseFrontmatter } from '../util/frontmatter'
+
 
 // =============================================================================
 // Types
@@ -87,17 +87,11 @@ async function copyDirectory(sourceDir: string, destinationDir: string): Promise
 }
 
 /**
- * Read a SKILL.md file and strip frontmatter, returning just the body content.
+ * Read a SKILL.md file and return the full raw content (including frontmatter).
  */
 async function readSkillContent(path: string): Promise<string | null> {
   try {
-    const raw = await Bun.file(path).text()
-    const result = parseFrontmatter(raw)
-    if (result) {
-      return result.body
-    }
-    // No frontmatter — return the whole file
-    return raw.trim()
+    return await Bun.file(path).text()
   } catch {
     return null
   }

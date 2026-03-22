@@ -12,7 +12,7 @@ import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
-import { thinkTool } from '../tools/globals'
+import { thinkTool, phaseSubmitTool } from '../tools/globals'
 import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -42,6 +42,7 @@ const tools = toolSet({
   webFetch:       webFetchTool,
 
   think:          thinkTool,
+  phaseSubmit:    phaseSubmitTool,
 })
 
 export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
