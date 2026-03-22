@@ -79,8 +79,8 @@ export async function handleChatControllerPaste(args: {
   addClipboardImage: () => Promise<boolean>
   addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
   setInputValue: (updater: (prev: InputValue) => InputValue) => void
-}) {
-  await runChatPasteFlow({
+}): Promise<PasteFlowOutcome> {
+  return await runChatPasteFlow({
     eventText: args.eventText,
     readClipboardText,
     addClipboardImage: args.addClipboardImage,
@@ -95,6 +95,25 @@ export async function handleChatControllerPaste(args: {
       args.setInputValue((prev) => insertPasteSegment(prev, pasteText, createId()))
     },
   })
+}
+
+export function shouldBumpBulkInsertEpoch(outcome: PasteFlowOutcome): boolean {
+  return outcome === 'text-inline' || outcome === 'text-segment'
+}
+
+export function nextBulkInsertEpochForPaste(
+  previousEpoch: number,
+  outcome: PasteFlowOutcome,
+): number {
+  return shouldBumpBulkInsertEpoch(outcome) ? previousEpoch + 1 : previousEpoch
+}
+
+export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): InputValue {
+  return {
+    ...EMPTY_INPUT,
+    text: restoredQueuedInputText,
+    cursorPosition: restoredQueuedInputText.length,
+  }
 }
 
 export function shouldCycleSubagentTabs(args: {
@@ -156,6 +175,7 @@ export function ChatController(props: ChatControllerProps) {
   const [pendingKillForkId, setPendingKillForkId] = useState<string | null>(null)
   const [isKillCancelHovered, setIsKillCancelHovered] = useState(false)
   const [isKillConfirmHovered, setIsKillConfirmHovered] = useState(false)
+  const [bulkInsertEpoch, setBulkInsertEpoch] = useState(0)
   const multilineInputRef = useRef<MultilineInputHandle | null>(null)
 
   useEffect(() => {
@@ -164,11 +184,8 @@ export function ChatController(props: ChatControllerProps) {
 
   useEffect(() => {
     if (restoredQueuedInputText == null) return
-    setInputValue({
-      ...EMPTY_INPUT,
-      text: restoredQueuedInputText,
-      cursorPosition: restoredQueuedInputText.length,
-    })
+    setInputValue(buildRestoredQueuedInputValue(restoredQueuedInputText))
+    setBulkInsertEpoch((prev) => prev + 1)
     onRestoredQueuedInputHandled?.()
   }, [restoredQueuedInputText, onRestoredQueuedInputHandled])
 
@@ -414,12 +431,13 @@ export function ChatController(props: ChatControllerProps) {
   }, [env.bashMode, nextEscWillClearInput, historyIndex, history])
 
   const handlePaste = useCallback(async (eventText?: string) => {
-    await handleChatControllerPaste({
+    const outcome = await handleChatControllerPaste({
       eventText,
       addClipboardImage: addImageAttachment,
       addImageFromFilePath: addImageAttachmentFromFilePath,
       setInputValue,
     })
+    setBulkInsertEpoch((prev) => nextBulkInsertEpochForPaste(prev, outcome))
   }, [addImageAttachment, addImageAttachmentFromFilePath])
 
   const clearComposer = useCallback(() => {
@@ -578,6 +596,7 @@ export function ChatController(props: ChatControllerProps) {
                     placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the main agent...'}
                     maxHeight={10}
                     minHeight={1}
+                    bulkInsertEpoch={bulkInsertEpoch}
                   />
                 </box>
               </box>

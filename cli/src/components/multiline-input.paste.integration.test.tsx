@@ -72,6 +72,7 @@ mock.module('../hooks/use-safe-timeout', () => ({
 
 mock.module('../utils/theme', () => ({
   terminalSupportsRgb24: () => false,
+  orange: { 400: 'darkyellow' },
 }))
 
 mock.module('@opentui/react', () => ({
@@ -81,6 +82,7 @@ mock.module('@opentui/react', () => ({
 
 mock.module('@opentui/core', () => ({
   TextAttributes: { BOLD: 1 },
+  RGBA: { fromInts: () => 'rgba(0,0,0,0)' },
   decodePasteBytes: (bytes: Uint8Array) => new TextDecoder().decode(bytes),
 }))
 
