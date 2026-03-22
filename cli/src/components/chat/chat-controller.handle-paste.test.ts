@@ -15,7 +15,7 @@ const EMPTY_INPUT: InputValue = {
 describe('handleChatControllerPaste', () => {
   test('inserts inline text into input state via real chat-controller paste path', async () => {
     let state = EMPTY_INPUT
-    await handleChatControllerPaste({
+    const outcome = await handleChatControllerPaste({
       eventText: 'hello',
       addClipboardImage: async () => false,
       addImageFromFilePath: async () => false,
@@ -24,6 +24,7 @@ describe('handleChatControllerPaste', () => {
       },
     })
 
+    expect(outcome).toBe('text-inline')
     expect(state.text).toBe('hello')
     expect(state.cursorPosition).toBe(5)
   })
@@ -31,7 +32,7 @@ describe('handleChatControllerPaste', () => {
   test('prefers image-path branch and skips text insertion', async () => {
     let state = EMPTY_INPUT
     let imagePathCalls = 0
-    await handleChatControllerPaste({
+    const outcome = await handleChatControllerPaste({
       eventText: '/tmp/image.png',
       addClipboardImage: async () => false,
       addImageFromFilePath: async () => {
@@ -43,7 +44,9 @@ describe('handleChatControllerPaste', () => {
       },
     })
 
+    expect(outcome).toBe('pasted-image-path')
     expect(imagePathCalls).toBe(1)
     expect(state.text).toBe('')
   })
+
 })

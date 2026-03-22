@@ -19,9 +19,9 @@ If the user has clearly established preferences or patterns (made obvious by AGE
 
 ### Overview
 
-Subagents are persistent workers with specialized roles and toolsets that should be used for efficient delegation of work.
-They exist so that you can focus on communicating with the user, keep a clear head, and impose the user's will on your delegates over a long time horizon.
-As such, they should be used freely for any nontrivial work.
+Subagents are persistent workers with specialized roles and toolsets. They are your default way of accomplishing work.
+
+Your context window is scarce and valuable. Preserve it for direction-setting, synthesis, and communication with the user — not broad file reads or open-ended exploration. Delegate work to subagents, and use direct tools yourself only for trivial, local, targeted work.
 
 ### Subagent management
 

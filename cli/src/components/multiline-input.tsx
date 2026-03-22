@@ -100,7 +100,7 @@ function columnToCharOffsetInLine(
   return Math.min(charOffset, lineEndOffsetExclusive)
 }
 
-function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null): number[] {
+export function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null): number[] {
   if (
     !lineInfo ||
     !Array.isArray(lineInfo.lineSources) ||
@@ -108,7 +108,7 @@ function deriveVisualLineStarts(text: string, lineInfo: LineInfo | null): number
     lineInfo.lineSources.length === 0 ||
     lineInfo.lineStartCols.length === 0
   ) {
-    return [0]
+    return computeLogicalLineStarts(text)
   }
 
   const logicalLineStarts = computeLogicalLineStarts(text)
@@ -350,6 +350,7 @@ interface MultilineInputProps {
   mentionSegments?: InputMentionSegment[]
   selectedPasteSegmentId?: string | null
   selectedMentionSegmentId?: string | null
+  bulkInsertEpoch?: number
 }
 
 export type MultilineInputHandle = {
@@ -379,6 +380,7 @@ export const MultilineInput = forwardRef<
     mentionSegments = [],
     selectedPasteSegmentId = null,
     selectedMentionSegmentId = null,
+    bulkInsertEpoch = 0,
   }: MultilineInputProps,
   forwardedRef,
 ) {
@@ -391,6 +393,8 @@ export const MultilineInput = forwardRef<
   const [lastActivity, setLastActivity] = useState(Date.now())
 
   const stickyColumnRef = useRef<number | null>(null)
+  const prevBulkInsertEpochRef = useRef(bulkInsertEpoch)
+  const [suppressBottomFollowAutoScroll, setSuppressBottomFollowAutoScroll] = useState(false)
 
   // Refs to track latest value and cursor position synchronously for IME input handling.
   // When IME sends multiple character events rapidly (e.g., Chinese input), React batches
@@ -428,6 +432,12 @@ export const MultilineInput = forwardRef<
   useEffect(() => {
     setLastActivity(Date.now())
   }, [value, cursorPosition])
+
+  useEffect(() => {
+    if (bulkInsertEpoch === prevBulkInsertEpochRef.current) return
+    prevBulkInsertEpochRef.current = bulkInsertEpoch
+    setSuppressBottomFollowAutoScroll(true)
+  }, [bulkInsertEpoch])
 
   const textRef = useRef<TextRenderable | null>(null)
 
@@ -492,6 +502,11 @@ export const MultilineInput = forwardRef<
 
   // Auto-scroll to cursor when content changes
   useEffect(() => {
+    if (suppressBottomFollowAutoScroll) {
+      setSuppressBottomFollowAutoScroll(false)
+      return
+    }
+
     const scrollMetrics = focused
       ? safeRenderableAccess(
           scrollBoxRef.current,
@@ -524,7 +539,7 @@ export const MultilineInput = forwardRef<
       },
       { mountedRef },
     )
-  }, [cursorPosition, focused, cursorRow, mountedRef])
+  }, [cursorPosition, focused, cursorRow, mountedRef, suppressBottomFollowAutoScroll])
 
   const sortedPasteSegments = sortSegments(pasteSegments)
   const sortedMentionSegments = sortMentionSegments(mentionSegments)
@@ -1840,7 +1855,7 @@ export const MultilineInput = forwardRef<
     <scrollbox
       ref={scrollBoxRef}
       scrollX={false}
-      stickyScroll={true}
+      stickyScroll={!suppressBottomFollowAutoScroll}
       stickyStart="bottom"
       scrollbarOptions={{ visible: false }}
       verticalScrollbarOptions={{

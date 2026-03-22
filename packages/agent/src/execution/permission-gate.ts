@@ -63,7 +63,7 @@ export function buildPermissionInterceptor(
               }
               if (!policyCtx.disableShellSafeguards && !isGitAllowed(input.command)) {
                 return reject(PermissionRejection.Forbidden({
-                  reason: 'Only read-only git commands are allowed (status, log, diff, show, branch).'
+                  reason: 'Only read-only git commands are allowed (status, log, diff, etc).'
                 }))
               }
             }

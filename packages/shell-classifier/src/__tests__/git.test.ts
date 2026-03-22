@@ -40,6 +40,9 @@ describe('git classification', () => {
       'show HEAD',
       'show HEAD:file.txt',
       'show --stat',
+      'rev-parse HEAD',
+      'rev-parse --show-toplevel',
+      'rev-parse --git-dir',
       'branch --list',
       'branch -l',
       'branch -a',
@@ -169,6 +172,14 @@ describe('git classification', () => {
 
     test('git -c user.name=x log', () => {
       expect(isGitReadOnly(args('-c user.name=x log'))).toBe(false)
+    })
+
+    test('git -c user.name=x rev-parse HEAD', () => {
+      expect(isGitReadOnly(args('-c user.name=x rev-parse HEAD'))).toBe(false)
+    })
+
+    test('git --config-env TOKEN=GH_TOKEN rev-parse HEAD', () => {
+      expect(isGitReadOnly(args('--config-env TOKEN=GH_TOKEN rev-parse HEAD'))).toBe(false)
     })
   })
 
@@ -303,10 +314,6 @@ describe('git classification', () => {
 
     test('git describe → forbidden (not allowlisted)', () => {
       expect(isGitReadOnly(args('describe'))).toBe(false)
-    })
-
-    test('git rev-parse HEAD → forbidden (not allowlisted)', () => {
-      expect(isGitReadOnly(args('rev-parse HEAD'))).toBe(false)
     })
 
     test('git ls-files → forbidden (not allowlisted)', () => {

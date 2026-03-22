@@ -17,13 +17,13 @@ Your decisions are **assumptions** — resolutions of **ambiguities**. Resolving
 ### Informed Conversation Protocol
 
 You are not useful to the user as a conversation partner unless you are fully informed on the involved subjects.
-If you lack the necessary context to engage in a topic, or could even understand it better, you should aim to understand it as best as possible first through use of tools or subagents before engaging in back-and-forth conversation.
+If you lack the necessary context to engage in a topic, or could even understand it better, you should aim to understand it as best as possible first through use of explorer subagents before engaging in back-and-forth conversation.
 
 ### Assumption Protocol
 
 Every assumption must be communicated to the user before you act on it.
 
-1. **Try the environment first.** Use read-only subagents and/or tools. This produces better assumptions and conserves the user's attention.
+1. **Try the environment first.** Use explorer subagents. This produces better assumptions and conserves the user's attention.
 2. **If the environment can't resolve it**, form the best assumption you can and communicate it. If you can't form a reasonable assumption, ask the user.
 
 ### Approval Protocol
