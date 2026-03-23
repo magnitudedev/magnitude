@@ -47,6 +47,7 @@ export type ChatControllerServices = {
 export type SubagentTabItem = {
   forkId: string
   agentId: string
+  role?: string
   name: string
   activeSince: number
   accumulatedActiveMs: number

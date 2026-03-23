@@ -10,6 +10,7 @@ import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
 import { renderToolStep } from '../tool-displays/render'
 import { selectLatestLiveActivityFromThinkSteps } from '../utils/live-activity'
+import { formatSubagentIdWithEmoji } from '../utils/subagent-role-emoji'
 
 const SHIMMER_INTERVAL_MS = 160
 
@@ -48,7 +49,7 @@ const SubagentStartedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 's
       <span style={{ fg: theme.muted }}>Subagent </span>
       <span style={{ fg: theme.muted }}>started</span>
       <span style={{ fg: theme.muted }}>: </span>
-      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      <span style={{ fg: theme.foreground }}>{formatSubagentIdWithEmoji(step.subagentId, step.subagentType)}</span>
       {step.resumed && <span style={{ fg: theme.muted }}> (resumed)</span>}
       <span style={{ fg: theme.muted }}> — {step.title}</span>
     </text>
@@ -65,7 +66,7 @@ const SubagentFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: '
       <span style={{ fg: theme.muted }}>Subagent </span>
       <span style={{ fg: theme.muted }}>finished</span>
       <span style={{ fg: theme.muted }}>: </span>
-      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      <span style={{ fg: theme.foreground }}>{formatSubagentIdWithEmoji(step.subagentId, step.subagentType)}</span>
       {step.resumed && <span style={{ fg: theme.muted }}> (resumed)</span>}
       <span style={{ fg: theme.muted }}> · {step.resumed ? '↺ ' : ''}{duration} · </span>
       <span style={{ fg: theme.primary }}>{tools}</span>
@@ -81,7 +82,7 @@ const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'su
     <text>
       <span style={{ fg: theme.error }}>■ </span>
       <span style={{ fg: theme.muted }}>{message}</span>
-      <span style={{ fg: theme.foreground }}>{step.subagentId}</span>
+      <span style={{ fg: theme.foreground }}>{formatSubagentIdWithEmoji(step.subagentId, step.subagentType)}</span>
       <span style={{ fg: theme.muted }}> - {step.title}</span>
     </text>
   )

@@ -7,6 +7,7 @@ import { slate } from '../../utils/palette'
 import { getDisplayWidth, padEndToDisplayWidth, truncateToDisplayWidth } from '../../utils/strings'
 
 import type { SubagentTabItem } from './types'
+import { formatSubagentIdWithEmoji } from '../../utils/subagent-role-emoji'
 
 const TAB_INNER_WIDTH = 32 // inner content width (chars), excluding border+padding
 const TAB_CLOSE_CELL_WIDTH = 2
@@ -203,7 +204,8 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
             const prefixWidth = getDisplayWidth(line1Prefix)
             const suffixWidth = getDisplayWidth(line1Suffix)
             const nameBudget = Math.max(1, TAB_INNER_WIDTH - prefixWidth - suffixWidth)
-            const namePart = truncateToDisplayWidth(tab.agentId, nameBudget)
+            const formattedId = formatSubagentIdWithEmoji(tab.agentId, tab.role)
+            const namePart = truncateToDisplayWidth(formattedId, nameBudget)
             const line1RestWidth = Math.max(0, TAB_INNER_WIDTH - prefixWidth - getDisplayWidth(namePart))
             const line1Rest = padEndToDisplayWidth(
               truncateToDisplayWidth(line1Suffix, line1RestWidth),

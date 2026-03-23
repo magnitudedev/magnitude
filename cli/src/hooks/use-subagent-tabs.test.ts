@@ -5,10 +5,10 @@ import { buildSubagentTabItem, reconcileForkMeta, sortSubagentTabs } from './use
 describe('sortSubagentTabs', () => {
   test('keeps active tabs first and sorts idle tabs by completedAt descending', () => {
     const tabs: SubagentTabItem[] = [
-      { forkId: 'idle-older', agentId: 'idle-older', name: 'Idle Older', activeSince: 10, accumulatedActiveMs: 1000, completedAt: 20, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle' },
-      { forkId: 'active-newer', agentId: 'active-newer', name: 'Active Newer', activeSince: 30, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
-      { forkId: 'active-older', agentId: 'active-older', name: 'Active Older', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
-      { forkId: 'idle-newer', agentId: 'idle-newer', name: 'Idle Newer', activeSince: 40, accumulatedActiveMs: 1000, completedAt: 50, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle' },
+      { forkId: 'idle-older', agentId: 'idle-older', name: 'Idle Older', activeSince: 10, accumulatedActiveMs: 1000, completedAt: 20, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
+      { forkId: 'active-newer', agentId: 'active-newer', name: 'Active Newer', activeSince: 30, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active', role: 'builder' },
+      { forkId: 'active-older', agentId: 'active-older', name: 'Active Older', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active', role: 'builder' },
+      { forkId: 'idle-newer', agentId: 'idle-newer', name: 'Idle Newer', activeSince: 40, accumulatedActiveMs: 1000, completedAt: 50, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
     ]
 
     const sorted = [...tabs].sort(sortSubagentTabs)
@@ -17,9 +17,9 @@ describe('sortSubagentTabs', () => {
 
   test('places idle tabs with undefined completedAt last within idle tabs', () => {
     const tabs: SubagentTabItem[] = [
-      { forkId: 'idle-no-completed', agentId: 'idle-no-completed', name: 'Idle No Completed', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle' },
-      { forkId: 'idle-with-completed', agentId: 'idle-with-completed', name: 'Idle With Completed', activeSince: 20, accumulatedActiveMs: 1000, completedAt: 10, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle' },
-      { forkId: 'active', agentId: 'active', name: 'Active', activeSince: 1, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active' },
+      { forkId: 'idle-no-completed', agentId: 'idle-no-completed', name: 'Idle No Completed', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
+      { forkId: 'idle-with-completed', agentId: 'idle-with-completed', name: 'Idle With Completed', activeSince: 20, accumulatedActiveMs: 1000, completedAt: 10, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
+      { forkId: 'active', agentId: 'active', name: 'Active', activeSince: 1, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active', role: 'builder' },
     ]
 
     const sorted = [...tabs].sort(sortSubagentTabs)

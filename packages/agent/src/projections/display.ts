@@ -114,6 +114,7 @@ export interface SubagentStartedStep {
 export interface SubagentFinishedStep {
   readonly id: string
   readonly type: 'subagent_finished'
+  readonly subagentType: string
   readonly subagentId: string
   readonly cumulativeTotalTimeMs: number
   readonly cumulativeTotalToolsUsed: number
@@ -123,6 +124,7 @@ export interface SubagentFinishedStep {
 export interface SubagentKilledStep {
   readonly id: string
   readonly type: 'subagent_killed'
+  readonly subagentType: string
   readonly subagentId: string
   readonly title: string
 }
@@ -130,6 +132,7 @@ export interface SubagentKilledStep {
 export interface SubagentUserKilledStep {
   readonly id: string
   readonly type: 'subagent_user_killed'
+  readonly subagentType: string
   readonly subagentId: string
   readonly title: string
 }
@@ -1475,6 +1478,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         const step: SubagentFinishedStep = {
           id: generateId(),
           type: 'subagent_finished',
+          subagentType: value.type,
           subagentId: value.agentId,
           cumulativeTotalTimeMs,
           cumulativeTotalToolsUsed: totalToolsUsed(msg.toolCounts),
@@ -1566,6 +1570,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const step: SubagentKilledStep = {
         id: generateId(),
         type: 'subagent_killed',
+        subagentType: value.type,
         subagentId: value.agentId,
         title: value.title,
       }
@@ -1591,6 +1596,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const step: SubagentUserKilledStep = {
         id: generateId(),
         type: 'subagent_user_killed',
+        subagentType: value.type,
         subagentId: value.agentId,
         title: value.title,
       }

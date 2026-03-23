@@ -24,6 +24,7 @@ type UseSubagentTabsArgs = {
 
 type ForkMeta = {
   agentId: string
+  role?: string
   name: string
   activeSince: number
   accumulatedActiveMs: number
@@ -62,6 +63,7 @@ export function buildSubagentTabItem(args: {
   return {
     forkId,
     agentId: meta.agentId,
+    role: meta.role,
     name: meta.name,
     activeSince,
     accumulatedActiveMs,
@@ -110,6 +112,7 @@ export function reconcileForkMeta(args: {
 
     next[forkId] = {
       agentId: forkAgent?.agentId ?? previous?.agentId ?? forkId,
+      role: forkAgent?.role ?? activity.role ?? previous?.role,
       name: activity.name,
       activeSince: activity.activeSince,
       accumulatedActiveMs: activity.accumulatedActiveMs,

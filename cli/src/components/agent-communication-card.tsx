@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/use-theme'
 import { useTerminalWidth } from '../hooks/use-terminal-width'
 import { PREVIEW_LINE_CAP, wrapTextToVisualLines } from '../utils/strings'
 import { TextAttributes } from '@opentui/core'
+import { formatSubagentIdWithEmoji } from '../utils/subagent-role-emoji'
 
 type AgentCommunicationMessage = Extract<DisplayMessage, { type: 'agent_communication' }>
 
@@ -48,11 +49,15 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
             <>
               <span fg={theme.info} attributes={TextAttributes.BOLD}>Main agent</span>
               <span attributes={TextAttributes.BOLD}> → </span>
-              <span fg={theme.secondary} attributes={TextAttributes.BOLD}>{message.agentId}</span>
+              <span fg={theme.secondary} attributes={TextAttributes.BOLD}>
+                {formatSubagentIdWithEmoji(message.agentId, message.agentRole)}
+              </span>
             </>
           ) : (
             <>
-              <span fg={theme.secondary} attributes={TextAttributes.BOLD}>{message.agentId}</span>
+              <span fg={theme.secondary} attributes={TextAttributes.BOLD}>
+                {formatSubagentIdWithEmoji(message.agentId, message.agentRole)}
+              </span>
               <span attributes={TextAttributes.BOLD}> → </span>
               <span fg={theme.info} attributes={TextAttributes.BOLD}>Main agent</span>
             </>

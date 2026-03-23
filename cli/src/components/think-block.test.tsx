@@ -45,6 +45,7 @@ test('ThinkBlock renders subagent started/finished/killed rows with structured f
           {
             id: 's2',
             type: 'subagent_finished',
+            subagentType: 'builder',
             subagentId: 'agent-7',
             cumulativeTotalTimeMs: 125000,
             cumulativeTotalToolsUsed: 3,
@@ -58,8 +59,8 @@ test('ThinkBlock renders subagent started/finished/killed rows with structured f
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('▶ Subagent started: agent-7 — Investigate flaky test')
-  expect(text).toContain('✓ Subagent finished: agent-7 · 2m 5s · 3 tools')
+  expect(text).toContain('▶ Subagent started: ⚒ agent-7 — Investigate flaky test')
+  expect(text).toContain('✓ Subagent finished: ⚒ agent-7 · 2m 5s · 3 tools')
 })
 
 test('ThinkBlock includes resumed marker for subagent lifecycle rows', () => {
@@ -83,6 +84,7 @@ test('ThinkBlock includes resumed marker for subagent lifecycle rows', () => {
           {
             id: 's2',
             type: 'subagent_finished',
+            subagentType: 'researcher',
             subagentId: 'agent-3',
             cumulativeTotalTimeMs: 60000,
             cumulativeTotalToolsUsed: 1,
@@ -213,6 +215,7 @@ test('ThinkBlock summary includes killed subagent counts from both kill sources'
           {
             id: 's2',
             type: 'subagent_killed',
+            subagentType: 'researcher',
             subagentId: 'researcher',
             title: 'gather evidence',
             timestamp: now + 2000,
@@ -221,6 +224,7 @@ test('ThinkBlock summary includes killed subagent counts from both kill sources'
           {
             id: 's3',
             type: 'subagent_user_killed',
+            subagentType: 'builder',
             subagentId: 'builder',
             title: 'fix tests',
             timestamp: now + 3000,
@@ -251,6 +255,7 @@ test('ThinkBlock renders user-killed subagent row with dedicated text', () => {
           {
             id: 's1',
             type: 'subagent_user_killed',
+            subagentType: 'researcher',
             subagentId: 'researcher',
             title: 'gather evidence',
             timestamp: now + 500,
