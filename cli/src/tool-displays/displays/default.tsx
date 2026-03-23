@@ -1,14 +1,14 @@
 import { TextAttributes } from '@opentui/core';
 import type { ToolState } from '@magnitudedev/agent';
-import type { CommonToolProps } from '../types';
+import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const defaultDisplay = {
-  render({ state, isExpanded, onToggle }: { state: ToolState } & CommonToolProps) {
+export const defaultDisplay = createToolDisplay<ToolState>({
+  render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isErrorLike = state.phase === 'error' || state.phase === 'rejected' || state.phase === 'interrupted';
@@ -42,7 +42,7 @@ export const defaultDisplay = {
       </box>
     );
   },
-  summary(state: ToolState): string {
+  summary: (state) => {
     const target = state.toolKey || 'tool';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Running ${target}`;
     if (state.phase === 'error') return `${target} error`;
@@ -50,4 +50,4 @@ export const defaultDisplay = {
     if (state.phase === 'interrupted') return `${target} interrupted`;
     return `${target} done`;
   },
-};
+});

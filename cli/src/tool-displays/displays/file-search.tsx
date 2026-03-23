@@ -1,5 +1,5 @@
 import { TextAttributes } from '@opentui/core';
-import type { CommonToolProps } from '../types';
+import { createToolDisplay } from '../types';
 import { type FileSearchState } from '@magnitudedev/agent/src/models';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
@@ -33,8 +33,8 @@ function truncateLine(text: string, max: number): string {
   return firstLine;
 }
 
-export const fileSearchDisplay = {
-  render({ state, isExpanded, onToggle }: { state: FileSearchState } & CommonToolProps) {
+export const fileSearchDisplay = createToolDisplay<FileSearchState>({
+  render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const inputSummary = summarizeInputs(state);
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
@@ -95,10 +95,10 @@ export const fileSearchDisplay = {
       </box>
     );
   },
-  summary(state: FileSearchState): string {
+  summary: (state) => {
     const summary = summarizeInputs(state);
     const target = summary.length > 0 ? summary : 'files';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Searching ${target}`;
     return `Searched ${target}`;
   },
-};
+});

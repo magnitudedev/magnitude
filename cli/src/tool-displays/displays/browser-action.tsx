@@ -1,29 +1,17 @@
-import type { ToolState } from '@magnitudedev/agent';
+import type { ToolState, ToolKey, ToolDefinitionMap } from '@magnitudedev/agent';
 import { getBrowserActionBaseLabel, getBrowserActionIcon } from '@magnitudedev/agent/src/tools/browser-action-visuals';
-import type { CommonToolProps } from '../types';
+import { createToolDisplay } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-type BrowserToolKey =
-  | 'click'
-  | 'doubleClick'
-  | 'rightClick'
-  | 'type'
-  | 'scroll'
-  | 'drag'
-  | 'navigate'
-  | 'goBack'
-  | 'switchTab'
-  | 'newTab'
-  | 'screenshot'
-  | 'evaluate'
+type BrowserToolKey = { [K in ToolKey]: ToolDefinitionMap[K] extends { group: 'browser' } ? K : never }[ToolKey]
 
 type BrowserActionToolState = Extract<ToolState, { toolKey: BrowserToolKey }>
 
-export const browserActionDisplay = {
-  render({ state }: { state: BrowserActionToolState } & CommonToolProps) {
+export const browserActionDisplay = createToolDisplay<BrowserActionToolState>({
+  render: ({ state }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -64,7 +52,7 @@ export const browserActionDisplay = {
       </box>
     );
   },
-  summary(state: BrowserActionToolState): string {
+  summary: (state) => {
     const label = (state.label ?? '').trim().replace(/\s+/g, ' ');
     const detail = (state.detail ?? '').trim().replace(/\s+/g, ' ');
     if (label.length === 0) return 'Browser action';
@@ -74,4 +62,4 @@ export const browserActionDisplay = {
     const separator = (noSpaceBeforeDetail || noSpaceAfterLabel) ? '' : ' ';
     return `${label}${separator}${detail}`;
   },
-};
+});

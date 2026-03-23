@@ -1,5 +1,5 @@
 import { type WebFetchState } from '@magnitudedev/agent/src/models';
-import type { CommonToolProps } from '../types';
+import { createToolDisplay } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
@@ -10,8 +10,8 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + '…';
 }
 
-export const webFetchDisplay = {
-  render({ state }: { state: WebFetchState } & CommonToolProps) {
+export const webFetchDisplay = createToolDisplay<WebFetchState>({
+  render: ({ state }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -47,10 +47,10 @@ export const webFetchDisplay = {
       </text>
     );
   },
-  summary(state: WebFetchState): string {
+  summary: (state) => {
     const url = state.url || 'URL';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Fetching ${url}`;
     if (state.phase === 'error') return `Fetch ${url}`;
     return `Fetched ${url}`;
   },
-};
+});

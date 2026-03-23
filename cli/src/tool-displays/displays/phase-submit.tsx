@@ -1,5 +1,5 @@
 import { TextAttributes } from '@opentui/core'
-import type { CommonToolProps } from '../types'
+import { createToolDisplay } from '../types'
 import { useTheme } from '../../hooks/use-theme'
 
 type PhaseSubmitState = {
@@ -30,8 +30,8 @@ function getSuccessText(state: PhaseSubmitState): string {
   return 'Phase submitted'
 }
 
-export const phaseSubmitDisplay = {
-  render({ state }: { state: PhaseSubmitState } & CommonToolProps) {
+export const phaseSubmitDisplay = createToolDisplay<PhaseSubmitState>({
+  render: ({ state }) => {
     const theme = useTheme()
     const isRunning = state.phase === 'streaming' || state.phase === 'executing'
     const errorText = getErrorText(state)
@@ -60,8 +60,8 @@ export const phaseSubmitDisplay = {
       </text>
     )
   },
-  summary(state: PhaseSubmitState): string {
+  summary: (state) => {
     if (state.phase === 'streaming' || state.phase === 'executing') return 'Submitting phase'
     return 'Submitted phase'
   },
-}
+})

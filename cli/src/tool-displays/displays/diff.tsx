@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { TextAttributes } from '@opentui/core';
 import { type DiffState } from '@magnitudedev/agent/src/models';
-import type { CommonToolProps } from '../types';
+import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { DiffHunk } from '../../components/diff-hunk';
@@ -9,8 +9,8 @@ import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const diffDisplay = {
-  render({ state, isExpanded, onToggle, onFileClick }: { state: DiffState } & CommonToolProps) {
+export const diffDisplay = createToolDisplay<DiffState>({
+  render: ({ state, isExpanded, onToggle, onFileClick }) => {
     const theme = useTheme();
     const path = state.path;
     const oldText = state.oldText ?? '';
@@ -118,9 +118,9 @@ export const diffDisplay = {
       </box>
     );
   },
-  summary(state: DiffState): string {
+  summary: (state) => {
     const path = state.path || 'file';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Editing ${String(path)}`;
     return `Edited ${String(path)}`;
   },
-};
+});

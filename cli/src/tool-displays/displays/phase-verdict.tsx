@@ -1,12 +1,12 @@
-import type { CommonToolProps } from '../types'
+import { createToolDisplay } from '../types'
 import { useTheme } from '../../hooks/use-theme'
 
 type PhaseVerdictState = {
   phase?: string
 }
 
-export const phaseVerdictDisplay = {
-  render({ state }: { state: PhaseVerdictState } & CommonToolProps) {
+export const phaseVerdictDisplay = createToolDisplay<PhaseVerdictState>({
+  render: ({ state }) => {
     const theme = useTheme()
     const isRunning = state.phase === 'streaming' || state.phase === 'executing'
 
@@ -19,7 +19,7 @@ export const phaseVerdictDisplay = {
       </text>
     )
   },
-  summary(state: PhaseVerdictState): string {
+  summary: (state) => {
     return state.phase === 'streaming' || state.phase === 'executing' ? 'Submitting verdict' : 'Verdict submitted'
   },
-}
+})

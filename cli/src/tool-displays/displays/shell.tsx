@@ -1,6 +1,6 @@
 import { TextAttributes } from '@opentui/core';
 import { type ShellState } from '@magnitudedev/agent/src/models';
-import type { CommonToolProps } from '../types';
+import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
@@ -17,8 +17,8 @@ function truncateLine(text: string, max: number): string {
   return firstLine;
 }
 
-export const shellDisplay = {
-  render({ state, isExpanded, onToggle }: { state: ShellState } & CommonToolProps) {
+export const shellDisplay = createToolDisplay<ShellState>({
+  render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const command = state.command || '';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
@@ -101,7 +101,7 @@ export const shellDisplay = {
       </box>
     );
   },
-  summary(state: ShellState): string {
+  summary: (state) => {
     const command = state.command.trim();
     if (state.phase === 'streaming' || state.phase === 'executing') return command ? `$ ${command}` : 'Running shell command';
     if (state.phase === 'error') return command ? `Shell error: $ ${command}` : 'Shell error';
@@ -109,4 +109,4 @@ export const shellDisplay = {
     if (state.done === 'detached') return 'Detached shell';
     return command ? `$ ${command}` : 'Ran shell command';
   },
-};
+});
