@@ -81,6 +81,18 @@ export const getEffectiveSelectedForkId = (
   return subagentTabs.some((tab) => tab.forkId === selectedTabForkId) ? selectedTabForkId : null
 }
 
+export const getSelectedForkContentVersion = (
+  selectedForkId: string | null,
+  forkDisplay: Pick<DisplayState, 'messages' | 'pendingInboundCommunications'> | null
+): string => {
+  if (!selectedForkId) return 'main'
+  return [
+    selectedForkId,
+    forkDisplay?.messages.length ?? 0,
+    forkDisplay?.pendingInboundCommunications.length ?? 0,
+  ].join(':')
+}
+
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
 export function App({ resume, debug, onClientReady }: { resume: boolean; debug: boolean; onClientReady?: (client: AgentClient | null) => void }) {
@@ -1520,6 +1532,43 @@ function AppInner({
   const lastStreamingMessageIdRef = useRef<string | null>(null)
   const interruptedMessageIdRef = useRef<string | null>(null)
   const [headerScrolledOff, setHeaderScrolledOff] = useState(false)
+
+  const snapChatToBottom = useCallback(() => {
+    const scrollbox = scrollboxRef.current
+    if (!scrollbox) return
+
+    // OpenTUI ScrollBoxRenderable API: use scrollTo(...); scrollTop is a minimal fallback.
+    if (typeof scrollbox.scrollTo === 'function') {
+      scrollbox.scrollTo(Number.MAX_SAFE_INTEGER)
+      return
+    }
+
+    if (typeof scrollbox.scrollTop === 'number') {
+      scrollbox.scrollTop = Number.MAX_SAFE_INTEGER
+    }
+  }, [])
+
+  useEffect(() => {
+    const t = setTimeout(() => snapChatToBottom(), 0)
+    return () => clearTimeout(t)
+  }, [selectedForkId, snapChatToBottom])
+
+  const selectedForkContentVersion = useMemo(
+    () => getSelectedForkContentVersion(selectedForkId, forkDisplay),
+    [selectedForkId, forkDisplay]
+  )
+
+  useEffect(() => {
+    if (!selectedForkId) return
+
+    const t1 = setTimeout(() => snapChatToBottom(), 0)
+    const t2 = setTimeout(() => snapChatToBottom(), 50)
+
+    return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+    }
+  }, [selectedForkContentVersion, selectedForkId, snapChatToBottom])
 
   const showStickyHeader = activeThinkBlock != null && !isCollapsed(activeThinkBlock.id) && headerScrolledOff
 
