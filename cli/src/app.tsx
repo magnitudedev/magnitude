@@ -160,9 +160,6 @@ function AppInner({
   const [forkTokenEstimate, setForkTokenEstimate] = useState(0)
   const [forkIsCompacting, setForkIsCompacting] = useState(false)
 
-  const [nextCtrlCWillExit, setNextCtrlCWillExit] = useState(false)
-  const exitTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-
   const [systemMessages, setSystemMessages] = useState<Array<{ id: string; text: string; timestamp: number }>>([])
   const systemMessageTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const [showRecentChatsOverlay, setShowRecentChatsOverlay] = useState(false)
@@ -188,7 +185,7 @@ function AppInner({
   const [debugSnapshot, setDebugSnapshot] = useState<DebugSnapshot | null>(null)
   const [debugEvents, setDebugEvents] = useState<AppEvent[]>([])
   const [debugLogs, setDebugLogs] = useState<LogEntry[]>([])
-  const [inputHasText, setInputHasText] = useState(false)
+  const [composerHasContent, setComposerHasContent] = useState(false)
   const [restoredQueuedInputText, setRestoredQueuedInputText] = useState<string | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
   const [isCompacting, setIsCompacting] = useState(false)
@@ -891,7 +888,7 @@ function AppInner({
   }, [onResumeSession])
 
   // Navigation for startup widget (active when no messages, overlay closed, and input empty)
-  const widgetNavActive = !showRecentChatsOverlay && (display?.messages ?? []).length === 0 && !inputHasText
+  const widgetNavActive = !showRecentChatsOverlay && (display?.messages ?? []).length === 0 && !composerHasContent
   const widgetNavigation = useRecentChatsNavigation(
     recentChats ? recentChats.slice(0, 5) : [],
     handleResumeChat,
@@ -1456,14 +1453,10 @@ function AppInner({
         const isCtrlR = key.ctrl && key.name === 'r' && !key.meta && !key.option
 
         if (isCtrlC) {
+          if (composerHasContent) return
+          if ((activeDisplay ?? display)?.status === 'streaming') return
           key.preventDefault()
-          if (nextCtrlCWillExit) {
-            process.kill(process.pid, 'SIGINT')
-          } else {
-            setNextCtrlCWillExit(true)
-            if (exitTimeoutRef.current) clearTimeout(exitTimeoutRef.current)
-            exitTimeoutRef.current = setTimeout(() => setNextCtrlCWillExit(false), 2000)
-          }
+          process.kill(process.pid, 'SIGINT')
           return
         }
 
@@ -1479,7 +1472,7 @@ function AppInner({
           setShowRecentChatsOverlay(prev => !prev)
         }
       },
-      [nextCtrlCWillExit, debugMode],
+      [composerHasContent, debugMode, activeDisplay, display],
     ),
   )
 
@@ -1835,7 +1828,7 @@ function AppInner({
                     onApprove={handleApprove}
                     onReject={handleReject}
 
-                    inputHasText={inputHasText}
+                    inputHasText={composerHasContent}
                     onFileClick={openFile}
                     onForkExpand={pushForkOverlay}
                   />
@@ -1925,7 +1918,6 @@ function AppInner({
               attachmentsMaxWidth,
               composerCanFocus,
               widgetNavActive,
-              nextCtrlCWillExit,
               isSubagentView: selectedForkId !== null,
             }}
             services={{
@@ -1990,7 +1982,7 @@ function AppInner({
             onCloseFilePanel={closeFilePanel}
             onApprove={handleApprove}
             onReject={handleReject}
-            onInputHasTextChange={setInputHasText}
+            onInputHasTextChange={setComposerHasContent}
             restoredQueuedInputText={restoredQueuedInputText}
             onRestoredQueuedInputHandled={() => setRestoredQueuedInputText(null)}
           />

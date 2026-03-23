@@ -19,7 +19,6 @@ export type ChatControllerEnv = {
   attachmentsMaxWidth: number
   composerCanFocus: boolean
   widgetNavActive: boolean
-  nextCtrlCWillExit: boolean
   isSubagentView: boolean
 }
 

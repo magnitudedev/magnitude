@@ -133,8 +133,7 @@ export function ChatController(props: ChatControllerProps) {
   const historyNavRef = useRef(false)
   const [nextEscWillKillAll, setNextEscWillKillAll] = useState(false)
   const killAllTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const [nextEscWillClearInput, setNextEscWillClearInput] = useState(false)
-  const clearInputTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+
   const [isProviderHovered, setIsProviderHovered] = useState(false)
   const [isModelHovered, setIsModelHovered] = useState(false)
   const [pendingKillForkId, setPendingKillForkId] = useState<string | null>(null)
@@ -382,10 +381,6 @@ export function ChatController(props: ChatControllerProps) {
       setSavedDraft('')
       return
     }
-    if (nextEscWillClearInput) {
-      setNextEscWillClearInput(false)
-      if (clearInputTimeoutRef.current) clearTimeout(clearInputTimeoutRef.current)
-    }
     if (historyNavRef.current) {
       historyNavRef.current = false
     } else if (historyIndex != null && value.text !== (history[historyIndex] ?? '')) {
@@ -393,7 +388,7 @@ export function ChatController(props: ChatControllerProps) {
       setSavedDraft('')
     }
     setInputValue(value)
-  }, [env.bashMode, nextEscWillClearInput, historyIndex, history])
+  }, [env.bashMode, historyIndex, history])
 
   const handlePaste = useCallback(async (eventText?: string): Promise<boolean> => {
     const result = await handleChatControllerPaste({
@@ -487,10 +482,7 @@ export function ChatController(props: ChatControllerProps) {
         killAllTimeoutRef={killAllTimeoutRef}
         onInterrupt={handleInterrupt}
         onInterruptAll={handleInterruptAll}
-        inputText={inputValue.text}
-        nextEscWillClearInput={nextEscWillClearInput}
-        setNextEscWillClearInput={setNextEscWillClearInput}
-        clearInputTimeoutRef={clearInputTimeoutRef}
+        composerHasContent={inputValue.text.trim().length > 0 || attachments.length > 0}
         onClearInput={clearComposer}
         bashMode={env.bashMode}
         onExitBashMode={() => {
@@ -601,10 +593,6 @@ export function ChatController(props: ChatControllerProps) {
             <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={env.attachmentsMaxWidth} />
           ) : nextEscWillKillAll ? (
             <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all subagents</text>
-          ) : nextEscWillClearInput ? (
-            <text style={{ fg: env.theme.secondary }}>Press Esc again to clear text</text>
-          ) : env.nextCtrlCWillExit ? (
-            <text style={{ fg: env.theme.secondary }}>Press Ctrl-C again to exit</text>
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null}
@@ -612,10 +600,6 @@ export function ChatController(props: ChatControllerProps) {
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
           {attachments.length > 0 && (nextEscWillKillAll ? (
             <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all subagents</text>
-          ) : nextEscWillClearInput ? (
-            <text style={{ fg: env.theme.secondary }}>Press Esc again to clear text</text>
-          ) : env.nextCtrlCWillExit ? (
-            <text style={{ fg: env.theme.secondary }}>Press Ctrl-C again to exit</text>
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null)}

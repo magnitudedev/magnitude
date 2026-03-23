@@ -10,10 +10,7 @@ interface ChatSurfaceKeyboardProps {
   killAllTimeoutRef: RefObject<NodeJS.Timeout | null>
   onInterrupt: () => void
   onInterruptAll: () => void
-  inputText: string
-  nextEscWillClearInput: boolean
-  setNextEscWillClearInput: (next: boolean) => void
-  clearInputTimeoutRef: RefObject<NodeJS.Timeout | null>
+  composerHasContent: boolean
   onClearInput: () => void
   bashMode: boolean
   onExitBashMode: () => void
@@ -30,10 +27,7 @@ export function ChatSurfaceKeyboard({
   killAllTimeoutRef,
   onInterrupt,
   onInterruptAll,
-  inputText,
-  nextEscWillClearInput,
-  setNextEscWillClearInput,
-  clearInputTimeoutRef,
+  composerHasContent,
   onClearInput,
   bashMode,
   onExitBashMode,
@@ -48,7 +42,7 @@ export function ChatSurfaceKeyboard({
       const isEscape = key.name === 'escape'
       const isCtrlC = key.ctrl && key.name === 'c' && !key.meta && !key.option
 
-      if (isCtrlC && inputText.trim().length > 0) {
+      if (isCtrlC && composerHasContent) {
         key.preventDefault()
         onClearInput()
         return
@@ -102,24 +96,7 @@ export function ChatSurfaceKeyboard({
         return
       }
 
-      if (isEscape && inputText.length > 0) {
-        key.preventDefault()
-        if (nextEscWillClearInput) {
-          onClearInput()
-          setNextEscWillClearInput(false)
-          if (clearInputTimeoutRef.current) {
-            clearTimeout(clearInputTimeoutRef.current)
-          }
-        } else {
-          setNextEscWillClearInput(true)
-          if (clearInputTimeoutRef.current) {
-            clearTimeout(clearInputTimeoutRef.current)
-          }
-          clearInputTimeoutRef.current = setTimeout(() => {
-            setNextEscWillClearInput(false)
-          }, 2000)
-        }
-      }
+
     }, [
       status,
       hasRunningForks,
@@ -128,10 +105,7 @@ export function ChatSurfaceKeyboard({
       killAllTimeoutRef,
       onInterrupt,
       onInterruptAll,
-      inputText,
-      nextEscWillClearInput,
-      setNextEscWillClearInput,
-      clearInputTimeoutRef,
+      composerHasContent,
       onClearInput,
       bashMode,
       onExitBashMode,
