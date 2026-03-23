@@ -21,16 +21,15 @@ import { actionsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitu
 import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
-import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError, NotConfigured, ProviderDisconnected } from '@magnitudedev/providers'
+import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
 import type { ModelError } from '@magnitudedev/providers'
 import { drainTurnEventStream } from './turn-event-drain'
 import type { ChatMessage } from '@magnitudedev/llm-core'
 import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { Image as BamlImage } from '@boundaryml/baml'
-import type { ObservationPart } from '@magnitudedev/agent-definition'
-import { getXmlActProtocol, buildAckTurn } from '@magnitudedev/agent-definition'
-import subagentBasePrompt from '../agents/prompts/subagent-base.txt' with { type: 'text' }
-import workspacePrompt from '../agents/prompts/workspace.txt' with { type: 'text' }
+import type { ObservationPart } from '@magnitudedev/roles'
+import { buildAckTurn } from '../prompts/protocol'
+import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
 import type { AppEvent, ResponsePart } from '../events'
 
@@ -44,9 +43,8 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { WorkingStateProjection } from '../projections/working-state'
 import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, ORCHESTRATOR_ONESHOT_PROMPT, type AgentVariant } from '../agents'
-import { oneshotThinkingLenses } from '../agents/orchestrator'
-import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
+import { getAgentDefinition, type AgentVariant } from '../agents'
+
 import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
@@ -100,22 +98,6 @@ function classifyRetryability(error: unknown): NonRetryableReason {
 // System Prompt Builder
 // =============================================================================
 
-function buildXmlActSystemPrompt(
-  roleDescription: string,
-  agentDef: ReturnType<typeof getAgentDefinition>,
-  implicitTools: readonly string[] = ['think'],
-  defaultRecipient = 'user',
-  role: 'orchestrator' | 'subagent' | 'oneshot' = 'orchestrator',
-  lenses = agentDef.thinkingLenses,
-): string {
-  const toolDocs = generateXmlActToolDocs(agentDef, implicitTools)
-  return roleDescription
-    .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol(defaultRecipient, lenses, role))
-    .replaceAll('{{TOOL_DOCS}}', toolDocs)
-    .replaceAll('{{SUBAGENT_BASE}}', subagentBasePrompt)
-    .replaceAll('{{WORKSPACE_SECTION}}', workspacePrompt)
-}
-
 // =============================================================================
 // Worker
 // =============================================================================
@@ -154,7 +136,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           : 'orchestrator'
 
         const agentDef = getAgentDefinition(variant)
-        const modelSlot = agentDef.model
+        const modelSlot = agentDef.slot as import('@magnitudedev/providers').ModelSlot
         const timezone = sessionCtx.context?.timezone ?? null
 
         const runtime = yield* ModelResolver
@@ -186,18 +168,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
 
         // 2. Build system prompt with runtime protocol/tool-doc substitution
-        const implicitTools = ['think'] as const
-        const isOneshot = variant === 'orchestrator' && !!sessionCtx.context?.oneshot
-        const systemPrompt = variant === 'orchestrator'
-          ? buildXmlActSystemPrompt(
-              isOneshot ? ORCHESTRATOR_ONESHOT_PROMPT : agentDef.systemPrompt,
-              agentDef,
-              implicitTools,
-              'user',
-              isOneshot ? 'oneshot' : 'orchestrator',
-              isOneshot ? oneshotThinkingLenses : agentDef.thinkingLenses,
-            )
-          : buildXmlActSystemPrompt(agentDef.systemPrompt, agentDef, implicitTools, 'parent', 'subagent')
+        const systemPrompt = renderSystemPrompt(agentDef)
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 
@@ -206,9 +177,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         if (Either.isLeft(resolveResult)) {
           const e = resolveResult.left
           const message = e._tag === 'NotConfigured'
-            ? (isOneshot
-              ? 'No model configured. Ensure --provider and --model flags are set correctly.'
-              : 'No model configured. Please connect a provider and select a model in /settings.')
+            ? 'No model configured. Please connect a provider and select a model in /settings.'
             : e._tag === 'ProviderDisconnected'
             ? e.message
             : `Authentication failed: ${e.message}`
@@ -220,7 +189,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // 3. Build and consume the turn event stream
         const turnStream = createTurnStream((queue) => Effect.gen(function* () {
 
-          const ackTurn = buildAckTurn(agentDef.thinkingLenses)
+          const ackTurn = buildAckTurn(agentDef.lenses)
           const cs = yield* withTraceScope(
             {
               metadata: { callType: 'chat', forkId, forkName: agentInstance?.name ?? 'root', turnId, chainId },
@@ -251,7 +220,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               forkId,
               turnId,
               chainId,
-              defaultProseDest: variant === 'orchestrator' ? 'user' : 'parent',
+              defaultProseDest: agentDef.defaultRecipient,
               allowSingleUserReplyThisTurn,
             },
             queue,

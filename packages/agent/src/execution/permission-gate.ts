@@ -18,13 +18,13 @@ import { PermissionRejection } from './permission-rejection'
 import { classifyShellCommand, writesStayWithin, isGitAllowed } from '@magnitudedev/shell-classifier'
 import { validateAndApply, toEditDiff } from '../util/edit'
 import type { ToolDisplay } from '../events'
-import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
+import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import { PolicyContextProviderTag, type PolicyContext } from '../agents/types'
 
 const { ForkContext } = Fork
 
 /** Resolves the active agent definition for a given fork. */
-export type AgentResolver = (forkId: string | null) => AgentDefinition<ToolSet, PolicyContext>
+export type AgentResolver = (forkId: string | null) => RoleDefinition<ToolSet, string, PolicyContext>
 
 /**
  * Build a ToolInterceptor that enforces the agent's permission policy.

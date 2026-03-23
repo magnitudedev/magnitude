@@ -303,7 +303,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       const backgroundProcessesProjection = yield* BackgroundProcessesProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
-      yield* executionManager.initFork(null, 'orchestrator')
+      const sessionContextState = yield* (yield* SessionContextProjection.Tag).get
+      const rootVariant = sessionContextState.context?.oneshot ? 'orchestrator-oneshot' : 'orchestrator'
+      yield* executionManager.initFork(null, rootVariant)
 
       // Create execution resources for all known agents.
       const agentState = yield* agentStatusProjection.get

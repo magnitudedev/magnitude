@@ -6,12 +6,14 @@
  * No file write access — reviewers only observe, test, and report.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import reviewerPromptRaw from './prompts/reviewer.txt' with { type: 'text' }
+import { compilePromptTemplate } from '../prompts/system-prompt'
 import { readTool, treeTool, searchTool, viewTool } from '../tools/fs'
 import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 
-import { thinkTool } from '../tools/globals'
+
 import { agentCreateTool } from '../tools/agent-tools'
 import { phaseVerdictTool } from '../tools/phase-verdict'
 import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
@@ -42,6 +44,8 @@ const turnLens = defineThinkingLens({
   description: 'Plan what to verify this turn. What tests to run, what commands to execute, what code to inspect? Prioritize execution-based verification over code reading.',
 })
 
+const systemPrompt = compilePromptTemplate(reviewerPromptRaw)
+
 const tools = toolSet({
   fileRead:       readTool,
   fileTree:       treeTool,
@@ -52,19 +56,23 @@ const tools = toolSet({
 
   agentCreate:    agentCreateTool,
 
-  think:          thinkTool,
   phaseVerdict:    phaseVerdictTool,
 })
 
-export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
+export const reviewerRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+  tools,
   id: 'reviewer',
-  model: 'secondary',
+  slot: 'secondary',
   systemPrompt,
-  thinkingLenses: [intentLens, qualityLens, skepticismLens, turnLens],
+  lenses: [intentLens, qualityLens, skepticismLens, turnLens],
+  defaultRecipient: 'parent',
+  protocolRole: 'subagent',
+  initialContext: { parentConversation: true },
+  spawnable: true,
   observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
-    shell(input, ctx) {
+    shell(input: { command: string }, ctx) {
       const result = classifyShellCommand(input.command)
       const allowedPrefixes = ctx.workspacePath ? [ctx.workspacePath] : undefined
       if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
@@ -83,10 +91,4 @@ export const createReviewer = (systemPrompt: string) => defineAgent<typeof tools
       return continue_()
     },
   },
-
-
-  display: (d) => ({
-    think() { return d.hidden() },
-    _default() { return d.visible() },
-  }),
 })

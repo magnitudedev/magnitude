@@ -1,5 +1,5 @@
 {
-  "name": "@magnitudedev/agent-definition",
+  "name": "@magnitudedev/roles",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@magnitudedev/tools": "workspace:*"
+    "@magnitudedev/tools": "workspace:*",
+    "effect": "^3.19.6"
   },
   "devDependencies": {
     "@types/bun": "latest"

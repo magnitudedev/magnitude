@@ -29,9 +29,10 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
   eventHandlers: {
 
     // Create root fork resources when session starts
-    session_initialized: (_event, _publish) => Effect.gen(function* () {
+    session_initialized: (event, _publish) => Effect.gen(function* () {
       const execManager = yield* ExecutionManager
-      yield* execManager.initFork(null, 'orchestrator')
+      const rootVariant = event.context?.oneshot ? 'orchestrator-oneshot' : 'orchestrator'
+      yield* execManager.initFork(null, rootVariant)
     }).pipe(Effect.orDie),
 
     // Interrupt stops the current turn and also kills tracked background

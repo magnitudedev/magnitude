@@ -24,7 +24,7 @@ import { isToolKey, type ToolKey } from '../tools/tool-definitions'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
 import { defaultXmlTagName } from '../tools'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 import { buildPermissionInterceptor, type AgentResolver } from './permission-gate'
 import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from './approval-state'
 
@@ -48,8 +48,8 @@ import { SessionContextProjection, type SessionContextState } from '../projectio
 import { ReplayProjection } from '../projections/replay'
 import { BackgroundProcessesProjection, getProcessesForFork, type BackgroundProcessesState } from '../projections/background-processes'
 
-import type { AgentDefinition, ToolSet, BoundObservable } from '@magnitudedev/agent-definition'
-import { bindObservable } from '@magnitudedev/agent-definition'
+import type { RoleDefinition, ToolSet, BoundObservable } from '@magnitudedev/roles'
+import { bindObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
@@ -65,7 +65,7 @@ import { BackgroundProcessRegistryTag, make as makeBackgroundProcessRegistry } f
 
 const { ForkContext } = Fork
 
-type AgentDef = AgentDefinition<ToolSet, PolicyContext>
+type AgentDef = RoleDefinition<ToolSet, string, PolicyContext>
 
 import { mapXmlToolResult } from '../util/tool-result'
 
@@ -287,11 +287,6 @@ const makeExecutionManager = Effect.gen(function* () {
   // Maps forkId → variant, populated when forks are created.
   const forkAgentVariants = new Map<string, AgentVariant>()
 
-  function isAgentVariant(value: unknown): value is AgentVariant {
-    return typeof value === 'string'
-      && ['builder', 'debugger', 'explorer', 'planner', 'reviewer', 'orchestrator', 'browser'].includes(value)
-  }
-
   function isToolAny(value: AnyTool): value is Tool.Any {
     return 'bindings' in value
   }
@@ -339,7 +334,7 @@ const makeExecutionManager = Effect.gen(function* () {
       if (forkId) {
         const agentInstance = getAgentByForkId(agentState, forkId)
         const role = agentInstance?.role
-        variant = isAgentVariant(role) ? role : 'builder'
+        variant = role && isValidVariant(role) ? role : 'builder'
       } else {
         variant = 'orchestrator'
       }
@@ -831,8 +826,9 @@ const makeExecutionManager = Effect.gen(function* () {
       forkCwds.set(forkId, cwd)
       forkWorkspacePaths.set(forkId, workspacePath)
 
-      // Inject browser harness for browser agent forks
-      if (variant === 'browser' && forkId) {
+      // Inject browser harness when role setup requires it
+      const roleDef = getAgentDefinition(variant)
+      if (roleDef.setup && forkId) {
         const browserService = yield* BrowserService
         const harness = yield* browserService.get(forkId)
         layers = Layer.merge(layers, Layer.succeed(BrowserHarnessTag, harness))

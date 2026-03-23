@@ -13,7 +13,7 @@
     "baseUrl": ".",
     "paths": {
       "@magnitudedev/agent": ["packages/agent/src"],
-      "@magnitudedev/agent-definition": ["packages/agent-definition/src"],
+      "@magnitudedev/roles": ["packages/roles/src"],
       "@magnitudedev/event-core": ["packages/event-core/src"],
       "@magnitudedev/js-act": ["packages/js-act/src"],
       "@magnitudedev/llm-core": ["packages/llm-core/src"],

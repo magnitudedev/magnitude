@@ -1,7 +1,7 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
 import type { Tool, AnyTool } from '@magnitudedev/tools'
 import { Context, Effect, Layer } from 'effect'
-import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
+import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import type { AppEvent, SessionContext } from '../events'
 import { textParts } from '../content'
 
@@ -112,7 +112,7 @@ const ALL_VARIANTS: AgentVariant[] = [
   'browser',
 ]
 
-type MagnitudeAgentDef = AgentDefinition<ToolSet, PolicyContext>
+type MagnitudeAgentDef = RoleDefinition<ToolSet, string, PolicyContext>
 
 function makeOverrideTool(source: AnyTool, handler: ToolOverrideHandler): AnyTool {
   if (!('execute' in source) || typeof source.execute !== 'function') {

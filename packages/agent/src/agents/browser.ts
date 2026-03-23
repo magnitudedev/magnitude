@@ -5,14 +5,16 @@
  * Receives automatic screenshots before each turn.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import browserPromptRaw from './prompts/browser.txt' with { type: 'text' }
+import { compilePromptTemplate } from '../prompts/system-prompt'
 import {
   clickTool, doubleClickTool, rightClickTool, typeTool,
   scrollTool, dragTool, navigateTool, goBackTool,
   switchTabTool, newTabTool, screenshotTool, evaluateTool
 } from '../tools/browser-tools'
 
-import { thinkTool } from '../tools/globals'
+
 import { browserObservable } from '../observables/browser-observable'
 import type { PolicyContext } from './types'
 
@@ -28,6 +30,8 @@ const turnLens = defineThinkingLens({
   description: 'Plan what browser actions to take this turn. What to click, type, or scroll? What can you do reliably before needing to observe the screen state again?',
 })
 
+const systemPrompt = compilePromptTemplate(browserPromptRaw)
+
 const tools = toolSet({
   click:        clickTool,
   doubleClick:  doubleClickTool,
@@ -42,14 +46,18 @@ const tools = toolSet({
   screenshot:   screenshotTool,
   evaluate:     evaluateTool,
 
-  think:        thinkTool,
 })
 
-export const createBrowser = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
+export const browserRole = defineRole<typeof tools, 'browser', PolicyContext>({
+  tools,
   id: 'browser',
-  model: 'browser',
+  slot: 'browser',
   systemPrompt,
-  thinkingLenses: [strategyLens, turnLens],
+  lenses: [strategyLens, turnLens],
+  defaultRecipient: 'parent',
+  protocolRole: 'subagent',
+  initialContext: { parentConversation: true },
+  spawnable: true,
 
   permission: (p) => ({
     _default() { return p.allow() },
@@ -63,13 +71,6 @@ export const createBrowser = (systemPrompt: string) => defineAgent<typeof tools,
       return continue_()
     },
   },
-
-
-  display: (d) => ({
-    think() { return d.hidden() },
-    screenshot() { return d.hidden() },
-    _default() { return d.visible() },
-  }),
 
   observables: [browserObservable],
 })

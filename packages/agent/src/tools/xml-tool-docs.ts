@@ -7,7 +7,7 @@
  * Relocated from strategies/prompt-utils.ts after strategy abstraction removal.
  */
 
-import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
+import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import { generateXmlToolGroupDoc, type XmlToolDocEntry } from '@magnitudedev/xml-act'
 import type { PolicyContext } from '../agents/types'
 import { defaultXmlTagName, getXmlBindingMap } from './index'
@@ -33,7 +33,7 @@ export interface ToolPresentation {
  * Build ToolPresentation[] from an agent definition.
  */
 export function buildToolPresentation(
-  agentDef: AgentDefinition<ToolSet, PolicyContext>,
+  agentDef: RoleDefinition<ToolSet, string, PolicyContext>,
   implicitTools: readonly string[] = []
 ): ToolPresentation[] {
   const presentations: ToolPresentation[] = []
@@ -42,7 +42,7 @@ export function buildToolPresentation(
     if (implicitTools.includes(defKey)) continue
     if (!tool) continue
 
-    const slug = agentDef.getSlug(defKey) ?? tool.name
+    const slug = defKey
 
     presentations.push({
       slug,
@@ -65,7 +65,7 @@ export function buildToolPresentation(
  * Uses XML bindings on tools to produce XML tag documentation grouped by namespace.
  */
 export function generateXmlActToolDocs(
-  agentDef: AgentDefinition<ToolSet, PolicyContext>,
+  agentDef: RoleDefinition<ToolSet, string, PolicyContext>,
   implicitTools: readonly string[] = []
 ): string {
   const xmlBindingMap = getXmlBindingMap()

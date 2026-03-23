@@ -1,0 +1,111 @@
+import { toolSet, continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
+import type { PolicyContext } from './types'
+import { agentsStatusObservable } from '../observables/agents-status-observable'
+import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+import { skillTool, phaseSubmitTool } from '../tools/globals'
+import { agentCreateTool, agentKillTool } from '../tools/agent-tools'
+import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
+import { shellBgTool } from '../tools/shell-bg'
+import { shellTool } from '../tools/shell'
+import { webFetchTool } from '../tools/web-fetch-tool'
+import { webSearchTool } from '../tools/web-search-tool'
+import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
+
+export const intentLens = defineThinkingLens({
+  name: 'intent',
+  trigger: 'When you receive a message from the user',
+  description: 'Carefully consider what the user means and what they actually want. Look past the literal request to understand the underlying goal.',
+})
+
+export const ideateLens = defineThinkingLens({
+  name: 'ideate',
+  trigger: 'When the problem requires creative thinking or there are multiple possible approaches',
+  description: 'Think freely about the problem space. Generate and consider different approaches, ideas, or solutions before committing to one. Explore tradeoffs and implications.',
+})
+
+export const strategyLens = defineThinkingLens({
+  name: 'strategy',
+  trigger: 'When deciding how to execute work',
+  description: 'Consider how to best tackle work - subagents, parallelism, sequencing, workspace usage.',
+})
+
+export const protocolLens = defineThinkingLens({
+  name: 'protocol',
+  trigger: 'When any relevant protocol applies',
+  description: 'Adhere to all protocols',
+})
+
+export const practicesLens = defineThinkingLens({
+  name: 'practices',
+  trigger: 'When any default practices apply',
+  description: 'Consider which default practices apply in this situation',
+})
+
+export const constraintsLens = defineThinkingLens({
+  name: 'constraints',
+  trigger: 'When planning work, delegating to subagents, or evaluating progress',
+  description:
+    'What are the exact requirements? Have I extracted all testable constraints? Which have I verified? Which remain? Am I missing any implicit requirements?',
+})
+
+export const pivotLens = defineThinkingLens({
+  name: 'pivot',
+  trigger: 'When an approach is not making progress or results are unexpected',
+  description:
+    'Is my current approach working? Are my subagents stuck or spinning? Should I try a different strategy, parallelize an alternative, or cut losses on this path? What signals indicate I should change direction?',
+})
+
+export const validationLens = defineThinkingLens({
+  name: 'validation',
+  trigger: 'When evaluating whether work is complete or results are acceptable',
+  description:
+    'Have I empirically tested my complete solution, not just individual pieces? Are there edge cases or details I haven\'t checked? Am I accepting results that look wrong or suspicious?',
+})
+
+export const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When your turn involves communications and actions that could benefit from planning',
+  description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
+})
+
+export const orchestratorTools = toolSet({
+  fileRead: readTool,
+  fileWrite: writeTool,
+  fileEdit: editTool,
+  fileTree: treeTool,
+  fileSearch: searchTool,
+  fileView: viewTool,
+  shell: shellTool,
+  shellBg: shellBgTool,
+  webSearch: webSearchTool,
+  webFetch: webFetchTool,
+  agentCreate: agentCreateTool,
+  agentKill: agentKillTool,
+  skill: skillTool,
+  phaseSubmit: phaseSubmitTool,
+})
+
+export const orchestratorObservables = [agentsStatusObservable, backgroundProcessesObservable]
+
+export const orchestratorPermission = (p: any) => ({
+  shell(input: { command: string }, pctx: PolicyContext) {
+    const result = classifyShellCommand(input.command)
+    const allowedPrefixes = pctx.workspacePath ? [pctx.workspacePath] : undefined
+    if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
+    if (!pctx.disableCwdSafeguards && !writesStayWithin(input.command, pctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
+    return p.allow()
+  },
+  _default() { return p.allow() },
+})
+
+export const orchestratorTurnPolicy = {
+  decide(turnCtx: any) {
+    if (turnCtx.cancelled) return yield_()
+    if (turnCtx.error) return continue_()
+    if (turnCtx.toolsCalled.length === 0) return yield_()
+    const yielders = ['agentCreate', 'agentKill']
+    if (turnCtx.lastTool && yielders.includes(turnCtx.lastTool)) return yield_()
+    if (turnCtx.messagesSent.some((m: { dest: string }) => m.dest !== 'user')) return yield_()
+    return continue_()
+  },
+}

@@ -2,7 +2,7 @@ import type { RunnableEval, Scenario, ScenarioResult, ModelSpec, CheckResult, Ev
 import { callModel } from '../../../runner'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { getXmlActProtocol } from '@magnitudedev/agent-definition'
+import { getXmlActProtocol } from '@magnitudedev/agent'
 import { getAgentDefinition, generateXmlActToolDocs } from '@magnitudedev/agent'
 import { ALL_SCENARIOS, type ToolUsageScenario } from './scenarios'
 
@@ -15,9 +15,9 @@ function getSystemPrompt(): string {
       'utf-8'
     )
     const agentDef = getAgentDefinition('orchestrator')
-    const toolDocs = generateXmlActToolDocs(agentDef, ['think'])
+    const toolDocs = generateXmlActToolDocs(agentDef, [])
     cachedSystemPrompt = raw
-      .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol('user', agentDef.thinkingLenses.slice()))
+      .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol('user', agentDef.lenses.slice()))
       .replaceAll('{{TOOL_DOCS}}', toolDocs)
   }
   return cachedSystemPrompt

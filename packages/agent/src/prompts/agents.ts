@@ -9,7 +9,7 @@ import { DateTime } from 'luxon'
 import type { ConversationEntry } from '../projections/conversation'
 import type { ContentPart, ImageMediaType } from '../content'
 import type { ObservedResult, TurnToolCall } from '../events'
-import type { ObservationPart } from '@magnitudedev/agent-definition'
+import type { ObservationPart } from '@magnitudedev/roles'
 import { formatResults, formatInterrupted, formatError, formatNoop } from './results'
 
 
@@ -288,6 +288,7 @@ export function buildConversationSummary(entries: readonly ConversationEntry[]):
 
   result = result.concat(included)
 
-  const header = 'These are the messages between the user and orchestrator. The user\'s intent as expressed in these messages is your primary reference for judging whether work meets expectations.'
-  return `<conversation_context>\n${header}\n\n${result.join('\n\n')}\n</conversation_context>`
+  //const header = 'These are the messages between the user and orchestrator. The user\'s intent as expressed in these messages is your primary reference for judging whether work meets expectations.'
+  //return `<conversation_context>\n${header}\n\n${result.join('\n\n')}\n</conversation_context>`
+  return `<conversation_context>\n${result.join('\n\n')}\n</conversation_context>`
 }

@@ -11,8 +11,8 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { createSandboxTool } from '@magnitudedev/js-act'
-import { toolSet, defineAgent, continue_, finish, perceive, omit, defineThinkingLens } from '@magnitudedev/agent-definition'
-import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
+import { toolSet, defineRole, continue_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import type { PolicyContext } from '@magnitudedev/agent'
 import type { DockerContainer } from './docker'
 import * as docker from './docker'
@@ -25,7 +25,7 @@ export type ToolsetId = 'fs-only' | 'shell-only' | 'fs-shell'
 
 export interface ToolBridgeResult {
   /** Agent definition for the real agent system (register as override) */
-  agentDef: AgentDefinition<ToolSet, PolicyContext>
+  agentDef: RoleDefinition<ToolSet, string, PolicyContext>
 }
 
 // =============================================================================
@@ -48,8 +48,11 @@ Rules:
 
 const BENCH_AGENT_CONFIG = {
   id: 'builder-bench-agent' as const,
-  model: 'primary' as const,
+  slot: 'primary' as const,
   systemPrompt: ROLE_DESCRIPTION,
+  defaultRecipient: 'parent' as const,
+  protocolRole: 'subagent' as const,
+  initialContext: { parentConversation: false },
 }
 
 const benchThinkingLenses = [
@@ -212,71 +215,49 @@ function createShellTool(container: DockerContainer) {
 }
 
 // =============================================================================
-// Context Policies
+// Tool Bridge Factory — one defineRole per toolset for type safety
 // =============================================================================
 
-const omitCtx = () => omit()
-
-const shellCtx = (input: { command: string }, output: { stdout: string; stderr: string; exitCode: number }) => {
-  const parts = [`$ ${input.command}`]
-  if (output.stdout) parts.push(output.stdout.trimEnd())
-  if (output.stderr) parts.push(`STDERR: ${output.stderr.trimEnd()}`)
-  parts.push(`[exit: ${output.exitCode}]`)
-  return perceive(parts.join('\n'))
-}
-
-const passthroughCtx = (_input: unknown, output: string) => perceive(output)
-const structuredCtx = (_input: unknown, output: unknown) =>
-  perceive(typeof output === 'string' ? output : JSON.stringify(output))
-const writeCtx = () => perceive('File written.')
-
-// =============================================================================
-// Tool Bridge Factory — one defineAgent per toolset for type safety
-// =============================================================================
-
-function createFsOnlyAgent(container: DockerContainer): AgentDefinition<ToolSet, PolicyContext> {
+function createFsOnlyAgent(container: DockerContainer): RoleDefinition<ToolSet, string, PolicyContext> {
   const { messageTool, thinkTool, doneTool } = createGlobalTools()
   const { fsRead, fsWrite, fsTree, fsSearch } = createFsTools(container)
 
   const tools = toolSet({ message: messageTool, think: thinkTool, done: doneTool, fileRead: fsRead, fileWrite: fsWrite, fileTree: fsTree, fileSearch: fsSearch })
-  return defineAgent(tools, {
+  return defineRole({
+    tools,
     ...BENCH_AGENT_CONFIG,
-    thinkingLenses: benchThinkingLenses.slice(),
+    lenses: benchThinkingLenses.slice(),
     permission: (p) => ({ _default: () => p.allow() }),
     turn: { decide: (turnCtx) => turnCtx.cancelled || turnCtx.toolsCalled.includes('done') ? finish() : continue_() },
-    context: { message: omitCtx, think: omitCtx, done: omitCtx, fileRead: passthroughCtx, fileWrite: writeCtx, fileTree: structuredCtx, fileSearch: structuredCtx },
-    display: (d) => ({ think: () => d.hidden(), _default: () => d.visible() }),
   })
 }
 
-function createShellOnlyAgent(container: DockerContainer): AgentDefinition<ToolSet, PolicyContext> {
+function createShellOnlyAgent(container: DockerContainer): RoleDefinition<ToolSet, string, PolicyContext> {
   const { messageTool, thinkTool, doneTool } = createGlobalTools()
   const shell = createShellTool(container)
 
   const tools = toolSet({ message: messageTool, think: thinkTool, done: doneTool, shell })
-  return defineAgent(tools, {
+  return defineRole({
+    tools,
     ...BENCH_AGENT_CONFIG,
-    thinkingLenses: benchThinkingLenses.slice(),
+    lenses: benchThinkingLenses.slice(),
     permission: (p) => ({ _default: () => p.allow() }),
     turn: { decide: (turnCtx) => turnCtx.cancelled || turnCtx.toolsCalled.includes('done') ? finish() : continue_() },
-    context: { message: omitCtx, think: omitCtx, done: omitCtx, shell: shellCtx },
-    display: (d) => ({ think: () => d.hidden(), _default: () => d.visible() }),
   })
 }
 
-function createFsShellAgent(container: DockerContainer): AgentDefinition<ToolSet, PolicyContext> {
+function createFsShellAgent(container: DockerContainer): RoleDefinition<ToolSet, string, PolicyContext> {
   const { messageTool, thinkTool, doneTool } = createGlobalTools()
   const { fsRead, fsWrite, fsTree, fsSearch } = createFsTools(container)
   const shell = createShellTool(container)
 
   const tools = toolSet({ message: messageTool, think: thinkTool, done: doneTool, shell, fileRead: fsRead, fileWrite: fsWrite, fileTree: fsTree, fileSearch: fsSearch })
-  return defineAgent(tools, {
+  return defineRole({
+    tools,
     ...BENCH_AGENT_CONFIG,
-    thinkingLenses: benchThinkingLenses.slice(),
+    lenses: benchThinkingLenses.slice(),
     permission: (p) => ({ _default: () => p.allow() }),
     turn: { decide: (turnCtx) => turnCtx.cancelled || turnCtx.toolsCalled.includes('done') ? finish() : continue_() },
-    context: { message: omitCtx, think: omitCtx, done: omitCtx, shell: shellCtx, fileRead: passthroughCtx, fileWrite: writeCtx, fileTree: structuredCtx, fileSearch: structuredCtx },
-    display: (d) => ({ think: () => d.hidden(), _default: () => d.visible() }),
   })
 }
 

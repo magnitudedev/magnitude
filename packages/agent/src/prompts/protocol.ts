@@ -1,9 +1,9 @@
 import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_FINISH, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
-import xmlActProtocolRaw from './xml-act-protocol.txt'
-import turnControlOneshotRaw from './turn-control-oneshot.txt'
-import turnControlOrchestratorRaw from './turn-control-orchestrator.txt'
-import turnControlSubagentRaw from './turn-control-subagent.txt'
-import type { ThinkingLens } from '../thinking-lens'
+import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
+import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
+import turnControlOrchestratorRaw from './protocol/turn-control-orchestrator.txt'
+import turnControlSubagentRaw from './protocol/turn-control-subagent.txt'
+import type { ThinkingLens } from '@magnitudedev/roles'
 
 const XML_ACT_PROTOCOL_RAW = xmlActProtocolRaw
 const TURN_CONTROL_ONESHOT_RAW = turnControlOneshotRaw
@@ -35,7 +35,6 @@ export function getXmlActProtocol(
     : TURN_CONTROL_ORCHESTRATOR_RAW
 
   return XML_ACT_PROTOCOL_RAW
-    // Inject turn control section first so its template vars get replaced by subsequent calls
     .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
     .replaceAll('{{ACTIONS_OPEN}}', actionsTagOpen())
     .replaceAll('{{ACTIONS_CLOSE}}', actionsTagClose())
@@ -51,7 +50,7 @@ export function getXmlActProtocol(
     .replaceAll('{{TURN_CONTROL_FINISH}}', TURN_CONTROL_FINISH)
 }
 
-export function buildAckTurn(lenses: ThinkingLens[]): string {
+export function buildAckTurn(_lenses: ThinkingLens[]): string {
   return `<lenses>
 </lenses>
 <comms>

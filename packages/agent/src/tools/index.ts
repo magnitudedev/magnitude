@@ -9,7 +9,7 @@
 import type { Tool } from '@magnitudedev/tools'
 import type { XmlTagBinding, RegisteredTool } from '@magnitudedev/xml-act'
 import { Effect, type Layer } from 'effect'
-import type { AgentDefinition, ToolSet } from '@magnitudedev/agent-definition'
+import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import { fsXmlBindings } from './fs'
 import { shellXmlBinding } from './shell'
 import { shellBgXmlBinding } from './shell-bg'
@@ -50,10 +50,10 @@ function getBindingGroup(config: { readonly group?: string; readonly [key: strin
 }
 
 /**
- * Derive a Map<tagName, RegisteredTool> from an AgentDefinition.
+ * Derive a Map<tagName, RegisteredTool> from an RoleDefinition.
  */
 export function buildRegisteredTools(
-  agentDef: AgentDefinition<ToolSet, unknown>,
+  agentDef: RoleDefinition<ToolSet, string, unknown>,
   layers: Layer.Layer<never>,
 ): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>()

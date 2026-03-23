@@ -14,8 +14,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
     "@google/genai": "^1.41.0",
-    "@magnitudedev/agent-definition": "workspace:*",
     "@magnitudedev/browser-harness": "workspace:*",
+    "@magnitudedev/roles": "workspace:*",
     "@magnitudedev/shell-classifier": "workspace:*",
     "@magnitudedev/skills": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",

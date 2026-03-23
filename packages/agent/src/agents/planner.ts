@@ -7,14 +7,16 @@
  */
 
 import { resolve } from 'node:path'
-import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import plannerPromptRaw from './prompts/planner.txt' with { type: 'text' }
+import { compilePromptTemplate } from '../prompts/system-prompt'
 import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
 import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
-import { thinkTool } from '../tools/globals'
+
 // import { gatherTool } from '../tools/gather'
 import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
@@ -51,6 +53,8 @@ const turnLens = defineThinkingLens({
   description: 'Plan what to read, explore, or write this turn. What information do you still need? Are you ready to write the plan, or do you need to investigate more?',
 })
 
+const systemPrompt = compilePromptTemplate(plannerPromptRaw)
+
 const tools = toolSet({
   fileRead:     readTool,
   fileWrite:    writeTool,
@@ -63,14 +67,18 @@ const tools = toolSet({
   webFetch:     webFetchTool,
   // gather:       gatherTool,
 
-  think:         thinkTool,
 })
 
-export const createPlanner = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
+export const plannerRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+  tools,
   id: 'planner',
-  model: 'secondary',
+  slot: 'secondary',
   systemPrompt,
-  thinkingLenses: [ideateLens, velocityLens, alignmentLens, capacityLens, turnLens],
+  lenses: [ideateLens, velocityLens, alignmentLens, capacityLens, turnLens],
+  defaultRecipient: 'parent',
+  protocolRole: 'subagent',
+  initialContext: { parentConversation: true },
+  spawnable: true,
   observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
@@ -104,10 +112,4 @@ export const createPlanner = (systemPrompt: string) => defineAgent<typeof tools,
       return continue_()
     },
   },
-
-
-  display: (d) => ({
-    think() { return d.hidden() },
-    _default() { return d.visible() },
-  }),
 })

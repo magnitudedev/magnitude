@@ -1,5 +1,5 @@
 import { Effect } from 'effect'
-import { createObservable } from '@magnitudedev/agent-definition'
+import { createObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag } from './projection-reader'
 import type { BackgroundProcessState } from '../projections/background-processes'
 

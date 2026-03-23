@@ -14,34 +14,17 @@ import { Signal, Projection } from '@magnitudedev/event-core'
 import type { AppEvent, ToolDisplay } from '../events'
 
 import { AgentRoutingProjection } from './agent-routing'
-import { AgentStatusProjection, type AgentStatusState, getAgentByForkId } from './agent-status'
+import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 import { WorkingStateProjection, type PendingInboundCommunication } from './working-state'
 
-import { getAgentDefinition, type AgentVariant } from '../agents'
+
 import { textOf } from '../content'
 import { createId } from '../util/id'
 
 import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
-import { type ToolKey } from '../tools/tool-definitions'
+import { TOOL_DEFINITIONS, type ToolKey } from '../tools/tool-definitions'
 import { createToolHandle, type ToolHandle, type ToolState } from '../tools/tool-handle'
 
-
-/**
- * Resolve display visibility for a tool call using the agent definition's display policy.
- * Reads the agent role from AgentStatusProjection to determine which agent definition to consult.
- */
-function isAgentVariant(value: unknown): value is AgentVariant {
-  return typeof value === 'string'
-    && ['builder', 'debugger', 'explorer', 'planner', 'reviewer', 'orchestrator', 'browser'].includes(value)
-}
-
-function isToolHidden(toolKey: ToolKey, forkId: string | null, input: unknown, agentState: AgentStatusState): boolean {
-  const role = forkId ? getAgentByForkId(agentState, forkId)?.role : undefined
-  const variant: AgentVariant = isAgentVariant(role) ? role : (forkId ? 'builder' : 'orchestrator')
-  const agentDef = getAgentDefinition(variant)
-  const result = agentDef.getDisplay(toolKey, input, undefined)
-  return result.action === 'hidden'
-}
 
 // =============================================================================
 // Types
@@ -1062,7 +1045,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
           // Consult agent definition's display policy
           const agentState = read(AgentStatusProjection)
-          if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
+          const toolDef = TOOL_DEFINITIONS[event.toolKey]
+          if ('display' in toolDef && toolDef.display === false) {
             return currentFork
           }
 
@@ -1106,7 +1090,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
           // Consult agent definition's display policy
           const agentState = read(AgentStatusProjection)
-          if (isToolHidden(event.toolKey, event.forkId, undefined, agentState)) {
+          const toolDef = TOOL_DEFINITIONS[event.toolKey]
+          if ('display' in toolDef && toolDef.display === false) {
             return currentFork
           }
 

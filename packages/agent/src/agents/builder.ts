@@ -5,14 +5,16 @@
  * and parent.message for communicating with the orchestrator. No task management tools.
  */
 
-import { toolSet, defineAgent, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/agent-definition'
+import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import builderPromptRaw from './prompts/builder.txt' with { type: 'text' }
+import { compilePromptTemplate } from '../prompts/system-prompt'
 import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
 import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
-import { thinkTool, phaseSubmitTool } from '../tools/globals'
+import { phaseSubmitTool } from '../tools/globals'
 import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -29,6 +31,8 @@ const turnLens = defineThinkingLens({
   description: 'Plan what to read and edit this turn. What files do you need to understand before making changes? What\'s the right order of edits?',
 })
 
+const systemPrompt = compilePromptTemplate(builderPromptRaw)
+
 const tools = toolSet({
   fileRead:       readTool,
   fileWrite:      writeTool,
@@ -41,15 +45,19 @@ const tools = toolSet({
   webSearch:      webSearchTool,
   webFetch:       webFetchTool,
 
-  think:          thinkTool,
   phaseSubmit:    phaseSubmitTool,
 })
 
-export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools, PolicyContext>(tools, {
+export const builderRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+  tools,
   id: 'builder',
-  model: 'secondary',
+  slot: 'secondary',
   systemPrompt,
-  thinkingLenses: [qualityLens, turnLens],
+  lenses: [qualityLens, turnLens],
+  defaultRecipient: 'parent',
+  protocolRole: 'subagent',
+  initialContext: { parentConversation: true },
+  spawnable: true,
   observables: [backgroundProcessesObservable],
 
   permission: (p) => ({
@@ -81,10 +89,4 @@ export const createBuilder = (systemPrompt: string) => defineAgent<typeof tools,
       return continue_()
     },
   },
-
-
-  display: (d) => ({
-    think() { return d.hidden() },
-    _default() { return d.visible() },
-  }),
 })

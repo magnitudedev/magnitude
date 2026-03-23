@@ -1,6 +1,6 @@
 import { Effect } from 'effect'
-import { createObservable } from '@magnitudedev/agent-definition'
-import type { ObservationPart } from '@magnitudedev/agent-definition'
+import { createObservable } from '@magnitudedev/roles'
+import type { ObservationPart } from '@magnitudedev/roles'
 import { BrowserHarnessTag } from '../tools/browser-tools'
 
 export const browserObservable = createObservable({

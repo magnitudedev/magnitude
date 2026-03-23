@@ -11,7 +11,7 @@ import type { ContentPart } from './content'
 import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './tools/tool-definitions'
-import type { ObservationPart } from '@magnitudedev/agent-definition'
+import type { ObservationPart } from '@magnitudedev/roles'
 import type { WorkflowSkill } from '@magnitudedev/skills'
 
 export type Attachment = ImageAttachment | MentionAttachment

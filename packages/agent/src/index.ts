@@ -148,6 +148,7 @@ export { PermissionRejection } from './execution/permission-rejection'
 
 // Prompt Utilities
 export { generateXmlActToolDocs } from './tools/xml-tool-docs'
+export { getXmlActProtocol, buildAckTurn } from './prompts/protocol'
 
 // Tool types (re-exported from xml-act and tools packages)
 export type { ToolCallEvent } from '@magnitudedev/xml-act'
@@ -160,7 +161,7 @@ export type {
   ToolEventFor,
 } from './tools/tool-definitions'
 export type { ToolHandle, ToolState } from './tools/tool-handle'
-export { thinkTool, globalTools } from './tools/globals'
+export { globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'
 export { shellBgTool, SHELL_BG_TOOLS } from './tools/shell-bg'
 export { readTool, writeTool, editTool, treeTool, searchTool, fsTools } from './tools/fs'

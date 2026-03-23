@@ -13,9 +13,6 @@ import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
-import type { AgentVariant } from '../agents'
-
-
 import { ConversationStateReaderTag } from './memory-reader'
 import { AgentStateReaderTag } from './fork'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
@@ -33,20 +30,18 @@ const AgentErrorSchema = ToolErrorSchema('AgentError', {})
 /** Execute logic for agent.create */
 function executeAgentCreate({ agentId, options }: {
   agentId: string;
-  options: { type: AgentVariant; title: string; message: string };
+  options: { type: string; title: string; message: string };
 }) {
   return Effect.gen(function* () {
     const { type: agentType, title, message } = options
 
-    // For reviewer agents, inject user↔orchestrator conversation context
+    // Always inject conversation context for all spawned agents
     let conversationContext = ''
-    if (agentType === 'reviewer') {
-      const conversationReader = yield* ConversationStateReaderTag
-      const conversationState = yield* conversationReader.getState()
-      const summary = buildConversationSummary(conversationState.entries)
-      if (summary) {
-        conversationContext = summary
-      }
+    const conversationReader = yield* ConversationStateReaderTag
+    const conversationState = yield* conversationReader.getState()
+    const summary = buildConversationSummary(conversationState.entries)
+    if (summary) {
+      conversationContext = summary
     }
 
     // Build context from title + message + conversation
@@ -71,7 +66,7 @@ function executeAgentCreate({ agentId, options }: {
       prompt: context,
       message,
       mode: 'spawn',
-      role: agentType,
+      role: agentType as any,
       taskId,
     })
 
@@ -80,6 +75,9 @@ function executeAgentCreate({ agentId, options }: {
 }
 
 
+// Agent type is validated downstream in execution-manager.fork() against the role registry.
+// Using Schema.String here avoids circular imports (agent-tools → agents → role files → agent-tools).
+
 export const agentCreateTool = defineTool({
   name: 'create' as const,
   group: 'agent' as const,
@@ -87,7 +85,7 @@ export const agentCreateTool = defineTool({
   inputSchema: Schema.Struct({
     agentId: Schema.String.annotations({ description: 'Unique agent ID. Must be prefixed with the type (e.g. explorer-auth, builder-api)' }),
     options: Schema.Struct({
-      type: Schema.Literal('explorer', 'planner', 'builder', 'debugger', 'reviewer', 'browser').annotations({ description: 'Agent type' }),
+      type: Schema.String.annotations({ description: 'Agent type' }),
       title: Schema.String.annotations({ description: 'Concise title of what this agent should accomplish' }),
       message: Schema.String.annotations({ description: 'Detailed message/instructions for the agent' }),
     }),
