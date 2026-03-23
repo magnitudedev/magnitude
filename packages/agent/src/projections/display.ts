@@ -11,8 +11,7 @@
  */
 
 import { Signal, Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ToolResult, ToolDisplay } from '../events'
-import type { XmlToolResult } from '@magnitudedev/xml-act'
+import type { AppEvent, ToolDisplay } from '../events'
 
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection, type AgentStatusState, getAgentByForkId } from './agent-status'
@@ -23,43 +22,20 @@ import { textOf } from '../content'
 import { createId } from '../util/id'
 
 import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
-import { ToolEventNormalizer } from '../normalizer'
-import { getModelForToolKey } from '../models/registry'
-import { emptyStreamingInput } from '@magnitudedev/tools'
+import { type ToolKey } from '../tools/tool-definitions'
+import { createToolHandle, type ToolHandle, type ToolState } from '../tools/tool-handle'
+
 
 /**
  * Resolve display visibility for a tool call using the agent definition's display policy.
  * Reads the agent role from AgentStatusProjection to determine which agent definition to consult.
  */
-/** Map XmlToolResult → ToolResult for display. */
-function mapXmlToolResultForDisplay(result: XmlToolResult, display?: ToolDisplay): ToolResult {
-  switch (result._tag) {
-    case 'Success':
-      return { status: 'success', output: result.output, ...(display ? { display } : {}) }
-    case 'Error':
-      return { status: 'error', message: result.error }
-    case 'Rejected': {
-      const rej = result.rejection
-      if (rej && typeof rej === 'object' && '_tag' in rej) {
-        if (rej._tag === 'UserRejection') {
-          return { status: 'rejected', message: 'User rejected the action' }
-        }
-        const reason = 'reason' in rej && typeof rej.reason === 'string' ? rej.reason : 'Unknown reason'
-        return { status: 'rejected', message: 'System rejected', reason }
-      }
-      return { status: 'rejected', message: String(rej) }
-    }
-    case 'Interrupted':
-      return { status: 'interrupted' }
-  }
-}
-
 function isAgentVariant(value: unknown): value is AgentVariant {
   return typeof value === 'string'
     && ['builder', 'debugger', 'explorer', 'planner', 'reviewer', 'orchestrator', 'browser'].includes(value)
 }
 
-function isToolHidden(toolKey: string, forkId: string | null, input: unknown, agentState: AgentStatusState): boolean {
+function isToolHidden(toolKey: ToolKey, forkId: string | null, input: unknown, agentState: AgentStatusState): boolean {
   const role = forkId ? getAgentByForkId(agentState, forkId)?.role : undefined
   const variant: AgentVariant = isAgentVariant(role) ? role : (forkId ? 'builder' : 'orchestrator')
   const agentDef = getAgentDefinition(variant)
@@ -106,12 +82,9 @@ export interface ThinkingStep {
 export interface ToolStep {
   readonly id: string
   readonly type: 'tool'
-  readonly toolKey?: string
+  readonly toolKey: ToolKey
   readonly cluster?: string
-  readonly input?: unknown
-  readonly result?: ToolResult
-  readonly label?: string
-  readonly visualState?: unknown
+  readonly state?: ToolState
 }
 
 export interface CommunicationStep {
@@ -269,7 +242,7 @@ export interface ApprovalRequestMessage {
   readonly id: string
   readonly type: 'approval_request'
   readonly toolCallId: string
-  readonly toolKey: string
+  readonly toolKey: ToolKey
   readonly input: unknown
   readonly reason: string
   readonly status: 'pending' | 'approved' | 'rejected'
@@ -293,6 +266,8 @@ export type DisplayMessage =
 /** Per-fork display state */
 export interface PendingInboundCommunicationDisplay extends PendingInboundCommunication {}
 
+
+
 export interface DisplayState {
   readonly status: 'idle' | 'streaming'
   readonly messages: readonly DisplayMessage[]
@@ -301,7 +276,7 @@ export interface DisplayState {
   readonly streamingMessageId: string | null  // Tracks streaming assistant message
   readonly activeThinkBlockId: string | null
   readonly showButton: 'send' | 'stop'
-  readonly toolModelStates: { readonly [callId: string]: { readonly toolKey: string; readonly modelState: object; readonly streaming: unknown } }
+  readonly toolHandles: { readonly [callId: string]: ToolHandle }
 }
 
 // =============================================================================
@@ -310,13 +285,10 @@ export interface DisplayState {
 
 const generateId = () => createId()
 
-const normalizer = new ToolEventNormalizer()
 
-function getVisualState(fork: DisplayState, callId: string): { state: object; streaming: unknown } | undefined {
-  const entry = fork.toolModelStates[callId]
-  if (!entry) return undefined
-  return { state: entry.modelState, streaming: entry.streaming }
-}
+
+const getVisualState = (fork: DisplayState, callId: string): ToolState | undefined =>
+  fork.toolHandles[callId]?.state
 
 /**
  * Find the index where new content should be inserted (before queued messages).
@@ -442,22 +414,23 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
   const block = findThinkBlock(state.messages, state.activeThinkBlockId)
   if (!block) return state
 
-  let updatedModelStates = state.toolModelStates
+  let updatedHandles = state.toolHandles
 
-  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (toolKey, visualState, stepId) => {
-    if (stepId) {
-      const entry = updatedModelStates[stepId]
-      if (entry) {
-        const model = getModelForToolKey(entry.toolKey)
-        const newModelState = model.reduce(entry.modelState, { type: 'interrupted' })
-        updatedModelStates = {
-          ...updatedModelStates,
-          [stepId]: { ...entry, modelState: newModelState },
-        }
-        return { state: newModelState, streaming: entry.streaming }
-      }
+  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (_toolKey, state, stepId) => {
+    if (!stepId) return state
+
+    const handle = updatedHandles[stepId]
+    if (!handle) {
+      throw new Error(`Display invariant violated: missing tool handle for stepId ${stepId}`)
     }
-    return visualState
+
+    const nextHandle = handle.interrupt()
+    updatedHandles = {
+      ...updatedHandles,
+      [stepId]: nextHandle,
+    }
+
+    return nextHandle.state
   })
 
   if (nextSteps === block.steps || nextSteps.every((step, i) => step === block.steps[i])) {
@@ -466,7 +439,7 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
 
   return {
     ...state,
-    toolModelStates: updatedModelStates,
+    toolHandles: updatedHandles,
     messages: updateMessageById<ThinkBlockMessage>(
       state.messages, state.activeThinkBlockId,
       (b) => ({ ...b, steps: nextSteps })
@@ -475,9 +448,9 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
 }
 
 // Standalone signal definition (needed for self-referencing in signalHandlers)
-const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: string }>('Display/forkToolStep')
+const forkToolStepSignalDef = Signal.create<{ forkId: string | null; toolKey: ToolKey }>('Display/forkToolStep')
 // Convert to Signal for use in signalHandlers on() calls (which expect Signal, not SignalDef)
-const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: string }, unknown>(forkToolStepSignalDef, 'Display')
+const forkToolStepSignal = Signal.fromDef<{ forkId: string | null; toolKey: ToolKey }, unknown>(forkToolStepSignalDef, 'Display')
 
 const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
   commands: 0,
@@ -496,15 +469,14 @@ const EMPTY_TOOL_COUNTS: ForkActivityToolCounts = {
   other: 0
 }
 
-function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): ForkActivityToolCounts {
+function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): ForkActivityToolCounts {
   switch (toolKey) {
     case 'shell': return { ...counts, commands: counts.commands + 1 }
     case 'fileRead':
     case 'fileTree': return { ...counts, reads: counts.reads + 1 }
     case 'fileWrite': return { ...counts, writes: counts.writes + 1 }
     case 'fileEdit': return { ...counts, edits: counts.edits + 1 }
-    case 'fileSearch':
-    case 'gather': return { ...counts, searches: counts.searches + 1 }
+    case 'fileSearch': return { ...counts, searches: counts.searches + 1 }
     case 'webSearch': return { ...counts, webSearches: counts.webSearches + 1 }
     case 'webFetch': return { ...counts, webFetches: counts.webFetches + 1 }
     case 'click':
@@ -517,7 +489,15 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: string): Fo
     case 'newTab': return { ...counts, navigations: counts.navigations + 1 }
     case 'type': return { ...counts, inputs: counts.inputs + 1 }
     case 'evaluate': return { ...counts, evaluations: counts.evaluations + 1 }
-    default: return { ...counts, other: counts.other + 1 }
+    case 'agentCreate':
+    case 'agentKill':
+    case 'skill':
+    case 'phase-submit':
+    case 'workflow-submit':
+    case 'phase-verdict':
+    case 'scroll':
+    case 'screenshot':
+      return { ...counts, other: counts.other + 1 }
   }
 }
 
@@ -607,16 +587,7 @@ export function upsertStreamingCommunicationStep(
   }
 }
 
-function shortenShellCommand(command: string, max = 50): string {
-  return command.length > max ? command.slice(0, max - 3) + '...' : command
-}
-
-function hasEdits(input: object): input is { edits: readonly unknown[] } {
-  return 'edits' in input && Array.isArray(input.edits)
-}
-
-
-function isFileStreamToolKey(toolKey: string | undefined): toolKey is 'fileWrite' | 'fileEdit' {
+function isFileStreamToolKey(toolKey: ToolKey | undefined): toolKey is 'fileWrite' | 'fileEdit' {
   return toolKey === 'fileWrite' || toolKey === 'fileEdit'
 }
 
@@ -638,25 +609,25 @@ interface EditPreviewState {
 }
 
 function hasFsWritePreview(
-  visualState: unknown,
-): visualState is WritePreviewState {
-  if (!visualState || typeof visualState !== 'object') return false
-  return 'path' in visualState
-    && typeof visualState.path === 'string'
-    && visualState.path.length > 0
-    && 'contentSoFar' in visualState
-    && typeof visualState.contentSoFar === 'string'
+  state: unknown,
+): state is WritePreviewState {
+  if (!state || typeof state !== 'object') return false
+  return 'path' in state
+    && typeof state.path === 'string'
+    && state.path.length > 0
+    && 'contentSoFar' in state
+    && typeof state.contentSoFar === 'string'
 }
 
 function hasEditPreview(
-  visualState: unknown,
-): visualState is EditPreviewState {
-  if (!visualState || typeof visualState !== 'object') return false
-  return 'path' in visualState
-    && typeof visualState.path === 'string'
-    && visualState.path.length > 0
-    && 'oldStringSoFar' in visualState
-    && typeof visualState.oldStringSoFar === 'string'
+  state: unknown,
+): state is EditPreviewState {
+  if (!state || typeof state !== 'object') return false
+  return 'path' in state
+    && typeof state.path === 'string'
+    && state.path.length > 0
+    && 'oldStringSoFar' in state
+    && typeof state.oldStringSoFar === 'string'
 }
 
 export interface InProgressFileView {
@@ -690,35 +661,37 @@ function collectFileStreams(
     for (const step of message.steps) {
       if (step.type !== 'tool' || !isFileStreamToolKey(step.toolKey)) continue
 
-      if (step.toolKey === 'fileWrite' && hasFsWritePreview(step.visualState)) {
+      if (step.toolKey === 'fileWrite' && hasFsWritePreview(step.state)) {
+        const previewState = step.state
         streams.push({
-          filePath: step.visualState.path,
+          filePath: previewState.path,
           toolCallId: step.id,
           toolKey: step.toolKey,
           forkId: null,
-          phase: step.visualState.phase,
+          phase: previewState.phase,
           preview: {
             mode: 'write',
-            contentSoFar: step.visualState.contentSoFar,
-            charCount: step.visualState.charCount,
-            lineCount: step.visualState.lineCount,
+            contentSoFar: previewState.contentSoFar,
+            charCount: previewState.charCount,
+            lineCount: previewState.lineCount,
           },
         })
       }
 
-      if (step.toolKey === 'fileEdit' && hasEditPreview(step.visualState)) {
+      if (step.toolKey === 'fileEdit' && hasEditPreview(step.state)) {
+        const previewState = step.state
         streams.push({
-          filePath: step.visualState.path,
+          filePath: previewState.path,
           toolCallId: step.id,
           toolKey: step.toolKey,
           forkId: null,
-          phase: step.visualState.phase,
+          phase: previewState.phase,
           preview: {
             mode: 'edit',
-            oldStringSoFar: step.visualState.oldStringSoFar,
-            newStringSoFar: step.visualState.newStringSoFar,
-            replaceAll: step.visualState.replaceAll,
-            childParsePhase: step.visualState.childParsePhase,
+            oldStringSoFar: previewState.oldStringSoFar,
+            newStringSoFar: previewState.newStringSoFar,
+            replaceAll: previewState.replaceAll,
+            childParsePhase: previewState.childParsePhase,
           },
         })
       }
@@ -755,7 +728,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     streamingMessageId: null,
     activeThinkBlockId: null,
     showButton: 'send',
-    toolModelStates: {},
+    toolHandles: {},
   },
 
   signals: {
@@ -1050,37 +1023,25 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     tool_event: ({ event, fork, read, emit }) => {
       const inner = event.event
 
-      const normalized = normalizer.normalize(event.toolKey, event.toolCallId, inner)
-
-      // Update model state immutably on the fork
       let currentFork = fork
-      if (normalized?.type === 'started') {
-        const model = getModelForToolKey(event.toolKey)
-        const initialState = model.reduce(model.initial, normalized)
+      if (inner._tag === 'ToolInputStarted') {
+        const handle = createToolHandle(event.toolKey).process(inner)
         currentFork = {
           ...currentFork,
-          toolModelStates: {
-            ...currentFork.toolModelStates,
-            [event.toolCallId]: {
-              toolKey: event.toolKey,
-              modelState: initialState,
-              streaming: normalizer.getStreaming(event.toolCallId) ?? emptyStreamingInput(),
-            },
+          toolHandles: {
+            ...currentFork.toolHandles,
+            [event.toolCallId]: handle,
           },
         }
-      } else if (normalized) {
-        const entry = currentFork.toolModelStates[event.toolCallId]
-        if (entry) {
-          const model = getModelForToolKey(entry.toolKey)
+      } else {
+        const handle = currentFork.toolHandles[event.toolCallId]
+        if (handle) {
+          const nextHandle = handle.process(inner)
           currentFork = {
             ...currentFork,
-            toolModelStates: {
-              ...currentFork.toolModelStates,
-              [event.toolCallId]: {
-                ...entry,
-                modelState: model.reduce(entry.modelState, normalized),
-                streaming: normalizer.getStreaming(event.toolCallId) ?? entry.streaming,
-              },
+            toolHandles: {
+              ...currentFork.toolHandles,
+              [event.toolCallId]: nextHandle,
             },
           }
         }
@@ -1109,9 +1070,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               id: event.toolCallId,
               type: 'tool',
               toolKey: event.toolKey,
-              input: undefined,
-              label: ({ artifactWrite: 'Writing artifact…', fileEdit: 'Editing file…' } satisfies Record<string, string>)[event.toolKey] ?? event.toolKey + '()',
-              visualState: getVisualState(newState, event.toolCallId),
+              state: getVisualState(newState, event.toolCallId),
             })
           }
         }
@@ -1120,8 +1079,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           if (currentFork.currentTurnId !== event.turnId) return currentFork
           if (!currentFork.activeThinkBlockId) return currentFork
 
-          // Update the step with the full parsed input and regenerate label
-          const label = generateToolLabel(event.toolKey, inner.input)
           return {
             ...currentFork,
             messages: updateStepInThinkBlock(
@@ -1131,9 +1088,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               (s) => s.type === 'tool'
                 ? {
                     ...s,
-                    input: inner.input,
-                    label,
-                    visualState: getVisualState(currentFork, event.toolCallId) ?? s.visualState,
+                    state: getVisualState(currentFork, event.toolCallId) ?? s.state,
                   }
                 : s
             )
@@ -1154,42 +1109,18 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
           if (!currentFork.activeThinkBlockId) return currentFork
 
-          // Map XmlToolResult → ToolResult for display
-          const result = mapXmlToolResultForDisplay(inner.result)
-
           return {
             ...currentFork,
             messages: updateStepInThinkBlock(
               currentFork.messages,
               currentFork.activeThinkBlockId,
               event.toolCallId,
-              (s) => {
-                if (s.type !== 'tool') return s
-
-                let label = s.label
-
-                if (
-                  event.toolKey === 'shell'
-                  && result.status === 'success'
-                  && result.output
-                  && typeof result.output === 'object'
-                  && 'mode' in result.output
-                  && result.output.mode === 'detached'
-                  && s.input
-                  && typeof s.input === 'object'
-                  && 'command' in s.input
-                  && typeof s.input.command === 'string'
-                ) {
-                  label = `$ (detached) ${shortenShellCommand(s.input.command)}`
-                }
-
-                return {
-                  ...s,
-                  label,
-                  result,
-                  visualState: getVisualState(currentFork, event.toolCallId) ?? s.visualState,
-                }
-              }
+              (s) => s.type === 'tool'
+                ? {
+                    ...s,
+                    state: getVisualState(currentFork, event.toolCallId) ?? s.state,
+                  }
+                : s
             )
           }
         }
@@ -1211,7 +1142,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               currentFork.activeThinkBlockId,
               event.toolCallId,
               (s) => s.type === 'tool'
-                ? { ...s, visualState: vs }
+                ? { ...s, state: vs }
                 : s
             )
           }
@@ -1874,56 +1805,4 @@ export function finalizeCommunicationStreamInFork(
   }
 }
 
-export function generateToolLabel(toolKey: string, input: unknown): string {
-  // For shell, show the command
-  if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input && typeof input.command === 'string') {
-    return `$ ${shortenShellCommand(input.command)}`
-  }
 
-  // For webSearch, show the query
-  if (toolKey === 'webSearch' && input && typeof input === 'object' && 'query' in input && typeof input.query === 'string') {
-    const shortQuery = input.query.length > 60 ? input.query.slice(0, 57) + '...' : input.query
-    return `Searching web for "${shortQuery}"`
-  }
-
-  // For webFetch, show the URL
-  if (toolKey === 'webFetch' && input && typeof input === 'string') {
-    const shortUrl = input.length > 60 ? input.slice(0, 57) + '...' : input
-    return `Fetching ${shortUrl}`
-  }
-
-  // For fileRead, show the path
-  if (toolKey === 'fileRead' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
-    return `Read ${input.path}`
-  }
-
-  // For fileWrite, show the path
-  if (toolKey === 'fileWrite' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
-    return `Wrote ${input.path}`
-  }
-
-  // For fileEdit, show the path
-  if (toolKey === 'fileEdit' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
-    const edits = hasEdits(input) ? input.edits.length : 0
-    return `Edited ${input.path}${edits > 0 ? ` (${edits}${edits === 1 ? ' change' : ' changes'})` : ''}`
-  }
-
-  // For fileSearch, show the pattern
-  if (toolKey === 'fileSearch' && input && typeof input === 'object' && 'pattern' in input && typeof input.pattern === 'string') {
-    const shortPattern = input.pattern.length > 40 ? input.pattern.slice(0, 37) + '...' : input.pattern
-    return `Searched for "${shortPattern}"`
-  }
-
-  // For fileTree, show the path
-  if (toolKey === 'fileTree' && input && typeof input === 'object' && 'path' in input && typeof input.path === 'string') {
-    return `Listed ${input.path}`
-  }
-
-  // For agent creation
-  if (toolKey === 'agentCreate' && input && typeof input === 'object' && 'name' in input && typeof input.name === 'string') {
-    return `Started agent "${input.name}"`
-  }
-
-  // Default: just the tool key
-  return `${toolKey}()`
-}

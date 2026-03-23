@@ -1,1 +1,1 @@
-export { ToolEventNormalizer } from './tool-event-normalizer'
+export { normalizeToolEvent } from './tool-event-normalizer'

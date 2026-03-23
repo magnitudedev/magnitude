@@ -1,6 +1,6 @@
 import { TextAttributes } from '@opentui/core';
 import { type WebSearchState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../types';
+import type { CommonToolProps } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
@@ -12,8 +12,8 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + '…';
 }
 
-export const webSearchDisplay = createToolDisplay<WebSearchState>('webSearch', {
-  render: ({ state, isExpanded, onToggle }) => {
+export const webSearchDisplay = {
+  render({ state, isExpanded, onToggle }: { state: WebSearchState } & CommonToolProps) {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -78,9 +78,9 @@ export const webSearchDisplay = createToolDisplay<WebSearchState>('webSearch', {
       </text>
     );
   },
-  summary: (state) => {
+  summary(state: WebSearchState): string {
     const target = state.query ? `"${state.query}"` : 'the web';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Searching web for ${target}`;
     return `Searched web for ${target}`;
   },
-});
+};

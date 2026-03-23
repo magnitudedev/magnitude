@@ -11,8 +11,35 @@ export { agentCreateModel, type AgentCreateState } from './agent-create'
 export { agentKillModel, type AgentKillState } from './agent-kill'
 export { skillModel, type SkillState } from './skill'
 export { shellModel, type ShellState } from './shell'
-export { browserActionModel, type BrowserActionState } from './browser-action'
-export { getModelForToolKey } from './registry'
+export { phaseSubmitModel, type PhaseSubmitState } from './phase-submit'
+export { phaseVerdictModel, type PhaseVerdictState } from './phase-verdict'
+export {
+  createBrowserActionModel,
+  type BrowserActionState,
+  type BrowserActionModelConfig,
+  clickModel,
+  doubleClickModel,
+  rightClickModel,
+  typeModel,
+  scrollModel,
+  dragModel,
+  navigateModel,
+  goBackModel,
+  switchTabModel,
+  newTabModel,
+  screenshotModel,
+  evaluateModel,
+} from './browser-action'
+export {
+  TOOL_DEFINITIONS,
+  isToolKey,
+  type ToolDefinitionMap,
+  type ToolDefinitionFor,
+  type ToolKey,
+  type ToolModelFor,
+  type ToolStateFor,
+  type ToolEventFor,
+} from '../tools/tool-definitions'
 
 // Aliases for display compatibility
 export { fileWriteModel as contentModel, type FileWriteState as ContentState } from './file-write'

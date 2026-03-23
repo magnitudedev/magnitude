@@ -13,7 +13,8 @@ export interface StateModel<TState, TInput, TOutput, TEmission, TStreaming> {
   ) => TState;
 }
 
-export function defineStateModel<TInput, TOutput, TEmission, TStreaming>(
+export function defineStateModel<TToolKey extends string, TInput, TOutput, TEmission, TStreaming>(
+  toolKey: TToolKey,
   chain: {
     tool: { inputSchema: { Type: TInput }; outputSchema: { Type: TOutput }; emissionSchema?: { Type: TEmission } };
     binding: ToolBinding<TInput, TStreaming>;
@@ -25,12 +26,12 @@ export function defineStateModel<TInput, TOutput, TEmission, TStreaming>(
     config: {
       initial: TExtra;
       reduce: (
-        state: BaseState & TExtra,
+        state: { toolKey: TToolKey } & BaseState & TExtra,
         event: ToolStateEvent<TInput, TOutput, TEmission, TStreaming>
-      ) => BaseState & TExtra;
+      ) => { toolKey: TToolKey } & BaseState & TExtra;
     }
-  ): StateModel<BaseState & TExtra, TInput, TOutput, TEmission, TStreaming> => {
-    const initial = { ...({ phase: 'streaming' } satisfies BaseState), ...config.initial };
+  ): StateModel<{ toolKey: TToolKey } & BaseState & TExtra, TInput, TOutput, TEmission, TStreaming> => {
+    const initial = { toolKey, ...({ phase: 'streaming' } satisfies BaseState), ...config.initial };
     return { initial, reduce: config.reduce };
   };
 }

@@ -1,14 +1,14 @@
 import { TextAttributes } from '@opentui/core';
 import { type FileTreeState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../types';
+import type { CommonToolProps } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const fileTreeDisplay = createToolDisplay<FileTreeState>('fileTree', {
-  render: ({ state, isExpanded, onToggle }) => {
+export const fileTreeDisplay = {
+  render({ state, isExpanded, onToggle }: { state: FileTreeState } & CommonToolProps) {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -72,10 +72,10 @@ export const fileTreeDisplay = createToolDisplay<FileTreeState>('fileTree', {
       </box>
     );
   },
-  summary: (state) => {
+  summary(state: FileTreeState): string {
     const path = state.path || 'files';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Listing ${path}`;
     if (state.phase === 'completed') return `Listed ${path}`;
     return `List ${path}`;
   },
-});
+};

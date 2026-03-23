@@ -4,6 +4,7 @@ import { treeTool, treeXmlBinding } from '../tools/fs'
 type TreeEntry = { path: string; name: string; type: 'file' | 'dir'; depth: number }
 
 export interface FileTreeState extends BaseState {
+  toolKey: 'fileTree'
   path?: string
   entries: TreeEntry[]
   fileCount: number
@@ -11,7 +12,7 @@ export interface FileTreeState extends BaseState {
   errorDetail?: string
 }
 
-const initial: Omit<FileTreeState, 'phase'> = {
+const initial: Omit<FileTreeState, 'phase' | 'toolKey'> = {
   path: undefined,
   entries: [],
   fileCount: 0,
@@ -19,7 +20,7 @@ const initial: Omit<FileTreeState, 'phase'> = {
   errorDetail: undefined,
 }
 
-export const fileTreeModel = defineStateModel({
+export const fileTreeModel = defineStateModel('fileTree', {
   tool: treeTool,
   binding: treeXmlBinding,
 })({

@@ -4,6 +4,7 @@ import type { ObservedResult, ResponsePart, ToolResult, TurnCompleted, TurnToolC
 import { mapXmlToolResult } from './tool-result'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { defaultXmlTagName } from '../tools'
+import { isToolKey, type ToolKey } from '../tools/tool-definitions'
 import { CanonicalTurnProjection, type CanonicalTurnState } from '../projections/canonical-turn'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { ReplayProjection } from '../projections/replay'
@@ -71,25 +72,24 @@ export const buildInterruptedTurnCompleted = (params: {
     : 'orchestrator'
 
   const agentDef = getAgentDefinition(variant)
-  const tagToMeta = new Map<string, { toolKey: string; group: string; toolName: string }>()
+  const tagToMeta = new Map<string, { toolKey: ToolKey; group: string; toolName: string }>()
   for (const [toolKey, tool] of Object.entries(agentDef.tools)) {
     if (!tool) continue
     const concreteTool = tool as { name: string; group?: string }
     const tagName = defaultXmlTagName(concreteTool as any)
-    tagToMeta.set(tagName, {
-      toolKey,
-      group: concreteTool.group ?? 'default',
-      toolName: concreteTool.name,
-    })
+    if (isToolKey(toolKey)) {
+      tagToMeta.set(tagName, {
+        toolKey,
+        group: concreteTool.group ?? 'default',
+        toolName: concreteTool.name,
+      })
+    }
   }
 
   const toolCalls: TurnToolCall[] = []
   for (const [toolCallId, tagName] of replay.toolCallMap.entries()) {
-    const meta = tagToMeta.get(tagName) ?? {
-      toolKey: tagName,
-      group: tagName,
-      toolName: tagName,
-    }
+    const meta = tagToMeta.get(tagName)
+    if (!meta) continue
 
     const outcome = replay.toolOutcomes.get(toolCallId)
     const result: ToolResult = outcome

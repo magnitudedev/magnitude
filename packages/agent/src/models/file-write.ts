@@ -2,20 +2,21 @@ import { defineStateModel, type BaseState } from '@magnitudedev/tools'
 import { writeTool, writeXmlBinding } from '../tools/fs'
 
 export interface FileWriteState extends BaseState {
+  toolKey: 'fileWrite'
   path?: string
   body: string
   charCount: number
   lineCount: number
 }
 
-const initial: Omit<FileWriteState, 'phase'> = {
+const initial: Omit<FileWriteState, 'phase' | 'toolKey'> = {
   path: undefined,
   body: '',
   charCount: 0,
   lineCount: 0,
 }
 
-export const fileWriteModel = defineStateModel({
+export const fileWriteModel = defineStateModel('fileWrite', {
   tool: writeTool,
   binding: writeXmlBinding,
 })({

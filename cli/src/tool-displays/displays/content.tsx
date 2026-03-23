@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { TextAttributes } from '@opentui/core';
 import { type ContentState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../types';
+import type { CommonToolProps } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { StreamingMarkdownContent } from '../../markdown/markdown-content';
@@ -13,8 +13,8 @@ import { useStreamingReveal } from '../../hooks/use-streaming-reveal';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const contentDisplay = createToolDisplay<ContentState>('fileWrite', {
-  render: ({ state, onFileClick }) => {
+export const contentDisplay = {
+  render({ state, onFileClick }: { state: ContentState } & CommonToolProps) {
     const theme = useTheme();
     const path = state.path;
     const content = state.body ?? '';
@@ -99,9 +99,9 @@ export const contentDisplay = createToolDisplay<ContentState>('fileWrite', {
       </box>
     );
   },
-  summary: (state) => {
+  summary(state: ContentState): string {
     const path = state.path || 'file';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Writing ${String(path)}`;
     return `Wrote ${String(path)}`;
   },
-});
+};

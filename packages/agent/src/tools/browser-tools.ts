@@ -10,6 +10,7 @@ import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
 import type { WebHarness } from '@magnitudedev/browser-harness'
+import { getBrowserActionBaseLabel } from './browser-action-visuals'
 
 export class BrowserHarnessTag extends Context.Tag('BrowserHarness')<
   BrowserHarnessTag,
@@ -39,7 +40,7 @@ export const clickTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('click'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -69,7 +70,7 @@ export const doubleClickTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('doubleClick'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -99,7 +100,7 @@ export const rightClickTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('rightClick'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -128,7 +129,7 @@ export const typeTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('type'),
   execute: ({ content }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -160,7 +161,7 @@ export const scrollTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('scroll'),
   execute: ({ x, y, deltaX, deltaY }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -199,7 +200,7 @@ export const dragTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('drag'),
   execute: ({ x1, y1, x2, y2 }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -235,7 +236,7 @@ export const navigateTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('navigate'),
   execute: ({ url }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -261,7 +262,7 @@ export const goBackTool = defineTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('goBack'),
   execute: () =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -290,7 +291,7 @@ export const switchTabTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('switchTab'),
   execute: ({ index }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -316,7 +317,7 @@ export const newTabTool = defineTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('newTab'),
   execute: () =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -342,7 +343,7 @@ export const screenshotTool = defineTool({
   outputSchema: Schema.String,
   errorSchema: BrowserError,
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('screenshot'),
   execute: () =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag
@@ -375,7 +376,7 @@ export const evaluateTool = defineTool({
   errorSchema: BrowserError,
 
 
-  label: () => 'Browser action',
+  label: () => getBrowserActionBaseLabel('evaluate'),
   execute: ({ code }) =>
     Effect.gen(function* () {
       const harness = yield* BrowserHarnessTag

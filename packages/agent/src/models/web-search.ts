@@ -4,16 +4,17 @@ import { webSearchTool, webSearchXmlBinding } from '../tools/web-search-tool'
 type Source = { title: string; url: string }
 
 export interface WebSearchState extends BaseState {
+  toolKey: 'webSearch'
   query?: string
   sources: Source[]
 }
 
-const initial: Omit<WebSearchState, 'phase'> = {
+const initial: Omit<WebSearchState, 'phase' | 'toolKey'> = {
   query: undefined,
   sources: [],
 }
 
-export const webSearchModel = defineStateModel({
+export const webSearchModel = defineStateModel('webSearch', {
   tool: webSearchTool,
   binding: webSearchXmlBinding,
 })({

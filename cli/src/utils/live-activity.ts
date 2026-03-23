@@ -1,24 +1,57 @@
 import type { DisplayMessage, ThinkBlockStep } from '@magnitudedev/agent'
-import { displayRegistry } from '../tool-displays/registry'
+import { summarizeToolStep } from '../tool-displays/render'
 
 function normalize(text: string): string {
   return text.trim().replace(/\s+/g, ' ')
 }
 
+function joinLabelDetail(label: string, detail: string): string {
+  const trimmedDetail = detail.trim()
+  if (trimmedDetail.length === 0) return normalize(label)
+  if (/^[,.;:!?)]/.test(trimmedDetail) || /^:/.test(trimmedDetail)) return normalize(`${label}${trimmedDetail}`)
+  if (/^\(/.test(trimmedDetail)) return normalize(`${label}${trimmedDetail}`)
+  if (label.trimEnd().endsWith('(')) return normalize(`${label}${trimmedDetail}`)
+  return normalize(`${label} ${trimmedDetail}`)
+}
+
 function getToolLiveText(step: ThinkBlockStep): string | null {
   if (step.type !== 'tool') return null
-  if (step.toolKey && typeof step.visualState === 'object' && step.visualState !== null) {
-    const display = displayRegistry.get(step.toolKey)
-    const value = display?.summary((step.visualState as any).state)
+  if (step.state) {
+    const value = summarizeToolStep(step.state)
     if (typeof value === 'string') {
       const normalized = normalize(value)
       if (normalized.length > 0) return normalized
     }
+
+    if (typeof step.state === 'object' && step.state !== null) {
+      if ('label' in step.state && typeof step.state.label === 'string') {
+        const detail = 'detail' in step.state && typeof step.state.detail === 'string'
+          ? step.state.detail
+          : ''
+        const joined = joinLabelDetail(step.state.label, detail)
+        if (joined.length > 0) return joined
+      }
+
+      const liveTextToolKey = String(step.toolKey)
+      const supportsProgressiveLiveText = (
+        liveTextToolKey === 'fileWrite'
+        || liveTextToolKey === 'fileEdit'
+        || liveTextToolKey === 'artifactWrite'
+        || liveTextToolKey === 'artifactUpdate'
+      )
+
+      if (supportsProgressiveLiveText && 'phase' in step.state) {
+        if ('name' in step.state && typeof step.state.name === 'string' && step.state.name.length > 0) {
+          return `Writing artifact ${step.state.name}`
+        }
+        if ('path' in step.state && typeof step.state.path === 'string' && step.state.path.length > 0) {
+          return step.toolKey === 'fileEdit' ? `Editing ${step.state.path}` : 'Writing artifact draft'
+        }
+      }
+    }
   }
-  if (typeof step.label === 'string') {
-    const normalized = normalize(step.label)
-    if (normalized.length > 0) return normalized
-  }
+  const fallback = normalize(String(step.toolKey))
+  if (fallback.length > 0) return fallback
   return null
 }
 

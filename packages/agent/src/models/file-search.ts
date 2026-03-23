@@ -4,6 +4,7 @@ import { searchTool, searchXmlBinding } from '../tools/fs'
 type SearchMatch = { file: string; match: string }
 
 export interface FileSearchState extends BaseState {
+  toolKey: 'fileSearch'
   pattern?: string
   path?: string
   glob?: string
@@ -14,7 +15,7 @@ export interface FileSearchState extends BaseState {
   errorDetail?: string
 }
 
-const initial: Omit<FileSearchState, 'phase'> = {
+const initial: Omit<FileSearchState, 'phase' | 'toolKey'> = {
   pattern: undefined,
   path: undefined,
   glob: undefined,
@@ -25,7 +26,7 @@ const initial: Omit<FileSearchState, 'phase'> = {
   errorDetail: undefined,
 }
 
-export const fileSearchModel = defineStateModel({
+export const fileSearchModel = defineStateModel('fileSearch', {
   tool: searchTool,
   binding: searchXmlBinding,
 })({

@@ -2,20 +2,21 @@ import { defineStateModel, type BaseState, type EditDiff } from '@magnitudedev/t
 import { editTool, editXmlBinding } from '../tools/fs'
 
 export interface FileEditState extends BaseState {
+  toolKey: 'fileEdit'
   path?: string
   oldText: string
   newText: string
   diffs: EditDiff[]
 }
 
-const initial: Omit<FileEditState, 'phase'> = {
+const initial: Omit<FileEditState, 'phase' | 'toolKey'> = {
   path: undefined,
   oldText: '',
   newText: '',
   diffs: [],
 }
 
-export const fileEditModel = defineStateModel({
+export const fileEditModel = defineStateModel('fileEdit', {
   tool: editTool,
   binding: editXmlBinding,
 })({

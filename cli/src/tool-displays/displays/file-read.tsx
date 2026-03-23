@@ -1,12 +1,12 @@
 import { type FileReadState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../types';
+import type { CommonToolProps } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const fileReadDisplay = createToolDisplay<FileReadState>('fileRead', {
-  render: ({ state }) => {
+export const fileReadDisplay = {
+  render({ state }: { state: FileReadState } & CommonToolProps) {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -42,9 +42,9 @@ export const fileReadDisplay = createToolDisplay<FileReadState>('fileRead', {
       </box>
     );
   },
-  summary: (state) => {
+  summary(state: FileReadState): string {
     const path = state.path || 'file';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Reading ${path}`;
     return `Read ${path}`;
   },
-});
+};

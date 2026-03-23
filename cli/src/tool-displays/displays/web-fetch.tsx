@@ -1,5 +1,5 @@
 import { type WebFetchState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../types';
+import type { CommonToolProps } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
@@ -10,8 +10,8 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + '…';
 }
 
-export const webFetchDisplay = createToolDisplay<WebFetchState>('webFetch', {
-  render: ({ state, result }) => {
+export const webFetchDisplay = {
+  render({ state }: { state: WebFetchState } & CommonToolProps) {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -28,7 +28,7 @@ export const webFetchDisplay = createToolDisplay<WebFetchState>('webFetch', {
     }
 
     if (isError) {
-      const errorMsg = result?.status === 'error' ? (result as any).message : '';
+      const errorMsg = state.errorDetail ?? '';
       return (
         <text style={{ wrapMode: 'word' }}>
           <span style={{ fg: theme.error }}>{'✗  '}</span>
@@ -47,10 +47,10 @@ export const webFetchDisplay = createToolDisplay<WebFetchState>('webFetch', {
       </text>
     );
   },
-  summary: (state) => {
+  summary(state: WebFetchState): string {
     const url = state.url || 'URL';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Fetching ${url}`;
     if (state.phase === 'error') return `Fetch ${url}`;
     return `Fetched ${url}`;
   },
-});
+};

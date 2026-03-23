@@ -1,10 +1,10 @@
 import { type AgentCreateState } from '@magnitudedev/agent/src/models';
-import { createToolDisplay } from '../types';
+import type { CommonToolProps } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
-export const agentCreateDisplay = createToolDisplay<AgentCreateState>('agentCreate', {
-  render: ({ state }) => {
+export const agentCreateDisplay = {
+  render({ state }: { state: AgentCreateState } & CommonToolProps) {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -26,10 +26,10 @@ export const agentCreateDisplay = createToolDisplay<AgentCreateState>('agentCrea
       </text>
     );
   },
-  summary: (state) => {
+  summary(state: AgentCreateState): string {
     const target = state.agentId ? `agent "${state.agentId}"` : 'agent';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Starting ${target}`;
     if (state.phase === 'error') return `Start ${target}`;
     return `Started ${target}`;
   },
-});
+};
