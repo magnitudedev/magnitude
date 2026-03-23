@@ -107,6 +107,7 @@ export function resolveOpenTag(state: ParseStack, tagName: string, toolCallId: s
     return events
   }
   if (config.knownTags.has(tagName)) {
+    if (!toolCallId) toolCallId = config.generateId()
     events.push(...endProseBlock(state))
     proseRoot.lastCharNewline = false
     events.push({ _tag: 'TagOpened', tagName, toolCallId, attributes: new Map(attrs) })
