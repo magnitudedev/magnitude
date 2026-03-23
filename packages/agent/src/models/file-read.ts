@@ -2,18 +2,19 @@ import { defineStateModel, type BaseState } from '@magnitudedev/tools'
 import { readTool, readXmlBinding } from '../tools/fs'
 
 export interface FileReadState extends BaseState {
+  toolKey: 'fileRead'
   path?: string
   lineCount?: number
   errorDetail?: string
 }
 
-const initial: Omit<FileReadState, 'phase'> = {
+const initial: Omit<FileReadState, 'phase' | 'toolKey'> = {
   path: undefined,
   lineCount: undefined,
   errorDetail: undefined,
 }
 
-export const fileReadModel = defineStateModel({
+export const fileReadModel = defineStateModel('fileRead', {
   tool: readTool,
   binding: readXmlBinding,
 })({

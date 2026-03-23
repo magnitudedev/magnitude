@@ -33,7 +33,7 @@ function truncateLine(text: string, max: number): string {
   return firstLine;
 }
 
-export const fileSearchDisplay = createToolDisplay<FileSearchState>('fileSearch', {
+export const fileSearchDisplay = createToolDisplay<FileSearchState>({
   render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const inputSummary = summarizeInputs(state);

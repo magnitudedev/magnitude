@@ -3,6 +3,7 @@ import type { PublishFn } from '@magnitudedev/event-core'
 import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
 
 import type { AppEvent } from '../events'
+import { isToolKey } from '../tools/tool-definitions'
 import type { TurnError, TurnEvent, TurnStrategyResult } from '../execution/types'
 
 /**
@@ -46,6 +47,9 @@ export function drainTurnEventStream<R>(
             yield* publish({ type: 'lens_end', forkId, turnId, name: event.name })
             break
           case 'ToolEvent':
+            if (!isToolKey(event.toolKey)) {
+              return yield* Effect.die(new Error(`Invalid tool key at boundary: ${event.toolKey}`))
+            }
             yield* publish({ type: 'tool_event', forkId, turnId, toolCallId: event.toolCallId, toolKey: event.toolKey, event: event.event })
             break
           case 'TurnResult':

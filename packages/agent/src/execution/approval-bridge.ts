@@ -15,6 +15,7 @@
 import { Effect, SubscriptionRef } from 'effect'
 import { ExecutionManager } from './execution-manager'
 import { DisplayProjection, type ApprovalRequestMessage } from '../projections/display'
+import { isToolKey } from '../tools/tool-definitions'
 import { WorkingStateProjection } from '../projections/working-state'
 
 /**
@@ -29,6 +30,7 @@ export const registerApprovalBridge = Effect.gen(function* () {
   // Display: insert/update ApprovalRequestMessage in the fork's messages
   executionManager.approvalState.registerHandler((update) => {
     if (update._tag === 'pending') {
+      if (!isToolKey(update.toolKey)) return
       const message: ApprovalRequestMessage = {
         id: update.toolCallId,
         type: 'approval_request',
@@ -50,7 +52,7 @@ export const registerApprovalBridge = Effect.gen(function* () {
           streamingMessageId: null,
           activeThinkBlockId: null,
           showButton: 'send' as const,
-          toolModelStates: {},
+          toolHandles: {},
         }
         const newForks = new Map(state.forks)
         newForks.set(forkId, {

@@ -1,5 +1,5 @@
 import { TextAttributes } from '@opentui/core';
-import type { BaseState } from '@magnitudedev/tools';
+import type { ToolState } from '@magnitudedev/agent';
 import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
@@ -7,11 +7,12 @@ import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const defaultDisplay = createToolDisplay<BaseState>('default', {
-  render: ({ state, label, result, isExpanded, onToggle }) => {
+export const defaultDisplay = createToolDisplay<ToolState>({
+  render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
-    const isErrorLike = state.phase === 'error' || state.phase === 'rejected' || state.phase === 'interrupted' || result?.status === 'error' || result?.status === 'rejected' || result?.status === 'interrupted';
+    const isErrorLike = state.phase === 'error' || state.phase === 'rejected' || state.phase === 'interrupted';
+    const label = state.toolKey || 'tool';
 
     return (
       <box style={{ flexDirection: 'column' }}>
@@ -42,7 +43,7 @@ export const defaultDisplay = createToolDisplay<BaseState>('default', {
     );
   },
   summary: (state) => {
-    const target = 'tool';
+    const target = state.toolKey || 'tool';
     if (state.phase === 'streaming' || state.phase === 'executing') return `Running ${target}`;
     if (state.phase === 'error') return `${target} error`;
     if (state.phase === 'rejected') return `${target} rejected`;

@@ -10,6 +10,7 @@ import type { EditDiff } from './util/line-edit'
 import type { ContentPart } from './content'
 import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
+import type { ToolKey } from './tools/tool-definitions'
 import type { ObservationPart } from '@magnitudedev/agent-definition'
 import type { WorkflowSkill } from '@magnitudedev/skills'
 
@@ -125,7 +126,7 @@ export interface TurnStarted {
 }
 
 export interface TurnToolCall {
-  readonly toolKey: string
+  readonly toolKey: ToolKey
   readonly group: string
   readonly toolName: string
   readonly result: ToolResult
@@ -258,7 +259,7 @@ export interface ToolEvent {
   readonly forkId: string | null
   readonly turnId: string
   readonly toolCallId: string
-  readonly toolKey: string
+  readonly toolKey: ToolKey
   readonly event: ToolCallEvent
 }
 

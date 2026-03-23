@@ -59,9 +59,6 @@ export { DEFAULT_CONTEXT_WINDOW, COMPACT_TRIGGER_RATIO, PROSE_DELIM_OPEN, PROSE_
 export { collectSessionContext } from './util/collect-session-context'
 export type { CollectSessionContextOptions } from './util/collect-session-context'
 
-// Tool normalizer
-export { ToolEventNormalizer } from './normalizer'
-
 // Skill Scanner
 export { scanSkills } from './util/skill-scanner'
 export type { SkillMetadata } from './util/skill-scanner'
@@ -157,7 +154,12 @@ export type { ToolCallEvent } from '@magnitudedev/xml-act'
 export type { Tool } from '@magnitudedev/tools'
 
 // Tools
-export { getModelForToolKey } from './models/registry'
+export type {
+  ToolKey,
+  ToolStateFor,
+  ToolEventFor,
+} from './tools/tool-definitions'
+export type { ToolHandle, ToolState } from './tools/tool-handle'
 export { thinkTool, globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'
 export { shellBgTool, SHELL_BG_TOOLS } from './tools/shell-bg'

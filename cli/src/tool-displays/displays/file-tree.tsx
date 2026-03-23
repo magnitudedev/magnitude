@@ -7,7 +7,7 @@ import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const fileTreeDisplay = createToolDisplay<FileTreeState>('fileTree', {
+export const fileTreeDisplay = createToolDisplay<FileTreeState>({
   render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';

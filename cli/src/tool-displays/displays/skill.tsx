@@ -2,7 +2,7 @@ import { type SkillState } from '@magnitudedev/agent/src/models';
 import { createToolDisplay } from '../types';
 import { useTheme } from '../../hooks/use-theme';
 
-export const skillDisplay = createToolDisplay<SkillState>('skill', {
+export const skillDisplay = createToolDisplay<SkillState>({
   render: ({ state }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';

@@ -10,8 +10,8 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + '…';
 }
 
-export const webFetchDisplay = createToolDisplay<WebFetchState>('webFetch', {
-  render: ({ state, result }) => {
+export const webFetchDisplay = createToolDisplay<WebFetchState>({
+  render: ({ state }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
@@ -28,7 +28,7 @@ export const webFetchDisplay = createToolDisplay<WebFetchState>('webFetch', {
     }
 
     if (isError) {
-      const errorMsg = result?.status === 'error' ? (result as any).message : '';
+      const errorMsg = state.errorDetail ?? '';
       return (
         <text style={{ wrapMode: 'word' }}>
           <span style={{ fg: theme.error }}>{'✗  '}</span>

@@ -9,7 +9,7 @@ import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const diffDisplay = createToolDisplay<DiffState>('fileEdit', {
+export const diffDisplay = createToolDisplay<DiffState>({
   render: ({ state, isExpanded, onToggle, onFileClick }) => {
     const theme = useTheme();
     const path = state.path;

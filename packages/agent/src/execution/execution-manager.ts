@@ -20,6 +20,7 @@ import {
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
 import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult } from '../events'
+import { isToolKey, type ToolKey } from '../tools/tool-definitions'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
 import { defaultXmlTagName } from '../tools'
@@ -391,8 +392,9 @@ const makeExecutionManager = Effect.gen(function* () {
       }
 
       /** Resolve a xml-act event's tagName to the definition key. */
-      const resolveKey = (tagName: string): string => {
-        return tagToDefKey.get(tagName) ?? tagName
+      const resolveKey = (tagName: string): ToolKey | undefined => {
+        const key = tagToDefKey.get(tagName) ?? tagName
+        return isToolKey(key) ? key : undefined
       }
 
       // Also build callable-based lookup for resolveKey from group+toolName
@@ -403,14 +405,15 @@ const makeExecutionManager = Effect.gen(function* () {
         const callable = (group && group !== 'default') ? `${group}.${tool.name}` : tool.name
         callableToKey.set(callable, key)
       }
-      const resolveKeyFromCallable = (group: string, toolName: string): string => {
+      const resolveKeyFromCallable = (group: string, toolName: string): ToolKey | undefined => {
         const callable = group === 'default' ? toolName : `${group}.${toolName}`
-        return callableToKey.get(callable) ?? callable
+        const key = callableToKey.get(callable) ?? callable
+        return isToolKey(key) ? key : undefined
       }
 
       // Track tools called (by definition key) for turn policy
-      const toolsCalledKeys: string[] = []
-      let lastToolKey: string | null = null
+      const toolsCalledKeys: ToolKey[] = []
+      let lastToolKey: ToolKey | null = null
       const toolCalls: TurnToolCall[] = []
       const messagesSent: Array<{ id: string, dest: string }> = []
       let hasAnyMessage = false
@@ -460,7 +463,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const eventStream = runtime.streamWith(xmlStream, { initialState: replayState })
 
       // Track toolCallId → toolKey mapping for event forwarding
-      const toolCallKeys = new Map<string, string>()
+      const toolCallKeys = new Map<string, ToolKey>()
 
       yield* Effect.scoped(
         eventStream.pipe(
@@ -470,6 +473,7 @@ const makeExecutionManager = Effect.gen(function* () {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
                 const toolKey = resolveKeyFromCallable(event.group, event.toolName)
+                if (!toolKey) break
                 toolCallTagNames.set(event.toolCallId, event.tagName)
                 toolCallKeys.set(event.toolCallId, toolKey)
 
@@ -499,6 +503,7 @@ const makeExecutionManager = Effect.gen(function* () {
               // --- Tool Input Parse Error ---
               case 'ToolInputParseError': {
                 const toolKey = resolveKeyFromCallable(event.group, event.toolName)
+                if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
 
                 // Track for turn policy so the loop continues and LLM sees the error
@@ -526,6 +531,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 yield* Ref.set(toolReminderRef, [])
 
                 const toolKey = toolCallKeys.get(event.toolCallId) ?? resolveKeyFromCallable(event.group, event.toolName)
+                if (!toolKey) break
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -549,6 +555,7 @@ const makeExecutionManager = Effect.gen(function* () {
               // --- Tool Execution Ended ---
               case 'ToolExecutionEnded': {
                 const toolKey = resolveKeyFromCallable(event.group, event.toolName)
+                if (!toolKey) break
 
                 // Skip cached tool calls — these are replays
                 if (cachedToolCallIds.has(event.toolCallId)) {
@@ -679,7 +686,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
-                  toolKey: toolCallKeys.get(event.toolCallId)!,
+                  toolKey: toolCallKeys.get(event.toolCallId) ?? resolveKey(event.tagName) ?? 'shell',
                   event,
                 })
                 break

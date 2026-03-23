@@ -13,7 +13,7 @@ import { useStreamingReveal } from '../../hooks/use-streaming-reveal';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const contentDisplay = createToolDisplay<ContentState>('fileWrite', {
+export const contentDisplay = createToolDisplay<ContentState>({
   render: ({ state, onFileClick }) => {
     const theme = useTheme();
     const path = state.path;

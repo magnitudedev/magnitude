@@ -17,8 +17,8 @@ function truncateLine(text: string, max: number): string {
   return firstLine;
 }
 
-export const shellDisplay = createToolDisplay<ShellState>('shell', {
-  render: ({ state, result, isExpanded, onToggle }) => {
+export const shellDisplay = createToolDisplay<ShellState>({
+  render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const command = state.command || '';
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
@@ -26,44 +26,24 @@ export const shellDisplay = createToolDisplay<ShellState>('shell', {
     const isInterrupted = state.phase === 'interrupted';
     const isDetached = state.done === 'detached';
     const isCompleted = state.phase === 'completed';
-    const isError = result?.status === 'error';
-    const isSuccess = result?.status === 'success';
+    const isError = state.phase === 'error';
+    const isSuccess = isCompleted || isDetached;
 
-    const isFailed = isError || (isSuccess && (result as any).output?.exitCode !== 0);
+    const isFailed = isError || (isSuccess && state.exitCode !== undefined && state.exitCode !== 0);
+    const rejectionReason = isRejected ? state.rejectionReason : undefined;
+    const detachedPid = isDetached ? state.pid : undefined;
 
-    // Extract rejection details from result
-    const rejectionReason = (() => {
-      if (!isRejected || !result) return undefined;
-      return (result as any).reason as string | undefined;
-    })();
+    const resultPreview = isSuccess
+      ? (isFailed ? (state.stderr || state.stdout) : (state.stdout || state.stderr))
+      : isError
+        ? state.errorMessage ?? ''
+        : '';
 
-    // Extract PID for detached
-    const detachedPid = (() => {
-      if (!isDetached || !result) return undefined;
-      const out = (result as any).output;
-      if (!out || typeof out !== 'object') return undefined;
-      return out.pid as number | undefined;
-    })();
-
-    // Compute result text
-    const shellOutput = isSuccess && (result as any).output
-      ? (result as any).output as { stdout?: string; stderr?: string; exitCode?: number }
-      : undefined;
-    const resultPreview = shellOutput
-      ? (isFailed ? (shellOutput.stderr || shellOutput.stdout) : (shellOutput.stdout || shellOutput.stderr))
-      : isDetached && (result as any)?.output
-        ? ((result as any).output.stdout || (result as any).output.stderr)
-        : isError
-          ? (result as any).message ?? ''
-          : '';
-
-    const fullResultText = shellOutput
-      ? [shellOutput.stdout, isFailed ? shellOutput.stderr : ''].filter(Boolean).join('\n').replace(/^\n+/, '').trimEnd()
-      : isDetached && (result as any)?.output
-        ? [(result as any).output.stdout, (result as any).output.stderr].filter(Boolean).join('\n').replace(/^\n+/, '').trimEnd()
-        : isError
-          ? (result as any).message ?? ''
-          : '';
+    const fullResultText = isSuccess
+      ? [state.stdout, isFailed ? state.stderr : ''].filter(Boolean).join('\n').replace(/^\n+/, '').trimEnd()
+      : isError
+        ? state.errorMessage ?? ''
+        : '';
 
     return (
       <box style={{ flexDirection: 'column' }}>

@@ -1,13 +1,14 @@
 import { memo, useEffect, useRef, useState, useCallback } from 'react'
-import { TextAttributes } from '@opentui/core'
-import type { ThinkBlockMessage, ThinkBlockStep, DisplayMessage } from '@magnitudedev/agent'
+import type { Ref } from 'react'
+import { TextAttributes, type BoxRenderable } from '@opentui/core'
+import type { ThinkBlockMessage, ThinkBlockStep, DisplayMessage, ToolKey } from '@magnitudedev/agent'
 import { Button } from './button'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { useTheme } from '../hooks/use-theme'
 import { orange } from '../utils/theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
-import { displayRegistry } from '../tool-displays/registry'
+import { renderToolStep } from '../tool-displays/render'
 import { selectLatestLiveActivityFromThinkSteps } from '../utils/live-activity'
 
 const SHIMMER_INTERVAL_MS = 160
@@ -20,7 +21,7 @@ interface ThinkBlockProps {
   onToggle: () => void
   timerStartTime?: number | null
   hideHeader?: boolean
-  onHeaderRef?: (ref: any) => void
+  onHeaderRef?: Ref<BoxRenderable>
   pendingApproval?: boolean
   onFileClick?: (path: string, section?: string) => void
   isInterrupted?: boolean
@@ -86,14 +87,14 @@ const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'su
   )
 }
 
-function buildSummary(steps: readonly { type: string; toolKey?: string }[]): string {
+function buildSummary(steps: readonly { type: string; toolKey?: ToolKey }[]): string {
   let webSearches = 0
   let commands = 0
   let reads = 0
   let writes = 0
   let searches = 0
   let edits = 0
-  let gathers = 0
+
   let clicks = 0
   let navigations = 0
   let inputs = 0
@@ -121,7 +122,6 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
     else if (step.toolKey === 'fileWrite') writes++
     else if (step.toolKey === 'fileSearch') searches++
     else if (step.toolKey === 'fileEdit') edits++
-    else if (step.toolKey === 'gather') gathers++
     else if (step.toolKey === 'click' || step.toolKey === 'doubleClick' || step.toolKey === 'rightClick' || step.toolKey === 'drag') clicks++
     else if (step.toolKey === 'navigate' || step.toolKey === 'goBack' || step.toolKey === 'switchTab' || step.toolKey === 'newTab') navigations++
     else if (step.toolKey === 'type') inputs++
@@ -134,7 +134,7 @@ function buildSummary(steps: readonly { type: string; toolKey?: string }[]): str
   if (writes > 0) parts.push(writes + ' ' + (writes === 1 ? 'write' : 'writes'))
   if (edits > 0) parts.push(edits + ' ' + (edits === 1 ? 'edit' : 'edits'))
   if (searches > 0) parts.push(`${searches} ${searches === 1 ? 'search' : 'searches'}`)
-  if (gathers > 0) parts.push(`${gathers} gather`)
+
   if (clicks > 0) parts.push(`${clicks} ${clicks === 1 ? 'click' : 'clicks'}`)
   if (navigations > 0) parts.push(`${navigations} ${navigations === 1 ? 'navigation' : 'navigations'}`)
   if (inputs > 0) parts.push(`${inputs} ${inputs === 1 ? 'input' : 'inputs'}`)
@@ -178,7 +178,7 @@ function groupByCluster(steps: readonly ThinkBlockStep[]): StepGroup[] {
 }
 
 // =============================================================================
-// Step rendering — delegates to visual registry
+// Step rendering — direct display dispatch
 // =============================================================================
 
 const ToolStepView = memo(function ToolStepView({
@@ -193,28 +193,17 @@ const ToolStepView = memo(function ToolStepView({
   onFileClick?: (name: string, section?: string) => void
 }) {
   const theme = useTheme()
-  const display = step.toolKey ? displayRegistry.get(step.toolKey) : undefined
-
-  if (display && step.visualState && typeof step.visualState === 'object' && 'state' in step.visualState) {
-    return <>{display.render({
-      state: (step.visualState as any).state,
-      label: step.label ?? step.toolKey ?? '',
-      result: step.result,
+  if (step.state) {
+    return <>{renderToolStep(step.state, {
       isExpanded,
       onToggle,
-      onFileClick,
+      onFileClick: onFileClick ?? (() => {}),
     })}</>
   }
 
-  // Fallback for tools without a visual definition
   return (
     <text>
-      <span style={{ fg: theme.warning }}>{step.label}</span>
-      {step.result && (
-        <span style={{ fg: step.result.status === 'success' ? theme.success : theme.error }}>
-          {' '}[{step.result.status}]
-        </span>
-      )}
+      <span style={{ fg: theme.warning }}>{step.toolKey}</span>
     </text>
   )
 })

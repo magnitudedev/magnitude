@@ -5,7 +5,7 @@ import { useTheme } from '../../hooks/use-theme';
 
 const SHIMMER_INTERVAL_MS = 160;
 
-export const fileReadDisplay = createToolDisplay<FileReadState>('fileRead', {
+export const fileReadDisplay = createToolDisplay<FileReadState>({
   render: ({ state }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';

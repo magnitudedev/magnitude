@@ -2,7 +2,7 @@ import { type AgentKillState } from '@magnitudedev/agent/src/models';
 import { createToolDisplay } from '../types';
 import { useTheme } from '../../hooks/use-theme';
 
-export const agentKillDisplay = createToolDisplay<AgentKillState>('agentKill', {
+export const agentKillDisplay = createToolDisplay<AgentKillState>({
   render: ({ state }) => {
     const theme = useTheme();
     const label = state.agentId ? `Dismissed agent "${state.agentId}"` : 'Dismissing agent...';

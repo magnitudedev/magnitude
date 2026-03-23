@@ -3,7 +3,7 @@ import { createToolDisplay } from '../types';
 import { ShimmerText } from '../../components/shimmer-text';
 import { useTheme } from '../../hooks/use-theme';
 
-export const agentCreateDisplay = createToolDisplay<AgentCreateState>('agentCreate', {
+export const agentCreateDisplay = createToolDisplay<AgentCreateState>({
   render: ({ state }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';

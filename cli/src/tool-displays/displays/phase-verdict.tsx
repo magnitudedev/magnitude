@@ -5,7 +5,7 @@ type PhaseVerdictState = {
   phase?: string
 }
 
-export const phaseVerdictDisplay = createToolDisplay<PhaseVerdictState>('phase-verdict', {
+export const phaseVerdictDisplay = createToolDisplay<PhaseVerdictState>({
   render: ({ state }) => {
     const theme = useTheme()
     const isRunning = state.phase === 'streaming' || state.phase === 'executing'
@@ -19,5 +19,7 @@ export const phaseVerdictDisplay = createToolDisplay<PhaseVerdictState>('phase-v
       </text>
     )
   },
-  summary: (state) => (state.phase === 'streaming' || state.phase === 'executing' ? 'Submitting verdict' : 'Verdict submitted'),
+  summary: (state) => {
+    return state.phase === 'streaming' || state.phase === 'executing' ? 'Submitting verdict' : 'Verdict submitted'
+  },
 })

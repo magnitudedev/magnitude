@@ -12,7 +12,7 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 1) + '…';
 }
 
-export const webSearchDisplay = createToolDisplay<WebSearchState>('webSearch', {
+export const webSearchDisplay = createToolDisplay<WebSearchState>({
   render: ({ state, isExpanded, onToggle }) => {
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';

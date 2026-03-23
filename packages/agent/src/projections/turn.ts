@@ -7,6 +7,7 @@
 
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
+import type { ToolKey } from '../tools/tool-definitions'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 
 // =============================================================================
@@ -15,7 +16,7 @@ import type { XmlToolResult } from '@magnitudedev/xml-act'
 
 export interface ToolCall {
   readonly toolCallId: string
-  readonly toolKey: string
+  readonly toolKey: ToolKey
   readonly input: unknown
   readonly result?: XmlToolResult
 }
