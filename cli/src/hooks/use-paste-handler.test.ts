@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { KeyEvent } from '@opentui/core'
-import { createPasteFallbackController, isPasteFallbackKey } from './use-paste-handler'
+import { createPasteFallbackController } from './use-paste-handler'
+import { isPasteFallbackKey } from '../components/chat/paste/ingest-coordinator'
 
 function createKey(overrides: Partial<KeyEvent> = {}): KeyEvent {
   return {
@@ -12,6 +13,18 @@ function createKey(overrides: Partial<KeyEvent> = {}): KeyEvent {
     shift: false,
     ...overrides,
   } as KeyEvent
+}
+
+function defer<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 describe('isPasteFallbackKey', () => {
@@ -34,64 +47,107 @@ describe('isPasteFallbackKey', () => {
 })
 
 describe('createPasteFallbackController', () => {
-  test('recognizes Cmd+V key path', async () => {
+  test('fallback-empty then late native inserts once from native', async () => {
     const calls: Array<string | undefined> = []
-    const controller = createPasteFallbackController((text) => calls.push(text), 10)
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      return Boolean(text)
+    }, 10)
 
-    const handled = controller.handlePasteKey(createKey({ name: 'v', meta: true }))
-    expect(handled).toBe(true)
+    controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
+    await sleep(20)
+    controller.handlePasteEvent({ text: 'native-late' })
+    await Promise.resolve()
 
-    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(calls).toEqual([undefined, 'native-late'])
+    controller.dispose()
+  })
+
+  test('fallback-success then late native is dropped', async () => {
+    const calls: Array<string | undefined> = []
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      return true
+    }, 10)
+
+    controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
+    await sleep(20)
+    controller.handlePasteEvent({ text: 'native-late' })
+    await Promise.resolve()
+
     expect(calls).toEqual([undefined])
     controller.dispose()
   })
 
-  test('fires fallback paste when no native paste event arrives', async () => {
+  test('native while fallback in-flight is dropped when fallback later succeeds', async () => {
     const calls: Array<string | undefined> = []
-    const controller = createPasteFallbackController((text) => calls.push(text), 10)
+    const fallback = defer<boolean>()
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      if (text === undefined) return fallback.promise
+      return true
+    }, 10)
 
-    const handled = controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
-    expect(handled).toBe(true)
+    controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
+    await sleep(20)
+    controller.handlePasteEvent({ text: 'native-during-inflight' })
+    await Promise.resolve()
 
-    await new Promise((resolve) => setTimeout(resolve, 25))
+    fallback.resolve(true)
+    await Promise.resolve()
+    await Promise.resolve()
+
     expect(calls).toEqual([undefined])
     controller.dispose()
   })
 
-  test('native paste event cancels fallback insertion', async () => {
+  test('native while fallback in-flight is replayed when fallback later resolves empty', async () => {
     const calls: Array<string | undefined> = []
-    const controller = createPasteFallbackController((text) => calls.push(text), 25)
+    const fallback = defer<boolean>()
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      if (text === undefined) return fallback.promise
+      return Boolean(text)
+    }, 10)
 
-    const handled = controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
-    expect(handled).toBe(true)
+    controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
+    await sleep(20)
+    controller.handlePasteEvent({ text: 'native-during-inflight-empty' })
+    await Promise.resolve()
 
-    controller.handlePasteEvent({ text: 'native-text' })
-    await new Promise((resolve) => setTimeout(resolve, 40))
+    fallback.resolve(false)
+    await Promise.resolve()
+    await Promise.resolve()
 
-    expect(calls).toEqual(['native-text'])
+    expect(calls).toEqual([undefined, 'native-during-inflight-empty'])
     controller.dispose()
   })
 
   test('near-deadline native paste still yields single insertion', async () => {
     const calls: Array<string | undefined> = []
-    const controller = createPasteFallbackController((text) => calls.push(text), 20)
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      return Boolean(text)
+    }, 20)
 
-    const handled = controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
-    expect(handled).toBe(true)
-
-    await new Promise((resolve) => setTimeout(resolve, 18))
+    controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
+    await sleep(18)
     controller.handlePasteEvent({ text: 'native-near-deadline' })
-    await new Promise((resolve) => setTimeout(resolve, 40))
+    await sleep(30)
 
     expect(calls).toEqual(['native-near-deadline'])
     controller.dispose()
   })
 
-  test('native paste without key path still inserts', () => {
+  test('native paste without key path still inserts', async () => {
     const calls: Array<string | undefined> = []
-    const controller = createPasteFallbackController((text) => calls.push(text), 10)
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      return true
+    }, 10)
 
     controller.handlePasteEvent({ text: 'native-only' })
+    await Promise.resolve()
 
     expect(calls).toEqual(['native-only'])
     controller.dispose()
@@ -99,12 +155,38 @@ describe('createPasteFallbackController', () => {
 
   test('dispose cancels pending fallback timer', async () => {
     const calls: Array<string | undefined> = []
-    const controller = createPasteFallbackController((text) => calls.push(text), 10)
+    const controller = createPasteFallbackController((text) => {
+      calls.push(text)
+      return true
+    }, 10)
 
     controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
     controller.dispose()
 
-    await new Promise((resolve) => setTimeout(resolve, 25))
+    await sleep(25)
     expect(calls).toEqual([])
+  })
+
+  test('callback updates do not reset pending attempt state', async () => {
+    const calls: Array<string | undefined> = []
+    let callback = (text?: string) => {
+      calls.push(text)
+      return Boolean(text)
+    }
+
+    const controller = createPasteFallbackController((text) => callback(text), 10)
+
+    controller.handlePasteKey(createKey({ name: 'v', ctrl: true }))
+    callback = (text?: string) => {
+      calls.push(text)
+      return Boolean(text)
+    }
+
+    await sleep(20)
+    controller.handlePasteEvent({ text: 'native-late' })
+    await Promise.resolve()
+
+    expect(calls).toEqual([undefined, 'native-late'])
+    controller.dispose()
   })
 })

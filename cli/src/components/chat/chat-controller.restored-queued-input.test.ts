@@ -1,23 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import {
-  buildRestoredQueuedInputValue,
-  nextBulkInsertEpochForPaste,
-  shouldBumpBulkInsertEpoch,
-} from './chat-controller'
+import { buildRestoredQueuedInputValue, nextBulkInsertEpochForPaste } from './chat-controller'
 
 describe('bulk-insert epoch helpers', () => {
-  test('bumps epoch only for text-affecting paste outcomes', () => {
-    expect(shouldBumpBulkInsertEpoch('text-inline')).toBe(true)
-    expect(shouldBumpBulkInsertEpoch('text-segment')).toBe(true)
-    expect(shouldBumpBulkInsertEpoch('clipboard-image')).toBe(false)
-    expect(shouldBumpBulkInsertEpoch('pasted-image-path')).toBe(false)
-    expect(shouldBumpBulkInsertEpoch('empty')).toBe(false)
-
-    expect(nextBulkInsertEpochForPaste(3, 'text-inline')).toBe(4)
-    expect(nextBulkInsertEpochForPaste(3, 'text-segment')).toBe(4)
-    expect(nextBulkInsertEpochForPaste(3, 'clipboard-image')).toBe(3)
-    expect(nextBulkInsertEpochForPaste(3, 'pasted-image-path')).toBe(3)
-    expect(nextBulkInsertEpochForPaste(3, 'empty')).toBe(3)
+  test('bumps epoch only when requested by paste effects', () => {
+    expect(nextBulkInsertEpochForPaste(3, true)).toBe(4)
+    expect(nextBulkInsertEpochForPaste(3, false)).toBe(3)
   })
 })
 

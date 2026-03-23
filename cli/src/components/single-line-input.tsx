@@ -68,9 +68,11 @@ export function SingleLineInput({
   )
 
   const handlePasteText = useCallback(
-    (eventText?: string) => {
+    (eventText?: string): boolean => {
       const text = eventText ?? readClipboardText()
-      if (text) insertAtCursor(text)
+      if (!text) return false
+      insertAtCursor(text)
+      return true
     },
     [insertAtCursor],
   )

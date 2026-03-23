@@ -13,7 +13,7 @@ interface ChatInputProps {
   cursorPosition?: number
   onChange?: (value: InputValue) => void
   onSubmit: (message: string) => void
-  onPaste: (text?: string) => void
+  onPaste: (text?: string) => boolean | Promise<boolean>
   disabled?: boolean
   placeholder?: string
 }

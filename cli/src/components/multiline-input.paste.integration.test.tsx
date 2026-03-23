@@ -99,7 +99,10 @@ describe('MultilineInput native paste integration', () => {
         cursorPosition={0}
         onChange={() => {}}
         onSubmit={() => {}}
-        onPaste={(text) => onPasteCalls.push(text)}
+        onPaste={(text) => {
+        onPasteCalls.push(text)
+        return Boolean(text)
+      }}
       />,
     )
 

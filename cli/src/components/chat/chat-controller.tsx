@@ -20,9 +20,11 @@ import { autoScaleImageAttachmentIfNeeded } from '../../utils/image-scaling'
 import {
   applyTextEditWithPastesAndMentions,
   insertMentionSegment,
-  insertPasteSegment,
   reconstituteInputTextWithMentions,
 } from '../../utils/strings'
+import { resolvePasteIntent, resolvePasteOutcomeFromApplyResult } from './paste/content-resolver'
+import { applyPasteIntent } from './paste/apply'
+import { derivePasteEffects } from './paste/effects'
 import type { InputValue } from '../../types/store'
 import type { ChatControllerProps } from './types'
 import { SubagentTabBar } from './subagent-tab-bar'
@@ -41,71 +43,34 @@ const EMPTY_INPUT: InputValue = {
 const INLINE_PASTE_PILL_CHAR_LIMIT = 1000
 const MAX_HISTORY = 200
 
-export type PasteFlowOutcome = 'clipboard-image' | 'empty' | 'pasted-image-path' | 'text-inline' | 'text-segment'
-
-export async function runChatPasteFlow(args: {
-  eventText?: string
-  readClipboardText: () => string | null
-  addClipboardImage: () => Promise<boolean>
-  addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
-  inlinePastePillCharLimit: number
-  insertText: (pasteText: string) => void
-  insertPasteSegment: (pasteText: string) => void
-}): Promise<PasteFlowOutcome> {
-  const eventText = args.eventText ?? ''
-  const hasNativeEventText = eventText.length > 0
-  const pasteText = hasNativeEventText ? eventText : args.readClipboardText()
-
-  if (!pasteText) {
-    const wasClipboardImage = await args.addClipboardImage()
-    if (wasClipboardImage) return 'clipboard-image'
-    return 'empty'
-  }
-
-  const wasImagePath = await args.addImageFromFilePath(pasteText)
-  if (wasImagePath) return 'pasted-image-path'
-
-  if (pasteText.length > args.inlinePastePillCharLimit) {
-    args.insertPasteSegment(pasteText)
-    return 'text-segment'
-  }
-
-  args.insertText(pasteText)
-  return 'text-inline'
-}
-
 export async function handleChatControllerPaste(args: {
   eventText?: string
   addClipboardImage: () => Promise<boolean>
   addImageFromFilePath: (rawPasteText: string) => Promise<boolean>
   setInputValue: (updater: (prev: InputValue) => InputValue) => void
-}): Promise<PasteFlowOutcome> {
-  return await runChatPasteFlow({
+}): Promise<{ didInsert: boolean; shouldBumpBulkInsertEpoch: boolean }> {
+  const intent = await resolvePasteIntent({
     eventText: args.eventText,
     readClipboardText,
-    addClipboardImage: args.addClipboardImage,
-    addImageFromFilePath: args.addImageFromFilePath,
+    tryAddClipboardImage: args.addClipboardImage,
+    tryAddImageFromFilePath: args.addImageFromFilePath,
     inlinePastePillCharLimit: INLINE_PASTE_PILL_CHAR_LIMIT,
-    insertText: (pasteText) => {
-      args.setInputValue((prev) =>
-        applyTextEditWithPastesAndMentions(prev, prev.cursorPosition, prev.cursorPosition, pasteText),
-      )
-    },
-    insertPasteSegment: (pasteText) => {
-      args.setInputValue((prev) => insertPasteSegment(prev, pasteText, createId()))
-    },
   })
+
+  const applyResult = applyPasteIntent({
+    intent,
+    setInputValue: args.setInputValue,
+  })
+
+  const effects = derivePasteEffects(applyResult)
+  return {
+    didInsert: resolvePasteOutcomeFromApplyResult(applyResult),
+    shouldBumpBulkInsertEpoch: effects.shouldBumpBulkInsertEpoch,
+  }
 }
 
-export function shouldBumpBulkInsertEpoch(outcome: PasteFlowOutcome): boolean {
-  return outcome === 'text-inline' || outcome === 'text-segment'
-}
-
-export function nextBulkInsertEpochForPaste(
-  previousEpoch: number,
-  outcome: PasteFlowOutcome,
-): number {
-  return shouldBumpBulkInsertEpoch(outcome) ? previousEpoch + 1 : previousEpoch
+export function nextBulkInsertEpochForPaste(previousEpoch: number, shouldBumpBulkInsertEpoch: boolean): number {
+  return shouldBumpBulkInsertEpoch ? previousEpoch + 1 : previousEpoch
 }
 
 export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): InputValue {
@@ -430,14 +395,15 @@ export function ChatController(props: ChatControllerProps) {
     setInputValue(value)
   }, [env.bashMode, nextEscWillClearInput, historyIndex, history])
 
-  const handlePaste = useCallback(async (eventText?: string) => {
-    const outcome = await handleChatControllerPaste({
+  const handlePaste = useCallback(async (eventText?: string): Promise<boolean> => {
+    const result = await handleChatControllerPaste({
       eventText,
       addClipboardImage: addImageAttachment,
       addImageFromFilePath: addImageAttachmentFromFilePath,
       setInputValue,
     })
-    setBulkInsertEpoch((prev) => nextBulkInsertEpochForPaste(prev, outcome))
+    setBulkInsertEpoch((prev) => nextBulkInsertEpochForPaste(prev, result.shouldBumpBulkInsertEpoch))
+    return result.didInsert
   }, [addImageAttachment, addImageAttachmentFromFilePath])
 
   const clearComposer = useCallback(() => {

@@ -24,7 +24,8 @@ describe('handleChatControllerPaste', () => {
       },
     })
 
-    expect(outcome).toBe('text-inline')
+    expect(outcome.didInsert).toBe(true)
+    expect(outcome.shouldBumpBulkInsertEpoch).toBe(true)
     expect(state.text).toBe('hello')
     expect(state.cursorPosition).toBe(5)
   })
@@ -44,7 +45,8 @@ describe('handleChatControllerPaste', () => {
       },
     })
 
-    expect(outcome).toBe('pasted-image-path')
+    expect(outcome.didInsert).toBe(true)
+    expect(outcome.shouldBumpBulkInsertEpoch).toBe(false)
     expect(imagePathCalls).toBe(1)
     expect(state.text).toBe('')
   })

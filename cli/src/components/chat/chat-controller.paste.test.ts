@@ -1,138 +1,99 @@
 import { describe, expect, test } from 'bun:test'
-import { runChatPasteFlow } from './chat-controller'
+import { nextBulkInsertEpochForPaste } from './chat-controller'
+import { resolvePasteIntent } from './paste/content-resolver'
+import { applyPasteIntent } from './paste/apply'
+import { derivePasteEffects } from './paste/effects'
 
-describe('runChatPasteFlow', () => {
-  test('prefers non-empty event text and skips clipboard image fallback', async () => {
+describe('paste pipeline', () => {
+  test('prefers event text and routes to inline insertion', async () => {
     const trace: string[] = []
-
-    const outcome = await runChatPasteFlow({
+    const intent = await resolvePasteIntent({
       eventText: 'pasted-text',
       readClipboardText: () => {
         trace.push('readClipboardText')
         return 'clipboard-text'
       },
-      addClipboardImage: async () => {
+      tryAddClipboardImage: async () => {
         trace.push('addClipboardImage')
         return true
       },
-      addImageFromFilePath: async () => {
+      tryAddImageFromFilePath: async () => {
         trace.push('addImageFromFilePath')
         return false
       },
       inlinePastePillCharLimit: 1000,
-      insertText: () => trace.push('insertText'),
-      insertPasteSegment: () => trace.push('insertPasteSegment'),
     })
 
-    expect(outcome).toBe('text-inline')
-    expect(trace).toEqual(['addImageFromFilePath', 'insertText'])
+    expect(intent).toEqual({ kind: 'insert-inline-text', text: 'pasted-text' })
+    expect(trace).toEqual(['addImageFromFilePath'])
   })
 
-  test('uses event text before clipboard fallback and checks image path before text insertion', async () => {
-    const trace: string[] = []
-
-    const outcome = await runChatPasteFlow({
+  test('path image resolution wins before insertion', async () => {
+    const intent = await resolvePasteIntent({
       eventText: '/tmp/image.png',
-      readClipboardText: () => {
-        trace.push('readClipboardText')
-        return 'clipboard-text'
-      },
-      addClipboardImage: async () => {
-        trace.push('addClipboardImage')
-        return false
-      },
-      addImageFromFilePath: async (text) => {
-        trace.push(`addImageFromFilePath:${text}`)
-        return true
-      },
+      readClipboardText: () => 'clipboard-text',
+      tryAddClipboardImage: async () => false,
+      tryAddImageFromFilePath: async () => true,
       inlinePastePillCharLimit: 1000,
-      insertText: () => trace.push('insertText'),
-      insertPasteSegment: () => trace.push('insertPasteSegment'),
     })
-
-    expect(outcome).toBe('pasted-image-path')
-    expect(trace).toEqual([
-      'addImageFromFilePath:/tmp/image.png',
-    ])
+    expect(intent).toEqual({ kind: 'add-path-image', rawPath: '/tmp/image.png' })
   })
 
-  test('falls back to clipboard text when event text is empty and only checks clipboard image when still empty', async () => {
-    const trace: string[] = []
-
-    const outcome = await runChatPasteFlow({
+  test('empty text falls back to clipboard image and can noop', async () => {
+    const intentNoImage = await resolvePasteIntent({
       eventText: '',
-      readClipboardText: () => {
-        trace.push('readClipboardText')
-        return ''
-      },
-      addClipboardImage: async () => {
-        trace.push('addClipboardImage')
-        return false
-      },
-      addImageFromFilePath: async () => {
-        trace.push('addImageFromFilePath')
-        return false
-      },
+      readClipboardText: () => '',
+      tryAddClipboardImage: async () => false,
+      tryAddImageFromFilePath: async () => false,
       inlinePastePillCharLimit: 1000,
-      insertText: () => trace.push('insertText'),
-      insertPasteSegment: () => trace.push('insertPasteSegment'),
     })
+    expect(intentNoImage).toEqual({ kind: 'noop', reason: 'empty' })
 
-    expect(outcome).toBe('empty')
-    expect(trace).toEqual(['readClipboardText', 'addClipboardImage'])
-  })
-
-  test('falls back to clipboard image when both event and clipboard text are empty', async () => {
-    const trace: string[] = []
-
-    const outcome = await runChatPasteFlow({
+    const intentWithImage = await resolvePasteIntent({
       eventText: '',
-      readClipboardText: () => {
-        trace.push('readClipboardText')
-        return ''
-      },
-      addClipboardImage: async () => {
-        trace.push('addClipboardImage')
-        return true
-      },
-      addImageFromFilePath: async () => {
-        trace.push('addImageFromFilePath')
-        return false
-      },
+      readClipboardText: () => '',
+      tryAddClipboardImage: async () => true,
+      tryAddImageFromFilePath: async () => false,
       inlinePastePillCharLimit: 1000,
-      insertText: () => trace.push('insertText'),
-      insertPasteSegment: () => trace.push('insertPasteSegment'),
     })
-
-    expect(outcome).toBe('clipboard-image')
-    expect(trace).toEqual(['readClipboardText', 'addClipboardImage'])
+    expect(intentWithImage).toEqual({ kind: 'add-clipboard-image' })
   })
 
-  test('routes text payloads to inline vs segment insertion by length', async () => {
-    const shortTrace: string[] = []
-    const shortOutcome = await runChatPasteFlow({
-      eventText: 'hello',
-      readClipboardText: () => '',
-      addClipboardImage: async () => false,
-      addImageFromFilePath: async () => false,
-      inlinePastePillCharLimit: 10,
-      insertText: (text) => shortTrace.push(`insertText:${text}`),
-      insertPasteSegment: (text) => shortTrace.push(`insertPasteSegment:${text}`),
+  test('apply/effects map inline vs segment + bulk insert epoch behavior', () => {
+    let text = ''
+    const inline = applyPasteIntent({
+      intent: { kind: 'insert-inline-text', text: 'hello' },
+      setInputValue: (updater) => {
+        const next = updater({
+          text,
+          cursorPosition: text.length,
+          lastEditDueToNav: false,
+          pasteSegments: [],
+          mentionSegments: [],
+          selectedPasteSegmentId: null,
+          selectedMentionSegmentId: null,
+        })
+        text = next.text
+      },
     })
-    expect(shortOutcome).toBe('text-inline')
-    expect(shortTrace).toEqual(['insertText:hello'])
+    expect(text).toBe('hello')
+    expect(derivePasteEffects(inline).shouldBumpBulkInsertEpoch).toBe(true)
 
-    const longTrace: string[] = []
-    const longOutcome = await runChatPasteFlow({
-      eventText: 'this is long',
-      readClipboardText: () => '',
-      addClipboardImage: async () => false,
-      addImageFromFilePath: async () => false,
-      inlinePastePillCharLimit: 4,
-      insertText: (text) => longTrace.push(`insertText:${text}`),
-      insertPasteSegment: (text) => longTrace.push(`insertPasteSegment:${text}`),
+    const segment = applyPasteIntent({
+      intent: { kind: 'insert-segment-text', text: 'this is long' },
+      setInputValue: () => {},
     })
-    expect(longOutcome).toBe('text-segment')
-    expect(longTrace).toEqual(['insertPasteSegment:this is long'])
+    expect(derivePasteEffects(segment).shouldBumpBulkInsertEpoch).toBe(true)
+
+    const noop = applyPasteIntent({
+      intent: { kind: 'noop', reason: 'empty' },
+      setInputValue: () => {},
+    })
+    expect(derivePasteEffects(noop).shouldBumpBulkInsertEpoch).toBe(false)
+  })
+
+  test('nextBulkInsertEpochForPaste only increments when effect says so', () => {
+    expect(nextBulkInsertEpochForPaste(1, true)).toBe(2)
+    expect(nextBulkInsertEpochForPaste(1, false)).toBe(1)
   })
 })

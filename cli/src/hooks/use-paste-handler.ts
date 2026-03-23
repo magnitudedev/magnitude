@@ -1,124 +1,54 @@
 import type { KeyEvent } from '@opentui/core'
 import { useCallback, useEffect, useRef } from 'react'
+import { createPasteIngestCoordinator, isPasteFallbackKey } from '../components/chat/paste/ingest-coordinator'
+import type { PasteEventLike } from '../components/chat/paste/types'
 
 interface UsePasteHandlerOptions {
   enabled?: boolean
-  onPaste: (eventText?: string) => void
+  onPaste: (eventText?: string) => boolean | Promise<boolean>
 }
 
-interface PasteEventLike {
-  text?: string
-}
-
-interface PendingPasteAttempt {
-  id: number
-  status: 'pending' | 'fallback-fired'
-}
-
-export function isPasteFallbackKey(key: KeyEvent): boolean {
-  const keyName = (key.name ?? '').toLowerCase()
-  const isCtrlV = key.ctrl && !key.meta
-  const isCmdV = key.meta && !key.ctrl
-  return !key.option && keyName === 'v' && (isCtrlV || isCmdV)
-}
+export { isPasteFallbackKey }
 
 export function createPasteFallbackController(
-  onPaste: (eventText?: string) => void,
+  onPaste: (eventText?: string) => boolean | Promise<boolean>,
   fallbackDelayMs = 25,
 ): {
   handlePasteKey: (key: KeyEvent, enabled?: boolean) => boolean
   handlePasteEvent: (event: PasteEventLike, enabled?: boolean) => void
   dispose: () => void
 } {
-  let fallbackTimer: ReturnType<typeof setTimeout> | null = null
-  let pendingAttemptCleanupTimer: ReturnType<typeof setTimeout> | null = null
-  let pendingAttempt: PendingPasteAttempt | null = null
-  let nextAttemptId = 1
-
-  const clearFallbackTimer = () => {
-    if (!fallbackTimer) return
-    clearTimeout(fallbackTimer)
-    fallbackTimer = null
-  }
-
-  const clearPendingAttemptCleanupTimer = () => {
-    if (!pendingAttemptCleanupTimer) return
-    clearTimeout(pendingAttemptCleanupTimer)
-    pendingAttemptCleanupTimer = null
-  }
-
-  const clearPendingAttempt = () => {
-    pendingAttempt = null
-    clearPendingAttemptCleanupTimer()
-  }
-
-  const handlePasteKey = (key: KeyEvent, enabled = true): boolean => {
-    if (!enabled) return false
-    if (!isPasteFallbackKey(key)) return false
-
-    key.preventDefault?.()
-    clearFallbackTimer()
-    clearPendingAttemptCleanupTimer()
-
-    const attemptId = nextAttemptId++
-    pendingAttempt = { id: attemptId, status: 'pending' }
-
-    fallbackTimer = setTimeout(() => {
-      fallbackTimer = null
-      if (!pendingAttempt || pendingAttempt.id !== attemptId || pendingAttempt.status !== 'pending') {
-        return
+  const coordinator = createPasteIngestCoordinator({
+    fallbackDelayMs,
+    requestFallbackPaste: () => onPaste(),
+    onOutcome: (outcome) => {
+      if (outcome.kind === 'native-event') {
+        void onPaste(outcome.text)
       }
+    },
+  })
 
-      pendingAttempt.status = 'fallback-fired'
-      onPaste()
-
-      pendingAttemptCleanupTimer = setTimeout(() => {
-        if (pendingAttempt?.id === attemptId && pendingAttempt.status === 'fallback-fired') {
-          pendingAttempt = null
-        }
-        pendingAttemptCleanupTimer = null
-      }, 50)
-    }, fallbackDelayMs)
-
-    return true
+  return {
+    handlePasteKey: (key: KeyEvent, enabled = true) => coordinator.handleKey(key, enabled),
+    handlePasteEvent: (event: PasteEventLike, enabled = true) => coordinator.handleNativeEvent(event, enabled),
+    dispose: () => coordinator.dispose(),
   }
-
-  const handlePasteEvent = (event: PasteEventLike, enabled = true) => {
-    if (!enabled) return
-
-    if (pendingAttempt?.status === 'pending') {
-      clearFallbackTimer()
-      clearPendingAttempt()
-      onPaste(event.text)
-      return
-    }
-
-    if (pendingAttempt?.status === 'fallback-fired') {
-      clearPendingAttempt()
-      return
-    }
-
-    onPaste(event.text)
-  }
-
-  const dispose = () => {
-    clearFallbackTimer()
-    clearPendingAttempt()
-  }
-
-  return { handlePasteKey, handlePasteEvent, dispose }
 }
 
 export function usePasteHandler({ enabled = true, onPaste }: UsePasteHandlerOptions): {
   handlePasteKey: (key: KeyEvent) => boolean
   handlePasteEvent: (event: PasteEventLike) => void
 } {
-  const controllerRef = useRef(createPasteFallbackController(onPaste))
+  const onPasteRef = useRef(onPaste)
+  const controllerRef = useRef(
+    createPasteFallbackController((eventText?: string) => onPasteRef.current(eventText)),
+  )
 
   useEffect(() => {
-    controllerRef.current = createPasteFallbackController(onPaste)
-    return () => controllerRef.current.dispose()
+    onPasteRef.current = onPaste
   }, [onPaste])
+
+  useEffect(() => () => controllerRef.current.dispose(), [])
 
   const handlePasteKey = useCallback(
     (key: KeyEvent): boolean => controllerRef.current.handlePasteKey(key, enabled),

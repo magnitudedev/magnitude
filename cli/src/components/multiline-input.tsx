@@ -337,7 +337,7 @@ interface MultilineInputProps {
   onChange: (value: InputValue) => void
   onSubmit: () => void
   onKeyIntercept?: (key: KeyEvent) => boolean
-  onPaste: (fallbackText?: string) => void
+  onPaste: (fallbackText?: string) => boolean | Promise<boolean>
   placeholder?: string
   focused?: boolean
   shouldBlinkCursor?: boolean
