@@ -307,12 +307,12 @@ export function InputCursor({
   }
 
   // When blink-off: show underlying character only for block cursor mode.
-  // For thin cursor mode, render nothing (never a space).
+  // For thin cursor mode, reserve width with a transparent space.
   if (isBlinkHidden) {
     if (activeChar !== undefined) {
       return <span>{activeChar}</span>
     }
-    return null
+    return <span fg="transparent"> </span>
   }
 
   return (
