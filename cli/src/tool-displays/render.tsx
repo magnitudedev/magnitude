@@ -8,8 +8,6 @@ import { fileSearchDisplay } from './displays/file-search'
 import { fileTreeDisplay } from './displays/file-tree'
 import { webSearchDisplay } from './displays/web-search'
 import { webFetchDisplay } from './displays/web-fetch'
-import { agentCreateDisplay } from './displays/agent-create'
-import { agentKillDisplay } from './displays/agent-kill'
 import { skillDisplay } from './displays/skill'
 import { browserActionDisplay } from './displays/browser-action'
 import { phaseSubmitDisplay } from './displays/phase-submit'
@@ -35,8 +33,6 @@ export function renderToolStep(state: RenderableToolState, common: CommonToolPro
     case 'fileSearch': return fileSearchDisplay.render({ state, ...common })
     case 'webSearch': return webSearchDisplay.render({ state, ...common })
     case 'webFetch': return webFetchDisplay.render({ state, ...common })
-    case 'agentCreate': return agentCreateDisplay.render({ state, ...common })
-    case 'agentKill': return agentKillDisplay.render({ state, ...common })
     case 'skill': return skillDisplay.render({ state, ...common })
     case 'click':
     case 'doubleClick':
@@ -71,8 +67,6 @@ export function summarizeToolStep(state: RenderableToolState): string {
     case 'fileSearch': return fileSearchDisplay.summary(state)
     case 'webSearch': return webSearchDisplay.summary(state)
     case 'webFetch': return webFetchDisplay.summary(state)
-    case 'agentCreate': return agentCreateDisplay.summary(state)
-    case 'agentKill': return agentKillDisplay.summary(state)
     case 'skill': return skillDisplay.summary(state)
     case 'click':
     case 'doubleClick':
