@@ -70,6 +70,9 @@ export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>(
   initialContext: { parentConversation: true },
   spawnable: true,
   observables: [backgroundProcessesObservable],
+  lifecyclePrompts: {
+    parentOnIdle: `Address ALL reviewer findings. Have builders fix the issues and run another review cycle. Do not stop working or report to the user until all findings are resolved and the work is correct, high quality, and fully meets the user's requirements.`,
+  },
 
   permission: (p) => ({
     shell(input: { command: string }, ctx) {

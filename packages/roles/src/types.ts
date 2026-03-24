@@ -101,10 +101,9 @@ export interface ForkSetupContext {
   workspacePath: string
 }
 
-export interface RoleConfig<
+export interface RoleBase<
   TTools extends ToolSet,
   TSlot extends string,
-  TCtx,
   TProvides = never,
   TRequirements = never
 > {
@@ -113,14 +112,27 @@ export interface RoleConfig<
   readonly tools: TTools
   readonly systemPrompt: string
   readonly lenses: ThinkingLens[]
-  readonly observables?: ObservableConfig<any>[]
+  readonly observables?: readonly ObservableConfig<any>[]
+  readonly lifecyclePrompts?: {
+    readonly parentOnSpawn?: string
+    readonly parentOnIdle?: string
+  }
   readonly defaultRecipient: 'user' | 'parent'
   readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
-  readonly permission: PermissionPolicy<TTools, TCtx>
-  readonly turn: TurnPolicy<TTools, TCtx>
   readonly initialContext: { parentConversation?: boolean }
   readonly spawnable?: boolean
   readonly setup?: (ctx: ForkSetupContext) => Effect.Effect<Layer.Layer<TProvides>, never, TRequirements>
+}
+
+export interface RoleConfig<
+  TTools extends ToolSet,
+  TSlot extends string,
+  TCtx,
+  TProvides = never,
+  TRequirements = never
+> extends RoleBase<TTools, TSlot, TProvides, TRequirements> {
+  readonly permission: PermissionPolicy<TTools, TCtx>
+  readonly turn: TurnPolicy<TTools, TCtx>
 }
 
 export interface RoleDefinition<
@@ -129,18 +141,9 @@ export interface RoleDefinition<
   TCtx = unknown,
   TProvides = never,
   TRequirements = never
-> {
-  readonly id: string
-  readonly slot: TSlot
-  readonly tools: TTools
-  readonly systemPrompt: string
-  readonly lenses: ThinkingLens[]
+> extends RoleBase<TTools, TSlot, TProvides, TRequirements> {
   readonly observables: readonly ObservableConfig<any>[]
-  readonly defaultRecipient: 'user' | 'parent'
-  readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
-  readonly initialContext: { parentConversation?: boolean }
   readonly spawnable: boolean
-  readonly setup?: (ctx: ForkSetupContext) => Effect.Effect<Layer.Layer<TProvides>, never, TRequirements>
 
   getPermission(tool: string, input: unknown, ctx: TCtx): PermissionResult
   getTurn(ctx: TurnContext<TCtx>): TurnResult

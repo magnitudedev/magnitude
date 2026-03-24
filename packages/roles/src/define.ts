@@ -62,6 +62,7 @@ export function defineRole<
     systemPrompt: config.systemPrompt,
     lenses: config.lenses,
     observables: config.observables ?? [],
+    lifecyclePrompts: config.lifecyclePrompts,
     defaultRecipient: config.defaultRecipient,
     protocolRole: config.protocolRole,
     initialContext: config.initialContext,

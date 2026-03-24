@@ -59,6 +59,10 @@ export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({
   initialContext: { parentConversation: true },
   spawnable: true,
   observables: [backgroundProcessesObservable],
+  lifecyclePrompts: {
+    parentOnSpawn: 'If there are other independent changes to make, spawn additional builders in parallel rather than waiting for this one.',
+    parentOnIdle: `Review the builder's work for correctness, quality, and adherance to user requirements. For nontrivial changes, spawn a reviewer. Do not present unverified work to user.`,
+  },
 
   permission: (p) => ({
     shell(input, pctx) {

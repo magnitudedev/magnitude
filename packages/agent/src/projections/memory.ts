@@ -22,6 +22,7 @@ import {
   formatCommsInbox, formatSystemInbox,
 } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
+import { getAgentDefinition, isValidVariant } from '../agents'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { formatSkillInitialPrompt } from '../prompts/skills'
 import { ContentPart, textParts, wrapTextParts } from '../content'
@@ -518,6 +519,17 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         pendingPresenceText: null,
       }
 
+      const roleDef = isValidVariant(value.role) ? getAgentDefinition(value.role) : undefined
+      const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
+      if (spawnReminder && parentState) {
+        const entry: SystemEntry = { kind: 'reminder', text: spawnReminder }
+        const updatedParent = {
+          ...parentState,
+          queuedMessages: [...parentState.queuedMessages, { kind: 'system' as const, timestamp: Date.now(), entry }]
+        }
+        return { ...state, forks: new Map(state.forks).set(value.parentForkId, updatedParent).set(forkId, newForkState) }
+      }
+
       return { ...state, forks: new Map(state.forks).set(forkId, newForkState) }
     }),
 
@@ -603,7 +615,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
 
-      const text = formatAgentIdleNotification(value.agentId, value.type, value.reason)
+      const roleDef = isValidVariant(value.type) ? getAgentDefinition(value.type) : undefined
+      const idleReminder = roleDef?.lifecyclePrompts?.parentOnIdle
+      const baseText = formatAgentIdleNotification(value.agentId, value.type, value.reason)
+      const text = idleReminder ? `${baseText}\n${idleReminder}` : baseText
 
       const entry: SystemEntry = { kind: 'reminder', text }
 
