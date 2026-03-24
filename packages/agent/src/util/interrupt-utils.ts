@@ -123,6 +123,8 @@ export const buildInterruptedTurnCompleted = (params: {
     outputTokens: null,
     cacheReadTokens: null,
     cacheWriteTokens: null,
+    providerId: null,
+    modelId: null,
   }
 
   return event

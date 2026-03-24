@@ -37,6 +37,7 @@ import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
+import { WorkflowStateReaderTag, type WorkflowStateReader } from '../tools/workflow-reader'
 import { ConversationProjection, type ConversationState } from '../projections/conversation'
 import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
@@ -46,6 +47,7 @@ import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentB
 import { WorkingStateProjection, type ForkWorkingState } from '../projections/working-state'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
+import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
 import { BackgroundProcessesProjection, getProcessesForFork, type BackgroundProcessesState } from '../projections/background-processes'
 
 import type { RoleDefinition, ToolSet, BoundObservable } from '@magnitudedev/roles'
@@ -118,7 +120,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     void,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | Projection.ProjectionInstance<BackgroundProcessesState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | Projection.ProjectionInstance<BackgroundProcessesState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -151,7 +153,7 @@ export interface ExecutionManagerService {
   }) => Effect.Effect<
     string,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ProjectionInstance<ConversationState> | Projection.ProjectionInstance<BackgroundProcessesState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | Projection.ProjectionInstance<BackgroundProcessesState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -183,6 +185,7 @@ function makeForkLayers(
   agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
+  workflowProjection: Projection.ForkedProjectionInstance<WorkflowCriteriaState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
   approvalState: ApprovalStateService,
@@ -209,8 +212,13 @@ function makeForkLayers(
     getState: () => conversationProjection.get
   } satisfies ConversationStateReader)
 
+  const workflowStateReaderLayer = Layer.succeed(WorkflowStateReaderTag, {
+    getState: (forkId: string | null) => workflowProjection.getFork(forkId),
+  } satisfies WorkflowStateReader)
+
   const agentStateReaderLayer = Layer.succeed(AgentStateReaderTag, {
     getAgentState: () => agentStatusProjection.get,
+    getAgent: (agentId: string) => Effect.map(agentStatusProjection.get, (state) => state.agents.get(agentId)),
   } satisfies AgentStateReader)
 
   const policyCtxProvider = createPolicyContextProvider(
@@ -240,6 +248,7 @@ function makeForkLayers(
 
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
+    workflowStateReaderLayer,
     skillStateReaderLayer,
     agentStateReaderLayer,
 
@@ -800,6 +809,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const agentProjection = yield* AgentRoutingProjection.Tag
       const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* WorkingStateProjection.Tag
+      const workflowProjection = yield* WorkflowProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
       const persistence = yield* ChatPersistence
@@ -818,7 +828,7 @@ const makeExecutionManager = Effect.gen(function* () {
       let layers = makeForkLayers(
         forkId,
         sessionContextProjection, agentProjection, agentStatusProjection,
-        workingStateProjection,
+        workingStateProjection, workflowProjection,
         conversationProjection,
         approvalState,
         persistenceLayer, permissionInterceptor, toolReminderRef, cwd, workspacePath, ephemeralSessionContext, backgroundProcessRegistry,

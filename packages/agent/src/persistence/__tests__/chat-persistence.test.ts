@@ -241,7 +241,9 @@ describe('ChatPersistenceService - JSON Backend', () => {
           success: true,
           calledActionTools: true, calledDone: false,
           lastToolSlug: 'shell'
-        }
+        },
+        providerId: null,
+        modelId: null
       }
 
       await persistence.persistNewEvents(sessionId, [event])

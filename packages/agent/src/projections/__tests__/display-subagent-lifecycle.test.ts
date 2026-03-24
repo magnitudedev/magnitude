@@ -92,6 +92,8 @@ describe('display subagent lifecycle think steps', () => {
         turnId: 't-sub-1',
         result: { success: true, turnDecision: 'yield', output: '' },
         toolCalls: [{ id: 'call-1', toolName: 'shell', input: {}, result: { _tag: 'Success', output: {} } }],
+        providerId: null,
+          modelId: null,
       } as any,
 
       {
@@ -117,6 +119,8 @@ describe('display subagent lifecycle think steps', () => {
         turnId: 't-sub-2',
         result: { success: true, turnDecision: 'yield', output: '' },
         toolCalls: [{ id: 'call-2', toolName: 'fileRead', input: {}, result: { _tag: 'Success', output: {} } }],
+        providerId: null,
+          modelId: null,
       } as any,
     ])
 

@@ -123,6 +123,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       const { forkId, turnId, chainId } = event
 
       const rawCodeChunks: string[] = []
+      let resolvedProviderId: string | null = null
+      let resolvedModelId: string | null = null
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
         const agentState = yield* read(AgentStatusProjection)
@@ -185,6 +187,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           return
         }
         const boundModel = resolveResult.right
+        resolvedProviderId = boundModel.model.providerId
+        resolvedModelId = boundModel.model.id
 
         // 3. Build and consume the turn event stream
         const turnStream = createTurnStream((queue) => Effect.gen(function* () {
@@ -275,6 +279,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           outputTokens: usage.outputTokens,
           cacheReadTokens: usage.cacheReadTokens,
           cacheWriteTokens: usage.cacheWriteTokens,
+          providerId: boundModel.model.providerId,
+          modelId: boundModel.model.id,
         })
 
 
@@ -354,6 +360,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               outputTokens: null,
               cacheReadTokens: null,
               cacheWriteTokens: null,
+              providerId: resolvedProviderId,
+              modelId: resolvedModelId,
             })
           } else {
             logger.error({

@@ -4,11 +4,13 @@ import { CompactionProjection } from '../src/projections/compaction'
 import { WorkingStateProjection, shouldTrigger } from '../src/projections/working-state'
 import { MemoryProjection } from '../src/projections/memory'
 import type { AppEvent, SessionContext } from '../src/events'
-import { SYSTEM_PROMPT_TOKENS } from '../src/generated/system-prompt-size'
 import { CHARS_PER_TOKEN } from '../src/constants'
 import { textParts } from '../src/content'
+import { getAgentDefinition } from '../src/agents'
+import { renderSystemPrompt } from '../src/prompts/system-prompt'
 
 const root = null
+const leadSystemPromptTokens = Math.ceil(renderSystemPrompt(getAgentDefinition('lead')).length / CHARS_PER_TOKEN)
 
 const baseContext = (): SessionContext => ({
   cwd: '/tmp/project',
@@ -39,6 +41,8 @@ const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'turn_comp
   outputTokens: null,
   cacheReadTokens: null,
   cacheWriteTokens: null,
+  providerId: null,
+  modelId: null,
   result: { success: true, turnDecision: 'yield' },
   ...overrides,
 })
@@ -48,7 +52,7 @@ describe('Compaction', async () => {
     test('initial token estimate includes system prompt tokens', async () =>
       withHarness(async (h) => {
         const state = await h.projectionFork(CompactionProjection.Tag, root)
-        expect(state.tokenEstimate).toBeGreaterThanOrEqual(SYSTEM_PROMPT_TOKENS)
+        expect(state.tokenEstimate).toBeGreaterThanOrEqual(leadSystemPromptTokens)
         expect(state.shouldCompact).toBe(false)
       }))
 

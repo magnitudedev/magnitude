@@ -169,6 +169,10 @@ export interface TurnCompleted {
   readonly cacheReadTokens: number | null
   /** Cache write token count (Anthropic prompt caching). Null when unavailable. */
   readonly cacheWriteTokens: number | null
+  /** Provider ID of the model used for this turn. Null when unavailable. */
+  readonly providerId: string | null
+  /** Model ID used for this turn. Null when unavailable. */
+  readonly modelId: string | null
 }
 
 export type TurnDecision = 'continue' | 'yield' | 'finish'

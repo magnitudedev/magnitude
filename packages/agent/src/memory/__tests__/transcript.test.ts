@@ -38,6 +38,8 @@ describe('memory transcript', () => {
         outputTokens: null,
         cacheReadTokens: null,
         cacheWriteTokens: null,
+        providerId: null,
+          modelId: null,
       },
     ] as unknown as AppEvent[]
 
@@ -134,6 +136,8 @@ describe('memory transcript', () => {
         outputTokens: null,
         cacheReadTokens: null,
         cacheWriteTokens: null,
+        providerId: null,
+          modelId: null,
       },
     ] as unknown as AppEvent[]
 
@@ -165,6 +169,8 @@ describe('memory transcript', () => {
         outputTokens: null,
         cacheReadTokens: null,
         cacheWriteTokens: null,
+        providerId: null,
+          modelId: null,
       },
     ] as unknown as AppEvent[]
 
@@ -194,6 +200,8 @@ describe('memory transcript', () => {
         outputTokens: null,
         cacheReadTokens: null,
         cacheWriteTokens: null,
+        providerId: null,
+          modelId: null,
       },
     ] as unknown as AppEvent[]
 

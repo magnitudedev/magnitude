@@ -103,6 +103,8 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
           outputTokens: usage.outputTokens,
           cacheReadTokens: usage.cacheReadTokens,
           cacheWriteTokens: usage.cacheWriteTokens,
+          providerId: null,
+          modelId: null,
         })
       }).pipe(
         Effect.onInterrupt(() => {
@@ -125,6 +127,8 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             outputTokens: null,
             cacheReadTokens: null,
             cacheWriteTokens: null,
+            providerId: null,
+            modelId: null,
           })
         }),
         Effect.catchAllCause((cause) => {

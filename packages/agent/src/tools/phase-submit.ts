@@ -5,7 +5,7 @@ import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { getCurrentPhase, validateFields } from '@magnitudedev/skills'
-import { WorkflowProjection } from '../projections/workflow'
+import { WorkflowStateReaderTag } from './workflow-reader'
 import { expandWorkspacePath } from '../workspace/workspace-path'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 
@@ -31,8 +31,8 @@ export const phaseSubmitTool = defineTool({
     Effect.gen(function* () {
       const workerBus = yield* WorkerBusTag<AppEvent>()
       const { forkId } = yield* ForkContext
-      const workflowProjection = yield* WorkflowProjection.Tag
-      const workflowState = yield* Effect.map(workflowProjection.getFork(forkId), (state) => state.workflowState)
+      const workflowStateReader = yield* WorkflowStateReaderTag
+      const workflowState = yield* Effect.map(workflowStateReader.getState(forkId), (state) => state.workflowState)
 
       if (!workflowState || workflowState.status === 'completed') {
         return yield* Effect.fail({

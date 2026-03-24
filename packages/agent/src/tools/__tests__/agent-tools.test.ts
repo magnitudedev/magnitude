@@ -34,6 +34,7 @@ function makeLayer(state: AgentStatusState, eventsRef: Ref.Ref<AppEvent[]>) {
     Layer.succeed(ForkContext, { forkId: 'parent-1' }),
     Layer.succeed(AgentStateReaderTag, {
       getAgentState: () => Effect.succeed(state),
+      getAgent: (agentId: string) => Effect.succeed(state.agents.get(agentId)),
     }),
     Layer.succeed(WorkerBusTag<AppEvent>(), {
       publish: (event: AppEvent) => Ref.update(eventsRef, (events) => [...events, event]),

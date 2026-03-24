@@ -5,7 +5,7 @@
  */
 
 import { Effect, Context } from 'effect'
-import type { AgentStatusState } from '../projections/agent-status'
+import type { AgentInfo, AgentStatusState } from '../projections/agent-status'
 
 // =============================================================================
 // Fork State Reader Service (for tools to access fork projection state)
@@ -13,6 +13,7 @@ import type { AgentStatusState } from '../projections/agent-status'
 
 export interface AgentStateReader {
   readonly getAgentState: () => Effect.Effect<AgentStatusState>
+  readonly getAgent: (agentId: string) => Effect.Effect<AgentInfo | undefined>
 }
 
 export class AgentStateReaderTag extends Context.Tag('AgentStateReader')<

@@ -17,8 +17,9 @@ import { AgentRoutingProjection } from './agent-routing'
 
 import { getContextLimits } from '../constants'
 import { CHARS_PER_TOKEN } from '../constants'
-import { SYSTEM_PROMPT_TOKENS } from '../generated/system-prompt-size'
+import { getAgentDefinition, type AgentVariant } from '../agents'
 import { buildSessionContextContent } from '../prompts'
+import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart, textOf } from '../content'
 
 // =============================================================================
@@ -32,8 +33,8 @@ function computeContextLimitBlocked(isCompacting: boolean, pendingFinalization: 
 
 /** Estimate tokens for content string or content parts */
 function estimateContentTokens(content: string): number
-function estimateContentTokens(content: ContentPart[]): number
-function estimateContentTokens(content: string | ContentPart[]): number {
+function estimateContentTokens(content: ContentPart[], modelId?: string | null, providerId?: string | null): number
+function estimateContentTokens(content: string | ContentPart[], modelId?: string | null, providerId?: string | null): number {
   if (typeof content === 'string') {
     return Math.ceil(content.length / CHARS_PER_TOKEN)
   }
@@ -44,10 +45,21 @@ function estimateContentTokens(content: string | ContentPart[]): number {
         tokens += Math.ceil(part.text.length / CHARS_PER_TOKEN)
         break
       case 'image':
-        tokens += getImageTokenEstimator()(part.width, part.height)
+        tokens += getImageTokenEstimator(modelId ?? null, providerId ?? null)(part.width, part.height)
         break
     }
   }
+  return tokens
+}
+
+const systemPromptTokenCache = new Map<string, number>()
+
+function estimateSystemPromptTokens(variant: AgentVariant): number {
+  const cached = systemPromptTokenCache.get(variant)
+  if (cached !== undefined) return cached
+  const prompt = renderSystemPrompt(getAgentDefinition(variant))
+  const tokens = Math.ceil(prompt.length / CHARS_PER_TOKEN)
+  systemPromptTokenCache.set(variant, tokens)
   return tokens
 }
 
@@ -94,14 +106,13 @@ const estimators: Record<string, ImageTokenEstimator> = {
   'vertex-ai': () => 560,
 }
 
-function getImageTokenEstimator(): ImageTokenEstimator {
-  const modelId = ''
-  const providerId = 'anthropic'
-
-  // 1. Model name heuristic (most reliable)
-  if (/claude/i.test(modelId)) return estimators.anthropic
-  if (/gpt|o[1-9]-/i.test(modelId)) return estimators.openai
-  if (/gemini/i.test(modelId)) return estimators.google
+function getImageTokenEstimator(modelId: string | null, providerId: string | null): ImageTokenEstimator {
+  // 1. Model name heuristic (most reliable — handles cross-provider routing like OpenRouter)
+  if (modelId) {
+    if (/claude/i.test(modelId)) return estimators.anthropic
+    if (/gpt|o[1-9]-/i.test(modelId)) return estimators.openai
+    if (/gemini/i.test(modelId)) return estimators.google
+  }
 
   // 2. Fall back to provider ID for unknown model names
   if (providerId === 'anthropic' || providerId === 'aws-bedrock') return estimators.anthropic
@@ -119,6 +130,8 @@ function getImageTokenEstimator(): ImageTokenEstimator {
 /** Per-fork compaction state */
 export interface ForkCompactionState {
   readonly tokenEstimate: number
+  readonly modelId: string | null
+  readonly providerId: string | null
   readonly shouldCompact: boolean
   readonly isCompacting: boolean
   readonly pendingFinalization: boolean
@@ -148,6 +161,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
 
   initialFork: {
     tokenEstimate: 0,
+    modelId: null,
+    providerId: null,
     shouldCompact: false,
     isCompacting: false,
     pendingFinalization: false,
@@ -159,7 +174,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
     session_initialized: ({ event, fork }) => {
       const content = buildSessionContextContent(event.context)
       const contentTokens = estimateContentTokens(content)
-      const tokenEstimate = SYSTEM_PROMPT_TOKENS + contentTokens
+      const tokenEstimate = estimateSystemPromptTokens('lead') + contentTokens
       return {
         ...fork,
         tokenEstimate,
@@ -188,6 +203,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
 
     turn_completed: ({ event, fork, emit }) => {
       let addedTokens = 0
+      const { modelId, providerId } = event
+
       // Estimate tokens from response parts
       for (const part of event.responseParts) {
         if (part.type === 'text' || part.type === 'thinking') {
@@ -195,13 +212,14 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
         }
       }
       for (const tc of event.toolCalls) {
-        if (tc.result.status === 'success') {
-          const output = typeof tc.result.output === 'string' ? tc.result.output : (JSON.stringify(tc.result.output) ?? '')
-          addedTokens += estimateContentTokens(output)
+        if (tc.result.status === 'error') {
+          addedTokens += estimateContentTokens(tc.result.message)
+        } else if (tc.result.status === 'rejected') {
+          addedTokens += estimateContentTokens(tc.result.message)
         }
       }
       for (const observed of event.observedResults) {
-        addedTokens += estimateContentTokens([...observed.content])
+        addedTokens += estimateContentTokens([...observed.content], modelId, providerId)
       }
 
       const newTokenEstimate = event.inputTokens !== null
@@ -218,6 +236,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
       return {
         ...fork,
         tokenEstimate: newTokenEstimate,
+        modelId: event.modelId ?? fork.modelId,
+        providerId: event.providerId ?? fork.providerId,
         shouldCompact: newShouldCompact,
         contextLimitBlocked: newBlocked,
       }
@@ -310,14 +330,16 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
 
   signalHandlers: (on) => [
     on(AgentRoutingProjection.signals.agentRegistered, ({ value, state }) => {
-      const { forkId, parentForkId } = value
+      const { forkId, parentForkId, role } = value
       const parentState = state.forks.get(parentForkId)
       if (!parentState) {
         throw new Error(`Parent fork ${parentForkId} not found in CompactionProjection`)
       }
 
       const newForkState: ForkCompactionState = {
-        tokenEstimate: parentState.tokenEstimate,
+        tokenEstimate: estimateSystemPromptTokens(role as AgentVariant),
+        modelId: parentState.modelId,
+        providerId: parentState.providerId,
         shouldCompact: false,
         isCompacting: false,
         pendingFinalization: false,

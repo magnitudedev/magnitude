@@ -76,7 +76,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
   },
 
   signals: {
-    agentRegistered: Signal.create<{ forkId: string; parentForkId: string | null }>('AgentRouting/registered'),
+    agentRegistered: Signal.create<{ forkId: string; parentForkId: string | null; role: string }>('AgentRouting/registered'),
     agentMessage: Signal.create<AgentMessageSignal>('AgentRouting/message'),
     agentResponse: Signal.create<AgentResponseSignal>('AgentRouting/response'),
     communicationStreamStarted: Signal.create<AgentCommunicationStreamSignal>('AgentRouting/communicationStreamStarted'),
@@ -102,7 +102,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         parentForkId: event.parentForkId,
       }
 
-      emit.agentRegistered({ forkId: event.forkId, parentForkId: event.parentForkId })
+      emit.agentRegistered({ forkId: event.forkId, parentForkId: event.parentForkId, role: event.role })
 
       return {
         ...state,

@@ -17,7 +17,6 @@ import { ConversationStateReaderTag } from './memory-reader'
 import { AgentStateReaderTag } from './fork'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
 import type { AppEvent } from '../events'
-import { getActiveAgent } from '../projections/agent-status'
 
 const { ForkContext } = Fork
 
@@ -109,8 +108,7 @@ export const agentKillTool = defineTool({
   execute: ({ agentId, reason }, _ctx) => Effect.gen(function* () {
     const { forkId: parentForkId } = yield* ForkContext
     const agentStateReader = yield* AgentStateReaderTag
-    const agentState = yield* agentStateReader.getAgentState()
-    const target = getActiveAgent(agentState, agentId)
+    const target = yield* agentStateReader.getAgent(agentId)
 
     if (!target) {
       return yield* Effect.fail({
