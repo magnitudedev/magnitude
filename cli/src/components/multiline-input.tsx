@@ -453,22 +453,12 @@ export const MultilineInput = forwardRef<
   const visualLineStarts = deriveVisualLineStarts(value, lineInfo)
 
   // Focus/blur scrollbox when focused prop changes
-  const prevFocusedRef = useRef(false)
   useEffect(() => {
-    if (focused && !prevFocusedRef.current) {
-      safeRenderableCall(
-        scrollBoxRef.current as FocusableScrollBox | null,
-        (sb) => sb.focus?.(),
-        { mountedRef },
-      )
-    } else if (!focused && prevFocusedRef.current) {
-      safeRenderableCall(
-        scrollBoxRef.current as FocusableScrollBox | null,
-        (sb) => sb.blur?.(),
-        { mountedRef },
-      )
+    if (focused) {
+      safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.focus?.(), { mountedRef })
+    } else {
+      safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.blur?.(), { mountedRef })
     }
-    prevFocusedRef.current = focused
   }, [focused, mountedRef])
 
   // Expose focus/blur for imperative use cases
@@ -756,6 +746,8 @@ export const MultilineInput = forwardRef<
     useCallback(
       (event: MouseEvent) => {
         if (!focused) return
+
+        safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.focus?.(), { mountedRef })
 
         // Clear sticky column since this is not up/down navigation
         stickyColumnRef.current = null
