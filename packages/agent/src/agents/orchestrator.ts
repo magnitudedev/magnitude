@@ -25,10 +25,10 @@ import {
 
 const systemPrompt = compilePromptTemplate(orchestratorPromptRaw)
 
-export const orchestratorRole = defineRole<typeof orchestratorTools, 'primary', PolicyContext>({
+export const orchestratorRole = defineRole<typeof orchestratorTools, 'orchestrator', PolicyContext>({
   tools: orchestratorTools,
   id: 'orchestrator',
-  slot: 'primary',
+  slot: 'orchestrator',
   systemPrompt,
   lenses: [intentLens, ideateLens, strategyLens, protocolLens, practicesLens, turnLens],
   defaultRecipient: 'user',

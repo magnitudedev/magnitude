@@ -1,16 +1,14 @@
 import type { ProviderDefinition } from './types'
-import type { ModelSlot } from './state/provider-state'
-import { isBrowserCompatible } from './browser-models'
 import { compareProviderOrder } from './registry'
 
 export interface ModelRecommendationRule {
   provider?: string | RegExp
   model: string | RegExp
-  slots: ModelSlot[]
+  classes: readonly string[]
 }
 
 export interface RecommendationMatch {
-  slots: Set<ModelSlot>
+  classes: Set<string>
 }
 
 const PRIMARY = 'primary' as const
@@ -19,10 +17,10 @@ const BROWSER = 'browser' as const
 
 function rule(
   model: string | RegExp,
-  slots: ModelRecommendationRule['slots'],
+  classes: ModelRecommendationRule['classes'],
   provider?: string | RegExp,
 ): ModelRecommendationRule {
-  return { provider, model, slots }
+  return { provider, model, classes }
 }
 
 export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
@@ -84,17 +82,20 @@ export function getModelRecommendation(providerId: string, modelId: string): Rec
   for (const rule of MODEL_RECOMMENDATION_RULES) {
     if (!matchesProvider(providerId, rule.provider)) continue
     if (!matchesRule(normalizedModelId, rule.model)) continue
-    return { slots: new Set(rule.slots) }
+    return { classes: new Set(rule.classes) }
   }
 
   return null
 }
 
-export function resolveRecommendedModel(
-  slot: ModelSlot,
+export function resolveRecommendedModelForClass(
+  targetClass: string,
   providers: ProviderDefinition[],
   connectedProviderIds: Set<string>,
-  options?: { preferredProviderId?: string },
+  options?: {
+    preferredProviderId?: string
+    isAllowedModel?: (providerId: string, modelId: string) => boolean
+  },
 ): { providerId: string; modelId: string } | null {
   const connectedProviders = providers.filter(provider =>
     connectedProviderIds.has(provider.id) && provider.models.length > 0,
@@ -108,13 +109,13 @@ export function resolveRecommendedModel(
   })
 
   for (const rule of MODEL_RECOMMENDATION_RULES) {
-    if (!rule.slots.includes(slot)) continue
+    if (!rule.classes.includes(targetClass)) continue
 
     for (const provider of sortedProviders) {
       if (!matchesProvider(provider.id, rule.provider)) continue
 
       for (const model of provider.models) {
-        if (slot === 'browser' && !isBrowserCompatible(provider.id, model.id)) continue
+        if (options?.isAllowedModel && !options.isAllowedModel(provider.id, model.id)) continue
 
         const normalizedModelId = normalizeModelId(provider.id, model.id)
         if (matchesRule(normalizedModelId, rule.model)) {
@@ -125,4 +126,23 @@ export function resolveRecommendedModel(
   }
 
   return null
+}
+
+export function resolveRecommendedModel<TSlot extends string>(
+  slot: TSlot,
+  providers: ProviderDefinition[],
+  connectedProviderIds: Set<string>,
+  options: {
+    slotClassOf: (slot: TSlot) => string
+    preferredProviderId?: string
+    isAllowedModel?: (slot: TSlot, providerId: string, modelId: string) => boolean
+  },
+): { providerId: string; modelId: string } | null {
+  const slotClass = options.slotClassOf(slot)
+  return resolveRecommendedModelForClass(slotClass, providers, connectedProviderIds, {
+    preferredProviderId: options.preferredProviderId,
+    isAllowedModel: options.isAllowedModel
+      ? (providerId, modelId) => options.isAllowedModel!(slot, providerId, modelId)
+      : undefined,
+  })
 }

@@ -1,15 +1,14 @@
 import { Effect, Layer } from 'effect'
 import { AppConfig } from '@magnitudedev/storage'
-import type { ModelSlot } from '../state/provider-state'
 import type { InferenceConfig } from '../model/inference-config'
 import { BamlDriver, ResponsesDriver } from '../drivers'
 import { ensureAuth } from './ensure-auth'
 import { createBoundModel } from './pipeline'
-import { ModelResolver } from './model-resolver'
+import { ModelResolver, type ModelResolverShape } from './model-resolver'
 import { NotConfigured, ProviderDisconnected } from '../errors/model-error'
 import { ProviderAuth, ProviderCatalog, ProviderState } from '../runtime/contracts'
 
-export function makeModelResolver(): Layer.Layer<ModelResolver, never, ProviderCatalog | ProviderState | ProviderAuth | AppConfig> {
+export function makeModelResolver<TSlot extends string>(): Layer.Layer<ModelResolver, never, ProviderCatalog | ProviderState | ProviderAuth | AppConfig> {
   return Layer.effect(
     ModelResolver,
     Effect.gen(function* () {
@@ -18,8 +17,8 @@ export function makeModelResolver(): Layer.Layer<ModelResolver, never, ProviderC
       const auth = yield* ProviderAuth
       const appConfig = yield* AppConfig
 
-      return {
-        resolve: (slot: ModelSlot) =>
+      const resolver: ModelResolverShape<TSlot> = {
+        resolve: (slot) =>
           Effect.gen(function* () {
             const initial = yield* state.peek(slot)
             if (!initial) {
@@ -59,10 +58,12 @@ export function makeModelResolver(): Layer.Layer<ModelResolver, never, ProviderC
               connection,
               driver,
               inference,
-              config.providerOptions?.[model.providerId],
+              config.providers?.[model.providerId],
             ).pipe(Effect.provideService(ProviderState, state))
           }),
       }
+
+      return resolver as ModelResolverShape<string>
     }),
   )
 }

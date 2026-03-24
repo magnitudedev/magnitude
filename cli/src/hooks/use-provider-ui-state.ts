@@ -3,6 +3,7 @@ import type { ModelSelection } from '@magnitudedev/providers'
 import type { DetectedProvider } from '@magnitudedev/agent'
 import { useProviderRuntime } from '../providers/provider-runtime'
 import { useStorage } from '../providers/storage-provider'
+import { getDisplaySlot } from '../utils/slot-compat'
 
 type LocalProviderConfig = Awaited<ReturnType<ReturnType<typeof useStorage>['config']['getLocalProviderConfig']>>
 
@@ -27,9 +28,9 @@ export function useProviderUiState() {
     const [setupComplete, telemetryEnabled, primarySlot, secondarySlot, browserSlot, runtimeDetectedProviders, localProviderConfig] = await Promise.all([
       storage.config.getSetupComplete(),
       storage.config.getTelemetryEnabled(),
-      runtime.state.peek('primary'),
-      runtime.state.peek('secondary'),
-      runtime.state.peek('browser'),
+      runtime.state.peek(getDisplaySlot('primary')),
+      runtime.state.peek(getDisplaySlot('secondary')),
+      runtime.state.peek(getDisplaySlot('browser')),
       runtime.auth.detectProviders(),
       storage.config.getLocalProviderConfig(),
     ])

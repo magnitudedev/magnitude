@@ -4,17 +4,18 @@ import { rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { createStorageClient, type StorageClient } from '@magnitudedev/storage'
+import type { MagnitudeSlot } from '../../model-slots'
 import { createMemoryExtractionJob, writePendingJob } from '../job-queue'
 
 describe('memory job queue', () => {
   const origHome = process.env.HOME
   let homeDir = ''
-  let storage: StorageClient
+  let storage: StorageClient<MagnitudeSlot>
 
   beforeEach(async () => {
     homeDir = mkdtempSync(join(tmpdir(), 'mem-queue-home-'))
     process.env.HOME = homeDir
-    storage = await createStorageClient()
+    storage = await createStorageClient<MagnitudeSlot>()
   })
 
   afterEach(async () => {

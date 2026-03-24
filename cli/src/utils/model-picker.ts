@@ -59,8 +59,8 @@ function normalizeForSearch(text: string): string {
 }
 
 function compareItemsForSlot(a: ModelPickerItem, b: ModelPickerItem, slot: ModelSlot): number {
-  const aRecommended = getModelRecommendation(a.providerId, a.modelId)?.slots.has(slot) ?? false
-  const bRecommended = getModelRecommendation(b.providerId, b.modelId)?.slots.has(slot) ?? false
+  const aRecommended = getModelRecommendation(a.providerId, a.modelId)?.classes.has(slot) ?? false
+  const bRecommended = getModelRecommendation(b.providerId, b.modelId)?.classes.has(slot) ?? false
   if (aRecommended !== bRecommended) return Number(bRecommended) - Number(aRecommended)
   return a.modelName.localeCompare(b.modelName) || a.modelId.localeCompare(b.modelId)
 }
@@ -105,7 +105,7 @@ export function buildModelPickerItems({
       }
 
       const recommendation = getModelRecommendation(provider.id, model.id)
-      const recommended = recommendation?.slots.has(selectingModelFor) ?? false
+      const recommended = recommendation?.classes.has(selectingModelFor) ?? false
 
       let selectable = connected
 

@@ -3,7 +3,9 @@ import {
   ChatPersistence,
   collectSessionContext,
   createCodingAgentClient,
+  MAGNITUDE_SLOTS,
   type AppEvent,
+  type MagnitudeSlot,
 } from '@magnitudedev/agent'
 import { ProviderAuth, ProviderState, makeProviderRuntimeLive } from '@magnitudedev/providers'
 import { createStorageClient } from '@magnitudedev/storage'
@@ -70,7 +72,7 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
   line('')
 
   const storage = await createStorageClient({ cwd: process.cwd() })
-  const providerRuntime = makeProviderRuntimeLive()
+  const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>()
 
   await Effect.runPromise(
     Effect.gen(function* () {
@@ -88,9 +90,9 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
 
       const selectedAuth = usable.auth ?? null
 
-      yield* state.setSelection('primary', providerId, modelId, selectedAuth, { persist: false })
-      yield* state.setSelection('secondary', providerId, modelId, selectedAuth, { persist: false })
-      yield* state.setSelection('browser', providerId, modelId, selectedAuth, { persist: false })
+      for (const slot of MAGNITUDE_SLOTS) {
+        yield* state.setSelection(slot, providerId, modelId, selectedAuth, { persist: false })
+      }
     }).pipe(Effect.provide(providerRuntime)),
   ).catch((e) => {
     line(`✗ ${err(e instanceof Error ? e.message : String(e))}`)

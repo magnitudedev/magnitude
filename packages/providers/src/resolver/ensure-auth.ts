@@ -12,7 +12,6 @@ import * as path from 'node:path'
 import { defaultGlobalStorageRoot } from '@magnitudedev/storage'
 import { Effect } from 'effect'
 import { logger } from '@magnitudedev/logger'
-import type { ModelSlot } from '../state/provider-state'
 import { AuthFailed } from '../errors/model-error'
 import { ProviderAuth, ProviderState } from '../runtime/contracts'
 import { refreshAnthropicToken } from '../auth/anthropic-oauth'
@@ -104,8 +103,8 @@ async function withProviderLock<T>(providerId: string, fn: () => Promise<T>): Pr
  * 5. Refresh using disk's refresh token, persist while holding lock
  * 6. On failure, re-read disk one more time (narrow race safety net)
  */
-export function ensureAuth(
-  slot: ModelSlot = 'primary',
+export function ensureAuth<TSlot extends string>(
+  slot: TSlot,
 ): Effect.Effect<void, AuthFailed, ProviderAuth | ProviderState> {
   return Effect.gen(function* () {
     const auth = yield* ProviderAuth

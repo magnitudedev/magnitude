@@ -10,9 +10,7 @@ import {
 } from '../types'
 
 export const DEFAULT_CONFIG: MagnitudeConfig = {
-  primaryModel: null,
-  secondaryModel: null,
-  browserModel: null,
+  roles: {},
 }
 
 function getDefaultPaths(): GlobalStoragePaths {
@@ -22,9 +20,14 @@ function getDefaultPaths(): GlobalStoragePaths {
 export async function loadConfig(
   paths: GlobalStoragePaths = getDefaultPaths()
 ): Promise<MagnitudeConfig> {
-  return readJsonFileWithSchema(paths.configFile, MagnitudeConfigSchema, {
+  const config = (await readJsonFileWithSchema(paths.configFile, MagnitudeConfigSchema, {
     fallback: DEFAULT_CONFIG,
-  }) as Promise<MagnitudeConfig>
+  })) as MagnitudeConfig
+
+  return {
+    ...config,
+    roles: config.roles ?? {},
+  }
 }
 
 export async function saveConfig(
@@ -41,26 +44,4 @@ export async function updateConfig(
   const nextConfig = await fn(await loadConfig(paths))
   await saveConfig(paths, nextConfig)
   return nextConfig
-}
-
-export async function setPrimarySelection(
-  paths: GlobalStoragePaths,
-  providerId: string,
-  modelId: string
-): Promise<void> {
-  await updateConfig(paths, (config) => ({
-    ...config,
-    primaryModel: { providerId, modelId },
-  }))
-}
-
-export async function setBrowserSelection(
-  paths: GlobalStoragePaths,
-  providerId: string,
-  modelId: string
-): Promise<void> {
-  await updateConfig(paths, (config) => ({
-    ...config,
-    browserModel: { providerId, modelId },
-  }))
 }

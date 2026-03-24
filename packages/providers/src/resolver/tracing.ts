@@ -1,7 +1,8 @@
 import { Context, Effect, Layer } from 'effect'
-import type { TraceInput, TraceData } from '@magnitudedev/tracing'
+import type { TraceInput as TracingTraceInput, TraceData as TracingTraceData } from '@magnitudedev/tracing'
 
-export type { TraceInput, TraceData }
+export type TraceInput = Omit<TracingTraceInput, 'slot'> & { slot: string }
+export type TraceData<M extends Record<string, unknown> = Record<string, unknown>> = Omit<TracingTraceData<M>, 'slot'> & { slot: string }
 
 /**
  * Driver-facing trace emitter — accepts transport-level trace input.

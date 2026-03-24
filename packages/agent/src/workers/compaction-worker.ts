@@ -101,7 +101,7 @@ function startCompaction(
 
     // Calculate how many messages to compact
     const providerState = yield* ProviderState
-    const { softCap } = yield* providerState.contextLimits('primary')
+    const { softCap } = yield* providerState.contextLimits('orchestrator')
     const keepTokenBudget = softCap * KEEP_MESSAGE_RATIO
     let keepTokens = 0
     let keepCount = 0
@@ -142,7 +142,7 @@ function startCompaction(
 
     const bamlEffect = Effect.gen(function* () {
       const runtime = yield* ModelResolver
-      const usable = yield* runtime.resolve('primary')
+      const usable = yield* runtime.resolve('orchestrator')
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const result = yield* withTraceScope(
           { metadata: { callType: 'compact', forkId } },

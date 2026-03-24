@@ -1,4 +1,5 @@
 import type { StorageClient } from '@magnitudedev/storage'
+import type { MagnitudeSlot } from '../model-slots'
 
 export const MEMORY_RELATIVE_PATH = '.magnitude/memory.md'
 
@@ -50,16 +51,16 @@ function sectionKeyFromHeader(line: string): keyof ParsedMemorySections | null {
   return null
 }
 
-export async function ensureMemoryFile(storage: StorageClient): Promise<string> {
+export async function ensureMemoryFile(storage: StorageClient<MagnitudeSlot>): Promise<string> {
   await storage.memory.ensureFile(MEMORY_TEMPLATE)
   return storage.memory.getPath()
 }
 
-export async function readMemory(storage: StorageClient): Promise<string> {
+export async function readMemory(storage: StorageClient<MagnitudeSlot>): Promise<string> {
   return await storage.memory.read()
 }
 
-export async function writeMemory(storage: StorageClient, content: string): Promise<void> {
+export async function writeMemory(storage: StorageClient<MagnitudeSlot>, content: string): Promise<void> {
   await storage.memory.write(content)
 }
 

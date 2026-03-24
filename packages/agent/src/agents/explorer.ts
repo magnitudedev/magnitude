@@ -49,10 +49,10 @@ const tools = toolSet({
 
 })
 
-export const explorerRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>({
   tools,
   id: 'explorer',
-  slot: 'secondary',
+  slot: 'explorer',
   systemPrompt,
   lenses: [strategyLens, turnLens],
   defaultRecipient: 'parent',

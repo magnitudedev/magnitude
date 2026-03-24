@@ -1,4 +1,4 @@
-import { getModelContextWindow, type ModelSlot } from '@magnitudedev/providers'
+import type { MagnitudeSlot } from './model-slots'
 
 /**
  * Agent Configuration Constants
@@ -56,8 +56,8 @@ export const USER_BLUR_DEBOUNCE_MS = 5_000
 // =============================================================================
 
 /** Get context limits for a model slot */
-export function getContextLimits(slot: ModelSlot = 'primary'): { hardCap: number; softCap: number } {
-  const hardCap = getModelContextWindow(slot)
+export function getContextLimits(_slot: MagnitudeSlot = 'orchestrator'): { hardCap: number; softCap: number } {
+  const hardCap = DEFAULT_CONTEXT_WINDOW
   const softCap = Math.floor(hardCap * COMPACT_TRIGGER_RATIO)
   return { hardCap, softCap }
 }

@@ -136,7 +136,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           : 'orchestrator'
 
         const agentDef = getAgentDefinition(variant)
-        const modelSlot = agentDef.slot as import('@magnitudedev/providers').ModelSlot
+        const modelSlot = agentDef.slot
         const timezone = sessionCtx.context?.timezone ?? null
 
         const runtime = yield* ModelResolver

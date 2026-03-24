@@ -4,6 +4,7 @@ import { rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { createStorageClient } from '@magnitudedev/storage'
+import type { MagnitudeSlot } from '../../model-slots'
 import {
   MEMORY_RELATIVE_PATH,
   MEMORY_TEMPLATE,
@@ -19,7 +20,7 @@ describe('memory-file', () => {
     const home = mkdtempSync(join(tmpdir(), 'mem-file-home-'))
     process.env.HOME = home
     const cwd = mkdtempSync(join(tmpdir(), 'mem-file-'))
-    const storage = await createStorageClient({ cwd })
+    const storage = await createStorageClient<MagnitudeSlot>({ cwd })
     const p = await ensureMemoryFile(storage)
     const text = await readMemory(storage)
     expect(p.endsWith(MEMORY_RELATIVE_PATH)).toBe(true)

@@ -148,7 +148,7 @@ export function webSearch(
 ): Effect.Effect<WebSearchResponse, Error, ProviderState | ProviderAuth> {
   return Effect.gen(function* () {
     const providerState = yield* ProviderState
-    const current = yield* providerState.peek('primary')
+    const current = yield* providerState.peek('orchestrator')
     const provider = detectSearchProvider(current?.model.providerId ?? null)
     const auth = yield* resolveSearchAuth(provider)
 

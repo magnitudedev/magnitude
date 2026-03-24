@@ -11,6 +11,11 @@ export const ModelSelectionSchema = Schema.Struct({
 })
 export type ModelSelection = Schema.Schema.Type<typeof ModelSelectionSchema>
 
+export const RoleConfigSchema = Schema.Struct({
+  model: Schema.NullishOr(ModelSelectionSchema),
+})
+export type RoleConfig = Schema.Schema.Type<typeof RoleConfigSchema>
+
 export const ProviderOptionsSchema = Schema.Struct({
   baseUrl: Schema.optional(Schema.String),
   region: Schema.optional(Schema.String),
@@ -29,10 +34,11 @@ export interface ContextLimitPolicy extends Omit<Schema.Schema.Type<typeof Conte
 }
 
 export const MagnitudeConfigSchema = Schema.Struct({
-  primaryModel: NullableOptional(ModelSelectionSchema),
-  secondaryModel: NullableOptional(ModelSelectionSchema),
-  browserModel: NullableOptional(ModelSelectionSchema),
-  providerOptions: Schema.optional(
+  roles: Schema.optional(
+    Schema.Record({ key: Schema.String, value: RoleConfigSchema })
+  ),
+  // used for provider options and local provider options like base URLs, API key etc., not used for oauth atm
+  providers: Schema.optional(
     Schema.Record({ key: Schema.String, value: ProviderOptionsSchema })
   ),
   setupComplete: Schema.optional(Schema.Boolean),
@@ -41,8 +47,6 @@ export const MagnitudeConfigSchema = Schema.Struct({
   memory: Schema.optional(Schema.Boolean),
   contextLimits: Schema.optional(ContextLimitPolicySchema),
 })
-export interface MagnitudeConfig extends Omit<Schema.Schema.Type<typeof MagnitudeConfigSchema>, 'primaryModel' | 'secondaryModel' | 'browserModel'> {
-  primaryModel: ModelSelection | null
-  secondaryModel: ModelSelection | null
-  browserModel: ModelSelection | null
+export interface MagnitudeConfig extends Omit<Schema.Schema.Type<typeof MagnitudeConfigSchema>, 'roles'> {
+  roles: Record<string, RoleConfig>
 }

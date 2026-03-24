@@ -11,7 +11,7 @@
  */
 
 import { Projection, Signal } from '@magnitudedev/event-core'
-import { peekSlot } from '@magnitudedev/providers'
+
 import type { AppEvent, SessionContext } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
 
@@ -95,9 +95,8 @@ const estimators: Record<string, ImageTokenEstimator> = {
 }
 
 function getImageTokenEstimator(): ImageTokenEstimator {
-  const model = peekSlot('primary')?.model
-  const modelId = model?.id ?? ''
-  const providerId = model?.providerId ?? 'anthropic'
+  const modelId = ''
+  const providerId = 'anthropic'
 
   // 1. Model name heuristic (most reliable)
   if (/claude/i.test(modelId)) return estimators.anthropic

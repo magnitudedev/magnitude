@@ -1,9 +1,9 @@
 import { Context, Effect } from 'effect'
 
 import type { ResolvedContextLimitPolicy } from './defaults'
-import type { ContextLimitPolicy, MagnitudeConfig, ModelSelection, ProviderOptions } from '../types'
+import type { ContextLimitPolicy, MagnitudeConfig, ModelSelection, ProviderOptions, RoleConfig } from '../types'
 
-export interface ConfigStorageShape {
+export interface ConfigStorageShape<TSlot extends string> {
   readonly load: () => Effect.Effect<MagnitudeConfig>
   readonly save: (config: MagnitudeConfig) => Effect.Effect<void>
   readonly update: (
@@ -21,11 +21,11 @@ export interface ConfigStorageShape {
   readonly setTelemetryEnabled: (value: boolean) => Effect.Effect<void>
   readonly getMemoryEnabled: () => Effect.Effect<boolean>
 
-  readonly getModelSelection: (
-    slot: 'primary' | 'secondary' | 'browser'
-  ) => Effect.Effect<ModelSelection | null>
+  readonly getRoleConfig: (slot: TSlot) => Effect.Effect<RoleConfig | null>
+  readonly getRoleConfigs: () => Effect.Effect<Record<TSlot, RoleConfig>>
+  readonly getModelSelection: (slot: TSlot) => Effect.Effect<ModelSelection | null>
   readonly setModelSelection: (
-    slot: 'primary' | 'secondary' | 'browser',
+    slot: TSlot,
     selection: ModelSelection | null
   ) => Effect.Effect<void>
   readonly getProviderOptions: (providerId: string) => Effect.Effect<ProviderOptions | undefined>
@@ -35,12 +35,10 @@ export interface ConfigStorageShape {
   ) => Effect.Effect<void>
 }
 
-export class ConfigStorage extends Context.Tag('ConfigStorage')<
-  ConfigStorage,
-  ConfigStorageShape
->() {}
+export const ConfigStorage = Context.GenericTag<ConfigStorageShape<string>>('ConfigStorage')
+export type ConfigStorage = Context.Tag.Identifier<typeof ConfigStorage>
 
 export {
   ConfigStorage as AppConfig,
-  type ConfigStorageShape as AppConfigShape,
 }
+export type AppConfigShape<TSlot extends string> = ConfigStorageShape<TSlot>

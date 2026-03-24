@@ -6,10 +6,8 @@ import type { CallUsage } from '../state/provider-state'
 import type { ModelError } from '../errors/model-error'
 import type { ModelDriverId } from '../model/model-driver'
 import type { AuthInfo, ProviderOptions } from '../types'
-import type { ModelSlot } from '../state/provider-state'
-
-export interface DriverRequest {
-  readonly slot: ModelSlot
+export interface DriverRequest<TSlot extends string = string> {
+  readonly slot: TSlot
   readonly functionName: string
   readonly args: readonly unknown[]
   readonly connection: ModelConnection
@@ -37,9 +35,9 @@ export interface CompleteResult<T = unknown> {
   readonly collectorData: CollectorData
 }
 
-export interface ExecutableDriver {
+export interface ExecutableDriver<TSlot extends string = string> {
   readonly id: ModelDriverId
   connect(model: Model, auth: AuthInfo | null, inference: InferenceConfig): Effect.Effect<ModelConnection, ModelError>
-  stream(req: DriverRequest): Effect.Effect<StreamResult, ModelError>
-  complete<T = unknown>(req: DriverRequest): Effect.Effect<CompleteResult<T>, ModelError>
+  stream(req: DriverRequest<TSlot>): Effect.Effect<StreamResult, ModelError>
+  complete<T = unknown>(req: DriverRequest<TSlot>): Effect.Effect<CompleteResult<T>, ModelError>
 }

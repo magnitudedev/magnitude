@@ -64,6 +64,7 @@ import { collectSessionContext } from './util/collect-session-context'
 
 // Providers
 import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister } from '@magnitudedev/providers'
+import { MAGNITUDE_SLOTS, type MagnitudeSlot } from './model-slots'
 import type { StorageClient } from '@magnitudedev/storage'
 import { initLogger } from '@magnitudedev/logger'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
@@ -146,7 +147,7 @@ export interface CreateClientOptions {
   /**
    * Storage client for config, sessions, memory, and memory jobs.
    */
-  storage: StorageClient
+  storage: StorageClient<MagnitudeSlot>
 
   /**
    * Enable LLM call tracing to ~/.magnitude/traces/
@@ -164,7 +165,7 @@ export interface CreateClientOptions {
    * When provided, provider bootstrap is skipped and the caller is responsible
    * for initializing model selections/auth inside the runtime.
    */
-  providerRuntime?: ReturnType<typeof makeProviderRuntimeLive>
+  providerRuntime?: ReturnType<typeof makeProviderRuntimeLive<MagnitudeSlot>>
 
   /**
    * Disable shell command classification safeguards for this runtime only.
@@ -191,9 +192,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
   // Bootstrap provider runtime from stored config / env vars unless the caller
   // supplied a pre-configured runtime (e.g. headless oneshot mode).
-  const providerRuntime = options.providerRuntime ?? makeProviderRuntimeLive()
+  const providerRuntime = options.providerRuntime ?? makeProviderRuntimeLive<MagnitudeSlot>()
   if (!options.providerRuntime) {
-    await Effect.runPromise(bootstrapProviderRuntime.pipe(Effect.provide(providerRuntime)))
+    await Effect.runPromise(bootstrapProviderRuntime<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS }).pipe(Effect.provide(providerRuntime)))
   }
 
   if (!hasDrainedPendingMemoryJobs) {
@@ -210,7 +211,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
   }
 
-  const tracerLayer = options.debug ? makeTracePersister((trace) => writeTrace(trace)) : makeNoopTracer()
+  const tracerLayer = options.debug ? makeTracePersister((trace) => writeTrace(trace as any)) : makeNoopTracer()
   const ephemeralSessionContextLayer = Layer.succeed(EphemeralSessionContextTag, {
     disableShellSafeguards: options.disableShellSafeguards ?? false,
     disableCwdSafeguards: options.disableCwdSafeguards ?? false,
@@ -218,7 +219,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
   const layer = Layer.mergeAll(
     Layer.provide(ExecutionManagerLive, ephemeralSessionContextLayer),
     Layer.provide(BrowserServiceLive, providerRuntime),
-    Layer.provide(makeModelResolver(), providerRuntime),
+    Layer.provide(makeModelResolver<MagnitudeSlot>(), providerRuntime),
     providerRuntime,
     tracerLayer,
     options.persistence,

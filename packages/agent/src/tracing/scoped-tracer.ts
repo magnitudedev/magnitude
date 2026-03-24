@@ -1,6 +1,7 @@
 import { Effect } from 'effect'
 import { TraceEmitter, TracePersister } from '@magnitudedev/providers'
-import type { TraceInput, AgentTraceMeta } from '@magnitudedev/tracing'
+import type { TraceInput } from '@magnitudedev/providers/src/resolver/tracing'
+import type { AgentTraceMeta } from '@magnitudedev/tracing'
 
 export interface TraceScope {
   readonly metadata: AgentTraceMeta

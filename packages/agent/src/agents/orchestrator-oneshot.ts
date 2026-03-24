@@ -16,10 +16,10 @@ import {
 
 const systemPrompt = compilePromptTemplate(oneshotPromptRaw)
 
-export const orchestratorOneshotRole = defineRole<typeof orchestratorTools, 'primary', PolicyContext>({
+export const orchestratorOneshotRole = defineRole<typeof orchestratorTools, 'orchestrator', PolicyContext>({
   tools: orchestratorTools,
   id: 'orchestrator-oneshot',
-  slot: 'primary',
+  slot: 'orchestrator',
   systemPrompt,
   lenses: [constraintsLens, pivotLens, strategyLens, validationLens, turnLens],
   defaultRecipient: 'user',

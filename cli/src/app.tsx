@@ -66,12 +66,7 @@ import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
 import { useFilePanel } from './hooks/use-file-panel'
 import { useLazyClient } from './hooks/use-lazy-client'
-
-const roleToSlot = (role: string): 'primary' | 'secondary' | 'browser' => {
-  if (role === 'browser') return 'browser'
-  if (role === 'orchestrator') return 'primary'
-  return 'secondary'
-}
+import { getDisplaySlot, getSlotsForGroup, roleToSlotGroup, setGroupSelection, type LegacySlotGroup } from './utils/slot-compat'
 
 export const getEffectiveSelectedForkId = (
   selectedTabForkId: string | null,
@@ -164,7 +159,7 @@ function AppInner({
   const systemMessageTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const [showRecentChatsOverlay, setShowRecentChatsOverlay] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
-  const [selectingModelFor, setSelectingModelFor] = useState<'primary' | 'secondary' | 'browser' | null>(null)
+  const [selectingModelFor, setSelectingModelFor] = useState<LegacySlotGroup | null>(null)
   const [primaryModel, setPrimaryModelState] = useState<ModelSelection | null>(null)
   const [secondaryModel, setSecondaryModelState] = useState<ModelSelection | null>(null)
   const [browserModel, setBrowserModelState] = useState<ModelSelection | null>(null)
@@ -285,7 +280,7 @@ function AppInner({
   }, [providerUiState])
 
   useEffect(() => {
-    providerRuntime.state.contextLimits('primary').then((limits) => {
+    providerRuntime.state.contextLimits(getDisplaySlot('primary')).then((limits) => {
       setContextHardCap(limits.hardCap)
     }).catch((error) => {
       logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Failed to load provider context limits')
@@ -386,11 +381,7 @@ function AppInner({
       const sessionTracker = new SessionTracker()
       setSessionTracker(sessionTracker)
       const forkRoles = new Map<string, { role: string; startTime: number }>()
-      const roleToSlot = (role: string): 'primary' | 'secondary' | 'browser' => {
-        if (role === 'browser') return 'browser'
-        if (role === 'orchestrator') return 'primary'
-        return 'secondary'
-      }
+
 
       // Log all events to event log file + collect for debug panel
       client.onEvent((event) => {
@@ -429,13 +420,13 @@ function AppInner({
         if (event.type === 'turn_completed') {
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'orchestrator'
-          const slot = roleToSlot(agentRole)
+          const slot = getDisplaySlot(roleToSlotGroup(agentRole))
 
           providerRuntime.state.peek(slot).then((resolved) => {
             trackTurnCompleted({
               providerId: resolved?.model.providerId ?? null,
               modelId: resolved?.model.id ?? null,
-              modelSlot: slot,
+              modelSlot: roleToSlotGroup(agentRole),
               authType: resolved?.auth?.type ?? null,
               inputTokens: event.inputTokens,
               outputTokens: event.outputTokens,
@@ -450,7 +441,7 @@ function AppInner({
             trackTurnCompleted({
               providerId: null,
               modelId: null,
-              modelSlot: slot,
+              modelSlot: roleToSlotGroup(agentRole),
               authType: null,
               inputTokens: event.inputTokens,
               outputTokens: event.outputTokens,
@@ -553,7 +544,7 @@ function AppInner({
         streamingMessageId: null,
         activeThinkBlockId: null,
         showButton: 'send',
-        toolModelStates: {},
+        toolHandles: {},
       })
       setClientFactory(async () => {
         const client = await createClient()
@@ -709,8 +700,9 @@ function AppInner({
     const agentId = agentStatusState.agentByForkId.get(selectedForkId)
     const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
     if (!agent) return rootModelSummary
-    const slot = roleToSlot(agent.role)
-    const selection = slot === 'primary' ? primaryModel : slot === 'browser' ? browserModel : secondaryModel
+    const group = roleToSlotGroup(agent.role)
+    const slot = getDisplaySlot(group)
+    const selection = slot === getDisplaySlot('primary') ? primaryModel : slot === getDisplaySlot('browser') ? browserModel : secondaryModel
     if (!selection) return null
     return {
       provider: getProvider(selection.providerId)?.name ?? selection.providerId,
@@ -910,18 +902,24 @@ function AppInner({
     if (selectingModelFor === 'primary') {
       setPrimaryModelState(selection)
       const auth = await providerRuntime.auth.getAuth(providerId)
-      await providerRuntime.state.setSelection('primary', providerId, modelId, auth ?? null, { persist: false })
-      await storage.config.setModelSelection('primary', selection)
+      await setGroupSelection(providerRuntime, 'primary', providerId, modelId, auth ?? null, { persist: false })
+      for (const slot of getSlotsForGroup('primary')) {
+        await storage.config.setModelSelection(slot, selection)
+      }
     } else if (selectingModelFor === 'secondary') {
       setSecondaryModelState(selection)
       const auth = await providerRuntime.auth.getAuth(providerId)
-      await providerRuntime.state.setSelection('secondary', providerId, modelId, auth ?? null)
-      await storage.config.setModelSelection('secondary', selection)
+      await setGroupSelection(providerRuntime, 'secondary', providerId, modelId, auth ?? null)
+      for (const slot of getSlotsForGroup('secondary')) {
+        await storage.config.setModelSelection(slot, selection)
+      }
     } else if (selectingModelFor === 'browser') {
       setBrowserModelState(selection)
       const auth = await providerRuntime.auth.getAuth(providerId)
-      await providerRuntime.state.setSelection('browser', providerId, modelId, auth ?? null, { persist: false })
-      await storage.config.setModelSelection('browser', selection)
+      await setGroupSelection(providerRuntime, 'browser', providerId, modelId, auth ?? null, { persist: false })
+      for (const slot of getSlotsForGroup('browser')) {
+        await storage.config.setModelSelection(slot, selection)
+      }
     }
 
     await reloadProviderState()
@@ -1161,17 +1159,23 @@ function AppInner({
     if (result.browserModel) setBrowserModelState(result.browserModel)
 
     const primaryAuth = await providerRuntime.auth.getAuth(result.primaryModel.providerId)
-    await providerRuntime.state.setSelection('primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, { persist: false })
-    await storage.config.setModelSelection('primary', result.primaryModel)
+    await setGroupSelection(providerRuntime, 'primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, { persist: false })
+    for (const slot of getSlotsForGroup('primary')) {
+      await storage.config.setModelSelection(slot, result.primaryModel)
+    }
 
     const secondaryAuth = await providerRuntime.auth.getAuth(result.secondaryModel.providerId)
-    await providerRuntime.state.setSelection('secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
-    await storage.config.setModelSelection('secondary', result.secondaryModel)
+    await setGroupSelection(providerRuntime, 'secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
+    for (const slot of getSlotsForGroup('secondary')) {
+      await storage.config.setModelSelection(slot, result.secondaryModel)
+    }
 
     if (result.browserModel) {
       const browserAuth = await providerRuntime.auth.getAuth(result.browserModel.providerId)
-      await providerRuntime.state.setSelection('browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, { persist: false })
-      await storage.config.setModelSelection('browser', result.browserModel)
+      await setGroupSelection(providerRuntime, 'browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, { persist: false })
+      for (const slot of getSlotsForGroup('browser')) {
+        await storage.config.setModelSelection(slot, result.browserModel)
+      }
     }
 
     if (wizardNeedsChromium) {
@@ -1237,18 +1241,24 @@ function AppInner({
 
     if (primaryModel?.providerId === providerId) {
       setPrimaryModelState(null)
-      await providerRuntime.state.clear('primary')
-      await storage.config.setModelSelection('primary', null)
+      for (const slot of getSlotsForGroup('primary')) {
+        await providerRuntime.state.clear(slot)
+        await storage.config.setModelSelection(slot, null)
+      }
     }
     if (secondaryModel?.providerId === providerId) {
       setSecondaryModelState(null)
-      await providerRuntime.state.clear('secondary')
-      await storage.config.setModelSelection('secondary', null)
+      for (const slot of getSlotsForGroup('secondary')) {
+        await providerRuntime.state.clear(slot)
+        await storage.config.setModelSelection(slot, null)
+      }
     }
     if (browserModel?.providerId === providerId) {
       setBrowserModelState(null)
-      await providerRuntime.state.clear('browser')
-      await storage.config.setModelSelection('browser', null)
+      for (const slot of getSlotsForGroup('browser')) {
+        await providerRuntime.state.clear(slot)
+        await storage.config.setModelSelection(slot, null)
+      }
     }
     if (providerId === 'local') {
       await storage.config.setLocalProviderConfig(null)
@@ -2033,8 +2043,8 @@ function AppInner({
                     !browserModel && 'browser',
                   ].filter(Boolean) as string[]
                   const list = missing.length === 1
-                    ? missing[0]
-                    : missing.slice(0, -1).join(', ') + ', or ' + missing[missing.length - 1]
+                    ? (missing[0] as string)
+                    : missing.slice(0, -1).join(', ') + ', or ' + (missing[missing.length - 1] as string)
                   return `No ${list} model configured. Run /settings to set up your models.`
                 })()}
               </text>

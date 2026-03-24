@@ -39,6 +39,7 @@ import { UserPresenceWorker } from '../workers/user-presence-worker'
 import { ExecutionManager, ExecutionManagerLive } from '../execution/execution-manager'
 import { BrowserServiceLive } from '../services/browser-service'
 import { makeProviderRuntimeLive, makeTestResolver, type TestModelConfig } from '@magnitudedev/providers'
+import type { MagnitudeSlot } from '../model-slots'
 import { registerApprovalBridge } from '../execution/approval-bridge'
 
 // Testing services
@@ -112,7 +113,7 @@ const ALL_VARIANTS: AgentVariant[] = [
   'browser',
 ]
 
-type MagnitudeAgentDef = RoleDefinition<ToolSet, string, PolicyContext>
+type MagnitudeAgentDef = RoleDefinition<ToolSet, MagnitudeSlot, PolicyContext>
 
 function makeOverrideTool(source: AnyTool, handler: ToolOverrideHandler): AnyTool {
   if (!('execute' in source) || typeof source.execute !== 'function') {
@@ -287,7 +288,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const defaultWaitTimeoutMs = options.defaults?.waitTimeoutMs ?? DEFAULT_TIMEOUT_MS
     const fakeClock = options.clock === 'fake' ? createFakeClock() : null
 
-    const providerRuntime = makeProviderRuntimeLive()
+    const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>()
     const ephemeralSessionContextLayer = Layer.succeed(EphemeralSessionContextTag, {
       disableShellSafeguards: false,
       disableCwdSafeguards: false,

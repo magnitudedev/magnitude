@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createStorageClient, type StorageClient } from '@magnitudedev/storage'
+import type { MagnitudeSlot } from '../../model-slots'
 import { createMemoryExtractionJob, drainPendingJobsOnStartup, writePendingJob } from '../job-queue'
 import { MEMORY_RELATIVE_PATH, ensureMemoryFile, readMemory } from '../memory-file'
 
@@ -63,7 +64,7 @@ describe('memory extraction integration', () => {
   const originalHome = process.env.HOME
   let homeDir = ''
   let cwd = ''
-  let storage: StorageClient
+  let storage: StorageClient<MagnitudeSlot>
 
   beforeEach(async () => {
     homeDir = mkdtempSync(join(tmpdir(), 'mem-extract-home-'))
@@ -75,7 +76,7 @@ describe('memory extraction integration', () => {
     providerState.throwOnExtract = null
     providerState.nextResult = { result: { additions: [], updates: [], deletions: [] } }
 
-    storage = await createStorageClient({ cwd })
+    storage = await createStorageClient<MagnitudeSlot>({ cwd })
     const jobs = await storage.memoryJobs.list()
     await Promise.all(jobs.map((filePath) => storage.memoryJobs.read({ filePath }).then((job) => storage.memoryJobs.remove(job.jobId))))
     await ensureMemoryFile(storage)

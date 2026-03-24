@@ -6,6 +6,7 @@
 
 import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
+import type { MagnitudeSlot } from '../model-slots'
 import { orchestratorRole } from './orchestrator'
 import { orchestratorOneshotRole } from './orchestrator-oneshot'
 import { builderRole } from './builder'
@@ -15,7 +16,7 @@ import { debuggerRole } from './debugger'
 import { reviewerRole } from './reviewer'
 import { browserRole } from './browser'
 
-type MagnitudeRoleDef = RoleDefinition<ToolSet, string, PolicyContext>
+type MagnitudeRoleDef = RoleDefinition<ToolSet, MagnitudeSlot, PolicyContext>
 
 const AGENTS: Record<string, MagnitudeRoleDef> = {
   orchestrator: orchestratorRole,
@@ -54,4 +55,8 @@ export function getAgentDefinition(variant: AgentVariant): MagnitudeRoleDef {
   const override = _overrides.get(variant)
   if (override) return override
   return AGENTS[variant]
+}
+
+export function getAgentSlot(variant: AgentVariant): MagnitudeSlot {
+  return getAgentDefinition(variant).slot
 }

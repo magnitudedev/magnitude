@@ -59,10 +59,10 @@ const tools = toolSet({
 
 })
 
-export const debuggerRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+export const debuggerRole = defineRole<typeof tools, 'debugger', PolicyContext>({
   tools,
   id: 'debugger',
-  slot: 'secondary',
+  slot: 'debugger',
   systemPrompt,
   lenses: [hypothesisLens, skepticismLens, strategyLens, turnLens],
   defaultRecipient: 'parent',

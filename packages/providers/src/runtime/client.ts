@@ -20,10 +20,10 @@ type Promisify<S> = {
     : never
 }
 
-export interface ProviderClient {
+export interface ProviderClient<TSlot extends string = string> {
   readonly catalog: Promisify<ProviderCatalogShape>
-  readonly state: Promisify<ProviderStateShape>
-  readonly config: Promisify<AppConfigShape>
+  readonly state: Promisify<ProviderStateShape<TSlot>>
+  readonly config: Promisify<AppConfigShape<TSlot>>
   readonly auth: Promisify<ProviderAuthShape>
   readonly layer: Layer.Layer<ProviderRuntimeServices>
 }
@@ -44,15 +44,15 @@ function buildServiceFacade<Id extends ProviderRuntimeServices, Shape>(
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
-export async function createProviderClient(): Promise<ProviderClient> {
-  const layer = makeProviderRuntimeLive()
+export async function createProviderClient<TSlot extends string>(args: { slots: readonly TSlot[] }): Promise<ProviderClient<TSlot>> {
+  const layer = makeProviderRuntimeLive<TSlot>()
   const runtime = ManagedRuntime.make(layer)
 
-  await runtime.runPromise(bootstrapProviderRuntime)
+  await runtime.runPromise(bootstrapProviderRuntime({ slots: args.slots }))
 
   return {
     catalog: buildServiceFacade(ProviderCatalog, (e) => runtime.runPromise(e)),
-    state: buildServiceFacade(ProviderState, (e) => runtime.runPromise(e)),
+    state: buildServiceFacade(ProviderState, (e) => runtime.runPromise(e)) as Promisify<ProviderStateShape<TSlot>>,
     config: buildServiceFacade(AppConfig, (e) => runtime.runPromise(e)),
     auth: buildServiceFacade(ProviderAuth, (e) => runtime.runPromise(e)),
     layer,

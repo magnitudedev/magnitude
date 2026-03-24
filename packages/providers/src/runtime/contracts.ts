@@ -1,6 +1,6 @@
 import { Context, Effect } from 'effect'
 import type { ProviderDefinition, ModelDefinition, AuthInfo, OAuthAuth } from '../types'
-import type { CallUsage, ModelSlot, SlotState, SlotUsage } from '../state/provider-state'
+import type { CallUsage, SlotState, SlotUsage } from '../state/provider-state'
 import type { DetectedAuthMethod, ProviderAuthMethodStatus } from '../detect'
 import type { Model } from '../model/model'
 
@@ -18,28 +18,26 @@ export class ProviderCatalog extends Context.Tag('ProviderCatalog')<
   ProviderCatalogShape
 >() {}
 
-export interface ProviderStateShape {
-  readonly peek: (slot?: ModelSlot) => Effect.Effect<{ model: Model; auth: AuthInfo | null } | null>
-  readonly getSlot: (slot: ModelSlot) => Effect.Effect<SlotState>
+export interface ProviderStateShape<TSlot extends string> {
+  readonly peek: (slot: TSlot) => Effect.Effect<{ model: Model; auth: AuthInfo | null } | null>
+  readonly getSlot: (slot: TSlot) => Effect.Effect<SlotState>
   readonly setSelection: (
-    slot: ModelSlot,
+    slot: TSlot,
     providerId: string,
     modelId: string,
     auth: AuthInfo | null,
     options?: { readonly persist?: boolean },
   ) => Effect.Effect<boolean>
-  readonly clear: (slot: ModelSlot) => Effect.Effect<void>
-  readonly contextWindow: (slot?: ModelSlot) => Effect.Effect<number>
-  readonly contextLimits: (slot?: ModelSlot) => Effect.Effect<{ hardCap: number; softCap: number }>
-  readonly accumulateUsage: (slot: ModelSlot, usage: CallUsage) => Effect.Effect<void>
-  readonly getUsage: (slot: ModelSlot) => Effect.Effect<SlotUsage>
-  readonly resetUsage: (slot: ModelSlot) => Effect.Effect<void>
+  readonly clear: (slot: TSlot) => Effect.Effect<void>
+  readonly contextWindow: (slot: TSlot) => Effect.Effect<number>
+  readonly contextLimits: (slot: TSlot) => Effect.Effect<{ hardCap: number; softCap: number }>
+  readonly accumulateUsage: (slot: TSlot, usage: CallUsage) => Effect.Effect<void>
+  readonly getUsage: (slot: TSlot) => Effect.Effect<SlotUsage>
+  readonly resetUsage: (slot: TSlot) => Effect.Effect<void>
 }
 
-export class ProviderState extends Context.Tag('ProviderState')<
-  ProviderState,
-  ProviderStateShape
->() {}
+export const ProviderState = Context.GenericTag<ProviderStateShape<string>>('ProviderState')
+export type ProviderState = Context.Tag.Identifier<typeof ProviderState>
 
 
 export interface ProviderAuthShape {

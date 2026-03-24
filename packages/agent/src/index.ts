@@ -6,6 +6,10 @@
 
 export type { StorageClient } from '@magnitudedev/storage'
 
+// Model Slots
+export { MAGNITUDE_SLOTS, isMagnitudeSlot } from './model-slots'
+export type { MagnitudeSlot } from './model-slots'
+
 // Agent
 export { CodingAgent, createCodingAgentClient } from './coding-agent'
 export type { CreateClientOptions } from './coding-agent'
@@ -263,7 +267,7 @@ export type {
   OpenAIBrowserOAuthStart,
   OpenAIDeviceOAuthStart,
   CopilotOAuthStart,
-  ModelSlot,
+  
   ChatStream,
   CallUsage,
   SlotUsage,

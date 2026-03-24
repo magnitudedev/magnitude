@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'url'
 import { logger } from '@magnitudedev/logger'
 import type { StorageClient } from '@magnitudedev/storage'
+import type { MagnitudeSlot } from '../model-slots'
 import { createId } from '../util/id'
 
 export interface MemoryExtractionJob {
@@ -32,7 +33,7 @@ export function createMemoryExtractionJob(params: {
   }
 }
 
-export async function writePendingJob(storage: StorageClient, job: MemoryExtractionJob): Promise<string> {
+export async function writePendingJob(storage: StorageClient<MagnitudeSlot>, job: MemoryExtractionJob): Promise<string> {
   return storage.memoryJobs.enqueue(job)
 }
 
@@ -51,7 +52,7 @@ export function spawnDetachedMemoryExtractionWorker(jobFilePath: string): void {
 
 const MAX_JOB_ATTEMPTS = 5
 
-export async function drainPendingJobsOnStartup(storage: StorageClient): Promise<void> {
+export async function drainPendingJobsOnStartup(storage: StorageClient<MagnitudeSlot>): Promise<void> {
   const jobFiles = await storage.memoryJobs.list()
   for (const jobFile of jobFiles) {
     try {

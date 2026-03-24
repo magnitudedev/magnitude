@@ -31,6 +31,7 @@ import type {
   ModelSelection,
   OAuthAuth,
   ProviderOptions,
+  RoleConfig,
   StoredLogEntry,
   StoredSessionMeta,
 } from './types'
@@ -45,13 +46,12 @@ export type AllStorageServices =
   | SkillStorage
   | TraceStorage
 
-export interface StorageClient {
+export interface StorageClient<TSlot extends string = string> {
   config: {
-    getModelSelection(
-      slot: 'primary' | 'secondary' | 'browser'
-    ): Promise<ModelSelection | null>
+    getRoleConfigs(): Promise<Record<TSlot, RoleConfig>>
+    getModelSelection(slot: TSlot): Promise<ModelSelection | null>
     setModelSelection(
-      slot: 'primary' | 'secondary' | 'browser',
+      slot: TSlot,
       selection: ModelSelection | null
     ): Promise<void>
 
@@ -154,9 +154,9 @@ export interface StorageClient {
   readonly layer: Layer.Layer<AllStorageServices>
 }
 
-export async function createStorageClient(options?: {
+export async function createStorageClient<TSlot extends string = string>(options?: {
   cwd?: string
-}): Promise<StorageClient> {
+}): Promise<StorageClient<TSlot>> {
   const cwd = options?.cwd ?? process.cwd()
   const projectPaths = makeProjectStoragePaths(cwd)
 
@@ -182,19 +182,18 @@ export async function createStorageClient(options?: {
 
   return {
     config: {
-      async getModelSelection(slot) {
-        const config = await run(Effect.flatMap(ConfigStorage, (s) => s.load()))
-        const key = `${slot}Model` as const
-        return config[key]
+      async getRoleConfigs() {
+        return (await run(
+          Effect.flatMap(ConfigStorage, (s) => s.getRoleConfigs())
+        )) as Record<TSlot, RoleConfig>
       },
 
-      async setModelSelection(slot, selection) {
-        const key = `${slot}Model` as const
-        await run(
-          Effect.flatMap(ConfigStorage, (s) =>
-            s.update((config) => ({ ...config, [key]: selection }))
-          )
-        )
+      getModelSelection(slot) {
+        return run(Effect.flatMap(ConfigStorage, (s) => s.getModelSelection(slot)))
+      },
+
+      setModelSelection(slot, selection) {
+        return run(Effect.flatMap(ConfigStorage, (s) => s.setModelSelection(slot, selection)))
       },
 
       getContextLimitPolicy() {
@@ -227,7 +226,7 @@ export async function createStorageClient(options?: {
 
       async getProviderOptions(providerId) {
         const config = await run(Effect.flatMap(ConfigStorage, (s) => s.load()))
-        return config.providerOptions?.[providerId]
+        return config.providers?.[providerId]
       },
 
       getLocalProviderConfig() {

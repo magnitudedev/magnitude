@@ -1,5 +1,5 @@
 import { Effect, Layer, Stream } from 'effect'
-import type { ModelSlot } from '../state/provider-state'
+
 import type { CallUsage } from '../state/provider-state'
 import { Model } from '../model/model'
 import { ModelConnection } from '../model/model-connection'
@@ -100,7 +100,7 @@ export function makeTestResolver(config: TestModelConfig = {}): Layer.Layer<Mode
 
   return Layer.merge(
     Layer.succeed(ModelResolver, {
-      resolve: (_slot: ModelSlot) => Effect.succeed(fakeBoundModel),
+      resolve: (_slot: string) => Effect.succeed(fakeBoundModel),
     }),
     tracerLayer,
   )

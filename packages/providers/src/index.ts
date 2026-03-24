@@ -54,8 +54,8 @@ export type { ModelError } from './errors/model-error'
 export { classifyHttpError, classifyUnknownError } from './errors/classify-error'
 
 // Legacy singleton state (compatibility — prefer runtime DI surface for new code)
-export type { ModelSlot, CallUsage, SlotUsage } from './state/provider-state'
-export { peekSlot, getModelContextWindow } from './state/provider-state'
+export type { CallUsage, SlotUsage, SlotState, ProviderStateStore } from './state/provider-state'
+export { makeProviderStateStore } from './state/provider-state'
 
 // Resolver (Effect services)
 export { ModelResolver } from './resolver/model-resolver'
@@ -90,6 +90,7 @@ export {
   getModelRecommendation,
   normalizeModelId,
   resolveRecommendedModel,
+  resolveRecommendedModelForClass,
   MODEL_RECOMMENDATION_RULES,
 } from './model-recommendations'
 export type { ModelRecommendationRule, RecommendationMatch } from './model-recommendations'

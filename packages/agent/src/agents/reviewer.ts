@@ -59,10 +59,10 @@ const tools = toolSet({
   phaseVerdict:    phaseVerdictTool,
 })
 
-export const reviewerRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>({
   tools,
   id: 'reviewer',
-  slot: 'secondary',
+  slot: 'reviewer',
   systemPrompt,
   lenses: [intentLens, qualityLens, skepticismLens, turnLens],
   defaultRecipient: 'parent',

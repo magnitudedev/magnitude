@@ -5,6 +5,7 @@ import { createRoot } from '@opentui/react'
 import { Command } from '@commander-js/extra-typings'
 import { createProviderClient } from '@magnitudedev/providers'
 import { createStorageClient } from '@magnitudedev/storage'
+import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
 import { App } from './app'
 import { initThemeStore, useThemeStateStore } from './hooks/use-theme'
 import { ProviderRuntimeProvider } from './providers/provider-runtime'
@@ -73,7 +74,7 @@ async function main() {
       })
 
       const storage = await createStorageClient({ cwd: process.cwd() })
-      const providerRuntime = await createProviderClient()
+      const providerRuntime = await createProviderClient<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS })
       createRoot(renderer).render(
         <StorageProvider client={storage}>
           <ProviderRuntimeProvider runtime={providerRuntime}>

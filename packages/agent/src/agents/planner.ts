@@ -69,10 +69,10 @@ const tools = toolSet({
 
 })
 
-export const plannerRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
   tools,
   id: 'planner',
-  slot: 'secondary',
+  slot: 'planner',
   systemPrompt,
   lenses: [ideateLens, velocityLens, alignmentLens, capacityLens, turnLens],
   defaultRecipient: 'parent',

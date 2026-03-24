@@ -48,10 +48,10 @@ const tools = toolSet({
   phaseSubmit:    phaseSubmitTool,
 })
 
-export const builderRole = defineRole<typeof tools, 'secondary', PolicyContext>({
+export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({
   tools,
   id: 'builder',
-  slot: 'secondary',
+  slot: 'builder',
   systemPrompt,
   lenses: [qualityLens, turnLens],
   defaultRecipient: 'parent',

@@ -12,8 +12,7 @@ import { logger } from '@magnitudedev/logger'
 import type { ModelError } from '../errors/model-error'
 import { isRetryableError } from '../errors/classify-error'
 
-import type { ModelSlot } from '../state/provider-state'
-import { ProviderState, type ProviderStateShape } from '../runtime/contracts'
+import { ProviderState } from '../runtime/contracts'
 import { TraceEmitter } from './tracing'
 
 /** Retry schedule for transient connection failures before first chunk */
@@ -52,11 +51,11 @@ function extractTraceResponse(
   }
 }
 
-export function createBoundModel(
-  slot: ModelSlot,
+export function createBoundModel<TSlot extends string>(
+  slot: TSlot,
   model: Model,
   connection: ModelConnection,
-  driver: ExecutableDriver,
+  driver: ExecutableDriver<TSlot>,
   inference: InferenceConfig = {},
   providerOptions?: ProviderOptions,
 ): Effect.Effect<BoundModel, never, ProviderState> {
@@ -66,14 +65,14 @@ export function createBoundModel(
   )
 }
 
-function createBoundModelImpl(
-  slot: ModelSlot,
+function createBoundModelImpl<TSlot extends string>(
+  slot: TSlot,
   model: Model,
   connection: ModelConnection,
-  driver: ExecutableDriver,
+  driver: ExecutableDriver<TSlot>,
   inference: InferenceConfig,
   providerOptions: ProviderOptions | undefined,
-  providerState: ProviderStateShape,
+  providerState: import('../runtime/contracts').ProviderStateShape<string>,
 ): BoundModel {
   const boundModel: BoundModel = {
     model,
@@ -140,7 +139,7 @@ function createBoundModelImpl(
                 timestamp: new Date().toISOString(),
                 model: model.id,
                 provider: model.providerId,
-                slot,
+                slot: slot as string,
                 request: extractTraceRequest(collectorData, fallbackRequest),
                 response: extractTraceResponse(collectorData, accumulatedOutput || null),
                 usage: usage ?? {
@@ -225,7 +224,7 @@ function createBoundModelImpl(
           timestamp: new Date().toISOString(),
           model: model.id,
           provider: model.providerId,
-          slot,
+          slot: slot as string,
           request: extractTraceRequest(collectorData, fallbackRequest),
           response: extractTraceResponse(collectorData, rawOutput),
           usage: usage ?? {

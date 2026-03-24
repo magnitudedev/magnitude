@@ -14,7 +14,7 @@ import {
   TraceEmitter,
 } from '../index'
 import type { AuthInfo } from '../types'
-import type { ModelSlot, CallUsage } from '../state/provider-state'
+import type { CallUsage } from '../state/provider-state'
 import type { Model } from '../model/model'
 import type { BoundModel } from '../model/bound-model'
 import type { TraceInput } from '../resolver/tracing'
@@ -27,7 +27,7 @@ export interface LiveTraceStore {
 }
 
 export interface LiveTestTarget {
-  readonly slot: ModelSlot
+  readonly slot: string
   readonly model: Model
   readonly auth: AuthInfo | null
   readonly expectedDriver: ExpectedDriver
@@ -41,7 +41,7 @@ export interface LiveHarness {
   readonly runtime: ManagedRuntime.ManagedRuntime<TraceEmitter | ModelResolver | ProviderAuth | ProviderState, never>
   readonly traces: LiveTraceStore
   getLiveTargets(): Promise<LiveTestTarget[]>
-  resolveSlot(slot: ModelSlot): Promise<ResolvedLiveTarget>
+  resolveSlot(slot: string): Promise<ResolvedLiveTarget>
   resolveTarget(target: LiveTestTarget): Promise<ResolvedLiveTarget>
   runBoundGenerateChatTitle(bound: BoundModel): Promise<{ title: string } | null>
   runBoundCodingAgentChat(bound: BoundModel): Promise<{ text: string; usage: CallUsage | null }>
@@ -50,7 +50,7 @@ export interface LiveHarness {
   runDriverCodingAgentChat(target: LiveTestTarget): Promise<{ text: string; usage: CallUsage | null; collectorData: StreamResult['getCollectorData'] extends () => infer T ? T : never }>
 }
 
-export const LIVE_TEST_SLOTS: ModelSlot[] = ['primary', 'secondary', 'browser']
+export const LIVE_TEST_SLOTS = ['slot-a', 'slot-b', 'slot-browser'] as const
 
 export function shouldRunLiveProviderTests(): boolean {
   return process.env.MAGNITUDE_RUN_LIVE_PROVIDER_TESTS === '1'
@@ -111,12 +111,12 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
       }),
   })
 
-  const providerLayer = makeProviderRuntimeLive()
-  const resolverLayer = makeModelResolver().pipe(Layer.provide(providerLayer))
+  const providerLayer = makeProviderRuntimeLive<string>()
+  const resolverLayer = makeModelResolver<string>().pipe(Layer.provide(providerLayer))
   const appLayer = Layer.mergeAll(providerLayer, resolverLayer, traceEmitterLayer)
   const runtime = ManagedRuntime.make(appLayer)
 
-  await runtime.runPromise(bootstrapProviderRuntime)
+  await runtime.runPromise(bootstrapProviderRuntime({ slots: LIVE_TEST_SLOTS }))
 
   async function getLiveTargets(): Promise<LiveTestTarget[]> {
     return runtime.runPromise(
@@ -145,7 +145,7 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
     )
   }
 
-  async function resolveSlot(slot: ModelSlot): Promise<ResolvedLiveTarget> {
+  async function resolveSlot(slot: string): Promise<ResolvedLiveTarget> {
     return runtime.runPromise(
       Effect.gen(function* () {
         const resolver = yield* ModelResolver
