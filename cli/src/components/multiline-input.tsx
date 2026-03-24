@@ -1813,14 +1813,7 @@ export const MultilineInput = forwardRef<
 
     const totalLines = visualLineStarts.length
 
-    // Add bottom gutter when cursor is on line 2 of exactly 2 lines
-    const gutterEnabled =
-      totalLines === 2 && cursorRow === 1 && totalLines + 1 <= safeMaxHeight
-
-    const rawHeight = Math.min(
-      totalLines + (gutterEnabled ? 1 : 0),
-      safeMaxHeight,
-    )
+    const rawHeight = Math.min(totalLines, safeMaxHeight)
 
     const heightLines = Math.max(effectiveMinHeight, rawHeight)
 
@@ -1829,7 +1822,6 @@ export const MultilineInput = forwardRef<
 
     return {
       heightLines,
-      gutterEnabled,
       isScrollable,
     }
   })()
@@ -1896,7 +1888,6 @@ export const MultilineInput = forwardRef<
               />
             )}
             {displayValueForRendering}
-            {layoutMetrics.gutterEnabled ? '\n' : ''}
           </>
         ) : (
           <>
@@ -2010,7 +2001,6 @@ export const MultilineInput = forwardRef<
 
               return out
             })()}
-            {layoutMetrics.gutterEnabled ? '\n' : ''}
           </>
         )}
       </text>
