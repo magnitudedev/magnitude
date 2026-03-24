@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
 import type { KeyEvent } from '@opentui/core'
+import type { MagnitudeSlot } from '@magnitudedev/agent'
 
 interface SetupWizardNavState {
   selectedIndex: number
@@ -7,15 +8,15 @@ interface SetupWizardNavState {
   handleKeyEvent: (key: KeyEvent) => boolean
 }
 
+const SLOT_ORDER: MagnitudeSlot[] = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser']
+
 /**
  * Manages keyboard navigation for the setup wizard model confirmation step.
- * Items: 0 = "Start chatting/Continue", 1 = "Change primary", 2 = "Change secondary", 3 = "Change browser"
+ * Items: 0 = "Start chatting/Continue", 1-7 = individual slots (lead, explorer, planner, builder, reviewer, debugger, browser)
  */
 export function useSetupWizardNavigation(
   onConfirm: () => void,
-  onChangePrimary: () => void,
-  onChangeSecondary: () => void,
-  onChangeBrowser: () => void,
+  onChangeSlot: (slot: MagnitudeSlot) => void,
   isActive: boolean,
 ): SetupWizardNavState {
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -34,20 +35,18 @@ export function useSetupWizardNavigation(
     }
 
     if (isDown) {
-      setSelectedIndex(prev => Math.min(3, prev + 1))
+      setSelectedIndex(prev => Math.min(7, prev + 1))
       return true
     }
 
     if (isEnter) {
       if (selectedIndex === 0) onConfirm()
-      else if (selectedIndex === 1) onChangePrimary()
-      else if (selectedIndex === 2) onChangeSecondary()
-      else if (selectedIndex === 3) onChangeBrowser()
+      else if (selectedIndex >= 1 && selectedIndex <= 7) onChangeSlot(SLOT_ORDER[selectedIndex - 1])
       return true
     }
 
     return false
-  }, [isActive, selectedIndex, onConfirm, onChangePrimary, onChangeSecondary, onChangeBrowser])
+  }, [isActive, selectedIndex, onConfirm, onChangeSlot])
 
   return {
     selectedIndex,

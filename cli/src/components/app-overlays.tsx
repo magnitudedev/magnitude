@@ -1,5 +1,6 @@
 import type { KeyEvent } from '@opentui/core'
 import { PROVIDERS, createCodingAgentClient, type AgentStatusState, type ModelSelection, type ProviderAuthMethodStatus, type ProviderDefinition, type DetectedProvider } from '@magnitudedev/agent'
+import type { MagnitudeSlot } from '@magnitudedev/agent'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
 import type { WizardStep } from './setup-wizard-overlay'
 import { BrowserSetupOverlay } from './browser-setup-overlay'
@@ -20,9 +21,7 @@ export type AppOverlaysProps = {
   showSetupWizard: boolean
   wizardStep: WizardStep
   wizardTotalSteps: number
-  wizardPrimaryModel: ModelSelection | null
-  wizardSecondaryModel: ModelSelection | null
-  wizardBrowserModel: ModelSelection | null
+  wizardSlotModels: Record<MagnitudeSlot, ModelSelection | null>
   wizardConnectedProvider: string | null
   wizardProviderSelectedIndex: number
   wizardModelSelectedIndex: number
@@ -44,11 +43,9 @@ export type AppOverlaysProps = {
 
   detectedProviders: DetectedProvider[]
   connectedProviders: ProviderDefinition[]
-  primaryModel: ModelSelection | null
-  secondaryModel: ModelSelection | null
-  browserModel: ModelSelection | null
-  selectingModelFor: 'primary' | 'secondary' | 'browser' | null
-  setSelectingModelFor: (v: 'primary' | 'secondary' | 'browser' | null) => void
+  slotModels: Record<MagnitudeSlot, ModelSelection | null>
+  selectingModelFor: MagnitudeSlot | null
+  setSelectingModelFor: (v: MagnitudeSlot | null) => void
   preferencesSelectedIndex: number
   setPreferencesSelectedIndex: (n: number) => void
   providerDetailStatus: ProviderAuthMethodStatus | null
@@ -68,9 +65,7 @@ export type AppOverlaysProps = {
   handleProviderDetailAction: (idx: number) => void
   handleProviderDetailBack: () => void
   onBackFromModelPicker: () => void
-  handleChangePrimary: () => void
-  handleChangeSecondary: () => void
-  handleChangeBrowser: () => void
+  handleChangeSlot: (slot: MagnitudeSlot) => void
   modelTabHandleKeyEvent: (key: KeyEvent) => boolean
   providerTabHandleKeyEvent: (key: KeyEvent) => boolean
   modelNavigation: { items: any[]; selectedIndex: number; setSelectedIndex: (n: number) => void }
@@ -98,9 +93,7 @@ export function AppOverlays({
   showSetupWizard,
   wizardStep,
   wizardTotalSteps,
-  wizardPrimaryModel,
-  wizardSecondaryModel,
-  wizardBrowserModel,
+  wizardSlotModels,
   wizardConnectedProvider,
   wizardProviderSelectedIndex,
   wizardModelSelectedIndex,
@@ -120,9 +113,7 @@ export function AppOverlays({
   setAuthMethodSelectedIndex,
   detectedProviders,
   connectedProviders,
-  primaryModel,
-  secondaryModel,
-  browserModel,
+  slotModels,
   selectingModelFor,
   setSelectingModelFor,
   preferencesSelectedIndex,
@@ -144,9 +135,7 @@ export function AppOverlays({
   handleProviderDetailAction,
   handleProviderDetailBack,
   onBackFromModelPicker,
-  handleChangePrimary,
-  handleChangeSecondary,
-  handleChangeBrowser,
+  handleChangeSlot,
   modelTabHandleKeyEvent,
   providerTabHandleKeyEvent,
   modelNavigation,
@@ -190,9 +179,7 @@ export function AppOverlays({
           step={wizardStep}
           allProviders={wizardProviders}
           detectedProviders={detectedProviders}
-          primaryModel={wizardPrimaryModel}
-          secondaryModel={wizardSecondaryModel}
-          browserModel={wizardBrowserModel}
+          slotModels={wizardSlotModels}
           connectedProviderName={wizardConnectedProvider}
           totalSteps={wizardTotalSteps}
           onProviderSelected={handleWizardProviderSelected}
@@ -282,13 +269,9 @@ export function AppOverlays({
           providerDetailSelectedIndex={providerDetailSelectedIndex}
           onProviderDetailAction={handleProviderDetailAction}
           onProviderDetailHoverIndex={setProviderDetailSelectedIndex}
-          primaryModel={primaryModel}
-          secondaryModel={secondaryModel}
-          browserModel={browserModel}
+          slotModels={slotModels}
           selectingModelFor={selectingModelFor}
-          onChangePrimary={handleChangePrimary}
-          onChangeSecondary={handleChangeSecondary}
-          onChangeBrowser={handleChangeBrowser}
+          onChangeSlot={handleChangeSlot}
           modelPrefsSelectedIndex={preferencesSelectedIndex}
           onModelPrefsHoverIndex={setPreferencesSelectedIndex}
           localProviderConfig={localProviderConfig}

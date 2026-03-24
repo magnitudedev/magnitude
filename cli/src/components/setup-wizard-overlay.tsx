@@ -7,6 +7,7 @@ import { WizardHeader } from './wizard-header'
 import { BOX_CHARS } from '../utils/ui-constants'
 import type { ProviderDefinition, ModelSelection } from '@magnitudedev/agent'
 import type { DetectedProvider } from '@magnitudedev/agent'
+import type { MagnitudeSlot } from '@magnitudedev/agent'
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
@@ -15,6 +16,16 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   local: '(Ollama, LM Studio, llama.cpp, vLLM)',
 }
 
+export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string }[] = [
+  { slot: 'lead', label: 'Team Lead' },
+  { slot: 'explorer', label: 'Explorer' },
+  { slot: 'planner', label: 'Planner' },
+  { slot: 'builder', label: 'Builder' },
+  { slot: 'reviewer', label: 'Reviewer' },
+  { slot: 'debugger', label: 'Debugger' },
+  { slot: 'browser', label: 'Browser' },
+]
+
 export type WizardStep = 'provider' | 'models' | 'browser'
 
 interface SetupWizardOverlayProps {
@@ -22,14 +33,12 @@ interface SetupWizardOverlayProps {
   allProviders: ProviderDefinition[]
   detectedProviders: DetectedProvider[]
   // Model defaults (set by app.tsx when advancing to models step)
-  primaryModel: ModelSelection | null
-  secondaryModel: ModelSelection | null
-  browserModel: ModelSelection | null
+  slotModels: Record<MagnitudeSlot, ModelSelection | null>
   connectedProviderName?: string | null
   totalSteps: number
   // Callbacks
   onProviderSelected: (providerId: string) => void
-  onComplete: (result: { primaryModel: ModelSelection; secondaryModel: ModelSelection; browserModel: ModelSelection | null }) => void
+  onComplete: (result: Record<MagnitudeSlot, ModelSelection | null>) => void
   onBack: () => void
   onSkip: () => void
   onWizardCtrlCExit: () => void
@@ -45,9 +54,7 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
   step,
   allProviders,
   detectedProviders,
-  primaryModel,
-  secondaryModel,
-  browserModel,
+  slotModels,
   connectedProviderName,
   totalSteps,
   onProviderSelected,
@@ -66,28 +73,21 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
   const [backHovered, setBackHovered] = useState(false)
 
   const handleConfirm = useCallback(() => {
-    if (!primaryModel || !secondaryModel) return
-    onComplete({ primaryModel, secondaryModel, browserModel: browserModel ?? null })
-  }, [primaryModel, secondaryModel, browserModel, onComplete])
+    if (!slotModels.lead) return
+    onComplete(slotModels)
+  }, [slotModels, onComplete])
 
-  // Resolve model display names
-  const primaryDisplay = useMemo(() => {
-    if (!primaryModel) return null
-    const provider = allProviders.find(p => p.id === primaryModel.providerId)
-    return { providerName: provider?.name ?? primaryModel.providerId, modelId: primaryModel.modelId }
-  }, [primaryModel, allProviders])
-
-  const secondaryDisplay = useMemo(() => {
-    if (!secondaryModel) return null
-    const provider = allProviders.find(p => p.id === secondaryModel.providerId)
-    return { providerName: provider?.name ?? secondaryModel.providerId, modelId: secondaryModel.modelId }
-  }, [secondaryModel, allProviders])
-
-  const browserDisplay = useMemo(() => {
-    if (!browserModel) return null
-    const provider = allProviders.find(p => p.id === browserModel.providerId)
-    return { providerName: provider?.name ?? browserModel.providerId, modelId: browserModel.modelId }
-  }, [browserModel, allProviders])
+  // Resolve model display names for all slots
+  const slotDisplays = useMemo(() => {
+    return Object.fromEntries(
+      SLOT_UI_ORDER.map(({ slot }) => {
+        const selection = slotModels[slot]
+        if (!selection) return [slot, null]
+        const provider = allProviders.find(p => p.id === selection.providerId)
+        return [slot, { providerName: provider?.name ?? selection.providerId, modelId: selection.modelId }]
+      })
+    ) as Record<MagnitudeSlot, { providerName: string; modelId: string } | null>
+  }, [slotModels, allProviders])
 
   const modelsSubtitle = connectedProviderName
     ? `You've successfully connected ${connectedProviderName}! We've configured default models based on your provider. You can change these anytime with /models.`
@@ -146,7 +146,7 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
       }
       if (key.name === 'down' && plain) {
         key.preventDefault()
-        onModelNavSelectedIndexChange(Math.min(3, modelNavSelectedIndex + 1))
+        onModelNavSelectedIndexChange(Math.min(7, modelNavSelectedIndex + 1))
         return
       }
       if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
@@ -183,101 +183,33 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
           theme={theme}
         />
 
-        {/* Model confirmation */}
-        <box style={{ flexDirection: 'column', paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexGrow: 1 }}>
-
-          {/* Primary Model */}
-          <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-            <box style={{ paddingBottom: 0 }}>
-              <text style={{ fg: theme.foreground }}>
-                <span attributes={TextAttributes.BOLD}>Primary Model</span>
-                <span attributes={TextAttributes.DIM}> (Smarter)</span>
-              </text>
-            </box>
-            <box style={{
-              flexDirection: 'row',
-              borderStyle: 'single',
-              borderColor: modelNavSelectedIndex === 1 ? theme.primary : theme.border,
-              customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
-            }}>
-              <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                {primaryDisplay ? (
-                  <>
-                    {primaryDisplay.providerName}
-                    <span attributes={TextAttributes.DIM}> · </span>
-                    {primaryDisplay.modelId}
-                  </>
-                ) : (
-                  <span style={{ fg: theme.muted }}>Not configured</span>
-                )}
-              </text>
-            </box>
-          </box>
-
-          {/* Secondary Model */}
-          <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-            <box style={{ paddingBottom: 0 }}>
-              <text style={{ fg: theme.foreground }}>
-                <span attributes={TextAttributes.BOLD}>Secondary Model</span>
-                <span attributes={TextAttributes.DIM}> (Faster)</span>
-              </text>
-            </box>
-            <box style={{
-              flexDirection: 'row',
-              borderStyle: 'single',
-              borderColor: modelNavSelectedIndex === 2 ? theme.primary : theme.border,
-              customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
-            }}>
-              <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                {secondaryDisplay ? (
-                  <>
-                    {secondaryDisplay.providerName}
-                    <span attributes={TextAttributes.DIM}> · </span>
-                    {secondaryDisplay.modelId}
-                  </>
-                ) : (
-                  <span style={{ fg: theme.muted }}>Not configured</span>
-                )}
-              </text>
-            </box>
-          </box>
-
-          {/* Browser Model */}
-          <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-            <box style={{ paddingBottom: 0 }}>
-              <text style={{ fg: theme.foreground }}>
-                <span attributes={TextAttributes.BOLD}>Browser Agent Model</span>
-                <span attributes={TextAttributes.DIM}> (Vision)</span>
-              </text>
-            </box>
-            <box style={{
-              flexDirection: 'row',
-              borderStyle: 'single',
-              borderColor: modelNavSelectedIndex === 3 ? theme.primary : theme.border,
-              customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
-            }}>
-              <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                {browserDisplay ? (
-                  <>
-                    {browserDisplay.providerName}
-                    <span attributes={TextAttributes.DIM}> · </span>
-                    {browserDisplay.modelId}
-                  </>
-                ) : (
-                  <span style={{ fg: theme.muted }}>None detected</span>
-                )}
-              </text>
-            </box>
-          </box>
-
+        {/* Model confirmation — scrollable for small terminals */}
+        <scrollbox
+          scrollX={false}
+          scrollbarOptions={{ visible: false }}
+          verticalScrollbarOptions={{
+            visible: true,
+            trackOptions: { width: 1 },
+          }}
+          style={{
+            flexGrow: 1,
+            rootOptions: {
+              flexGrow: 1,
+              backgroundColor: 'transparent',
+            },
+            wrapperOptions: {
+              border: false,
+              backgroundColor: 'transparent',
+            },
+            contentOptions: {
+              paddingLeft: 2,
+              paddingRight: 2,
+              paddingTop: 1,
+            },
+          }}
+        >
           {/* Start chatting / Continue button */}
-          <box style={{ paddingTop: 1 }}>
+          <box style={{ paddingBottom: 1 }}>
             <Button onClick={handleConfirm}>
               <box style={{
                 borderStyle: 'single',
@@ -292,7 +224,41 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
               </box>
             </Button>
           </box>
-        </box>
+
+          {SLOT_UI_ORDER.map(({ slot, label }, idx) => {
+            const display = slotDisplays[slot]
+            const navIndex = idx + 1 // 0 is confirm button, 1-7 are slots
+            return (
+              <box key={slot} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                <box style={{ paddingBottom: 0 }}>
+                  <text style={{ fg: theme.foreground }}>
+                    <span attributes={TextAttributes.BOLD}>{label}</span>
+                  </text>
+                </box>
+                <box style={{
+                  flexDirection: 'row',
+                  borderStyle: 'single',
+                  borderColor: modelNavSelectedIndex === navIndex ? theme.primary : theme.border,
+                  customBorderChars: BOX_CHARS,
+                  paddingLeft: 1,
+                  paddingRight: 1,
+                }}>
+                  <text style={{ fg: theme.foreground, flexGrow: 1 }}>
+                    {display ? (
+                      <>
+                        {display.providerName}
+                        <span attributes={TextAttributes.DIM}> · </span>
+                        {display.modelId}
+                      </>
+                    ) : (
+                      <span style={{ fg: theme.muted }}>Not configured</span>
+                    )}
+                  </text>
+                </box>
+              </box>
+            )
+          })}
+        </scrollbox>
 
         {/* Footer */}
         <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>

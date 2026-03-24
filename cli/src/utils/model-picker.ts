@@ -3,7 +3,7 @@ import type {
   ProviderAuthMethodStatus,
 } from '@magnitudedev/agent'
 import { isBrowserCompatible } from '@magnitudedev/providers'
-import type { ModelSlot, ProviderDefinition } from '@magnitudedev/providers'
+import type { ProviderDefinition } from '@magnitudedev/providers'
 import {
   compareProviderOrder,
   getModelRecommendation,
@@ -25,7 +25,7 @@ export interface ModelPickerItem {
 interface BuildModelPickerItemsArgs {
   allProviders: ProviderDefinition[]
   connectedProviderIds: Set<string>
-  selectingModelFor: ModelSlot
+  selectingModelFor: string
   localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null
   authStatusesByProviderId?: Map<string, ProviderAuthMethodStatus | null>
   detectedAuthTypeByProviderId?: Map<string, string | null>
@@ -33,7 +33,7 @@ interface BuildModelPickerItemsArgs {
 
 interface FilterModelPickerItemsArgs {
   items: ModelPickerItem[]
-  selectingModelFor: ModelSlot
+  selectingModelFor: string
   showAllProviders: boolean
   showRecommendedOnly?: boolean
   search: string
@@ -42,7 +42,7 @@ interface FilterModelPickerItemsArgs {
 interface ResolveSlotDefaultSelectionArgs {
   allProviders: ProviderDefinition[]
   connectedProviderIds: Set<string>
-  slot: ModelSlot
+  slot: string
   preferredProviderId?: string | null
   detectedAuthTypeByProviderId?: Map<string, string | null>
 }
@@ -58,7 +58,7 @@ function normalizeForSearch(text: string): string {
     .replace(/[-_]/g, ' ')                // word separators → space
 }
 
-function compareItemsForSlot(a: ModelPickerItem, b: ModelPickerItem, slot: ModelSlot): number {
+function compareItemsForSlot(a: ModelPickerItem, b: ModelPickerItem, slot: string): number {
   const aRecommended = getModelRecommendation(a.providerId, a.modelId)?.classes.has(slot) ?? false
   const bRecommended = getModelRecommendation(b.providerId, b.modelId)?.classes.has(slot) ?? false
   if (aRecommended !== bRecommended) return Number(bRecommended) - Number(aRecommended)
@@ -180,7 +180,7 @@ export function resolveSlotDefaultSelection({
   for (const provider of preferredFirst) {
     const isOAuth = detectedAuthTypeByProviderId?.get(provider.id) === 'oauth'
     const defaults = getDefaultModels(provider.id, isOAuth)
-    const defaultModelId = defaults[slot]
+    const defaultModelId = defaults[slot as keyof typeof defaults]
     if (defaultModelId && provider.models.some(model => model.id === defaultModelId)) {
       return { providerId: provider.id, modelId: defaultModelId }
     }

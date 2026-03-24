@@ -11,10 +11,6 @@ export interface RecommendationMatch {
   classes: Set<string>
 }
 
-const PRIMARY = 'primary' as const
-const SECONDARY = 'secondary' as const
-const BROWSER = 'browser' as const
-
 function rule(
   model: string | RegExp,
   classes: ModelRecommendationRule['classes'],
@@ -23,31 +19,40 @@ function rule(
   return { provider, model, classes }
 }
 
+const ALL_SLOTS = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser'] as const
+const SUBAGENT_SLOTS = ['explorer', 'planner', 'builder', 'reviewer', 'debugger'] as const
+const NON_BROWSER_SLOTS = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger'] as const
+const SUBAGENT_AND_BROWSER = ['explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser'] as const
+
 export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
-  // Primary — smartest/newest of each family
-  rule(/^claude-opus-4[.-]6(-v1:0)?$/, [PRIMARY]),
-  rule(/^gpt-5\.4$/, [PRIMARY, SECONDARY, BROWSER]),
-  rule(/^gpt-5\.3-codex$/, [PRIMARY, SECONDARY, BROWSER]),
-  rule(/^qwen3\.5-(397b-a17b|max-thinking|coder-next)$/, [PRIMARY, SECONDARY]),
-  rule('gemini-3.1-pro-preview', [PRIMARY]),
-  rule(/^MiniMax-M2\.5$/, [PRIMARY, SECONDARY]),
-  rule(/^glm-5$/, [PRIMARY]),
+  // Anthropic
+  rule(/^claude-opus-4[.-]6(-v1:0)?$/, ['lead']),
+  rule(/^claude-sonnet-4[.-]6(-v1:0)?$/, [...SUBAGENT_AND_BROWSER]),
+  rule(/^claude-haiku-4[.-]5(-v1:0)?$/, ['browser']),
 
-  // Secondary — fast models
-  rule(/^claude-sonnet-4[.-]6(-v1:0)?$/, [SECONDARY, BROWSER]),
+  // OpenAI
+  rule(/^gpt-5\.4$/, ['lead']),
+  rule(/^gpt-5\.3-codex$/, [...SUBAGENT_AND_BROWSER]),
 
-  rule(/^gemini-3-flash-preview$/, [SECONDARY, BROWSER]),
-  rule(/^gemini-3\.1-flash-lite-preview$/, [SECONDARY, BROWSER]),
-  rule(/^qwen3\.5-27b$/, [SECONDARY, BROWSER]),
-  rule(/^qwen3\.5-9b$/, [BROWSER]),
-  rule(/^glm-5$/, [SECONDARY], 'zai'),
+  // Google
+  rule(/^gemini-3\.1-pro-preview$/, ['lead']),
+  rule(/^gemini-3-flash-preview$/, [...SUBAGENT_AND_BROWSER]),
 
-  // Browser
-  rule(/^claude-haiku-4[.-]5(-v1:0)?$/, [BROWSER]),
-  rule(/^gemini-3\.1-pro-preview$/, [BROWSER]),
-  rule(/^kimi-k2\.5$/, [PRIMARY, SECONDARY, BROWSER]),
-  rule(/^MiniMax-M2\.5$/, [BROWSER]),
-  rule(/^glm-5$/, [BROWSER]),
+  // Qwen
+  rule(/^qwen3\.5-(397b-a17b|max-thinking|coder-next)$/, [...NON_BROWSER_SLOTS]),
+  rule(/^qwen3\.5-27b$/, [...SUBAGENT_AND_BROWSER]),
+  rule(/^qwen3\.5-9b$/, ['browser']),
+
+  // ZAI / GLM
+  rule(/^glm-5$/, [...ALL_SLOTS], 'zai'),
+  rule(/^glm-5$/, ['lead', 'browser']),
+
+  // MiniMax
+  rule(/^MiniMax-M2\.5$/, [...ALL_SLOTS]),
+
+  // Moonshot
+  rule(/^kimi-k2\.5$/, [...ALL_SLOTS]),
+
   // Local intentionally omitted: recommendations depend on user-local inventory
 ]
 
@@ -128,21 +133,14 @@ export function resolveRecommendedModelForClass(
   return null
 }
 
-export function resolveRecommendedModel<TSlot extends string>(
-  slot: TSlot,
+export function resolveRecommendedModel(
+  slot: string,
   providers: ProviderDefinition[],
   connectedProviderIds: Set<string>,
-  options: {
-    slotClassOf: (slot: TSlot) => string
+  options?: {
     preferredProviderId?: string
-    isAllowedModel?: (slot: TSlot, providerId: string, modelId: string) => boolean
+    isAllowedModel?: (providerId: string, modelId: string) => boolean
   },
 ): { providerId: string; modelId: string } | null {
-  const slotClass = options.slotClassOf(slot)
-  return resolveRecommendedModelForClass(slotClass, providers, connectedProviderIds, {
-    preferredProviderId: options.preferredProviderId,
-    isAllowedModel: options.isAllowedModel
-      ? (providerId, modelId) => options.isAllowedModel!(slot, providerId, modelId)
-      : undefined,
-  })
+  return resolveRecommendedModelForClass(slot, providers, connectedProviderIds, options)
 }

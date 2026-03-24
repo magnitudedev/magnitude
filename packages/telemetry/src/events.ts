@@ -48,7 +48,7 @@ export function trackUserMessage(props: {
 export function trackTurnCompleted(props: {
   providerId: string | null
   modelId: string | null
-  modelSlot: 'primary' | 'secondary' | 'browser'
+  modelSlot: string
   authType: string | null
   inputTokens: number | null
   outputTokens: number | null

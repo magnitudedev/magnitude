@@ -1,17 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ModelSelection } from '@magnitudedev/providers'
-import type { DetectedProvider } from '@magnitudedev/agent'
+import type { DetectedProvider, MagnitudeSlot } from '@magnitudedev/agent'
+import { MAGNITUDE_SLOTS } from '@magnitudedev/agent'
 import { useProviderRuntime } from '../providers/provider-runtime'
 import { useStorage } from '../providers/storage-provider'
-import { getDisplaySlot } from '../utils/slot-compat'
 
 type LocalProviderConfig = Awaited<ReturnType<ReturnType<typeof useStorage>['config']['getLocalProviderConfig']>>
 
 interface ProviderUiState {
   detectedProviders: DetectedProvider[]
-  primaryModel: ModelSelection | null
-  secondaryModel: ModelSelection | null
-  browserModel: ModelSelection | null
+  slotModels: Record<MagnitudeSlot, ModelSelection | null>
   localProviderConfig: LocalProviderConfig
   setupComplete: boolean
   telemetryEnabled: boolean
@@ -25,14 +23,12 @@ export function useProviderUiState() {
 
   const reload = useCallback(async () => {
     const version = ++versionRef.current
-    const [setupComplete, telemetryEnabled, primarySlot, secondarySlot, browserSlot, runtimeDetectedProviders, localProviderConfig] = await Promise.all([
+    const [setupComplete, telemetryEnabled, runtimeDetectedProviders, localProviderConfig, ...slotStates] = await Promise.all([
       storage.config.getSetupComplete(),
       storage.config.getTelemetryEnabled(),
-      runtime.state.peek(getDisplaySlot('primary')),
-      runtime.state.peek(getDisplaySlot('secondary')),
-      runtime.state.peek(getDisplaySlot('browser')),
       runtime.auth.detectProviders(),
       storage.config.getLocalProviderConfig(),
+      ...MAGNITUDE_SLOTS.map(slot => runtime.state.peek(slot)),
     ])
 
     const detectedProviders: DetectedProvider[] = runtimeDetectedProviders.map((entry) => {
@@ -50,16 +46,15 @@ export function useProviderUiState() {
 
     if (version !== versionRef.current) return
 
+    const slotModels = Object.fromEntries(
+      MAGNITUDE_SLOTS.map((slot, i) => {
+        const s = slotStates[i]
+        return [slot, s?.model ? { providerId: s.model.providerId, modelId: s.model.id } : null]
+      })
+    ) as Record<MagnitudeSlot, ModelSelection | null>
+
     setState({
-      primaryModel: primarySlot?.model
-        ? { providerId: primarySlot.model.providerId, modelId: primarySlot.model.id }
-        : null,
-      secondaryModel: secondarySlot?.model
-        ? { providerId: secondarySlot.model.providerId, modelId: secondarySlot.model.id }
-        : null,
-      browserModel: browserSlot?.model
-        ? { providerId: browserSlot.model.providerId, modelId: browserSlot.model.id }
-        : null,
+      slotModels,
       detectedProviders,
       localProviderConfig,
       setupComplete,

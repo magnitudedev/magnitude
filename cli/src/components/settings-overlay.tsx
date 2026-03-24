@@ -5,9 +5,10 @@ import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { SingleLineInput } from './single-line-input'
 import { BOX_CHARS } from '../utils/ui-constants'
-import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus } from '@magnitudedev/agent'
+import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus, MagnitudeSlot } from '@magnitudedev/agent'
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
+import { SLOT_UI_ORDER } from './setup-wizard-overlay'
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
@@ -59,14 +60,10 @@ interface SettingsOverlayProps {
   providerDetailSelectedIndex: number
   onProviderDetailAction: (actionIndex: number) => void
   onProviderDetailHoverIndex?: (index: number) => void
-  // Model tab — primary/secondary/browser view
-  primaryModel: ModelSelection | null
-  secondaryModel: ModelSelection | null
-  browserModel: ModelSelection | null
-  selectingModelFor: 'primary' | 'secondary' | 'browser' | null
-  onChangePrimary: () => void
-  onChangeSecondary: () => void
-  onChangeBrowser: () => void
+  // Model tab — per-slot view
+  slotModels: Record<MagnitudeSlot, ModelSelection | null>
+  selectingModelFor: MagnitudeSlot | null
+  onChangeSlot: (slot: MagnitudeSlot) => void
   modelPrefsSelectedIndex: number
   onModelPrefsHoverIndex?: (index: number) => void
   localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null
@@ -130,13 +127,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   providerDetailSelectedIndex,
   onProviderDetailAction,
   onProviderDetailHoverIndex,
-  primaryModel,
-  secondaryModel,
-  browserModel,
+  slotModels,
   selectingModelFor,
-  onChangePrimary,
-  onChangeSecondary,
-  onChangeBrowser,
+  onChangeSlot,
   modelPrefsSelectedIndex,
   onModelPrefsHoverIndex,
   localProviderConfig,
@@ -173,9 +166,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     return groups
   }, [modelItems])
 
-  const primaryDisplay = resolveModelDisplay(primaryModel, modelItems, allProviders)
-  const secondaryDisplay = resolveModelDisplay(secondaryModel, modelItems, allProviders)
-  const browserDisplay = resolveModelDisplay(browserModel, modelItems, allProviders)
+  const slotDisplays = Object.fromEntries(
+    SLOT_UI_ORDER.map(({ slot }) => [slot, resolveModelDisplay(slotModels[slot], modelItems, allProviders)])
+  ) as Record<MagnitudeSlot, ReturnType<typeof resolveModelDisplay>>
 
   const TABS: { id: SettingsTab; label: string }[] = [
     { id: 'provider', label: 'Provider' },
@@ -318,7 +311,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             >
               <box style={{ paddingLeft: 1, paddingBottom: 1, flexDirection: 'column' }}>
                 <text style={{ fg: theme.warning }}>
-                  Select a model for your <span attributes={TextAttributes.BOLD}>{selectingModelFor === 'primary' ? 'Primary' : selectingModelFor === 'secondary' ? 'Secondary' : 'Browser Agent'}</span> model. Press Esc to go back.
+                  Select a model for your <span attributes={TextAttributes.BOLD}>{SLOT_UI_ORDER.find(s => s.slot === selectingModelFor)?.label ?? selectingModelFor}</span> model. Press Esc to go back.
                 </text>
                 <box style={{ paddingTop: 1, paddingRight: 1, flexDirection: 'column' }}>
                   <box style={{
@@ -411,119 +404,46 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               paddingTop: 1,
               flexGrow: 1,
             }}>
-              {/* Primary Model */}
-              <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-                <box style={{ paddingBottom: 0 }}>
-                  <text style={{ fg: theme.foreground }}>
-                    <span attributes={TextAttributes.BOLD}>Primary Model</span>
-                    <span attributes={TextAttributes.DIM}> (Smarter)</span>
-                  </text>
-                </box>
-                <Button
-                  onClick={onChangePrimary}
-                  onMouseOver={() => onModelPrefsHoverIndex?.(0)}
-                >
-                  <box style={{
-                    flexDirection: 'row',
-                    borderStyle: 'single',
-                    borderColor: modelPrefsSelectedIndex === 0 ? theme.primary : theme.border,
-                    customBorderChars: BOX_CHARS,
-                    paddingLeft: 1,
-                    paddingRight: 1,
-                  }}>
-                    <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                      {primaryDisplay ? (
-                        <>
-                          {primaryDisplay.providerName}
-                          <span attributes={TextAttributes.DIM}> · </span>
-                          {primaryDisplay.modelName}
-                        </>
-                      ) : (
-                        <span style={{ fg: theme.muted }}>Not configured</span>
-                      )}
-                    </text>
-                    <text style={{ fg: modelPrefsSelectedIndex === 0 ? theme.primary : theme.muted }}>
-                      {' [Change]'}
-                    </text>
+              {SLOT_UI_ORDER.map(({ slot, label }, idx) => {
+                const display = slotDisplays[slot]
+                return (
+                  <box key={slot} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                    <box style={{ paddingBottom: 0 }}>
+                      <text style={{ fg: theme.foreground }}>
+                        <span attributes={TextAttributes.BOLD}>{label}</span>
+                      </text>
+                    </box>
+                    <Button
+                      onClick={() => onChangeSlot(slot)}
+                      onMouseOver={() => onModelPrefsHoverIndex?.(idx)}
+                    >
+                      <box style={{
+                        flexDirection: 'row',
+                        borderStyle: 'single',
+                        borderColor: modelPrefsSelectedIndex === idx ? theme.primary : theme.border,
+                        customBorderChars: BOX_CHARS,
+                        paddingLeft: 1,
+                        paddingRight: 1,
+                      }}>
+                        <text style={{ fg: theme.foreground, flexGrow: 1 }}>
+                          {display ? (
+                            <>
+                              {display.providerName}
+                              <span attributes={TextAttributes.DIM}> · </span>
+                              {display.modelName}
+                            </>
+                          ) : (
+                            <span style={{ fg: theme.muted }}>Not configured</span>
+                          )}
+                        </text>
+                        <text style={{ fg: modelPrefsSelectedIndex === idx ? theme.primary : theme.muted }}>
+                          {' [Change]'}
+                        </text>
+                      </box>
+                    </Button>
                   </box>
-                </Button>
-              </box>
-
-              {/* Secondary Model */}
-              <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-                <box style={{ paddingBottom: 0 }}>
-                  <text style={{ fg: theme.foreground }}>
-                    <span attributes={TextAttributes.BOLD}>Secondary Model</span>
-                    <span attributes={TextAttributes.DIM}> (Faster)</span>
-                  </text>
-                </box>
-                <Button
-                  onClick={onChangeSecondary}
-                  onMouseOver={() => onModelPrefsHoverIndex?.(1)}
-                >
-                  <box style={{
-                    flexDirection: 'row',
-                    borderStyle: 'single',
-                    borderColor: modelPrefsSelectedIndex === 1 ? theme.primary : theme.border,
-                    customBorderChars: BOX_CHARS,
-                    paddingLeft: 1,
-                    paddingRight: 1,
-                  }}>
-                    <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                      {secondaryDisplay ? (
-                        <>
-                          {secondaryDisplay.providerName}
-                          <span attributes={TextAttributes.DIM}> · </span>
-                          {secondaryDisplay.modelName}
-                        </>
-                      ) : (
-                        <span style={{ fg: theme.muted }}>Not configured</span>
-                      )}
-                    </text>
-                    <text style={{ fg: modelPrefsSelectedIndex === 1 ? theme.primary : theme.muted }}>
-                      {' [Change]'}
-                    </text>
-                  </box>
-                </Button>
-              </box>
-
-              {/* Browser Agent Model */}
-              <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
-                <box style={{ paddingBottom: 0 }}>
-                  <text style={{ fg: theme.foreground }}>
-                    <span attributes={TextAttributes.BOLD}>Browser Agent Model</span>
-                    <span attributes={TextAttributes.DIM}> (Vision)</span>
-                  </text>
-                </box>
-                <Button
-                  onClick={onChangeBrowser}
-                  onMouseOver={() => onModelPrefsHoverIndex?.(2)}
-                >
-                  <box style={{
-                    flexDirection: 'row',
-                    borderStyle: 'single',
-                    borderColor: modelPrefsSelectedIndex === 2 ? theme.primary : theme.border,
-                    customBorderChars: BOX_CHARS,
-                    paddingLeft: 1,
-                    paddingRight: 1,
-                  }}>
-                    <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                      {browserDisplay ? (
-                        <>
-                          {browserDisplay.providerName}
-                          <span attributes={TextAttributes.DIM}> · </span>
-                          {browserDisplay.modelName}
-                        </>
-                      ) : (
-                        <span style={{ fg: theme.muted }}>Not configured</span>
-                      )}
-                    </text>
-                    <text style={{ fg: modelPrefsSelectedIndex === 2 ? theme.primary : theme.muted }}>
-                      {' [Change]'}
-                    </text>
-                  </box>
-                </Button>
-              </box>
+                )
+              })}
             </box>
 
             {/* Model prefs footer */}

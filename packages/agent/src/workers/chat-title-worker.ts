@@ -73,7 +73,7 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
       logger.info({ messageCount: parts.length, userMessageCount }, '[ChatTitleWorker] Generating chat title')
 
       const runtime = yield* ModelResolver
-      const model = yield* runtime.resolve('planner')
+      const model = yield* runtime.resolve('explorer')
       const result = yield* withTraceScope(
         { metadata: { callType: 'title', forkId: event.forkId ?? null } },
         model.invoke(

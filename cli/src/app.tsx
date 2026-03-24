@@ -66,7 +66,7 @@ import { useStorage } from './providers/storage-provider'
 import { useProviderUiState } from './hooks/use-provider-ui-state'
 import { useFilePanel } from './hooks/use-file-panel'
 import { useLazyClient } from './hooks/use-lazy-client'
-import { getDisplaySlot, getSlotsForGroup, roleToSlotGroup, setGroupSelection, type LegacySlotGroup } from './utils/slot-compat'
+import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
 
 export const getEffectiveSelectedForkId = (
   selectedTabForkId: string | null,
@@ -159,10 +159,11 @@ function AppInner({
   const systemMessageTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const [showRecentChatsOverlay, setShowRecentChatsOverlay] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
-  const [selectingModelFor, setSelectingModelFor] = useState<LegacySlotGroup | null>(null)
-  const [primaryModel, setPrimaryModelState] = useState<ModelSelection | null>(null)
-  const [secondaryModel, setSecondaryModelState] = useState<ModelSelection | null>(null)
-  const [browserModel, setBrowserModelState] = useState<ModelSelection | null>(null)
+  const [selectingModelFor, setSelectingModelFor] = useState<MagnitudeSlot | null>(null)
+  const [slotModels, setSlotModels] = useState<Record<MagnitudeSlot, ModelSelection | null>>({
+    lead: null, explorer: null, planner: null, builder: null,
+    reviewer: null, debugger: null, browser: null,
+  })
 
   const [preferencesSelectedIndex, setPreferencesSelectedIndex] = useState(0)
   const [showAllProviders, setShowAllProviders] = useState(false)
@@ -242,9 +243,10 @@ function AppInner({
   const [wizardModelSelectedIndex, setWizardModelSelectedIndex] = useState(0)
   const [recentChatsSelectedIndex, setRecentChatsSelectedIndex] = useState(0)
   const [authMethodSelectedIndex, setAuthMethodSelectedIndex] = useState(0)
-  const [wizardPrimaryModel, setWizardPrimaryModel] = useState<ModelSelection | null>(null)
-  const [wizardSecondaryModel, setWizardSecondaryModel] = useState<ModelSelection | null>(null)
-  const [wizardBrowserModel, setWizardBrowserModel] = useState<ModelSelection | null>(null)
+  const [wizardSlotModels, setWizardSlotModels] = useState<Record<MagnitudeSlot, ModelSelection | null>>({
+    lead: null, explorer: null, planner: null, builder: null,
+    reviewer: null, debugger: null, browser: null,
+  })
   const [wizardConnectedProvider, setWizardConnectedProvider] = useState<string | null>(null)
   const [wizardNeedsChromium, setWizardNeedsChromium] = useState<boolean | null>(null)
 
@@ -268,9 +270,7 @@ function AppInner({
   useEffect(() => {
     if (!providerUiState) return
 
-    setPrimaryModelState(providerUiState.primaryModel)
-    setSecondaryModelState(providerUiState.secondaryModel)
-    setBrowserModelState(providerUiState.browserModel)
+    setSlotModels(providerUiState.slotModels)
 
     initTelemetry({ telemetryEnabled: providerUiState.telemetryEnabled })
 
@@ -280,12 +280,12 @@ function AppInner({
   }, [providerUiState])
 
   useEffect(() => {
-    providerRuntime.state.contextLimits(getDisplaySlot('primary')).then((limits) => {
+    providerRuntime.state.contextLimits('lead').then((limits) => {
       setContextHardCap(limits.hardCap)
     }).catch((error) => {
       logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Failed to load provider context limits')
     })
-  }, [providerRuntime, primaryModel])
+  }, [providerRuntime, slotModels.lead])
 
   // Check Chromium installation when wizard opens
   useEffect(() => {
@@ -420,13 +420,13 @@ function AppInner({
         if (event.type === 'turn_completed') {
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'lead'
-          const slot = getDisplaySlot(roleToSlotGroup(agentRole))
+          const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agentRole) ? agentRole as MagnitudeSlot : 'lead' as MagnitudeSlot
 
           providerRuntime.state.peek(slot).then((resolved) => {
             trackTurnCompleted({
               providerId: resolved?.model.providerId ?? null,
               modelId: resolved?.model.id ?? null,
-              modelSlot: roleToSlotGroup(agentRole),
+              modelSlot: slot,
               authType: resolved?.auth?.type ?? null,
               inputTokens: event.inputTokens,
               outputTokens: event.outputTokens,
@@ -441,7 +441,7 @@ function AppInner({
             trackTurnCompleted({
               providerId: null,
               modelId: null,
-              modelSlot: roleToSlotGroup(agentRole),
+              modelSlot: slot,
               authType: null,
               inputTokens: event.inputTokens,
               outputTokens: event.outputTokens,
@@ -692,23 +692,26 @@ function AppInner({
   const activeDisplay = selectedForkId ? forkDisplay : display
 
   const activeModelSummary = useMemo(() => {
-    const rootModelSummary = primaryModel ? {
-      provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
-      model: getProvider(primaryModel.providerId)?.models.find(m => m.id === primaryModel.modelId)?.name ?? primaryModel.modelId,
+    const leadModel = slotModels.lead
+    const rootModelSummary = leadModel ? {
+      provider: getProvider(leadModel.providerId)?.name ?? leadModel.providerId,
+      model: getProvider(leadModel.providerId)?.models.find(m => m.id === leadModel.modelId)?.name ?? leadModel.modelId,
     } : null
     if (!selectedForkId || !agentStatusState) return rootModelSummary
     const agentId = agentStatusState.agentByForkId.get(selectedForkId)
     const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
     if (!agent) return rootModelSummary
-    const group = roleToSlotGroup(agent.role)
-    const slot = getDisplaySlot(group)
-    const selection = slot === getDisplaySlot('primary') ? primaryModel : slot === getDisplaySlot('browser') ? browserModel : secondaryModel
+    // agent.role is the slot name (lead, explorer, planner, etc.)
+    const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agent.role)
+      ? agent.role as MagnitudeSlot
+      : 'lead' as MagnitudeSlot
+    const selection = slotModels[slot]
     if (!selection) return null
     return {
       provider: getProvider(selection.providerId)?.name ?? selection.providerId,
       model: getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)?.name ?? selection.modelId,
     }
-  }, [selectedForkId, agentStatusState, primaryModel, secondaryModel, browserModel])
+  }, [selectedForkId, agentStatusState, slotModels])
 
   const mainTimelineMessages = useMemo(
     () => (activeDisplay?.messages ?? []).filter(m => {
@@ -898,29 +901,10 @@ function AppInner({
     if (!selectingModelFor || !providerUiState) return
 
     const selection: ModelSelection = { providerId, modelId }
-
-    if (selectingModelFor === 'primary') {
-      setPrimaryModelState(selection)
-      const auth = await providerRuntime.auth.getAuth(providerId)
-      await setGroupSelection(providerRuntime, 'primary', providerId, modelId, auth ?? null, { persist: false })
-      for (const slot of getSlotsForGroup('primary')) {
-        await storage.config.setModelSelection(slot, selection)
-      }
-    } else if (selectingModelFor === 'secondary') {
-      setSecondaryModelState(selection)
-      const auth = await providerRuntime.auth.getAuth(providerId)
-      await setGroupSelection(providerRuntime, 'secondary', providerId, modelId, auth ?? null)
-      for (const slot of getSlotsForGroup('secondary')) {
-        await storage.config.setModelSelection(slot, selection)
-      }
-    } else if (selectingModelFor === 'browser') {
-      setBrowserModelState(selection)
-      const auth = await providerRuntime.auth.getAuth(providerId)
-      await setGroupSelection(providerRuntime, 'browser', providerId, modelId, auth ?? null, { persist: false })
-      for (const slot of getSlotsForGroup('browser')) {
-        await storage.config.setModelSelection(slot, selection)
-      }
-    }
+    const auth = await providerRuntime.auth.getAuth(providerId)
+    await providerRuntime.state.setSelection(selectingModelFor, providerId, modelId, auth ?? null)
+    await storage.config.setModelSelection(selectingModelFor, selection)
+    setSlotModels(prev => ({ ...prev, [selectingModelFor]: selection }))
 
     await reloadProviderState()
     setSelectingModelFor(null)
@@ -1035,33 +1019,21 @@ function AppInner({
         // Wizard mode: advance to models step with defaults for this provider
         const provider = getProvider(providerId)
 
-        const primarySelection = resolveSlotDefaultSelection({
-          allProviders: PROVIDERS,
-          connectedProviderIds,
-          slot: 'primary',
-          preferredProviderId: providerId,
-          detectedAuthTypeByProviderId,
-        })
-
-        const secondarySelection = resolveSlotDefaultSelection({
-          allProviders: PROVIDERS,
-          connectedProviderIds,
-          slot: 'secondary',
-          preferredProviderId: providerId,
-          detectedAuthTypeByProviderId,
-        })
-
-        const browserSelection = resolveSlotDefaultSelection({
-          allProviders: PROVIDERS,
-          connectedProviderIds,
-          slot: 'browser',
-          preferredProviderId: providerId,
-          detectedAuthTypeByProviderId,
-        })
-
-        if (primarySelection && provider?.models.some(model => model.id === primarySelection.modelId)) setWizardPrimaryModel(primarySelection)
-        if (secondarySelection) setWizardSecondaryModel(secondarySelection)
-        setWizardBrowserModel(browserSelection)
+        const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
+          lead: null, explorer: null, planner: null, builder: null,
+          reviewer: null, debugger: null, browser: null,
+        }
+        for (const slot of MAGNITUDE_SLOTS) {
+          const selection = resolveSlotDefaultSelection({
+            allProviders: PROVIDERS,
+            connectedProviderIds,
+            slot,
+            preferredProviderId: providerId,
+            detectedAuthTypeByProviderId,
+          })
+          if (selection) newWizardSlotModels[slot] = selection
+        }
+        setWizardSlotModels(newWizardSlotModels)
         setWizardConnectedProvider(providerName)
         setWizardStep('models')
       } else {
@@ -1105,30 +1077,20 @@ function AppInner({
 
     if (match) {
       // Already authenticated — compute model defaults and go to models step
-      const primarySelection = resolveSlotDefaultSelection({
-        allProviders: PROVIDERS,
-        connectedProviderIds,
-        slot: 'primary',
-        preferredProviderId: providerId,
-      })
-
-      const secondarySelection = resolveSlotDefaultSelection({
-        allProviders: PROVIDERS,
-        connectedProviderIds,
-        slot: 'secondary',
-        preferredProviderId: providerId,
-      })
-
-      const browserSelection = resolveSlotDefaultSelection({
-        allProviders: PROVIDERS,
-        connectedProviderIds,
-        slot: 'browser',
-        preferredProviderId: providerId,
-      })
-
-      if (primarySelection) setWizardPrimaryModel(primarySelection)
-      if (secondarySelection) setWizardSecondaryModel(secondarySelection)
-      setWizardBrowserModel(browserSelection)
+      const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
+        lead: null, explorer: null, planner: null, builder: null,
+        reviewer: null, debugger: null, browser: null,
+      }
+      for (const slot of MAGNITUDE_SLOTS) {
+        const selection = resolveSlotDefaultSelection({
+          allProviders: PROVIDERS,
+          connectedProviderIds,
+          slot,
+          preferredProviderId: providerId,
+        })
+        if (selection) newWizardSlotModels[slot] = selection
+      }
+      setWizardSlotModels(newWizardSlotModels)
       setWizardConnectedProvider(provider.name)
       setWizardStep('models')
     } else if (provider.authMethods.length === 1) {
@@ -1143,42 +1105,24 @@ function AppInner({
   const finishWizard = useCallback(() => {
     setShowSetupWizard(false)
     setWizardStep('provider')
-    setWizardPrimaryModel(null)
-    setWizardSecondaryModel(null)
-    setWizardBrowserModel(null)
+    setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardConnectedProvider(null)
     setProviderRefreshKey(prev => prev + 1)
   }, [])
 
-  const handleWizardComplete = useCallback(async (result: { primaryModel: ModelSelection; secondaryModel: ModelSelection; browserModel: ModelSelection | null }) => {
+  const handleWizardComplete = useCallback(async (result: Record<MagnitudeSlot, ModelSelection | null>) => {
     if (!providerUiState) return
     authFlow.cancelAll()
 
-    setPrimaryModelState(result.primaryModel)
-    setSecondaryModelState(result.secondaryModel)
-    if (result.browserModel) setBrowserModelState(result.browserModel)
-
-    const primaryAuth = await providerRuntime.auth.getAuth(result.primaryModel.providerId)
-    await setGroupSelection(providerRuntime, 'primary', result.primaryModel.providerId, result.primaryModel.modelId, primaryAuth ?? null, { persist: false })
-    for (const slot of getSlotsForGroup('primary')) {
-      await storage.config.setModelSelection(slot, result.primaryModel)
+    for (const [slot, selection] of Object.entries(result) as [MagnitudeSlot, ModelSelection | null][]) {
+      if (!selection) continue
+      const auth = await providerRuntime.auth.getAuth(selection.providerId)
+      await providerRuntime.state.setSelection(slot, selection.providerId, selection.modelId, auth ?? null)
+      await storage.config.setModelSelection(slot, selection)
     }
+    setSlotModels(result)
 
-    const secondaryAuth = await providerRuntime.auth.getAuth(result.secondaryModel.providerId)
-    await setGroupSelection(providerRuntime, 'secondary', result.secondaryModel.providerId, result.secondaryModel.modelId, secondaryAuth ?? null)
-    for (const slot of getSlotsForGroup('secondary')) {
-      await storage.config.setModelSelection(slot, result.secondaryModel)
-    }
-
-    if (result.browserModel) {
-      const browserAuth = await providerRuntime.auth.getAuth(result.browserModel.providerId)
-      await setGroupSelection(providerRuntime, 'browser', result.browserModel.providerId, result.browserModel.modelId, browserAuth ?? null, { persist: false })
-      for (const slot of getSlotsForGroup('browser')) {
-        await storage.config.setModelSelection(slot, result.browserModel)
-      }
-    }
-
-    if (wizardNeedsChromium) {
+    if (wizardNeedsChromium !== false) {
       await reloadProviderState()
       setWizardStep('browser')
     } else {
@@ -1209,9 +1153,7 @@ function AppInner({
       return
     }
     setWizardStep('provider')
-    setWizardPrimaryModel(null)
-    setWizardSecondaryModel(null)
-    setWizardBrowserModel(null)
+    setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardConnectedProvider(null)
   }, [wizardStep])
 
@@ -1239,26 +1181,17 @@ function AppInner({
     if (!providerUiState) return
     await storage.auth.remove(providerId)
 
-    if (primaryModel?.providerId === providerId) {
-      setPrimaryModelState(null)
-      for (const slot of getSlotsForGroup('primary')) {
+    const affectedSlots = MAGNITUDE_SLOTS.filter(slot => slotModels[slot]?.providerId === providerId)
+    if (affectedSlots.length > 0) {
+      for (const slot of affectedSlots) {
         await providerRuntime.state.clear(slot)
         await storage.config.setModelSelection(slot, null)
       }
-    }
-    if (secondaryModel?.providerId === providerId) {
-      setSecondaryModelState(null)
-      for (const slot of getSlotsForGroup('secondary')) {
-        await providerRuntime.state.clear(slot)
-        await storage.config.setModelSelection(slot, null)
-      }
-    }
-    if (browserModel?.providerId === providerId) {
-      setBrowserModelState(null)
-      for (const slot of getSlotsForGroup('browser')) {
-        await providerRuntime.state.clear(slot)
-        await storage.config.setModelSelection(slot, null)
-      }
+      setSlotModels(prev => {
+        const next = { ...prev }
+        for (const slot of affectedSlots) next[slot] = null
+        return next
+      })
     }
     if (providerId === 'local') {
       await storage.config.setLocalProviderConfig(null)
@@ -1268,7 +1201,7 @@ function AppInner({
     setProviderDetailSelectedIndex(0)
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(`Disconnected ${getProvider(providerId)?.name ?? providerId}`, theme.warning)
-  }, [primaryModel, secondaryModel, browserModel, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderState, storage])
+  }, [slotModels, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderState, storage])
 
   const handleProviderDetailBack = useCallback(() => {
     setProviderDetailId(null)
@@ -1306,29 +1239,21 @@ function AppInner({
   }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider])
 
 
-  const handleChangePrimary = useCallback(() => {
+  const handleChangeSlot = useCallback((slot: MagnitudeSlot) => {
     resetModelPickerState()
-    setSelectingModelFor('primary')
+    setSelectingModelFor(slot)
   }, [resetModelPickerState])
 
-  const handleChangeSecondary = useCallback(() => {
-    resetModelPickerState()
-    setSelectingModelFor('secondary')
-  }, [resetModelPickerState])
+  const SLOT_UI_ORDER_KEYS: MagnitudeSlot[] = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser']
 
-  const handleChangeBrowser = useCallback(() => {
-    resetModelPickerState()
-    setSelectingModelFor('browser')
-  }, [resetModelPickerState])
-
-  // Combined model tab keyboard handler — switches between primary/secondary/browser view and model picker
+  // Combined model tab keyboard handler — switches between slot view and model picker
   const modelTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
     if (settingsTab !== 'model') return false
     const plain = !key.ctrl && !key.meta && !key.option
 
     // When in model picker sub-view
     if (selectingModelFor) {
-      // Esc goes back to primary/secondary/browser view
+      // Esc goes back to slot view
       if (key.name === 'escape') {
         resetModelPickerState()
         return true
@@ -1336,23 +1261,21 @@ function AppInner({
       return modelNavigation.handleKeyEvent(key)
     }
 
-    // Primary/secondary/browser view navigation (3 items: 0=primary, 1=secondary, 2=browser)
+    // Slot view navigation (7 items: 0-6)
     if (key.name === 'up' && plain) {
       setPreferencesSelectedIndex(prev => Math.max(0, prev - 1))
       return true
     }
     if (key.name === 'down' && plain) {
-      setPreferencesSelectedIndex(prev => Math.min(2, prev + 1))
+      setPreferencesSelectedIndex(prev => Math.min(6, prev + 1))
       return true
     }
     if (key.name === 'return' && plain) {
-      if (preferencesSelectedIndex === 0) handleChangePrimary()
-      else if (preferencesSelectedIndex === 1) handleChangeSecondary()
-      else handleChangeBrowser()
+      handleChangeSlot(SLOT_UI_ORDER_KEYS[preferencesSelectedIndex])
       return true
     }
     return false
-  }, [settingsTab, selectingModelFor, modelNavigation.handleKeyEvent, preferencesSelectedIndex, handleChangePrimary, handleChangeSecondary, handleChangeBrowser, resetModelPickerState])
+  }, [settingsTab, selectingModelFor, modelNavigation.handleKeyEvent, preferencesSelectedIndex, handleChangeSlot, resetModelPickerState])
 
   const providerNavigation = useProviderSelectNavigation(
     PROVIDERS,
@@ -1406,9 +1329,7 @@ function AppInner({
     setWizardStep('provider')
     setWizardProviderSelectedIndex(0)
     setWizardModelSelectedIndex(0)
-    setWizardPrimaryModel(null)
-    setWizardSecondaryModel(null)
-    setWizardBrowserModel(null)
+    setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardNeedsChromium(null)
     setShowSetupWizard(true)
   }, [])
@@ -1655,9 +1576,7 @@ function AppInner({
       showSetupWizard={showSetupWizard}
       wizardStep={wizardStep}
       wizardTotalSteps={wizardTotalSteps}
-      wizardPrimaryModel={wizardPrimaryModel}
-      wizardSecondaryModel={wizardSecondaryModel}
-      wizardBrowserModel={wizardBrowserModel}
+      wizardSlotModels={wizardSlotModels}
       wizardConnectedProvider={wizardConnectedProvider}
       wizardProviderSelectedIndex={wizardProviderSelectedIndex}
       wizardModelSelectedIndex={wizardModelSelectedIndex}
@@ -1677,9 +1596,7 @@ function AppInner({
       setAuthMethodSelectedIndex={setAuthMethodSelectedIndex}
       detectedProviders={detectedProviders}
       connectedProviders={connectedProviders}
-      primaryModel={primaryModel}
-      secondaryModel={secondaryModel}
-      browserModel={browserModel}
+      slotModels={slotModels}
       selectingModelFor={selectingModelFor}
       setSelectingModelFor={setSelectingModelFor}
       preferencesSelectedIndex={preferencesSelectedIndex}
@@ -1700,9 +1617,7 @@ function AppInner({
       handleProviderSelect={handleProviderSelect}
       handleProviderDetailAction={handleProviderDetailAction}
       handleProviderDetailBack={handleProviderDetailBack}
-      handleChangePrimary={handleChangePrimary}
-      handleChangeSecondary={handleChangeSecondary}
-      handleChangeBrowser={handleChangeBrowser}
+      handleChangeSlot={handleChangeSlot}
       modelTabHandleKeyEvent={modelTabHandleKeyEvent}
       providerTabHandleKeyEvent={providerTabHandleKeyEvent}
       modelNavigation={modelNavigation}
@@ -1731,7 +1646,7 @@ function AppInner({
   )
 
   const isOverlayActive = (showSetupWizard && wizardStep === 'browser')
-    || (showSetupWizard && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay)
+    || (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay)
     || showRecentChatsOverlay
     || (expandedForkId && client)
     || showBrowserSetup
@@ -1870,9 +1785,9 @@ function AppInner({
     </scrollbox>
   )
 
-  const modelSummary = primaryModel ? {
-    provider: getProvider(primaryModel.providerId)?.name ?? primaryModel.providerId,
-    model: getProvider(primaryModel.providerId)?.models.find(m => m.id === primaryModel.modelId)?.name ?? primaryModel.modelId,
+  const modelSummary = slotModels.lead ? {
+    provider: getProvider(slotModels.lead.providerId)?.name ?? slotModels.lead.providerId,
+    model: getProvider(slotModels.lead.providerId)?.models.find(m => m.id === slotModels.lead!.modelId)?.name ?? slotModels.lead.modelId,
   } : null
 
   const composerCanFocus = !showSetupWizard
@@ -1922,7 +1837,7 @@ function AppInner({
               pendingApproval: pendingApproval != null,
               hasRunningForks,
               bashMode,
-              modelsConfigured: !!primaryModel && !!secondaryModel && !!browserModel,
+              modelsConfigured: !!slotModels.lead,
               modelSummary: activeModelSummary,
               tokenEstimate: selectedForkId ? forkTokenEstimate : tokenEstimate,
               contextHardCap,
@@ -1940,7 +1855,7 @@ function AppInner({
               executeBash: async (command: string) => {
                 const { workspacePath: wp } = await ensureClientReady()
                 return executeBashCommand(command, {
-                  workspacePath: wp,
+                  workspacePath: wp!,
                   projectRoot: process.cwd(),
                 })
               },
@@ -2026,7 +1941,7 @@ function AppInner({
         )}
 
 
-        {providerUiState && (!primaryModel || !secondaryModel || !browserModel) && (
+        {providerUiState && !slotModels.lead && (
           <box style={{
             paddingLeft: 1,
             paddingRight: 1,
@@ -2040,17 +1955,7 @@ function AppInner({
               paddingRight: 1,
             }}>
               <text style={{ fg: theme.error }}>
-                {(() => {
-                  const missing = [
-                    !primaryModel && 'primary',
-                    !secondaryModel && 'secondary',
-                    !browserModel && 'browser',
-                  ].filter(Boolean) as string[]
-                  const list = missing.length === 1
-                    ? (missing[0] as string)
-                    : missing.slice(0, -1).join(', ') + ', or ' + (missing[missing.length - 1] as string)
-                  return `No ${list} model configured. Run /settings to set up your models.`
-                })()}
+                No model configured. Run /models to set up your models.
               </text>
             </box>
           </box>

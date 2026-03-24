@@ -40,7 +40,7 @@ export async function runExtractionJobFromFile(jobFilePath: string): Promise<voi
     const result = await Effect.runPromise(
       Effect.gen(function* () {
         const runtime = yield* ModelResolver
-        const model = yield* runtime.resolve('planner')
+        const model = yield* runtime.resolve('lead')
         return yield* withTraceScope(
           { metadata: { callType: 'extract-memory-diff', forkId: null } },
           model.invoke(
