@@ -2,6 +2,7 @@ import { memo, useCallback, useMemo, useState } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
+import { slate } from '../utils/theme'
 import { Button } from './button'
 import { WizardHeader } from './wizard-header'
 import { BOX_CHARS } from '../utils/ui-constants'
@@ -71,6 +72,7 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
 }: SetupWizardOverlayProps) {
   const theme = useTheme()
   const [backHovered, setBackHovered] = useState(false)
+  const [confirmHovered, setConfirmHovered] = useState(false)
 
   const handleConfirm = useCallback(() => {
     if (!slotModels.lead) return
@@ -90,8 +92,8 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
   }, [slotModels, allProviders])
 
   const modelsSubtitle = connectedProviderName
-    ? `You've successfully connected ${connectedProviderName}! We've configured default models based on your provider. You can change these anytime with /models.`
-    : 'Your default models have been configured. You can change these anytime with /models.'
+    ? `You've successfully connected ${connectedProviderName}! We have configured default models for you. You can change these anytime in /models.`
+    : 'We have configured default models for you. You can change these anytime in /models.'
 
   useKeyboard(useCallback((key: KeyEvent) => {
     const plain = !key.ctrl && !key.meta && !key.option
@@ -139,19 +141,9 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
         onBack()
         return
       }
-      if (key.name === 'up' && plain) {
-        key.preventDefault()
-        onModelNavSelectedIndexChange(Math.max(0, modelNavSelectedIndex - 1))
-        return
-      }
-      if (key.name === 'down' && plain) {
-        key.preventDefault()
-        onModelNavSelectedIndexChange(Math.min(7, modelNavSelectedIndex + 1))
-        return
-      }
       if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
         key.preventDefault()
-        if (modelNavSelectedIndex === 0) handleConfirm()
+        handleConfirm()
         return
       }
       key.preventDefault()
@@ -208,56 +200,44 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
             },
           }}
         >
-          {/* Start chatting / Continue button */}
+          {SLOT_UI_ORDER.map(({ slot, label, description }) => {
+            const display = slotDisplays[slot]
+            return (
+              <box key={slot} style={{ paddingBottom: 1 }}>
+                <text style={{ fg: theme.foreground }}>
+                  <span attributes={TextAttributes.BOLD}>{label}</span>{' '}
+                  <span style={{ fg: theme.muted }}>{description}</span>
+                  {display ? (
+                    <>
+                      <span style={{ fg: theme.muted }}>: </span>
+                      <span style={{ fg: slate[300] }}>{display.providerName}</span>
+                      <span style={{ fg: slate[300] }} attributes={TextAttributes.DIM}> · </span>
+                      <span style={{ fg: slate[300] }}>{display.modelId}</span>
+                    </>
+                  ) : (
+                    <span style={{ fg: theme.muted }}>: Not configured</span>
+                  )}
+                </text>
+              </box>
+            )
+          })}
+
+          {/* Start coding / Continue button */}
           <box style={{ paddingBottom: 1 }}>
-            <Button onClick={handleConfirm}>
+            <Button onClick={handleConfirm} onMouseOver={() => setConfirmHovered(true)} onMouseOut={() => setConfirmHovered(false)}>
               <box style={{
                 borderStyle: 'single',
-                borderColor: modelNavSelectedIndex === 0 ? theme.success : theme.border,
+                borderColor: confirmHovered ? theme.success : theme.border,
                 customBorderChars: BOX_CHARS,
                 paddingLeft: 2,
                 paddingRight: 2,
               }}>
-                <text style={{ fg: modelNavSelectedIndex === 0 ? theme.success : theme.foreground }}>
-                  {modelNavSelectedIndex === 0 ? '> ' : '  '}{totalSteps > 2 ? 'Continue (Enter)' : 'Start chatting (Enter)'}
+                <text style={{ fg: theme.success }}>
+                  {modelNavSelectedIndex === 0 ? '> ' : '  '}{totalSteps > 2 ? 'Continue (Enter)' : 'Start coding (Enter)'}
                 </text>
               </box>
             </Button>
           </box>
-
-          {SLOT_UI_ORDER.map(({ slot, label, description }, idx) => {
-            const display = slotDisplays[slot]
-            const navIndex = idx + 1 // 0 is confirm button, 1-7 are slots
-            return (
-              <box key={slot} style={{ flexDirection: 'column', paddingBottom: 1 }}>
-                <box style={{ paddingBottom: 0 }}>
-                  <text style={{ fg: theme.foreground }}>
-                    <span attributes={TextAttributes.BOLD}>{label}</span> {description}
-                  </text>
-                </box>
-                <box style={{
-                  flexDirection: 'row',
-                  borderStyle: 'single',
-                  borderColor: modelNavSelectedIndex === navIndex ? theme.primary : theme.border,
-                  customBorderChars: BOX_CHARS,
-                  paddingLeft: 1,
-                  paddingRight: 1,
-                }}>
-                  <text style={{ fg: theme.foreground, flexGrow: 1 }}>
-                    {display ? (
-                      <>
-                        {display.providerName}
-                        <span attributes={TextAttributes.DIM}> · </span>
-                        {display.modelId}
-                      </>
-                    ) : (
-                      <span style={{ fg: theme.muted }}>Not configured</span>
-                    )}
-                  </text>
-                </box>
-              </box>
-            )
-          })}
         </scrollbox>
 
         {/* Footer */}
