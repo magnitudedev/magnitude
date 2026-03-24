@@ -192,7 +192,7 @@ export type { ResolvedSkill } from './skills'
 // Workers
 export { TurnController } from './workers/turn-controller'
 export { Cortex } from './workers/cortex'
-export { AgentOrchestrator } from './workers/agent-orchestrator'
+export { AgentLifecycle } from './workers/agent-lifecycle'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'

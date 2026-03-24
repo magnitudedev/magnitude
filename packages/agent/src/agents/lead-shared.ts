@@ -68,7 +68,7 @@ export const turnLens = defineThinkingLens({
   description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
 })
 
-export const orchestratorTools = toolSet({
+export const leadTools = toolSet({
   fileRead: readTool,
   fileWrite: writeTool,
   fileEdit: editTool,
@@ -85,9 +85,9 @@ export const orchestratorTools = toolSet({
   phaseSubmit: phaseSubmitTool,
 })
 
-export const orchestratorObservables = [agentsStatusObservable, backgroundProcessesObservable]
+export const leadObservables = [agentsStatusObservable, backgroundProcessesObservable]
 
-export const orchestratorPermission = (p: any) => ({
+export const leadPermission = (p: any) => ({
   shell(input: { command: string }, pctx: PolicyContext) {
     const result = classifyShellCommand(input.command)
     const allowedPrefixes = pctx.workspacePath ? [pctx.workspacePath] : undefined
@@ -98,7 +98,7 @@ export const orchestratorPermission = (p: any) => ({
   _default() { return p.allow() },
 })
 
-export const orchestratorTurnPolicy = {
+export const leadTurnPolicy = {
   decide(turnCtx: any) {
     if (turnCtx.cancelled) return yield_()
     if (turnCtx.error) return continue_()

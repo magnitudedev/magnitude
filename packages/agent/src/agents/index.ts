@@ -7,8 +7,8 @@
 import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
 import type { MagnitudeSlot } from '../model-slots'
-import { orchestratorRole } from './orchestrator'
-import { orchestratorOneshotRole } from './orchestrator-oneshot'
+import { leadRole } from './lead'
+import { leadOneshotRole } from './lead-oneshot'
 import { builderRole } from './builder'
 import { explorerRole } from './explorer'
 import { plannerRole } from './planner'
@@ -19,8 +19,8 @@ import { browserRole } from './browser'
 type MagnitudeRoleDef = RoleDefinition<ToolSet, MagnitudeSlot, PolicyContext>
 
 const AGENTS: Record<string, MagnitudeRoleDef> = {
-  orchestrator: orchestratorRole,
-  'orchestrator-oneshot': orchestratorOneshotRole,
+  lead: leadRole,
+  'lead-oneshot': leadOneshotRole,
   builder: builderRole,
   explorer: explorerRole,
   planner: plannerRole,
@@ -29,7 +29,7 @@ const AGENTS: Record<string, MagnitudeRoleDef> = {
   browser: browserRole,
 }
 
-export type AgentVariant = 'orchestrator' | 'orchestrator-oneshot' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'
+export type AgentVariant = 'lead' | 'lead-oneshot' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'
 
 export function isValidVariant(v: string): v is AgentVariant {
   return Object.hasOwn(AGENTS, v)

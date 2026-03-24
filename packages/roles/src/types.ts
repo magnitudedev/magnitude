@@ -115,7 +115,7 @@ export interface RoleConfig<
   readonly lenses: ThinkingLens[]
   readonly observables?: ObservableConfig<any>[]
   readonly defaultRecipient: 'user' | 'parent'
-  readonly protocolRole: 'orchestrator' | 'subagent' | 'oneshot-orchestrator'
+  readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
   readonly permission: PermissionPolicy<TTools, TCtx>
   readonly turn: TurnPolicy<TTools, TCtx>
   readonly initialContext: { parentConversation?: boolean }
@@ -137,7 +137,7 @@ export interface RoleDefinition<
   readonly lenses: ThinkingLens[]
   readonly observables: readonly ObservableConfig<any>[]
   readonly defaultRecipient: 'user' | 'parent'
-  readonly protocolRole: 'orchestrator' | 'subagent' | 'oneshot-orchestrator'
+  readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
   readonly initialContext: { parentConversation?: boolean }
   readonly spawnable: boolean
   readonly setup?: (ctx: ForkSetupContext) => Effect.Effect<Layer.Layer<TProvides>, never, TRequirements>

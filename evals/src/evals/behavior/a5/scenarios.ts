@@ -72,7 +72,7 @@ const taskRoutesWithoutDelete = mockProject.read('server/src/routes/tasks.ts')
 export const ALL_SCENARIOS: A5Scenario[] = [
 
   scenario('tenet1/communicate-before-building')
-    .description('After explorer returns results and all relevant files are read, orchestrator should communicate plan before deploying builder')
+    .description('After explorer returns results and all relevant files are read, lead should communicate plan before deploying builder')
     .context(mockProject.sessionContext())
     .user('add due date support to tasks — users should be able to set a deadline on any task')
     .assistant((t) =>
@@ -112,7 +112,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .build(),
 
   scenario('tenet2/surface-color-assumption')
-    .description('After reading relevant files, orchestrator must explicitly state which blue token it will use before acting')
+    .description('After reading relevant files, lead must explicitly state which blue token it will use before acting')
     .context(mockProject.sessionContext())
     .user('make the header blue')
     .assistant((t) =>
@@ -127,7 +127,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .build(),
 
   scenario('tenet3/act-on-production-error')
-    .description('Given a specific production error with stack trace, orchestrator should investigate immediately without asking for clarification')
+    .description('Given a specific production error with stack trace, lead should investigate immediately without asking for clarification')
     .context(mockProject.sessionContext())
     .user('the app crashed in production')
     .user(
@@ -144,7 +144,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .build(),
 
   scenario('tenet1/conversational-premature-action')
-    .description('After conversational diagnosis, explorer results, and file reads, orchestrator should communicate approach before acting')
+    .description('After conversational diagnosis, explorer results, and file reads, lead should communicate approach before acting')
     .context(mockProject.sessionContext())
     .user('the task list endpoint is really slow when projects have lots of tasks')
     .assistant((t) => t.message('Are you returning all tasks at once without any limit or pagination?'))
@@ -184,7 +184,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .build(),
 
   scenario('tenet2/planner-soft-delete-assumption')
-    .description('When planner proposes soft delete, orchestrator should explicitly surface the soft vs hard delete assumption')
+    .description('When planner proposes soft delete, lead should explicitly surface the soft vs hard delete assumption')
     .context(mockProject.sessionContext())
     .user('add a delete endpoint for tasks')
     .assistant((t) =>
@@ -234,7 +234,7 @@ export const ALL_SCENARIOS: A5Scenario[] = [
     .build(),
 
   scenario('tenet3/soft-judgment-codebase-answer')
-    .description('For a validation architecture question, orchestrator should inspect existing patterns before answering')
+    .description('For a validation architecture question, lead should inspect existing patterns before answering')
     .context(mockProject.sessionContext())
     .user("we're debating whether to put input validation in the route handlers or in the service layer — what makes more sense for this codebase?")
     .judge(

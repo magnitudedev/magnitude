@@ -51,7 +51,7 @@ export type SystemEntry =
 /** Build the context prompt injected into a sub-agent's fork */
 export function buildAgentContext(title: string, message: string, extraContext: string): string {
   const parts: string[] = []
-  parts.push('<orchestrator>')
+  parts.push('<lead>')
   parts.push(`<title>${title}</title>`)
   parts.push('<message>')
   parts.push(message)
@@ -59,7 +59,7 @@ export function buildAgentContext(title: string, message: string, extraContext: 
   if (extraContext) {
     parts.push(extraContext)
   }
-  parts.push('</orchestrator>')
+  parts.push('</lead>')
   return parts.join('\n')
 }
 
@@ -71,7 +71,7 @@ Result: ${JSON.stringify(result)}
 </task_result>`
 }
 
-/** Format sub-agent response for orchestrator */
+/** Format sub-agent response for lead */
 export function formatAgentResponse(
   agentId: string,
   message: string,
@@ -79,9 +79,9 @@ export function formatAgentResponse(
   return `<agent_response from="${agentId}">\n${message}\n</agent_response>`
 }
 
-/** Format orchestrator message for sub-agent */
-export function formatOrchestratorMessage(message: string): string {
-  return `<orchestrator_message>\n${message}\n</orchestrator_message>\n<system>Use parent.message() to reply.</system>`
+/** Format lead message for sub-agent */
+export function formatLeadMessage(message: string): string {
+  return `<lead_message>\n${message}\n</lead_message>\n<system>Use parent.message() to reply.</system>`
 }
 
 function formatTimestamp(timestamp: number, timezone: string | null): string {

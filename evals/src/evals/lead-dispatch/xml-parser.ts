@@ -1,7 +1,7 @@
 /**
  * XML Response Parser for Orchestrator Dispatch Eval
  *
- * Regex-based extraction of agent/direct-tool tags from orchestrator XML-ACT responses.
+ * Regex-based extraction of agent/direct-tool tags from lead XML-ACT responses.
  * Does NOT use a strict XML parser.
  */
 

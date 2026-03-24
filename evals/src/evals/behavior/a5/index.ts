@@ -11,10 +11,10 @@ let cachedSystemPrompt: string | null = null
 function getSystemPrompt(): string {
   if (!cachedSystemPrompt) {
     const raw = readFileSync(
-      join(__dirname, '../../../../packages/agent/src/agents/prompts/orchestrator.txt'),
+      join(__dirname, '../../../../packages/agent/src/agents/prompts/lead.txt'),
       'utf-8'
     )
-    const agentDef = getAgentDefinition('orchestrator')
+    const agentDef = getAgentDefinition('lead')
     const toolDocs = generateXmlActToolDocs(agentDef, [])
     cachedSystemPrompt = raw
       .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol('user', agentDef.lenses.slice()))
@@ -33,9 +33,9 @@ const JUDGE_MODEL_SPEC: ModelSpec = {
 
 async function runJudge(
   question: string,
-  orchestratorResponse: string
+  leadResponse: string
 ): Promise<boolean> {
-  const prompt = `Here is an AI assistant's response:\n\n<response>\n${orchestratorResponse}\n</response>\n\nQuestion: ${question}\n\nAnswer with only "yes" or "no".`
+  const prompt = `Here is an AI assistant's response:\n\n<response>\n${leadResponse}\n</response>\n\nQuestion: ${question}\n\nAnswer with only "yes" or "no".`
   const result = await callModel(JUDGE_SYSTEM_PROMPT, [{ role: 'user', content: [prompt] }], JUDGE_MODEL_SPEC)
   return result.trim().toLowerCase().startsWith('yes')
 }
@@ -100,7 +100,7 @@ const VARIANTS: EvalVariant[] = [
 export const a5Eval: RunnableEval = {
   id: 'a5',
   name: 'A5 Behavioral Eval',
-  description: 'Tests orchestrator adherence to the A5 behavioral tenets',
+  description: 'Tests lead adherence to the A5 behavioral tenets',
   scenarios: ALL_SCENARIOS,
   variants: VARIANTS,
   defaultConcurrency: 3,

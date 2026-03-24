@@ -69,7 +69,7 @@ export const buildInterruptedTurnCompleted = (params: {
 
   const variant: AgentVariant = forkId
     ? ((getAgentByForkId(agentState, forkId)?.role ?? 'builder') as AgentVariant)
-    : 'orchestrator'
+    : 'lead'
 
   const agentDef = getAgentDefinition(variant)
   const tagToMeta = new Map<string, { toolKey: ToolKey; group: string; toolName: string }>()

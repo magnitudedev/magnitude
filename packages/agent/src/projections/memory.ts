@@ -526,8 +526,8 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       const agentState = read(AgentStatusProjection)
       const senderAgentId = value.forkId === null
-        ? 'orchestrator'
-        : (getAgentByForkId(agentState, value.forkId)?.agentId ?? 'orchestrator')
+        ? 'lead'
+        : (getAgentByForkId(agentState, value.forkId)?.agentId ?? 'lead')
 
       const targetForkId = value.targetForkId
       if (targetForkId === undefined) return state

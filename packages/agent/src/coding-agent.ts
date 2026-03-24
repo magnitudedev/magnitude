@@ -38,7 +38,7 @@ import { BackgroundProcessesProjection } from './projections/background-processe
 // Workers
 import { TurnController } from './workers/turn-controller'
 import { Cortex } from './workers/cortex'
-import { AgentOrchestrator } from './workers/agent-orchestrator'
+import { AgentLifecycle } from './workers/agent-lifecycle'
 import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 
 import { Autopilot } from './workers/autopilot'
@@ -103,7 +103,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
   workers: [
     TurnController,
     Cortex,
-    AgentOrchestrator,
+    AgentLifecycle,
     LifecycleCoordinator,
     Autopilot,
     CompactionWorker,
@@ -305,7 +305,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
       // Create root sandbox (hydration happens lazily in execute())
       const sessionContextState = yield* (yield* SessionContextProjection.Tag).get
-      const rootVariant = sessionContextState.context?.oneshot ? 'orchestrator-oneshot' : 'orchestrator'
+      const rootVariant = sessionContextState.context?.oneshot ? 'lead-oneshot' : 'lead'
       yield* executionManager.initFork(null, rootVariant)
 
       // Create execution resources for all known agents.
@@ -328,7 +328,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         }
       }
 
-      // Same check for the root fork (orchestrator, forkId=null).
+      // Same check for the root fork (lead, forkId=null).
       // Root doesn't get fork_completed, but the interrupt still closes
       // any in-flight turn via the turnInterrupted → turn_completed path.
       const rootState = yield* workingStateProjection.getFork(null)

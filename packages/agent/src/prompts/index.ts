@@ -6,7 +6,7 @@ export {
   buildAgentContext,
   formatTaskResult,
   formatAgentResponse,
-  formatOrchestratorMessage,
+  formatLeadMessage,
   formatCommsInbox,
   formatSystemInbox,
   formatAgentsStatus,

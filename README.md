@@ -36,7 +36,7 @@ See the [provider docs](https://docs.magnitude.dev/configuration/providers) for 
 
 ## How it works
 
-Magnitude has a main agent that orchestrates subagent usage on your behalf. Its primary objective is to listen to you and turn your intent into running subagents. It can message, stop, resume, or redirect subagents and run many in parallel. You can also message subagents directly.
+Magnitude has a team lead that coordinates subagent usage on your behalf. Its primary objective is to listen to you and turn your intent into running subagents. It can message, stop, resume, or redirect subagents and run many in parallel. You can also message subagents directly.
 
 Magnitude comes out of the box with the following specialized subagents:
 - **Explorer**: for codebase or web research, both broad and narrow
@@ -54,7 +54,7 @@ We became fully subagent-pilled the first time we saw Claude Code use an explore
 
 The community clearly feels the same — projects like Superpowers have hit 100k+ GitHub stars augmenting coding agents with custom skills and subagents. But these approaches are limited by the underlying agent they plug into. They provide great skills but rely on the host agent to actually use them consistently and effectively. And often you're stuck manually orchestrating them with slash commands.
 
-By controlling the underlying agent primitive, you can go much further. Fine-grained control over orchestrator-subagent communication, lifecycle, and behavior. Mechanical consistency, not just prompts. That's what Magnitude is.
+By controlling the underlying agent primitive, you can go much further. Fine-grained control over lead-subagent communication, lifecycle, and behavior. Mechanical consistency, not just prompts. That's what Magnitude is.
 
 ## Additional Info
 

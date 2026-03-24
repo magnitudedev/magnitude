@@ -1,9 +1,9 @@
 /**
  * Orchestrator Dispatch Eval
  *
- * Tests orchestrator subagent dispatching across multiple turns.
- * Uses the real orchestrator system prompt, calls the model in a loop,
- * and injects synthetic agent responses to drive the orchestrator.
+ * Tests lead subagent dispatching across multiple turns.
+ * Uses the real lead system prompt, calls the model in a loop,
+ * and injects synthetic agent responses to drive the lead.
  */
 
 import type { RunnableEval, Scenario, ScenarioResult, ModelSpec, CheckResult, EvalVariant } from '../../types'
@@ -23,7 +23,7 @@ let cachedSystemPrompt: string | null = null
 
 function getSystemPrompt(): string {
   if (!cachedSystemPrompt) {
-    const agentDef = getAgentDefinition('orchestrator')
+    const agentDef = getAgentDefinition('lead')
     const toolDocs = generateXmlActToolDocs(agentDef, [])
     cachedSystemPrompt = `${getXmlActProtocol('user', agentDef.lenses.slice())}\n\n${agentDef.systemPrompt}\n\n## Tools\n\n${toolDocs}`
   }
@@ -376,10 +376,10 @@ const VARIANTS: EvalVariant[] = [
 // Export
 // =============================================================================
 
-export const orchestratorDispatchEval: RunnableEval = {
-  id: 'orchestrator-dispatch',
-  name: 'Orchestrator Dispatch Behavior',
-  description: `Tests orchestrator subagent dispatching across ${ALL_SCENARIOS.length} task patterns`,
+export const leadDispatchEval: RunnableEval = {
+  id: 'lead-dispatch',
+  name: 'Lead Dispatch Behavior',
+  description: `Tests lead subagent dispatching across ${ALL_SCENARIOS.length} task patterns`,
   scenarios: ALL_SCENARIOS,
   variants: VARIANTS,
   defaultConcurrency: 4,

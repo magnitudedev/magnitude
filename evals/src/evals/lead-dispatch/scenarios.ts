@@ -3,10 +3,10 @@
  *
  * 12 scenarios across 6 task categories + lifecycle tests.
  * Multi-turn scenarios provide syntheticResponses so the turn loop
- * can feed realistic agent output back to the orchestrator.
+ * can feed realistic agent output back to the lead.
  *
  * Agent responses use the artifact pattern: agents write detailed reports
- * into artifacts and send a brief message back. The orchestrator receives
+ * into artifacts and send a brief message back. The lead receives
  * the message + artifact content as separate XML blocks.
  */
 
@@ -33,18 +33,18 @@ export interface SyntheticAgentResponse {
   /** Brief completion message (what goes inside <agent_response>) */
   message: string
   /** Content to write into the agent's writable artifact. The artifact ID
-   *  comes from whatever the orchestrator passes as <writable-artifact>. */
+   *  comes from whatever the lead passes as <writable-artifact>. */
   artifactContent?: string
 }
 
 export interface DispatchScenario extends Scenario {
-  /** Agent type → synthetic response. Fed back when the orchestrator deploys that agent type. */
+  /** Agent type → synthetic response. Fed back when the lead deploys that agent type. */
   syntheticResponses?: Record<string, SyntheticAgentResponse>
   /** Optional scripted approval/rejection user message injected by runtime. */
   conversationScript?: { approval?: string; rejection?: string; injectAfter?: number | 'first-plan-message' }
   /** Optional lifecycle completion requirements. */
   completionExpectations?: { requireBuilder?: boolean; requireReviewer?: boolean }
-  /** Mock file contents for the fake project. Path → content. Used when the orchestrator reads files directly. */
+  /** Mock file contents for the fake project. Path → content. Used when the lead reads files directly. */
   mockFiles?: Record<string, string>
 }
 
@@ -1598,7 +1598,7 @@ export const ALL_SCENARIOS: DispatchScenario[] = [
   // -------------------------------------------------------------------------
   {
     id: 'lifecycle/approval-deploys-builder',
-    description: 'After user approval, orchestrator should deploy builder then reviewer for multi-file change',
+    description: 'After user approval, lead should deploy builder then reviewer for multi-file change',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("add input validation across all the API endpoints using zod. create user should validate email and password, posts should validate title and body, comments should validate content. set up a reusable validation middleware")] },
@@ -1688,7 +1688,7 @@ TypeScript compiles cleanly.`,
   // -------------------------------------------------------------------------
   {
     id: 'lifecycle/rejection-revises',
-    description: 'After user rejection, orchestrator should revise approach and avoid execution',
+    description: 'After user rejection, lead should revise approach and avoid execution',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg("add rate limiting to the api routes, we already have redis set up so use that for the counters. should return 429 when someone hits the limit")] },

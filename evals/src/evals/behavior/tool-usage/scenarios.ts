@@ -15,7 +15,7 @@ export interface ToolUsageScenario extends Scenario {
 export const ALL_SCENARIOS: ToolUsageScenario[] = [
 
   scenario('tool-usage/explorer-vs-reads')
-    .description('When asked to add a feature to an unfamiliar area, orchestrator should deploy an explorer rather than reading files itself')
+    .description('When asked to add a feature to an unfamiliar area, lead should deploy an explorer rather than reading files itself')
     .context(mockProject.sessionContext())
     .user('add request logging to all routes — log method, path, status code, and duration for every request')
     .judge(
@@ -25,7 +25,7 @@ export const ALL_SCENARIOS: ToolUsageScenario[] = [
     .build(),
 
   scenario('tool-usage/builder-vs-edits')
-    .description('After user approves a multi-file plan, orchestrator should deploy builder rather than editing files itself')
+    .description('After user approves a multi-file plan, lead should deploy builder rather than editing files itself')
     .context(mockProject.sessionContext())
     .user('add role-based access control — project owners can delete any task, members can only delete tasks they created')
     .assistant((t) =>
@@ -75,7 +75,7 @@ export const ALL_SCENARIOS: ToolUsageScenario[] = [
     .build(),
 
   scenario('tool-usage/planner-vs-self-plan')
-    .description('When asked to plan a feature with real tradeoffs, orchestrator should deploy planner rather than drafting the plan itself')
+    .description('When asked to plan a feature with real tradeoffs, lead should deploy planner rather than drafting the plan itself')
     .context(mockProject.sessionContext())
     .user('we need to add notifications — users should get notified when a task is assigned to them. can you plan this out? we could do polling, websockets, or webhooks to an external service, not sure which fits best')
     .judge(
@@ -85,7 +85,7 @@ export const ALL_SCENARIOS: ToolUsageScenario[] = [
     .build(),
 
   scenario('tool-usage/explorer-vs-direct-reads-depth')
-    .description('For a deep end-to-end question about a specific system, orchestrator should deploy an explorer rather than performing direct reads itself')
+    .description('For a deep end-to-end question about a specific system, lead should deploy an explorer rather than performing direct reads itself')
     .context(mockProject.sessionContext())
     .user('how does auth token validation work end-to-end in this codebase? i want to understand exactly what happens from the moment a request comes in to when we know if the user is authenticated')
     .judge(

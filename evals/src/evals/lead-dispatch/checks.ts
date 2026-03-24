@@ -1,7 +1,7 @@
 /**
  * Orchestrator Dispatch Check Factories
  *
- * Each factory returns a Check that parses the raw orchestrator XML response
+ * Each factory returns a Check that parses the raw lead XML response
  * and asserts a specific behavioral property.
  */
 

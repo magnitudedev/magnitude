@@ -419,7 +419,7 @@ function AppInner({
 
         if (event.type === 'turn_completed') {
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
-          const agentRole = forkInfo?.role ?? 'orchestrator'
+          const agentRole = forkInfo?.role ?? 'lead'
           const slot = getDisplaySlot(roleToSlotGroup(agentRole))
 
           providerRuntime.state.peek(slot).then((resolved) => {

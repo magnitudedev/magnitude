@@ -79,7 +79,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
         timestamp: ts(3),
         turnId: 'turn-1',
         forkId: null,
-        strategyId: 'orchestrator',
+        strategyId: 'lead',
         chainId: null,
       } as any)
 
@@ -161,7 +161,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
         timestamp: ts(3),
         turnId: 'turn-1',
         forkId: null,
-        strategyId: 'orchestrator',
+        strategyId: 'lead',
         chainId: null,
       } as any)
 

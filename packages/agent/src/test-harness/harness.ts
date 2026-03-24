@@ -27,7 +27,7 @@ import { FileAwarenessProjection } from '../projections/file-awareness'
 
 // Workers
 import { TurnController } from '../workers/turn-controller'
-import { AgentOrchestrator } from '../workers/agent-orchestrator'
+import { AgentLifecycle } from '../workers/agent-lifecycle'
 import { LifecycleCoordinator } from '../workers/lifecycle-coordinator'
 import { ApprovalWorker } from '../workers/approval-worker'
 import { Autopilot } from '../workers/autopilot'
@@ -104,7 +104,7 @@ export interface HarnessOptions {
 }
 
 const ALL_VARIANTS: AgentVariant[] = [
-  'orchestrator',
+  'lead',
   'builder',
   'explorer',
   'planner',
@@ -208,7 +208,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const workers = [
       TurnController,
       MockCortex,
-      AgentOrchestrator,
+      AgentLifecycle,
       LifecycleCoordinator,
       ApprovalWorker,
       ...(options.workers?.autopilot ? [Autopilot] : []),
@@ -310,7 +310,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
     await client.runEffect(registerApprovalBridge)
     await client.runEffect(
-      Effect.flatMap(ExecutionManager, (manager) => manager.initFork(null, 'orchestrator'))
+      Effect.flatMap(ExecutionManager, (manager) => manager.initFork(null, 'lead'))
     )
 
     const transcript: AppEvent[] = []

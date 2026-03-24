@@ -17,10 +17,10 @@ let cachedSystemPrompt: string | null = null
 function getSystemPrompt(): string {
   if (!cachedSystemPrompt) {
     const raw = readFileSync(
-      join(__dirname, '../../../../packages/agent/src/agents/prompts/orchestrator.txt'),
+      join(__dirname, '../../../../packages/agent/src/agents/prompts/lead.txt'),
       'utf-8'
     )
-    const agentDef = getAgentDefinition('orchestrator')
+    const agentDef = getAgentDefinition('lead')
     const toolDocs = generateXmlActToolDocs(agentDef, [])
     cachedSystemPrompt = raw
       .replaceAll('{{RESPONSE_PROTOCOL}}', getXmlActProtocol('user', agentDef.lenses.slice()))
@@ -96,7 +96,7 @@ const VARIANTS: EvalVariant[] = [
 export const behaviorEval: RunnableEval = {
   id: 'behavior',
   name: 'Orchestrator Behavior Eval',
-  description: 'Tests orchestrator behavioral correctness across A5 tenets and tool/subagent usage',
+  description: 'Tests lead behavioral correctness across A5 tenets and tool/subagent usage',
   scenarios: ALL_SCENARIOS,
   variants: VARIANTS,
   defaultConcurrency: 3,

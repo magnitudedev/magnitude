@@ -74,7 +74,7 @@ List available evaluations and their scenarios.
 | MiniMax | `minimax:MiniMax-M2.5` |
 | Z.AI | `zai:glm-4.7` |
 
-Uses your configured Magnitude provider auth (OAuth subs, API keys from `~/.magnitude/config.json`) — same credentials as the main agent.
+Uses your configured Magnitude provider auth (OAuth subs, API keys from `~/.magnitude/config.json`) — same credentials as the team lead.
 
 ## Results
 

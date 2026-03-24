@@ -3,7 +3,7 @@ import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagO
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
 import { getXmlActProtocol } from './protocol'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
-import toolingSectionRaw from '../agents/prompts/orchestrator-tooling.txt' with { type: 'text' }
+import toolingSectionRaw from '../agents/prompts/lead-tooling.txt' with { type: 'text' }
 import subagentBaseRaw from '../agents/prompts/subagent-base.txt' with { type: 'text' }
 import workspaceRaw from '../agents/prompts/workspace.txt' with { type: 'text' }
 
@@ -20,9 +20,9 @@ export function compilePromptTemplate(raw: string): string {
     .replaceAll('{{TOOLING_SECTION}}', toolingSectionRaw)
 }
 
-function mapProtocolMode(roleDef: RoleDefinition<ToolSet, string, any>): 'orchestrator' | 'subagent' | 'oneshot' {
-  if (roleDef.protocolRole === 'oneshot-orchestrator') return 'oneshot'
-  if (roleDef.protocolRole === 'orchestrator') return 'orchestrator'
+function mapProtocolMode(roleDef: RoleDefinition<ToolSet, string, any>): 'lead' | 'subagent' | 'oneshot' {
+  if (roleDef.protocolRole === 'oneshot-lead') return 'oneshot'
+  if (roleDef.protocolRole === 'lead') return 'lead'
   return 'subagent'
 }
 

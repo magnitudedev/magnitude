@@ -1,9 +1,9 @@
 /**
  * ConversationProjection
  *
- * Tracks the clean user↔orchestrator conversation for the root fork.
+ * Tracks the clean user↔lead conversation for the root fork.
  * User messages come from user_message events.
- * Orchestrator prose comes from message_* events filtered to dest='user'.
+ * Lead prose comes from message_* events filtered to dest='user'.
  * Turn boundaries flush accumulated prose into a conversation entry.
  *
  * Used by the reviewer agent to get injected with user intent context.
@@ -18,7 +18,7 @@ import { textOf } from '../content'
 // =============================================================================
 
 export interface ConversationEntry {
-  readonly role: 'user' | 'orchestrator'
+  readonly role: 'user' | 'lead'
   readonly text: string
 }
 
@@ -47,7 +47,7 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
     oneshot_task: ({ state }) => state,
 
     user_message: ({ event, state }) => {
-      // Only track root fork (orchestrator) conversation
+      // Only track root fork (lead) conversation
       if (event.forkId !== null) return state
 
       const text = textOf(event.content)
@@ -69,7 +69,7 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
     },
 
     message_chunk: ({ event, state }) => {
-      // Only track root fork (orchestrator) prose
+      // Only track root fork (lead) prose
       if (event.forkId !== null) return state
       if (!state.userMessageIds.has(event.id)) return state
 
@@ -90,7 +90,7 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
       }
 
       return {
-        entries: [...state.entries, { role: 'orchestrator' as const, text: prose }],
+        entries: [...state.entries, { role: 'lead' as const, text: prose }],
         pendingProse: '',
         userMessageIds: new Set(),
       }

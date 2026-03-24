@@ -1,5 +1,5 @@
 /**
- * AgentOrchestrator Worker
+ * AgentLifecycle Worker
  *
  * Handles agent infrastructure that tools can't own:
  * - Root fork init on session start
@@ -20,8 +20,8 @@ import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 // Worker
 // =============================================================================
 
-export const AgentOrchestrator = Worker.define<AppEvent>()({
-  name: 'AgentOrchestrator',
+export const AgentLifecycle = Worker.define<AppEvent>()({
+  name: 'AgentLifecycle',
 
   // interrupt handler must not be interrupted itself
   ignoreInterrupt: ['interrupt'] as const,
@@ -31,7 +31,7 @@ export const AgentOrchestrator = Worker.define<AppEvent>()({
     // Create root fork resources when session starts
     session_initialized: (event, _publish) => Effect.gen(function* () {
       const execManager = yield* ExecutionManager
-      const rootVariant = event.context?.oneshot ? 'orchestrator-oneshot' : 'orchestrator'
+      const rootVariant = event.context?.oneshot ? 'lead-oneshot' : 'lead'
       yield* execManager.initFork(null, rootVariant)
     }).pipe(Effect.orDie),
 

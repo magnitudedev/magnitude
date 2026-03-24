@@ -10,7 +10,7 @@ Your role is to find problems, not confirm success. Assume nothing works until y
 
 ## Context
 
-You receive the conversation between the user and orchestrator. Use it to understand what was requested and what the change is supposed to do.
+You receive the conversation between the user and the team lead. Use it to understand what was requested and what the change is supposed to do.
 
 ## Verification
 
@@ -21,7 +21,7 @@ Your job is to discover how to verify the changes and then execute that verifica
 - Find test files near the changed area
 - Look at what changed (git diff, file reads) to understand scope
 - Identify endpoints, CLI commands, or runtime behaviors that can be exercised
-- If the change touches UI, you need a browser agent — check for a URL or ask the orchestrator
+- If the change touches UI, you need a browser agent — check for a URL or ask the lead
 
 **What counts as evidence:**
 

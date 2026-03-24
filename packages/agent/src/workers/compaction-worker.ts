@@ -101,7 +101,7 @@ function startCompaction(
 
     // Calculate how many messages to compact
     const providerState = yield* ProviderState
-    const { softCap } = yield* providerState.contextLimits('orchestrator')
+    const { softCap } = yield* providerState.contextLimits('lead')
     const keepTokenBudget = softCap * KEEP_MESSAGE_RATIO
     let keepTokens = 0
     let keepCount = 0
@@ -142,14 +142,14 @@ function startCompaction(
 
     const bamlEffect = Effect.gen(function* () {
       const runtime = yield* ModelResolver
-      const usable = yield* runtime.resolve('orchestrator')
+      const usable = yield* runtime.resolve('lead')
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const result = yield* withTraceScope(
           { metadata: { callType: 'compact', forkId } },
           usable.invoke(
             CodingAgentCompact,
             {
-              systemPrompt: getAgentDefinition('orchestrator').systemPrompt,
+              systemPrompt: getAgentDefinition('lead').systemPrompt,
               messages: trimmedMessages,
             },
           ),

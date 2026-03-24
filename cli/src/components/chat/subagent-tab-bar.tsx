@@ -155,7 +155,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
         >
           <box style={{ paddingLeft: 1, paddingRight: 1, flexDirection: 'column', height: 2, minHeight: 2, maxHeight: 2 }}>
             <box style={{ flexDirection: 'row', height: 1 }}>
-              <text style={{ fg: mainTextColor }}>Main Agent</text>
+              <text style={{ fg: mainTextColor }}>Team Lead</text>
             </box>
             <box style={{ flexDirection: 'row', height: 1 }}>
               <text style={{ fg: mainTextColor }}> </text>

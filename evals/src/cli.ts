@@ -17,7 +17,7 @@ import { visualGroundingEval } from './evals/visual-grounding/index'
 import { xpathEval } from './evals/xpath/index'
 import { geminiGroundingEval } from './evals/gemini-grounding/index'
 import { oneShotsEval } from './evals/one-shots/index'
-import { orchestratorDispatchEval } from './evals/orchestrator-dispatch/index'
+import { leadDispatchEval } from './evals/lead-dispatch/index'
 import { behaviorEval } from './evals/behavior/index'
 import { memoryExtractionEval } from './evals/memory-extraction/index'
 import { xmlNewlinesEval } from './evals/xml-newlines/index'
@@ -57,7 +57,7 @@ const EVALS: Record<string, Eval> = {
   xpath: xpathEval,
   'gemini-grounding': geminiGroundingEval,
   'one-shots': oneShotsEval,
-  'orchestrator-dispatch': orchestratorDispatchEval,
+  'lead-dispatch': leadDispatchEval,
   behavior: behaviorEval,
   'memory-extraction': memoryExtractionEval,
   'xml-newlines': xmlNewlinesEval,

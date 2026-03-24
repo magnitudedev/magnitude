@@ -237,7 +237,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         const agentState = read(AgentStatusProjection)
         const variant: AgentVariant = event.forkId
           ? ((getAgentByForkId(agentState, event.forkId)?.role ?? 'builder') as AgentVariant)
-          : 'orchestrator'
+          : 'lead'
         const agentDef = getAgentDefinition(variant)
         const bindings = getBindingRegistry(agentDef)
         const trace: CanonicalTrace = {

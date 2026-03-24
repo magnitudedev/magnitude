@@ -15,7 +15,7 @@ export type TBenchMagnitudeMeta = {
 export type HarborJobConfig = {
   job_name?: string
   timeout_multiplier?: number
-  orchestrator?: {
+  lead?: {
     type?: string
     n_concurrent_trials?: number
     quiet?: boolean

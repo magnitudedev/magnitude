@@ -11,7 +11,7 @@ export interface TurnsResult {
 
 export interface TurnsBuilder {
   user(message: string): this
-  orchestrator(response: TurnFrame): this
+  lead(response: TurnFrame): this
   agent(agentId: string, response: TurnFrame): this
   agents(mapping: Record<string, TurnFrame>): this
   run(): Promise<TurnsResult>
@@ -19,7 +19,7 @@ export interface TurnsBuilder {
 
 type Step =
   | { kind: 'user'; message: string }
-  | { kind: 'orchestrator'; response: MockTurnResponse }
+  | { kind: 'lead'; response: MockTurnResponse }
   | { kind: 'agent'; agentId: string; response: MockTurnResponse }
   | { kind: 'agents'; mapping: Record<string, MockTurnResponse> }
 
@@ -81,8 +81,8 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
       return this
     },
 
-    orchestrator(response: TurnFrame) {
-      steps.push({ kind: 'orchestrator', response: toFrame(response) })
+    lead(response: TurnFrame) {
+      steps.push({ kind: 'lead', response: toFrame(response) })
       return this
     },
 
@@ -133,7 +133,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
       const subagentQueues = new Map<string, MockTurnResponse[]>()
 
       for (const step of steps) {
-        if (step.kind === 'orchestrator') {
+        if (step.kind === 'lead') {
           rootQueue.push(step.response)
           continue
         }
@@ -181,7 +181,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
             continue
           }
 
-          if (step.kind === 'orchestrator') {
+          if (step.kind === 'lead') {
             await flushPendingUsers()
             await waitForNextTurnCompleted(null)
             continue

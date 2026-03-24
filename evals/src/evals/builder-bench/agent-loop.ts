@@ -2,7 +2,7 @@
  * Agent Loop — runs the real Magnitude agent system for builder-bench scenarios.
  *
  * Uses createCodingAgentClient with Docker-bridged tools registered as
- * an override for the orchestrator agent. The real TurnController, Cortex,
+ * an override for the lead agent. The real TurnController, Cortex,
  * and ExecutionManager drive the turn loop.
  */
 
@@ -90,7 +90,7 @@ function buildSessionContext(workDir: string): SessionContext {
 /**
  * Run the real Magnitude agent for a builder-bench scenario.
  *
- * 1. Registers Docker-backed agent definition as 'orchestrator' override
+ * 1. Registers Docker-backed agent definition as 'lead' override
  * 2. Creates a headless agent client (no persistence, synthetic session context)
  * 4. Sends the task prompt and waits for the agent to become stable
  * 5. Collects metrics and cleans up
@@ -103,7 +103,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   const log = (msg: string) => console.log(`  ${prefix} ${msg}`)
 
   // Register overrides
-  registerAgentDefinition('orchestrator', toolBridge.agentDef)
+  registerAgentDefinition('lead', toolBridge.agentDef)
 
   try {
     // Create headless agent client (restores provider runtime state internally)

@@ -304,7 +304,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const variant = forkAgentVariants.get(forkId) ?? 'builder'
       return getAgentDefinition(variant)
     }
-    return getAgentDefinition('orchestrator')
+    return getAgentDefinition('lead')
   }
 
   // Build the permission interceptor (shared across all forks, resolves agent dynamically)
@@ -336,7 +336,7 @@ const makeExecutionManager = Effect.gen(function* () {
         const role = agentInstance?.role
         variant = role && isValidVariant(role) ? role : 'builder'
       } else {
-        variant = 'orchestrator'
+        variant = 'lead'
       }
       const agentDef = getAgentDefinition(variant)
 
