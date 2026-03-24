@@ -1,5 +1,5 @@
 import { memo, useMemo, useState, useCallback } from 'react'
-import { TextAttributes, type KeyEvent } from '@opentui/core'
+import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
@@ -72,6 +72,7 @@ interface SettingsOverlayProps {
   onProviderHandleKeyEvent: (key: KeyEvent) => boolean
   onBackFromModelPicker: () => void
   onBackFromProviderDetail: () => void
+  onResetToDefaults: (providerId: string) => void | Promise<void>
 }
 
 function FilterCheckbox({ label, checked, onToggle }: { label: string; checked: boolean; onToggle: () => void }) {
@@ -138,10 +139,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onProviderHandleKeyEvent,
   onBackFromModelPicker,
   onBackFromProviderDetail,
+  onResetToDefaults,
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const [hoveredTab, setHoveredTab] = useState<SettingsTab | null>(null)
   const [closeHover, setCloseHover] = useState(false)
+  const [showResetModal, setShowResetModal] = useState(false)
+  const [resetSelectedIndex, setResetSelectedIndex] = useState(0)
+  const [resetHover, setResetHover] = useState(false)
 
   // Group model items by provider for section headers
   const modelSections = useMemo(() => {
@@ -177,6 +182,25 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
   useKeyboard(useCallback((key: KeyEvent) => {
     const plain = !key.ctrl && !key.meta && !key.option
+
+    if (showResetModal) {
+      key.preventDefault()
+      const connectedProviders = detectedProviders
+      if (key.name === 'escape') {
+        setShowResetModal(false)
+      } else if (key.name === 'up' && plain) {
+        setResetSelectedIndex(i => Math.max(0, i - 1))
+      } else if (key.name === 'down' && plain) {
+        setResetSelectedIndex(i => Math.min(connectedProviders.length - 1, i + 1))
+      } else if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+        const provider = connectedProviders[resetSelectedIndex]
+        if (provider) {
+          onResetToDefaults(provider.provider.id)
+          setShowResetModal(false)
+        }
+      }
+      return
+    }
 
     if (key.name === 'escape') {
       key.preventDefault()
@@ -216,10 +240,14 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     onBackFromProviderDetail,
     onModelHandleKeyEvent,
     onProviderHandleKeyEvent,
+    showResetModal,
+    resetSelectedIndex,
+    detectedProviders,
+    onResetToDefaults,
   ]))
 
   return (
-    <box style={{ flexDirection: 'column', height: '100%' }}>
+    <box style={{ flexDirection: 'column', height: '100%', position: 'relative' }}>
       {/* Header */}
       <box style={{
         flexDirection: 'row',
@@ -254,7 +282,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       </box>
 
       {/* Tabs */}
-      <box style={{ flexDirection: 'row', paddingLeft: 1, flexShrink: 0 }}>
+      <box style={{ flexDirection: 'row', paddingLeft: 1, paddingRight: 1, flexShrink: 0, alignItems: 'center' }}>
         {TABS.map(tab => (
           <Button
             key={tab.id}
@@ -278,6 +306,26 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             </box>
           </Button>
         ))}
+        {activeTab === 'model' && !selectingModelFor && (
+          <box style={{ flexGrow: 1 }} />
+        )}
+        {activeTab === 'model' && !selectingModelFor && (
+          <Button
+            onClick={() => { setResetSelectedIndex(0); setShowResetModal(true) }}
+            onMouseOver={() => setResetHover(true)}
+            onMouseOut={() => setResetHover(false)}
+          >
+            <box style={{
+              borderStyle: 'single',
+              borderColor: resetHover ? theme.foreground : theme.muted,
+              customBorderChars: BOX_CHARS,
+              paddingLeft: 1,
+              paddingRight: 1,
+            }}>
+              <text style={{ fg: resetHover ? theme.foreground : theme.muted }}>Reset to default</text>
+            </box>
+          </Button>
+        )}
       </box>
 
       {/* Content area */}
@@ -657,6 +705,81 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           </box>
         </>
       )}
+
+      {/* Reset to default modal */}
+      {showResetModal && (() => {
+        const connectedProviders = detectedProviders
+        return (
+          <box style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 20,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: RGBA.fromInts(0, 0, 0, 153),
+          }}>
+            <box style={{
+              borderStyle: 'single',
+              border: ['left', 'right', 'top', 'bottom'],
+              borderColor: theme.border,
+              backgroundColor: theme.surface,
+              customBorderChars: BOX_CHARS,
+              minWidth: 52,
+              maxWidth: 72,
+              paddingLeft: 0,
+              paddingRight: 0,
+              paddingTop: 0,
+              paddingBottom: 0,
+            }}>
+              <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
+                <box style={{ paddingBottom: 1 }}>
+                  <text style={{ fg: theme.primary }}>
+                    <span attributes={TextAttributes.BOLD}>Reset models to default</span>
+                  </text>
+                </box>
+                <box style={{ paddingBottom: 1 }}>
+                  <text style={{ fg: theme.foreground }}>Select a provider to use as the default for all model slots:</text>
+                </box>
+                {connectedProviders.length === 0 ? (
+                  <text style={{ fg: theme.muted }}>No connected providers found.</text>
+                ) : (
+                  connectedProviders.map((dp, index) => {
+                    const isSelected = index === resetSelectedIndex
+                    return (
+                      <Button
+                        key={dp.provider.id}
+                        onClick={() => {
+                          onResetToDefaults(dp.provider.id)
+                          setShowResetModal(false)
+                        }}
+                        onMouseOver={() => setResetSelectedIndex(index)}
+                        style={{
+                          flexDirection: 'row',
+                          paddingLeft: 1,
+                          paddingRight: 1,
+                          backgroundColor: isSelected ? theme.background : undefined,
+                        }}
+                      >
+                        <text style={{ fg: isSelected ? theme.primary : theme.foreground }}>
+                          {isSelected ? '> ' : '  '}{dp.provider.name}
+                        </text>
+                      </Button>
+                    )
+                  })
+                )}
+                <box style={{ paddingTop: 1 }}>
+                  <text style={{ fg: theme.muted }}>
+                    <span attributes={TextAttributes.DIM}>{'↑/↓ navigate  |  Enter select  |  Esc cancel'}</span>
+                  </text>
+                </box>
+              </box>
+            </box>
+          </box>
+        )
+      })()}
     </box>
   )
 })

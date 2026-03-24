@@ -910,6 +910,33 @@ function AppInner({
     setSelectingModelFor(null)
   }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderState, storage])
 
+  const handleResetToDefaults = useCallback(async (preferredProviderId: string) => {
+    if (!providerUiState) return
+    const connectedProviderIds = new Set(providerUiState.detectedProviders.map(d => d.provider.id))
+    const detectedAuthTypeByProviderId = new Map<string, string | null>()
+    for (const detected of providerUiState.detectedProviders) {
+      detectedAuthTypeByProviderId.set(detected.provider.id, detected.auth?.type ?? null)
+    }
+    const newSlotModels: Partial<Record<MagnitudeSlot, ModelSelection>> = {}
+    for (const slot of MAGNITUDE_SLOTS) {
+      const selection = resolveSlotDefaultSelection({
+        allProviders: PROVIDERS,
+        connectedProviderIds,
+        slot,
+        preferredProviderId,
+        detectedAuthTypeByProviderId,
+      })
+      if (selection) {
+        newSlotModels[slot] = selection
+        const auth = await providerRuntime.auth.getAuth(selection.providerId)
+        await providerRuntime.state.setSelection(slot, selection.providerId, selection.modelId, auth ?? null)
+        await storage.config.setModelSelection(slot, selection)
+      }
+    }
+    setSlotModels(prev => ({ ...prev, ...newSlotModels }))
+    await reloadProviderState()
+  }, [providerUiState, providerRuntime, storage, reloadProviderState])
+
   const detectedProviders = providerUiState?.detectedProviders ?? []
 
   useEffect(() => {
@@ -1624,6 +1651,7 @@ function AppInner({
       providerNavigation={providerNavigation}
       onSettingsClose={onSettingsClose}
       onBackFromModelPicker={handleBackFromModelPicker}
+      onResetToDefaults={handleResetToDefaults}
       showRecentChatsOverlay={showRecentChatsOverlay}
       recentChats={recentChats}
       recentChatsSelectedIndex={recentChatsSelectedIndex}
