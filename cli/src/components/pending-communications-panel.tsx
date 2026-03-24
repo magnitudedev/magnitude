@@ -6,9 +6,10 @@ import { AgentCommunicationCard } from './agent-communication-card'
 
 interface PendingCommunicationsPanelProps {
   messages: readonly PendingInboundCommunicationDisplay[]
+  onFileClick?: (path: string, section?: string) => void
 }
 
-export function PendingCommunicationsPanel({ messages }: PendingCommunicationsPanelProps) {
+export function PendingCommunicationsPanel({ messages, onFileClick }: PendingCommunicationsPanelProps) {
   const theme = useTheme()
   const agentMessages = messages.filter((message) => message.source === 'agent')
   if (agentMessages.length === 0) return null
@@ -42,7 +43,7 @@ export function PendingCommunicationsPanel({ messages }: PendingCommunicationsPa
 
           return (
             <box key={message.id} style={{ marginTop: 1 }}>
-              <AgentCommunicationCard message={cardMessage} />
+              <AgentCommunicationCard message={cardMessage} onFileClick={onFileClick} />
             </box>
           )
         })}

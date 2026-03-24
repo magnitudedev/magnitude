@@ -1720,6 +1720,7 @@ function AppInner({
       agentStatusState={agentStatusState}
       popForkOverlay={popForkOverlay}
       pushForkOverlay={pushForkOverlay}
+      onFileClick={openFile}
       localProviderConfig={providerUiState?.localProviderConfig
         ? {
             baseUrl: providerUiState.localProviderConfig.baseUrl ?? undefined,
@@ -1861,7 +1862,10 @@ function AppInner({
         })
       })()}
       {selectedForkId !== null && (
-        <PendingCommunicationsPanel messages={activeDisplay?.pendingInboundCommunications ?? []} />
+        <PendingCommunicationsPanel
+          messages={activeDisplay?.pendingInboundCommunications ?? []}
+          onFileClick={openFile}
+        />
       )}
     </scrollbox>
   )

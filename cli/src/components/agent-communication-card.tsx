@@ -3,31 +3,34 @@ import type { DisplayMessage } from '@magnitudedev/agent'
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { useTerminalWidth } from '../hooks/use-terminal-width'
-import { PREVIEW_LINE_CAP, wrapTextToVisualLines } from '../utils/strings'
 import { TextAttributes } from '@opentui/core'
 import { formatSubagentIdWithEmoji } from '../utils/subagent-role-emoji'
+import { MarkdownContent } from '../markdown/markdown-content'
+import { PREVIEW_LINE_CAP } from '../utils/strings'
 
 type AgentCommunicationMessage = Extract<DisplayMessage, { type: 'agent_communication' }>
 
 export function getCommunicationPreview(
   content: string,
-  contentWidth: number,
+  _contentWidth: number,
 ): { previewLines: string[]; hasOverflow: boolean } {
-  const wrappedLines = wrapTextToVisualLines(content, contentWidth)
+  const lines = content.split('\n')
   return {
-    previewLines: wrappedLines.slice(0, PREVIEW_LINE_CAP),
-    hasOverflow: wrappedLines.length > PREVIEW_LINE_CAP,
+    previewLines: lines.slice(0, PREVIEW_LINE_CAP),
+    hasOverflow: lines.length > PREVIEW_LINE_CAP,
   }
 }
 
 interface AgentCommunicationCardProps {
   message: AgentCommunicationMessage
   widthAdjustment?: number
+  onFileClick?: (path: string, section?: string) => void
 }
 
 export const AgentCommunicationCard = memo(function AgentCommunicationCard({
   message,
   widthAdjustment = 0,
+  onFileClick,
 }: AgentCommunicationCardProps) {
   const theme = useTheme()
   const [expanded, setExpanded] = useState(false)
@@ -35,10 +38,13 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
   const terminalWidth = useTerminalWidth()
   const contentWidth = Math.max(1, terminalWidth - 6 - widthAdjustment)
 
-  const { previewLines, hasOverflow } = useMemo(
-    () => getCommunicationPreview(message.content, contentWidth),
-    [message.content, contentWidth]
-  )
+  const { previewContent, hasOverflow } = useMemo(() => {
+    const { previewLines, hasOverflow } = getCommunicationPreview(message.content, contentWidth)
+    return {
+      previewContent: previewLines.join('\n'),
+      hasOverflow,
+    }
+  }, [message.content, contentWidth])
 
   return (
     <box style={{ alignSelf: 'flex-start', flexDirection: 'column' }}>
@@ -67,11 +73,9 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
 
       <box style={{ paddingLeft: 2, flexDirection: 'column' }}>
         {expanded ? (
-          <text style={{ fg: theme.foreground }}>{message.content}</text>
+          <MarkdownContent content={message.content} contentWidth={contentWidth} onOpenFile={onFileClick} />
         ) : (
-          previewLines.map((line, index) => (
-            <text key={`${message.id}-line-${index}`} style={{ fg: theme.foreground }}>{line}</text>
-          ))
+          <MarkdownContent content={previewContent} contentWidth={contentWidth} onOpenFile={onFileClick} />
         )}
 
         {hasOverflow ? (

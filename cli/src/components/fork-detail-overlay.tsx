@@ -13,6 +13,7 @@ interface ForkDetailOverlayProps {
   forkRole: string
   onClose: () => void
   onForkExpand?: (forkId: string) => void
+  onFileClick?: (path: string, section?: string) => void
   subscribeForkDisplay: (forkId: string, cb: (state: DisplayState) => void) => () => void
 }
 
@@ -27,6 +28,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
 
   onClose,
   onForkExpand,
+  onFileClick,
   subscribeForkDisplay,
 }: ForkDetailOverlayProps) {
   const theme = useTheme()
@@ -131,6 +133,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
                 isCollapsed={msg.type === 'think_block' ? isCollapsed(msg.id) : undefined}
                 onToggleCollapse={msg.type === 'think_block' ? () => toggleCollapse(msg.id) : undefined}
                 onForkExpand={onForkExpand}
+                onFileClick={onFileClick}
               />
             )
           })

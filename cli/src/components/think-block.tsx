@@ -365,7 +365,7 @@ const StepGroupView = memo(function StepGroupView({
             timestamp: step.timestamp,
           }
 
-          return <AgentCommunicationCard key={step.id} message={message} widthAdjustment={2} />
+          return <AgentCommunicationCard key={step.id} message={message} widthAdjustment={2} onFileClick={onFileClick} />
         }
 
         if (step.type !== 'tool') return null

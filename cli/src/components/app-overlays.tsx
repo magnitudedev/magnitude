@@ -89,6 +89,7 @@ export type AppOverlaysProps = {
   agentStatusState: AgentStatusState | null
   popForkOverlay: () => void
   pushForkOverlay: (forkId: string) => void
+  onFileClick?: (path: string, section?: string) => void
 
   localProviderConfig: { baseUrl?: string; modelId?: string } | null
 }
@@ -162,6 +163,7 @@ export function AppOverlays({
   agentStatusState,
   popForkOverlay,
   pushForkOverlay,
+  onFileClick,
   localProviderConfig,
 }: AppOverlaysProps) {
   if (showSetupWizard && wizardStep === 'browser') {
@@ -235,6 +237,7 @@ export function AppOverlays({
           forkRole={agent?.role ?? 'agent'}
           onClose={popForkOverlay}
           onForkExpand={pushForkOverlay}
+          onFileClick={onFileClick}
           subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}
         />
       </box>

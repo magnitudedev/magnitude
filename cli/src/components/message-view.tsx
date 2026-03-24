@@ -116,7 +116,7 @@ export const MessageView = memo(function MessageView({
       case 'agent_communication':
         return (
           <box style={{ marginBottom: 1 }}>
-            <AgentCommunicationCard message={message} />
+            <AgentCommunicationCard message={message} onFileClick={onFileClick} />
           </box>
         )
 
