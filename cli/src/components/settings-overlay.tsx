@@ -404,13 +404,13 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               paddingTop: 1,
               flexGrow: 1,
             }}>
-              {SLOT_UI_ORDER.map(({ slot, label }, idx) => {
+              {SLOT_UI_ORDER.map(({ slot, label, description }, idx) => {
                 const display = slotDisplays[slot]
                 return (
                   <box key={slot} style={{ flexDirection: 'column', paddingBottom: 1 }}>
                     <box style={{ paddingBottom: 0 }}>
                       <text style={{ fg: theme.foreground }}>
-                        <span attributes={TextAttributes.BOLD}>{label}</span>
+                        <span attributes={TextAttributes.BOLD}>{label}</span> {description}
                       </text>
                     </box>
                     <Button

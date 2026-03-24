@@ -16,14 +16,14 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   local: '(Ollama, LM Studio, llama.cpp, vLLM)',
 }
 
-export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string }[] = [
-  { slot: 'lead', label: 'Team Lead' },
-  { slot: 'explorer', label: 'Explorer' },
-  { slot: 'planner', label: 'Planner' },
-  { slot: 'builder', label: 'Builder' },
-  { slot: 'reviewer', label: 'Reviewer' },
-  { slot: 'debugger', label: 'Debugger' },
-  { slot: 'browser', label: 'Browser' },
+export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string; description: string }[] = [
+  { slot: 'lead', label: 'Team Lead', description: '(Coordinates all subagent usage)' },
+  { slot: 'explorer', label: 'Explorer', description: '(Reads lots of files and does web searches)' },
+  { slot: 'planner', label: 'Planner', description: '(Plans out implementation approaches)' },
+  { slot: 'builder', label: 'Builder', description: '(Implements changes in files)' },
+  { slot: 'reviewer', label: 'Reviewer', description: '(Reviews code for correctness)' },
+  { slot: 'debugger', label: 'Debugger', description: '(Root causes and fixes issues)' },
+  { slot: 'browser', label: 'Browser', description: '(Visually navigates a browser)' },
 ]
 
 export type WizardStep = 'provider' | 'models' | 'browser'
@@ -225,14 +225,14 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
             </Button>
           </box>
 
-          {SLOT_UI_ORDER.map(({ slot, label }, idx) => {
+          {SLOT_UI_ORDER.map(({ slot, label, description }, idx) => {
             const display = slotDisplays[slot]
             const navIndex = idx + 1 // 0 is confirm button, 1-7 are slots
             return (
               <box key={slot} style={{ flexDirection: 'column', paddingBottom: 1 }}>
                 <box style={{ paddingBottom: 0 }}>
                   <text style={{ fg: theme.foreground }}>
-                    <span attributes={TextAttributes.BOLD}>{label}</span>
+                    <span attributes={TextAttributes.BOLD}>{label}</span> {description}
                   </text>
                 </box>
                 <box style={{
