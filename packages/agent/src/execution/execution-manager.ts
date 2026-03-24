@@ -836,12 +836,11 @@ const makeExecutionManager = Effect.gen(function* () {
       forkCwds.set(forkId, cwd)
       forkWorkspacePaths.set(forkId, workspacePath)
 
-      // Inject browser harness when role setup requires it
+      // Inject role-specific setup layer when the role defines a setup function
       const roleDef = getAgentDefinition(variant)
       if (roleDef.setup && forkId) {
-        const browserService = yield* BrowserService
-        const harness = yield* browserService.get(forkId)
-        layers = Layer.merge(layers, Layer.succeed(BrowserHarnessTag, harness))
+        const setupLayer = yield* roleDef.setup({ forkId, cwd, workspacePath })
+        layers = Layer.merge(layers, setupLayer)
       }
 
       // Store variant for agent resolution
