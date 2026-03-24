@@ -10,7 +10,7 @@ Magnitude is designed so you can quickly understand what the agent is doing at e
 
 Assistant messages stream in real time, so you can follow progress as it happens.
 
-Think blocks appear inline while the agent works. They are collapsible and summarize internal reasoning and tool activity (reads, edits, searches, shell output, and more). Tool results are rendered with visual views so changes and outputs are easier to scan.
+Think blocks appear inline while the agent works. They are collapsible and summarize internal reasoning and tool activity (reads, edits, searches, shell output, and more), including subagent lifecycle events. Tool results are rendered with visual views so changes and outputs are easier to scan.
 
 <Info>
 Think blocks are there to help you follow execution, not just final answers.
@@ -20,21 +20,27 @@ Think blocks are there to help you follow execution, not just final answers.
 
 Use the Up and Down arrow keys on an empty input to browse your conversation history.
 
-Type `@` in the chat input to mention files or directories. A file picker appears with autocomplete. Mentioned files are included as context for the agent.
+Type `@` in the chat input to mention files or directories. A file picker appears with autocomplete for project files and folders. Mentioned files are included as context for the agent.
 
 You can paste or drag images into the chat input. Large text pastes (over 1000 characters) are automatically collapsed into paste segments.
 
-## Agent activity
+## Working with subagents
 
-When work is delegated, you'll see inline subagent activity cards in the conversation.
+When work is delegated, you'll see subagent activity in the conversation.
 
 Each card shows what a subagent is doing, along with status and progress. Select **View details** to open a deeper timeline for that subagent, including its messages and think blocks. If that subagent delegates further, you can continue drilling into nested activity.
 
-## Artifacts
+A subagent tab bar near the composer shows **Main** plus delegated subagents. Select a subagent tab to route your next message directly to that subagent. Pending routed messages are shown in the conversation until they are handled.
 
-When an agent references an artifact, it appears as a clickable `[[artifact]]` chip in the message.
+For the full workflow, see [Subagents](/working-with-magnitude/subagents).
 
-Selecting a chip opens the artifact reader side panel, where you can review content, copy it, and close the panel when done.
+## Workspace and file references
+
+Assistant messages can include clickable file links such as project files (`[app](cli/src/app.tsx)`), workspace files (`[plan]($M/plan.md)`), and heading links (`[Approach]($M/plan.md#Approach)`).
+
+Selecting a file link opens the file viewer side panel. Open files refresh as their contents change.
+
+Use workspace files for session scratch work, then promote important outputs into repository files. For details, see [Workspace and Files](/working-with-magnitude/workspace-and-files).
 
 ## Context bar
 

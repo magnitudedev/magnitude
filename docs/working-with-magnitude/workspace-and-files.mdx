@@ -1,0 +1,33 @@
+---
+title: Workspace and Files
+description: "How Magnitude organizes session workspace paths and file links"
+icon: folder-open
+---
+
+Magnitude runs each session inside a workspace, referenced internally as `$M`.
+
+`$M` points to Magnitude's workspace area under `~/.magnitude`. If you want to inspect generated plans, specs, or other session files directly, you can find them there.
+
+Your project is exposed inside that workspace at `$M/project`. `project/` is a symlink to your actual project directory, so the real files stay in their original location. This gives the agent one logical root for both temporary session files and project files.
+
+## File paths in chat
+
+Assistant messages can include clickable file links, including:
+- project files, for example `[app](cli/src/app.tsx)`,
+- workspace files, for example `[plan]($M/plan.md)`,
+- heading links, for example `[Approach]($M/plan.md#Approach)`.
+
+`$M/...` paths refer to files in the session workspace. `$M/project/...` refers to files in your actual project through the `project/` symlink.
+
+## Opening files from assistant messages
+
+Selecting a file link opens the file viewer side panel.
+
+Markdown links with heading fragments scroll to the matching section. Open files refresh as their contents change.
+
+## Path handling
+
+Magnitude normalizes file references before opening them.
+
+- Unsafe traversal-style paths are rejected.
+- Web URLs in markdown links are treated as URLs, not local file references.
