@@ -66,6 +66,12 @@ export const AgentLifecycle = Worker.define<AppEvent>()({
     on(WorkingStateProjection.signals.turnInterrupted, ({ forkId, turnId, chainId }, publish) => Effect.gen(function* () {
       const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
       yield* publish(turnCompleted)
+    }).pipe(Effect.orDie)),
+
+    on(WorkingStateProjection.signals.forkBecameStable, ({ forkId }) => Effect.gen(function* () {
+      if (forkId === null) return
+      const execManager = yield* ExecutionManager
+      yield* execManager.releaseBrowserFork(forkId)
     }).pipe(Effect.orDie))
   ]
 })

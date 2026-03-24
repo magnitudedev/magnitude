@@ -157,6 +157,12 @@ export interface ExecutionManagerService {
   >
 
   /**
+   * Release the browser for a fork (called when fork goes idle).
+   * No-op if the fork has no browser.
+   */
+  readonly releaseBrowserFork: (forkId: string) => Effect.Effect<void>
+
+  /**
    * The approval state service instance.
    * Exposed so workers (ApprovalWorker) and projections can register handlers and resolve approvals.
    */
@@ -295,6 +301,12 @@ const makeExecutionManager = Effect.gen(function* () {
 
   // Maps forkId → variant, populated when forks are created.
   const forkAgentVariants = new Map<string, AgentVariant>()
+
+  // Pre-built teardown effects (captured at initFork time with services already provided)
+  const forkTeardowns = new Map<string, Effect.Effect<void>>()
+
+  // Pre-built idle release effects (repeatable; run each time fork goes idle)
+  const forkIdleReleases = new Map<string, Effect.Effect<void>>()
 
   function isToolAny(value: AnyTool): value is Tool.Any {
     return 'bindings' in value
@@ -843,6 +855,21 @@ const makeExecutionManager = Effect.gen(function* () {
         layers = Layer.merge(layers, setupLayer)
       }
 
+      // Pre-build teardown effect with services captured now (so disposeFork needs no requirements)
+      if (forkId && (roleDef.setup || roleDef.teardown)) {
+        const browserService = yield* BrowserService
+
+        if (roleDef.teardown) {
+          const teardownEffect = roleDef.teardown({ forkId, cwd, workspacePath }).pipe(
+            Effect.provideService(BrowserService, browserService)
+          )
+          forkTeardowns.set(forkId, teardownEffect)
+        }
+
+        // Store repeatable idle release (for browser forks)
+        forkIdleReleases.set(forkId, browserService.release(forkId))
+      }
+
       // Store variant for agent resolution
       if (forkId !== null) {
         forkAgentVariants.set(forkId, variant)
@@ -872,12 +899,21 @@ const makeExecutionManager = Effect.gen(function* () {
     }),
 
     disposeFork: (forkId) => Effect.gen(function* () {
+      // Run role teardown if defined (e.g. browser cleanup)
+      const teardown = forkTeardowns.get(forkId)
+      if (teardown) {
+        yield* Effect.ignore(teardown)
+        forkTeardowns.delete(forkId)
+      }
+
       yield* backgroundProcessRegistry.cleanupFork(forkId)
       forkLayers.delete(forkId)
       forkCwds.delete(forkId)
       forkWorkspacePaths.delete(forkId)
       toolReminderRefs.delete(forkId)
       boundObservables.delete(forkId)
+      forkAgentVariants.delete(forkId)
+      forkIdleReleases.delete(forkId)
     }),
 
     interruptProcesses: (forkId) => (
@@ -919,6 +955,13 @@ const makeExecutionManager = Effect.gen(function* () {
       })
 
       return forkId
+    }),
+
+    releaseBrowserFork: (forkId) => Effect.gen(function* () {
+      const release = forkIdleReleases.get(forkId)
+      if (release) {
+        yield* Effect.ignore(release)
+      }
     }),
 
     approvalState,

@@ -64,8 +64,14 @@ export const browserRole = defineRole<typeof tools, 'browser', PolicyContext, Br
 
   setup: ({ forkId }) => Effect.gen(function* () {
     const browserService = yield* BrowserService
-    const harness = yield* browserService.get(forkId)
-    return Layer.succeed(BrowserHarnessTag, harness)
+    return Layer.succeed(BrowserHarnessTag, {
+      get: () => browserService.get(forkId)
+    })
+  }),
+
+  teardown: ({ forkId }) => Effect.gen(function* () {
+    const browserService = yield* BrowserService
+    yield* browserService.release(forkId)
   }),
 
   permission: (p) => ({

@@ -12,9 +12,13 @@ import { defineXmlBinding } from '@magnitudedev/xml-act'
 import type { WebHarness } from '@magnitudedev/browser-harness'
 import { getBrowserActionBaseLabel } from './browser-action-visuals'
 
+export interface BrowserHarnessAccessor {
+  readonly get: () => Effect.Effect<WebHarness>
+}
+
 export class BrowserHarnessTag extends Context.Tag('BrowserHarness')<
   BrowserHarnessTag,
-  WebHarness
+  BrowserHarnessAccessor
 >() {}
 
 const BrowserError = ToolErrorSchema('BrowserError', {})
@@ -43,7 +47,8 @@ export const clickTool = defineTool({
   label: () => getBrowserActionBaseLabel('click'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.click({ x, y }), catch: browserError })
       return 'clicked'
     }),
@@ -73,7 +78,8 @@ export const doubleClickTool = defineTool({
   label: () => getBrowserActionBaseLabel('doubleClick'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.doubleClick({ x, y }), catch: browserError })
       return 'double-clicked'
     }),
@@ -103,7 +109,8 @@ export const rightClickTool = defineTool({
   label: () => getBrowserActionBaseLabel('rightClick'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.rightClick({ x, y }), catch: browserError })
       return 'right-clicked'
     }),
@@ -132,7 +139,8 @@ export const typeTool = defineTool({
   label: () => getBrowserActionBaseLabel('type'),
   execute: ({ content }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.type({ content }), catch: browserError })
       return 'typed'
     }),
@@ -164,7 +172,8 @@ export const scrollTool = defineTool({
   label: () => getBrowserActionBaseLabel('scroll'),
   execute: ({ x, y, deltaX, deltaY }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.scroll({ x, y, deltaX: deltaX ?? 0, deltaY }), catch: browserError })
       return 'scrolled'
     }),
@@ -203,7 +212,8 @@ export const dragTool = defineTool({
   label: () => getBrowserActionBaseLabel('drag'),
   execute: ({ x1, y1, x2, y2 }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.drag({ x1, y1, x2, y2 }), catch: browserError })
       return 'dragged'
     }),
@@ -239,7 +249,8 @@ export const navigateTool = defineTool({
   label: () => getBrowserActionBaseLabel('navigate'),
   execute: ({ url }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.navigate(url), catch: browserError })
       return `navigated to ${url}`
     }),
@@ -265,7 +276,8 @@ export const goBackTool = defineTool({
   label: () => getBrowserActionBaseLabel('goBack'),
   execute: () =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.goBack(), catch: browserError })
       return 'went back'
     }),
@@ -294,7 +306,8 @@ export const switchTabTool = defineTool({
   label: () => getBrowserActionBaseLabel('switchTab'),
   execute: ({ index }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.switchTab({ index }), catch: browserError })
       return `switched to tab ${index}`
     }),
@@ -320,7 +333,8 @@ export const newTabTool = defineTool({
   label: () => getBrowserActionBaseLabel('newTab'),
   execute: () =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       yield* Effect.tryPromise({ try: () => harness.newTab(), catch: browserError })
       return 'new tab opened'
     }),
@@ -346,7 +360,8 @@ export const screenshotTool = defineTool({
   label: () => getBrowserActionBaseLabel('screenshot'),
   execute: () =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       const tabState = yield* Effect.tryPromise({ try: () => harness.retrieveTabState(), catch: browserError })
       const tabLines = tabState.tabs.map((t, i) =>
         `${i === tabState.activeTab ? '[ACTIVE] ' : ''}${i}: ${t.title} (${t.url})`
@@ -379,7 +394,8 @@ export const evaluateTool = defineTool({
   label: () => getBrowserActionBaseLabel('evaluate'),
   execute: ({ code }) =>
     Effect.gen(function* () {
-      const harness = yield* BrowserHarnessTag
+      const { get } = yield* BrowserHarnessTag
+      const harness = yield* get()
       const result = yield* Effect.tryPromise({ try: () => harness.page.evaluate(code), catch: browserError })
       try {
         return JSON.stringify(result, null, 2)

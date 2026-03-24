@@ -122,6 +122,7 @@ export interface RoleBase<
   readonly initialContext: { parentConversation?: boolean }
   readonly spawnable?: boolean
   readonly setup?: (ctx: ForkSetupContext) => Effect.Effect<Layer.Layer<TProvides>, never, TRequirements>
+  readonly teardown?: (ctx: ForkSetupContext) => Effect.Effect<void, never, TRequirements>
 }
 
 export interface RoleConfig<
