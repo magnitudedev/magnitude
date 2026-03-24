@@ -6,8 +6,6 @@
  */
 
 import type { ModelSelection } from './types'
-import type { DetectedProvider } from './detect'
-import { compareProviderOrder } from './registry'
 
 /**
  * Browser-compatible models keyed by provider ID.
@@ -34,7 +32,7 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
     // DeepSeek
     'deepseek/deepseek-v3.2', 'deepseek/deepseek-v3.2-speciale',
     // MiniMax
-    'minimax/minimax-m2.5', 'minimax/minimax-m2.1',
+    'minimax/minimax-m2.7', 'minimax/minimax-m2.5', 'minimax/minimax-m2.1',
     // GLM
     'z-ai/glm-5', 'z-ai/glm-4.7', 'z-ai/glm-4.6v', 'z-ai/glm-4.7-flash',
     // Grok
@@ -67,7 +65,7 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
     // DeepSeek
     'deepseek/deepseek-v3.2-exp', 'deepseek/deepseek-v3.2-thinking',
     // MiniMax
-    'minimax/minimax-m2.5', 'minimax/minimax-m2.1',
+    'minimax/minimax-m2.7', 'minimax/minimax-m2.5', 'minimax/minimax-m2.1',
     // GLM
     'zai/glm-5', 'zai/glm-4.7', 'zai/glm-4.6v',
     // Grok
@@ -85,7 +83,7 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
 
   // ─── MiniMax (direct) ───────────────────────────────────────
   'minimax': [
-    'MiniMax-M2.5', 'MiniMax-M2.1',
+    'MiniMax-M2.7', 'MiniMax-M2.5', 'MiniMax-M2.1',
   ],
 
   // ─── Cerebras ─────────────────────────────────────────────────
@@ -124,33 +122,3 @@ export function getBrowserCompatibleModels(providerId: string): string[] {
   return BROWSER_COMPATIBLE_MODELS[providerId] ?? []
 }
 
-/**
- * Auto-detect the best browser model from all connected providers.
- * If preferredProviderId is given (e.g. the user's primary model provider),
- * tries that provider first before falling back to the static priority list.
- * Returns null if no compatible model is found.
- */
-export function detectBrowserModel(
-  detectedProviders: DetectedProvider[],
-  preferredProviderId?: string | null,
-): ModelSelection | null {
-  const detectedIds = detectedProviders.map(d => d.provider.id).sort(compareProviderOrder)
-  const scanOrder = preferredProviderId
-    ? [preferredProviderId, ...detectedIds.filter(id => id !== preferredProviderId)]
-    : detectedIds
-
-  for (const pid of scanOrder) {
-    const detected = detectedProviders.find(d => d.provider.id === pid)
-    if (!detected) continue
-
-    const compatible = getBrowserCompatibleModels(pid)
-    for (const prefix of compatible) {
-      // Find an actual model in the provider's model list that matches
-      const model = detected.provider.models.find(m => m.id.startsWith(prefix))
-      if (model) {
-        return { providerId: pid, modelId: model.id }
-      }
-    }
-  }
-  return null
-}

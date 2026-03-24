@@ -445,13 +445,30 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         ) : (
           <>
             {/* Primary/Secondary model view */}
-            <box style={{
-              flexDirection: 'column',
-              paddingLeft: 2,
-              paddingRight: 2,
-              paddingTop: 1,
-              flexGrow: 1,
-            }}>
+            <scrollbox
+              scrollX={false}
+              scrollbarOptions={{ visible: false }}
+              verticalScrollbarOptions={{
+                visible: true,
+                trackOptions: { width: 1 },
+              }}
+              style={{
+                flexGrow: 1,
+                rootOptions: {
+                  flexGrow: 1,
+                  backgroundColor: 'transparent',
+                },
+                wrapperOptions: {
+                  border: false,
+                  backgroundColor: 'transparent',
+                },
+                contentOptions: {
+                  paddingLeft: 2,
+                  paddingRight: 2,
+                  paddingTop: 1,
+                },
+              }}
+            >
               {SLOT_UI_ORDER.map(({ slot, label, description }, idx) => {
                 const display = slotDisplays[slot]
                 return (
@@ -492,7 +509,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                   </box>
                 )
               })}
-            </box>
+            </scrollbox>
 
             {/* Model prefs footer */}
             <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>

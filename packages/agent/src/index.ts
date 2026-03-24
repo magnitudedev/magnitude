@@ -240,7 +240,6 @@ export {
   exchangeCopilotToken,
   COPILOT_HEADERS,
 
-  detectBrowserModel,
   isBrowserCompatible,
   getBrowserCompatibleModels,
   BROWSER_COMPATIBLE_MODELS,

@@ -30,9 +30,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'anthropic',
     name: 'Anthropic',
     bamlProvider: 'anthropic',
-    defaultModel: 'claude-opus-4-6',
-    defaultSecondaryModel: 'claude-sonnet-4-6',
-    defaultBrowserModel: 'claude-haiku-4-5',
     models: [
       staticModel({ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
       staticModel({ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
@@ -46,10 +43,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'openai',
     name: 'OpenAI',
     bamlProvider: 'openai',
-    defaultModel: 'gpt-5.3-codex',
-    defaultOAuthModel: 'gpt-5.3-codex',
-    defaultSecondaryModel: 'gpt-5.3-codex',
-    defaultBrowserModel: 'gpt-5.3-codex',
     oauthOnlyModelIds: ['gpt-5.3-codex-spark'],
     models: [
       staticModel({ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', family: 'gpt', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
@@ -67,9 +60,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'GitHub Copilot',
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'https://api.githubcopilot.com',
-    defaultModel: 'claude-opus-4.6',
-    defaultSecondaryModel: 'claude-sonnet-4.6',
-    defaultBrowserModel: 'claude-haiku-4.5',
     models: [
       staticModel({ id: 'claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
     ],
@@ -81,7 +71,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'google',
     name: 'Google (Gemini)',
     bamlProvider: 'google-ai',
-    defaultModel: 'gemini-3.1-pro-preview',
     models: [
       staticModel({ id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', family: 'gemini', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
       staticModel({ id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', family: 'gemini', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 1048576 }),
@@ -96,9 +85,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'OpenRouter',
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
-    defaultModel: 'anthropic/claude-opus-4.6',
-    defaultSecondaryModel: 'anthropic/claude-sonnet-4.6',
-    defaultBrowserModel: 'anthropic/claude-haiku-4.5',
     models: [
       staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
     ],
@@ -110,9 +96,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'vercel',
     name: 'Vercel AI Gateway',
     bamlProvider: 'openai-generic',
-    defaultModel: 'anthropic/claude-opus-4.6',
-    defaultSecondaryModel: 'anthropic/claude-sonnet-4.6',
-    defaultBrowserModel: 'anthropic/claude-haiku-4.5',
     models: [
       staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
     ],
@@ -124,7 +107,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'google-vertex',
     name: 'Google Vertex AI',
     bamlProvider: 'vertex-ai',
-    defaultModel: 'gemini-3.1-pro-preview',
     models: [
       staticModel({ id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', family: 'gemini', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
       staticModel({ id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', family: 'gemini', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
@@ -138,9 +120,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'google-vertex-anthropic',
     name: 'Vertex AI (Anthropic)',
     bamlProvider: 'vertex-ai',
-    defaultModel: 'claude-opus-4-6@default',
-    defaultSecondaryModel: 'claude-sonnet-4-6@default',
-    defaultBrowserModel: 'claude-haiku-4-5@default',
     models: [
       staticModel({ id: 'claude-opus-4-6@default', name: 'Claude Opus 4.6 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
     ],
@@ -152,9 +131,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'amazon-bedrock',
     name: 'Amazon Bedrock',
     bamlProvider: 'aws-bedrock',
-    defaultModel: 'us.anthropic.claude-opus-4-6-v1',
-    defaultSecondaryModel: 'us.anthropic.claude-sonnet-4-6-v1',
-    defaultBrowserModel: 'us.anthropic.claude-haiku-4-5-v1',
     models: [
       staticModel({ id: 'us.anthropic.claude-opus-4-6-v1', name: 'Claude Opus 4.6 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
     ],
@@ -167,10 +143,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'MiniMax',
     bamlProvider: 'anthropic',
     defaultBaseUrl: 'https://api.minimax.io/anthropic',
-    defaultModel: 'MiniMax-M2.5',
-    defaultSecondaryModel: 'MiniMax-M2.5',
-    defaultBrowserModel: 'MiniMax-M2.5',
     models: [
+      staticModel({ id: 'MiniMax-M2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
       staticModel({ id: 'MiniMax-M2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
     ],
     authMethods: [
@@ -182,9 +156,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Z.AI (Zhipu AI)',
     bamlProvider: 'anthropic',
     defaultBaseUrl: 'https://api.z.ai/api/anthropic',
-    defaultModel: 'glm-5',
-    defaultSecondaryModel: 'glm-5',
-    defaultBrowserModel: 'glm-5',
     models: [
       staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
       staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
@@ -198,9 +169,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Cerebras',
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'https://api.cerebras.ai/v1',
-    defaultModel: 'zai-glm-4.7',
-    defaultSecondaryModel: 'zai-glm-4.7',
-    defaultBrowserModel: 'zai-glm-4.7',
     models: [
       staticModel({ id: 'gpt-oss-120b', name: 'GPT-OSS 120B', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 32768, contextWindow: 131072 }),
     ],
@@ -213,7 +181,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Local',
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'http://localhost:1234/v1',
-    defaultModel: 'local-model',
     models: [],
     authMethods: [
       { type: 'none', label: 'Local (no auth required)' },

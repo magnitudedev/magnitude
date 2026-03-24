@@ -48,7 +48,7 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   rule(/^glm-5$/, ['lead', 'browser']),
 
   // MiniMax
-  rule(/^MiniMax-M2\.5$/, [...ALL_SLOTS]),
+  rule(/^MiniMax-M2\.7$/, [...ALL_SLOTS]),
 
   // Moonshot
   rule(/^kimi-k2\.5$/, [...ALL_SLOTS]),
