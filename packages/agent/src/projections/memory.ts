@@ -618,15 +618,19 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const roleDef = isValidVariant(value.type) ? getAgentDefinition(value.type) : undefined
       const idleReminder = roleDef?.lifecyclePrompts?.parentOnIdle
       const baseText = formatAgentIdleNotification(value.agentId, value.type, value.reason)
-      const text = idleReminder ? `${baseText}\n${idleReminder}` : baseText
+      const baseEntry: SystemEntry = { kind: 'reminder', text: baseText }
+      const entries: QueuedMessage[] = [{ kind: 'system' as const, timestamp: value.timestamp, entry: baseEntry }]
 
-      const entry: SystemEntry = { kind: 'reminder', text }
+      if (idleReminder) {
+        const idleEntry: SystemEntry = { kind: 'reminder', text: idleReminder }
+        entries.push({ kind: 'system' as const, timestamp: value.timestamp, entry: idleEntry })
+      }
 
       return {
         ...state,
         forks: new Map(state.forks).set(value.parentForkId, {
           ...parentState,
-          queuedMessages: [...parentState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
+          queuedMessages: [...parentState.queuedMessages, ...entries]
         })
       }
     }),
