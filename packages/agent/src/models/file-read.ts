@@ -25,7 +25,7 @@ export const fileReadModel = defineStateModel('fileRead', {
         return { ...state, phase: 'streaming', errorDetail: undefined }
       case 'inputUpdated':
       case 'inputReady':
-        return { ...state, phase: 'streaming', path: event.streaming.fields.path ?? state.path }
+        return { ...state, phase: 'streaming', path: event.streaming.path?.value ?? state.path }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

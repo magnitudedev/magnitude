@@ -25,6 +25,7 @@ export type {
   AttrNames,
   ChildTagNames,
   DeriveStreamingShape,
+  ChildAcc,
 } from './bindings'
 
 export { ToolErrorSchema } from './errors'
@@ -46,11 +47,11 @@ export {
 export type { ToolInterfaceResult, ToolInterfaceOptions, ToolGroupInterfaceOptions, AstGenOptions, KnownEntityInfo } from './ets'
 
 // New tool system contracts
-export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type AnyTool, type AnyToolDefinition } from './tool-definition'
+export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type AnyTool, type AnyToolDefinition, type StreamHook } from './tool-definition'
 export * from './tool-context'
 export * from './tool-state-event'
 export * from './tool-binding'
-export * from './streaming-input'
+export * from './streaming-partial'
 export * from './state-model'
 export { ToolCallState, createToolCallState } from './tool-call-state'
 export * from './composition'

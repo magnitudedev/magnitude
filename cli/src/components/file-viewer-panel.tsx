@@ -1,62 +1,17 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useMemo, useRef } from 'react'
 import { TextAttributes } from '@opentui/core'
 import { useTerminalDimensions } from '@opentui/react'
-import { useMountedRef } from '../hooks/use-mounted-ref'
-import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { useTheme } from '../hooks/use-theme'
-import { safeRenderableAccess, safeRenderableCall } from '../utils/safe-renderable-access'
-import { BOX_CHARS } from '../utils/ui-constants'
-import { MarkdownContent } from '../markdown/markdown-content'
-import { Button } from './button'
-import { slugify } from '../markdown/blocks'
+import { usePanelStreaming } from '../hooks/use-panel-streaming'
+import { useScrollToElement } from '../hooks/use-scroll-to-element'
+import type { FilePanelStream } from '../hooks/use-file-panel'
+import { StreamingMarkdownContent } from '../markdown/markdown-content'
 import { highlightFile } from '../markdown/highlight-file'
+import { slugify } from '../markdown/blocks'
 import { isMarkdownFile, renderCodeLines } from '../utils/file-lang'
-
-function CopyButton({ content, theme }: { content: string; theme: any }) {
-  const [copied, setCopied] = useState(false)
-  const [hovered, setHovered] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const safeTimeout = useSafeTimeout()
-
-  const handleCopy = useCallback(() => {
-    const proc = require('child_process').spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
-    proc.stdin.write(content)
-    proc.stdin.end()
-
-    setCopied(true)
-    safeTimeout.clear(timerRef.current)
-    timerRef.current = safeTimeout.set(() => setCopied(false), 2000)
-  }, [content, safeTimeout])
-
-  const color = copied ? theme.success : hovered ? theme.foreground : theme.muted
-
-  return (
-    <Button
-      onClick={handleCopy}
-      onMouseOver={() => setHovered(true)}
-      onMouseOut={() => setHovered(false)}
-    >
-      <text style={{ fg: color }}>
-        {copied ? '[✓]' : '[Copy]'}
-      </text>
-    </Button>
-  )
-}
-
-function CloseButton({ theme, onClose }: { theme: any; onClose: () => void }) {
-  const [hovered, setHovered] = useState(false)
-  const color = hovered ? theme.foreground : theme.muted
-
-  return (
-    <Button
-      onClick={onClose}
-      onMouseOver={() => setHovered(true)}
-      onMouseOut={() => setHovered(false)}
-    >
-      <text style={{ fg: color }}>[✕]</text>
-    </Button>
-  )
-}
+import { highlightCodeLines } from '../utils/file-panel-utils'
+import { BOX_CHARS } from '../utils/ui-constants'
+import { CloseButton, CopyButton } from './panel-buttons'
 
 interface FileViewerPanelProps {
   filePath: string
@@ -64,84 +19,35 @@ interface FileViewerPanelProps {
   scrollToSection?: string
   onClose: () => void
   onOpenFile?: (path: string, section?: string) => void
+  streaming?: FilePanelStream | null
 }
 
-
 export const FileViewerPanel = memo(function FileViewerPanel({
-  filePath, content, scrollToSection, onClose, onOpenFile,
+  filePath, content, scrollToSection, onClose, onOpenFile, streaming,
 }: FileViewerPanelProps) {
   const theme = useTheme()
   const { width: terminalWidth } = useTerminalDimensions()
   const scrollboxRef = useRef<any>(null)
-  const mountedRef = useMountedRef()
-  const safeTimeout = useSafeTimeout()
   const markdown = isMarkdownFile(filePath)
 
-  const displayedContent = useMemo(() => content ?? '', [content])
-  const copyContent = useMemo(() => content ?? '', [content])
+  const {
+    displayedContent,
+    showCursor,
+    highlightCharRanges,
+    highlightAnchorId,
+    copyContent,
+    isActivelyStreaming,
+  } = usePanelStreaming(streaming, content)
+
   const codeBlockWidth = Math.max(20, terminalWidth - 10)
-  const targetSectionScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const targetSectionId = useMemo(
     () => markdown && scrollToSection ? `section-${slugify(scrollToSection)}` : null,
     [markdown, scrollToSection],
   )
 
-  useEffect(() => {
-    safeTimeout.clear(targetSectionScrollTimeoutRef.current)
-    if (!targetSectionId) return
-
-    safeRenderableCall(
-      scrollboxRef.current,
-      (scrollbox) => {
-        scrollbox.stickyScroll = false
-      },
-      { mountedRef },
-    )
-
-    const doScroll = () => {
-      const offsetY = safeRenderableAccess(
-        scrollboxRef.current,
-        (scrollbox) => {
-          const contentNode = scrollbox.content
-          if (!contentNode) return null
-
-          const targetEl = contentNode.findDescendantById(targetSectionId)
-          if (!targetEl) return null
-
-          let offsetY = 0
-          let node: any = targetEl
-          while (node && node !== contentNode) {
-            const yogaNode = node.yogaNode || node.getLayoutNode?.()
-            if (yogaNode) {
-              offsetY += yogaNode.getComputedTop()
-            }
-            node = node.parent
-          }
-
-          return offsetY
-        },
-        {
-          mountedRef,
-          fallback: null,
-        },
-      )
-      if (offsetY == null) return
-
-      safeRenderableCall(
-        scrollboxRef.current,
-        (sb) => sb.scrollTo(offsetY),
-        { mountedRef },
-      )
-    }
-
-    targetSectionScrollTimeoutRef.current = safeTimeout.set(doScroll, 50)
-
-    return () => {
-      safeTimeout.clear(targetSectionScrollTimeoutRef.current)
-      targetSectionScrollTimeoutRef.current = null
-    }
-  }, [targetSectionId, mountedRef, safeTimeout])
+  useScrollToElement(scrollboxRef, targetSectionId)
+  useScrollToElement(scrollboxRef, highlightAnchorId, [displayedContent])
 
   const headerLabel = scrollToSection && markdown
     ? `≡  ${filePath} > ${scrollToSection}`
@@ -150,6 +56,10 @@ export const FileViewerPanel = memo(function FileViewerPanel({
   const codeLines = useMemo(
     () => highlightFile(displayedContent, filePath, theme.syntax),
     [displayedContent, filePath, theme.syntax],
+  )
+  const highlightedCodeLines = useMemo(
+    () => highlightCodeLines(codeLines, highlightCharRanges),
+    [codeLines, highlightCharRanges],
   )
 
   return (
@@ -197,14 +107,19 @@ export const FileViewerPanel = memo(function FileViewerPanel({
         }}
       >
         {markdown ? (
-          <MarkdownContent
+          <StreamingMarkdownContent
             content={displayedContent}
             onOpenFile={onOpenFile}
+            showCursor={showCursor}
+            highlightRanges={highlightCharRanges}
+            highlightAnchorId={highlightAnchorId}
+            streaming={isActivelyStreaming}
             codeBlockWidth={codeBlockWidth}
           />
         ) : (
           <box style={{ flexDirection: 'column' }}>
-            {codeLines.map((line, idx) => renderCodeLines(line, idx, theme.foreground))}
+            {highlightedCodeLines.map((line, idx) => renderCodeLines(line, idx, theme.foreground))}
+            {showCursor && <text style={{ fg: theme.foreground }}>▍</text>}
           </box>
         )}
       </scrollbox>

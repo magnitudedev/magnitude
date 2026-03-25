@@ -25,14 +25,24 @@ export const fileWriteModel = defineStateModel('fileWrite', {
     switch (event.type) {
       case 'started':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-      case 'inputReady': {
-        const content = event.streaming.body ?? ''
+      case 'inputUpdated': {
+        const content = event.streaming.content?.value ?? ''
         return {
           ...state,
           phase: 'streaming',
-          path: event.streaming.fields.path ?? state.path,
-          body: event.streaming.body ?? '',
+          path: event.streaming.path?.value ?? state.path,
+          body: content,
+          charCount: content.length,
+          lineCount: content.length > 0 ? content.split('\n').length : 0,
+        }
+      }
+      case 'inputReady': {
+        const content = event.input.content
+        return {
+          ...state,
+          phase: 'streaming',
+          path: event.input.path ?? state.path,
+          body: content,
           charCount: content.length,
           lineCount: content.length > 0 ? content.split('\n').length : 0,
         }

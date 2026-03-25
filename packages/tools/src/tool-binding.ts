@@ -1,6 +1,3 @@
-export interface ToolBinding<TInput, TStreaming> {
+export interface ToolBinding<TInput> {
   readonly _tool?: TInput;
-  readonly _streaming?: TStreaming;
 }
-
-export type BindingStreaming<B> = B extends ToolBinding<any, infer S> ? S : never;

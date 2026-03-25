@@ -1,5 +1,5 @@
-import type { FieldPath, StreamingInput, ToolBinding } from '@magnitudedev/tools'
-import type { DeriveChildren, DeriveFields } from './type-chain'
+import type { FieldPath, ToolBinding } from '@magnitudedev/tools'
+import { StreamingAccumulator, type StreamingAccumulatorConfig } from './streaming-accumulator'
 import type { XmlTagBinding } from './types'
 
 type ArrayElement<T> = T extends ReadonlyArray<infer E> ? E : never
@@ -61,7 +61,7 @@ export interface XmlMappingConfig<TInput, TOutput = unknown> {
 }
 
 export interface XmlBindingResult<TInput, TOutput, TMapping>
-  extends ToolBinding<TInput, StreamingInput<DeriveFields<TMapping>, DeriveChildren<TMapping>>> {
+  extends ToolBinding<TInput> {
   readonly tool: { name: string; group?: string }
   readonly config: TMapping
 
@@ -75,6 +75,8 @@ export interface XmlBindingResult<TInput, TOutput, TMapping>
    * Convert to the runtime output binding format.
    */
   toXmlOutputBinding(): XmlOutputBinding<TOutput>
+
+  createAccumulator(): StreamingAccumulator<TInput>
 }
 
 /**
@@ -98,7 +100,6 @@ export function defineXmlBinding<
 ): XmlBindingResult<TInput, TOutput, TMapping> {
   return {
     _tool: undefined,
-    _streaming: undefined,
     tool: { name: tool.name, group: config.group ?? tool.group },
     config,
     toXmlTagBinding() {
@@ -159,6 +160,25 @@ export function defineXmlBinding<
     toXmlOutputBinding() {
       const output: XmlOutputBinding<TOutput> = config.output ?? {}
       return output
+    },
+    createAccumulator() {
+      const input = config.input
+
+      const attrs: StreamingAccumulatorConfig['attrs'] = new Map()
+      for (const a of input.attributes ?? []) {
+        attrs.set(a.attr, { segments: a.field.split('.') })
+      }
+
+      const bodyField: StreamingAccumulatorConfig['bodyField'] = input.body
+        ? { segments: input.body.split('.') }
+        : null
+
+      const childFields: StreamingAccumulatorConfig['childFields'] = new Map()
+      for (const ct of input.childTags ?? []) {
+        childFields.set(ct.field, { segments: ct.field.split('.') })
+      }
+
+      return new StreamingAccumulator<TInput>({ attrs, bodyField, childFields })
     },
   }
 }

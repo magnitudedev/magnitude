@@ -1,5 +1,7 @@
 export type { Phase, BaseState, EditDiff } from '@magnitudedev/tools'
 
+export type { ToolState } from '../tools/tool-definitions'
+
 export { fileReadModel, type FileReadState } from './file-read'
 export { fileWriteModel, type FileWriteState } from './file-write'
 export { fileEditModel, type FileEditState } from './file-edit'
@@ -39,6 +41,7 @@ export {
   type ToolModelFor,
   type ToolStateFor,
   type ToolEventFor,
+  type BrowserToolKey,
 } from '../tools/tool-definitions'
 
 // Aliases for display compatibility

@@ -11,13 +11,10 @@
 
 import { Effect } from 'effect'
 import { Fork } from '@magnitudedev/event-core'
-import { join } from 'path'
 import type { InterceptorContext, InterceptorDecision } from '@magnitudedev/xml-act'
 import { ApprovalStateTag } from './approval-state'
 import { PermissionRejection } from './permission-rejection'
 import { classifyShellCommand, writesStayWithin, isGitAllowed } from '@magnitudedev/shell-classifier'
-import { validateAndApply, toEditDiff } from '../util/edit'
-import type { ToolDisplay } from '../events'
 import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
 import { PolicyContextProviderTag, type PolicyContext } from '../agents/types'
 
@@ -85,20 +82,6 @@ export function buildPermissionInterceptor(
           }))
         }
 
-        // Compute display data for edit before blocking on approval
-        let display: ToolDisplay | undefined
-        if (defKey === 'fileEdit') {
-          try {
-            const input = ctx.input as { path: string; oldString: string; newString: string; replaceAll?: boolean }
-            const fullPath = join(policyCtx.cwd, input.path)
-            const content = yield* Effect.promise(() => Bun.file(fullPath).text())
-            const applied = validateAndApply(content, input.oldString, input.newString, input.replaceAll ?? false)
-            display = { type: 'edit_diff' as const, path: input.path, diffs: [toEditDiff(applied, applied.result)] }
-          } catch {
-            // Fail silently — approval card shows without diff
-          }
-        }
-
         // Approve — request async approval (orchestrator only)
         const approvalDecision = yield* approvalState.requestApproval(
           ctx.toolCallId,
@@ -106,7 +89,7 @@ export function buildPermissionInterceptor(
           defKey,
           ctx.input,
           reason,
-          display
+          undefined
         )
 
         if (approvalDecision === 'approved') return { _tag: 'Proceed' } satisfies InterceptorDecision

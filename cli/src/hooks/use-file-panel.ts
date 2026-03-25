@@ -1,14 +1,39 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { resolveFileRef } from '@magnitudedev/agent'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  resolveFileRef,
+  type DisplayState,
+} from '@magnitudedev/agent'
 import { logger } from '@magnitudedev/logger'
 import { readFileSync, watchFile, unwatchFile } from 'node:fs'
+import { useFrozenBaseContent } from './use-frozen-base-content'
+import { findActiveFileStream } from '../utils/file-panel-utils'
 
 export interface SelectedFileRef {
   path: string
   section?: string
 }
 
+export type FileOperationStatus = 'receiving' | 'applying'
+
+export type FilePanelStream =
+  | {
+      mode: 'write'
+      status: FileOperationStatus
+      body: string
+      baseContent: string | null
+    }
+  | {
+      mode: 'edit'
+      status: FileOperationStatus
+      oldText: string
+      newText: string
+      replaceAll: boolean
+      streamingTarget: 'old' | 'new' | null
+      baseContent: string | null
+    }
+
 export interface UseFilePanelParams {
+  display: DisplayState | null
   workspacePath: string | null
   projectRoot: string
 }
@@ -16,13 +41,16 @@ export interface UseFilePanelParams {
 export interface UseFilePanelResult {
   selectedFile: SelectedFileRef | null
   selectedFileContent: string | null
+  selectedFileStreaming: FilePanelStream | null
   selectedFileResolvedPath: string | null
   isOpen: boolean
+  canRenderPanel: boolean
   openFile: (path: string, section?: string) => void
   closeFilePanel: () => void
 }
 
 export function useFilePanel({
+  display,
   workspacePath,
   projectRoot,
 }: UseFilePanelParams): UseFilePanelResult {
@@ -61,6 +89,21 @@ export function useFilePanel({
     }
   }, [selectedFile, selectedFileResolvedPath, projectRoot, workspacePath])
 
+  const activeStream = useMemo(() => {
+    if (!selectedFile || !display) return null
+    const byRaw = findActiveFileStream(display, selectedFile.path)
+    if (byRaw) return byRaw
+    if (selectedFileResolvedPath && selectedFileResolvedPath !== selectedFile.path) {
+      return findActiveFileStream(display, selectedFileResolvedPath)
+    }
+    return null
+  }, [selectedFile, selectedFileResolvedPath, display])
+
+  const hasActiveSelectedFileStreamRef = useRef(false)
+  useEffect(() => {
+    hasActiveSelectedFileStreamRef.current = activeStream != null
+  }, [activeStream])
+
   useEffect(() => {
     void readSelectedFileFromDisk()
   }, [selectedFileResolvedPath, readSelectedFileFromDisk])
@@ -69,6 +112,7 @@ export function useFilePanel({
     if (!selectedFileResolvedPath) return
 
     const onFileChanged = () => {
+      if (hasActiveSelectedFileStreamRef.current) return
       void readSelectedFileFromDisk()
     }
 
@@ -77,6 +121,40 @@ export function useFilePanel({
       unwatchFile(selectedFileResolvedPath, onFileChanged)
     }
   }, [selectedFileResolvedPath, readSelectedFileFromDisk])
+
+  const frozenBaseContent = useFrozenBaseContent(
+    activeStream ? { toolCallId: activeStream.toolCallId } : null,
+    selectedFileContent,
+    selectedFileResolvedPath,
+    readSelectedFileFromDisk,
+  )
+
+  const selectedFileStreaming = useMemo<FilePanelStream | null>(() => {
+    if (!activeStream) return null
+    const { state } = activeStream
+    const status: FileOperationStatus = state.phase === 'streaming' ? 'receiving' : 'applying'
+
+    const frozenBase = frozenBaseContent ?? selectedFileContent
+
+    if (state.toolKey === 'fileWrite') {
+      return {
+        mode: 'write',
+        status,
+        body: state.body,
+        baseContent: frozenBase,
+      }
+    }
+
+    return {
+      mode: 'edit',
+      status,
+      oldText: state.oldText,
+      newText: state.newText,
+      replaceAll: state.replaceAll,
+      streamingTarget: state.streamingTarget,
+      baseContent: frozenBase,
+    }
+  }, [activeStream, frozenBaseContent, selectedFileContent])
 
   const openFile = useCallback((path: string, section?: string) => {
     setSelectedFile(prev => prev?.path === path && prev?.section === section ? null : { path, section })
@@ -87,11 +165,15 @@ export function useFilePanel({
   }, [])
 
   const isOpen = selectedFile != null
+  const canRenderPanel = selectedFile != null && (selectedFileContent !== null || selectedFileStreaming !== null)
+
   return {
     selectedFile,
     selectedFileContent,
+    selectedFileStreaming,
     selectedFileResolvedPath,
     isOpen,
+    canRenderPanel,
     openFile,
     closeFilePanel,
   }

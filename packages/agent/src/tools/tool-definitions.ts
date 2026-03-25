@@ -19,18 +19,18 @@ export const TOOL_DEFINITIONS = {
   agentCreate: { key: 'agentCreate', model: agentCreateModel, display: false },
   agentKill: { key: 'agentKill', model: agentKillModel, display: false },
   skill: { key: 'skill', model: skillModel },
-  click: { key: 'click', model: clickModel },
-  doubleClick: { key: 'doubleClick', model: doubleClickModel },
-  rightClick: { key: 'rightClick', model: rightClickModel },
-  type: { key: 'type', model: typeModel },
-  scroll: { key: 'scroll', model: scrollModel },
-  drag: { key: 'drag', model: dragModel },
-  navigate: { key: 'navigate', model: navigateModel },
-  goBack: { key: 'goBack', model: goBackModel },
-  switchTab: { key: 'switchTab', model: switchTabModel },
-  newTab: { key: 'newTab', model: newTabModel },
-  screenshot: { key: 'screenshot', model: screenshotModel },
-  evaluate: { key: 'evaluate', model: evaluateModel },
+  click: { key: 'click', model: clickModel, group: 'browser' },
+  doubleClick: { key: 'doubleClick', model: doubleClickModel, group: 'browser' },
+  rightClick: { key: 'rightClick', model: rightClickModel, group: 'browser' },
+  type: { key: 'type', model: typeModel, group: 'browser' },
+  scroll: { key: 'scroll', model: scrollModel, group: 'browser' },
+  drag: { key: 'drag', model: dragModel, group: 'browser' },
+  navigate: { key: 'navigate', model: navigateModel, group: 'browser' },
+  goBack: { key: 'goBack', model: goBackModel, group: 'browser' },
+  switchTab: { key: 'switchTab', model: switchTabModel, group: 'browser' },
+  newTab: { key: 'newTab', model: newTabModel, group: 'browser' },
+  screenshot: { key: 'screenshot', model: screenshotModel, group: 'browser' },
+  evaluate: { key: 'evaluate', model: evaluateModel, group: 'browser' },
   'phase-submit': { key: 'phase-submit', model: phaseSubmitModel },
   'workflow-submit': { key: 'workflow-submit', model: phaseSubmitModel },
   'phase-verdict': { key: 'phase-verdict', model: phaseVerdictModel },
@@ -41,6 +41,10 @@ export type ToolKey = keyof ToolDefinitionMap
 export type ToolDefinitionFor<K extends ToolKey> = ToolDefinitionMap[K]
 export type ToolModelFor<K extends ToolKey> = ToolDefinitionFor<K>['model']
 export type ToolStateFor<K extends ToolKey> = ToolDefinitionFor<K>['model']['initial']
+export type ToolState = ToolStateFor<ToolKey>
+export type BrowserToolKey = {
+  [K in ToolKey]: ToolDefinitionMap[K] extends { group: 'browser' } ? K : never
+}[ToolKey]
 export type ToolEventFor<K extends ToolKey> = Parameters<ToolDefinitionFor<K>['model']['reduce']>[1]
 export function isToolKey(value: string): value is ToolKey {
   return Object.prototype.hasOwnProperty.call(TOOL_DEFINITIONS, value)

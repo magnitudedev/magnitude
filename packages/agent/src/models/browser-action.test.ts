@@ -8,7 +8,7 @@ describe('browser action model', () => {
       type: 'inputUpdated',
       changed: 'field',
       name: 'url',
-      streaming: { fields: { url: 'https://example.com' }, body: '', children: {} },
+      streaming: { url: { value: 'https://example.com', isFinal: true } },
     })
 
     expect(state.label).toBe('Navigate')
@@ -20,7 +20,10 @@ describe('browser action model', () => {
     const state = clickModel.reduce(started, {
       type: 'inputReady',
       input: { x: 10, y: 20 },
-      streaming: { fields: { x: '10', y: '20' }, body: '', children: {} },
+      streaming: {
+        x: { value: '10', isFinal: false },
+        y: { value: '20', isFinal: false },
+      },
     })
 
     expect(state.label).toBe('Click')

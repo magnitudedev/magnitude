@@ -18,6 +18,7 @@ import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 import { WorkingStateProjection, type PendingInboundCommunication } from './working-state'
 
 
+
 import { textOf } from '../content'
 import { createId } from '../util/id'
 
@@ -571,129 +572,6 @@ export function upsertStreamingCommunicationStep(
     ...stateWithBlock,
     messages: addStepToThinkBlock(stateWithBlock.messages, thinkBlockId, step)
   }
-}
-
-function isFileStreamToolKey(toolKey: ToolKey | undefined): toolKey is 'fileWrite' | 'fileEdit' {
-  return toolKey === 'fileWrite' || toolKey === 'fileEdit'
-}
-
-interface WritePreviewState {
-  path: string
-  phase: string
-  contentSoFar: string
-  charCount: number
-  lineCount: number
-}
-
-interface EditPreviewState {
-  path: string
-  phase: string
-  oldStringSoFar: string
-  newStringSoFar: string
-  replaceAll: boolean
-  childParsePhase: 'idle' | 'streaming_old' | 'streaming_new'
-}
-
-function hasFsWritePreview(
-  state: unknown,
-): state is WritePreviewState {
-  if (!state || typeof state !== 'object') return false
-  return 'path' in state
-    && typeof state.path === 'string'
-    && state.path.length > 0
-    && 'contentSoFar' in state
-    && typeof state.contentSoFar === 'string'
-}
-
-function hasEditPreview(
-  state: unknown,
-): state is EditPreviewState {
-  if (!state || typeof state !== 'object') return false
-  return 'path' in state
-    && typeof state.path === 'string'
-    && state.path.length > 0
-    && 'oldStringSoFar' in state
-    && typeof state.oldStringSoFar === 'string'
-}
-
-export interface InProgressFileView {
-  filePath: string
-  toolCallId: string
-  toolKey: 'fileWrite' | 'fileEdit'
-  forkId: string | null
-  phase: string
-  preview: {
-    mode: 'write'
-    contentSoFar: string
-    charCount: number
-    lineCount: number
-  } | {
-    mode: 'edit'
-    oldStringSoFar: string
-    newStringSoFar: string
-    replaceAll: boolean
-    childParsePhase: 'idle' | 'streaming_old' | 'streaming_new'
-  }
-}
-
-function collectFileStreams(
-  state: DisplayState,
-): InProgressFileView[] {
-  const streams: InProgressFileView[] = []
-
-  for (const message of state.messages) {
-    if (message.type !== 'think_block') continue
-
-    for (const step of message.steps) {
-      if (step.type !== 'tool' || !isFileStreamToolKey(step.toolKey)) continue
-
-      if (step.toolKey === 'fileWrite' && hasFsWritePreview(step.state)) {
-        const previewState = step.state
-        streams.push({
-          filePath: previewState.path,
-          toolCallId: step.id,
-          toolKey: step.toolKey,
-          forkId: null,
-          phase: previewState.phase,
-          preview: {
-            mode: 'write',
-            contentSoFar: previewState.contentSoFar,
-            charCount: previewState.charCount,
-            lineCount: previewState.lineCount,
-          },
-        })
-      }
-
-      if (step.toolKey === 'fileEdit' && hasEditPreview(step.state)) {
-        const previewState = step.state
-        streams.push({
-          filePath: previewState.path,
-          toolCallId: step.id,
-          toolKey: step.toolKey,
-          forkId: null,
-          phase: previewState.phase,
-          preview: {
-            mode: 'edit',
-            oldStringSoFar: previewState.oldStringSoFar,
-            newStringSoFar: previewState.newStringSoFar,
-            replaceAll: previewState.replaceAll,
-            childParsePhase: previewState.childParsePhase,
-          },
-        })
-      }
-    }
-  }
-
-  return streams
-}
-
-export function getInProgressFileStreams(
-  state: DisplayState,
-  resolvedPath?: string
-): InProgressFileView[] {
-  const streams = collectFileStreams(state)
-  if (!resolvedPath) return streams
-  return streams.filter(s => s.filePath === resolvedPath)
 }
 
 

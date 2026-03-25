@@ -37,13 +37,14 @@ export const fileSearchModel = defineStateModel('fileSearch', {
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
       case 'inputReady': {
-        const limitStr = event.streaming.fields.limit
+        const limitValue = event.streaming.limit?.value
+        const limitStr = typeof limitValue === 'string' ? limitValue : limitValue?.toString()
         return {
           ...state,
           phase: 'streaming',
-          pattern: event.streaming.fields.pattern ?? state.pattern,
-          path: event.streaming.fields.path ?? state.path,
-          glob: event.streaming.fields.glob ?? state.glob,
+          pattern: event.streaming.pattern?.value ?? state.pattern,
+          path: event.streaming.path?.value ?? state.path,
+          glob: event.streaming.glob?.value ?? state.glob,
           limit: limitStr ? parseInt(limitStr, 10) || undefined : state.limit,
         }
       }

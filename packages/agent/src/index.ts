@@ -86,8 +86,6 @@ export type { ForkCompactionState } from './projections/compaction'
 
 export {
   DisplayProjection,
-  getInProgressFileStreams,
-
 } from './projections/display'
 export type {
   DisplayState,
@@ -161,10 +159,13 @@ export type { Tool } from '@magnitudedev/tools'
 // Tools
 export type {
   ToolKey,
+  ToolDefinitionMap,
+  ToolDefinitionFor,
   ToolStateFor,
   ToolEventFor,
 } from './tools/tool-definitions'
 export type { ToolHandle, ToolState } from './tools/tool-handle'
+export type { FileEditState, FileWriteState } from './models'
 export { globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'
 export { shellBgTool, SHELL_BG_TOOLS } from './tools/shell-bg'

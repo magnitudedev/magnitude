@@ -1,10 +1,10 @@
-import type { SchemaAccumulator, ToolCallEvent, XmlToolResult } from '@magnitudedev/xml-act'
-import type { ToolStateEvent } from '@magnitudedev/tools'
+import type { ToolCallEvent, XmlToolResult } from '@magnitudedev/xml-act'
+import type { StreamingPartial, ToolStateEvent } from '@magnitudedev/tools'
 
-export function normalizeToolEvent<TInput, TOutput, TEmission, TStreaming>(
+export function normalizeToolEvent<TInput, TOutput, TEmission>(
   raw: ToolCallEvent,
-  acc: SchemaAccumulator
-): ToolStateEvent<TInput, TOutput, TEmission, TStreaming> | undefined {
+  streaming: StreamingPartial<TInput>,
+): ToolStateEvent<TInput, TOutput, TEmission> | undefined {
   switch (raw._tag) {
     case 'ToolInputStarted':
       return { type: 'started' }
@@ -15,10 +15,10 @@ export function normalizeToolEvent<TInput, TOutput, TEmission, TStreaming>(
       const changed = raw._tag === 'ToolInputFieldValue' ? 'field'
         : raw._tag === 'ToolInputBodyChunk' ? 'body' : 'child'
       const name = raw._tag === 'ToolInputFieldValue' ? String(raw.field) : undefined
-      return { type: 'inputUpdated', streaming: acc.current as TStreaming, changed, name }
+      return { type: 'inputUpdated', streaming, changed, name }
     }
     case 'ToolInputReady':
-      return { type: 'inputReady', input: raw.input as TInput, streaming: acc.current as TStreaming }
+      return { type: 'inputReady', input: raw.input as TInput, streaming }
     case 'ToolInputParseError': {
       const err = raw.error
       const detail = typeof err === 'object' && err !== null && 'detail' in err
@@ -36,15 +36,15 @@ export function normalizeToolEvent<TInput, TOutput, TEmission, TStreaming>(
     case 'ToolEmission':
       return { type: 'emission', value: raw.value as TEmission }
     case 'ToolExecutionEnded':
-      return normalizeToolResult<TInput, TOutput, TEmission, TStreaming>(raw.result)
+      return normalizeToolResult<TInput, TOutput, TEmission>(raw.result)
     case 'ToolObservation':
       return undefined
   }
 }
 
-function normalizeToolResult<TInput, TOutput, TEmission, TStreaming>(
+function normalizeToolResult<TInput, TOutput, TEmission>(
   result: XmlToolResult
-): ToolStateEvent<TInput, TOutput, TEmission, TStreaming> {
+): ToolStateEvent<TInput, TOutput, TEmission> {
   switch (result._tag) {
     case 'Success':
       return { type: 'completed', output: result.output as TOutput }

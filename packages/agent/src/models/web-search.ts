@@ -25,7 +25,7 @@ export const webSearchModel = defineStateModel('webSearch', {
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
       case 'inputReady':
-        return { ...state, phase: 'streaming', query: event.streaming.body ?? state.query }
+        return { ...state, phase: 'streaming', query: event.streaming.query?.value ?? state.query }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

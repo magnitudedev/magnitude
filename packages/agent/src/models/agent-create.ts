@@ -21,7 +21,7 @@ export const agentCreateModel = defineStateModel('agentCreate', {
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
       case 'inputReady':
-        return { ...state, phase: 'streaming', agentId: event.streaming.fields.agentId ?? state.agentId }
+        return { ...state, phase: 'streaming', agentId: event.streaming.agentId?.value ?? state.agentId }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

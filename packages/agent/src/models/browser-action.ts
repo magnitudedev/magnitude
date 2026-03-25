@@ -1,4 +1,5 @@
-import { defineStateModel, type BaseState, type ToolBinding } from '@magnitudedev/tools'
+import { defineStateModel, type BaseState, type StreamingPartial, type ToolBinding } from '@magnitudedev/tools'
+import type { BrowserToolKey } from '../tools/tool-definitions'
 import {
   clickTool,
   clickXmlBinding,
@@ -28,6 +29,7 @@ import {
 import { formatBrowserActionVisualFromStreaming } from '../tools/browser-action-visuals'
 
 export interface BrowserActionState extends BaseState {
+  toolKey: BrowserToolKey
   label?: string
   detail?: string
   errorDetail?: string
@@ -37,8 +39,7 @@ export interface BrowserActionModelConfig<
   K extends string,
   TInput,
   TOutput,
-  TEmission,
-  TStreaming extends { fields: Record<string, unknown>; body?: string | undefined }
+  TEmission
 > {
   readonly toolKey: K
   readonly tool: {
@@ -46,7 +47,7 @@ export interface BrowserActionModelConfig<
     outputSchema: { Type: TOutput }
     emissionSchema?: { Type: TEmission }
   }
-  readonly binding: ToolBinding<TInput, TStreaming>
+  readonly binding: ToolBinding<TInput>
 }
 
 const initial: Omit<BrowserActionState, 'phase' | 'toolKey'> = {
@@ -55,14 +56,29 @@ const initial: Omit<BrowserActionState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
+function unwrapStreamingLeaf(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value
+  if ('value' in value && 'isFinal' in value) {
+    return (value as { value: unknown }).value
+  }
+  return value
+}
+
+function normalizeStreamingInput(streaming: Record<string, unknown>): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(streaming)) {
+    normalized[key] = unwrapStreamingLeaf(value)
+  }
+  return normalized
+}
+
 export function createBrowserActionModel<
   K extends string,
   TInput,
   TOutput,
   TEmission,
-  TStreaming extends { fields: Record<string, unknown>; body?: string | undefined },
 >(
-  config: BrowserActionModelConfig<K, TInput, TOutput, TEmission, TStreaming>,
+  config: BrowserActionModelConfig<K, TInput, TOutput, TEmission>,
 ) {
   return defineStateModel(config.toolKey, {
     tool: config.tool,
@@ -75,8 +91,10 @@ export function createBrowserActionModel<
           return { ...state, phase: 'streaming', errorDetail: undefined }
         case 'inputUpdated':
         case 'inputReady': {
-          const fields = event.streaming.fields as Record<string, unknown>
-          const visual = formatBrowserActionVisualFromStreaming(config.toolKey, fields, event.streaming.body ?? undefined)
+          const visual = formatBrowserActionVisualFromStreaming(
+            config.toolKey,
+            normalizeStreamingInput(event.streaming as Record<string, unknown>),
+          )
           return {
             ...state,
             phase: 'streaming',

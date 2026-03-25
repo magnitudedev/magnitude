@@ -3,8 +3,8 @@ import { useTheme } from '../hooks/use-theme'
 import { BOX_CHARS } from '../utils/ui-constants'
 
 import { Button } from './button'
-import { DiffView, computeDiffStats } from './diff-view'
-import type { ApprovalRequestMessage, ToolDisplay } from '@magnitudedev/agent'
+import { DiffView } from './diff-view'
+import type { ApprovalRequestMessage } from '@magnitudedev/agent'
 
 interface ApprovalRequestProps {
   message: ApprovalRequestMessage
@@ -124,13 +124,11 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
 
   // Pending state — approval card with neutral border
   const lineCount = getLineCount(message.input)
-  const editDisplay = getEditDisplay(message)
-  const editStats = editDisplay ? computeDiffStats(editDisplay.diffs) : null
   const writeContent = getWriteContent(message)
   const writeDiffs = writeContent
     ? [{ startLine: 1, removedLines: [] as string[], addedLines: writeContent.split('\n'), contextBefore: [] as string[], contextAfter: [] as string[] }]
     : null
-  const hasContentPreview = !!(editDisplay || writeDiffs)
+  const hasContentPreview = !!writeDiffs
 
   return (
     <box style={{
@@ -142,12 +140,7 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
       paddingLeft: 1,
       paddingRight: 1,
     }}>
-      {renderPendingToolInfo(message.toolKey, message.input, theme, lineCount, editStats)}
-      {editDisplay && editDisplay.diffs.length > 0 && (
-        <box style={{ flexDirection: 'column', marginTop: 1 }}>
-          <DiffView diffs={editDisplay.diffs} />
-        </box>
-      )}
+      {renderPendingToolInfo(message.toolKey, message.input, theme, lineCount)}
       {writeDiffs && (
         <box style={{ flexDirection: 'column', marginTop: 1 }}>
           <DiffView diffs={writeDiffs} />
@@ -188,13 +181,6 @@ export const ApprovalRequest = memo(function ApprovalRequest({ message, onApprov
   )
 })
 
-function getEditDisplay(message: ApprovalRequestMessage): ToolDisplay & { type: 'edit_diff' } | null {
-  if (message.toolKey === 'fileEdit' && message.display?.type === 'edit_diff') {
-    return message.display as ToolDisplay & { type: 'edit_diff' }
-  }
-  return null
-}
-
 function getWriteContent(message: ApprovalRequestMessage): string | null {
   if (message.toolKey === 'fileWrite' && message.input && typeof message.input === 'object' && 'content' in message.input) {
     return (message.input as { content: string }).content
@@ -202,7 +188,7 @@ function getWriteContent(message: ApprovalRequestMessage): string | null {
   return null
 }
 
-function renderPendingToolInfo(toolKey: string, input: unknown, theme: ReturnType<typeof useTheme>, lineCount: number | null, editStats?: { totalRemoved: number; totalAdded: number; changeCount: number } | null) {
+function renderPendingToolInfo(toolKey: string, input: unknown, theme: ReturnType<typeof useTheme>, lineCount: number | null) {
   if (toolKey === 'shell' && input && typeof input === 'object' && 'command' in input) {
     const cmd = (input as { command: string }).command
     const shortCmd = cmd.length > 80 ? cmd.slice(0, 77) + '...' : cmd
@@ -234,20 +220,7 @@ function renderPendingToolInfo(toolKey: string, input: unknown, theme: ReturnTyp
         <span style={{ fg: theme.info }}>{'✎ '}</span>
         <span style={{ fg: theme.foreground }}>Edit </span>
         <span style={{ fg: theme.muted }}>{path}</span>
-        {editStats && (
-          <>
-            <span style={{ fg: theme.info }}>{` · ${editStats.changeCount} ${editStats.changeCount === 1 ? 'change' : 'changes'}`}</span>
-            {(editStats.totalRemoved > 0 || editStats.totalAdded > 0) && (
-              <span style={{ fg: theme.muted }}>
-                {' ('}
-                {editStats.totalRemoved > 0 && <span style={{ fg: theme.error }}>-{editStats.totalRemoved}</span>}
-                {editStats.totalRemoved > 0 && editStats.totalAdded > 0 && ', '}
-                {editStats.totalAdded > 0 && <span style={{ fg: theme.success }}>+{editStats.totalAdded}</span>}
-                {')'}
-              </span>
-            )}
-          </>
-        )}
+
       </text>
     )
   }

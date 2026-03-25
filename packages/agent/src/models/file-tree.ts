@@ -31,7 +31,7 @@ export const fileTreeModel = defineStateModel('fileTree', {
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
       case 'inputReady':
-        return { ...state, phase: 'streaming', path: event.streaming.fields.path ?? state.path }
+        return { ...state, phase: 'streaming', path: event.streaming.path?.value ?? state.path }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

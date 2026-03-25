@@ -34,7 +34,7 @@ export const shellModel = defineStateModel('shell', {
       case 'started':
         return { ...state, phase: 'streaming' as Phase, done: null }
       case 'inputUpdated':
-        return { ...state, command: event.streaming.body ?? state.command }
+        return { ...state, command: event.streaming.command?.value ?? state.command }
       case 'inputReady':
         return { ...state, command: event.input.command }
       case 'executionStarted':

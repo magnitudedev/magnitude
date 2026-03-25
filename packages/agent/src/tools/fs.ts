@@ -10,8 +10,7 @@ import { relative, resolve } from 'path'
 import { resolveRgPath } from '@magnitudedev/ripgrep'
 import { walk } from '../util/walk'
 import { createDefaultIgnore } from '../util/gitignore'
-import { validateAndApply, toEditDiff } from '../util/edit'
-import type { EditDiff } from '@magnitudedev/tools'
+import { validateAndApply } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 import { readImageFileForModel } from '../util/read-image-file'
 import { expandWorkspacePath } from '../workspace'
@@ -27,14 +26,6 @@ function fsError(message: string): FsError {
 }
 
 const FsErrorSchema = ToolErrorSchema('FsError', {})
-
-const EditDiffSchema = Schema.Struct({
-  startLine: Schema.Number,
-  removedLines: Schema.Array(Schema.String),
-  addedLines: Schema.Array(Schema.String),
-  contextBefore: Schema.Array(Schema.String),
-  contextAfter: Schema.Array(Schema.String),
-})
 
 // =============================================================================
 // fs.read()
@@ -177,12 +168,30 @@ export const editTool = defineTool({
   outputSchema: Schema.String,
   errorSchema: FsErrorSchema,
   emissionSchema: Schema.Struct({
-    type: Schema.Literal('edit_diff'),
+    type: Schema.Literal('file_edit_base_content'),
     path: Schema.String,
-    diffs: Schema.Array(EditDiffSchema),
+    baseContent: Schema.String,
   }),
+  stream: {
+    initial: { emitted: false },
+    onInput: (input, state, ctx) => Effect.gen(function* () {
+      if (state.emitted) return state
+      const path = input.path
+      if (!path || !path.isFinal) return state
+      const { cwd, workspacePath } = yield* WorkingDirectoryTag
+      const expandedPath = expandWorkspacePath(path.value, workspacePath)
+      const fullPath = resolve(cwd, expandedPath)
+      const content = yield* Effect.tryPromise({
+        try: () => Bun.file(fullPath).text(),
+        catch: () => new Error('read failed'),
+      }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
+      if (content == null) return state
+      yield* ctx.emit({ type: 'file_edit_base_content', path: path.value, baseContent: content })
+      return { emitted: true }
+    }),
+  },
   label: (input) => input.path ? `Editing ${input.path}` : 'Editing file...',
-  execute: ({ path, oldString, newString, replaceAll }, ctx) => Effect.gen(function* () {
+  execute: ({ path, oldString, newString, replaceAll }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
@@ -206,43 +215,6 @@ export const editTool = defineTool({
       try: () => Bun.write(fullPath, applied.result),
       catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
     })
-
-    // Emit diff(s) for UI
-    const diffs = (replaceAll ?? false)
-      ? (() => {
-          if (oldString.length === 0) return [toEditDiff(applied, applied.result)]
-          const oldLines = oldString.split('\n')
-          const newLines = newString.split('\n')
-          const perDiff: ReturnType<typeof toEditDiff>[] = []
-
-          let originalCursor = 0
-          let lineDelta = 0
-          while (true) {
-            const originalIdx = content.indexOf(oldString, originalCursor)
-            if (originalIdx === -1) break
-
-            const originalPrefix = content.slice(0, originalIdx)
-            const originalLine = originalPrefix.split('\n').length
-            const adjustedStartLine = originalLine + lineDelta
-
-            const perApplied = {
-              result: applied.result,
-              startLine: adjustedStartLine,
-              removedLines: oldLines,
-              addedLines: newLines,
-              replaceCount: 1,
-            }
-
-            perDiff.push(toEditDiff(perApplied, applied.result))
-
-            lineDelta += newLines.length - oldLines.length
-            originalCursor = originalIdx + oldString.length
-          }
-
-          return perDiff.length > 0 ? perDiff : [toEditDiff(applied, applied.result)]
-        })()
-      : [toEditDiff(applied, applied.result)]
-    yield* ctx.emit({ type: 'edit_diff', path, diffs })
 
     // Build summary
     if (applied.replaceCount > 1) {

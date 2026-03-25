@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, getInProgressFileStreams, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -456,28 +456,17 @@ function AppInner({
 
           // Track individual tool calls
           for (const tc of event.toolCalls) {
-            let linesAdded: number | undefined
-            let linesRemoved: number | undefined
             let linesWritten: number | undefined
 
-            if (tc.result.status === 'success' && tc.result.display) {
-              if (tc.result.display.type === 'edit_diff') {
-                linesAdded = tc.result.display.diffs.reduce((sum, d) => sum + d.addedLines.length, 0)
-                linesRemoved = tc.result.display.diffs.reduce((sum, d) => sum + d.removedLines.length, 0)
-                sessionTracker.recordLinesAdded(linesAdded)
-                sessionTracker.recordLinesRemoved(linesRemoved)
-              } else if (tc.result.display.type === 'write_stats') {
-                linesWritten = tc.result.display.linesWritten
-                sessionTracker.recordLinesWritten(linesWritten)
-              }
+            if (tc.result.status === 'success' && tc.result.display?.type === 'write_stats') {
+              linesWritten = tc.result.display.linesWritten
+              sessionTracker.recordLinesWritten(linesWritten)
             }
 
             trackToolUsage({
               toolName: tc.toolName,
               group: tc.group,
               status: tc.result.status,
-              linesAdded,
-              linesRemoved,
               linesWritten,
               forkId: event.forkId,
               agentRole,
@@ -1411,32 +1400,17 @@ function AppInner({
   const {
     selectedFile,
     selectedFileContent,
+    selectedFileStreaming,
     selectedFileResolvedPath,
     isOpen: isFilePanelOpen,
+    canRenderPanel,
     openFile,
     closeFilePanel,
   } = useFilePanel({
+    display: activeDisplay ?? display,
     workspacePath,
     projectRoot: process.cwd(),
   })
-
-  const inProgressStreams = useMemo(() => {
-    const state = activeDisplay ?? display
-    if (!state) return []
-    return getInProgressFileStreams(state, selectedFileResolvedPath ?? undefined)
-  }, [activeDisplay, display, selectedFileResolvedPath])
-
-  const inProgressFileContent = useMemo(() => {
-    if (inProgressStreams.length === 0) return null
-    const latest = inProgressStreams[inProgressStreams.length - 1]
-    if (!latest) return null
-    if (latest.preview.mode === 'write') return latest.preview.contentSoFar
-    if (latest.preview.mode === 'edit') return latest.preview.newStringSoFar
-    return null
-  }, [inProgressStreams])
-
-  const filePanelContent = inProgressFileContent ?? selectedFileContent
-  const canRenderPanel = selectedFile != null && filePanelContent !== null
 
   // Find active expanded think block for sticky header
   const activeThinkBlock = useMemo(() => {
@@ -1967,10 +1941,11 @@ function AppInner({
           <FileViewerPanel
             key={selectedFile.path}
             filePath={selectedFile.path}
-            content={filePanelContent}
+            content={selectedFileContent}
             scrollToSection={selectedFile.section}
             onClose={closeFilePanel}
             onOpenFile={openFile}
+            streaming={selectedFileStreaming}
           />
         </box>
       )}

@@ -121,5 +121,6 @@ export type { StreamingXmlParser, IdGenerator } from './parser/streaming-xml-par
 export type { ParseEvent, ParsedElement, ParsedChild, AttributeValue } from './parser/types'
 
 export { SchemaAccumulator } from './schema-accumulator'
+export { StreamingAccumulator, type StreamingAccumulatorConfig } from './streaming-accumulator'
 export { defineXmlBinding, type XmlBindingResult, type XmlMappingConfig, type XmlInputMappingConfig, type XmlOutputBinding } from './xml-binding'
 export type { DeriveStreamingShape, DeriveFields, DeriveChildren, AttrNames, ChildTagNames, ChildrenTagNames } from './type-chain'

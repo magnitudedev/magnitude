@@ -4,7 +4,6 @@ export interface ToolChain<
   TInput,
   TOutput,
   TEmission,
-  TStreaming,
 > {
   readonly tool: {
     inputSchema?: unknown;
@@ -13,7 +12,6 @@ export interface ToolChain<
   };
   readonly binding: {
     _tool?: TInput;
-    _streaming?: TStreaming;
   };
 }
 
@@ -22,10 +20,9 @@ export function attachModel<
   TInput,
   TOutput,
   TEmission,
-  TStreaming,
 >(
-  chain: ToolChain<TInput, TOutput, TEmission, TStreaming>,
-  model: StateModel<TState, TInput, TOutput, TEmission, TStreaming>,
+  chain: ToolChain<TInput, TOutput, TEmission>,
+  model: StateModel<TState, TInput, TOutput, TEmission>,
 ) {
   return { ...chain, model };
 }

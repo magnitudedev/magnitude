@@ -11,7 +11,6 @@ import {
   CompactionProjection,
   WorkingStateProjection,
   SessionContextProjection,
-  ArtifactProjection,
   ChatTitleProjection,
   ReplayProjection
 } from '@magnitudedev/agent'
@@ -298,7 +297,6 @@ const InspectAgent = Agent.define<AppEvent>()({
   name: 'SessionInspect',
   projections: [
     SessionContextProjection,
-    ArtifactProjection,
     ChatTitleProjection,
     WorkingStateProjection,
     CompactionProjection,
@@ -311,7 +309,6 @@ const InspectAgent = Agent.define<AppEvent>()({
   expose: {
     state: {
       sessionContext: SessionContextProjection,
-      artifact: ArtifactProjection,
       chatTitle: ChatTitleProjection,
       workingState: WorkingStateProjection,
       compaction: CompactionProjection,

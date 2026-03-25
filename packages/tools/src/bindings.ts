@@ -6,7 +6,15 @@
  * (OpenAI function calling, codegen/JS-ACT, XML-ACT).
  */
 
-import type { ChildAcc } from './streaming-input';
+/**
+ * Accumulated state of a child XML tag during streaming.
+ * Tracks the tag's body text, completion status, and attributes.
+ */
+export type ChildAcc = {
+  body: string;
+  complete: boolean;
+  attrs: Record<string, string>;
+};
 
 // =============================================================================
 // Utility Types

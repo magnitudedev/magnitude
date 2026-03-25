@@ -5,7 +5,9 @@ import { createToolDisplay } from '../types';
 import { Button } from '../../components/button';
 import { ShimmerText } from '../../components/shimmer-text';
 import { DiffHunk } from '../../components/diff-hunk';
+import { useStreamingReveal } from '../../hooks/use-streaming-reveal';
 import { useTheme } from '../../hooks/use-theme';
+
 
 const SHIMMER_INTERVAL_MS = 160;
 
@@ -13,10 +15,7 @@ export const diffDisplay = createToolDisplay<DiffState>({
   render: ({ state, isExpanded, onToggle, onFileClick }) => {
     const theme = useTheme();
     const path = state.path;
-    const oldText = state.oldText ?? '';
     const newText = state.newText ?? '';
-    const oldLines = oldText.length > 0 ? oldText.split('\n') : [];
-    const newLines = newText.length > 0 ? newText.split('\n') : [];
     const [isHovered, setIsHovered] = useState(false);
     const [isExpandHovered, setIsExpandHovered] = useState(false);
 
@@ -29,6 +28,14 @@ export const diffDisplay = createToolDisplay<DiffState>({
     const isStreaming = state.phase === 'streaming' || state.phase === 'executing';
     const isDone = state.phase === 'completed';
     const isError = state.phase === 'error' || state.phase === 'rejected' || state.phase === 'interrupted';
+
+    const isStreamingNew = isStreaming && state.streamingTarget === 'new';
+
+    // Progressive reveal of new text
+    const { displayedContent: revealedNewText } = useStreamingReveal(newText, isStreamingNew);
+
+    const streamingDiff = state.diffs[0];
+    const showStreamingDiff = isStreaming && !!streamingDiff;
 
     if (isDone) {
       return (
@@ -106,11 +113,13 @@ export const diffDisplay = createToolDisplay<DiffState>({
                 </>
               )}
             </text>
-            {isStreaming && oldLines.length > 0 && (
+            {showStreamingDiff && (
               <DiffHunk
-                removedLines={oldLines}
-                addedLines={newLines}
-                streamingCursor
+                contextBefore={streamingDiff.contextBefore}
+                removedLines={streamingDiff.removedLines}
+                addedLines={isStreamingNew ? revealedNewText.split('\n') : streamingDiff.addedLines}
+                contextAfter={streamingDiff.contextAfter}
+                streamingCursor={isStreamingNew}
               />
             )}
           </box>

@@ -23,7 +23,7 @@ export const webFetchModel = defineStateModel('webFetch', {
         return { ...state, phase: 'streaming', errorDetail: undefined }
       case 'inputUpdated':
       case 'inputReady':
-        return { ...state, phase: 'streaming', url: event.streaming.body ?? state.url }
+        return { ...state, phase: 'streaming', url: event.streaming.url?.value ?? state.url }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

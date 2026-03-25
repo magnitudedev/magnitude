@@ -1,10 +1,12 @@
+import type { StreamingPartial } from './streaming-partial'
+
 /**
  * Normalized tool state event stream consumed by state models.
  */
-export type ToolStateEvent<TInput, TOutput, TEmission, TStreaming> =
+export type ToolStateEvent<TInput, TOutput, TEmission> =
   | { type: 'started' }
-  | { type: 'inputUpdated'; streaming: TStreaming; changed: 'field' | 'body' | 'child'; name?: string }
-  | { type: 'inputReady'; input: TInput; streaming: TStreaming }
+  | { type: 'inputUpdated'; streaming: StreamingPartial<TInput>; changed: 'field' | 'body' | 'child'; name?: string }
+  | { type: 'inputReady'; input: TInput; streaming: StreamingPartial<TInput> }
   | { type: 'parseError'; error: string }
   | { type: 'awaitingApproval'; preview?: unknown }
   | { type: 'approvalGranted' }
@@ -17,4 +19,4 @@ export type ToolStateEvent<TInput, TOutput, TEmission, TStreaming> =
   | { type: 'interrupted' }
 
 /** @deprecated Use ToolStateEvent */
-export type ToolLifecycleEvent<TInput, TOutput, TEmission, TStreaming> = ToolStateEvent<TInput, TOutput, TEmission, TStreaming>;
+export type ToolLifecycleEvent<TInput, TOutput, TEmission> = ToolStateEvent<TInput, TOutput, TEmission>;

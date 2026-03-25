@@ -21,7 +21,7 @@ export const skillModel = defineStateModel('skill', {
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
       case 'inputReady':
-        return { ...state, phase: 'streaming', name: event.streaming.fields.name ?? state.name }
+        return { ...state, phase: 'streaming', name: event.streaming.name?.value ?? state.name }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

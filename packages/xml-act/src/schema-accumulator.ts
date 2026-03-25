@@ -1,11 +1,17 @@
-import type { ChildAcc, StreamingInput } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamingPartial } from '@magnitudedev/tools'
 import type { ToolCallEvent } from './types'
 
+type ChildAcc = {
+  body: string
+  complete: boolean
+  attrs: Record<string, string>
+}
+
 export class SchemaAccumulator<
-  TAccFields extends Record<string, string | undefined> = Record<string, string | undefined>,
+  TAccFields extends Record<string, unknown> = Record<string, unknown>,
   TAccChildren extends Record<string, ChildAcc[]> = Record<string, ChildAcc[]>
 > {
-  private _fields: Record<string, string> = {}
+  private _fields: Record<string, unknown> = {}
   private _body = ''
   private _children: Record<string, ChildAcc[]> = {}
 
@@ -22,7 +28,7 @@ export class SchemaAccumulator<
         break
       }
       case 'ToolInputFieldValue': {
-        this._fields[event.field] = String(event.value)
+        this._fields[event.field] = event.value
         break
       }
       case 'ToolInputBodyChunk': {
@@ -79,17 +85,37 @@ export class SchemaAccumulator<
   }
 
   /** Current accumulated snapshot */
-  get current(): StreamingInput<TAccFields, TAccChildren> {
+  get current(): StreamingPartial<TAccFields> {
+    const fields = Object.fromEntries(
+      Object.entries(this._fields).map(([key, value]) => [
+        key,
+        { isFinal: true, value } satisfies StreamingLeaf<unknown>,
+      ]),
+    )
+
+    const children = Object.fromEntries(
+      Object.entries(this._children).map(([key, value]) => [
+        key,
+        value.map((child) => ({
+          body: {
+            value: child.body,
+            isFinal: child.complete,
+          } satisfies StreamingLeaf<string>,
+          attrs: Object.fromEntries(
+            Object.entries(child.attrs).map(([attrKey, attrValue]) => [
+              attrKey,
+              { value: attrValue, isFinal: true } satisfies StreamingLeaf<string>,
+            ]),
+          ),
+        })),
+      ]),
+    )
+
     return {
-      fields: { ...this._fields } as Partial<TAccFields>,
-      body: this._body,
-      children: Object.fromEntries(
-        Object.entries(this._children).map(([key, value]) => [
-          key,
-          value.map((child) => ({ ...child, attrs: { ...child.attrs } })),
-        ]),
-      ) as StreamingInput<TAccFields, TAccChildren>['children'],
-    }
+      ...(fields as object),
+      body: { value: this._body, isFinal: false },
+      children,
+    } as unknown as StreamingPartial<TAccFields>
   }
 
   /** Reset for reuse */

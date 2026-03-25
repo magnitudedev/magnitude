@@ -6,7 +6,7 @@
  * forkId is REQUIRED (not optional) so TypeScript catches missing forkId at compile time.
  */
 
-import type { EditDiff } from './util/line-edit'
+
 import type { ContentPart } from './content'
 import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
@@ -268,7 +268,6 @@ export interface ToolEvent {
 }
 
 export type ToolDisplay =
-  | { readonly type: 'edit_diff'; readonly path: string; readonly diffs: readonly EditDiff[] }
   | { readonly type: 'gather'; readonly targetCount: number; readonly paths: readonly string[] }
   | { readonly type: 'write_stats'; readonly path: string; readonly linesWritten: number }
 

@@ -3,6 +3,15 @@ import type { Effect } from 'effect';
 import type { Tool } from './tool';
 import type { ToolContext } from './tool-context';
 
+export interface StreamHook<TInput, TEmission, TStreamState, E = never, R = never> {
+  readonly initial: TStreamState
+  readonly onInput: (
+    input: import('./streaming-partial').StreamingPartial<TInput>,
+    state: TStreamState,
+    ctx: ToolContext<TEmission>
+  ) => Effect.Effect<TStreamState, E, R>
+}
+
 /**
  * A tool definition — pure typed function with schemas.
  * No knowledge of XML, display, or lifecycle.
@@ -26,6 +35,7 @@ export interface ToolDefinition<
   readonly outputSchema: Schema.Schema<TOutput, TOutputEncoded, never>;
   readonly emissionSchema?: Schema.Schema<TEmission, TEmissionEncoded, never>;
   readonly errorSchema?: Schema.Schema<TError, TErrorEncoded, never>;
+  readonly stream?: StreamHook<TInput, TEmission, any, E, R>;
   readonly execute: (
     input: TInput,
     ctx: ToolContext<TEmission>
@@ -71,6 +81,7 @@ export interface ToolDefinitionConfig<
   outputSchema: Schema.Schema<TOutput, TOutputEncoded, never>;
   emissionSchema?: Schema.Schema<TEmission, TEmissionEncoded, never>;
   errorSchema?: Schema.Schema<TError, TErrorEncoded, never>;
+  stream?: StreamHook<TInput, TEmission, any, E, R>;
   execute: (
     input: TInput,
     ctx: ToolContext<TEmission>
@@ -128,6 +139,7 @@ export function defineTool<
     outputSchema: config.outputSchema,
     emissionSchema: config.emissionSchema,
     errorSchema: config.errorSchema,
+    stream: config.stream,
     execute: config.execute,
     label: config.label,
   };

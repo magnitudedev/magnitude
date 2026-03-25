@@ -1,33 +1,26 @@
 import type { StateModel } from './state-model';
 import type { ToolStateEvent } from './tool-state-event';
 
-export class ToolCallState<TState, TStreaming> {
+export class ToolCallState<TState> {
   state: TState;
-  streaming: TStreaming;
 
   constructor(
-    private readonly model: StateModel<TState, any, any, any, TStreaming>,
-    initialStreaming: TStreaming,
+    private readonly model: StateModel<TState, any, any, any>,
   ) {
     this.state = model.initial;
-    this.streaming = initialStreaming;
   }
 
-  dispatch(event: ToolStateEvent<any, any, any, TStreaming>): void {
+  dispatch(event: ToolStateEvent<any, any, any>): void {
     this.state = this.model.reduce(this.state, event);
-    if (event.type === 'inputUpdated' || event.type === 'inputReady') {
-      this.streaming = event.streaming;
-    }
   }
 
-  snapshot(): { state: TState; streaming: TStreaming } {
-    return { state: this.state, streaming: this.streaming };
+  snapshot(): { state: TState } {
+    return { state: this.state };
   }
 }
 
-export function createToolCallState<TState, TStreaming>(
-  model: StateModel<TState, any, any, any, TStreaming>,
-  initialStreaming: TStreaming,
-): ToolCallState<TState, TStreaming> {
-  return new ToolCallState(model, initialStreaming);
+export function createToolCallState<TState>(
+  model: StateModel<TState, any, any, any>,
+): ToolCallState<TState> {
+  return new ToolCallState(model);
 }

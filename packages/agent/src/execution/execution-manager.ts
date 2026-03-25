@@ -59,7 +59,7 @@ import type { TurnEvent } from './types'
 import { ToolReminderTag } from './tool-reminder'
 import { WorkingDirectoryTag } from './working-directory'
 import { ToolExecutionContextTag } from './tool-execution-context'
-import type { Tool, AnyTool } from '@magnitudedev/tools'
+import type { Tool, AnyTool, StreamingLeaf, StreamingPartial } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -383,14 +383,17 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolReminderRef = toolReminderRefs.get(forkId)!
 
 
-      // Build tool tagName → defKey lookup and defKey → tool lookup
+      // Build tool tagName → defKey lookup and tagName → tool lookup
+      // Use registeredTools metadata so both legacy and defineTool tools are covered.
       const tagToDefKey = new Map<string, string>()
-      const tagToTool = new Map<string, Tool.Any>()
-      for (const [defKey, tool] of Object.entries(agentDef.tools)) {
-        if (!tool) continue
-        if (isToolAny(tool)) {
-          const tagName = defaultXmlTagName(tool)
-          tagToDefKey.set(tagName, defKey)
+      const tagToTool = new Map<string, AnyTool>()
+      for (const [tagName, registered] of registeredTools.entries()) {
+        const meta = registered.meta as Record<string, unknown> | undefined
+        const defKey = typeof meta?.defKey === 'string' ? meta.defKey : undefined
+        if (!defKey) continue
+        tagToDefKey.set(tagName, defKey)
+        const tool = agentDef.tools[defKey]
+        if (tool) {
           tagToTool.set(tagName, tool)
         }
       }
@@ -431,6 +434,19 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Position counter for tool events
       let positionCounter = 0
+
+      // Streaming hook state per tool call
+      const streamHookStates = new Map<string, unknown>()
+      const streamHookConfigs = new Map<string, {
+        onInput: (
+          input: StreamingPartial<Record<string, unknown>>,
+          state: unknown,
+          ctx: { emit: (value: unknown) => Effect.Effect<void> }
+        ) => Effect.Effect<unknown, unknown, unknown>
+        initial: unknown
+      }>()
+      // Simple field accumulator for streaming partial input
+      const streamingFields = new Map<string, Record<string, StreamingLeaf<unknown>>>()
 
       // Track tag names for ToolStarted events
       const toolCallTagNames = new Map<string, string>()
@@ -481,6 +497,22 @@ const makeExecutionManager = Effect.gen(function* () {
                 toolCallTagNames.set(event.toolCallId, event.tagName)
                 toolCallKeys.set(event.toolCallId, toolKey)
 
+                // Check for stream hook
+                const tool = tagToTool.get(event.tagName)
+                if (tool && 'stream' in tool && (tool as any).stream) {
+                  const streamConfig = (tool as any).stream as {
+                    onInput: (
+                      input: StreamingPartial<Record<string, unknown>>,
+                      state: unknown,
+                      ctx: { emit: (value: unknown) => Effect.Effect<void> }
+                    ) => Effect.Effect<unknown, unknown, unknown>
+                    initial: unknown
+                  }
+                  streamHookStates.set(event.toolCallId, streamConfig.initial)
+                  streamHookConfigs.set(event.toolCallId, streamConfig)
+                  streamingFields.set(event.toolCallId, {})
+                }
+
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -495,6 +527,34 @@ const makeExecutionManager = Effect.gen(function* () {
                 toolInputs.set(event.toolCallId, event.input)
 
                 const toolKey = toolCallKeys.get(event.toolCallId) ?? event.toolCallId
+
+                const fields = streamingFields.get(event.toolCallId)
+                if (fields) {
+                  for (const [key, field] of Object.entries(fields)) {
+                    if (!field.isFinal) fields[key] = { value: field.value, isFinal: true }
+                  }
+                }
+
+                const streamConfig = streamHookConfigs.get(event.toolCallId)
+                if (streamConfig) {
+                  const currentState = streamHookStates.get(event.toolCallId)
+                  const partialInput = streamingFields.get(event.toolCallId) ?? {}
+                  const streamCtx = {
+                    emit: (value: unknown) => Queue.offer(sink, {
+                      _tag: 'ToolEvent' as const,
+                      toolCallId: event.toolCallId,
+                      toolKey,
+                      event: { _tag: 'ToolEmission' as const, toolCallId: event.toolCallId, value },
+                    }),
+                  }
+                  const streamEffect = streamConfig.onInput(partialInput, currentState, streamCtx) as Effect.Effect<unknown, unknown, any>
+                  const newState = yield* (streamEffect.pipe(
+                    Effect.provide(executionLayer),
+                    Effect.catchAll(() => Effect.succeed(currentState)),
+                  ) as Effect.Effect<unknown, never, never>)
+                  streamHookStates.set(event.toolCallId, newState)
+                }
+
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -572,6 +632,9 @@ const makeExecutionManager = Effect.gen(function* () {
                 lastToolKey = toolKey
 
                 toolInputs.delete(event.toolCallId)
+                streamHookStates.delete(event.toolCallId)
+                streamHookConfigs.delete(event.toolCallId)
+                streamingFields.delete(event.toolCallId)
 
                 // Read and clear tool reminders
                 const reminders = yield* Ref.getAndSet(toolReminderRef, [])
@@ -602,6 +665,59 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ToolInputChildStarted':
               case 'ToolInputChildComplete': {
                 const toolKey = toolCallKeys.get(event.toolCallId) ?? event.toolCallId
+
+                // Accumulate fields for stream hook
+                if (event._tag === 'ToolInputFieldValue') {
+                  const fields = streamingFields.get(event.toolCallId)
+                  if (fields) {
+                    fields[event.field] = { value: event.value, isFinal: true }
+                  }
+                }
+
+                if (event._tag === 'ToolInputChildStarted') {
+                  const fields = streamingFields.get(event.toolCallId)
+                  if (fields) {
+                    fields[event.field] = { value: '', isFinal: false }
+                  }
+                }
+
+                if (event._tag === 'ToolInputChildComplete') {
+                  const fields = streamingFields.get(event.toolCallId)
+                  if (fields && fields[event.field]) {
+                    fields[event.field] = { value: fields[event.field]!.value, isFinal: true }
+                  }
+                }
+
+                if (event._tag === 'ToolInputBodyChunk') {
+                  const fields = streamingFields.get(event.toolCallId)
+                  if (fields) {
+                    const existing = fields._body
+                    const prior = typeof existing?.value === 'string' ? existing.value : ''
+                    fields._body = { value: `${prior}${event.text}`, isFinal: false }
+                  }
+                }
+
+                // Invoke stream hook if present
+                const streamConfig = streamHookConfigs.get(event.toolCallId)
+                if (streamConfig) {
+                  const currentState = streamHookStates.get(event.toolCallId)
+                  const partialInput = streamingFields.get(event.toolCallId) ?? {}
+                  const streamCtx = {
+                    emit: (value: unknown) => Queue.offer(sink, {
+                      _tag: 'ToolEvent' as const,
+                      toolCallId: event.toolCallId,
+                      toolKey,
+                      event: { _tag: 'ToolEmission' as const, toolCallId: event.toolCallId, value },
+                    }),
+                  }
+                  const streamEffect = streamConfig.onInput(partialInput, currentState, streamCtx) as Effect.Effect<unknown, unknown, any>
+                  const newState = yield* (streamEffect.pipe(
+                    Effect.provide(executionLayer),
+                    Effect.catchAll(() => Effect.succeed(currentState)),
+                  ) as Effect.Effect<unknown, never, never>)
+                  streamHookStates.set(event.toolCallId, newState)
+                }
+
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
