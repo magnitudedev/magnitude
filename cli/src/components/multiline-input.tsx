@@ -1725,6 +1725,9 @@ export const MultilineInput = forwardRef<
         (key: KeyEvent) => {
           if (!focused) return
 
+          // Ensure scrollbox has TUI focus so paste events are delivered (no-op if already focused)
+          safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.focus?.(), { mountedRef })
+
           const selectedSegment = findSegmentById(
             sortedPasteSegments,
             selectedPasteSegmentId,

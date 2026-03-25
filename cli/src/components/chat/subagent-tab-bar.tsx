@@ -166,6 +166,7 @@ export const SubagentTabBar = memo(function SubagentTabBar({ tabs, selectedForkI
 
       <scrollbox
         ref={scrollBoxRef}
+        focusable={false}
         scrollX={true}
         scrollbarOptions={{ visible: false }}
         horizontalScrollbarOptions={{ visible: false }}
