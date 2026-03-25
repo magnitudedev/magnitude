@@ -75,7 +75,7 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
     case 'body-capture':
       return [replace({ ...frame, body: frame.body + text })]
     case 'container':
-      if (frame.tag === 'comms' && text.length > 0) {
+      if (frame.tag === 'comms' && text.trim().length > 0) {
         return [emit({ _tag: 'ProseChunk', patternId: 'prose', text })]
       }
       return []

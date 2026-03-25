@@ -10,6 +10,33 @@ export function appendTopProse(stack: ReadonlyArray<XmlActFrame>, text: string):
     return [emit({ _tag: 'ProseChunk', patternId: 'prose', text })]
   }
   const prose: ProseFrame = top
+
+  // At the start of a new prose section, skip leading whitespace
+  if (prose.body === '' && prose.pendingNewlines === 0) {
+    const stripped = text.replace(/^[ \t\r\n]+/, '')
+    if (stripped.length === 0) return []
+    return [
+      replace({ type: 'prose', body: stripped, pendingNewlines: 0 }),
+      emit({ _tag: 'ProseChunk', patternId: 'prose', text: stripped }),
+    ]
+  }
+
+  // If body is still empty but we have pending newlines, check if adding
+  // this text would result in non-whitespace content
+  if (prose.body === '' && prose.pendingNewlines > 0) {
+    const stripped = text.replace(/^[ \t\r\n]+/, '')
+    if (stripped.length === 0) {
+      // Still all whitespace — keep deferring
+      return [replace({ type: 'prose', body: '', pendingNewlines: prose.pendingNewlines + text.split('\n').length - 1 })]
+    }
+    // Has real content — emit with prefix
+    const prefix = '\n'.repeat(prose.pendingNewlines)
+    return [
+      replace({ type: 'prose', body: stripped, pendingNewlines: 0 }),
+      emit({ _tag: 'ProseChunk', patternId: 'prose', text: stripped }),
+    ]
+  }
+
   const prefix = prose.pendingNewlines > 0 ? '\n'.repeat(prose.pendingNewlines) : ''
   const full = prefix + text
   return [
