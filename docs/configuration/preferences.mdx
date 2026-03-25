@@ -15,7 +15,7 @@ Magnitude creates `~/.magnitude/` automatically to store your local settings, cr
 | `sessions/` | Session history |
 | `logs/` | CLI and event logs |
 | `skills/` | Global Magnitude skills |
-| `models-cache.json` | Cached model list |
+| `model-catalog/` | Model catalog cache |
 | `traces/` | Debug trace data |
 
 ## `config.json`
@@ -31,10 +31,16 @@ It also stores model selections, provider options, `machineId`, and `setupComple
 
 ```json
 {
-  "primaryModel": { "providerId": "anthropic", "modelId": "claude-opus-4-6" },
-  "secondaryModel": { "providerId": "openai", "modelId": "gpt-5.3-codex" },
-  "browserModel": { "providerId": "anthropic", "modelId": "claude-haiku-4-5-20251001" },
-  "providerOptions": {
+  "roles": {
+    "lead": { "model": { "providerId": "anthropic", "modelId": "claude-opus-4-6" } },
+    "explorer": { "model": { "providerId": "anthropic", "modelId": "claude-sonnet-4-6" } },
+    "planner": { "model": { "providerId": "anthropic", "modelId": "claude-sonnet-4-6" } },
+    "builder": { "model": { "providerId": "anthropic", "modelId": "claude-sonnet-4-6" } },
+    "reviewer": { "model": { "providerId": "anthropic", "modelId": "claude-sonnet-4-6" } },
+    "debugger": { "model": { "providerId": "anthropic", "modelId": "claude-sonnet-4-6" } },
+    "browser": { "model": { "providerId": "anthropic", "modelId": "claude-haiku-4-5" } }
+  },
+  "providers": {
     "local": { "baseUrl": "http://localhost:1234/v1", "modelId": "qwen2.5-coder" }
   },
   "setupComplete": true,
@@ -66,10 +72,6 @@ Run `/init` to generate an `AGENTS.md` file that gives Magnitude context about y
 ## `logs/`
 
 `~/.magnitude/logs/` stores CLI and event logs. You can inspect them with `bun logs`.
-
-## `models-cache.json`
-
-`~/.magnitude/models-cache.json` stores cached model metadata. You can delete it to force a refresh.
 
 ## `traces/`
 

@@ -22,7 +22,7 @@ Returns:
 </shell>
 ```
 
-- Commands run with a 30-second timeout
+- Commands run with a 10-second timeout
 - Output is capped at 10MB
 - Returns stdout, stderr, and exit code
 
@@ -43,7 +43,7 @@ Forbidden commands include:
 - Package registry publishing (`npm publish`, `cargo publish`, and similar)
 - Dangerous Git operations (force push, reset, and similar)
 
-Non-read-only Git commands are always blocked.
+Read-only Git commands (like `git status`, `git log`, and `git diff`) are always allowed. All other Git commands are blocked.
 
 ## Path safety
 
@@ -55,6 +55,9 @@ Not all agents have the same access:
 
 - **Explorer** and **Planner** are read-only (read-only shell only, no file writes)
 - **Builder** and **Debugger** can write files and run standard shell commands within the working directory
-- The **Orchestrator** has the broadest access, but is still subject to shell safety rules
+- **Reviewer** has read-only shell access (like Explorer/Planner), but can also spawn browser agents for visual verification
+- The **team lead** has the broadest access, but is still subject to shell safety rules
+
+All agents can read and write to the session workspace (`$M`) regardless of their file access level. "Read-only" refers to project files only.
 
 <Info>If a command is blocked that you need, you can run it yourself in bash mode (`/bash`) or a separate terminal.</Info>

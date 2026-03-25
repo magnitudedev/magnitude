@@ -41,3 +41,11 @@ These commands let you list sessions, inspect event timelines, search payloads, 
 <Warning>
 Session files are source data for inspection. Avoid manual edits unless you're doing controlled debugging.
 </Warning>
+
+## Context compaction
+
+When a conversation gets long, Magnitude automatically compacts context to stay within model limits. Old messages are summarized and recent messages are kept — the session continues without interruption.
+
+You may briefly see an indicator in the context bar while compaction is running. No action is needed; it's fully automatic and transparent.
+
+Each subagent compacts its context independently.

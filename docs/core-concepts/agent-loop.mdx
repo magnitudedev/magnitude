@@ -1,12 +1,14 @@
 ---
 title: Overview
-description: "How Magnitude's orchestrator and subagents work together"
+description: "How the team lead and subagents work together"
 icon: workflow
 ---
 
-## The orchestrator
+## The team lead
 
-The orchestrator is the agent you interact with directly. For quick tasks, it can read files, run commands, and make small edits on its own. For anything substantial, it deploys **subagents** — specialized agents that run in parallel on isolated forks.
+The team lead is the agent you interact with directly. It coordinates your session, delegates to subagents, and keeps your intent in focus across longer tasks.
+
+The team lead is designed to gather context and confirm its approach before making changes, keeping you in control. Before acting, it explores, communicates its assumptions, and checks in with you — so you can redirect early rather than undo later.
 
 ## The loop
 
@@ -14,18 +16,18 @@ A typical workflow looks like:
 
 ```
 You send a message
-  → Orchestrator deploys an explorer to investigate the codebase
-  → Orchestrator discusses findings with you
-  → Orchestrator deploys a planner
-  → You confirm the approach
-  → Orchestrator deploys a builder
-  → Orchestrator deploys a reviewer to verify
+  → Team lead deploys an explorer to investigate
+  → Team lead discusses findings and proposes an approach
+  → You confirm (or redirect)
+  → Team lead deploys builder(s) to implement
+  → Team lead deploys a reviewer to verify
   → Back to conversation
 ```
 
-Not every task needs every step — the orchestrator adapts based on complexity. Simple questions get answered directly. Large changes get the full explore → plan → build → review treatment.
+Not every task needs every step — the team lead adapts based on complexity. Simple questions get answered directly. Quick fixes may skip exploration. Large changes get the full explore → plan → build → review treatment.
 
 ## Subagents
 
-The orchestrator can deploy [6 types of subagents](/core-concepts/subagents), each specialized for a different job. Multiple subagents can run in parallel, and they share context through [artifacts](/core-concepts/artifacts).
+The team lead delegates to [six types of subagents](/core-concepts/subagents), each specialized for a different job. Multiple subagents can run in parallel, each with its own context, tools, and model.
 
+Subagents report back when they finish. You can watch their progress in the subagent tabs, send them direct messages, or interrupt them if needed.

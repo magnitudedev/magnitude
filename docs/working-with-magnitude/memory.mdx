@@ -10,9 +10,11 @@ Magnitude learns your preferences and conventions over time. It stores what it l
 
 ## How it works
 
-At the end of each session, Magnitude extracts key preferences and patterns from the conversation and saves them to `.magnitude/memory.md` in your project directory.
+At the end of each session, Magnitude extracts key preferences and patterns from the conversation and saves them to `.magnitude/memory.md` in your **project directory** (i.e. `<cwd>/.magnitude/memory.md`).
 
 In future sessions, this file is loaded as context so the agent remembers your preferences.
+
+Because memory lives in your project directory, you can commit it to git and share it with your team. Everyone on the project benefits from the same accumulated preferences and conventions.
 
 ## What gets remembered
 

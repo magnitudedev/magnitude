@@ -15,6 +15,8 @@ Read the contents of a file.
 ```
 
 - **path** — relative path from your project root
+- **offset** — optional; 1-indexed line number to start reading from
+- **limit** — optional; maximum number of lines to return (default `2000`)
 
 ## fs write
 
@@ -79,3 +81,15 @@ Search file contents with regex.
 - **path** — optional directory to scope the search
 - **glob** — optional file filter (e.g. `"*.ts"`)
 - **limit** — optional maximum number of matches (default `50`)
+
+## fs view
+
+Read an image file for visual inspection.
+
+```xml
+<fs-view path="screenshots/error.png" />
+```
+
+- **path** — relative path to the image file
+- Supports PNG, JPEG, WebP, GIF, and SVG
+- Returns the image as visual output — useful for inspecting screenshots, diagrams, or design assets

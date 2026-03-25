@@ -10,9 +10,9 @@ Magnitude supports a wide range of LLM providers. You can configure them through
 
 | Provider | Auth method | Environment variable |
 |----------|------------|---------------------|
-| OpenAI | OAuth (ChatGPT Plus/Pro), API key | `OPENAI_API_KEY` |
+| OpenAI | Subscription (ChatGPT Plus/Pro), API key | `OPENAI_API_KEY` |
 | Anthropic | API key | `ANTHROPIC_API_KEY` |
-| GitHub Copilot | OAuth (GitHub) | — |
+| GitHub Copilot | Subscription (GitHub) | — |
 | Google (Gemini) | API key | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | OpenRouter | API key | `OPENROUTER_API_KEY` |
 | Vercel AI Gateway | API key | `VERCEL_API_KEY` |
@@ -36,7 +36,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 You can also enter API keys through the `/settings` overlay — they'll be stored locally in your Magnitude config.
 
-### OAuth (Subscriptions)
+### Subscriptions
 
 #### OpenAI
 
@@ -48,8 +48,6 @@ If you have a ChatGPT Plus or Pro subscription:
 4. Pick your preferred method:
    - **Browser** — opens a browser window to authenticate
    - **Device code** — gives you a URL and code to enter manually, useful for headless environments
-
-<Info>OpenAI OAuth gives you access to newer models like GPT-5.3 Codex that aren't available via API key.</Info>
 
 #### GitHub Copilot
 
@@ -89,22 +87,28 @@ The default endpoint is `http://localhost:1234/v1` (LM Studio's default). To con
 2. Select "Local"
 3. Configure the base URL for your local server if different from default
 
-<Warning>Local models vary significantly in quality. For best results, use a near frontier model as your primary model.</Warning>
+<Warning>Local models vary significantly in quality. For best results, use a near frontier model as your lead model.</Warning>
 
 ## Model slots
 
-Magnitude uses three model slots that work together:
+Magnitude uses seven model slots — one for each agent role:
 
-- **Primary model** — powers the orchestrator and the builder. This should be your smartest, strongest model.
-- **Secondary model** — powers some of the subagents and secondary operations. This should be a faster but still capable model.
-- **Browser agent model** — powers the browser agent. This must be a visually grounded model. To see the full list of supported browser agent models, [click here](#visually-grounded-models).
+- **Lead** — the team lead you interact with directly. Use your strongest model here.
+- **Explorer** — codebase investigation. Fast and capable.
+- **Planner** — converts findings into implementation plans. Fast and capable.
+- **Builder** — performs code changes. Fast and capable.
+- **Reviewer** — validates quality and completion. Fast and capable.
+- **Debugger** — diagnoses failures. Fast and capable.
+- **Browser** — visual browser tasks. Must be a visually grounded model. To see the full list of supported browser agent models, [click here](#visually-grounded-models).
+
+Configure each slot independently via `/settings`. The setup wizard sets sensible defaults based on your provider: a strong model for the lead, a fast capable model for subagents (explorer, planner, builder, reviewer, debugger), and a visually capable model for the browser agent.
 
 ## Default models by provider
 
-| Provider | Primary | Secondary | Browser Agent |
-|----------|---------|-----------|---------------|
-| OpenAI (OAuth) | GPT-5.3 Codex | GPT-5.3 Codex Spark | GPT-5.3 Codex |
-| OpenAI (API key) | GPT-5.3 Codex | GPT-5.3 Codex | GPT-5.3 Codex |
+| Provider | Lead | Subagents | Browser |
+|----------|------|-----------|---------|
+| OpenAI (OAuth) | GPT-5.4 | GPT-5.3 Codex | GPT-5.3 Codex |
+| OpenAI (API key) | GPT-5.4 | GPT-5.3 Codex | GPT-5.3 Codex |
 | Anthropic | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
 | GitHub Copilot | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
 | Google (Gemini) | Gemini 3.1 Pro | Gemini 3 Flash | Gemini 3 Flash |
@@ -114,10 +118,8 @@ Magnitude uses three model slots that work together:
 | Vertex AI (Anthropic) | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
 | Amazon Bedrock | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
 | Cerebras | ZAI GLM-4.7 | ZAI GLM-4.7 | ZAI GLM-4.7 |
-| MiniMax | MiniMax M2.5 | MiniMax M2.5 | MiniMax M2.5 |
+| MiniMax | MiniMax M2.7 | MiniMax M2.7 | MiniMax M2.7 |
 | Z.AI | GLM-5 | GLM-5 | GLM-5 |
-
-<Info>Model lists are fetched dynamically from [models.dev](https://models.dev) and cached locally for 60 minutes. You'll always see the latest available models.</Info>
 
 ## Switching models
 
@@ -182,7 +184,8 @@ Most modern frontier models support [visual grounding](https://arxiv.org/abs/250
 | **Cerebras** | GPT-OSS 120B |
 | | Qwen 3 235B A22B Instruct |
 | | ZAI GLM-4.7 |
-| **MiniMax** | MiniMax M2.5 |
+| **MiniMax** | MiniMax M2.7 |
+| | MiniMax M2.5 |
 | | MiniMax M2.1 |
 | **Z.AI** | GLM-5 |
 | | GLM-4.7 |

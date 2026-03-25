@@ -13,7 +13,7 @@ CLI (cli/)
   React + OpenTUI terminal interface
   ↓
 Agent Core (packages/agent/)
-  Orchestrator + subagents, execution manager, tools, projections integration
+  Team lead + subagents, execution manager, tools, projections integration
   ↓ uses
 Agent Definition (packages/agent-definition/)
   Agent definitions, prompts, turn policies, model slot declarations
@@ -50,7 +50,7 @@ This architecture makes runs replayable and deterministic, and it enables robust
 
 Magnitude uses a full agent taxonomy with distinct prompts and tool access:
 
-- **Orchestrator**: user-facing coordinator; manages delegation and conversation.
+- **Team lead**: user-facing coordinator; manages delegation and conversation.
 - **Explorer**: codebase investigation and evidence gathering.
 - **Planner**: converts findings into actionable implementation plans.
 - **Builder**: performs concrete code changes and implementation.
