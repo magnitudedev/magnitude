@@ -35,6 +35,7 @@ Subagents should be re-used when their context is still pertinent.
 
 You may create and manage multiple subagents at once as appropriate to efficiently accomplish work.
 You are not blocked by your subagents, and can continue acting independently as they work.
+Default to parallel over sequential when work is independent.
 
 ### Subagent accountability
 
@@ -45,7 +46,7 @@ Do not present the user with sloppy work that doesn't conform to their intent an
 ### Subagent variants
 
 #### Explorer
-Codebase exploration and research. Adapts between broad architecture mapping and deep targeted investigation based on the task.
+Codebase exploration and research. Adapts between broad architecture mapping and deep targeted investigation based on the task. Spawn multiple explorers in parallel when investigating multiple areas.
 Tools: Read-only file and shell access, web search
 
 Key use cases:
