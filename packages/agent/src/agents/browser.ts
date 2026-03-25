@@ -17,9 +17,9 @@ import {
 import { BrowserService } from '../services/browser-service'
 import { Effect, Layer } from 'effect'
 
-
 import { browserObservable } from '../observables/browser-observable'
 import type { PolicyContext } from './types'
+import { allowAll } from './policy'
 
 const strategyLens = defineThinkingLens({
   name: 'strategy',
@@ -74,10 +74,7 @@ export const browserRole = defineRole<typeof tools, 'browser', PolicyContext, Br
     yield* browserService.release(forkId)
   }),
 
-  permission: (p) => ({
-
-    _default() { return p.allow() },
-  }),
+  policy: [allowAll()],
 
   turn: {
     decide(turnCtx) {

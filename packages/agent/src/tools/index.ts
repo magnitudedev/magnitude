@@ -52,8 +52,8 @@ function getBindingGroup(config: { readonly group?: string; readonly [key: strin
 /**
  * Derive a Map<tagName, RegisteredTool> from an RoleDefinition.
  */
-export function buildRegisteredTools(
-  agentDef: RoleDefinition<ToolSet, string, unknown>,
+export function buildRegisteredTools<TCtx>(
+  agentDef: RoleDefinition<ToolSet, string, TCtx>,
   layers: Layer.Layer<never>,
 ): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>()

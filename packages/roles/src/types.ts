@@ -26,28 +26,28 @@ export type ToolInput<T extends ToolSet, K extends ToolNames<T>> = ExtractToolIn
 export type ToolOutput<T extends ToolSet, K extends ToolNames<T>> = ExtractToolOutput<T[K]>
 
 // =============================================================================
-// Permission Policy
+// Tool Policy
 // =============================================================================
 
-export type PermissionResult =
+/** Terminal policy decision */
+export type Decision =
   | { readonly decision: 'allow' }
-  | { readonly decision: 'approve'; readonly reason?: string }
-  | { readonly decision: 'reject'; readonly reason?: string }
+  | { readonly decision: 'deny'; readonly reason: string }
 
-export interface PermissionHelpers {
-  allow(): PermissionResult
-  approve(reason?: string): PermissionResult
-  reject(reason?: string): PermissionResult
+/** A policy handler — returns Effect because interception may involve async exchanges (e.g. approval) */
+export type PolicyHandler<TInput, TCtx> = (input: TInput, ctx: TCtx) => Effect.Effect<Decision | null>
+
+/** A fragment is a partial handler map over a toolset. '*' matches any tool. */
+export type PolicyFragment<T extends ToolSet, TCtx> = {
+  [K in ToolNames<T> | '*']?: K extends '*'
+    ? PolicyHandler<unknown, TCtx>
+    : K extends ToolNames<T>
+      ? PolicyHandler<ToolInput<T, K>, TCtx>
+      : never
 }
 
-export type PermissionHandlers<T extends ToolSet, TCtx> = {
-  [K in ToolNames<T>]?: (input: ToolInput<T, K>, ctx: TCtx) => PermissionResult
-} & {
-  _default?: (input: unknown, ctx: TCtx & { tool: string }) => PermissionResult
-}
-
-export type PermissionPolicy<T extends ToolSet, TCtx> =
-  (p: PermissionHelpers) => PermissionHandlers<T, TCtx>
+/** A policy is an ordered array of fragments. All fragments evaluate; deny > allow > implicit deny. */
+export type Policy<T extends ToolSet, TCtx> = PolicyFragment<T, TCtx>[]
 
 // =============================================================================
 // Turn Policy
@@ -132,7 +132,7 @@ export interface RoleConfig<
   TProvides = never,
   TRequirements = never
 > extends RoleBase<TTools, TSlot, TProvides, TRequirements> {
-  readonly permission: PermissionPolicy<TTools, TCtx>
+  readonly policy: Policy<TTools, TCtx>
   readonly turn: TurnPolicy<TTools, TCtx>
 }
 
@@ -146,7 +146,7 @@ export interface RoleDefinition<
   readonly observables: readonly ObservableConfig<any>[]
   readonly spawnable: boolean
 
-  getPermission(tool: string, input: unknown, ctx: TCtx): PermissionResult
+  readonly policy: Policy<TTools, TCtx>
   getTurn(ctx: TurnContext<TCtx>): TurnResult
 }
 

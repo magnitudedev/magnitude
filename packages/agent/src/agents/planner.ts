@@ -1,12 +1,12 @@
 /**
  * Planner Agent Definition
  *
- * Read-only agent that produces implementation plans and makes decisions.
+ * Agent that produces implementation plans and makes decisions.
+ * Has read-only shell access, but can write files within the workspace.
  * Uses primary model (planning needs reasoning power).
  * Communicates back via parent.message.
  */
 
-import { resolve } from 'node:path'
 import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
 import plannerPromptRaw from './prompts/planner.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
@@ -16,12 +16,10 @@ import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
-
 // import { gatherTool } from '../tools/gather'
-import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
+import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
-import { expandWorkspacePath } from '../workspace/workspace-path'
 
 const ideateLens = defineThinkingLens({
   name: 'ideate',
@@ -81,28 +79,13 @@ export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
   spawnable: true,
   observables: [backgroundProcessesObservable],
 
-  permission: (p) => ({
-    shell(input, ctx) {
-      const result = classifyShellCommand(input.command)
-      if (result.tier === 'readonly') return p.allow()
-      if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
-      if (writesStayWithin(input.command, ctx.workspacePath)) return p.allow()
-      return p.reject('Explorers can only run read-only shell commands, or write to the workspace ($M/).')
-    },
-    fileWrite(input, ctx) {
-      const expanded = expandWorkspacePath(input.path, ctx.workspacePath)
-      const resolved = resolve(ctx.cwd, expanded)
-      if (isPathWithin(resolved, ctx.workspacePath)) return p.allow()
-      return p.reject('Explorers can only write to the workspace ($M/).')
-    },
-    fileEdit(input, ctx) {
-      const expanded = expandWorkspacePath(input.path, ctx.workspacePath)
-      const resolved = resolve(ctx.cwd, expanded)
-      if (isPathWithin(resolved, ctx.workspacePath)) return p.allow()
-      return p.reject('Explorers can only edit files in the workspace ($M/).')
-    },
-    _default() { return p.allow() },
-  }),
+  policy: [
+    allowReadonlyShell(),
+    denyForbiddenCommands(),
+    denyMutatingGit(),
+    denyWritesOutside(ctx => [ctx.workspacePath]),
+    allowAll(),
+  ],
 
   turn: {
     decide(turnCtx) {

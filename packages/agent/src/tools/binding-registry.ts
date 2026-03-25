@@ -5,8 +5,8 @@ import { defaultXmlTagName, getXmlBindingMap } from './index'
 /**
  * Build a lightweight Map<tagName, XmlTagBinding> from an RoleDefinition.
  */
-export function getBindingRegistry(
-  agentDef: RoleDefinition<ToolSet, string, unknown>,
+export function getBindingRegistry<TCtx>(
+  agentDef: RoleDefinition<ToolSet, string, TCtx>,
 ): Map<string, XmlTagBinding> {
   const bindings = new Map<string, XmlTagBinding>()
   const xmlBindingMap = getXmlBindingMap()

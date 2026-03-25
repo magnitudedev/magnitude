@@ -13,10 +13,9 @@ import { readTool, treeTool, searchTool, viewTool } from '../tools/fs'
 import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 
-
 import { agentCreateTool } from '../tools/agent-tools'
 import { phaseVerdictTool } from '../tools/phase-verdict'
-import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
+import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
@@ -74,16 +73,12 @@ export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>(
     parentOnIdle: `Address ALL reviewer findings. Have builders fix the issues and run another review cycle. Do not stop working or report to the user until all findings are resolved and the work is correct, high quality, and fully meets the user's requirements.`,
   },
 
-  permission: (p) => ({
-    shell(input: { command: string }, ctx) {
-      const result = classifyShellCommand(input.command)
-      const allowedPrefixes = ctx.workspacePath ? [ctx.workspacePath] : undefined
-      if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
-      if (!writesStayWithin(input.command, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
-      return p.allow()
-    },
-    _default() { return p.allow() },
-  }),
+  policy: [
+    denyForbiddenCommands(),
+    denyMutatingGit(),
+    denyWritesOutside(ctx => [ctx.cwd, ctx.workspacePath]),
+    allowAll(),
+  ],
 
   turn: {
     decide(turnCtx) {

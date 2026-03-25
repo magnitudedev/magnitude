@@ -3,32 +3,17 @@ import type {
   ToolNames,
   RoleConfig,
   RoleDefinition,
-  PermissionResult,
-  PermissionHelpers,
   TurnContext,
   TurnResult,
 } from './types'
-import { allow, approve, reject } from './helpers'
 
 export function toolSet<T extends ToolSet>(tools: T): T {
   return tools
 }
 
-function dispatchHandler(
-  handlers: Record<string, Function | undefined>,
-  tool: string,
-  args: unknown[],
-  defaultArgs: unknown[],
-  fallback: () => unknown,
-): unknown {
-  const handler = handlers[tool]
-  if (handler) return handler(...args)
-  const defaultHandler = handlers._default
-  if (defaultHandler) return defaultHandler(...defaultArgs)
-  return fallback()
+function toolNames<T extends ToolSet>(tools: T): ToolNames<T>[] {
+  return Object.keys(tools) as ToolNames<T>[]
 }
-
-const permissionHelpers: PermissionHelpers = { allow, approve, reject }
 
 export function defineRole<
   TTools extends ToolSet,
@@ -39,20 +24,10 @@ export function defineRole<
 >(
   config: RoleConfig<TTools, TSlot, TCtx, TProvides, TRequirements>
 ): RoleDefinition<TTools, TSlot, TCtx, TProvides, TRequirements> {
-  const permissionHandlers = config.permission(permissionHelpers) as Record<string, Function | undefined>
-
-  function getPermission(tool: string, input: unknown, ctx: TCtx): PermissionResult {
-    return dispatchHandler(
-      permissionHandlers,
-      tool,
-      [input, ctx],
-      [input, { ...ctx as object, tool }],
-      () => allow()
-    ) as PermissionResult
-  }
+  const tools = toolNames(config.tools)
 
   function getTurn(ctx: TurnContext<TCtx>): TurnResult {
-    return config.turn.decide(ctx as TurnContext<TCtx> & { tools: ToolNames<TTools>[] })
+    return config.turn.decide({ ...ctx, tools })
   }
 
   return {
@@ -69,7 +44,7 @@ export function defineRole<
     spawnable: config.spawnable ?? false,
     setup: config.setup,
     teardown: config.teardown,
-    getPermission,
+    policy: config.policy,
     getTurn,
   }
 }

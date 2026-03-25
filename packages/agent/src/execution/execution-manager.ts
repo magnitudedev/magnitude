@@ -25,7 +25,7 @@ import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
 import { defaultXmlTagName } from '../tools'
 import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
-import { buildPermissionInterceptor, type AgentResolver } from './permission-gate'
+import { buildPolicyInterceptor, type AgentResolver } from './permission-gate'
 import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from './approval-state'
 
 import { BrowserService } from '../services/browser-service'
@@ -196,7 +196,7 @@ function makeForkLayers(
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
   approvalState: ApprovalStateService,
   persistenceLayer: Layer.Layer<ChatPersistence, never, never>,
-  permissionInterceptor: ReturnType<typeof buildPermissionInterceptor>,
+  policyInterceptor: ReturnType<typeof buildPolicyInterceptor>,
   toolReminderRef: Ref.Ref<string[]>,
   cwd: string,
   workspacePath: string,
@@ -242,7 +242,7 @@ function makeForkLayers(
 
   const providedInterceptor: ToolInterceptor = {
     beforeExecute: (ctx) =>
-      permissionInterceptor(ctx).pipe(
+      policyInterceptor(ctx).pipe(
         Effect.provideService(ForkContext, { forkId }),
         Effect.provideService(PolicyContextProviderTag, policyCtxProvider),
         Effect.provideService(ApprovalStateTag, approvalState),
@@ -328,8 +328,8 @@ const makeExecutionManager = Effect.gen(function* () {
     return getAgentDefinition('lead')
   }
 
-  // Build the permission interceptor (shared across all forks, resolves agent dynamically)
-  const permissionInterceptor = buildPermissionInterceptor(resolveAgent)
+  // Build the policy interceptor (shared across all forks, resolves agent dynamically)
+  const policyInterceptor = buildPolicyInterceptor(resolveAgent)
 
   function buildForkContext(params: { mode: string; prompt: string; outputSchema?: JsonSchema | undefined }) {
     return Effect.gen(function* () {
@@ -959,7 +959,7 @@ const makeExecutionManager = Effect.gen(function* () {
         workingStateProjection, workflowProjection,
         conversationProjection,
         approvalState,
-        persistenceLayer, permissionInterceptor, toolReminderRef, cwd, workspacePath, ephemeralSessionContext, backgroundProcessRegistry,
+        persistenceLayer, policyInterceptor, toolReminderRef, cwd, workspacePath, ephemeralSessionContext, backgroundProcessRegistry,
       )
       forkCwds.set(forkId, cwd)
       forkWorkspacePaths.set(forkId, workspacePath)

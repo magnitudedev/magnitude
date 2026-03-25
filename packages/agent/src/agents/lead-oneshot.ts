@@ -5,7 +5,7 @@ import { compilePromptTemplate } from '../prompts/system-prompt'
 import {
   constraintsLens,
   leadObservables,
-  leadPermission,
+  leadPolicy,
   leadTools,
   leadTurnPolicy,
   pivotLens,
@@ -27,6 +27,6 @@ export const leadOneshotRole = defineRole<typeof leadTools, 'lead', PolicyContex
   initialContext: { parentConversation: false },
   spawnable: false,
   observables: leadObservables,
-  permission: leadPermission,
+  policy: leadPolicy,
   turn: leadTurnPolicy,
 })

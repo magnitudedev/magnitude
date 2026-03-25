@@ -14,7 +14,7 @@ export class EphemeralSessionContextTag extends Context.Tag('EphemeralSessionCon
   EphemeralSessionContext
 >() {}
 
-/** Framework state provided to agent policies (permission + turn) for decision-making. */
+/** Framework state provided to agent policies (tool + turn) for decision-making. */
 export interface PolicyContext {
   readonly forkId: string | null
   readonly cwd: string

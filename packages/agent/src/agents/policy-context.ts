@@ -2,7 +2,7 @@
  * PolicyContext provider factory.
  *
  * Reads from projections to build the PolicyContext snapshot
- * that turn policies and permission policies use for decision-making.
+ * that turn policies and tool policies use for decision-making.
  */
 
 import { Effect } from 'effect'

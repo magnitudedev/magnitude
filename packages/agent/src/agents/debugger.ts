@@ -14,8 +14,7 @@ import { shellTool } from '../tools/shell'
 import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
-
-import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
+import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
@@ -71,26 +70,12 @@ export const debuggerRole = defineRole<typeof tools, 'debugger', PolicyContext>(
   spawnable: true,
   observables: [backgroundProcessesObservable],
 
-  permission: (p) => ({
-    shell(input, ctx) {
-      const result = classifyShellCommand(input.command)
-      const allowedPrefixes = [ctx.workspacePath]
-      if (result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden.')
-      if (!writesStayWithin(input.command, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
-      return p.allow()
-    },
-    fileWrite(input, ctx) {
-      const allowedPrefixes = [ctx.workspacePath]
-      if (!isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
-      return p.allow()
-    },
-    fileEdit(input, ctx) {
-      const allowedPrefixes = [ctx.workspacePath]
-      if (!isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
-      return p.allow()
-    },
-    _default() { return p.allow() },
-  }),
+  policy: [
+    denyForbiddenCommands(),
+    denyMutatingGit(),
+    denyWritesOutside(ctx => [ctx.cwd, ctx.workspacePath]),
+    allowAll(),
+  ],
 
   turn: {
     decide(turnCtx) {

@@ -1,4 +1,5 @@
 import { toolSet, continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
+import type { TurnPolicy } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -9,7 +10,7 @@ import { shellBgTool } from '../tools/shell-bg'
 import { shellTool } from '../tools/shell'
 import { webFetchTool } from '../tools/web-fetch-tool'
 import { webSearchTool } from '../tools/web-search-tool'
-import { classifyShellCommand, writesStayWithin } from '@magnitudedev/shell-classifier'
+import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 
 export const intentLens = defineThinkingLens({
   name: 'intent',
@@ -87,19 +88,15 @@ export const leadTools = toolSet({
 
 export const leadObservables = [agentsStatusObservable, backgroundProcessesObservable]
 
-export const leadPermission = (p: any) => ({
-  shell(input: { command: string }, pctx: PolicyContext) {
-    const result = classifyShellCommand(input.command)
-    const allowedPrefixes = pctx.workspacePath ? [pctx.workspacePath] : undefined
-    if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-    if (!pctx.disableCwdSafeguards && !writesStayWithin(input.command, pctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
-    return p.allow()
-  },
-  _default() { return p.allow() },
-})
+export const leadPolicy = [
+  denyForbiddenCommands(),
+  denyMutatingGit(),
+  denyWritesOutside((ctx: PolicyContext) => [ctx.cwd, ctx.workspacePath]),
+  allowAll(),
+]
 
-export const leadTurnPolicy = {
-  decide(turnCtx: any) {
+export const leadTurnPolicy: TurnPolicy<typeof leadTools, PolicyContext> = {
+  decide(turnCtx) {
     if (turnCtx.cancelled) return yield_()
     if (turnCtx.error) return continue_()
     if (turnCtx.toolsCalled.length === 0) return yield_()

@@ -1,20 +1,4 @@
-import type { PermissionResult, TurnResult } from './types'
-
-// =============================================================================
-// Permission helpers
-// =============================================================================
-
-export function allow(): PermissionResult {
-  return { decision: 'allow' }
-}
-
-export function approve(reason?: string): PermissionResult {
-  return reason ? { decision: 'approve', reason } : { decision: 'approve' }
-}
-
-export function reject(reason?: string): PermissionResult {
-  return { decision: 'reject', reason }
-}
+import type { TurnResult } from './types'
 
 // =============================================================================
 // Turn helpers

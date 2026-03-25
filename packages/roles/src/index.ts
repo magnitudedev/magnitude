@@ -3,10 +3,10 @@ export type {
   ToolNames,
   ToolInput,
   ToolOutput,
-  PermissionResult,
-  PermissionHelpers,
-  PermissionHandlers,
-  PermissionPolicy,
+  Decision,
+  PolicyHandler,
+  PolicyFragment,
+  Policy,
   TurnContext,
   TurnDecision,
   TurnResult,
@@ -24,14 +24,7 @@ export type {
 } from './types'
 export type { ThinkingLens } from './thinking-lens'
 
-export {
-  allow,
-  approve,
-  reject,
-  continue_,
-  yield_,
-  finish,
-} from './helpers'
+export { continue_, yield_, finish } from './helpers'
 
 export { defineRole, defineRoleSet, toolSet } from './define'
 export { createObservable, bindObservable } from './observable'

@@ -14,7 +14,7 @@ import {
   ideateLens,
   intentLens,
   leadObservables,
-  leadPermission,
+  leadPolicy,
   leadTools,
   leadTurnPolicy,
   practicesLens,
@@ -35,6 +35,6 @@ export const leadRole = defineRole<typeof leadTools, 'lead', PolicyContext>({
   protocolRole: 'lead',
   initialContext: { parentConversation: false },
   observables: leadObservables,
-  permission: leadPermission,
+  policy: leadPolicy,
   turn: leadTurnPolicy,
 })

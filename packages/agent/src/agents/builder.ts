@@ -15,7 +15,7 @@ import { webSearchTool } from '../tools/web-search-tool'
 import { webFetchTool } from '../tools/web-fetch-tool'
 
 import { phaseSubmitTool } from '../tools/globals'
-import { classifyShellCommand, writesStayWithin, isPathWithin } from '@magnitudedev/shell-classifier'
+import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
 
@@ -64,26 +64,12 @@ export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({
     parentOnIdle: `Review the builder's work for correctness, quality, and adherance to user requirements. For nontrivial changes, spawn a reviewer. Do not present unverified work to user.`,
   },
 
-  permission: (p) => ({
-    shell(input, pctx) {
-      const result = classifyShellCommand(input.command)
-      const allowedPrefixes = [pctx.workspacePath]
-      if (!pctx.disableShellSafeguards && result.tier === 'forbidden') return p.reject(result.reason ? `This command is forbidden: ${result.reason}` : 'This command is forbidden and cannot be executed.')
-      if (!pctx.disableCwdSafeguards && !writesStayWithin(input.command, pctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('This command targets paths outside the working directory.')
-      return p.allow()
-    },
-    fileWrite(input, ctx) {
-      const allowedPrefixes = [ctx.workspacePath]
-      if (!ctx.disableCwdSafeguards && !isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
-      return p.allow()
-    },
-    fileEdit(input, ctx) {
-      const allowedPrefixes = [ctx.workspacePath]
-      if (!ctx.disableCwdSafeguards && !isPathWithin(input.path, ctx.cwd, ...(allowedPrefixes ?? []))) return p.reject('Cannot write to files outside the working directory')
-      return p.allow()
-    },
-    _default() { return p.allow() },
-  }),
+  policy: [
+    denyForbiddenCommands(),
+    denyMutatingGit(),
+    denyWritesOutside(ctx => [ctx.cwd, ctx.workspacePath]),
+    allowAll(),
+  ],
 
   turn: {
     decide(turnCtx) {

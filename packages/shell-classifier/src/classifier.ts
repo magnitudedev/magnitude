@@ -54,12 +54,12 @@ export function isGitAllowed(command: string): boolean {
   return true
 }
 
-export function writesStayWithin(command: string, ...allowedRoots: string[]): boolean {
+export function writesStayWithin(command: string, env: Record<string, string>, ...allowedRoots: string[]): boolean {
   const commands = parseShellCommand(command)
 
   for (const cmd of commands) {
     for (const redir of cmd.redirects) {
-      if (!isPathWithin(redir.target, ...allowedRoots)) return false
+      if (!isPathWithin(redir.target, env, ...allowedRoots)) return false
     }
 
     if (cmd.name) {
@@ -67,7 +67,7 @@ export function writesStayWithin(command: string, ...allowedRoots: string[]): bo
       if (WRITE_PATH_COMMANDS.has(name)) {
         for (const arg of cmd.args) {
           if (arg.startsWith('-')) continue
-          if (!isPathWithin(arg, ...allowedRoots)) return false
+          if (!isPathWithin(arg, env, ...allowedRoots)) return false
         }
       }
     }
@@ -320,7 +320,14 @@ function baseName(cmd: string): string {
 
 const ALLOWED_OUTSIDE_PREFIXES = ['/tmp/', '/dev/null']
 
-export function isPathWithin(path: string, ...allowedRoots: string[]): boolean {
+function expandEnvVars(p: string, env: Record<string, string>): string {
+  return p.replace(/\$\{(\w+)\}|\$(\w+)/g, (_, braced, bare) => {
+    const key = braced ?? bare
+    return env[key] ?? ''
+  })
+}
+
+export function isPathWithin(path: string, env: Record<string, string>, ...allowedRoots: string[]): boolean {
   if (!path || path.startsWith('-')) return true
 
   const [primaryRoot, ...additionalRoots] = allowedRoots
@@ -329,11 +336,12 @@ export function isPathWithin(path: string, ...allowedRoots: string[]): boolean {
   const cwdNoSlash = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd
 
   let resolved: string
-  if (path.startsWith('~')) {
-    const home = process.env.HOME ?? process.env.USERPROFILE ?? ''
-    resolved = resolve(home, path.slice(path.startsWith('~/') ? 2 : 1))
+  const expanded = expandEnvVars(path, env)
+  if (expanded.startsWith('~')) {
+    const home = env.HOME ?? env.USERPROFILE ?? ''
+    resolved = resolve(home, expanded.slice(expanded.startsWith('~/') ? 2 : 1))
   } else {
-    resolved = resolve(cwdNoSlash, path)
+    resolved = resolve(cwdNoSlash, expanded)
   }
 
   if (resolved === cwdNoSlash || resolved.startsWith(normalizedCwd)) return true
