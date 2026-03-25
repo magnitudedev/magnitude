@@ -32,6 +32,7 @@ export function DiffHunk({
       }}
     >
       <scrollbox
+        onMouseScroll={(e) => e.stopPropagation()}
         stickyScroll
         stickyStart="bottom"
         scrollX={false}

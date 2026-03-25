@@ -64,10 +64,6 @@ export interface ProviderDefinition {
   name: string                  // Display name: "Anthropic", "OpenRouter", etc.
   bamlProvider: BamlProviderType
   defaultBaseUrl?: string       // For openai-generic providers
-  defaultModel?: string         // Sensible default model (API key auth)
-  defaultOAuthModel?: string    // Default model for OAuth/subscription auth (if different)
-  defaultSecondaryModel?: string // Default secondary (faster) model
-  defaultBrowserModel?: string  // Default browser agent model
   models: ModelDefinition[]     // Known models for this provider
   authMethods: AuthMethodDef[]  // All supported auth methods, in display order
   oauthOnlyModelIds?: string[]  // Model IDs that require OAuth (hidden for API key users)

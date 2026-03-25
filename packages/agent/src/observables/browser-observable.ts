@@ -6,7 +6,8 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 export const browserObservable = createObservable({
   name: 'browser',
   observe: () => Effect.gen(function* () {
-    const harness = yield* BrowserHarnessTag
+    const { get } = yield* BrowserHarnessTag
+    const harness = yield* get()
     yield* Effect.promise(() => harness.waitForStability())
     const image = yield* Effect.promise(() => harness.screenshot())
     const base64 = image.toBase64('png')

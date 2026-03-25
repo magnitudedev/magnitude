@@ -1,4 +1,5 @@
 import { Browser, BrowserContext, BrowserContextOptions, chromium, LaunchOptions, CDPSession } from "playwright";
+import { getBrowserExecutablePath } from './browser-setup';
 import objectHash from 'object-hash';
 import { createId } from '@magnitudedev/generate-id';
 import logger, { Logger } from "./logger";
@@ -55,7 +56,8 @@ export class BrowserProvider {
         if (!(hash in this.activeBrowsers)) {
             this.logger.debug({ name: 'browser_provider' }, "Launching new browser");
             // Launch new browser, get the PROMISE
-            const launchPromise = chromium.launch({ ...DEFAULT_BROWSER_OPTIONS, ...options });
+            const execPath = getBrowserExecutablePath() ?? undefined
+            const launchPromise = chromium.launch({ ...DEFAULT_BROWSER_OPTIONS, ...(execPath ? { executablePath: execPath } : {}), ...options });
 
             activeBrowser = {
                 browserPromise: launchPromise,

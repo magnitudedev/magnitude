@@ -68,6 +68,7 @@ export function defineRole<
     initialContext: config.initialContext,
     spawnable: config.spawnable ?? false,
     setup: config.setup,
+    teardown: config.teardown,
     getPermission,
     getTurn,
   }

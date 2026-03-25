@@ -11,8 +11,11 @@ import { compilePromptTemplate } from '../prompts/system-prompt'
 import {
   clickTool, doubleClickTool, rightClickTool, typeTool,
   scrollTool, dragTool, navigateTool, goBackTool,
-  switchTabTool, newTabTool, screenshotTool, evaluateTool
+  switchTabTool, newTabTool, screenshotTool, evaluateTool,
+  BrowserHarnessTag
 } from '../tools/browser-tools'
+import { BrowserService } from '../services/browser-service'
+import { Effect, Layer } from 'effect'
 
 
 import { browserObservable } from '../observables/browser-observable'
@@ -48,7 +51,7 @@ const tools = toolSet({
 
 })
 
-export const browserRole = defineRole<typeof tools, 'browser', PolicyContext>({
+export const browserRole = defineRole<typeof tools, 'browser', PolicyContext, BrowserHarnessTag, BrowserService>({
   tools,
   id: 'browser',
   slot: 'browser',
@@ -59,7 +62,20 @@ export const browserRole = defineRole<typeof tools, 'browser', PolicyContext>({
   initialContext: { parentConversation: true },
   spawnable: true,
 
+  setup: ({ forkId }) => Effect.gen(function* () {
+    const browserService = yield* BrowserService
+    return Layer.succeed(BrowserHarnessTag, {
+      get: () => browserService.get(forkId)
+    })
+  }),
+
+  teardown: ({ forkId }) => Effect.gen(function* () {
+    const browserService = yield* BrowserService
+    yield* browserService.release(forkId)
+  }),
+
   permission: (p) => ({
+
     _default() { return p.allow() },
   }),
 

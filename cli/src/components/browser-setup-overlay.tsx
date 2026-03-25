@@ -37,20 +37,28 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
   // Fire-once guard for onResult
   const resultFiredRef = useRef(false)
   const installSucceededRef = useRef(false)
+
+  // Keep a ref to the latest onResult so the unmount cleanup always calls the current version
+  const onResultRef = useRef(onResult)
+  useEffect(() => {
+    onResultRef.current = onResult
+  })
+
   const fireResult = useCallback((installed: boolean) => {
     if (resultFiredRef.current) return
     resultFiredRef.current = true
-    onResult(installed)
-  }, [onResult])
+    onResultRef.current(installed)
+  }, [])
 
   // On unmount, fire onResult based on install success if no result was sent yet
+  // Empty deps — intentional: this should only run on true unmount, not on every onResult change
   useEffect(() => {
     return () => {
       if (!resultFiredRef.current) {
-        onResult(installSucceededRef.current)
+        onResultRef.current(installSucceededRef.current)
       }
     }
-  }, [onResult])
+  }, [])
 
   // Check browser installation on mount
   useEffect(() => {

@@ -3,7 +3,7 @@ const ROLE_EMOJI: Record<string, string> = {
   planner: '⚙',
   builder: '⚒',
   reviewer: '✔',
-  debugger: '⚠',
+  debugger: '⛏',
   browser: '⌨',
 }
 

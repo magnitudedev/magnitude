@@ -31,7 +31,7 @@ export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'google': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3-flash-preview'),
   'google-vertex': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3-flash-preview'),
   'cerebras': rest('zai-glm-4.7'),
-  'minimax': rest('MiniMax-M2.5'),
+  'minimax': rest('MiniMax-M2.7'),
   'zai': rest('glm-5'),
 }
 

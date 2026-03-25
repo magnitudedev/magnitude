@@ -65,6 +65,7 @@ export type AppOverlaysProps = {
   handleProviderDetailAction: (idx: number) => void
   handleProviderDetailBack: () => void
   onBackFromModelPicker: () => void
+  onResetToDefaults: (providerId: string) => void | Promise<void>
   handleChangeSlot: (slot: MagnitudeSlot) => void
   modelTabHandleKeyEvent: (key: KeyEvent) => boolean
   providerTabHandleKeyEvent: (key: KeyEvent) => boolean
@@ -135,6 +136,7 @@ export function AppOverlays({
   handleProviderDetailAction,
   handleProviderDetailBack,
   onBackFromModelPicker,
+  onResetToDefaults,
   handleChangeSlot,
   modelTabHandleKeyEvent,
   providerTabHandleKeyEvent,
@@ -283,6 +285,7 @@ export function AppOverlays({
           onProviderHandleKeyEvent={providerTabHandleKeyEvent}
           onBackFromModelPicker={onBackFromModelPicker}
           onBackFromProviderDetail={handleProviderDetailBack}
+          onResetToDefaults={onResetToDefaults}
         />
       </box>
     )

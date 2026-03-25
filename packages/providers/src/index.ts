@@ -113,7 +113,6 @@ export {
   BROWSER_COMPATIBLE_MODELS,
   isBrowserCompatible,
   getBrowserCompatibleModels,
-  detectBrowserModel,
 } from './browser-models'
 
 // OAuth flows

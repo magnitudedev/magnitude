@@ -26,7 +26,7 @@ const AGENTS: Record<string, MagnitudeRoleDef> = {
   planner: plannerRole,
   debugger: debuggerRole,
   reviewer: reviewerRole,
-  browser: browserRole,
+  browser: browserRole as unknown as MagnitudeRoleDef,
 }
 
 export type AgentVariant = 'lead' | 'lead-oneshot' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'

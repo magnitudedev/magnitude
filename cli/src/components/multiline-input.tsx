@@ -453,22 +453,12 @@ export const MultilineInput = forwardRef<
   const visualLineStarts = deriveVisualLineStarts(value, lineInfo)
 
   // Focus/blur scrollbox when focused prop changes
-  const prevFocusedRef = useRef(false)
   useEffect(() => {
-    if (focused && !prevFocusedRef.current) {
-      safeRenderableCall(
-        scrollBoxRef.current as FocusableScrollBox | null,
-        (sb) => sb.focus?.(),
-        { mountedRef },
-      )
-    } else if (!focused && prevFocusedRef.current) {
-      safeRenderableCall(
-        scrollBoxRef.current as FocusableScrollBox | null,
-        (sb) => sb.blur?.(),
-        { mountedRef },
-      )
+    if (focused) {
+      safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.focus?.(), { mountedRef })
+    } else {
+      safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.blur?.(), { mountedRef })
     }
-    prevFocusedRef.current = focused
   }, [focused, mountedRef])
 
   // Expose focus/blur for imperative use cases
@@ -756,6 +746,8 @@ export const MultilineInput = forwardRef<
     useCallback(
       (event: MouseEvent) => {
         if (!focused) return
+
+        safeRenderableCall(scrollBoxRef.current as FocusableScrollBox | null, (sb) => sb.focus?.(), { mountedRef })
 
         // Clear sticky column since this is not up/down navigation
         stickyColumnRef.current = null
@@ -1821,14 +1813,7 @@ export const MultilineInput = forwardRef<
 
     const totalLines = visualLineStarts.length
 
-    // Add bottom gutter when cursor is on line 2 of exactly 2 lines
-    const gutterEnabled =
-      totalLines === 2 && cursorRow === 1 && totalLines + 1 <= safeMaxHeight
-
-    const rawHeight = Math.min(
-      totalLines + (gutterEnabled ? 1 : 0),
-      safeMaxHeight,
-    )
+    const rawHeight = Math.min(totalLines, safeMaxHeight)
 
     const heightLines = Math.max(effectiveMinHeight, rawHeight)
 
@@ -1837,7 +1822,6 @@ export const MultilineInput = forwardRef<
 
     return {
       heightLines,
-      gutterEnabled,
       isScrollable,
     }
   })()
@@ -1904,7 +1888,6 @@ export const MultilineInput = forwardRef<
               />
             )}
             {displayValueForRendering}
-            {layoutMetrics.gutterEnabled ? '\n' : ''}
           </>
         ) : (
           <>
@@ -2018,7 +2001,6 @@ export const MultilineInput = forwardRef<
 
               return out
             })()}
-            {layoutMetrics.gutterEnabled ? '\n' : ''}
           </>
         )}
       </text>
