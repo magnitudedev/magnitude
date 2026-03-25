@@ -22,13 +22,12 @@ import {
   type XmlRuntimeEvent,
   type RegisteredTool,
   type XmlTagBinding,
-  actionsTagOpen,
-  actionsTagClose,
+
 } from './index'
 
-const ACTIONS_TAG_OPEN = actionsTagOpen()
-const ACTIONS_TAG_CLOSE = actionsTagClose()
-import type { ParsedElement } from './parser/types'
+const ACTIONS_TAG_OPEN = '<actions>'
+const ACTIONS_TAG_CLOSE = '</actions>'
+import type { ParsedElement } from './format/types'
 
 // ---------------------------------------------------------------------------
 // Helpers

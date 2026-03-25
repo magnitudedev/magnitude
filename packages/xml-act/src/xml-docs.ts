@@ -24,7 +24,7 @@ export interface XmlToolDocEntry {
 
 type XmlOutputItemBinding = {
   readonly tag?: string
-  readonly attributes?: readonly string[] | readonly { readonly attr: string; readonly field: string }[]
+  readonly attributes?: readonly { readonly attr: string; readonly field: string }[]
   readonly body?: string
 }
 
@@ -595,8 +595,7 @@ function buildOutputWithBinding(
     let itemAttrs = ''
     if (itemsBinding.attributes) {
       for (const attr of itemsBinding.attributes) {
-        if (typeof attr === 'string') itemAttrs += ` ${attr}="..."`
-        else itemAttrs += ` ${attr.attr}="..."`
+        itemAttrs += ` ${attr.attr}="..."`
       }
     }
 

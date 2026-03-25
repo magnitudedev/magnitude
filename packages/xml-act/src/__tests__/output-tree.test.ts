@@ -212,7 +212,7 @@ describe('buildOutputTree — items', () => {
     ]
     expect(render('tree', output, {
       type: 'tag',
-      items: { tag: 'entry', attributes: ['file', 'type', 'depth'] },
+      items: { tag: 'entry', attributes: [{ attr: 'file', field: 'file' }, { attr: 'type', field: 'type' }, { attr: 'depth', field: 'depth' }] },
     } as XmlBinding<unknown>)).toBe('<tree><entry file="a.ts" type="file" depth="0" /><entry file="b/" type="dir" depth="0" /></tree>')
   })
 
@@ -223,7 +223,7 @@ describe('buildOutputTree — items', () => {
     ]
     expect(render('search', output, {
       type: 'tag',
-      items: { tag: 'item', attributes: ['file'], body: 'match' },
+      items: { tag: 'item', attributes: [{ attr: 'file', field: 'file' }], body: 'match' },
     } as XmlBinding<unknown>)).toBe('<search><item file="a.ts">line 1: hello</item><item file="b.ts">line 5: world</item></search>')
   })
 
@@ -253,14 +253,14 @@ describe('buildOutputTree — items', () => {
   test('items with echoAttrs', () => {
     expect(render('search', [{ file: 'a.ts', match: 'hi' }], {
       type: 'tag',
-      items: { tag: 'item', attributes: ['file'], body: 'match' },
+      items: { tag: 'item', attributes: [{ attr: 'file', field: 'file' }], body: 'match' },
     } as XmlBinding<unknown>, { pattern: '*.ts' })).toBe('<search pattern="*.ts"><item file="a.ts">hi</item></search>')
   })
 
   test('items with special chars in body', () => {
     expect(render('search', [{ file: 'a.ts', match: 'x < y && z > w' }], {
       type: 'tag',
-      items: { tag: 'item', attributes: ['file'], body: 'match' },
+      items: { tag: 'item', attributes: [{ attr: 'file', field: 'file' }], body: 'match' },
     } as XmlBinding<unknown>)).toBe('<search><item file="a.ts">x < y && z > w</item></search>')
   })
 })
@@ -455,7 +455,7 @@ describe('buildOutputTree — XPath integration', () => {
   test('XPath attribute query on items', () => {
     const tree = build('tree', [{ file: 'a.ts', type: 'file' }, { file: 'b/', type: 'dir' }], {
       type: 'tag',
-      items: { tag: 'entry', attributes: ['file', 'type'] },
+      items: { tag: 'entry', attributes: [{ attr: 'file', field: 'file' }, { attr: 'type', field: 'type' }] },
     } as XmlBinding<unknown>)
     const { root } = outputToDOM(tree)
     const result = evaluateXPath('entry[@type="dir"]/@file', root, null, null,
@@ -486,7 +486,7 @@ describe('buildOutputTree — XPath integration', () => {
   test('DOM round-trip with items preserves attributes', () => {
     const tree = build('list', [{ file: 'a.ts', match: 'hello' }], {
       type: 'tag',
-      items: { tag: 'item', attributes: ['file'], body: 'match' },
+      items: { tag: 'item', attributes: [{ attr: 'file', field: 'file' }], body: 'match' },
     } as XmlBinding<unknown>)
     const { root } = outputToDOM(tree)
     const roundTripped = outputFromDOM(root)

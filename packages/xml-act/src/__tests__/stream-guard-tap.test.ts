@@ -1,7 +1,8 @@
 import { describe, test, expect } from 'bun:test'
 import { Stream, Effect } from 'effect'
 import { guardEffectStream } from '../stream-guard'
-import { actionsTagClose, actionsTagOpen } from '../constants'
+const actionsTagOpen = () => '<actions>'
+const actionsTagClose = () => '</actions>'
 
 /**
  * Regression test: the stream guard's injected closing tag must be captured

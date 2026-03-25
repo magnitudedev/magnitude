@@ -1,4 +1,4 @@
-import { createStreamingXmlParser, type ParseEvent } from '@magnitudedev/xml-act'
+import { createStreamingXmlParser, type XmlActEvent } from '@magnitudedev/xml-act'
 
 export interface ParsedResponse {
   agentCreates: Array<{ type: string; agentId: string }>
@@ -18,10 +18,9 @@ export function parseOrchestratorResponse(raw: string): ParsedResponse {
 
   const parser = createStreamingXmlParser(knownTags, childTagMap)
 
-  const events: ParseEvent[] = [
-    ...parser.processChunk(raw),
-    ...parser.flush(),
-  ]
+  parser.push(raw)
+  parser.end()
+  const events = parser.events
 
   const agentCreates: Array<{ type: string; agentId: string }> = []
   const proposes: Array<{ title: string }> = []
@@ -60,18 +59,18 @@ export function parseOrchestratorResponse(raw: string): ParsedResponse {
       continue
     }
 
-    if (event._tag === 'MessageTagOpen') {
+    if (event._tag === 'MessageStart') {
       messageBodies.set(event.id, '')
       if (event.dest === 'user') userMessageIds.add(event.id)
       continue
     }
 
-    if (event._tag === 'MessageBodyChunk') {
+    if (event._tag === 'MessageChunk') {
       messageBodies.set(event.id, (messageBodies.get(event.id) ?? '') + event.text)
       continue
     }
 
-    if (event._tag === 'MessageTagClose') {
+    if (event._tag === 'MessageEnd') {
       if (userMessageIds.has(event.id)) {
         userMessages.push((messageBodies.get(event.id) ?? '').trim())
       }

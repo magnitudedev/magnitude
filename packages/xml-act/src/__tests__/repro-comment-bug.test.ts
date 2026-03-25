@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
+import { createStreamingXmlParser } from '../parser'
 
 describe('repro: comment with <-- does not corrupt prose', () => {
   it('passes the exact LLM response through as prose unchanged', () => {

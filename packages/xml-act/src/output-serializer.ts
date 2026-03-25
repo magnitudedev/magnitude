@@ -260,7 +260,7 @@ function resolveNestedField(obj: Record<string, unknown>, path: string): unknown
   return current
 }
 
-function serializeItem(item: unknown, itemBinding: { tag: string; attributes?: readonly (string | number | symbol)[]; body?: string | number | symbol }): string {
+function serializeItem(item: unknown, itemBinding: { tag: string; attributes?: readonly { attr: string; field: string }[]; body?: string | number | symbol }): string {
   const itemTag = itemBinding.tag
 
   // Scalar items (string, number, boolean) — render as body text
@@ -273,11 +273,10 @@ function serializeItem(item: unknown, itemBinding: { tag: string; attributes?: r
   // Build attributes
   let itemAttrs = ''
   if (itemBinding.attributes) {
-    for (const attr of itemBinding.attributes) {
-      const attrKey = String(attr)
-      const val = itemObj[attrKey]
+    for (const attrSpec of itemBinding.attributes) {
+      const val = itemObj[attrSpec.field]
       if (val !== undefined && val !== null) {
-        itemAttrs += ` ${attrKey}="${escapeXmlAttr(String(val))}"`
+        itemAttrs += ` ${attrSpec.attr}="${escapeXmlAttr(String(val))}"`
       }
     }
   }

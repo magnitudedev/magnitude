@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import type { ParseEvent } from '../parser/types'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
 
 function collectParseEvents(input: string): ParseEvent[] {
   const parser = createStreamingXmlParser(new Set(), new Map())

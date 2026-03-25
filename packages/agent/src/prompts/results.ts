@@ -5,8 +5,9 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import type { TurnToolCall, ObservedResult } from '../events'
 import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
+import type { TurnToolCall, ObservedResult } from '../events'
+
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from './constants'
 import { type ContentPart } from '../content'
@@ -81,5 +82,5 @@ export function formatError(message: string): string {
 
 /** Noop turn — agent continued without taking any actions */
 export function formatNoop(): string {
-  return `<noop>No actions were taken. Use <${TURN_CONTROL_YIELD}/> if you have nothing more to do, instead of <${TURN_CONTROL_NEXT}/>.</noop>`
+  return `<noop>No actions were taken. Use ${TURN_CONTROL_YIELD} if you have nothing more to do, instead of ${TURN_CONTROL_NEXT}.</noop>`
 }

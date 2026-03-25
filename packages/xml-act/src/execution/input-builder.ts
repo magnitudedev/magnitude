@@ -4,7 +4,7 @@
  * Maps XML structure to the tool's expected input shape based on the binding.
  */
 
-import type { ParsedElement } from '../parser/types'
+import type { ParsedElement } from '../format/types'
 import type { XmlTagBinding } from '../types'
 
 /** Set a value at a dotted path, creating intermediate objects as needed. */

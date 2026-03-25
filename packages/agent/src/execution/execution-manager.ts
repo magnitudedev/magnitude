@@ -829,7 +829,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 const msg = event.error._tag === 'UnclosedThink'
                   ? UNCLOSED_THINK_REMINDER
                   : event.error._tag === 'FinishWithoutEvidence'
-                  ? event.error.detail
+                  ? 'Finish tag used without evidence'
                   : UNCLOSED_ACTIONS_REMINDER
                 structuralParseErrorReminder = `<error>\n${msg}\n</error>`
                 break

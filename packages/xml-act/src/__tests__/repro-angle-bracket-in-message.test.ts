@@ -12,9 +12,14 @@
  *   tool-body.ts — ChildTagName/ChildAttrs for valid child tag names
  */
 import { describe, it, expect } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import { TURN_CONTROL_YIELD, commsTagOpen, commsTagClose, actionsTagOpen, actionsTagClose } from '../constants'
-import type { ParseEvent } from '../parser/types'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
+
+const TURN_CONTROL_YIELD = 'yield'
+const commsTagOpen = () => '<comms>'
+const commsTagClose = () => '</comms>'
+const actionsTagOpen = () => '<actions>'
+const actionsTagClose = () => '</actions>'
 
 const knownTags = new Set(['shell', 'fs-read'])
 const childTagMap = new Map<string, ReadonlySet<string>>([
@@ -36,7 +41,7 @@ function parseCharByChar(xml: string): ParseEvent[] {
 
 function messageBody(events: ParseEvent[]): string {
   return events
-    .filter((e): e is Extract<ParseEvent, { _tag: 'MessageBodyChunk' }> => e._tag === 'MessageBodyChunk')
+    .filter((e): e is Extract<ParseEvent, { _tag: 'MessageChunk' }> => e._tag === 'MessageChunk')
     .map(e => e.text)
     .join('')
 }
@@ -64,7 +69,7 @@ describe('message.ts: generic tag matching in message body', () => {
 
     // BUG: </message>, </comms>, <yield/> all leak into message body
     expect(body).not.toContain('</message>')
-    expect(events.filter(e => e._tag === 'MessageTagClose')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'MessageEnd')).toHaveLength(1)
     expect(turnControls(events)).toHaveLength(1)
   })
 
@@ -80,7 +85,7 @@ describe('message.ts: generic tag matching in message body', () => {
     const body = messageBody(events)
 
     expect(body).not.toContain('</message>')
-    expect(events.filter(e => e._tag === 'MessageTagClose')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'MessageEnd')).toHaveLength(1)
     expect(turnControls(events)).toHaveLength(1)
   })
 
@@ -106,9 +111,9 @@ describe('message.ts: generic tag matching in message body', () => {
     expect(body).not.toContain('</comms>')
     expect(body).not.toContain('<yield/>')
     expect(body).toContain('<20%')
-    expect(events.filter(e => e._tag === 'MessageTagOpen')).toHaveLength(1)
-    expect(events.filter(e => e._tag === 'MessageTagClose')).toHaveLength(1)
-    expect(events.filter(e => e._tag === 'CommsClose')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'MessageStart')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'MessageEnd')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'ContainerClose')).toHaveLength(1)
     expect(turnControls(events)).toHaveLength(1)
   })
 
@@ -124,7 +129,7 @@ describe('message.ts: generic tag matching in message body', () => {
     const body = messageBody(events)
 
     expect(body).not.toContain('</message>')
-    expect(events.filter(e => e._tag === 'MessageTagClose')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'MessageEnd')).toHaveLength(1)
     expect(turnControls(events)).toHaveLength(1)
   })
 })
@@ -147,7 +152,7 @@ describe('think.ts: <lens inside lens body without closing >', () => {
 
     const events = parse(xml)
     const lensEnds = events.filter((e): e is Extract<ParseEvent, { _tag: 'LensEnd' }> => e._tag === 'LensEnd')
-    const msgClose = events.filter(e => e._tag === 'MessageTagClose')
+    const msgClose = events.filter(e => e._tag === 'MessageEnd')
 
     // BUG: <lens enters LensTagAttrs which eats everything, lens never closes
     expect(lensEnds).toHaveLength(1)
@@ -166,7 +171,7 @@ describe('think.ts: <lens inside lens body without closing >', () => {
 
     const events = parse(xml)
     const lensEnds = events.filter((e): e is Extract<ParseEvent, { _tag: 'LensEnd' }> => e._tag === 'LensEnd')
-    const msgClose = events.filter(e => e._tag === 'MessageTagClose')
+    const msgClose = events.filter(e => e._tag === 'MessageEnd')
 
     // BUG: unclosed " in attr value eats entire rest of stream
     expect(lensEnds).toHaveLength(1)

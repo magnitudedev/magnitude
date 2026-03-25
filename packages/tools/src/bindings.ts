@@ -187,7 +187,7 @@ export type XmlArrayChildBinding<T> = [ArrayFields<T>] extends [never]
  */
 export type XmlItemBinding<E> = {
   readonly tag: string
-  readonly attributes?: ReadonlyArray<keyof E & string>
+  readonly attributes?: ReadonlyArray<{ readonly attr: string; readonly field: keyof E & string }>
   readonly body?: keyof E & string
 }
 

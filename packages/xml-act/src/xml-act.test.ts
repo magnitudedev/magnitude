@@ -22,13 +22,12 @@ import {
   type XmlTagBinding,
   type ToolInterceptor,
   type ReactorState,
-  actionsTagOpen,
-  actionsTagClose,
+
 } from './index'
 
-const ACTIONS_TAG_OPEN = actionsTagOpen()
-const ACTIONS_TAG_CLOSE = actionsTagClose()
-import type { ParseEvent } from './parser/types'
+const ACTIONS_TAG_OPEN = '<actions>'
+const ACTIONS_TAG_CLOSE = '</actions>'
+import type { ParseEvent } from './format/types'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1225,7 +1224,7 @@ describe('foldReactorState', () => {
       tagName: 'read',
       toolName: 'read',
       group: 'default',
-      error: { _tag: 'MissingRequiredFields', fields: ['path'], detail: 'missing', call: { toolCallId: 'tc_1', tagName: 'read', toolName: 'read', group: 'default' } },
+      error: { _tag: 'MissingRequiredFields', id: 'tc_1', tagName: 'read', fields: ['path'], detail: 'missing' },
     })
     expect(next.deadToolCalls.has('tc_1')).toBe(true)
     expect(next.toolOutcomes.get('tc_1')).toEqual({ _tag: 'ParseError' })
@@ -1697,10 +1696,10 @@ describe('prose streaming (parser-level)', () => {
     expect(chunks[1].text).toBe('i')
   })
 
-  test('ProseEnd emitted before ActionsOpen', () => {
+  test('ProseEnd emitted before ContainerOpen', () => {
     const events = parseChunked([`Hello\n${ACTIONS_TAG_OPEN}\n${ACTIONS_TAG_CLOSE}`])
     const proseEndIdx = events.findIndex(e => e._tag === 'ProseEnd' && e.patternId === 'prose')
-    const actionsIdx = events.findIndex(e => e._tag === 'ActionsOpen')
+    const actionsIdx = events.findIndex(e => e._tag === 'ContainerOpen')
     expect(proseEndIdx).not.toBe(-1)
     expect(actionsIdx).not.toBe(-1)
     expect(proseEndIdx).toBeLessThan(actionsIdx)
@@ -1947,10 +1946,10 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<lenses>\n<lens name="foo">thinking</lens>\n<comms>\n<message to="user">hi</message>\n</comms>',
     ])
-    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
-    expect(parseEvents(events, 'MessageTagOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'MessageTagClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(1)
+    expect(parseEvents(events, 'MessageStart')).toHaveLength(1)
+    expect(parseEvents(events, 'MessageEnd')).toHaveLength(1)
     expect(parseEvents(events, 'ParseError')).toHaveLength(0)
   })
 
@@ -1959,8 +1958,8 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<lenses>\n<lens name="foo">thinking</lens>\n<actions>\n</actions>',
     ], ['read'])
-    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(1)
     expect(parseEvents(events, 'ParseError')).toHaveLength(0)
   })
 
@@ -1991,10 +1990,8 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<comms>\n<message to="user">hi</message>\n<actions>\n</actions>',
     ], ['read'])
-    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
-    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(2)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(2)
     expect(parseEvents(events, 'ParseError')).toHaveLength(0)
   })
 
@@ -2003,8 +2000,8 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<comms>\n<message to="user">hi</message>\n<next/>',
     ])
-    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(1)
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('continue')
@@ -2016,8 +2013,8 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<comms>\n<message to="user">hi</message>\n<yield/>',
     ])
-    expect(parseEvents(events, 'CommsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'CommsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(1)
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('yield')
@@ -2029,8 +2026,8 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<actions>\n<next/>',
     ], ['read'])
-    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(1)
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('continue')
@@ -2042,8 +2039,8 @@ describe('structural tag auto-close', () => {
     const events = parseChunked([
       '<actions>\n<yield/>',
     ], ['read'])
-    expect(parseEvents(events, 'ActionsOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'ActionsClose')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'ContainerClose')).toHaveLength(1)
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
     expect(tc[0].decision).toBe('yield')

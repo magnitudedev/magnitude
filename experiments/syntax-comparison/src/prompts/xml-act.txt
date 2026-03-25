@@ -1,100 +1,72 @@
-You are an assistant that must answer using a simplified XML-act format.
+You are participating in a syntax comparison experiment.
+
+Produce exactly one turn in current xml-act format.
 
 Grammar:
-response  := reasoning message? actions turnctl
-reasoning := <reasoning> text </reasoning>
-message   := <message> text </message>
-actions   := <actions> tool* inspect? </actions> | <actions/>
-inspect   := <inspect> ref+ </inspect>
-ref       := <ref tool="name" />
+response  := lenses comms actions turnctl
+lenses    := <lenses> lens+ </lenses>
+lens      := <lens name="...">...</lens>
+comms     := <comms> message* </comms>
+message   := <message to="user">...</message>
+actions   := <actions> tool* </actions> | <actions/>
 turnctl   := <next/> | <yield/>
 
-
 Required shape:
-<reasoning>
-Internal reasoning only.
-</reasoning>
-<message>
-User-facing communication for this turn.
-</message>
+<lenses>
+  <lens name="intent">...</lens>
+  <lens name="strategy">...</lens>
+</lenses>
+<comms>
+  <message to="user">...</message>
+</comms>
 <actions>
-Zero or more tool calls.
-
-<inspect>
-<ref tool="..." />
-</inspect>
+  zero or more tool calls
 </actions>
 <next/> or <yield/>
 
 Rules:
-- Always start with one <reasoning> block.
-- Then write one <message> block.
-- Then write one <actions> block.
+- Start with one <lenses> block containing one or more <lens name="..."> blocks.
+- Then include one <comms> block with any user-facing communication.
+- Then include one <actions> block with tool calls.
 - End with exactly one turn-control tag: <next/> or <yield/>.
-- If you need tool results before giving the real answer, include tool calls, inspect what you need with <inspect> and <ref>, and end with <next/>.
-- If you do not need results, end with <yield/>.
-- Do not claim file contents, search results, or command results unless you have already inspected them.
-- If no tools are needed, leave <actions> empty and use <yield/>.
-- Batch independent tool calls in one <actions> block when useful.
+- Every tool call MUST include an observe attribute.
+  - Use observe="." to request full output.
+  - Or use an XPath-style expression to request a subset.
+- There is no <inspect> block in this format.
+- Progressive disclosure is done using observe="..." on tool calls.
+- Use <next/> when you need tool results before continuing.
+- Use <yield/> when done or waiting for external input.
+- Do not claim file contents, search results, or command output unless already observed in a prior turn.
+- Content is literal text; do NOT use HTML entity escaping.
+- This is not standard XML parsing mode; do not escape with entities.
+- Return only raw XML, no markdown code fences.
 
 Mock tools:
+<read path="..." observe="."/>
+<write path="..." observe=".">content</write>
+<edit path="..." observe="."><old>...</old><new>...</new></edit>
+<search pattern="..." path="..." observe="."/>
+<run observe=".">command</run>
+<tree path="..." observe="."/>
 
-<read file="path" offset="1" limit="200" />
-Read a file's contents.
-Params:
-- file: path
-- offset: optional start line number
-- limit: optional max lines
-Output fields:
-- content
-- lines
+Anti-example (invalid: simulates multiple turns in one response):
+<lenses>
+  <lens name="intent">Read first.</lens>
+</lenses>
+<comms>
+  <message to="user">Checking now.</message>
+</comms>
+<actions>
+  <read path="config.json" observe="."/>
+</actions>
+<next/>
+<lenses>
+  <lens name="intent">Now answer.</lens>
+</lenses>
+<comms>
+  <message to="user">It contains ...</message>
+</comms>
+<actions/>
+<yield/>
 
-<write file="path">content</write>
-Write content to a file.
-Params:
-- file: path
-- content: string body
-Output fields:
-- status
-
-<search pattern="regex" path="dir" glob="pattern" />
-Search file contents with a regex.
-Params:
-- pattern: regex
-- path: optional directory
-- glob: optional file filter
-Output fields:
-- matches: list of { file, line, text }
-
-<run cmd="command" />
-Run a shell command.
-Params:
-- cmd: string
-Output fields:
-- stdout
-- stderr
-- exitCode
-
-<tree path="dir" />
-List directory structure.
-Params:
-- path: directory
-Output fields:
-- entries: list of { path, type }
-
-Progressive disclosure:
-Use <inspect> with <ref tool="..." /> to select only the tool outputs you need now.
-Examples:
-<inspect>
-  <ref tool="read" />
-</inspect>
-
-<inspect>
-  <ref tool="search" />
-  <ref tool="run" />
-</inspect>
-
-IMPORTANT: Your entire response must be in this format and nothing else. No markdown code fences, no extra formatting, no preamble, no commentary outside the format. Output the raw format directly.
-Do not wrap your response in markdown code fences. Output the format directly.
-
-Content inside tags is literal text — do NOT use HTML entity escaping. Write <, >, &, quotes etc. directly as-is.
+Invalid because a response must contain exactly one turn.

@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import { useAltKeywords, useDefaultKeywords, getKeywords, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose } from '../constants'
-import type { ParseEvent } from '../parser/types'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
 
-beforeAll(() => useAltKeywords())
-afterAll(() => useDefaultKeywords())
+const actionsTagOpen = () => '<actions>'
+const actionsTagClose = () => '</actions>'
+const thinkTagOpen = () => '<think>'
+const thinkTagClose = () => '</think>'
+
 
 const knownTags = new Set(['fs-search', 'shell', 'write'])
 const childTagMap = new Map<string, Set<string>>()
@@ -115,25 +117,25 @@ describe('actions open tag', () => {
   // VALID: <actions> at start of input
   it('at start of input: valid', () => {
     const events = parse(`${actionsTagOpen()}\n<shell>echo hi</shell>\n${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
     expect(tagCloseds(events)).toHaveLength(1)
   })
 
   // VALID: \n<actions>
   it('after newline: valid', () => {
     const events = parse(`hello\n${actionsTagOpen()}\n<shell>echo hi</shell>\n${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
   })
 
   // NOT VALID: foo<actions>
   it('inline (no preceding newline): NOT valid', () => {
     const events = parse(`foo${actionsTagOpen()}\n<shell>echo hi</shell>\n${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(false)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(false)
   })
 
   it('inline (no preceding newline): NOT valid (char-by-char)', () => {
     const events = parseCharByChar(`foo${actionsTagOpen()}\n<shell>echo hi</shell>\n${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(false)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(false)
   })
 })
 
@@ -145,26 +147,26 @@ describe('actions close tag', () => {
   // VALID: \n</actions>
   it('after newline: valid', () => {
     const events = parse(`${actionsTagOpen()}\n<shell>hi</shell>\n${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
   })
 
   // NOT VALID: <actions>...</actions>  (close not after \n)
   it('same-line close (no newline before close): NOT valid', () => {
     const events = parse(`${actionsTagOpen()}${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(false)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(false)
   })
 
   it('same-line close: NOT valid (char-by-char)', () => {
     const events = parseCharByChar(`${actionsTagOpen()}${actionsTagClose()}`)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(false)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(false)
   })
 
   // NOT VALID: inline </actions>
   it('inline close in prose: NOT valid', () => {
     const events = parse(`and ${actionsTagClose()} closes it`)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(false)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(false)
   })
 })
 
@@ -174,7 +176,7 @@ describe('actions close tag', () => {
 
 describe('think depth only increments on newline-prefixed opens', () => {
   it('inline think tag inside think body does NOT increment depth', () => {
-    const kw = getKeywords()
+    const kw = { think: 'think', actions: 'actions' }
     const events = parse([
       thinkTagOpen(),
       `So searching for \`${thinkTagOpen()}\` returns 0 results.`,
@@ -296,7 +298,7 @@ describe('session repro: inline think tag in think body eats tool calls', () => 
     expect(thinks[0].content).not.toContain(actionsTagOpen())
     expect(thinks[0].content).not.toContain('<shell')
 
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
 
     const tools = tagCloseds(events)
     expect(tools).toHaveLength(2)
@@ -323,7 +325,7 @@ describe('session repro: inline think tag in think body eats tool calls', () => 
     expect(thinks).toHaveLength(1)
     expect(thinks[0].content).not.toContain(actionsTagOpen())
 
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
     const tools = tagCloseds(events)
     expect(tools).toHaveLength(1)
     expect(tools[0].element.attributes.get('id')).toBe('s5')
@@ -346,7 +348,7 @@ describe('structural tags inside tool body remain literal', () => {
 
 describe('structural tags inside attribute values remain literal', () => {
   it('think tag in attribute value is literal', () => {
-    const kw = getKeywords()
+    const kw = { think: 'think', actions: 'actions' }
     const events = parse(`${actionsTagOpen()}\n<fs-search id="s2" pattern="${thinkTagOpen()}" />\n${actionsTagClose()}`)
     const tools = tagCloseds(events)
     expect(tools).toHaveLength(1)
@@ -450,16 +452,16 @@ describe('think open tag followed by newline (no preceding newline): valid', () 
 describe('actions close tag followed by newline (no preceding newline): valid', () => {
   it('inline actions close followed by newline: valid', () => {
     const events = parse(`${actionsTagOpen()}\n<shell>hi</shell>${actionsTagClose()}\n`)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
   })
 
   it('inline actions close followed by newline: valid (char-by-char)', () => {
     const events = parseCharByChar(`${actionsTagOpen()}\n<shell>hi</shell>${actionsTagClose()}\n`)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
   })
 
   it('inline actions close NOT followed by newline: NOT valid', () => {
     const events = parse(`${actionsTagOpen()}\n<shell>hi</shell>${actionsTagClose()}more`)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(false)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(false)
   })
 })
