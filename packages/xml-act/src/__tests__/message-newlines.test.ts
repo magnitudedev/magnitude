@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createStreamingXmlParser } from '../index'
 import type { ParseEvent } from '../index'
-import { parseMarkdownToMdast } from '../../../../cli/src/utils/markdown-parser'
+import { parseMarkdownToMdast } from '../../../../cli/src/markdown/parse'
 
 function parse(xml: string): ParseEvent[] {
   const parser = createStreamingXmlParser(new Set(), new Map())
@@ -10,7 +10,7 @@ function parse(xml: string): ParseEvent[] {
 
 function extractMessageText(xml: string): string {
   return parse(xml)
-    .filter((event): event is Extract<ParseEvent, { _tag: 'MessageBodyChunk' }> => event._tag === 'MessageBodyChunk')
+    .filter((event): event is Extract<ParseEvent, { _tag: 'MessageChunk' }> => event._tag === 'MessageChunk')
     .map(event => event.text)
     .join('')
 }
@@ -39,7 +39,7 @@ line2</message>
 
     const events = parse(xml)
     const text = events
-      .filter((event): event is Extract<ParseEvent, { _tag: 'MessageBodyChunk' }> => event._tag === 'MessageBodyChunk')
+      .filter((event): event is Extract<ParseEvent, { _tag: 'MessageChunk' }> => event._tag === 'MessageChunk')
       .map(event => event.text)
       .join('')
 

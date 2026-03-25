@@ -1,7 +1,16 @@
 import { describe, it, expect } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import { TURN_CONTROL_FINISH, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose } from '../constants'
-import type { ParseEvent } from '../parser/types'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
+
+const TURN_CONTROL_NEXT = 'next'
+const TURN_CONTROL_YIELD = 'yield'
+const TURN_CONTROL_FINISH = 'finish'
+const actionsTagOpen = () => '<actions>'
+const actionsTagClose = () => '</actions>'
+const thinkTagOpen = () => '<think>'
+const thinkTagClose = () => '</think>'
+const commsTagOpen = () => '<comms>'
+const commsTagClose = () => '</comms>'
 
 const knownTags = new Set(['shell', 'fs-read'])
 const childTagMap = new Map<string, Set<string>>()

@@ -1,9 +1,6 @@
-import { describe, it, expect, afterAll } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import { useAltKeywords, useDefaultKeywords } from '../constants'
-import type { ParseEvent } from '../parser/types'
-
-afterAll(() => useDefaultKeywords())
+import { describe, it, expect } from 'bun:test'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
 
 /**
  * Repro: <reason> (think tag with alt keywords) inside think body text
@@ -26,7 +23,7 @@ afterAll(() => useDefaultKeywords())
  */
 describe('repro: think tag name in think body causes depth mismatch', () => {
   it('reason mentioned in think body eats all subsequent tool calls', () => {
-    useAltKeywords()
+
 
     const knownTags = new Set(['fs-search', 'shell'])
     const parser = createStreamingXmlParser(knownTags, new Map())
@@ -58,7 +55,7 @@ describe('repro: think tag name in think body causes depth mismatch', () => {
     expect(thinkEnd!.content).not.toContain('<shell')
 
     // The tooluse block should be parsed as actions
-    const actionsOpen = events.find(e => e._tag === 'ActionsOpen')
+    const actionsOpen = events.find(e => e._tag === 'ContainerOpen')
     expect(actionsOpen).toBeDefined()
 
     // The shell tool should be parsed with its attributes

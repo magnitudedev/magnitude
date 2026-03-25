@@ -14,13 +14,7 @@
 import { Context, Effect, Layer } from "effect"
 import type { Tool, XmlBinding, XmlChildBinding, ContentPart } from "@magnitudedev/tools"
 import type { OutputNode } from './output-tree'
-import type {
-  BaseToolParseErrorDetail,
-  UnclosedThinkDetail,
-  FinishWithoutEvidenceDetail,
-  UnclosedActionsDetail,
-  TurnControlConflictDetail,
-} from './parser/types'
+import type { TagParseErrorDetail, StructuralParseErrorDetail } from './format/types'
 
 // =============================================================================
 // XML Tag Binding (erased tag variant of XmlBinding<T>)
@@ -82,7 +76,7 @@ export type ChildAttrsPick<Elem, C> =
   [ChildBindingAttrFields<C>] extends [never] ? {} : Pick<Elem, ChildBindingAttrFields<C> & keyof Elem>
 
 // =============================================================================
-// Tool Call Context + Error (consumer-facing, self-contained)
+// Tool Call Context (consumer-facing, self-contained)
 // =============================================================================
 
 export interface ToolCallContext {
@@ -92,7 +86,7 @@ export interface ToolCallContext {
   readonly group: string
 }
 
-export type ToolCallError = BaseToolParseErrorDetail & { readonly call: ToolCallContext }
+
 
 // =============================================================================
 // Registered Tool
@@ -181,7 +175,7 @@ export interface ToolInputParseError {
   readonly tagName: string
   readonly toolName: string
   readonly group: string
-  readonly error: ToolCallError
+  readonly error: TagParseErrorDetail
 }
 
 // =============================================================================
@@ -303,7 +297,7 @@ export interface ToolObservation {
 
 export interface StructuralParseError {
   readonly _tag: 'StructuralParseError'
-  readonly error: UnclosedThinkDetail | UnclosedActionsDetail | TurnControlConflictDetail | FinishWithoutEvidenceDetail
+  readonly error: StructuralParseErrorDetail
 }
 
 

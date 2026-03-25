@@ -51,8 +51,17 @@ export type {
 } from './types'
 
 // Core types — errors
-export type { ToolCallContext, ToolCallError } from './types'
-export type { UnclosedThinkDetail, UnclosedActionsDetail } from './parser/types'
+export type { ToolCallContext } from './types'
+export type {
+  TagParseErrorDetail,
+  ParseErrorDetail,
+  StructuralParseErrorDetail,
+  UnclosedThinkDetail,
+  UnclosedContainerDetail,
+  FinishWithoutEvidenceDetail,
+  TurnControlConflictDetail,
+  UnclosedActionsDetail,
+} from './format/types'
 
 // Core types — results
 export type {
@@ -111,16 +120,21 @@ export type { OutputNode } from './output-tree'
 // Stream guard
 export { guardStream, guardEffectStream } from './stream-guard'
 
-// Protocol constants & keyword configuration
-export { getKeywords, useAltKeywords, useDefaultKeywords, actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, TURN_CONTROL_FINISH } from './constants'
-export type { KeywordSet } from './constants'
+// Parser
+export { createStreamingXmlParser, createParser, defaultIdGenerator } from './parser'
+export type { StreamingParser, IdGenerator } from './parser'
 
-// Parser (for testing — not part of the public API)
-export { createStreamingXmlParser, defaultIdGenerator } from './parser/streaming-xml-parser'
-export type { StreamingXmlParser, IdGenerator } from './parser/streaming-xml-parser'
-export type { ParseEvent, ParsedElement, ParsedChild, AttributeValue } from './parser/types'
+// Machine + scanner
+export { createStackMachine } from './machine'
+export type { Op, StackMachine } from './machine'
+export { createScanner } from './scanner'
+export type { Scanner, ScannerSignal } from './scanner'
 
+// Format
+export * from './format'
+export type { ParseEvent, ParsedElement, ParsedChild, AttributeValue, XmlActEvent } from './format/types'
 export { SchemaAccumulator } from './schema-accumulator'
 export { StreamingAccumulator, type StreamingAccumulatorConfig } from './streaming-accumulator'
 export { defineXmlBinding, type XmlBindingResult, type XmlMappingConfig, type XmlInputMappingConfig, type XmlOutputBinding } from './xml-binding'
 export type { DeriveStreamingShape, DeriveFields, DeriveChildren, AttrNames, ChildTagNames, ChildrenTagNames } from './type-chain'
+export * from './constants'

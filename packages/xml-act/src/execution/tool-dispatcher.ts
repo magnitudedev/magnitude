@@ -14,8 +14,7 @@ import { Effect, Either } from "effect"
 import { AST } from "@effect/schema"
 import { Schema } from "@effect/schema"
 import type { ToolContext } from '@magnitudedev/tools'
-import type { ParsedElement } from '../parser/types'
-import type { BaseToolParseErrorDetail } from '../parser/types'
+import type { ParsedElement, TagParseErrorDetail } from '../format/types'
 import type {
   RegisteredTool,
   XmlRuntimeEvent,
@@ -60,7 +59,7 @@ function findMissingRequiredFields(
 
 export type DispatchResult =
   | { readonly _tag: 'Dispatched' }
-  | { readonly _tag: 'ParseError'; readonly error: BaseToolParseErrorDetail }
+  | { readonly _tag: 'ParseError'; readonly error: TagParseErrorDetail }
 
 export interface DispatchContext {
   readonly tools: ReadonlyMap<string, RegisteredTool>
@@ -133,6 +132,8 @@ export function dispatchTool(
         _tag: 'ParseError' as const,
         error: {
           _tag: 'MissingRequiredFields' as const,
+          id: element.toolCallId,
+          tagName: element.tagName,
           fields: missingFields,
           detail: `Required field${missingFields.length > 1 ? 's' : ''} ${fieldList} missing on <${element.tagName}>`,
         },
@@ -149,6 +150,8 @@ export function dispatchTool(
         _tag: 'ParseError' as const,
         error: {
           _tag: 'MissingRequiredFields' as const,
+          id: element.toolCallId,
+          tagName: element.tagName,
           fields: [],
           detail: `Validation failed on <${element.tagName}>: ${msg}`,
         },

@@ -1,9 +1,8 @@
-import { actionsTagOpen, actionsTagClose } from '@magnitudedev/xml-act'
 import type { Scenario, Check } from '../../types'
 import { mockProject } from './mock-project'
 
-const AO = actionsTagOpen()
-const AC = actionsTagClose()
+const AO = '<actions>'
+const AC = '</actions>'
 
 export function makeRef(tool: string, content = ''): string {
   return ['<', 'ref tool="', tool, '">', content, '</', 'ref>'].join('')

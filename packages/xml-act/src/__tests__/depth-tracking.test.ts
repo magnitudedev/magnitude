@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import type { ParseEvent } from '../parser/types'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
 
 const knownTags = new Set(['shell'])
 const childTagMap = new Map<string, Set<string>>()
@@ -50,7 +50,8 @@ function normalizeEvents(events: ParseEvent[]): unknown {
     return normalized
   }
 
-  const normalized = events.map((event) => {
+  const normalized = events
+    .map((event) => {
     if ('toolCallId' in event && typeof event.toolCallId === 'string') {
       return {
         ...event,
@@ -83,8 +84,8 @@ function normalizeEvents(events: ParseEvent[]): unknown {
 
     if (
       prev
-      && prev._tag === 'MessageBodyChunk'
-      && current._tag === 'MessageBodyChunk'
+      && prev._tag === 'MessageChunk'
+      && current._tag === 'MessageChunk'
       && prev.id === current.id
     ) {
       prev.text = String(prev.text) + String(current.text)
@@ -96,6 +97,16 @@ function normalizeEvents(events: ParseEvent[]): unknown {
       && prev._tag === 'BodyChunk'
       && current._tag === 'BodyChunk'
       && prev.toolCallId === current.toolCallId
+    ) {
+      prev.text = String(prev.text) + String(current.text)
+      continue
+    }
+
+    if (
+      prev
+      && prev._tag === 'ProseChunk'
+      && current._tag === 'ProseChunk'
+      && prev.patternId === current.patternId
     ) {
       prev.text = String(prev.text) + String(current.text)
       continue
@@ -115,7 +126,7 @@ function expectSameEventsForAllSingleSplits(xml: string): void {
 }
 
 function messages(events: ParseEvent[]) {
-  return events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageBodyChunk' }> => e._tag === 'MessageBodyChunk')
+  return events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageChunk' }> => e._tag === 'MessageChunk')
 }
 
 function lenses(events: ParseEvent[]) {
@@ -136,8 +147,8 @@ describe('structural tag depth tracking', () => {
       ].join('\n') + '\n',
     )
 
-    const actionOpens = events.filter(e => e._tag === 'ActionsOpen')
-    const actionCloses = events.filter(e => e._tag === 'ActionsClose')
+    const actionOpens = events.filter(e => e._tag === 'ContainerOpen')
+    const actionCloses = events.filter(e => e._tag === 'ContainerClose')
     const shells = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
         e._tag === 'TagClosed' && e.tagName === 'shell',
@@ -166,13 +177,13 @@ describe('structural tag depth tracking', () => {
 
     const events = parse(xml)
 
-    const commsOpens = events.filter(e => e._tag === 'CommsOpen')
-    const commsCloses = events.filter(e => e._tag === 'CommsClose')
-    const messageOpens = events.filter(e => e._tag === 'MessageTagOpen')
-    const messageCloses = events.filter(e => e._tag === 'MessageTagClose')
-    const closeIndex = events.findIndex(e => e._tag === 'CommsClose')
+    const commsOpens = events.filter((e): e is Extract<ParseEvent, { _tag: 'ContainerOpen' }> => e._tag === 'ContainerOpen' && e.tag === 'comms')
+    const commsCloses = events.filter((e): e is Extract<ParseEvent, { _tag: 'ContainerClose' }> => e._tag === 'ContainerClose' && e.tag === 'comms')
+    const messageOpens = events.filter(e => e._tag === 'MessageStart')
+    const messageCloses = events.filter(e => e._tag === 'MessageEnd')
+    const closeIndex = events.findIndex(e => e._tag === 'ContainerClose')
     const secondMessageIndex = events.findIndex(
-      (e, i) => i > 0 && e._tag === 'MessageBodyChunk' && e.text.includes('after'),
+      (e, i) => i > 0 && e._tag === 'MessageChunk' && e.text.includes('after'),
     )
 
     expect(commsOpens).toHaveLength(1)
@@ -230,8 +241,8 @@ describe('structural tag depth tracking', () => {
 
     const events = parse(xml)
 
-    const messageOpens = events.filter(e => e._tag === 'MessageTagOpen')
-    const messageCloses = events.filter(e => e._tag === 'MessageTagClose')
+    const messageOpens = events.filter(e => e._tag === 'MessageStart')
+    const messageCloses = events.filter(e => e._tag === 'MessageEnd')
     const shells = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
         e._tag === 'TagClosed' && e.tagName === 'shell',

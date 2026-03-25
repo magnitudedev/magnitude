@@ -12,7 +12,7 @@ import { ProviderRuntimeProvider } from './providers/provider-runtime'
 import { StorageProvider } from './providers/storage-provider'
 import { isLightBackground } from './utils/theme'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
-import { useAltKeywords } from '@magnitudedev/xml-act'
+
 import { runOneshot } from './oneshot'
 
 async function main() {
@@ -24,7 +24,7 @@ async function main() {
     .version('0.0.1')
     .option('--resume', 'Resume the most recent chat session')
     .option('--debug', 'Enable debug mode with debug panel')
-    .option('--alt-keywords', 'Use alternate XML keywords (magniactions/magnithink) for self-development')
+
     .option('--oneshot [prompt]', 'Run autonomous oneshot task and exit on completion')
     .option('--provider <id>', 'Provider ID for oneshot mode (e.g. anthropic, openai)')
     .option('--model <id>', 'Model ID for oneshot mode')
@@ -32,10 +32,6 @@ async function main() {
     .option('--disable-cwd-safeguards', 'Disable working-directory boundary safeguards for this oneshot run')
     .argument('[prompt]')
     .action(async (promptArg, opts) => {
-      if (opts.altKeywords) {
-        useAltKeywords()
-      }
-
       if (opts.oneshot !== undefined) {
         if (opts.resume) {
           console.error('--resume and --oneshot cannot be used together')

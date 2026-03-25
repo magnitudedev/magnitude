@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test'
-import { createStreamingXmlParser } from '../parser/streaming-xml-parser'
-import type { ParseEvent } from '../parser/types'
+import { createStreamingXmlParser } from '../parser'
+import type { ParseEvent } from '../format/types'
 
 const knownTags = new Set(['shell'])
 const childTagMap = new Map<string, Set<string>>()
@@ -12,10 +12,9 @@ function parse(xml: string): ParseEvent[] {
 
 function parseCharByChar(xml: string): ParseEvent[] {
   const parser = createStreamingXmlParser(knownTags, childTagMap)
-  const events: ParseEvent[] = []
-  for (const ch of xml) events.push(...parser.processChunk(ch))
-  events.push(...parser.flush())
-  return events
+  for (const ch of xml) parser.push(ch)
+  parser.flush()
+  return [...parser.events]
 }
 
 function parseByChunks(chunks: string[]): ParseEvent[] {
@@ -131,10 +130,10 @@ describe('lenses parsing', () => {
 
     expect(lensStarts(events).map(e => e.name)).toEqual(['task'])
     expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'task', content: 'Reason briefly.' }])
-    expect(events.some(e => e._tag === 'CommsOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'CommsClose')).toBe(true)
-    expect(events.some(e => e._tag === 'ActionsOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ActionsClose')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
     expect(events.some(e => e._tag === 'TagClosed' && e.tagName === 'shell')).toBe(true)
   })
 

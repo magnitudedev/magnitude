@@ -1,4 +1,4 @@
-import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { ACTIONS_CLOSE, ACTIONS_OPEN, COMMS_CLOSE, COMMS_OPEN, LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, type XmlTagBinding } from '@magnitudedev/xml-act'
 
 export interface ThinkBlock {
   about: string | null
@@ -135,7 +135,7 @@ export function serializeCanonicalTurn(
       const lensLines = activeLenses.map((lens) =>
         `<lens name="${lens.name}">${lens.content}</lens>`
       )
-      parts.push(`<lenses>\n${lensLines.join('\n')}\n</lenses>`)
+      parts.push(`${LENSES_OPEN}\n${lensLines.join('\n')}\n${LENSES_CLOSE}`)
     }
   }
 
@@ -152,7 +152,7 @@ export function serializeCanonicalTurn(
       const trimmedText = msg.text.trim()
       return `\n${serializeTag('message', attrs, trimmedText, [])}`
     }).join('')
-    parts.push(`<comms>${messageLines}\n</comms>`)
+    parts.push(`${COMMS_OPEN}${messageLines}\n${COMMS_CLOSE}`)
   }
 
   const actionLines: string[] = []
@@ -163,10 +163,10 @@ export function serializeCanonicalTurn(
   }
 
   if (actionLines.length > 0) {
-    parts.push(`<actions>\n${actionLines.join('\n')}\n</actions>`)
+    parts.push(`${ACTIONS_OPEN}\n${actionLines.join('\n')}\n${ACTIONS_CLOSE}`)
   }
 
-  const control = trace.turnDecision === 'continue' ? `<${TURN_CONTROL_NEXT}/>` : `<${TURN_CONTROL_YIELD}/>`
+  const control = trace.turnDecision === 'continue' ? TURN_CONTROL_NEXT : TURN_CONTROL_YIELD
   parts.push(control)
   return parts.join('\n')
 }

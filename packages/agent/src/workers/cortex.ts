@@ -17,7 +17,7 @@
 
 import { Effect, Stream, Queue, Either } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
-import { actionsTagClose, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
+
 import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 

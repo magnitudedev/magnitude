@@ -1,9 +1,17 @@
-import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose, TURN_CONTROL_FINISH, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
+import type { ThinkingLens } from '@magnitudedev/roles'
+import {
+  ACTIONS_CLOSE,
+  ACTIONS_OPEN,
+  COMMS_CLOSE,
+  COMMS_OPEN,
+  LENSES_CLOSE,
+  LENSES_OPEN,
+  TURN_CONTROL_YIELD,
+} from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
 import turnControlSubagentRaw from './protocol/turn-control-subagent.txt'
-import type { ThinkingLens } from '@magnitudedev/roles'
 
 const XML_ACT_PROTOCOL_RAW = xmlActProtocolRaw
 const TURN_CONTROL_ONESHOT_RAW = turnControlOneshotRaw
@@ -36,26 +44,26 @@ export function getXmlActProtocol(
 
   return XML_ACT_PROTOCOL_RAW
     .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
-    .replaceAll('{{ACTIONS_OPEN}}', actionsTagOpen())
-    .replaceAll('{{ACTIONS_CLOSE}}', actionsTagClose())
-    .replaceAll('{{THINK_OPEN}}', thinkTagOpen())
-    .replaceAll('{{THINK_CLOSE}}', thinkTagClose())
-    .replaceAll('{{COMMS_OPEN}}', commsTagOpen())
-    .replaceAll('{{COMMS_CLOSE}}', commsTagClose())
+    .replaceAll('{{ACTIONS_OPEN}}', ACTIONS_OPEN)
+    .replaceAll('{{ACTIONS_CLOSE}}', ACTIONS_CLOSE)
+    .replaceAll('{{THINK_OPEN}}', LENSES_OPEN)
+    .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
+    .replaceAll('{{COMMS_OPEN}}', COMMS_OPEN)
+    .replaceAll('{{COMMS_CLOSE}}', COMMS_CLOSE)
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
-    .replaceAll('{{TURN_CONTROL_NEXT}}', TURN_CONTROL_NEXT)
-    .replaceAll('{{TURN_CONTROL_YIELD}}', TURN_CONTROL_YIELD)
-    .replaceAll('{{TURN_CONTROL_FINISH}}', TURN_CONTROL_FINISH)
+    .replaceAll('{{TURN_CONTROL_NEXT}}', 'next')
+    .replaceAll('{{TURN_CONTROL_YIELD}}', 'yield')
+    .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
 }
 
 export function buildAckTurn(_lenses: ThinkingLens[]): string {
-  return `<lenses>
-</lenses>
-<comms>
+  return `${LENSES_OPEN}
+${LENSES_CLOSE}
+${COMMS_OPEN}
 <message>I understand the response format and am ready.
 </message>
-</comms>
-<yield/>`
+${COMMS_CLOSE}
+${TURN_CONTROL_YIELD}`
 }

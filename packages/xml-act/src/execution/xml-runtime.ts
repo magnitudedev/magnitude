@@ -11,15 +11,14 @@
 import { Effect, Stream, Ref, Option, Queue, Scope, Cause } from "effect"
 import type { ToolContext } from '@magnitudedev/tools'
 
-import { createStreamingXmlParser, defaultIdGenerator } from '../parser/streaming-xml-parser'
+import { createStreamingXmlParser, defaultIdGenerator, type IdGenerator } from '../parser'
 import { createShortId } from '../util'
-import type { IdGenerator } from '../parser/streaming-xml-parser'
-import type { ParseEvent } from '../parser/types'
+import type { ParseEvent } from '../format/types'
 import type {
   XmlRuntimeConfig,
   XmlRuntimeEvent,
   ToolInterceptor,
-  ToolCallContext,
+
   RegisteredTool,
   ReactorState,
 } from '../types'
@@ -108,109 +107,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
           )
 
           // ---------------------------------------------------------------
-          // Text coalescing queue
-          //
-          // The reactor processes chars one at a time (for ref store correctness)
-          // which produces per-character BodyChunk/ProseChunk events. The
-          // coalescing queue accumulates consecutive text events and flushes
-          // them as single chunk-sized events at natural boundaries.
-          // ---------------------------------------------------------------
-
-          type TextBuffer =
-            | { _tag: 'body'; toolCallId: string; path: readonly string[]; field: string; text: string }
-            | { _tag: 'prose'; patternId: string; text: string }
-            | { _tag: 'lens'; text: string }
-            | { _tag: 'message'; id: string; text: string }
-          let textBuffer: TextBuffer | null = null
-
-          function flushTextBuffer(): Effect.Effect<void> {
-            if (!textBuffer) return Effect.void
-            const buf = textBuffer
-            textBuffer = null
-            switch (buf._tag) {
-              case 'body':
-                return Queue.offer(queue, {
-                  _tag: 'ToolInputBodyChunk',
-                  toolCallId: buf.toolCallId,
-                  path: buf.path,
-                  field: buf.field,
-                  text: buf.text,
-                } satisfies XmlRuntimeEvent)
-              case 'prose':
-                return Queue.offer(queue, {
-                  _tag: 'ProseChunk',
-                  patternId: buf.patternId,
-                  text: buf.text,
-                } satisfies XmlRuntimeEvent)
-              case 'lens':
-                return Queue.offer(queue, {
-                  _tag: 'LensChunk',
-                  text: buf.text,
-                } satisfies XmlRuntimeEvent)
-              case 'message':
-                return Queue.offer(queue, {
-                  _tag: 'MessageChunk',
-                  id: buf.id,
-                  text: buf.text,
-                } satisfies XmlRuntimeEvent)
-            }
-          }
-
-          function offerCoalesced(event: XmlRuntimeEvent): Effect.Effect<void> {
-            if (event._tag === 'ToolInputBodyChunk') {
-              if (textBuffer && textBuffer._tag === 'body'
-                && textBuffer.toolCallId === event.toolCallId) {
-                textBuffer.text += event.text
-                return Effect.void
-              }
-              return Effect.gen(function* () {
-                yield* flushTextBuffer()
-                textBuffer = { _tag: 'body', toolCallId: event.toolCallId, path: event.path, field: event.field, text: event.text }
-              })
-            }
-
-            if (event._tag === 'ProseChunk') {
-              if (textBuffer && textBuffer._tag === 'prose'
-                && textBuffer.patternId === event.patternId) {
-                textBuffer.text += event.text
-                return Effect.void
-              }
-              return Effect.gen(function* () {
-                yield* flushTextBuffer()
-                textBuffer = { _tag: 'prose', patternId: event.patternId, text: event.text }
-              })
-            }
-
-            if (event._tag === 'LensChunk') {
-              if (textBuffer && textBuffer._tag === 'lens') {
-                textBuffer.text += event.text
-                return Effect.void
-              }
-              return Effect.gen(function* () {
-                yield* flushTextBuffer()
-                textBuffer = { _tag: 'lens', text: event.text }
-              })
-            }
-
-            if (event._tag === 'MessageChunk') {
-              if (textBuffer && textBuffer._tag === 'message'
-                && textBuffer.id === event.id) {
-                textBuffer.text += event.text
-                return Effect.void
-              }
-              return Effect.gen(function* () {
-                yield* flushTextBuffer()
-                textBuffer = { _tag: 'message', id: event.id, text: event.text }
-              })
-            }
-
-            return Effect.gen(function* () {
-              yield* flushTextBuffer()
-              yield* Queue.offer(queue, event)
-            })
-          }
-
-          // ---------------------------------------------------------------
           // Reactor glue
           // ---------------------------------------------------------------
 
@@ -219,7 +115,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             event: XmlRuntimeEvent,
           ): Effect.Effect<ReactorState> {
             return Effect.gen(function* () {
-              yield* offerCoalesced(event)
+              yield* Queue.offer(queue, event)
               return foldReactorState(state, event)
             })
           }
@@ -243,10 +139,8 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
           }
 
           // Producer fiber: parse → react → dispatch, offer events to queue.
-          // Processes char by char so the reactor runs between each character,
-          // ensuring the ref store is populated before the parser encounters <ref>.
-          // Text events (BodyChunk, ProseChunk) are coalesced within each LLM chunk
-          // so consumers see chunk-sized text instead of single characters.
+          // Each LLM chunk is passed to parser.processChunk() which returns
+          // coalesced events (text events merged by the parser's coalescing layer).
           const producer = Effect.gen(function* () {
             yield* xmlStream.pipe(
               Stream.mapError((e) => new XmlRuntimeCrash(e.message, e)),
@@ -255,16 +149,11 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                   let state = yield* Ref.get(stateRef)
                   if (state.stopped) return false
 
-                  for (const ch of chunk) {
+                  const parseEvents = parser.processChunk(chunk)
+                  for (const pe of parseEvents) {
                     if (state.stopped) break
-                    const parseEvents = parser.processChunk(ch)
-                    for (const pe of parseEvents) {
-                      if (state.stopped) break
-                      state = yield* react(state, pe)
-                    }
+                    state = yield* react(state, pe)
                   }
-                  // Flush any coalesced text at chunk boundary
-                  yield* flushTextBuffer()
                   yield* Ref.set(stateRef, state)
                   return !state.stopped
                 }),
@@ -279,7 +168,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                 if (state.stopped) break
                 state = yield* react(state, pe)
               }
-              yield* flushTextBuffer()
               yield* Ref.set(stateRef, state)
             }
 
@@ -432,7 +320,6 @@ function reactImpl(
         } else if (tagSchema && !tagSchema.acceptsBody) {
           const registered = config.tools.get(tagNameForBody)
           if (registered) {
-            const call = makeCallContext(parseEvent.toolCallId, tagNameForBody, registered)
             currentState = yield* emitAndFold(currentState, {
               _tag: 'ToolInputParseError',
               toolCallId: parseEvent.toolCallId,
@@ -441,8 +328,9 @@ function reactImpl(
               group: registered.groupName,
               error: {
                 _tag: 'UnexpectedBody',
+                id: parseEvent.toolCallId,
+                tagName: tagNameForBody,
                 detail: `Tool <${tagNameForBody}> does not accept body content`,
-                call,
               },
             })
           }
@@ -568,14 +456,13 @@ function reactImpl(
         const result: DispatchResult = yield* dispatchTool(parseEvent.element, dispatchCtx)
 
         if (result._tag === 'ParseError') {
-          const call = makeCallContext(parseEvent.toolCallId, parseEvent.tagName, registered)
           currentState = yield* emitAndFold(currentState, {
             _tag: 'ToolInputParseError',
             toolCallId: parseEvent.toolCallId,
             tagName: parseEvent.tagName,
             toolName: registered.tool.name,
             group: registered.groupName,
-            error: { ...result.error, call },
+            error: result.error,
           })
         } else {
           // Check for rejection (state already folded via emit callback)
@@ -666,8 +553,7 @@ function reactImpl(
         break
       }
 
-
-      case 'MessageTagOpen': {
+      case 'MessageStart': {
         currentState = yield* emitAndFold(currentState, {
           _tag: 'MessageStart',
           id: parseEvent.id,
@@ -677,7 +563,7 @@ function reactImpl(
         break
       }
 
-      case 'MessageBodyChunk': {
+      case 'MessageChunk': {
         currentState = yield* emitAndFold(currentState, {
           _tag: 'MessageChunk',
           id: parseEvent.id,
@@ -686,7 +572,7 @@ function reactImpl(
         break
       }
 
-      case 'MessageTagClose': {
+      case 'MessageEnd': {
         currentState = yield* emitAndFold(currentState, {
           _tag: 'MessageEnd',
           id: parseEvent.id,
@@ -707,7 +593,7 @@ function reactImpl(
       case 'ParseError': {
         const error = parseEvent.error
 
-        if (error._tag === 'UnclosedThink' || error._tag === 'UnclosedActions') {
+        if (error._tag === 'UnclosedThink' || error._tag === 'UnclosedContainer') {
           currentState = yield* emitAndFold(currentState, {
             _tag: 'StructuralParseError',
             error,
@@ -723,29 +609,25 @@ function reactImpl(
           break
         }
 
-        // Tool-scoped error — needs toolCallId/tagName from the detail
-        if (currentState.deadToolCalls.has(error.toolCallId)) break
-        if (hasPriorOutcome(priorOutcomes, error.toolCallId)) break
+        if (currentState.deadToolCalls.has(error.id)) break
+        if (hasPriorOutcome(priorOutcomes, error.id)) break
 
         const registered = config.tools.get(error.tagName)
         if (registered) {
-          const call = makeCallContext(error.toolCallId, error.tagName, registered)
           currentState = yield* emitAndFold(currentState, {
             _tag: 'ToolInputParseError',
-            toolCallId: error.toolCallId,
+            toolCallId: error.id,
             tagName: error.tagName,
             toolName: registered.tool.name,
             group: registered.groupName,
-            error: { ...error, call },
+            error,
           })
         }
         break
       }
 
-      case 'ActionsOpen':
-      case 'ActionsClose':
-      case 'CommsOpen':
-      case 'CommsClose':
+      case 'ContainerOpen':
+      case 'ContainerClose':
         // Structural — no runtime events
         break
     }
@@ -758,14 +640,7 @@ function reactImpl(
 // Binding resolution helpers
 // =============================================================================
 
-function makeCallContext(toolCallId: string, tagName: string, registered: RegisteredTool): ToolCallContext {
-  return {
-    toolCallId,
-    tagName,
-    toolName: registered.tool.name,
-    group: registered.groupName,
-  }
-}
+
 
 function resolveBodyField(
   toolCallId: string,

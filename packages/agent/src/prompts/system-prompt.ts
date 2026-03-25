@@ -1,5 +1,6 @@
 import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
-import { actionsTagOpen, actionsTagClose, thinkTagOpen, thinkTagClose, commsTagOpen, commsTagClose } from '@magnitudedev/xml-act'
+import { ACTIONS_CLOSE, ACTIONS_OPEN, COMMS_CLOSE, COMMS_OPEN, LENSES_CLOSE, LENSES_OPEN } from '@magnitudedev/xml-act'
+
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
 import { getXmlActProtocol } from './protocol'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
@@ -11,12 +12,12 @@ export function compilePromptTemplate(raw: string): string {
   return raw
     .replaceAll('{{PROSE_OPEN}}', PROSE_DELIM_OPEN)
     .replaceAll('{{PROSE_CLOSE}}', PROSE_DELIM_CLOSE)
-    .replaceAll('{{ACTIONS_OPEN}}', actionsTagOpen())
-    .replaceAll('{{ACTIONS_CLOSE}}', actionsTagClose())
-    .replaceAll('{{THINK_OPEN}}', thinkTagOpen())
-    .replaceAll('{{THINK_CLOSE}}', thinkTagClose())
-    .replaceAll('{{COMMS_OPEN}}', commsTagOpen())
-    .replaceAll('{{COMMS_CLOSE}}', commsTagClose())
+    .replaceAll('{{ACTIONS_OPEN}}', ACTIONS_OPEN)
+    .replaceAll('{{ACTIONS_CLOSE}}', ACTIONS_CLOSE)
+    .replaceAll('{{THINK_OPEN}}', LENSES_OPEN)
+    .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
+    .replaceAll('{{COMMS_OPEN}}', COMMS_OPEN)
+    .replaceAll('{{COMMS_CLOSE}}', COMMS_CLOSE)
     .replaceAll('{{TOOLING_SECTION}}', toolingSectionRaw)
 }
 

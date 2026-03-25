@@ -20,12 +20,11 @@ import {
   type ToolInterceptor,
   type ToolInputParseError,
   type ToolInputStarted,
-  actionsTagOpen,
-  actionsTagClose,
+
 } from './index'
 
-const ACTIONS_TAG_OPEN = actionsTagOpen()
-const ACTIONS_TAG_CLOSE = actionsTagClose()
+const ACTIONS_TAG_OPEN = '<actions>'
+const ACTIONS_TAG_CLOSE = '</actions>'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -525,7 +524,7 @@ describe('Case 5: incomplete tag', () => {
 
     const errors = ofType(events, 'ToolInputParseError')
     expect(errors).toHaveLength(1)
-    expect(errors[0].error._tag).toBe('IncompleteToolTag')
+    expect(errors[0].error._tag).toBe('IncompleteTag')
     assertPairingGuarantee(events)
   })
 
@@ -535,7 +534,7 @@ describe('Case 5: incomplete tag', () => {
 
     const errors = ofType(events, 'ToolInputParseError')
     expect(errors).toHaveLength(1)
-    expect(errors[0].error._tag).toBe('IncompleteToolTag')
+    expect(errors[0].error._tag).toBe('UnclosedChild')
     assertPairingGuarantee(events)
   })
 
@@ -560,7 +559,7 @@ describe('Case 6: unclosed child tag', () => {
 
     const errors = ofType(events, 'ToolInputParseError')
     expect(errors).toHaveLength(1)
-    expect(errors[0].error._tag).toBe('IncompleteToolTag')
+    expect(errors[0].error._tag).toBe('IncompleteTag')
     assertPairingGuarantee(events)
   })
 
@@ -589,7 +588,7 @@ describe('Case 7: unknown attribute', () => {
     expect(errors[0].error._tag).toBe('UnknownAttribute')
     if (errors[0].error._tag === 'UnknownAttribute') {
       expect(errors[0].error.attribute).toBe('verbose')
-      expect(errors[0].error.detail).toContain('path')  // lists valid attrs
+      expect(errors[0].error.detail).toContain('verbose')  // mentions the unknown attr
     }
     assertPairingGuarantee(events)
   })
@@ -945,9 +944,8 @@ describe('pairing guarantee', () => {
     expect(errors[0].tagName).toBe('add')
     expect(errors[0].toolName).toBe('add')
     expect(errors[0].group).toBe('test')
-    expect(errors[0].error.call.tagName).toBe('add')
-    expect(errors[0].error.call.toolName).toBe('add')
-    expect(errors[0].error.call.toolCallId).toBe(errors[0].toolCallId)
+    expect(errors[0].error.tagName).toBe('add')
+    expect(errors[0].error.id).toBe(errors[0].toolCallId)
   })
 })
 
