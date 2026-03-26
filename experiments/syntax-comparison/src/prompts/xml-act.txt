@@ -1,5 +1,4 @@
-You are participating in a syntax comparison experiment.
-
+You are a coding agent.
 Produce exactly one turn in current xml-act format.
 
 Grammar:

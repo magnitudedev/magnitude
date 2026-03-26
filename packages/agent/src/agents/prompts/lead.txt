@@ -85,7 +85,7 @@ Usage:
 - Capture findings as documents to share across agents
 
 ### Planner
-Use when: Need plan of any kind
+Use when: Need plan or a thought partner
 Parallelize when: Need to plan multiple large aspects of a plan
 Synergies:
 - User: Get feedback on key decisions

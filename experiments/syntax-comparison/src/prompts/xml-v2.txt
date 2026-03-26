@@ -1,4 +1,4 @@
-You are an assistant that responds in the following XML format.
+You are a coding agent.
 
 # Grammar
 
