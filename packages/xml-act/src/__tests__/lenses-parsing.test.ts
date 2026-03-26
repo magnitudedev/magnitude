@@ -303,6 +303,58 @@ describe('tags inside plain think are passthrough', () => {
   })
 })
 
+function proseChunks(events: ParseEvent[]) {
+  return events.filter((e): e is Extract<ParseEvent, { _tag: 'ProseChunk' }> => e._tag === 'ProseChunk')
+}
+function thinkProseChunks(events: ParseEvent[]) {
+  return proseChunks(events).filter(e => e.patternId === 'think')
+}
+
+describe('lenses whitespace suppression', () => {
+  it('no think prose chunks emitted for inter-lens whitespace', () => {
+    const events = parse('<lenses>\n<lens name="a">content a</lens>\n<lens name="b">content b</lens>\n</lenses>\n')
+    // Whitespace between <lenses> and <lens>, between </lens> and <lens>, and between </lens> and </lenses>
+    // should NOT produce ProseChunk events with patternId 'think'
+    expect(thinkProseChunks(events)).toHaveLength(0)
+  })
+
+  it('no think prose chunks for whitespace in empty lenses block', () => {
+    const events = parse('<lenses>\n\n\n</lenses>\n')
+    expect(thinkProseChunks(events)).toHaveLength(0)
+  })
+
+  it('no think prose chunks for whitespace around lenses (char-by-char)', () => {
+    const xml = '<lenses>\n<lens name="a">hello</lens>\n</lenses>\n'
+    const events = parseCharByChar(xml)
+    expect(thinkProseChunks(events)).toHaveLength(0)
+  })
+})
+
+describe('lens content trimming', () => {
+  it('lens content trims leading/trailing spaces and tabs', () => {
+    const events = parse('<lenses>\n<lens name="a">  \tcontent here\t  </lens>\n</lenses>\n')
+    expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'a', content: 'content here' }])
+  })
+
+  it('lens content trims leading/trailing newlines', () => {
+    const events = parse('<lenses>\n<lens name="a">\n\ncontent here\n\n</lens>\n</lenses>\n')
+    expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'a', content: 'content here' }])
+  })
+
+  it('lens content trims mixed whitespace at boundaries', () => {
+    const events = parse('<lenses>\n<lens name="a">\n  \tcontent here\t  \n</lens>\n</lenses>\n')
+    expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'a', content: 'content here' }])
+  })
+
+  it('early-close lens content is also trimmed', () => {
+    // When </lenses> closes while lens is still open
+    const events = parse('<lenses>\n<lens name="a">\n  content here  \n</lenses>\n')
+    const ends = lensEnds(events)
+    expect(ends).toHaveLength(1)
+    expect(ends[0].content).toBe('content here')
+  })
+})
+
 describe('char-by-char passthrough parity', () => {
   it('char-by-char: tags inside lenses remain passthrough', () => {
     const xml = `${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_NEXT} ${ACTIONS_OPEN}x${ACTIONS_CLOSE} ${shellOpen()}y${shellClose()}${lensClose()}\n${LENSES_CLOSE}\n`

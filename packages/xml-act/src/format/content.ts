@@ -37,6 +37,10 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
           emit({ _tag: 'LensChunk', text }),
         ]
       }
+      if (frame.isLenses && !frame.activeLens) {
+        // In lenses mode outside an active lens, inter-lens text is structural whitespace — accumulate but don't emit
+        return [replace({ ...frame, body: frame.body + text })]
+      }
       return [replace({ ...frame, body: frame.body + text }), emit({ _tag: 'ProseChunk', patternId: 'think', text })]
     }
     case 'message': {

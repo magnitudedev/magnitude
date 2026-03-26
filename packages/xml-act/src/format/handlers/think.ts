@@ -80,7 +80,7 @@ export function thinkHandler(
 
       if (think.isLenses) {
         if (think.activeLens) {
-          return [emit({ _tag: 'LensEnd', name: think.activeLens.name, content: think.activeLens.body }), pop]
+          return [emit({ _tag: 'LensEnd', name: think.activeLens.name, content: think.activeLens.body.trim() }), pop]
         }
         return [pop]
       }
@@ -138,7 +138,7 @@ export function lensHandler(
           emit({ _tag: 'LensChunk', text: raw }),
         ]
       }
-      const content = think.activeLens.body.replace(/^\n+|\n+$/g, '')
+      const content = think.activeLens.body.trim()
       return [
         emit({ _tag: 'LensEnd', name: think.activeLens.name, content }),
         replace({
