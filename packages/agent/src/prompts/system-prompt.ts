@@ -6,7 +6,7 @@ import { getXmlActProtocol } from './protocol'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
 import toolingSectionRaw from '../agents/prompts/lead-tooling.txt' with { type: 'text' }
 import subagentBaseRaw from '../agents/prompts/subagent-base.txt' with { type: 'text' }
-import workspaceRaw from '../agents/prompts/workspace.txt' with { type: 'text' }
+//import workspaceRaw from '../agents/prompts/workspace.txt' with { type: 'text' }
 
 export function compilePromptTemplate(raw: string): string {
   return raw
@@ -39,5 +39,5 @@ export function renderSystemPrompt(
     )
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)
-    .replaceAll('{{WORKSPACE_SECTION}}', workspaceRaw)
+    //.replaceAll('{{WORKSPACE_SECTION}}', workspaceRaw)
 }

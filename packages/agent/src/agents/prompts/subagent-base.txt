@@ -1,4 +1,3 @@
-{{WORKSPACE_SECTION}}
 
 ## Communication
 
@@ -11,3 +10,9 @@ If this turn includes a direct user message in your inbound communications, you 
 You parent may request plans, research, or other information. By default you should prefer to capture such information as documents in an appropriate part of the workspace ($M).
 Ensure that you tell the parents about these files AFTER you write them.
 
+## Workspace
+
+You have a workspace directory at `$M/`, shared across all agents in this session.
+Use this workspace freely to store documents (reports, plans), temporary scripts, or other scratch work.
+The workspace should be used to maintain documents and share with parent efficiently and losslessly.
+`$M/project` is a symlink to the project directory that scripts can use if necessary.
