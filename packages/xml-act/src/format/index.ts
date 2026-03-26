@@ -57,6 +57,10 @@ export function createXmlActFormat(
       if (top?.type === 'think' && top.isLenses && tagName === 'lens') {
         return lensHandler()
       }
+      if (top?.type === 'think') {
+        if (tagName === top.tag) return handlers.get(aliasMap.get(tagName) ?? tagName)
+        if (!top.isLenses || top.activeLens) return undefined
+      }
       const canonical = aliasMap.get(tagName) ?? tagName
       return handlers.get(canonical)
     },
