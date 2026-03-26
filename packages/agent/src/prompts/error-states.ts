@@ -7,3 +7,5 @@ export const ONESHOT_LIVENESS_REMINDER = 'You yielded but no subagents are activ
 export function formatNonexistentAgentError(destList: string): string {
   return `Message sent to nonexistent agent ID(s): ${destList}. The message was not delivered. Check the agent ID and ensure the agent has been created and is still active.`
 }
+
+export const EMPTY_RESPONSE_ERROR = 'Your response was empty. You must respond with lenses/comms/actions. Use `<yield/>` if done taking turns.'

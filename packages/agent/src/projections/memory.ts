@@ -28,6 +28,7 @@ import { formatSkillInitialPrompt } from '../prompts/skills'
 import { ContentPart, textParts, wrapTextParts } from '../content'
 import { formatAgentIdleNotification, formatSubagentUserKilledNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
 import { FileAwarenessProjection } from './file-awareness'
+import { EMPTY_RESPONSE_ERROR } from '../prompts/error-states'
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -359,6 +360,20 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
 
       const systemEntries: SystemEntry[] = []
+      if (event.responseParts.length === 0 && !isCancelled && event.result.success) {
+        // Empty response on a successful turn — synthesize a placeholder assistant message
+        // and queue an error so the model sees what happened and can self-correct.
+        // Skip for cancelled/failed turns where empty responseParts is expected.
+        newMessages.push({
+          type: 'assistant_turn',
+          source: 'agent',
+          content: textParts('(empty response)'),
+          strategyId: event.strategyId,
+          responseParts: [],
+        })
+        systemEntries.push({ kind: 'error', message: EMPTY_RESPONSE_ERROR })
+      }
+
       const hasError = !event.result.success
       const errorMessage = hasError ? event.result.error : undefined
       const observedResults = isCancelled ? [] : event.observedResults
