@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-232f41?style=flat-square&labelColor=232f41&color=gray" alt="Documentation" /></a> <img src="https://img.shields.io/badge/License-Apache%202.0-232f41?style=flat-square&labelColor=232f41&color=gray" alt="License" /> <a href="https://discord.gg/VcdpMh9tTy" target="_blank"><img src="https://img.shields.io/discord/1305570963206836295?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=5865F2&color=gray" alt="Discord" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/-Follow%20Magnitude-000000?style=flat-square&labelColor=000000&color=gray&logo=x&logoColor=white" alt="Follow Magnitude" /></a>
+  <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a> <img src="https://img.shields.io/badge/License-Apache%202.0-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="License" /> <a href="https://discord.gg/VcdpMh9tTy" target="_blank"><img src="https://img.shields.io/discord/1305570963206836295?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=5865F2&color=gray" alt="Discord" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/-Follow%20Magnitude-000000?style=flat-square&labelColor=000000&color=gray&logo=x&logoColor=white" alt="Follow Magnitude" /></a>
 </p>
 
-Magnitude is an **open source coding agent** built from the ground up around subagents. You chat with the lead agent and it coordinates specialized subagents — explorers, planners, builders, reviewers, debuggers, and a browser agent — on your behalf.
+Magnitude is an **open source coding agent** built from the ground up around subagents. You chat with a lead agent that coordinates specialized subagents on your behalf: explorers, planners, builders, reviewers, debuggers, and a browser agent.
 
 - Building happens in subagents, so the **lead stays focused on you**
 - Subagents are **long-lived** and **resumable**, not disposable
@@ -54,6 +54,10 @@ Magnitude comes out of the box with the following subagents:
 - **Browser**: for verifying UI changes with a built-in browser agent
 
 Magnitude may use none or all of these in a given session. For a quick fix in a single file, it may edit it directly. For a very in-depth change, it may use the whole team. For most tasks, it will use some combination of explorer, planner, builder, and reviewer.
+
+<p align="center">
+  <img src="architecture.png" alt="Magnitude Architecture" width="100%" />
+</p>
 
 ## Why we built this
 
