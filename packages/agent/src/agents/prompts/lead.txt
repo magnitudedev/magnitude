@@ -138,6 +138,8 @@ Use this workspace freely to store documents (reports, plans), temporary scripts
 The workspace should be used to maintain documents and share with subagents efficiently and losslessly.
 `$M/project` is a symlink to the project directory that scripts can use if necessary.
 
+The workspace env var $M is valid for all of your tools, and should be the way that you access and write to the workspace.
+
 ### Workspace structure
 $M/
   project/ - symlink to user's project

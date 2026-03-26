@@ -18,6 +18,8 @@ The workspace should be used to maintain documents and share with parent efficie
 `$M/project` is a symlink to the project directory that scripts can use if necessary.
 Unless the parent suggests explicitly states otherwise, you should default to putting any documents you create in $M.
 
+The workspace env var $M is valid for all of your tools, and should be the way that you access and write to the workspace.
+
 ### Workspace structure
 $M/
   project/ - symlink to user's project
