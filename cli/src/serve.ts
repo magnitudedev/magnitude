@@ -1,4 +1,7 @@
+import { Effect } from 'effect'
 import { createStorageClient } from '@magnitudedev/storage'
+import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
+import { bootstrapProviderRuntime, makeProviderRuntimeLive } from '@magnitudedev/providers'
 import { SessionManager } from './serve/session-manager'
 import { handleSessionsRoute } from './serve/routes/sessions'
 import { handleEventsRoute } from './serve/routes/events'
@@ -46,7 +49,13 @@ export async function startServer(options: ServeOptions): Promise<void> {
   }
 
   const storage = await createStorageClient({ cwd: process.cwd() })
-  const sessionManager = new SessionManager({ debug: options.debug, storage })
+  const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>()
+  await Effect.runPromise(
+    bootstrapProviderRuntime<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS }).pipe(
+      Effect.provide(providerRuntime),
+    ),
+  )
+  const sessionManager = new SessionManager({ debug: options.debug, storage, providerRuntime })
 
   const server = Bun.serve({
     port: options.port,

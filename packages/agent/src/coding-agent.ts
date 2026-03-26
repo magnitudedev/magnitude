@@ -63,7 +63,7 @@ import { ChatPersistence } from './persistence/chat-persistence-service'
 import { collectSessionContext } from './util/collect-session-context'
 
 // Providers
-import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister } from '@magnitudedev/providers'
+import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister, type ProviderRuntime } from '@magnitudedev/providers'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from './model-slots'
 import type { StorageClient } from '@magnitudedev/storage'
 import { initLogger } from '@magnitudedev/logger'
@@ -165,7 +165,7 @@ export interface CreateClientOptions {
    * When provided, provider bootstrap is skipped and the caller is responsible
    * for initializing model selections/auth inside the runtime.
    */
-  providerRuntime?: ReturnType<typeof makeProviderRuntimeLive<MagnitudeSlot>>
+  providerRuntime?: ProviderRuntime<MagnitudeSlot>
 
   /**
    * Disable shell command classification safeguards for this runtime only.

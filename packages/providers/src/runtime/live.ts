@@ -143,3 +143,6 @@ export function makeProviderRuntimeLive<TSlot extends string>() {
 
   return Layer.mergeAll(storageLayer, providerLayer)
 }
+
+/** Canonical type for the provider runtime layer. */
+export type ProviderRuntime<TSlot extends string = string> = ReturnType<typeof makeProviderRuntimeLive<TSlot>>

@@ -68,6 +68,7 @@ export type { TraceData } from './resolver/tracing'
 // Runtime DI surface
 export { ProviderCatalog, ProviderState, ProviderAuth } from './runtime/contracts'
 export { makeProviderRuntimeLive } from './runtime/live'
+export type { ProviderRuntime } from './runtime/live'
 export { bootstrapProviderRuntime } from './runtime/bootstrap'
 export { createProviderClient } from './runtime/client'
 export type { ProviderClient } from './runtime/client'

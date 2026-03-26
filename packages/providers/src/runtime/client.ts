@@ -9,7 +9,7 @@ import {
   type ProviderCatalogShape,
   type ProviderStateShape,
 } from './contracts'
-import { makeProviderRuntimeLive } from './live'
+import { makeProviderRuntimeLive, type ProviderRuntime } from './live'
 
 type ProviderRuntimeServices = ProviderCatalog | ProviderState | AppConfig | ProviderAuth
 
@@ -25,7 +25,7 @@ export interface ProviderClient<TSlot extends string = string> {
   readonly state: Promisify<ProviderStateShape<TSlot>>
   readonly config: Promisify<AppConfigShape<TSlot>>
   readonly auth: Promisify<ProviderAuthShape>
-  readonly layer: Layer.Layer<ProviderRuntimeServices>
+  readonly layer: ProviderRuntime<TSlot>
 }
 
 // Internal: builds a Promise-based facade for a service tag using a proxy.

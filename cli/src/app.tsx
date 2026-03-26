@@ -363,7 +363,8 @@ function AppInner({
       return createCodingAgentClient({
         persistence: persistenceLayer,
         storage,
-        debug: debugMode
+        debug: debugMode,
+        providerRuntime: providerRuntime.layer,
       })
     }
 
@@ -422,36 +423,19 @@ function AppInner({
           const agentRole = forkInfo?.role ?? 'lead'
           const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agentRole) ? agentRole as MagnitudeSlot : 'lead' as MagnitudeSlot
 
-          providerRuntime.state.peek(slot).then((resolved) => {
-            trackTurnCompleted({
-              providerId: resolved?.model.providerId ?? null,
-              modelId: resolved?.model.id ?? null,
-              modelSlot: slot,
-              authType: resolved?.auth?.type ?? null,
-              inputTokens: event.inputTokens,
-              outputTokens: event.outputTokens,
-              cacheReadTokens: event.cacheReadTokens,
-              cacheWriteTokens: event.cacheWriteTokens,
-              toolCount: event.toolCalls.length,
-              success: event.result.success,
-              forkId: event.forkId,
-              agentRole,
-            })
-          }).catch(() => {
-            trackTurnCompleted({
-              providerId: null,
-              modelId: null,
-              modelSlot: slot,
-              authType: null,
-              inputTokens: event.inputTokens,
-              outputTokens: event.outputTokens,
-              cacheReadTokens: event.cacheReadTokens,
-              cacheWriteTokens: event.cacheWriteTokens,
-              toolCount: event.toolCalls.length,
-              success: event.result.success,
-              forkId: event.forkId,
-              agentRole,
-            })
+          trackTurnCompleted({
+            providerId: event.providerId ?? null,
+            modelId: event.modelId ?? null,
+            modelSlot: slot,
+            authType: null,
+            inputTokens: event.inputTokens,
+            outputTokens: event.outputTokens,
+            cacheReadTokens: event.cacheReadTokens,
+            cacheWriteTokens: event.cacheWriteTokens,
+            toolCount: event.toolCalls.length,
+            success: event.result.success,
+            forkId: event.forkId,
+            agentRole,
           })
 
           // Track individual tool calls
@@ -558,7 +542,7 @@ function AppInner({
       onClientReady?.(null)
       c?.dispose()
     }
-  }, [debugMode, onClientReady, renderer, sessionSelection, setClientFactory, setLazyClient, storage])
+  }, [debugMode, onClientReady, providerRuntime, renderer, sessionSelection, setClientFactory, setLazyClient, storage])
 
   // Subscribe to display state for selected fork
   useEffect(() => {

@@ -12,7 +12,9 @@ import {
   type AgentStatusState,
   type ForkWorkingState,
   type ArtifactState,
+  type MagnitudeSlot,
 } from '@magnitudedev/agent'
+import type { ProviderRuntime } from '@magnitudedev/providers'
 import { JsonChatPersistence } from '../persistence'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
@@ -114,10 +116,12 @@ export class SessionManager {
   private globalSubscribers = new Set<(evt: GlobalSseEnvelope) => void>()
 
   private readonly storage: StorageClient
+  private readonly providerRuntime: ProviderRuntime<MagnitudeSlot>
 
-  constructor(opts: { debug: boolean; storage: StorageClient }) {
+  constructor(opts: { debug: boolean; storage: StorageClient; providerRuntime: ProviderRuntime<MagnitudeSlot> }) {
     this.debug = opts.debug
     this.storage = opts.storage
+    this.providerRuntime = opts.providerRuntime
   }
 
   async createSession(opts?: CreateSessionOptions): Promise<SessionInfo> {
@@ -140,7 +144,13 @@ export class SessionManager {
       storage: this.storage,
     })
     const sessionContext = { ...baseSessionContext, workspacePath: requestedCwd }
-    const client = await createCodingAgentClient({ persistence: layer, storage: this.storage, debug: this.debug, sessionContext })
+    const client = await createCodingAgentClient({
+      persistence: layer,
+      storage: this.storage,
+      debug: this.debug,
+      sessionContext,
+      providerRuntime: this.providerRuntime,
+    })
     const createdAt = new Date().toISOString()
 
     const record: SessionRecord = {
