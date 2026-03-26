@@ -4,7 +4,7 @@ let _client: ProviderClient | null = null
 
 export async function getEvalProviderClient(): Promise<ProviderClient> {
   if (!_client) {
-    _client = await createProviderClient()
+    _client = await createProviderClient({ slots: ['primary', 'secondary'] as const })
   }
   return _client
 }
