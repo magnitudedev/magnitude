@@ -78,6 +78,10 @@ export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
   initialContext: { parentConversation: true },
   spawnable: true,
   observables: [backgroundProcessesObservable],
+  lifecyclePrompts: {
+    parentOnSpawn: 'If the task has multiple large independent facets that need separate plans, spawn additional planners in parallel.',
+    parentOnIdle: `Critique the planner's plan against the user's stated requirements and intent. Check: Does the requirements section accurately capture what the user wants? Do the implementation steps concretely address every requirement? Are there gaps, unclear steps, or unaddressed trade-offs? If the plan is not solid, message the planner with specific feedback to revise. Do not present the plan to the user or proceed to building until the plan is concrete, complete, and aligned with the user's intent.`,
+  },
 
   policy: [
     allowReadonlyShell(),

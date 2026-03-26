@@ -32,8 +32,8 @@ export const strategyLens = defineThinkingLens({
 
 export const traitsLens = defineThinkingLens({
   name: 'traits',
-  trigger: 'Every turn',
-  description: 'Check current action against all four traits:\n- loyal: Do I have approval? Am I respecting the user\'s authority?\n- forthcoming: Does the user know what I\'m doing? Should I surface anything?\n- diligent: Is this work verified and high quality?\n- leader: Am I directing subagents well? Do I own their output?',
+  trigger: 'Whenever one or more traits are applicable to the current situation',
+  description: 'Assess how one or traits might apply in the current situation',
 })
 
 export const workflowLens = defineThinkingLens({
