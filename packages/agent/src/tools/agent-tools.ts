@@ -17,6 +17,7 @@ import { ConversationStateReaderTag } from './memory-reader'
 import { AgentStateReaderTag } from './fork'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
 import type { AppEvent } from '../events'
+import { getSpawnableVariants, type AgentVariant } from '../agents'
 
 const { ForkContext } = Fork
 
@@ -33,6 +34,15 @@ function executeAgentCreate({ agentId, options }: {
 }) {
   return Effect.gen(function* () {
     const { type: agentType, title, message } = options
+
+    const normalizedType = agentType.toLowerCase()
+    const spawnable = getSpawnableVariants()
+    if (!spawnable.includes(normalizedType as any)) {
+      return yield* Effect.fail({
+        _tag: 'AgentError' as const,
+        message: `Invalid agent type "${agentType}". Valid types: ${spawnable.join(', ')}`,
+      })
+    }
 
     // Always inject conversation context for all spawned agents
     let conversationContext = ''
@@ -65,7 +75,7 @@ function executeAgentCreate({ agentId, options }: {
       prompt: context,
       message,
       mode: 'spawn',
-      role: agentType as any,
+      role: normalizedType as AgentVariant,
       taskId,
     })
 
@@ -74,9 +84,6 @@ function executeAgentCreate({ agentId, options }: {
 }
 
 
-// Agent type is validated downstream in execution-manager.fork() against the role registry.
-// Using Schema.String here avoids circular imports (agent-tools → agents → role files → agent-tools).
-
 export const agentCreateTool = defineTool({
   name: 'create' as const,
   group: 'agent' as const,
@@ -84,7 +91,7 @@ export const agentCreateTool = defineTool({
   inputSchema: Schema.Struct({
     agentId: Schema.String.annotations({ description: 'Unique agent ID. Must be prefixed with the type (e.g. explorer-auth, builder-api)' }),
     options: Schema.Struct({
-      type: Schema.String.annotations({ description: 'Agent type' }),
+      type: Schema.String.annotations({ description: 'Agent type: explorer, planner, builder, reviewer, debugger, browser' }),
       title: Schema.String.annotations({ description: 'Concise title of what this agent should accomplish' }),
       message: Schema.String.annotations({ description: 'Detailed message/instructions for the agent' }),
     }),
