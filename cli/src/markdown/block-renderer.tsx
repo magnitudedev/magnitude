@@ -83,7 +83,7 @@ const SpanRenderer = memo(function SpanRenderer({
 
       const isHovered = hoveredZone === zoneIdx
       elements.push(
-        <span key={i} fg={isHovered ? theme.primary : (span.fg ?? theme.link)} bg={span.bg} attributes={attrs ?? TextAttributes.BOLD}>
+        <span key={i} fg={isHovered ? theme.link : theme.primary} bg={span.bg} attributes={(attrs ?? 0) | TextAttributes.UNDERLINE}>
           {span.text}
         </span>,
       )
@@ -94,7 +94,7 @@ const SpanRenderer = memo(function SpanRenderer({
     if (span.url) {
       elements.push(
         <a key={i} href={span.url}>
-          <span fg={span.fg ?? theme.link} bg={span.bg} attributes={attrs ?? TextAttributes.BOLD}>
+          <span fg={span.fg ?? theme.link} bg={span.bg} attributes={(attrs ?? 0) | TextAttributes.UNDERLINE}>
             {span.text}
           </span>
         </a>,
@@ -118,7 +118,7 @@ const SpanRenderer = memo(function SpanRenderer({
 
       const isHovered = hoveredZone === zoneIdx
       elements.push(
-        <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.BOLD}>
+        <span key={i} fg={isHovered ? theme.link : theme.primary} attributes={TextAttributes.UNDERLINE}>
           {displayText}
         </span>,
       )
