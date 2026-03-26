@@ -25,6 +25,8 @@ $M/
   plans/ - put plans in here
   scripts/ - temporary scripts
   tests/ - temporary tests or repros
+  thoughts/ - space for ideation, iteration, problem solving
+  ...other directories as appropriate
 
 Prefer to iterate on and edit existing documents when appropraite instead of constantly writing new ones.
 Give documents unique names rather than generic ones.
