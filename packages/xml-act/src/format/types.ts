@@ -47,15 +47,11 @@ export function HANDLE<F, E>(handler: TagHandler<F, E>): ResolveResult<F, E> {
 
 export const PASS: ResolveResult<never, never> = { _tag: 'passthrough' }
 
-export type FrameResolve<F, E> = (tagName: string) => ResolveResult<F, E>
-
-export type Resolve = FrameResolve<XmlActFrame, XmlActEvent>
-
-export const PASSTHROUGH: Resolve = () => PASS
+export type TagMap = ReadonlyMap<string, TagHandler<XmlActFrame, XmlActEvent>>
 
 export type XmlActFrame =
-  | { readonly type: 'prose'; readonly body: string; readonly pendingNewlines: number; readonly resolve: Resolve }
-  | { readonly type: 'container'; readonly tag: string; readonly depth: number; readonly resolve: Resolve }
+  | { readonly type: 'prose'; readonly body: string; readonly pendingNewlines: number; readonly tags: TagMap }
+  | { readonly type: 'container'; readonly tag: string; readonly depth: number; readonly tags: TagMap }
   | {
       readonly type: 'think'
       readonly tag: string
@@ -65,7 +61,7 @@ export type XmlActFrame =
       readonly isLenses: boolean
       readonly activeLens: ActiveLens | null
       readonly lenses: readonly CompletedLens[]
-      readonly resolve: Resolve
+      readonly tags: TagMap
     }
   | {
       readonly type: 'message'
@@ -75,7 +71,7 @@ export type XmlActFrame =
       readonly body: string
       readonly depth: number
       readonly pendingNewlines: number
-      readonly resolve: Resolve
+      readonly tags: TagMap
     }
   | {
       readonly type: 'tool-body'
@@ -87,7 +83,7 @@ export type XmlActFrame =
       readonly childCounts: ReadonlyMap<string, number>
       readonly childTags: ReadonlySet<string>
       readonly schema: TagSchema | undefined
-      readonly resolve: Resolve
+      readonly tags: TagMap
     }
   | {
       readonly type: 'child-body'
@@ -97,9 +93,9 @@ export type XmlActFrame =
       readonly parentToolId: string
       readonly parentTag: string
       readonly childIndex: number
-      readonly resolve: Resolve
+      readonly tags: TagMap
     }
-  | { readonly type: 'body-capture'; readonly tag: string; readonly body: string; readonly resolve: Resolve }
+  | { readonly type: 'body-capture'; readonly tag: string; readonly body: string; readonly tags: TagMap }
 
 export type StructuralParseErrorDetail =
   | { readonly _tag: 'UnclosedThink' }
@@ -200,7 +196,6 @@ export interface TagHandler<F, E> {
   close(ctx: CloseContext<F>): Op<F, E>[]
   selfClose(ctx: SelfCloseContext<F>): Op<F, E>[]
 }
-
 
 export interface Format<F, E> {
   resolve(tagName: string, stack: ReadonlyArray<F>): ResolveResult<F, E>

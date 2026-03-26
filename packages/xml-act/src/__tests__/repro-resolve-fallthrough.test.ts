@@ -191,12 +191,13 @@ describe('BUG 2: body-capture fallthrough — structural tags inside finish body
     const events = parse(xml)
 
     const turnControl = events.find(
-      (e): e is Extract<ParseEvent, { _tag: 'TurnControl' }> =>
+      (e): e is Extract<ParseEvent, { _tag: 'TurnControl'; decision: 'finish' }> =>
         e._tag === 'TurnControl' && e.decision === 'finish',
     )
     expect(turnControl).toBeDefined()
-    expect(turnControl!.evidence).toContain('Used')
-    expect(turnControl!.evidence).toContain('complete it')
+    if (!turnControl) return
+    expect(turnControl.evidence).toContain('Used')
+    expect(turnControl.evidence).toContain('complete it')
 
     // Should NOT have opened a container or tool
     const containerOpens = events.filter(e => e._tag === 'ContainerOpen')

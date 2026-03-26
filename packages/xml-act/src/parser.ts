@@ -1,7 +1,7 @@
 import { createStackMachine } from './machine'
 import { createTokenizer } from './tokenizer'
-import type { Format, Resolve, XmlActFrame, XmlActEvent, ToolDef } from './format/types'
-import { createCurrentFormat } from './format/index'
+import type { Format, XmlActFrame, XmlActEvent, ToolDef } from './format/types'
+import { createCurrentFormat, structuralTags } from './format/index'
 import type { TagSchema } from './execution/binding-validator'
 import { createId } from './util'
 import { classifyXmlActEvent, createCoalescingLayer, mergeXmlActEvent } from './coalescing'
@@ -17,7 +17,7 @@ export interface StreamingParser {
   readonly events: readonly XmlActEvent[]
 }
 
-export function createParser<F, E>(config: {
+export function createParser<F extends { readonly type: string }, E>(config: {
   format: Format<F, E>
   initialFrame: F
   generateId?: () => string
@@ -175,11 +175,9 @@ export function createStreamingXmlParser(
 
   let emittedTurnControl = false
 
-  const structuralResolve: Resolve = (tagName) => format.resolve(tagName, [])
-
   return createParser<XmlActFrame, XmlActEvent>({
     format,
-    initialFrame: { type: 'prose', body: '', pendingNewlines: 0, resolve: structuralResolve },
+    initialFrame: { type: 'prose', body: '', pendingNewlines: 0, tags: structuralTags },
     generateId,
     filter(event) {
       if (event._tag !== 'TurnControl') return true

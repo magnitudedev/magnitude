@@ -37,7 +37,10 @@ describe('prose whitespace trimming', () => {
     ].join('')
 
     const events = parse(xml)
-    const proseChunks = events.filter(e => e._tag === 'ProseChunk' && e.patternId === 'prose')
+    const proseChunks = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'ProseChunk' }> =>
+        e._tag === 'ProseChunk' && e.patternId === 'prose',
+    )
     const whitespaceOnlyProse = proseChunks.filter(e => e.text.trim() === '')
 
     expect(whitespaceOnlyProse).toEqual([])
@@ -71,7 +74,9 @@ describe('prose whitespace trimming', () => {
     ].join('')
 
     const events = parse(xml)
-    const proseChunks = events.filter(e => e._tag === 'ProseChunk')
+    const proseChunks = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'ProseChunk' }> => e._tag === 'ProseChunk',
+    )
     const combined = proseChunks.map(e => e.text).join('')
 
     expect(combined).toContain('Hello world')
@@ -85,7 +90,10 @@ describe('prose whitespace trimming', () => {
     ]
 
     const events = parseChunks(chunks)
-    const proseChunks = events.filter(e => e._tag === 'ProseChunk' && e.patternId === 'prose')
+    const proseChunks = events.filter(
+      (e): e is Extract<ParseEvent, { _tag: 'ProseChunk' }> =>
+        e._tag === 'ProseChunk' && e.patternId === 'prose',
+    )
     const whitespaceOnlyProse = proseChunks.filter(e => e.text.trim() === '')
 
     expect(whitespaceOnlyProse).toEqual([])

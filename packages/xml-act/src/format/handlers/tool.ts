@@ -4,9 +4,7 @@ import { rawOpenTag, rawSelfCloseTag } from '../raw'
 import type { Fx } from '../ops'
 import type { TagSchema } from '../../execution/binding-validator'
 import { validateChildAttr, validateToolAttr } from '../validate-attrs'
-import type { AttributeValue, ParsedChild, ParsedElement, Resolve } from '../types'
-import { PASSTHROUGH } from '../types'
-import { HANDLE, PASS } from '../types'
+import type { AttributeValue, ParsedChild, ParsedElement, TagMap } from '../types'
 import type { TagHandler, XmlActEvent, XmlActFrame } from '../types'
 import { findFrame } from '../types'
 
@@ -56,7 +54,7 @@ export function toolHandler(
   tag: string,
   childTags: ReadonlySet<string>,
   schema: TagSchema | undefined,
-  resolve: Resolve = PASSTHROUGH,
+  tags: TagMap,
 ): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
@@ -80,7 +78,7 @@ export function toolHandler(
           childCounts: new Map(),
           childTags,
           schema,
-          resolve,
+          tags,
         }),
       ]
     },
@@ -187,10 +185,7 @@ export function childHandler(): TagHandler<XmlActFrame, XmlActEvent> {
       }
       const nextCounts = new Map(parent.childCounts)
       nextCounts.set(ctx.tagName, childIndex + 1)
-      const childResolve: Resolve = (tagName) => {
-        if (tagName === ctx.tagName) return HANDLE(childHandler())
-        return PASS
-      }
+      const childTags: TagMap = new Map([[ctx.tagName, childHandler()]])
       return [
         replace({ ...parent, childCounts: nextCounts }),
         ...errors.map((e) => ({ type: 'emit', event: e } as const)),
@@ -209,7 +204,7 @@ export function childHandler(): TagHandler<XmlActFrame, XmlActEvent> {
           parentToolId: parent.id,
           parentTag: parent.tag,
           childIndex,
-          resolve: childResolve,
+          tags: childTags,
         }),
       ]
     },

@@ -1,104 +1,108 @@
 import { describe, expect, test } from 'bun:test'
 import { createStackMachine, type Op } from '../machine'
 
+type Frame = { readonly type: string }
+
+const frame = (type: string): Frame => ({ type })
+
 describe('createStackMachine', () => {
   test('push/pop/peek basics', () => {
     const events: string[] = []
-    const machine = createStackMachine<string, string>('root', (event) => events.push(event))
+    const machine = createStackMachine<Frame, string>(frame('root'), (event) => events.push(event))
 
-    machine.apply([{ type: 'push', frame: 'a' }])
-    expect(machine.peek()).toBe('a')
-    expect(machine.stack).toEqual(['root', 'a'])
+    machine.apply([{ type: 'push', frame: frame('a') }])
+    expect(machine.peek()).toEqual(frame('a'))
+    expect(machine.stack).toEqual([frame('root'), frame('a')])
 
     machine.apply([{ type: 'pop' }])
-    expect(machine.peek()).toBe('root')
-    expect(machine.stack).toEqual(['root'])
+    expect(machine.peek()).toEqual(frame('root'))
+    expect(machine.stack).toEqual([frame('root')])
     expect(events).toEqual([])
   })
 
   test('popUntil stops at predicate match (exclusive)', () => {
-    const machine = createStackMachine<string, string>('root', () => {})
+    const machine = createStackMachine<Frame, string>(frame('root'), () => {})
     machine.apply([
-      { type: 'push', frame: 'a' },
-      { type: 'push', frame: 'b' },
-      { type: 'push', frame: 'c' },
-      { type: 'popUntil', predicate: (frame) => frame === 'a' },
+      { type: 'push', frame: frame('a') },
+      { type: 'push', frame: frame('b') },
+      { type: 'push', frame: frame('c') },
+      { type: 'popUntil', predicate: (f) => f.type === 'a' },
     ])
 
-    expect(machine.stack).toEqual(['root', 'a'])
-    expect(machine.peek()).toBe('a')
+    expect(machine.stack).toEqual([frame('root'), frame('a')])
+    expect(machine.peek()).toEqual(frame('a'))
   })
 
   test('replace swaps top', () => {
-    const machine = createStackMachine<string, string>('root', () => {})
-    machine.apply([{ type: 'replace', frame: 'new-root' }])
-    expect(machine.stack).toEqual(['new-root'])
+    const machine = createStackMachine<Frame, string>(frame('root'), () => {})
+    machine.apply([{ type: 'replace', frame: frame('new-root') }])
+    expect(machine.stack).toEqual([frame('new-root')])
 
-    machine.apply([{ type: 'push', frame: 'a' }])
-    machine.apply([{ type: 'replace', frame: 'b' }])
-    expect(machine.stack).toEqual(['new-root', 'b'])
+    machine.apply([{ type: 'push', frame: frame('a') }])
+    machine.apply([{ type: 'replace', frame: frame('b') }])
+    expect(machine.stack).toEqual([frame('new-root'), frame('b')])
   })
 
   test('done stops current batch and future batches', () => {
     const events: string[] = []
-    const machine = createStackMachine<string, string>('root', (event) => events.push(event))
+    const machine = createStackMachine<Frame, string>(frame('root'), (event) => events.push(event))
 
     machine.apply([
       { type: 'emit', event: 'before' },
       { type: 'done' },
       { type: 'emit', event: 'after' },
-      { type: 'push', frame: 'x' },
+      { type: 'push', frame: frame('x') },
     ])
 
     expect(machine.done).toBe(true)
     expect(events).toEqual(['before'])
-    expect(machine.stack).toEqual(['root'])
+    expect(machine.stack).toEqual([frame('root')])
 
     machine.apply([
       { type: 'emit', event: 'future' },
-      { type: 'push', frame: 'y' },
+      { type: 'push', frame: frame('y') },
     ])
 
     expect(events).toEqual(['before'])
-    expect(machine.stack).toEqual(['root'])
+    expect(machine.stack).toEqual([frame('root')])
   })
 
   test('pop never removes initial frame', () => {
-    const machine = createStackMachine<string, string>('root', () => {})
+    const machine = createStackMachine<Frame, string>(frame('root'), () => {})
     machine.apply([{ type: 'pop' }, { type: 'pop' }])
-    expect(machine.stack).toEqual(['root'])
-    expect(machine.peek()).toBe('root')
+    expect(machine.stack).toEqual([frame('root')])
+    expect(machine.peek()).toEqual(frame('root'))
   })
 
   test('empty ops array is no-op', () => {
-    const machine = createStackMachine<string, string>('root', () => {})
+    const machine = createStackMachine<Frame, string>(frame('root'), () => {})
     machine.apply([])
-    expect(machine.stack).toEqual(['root'])
+    expect(machine.stack).toEqual([frame('root')])
     expect(machine.done).toBe(false)
   })
 
   test('replace on stack with only initial frame works', () => {
-    const machine = createStackMachine<string, string>('root', () => {})
-    machine.apply([{ type: 'replace', frame: 'updated-root' }])
-    expect(machine.stack).toEqual(['updated-root'])
+    const machine = createStackMachine<Frame, string>(frame('root'), () => {})
+    machine.apply([{ type: 'replace', frame: frame('updated-root') }])
+    expect(machine.stack).toEqual([frame('updated-root')])
   })
 
   test('multiple ops in one apply call', () => {
     const events: string[] = []
-    const machine = createStackMachine<string, string>('root', (event) => events.push(event))
+    const machine = createStackMachine<Frame, string>(frame('root'), (event) => events.push(event))
 
-    const ops: Op<string, string>[] = [
-      { type: 'push', frame: 'a' },
+    const ops: Op<Frame, string>[] = [
+      { type: 'push', frame: frame('a') },
       { type: 'emit', event: 'one' },
-      { type: 'replace', frame: 'b' },
+      { type: 'replace', frame: frame('b') },
       { type: 'pop' },
       { type: 'emit', event: 'two' },
     ]
 
     machine.apply(ops)
 
-    expect(machine.stack).toEqual(['root'])
-    expect(machine.peek()).toBe('root')
+    expect(machine.stack).toEqual([frame('root')])
+    expect(machine.peek()).toEqual(frame('root'))
     expect(events).toEqual(['one', 'two'])
   })
 })

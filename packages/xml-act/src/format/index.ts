@@ -7,8 +7,10 @@ import { lensHandler, thinkHandler } from './handlers/think'
 import { childHandler, toolHandler } from './handlers/tool'
 import { turnControlHandler } from './handlers/turn-control'
 import { HANDLE, PASS } from './types'
-import type { Format, Resolve, TagHandler, ToolDef, XmlActEvent, XmlActFrame } from './types'
+import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
+
+export const structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
 
 export function createXmlActFormat(
   tools: readonly ToolDef[],
@@ -25,78 +27,91 @@ export function createXmlActFormat(
     ['respond', 'comms'],
   ])
 
-  const structuralResolve: Resolve = (tagName) => {
-    const canonical = aliasMap.get(tagName) ?? tagName
-    const handler = handlers.get(canonical)
-    if (!handler) return PASS
-    return HANDLE(handler)
-  }
+  const messageTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
+  const insideLensTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
+  const plainThinkTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
+  const betweenLensTags: TagMap = structuralTags
 
-  const lens = lensHandler()
-
-  let message: TagHandler<XmlActFrame, XmlActEvent> | undefined
-  const messageResolve: Resolve = (tagName) => {
-    if (tagName === 'message' && message) return HANDLE(message)
-    return PASS
-  }
-  message = messageHandler(defaultMessageDest, messageResolve)
-
-  function makeThinkResolve(
-    thinkTag: string,
-    isLenses: boolean,
-    getSelf: () => TagHandler<XmlActFrame, XmlActEvent> | undefined,
-  ): Resolve {
-    return (tagName) => {
-      if (isLenses && tagName === 'lens') return HANDLE(lens)
-      if (tagName === thinkTag) {
-        const self = getSelf()
-        if (self) return HANDLE(self)
-      }
-      return PASS
-    }
-  }
-
-  let think: TagHandler<XmlActFrame, XmlActEvent> | undefined
-  think = thinkHandler('lenses', (tagName, isLenses) => makeThinkResolve(tagName, isLenses, () => think))
-
-  let lenses: TagHandler<XmlActFrame, XmlActEvent> | undefined
-  lenses = thinkHandler('lenses', (tagName, isLenses) => makeThinkResolve(tagName, isLenses, () => lenses))
-
-  let thinking: TagHandler<XmlActFrame, XmlActEvent> | undefined
-  thinking = thinkHandler('lenses', (tagName, isLenses) => makeThinkResolve(tagName, isLenses, () => thinking))
-
-  handlers.set('actions', containerHandler('actions', structuralResolve))
-  handlers.set('comms', containerHandler('comms', structuralResolve))
-  if (think) handlers.set('think', think)
-  if (lenses) handlers.set('lenses', lenses)
-  if (thinking) handlers.set('thinking', thinking)
+  const lens = lensHandler(betweenLensTags, insideLensTags)
   handlers.set('lens', lens)
-  handlers.set('message', message)
+
+  const think = thinkHandler('lenses', betweenLensTags, plainThinkTags)
+  const lenses = thinkHandler('lenses', betweenLensTags, plainThinkTags)
+  const thinking = thinkHandler('lenses', betweenLensTags, plainThinkTags)
+
+  handlers.set('actions', containerHandler('actions', structuralTags))
+  handlers.set('comms', containerHandler('comms', structuralTags))
+  handlers.set('think', think)
+  handlers.set('lenses', lenses)
+  handlers.set('thinking', thinking)
+  handlers.set('message', messageHandler(defaultMessageDest, messageTags))
   handlers.set('next', turnControlHandler('continue'))
   handlers.set('yield', turnControlHandler('yield'))
   handlers.set('finish', finishHandler())
 
   for (const tool of tools) {
-    let selfHandler: TagHandler<XmlActFrame, XmlActEvent> | undefined
-    const toolResolve: Resolve = (tagName) => {
-      if (tool.childTags.has(tagName)) return HANDLE(childHandler())
-      if (tagName === tool.tag && selfHandler) return HANDLE(selfHandler)
-      return PASS
+    const toolTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
+    for (const childTag of tool.childTags) {
+      toolTags.set(childTag, childHandler())
     }
-    selfHandler = toolHandler(tool.tag, tool.childTags, tool.schema, toolResolve)
-    handlers.set(tool.tag, selfHandler)
+    const selfToolHandler = toolHandler(tool.tag, tool.childTags, tool.schema, toolTags)
+    if (!tool.childTags.has(tool.tag)) {
+      toolTags.set(tool.tag, selfToolHandler)
+    }
+    handlers.set(tool.tag, selfToolHandler)
+  }
+
+  const messageEntry = handlers.get('message')
+  if (messageEntry) {
+    messageTags.set('message', messageEntry)
+  }
+
+  const lensEntry = handlers.get('lens')
+  if (lensEntry) {
+    insideLensTags.set('lens', lensEntry)
+  }
+  const lensesEntry = handlers.get('lenses')
+  if (lensesEntry) {
+    insideLensTags.set('lenses', lensesEntry)
+  }
+
+  const thinkEntry = handlers.get('think')
+  if (thinkEntry) {
+    plainThinkTags.set('think', thinkEntry)
+  }
+  const thinkingEntry = handlers.get('thinking')
+  if (thinkingEntry) {
+    plainThinkTags.set('thinking', thinkingEntry)
+  }
+  for (const [alias, canonical] of aliasMap) {
+    if (canonical === 'think') {
+      const aliasThink = handlers.get('think')
+      if (aliasThink) plainThinkTags.set(alias, aliasThink)
+    }
+    if (canonical === 'lenses') {
+      const aliasLenses = handlers.get('lenses')
+      if (aliasLenses) insideLensTags.set(alias, aliasLenses)
+    }
+  }
+
+  structuralTags.clear()
+  for (const [tag, handler] of handlers) {
+    structuralTags.set(tag, handler)
+  }
+  for (const [alias, canonical] of aliasMap) {
+    const aliased = handlers.get(canonical)
+    if (aliased) {
+      structuralTags.set(alias, aliased)
+    }
   }
 
   return {
     resolve(tagName, stack) {
       const top = stack[stack.length - 1]
-      if (!top) return structuralResolve(tagName)
-      const resolved = top.resolve(tagName)
-      if (resolved._tag === 'handle') return resolved
-      if (top.type === 'think' && top.isLenses && !top.activeLens) {
-        return structuralResolve(tagName)
-      }
-      return resolved
+      if (!top) return { _tag: 'passthrough' }
+      const handler = top.tags.get(tagName)
+      if (!handler) return { _tag: 'passthrough' }
+      return { _tag: 'handle', handler }
     },
     onContent: xmlActContent,
     onFlush: xmlActFlush,
@@ -177,9 +192,8 @@ export type {
   ToolDef,
   Format,
   TagHandler,
+  TagMap,
   ResolveResult,
-  Resolve,
-  FrameResolve,
   OpenContext,
   CloseContext,
   SelfCloseContext,
@@ -193,4 +207,4 @@ export { messageHandler } from './handlers/message'
 export { toolHandler, childHandler } from './handlers/tool'
 export { turnControlHandler } from './handlers/turn-control'
 export { finishHandler } from './handlers/finish'
-export { HANDLE, PASS, PASSTHROUGH } from './types'
+export { HANDLE, PASS } from './types'

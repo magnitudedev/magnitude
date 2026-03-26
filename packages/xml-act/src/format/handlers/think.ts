@@ -1,13 +1,13 @@
 import { emit, pop, push, replace } from '../ops'
 import { appendTopProse, endTopProse } from '../prose'
 import { rawCloseTag, rawOpenTag } from '../raw'
-import type { Resolve, TagHandler, XmlActFrame, XmlActEvent } from '../types'
-import { PASSTHROUGH } from '../types'
+import type { TagMap, TagHandler, XmlActFrame, XmlActEvent } from '../types'
 import { findFrame } from '../types'
 
 export function thinkHandler(
-  lensesTag = 'lenses',
-  makeResolve: (tagName: string, isLenses: boolean) => Resolve = () => PASSTHROUGH,
+  lensesTag: string,
+  betweenLensTags: TagMap,
+  plainThinkTags: TagMap,
 ): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
@@ -28,11 +28,16 @@ export function thinkHandler(
         }
         return appendTopProse(ctx.stack, raw)
       }
+
       const isLenses = ctx.tagName === lensesTag
       const currentThink = findFrame(ctx.stack, 'think')
       if (currentThink && currentThink.tag === ctx.tagName) {
-        return [replace({ ...currentThink, depth: currentThink.depth + 1, body: currentThink.body + raw }), emit({ _tag: 'ProseChunk', patternId: 'think', text: raw })]
+        return [
+          replace({ ...currentThink, depth: currentThink.depth + 1, body: currentThink.body + raw }),
+          emit({ _tag: 'ProseChunk', patternId: 'think', text: raw }),
+        ]
       }
+
       return [
         ...endTopProse(ctx.stack),
         push({
@@ -44,7 +49,7 @@ export function thinkHandler(
           isLenses,
           activeLens: null,
           lenses: [],
-          resolve: makeResolve(ctx.tagName, isLenses),
+          tags: isLenses ? betweenLensTags : plainThinkTags,
         }),
       ]
     },
@@ -52,6 +57,7 @@ export function thinkHandler(
       const think = findFrame(ctx.stack, 'think')
       if (!think) return []
       const rawClose = rawCloseTag(ctx.tagName)
+
       if (!ctx.afterNewline) {
         if (think.activeLens) {
           return [
@@ -61,6 +67,7 @@ export function thinkHandler(
         }
         return [replace({ ...think, body: think.body + rawClose }), emit({ _tag: 'ProseChunk', patternId: 'think', text: rawClose })]
       }
+
       if (think.depth > 0) {
         if (think.activeLens) {
           return [
@@ -70,19 +77,15 @@ export function thinkHandler(
         }
         return [replace({ ...think, depth: think.depth - 1, body: think.body + rawClose }), emit({ _tag: 'ProseChunk', patternId: 'think', text: rawClose })]
       }
+
       if (think.isLenses) {
         if (think.activeLens) {
-          return [
-            emit({ _tag: 'LensEnd', name: think.activeLens.name, content: think.activeLens.body }),
-            pop,
-          ]
+          return [emit({ _tag: 'LensEnd', name: think.activeLens.name, content: think.activeLens.body }), pop]
         }
         return [pop]
       }
-      return [
-        emit({ _tag: 'ProseEnd', patternId: 'think', content: think.body, about: think.about }),
-        pop,
-      ]
+
+      return [emit({ _tag: 'ProseEnd', patternId: 'think', content: think.body, about: think.about }), pop]
     },
     selfClose() {
       return []
@@ -90,7 +93,10 @@ export function thinkHandler(
   }
 }
 
-export function lensHandler(): TagHandler<XmlActFrame, XmlActEvent> {
+export function lensHandler(
+  betweenLensTags: TagMap,
+  insideLensTags: TagMap,
+): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
       const think = findFrame(ctx.stack, 'think')
@@ -112,7 +118,7 @@ export function lensHandler(): TagHandler<XmlActFrame, XmlActEvent> {
       }
       return [
         emit({ _tag: 'LensStart', name: nextName }),
-        replace({ ...think, activeLens: { name: nextName, body: '', depth: 0 } }),
+        replace({ ...think, activeLens: { name: nextName, body: '', depth: 0 }, tags: insideLensTags }),
       ]
     },
     close(ctx) {
@@ -139,6 +145,7 @@ export function lensHandler(): TagHandler<XmlActFrame, XmlActEvent> {
           ...think,
           activeLens: null,
           lenses: [...think.lenses, { name: think.activeLens.name, body: content }],
+          tags: betweenLensTags,
         }),
       ]
     },
