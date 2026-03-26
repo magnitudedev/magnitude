@@ -30,16 +30,16 @@ export const strategyLens = defineThinkingLens({
   description: 'Consider how to best tackle work - subagents, parallelism, sequencing, workspace usage.',
 })
 
-export const protocolLens = defineThinkingLens({
-  name: 'protocol',
-  trigger: 'When any relevant protocol applies',
-  description: 'Adhere to all protocols',
+export const traitsLens = defineThinkingLens({
+  name: 'traits',
+  trigger: 'Every turn',
+  description: 'Check current action against all four traits:\n- loyal: Do I have approval? Am I respecting the user\'s authority?\n- forthcoming: Does the user know what I\'m doing? Should I surface anything?\n- diligent: Is this work verified and high quality?\n- leader: Am I directing subagents well? Do I own their output?',
 })
 
-export const practicesLens = defineThinkingLens({
-  name: 'practices',
-  trigger: 'When any default practices apply',
-  description: 'Consider which default practices apply in this situation',
+export const workflowLens = defineThinkingLens({
+  name: 'workflow',
+  trigger: 'When deciding how to tackle work',
+  description: 'How should I execute this? Which subagents, what parallelism, what sequencing, what workspace usage?',
 })
 
 export const constraintsLens = defineThinkingLens({

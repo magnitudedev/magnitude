@@ -11,15 +11,13 @@ import type { PolicyContext } from './types'
 import leadPromptRaw from './prompts/lead.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import {
-  ideateLens,
   intentLens,
   leadObservables,
   leadPolicy,
   leadTools,
   leadTurnPolicy,
-  practicesLens,
-  protocolLens,
-  strategyLens,
+  traitsLens,
+  workflowLens,
   turnLens,
 } from './lead-shared'
 
@@ -30,7 +28,7 @@ export const leadRole = defineRole<typeof leadTools, 'lead', PolicyContext>({
   id: 'lead',
   slot: 'lead',
   systemPrompt,
-  lenses: [intentLens, ideateLens, strategyLens, protocolLens, practicesLens, turnLens],
+  lenses: [intentLens, traitsLens, workflowLens, turnLens],
   defaultRecipient: 'user',
   protocolRole: 'lead',
   initialContext: { parentConversation: false },
