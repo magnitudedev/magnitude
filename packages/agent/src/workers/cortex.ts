@@ -286,12 +286,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
       }).pipe(
         Effect.onInterrupt(() => Effect.gen(function* () {
-          const forkWorkingState = yield* read(WorkingStateProjection)
-
-          if (forkWorkingState.working === false) {
-            return
-          }
-
           const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
           yield* publish(turnCompleted)
         }).pipe(Effect.orDie)),

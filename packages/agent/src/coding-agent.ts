@@ -330,7 +330,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
       // Same check for the root fork (lead, forkId=null).
       // Root doesn't get fork_completed, but the interrupt still closes
-      // any in-flight turn via the turnInterrupted → turn_completed path.
+      // any in-flight turn via Cortex's onInterrupt → turn_completed path.
       const rootState = yield* workingStateProjection.getFork(null)
       if (!isStable(rootState)) {
         yield* Effect.promise(() => client.send({

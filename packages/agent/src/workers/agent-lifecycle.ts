@@ -14,7 +14,6 @@ import type { AppEvent } from '../events'
 import { ExecutionManager } from '../execution/execution-manager'
 import { WorkingStateProjection } from '../projections/working-state'
 
-import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 
 // =============================================================================
 // Worker
@@ -63,11 +62,6 @@ export const AgentLifecycle = Worker.define<AppEvent>()({
   },
 
   signalHandlers: (on) => [
-    on(WorkingStateProjection.signals.turnInterrupted, ({ forkId, turnId, chainId }, publish) => Effect.gen(function* () {
-      const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
-      yield* publish(turnCompleted)
-    }).pipe(Effect.orDie)),
-
     on(WorkingStateProjection.signals.forkBecameStable, ({ forkId }) => Effect.gen(function* () {
       if (forkId === null) return
       const execManager = yield* ExecutionManager

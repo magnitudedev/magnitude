@@ -94,7 +94,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     shouldTriggerChanged: Signal.create<{ forkId: string | null; shouldTrigger: boolean; chainId: string | null }>('WorkingState/shouldTriggerChanged'),
     forkBecameStable: Signal.create<{ forkId: string | null; timestamp: number }>('WorkingState/forkBecameStable'),
     softInterruptResolved: Signal.create<{ forkId: string }>('WorkingState/softInterruptResolved'),
-    turnInterrupted: Signal.create<{ forkId: string | null; turnId: string; chainId: string | null }>('WorkingState/turnInterrupted'),
     pendingInboundCommunicationsRead: Signal.create<{ forkId: string | null; turnId: string; messages: readonly PendingInboundCommunication[]; timestamp: number }>('WorkingState/pendingInboundCommunicationsRead'),
   },
 
@@ -277,6 +276,10 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     },
 
     turn_started: ({ event, fork, emit }) => {
+      if (fork.working) {
+        console.error(`[WorkingState] OVERLAPPING TURN DETECTED: turn_started(${event.turnId}) arrived while turn ${fork.currentTurnId} is still in-flight on fork ${event.forkId ?? 'root'}`)
+      }
+
       if (fork.pendingInboundCommunications.length > 0) {
         emit.pendingInboundCommunicationsRead({
           forkId: event.forkId,
@@ -302,6 +305,11 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     },
 
     turn_completed: ({ event, fork, emit }) => {
+      if (fork.currentTurnId !== null && fork.currentTurnId !== event.turnId) {
+        console.error(`[WorkingState] STALE TURN_COMPLETED: got turnId=${event.turnId} but currentTurnId=${fork.currentTurnId} on fork ${event.forkId ?? 'root'}`)
+        return fork
+      }
+
       let turnWantsContinue: boolean
 
       if (event.result.success) {
@@ -353,6 +361,11 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
     // Unexpected error during turn - clear all flags, go stable
     turn_unexpected_error: ({ event, fork, emit }) => {
+      if (fork.currentTurnId !== null && fork.currentTurnId !== event.turnId) {
+        console.error(`[WorkingState] STALE TURN_UNEXPECTED_ERROR: got turnId=${event.turnId} but currentTurnId=${fork.currentTurnId} on fork ${event.forkId ?? 'root'}`)
+        return fork
+      }
+
       const newFork: ForkWorkingState = {
         ...fork,
         working: false,
@@ -405,14 +418,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           forkId: event.forkId,
           shouldTrigger: shouldTrigger(newFork),
           chainId: newFork.currentChainId
-        })
-      }
-
-      if (interruptedTurnId !== null) {
-        emit.turnInterrupted({
-          forkId: event.forkId,
-          turnId: interruptedTurnId,
-          chainId: interruptedChainId
         })
       }
 
