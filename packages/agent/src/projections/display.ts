@@ -479,9 +479,11 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'agentCreate':
     case 'agentKill':
     case 'skill':
-    case 'phase-submit':
-    case 'workflow-submit':
-    case 'phase-verdict':
+    case 'shellBg':
+    case 'fileView':
+    case 'phaseSubmit':
+    case 'workflowSubmit':
+    case 'phaseVerdict':
     case 'scroll':
     case 'screenshot':
       return { ...counts, other: counts.other + 1 }

@@ -2,12 +2,12 @@ import { defineStateModel, type BaseState, type Phase } from '@magnitudedev/tool
 import { phaseSubmitTool, phaseSubmitXmlBinding } from '../tools/phase-submit'
 
 export interface PhaseSubmitState extends BaseState {
-  toolKey: 'phase-submit'
+  toolKey: 'phaseSubmit'
   output?: string
   errorMessage?: string
 }
 
-export const phaseSubmitModel = defineStateModel('phase-submit', {
+export const phaseSubmitModel = defineStateModel('phaseSubmit', {
   tool: phaseSubmitTool,
   binding: phaseSubmitXmlBinding,
 })({

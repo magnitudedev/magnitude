@@ -4,7 +4,7 @@ import {
   agentCreateModel, agentKillModel, skillModel,
   clickModel, doubleClickModel, rightClickModel, typeModel, scrollModel, dragModel,
   navigateModel, goBackModel, switchTabModel, newTabModel, screenshotModel, evaluateModel,
-  phaseSubmitModel, phaseVerdictModel,
+  phaseSubmitModel, phaseVerdictModel, shellBgModel, fileViewModel,
 } from '../models'
 
 export const TOOL_DEFINITIONS = {
@@ -19,6 +19,8 @@ export const TOOL_DEFINITIONS = {
   agentCreate: { key: 'agentCreate', model: agentCreateModel, display: false },
   agentKill: { key: 'agentKill', model: agentKillModel, display: false },
   skill: { key: 'skill', model: skillModel },
+  shellBg: { key: 'shellBg', model: shellBgModel },
+  fileView: { key: 'fileView', model: fileViewModel },
   click: { key: 'click', model: clickModel, group: 'browser' },
   doubleClick: { key: 'doubleClick', model: doubleClickModel, group: 'browser' },
   rightClick: { key: 'rightClick', model: rightClickModel, group: 'browser' },
@@ -31,9 +33,9 @@ export const TOOL_DEFINITIONS = {
   newTab: { key: 'newTab', model: newTabModel, group: 'browser' },
   screenshot: { key: 'screenshot', model: screenshotModel, group: 'browser' },
   evaluate: { key: 'evaluate', model: evaluateModel, group: 'browser' },
-  'phase-submit': { key: 'phase-submit', model: phaseSubmitModel },
-  'workflow-submit': { key: 'workflow-submit', model: phaseSubmitModel },
-  'phase-verdict': { key: 'phase-verdict', model: phaseVerdictModel },
+  phaseSubmit: { key: 'phaseSubmit', model: phaseSubmitModel },
+  workflowSubmit: { key: 'workflowSubmit', model: phaseSubmitModel },
+  phaseVerdict: { key: 'phaseVerdict', model: phaseVerdictModel },
 } as const
 
 export type ToolDefinitionMap = typeof TOOL_DEFINITIONS

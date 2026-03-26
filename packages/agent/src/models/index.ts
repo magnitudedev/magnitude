@@ -13,6 +13,8 @@ export { agentCreateModel, type AgentCreateState } from './agent-create'
 export { agentKillModel, type AgentKillState } from './agent-kill'
 export { skillModel, type SkillState } from './skill'
 export { shellModel, type ShellState } from './shell'
+export { shellBgModel, type ShellBgState } from './shell-bg'
+export { fileViewModel, type FileViewState } from './file-view'
 export { phaseSubmitModel, type PhaseSubmitState } from './phase-submit'
 export { phaseVerdictModel, type PhaseVerdictState } from './phase-verdict'
 export {

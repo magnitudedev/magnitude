@@ -2,10 +2,10 @@ import { defineStateModel, type BaseState, type Phase } from '@magnitudedev/tool
 import { phaseVerdictTool, phaseVerdictXmlBinding } from '../tools/phase-verdict'
 
 export interface PhaseVerdictState extends BaseState {
-  toolKey: 'phase-verdict'
+  toolKey: 'phaseVerdict'
 }
 
-export const phaseVerdictModel = defineStateModel('phase-verdict', {
+export const phaseVerdictModel = defineStateModel('phaseVerdict', {
   tool: phaseVerdictTool,
   binding: phaseVerdictXmlBinding,
 })({

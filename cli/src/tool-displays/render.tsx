@@ -15,7 +15,7 @@ import { phaseVerdictDisplay } from './displays/phase-verdict'
 import { defaultDisplay } from './displays/default'
 
 type WorkflowSubmitState = {
-  toolKey: 'workflow-submit'
+  toolKey: 'workflowSubmit'
   phase?: string
   output?: string
   errorMessage?: string
@@ -47,10 +47,10 @@ export function renderToolStep(state: RenderableToolState, common: CommonToolPro
     case 'screenshot':
     case 'evaluate':
       return browserActionDisplay.render({ state, ...common })
-    case 'phase-submit':
-    case 'workflow-submit':
+    case 'phaseSubmit':
+    case 'workflowSubmit':
       return phaseSubmitDisplay.render({ state, ...common })
-    case 'phase-verdict':
+    case 'phaseVerdict':
       return phaseVerdictDisplay.render({ state, ...common })
     default:
       return defaultDisplay.render({ state, ...common })
@@ -81,10 +81,10 @@ export function summarizeToolStep(state: RenderableToolState): string {
     case 'screenshot':
     case 'evaluate':
       return browserActionDisplay.summary(state)
-    case 'phase-submit':
-    case 'workflow-submit':
+    case 'phaseSubmit':
+    case 'workflowSubmit':
       return phaseSubmitDisplay.summary(state)
-    case 'phase-verdict':
+    case 'phaseVerdict':
       return phaseVerdictDisplay.summary(state)
     default:
       return defaultDisplay.summary(state)

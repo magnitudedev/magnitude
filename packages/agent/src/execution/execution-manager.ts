@@ -505,7 +505,10 @@ const makeExecutionManager = Effect.gen(function* () {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
                 const toolKey = resolveKeyFromCallable(event.group, event.toolName)
-                if (!toolKey) break
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Failed to resolve tool key for ${event.group}.${event.toolName} (toolCallId: ${event.toolCallId}). The tool's defKey is not a valid ToolKey in TOOL_DEFINITIONS.`)
+                  break
+                }
                 toolCallTagNames.set(event.toolCallId, event.tagName)
                 toolCallKeys.set(event.toolCallId, toolKey)
 
@@ -538,7 +541,11 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ToolInputReady': {
                 toolInputs.set(event.toolCallId, event.input)
 
-                const toolKey = toolCallKeys.get(event.toolCallId) ?? event.toolCallId
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  break
+                }
 
                 const fields = streamingFields.get(event.toolCallId)
                 if (fields) {
@@ -618,7 +625,11 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'ToolEmission': {
-                const toolKey = toolCallKeys.get(event.toolCallId) ?? event.toolCallId
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  break
+                }
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -676,7 +687,11 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ToolInputFieldValue':
               case 'ToolInputChildStarted':
               case 'ToolInputChildComplete': {
-                const toolKey = toolCallKeys.get(event.toolCallId) ?? event.toolCallId
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  break
+                }
 
                 // Accumulate fields for stream hook
                 if (event._tag === 'ToolInputFieldValue') {
@@ -809,6 +824,11 @@ const makeExecutionManager = Effect.gen(function* () {
 
 
               case 'ToolObservation': {
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  break
+                }
                 observedResults.push({
                   toolCallId: event.toolCallId,
                   tagName: event.tagName,
@@ -818,7 +838,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
-                  toolKey: toolCallKeys.get(event.toolCallId) ?? resolveKey(event.tagName) ?? 'shell',
+                  toolKey,
                   event,
                 })
                 break
