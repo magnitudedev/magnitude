@@ -16,7 +16,7 @@ export function appendTopProse(stack: ReadonlyArray<XmlActFrame>, text: string):
     const stripped = text.replace(/^[ \t\r\n]+/, '')
     if (stripped.length === 0) return []
     return [
-      replace({ type: 'prose', body: stripped, pendingNewlines: 0 }),
+      replace({ ...prose, body: stripped, pendingNewlines: 0 }),
       emit({ _tag: 'ProseChunk', patternId: 'prose', text: stripped }),
     ]
   }
@@ -27,12 +27,12 @@ export function appendTopProse(stack: ReadonlyArray<XmlActFrame>, text: string):
     const stripped = text.replace(/^[ \t\r\n]+/, '')
     if (stripped.length === 0) {
       // Still all whitespace — keep deferring
-      return [replace({ type: 'prose', body: '', pendingNewlines: prose.pendingNewlines + text.split('\n').length - 1 })]
+      return [replace({ ...prose, body: '', pendingNewlines: prose.pendingNewlines + text.split('\n').length - 1 })]
     }
     // Has real content — emit with prefix
     const prefix = '\n'.repeat(prose.pendingNewlines)
     return [
-      replace({ type: 'prose', body: stripped, pendingNewlines: 0 }),
+      replace({ ...prose, body: stripped, pendingNewlines: 0 }),
       emit({ _tag: 'ProseChunk', patternId: 'prose', text: stripped }),
     ]
   }
@@ -40,7 +40,7 @@ export function appendTopProse(stack: ReadonlyArray<XmlActFrame>, text: string):
   const prefix = prose.pendingNewlines > 0 ? '\n'.repeat(prose.pendingNewlines) : ''
   const full = prefix + text
   return [
-    replace({ type: 'prose', body: prose.body + full, pendingNewlines: 0 }),
+    replace({ ...prose, body: prose.body + full, pendingNewlines: 0 }),
     ...(prefix ? [emit({ _tag: 'ProseChunk', patternId: 'prose', text: prefix })] : []),
     emit({ _tag: 'ProseChunk', patternId: 'prose', text }),
   ]
@@ -51,9 +51,9 @@ export function endTopProse(stack: ReadonlyArray<XmlActFrame>): Fx[] {
   if (!top || top.type !== 'prose') return []
   const prose: ProseFrame = top
   const trimmed = prose.body.replace(/[ \t\r\n]+$/g, '')
-  if (trimmed.length === 0) return [replace({ type: 'prose', body: '', pendingNewlines: 0 })]
+  if (trimmed.length === 0) return [replace({ ...prose, body: '', pendingNewlines: 0 })]
   return [
     emit({ _tag: 'ProseEnd', patternId: 'prose', content: trimmed, about: null }),
-    replace({ type: 'prose', body: '', pendingNewlines: 0 }),
+    replace({ ...prose, body: '', pendingNewlines: 0 }),
   ]
 }

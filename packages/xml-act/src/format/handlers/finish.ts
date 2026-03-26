@@ -1,12 +1,13 @@
 import { done, emit, pop, push } from '../ops'
 import { endTopProse } from '../prose'
+import { PASSTHROUGH } from '../types'
 import type { TagHandler, XmlActEvent, XmlActFrame } from '../types'
 import { findFrame } from '../types'
 
 export function finishHandler(): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
-      return [...endTopProse(ctx.stack), push({ type: 'body-capture', tag: ctx.tagName, body: '' })]
+      return [...endTopProse(ctx.stack), push({ type: 'body-capture', tag: ctx.tagName, body: '', resolve: PASSTHROUGH })]
     },
     close(ctx) {
       const frame = findFrame(ctx.stack, 'body-capture')

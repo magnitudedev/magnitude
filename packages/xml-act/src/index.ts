@@ -124,11 +124,11 @@ export { guardStream, guardEffectStream } from './stream-guard'
 export { createStreamingXmlParser, createParser, defaultIdGenerator } from './parser'
 export type { StreamingParser, IdGenerator } from './parser'
 
-// Machine + scanner
+// Machine + tokenizer
 export { createStackMachine } from './machine'
 export type { Op, StackMachine } from './machine'
-export { createScanner } from './scanner'
-export type { Scanner, ScannerSignal } from './scanner'
+export { createTokenizer } from './tokenizer'
+export type { Tokenizer, Token } from './tokenizer'
 
 // Format
 export * from './format'

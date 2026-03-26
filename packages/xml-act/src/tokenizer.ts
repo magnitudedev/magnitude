@@ -1,4 +1,4 @@
-export type ScannerSignal =
+export type Token =
   | {
       readonly type: 'open'
       readonly tagName: string
@@ -21,7 +21,7 @@ export type ScannerSignal =
     }
   | { readonly type: 'content'; readonly text: string }
 
-export interface Scanner {
+export interface Tokenizer {
   push(chunk: string): void
   end(): void
 }
@@ -72,7 +72,7 @@ function isNameContinue(ch: string): boolean {
   return /[a-zA-Z0-9_.-]/.test(ch)
 }
 
-function withAfterNewline(signal: ScannerSignal): ScannerSignal {
+function withAfterNewline(signal: Token): Token {
   switch (signal.type) {
     case 'open': return { ...signal, afterNewline: true }
     case 'close': return { ...signal, afterNewline: true }
@@ -81,7 +81,7 @@ function withAfterNewline(signal: ScannerSignal): ScannerSignal {
   }
 }
 
-export function createScanner(onSignal: (signal: ScannerSignal) => void): Scanner {
+export function createTokenizer(onSignal: (signal: Token) => void): Tokenizer {
   let contentBuffer = ''
   let afterNewline = true
 
@@ -95,7 +95,7 @@ export function createScanner(onSignal: (signal: ScannerSignal) => void): Scanne
   }
 
   let activeTag: ActiveTag | null = null
-  let pendingTag: { signal: ScannerSignal; allowEofAsNewline: boolean } | null = null
+  let pendingTag: { signal: Token; allowEofAsNewline: boolean } | null = null
 
   let cdataBuffer: string | null = null
 
@@ -128,7 +128,7 @@ export function createScanner(onSignal: (signal: ScannerSignal) => void): Scanne
   function emitTag(tag: ActiveTag): void {
     flushContent()
     const base = tag.savedAfterNewline
-    const signal: ScannerSignal = tag.isClose
+    const signal: Token = tag.isClose
       ? { type: 'close', tagName: tag.name, afterNewline: base, raw: tag.raw }
       : tag.pendingSelfClose
         ? {

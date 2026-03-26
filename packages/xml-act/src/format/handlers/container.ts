@@ -2,7 +2,8 @@ import { emit, pop, push, replace } from '../ops'
 import { appendTopProse, endTopProse } from '../prose'
 import { rawCloseTag, rawOpenTag } from '../raw'
 import type { Fx } from '../ops'
-import type { TagHandler, XmlActFrame, XmlActEvent } from '../types'
+import type { Resolve, TagHandler, XmlActFrame, XmlActEvent } from '../types'
+import { PASSTHROUGH } from '../types'
 
 function closeOpenThink(stack: ReadonlyArray<XmlActFrame>): Fx[] {
   const top = stack[stack.length - 1]
@@ -27,7 +28,7 @@ function closeInnermostContainer(stack: ReadonlyArray<XmlActFrame>, skipTag: str
   return []
 }
 
-export function containerHandler(tag: string): TagHandler<XmlActFrame, XmlActEvent> {
+export function containerHandler(tag: string, resolve: Resolve = PASSTHROUGH): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
       if (!ctx.afterNewline) {
@@ -44,7 +45,7 @@ export function containerHandler(tag: string): TagHandler<XmlActFrame, XmlActEve
         ...endTopProse(ctx.stack),
         ...closeOpenThink(ctx.stack),
         ...closeInnermostContainer(ctx.stack, tag),
-        push({ type: 'container', tag, depth: 0 }),
+        push({ type: 'container', tag, depth: 0, resolve }),
         emit({ _tag: 'ContainerOpen', tag }),
       ]
     },

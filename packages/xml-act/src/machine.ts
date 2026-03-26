@@ -1,3 +1,4 @@
+
 export type Op<F, E> =
   | { readonly type: 'push'; readonly frame: F }
   | { readonly type: 'pop' }
@@ -13,9 +14,9 @@ export interface StackMachine<F, E> {
   readonly done: boolean
 }
 
-export function createStackMachine<F, E>(
+export function createStackMachine<F extends { readonly type: string }, E>(
   initialFrame: F,
-  emit: (event: E) => void
+  emit: (event: E) => void,
 ): StackMachine<F, E> {
   const stack: F[] = [initialFrame]
   let isDone = false

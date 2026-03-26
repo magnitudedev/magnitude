@@ -37,9 +37,25 @@ export type CompletedLens = {
   readonly body: string
 }
 
+export type ResolveResult<F, E> =
+  | { readonly _tag: 'handle'; readonly handler: TagHandler<F, E> }
+  | { readonly _tag: 'passthrough' }
+
+export function HANDLE<F, E>(handler: TagHandler<F, E>): ResolveResult<F, E> {
+  return { _tag: 'handle', handler }
+}
+
+export const PASS: ResolveResult<never, never> = { _tag: 'passthrough' }
+
+export type FrameResolve<F, E> = (tagName: string) => ResolveResult<F, E>
+
+export type Resolve = FrameResolve<XmlActFrame, XmlActEvent>
+
+export const PASSTHROUGH: Resolve = () => PASS
+
 export type XmlActFrame =
-  | { readonly type: 'prose'; readonly body: string; readonly pendingNewlines: number }
-  | { readonly type: 'container'; readonly tag: string; readonly depth: number }
+  | { readonly type: 'prose'; readonly body: string; readonly pendingNewlines: number; readonly resolve: Resolve }
+  | { readonly type: 'container'; readonly tag: string; readonly depth: number; readonly resolve: Resolve }
   | {
       readonly type: 'think'
       readonly tag: string
@@ -49,6 +65,7 @@ export type XmlActFrame =
       readonly isLenses: boolean
       readonly activeLens: ActiveLens | null
       readonly lenses: readonly CompletedLens[]
+      readonly resolve: Resolve
     }
   | {
       readonly type: 'message'
@@ -58,6 +75,7 @@ export type XmlActFrame =
       readonly body: string
       readonly depth: number
       readonly pendingNewlines: number
+      readonly resolve: Resolve
     }
   | {
       readonly type: 'tool-body'
@@ -69,6 +87,7 @@ export type XmlActFrame =
       readonly childCounts: ReadonlyMap<string, number>
       readonly childTags: ReadonlySet<string>
       readonly schema: TagSchema | undefined
+      readonly resolve: Resolve
     }
   | {
       readonly type: 'child-body'
@@ -78,8 +97,9 @@ export type XmlActFrame =
       readonly parentToolId: string
       readonly parentTag: string
       readonly childIndex: number
+      readonly resolve: Resolve
     }
-  | { readonly type: 'body-capture'; readonly tag: string; readonly body: string }
+  | { readonly type: 'body-capture'; readonly tag: string; readonly body: string; readonly resolve: Resolve }
 
 export type StructuralParseErrorDetail =
   | { readonly _tag: 'UnclosedThink' }
@@ -181,12 +201,20 @@ export interface TagHandler<F, E> {
   selfClose(ctx: SelfCloseContext<F>): Op<F, E>[]
 }
 
+
 export interface Format<F, E> {
-  resolve(tagName: string, stack: ReadonlyArray<F>): TagHandler<F, E> | undefined
+  resolve(tagName: string, stack: ReadonlyArray<F>): ResolveResult<F, E>
   onContent(frame: F, text: string): Op<F, E>[]
   onFlush(stack: ReadonlyArray<F>): Op<F, E>[]
   onUnknownOpen(tagName: string, attrs: ReadonlyMap<string, string>, afterNewline: boolean, stack: ReadonlyArray<F>, raw: string): Op<F, E>[]
   onUnknownClose(tagName: string, stack: ReadonlyArray<F>, raw: string): Op<F, E>[]
+}
+
+function isFrameType<T extends XmlActFrame['type']>(
+  frame: XmlActFrame,
+  type: T,
+): frame is Extract<XmlActFrame, { type: T }> {
+  return frame.type === type
 }
 
 export function findFrame<T extends XmlActFrame['type']>(
@@ -195,7 +223,7 @@ export function findFrame<T extends XmlActFrame['type']>(
 ): Extract<XmlActFrame, { type: T }> | undefined {
   for (let i = stack.length - 1; i >= 0; i--) {
     const frame = stack[i]
-    if (frame.type === type) return frame as Extract<XmlActFrame, { type: T }>
+    if (isFrameType(frame, type)) return frame
   }
   return undefined
 }

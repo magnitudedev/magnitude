@@ -1,20 +1,20 @@
 import { describe, expect, it } from 'bun:test'
-import { createScanner, type ScannerSignal } from '../scanner'
+import { createTokenizer, type Token } from '../tokenizer'
 
-function collect(input: string | string[]): ScannerSignal[] {
-  const out: ScannerSignal[] = []
-  const scanner = createScanner((signal) => out.push(signal))
+function collect(input: string | string[]): Token[] {
+  const out: Token[] = []
+  const tokenizer = createTokenizer((signal) => out.push(signal))
   if (Array.isArray(input)) {
-    for (const chunk of input) scanner.push(chunk)
+    for (const chunk of input) tokenizer.push(chunk)
   } else {
-    scanner.push(input)
+    tokenizer.push(input)
   }
-  scanner.end()
+  tokenizer.end()
   // Strip `raw` field — it's an implementation detail for unknown tag reconstruction
-  return out.map(s => { const { raw, ...rest } = s as any; return rest }) as ScannerSignal[]
+  return out.map(s => { const { raw, ...rest } = s as any; return rest }) as Token[]
 }
 
-describe('scanner', () => {
+describe('tokenizer', () => {
   it('basic open tag', () => {
     expect(collect('<foo>')).toEqual([
       { type: 'open', tagName: 'foo', attrs: new Map(), afterNewline: true },
@@ -85,7 +85,7 @@ describe('scanner', () => {
   })
 
   it('end flushes partial tag buffer', () => {
-    // New scanner completes partial tags at EOF as open signals (for incomplete tool detection)
+    // New tokenizer completes partial tags at EOF as open signals (for incomplete tool detection)
     expect(collect('<foo')).toEqual([{ type: 'open', tagName: 'foo', attrs: new Map(), afterNewline: true }])
   })
 

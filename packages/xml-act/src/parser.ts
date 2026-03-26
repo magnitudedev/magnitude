@@ -1,6 +1,6 @@
 import { createStackMachine } from './machine'
-import { createScanner } from './scanner'
-import type { Format, XmlActFrame, XmlActEvent, ToolDef } from './format/types'
+import { createTokenizer } from './tokenizer'
+import type { Format, Resolve, XmlActFrame, XmlActEvent, ToolDef } from './format/types'
 import { createCurrentFormat } from './format/index'
 import type { TagSchema } from './execution/binding-validator'
 import { createId } from './util'
@@ -62,14 +62,14 @@ export function createParser<F, E>(config: {
 
   const machine = createStackMachine<F, E>(config.initialFrame, onEvent)
 
-  const scanner = createScanner((signal) => {
+  const tokenizer = createTokenizer((signal) => {
     if (machine.done) return
 
     switch (signal.type) {
       case 'open': {
-        const handler = config.format.resolve(signal.tagName, machine.stack)
-        if (handler) {
-          machine.apply(handler.open({
+        const result = config.format.resolve(signal.tagName, machine.stack)
+        if (result._tag === 'handle') {
+          machine.apply(result.handler.open({
             tagName: signal.tagName,
             attrs: signal.attrs,
             afterNewline: signal.afterNewline,
@@ -84,9 +84,9 @@ export function createParser<F, E>(config: {
         break
       }
       case 'close': {
-        const handler = config.format.resolve(signal.tagName, machine.stack)
-        if (handler) {
-          machine.apply(handler.close({
+        const result = config.format.resolve(signal.tagName, machine.stack)
+        if (result._tag === 'handle') {
+          machine.apply(result.handler.close({
             tagName: signal.tagName,
             afterNewline: signal.afterNewline,
             stack: machine.stack,
@@ -101,9 +101,9 @@ export function createParser<F, E>(config: {
         break
       }
       case 'selfClose': {
-        const handler = config.format.resolve(signal.tagName, machine.stack)
-        if (handler) {
-          machine.apply(handler.selfClose({
+        const result = config.format.resolve(signal.tagName, machine.stack)
+        if (result._tag === 'handle') {
+          machine.apply(result.handler.selfClose({
             tagName: signal.tagName,
             attrs: signal.attrs,
             afterNewline: signal.afterNewline,
@@ -129,14 +129,14 @@ export function createParser<F, E>(config: {
 
   const processChunk = (chunk: string): readonly E[] => {
     const start = events.length
-    if (!machine.done) scanner.push(chunk)
+    if (!machine.done) tokenizer.push(chunk)
     if (coalescingLayer) coalescingLayer.flush()
     return events.slice(start)
   }
 
   const flush = (): readonly E[] => {
     const start = events.length
-    scanner.end()
+    tokenizer.end()
     machine.apply(config.format.onFlush(machine.stack))
     if (coalescingLayer) coalescingLayer.flush()
     return events.slice(start)
@@ -144,10 +144,10 @@ export function createParser<F, E>(config: {
 
   return {
     push(chunk) {
-      if (!machine.done) scanner.push(chunk)
+      if (!machine.done) tokenizer.push(chunk)
     },
     end() {
-      scanner.end()
+      tokenizer.end()
       if (coalescingLayer) coalescingLayer.flush()
     },
     processChunk,
@@ -175,9 +175,11 @@ export function createStreamingXmlParser(
 
   let emittedTurnControl = false
 
+  const structuralResolve: Resolve = (tagName) => format.resolve(tagName, [])
+
   return createParser<XmlActFrame, XmlActEvent>({
     format,
-    initialFrame: { type: 'prose', body: '', pendingNewlines: 0 },
+    initialFrame: { type: 'prose', body: '', pendingNewlines: 0, resolve: structuralResolve },
     generateId,
     filter(event) {
       if (event._tag !== 'TurnControl') return true

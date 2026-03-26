@@ -1,10 +1,14 @@
 import { emit, pop, push, replace } from '../ops'
 import { appendTopProse, endTopProse } from '../prose'
 import { rawCloseTag, rawOpenTag } from '../raw'
-import type { TagHandler, XmlActFrame, XmlActEvent } from '../types'
+import type { Resolve, TagHandler, XmlActFrame, XmlActEvent } from '../types'
+import { PASSTHROUGH } from '../types'
 import { findFrame } from '../types'
 
-export function thinkHandler(lensesTag = 'lenses'): TagHandler<XmlActFrame, XmlActEvent> {
+export function thinkHandler(
+  lensesTag = 'lenses',
+  makeResolve: (tagName: string, isLenses: boolean) => Resolve = () => PASSTHROUGH,
+): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
       const raw = rawOpenTag(ctx.tagName, ctx.attrs)
@@ -40,6 +44,7 @@ export function thinkHandler(lensesTag = 'lenses'): TagHandler<XmlActFrame, XmlA
           isLenses,
           activeLens: null,
           lenses: [],
+          resolve: makeResolve(ctx.tagName, isLenses),
         }),
       ]
     },

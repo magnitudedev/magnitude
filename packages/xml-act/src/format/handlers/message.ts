@@ -1,10 +1,11 @@
 import { emit, pop, push, replace } from '../ops'
 import { endTopProse } from '../prose'
-import type { TagHandler, XmlActFrame, XmlActEvent } from '../types'
+import type { Resolve, TagHandler, XmlActFrame, XmlActEvent } from '../types'
+import { PASSTHROUGH } from '../types'
 import { findFrame } from '../types'
 import { rawCloseTag, rawOpenTag } from '../raw'
 
-export function messageHandler(defaultDest: string): TagHandler<XmlActFrame, XmlActEvent> {
+export function messageHandler(defaultDest: string, resolve: Resolve = PASSTHROUGH): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
       const existing = findFrame(ctx.stack, 'message')
@@ -39,6 +40,7 @@ export function messageHandler(defaultDest: string): TagHandler<XmlActFrame, Xml
           body: '',
           depth: 0,
           pendingNewlines: 0,
+          resolve,
         }),
       ]
     },
