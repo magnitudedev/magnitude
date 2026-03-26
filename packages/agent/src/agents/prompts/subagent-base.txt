@@ -16,3 +16,15 @@ You have a workspace directory at `$M/`, shared across all agents in this sessio
 Use this workspace freely to store documents (reports, plans), temporary scripts, or other scratch work.
 The workspace should be used to maintain documents and share with parent efficiently and losslessly.
 `$M/project` is a symlink to the project directory that scripts can use if necessary.
+Unless the parent suggests explicitly states otherwise, you should default to putting any documents you create in $M.
+
+### Workspace structure
+$M/
+  project/ - symlink to user's project
+  reports/ - put informational reports here
+  plans/ - put plans in here
+  scripts/ - temporary scripts
+  tests/ - temporary tests or repros
+
+Prefer to iterate on and edit existing documents when appropraite instead of constantly writing new ones.
+Give documents unique names rather than generic ones.
