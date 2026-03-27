@@ -7,10 +7,9 @@
  * Relocated from strategies/prompt-utils.ts after strategy abstraction removal.
  */
 
-import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
+import type { RoleDefinition } from '@magnitudedev/roles'
 import { generateXmlToolGroupDoc, type XmlToolDocEntry } from '@magnitudedev/xml-act'
-import type { PolicyContext } from '../agents/types'
-import { defaultXmlTagName, getXmlBindingMap } from './index'
+import type { AgentCatalogEntry } from '../catalog'
 
 // =============================================================================
 // Tool Presentation (strategy-agnostic tool metadata)
@@ -33,23 +32,25 @@ export interface ToolPresentation {
  * Build ToolPresentation[] from an agent definition.
  */
 export function buildToolPresentation(
-  agentDef: RoleDefinition<ToolSet, string, PolicyContext>,
+  agentDef: RoleDefinition,
   implicitTools: readonly string[] = []
 ): ToolPresentation[] {
   const presentations: ToolPresentation[] = []
 
-  for (const [defKey, tool] of Object.entries(agentDef.tools)) {
+  for (const defKey of agentDef.tools.keys) {
+    const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
+    const tool = entry.tool
     if (implicitTools.includes(defKey)) continue
-    if (!tool) continue
 
     const slug = defKey
 
     presentations.push({
       slug,
-      description: 'description' in tool && typeof tool.description === 'string' ? tool.description : '',
+      description: typeof tool.description === 'string' ? tool.description : '',
       inputSchema: tool.inputSchema,
       outputSchema: tool.outputSchema,
-      argMapping: 'argMapping' in tool && Array.isArray(tool.argMapping) ? tool.argMapping : [],
+      argMapping: [],
+
     })
   }
 
@@ -65,10 +66,9 @@ export function buildToolPresentation(
  * Uses XML bindings on tools to produce XML tag documentation grouped by namespace.
  */
 export function generateXmlActToolDocs(
-  agentDef: RoleDefinition<ToolSet, string, PolicyContext>,
+  agentDef: RoleDefinition,
   implicitTools: readonly string[] = []
 ): string {
-  const xmlBindingMap = getXmlBindingMap()
 
   // Build defKey lookup: entry instance → defKey (for implicit filtering)
   const defKeyLookup = new Map<XmlToolDocEntry, string>()
@@ -76,12 +76,10 @@ export function generateXmlActToolDocs(
   // Group tools by group name for documentation
   const groups = new Map<string, { tools: XmlToolDocEntry[]; global: boolean }>()
 
-  for (const [defKey, tool] of Object.entries(agentDef.tools)) {
-    if (!tool) continue
-
-    const tagName = defaultXmlTagName(tool)
-    const xmlBinding = xmlBindingMap.get(tagName)
-    if (!xmlBinding) continue
+  for (const defKey of agentDef.tools.keys) {
+    const catalogEntry = agentDef.tools.entries[defKey] as AgentCatalogEntry
+    const tool = catalogEntry.tool
+    const xmlBinding = catalogEntry.binding
 
     const entry: XmlToolDocEntry = {
       name: tool.name,
@@ -90,7 +88,7 @@ export function generateXmlActToolDocs(
       inputSchema: tool.inputSchema,
       outputSchema: tool.outputSchema,
       xmlInput: xmlBinding.toXmlTagBinding(),
-      xmlOutput: xmlBinding.toXmlOutputBinding(),
+      // xml output docs are optional for current agent bindings
     }
 
     defKeyLookup.set(entry, defKey)

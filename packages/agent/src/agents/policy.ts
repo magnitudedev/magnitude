@@ -1,5 +1,6 @@
 import { Effect } from 'effect'
-import type { Decision, Policy, ToolInput, ToolNames, ToolSet } from '@magnitudedev/roles'
+import type { Decision, Policy, PolicyHandler } from '@magnitudedev/roles'
+import type { ToolCatalog } from '@magnitudedev/tools'
 import type { Schema } from '@effect/schema'
 import {
   classifyShellCommand,
@@ -22,17 +23,18 @@ const NO_MATCHING_POLICY_RULE = 'No matching policy rule'
 const deny = (reason: string): Decision => ({ decision: 'deny', reason })
 const allow: Decision = { decision: 'allow' }
 
-export function evaluate<T extends ToolSet, TCtx, K extends ToolNames<T>>(
-  policy: Policy<T, TCtx>,
-  tool: K,
-  input: ToolInput<T, K>,
-  ctx: TCtx,
+export function evaluate(
+  policy: Policy<ToolCatalog, unknown>,
+  tool: string,
+  input: unknown,
+  ctx: unknown,
 ): Effect.Effect<Decision> {
   const handlers: Array<Effect.Effect<Decision | null>> = []
 
   for (const fragment of policy) {
-    const toolHandler = fragment[tool]
-    const wildcardHandler = fragment['*']
+    const handlersByKey = fragment as Record<string, PolicyHandler<unknown, unknown> | undefined>
+    const toolHandler = handlersByKey[tool]
+    const wildcardHandler = handlersByKey['*']
 
     if (toolHandler) {
       handlers.push(toolHandler(input, ctx))

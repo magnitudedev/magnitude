@@ -1,6 +1,5 @@
 import type { Schema } from '@effect/schema';
 import type { Effect } from 'effect';
-import type { Tool } from './tool';
 import type { ToolContext } from './tool-context';
 
 export interface StreamHook<TInput, TEmission, TStreamState, E = never, R = never> {
@@ -16,51 +15,59 @@ export interface StreamHook<TInput, TEmission, TStreamState, E = never, R = neve
  * A tool definition — pure typed function with schemas.
  * No knowledge of XML, display, or lifecycle.
  */
-export interface ToolDefinition<
-  TInput = unknown,
-  TOutput = unknown,
-  TEmission = never,
-  TInputEncoded = unknown,
-  TOutputEncoded = unknown,
-  TEmissionEncoded = unknown,
-  TError = unknown,
-  TErrorEncoded = unknown,
-  R = unknown,
-  E = unknown
-> {
-  readonly name: string;
-  readonly description?: string;
-  readonly group?: string;
-  readonly inputSchema: Schema.Schema<TInput, TInputEncoded, never>;
-  readonly outputSchema: Schema.Schema<TOutput, TOutputEncoded, never>;
-  readonly emissionSchema?: Schema.Schema<TEmission, TEmissionEncoded, never>;
-  readonly errorSchema?: Schema.Schema<TError, TErrorEncoded, never>;
-  readonly stream?: StreamHook<TInput, TEmission, any, E, R>;
-  readonly execute: (
-    input: TInput,
-    ctx: ToolContext<TEmission>
-  ) => Effect.Effect<TOutput, E, R>;
-  readonly label: (input: Partial<TInput>) => string;
-}
-
-/**
- * Structural shape for new-architecture tool definitions.
- * Kept broad to avoid variance issues with concrete generic instantiations.
- */
-export interface AnyToolDefinition {
+interface ToolDefinitionErased {
   readonly name: string;
   readonly description?: string;
   readonly group?: string;
   readonly inputSchema: Schema.Schema.Any;
   readonly outputSchema: Schema.Schema.Any;
-  readonly errorSchema?: Schema.Schema.Any;
+  readonly emissionSchema?: Schema.Schema.Any | undefined;
+  readonly errorSchema?: Schema.Schema.Any | undefined;
+  readonly stream?: unknown;
+  execute(input: unknown, ctx: unknown): Effect.Effect<unknown, unknown, unknown>;
+  label(input: unknown): string;
 }
 
-/**
- * Any tool contract supported by Magnitude.
- * Includes both legacy tools (`Tool.Any`) and new architecture tools (`ToolDefinition`).
- */
-export type AnyTool = Tool.Any | AnyToolDefinition;
+type ToolDefinitionConcrete<
+  TInput,
+  TOutput,
+  TEmission,
+  TInputEncoded,
+  TOutputEncoded,
+  TEmissionEncoded,
+  TError,
+  TErrorEncoded,
+  R,
+  E
+> = {
+  readonly name: string;
+  readonly description?: string;
+  readonly group?: string;
+  readonly inputSchema: Schema.Schema<TInput, TInputEncoded, never>;
+  readonly outputSchema: Schema.Schema<TOutput, TOutputEncoded, never>;
+  readonly emissionSchema?: [TEmission] extends [never] ? Schema.Schema.Any | undefined : Schema.Schema<TEmission, TEmissionEncoded, never>;
+  readonly errorSchema?: [TError] extends [never] ? Schema.Schema.Any | undefined : Schema.Schema<TError, TErrorEncoded, never>;
+  readonly stream?: StreamHook<TInput, TEmission, unknown, E, R>;
+  readonly execute: (input: TInput, ctx: ToolContext<TEmission>) => Effect.Effect<TOutput, E, R>;
+  readonly label: (input: Partial<TInput>) => string;
+}
+
+export type ToolDefinition<
+  TInput = never,
+  TOutput = never,
+  TEmission = never,
+  TInputEncoded = never,
+  TOutputEncoded = never,
+  TEmissionEncoded = never,
+  TError = never,
+  TErrorEncoded = never,
+  R = never,
+  E = never
+> = [TInput] extends [never]
+  ? ToolDefinitionErased
+  : ToolDefinitionConcrete<TInput, TOutput, TEmission, TInputEncoded, TOutputEncoded, TEmissionEncoded, TError, TErrorEncoded, R, E>
+
+
 
 export interface ToolDefinitionConfig<
   TInput,

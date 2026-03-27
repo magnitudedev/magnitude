@@ -1,15 +1,9 @@
-import { toolSet, continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
+import { continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
 import type { TurnPolicy } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
-import { skillTool, phaseSubmitTool } from '../tools/globals'
-import { agentCreateTool, agentKillTool } from '../tools/agent-tools'
-import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
-import { shellBgTool } from '../tools/shell-bg'
-import { shellTool } from '../tools/shell'
-import { webFetchTool } from '../tools/web-fetch-tool'
-import { webSearchTool } from '../tools/web-search-tool'
+import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 
 export const intentLens = defineThinkingLens({
@@ -69,22 +63,22 @@ export const turnLens = defineThinkingLens({
   description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
 })
 
-export const leadTools = toolSet({
-  fileRead: readTool,
-  fileWrite: writeTool,
-  fileEdit: editTool,
-  fileTree: treeTool,
-  fileSearch: searchTool,
-  fileView: viewTool,
-  shell: shellTool,
-  shellBg: shellBgTool,
-  webSearch: webSearchTool,
-  webFetch: webFetchTool,
-  agentCreate: agentCreateTool,
-  agentKill: agentKillTool,
-  skill: skillTool,
-  phaseSubmit: phaseSubmitTool,
-})
+export const leadTools = catalog.pick(
+  'fileRead',
+  'fileWrite',
+  'fileEdit',
+  'fileTree',
+  'fileSearch',
+  'fileView',
+  'shell',
+  'shellBg',
+  'webSearch',
+  'webFetch',
+  'agentCreate',
+  'agentKill',
+  'skill',
+  'phaseSubmit',
+)
 
 export const leadObservables = [agentsStatusObservable, backgroundProcessesObservable]
 

@@ -6,14 +6,10 @@
  * Uses secondary model. Communicates back via parent.message.
  */
 
-import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
 import explorerPromptRaw from './prompts/explorer.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
-import { readTool, writeTool, editTool, treeTool, searchTool, viewTool } from '../tools/fs'
-import { shellBgTool } from '../tools/shell-bg'
-import { shellTool } from '../tools/shell'
-import { webSearchTool } from '../tools/web-search-tool'
-import { webFetchTool } from '../tools/web-fetch-tool'
+import { catalog } from '../catalog'
 
 import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
@@ -33,19 +29,18 @@ const turnLens = defineThinkingLens({
 
 const systemPrompt = compilePromptTemplate(explorerPromptRaw)
 
-const tools = toolSet({
-  fileRead:      readTool,
-  fileWrite:     writeTool,
-  fileEdit:      editTool,
-  fileTree:      treeTool,
-  fileSearch:    searchTool,
-  fileView:      viewTool,
-  shell:         shellTool,
-  shellBg:       shellBgTool,
-  webSearch:     webSearchTool,
-  webFetch:      webFetchTool,
-
-})
+const tools = catalog.pick(
+  'fileRead',
+  'fileWrite',
+  'fileEdit',
+  'fileTree',
+  'fileSearch',
+  'fileView',
+  'shell',
+  'shellBg',
+  'webSearch',
+  'webFetch',
+)
 
 export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>({
   tools,

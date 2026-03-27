@@ -6,15 +6,10 @@
  * No file write access — reviewers only observe, test, and report.
  */
 
-import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
 import reviewerPromptRaw from './prompts/reviewer.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
-import { readTool, treeTool, searchTool, viewTool } from '../tools/fs'
-import { shellBgTool } from '../tools/shell-bg'
-import { shellTool } from '../tools/shell'
-
-import { agentCreateTool } from '../tools/agent-tools'
-import { phaseVerdictTool } from '../tools/phase-verdict'
+import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { backgroundProcessesObservable } from '../observables/background-processes-observable'
@@ -45,18 +40,16 @@ const turnLens = defineThinkingLens({
 
 const systemPrompt = compilePromptTemplate(reviewerPromptRaw)
 
-const tools = toolSet({
-  fileRead:       readTool,
-  fileTree:       treeTool,
-  fileSearch:     searchTool,
-  fileView:       viewTool,
-  shell:          shellTool,
-  shellBg:        shellBgTool,
-
-  agentCreate:    agentCreateTool,
-
-  phaseVerdict:    phaseVerdictTool,
-})
+const tools = catalog.pick(
+  'fileRead',
+  'fileTree',
+  'fileSearch',
+  'fileView',
+  'shell',
+  'shellBg',
+  'agentCreate',
+  'phaseVerdict',
+)
 
 export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>({
   tools,

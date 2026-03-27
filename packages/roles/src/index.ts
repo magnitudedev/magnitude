@@ -1,5 +1,4 @@
 export type {
-  ToolSet,
   ToolNames,
   ToolInput,
   ToolOutput,
@@ -26,6 +25,6 @@ export type { ThinkingLens } from './thinking-lens'
 
 export { continue_, yield_, finish } from './helpers'
 
-export { defineRole, defineRoleSet, toolSet } from './define'
+export { defineRole, defineRoleSet } from './define'
 export { createObservable, bindObservable } from './observable'
 export { defineThinkingLens } from './thinking-lens'

@@ -295,19 +295,10 @@ function classifyOutputDoc(schemaAst: AST.AST): OutputDocShape {
 // =============================================================================
 
 /**
- * Derive a default XML tag name from a tool.
- */
-export function defaultXmlTagName(tool: { name: string; group?: string }): string {
-  const group = tool.group
-  if (!group || group === 'default') return tool.name
-  return `${group}-${tool.name}`
-}
-
-/**
  * Generate unified annotated XML documentation for a single tool.
  */
 export function generateXmlToolDoc(tool: XmlToolDocEntry): string {
-  const tagName = tool.xmlInput.tag ?? defaultXmlTagName(tool)
+  const tagName = tool.xmlInput.tag
   const fields = getFieldInfos(tool.inputSchema.ast)
   const lines: string[] = []
 

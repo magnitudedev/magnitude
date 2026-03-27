@@ -3,8 +3,7 @@ import { observeOutput, type ReactorState } from '@magnitudedev/xml-act'
 import type { ObservedResult, ResponsePart, ToolResult, TurnCompleted, TurnToolCall } from '../events'
 import { mapXmlToolResult } from './tool-result'
 import { getAgentDefinition, type AgentVariant } from '../agents'
-import { defaultXmlTagName } from '../tools'
-import { isToolKey, type ToolKey } from '../tools/tool-definitions'
+import { isToolKey, type ToolKey, type AgentCatalogEntry } from '../catalog'
 import { CanonicalTurnProjection, type CanonicalTurnState } from '../projections/canonical-turn'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { ReplayProjection } from '../projections/replay'
@@ -73,15 +72,15 @@ export const buildInterruptedTurnCompleted = (params: {
 
   const agentDef = getAgentDefinition(variant)
   const tagToMeta = new Map<string, { toolKey: ToolKey; group: string; toolName: string }>()
-  for (const [toolKey, tool] of Object.entries(agentDef.tools)) {
-    if (!tool) continue
-    const concreteTool = tool as { name: string; group?: string }
-    const tagName = defaultXmlTagName(concreteTool as any)
+  for (const toolKey of agentDef.tools.keys) {
+    const entry = agentDef.tools.entries[toolKey] as AgentCatalogEntry
+    const tool = entry.tool
+    const tagName = entry.binding.toXmlTagBinding().tag
     if (isToolKey(toolKey)) {
       tagToMeta.set(tagName, {
         toolKey,
-        group: concreteTool.group ?? 'default',
-        toolName: concreteTool.name,
+        group: tool.group ?? 'default',
+        toolName: tool.name,
       })
     }
   }

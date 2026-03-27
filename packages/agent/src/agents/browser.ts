@@ -5,17 +5,13 @@
  * Receives automatic screenshots before each turn.
  */
 
-import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
 import browserPromptRaw from './prompts/browser.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
-import {
-  clickTool, doubleClickTool, rightClickTool, typeTool,
-  scrollTool, dragTool, navigateTool, goBackTool,
-  switchTabTool, newTabTool, screenshotTool, evaluateTool,
-  BrowserHarnessTag
-} from '../tools/browser-tools'
+import { BrowserHarnessTag } from '../tools/browser-tools'
 import { BrowserService } from '../services/browser-service'
 import { Effect, Layer } from 'effect'
+import { catalog } from '../catalog'
 
 import { browserObservable } from '../observables/browser-observable'
 import type { PolicyContext } from './types'
@@ -35,21 +31,20 @@ const turnLens = defineThinkingLens({
 
 const systemPrompt = compilePromptTemplate(browserPromptRaw)
 
-const tools = toolSet({
-  click:        clickTool,
-  doubleClick:  doubleClickTool,
-  rightClick:   rightClickTool,
-  type:         typeTool,
-  scroll:       scrollTool,
-  drag:         dragTool,
-  navigate:     navigateTool,
-  goBack:       goBackTool,
-  switchTab:    switchTabTool,
-  newTab:       newTabTool,
-  screenshot:   screenshotTool,
-  evaluate:     evaluateTool,
-
-})
+const tools = catalog.pick(
+  'click',
+  'doubleClick',
+  'rightClick',
+  'type',
+  'scroll',
+  'drag',
+  'navigate',
+  'goBack',
+  'switchTab',
+  'newTab',
+  'screenshot',
+  'evaluate',
+)
 
 export const browserRole = defineRole<typeof tools, 'browser', PolicyContext, BrowserHarnessTag, BrowserService>({
   tools,

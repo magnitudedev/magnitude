@@ -7,14 +7,10 @@
  * Communicates back via parent.message.
  */
 
-import { toolSet, defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
 import plannerPromptRaw from './prompts/planner.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
-import { readTool, writeTool, editTool, treeTool, searchTool } from '../tools/fs'
-import { shellBgTool } from '../tools/shell-bg'
-import { shellTool } from '../tools/shell'
-import { webSearchTool } from '../tools/web-search-tool'
-import { webFetchTool } from '../tools/web-fetch-tool'
+import { catalog } from '../catalog'
 
 // import { gatherTool } from '../tools/gather'
 import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
@@ -53,19 +49,18 @@ const turnLens = defineThinkingLens({
 
 const systemPrompt = compilePromptTemplate(plannerPromptRaw)
 
-const tools = toolSet({
-  fileRead:     readTool,
-  fileWrite:    writeTool,
-  fileEdit:     editTool,
-  fileTree:     treeTool,
-  fileSearch:   searchTool,
-  shell:        shellTool,
-  shellBg:      shellBgTool,
-  webSearch:    webSearchTool,
-  webFetch:     webFetchTool,
-  // gather:       gatherTool,
-
-})
+const tools = catalog.pick(
+  'fileRead',
+  'fileWrite',
+  'fileEdit',
+  'fileTree',
+  'fileSearch',
+  'shell',
+  'shellBg',
+  'webSearch',
+  'webFetch',
+  // 'gather',
+)
 
 export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
   tools,

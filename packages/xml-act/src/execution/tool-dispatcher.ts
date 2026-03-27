@@ -143,7 +143,7 @@ export function dispatchTool(
     // 3. Validate against schema
     let input: unknown
     try {
-      input = Schema.decodeUnknownSync(tool.inputSchema)(rawInput)
+      input = Schema.decodeUnknownSync(tool.inputSchema as Schema.Schema<unknown>)(rawInput)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       return {
@@ -207,7 +207,8 @@ export function dispatchTool(
     } else {
       const output = executionResult.right
       
-      const outputTree = buildOutputTree(element.tagName, output, tool.bindings.xmlOutput, undefined, { outputSchema: tool.outputSchema })
+      const outputBinding = registered.outputBinding ?? { type: 'tag' as const, ...registered.binding }
+      const outputTree = buildOutputTree(element.tagName, output, outputBinding, undefined, { outputSchema: tool.outputSchema as Schema.Schema<unknown> })
       result = { _tag: 'Success', output, outputTree: { tag: element.tagName, tree: outputTree }, query: observe }
     }
 

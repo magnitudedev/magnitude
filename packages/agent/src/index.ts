@@ -154,17 +154,12 @@ export { getXmlActProtocol, buildAckTurn } from './prompts/protocol'
 
 // Tool types (re-exported from xml-act and tools packages)
 export type { ToolCallEvent } from '@magnitudedev/xml-act'
-export type { Tool } from '@magnitudedev/tools'
+export type { ToolDefinition } from '@magnitudedev/tools'
 
 // Tools
-export type {
-  ToolKey,
-  ToolDefinitionMap,
-  ToolDefinitionFor,
-  ToolStateFor,
-  ToolEventFor,
-} from './tools/tool-definitions'
-export type { ToolHandle, ToolState } from './tools/tool-handle'
+export { catalog, isToolKey, type ToolKey } from './catalog'
+export type { ToolHandle } from './tools/tool-handle'
+export type { ToolState } from './models'
 export type { FileEditState, FileWriteState } from './models'
 export { globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'

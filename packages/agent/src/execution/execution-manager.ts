@@ -20,10 +20,10 @@ import {
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
 import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult } from '../events'
-import { isToolKey, type ToolKey } from '../tools/tool-definitions'
+import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
-import { defaultXmlTagName } from '../tools'
+
 import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 import { buildPolicyInterceptor, type AgentResolver } from './permission-gate'
 import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from './approval-state'
@@ -50,7 +50,7 @@ import { ReplayProjection } from '../projections/replay'
 import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
 import { BackgroundProcessesProjection, getProcessesForFork, type BackgroundProcessesState } from '../projections/background-processes'
 
-import type { RoleDefinition, ToolSet, BoundObservable } from '@magnitudedev/roles'
+import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
 import { bindObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
@@ -59,7 +59,7 @@ import type { TurnEvent } from './types'
 import { ToolReminderTag } from './tool-reminder'
 import { WorkingDirectoryTag } from './working-directory'
 import { ToolExecutionContextTag } from './tool-execution-context'
-import type { Tool, AnyTool, StreamingLeaf, StreamingPartial } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamingPartial } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -67,7 +67,7 @@ import { BackgroundProcessRegistryTag, make as makeBackgroundProcessRegistry } f
 
 const { ForkContext } = Fork
 
-type AgentDef = RoleDefinition<ToolSet, string, PolicyContext>
+type AgentDef = RoleDefinition
 
 import { mapXmlToolResult } from '../util/tool-result'
 
@@ -308,13 +308,7 @@ const makeExecutionManager = Effect.gen(function* () {
   // Pre-built idle release effects (repeatable; run each time fork goes idle)
   const forkIdleReleases = new Map<string, Effect.Effect<void>>()
 
-  function isToolAny(value: AnyTool): value is Tool.Any {
-    return 'bindings' in value
-  }
 
-  function hasNameAndOptionalGroup(value: AnyTool): value is Extract<AnyTool, { name: string; group?: string }> {
-    return typeof value.name === 'string'
-  }
 
   /**
    * Resolve the active agent definition for a fork.
@@ -395,39 +389,19 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolReminderRef = toolReminderRefs.get(forkId)!
 
 
-      // Build tool tagName → defKey lookup and tagName → tool lookup
-      // Use registeredTools metadata so both legacy and defineTool tools are covered.
+      // Build tool tagName → defKey lookup from registered metadata.
       const tagToDefKey = new Map<string, string>()
-      const tagToTool = new Map<string, AnyTool>()
       for (const [tagName, registered] of registeredTools.entries()) {
         const meta = registered.meta as Record<string, unknown> | undefined
         const defKey = typeof meta?.defKey === 'string' ? meta.defKey : undefined
         if (!defKey) continue
         tagToDefKey.set(tagName, defKey)
-        const tool = agentDef.tools[defKey]
-        if (tool) {
-          tagToTool.set(tagName, tool)
-        }
       }
 
       /** Resolve a xml-act event's tagName to the definition key. */
       const resolveKey = (tagName: string): ToolKey | undefined => {
-        const key = tagToDefKey.get(tagName) ?? tagName
-        return isToolKey(key) ? key : undefined
-      }
-
-      // Also build callable-based lookup for resolveKey from group+toolName
-      const callableToKey = new Map<string, string>()
-      for (const [key, tool] of Object.entries(agentDef.tools)) {
-        if (!tool || !hasNameAndOptionalGroup(tool)) continue
-        const group = tool.group
-        const callable = (group && group !== 'default') ? `${group}.${tool.name}` : tool.name
-        callableToKey.set(callable, key)
-      }
-      const resolveKeyFromCallable = (group: string, toolName: string): ToolKey | undefined => {
-        const callable = group === 'default' ? toolName : `${group}.${toolName}`
-        const key = callableToKey.get(callable) ?? callable
-        return isToolKey(key) ? key : undefined
+        const key = tagToDefKey.get(tagName)
+        return key && isToolKey(key) ? key : undefined
       }
 
       // Track tools called (by definition key) for turn policy
@@ -504,16 +478,17 @@ const makeExecutionManager = Effect.gen(function* () {
             switch (event._tag) {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
-                const toolKey = resolveKeyFromCallable(event.group, event.toolName)
+                const toolKey = resolveKey(event.tagName)
                 if (!toolKey) {
-                  logger.error(`[ExecutionManager] Failed to resolve tool key for ${event.group}.${event.toolName} (toolCallId: ${event.toolCallId}). The tool's defKey is not a valid ToolKey in TOOL_DEFINITIONS.`)
+                  logger.error(`[ExecutionManager] Failed to resolve tool key for tag ${event.tagName} (toolCallId: ${event.toolCallId}).`)
                   break
                 }
                 toolCallTagNames.set(event.toolCallId, event.tagName)
                 toolCallKeys.set(event.toolCallId, toolKey)
 
                 // Check for stream hook
-                const tool = tagToTool.get(event.tagName)
+                const toolEntry = catalog.entries[toolKey]
+                const tool = toolEntry?.tool
                 if (tool && 'stream' in tool && (tool as any).stream) {
                   const streamConfig = (tool as any).stream as {
                     onInput: (
@@ -543,7 +518,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
-                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
 
@@ -585,7 +560,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Tool Input Parse Error ---
               case 'ToolInputParseError': {
-                const toolKey = resolveKeyFromCallable(event.group, event.toolName)
+                const toolKey = resolveKey(event.tagName)
                 if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
 
@@ -613,8 +588,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 // Reset tool reminders for the new tool execution
                 yield* Ref.set(toolReminderRef, [])
 
-                const toolKey = toolCallKeys.get(event.toolCallId) ?? resolveKeyFromCallable(event.group, event.toolName)
-                if (!toolKey) break
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
+                  break
+                }
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -627,7 +605,7 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ToolEmission': {
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
-                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
                 yield* Queue.offer(sink, {
@@ -641,8 +619,11 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Tool Execution Ended ---
               case 'ToolExecutionEnded': {
-                const toolKey = resolveKeyFromCallable(event.group, event.toolName)
-                if (!toolKey) break
+                const toolKey = toolCallKeys.get(event.toolCallId)
+                if (!toolKey) {
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
+                  break
+                }
 
                 // Skip cached tool calls — these are replays
                 if (cachedToolCallIds.has(event.toolCallId)) {
@@ -689,7 +670,7 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ToolInputChildComplete': {
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
-                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
 
@@ -826,7 +807,7 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ToolObservation': {
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
-                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}). This indicates a tool registration mismatch — the tool's defKey is missing from TOOL_DEFINITIONS.`)
+                  logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
                 observedResults.push({
@@ -947,7 +928,7 @@ const makeExecutionManager = Effect.gen(function* () {
       }
     }),
 
-    initFork: (forkId, variant) => Effect.gen(function* () {
+    initFork: (forkId, variant) => (Effect.gen(function* () {
       const workerBus = yield* WorkerBusTag<AppEvent>()
       publishBackgroundProcessEvent = (event) => {
         void Effect.runPromise(workerBus.publish(event))
@@ -987,7 +968,7 @@ const makeExecutionManager = Effect.gen(function* () {
       // Inject role-specific setup layer when the role defines a setup function
       const roleDef = getAgentDefinition(variant)
       if (roleDef.setup && forkId) {
-        const setupLayer = yield* roleDef.setup({ forkId, cwd, workspacePath })
+        const setupLayer = (yield* roleDef.setup({ forkId, cwd, workspacePath })) as Layer.Layer<never>
         layers = Layer.merge(layers, setupLayer)
       }
 
@@ -998,12 +979,12 @@ const makeExecutionManager = Effect.gen(function* () {
         if (roleDef.teardown) {
           const teardownEffect = roleDef.teardown({ forkId, cwd, workspacePath }).pipe(
             Effect.provideService(BrowserService, browserService)
-          )
+          ) as Effect.Effect<void>
           forkTeardowns.set(forkId, teardownEffect)
         }
 
         // Store repeatable idle release (for browser forks)
-        forkIdleReleases.set(forkId, browserService.release(forkId))
+        forkIdleReleases.set(forkId, browserService.release(forkId) as Effect.Effect<void>)
       }
 
       // Store variant for agent resolution
@@ -1029,10 +1010,10 @@ const makeExecutionManager = Effect.gen(function* () {
       // Bind observables
       const agentDef = getAgentDefinition(variant)
       const agentObservables = agentDef.observables.map((obs) =>
-        bindObservable(obs, () => Effect.succeed(layers))
+        bindObservable(obs, () => Effect.succeed(layers as Layer.Layer<unknown>))
       )
       boundObservables.set(forkId, agentObservables)
-    }),
+    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | Projection.ProjectionInstance<BackgroundProcessesState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
 
     disposeFork: (forkId) => Effect.gen(function* () {
       // Run role teardown if defined (e.g. browser cleanup)

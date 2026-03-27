@@ -15,14 +15,14 @@ export function createObservable<R = never>(config: ObservableConfig<R>): Observ
  */
 export function bindObservable<R>(
   observable: ObservableConfig<R>,
-  createLayer: () => Effect.Effect<Layer.Layer<R>, unknown>
+  createLayer: () => Effect.Effect<Layer.Layer<R>>
 ): BoundObservable {
   let cachedLayer: Layer.Layer<R> | null = null
   return {
     name: observable.name,
     observe: (): Effect.Effect<ObservationPart[]> => Effect.gen(function* () {
       if (!cachedLayer) {
-        cachedLayer = yield* (createLayer() as Effect.Effect<Layer.Layer<R>, never>)
+        cachedLayer = yield* createLayer()
       }
       return yield* observable.observe().pipe(
         Effect.provide(cachedLayer)

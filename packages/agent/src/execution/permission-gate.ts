@@ -8,17 +8,15 @@ import { Effect } from 'effect'
 import { Fork } from '@magnitudedev/event-core'
 import type { InterceptorContext, InterceptorDecision } from '@magnitudedev/xml-act'
 import { PermissionRejection } from './permission-rejection'
-import type {
-  RoleDefinition,
-  ToolSet,
-} from '@magnitudedev/roles'
-import { PolicyContextProviderTag, type PolicyContext } from '../agents/types'
+import type { RoleDefinition, Policy } from '@magnitudedev/roles'
+import type { ToolCatalog } from '@magnitudedev/tools'
+import { PolicyContextProviderTag } from '../agents/types'
 import { evaluate } from '../agents/policy'
 
 const { ForkContext } = Fork
 
 /** Resolves the active agent definition for a given fork. */
-export type AgentResolver = (forkId: string | null) => RoleDefinition<ToolSet, string, PolicyContext>
+export type AgentResolver = (forkId: string | null) => RoleDefinition
 
 export function buildPolicyInterceptor(
   resolveAgent: AgentResolver,
@@ -33,12 +31,12 @@ export function buildPolicyInterceptor(
         return reject(PermissionRejection.Forbidden({ reason: 'Invalid tool metadata' }))
       }
 
-      if (!(defKey in agentDef.tools)) {
+      if (!(defKey in agentDef.tools.entries)) {
         return reject(PermissionRejection.Forbidden({ reason: `Unknown tool: ${defKey}` }))
       }
 
       const decision = yield* evaluate(
-        agentDef.policy,
+        agentDef.policy as Policy<ToolCatalog, unknown>,
         defKey,
         ctx.input,
         policyCtx,

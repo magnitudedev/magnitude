@@ -23,7 +23,7 @@ import { textOf } from '../content'
 import { createId } from '../util/id'
 
 import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
-import { TOOL_DEFINITIONS, type ToolKey } from '../tools/tool-definitions'
+import { catalog, type ToolKey } from '../catalog'
 import { createToolHandle, type ToolHandle, type ToolState } from '../tools/tool-handle'
 
 
@@ -487,6 +487,8 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'scroll':
     case 'screenshot':
       return { ...counts, other: counts.other + 1 }
+    default:
+      return { ...counts, other: counts.other + 1 }
   }
 }
 
@@ -924,9 +926,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           // Consult agent definition's display policy
-          const agentState = read(AgentStatusProjection)
-          const toolDef = TOOL_DEFINITIONS[event.toolKey]
-          if ('display' in toolDef && toolDef.display === false) {
+          void read(AgentStatusProjection)
+          const entry = catalog.entries[event.toolKey]
+          if ('display' in entry && entry.display === false) {
             return currentFork
           }
 
@@ -969,9 +971,9 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           }
 
           // Consult agent definition's display policy
-          const agentState = read(AgentStatusProjection)
-          const toolDef = TOOL_DEFINITIONS[event.toolKey]
-          if ('display' in toolDef && toolDef.display === false) {
+          void read(AgentStatusProjection)
+          const entry = catalog.entries[event.toolKey]
+          if ('display' in entry && entry.display === false) {
             return currentFork
           }
 

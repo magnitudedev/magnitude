@@ -1,34 +1,27 @@
 import type {
-  ToolSet,
-  ToolNames,
   RoleConfig,
   RoleDefinition,
+  RoleDefinitionConcrete,
+  ToolNames,
   TurnContext,
   TurnResult,
 } from './types'
-
-export function toolSet<T extends ToolSet>(tools: T): T {
-  return tools
-}
-
-function toolNames<T extends ToolSet>(tools: T): ToolNames<T>[] {
-  return Object.keys(tools) as ToolNames<T>[]
-}
+import type { ToolCatalog } from '@magnitudedev/tools'
 
 export function defineRole<
-  TTools extends ToolSet,
+  TTools extends ToolCatalog,
   TSlot extends string,
   TCtx,
   TProvides = never,
-  TRequirements = never
+  TRequirements = never,
+  RObs = unknown
 >(
-  config: RoleConfig<TTools, TSlot, TCtx, TProvides, TRequirements>
-): RoleDefinition<TTools, TSlot, TCtx, TProvides, TRequirements> {
-  const tools = toolNames(config.tools)
+  config: RoleConfig<TTools, TSlot, TCtx, TProvides, TRequirements, RObs>
+): RoleDefinitionConcrete<TTools, TSlot, TCtx, TProvides, TRequirements, RObs> {
+  const tools = config.tools.keys as ToolNames<TTools>[]
 
-  function getTurn(ctx: TurnContext<TCtx>): TurnResult {
-    return config.turn.decide({ ...ctx, tools })
-  }
+  const getTurn = (ctx: TurnContext<unknown>): TurnResult =>
+    config.turn.decide({ ...(ctx as TurnContext<TCtx>), tools })
 
   return {
     id: config.id,
@@ -49,6 +42,6 @@ export function defineRole<
   }
 }
 
-export function defineRoleSet<R extends Record<string, RoleDefinition<any, any, any, any, any>>>(roles: R): R {
+export function defineRoleSet<R extends Record<string, RoleDefinition>>(roles: R): R {
   return roles
 }

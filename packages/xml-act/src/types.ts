@@ -12,7 +12,7 @@
  */
 
 import { Context, Effect, Layer } from "effect"
-import type { Tool, XmlBinding, XmlChildBinding, ContentPart } from "@magnitudedev/tools"
+import type { ToolDefinition, XmlBinding, XmlChildBinding, ContentPart } from "@magnitudedev/tools"
 import type { OutputNode } from './output-tree'
 import type { TagParseErrorDetail, StructuralParseErrorDetail } from './format/types'
 
@@ -21,7 +21,7 @@ import type { TagParseErrorDetail, StructuralParseErrorDetail } from './format/t
 // =============================================================================
 
 /** Runtime-erased tag variant of XmlBinding<T>, without the discriminator. */
-export type XmlTagBinding = Omit<Extract<XmlBinding<unknown>, { type: 'tag' }>, 'type'>
+export type XmlTagBinding = Omit<Extract<XmlBinding<unknown>, { type: 'tag' }>, 'type'> & { readonly tag: string }
 
 export type { XmlChildBinding }
 
@@ -96,10 +96,11 @@ export interface ToolCallContext {
  * A tool registered with the runtime, including its XML binding and metadata.
  */
 export interface RegisteredTool {
-  readonly tool: Tool.Any
+  readonly tool: ToolDefinition
   readonly tagName: string
   readonly groupName: string
   readonly binding: XmlTagBinding
+  readonly outputBinding?: import('@magnitudedev/tools').XmlBinding<unknown>
   readonly meta?: unknown
   readonly layerProvider?: () => Effect.Effect<Layer.Layer<never>, unknown>
 }

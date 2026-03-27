@@ -4,9 +4,10 @@
  * All agent definitions, accessible by variant.
  */
 
-import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
-import type { PolicyContext } from './types'
+import type { RoleDefinition } from '@magnitudedev/roles'
+
 import type { MagnitudeSlot } from '../model-slots'
+
 import { leadRole } from './lead'
 import { leadOneshotRole } from './lead-oneshot'
 import { builderRole } from './builder'
@@ -16,9 +17,11 @@ import { debuggerRole } from './debugger'
 import { reviewerRole } from './reviewer'
 import { browserRole } from './browser'
 
-type MagnitudeRoleDef = RoleDefinition<ToolSet, MagnitudeSlot, PolicyContext>
+export type AgentVariant = 'lead' | 'lead-oneshot' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'
 
-const AGENTS: Record<string, MagnitudeRoleDef> = {
+type MagnitudeRoleDef = RoleDefinition
+
+const AGENTS: Record<AgentVariant, MagnitudeRoleDef> = {
   lead: leadRole,
   'lead-oneshot': leadOneshotRole,
   builder: builderRole,
@@ -26,10 +29,8 @@ const AGENTS: Record<string, MagnitudeRoleDef> = {
   planner: plannerRole,
   debugger: debuggerRole,
   reviewer: reviewerRole,
-  browser: browserRole as unknown as MagnitudeRoleDef,
+  browser: browserRole,
 }
-
-export type AgentVariant = 'lead' | 'lead-oneshot' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'
 
 export function isValidVariant(v: string): v is AgentVariant {
   return Object.hasOwn(AGENTS, v)
@@ -58,5 +59,5 @@ export function getAgentDefinition(variant: AgentVariant): MagnitudeRoleDef {
 }
 
 export function getAgentSlot(variant: AgentVariant): MagnitudeSlot {
-  return getAgentDefinition(variant).slot
+  return getAgentDefinition(variant).slot as MagnitudeSlot
 }

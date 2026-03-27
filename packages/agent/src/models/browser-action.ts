@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState, type StreamingPartial, type ToolBinding } from '@magnitudedev/tools'
-import type { BrowserToolKey } from '../tools/tool-definitions'
+import type { ToolKey } from '../catalog'
 import {
   clickTool,
   clickXmlBinding,
@@ -27,6 +27,11 @@ import {
   evaluateXmlBinding,
 } from '../tools/browser-tools'
 import { formatBrowserActionVisualFromStreaming } from '../tools/browser-action-visuals'
+
+type BrowserToolKey = Extract<
+  ToolKey,
+  'click' | 'doubleClick' | 'rightClick' | 'type' | 'scroll' | 'drag' | 'navigate' | 'goBack' | 'switchTab' | 'newTab' | 'screenshot' | 'evaluate'
+>
 
 export interface BrowserActionState extends BaseState {
   toolKey: BrowserToolKey

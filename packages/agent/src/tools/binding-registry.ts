@@ -1,22 +1,19 @@
 import type { XmlTagBinding } from '@magnitudedev/xml-act'
-import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
-import { defaultXmlTagName, getXmlBindingMap } from './index'
+import type { RoleDefinition } from '@magnitudedev/roles'
+import type { AgentCatalogEntry } from '../catalog'
 
 /**
  * Build a lightweight Map<tagName, XmlTagBinding> from an RoleDefinition.
  */
-export function getBindingRegistry<TCtx>(
-  agentDef: RoleDefinition<ToolSet, string, TCtx>,
+export function getBindingRegistry(
+  agentDef: RoleDefinition,
 ): Map<string, XmlTagBinding> {
   const bindings = new Map<string, XmlTagBinding>()
-  const xmlBindingMap = getXmlBindingMap()
 
-  for (const [, tool] of Object.entries(agentDef.tools)) {
-    if (!tool) continue
-    const tagName = defaultXmlTagName(tool)
-    const xmlBinding = xmlBindingMap.get(tagName)
-    if (!xmlBinding) continue
-    bindings.set(tagName, xmlBinding.toXmlTagBinding())
+  for (const key of agentDef.tools.keys) {
+    const entry = agentDef.tools.entries[key] as AgentCatalogEntry
+    const binding = entry.binding.toXmlTagBinding()
+    bindings.set(binding.tag, binding)
   }
 
   return bindings

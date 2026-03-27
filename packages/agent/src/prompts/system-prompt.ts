@@ -1,4 +1,5 @@
-import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
+import type { RoleDefinition } from '@magnitudedev/roles'
+
 import { ACTIONS_CLOSE, ACTIONS_OPEN, COMMS_CLOSE, COMMS_OPEN, LENSES_CLOSE, LENSES_OPEN } from '@magnitudedev/xml-act'
 
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
@@ -21,14 +22,14 @@ export function compilePromptTemplate(raw: string): string {
     .replaceAll('{{TOOLING_SECTION}}', toolingSectionRaw)
 }
 
-function mapProtocolMode(roleDef: RoleDefinition<ToolSet, string, any>): 'lead' | 'subagent' | 'oneshot' {
+function mapProtocolMode(roleDef: RoleDefinition): 'lead' | 'subagent' | 'oneshot' {
   if (roleDef.protocolRole === 'oneshot-lead') return 'oneshot'
   if (roleDef.protocolRole === 'lead') return 'lead'
   return 'subagent'
 }
 
 export function renderSystemPrompt(
-  roleDef: RoleDefinition<ToolSet, string, any>,
+  roleDef: RoleDefinition,
   options?: { implicitTools?: readonly string[] },
 ): string {
   const toolDocs = generateXmlActToolDocs(roleDef, options?.implicitTools ?? [])

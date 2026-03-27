@@ -5,8 +5,6 @@
  * Knows nothing about sandboxes, groups, agents, or runtimes.
  */
 
-export { createTool, Tool } from './tool'
-export type { ToolConfig } from './tool'
 
 export type {
   ToolBindings,
@@ -47,12 +45,13 @@ export {
 export type { ToolInterfaceResult, ToolInterfaceOptions, ToolGroupInterfaceOptions, AstGenOptions, KnownEntityInfo } from './ets'
 
 // New tool system contracts
-export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type AnyTool, type AnyToolDefinition, type StreamHook } from './tool-definition'
+export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type StreamHook } from './tool-definition'
 export * from './tool-context'
 export * from './tool-state-event'
 export * from './tool-binding'
 export * from './streaming-partial'
 export * from './state-model'
+export { defineCatalog, type ToolCatalog, type PickableCatalog, type BaseCatalogEntry, type CatalogKeys, type CatalogEntry, type CatalogTool } from './tool-catalog'
 export { ToolCallState, createToolCallState } from './tool-call-state'
 export * from './composition'
 export * from './models'

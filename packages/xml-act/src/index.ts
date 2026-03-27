@@ -104,7 +104,7 @@ export { validateBinding } from './execution/binding-validator'
 export type { TagSchema, ChildTagSchema, AttributeSchema } from './execution/binding-validator'
 
 // XML documentation generation
-export { generateXmlToolDoc, generateXmlToolGroupDoc, defaultXmlTagName } from './xml-docs'
+export { generateXmlToolDoc, generateXmlToolGroupDoc } from './xml-docs'
 export type { XmlToolDocEntry } from './xml-docs'
 
 // Output serializer

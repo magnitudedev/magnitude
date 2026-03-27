@@ -102,60 +102,33 @@ export function defineXmlBinding<
     _tool: undefined,
     tool: { name: tool.name, group: config.group ?? tool.group },
     config,
-    toXmlTagBinding() {
+    toXmlTagBinding(): XmlTagBinding {
       const input = config.input
-      const binding: {
-        tag?: string
-        attributes?: { attr: string; field: string }[]
-        body?: string
-        childTags?: { tag: string; field: string }[]
-        children?: {
-          field: string
-          tag?: string
-          attributes?: { attr: string; field: string }[]
-          body?: string
-        }[]
-        childRecord?: {
-          field: string
-          tag: string
-          keyAttr: string
-        }
-      } = {}
-
-      if (config.tag) {
-        binding.tag = config.tag
+      return {
+        tag: config.tag ?? tool.name,
+        ...(input.attributes && {
+          attributes: input.attributes.map((a) => ({ attr: a.attr, field: a.field })),
+        }),
+        ...(input.body && { body: input.body }),
+        ...(input.childTags && {
+          childTags: input.childTags.map((ct) => ({ tag: ct.tag, field: ct.field })),
+        }),
+        ...(input.children && {
+          children: input.children.map((ch) => ({
+            field: ch.field,
+            tag: ch.tag,
+            attributes: ch.attributes ? ch.attributes.map((a) => ({ attr: a.attr, field: a.field })) : undefined,
+            body: ch.body,
+          })),
+        }),
+        ...(input.childRecord && {
+          childRecord: {
+            field: input.childRecord.field,
+            tag: input.childRecord.tag,
+            keyAttr: input.childRecord.keyAttr,
+          },
+        }),
       }
-      if (input.attributes) {
-        const attributes: { attr: string; field: string }[] = input.attributes.map((a) => ({ attr: a.attr, field: a.field }))
-        binding.attributes = attributes
-      }
-      if (input.body) {
-        const body: string = input.body
-        binding.body = body
-      }
-      if (input.childTags) {
-        const childTags: { tag: string; field: string }[] = input.childTags.map((ct) => ({ tag: ct.tag, field: ct.field }))
-        binding.childTags = childTags
-      }
-      if (input.children) {
-        const children: NonNullable<typeof binding.children> = input.children.map((ch) => ({
-          field: ch.field,
-          tag: ch.tag,
-          attributes: ch.attributes ? ch.attributes.map((a) => ({ attr: a.attr, field: a.field })) : undefined,
-          body: ch.body,
-        }))
-        binding.children = children
-      }
-      if (input.childRecord) {
-        const childRecord: NonNullable<typeof binding.childRecord> = {
-          field: input.childRecord.field,
-          tag: input.childRecord.tag,
-          keyAttr: input.childRecord.keyAttr,
-        }
-        binding.childRecord = childRecord
-      }
-
-      return binding
     },
     toXmlOutputBinding() {
       const output: XmlOutputBinding<TOutput> = config.output ?? {}

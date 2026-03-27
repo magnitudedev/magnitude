@@ -1,6 +1,13 @@
 export type { Phase, BaseState, EditDiff } from '@magnitudedev/tools'
 
-export type { ToolState } from '../tools/tool-definitions'
+import { catalog } from '../catalog'
+
+export type ToolState = {
+  [K in keyof typeof catalog.entries]:
+    (typeof catalog.entries)[K] extends { state: { initial: infer S } }
+      ? S
+      : never
+}[keyof typeof catalog.entries]
 
 export { fileReadModel, type FileReadState } from './file-read'
 export { fileWriteModel, type FileWriteState } from './file-write'
@@ -34,17 +41,7 @@ export {
   screenshotModel,
   evaluateModel,
 } from './browser-action'
-export {
-  TOOL_DEFINITIONS,
-  isToolKey,
-  type ToolDefinitionMap,
-  type ToolDefinitionFor,
-  type ToolKey,
-  type ToolModelFor,
-  type ToolStateFor,
-  type ToolEventFor,
-  type BrowserToolKey,
-} from '../tools/tool-definitions'
+export { catalog, isToolKey, type ToolKey } from '../catalog'
 
 // Aliases for display compatibility
 export { fileWriteModel as contentModel, type FileWriteState as ContentState } from './file-write'

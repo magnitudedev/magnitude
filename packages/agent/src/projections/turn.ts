@@ -7,7 +7,7 @@
 
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import type { ToolKey } from '../tools/tool-definitions'
+import type { ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 
 // =============================================================================

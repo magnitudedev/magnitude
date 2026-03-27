@@ -3,7 +3,7 @@ import type { PublishFn } from '@magnitudedev/event-core'
 import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
 
 import type { AppEvent } from '../events'
-import { isToolKey } from '../tools/tool-definitions'
+import { isToolKey } from '../catalog'
 import type { TurnError, TurnEvent, TurnStrategyResult } from '../execution/types'
 
 /**

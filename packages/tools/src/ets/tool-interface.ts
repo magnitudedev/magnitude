@@ -8,7 +8,7 @@
 import ts from "typescript"
 import { Schema } from "@effect/schema"
 import { AST } from "@effect/schema"
-import type { Tool } from "../tool"
+import type { ToolDefinition } from "../tool-definition"
 import type { ToolErrorBase } from "../errors"
 import { schemaToTypeNode, getTypeNode, printAst, unwrapOptionalUnion, type KnownEntityInfo } from "./converter"
 
@@ -45,7 +45,7 @@ function unwrapOutputAst(ast: AST.AST): AST.AST {
 /**
  * Collect known entities from tool schemas by scanning for types with identifiers.
  */
-function collectKnownEntities(tools: ReadonlyArray<Tool.Any>): Map<string, KnownEntityInfo> {
+function collectKnownEntities(tools: ReadonlyArray<ToolDefinition>): Map<string, KnownEntityInfo> {
   const result = new Map<string, KnownEntityInfo>()
 
   function getStructFields(ast: AST.AST): Set<string> | undefined {
@@ -170,7 +170,7 @@ export interface ToolInterfaceOptions {
  * @param options - Options to control output format
  */
 export function generateToolInterface(
-  tool: Tool.Any,
+  tool: ToolDefinition,
   errorNamespace: string,
   knownEntities?: Map<string, KnownEntityInfo>,
   options?: ToolInterfaceOptions,
@@ -233,43 +233,6 @@ export function generateToolInterface(
   if (hasNoProperties) {
     // No parameters needed for empty input
     params = []
-  } else if (tool.argMapping && tool.argMapping.length > 0) {
-    // Use positional args based on argMapping
-    const propertyTypes = new Map<string, ts.TypeNode>()
-
-    // Extract property types from input schema
-    if (inputAst._tag === "TypeLiteral") {
-      for (const prop of inputAst.propertySignatures) {
-        if (typeof prop.name === "string") {
-          const typeAst = prop.isOptional ? unwrapOptionalUnion(prop.type) : prop.type
-          const propType = schemaToTypeNode(Schema.make(typeAst), {
-            mode: "expression",
-            referencedEntities: extractCommon ? referencedEntities : undefined,
-            knownEntities: effectiveKnownEntities,
-            hasResources: hasResourcesRef,
-            isInput: true
-          })
-          propertyTypes.set(prop.name, propType)
-        }
-      }
-    }
-
-    // Create positional parameters in argMapping order
-    params = tool.argMapping.map(argName => {
-      const argType = propertyTypes.get(argName) ?? ts.factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)
-      // Check if optional in the schema
-      const isOptional = inputAst._tag === "TypeLiteral" &&
-        inputAst.propertySignatures.some(p => p.name === argName && p.isOptional)
-
-      return ts.factory.createParameterDeclaration(
-        undefined,
-        undefined,
-        argName,
-        isOptional ? ts.factory.createToken(ts.SyntaxKind.QuestionToken) : undefined,
-        argType,
-        undefined
-      )
-    })
   } else {
     // Use single params object
     params = [
@@ -489,7 +452,7 @@ export interface ToolGroupInterfaceOptions extends ToolInterfaceOptions {
  */
 export function generateToolGroupInterface(
   groupName: string,
-  tools: ReadonlyArray<Tool.Any>,
+  tools: ReadonlyArray<ToolDefinition>,
   options?: ToolGroupInterfaceOptions,
 ): string {
   const extractCommon = options?.extractCommon ?? true

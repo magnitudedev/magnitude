@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test'
 import { Schema } from '@effect/schema'
-import { createTool } from '../tool'
+import { defineTool } from '../tool-definition'
 import { generateToolInterface, generateToolGroupInterface } from './tool-interface'
 
 // ---------------------------------------------------------------------------
@@ -15,15 +15,14 @@ function makeTool(config: {
   errorSchema?: Schema.Schema.AnyNoContext
   argMapping?: string[]
 }) {
-  return createTool({
+  return defineTool({
     name: config.name,
     description: config.description ?? '',
     inputSchema: config.inputSchema,
     outputSchema: config.outputSchema ?? Schema.Void,
     errorSchema: config.errorSchema,
-    argMapping: config.argMapping,
-    bindings: {},
     execute: () => { throw new Error('not used') },
+    label: () => config.name,
   })
 }
 

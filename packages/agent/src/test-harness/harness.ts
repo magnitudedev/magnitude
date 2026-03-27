@@ -1,7 +1,8 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
-import type { Tool, AnyTool } from '@magnitudedev/tools'
+import { defineCatalog, type ToolDefinition } from '@magnitudedev/tools'
 import { Context, Effect, Layer } from 'effect'
-import type { RoleDefinition, ToolSet } from '@magnitudedev/roles'
+import type { RoleDefinition } from '@magnitudedev/roles'
+import type { AgentCatalogEntry } from '../catalog'
 import type { AppEvent, SessionContext } from '../events'
 import { textParts } from '../content'
 
@@ -49,7 +50,6 @@ import { MockTurnScriptTag, MockTurnScriptLive, createScriptGate, type MockTurnR
 import { response as standaloneResponse } from './response-builder'
 import { createTurnsBuilder } from './scenario-builder'
 import { clearAgentOverrides, getAgentDefinition, registerAgentDefinition, type AgentVariant } from '../agents'
-import { defaultXmlTagName } from '../tools'
 import { createDefaultToolOverrides, createVirtualFs } from './virtual-fs'
 import { EphemeralSessionContextTag, type PolicyContext } from '../agents/types'
 import { ChatPersistence, PersistenceError, type ChatPersistenceService } from '../persistence/chat-persistence-service'
@@ -113,9 +113,9 @@ const ALL_VARIANTS: AgentVariant[] = [
   'browser',
 ]
 
-type MagnitudeAgentDef = RoleDefinition<ToolSet, MagnitudeSlot, PolicyContext>
+type MagnitudeAgentDef = RoleDefinition<import('../catalog').AgentCatalog, MagnitudeSlot, PolicyContext>
 
-function makeOverrideTool(source: AnyTool, handler: ToolOverrideHandler): AnyTool {
+function makeOverrideTool(source: ToolDefinition, handler: ToolOverrideHandler): ToolDefinition {
   if (!('execute' in source) || typeof source.execute !== 'function') {
     return source
   }
@@ -138,14 +138,13 @@ function applyToolOverrides(
 ): void {
   for (const variant of ALL_VARIANTS) {
     const def = getAgentDefinition(variant)
-    const tools: Partial<Record<keyof typeof def.tools, AnyTool>> = {}
+    const tools = new Map<string, ToolDefinition>()
 
-    for (const key of Object.keys(def.tools) as Array<keyof typeof def.tools>) {
-      const concreteTool = def.tools[key]
-      if (!concreteTool) {
-        continue
-      }
-      const tagName = defaultXmlTagName(concreteTool as Tool.Any)
+    for (const key of def.tools.keys) {
+      const entry = def.tools.entries[key] as AgentCatalogEntry
+      const concreteTool = entry.tool
+
+      const tagName = entry.binding.toXmlTagBinding().tag
       const override = handlers[tagName]
       const wrappedOverride = override
         ? async (input: unknown) => {
@@ -154,14 +153,26 @@ function applyToolOverrides(
         }
         : null
 
-      tools[key] = wrappedOverride
-        ? makeOverrideTool(concreteTool, wrappedOverride)
-        : concreteTool
+      tools.set(
+        key,
+        wrappedOverride
+          ? makeOverrideTool(concreteTool, wrappedOverride)
+          : concreteTool,
+      )
     }
 
-    const overridden: MagnitudeAgentDef = {
+    const nextEntries: Record<string, AgentCatalogEntry> = {}
+    for (const key of def.tools.keys) {
+      const entry = def.tools.entries[key] as AgentCatalogEntry
+      nextEntries[key] = {
+        ...entry,
+        tool: tools.get(key) ?? entry.tool,
+      }
+    }
+
+    const overridden: RoleDefinition = {
       ...def,
-      tools: tools as MagnitudeAgentDef['tools'],
+      tools: defineCatalog(nextEntries),
     }
 
     registerAgentDefinition(variant, overridden)
