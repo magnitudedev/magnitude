@@ -158,7 +158,7 @@ export interface CreateClientOptions {
    * Provide a pre-built session context instead of collecting from the local environment.
    * Useful for evals / headless runs where the agent operates in a container.
    */
-  sessionContext?: SessionContext
+  sessionContext?: Omit<SessionContext, 'workspacePath'>
 
   /**
    * Optional pre-configured provider runtime.

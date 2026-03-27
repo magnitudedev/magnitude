@@ -1,7 +1,7 @@
 import { createStackMachine } from './machine'
 import { createTokenizer } from './tokenizer'
 import type { Format, XmlActFrame, XmlActEvent, ToolDef } from './format/types'
-import { createCurrentFormat, structuralTags } from './format/index'
+import { createCurrentFormat } from './format/index'
 import type { TagSchema } from './execution/binding-validator'
 import { createId } from './util'
 import { classifyXmlActEvent, createCoalescingLayer, mergeXmlActEvent } from './coalescing'
@@ -171,7 +171,7 @@ export function createStreamingXmlParser(
     schema: tagSchemas?.get(tag),
   }))
 
-  const { format } = createCurrentFormat(tools, defaultMessageDest)
+  const { format, structuralTags } = createCurrentFormat(tools, defaultMessageDest)
 
   let emittedTurnControl = false
 

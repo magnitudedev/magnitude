@@ -948,8 +948,13 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolReminderRef = yield* Ref.make<string[]>([])
       toolReminderRefs.set(forkId, toolReminderRef)
       const sessionState = yield* sessionContextProjection.get
-      const cwd = sessionState.context?.cwd ?? process.cwd()
-      const workspacePath = sessionState.context?.workspacePath ?? cwd
+      if (!sessionState.context) {
+        return yield* Effect.die(
+          new Error('Session context not initialized. session_initialized must be processed before initFork().'),
+        )
+      }
+      const cwd = sessionState.context.cwd
+      const workspacePath = sessionState.context.workspacePath
       if (forkId === null) {
         oneshotEnabled = !!sessionState.context?.oneshot
       }
