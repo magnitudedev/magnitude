@@ -43,5 +43,8 @@
   },
   "trustedDependencies": [
     "protobufjs"
-  ]
+  ],
+  "patchedDependencies": {
+    "@opentui/core@0.1.88": "patches/@opentui%2Fcore@0.1.88.patch"
+  }
 }
