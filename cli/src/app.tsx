@@ -1927,7 +1927,7 @@ function AppInner({
         )}
 
 
-        {providerUiState && !slotModels.lead && (
+        {providerUiState && !providerUiState.slotModels.lead && (
           <box style={{
             paddingLeft: 1,
             paddingRight: 1,
