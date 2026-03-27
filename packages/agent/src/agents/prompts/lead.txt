@@ -136,9 +136,9 @@ Usage:
 You have a workspace directory at `$M/`, shared across all agents in this session.
 Use this workspace freely to store documents (reports, plans), temporary scripts, or other scratch work.
 The workspace should be used to maintain documents and share with subagents efficiently and losslessly.
-`$M/project` is a symlink to the project directory that scripts can use if necessary.
+`$M/project` is a symlink to the project directory.
 
-The workspace env var $M is valid for all of your tools, and should be the way that you access and write to the workspace.
+`$M` resolves in tool path attributes (e.g., `path="$M/reports/foo.md"`) and as a shell environment variable. It does NOT resolve inside source code — in scripts, use `os.environ["M"]` (Python) or `process.env.M` (JS/TS).
 
 ### Workspace structure
 $M/
