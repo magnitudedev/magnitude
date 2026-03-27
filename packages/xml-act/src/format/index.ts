@@ -10,14 +10,16 @@ import { HANDLE, PASS } from './types'
 import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
 
-export const structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
-
 export function createXmlActFormat(
   tools: readonly ToolDef[],
   defaultMessageDest: string,
   aliases?: ReadonlyMap<string, string>,
-): Format<XmlActFrame, XmlActEvent> {
+): {
+  readonly format: Format<XmlActFrame, XmlActEvent>
+  readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
+} {
   const handlers = new Map<string, TagHandler<XmlActFrame, XmlActEvent>>()
+  const structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
 
   const aliasMap = aliases ?? new Map<string, string>([
     ['thinking', 'think'],
@@ -94,7 +96,6 @@ export function createXmlActFormat(
     }
   }
 
-  structuralTags.clear()
   for (const [tag, handler] of handlers) {
     structuralTags.set(tag, handler)
   }
@@ -106,17 +107,20 @@ export function createXmlActFormat(
   }
 
   return {
-    resolve(tagName, stack) {
-      const top = stack[stack.length - 1]
-      if (!top) return { _tag: 'passthrough' }
-      const handler = top.tags.get(tagName)
-      if (!handler) return { _tag: 'passthrough' }
-      return { _tag: 'handle', handler }
+    format: {
+      resolve(tagName, stack) {
+        const top = stack[stack.length - 1]
+        if (!top) return { _tag: 'passthrough' }
+        const handler = top.tags.get(tagName)
+        if (!handler) return { _tag: 'passthrough' }
+        return { _tag: 'handle', handler }
+      },
+      onContent: xmlActContent,
+      onFlush: xmlActFlush,
+      onUnknownOpen: xmlActUnknownOpen,
+      onUnknownClose: xmlActUnknownClose,
     },
-    onContent: xmlActContent,
-    onFlush: xmlActFlush,
-    onUnknownOpen: xmlActUnknownOpen,
-    onUnknownClose: xmlActUnknownClose,
+    structuralTags,
   }
 }
 
@@ -125,6 +129,7 @@ export function createCurrentFormat(
   defaultMessageDest = 'user',
 ): {
   readonly format: Format<XmlActFrame, XmlActEvent>
+  readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
   readonly tags: {
     readonly actions: 'actions'
     readonly comms: 'comms'
@@ -135,8 +140,10 @@ export function createCurrentFormat(
     readonly finish: 'finish'
   }
 } {
+  const { format, structuralTags } = createXmlActFormat(tools, defaultMessageDest)
   return {
-    format: createXmlActFormat(tools, defaultMessageDest),
+    format,
+    structuralTags,
     tags: {
       actions: 'actions',
       comms: 'comms',
@@ -154,6 +161,7 @@ export function createAltFormat(
   defaultMessageDest = 'user',
 ): {
   readonly format: Format<XmlActFrame, XmlActEvent>
+  readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
   readonly tags: {
     readonly actions: 'tooluse'
     readonly comms: 'respond'
@@ -169,8 +177,10 @@ export function createAltFormat(
     ['respond', 'comms'],
     ['reason', 'think'],
   ])
+  const { format, structuralTags } = createXmlActFormat(tools, defaultMessageDest, aliases)
   return {
-    format: createXmlActFormat(tools, defaultMessageDest, aliases),
+    format,
+    structuralTags,
     tags: {
       actions: 'tooluse',
       comms: 'respond',
