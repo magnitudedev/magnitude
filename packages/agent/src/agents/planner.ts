@@ -15,7 +15,7 @@ import { catalog } from '../catalog'
 // import { gatherTool } from '../tools/gather'
 import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
-import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+
 
 const ideateLens = defineThinkingLens({
   name: 'ideate',
@@ -56,7 +56,6 @@ const tools = catalog.pick(
   'fileTree',
   'fileSearch',
   'shell',
-  'shellBg',
   'webSearch',
   'webFetch',
   // 'gather',
@@ -72,7 +71,7 @@ export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
   protocolRole: 'subagent',
   initialContext: { parentConversation: true },
   spawnable: true,
-  observables: [backgroundProcessesObservable],
+  observables: [],
   lifecyclePrompts: {
     parentOnSpawn: 'If the task has multiple large independent facets that need separate plans, spawn additional planners in parallel.',
     parentOnIdle: `Critique the planner's plan against the user's stated requirements and intent. Check: Does the requirements section accurately capture what the user wants? Do the implementation steps concretely address every requirement? Are there gaps, unclear steps, or unaddressed trade-offs? If the plan is not solid, message the planner with specific feedback to revise. Do not present the plan to the user or proceed to building until the plan is concrete, complete, and aligned with the user's intent.`,

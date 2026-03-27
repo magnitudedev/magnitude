@@ -2,7 +2,7 @@ import { continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
 import type { TurnPolicy } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
 import { agentsStatusObservable } from '../observables/agents-status-observable'
-import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+
 import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 
@@ -71,7 +71,6 @@ export const leadTools = catalog.pick(
   'fileSearch',
   'fileView',
   'shell',
-  'shellBg',
   'webSearch',
   'webFetch',
   'agentCreate',
@@ -80,7 +79,7 @@ export const leadTools = catalog.pick(
   'phaseSubmit',
 )
 
-export const leadObservables = [agentsStatusObservable, backgroundProcessesObservable]
+export const leadObservables = [agentsStatusObservable]
 
 export const leadPolicy = [
   denyForbiddenCommands(),

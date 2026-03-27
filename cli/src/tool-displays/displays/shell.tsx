@@ -24,14 +24,12 @@ export const shellDisplay = createToolDisplay<ShellState>({
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isRejected = state.phase === 'rejected';
     const isInterrupted = state.phase === 'interrupted';
-    const isDetached = state.done === 'detached';
     const isCompleted = state.phase === 'completed';
     const isError = state.phase === 'error';
-    const isSuccess = isCompleted || isDetached;
+    const isSuccess = isCompleted;
 
     const isFailed = isError || (isSuccess && state.exitCode !== undefined && state.exitCode !== 0);
     const rejectionReason = isRejected ? state.rejectionReason : undefined;
-    const detachedPid = isDetached ? state.pid : undefined;
 
     const resultPreview = isSuccess
       ? (isFailed ? (state.stderr || state.stdout) : (state.stdout || state.stderr))
@@ -71,13 +69,6 @@ export const shellDisplay = createToolDisplay<ShellState>({
                 rejectionReason
                   ? <><span style={{ fg: theme.error }}>{' · System Rejected'}</span><span style={{ fg: theme.muted }}>{` (${rejectionReason})`}</span></>
                   : <span style={{ fg: theme.error }}>{' · User Rejected'}</span>
-              ) : isDetached ? (
-                <>
-                  <span style={{ fg: theme.warning }}>{` · ⇀ Detached (PID ${detachedPid ?? '?'})`}</span>
-                  <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
-                    {isExpanded ? ' · (collapse)' : ' · (expand)'}
-                  </span>
-                </>
               ) : (isCompleted || isError) ? (
                 <span style={{ fg: theme.secondary }} attributes={TextAttributes.DIM}>
                   {isExpanded ? ' · (collapse)' : ' · (expand)'}
@@ -93,9 +84,9 @@ export const shellDisplay = createToolDisplay<ShellState>({
           </text>
         )}
 
-        {isExpanded && (isCompleted || isDetached || isError) && fullResultText.trim() && (
-          <text style={{ fg: isDetached ? theme.warning : isFailed ? theme.error : theme.muted }} attributes={TextAttributes.DIM}>
-            {isDetached ? '' : isFailed ? '✗ ' : ''}{fullResultText}
+        {isExpanded && (isCompleted || isError) && fullResultText.trim() && (
+          <text style={{ fg: isFailed ? theme.error : theme.muted }} attributes={TextAttributes.DIM}>
+            {isFailed ? '✗ ' : ''}{fullResultText}
           </text>
         )}
       </box>
@@ -106,7 +97,6 @@ export const shellDisplay = createToolDisplay<ShellState>({
     if (state.phase === 'streaming' || state.phase === 'executing') return command ? `$ ${command}` : 'Running shell command';
     if (state.phase === 'error') return command ? `Shell error: $ ${command}` : 'Shell error';
     if (state.phase === 'rejected') return command ? `Rejected: $ ${command}` : 'Shell command rejected';
-    if (state.done === 'detached') return 'Detached shell';
     return command ? `$ ${command}` : 'Ran shell command';
   },
 });

@@ -3,7 +3,6 @@
  *
  * Handles agent infrastructure that tools can't own:
  * - Root fork init on session start
- * - Interrupt process cleanup for active forks
  *
  * fork() and task.validate handle their own lifecycle directly.
  */
@@ -34,13 +33,8 @@ export const AgentLifecycle = Worker.define<AppEvent>()({
       yield* execManager.initFork(null, rootVariant)
     }).pipe(Effect.orDie),
 
-    // Interrupt stops the current turn and also kills tracked background
-    // processes for that fork. Child process exit listeners publish
-    // background_process_exited events as cleanup completes.
-    interrupt: (event, _publish, _read) => Effect.gen(function* () {
-      const execManager = yield* ExecutionManager
-      yield* execManager.interruptProcesses(event.forkId)
-    }).pipe(Effect.orDie),
+    // Interrupt stopping is handled by turn/runtime cancellation.
+    interrupt: (_event, _publish, _read) => Effect.void,
 
     soft_interrupt: () => Effect.void,
 

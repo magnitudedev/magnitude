@@ -57,7 +57,6 @@ export { getBindingRegistry } from './binding-registry'
 export { globalTools } from './globals'
 
 export { shellTool } from './shell'
-export { shellBgTool } from './shell-bg'
 export { fsTools } from './fs'
 
 export { agentTools } from './agent-tools'

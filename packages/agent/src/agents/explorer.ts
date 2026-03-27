@@ -13,7 +13,7 @@ import { catalog } from '../catalog'
 
 import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
-import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+
 
 const strategyLens = defineThinkingLens({
   name: 'strategy',
@@ -37,7 +37,6 @@ const tools = catalog.pick(
   'fileSearch',
   'fileView',
   'shell',
-  'shellBg',
   'webSearch',
   'webFetch',
 )
@@ -52,7 +51,7 @@ export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>(
   protocolRole: 'subagent',
   initialContext: { parentConversation: true },
   spawnable: true,
-  observables: [backgroundProcessesObservable],
+  observables: [],
   lifecyclePrompts: {
     parentOnSpawn: 'If you need context on multiple areas, spawn additional explorers in parallel rather than waiting for one at a time.',
     parentOnIdle: 'Evaluate whether the explorer\'s findings are sufficient. If ambiguities or unknowns remain, send the explorer back with specific questions or spawn additional explorers. Do not proceed to planning or building with incomplete context.',

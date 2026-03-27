@@ -12,7 +12,7 @@ import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
-import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+
 
 const intentLens = defineThinkingLens({
   name: 'intent',
@@ -46,7 +46,6 @@ const tools = catalog.pick(
   'fileSearch',
   'fileView',
   'shell',
-  'shellBg',
   'agentCreate',
   'phaseVerdict',
 )
@@ -61,7 +60,7 @@ export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>(
   protocolRole: 'subagent',
   initialContext: { parentConversation: true },
   spawnable: true,
-  observables: [backgroundProcessesObservable],
+  observables: [],
   lifecyclePrompts: {
     parentOnIdle: `Address ALL reviewer findings. Have builders fix the issues and run another review cycle. Do not stop working or report to the user until all findings are resolved and the work is correct, high quality, and fully meets the user's requirements.`,
   },

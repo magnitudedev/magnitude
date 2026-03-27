@@ -241,40 +241,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       return newFork
     },
 
-    background_process_exited: ({ event, fork, emit }) => {
-      const newFork: ForkWorkingState = {
-        ...fork,
-        willContinue: true,
-      }
-
-      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
-        emit.shouldTriggerChanged({
-          forkId: event.forkId,
-          shouldTrigger: shouldTrigger(newFork),
-          chainId: newFork.currentChainId
-        })
-      }
-
-      return newFork
-    },
-
-    background_process_auto_killed: ({ event, fork, emit }) => {
-      const newFork: ForkWorkingState = {
-        ...fork,
-        willContinue: true,
-      }
-
-      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
-        emit.shouldTriggerChanged({
-          forkId: event.forkId,
-          shouldTrigger: shouldTrigger(newFork),
-          chainId: newFork.currentChainId
-        })
-      }
-
-      return newFork
-    },
-
     turn_started: ({ event, fork, emit }) => {
       if (fork.working) {
         console.error(`[WorkingState] OVERLAPPING TURN DETECTED: turn_started(${event.turnId}) arrived while turn ${fork.currentTurnId} is still in-flight on fork ${event.forkId ?? 'root'}`)

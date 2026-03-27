@@ -12,7 +12,7 @@ import { catalog } from '../catalog'
 
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
-import { backgroundProcessesObservable } from '../observables/background-processes-observable'
+
 
 const hypothesisLens = defineThinkingLens({
   name: 'hypothesis',
@@ -48,7 +48,6 @@ const tools = catalog.pick(
   'fileSearch',
   'fileView',
   'shell',
-  'shellBg',
   'webSearch',
   'webFetch',
 )
@@ -63,7 +62,7 @@ export const debuggerRole = defineRole<typeof tools, 'debugger', PolicyContext>(
   protocolRole: 'subagent',
   initialContext: { parentConversation: true },
   spawnable: true,
-  observables: [backgroundProcessesObservable],
+  observables: [],
 
   policy: [
     denyForbiddenCommands(),

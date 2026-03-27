@@ -5,7 +5,7 @@ import type { ThinkBlockMessage, ThinkBlockStep, DisplayMessage, ToolKey } from 
 import { Button } from './button'
 import { AgentCommunicationCard } from './agent-communication-card'
 import { useTheme } from '../hooks/use-theme'
-import { orange } from '../utils/theme'
+import { violet } from '../utils/theme'
 import { ShimmerText } from './shimmer-text'
 import { MiniWave } from './mini-wave'
 import { renderToolStep } from '../tool-displays/render'
@@ -45,7 +45,7 @@ const SubagentStartedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 's
   const theme = useTheme()
   return (
     <text>
-      <span style={{ fg: orange[400] }}>▶ </span>
+      <span style={{ fg: violet[300] }}>▶ </span>
       <span style={{ fg: theme.muted }}>Subagent </span>
       <span style={{ fg: theme.muted }}>started</span>
       <span style={{ fg: theme.muted }}>: </span>

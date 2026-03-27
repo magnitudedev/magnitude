@@ -21,7 +21,6 @@ export type AgentCatalog<T extends Record<string, AgentCatalogEntry> = Record<st
 
 // Tools + Bindings
 import { shellTool, shellXmlBinding } from './tools/shell'
-import { shellBgTool, shellBgXmlBinding } from './tools/shell-bg'
 import {
   readTool,
   readXmlBinding,
@@ -76,7 +75,6 @@ import {
 
 // State models
 import { shellModel } from './models/shell'
-import { shellBgModel } from './models/shell-bg'
 import { fileReadModel } from './models/file-read'
 import { fileWriteModel } from './models/file-write'
 import { fileEditModel } from './models/file-edit'
@@ -107,7 +105,6 @@ import {
 
 export const catalog = defineCatalog({
   shell: { tool: shellTool, binding: shellXmlBinding, state: shellModel },
-  shellBg: { tool: shellBgTool, binding: shellBgXmlBinding, state: shellBgModel },
   fileRead: { tool: readTool, binding: readXmlBinding, state: fileReadModel },
   fileWrite: { tool: writeTool, binding: writeXmlBinding, state: fileWriteModel },
   fileEdit: { tool: editTool, binding: editXmlBinding, state: fileEditModel },
