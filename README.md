@@ -6,14 +6,15 @@
   <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a> <img src="https://img.shields.io/badge/License-Apache%202.0-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="License" /> <a href="https://discord.gg/VcdpMh9tTy" target="_blank"><img src="https://img.shields.io/discord/1305570963206836295?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=5865F2&color=gray" alt="Discord" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/-Follow%20Magnitude-000000?style=flat-square&labelColor=000000&color=gray&logo=x&logoColor=white" alt="Follow Magnitude" /></a>
 </p>
 
-Magnitude is an **open source coding agent** built from the ground up around subagents. You chat with a lead agent that coordinates specialized subagents on your behalf: explorers, planners, builders, reviewers, debuggers, and a browser agent.
 
-- Building happens in subagents, so the **lead stays focused on you**
-- Subagents are **long-lived** and **resumable**, not disposable
-- The lead can **redirect subagents mid-task** without starting over
-- Subagents are spun up in **parallel** for faster work
-- A **shared workspace** keeps handoffs between agents lossless
-- **Mix and match models** by role to balance intelligence and speed
+Magnitude is an **open source coding agent** that orchestrates a team of subagents, each specialized for a role in the development process. A lead agent breaks down your task and delegates to explorers, planners, builders, reviewers, debuggers, and a browser agent.
+
+- **Everything runs in subagents, including implementation.** The lead's context stays clean, so it remains coherent across long tasks.
+- **The agent follows a process without you enforcing it.** No praying the agent invokes your skills. No manually triggering them when it doesn't.
+- **A lead agent manages the work, not you.** You don't babysit, assign tasks, or decide what happens next. Go get a coffee.
+- **Subagents stay alive.** The lead can tell the planner to consider more angles. The same builder can fix bugs that the reviewer found.
+- **Agents share context through files, not summarization.** No output tokens burned on lossy summaries. Every handoff is a file you can view later.
+- **Mix models by role.** Fast models for exploration. Frontier models for planning and review. You control the cost-intelligence tradeoff.
 
 <p align="center">
   <img src="interface.png" alt="Magnitude Interface" width="100%" />
@@ -61,23 +62,21 @@ Magnitude may use none or all of these in a given session. For a quick fix in a 
 
 ## Why we built this
 
-We became fully subagent-pilled the first time we saw Claude Code use an explore agent. We expected it to continue getting better and better. **But it didn't.**
+The community clearly wants more out of Claude Code. Projects like Superpowers have hit 100k+ GitHub stars augmenting Claude Code with more skills/subagents. People want agents to follow better software development processes. 
 
-The community clearly feels the same — projects like Superpowers have hit 100k+ GitHub stars augmenting Claude Code with more subagents. But they're plugging into an existing primitive that wasn't designed for deep subagent orchestration.
+But they're plugging into an existing coding agent that wasn't built to use them consistently and effectively. The result is inconsistent usage and mixed results, often having to repeatedly prompt the agent to actually use the skills. 
 
-Instead of plugging into an existing primitive, we built a new one from the ground up. That's the difference between bolting on subagents and building around them.
+Instead of plugging into an existing primitive, we built a new one from the ground up. Imagine Claude Code was actually built around Superpowers. **That's Magnitude.**
 
-## Additional Info
-
-### Documentation
+## Documentation
 
 Full documentation is available at [docs.magnitude.dev](https://docs.magnitude.dev).
 
-### Contributing
+## Contributing
 
 See the [contributing guide](https://docs.magnitude.dev/contributing) to get started.
 
-### Acknowledgements
+## Acknowledgements
 
 Built on top of [BAML](https://boundaryml.com), [Effect](https://effect.website), and [OpenTUI](https://github.com/anomalyco/opentui).
 
