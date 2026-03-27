@@ -2,7 +2,7 @@ import { describe, it, expect } from 'bun:test'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
-const knownTags = new Set(['shell', 'fs-read'])
+const knownTags = new Set(['shell', 'read'])
 const childTagMap = new Map<string, Set<string>>()
 
 function parse(xml: string): ParseEvent[] {

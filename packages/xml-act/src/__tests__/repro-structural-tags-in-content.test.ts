@@ -25,7 +25,7 @@ describe('repro: think tag name in think body causes depth mismatch', () => {
   it('reason mentioned in think body eats all subsequent tool calls', () => {
 
 
-    const knownTags = new Set(['fs-search', 'shell'])
+    const knownTags = new Set(['grep', 'shell'])
     const parser = createStreamingXmlParser(knownTags, new Map())
 
     const xml = [

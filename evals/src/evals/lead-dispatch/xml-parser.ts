@@ -135,12 +135,12 @@ function detectFirstActionKind(raw: string): string | null {
   const actionPatterns: Array<{ re: RegExp; kind: string }> = [
     { re: /<agent-create\b/gi, kind: 'agent:create' },
     { re: /<artifact-create\b/gi, kind: 'artifact:create' },
-    { re: /<(?:fs-)?read\b/gi, kind: 'tool:fs-read' },
-    { re: /<(?:fs-)?search\b/gi, kind: 'tool:fs-search' },
-    { re: /<(?:fs-)?tree\b/gi, kind: 'tool:fs-tree' },
+    { re: /<(?:fs-)?read\b/gi, kind: 'tool:read' },
+    { re: /<(?:fs-)?search\b/gi, kind: 'tool:grep' },
+    { re: /<(?:fs-)?tree\b/gi, kind: 'tool:tree' },
     { re: /<shell\b/gi, kind: 'tool:shell' },
     { re: /<(?:fs-)?edit\b/gi, kind: 'tool:fs-edit' },
-    { re: /<(?:fs-)?write\b/gi, kind: 'tool:fs-write' },
+    { re: /<(?:fs-)?write\b/gi, kind: 'tool:write' },
     { re: /<artifact-read\b/gi, kind: 'tool:artifact-read' },
     { re: /<artifact-write\b/gi, kind: 'tool:artifact-write' },
   ]
@@ -197,25 +197,25 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
   }
 
   // direct tool usage detection
-  const directToolTags = ['fs-read', 'fs-write', 'fs-edit', 'fs-tree', 'fs-search', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write']
+  const directToolTags = ['read', 'write', 'fs-edit', 'tree', 'grep', 'shell', 'edit', 'write', 'read', 'search', 'tree', 'artifact-read', 'artifact-write']
   for (const tag of directToolTags) {
     const re = new RegExp(`<${tag}\\b`, 'i')
     if (re.test(raw)) directToolUses.push(tag)
   }
 
-  // fs-read (both fs-read + read)
+  // read (both read + read)
   const fsReads: ParsedFsRead[] = []
   const fsReadRe = /<(?:fs-)?read\b[^>]*\bpath\s*=\s*"([^"]*)"[^>]*\/?>/gi
   let fsReadCount = 0
   while ((m = fsReadRe.exec(raw)) !== null) {
     fsReads.push({
       path: m[1],
-      refName: fsReadCount === 0 ? 'fs-read' : `fs-read~${fsReadCount}`,
+      refName: fsReadCount === 0 ? 'read' : `read~${fsReadCount}`,
     })
     fsReadCount++
   }
 
-  // fs-search (both fs-search + search)
+  // grep (both grep + search)
   const fsSearches: ParsedFsSearch[] = []
   const fsSearchRe = /<(?:fs-)?search\b([^>]*)\/?>/gi
   let fsSearchCount = 0
@@ -223,19 +223,19 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     fsSearches.push({
       pattern: extractAttribute(m[1], 'pattern'),
       path: extractAttribute(m[1], 'path') || '.',
-      refName: fsSearchCount === 0 ? 'fs-search' : `fs-search~${fsSearchCount}`,
+      refName: fsSearchCount === 0 ? 'grep' : `grep~${fsSearchCount}`,
     })
     fsSearchCount++
   }
 
-  // fs-tree (both fs-tree + tree)
+  // tree (both tree + tree)
   const fsTrees: ParsedFsTree[] = []
   const fsTreeRe = /<(?:fs-)?tree\b([^>]*)\/?>/gi
   let fsTreeCount = 0
   while ((m = fsTreeRe.exec(raw)) !== null) {
     fsTrees.push({
       path: extractAttribute(m[1], 'path') || '.',
-      refName: fsTreeCount === 0 ? 'fs-tree' : `fs-tree~${fsTreeCount}`,
+      refName: fsTreeCount === 0 ? 'tree' : `tree~${fsTreeCount}`,
     })
     fsTreeCount++
   }
@@ -264,7 +264,7 @@ export function parseOrchestratorResponse(raw: string): ParsedOrchestratorRespon
     })
   }
 
-  // fs-write (both fs-write + write)
+  // write (both write + write)
   const fsWrites: ParsedFsWrite[] = []
   const fsWriteRe = /<(?:fs-)?write\b[^>]*\bpath\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/(?:fs-)?write>/gi
   while ((m = fsWriteRe.exec(raw)) !== null) {

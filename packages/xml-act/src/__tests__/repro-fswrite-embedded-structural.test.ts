@@ -3,10 +3,10 @@ import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
 /**
- * Repro: <fs-write> body contains embedded structural tags like <results>,
+ * Repro: <write> body contains embedded structural tags like <results>,
  * </results>, <think>, <actions>, and tool tags with observe attrs.
  *
- * The parser should treat ALL content inside the fs-write body as literal
+ * The parser should treat ALL content inside the write body as literal
  * text — not as structural open/close events. But embedded structural-looking
  * close tags may cause the parser to break out of the tool body prematurely.
  *
@@ -14,7 +14,7 @@ import type { ParseEvent } from '../format/types'
  * content that references protocol tags.
  */
 
-const knownTags = new Set(['fs-write', 'fs-read', 'fs-search', 'agent-create', 'shell'])
+const knownTags = new Set(['write', 'read', 'grep', 'agent-create', 'shell'])
 const childTagMap = new Map<string, Set<string>>()
 
 function parse(xml: string): ParseEvent[] {
@@ -32,7 +32,7 @@ function parseCharByChar(xml: string): ParseEvent[] {
   return events
 }
 
-// The actual content from the breaking scenario — fs-write body contains
+// The actual content from the breaking scenario — write body contains
 // embedded structural tags like <think>, <actions>, tool tags, and </results>
 const FS_WRITE_BODY = `import type { Scenario } from '../../types'
 import { hasThinkBlock } from './checks'
@@ -82,8 +82,8 @@ export const ALL_SCENARIOS = [
         content: [
           '<think>I need to find the header.</think>\\n' +
           AO + '\\n' +
-          '<fs-read path="src/styles/tokens.ts" observe="." />\\n' +
-          '<fs-search pattern="header" path="src/" observe="//item" />\\n' +
+          '<read path="src/styles/tokens.ts" observe="." />\\n' +
+          '<grep pattern="header" path="src/" observe="//item" />\\n' +
           AC,
         ],
       },
@@ -91,10 +91,10 @@ export const ALL_SCENARIOS = [
         role: 'user',
         content: [
           '<results>\\n' +
-          '<fs-read observe=".">export const colors = {}</fs-read>\\n' +
-          '<fs-search observe="//item">\\n' +
+          '<read observe=".">export const colors = {}</read>\\n' +
+          '<grep observe="//item">\\n' +
           '<item file="src/app.ts">12|  header</item>\\n' +
-          '</fs-search>\\n' +
+          '</grep>\\n' +
           '</results>',
         ],
       },
@@ -104,58 +104,58 @@ export const ALL_SCENARIOS = [
 `
 
 const FULL_XML = `<actions>
-<fs-write path="evals/src/evals/a5/scenarios.ts">${FS_WRITE_BODY}</fs-write>
-<fs-read path="evals/src/evals/a5/scenarios.ts" observe="content" />
+<write path="evals/src/evals/a5/scenarios.ts">${FS_WRITE_BODY}</write>
+<read path="evals/src/evals/a5/scenarios.ts" observe="content" />
 </actions>`
 
 describe('isolation: embedded tool-like tags are treated as literal text', () => {
-  it('fs-write body with an observe-bearing tool tag stays literal', () => {
-    const xml = '<actions>\n<fs-write path="x.ts">before <fs-read path="foo" observe="." /> after</fs-write>\n</actions>'
+  it('write body with an observe-bearing tool tag stays literal', () => {
+    const xml = '<actions>\n<write path="x.ts">before <read path="foo" observe="." /> after</write>\n</actions>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
-    expect(closed[0].element.body).toBe('before <fs-read path="foo" observe="." /> after')
+    expect(closed[0].element.body).toBe('before <read path="foo" observe="." /> after')
   })
 
-  it('fs-write body with unknown tags like <foo> is fine (treated as literal)', () => {
-    const xml = '<actions>\n<fs-write path="x.ts">before <foo bar="1">baz</foo> after</fs-write>\n</actions>'
+  it('write body with unknown tags like <foo> is fine (treated as literal)', () => {
+    const xml = '<actions>\n<write path="x.ts">before <foo bar="1">baz</foo> after</write>\n</actions>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toContain('before')
     expect(closed[0].element.body).toContain('after')
   })
 
-  it('fs-write body with known tag <fs-read> is fine (not valid child, flushed back)', () => {
-    const xml = '<actions>\n<fs-write path="x.ts">before <fs-read path="y" /> after</fs-write>\n</actions>'
+  it('write body with known tag <read> is fine (not valid child, flushed back)', () => {
+    const xml = '<actions>\n<write path="x.ts">before <read path="y" /> after</write>\n</actions>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
-    expect(closed[0].element.body).toBe('before <fs-read path="y" /> after')
+    expect(closed[0].element.body).toBe('before <read path="y" /> after')
   })
 })
 
-describe('repro: fs-write body with embedded structural tags', () => {
-  it('parses fs-write with embedded tool and structural tags in body', () => {
+describe('repro: write body with embedded structural tags', () => {
+  it('parses write with embedded tool and structural tags in body', () => {
     const events = parse(FULL_XML)
 
     // Should have actions open/close
     expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
     expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
 
-    // fs-write should be parsed as a complete tool
+    // write should be parsed as a complete tool
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.attributes.get('path')).toBe('evals/src/evals/a5/scenarios.ts')
@@ -173,7 +173,7 @@ describe('repro: fs-write body with embedded structural tags', () => {
 
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toBe(FS_WRITE_BODY)
@@ -184,16 +184,16 @@ describe('repro: fs-write body with embedded structural tags', () => {
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
-  it('embedded </results> inside fs-write body does not corrupt the body', () => {
+  it('embedded </results> inside write body does not corrupt the body', () => {
     const xml = `<actions>
-<fs-write path="test.ts">some code with </results> in it and observe="." too</fs-write>
+<write path="test.ts">some code with </results> in it and observe="." too</write>
 </actions>`
 
     const events = parse(xml)
 
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toBe('some code with </results> in it and observe="." too')
@@ -202,16 +202,16 @@ describe('repro: fs-write body with embedded structural tags', () => {
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
-  it('embedded <think> and </think> inside fs-write body are treated as literal text', () => {
+  it('embedded <think> and </think> inside write body are treated as literal text', () => {
     const xml = `<actions>
-<fs-write path="test.ts">const x = '<think>hello</think>'</fs-write>
+<write path="test.ts">const x = '<think>hello</think>'</write>
 </actions>`
 
     const events = parse(xml)
 
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toBe("const x = '<think>hello</think>'")
@@ -224,9 +224,9 @@ describe('repro: fs-write body with embedded structural tags', () => {
     expect(thinkEnds).toHaveLength(0)
   })
 
-  it('embedded <actions> inside fs-write body does not create nested actions block', () => {
+  it('embedded <actions> inside write body does not create nested actions block', () => {
     const xml = `<actions>
-<fs-write path="test.ts">code with <actions> and </actions> inside</fs-write>
+<write path="test.ts">code with <actions> and </actions> inside</write>
 </actions>`
 
     const events = parse(xml)
@@ -237,7 +237,7 @@ describe('repro: fs-write body with embedded structural tags', () => {
 
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
-        e._tag === 'TagClosed' && e.tagName === 'fs-write',
+        e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toBe('code with <actions> and </actions> inside')

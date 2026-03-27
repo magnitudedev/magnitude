@@ -1,4 +1,4 @@
-<fs-read>[1] 1777200000000 user_message
+<read>[1] 1777200000000 user_message
 I need a cross-package refactor for auth token refresh behavior.
 
 Workflow preference:
@@ -145,7 +145,7 @@ Merging now.
 [980] 1777200190000 assistant_turn_completed
 Great.
 
-Task complete and merged workflow pattern noted.</fs-read>
+Task complete and merged workflow pattern noted.</read>
 [1200] 1777300153000 user_message
 Quick closeout:
 thanks for following the strict test-before-done workflow.

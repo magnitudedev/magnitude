@@ -55,14 +55,14 @@ XML-ACT isn't a strict XML format - no HTML entity escaping or other XML escapin
 ## Action Calls
 Inside \`<actions>\`, each tool call is an XML element. Give each call an \`id\` attribute to enable composition.
 \`<search id="s1" query="weather" />\`
-\`<fs-write id="w1" path="/tmp/a.txt">long content...</fs-write>\`
+\`<write id="w1" path="/tmp/a.txt">long content...</write>\`
 
 ## Composition (refs)
 Tool outputs are XML-serialized. Use \`<ref id=".."/>\` inside a tool body to insert a prior action's output inline.
 
 Without \`query\`, the ref resolves to the full text content of the output:
 \`\`\`
-<fs-read id="r1" path="src/config.ts" />
+<read id="r1" path="src/config.ts" />
 <edit id="e1" path="src/config.ts">
 <old>const port = 3000;</old>
 <new>const port = 8080;</new>
@@ -71,10 +71,10 @@ Without \`query\`, the ref resolves to the full text content of the output:
 
 With \`query\`, an XPath/XQuery 3.1 expression selects into the XML output:
 \`\`\`
-<search id="s1" pattern="TODO" />
-<fs-read id="r1" path="...">
+<grep id="s1" pattern="TODO" />
+<read id="r1" path="...">
 <ref id="s1" query="//item[1]/@file" />
-</fs-read>
+</read>
 \`\`\`
 
 Query examples:
@@ -102,10 +102,10 @@ Use \`<ref>\` entries to select specific outputs. Without \`query\`, you see the
 <think>Need to find the config file and update the port.</think>
 Updating the port configuration.
 <actions>
-<search id="s1" pattern="port" path="src/" />
-<fs-read id="r1">
+<grep id="s1" pattern="port" path="src/" />
+<read id="r1">
 <ref id="s1" query="//item[1]/@file" />
-</fs-read>
+</read>
 <edit id="e1" path="src/config.ts">
 <old>const port = 3000;</old>
 <new>const port = 8080;</new>
@@ -154,25 +154,25 @@ You are deployed when the team lead needs:
 
 Read file content as string
 
-<fs-read id="r1"
+<read id="r1"
 path="..." <!-- — Relative path to a file from cwd. Use tree instead for directories -->
 />
 
 Returns: string
-  <fs-read>...</fs-read>
+  <read>...</read>
 
 List directory structure with optional gitignore filtering
 
-<fs-tree id="r1"
+<tree id="r1"
 path="..." <!-- — Relative path from cwd -->
 />
 
 Returns:
-  <fs-tree />
+  <tree />
 
 Search file contents with regex
 
-<fs-search id="r1"
+<grep id="r1"
 pattern="..." <!-- — Regex pattern to search for -->
 path="..." <!-- optional. — Directory to search in (default: cwd) -->
 glob="..." <!-- optional. — Glob pattern to filter files (e.g., "*.ts") -->
@@ -180,7 +180,7 @@ limit="..." <!-- optional. number. — Maximum number of matches to return (defa
 />
 
 Returns:
-  <fs-search />
+  <grep />
 
 ### Global
 

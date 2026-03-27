@@ -93,7 +93,7 @@ describe('self-closing tags', () => {
     })
     const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Read file content')
-    expect(doc).toContain('<fs-read')
+    expect(doc).toContain('<read')
     expect(doc).toContain('path="..."')
     expect(doc).toContain('Relative path from cwd')
     expect(doc).toContain('/>')
@@ -111,7 +111,7 @@ describe('self-closing tags', () => {
       bindings: { xmlInput: { type: 'tag', attributes: [{ field: 'pattern', attr: 'pattern' }, { field: 'path', attr: 'path' }], selfClosing: true } },
     })
     const doc = generateXmlToolDoc(expectTool(tool))
-    expect(doc).toContain('<search')
+    expect(doc).toContain('<grep')
     expect(doc).toContain('pattern="..."')
     expect(doc).toContain('path="..."')
     expect(doc).toContain('Regex pattern')
@@ -419,7 +419,7 @@ describe('output documentation', () => {
     })
     const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns: string')
-    expect(doc).toContain('<fs-read>...</fs-read>')
+    expect(doc).toContain('<read>...</read>')
   })
 
   test('image output shows Returns: image', () => {
@@ -529,7 +529,7 @@ describe('output documentation', () => {
     })
     const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
-    expect(doc).toContain('<fs-read>content</fs-read>')
+    expect(doc).toContain('<read>content</read>')
   })
 
   test('explicit output childTags render image placeholder for image fields', () => {
@@ -585,9 +585,9 @@ describe('output documentation', () => {
     })
     const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
-    expect(doc).toContain('<fs-tree>')
+    expect(doc).toContain('<tree>')
     expect(doc).toContain('<entry path="..." name="..." type="..." depth="..." />')
-    expect(doc).toContain('</fs-tree>')
+    expect(doc).toContain('</tree>')
   })
 
   test('explicit output items binding renders item attrs + body', () => {
@@ -606,9 +606,9 @@ describe('output documentation', () => {
     })
     const doc = generateXmlToolDoc(expectTool(tool))
     expect(doc).toContain('Returns:')
-    expect(doc).toContain('<fs-search>')
+    expect(doc).toContain('<grep>')
     expect(doc).toContain('<item file="...">a string</item>')
-    expect(doc).toContain('</fs-search>')
+    expect(doc).toContain('</grep>')
   })
 })
 

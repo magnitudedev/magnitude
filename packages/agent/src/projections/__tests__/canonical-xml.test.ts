@@ -4,8 +4,8 @@ import { serializeCanonicalTurn, type CanonicalTrace } from '../canonical-xml'
 
 const bindings = new Map<string, XmlTagBinding>([
   ['shell', { body: 'command' }],
-  ['fs-read', { attributes: [{ field: 'path', attr: 'path' }] }],
-  ['fs-write', { attributes: [{ field: 'path', attr: 'path' }], body: 'content' }],
+  ['read', { attributes: [{ field: 'path', attr: 'path' }] }],
+  ['write', { attributes: [{ field: 'path', attr: 'path' }], body: 'content' }],
   ['edit', { attributes: [{ field: 'path', attr: 'path' }], childTags: [{ tag: 'old', field: 'old' }, { tag: 'new', field: 'new' }] }],
   ['items-tool', { children: [{ field: 'items', tag: 'item', attributes: [{ field: 'k', attr: 'k' }], body: 'v' }] }],
   ['record-tool', { childRecord: { field: 'vars', keyAttr: 'name', tag: 'var' } }],
@@ -67,18 +67,18 @@ describe('serializeCanonicalTurn structural variations', () => {
       lenses: null,
       thinkBlocks: [],
       messages: [],
-      toolCalls: [{ tagName: 'shell', input: { command: 'ls' }, query: '.' }, { tagName: 'fs-read', input: { path: 'a.ts' }, query: '.' }],
+      toolCalls: [{ tagName: 'shell', input: { command: 'ls' }, query: '.' }, { tagName: 'read', input: { path: 'a.ts' }, query: '.' }],
       turnDecision: 'yield',
     }
     expect(serializeCanonicalTurn(trace, bindings)).toBe(
-      withYield('<actions>\n<shell observe=".">ls</shell>\n<fs-read observe="." path="a.ts" />\n</actions>'),
+      withYield('<actions>\n<shell observe=".">ls</shell>\n<read observe="." path="a.ts" />\n</actions>'),
     )
   })
 
   test('7) tool with attributes only (self-closing)', () => {
     const trace: CanonicalTrace = {
-      lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'fs-read', input: { path: 'src/a.ts' }, query: '.' }], turnDecision: 'yield' }
-    expect(serializeCanonicalTurn(trace, bindings)).toBe(withYield('<actions>\n<fs-read observe="." path="src/a.ts" />\n</actions>'))
+      lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'read', input: { path: 'src/a.ts' }, query: '.' }], turnDecision: 'yield' }
+    expect(serializeCanonicalTurn(trace, bindings)).toBe(withYield('<actions>\n<read observe="." path="src/a.ts" />\n</actions>'))
   })
 
   test('8) tool with body only', () => {
@@ -89,9 +89,9 @@ describe('serializeCanonicalTurn structural variations', () => {
 
   test('9) tool with attributes and body', () => {
     const trace: CanonicalTrace = {
-      lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'fs-write', input: { path: 'a.txt', content: 'hello' }, query: '.' }], turnDecision: 'yield' }
+      lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'write', input: { path: 'a.txt', content: 'hello' }, query: '.' }], turnDecision: 'yield' }
     expect(serializeCanonicalTurn(trace, bindings)).toBe(
-      withYield('<actions>\n<fs-write observe="." path="a.txt">hello</' + 'fs-write>\n</actions>'),
+      withYield('<actions>\n<write observe="." path="a.txt">hello</' + 'write>\n</actions>'),
     )
   })
 
@@ -131,9 +131,9 @@ describe('serializeCanonicalTurn structural variations', () => {
 
   test('13) self-closing tool can serialize non-default observe', () => {
     const trace: CanonicalTrace = {
-      lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'fs-read', input: { path: 'x.ts' }, query: '//item[1]' }], turnDecision: 'yield' }
+      lenses: null, thinkBlocks: [], messages: [], toolCalls: [{ tagName: 'read', input: { path: 'x.ts' }, query: '//item[1]' }], turnDecision: 'yield' }
     expect(serializeCanonicalTurn(trace, bindings)).toBe(
-      withYield('<actions>\n<fs-read observe="//item[1]" path="x.ts" />\n</actions>'),
+      withYield('<actions>\n<read observe="//item[1]" path="x.ts" />\n</actions>'),
     )
   })
 
@@ -152,12 +152,12 @@ describe('serializeCanonicalTurn structural variations', () => {
       messages: [],
       toolCalls: [
         { tagName: 'shell', input: { command: 'ls' }, query: 'stdout' },
-        { tagName: 'fs-read', input: { path: 'a.ts' }, query: '.' },
+        { tagName: 'read', input: { path: 'a.ts' }, query: '.' },
       ],
       turnDecision: 'yield',
     }
     expect(serializeCanonicalTurn(trace, bindings)).toBe(
-      withYield('<actions>\n<shell observe="stdout">ls</shell>\n<fs-read observe="." path="a.ts" />\n</actions>'),
+      withYield('<actions>\n<shell observe="stdout">ls</shell>\n<read observe="." path="a.ts" />\n</actions>'),
     )
   })
 

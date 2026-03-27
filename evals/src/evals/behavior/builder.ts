@@ -78,12 +78,12 @@ class TurnBuilderImpl implements TurnBuilder {
     this.fileReadPaths.push(...pathArr)
     Object.assign(this.fileReadOverrides, overrides)
     for (const path of pathArr) {
-      this.actions.push(`<fs-read path="${path}" />`)
+      this.actions.push(`<read path="${path}" />`)
     }
     const n = pathArr.length
     const refs: string[] = []
-    for (let i = n - 1; i >= 1; i--) refs.push(makeRef(`fs-read~${i}`))
-    if (n > 0) refs.push(makeRef('fs-read'))
+    for (let i = n - 1; i >= 1; i--) refs.push(makeRef(`read~${i}`))
+    if (n > 0) refs.push(makeRef('read'))
     this.actions.push(`<inspect>\n${refs.join('\n')}\n</inspect>`)
     return this
   }
@@ -94,15 +94,15 @@ class TurnBuilderImpl implements TurnBuilder {
   }
 
   fsTree(path: string): TurnBuilder {
-    this.actions.push(`<fs-tree path="${path}" />`)
+    this.actions.push(`<tree path="${path}" />`)
     return this
   }
 
   fsSearch(pattern: string, path?: string): TurnBuilder {
     this.actions.push(
       path
-        ? `<fs-search pattern="${pattern}" path="${path}" />`
-        : `<fs-search pattern="${pattern}" />`
+        ? `<grep pattern="${pattern}" path="${path}" />`
+        : `<grep pattern="${pattern}" />`
     )
     return this
   }
@@ -137,11 +137,11 @@ function readFile(path: string, overrides: Record<string, string>): string {
 function buildFileToolResults(paths: string[], overrides: Record<string, string>): string {
   const n = paths.length
   const refs: string[] = []
-  // paths[0] was first read → fs-read~(n-1), paths[n-1] was last → fs-read
+  // paths[0] was first read → read~(n-1), paths[n-1] was last → read
   for (let i = n - 1; i >= 1; i--) {
-    refs.push(makeRef(`fs-read~${i}`, readFile(paths[n - 1 - i], overrides)))
+    refs.push(makeRef(`read~${i}`, readFile(paths[n - 1 - i], overrides)))
   }
-  refs.push(makeRef('fs-read', readFile(paths[n - 1], overrides)))
+  refs.push(makeRef('read', readFile(paths[n - 1], overrides)))
   return `<results>\n<inspect>\n${refs.join('\n')}\n</inspect>\n</results>`
 }
 

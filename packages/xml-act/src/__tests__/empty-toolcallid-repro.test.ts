@@ -2,7 +2,7 @@ import { describe, it, expect } from 'bun:test'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
-const knownTags = new Set(['shell', 'fs-read'])
+const knownTags = new Set(['shell', 'read'])
 const childTagMap = new Map<string, Set<string>>()
 
 function parse(xml: string): ParseEvent[] {
@@ -40,15 +40,15 @@ describe('empty toolCallId repro', () => {
     expect(opened.toolCallId).toBeTruthy()
   })
 
-  it('self-closing fs-read with attribute and no space before /> gets non-empty toolCallId', () => {
-    const events = parse('<actions>\n<fs-read path="x.ts"/>\n</actions>\n<next/>')
-    const opened = getTagOpened(events, 'fs-read')
+  it('self-closing read with attribute and no space before /> gets non-empty toolCallId', () => {
+    const events = parse('<actions>\n<read path="x.ts"/>\n</actions>\n<next/>')
+    const opened = getTagOpened(events, 'read')
     expect(opened.toolCallId).toBeTruthy()
   })
 
-  it('self-closing fs-read with attribute and space before /> gets non-empty toolCallId', () => {
-    const events = parse('<actions>\n<fs-read path="x.ts" />\n</actions>\n<next/>')
-    const opened = getTagOpened(events, 'fs-read')
+  it('self-closing read with attribute and space before /> gets non-empty toolCallId', () => {
+    const events = parse('<actions>\n<read path="x.ts" />\n</actions>\n<next/>')
+    const opened = getTagOpened(events, 'read')
     expect(opened.toolCallId).toBeTruthy()
   })
 

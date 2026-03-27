@@ -48,17 +48,17 @@ function buildToolResults(
   const resultLines: string[] = []
   const inspectLines: string[] = []
 
-  // fs-read
+  // read
   for (const fsRead of parsed.fsReads) {
     const content = mockFiles[fsRead.path]
     if (content !== undefined) {
       inspectLines.push(`<ref tool="${fsRead.refName}">${content}</ref>`)
     } else {
-      resultLines.push(`<tool name="fs-read"><error>ENOENT: no such file or directory '${fsRead.path}'</error></tool>`)
+      resultLines.push(`<tool name="read"><error>ENOENT: no such file or directory '${fsRead.path}'</error></tool>`)
     }
   }
 
-  // fs-search
+  // grep
   for (const fsSearch of parsed.fsSearches) {
     const items: string[] = []
     let pattern: RegExp
@@ -81,7 +81,7 @@ function buildToolResults(
     else inspectLines.push(`<ref tool="${fsSearch.refName}">No matches found</ref>`)
   }
 
-  // fs-tree
+  // tree
   for (const fsTree of parsed.fsTrees) {
     const dirs = new Set<string>()
     const entries: string[] = []
@@ -130,10 +130,10 @@ function buildToolResults(
     }
   }
 
-  // fs-write
+  // write
   for (const fsWrite of parsed.fsWrites) {
     mockFiles[fsWrite.path] = fsWrite.content
-    inspectLines.push(`<ref tool="fs-write" />`)
+    inspectLines.push(`<ref tool="write" />`)
   }
 
   // artifact-read

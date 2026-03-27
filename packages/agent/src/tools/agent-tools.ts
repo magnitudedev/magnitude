@@ -24,10 +24,10 @@ const { ForkContext } = Fork
 const AgentErrorSchema = ToolErrorSchema('AgentError', {})
 
 // =============================================================================
-// agent.create — Create and dispatch an agent
+// agent-create — Create and dispatch an agent
 // =============================================================================
 
-/** Execute logic for agent.create */
+/** Execute logic for agent-create */
 function executeAgentCreate({ agentId, options }: {
   agentId: string;
   options: { type: string; title: string; message: string };
@@ -85,7 +85,7 @@ function executeAgentCreate({ agentId, options }: {
 
 
 export const agentCreateTool = defineTool({
-  name: 'create' as const,
+  name: 'agent-create' as const,
   group: 'agent' as const,
   description: 'Create a new agent and dispatch it with a title and message.',
   inputSchema: Schema.Struct({
@@ -103,7 +103,7 @@ export const agentCreateTool = defineTool({
 })
 
 export const agentKillTool = defineTool({
-  name: 'kill' as const,
+  name: 'agent-kill' as const,
   group: 'agent' as const,
   description: 'Kill an active subagent that was started accidentally or no longer needed. Not meant for idle subagents.',
   inputSchema: Schema.Struct({
@@ -144,7 +144,7 @@ export const agentKillTool = defineTool({
       forkId: target.forkId,
       parentForkId,
       agentId: target.agentId,
-      reason: reason?.trim() || 'Killed by parent via agent.kill',
+      reason: reason?.trim() || 'Killed by parent via agent-kill',
     })
 
     return { agentId: target.agentId, forkId: target.forkId }

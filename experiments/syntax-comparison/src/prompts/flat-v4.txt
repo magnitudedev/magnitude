@@ -6,7 +6,7 @@ response := lens+ step* idle?
 lens     := <lens name="...">...</lens>
 step     := message | tool
 message  := <message to="user">...</message>
-tool     := <read .../> | <search .../> | <run ...>...</run> | <tree .../> | <write ...>...</write> | <edit ...>...</edit>
+tool     := <read .../> | <grep .../> | <run ...>...</run> | <tree .../> | <write ...>...</write> | <edit ...>...</edit>
 idle     := <idle/>
 
 Required shape:
@@ -45,6 +45,6 @@ Mock tools:
 <read path="..." observe="."/>
 <write path="..." observe=".">content</write>
 <edit path="..." observe="."><old>...</old><new>...</new></edit>
-<search pattern="..." path="..." observe="."/>
+<grep pattern="..." path="..." observe="."/>
 <run observe=".">command</run>
 <tree path="..." observe="."/>

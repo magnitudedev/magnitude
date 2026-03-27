@@ -33,7 +33,7 @@ export const FAKE_TOOLS: FakeTool[] = [
     ],
     returnType: 'string',
     xmlBinding: {
-      tagName: 'fs-read',
+      tagName: 'read',
       attributes: ['path'],
       selfClosing: true,
     },
@@ -73,7 +73,7 @@ export async function login(email: string, password: string) {
     ],
     returnType: 'void',
     xmlBinding: {
-      tagName: 'fs-write',
+      tagName: 'write',
       attributes: ['path'],
       body: 'content',
     },
@@ -128,7 +128,7 @@ export async function login(email: string, password: string) {
     ],
     returnType: 'Array<{ path, name, type, depth }>',
     xmlBinding: {
-      tagName: 'fs-tree',
+      tagName: 'tree',
       attributes: ['path'],
       selfClosing: true,
     },
@@ -164,7 +164,7 @@ export async function login(email: string, password: string) {
     ],
     returnType: 'Array<{ file: string, match: string }>',
     xmlBinding: {
-      tagName: 'fs-search',
+      tagName: 'grep',
       attributes: ['pattern'],
       selfClosing: true,
     },

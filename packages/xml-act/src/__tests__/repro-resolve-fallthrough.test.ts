@@ -12,7 +12,7 @@ import type { ParseEvent } from '../format/types'
  * that has a permissive default fallthrough.
  */
 
-const knownTags = new Set(['edit', 'shell', 'fs-write', 'fs-read'])
+const knownTags = new Set(['edit', 'shell', 'write', 'read'])
 const childTagMap = new Map<string, Set<string>>([
   ['edit', new Set(['old', 'new'])],
 ])

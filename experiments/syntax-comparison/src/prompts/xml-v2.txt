@@ -90,7 +90,7 @@ Tool calls without observe execute but you don't see their output.
 <read path="file" offset="1" limit="100" observe=".content"/>
 <write path="file">content</write>
 <edit path="file"><old>find</old><new>replace</new></edit>
-<search pattern="regex" path="dir" glob="*.ts" observe=".matches[0:5]"/>
+<grep pattern="regex" path="dir" glob="*.ts" observe=".matches[0:5]"/>
 <run observe=".exitCode">command</run>
 <tree path="dir" observe=".entries[0:20]"/>
 
@@ -105,7 +105,7 @@ User: Fix the database connection error.
 <lens name="strategy">Search first.</lens>
 </lenses>
 <declare>Finding your database config.</declare>
-<search pattern="database" glob="*.yml" observe=".matches[0:5]"/>
+<grep pattern="database" glob="*.yml" observe=".matches[0:5]"/>
 <observe/>
 </turn:work>
 

@@ -1767,7 +1767,7 @@ TypeScript compiles cleanly.`,
   // -------------------------------------------------------------------------
   {
     id: 'delegation/small-readonly-direct-tools',
-    description: 'Tiny read-only question should be answered via direct fs-read without subagent dispatch',
+    description: 'Tiny read-only question should be answered via direct read without subagent dispatch',
     messages: [
       { role: 'user', content: [SESSION_CONTEXT] },
       { role: 'user', content: [userMsg('what is the package name in package.json? just tell me the value')] },

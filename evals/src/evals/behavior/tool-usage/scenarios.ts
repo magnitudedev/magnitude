@@ -19,7 +19,7 @@ export const ALL_SCENARIOS: ToolUsageScenario[] = [
     .context(mockProject.sessionContext())
     .user('add request logging to all routes — log method, path, status code, and duration for every request')
     .judge(
-      'Does the response deploy an explorer agent to explore the codebase rather than immediately reading individual files itself using fs-read or similar tools?',
+      'Does the response deploy an explorer agent to explore the codebase rather than immediately reading individual files itself using read or similar tools?',
       'deploys-explorer-not-reads'
     )
     .build(),
@@ -69,7 +69,7 @@ export const ALL_SCENARIOS: ToolUsageScenario[] = [
     .assistant((t) => t.message("Here's the plan for adding RBAC to task deletion. Want me to go ahead?"))
     .user('yeah go for it')
     .judge(
-      'Does the response deploy a builder agent to implement the plan rather than making file edits directly using edit, fs-write, or shell commands?',
+      'Does the response deploy a builder agent to implement the plan rather than making file edits directly using edit, write, or shell commands?',
       'deploys-builder-not-edits'
     )
     .build(),

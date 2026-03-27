@@ -183,7 +183,7 @@ export function reviewerDeployedAfterBuilder(): Check {
 export function usedDirectTools(): Check {
   return {
     id: 'used-direct-tools',
-    description: 'Orchestrator uses its own tools directly (fs-read, shell, etc.)',
+    description: 'Orchestrator uses its own tools directly (read, shell, etc.)',
     evaluate(raw) {
       const parsed = parseOrchestratorResponse(raw)
       const found = parsed.directToolUses.length > 0
@@ -201,7 +201,7 @@ export function noDirectFileEdits(): Check {
     description: 'Orchestrator does NOT edit files directly',
     evaluate(raw) {
       const parsed = parseOrchestratorResponse(raw)
-      const editTools = parsed.directToolUses.filter(t => t === 'fs-write' || t === 'fs-edit' || t === 'write' || t === 'edit')
+      const editTools = parsed.directToolUses.filter(t => t === 'write' || t === 'fs-edit' || t === 'write' || t === 'edit')
       return {
         passed: editTools.length === 0,
         message: editTools.length === 0 ? undefined : `Orchestrator directly edited files: ${editTools.join(', ')}`,
@@ -238,9 +238,9 @@ export function usesReadOnlyInvestigationBeforeExecution(): Check {
       if (!first) return { passed: true }
 
       const readOnlyAction =
-        first === 'tool:fs-read' ||
-        first === 'tool:fs-search' ||
-        first === 'tool:fs-tree' ||
+        first === 'tool:read' ||
+        first === 'tool:grep' ||
+        first === 'tool:tree' ||
         first === 'tool:shell' ||
         first === 'tool:artifact-read'
 

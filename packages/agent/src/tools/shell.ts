@@ -43,7 +43,7 @@ const shortenCommandPreview = (command: string, maxLength = 80): string => {
 export const shellTool = defineTool({
   name: 'shell',
   group: 'default',
-  description: 'Execute a shell command. Do not use this for operations covered by built-in tools like fs-read, fs-search, fs-tree, fs-write, edit, and web-fetch.',
+  description: 'Execute a shell command. Do not use this for operations covered by built-in tools like read, grep, tree, write, edit, and web-fetch.',
   inputSchema: Schema.Struct({
     command: Schema.String,
     timeout: Schema.optional(

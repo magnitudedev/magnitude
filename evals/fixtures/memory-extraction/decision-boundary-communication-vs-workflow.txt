@@ -1,4 +1,4 @@
-<fs-read>[1] 1777400000000 user_message
+<read>[1] 1777400000000 user_message
 Can you handle the monorepo telemetry cleanup task?
 
 Quick way I want this run:
@@ -142,7 +142,7 @@ Merging this.
 [980] 1777400190000 assistant_turn_completed
 Great.
 
-Task complete and ready for release.</fs-read>
+Task complete and ready for release.</read>
 [1200] 1777400197000 user_message
 Quick retrospective:
 the staged explorer-first execution worked and concise updates were helpful.

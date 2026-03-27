@@ -96,7 +96,7 @@ Every tool call must include an `observe` attribute.
 - `observe` is framework metadata, not tool input.
 
 Examples:
-<search pattern="TODO" observe="//item[1]/@file" />
+<grep pattern="TODO" observe="//item[1]/@file" />
 <shell observe="//stdout">echo hello</shell>
 
 Query examples:

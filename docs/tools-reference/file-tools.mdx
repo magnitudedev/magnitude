@@ -11,7 +11,7 @@ The agent has a full set of filesystem tools for working with your code.
 Read the contents of a file.
 
 ```xml
-<fs-read path="src/index.ts" />
+<read path="src/index.ts" />
 ```
 
 - **path** — relative path from your project root
@@ -23,7 +23,7 @@ Read the contents of a file.
 Create or overwrite a file.
 
 ```xml
-<fs-write path="src/index.ts">full file content here</fs-write>
+<write path="src/index.ts">full file content here</write>
 ```
 
 - **path** — relative path from your project root
@@ -63,7 +63,7 @@ The `<old>` content must match the file exactly. Read the file first, then apply
 List directory structure.
 
 ```xml
-<fs-tree path="src/" />
+<tree path="src/" />
 ```
 
 - Respects `.gitignore` by default
@@ -74,7 +74,7 @@ List directory structure.
 Search file contents with regex.
 
 ```xml
-<fs-search pattern="TODO|FIXME" path="src/" glob="*.ts" limit="50" />
+<grep pattern="TODO|FIXME" path="src/" glob="*.ts" limit="50" />
 ```
 
 - **pattern** — regex pattern to search for

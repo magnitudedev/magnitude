@@ -329,7 +329,7 @@ const SearchMatch = Schema.Struct({
 
 type SearchMatch = Schema.Schema.Type<typeof SearchMatch>
 
-export async function searchFiles(
+export async function grepFiles(
   pattern: string,
   searchPath: string,
   globPattern: string | undefined,
@@ -432,8 +432,8 @@ export async function searchFiles(
   }
 }
 
-export const searchTool = defineTool({
-  name: 'search',
+export const grepTool = defineTool({
+  name: 'grep',
   group: 'fs',
   description: 'Search file contents with regex. Use this instead of running grep, rg, or ag in the shell — it uses ripgrep under the hood.',
   inputSchema: Schema.Struct({
@@ -471,14 +471,14 @@ export const searchTool = defineTool({
           ? resolve(cwd, resolvedPath)
           : cwd
 
-        return await searchFiles(pattern, searchPath, resolvedGlob, resolvedLimit)
+        return await grepFiles(pattern, searchPath, resolvedGlob, resolvedLimit)
       },
       catch: (e) => fsError(e instanceof Error ? e.message : `Search failed for ${pattern}`),
     })
   })
 })
 
-export const searchXmlBinding = defineXmlBinding(searchTool, {
+export const grepXmlBinding = defineXmlBinding(grepTool, {
   input: {
     attributes: [
       { field: 'pattern', attr: 'pattern' },
@@ -535,13 +535,13 @@ export const viewXmlBinding = defineXmlBinding(viewTool, {
 // Filesystem Tools Group
 // =============================================================================
 
-export const fsTools = [readTool, writeTool, editTool, treeTool, searchTool, viewTool]
+export const fsTools = [readTool, writeTool, editTool, treeTool, grepTool, viewTool]
 
 export const fsXmlBindings = [
   readXmlBinding,
   writeXmlBinding,
   editXmlBinding,
   treeXmlBinding,
-  searchXmlBinding,
+  grepXmlBinding,
   viewXmlBinding,
 ]

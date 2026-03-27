@@ -44,7 +44,7 @@ Mock tools:
 <read path="..." observe="."/>
 <write path="..." observe=".">content</write>
 <edit path="..." observe="."><old>...</old><new>...</new></edit>
-<search pattern="..." path="..." observe="."/>
+<grep pattern="..." path="..." observe="."/>
 <run observe=".">command</run>
 <tree path="..." observe="."/>
 

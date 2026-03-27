@@ -109,8 +109,8 @@ describe('tokenizer', () => {
   })
 
   it('tag names allow hyphen', () => {
-    expect(collect('<fs-read>')).toEqual([
-      { type: 'open', tagName: 'fs-read', attrs: new Map(), afterNewline: true },
+    expect(collect('<read>')).toEqual([
+      { type: 'open', tagName: 'read', attrs: new Map(), afterNewline: true },
     ])
   })
 

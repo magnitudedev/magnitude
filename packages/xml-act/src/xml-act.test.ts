@@ -1628,18 +1628,18 @@ describe('prose streaming (parser-level)', () => {
 
 
   test('think then actions with self-closing tool — character by character', () => {
-    const xml = `<think>thought\n</think>\n${ACTIONS_TAG_OPEN}\n<fs-read id="r1" path="x.ts" />\n${ACTIONS_TAG_CLOSE}`
-    const events = parseChunked([...xml], ['fs-read'])
+    const xml = `<think>thought\n</think>\n${ACTIONS_TAG_OPEN}\n<read id="r1" path="x.ts" />\n${ACTIONS_TAG_CLOSE}`
+    const events = parseChunked([...xml], ['read'])
 
     const thinkEnds = parseEvents(events, 'ProseEnd').filter(e => e.patternId === 'think')
     expect(thinkEnds).toHaveLength(1)
 
     const tagOpened = parseEvents(events, 'TagOpened')
     expect(tagOpened).toHaveLength(1)
-    expect(tagOpened[0].tagName).toBe('fs-read')
+    expect(tagOpened[0].tagName).toBe('read')
     expect(tagOpened[0].attributes.get('path')).toBe('x.ts')
 
-    const tagClosed = parseEvents(events, 'TagClosed').filter(e => e.tagName === 'fs-read')
+    const tagClosed = parseEvents(events, 'TagClosed').filter(e => e.tagName === 'read')
     expect(tagClosed).toHaveLength(1)
   })
 

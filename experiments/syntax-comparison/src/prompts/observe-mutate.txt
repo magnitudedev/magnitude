@@ -36,7 +36,7 @@ Write content to a file.
 <edit path="..."><old>...</old><new>...</new></edit>
 Edit file content by replacement.
 
-<search path="..." pattern="..."/>
+<grep path="..." pattern="..."/>
 Search file contents.
 
 <run>command</run>

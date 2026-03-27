@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { searchTool, searchXmlBinding } from '../tools/fs'
+import { grepTool, grepXmlBinding } from '../tools/fs'
 
 type SearchMatch = { file: string; match: string }
 
@@ -27,8 +27,8 @@ const initial: Omit<FileSearchState, 'phase' | 'toolKey'> = {
 }
 
 export const fileSearchModel = defineStateModel('fileSearch', {
-  tool: searchTool,
-  binding: searchXmlBinding,
+  tool: grepTool,
+  binding: grepXmlBinding,
 })({
   initial,
   reduce: (state, event): FileSearchState => {

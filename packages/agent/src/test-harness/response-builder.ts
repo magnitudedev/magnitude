@@ -64,11 +64,11 @@ export class ResponseBuilder {
   }
 
   readFile(path: string): this {
-    return this.tool('fs-read', { path })
+    return this.tool('read', { path })
   }
 
   writeFile(path: string, content: string): this {
-    return this.tool('fs-write', { path }, content)
+    return this.tool('write', { path }, content)
   }
 
   shell(command: string): this {

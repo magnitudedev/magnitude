@@ -21,7 +21,7 @@ const commsTagClose = () => '</comms>'
 const actionsTagOpen = () => '<actions>'
 const actionsTagClose = () => '</actions>'
 
-const knownTags = new Set(['shell', 'fs-read'])
+const knownTags = new Set(['shell', 'read'])
 const childTagMap = new Map<string, ReadonlySet<string>>([
   ['shell', new Set(['stdin'])],
 ])

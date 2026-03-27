@@ -13,12 +13,12 @@ import type { XmlActEvent } from '../format/types'
  * Fixed by making structuralTags instance-scoped in createXmlActFormat().
  */
 
-const parentTags = new Set(['fs-write', 'agent-create'])
+const parentTags = new Set(['write', 'agent-create'])
 const parentChildMap = new Map([
   ['agent-create', new Set(['type', 'title', 'message'])],
 ])
 
-const subagentTags = new Set(['shell', 'fs-read', 'fs-write', 'edit'])
+const subagentTags = new Set(['shell', 'read', 'write', 'edit'])
 const subagentChildMap = new Map([
   ['shell', new Set(['stdin'])],
 ])

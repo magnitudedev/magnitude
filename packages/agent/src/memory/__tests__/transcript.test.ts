@@ -24,7 +24,7 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<lenses><lens name="task">thinking</lens></lenses><comms><message to="user">Got it, I will update exports.</message><message to="explorer-1">Please review the files.</message></comms><actions><fs-read path="src/index.ts" observe="." /></actions>',
+              '<lenses><lens name="task">thinking</lens></lenses><comms><message to="user">Got it, I will update exports.</message><message to="explorer-1">Please review the files.</message></comms><actions><read path="src/index.ts" observe="." /></actions>',
           },
           {
             type: 'thinking',
@@ -159,7 +159,7 @@ describe('memory transcript', () => {
           {
             type: 'text',
             content:
-              '<comms><message to="explorer-1">Review src/</message></comms><actions><fs-tree path="src" observe="." /></actions>',
+              '<comms><message to="explorer-1">Review src/</message></comms><actions><tree path="src" observe="." /></actions>',
           },
         ],
         toolCalls: [],

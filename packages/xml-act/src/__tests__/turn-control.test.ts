@@ -12,7 +12,7 @@ const thinkTagClose = () => '</think>'
 const commsTagOpen = () => '<comms>'
 const commsTagClose = () => '</comms>'
 
-const knownTags = new Set(['shell', 'fs-read'])
+const knownTags = new Set(['shell', 'read'])
 const childTagMap = new Map<string, Set<string>>()
 
 function parse(xml: string): ParseEvent[] {

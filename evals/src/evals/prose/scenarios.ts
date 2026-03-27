@@ -129,7 +129,7 @@ This is a brand new file — just create it directly.
     executesCleanly(),
     usesProseDelimiters(),
     {
-      id: 'calls-fs-write',
+      id: 'calls-write',
       description: 'Calls fs.write to create the file',
       evaluate(raw, result) {
         const call = findCall(result, 'fs.write')
@@ -206,7 +206,7 @@ Write the complete file with fs.write().
     executesCleanly(),
     usesProseDelimiters(),
     {
-      id: 'calls-fs-write',
+      id: 'calls-write',
       description: 'Calls fs.write to create the markdown file',
       evaluate(raw, result) {
         const call = findCall(result, 'fs.write')
@@ -458,7 +458,7 @@ This is a new file — create it directly.
     executesCleanly(),
     usesProseDelimiters(),
     {
-      id: 'calls-fs-write',
+      id: 'calls-write',
       description: 'Calls fs.write to create the file',
       evaluate(raw, result) {
         const call = findCall(result, 'fs.write')
@@ -571,7 +571,7 @@ This is a new file — create it directly.
     executesCleanly(),
     usesProseDelimiters(),
     {
-      id: 'calls-fs-write',
+      id: 'calls-write',
       description: 'Calls fs.write to create the file',
       evaluate(raw, result) {
         const call = findCall(result, 'fs.write')

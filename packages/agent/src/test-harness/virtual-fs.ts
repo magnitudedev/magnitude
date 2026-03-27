@@ -226,11 +226,11 @@ export function createFsSearchHandler(files: Map<string, string>) {
 
 export function createDefaultToolOverrides(files: Map<string, string>): Record<string, (input: unknown) => unknown> {
   return {
-    'fs-read': createFsReadHandler(files),
-    'fs-write': createFsWriteHandler(files),
+    'read': createFsReadHandler(files),
+    'write': createFsWriteHandler(files),
     edit: createEditHandler(files),
-    'fs-tree': createFsTreeHandler(files),
-    'fs-search': createFsSearchHandler(files),
+    'tree': createFsTreeHandler(files),
+    'grep': createFsSearchHandler(files),
     shell: () => ({ stdout: '', stderr: '', exitCode: 0 }),
     'web-fetch': (input: unknown) => {
       const { url } = input as { url: string }

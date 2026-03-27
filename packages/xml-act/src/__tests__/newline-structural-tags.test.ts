@@ -8,7 +8,7 @@ const thinkTagOpen = () => '<think>'
 const thinkTagClose = () => '</think>'
 
 
-const knownTags = new Set(['fs-search', 'shell', 'write'])
+const knownTags = new Set(['grep', 'shell', 'write'])
 const childTagMap = new Map<string, Set<string>>()
 
 function parse(xml: string): ParseEvent[] {
@@ -284,7 +284,7 @@ describe('session repro: inline think tag in think body eats tool calls', () => 
       'Let me check if the pattern is being eaten.',
       '',
       actionsTagOpen(),
-      '<fs-search id="s2" pattern="test" />',
+      '<grep id="s2" pattern="test" />',
       '<shell id="s4">grep foo</shell>',
       '<inspect>',
       '<ref tool="s2" />',
@@ -302,7 +302,7 @@ describe('session repro: inline think tag in think body eats tool calls', () => 
 
     const tools = tagCloseds(events)
     expect(tools).toHaveLength(2)
-    expect(tools[0].tagName).toBe('fs-search')
+    expect(tools[0].tagName).toBe('grep')
     expect(tools[0].element.attributes.get('id')).toBe('s2')
     expect(tools[1].tagName).toBe('shell')
     expect(tools[1].element.attributes.get('id')).toBe('s4')
@@ -349,7 +349,7 @@ describe('structural tags inside tool body remain literal', () => {
 describe('structural tags inside attribute values remain literal', () => {
   it('think tag in attribute value is literal', () => {
     const kw = { think: 'think', actions: 'actions' }
-    const events = parse(`${actionsTagOpen()}\n<fs-search id="s2" pattern="${thinkTagOpen()}" />\n${actionsTagClose()}`)
+    const events = parse(`${actionsTagOpen()}\n<grep id="s2" pattern="${thinkTagOpen()}" />\n${actionsTagClose()}`)
     const tools = tagCloseds(events)
     expect(tools).toHaveLength(1)
     expect(tools[0].element.attributes.get('id')).toBe('s2')
@@ -357,7 +357,7 @@ describe('structural tags inside attribute values remain literal', () => {
   })
 
   it('think tag in attribute value is literal (char-by-char)', () => {
-    const events = parseCharByChar(`${actionsTagOpen()}\n<fs-search id="s2" pattern="${thinkTagOpen()}" />\n${actionsTagClose()}`)
+    const events = parseCharByChar(`${actionsTagOpen()}\n<grep id="s2" pattern="${thinkTagOpen()}" />\n${actionsTagClose()}`)
     const tools = tagCloseds(events)
     expect(tools).toHaveLength(1)
     expect(tools[0].element.attributes.get('id')).toBe('s2')

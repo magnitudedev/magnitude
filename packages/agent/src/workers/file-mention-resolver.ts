@@ -84,7 +84,7 @@ async function resolveDirectoryMention(path: string, absolutePath: string): Prom
   const lines = entries.map((entry) =>
     `<entry path="${escapeXml(entry.relativePath)}" name="${escapeXml(entry.name)}" type="${entry.type}" depth="${entry.depth}" />`
   )
-  const content = `<fs-tree>${lines.join('')}</fs-tree>`
+  const content = `<tree>${lines.join('')}</tree>`
   return {
     path,
     contentType: 'directory',

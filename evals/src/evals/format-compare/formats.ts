@@ -301,7 +301,7 @@ Response format rules:
 
 Well-formed example:
 I will read the auth login file.
-<fs-read id="file1" path="src/auth/login.ts" />
+<read id="file1" path="src/auth/login.ts" />
 `;
     },
   },
@@ -335,7 +335,7 @@ Response format rules:
 
 Well-formed example:
 Reading the file, then inspecting the result.
-<fs-read id="file1" path="src/auth/login.ts" />
+<read id="file1" path="src/auth/login.ts" />
 <inspect>
   <ref id="file1" />
 </inspect>
@@ -375,8 +375,8 @@ Response format rules:
 Well-formed example:
 I'll search for budget emails and check the calendar.
 <actions>
-  <fs-search id="search1" pattern="auth" path="src" glob="*.ts" />
-  <fs-tree id="tree1" path="src" maxDepth="2" />
+  <grep id="search1" pattern="auth" path="src" glob="*.ts" />
+  <tree id="tree1" path="src" maxDepth="2" />
   <inspect>
     <ref id="search1" />
     <ref id="tree1" />
@@ -417,11 +417,11 @@ Response format rules:
 - Without \`<inspect>\`, you see nothing.
 
 Well-formed example:
-<think>The user wants to search for auth files and check the directory structure. I should use fs-search and fs-tree.</think>
+<think>The user wants to search for auth files and check the directory structure. I should use grep and tree.</think>
 I'll search for auth files and check the structure.
 <actions>
-  <fs-search id="search1" pattern="auth" path="src" />
-  <fs-tree id="tree1" path="src" />
+  <grep id="search1" pattern="auth" path="src" />
+  <tree id="tree1" path="src" />
   <inspect>
     <ref id="search1" />
     <ref id="tree1" />

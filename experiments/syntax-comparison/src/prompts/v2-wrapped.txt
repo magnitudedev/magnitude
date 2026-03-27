@@ -25,7 +25,7 @@ Tools:
 <read path="..."/>
 <write path="...">content</write>
 <edit path="..."><old>...</old><new>...</new></edit>
-<search path="..." pattern="..."/>
+<grep path="..." pattern="..."/>
 <run>command</run>
 <tree path="..."/>
 

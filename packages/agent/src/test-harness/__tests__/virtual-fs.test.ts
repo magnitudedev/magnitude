@@ -12,13 +12,13 @@ import {
 } from '../virtual-fs'
 
 describe('virtual fs handlers', () => {
-  test('fs-read returns seeded content', () => {
+  test('read returns seeded content', () => {
     const files = createVirtualFs({ 'src/index.ts': 'console.log("hi")' })
     const read = createFsReadHandler(files)
     expect(read({ path: 'src/index.ts' })).toBe('console.log("hi")')
   })
 
-  test('fs-read with offset/limit', () => {
+  test('read with offset/limit', () => {
     const files = createVirtualFs({
       'a.txt': ['line1', 'line2', 'line3', 'line4', 'line5'].join('\n'),
     })
@@ -28,19 +28,19 @@ describe('virtual fs handlers', () => {
     )
   })
 
-  test('fs-read missing file', () => {
+  test('read missing file', () => {
     const read = createFsReadHandler(createVirtualFs())
     expect(() => read({ path: 'missing.txt' })).toThrow('Failed to read missing.txt')
   })
 
-  test('fs-write creates file', () => {
+  test('write creates file', () => {
     const files = createVirtualFs()
     const write = createFsWriteHandler(files)
     write({ path: 'output.txt', content: 'content' })
     expect(files.get('output.txt')).toBe('content')
   })
 
-  test('fs-write overwrites', () => {
+  test('write overwrites', () => {
     const files = createVirtualFs({ 'output.txt': 'old' })
     const write = createFsWriteHandler(files)
     write({ path: 'output.txt', content: 'new' })
@@ -77,7 +77,7 @@ describe('virtual fs handlers', () => {
     )
   })
 
-  test('fs-tree lists files', () => {
+  test('tree lists files', () => {
     const files = createVirtualFs({
       'src/index.ts': 'a',
       'src/lib/util.ts': 'b',
@@ -93,7 +93,7 @@ describe('virtual fs handlers', () => {
     ])
   })
 
-  test('fs-search matches regex', () => {
+  test('grep matches regex', () => {
     const files = createVirtualFs({
       'src/a.ts': 'alpha\nbeta',
       'src/b.ts': 'gamma\nalphabet',
@@ -105,7 +105,7 @@ describe('virtual fs handlers', () => {
     ])
   })
 
-  test('fs-search respects path prefix', () => {
+  test('grep respects path prefix', () => {
     const files = createVirtualFs({
       'src/a.ts': 'todo here',
       'lib/b.ts': 'todo there',
@@ -114,7 +114,7 @@ describe('virtual fs handlers', () => {
     expect(search({ pattern: 'todo', path: 'src' })).toEqual([{ file: 'src/a.ts', match: '1|todo here' }])
   })
 
-  test('fs-search respects limit', () => {
+  test('grep respects limit', () => {
     const files = createVirtualFs({
       'a.txt': 'hit\nhit\nhit',
       'b.txt': 'hit\nhit',
@@ -138,7 +138,7 @@ describe('virtual fs integration with harness', () => {
         Effect.flatMap(MockTurnScriptTag, (script) =>
           script.enqueue(
             {
-              xml: '<actions><fs-read path="src/index.ts"/></actions><yield/>',
+              xml: '<actions><read path="src/index.ts"/></actions><yield/>',
             },
             null,
           ),
@@ -172,7 +172,7 @@ describe('virtual fs integration with harness', () => {
         Effect.flatMap(MockTurnScriptTag, (script) =>
           script.enqueue(
             {
-              xml: '<actions><fs-write path="output.txt">content</' + 'fs-write></actions><yield/>',
+              xml: '<actions><write path="output.txt">content</' + 'write></actions><yield/>',
             },
             null,
           ),

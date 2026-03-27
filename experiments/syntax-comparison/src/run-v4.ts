@@ -153,7 +153,7 @@ function hasObserveAttr(content: string): boolean {
 }
 
 function hasAnyTool(content: string): boolean {
-  return /<(read|write|edit|search|run|tree|fs-read|fs-write|fs-edit|fs-search|shell|fs-tree)\b/.test(content)
+  return /<(read|write|edit|grep|run|tree|read|write|fs-edit|grep|shell|tree)\b/.test(content)
 }
 
 function stripCodeFences(output: string): string {
@@ -241,7 +241,7 @@ function parseFlat(output: string): FlatParse {
   const users: string[] = []
   const tools: string[] = []
 
-  const known = /<lens\s+name="[^"]+">[\s\S]*?<\/lens>|<message\s+to="user">[\s\S]*?<\/message>|<idle\/>|<(read|write|edit|search|run|tree|fs-read|fs-write|fs-edit|fs-search|shell|fs-tree)\b[\s\S]*?(?:\/>|<\/\1>)/g
+  const known = /<lens\s+name="[^"]+">[\s\S]*?<\/lens>|<message\s+to="user">[\s\S]*?<\/message>|<idle\/>|<(read|write|edit|grep|run|tree|read|write|fs-edit|grep|shell|tree)\b[\s\S]*?(?:\/>|<\/\1>)/g
   let last = 0
   for (const m of output.matchAll(known)) {
     const idx = m.index ?? 0
@@ -293,7 +293,7 @@ function evaluateXmlAct(scenario: Scenario, rawOutput: string): Scores {
   const actions = (blocks.find(b => b.type === 'actions') as { content: string } | undefined)?.content ?? ''
   const comms = (blocks.find(b => b.type === 'comms') as { content: string } | undefined)?.content ?? ''
   const userText = [...comms.matchAll(/<message\s+to="user">([\s\S]*?)<\/message>/g)].map(m => (m[1] ?? '').trim()).join(' ').trim()
-  const hallucinated = claimsResults(userText) && /<(read|search|run|tree)\b/.test(actions) && !blocks.some(b => b.type === 'next')
+  const hallucinated = claimsResults(userText) && /<(read|grep|run|tree)\b/.test(actions) && !blocks.some(b => b.type === 'next')
 
   let turn_control_correct = true
   const hasNext = blocks.some(b => b.type === 'next')
@@ -326,7 +326,7 @@ function evaluateFlat(scenario: Scenario, rawOutput: string): Scores {
   const syntax_valid = !hasUnknown && thinkPrefixOk && idleAtEnd
   const single_turn = thinkPrefixOk && !hasUnknown
 
-  const hasObserveTool = /<(read|search|run|tree|fs-read|fs-search|shell|fs-tree)\b/.test(parsed.toolText)
+  const hasObserveTool = /<(read|grep|run|tree|read|grep|shell|tree)\b/.test(parsed.toolText)
   const hallucinated = claimsResults(parsed.userText) && !hasObserveTool
 
   let turn_control_correct = scenario.shouldContinue ? (hasObserveTool && !hallucinated) : !hallucinated
