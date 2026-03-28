@@ -303,7 +303,8 @@ export function ChatController(props: ChatControllerProps) {
     if (env.pendingApproval) return true
     if (!env.bashMode && fileMentions.handleKeyIntercept(key)) return true
     if (!env.bashMode && shouldHandleSlashCommandInTab(selectedForkId) && slashCommands.handleKeyIntercept(key)) return true
-    if (env.widgetNavActive && services.handleWidgetKeyEvent(key)) return true
+    const hasContent = inputValue.text.trim().length > 0 || attachments.length > 0
+    if (env.widgetNavActive && !hasContent && services.handleWidgetKeyEvent(key)) return true
 
     if (shouldCycleSubagentTabs({
       keyName: key.name,
