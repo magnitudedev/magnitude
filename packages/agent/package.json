@@ -7,6 +7,8 @@
   "types": "src/index.ts",
   "scripts": {
     "test": "bun test",
+    "test:vitest": "bunx vitest run",
+    "test:vitest:watch": "bunx vitest",
     "typecheck": "tsc --noEmit",
     "measure-system-prompt": "bun run scripts/measure-system-prompt.ts",
     "memory-extract": "bun run src/memory/run-extraction-job.ts"
@@ -30,11 +32,13 @@
     "slimdom": "^4.3.5"
   },
   "devDependencies": {
+    "@effect/vitest": "^0.25.0",
     "@magnitudedev/llm-core": "workspace:*",
     "@magnitudedev/logger": "workspace:*",
     "@magnitudedev/providers": "workspace:*",
     "@magnitudedev/tracing": "workspace:*",
     "@types/bun": "latest",
-    "@types/luxon": "^3.7.1"
+    "@types/luxon": "^3.7.1",
+    "vitest": "^3.2.1"
   }
 }

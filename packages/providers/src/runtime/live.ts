@@ -18,7 +18,9 @@ import { refreshAnthropicToken } from '../auth/anthropic-oauth'
 import { refreshOpenAIToken } from '../auth/openai-oauth'
 import { exchangeCopilotToken } from '../auth/copilot-oauth'
 
-export function makeProviderRuntimeLive<TSlot extends string>() {
+export function makeProviderRuntimeLive<TSlot extends string>(
+  modelCatalogLayer?: Layer.Layer<ModelCatalog, never, never>
+) {
   const stateStore = makeProviderStateStore<TSlot>()
 
   const storageLayer = Layer.mergeAll(
@@ -27,7 +29,7 @@ export function makeProviderRuntimeLive<TSlot extends string>() {
     Layer.provide(CatalogCacheLive, GlobalStorageLive),
   )
 
-  const catalogLayer = Layer.provide(ModelCatalogLive, storageLayer)
+  const catalogLayer = modelCatalogLayer ?? Layer.provide(ModelCatalogLive, storageLayer)
 
   const providerCatalogLayer = Layer.effect(
     ProviderCatalog,

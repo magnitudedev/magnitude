@@ -10,6 +10,7 @@ import { textParts } from '../content'
 // Projections
 import { SessionContextProjection } from '../projections/session-context'
 import { WorkingStateProjection } from '../projections/working-state'
+import { WorkflowProjection } from '../projections/workflow'
 import { TurnProjection } from '../projections/turn'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { MemoryProjection, getView } from '../projections/memory'
@@ -37,9 +38,9 @@ import { ChatTitleWorker } from '../workers/chat-title-worker'
 import { UserPresenceWorker } from '../workers/user-presence-worker'
 
 // Runtime/services
-import { ExecutionManager, ExecutionManagerLive } from '../execution/execution-manager'
+import { ExecutionManagerLive } from '../execution/execution-manager'
 import { BrowserServiceLive } from '../services/browser-service'
-import { makeProviderRuntimeLive, makeTestResolver, type TestModelConfig } from '@magnitudedev/providers'
+import { ModelCatalog, makeProviderRuntimeLive, makeTestResolver, type TestModelConfig } from '@magnitudedev/providers'
 import type { MagnitudeSlot } from '../model-slots'
 import { registerApprovalBridge } from '../execution/approval-bridge'
 
@@ -181,6 +182,70 @@ function applyToolOverrides(
 
 const DEFAULT_TIMEOUT_MS = 10_000
 
+export interface TestHarnessService {
+  readonly client: AgentTestHarness['client']
+  readonly files: AgentTestHarness['files']
+  readonly send: (event: AppEvent) => Effect.Effect<void>
+  readonly user: (text: string) => Effect.Effect<void>
+  readonly events: () => readonly AppEvent[]
+  readonly wait: {
+    readonly event: <T extends AppEvent['type']>(
+      type: T,
+      pred?: (e: Extract<AppEvent, { type: T }>) => boolean,
+      opts?: WaitOptions,
+    ) => Effect.Effect<Extract<AppEvent, { type: T }>>
+    readonly turnCompleted: (forkId?: string | null, opts?: WaitOptions) => Effect.Effect<Extract<AppEvent, { type: 'turn_completed' }>>
+    readonly idle: (forkId?: string | null, opts?: WaitOptions) => Effect.Effect<void>
+    readonly agentCreated: (
+      pred?: (e: Extract<AppEvent, { type: 'agent_created' }>) => boolean,
+      opts?: WaitOptions,
+    ) => Effect.Effect<Extract<AppEvent, { type: 'agent_created' }>>
+  }
+  readonly script: {
+    readonly next: (frame: MockTurnResponse, forkId?: string | null) => Effect.Effect<void>
+    readonly setResolver: (resolver: MockTurnScriptResolver | null) => Effect.Effect<void>
+    readonly route: (mapping: ScriptRouteMapping) => Effect.Effect<() => void>
+  }
+  readonly projectionFork: <S>(
+    tag: Context.Tag<Projection.ForkedProjectionInstance<S>, Projection.ForkedProjectionInstance<S>>,
+    forkId: string | null,
+  ) => Effect.Effect<S>
+  readonly runEffect: <A, E>(effect: Effect.Effect<A, E, any>) => Effect.Effect<A, E>
+}
+
+export class TestHarness extends Context.Tag('TestHarness')<TestHarness, TestHarnessService>() {}
+
+export function TestHarnessLive(options: HarnessOptions = {}): Layer.Layer<TestHarness> {
+  return Layer.scoped(
+    TestHarness,
+    Effect.acquireRelease(
+      Effect.promise(() => createAgentTestHarness(options)),
+      (harness) => Effect.promise(() => harness.dispose()),
+    ).pipe(
+      Effect.map((harness): TestHarnessService => ({
+        client: harness.client,
+        files: harness.files,
+        send: (event) => Effect.promise(() => harness.send(event)),
+        user: (text) => Effect.promise(() => harness.user(text)),
+        events: () => harness.events(),
+        wait: {
+          event: (type, pred, opts) => Effect.promise(() => harness.wait.event(type, pred as never, opts)),
+          turnCompleted: (forkId = null, opts) => Effect.promise(() => harness.wait.turnCompleted(forkId, opts)),
+          idle: (forkId = null, opts) => Effect.promise(() => harness.wait.idle(forkId, opts)),
+          agentCreated: (pred, opts) => Effect.promise(() => harness.wait.agentCreated(pred, opts)),
+        },
+        script: {
+          next: (frame, forkId = null) => Effect.promise(() => harness.script.next(frame, forkId)),
+          setResolver: (resolver) => Effect.promise(() => harness.script.setResolver(resolver)),
+          route: (mapping) => Effect.promise(() => harness.script.route(mapping)),
+        },
+        projectionFork: (tag, forkId) => Effect.promise(() => harness.projectionFork(tag, forkId)),
+        runEffect: (effect) => Effect.promise(() => harness.runEffect(effect)),
+      })),
+    ),
+  )
+}
+
 function defaultSessionContext(overrides: Partial<SessionContext> = {}): SessionContext {
   return {
     cwd: process.cwd(),
@@ -236,6 +301,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         AgentStatusProjection,
         CompactionProjection,
         WorkingStateProjection,
+        WorkflowProjection,
         TurnProjection,
         CanonicalTurnProjection,
 
@@ -299,7 +365,11 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const defaultWaitTimeoutMs = options.defaults?.waitTimeoutMs ?? DEFAULT_TIMEOUT_MS
     const fakeClock = options.clock === 'fake' ? createFakeClock() : null
 
-    const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>()
+    const testModelCatalogLayer = Layer.succeed(ModelCatalog, {
+      refresh: () => Effect.void,
+      getModels: () => Effect.succeed([]),
+    })
+    const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>(testModelCatalogLayer)
     const ephemeralSessionContextLayer = Layer.succeed(EphemeralSessionContextTag, {
       disableShellSafeguards: false,
       disableCwdSafeguards: false,
@@ -320,9 +390,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
     const client = await TestCodingAgent.createClient(runtimeLayer)
 
     await client.runEffect(registerApprovalBridge)
-    await client.runEffect(
-      Effect.flatMap(ExecutionManager, (manager) => manager.initFork(null, 'lead'))
-    )
 
     const transcript: AppEvent[] = []
     const listeners = new Set<(e: AppEvent) => void>()
@@ -332,15 +399,18 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       for (const listener of listeners) listener(event)
     })
 
-    const send = async (event: AppEvent): Promise<void> => {
-      await client.send(event)
-    }
-
-    await send({
+    await client.send({
       type: 'session_initialized',
       forkId: null,
       context: defaultSessionContext(options.sessionContext),
-    })
+    } as AppEvent)
+
+    // Let AgentLifecycle process session initialization and initialize root fork
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const send = async (event: AppEvent): Promise<void> => {
+      await client.send(event)
+    }
 
     const onEvent = (cb: (e: AppEvent) => void): (() => void) => {
       listeners.add(cb)

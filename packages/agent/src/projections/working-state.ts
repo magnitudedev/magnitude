@@ -458,6 +458,37 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       }
     },
 
+    turn_completed: ({ event, state, emit }) => {
+      if (event.forkId === null) return state
+
+      const subFork = state.forks.get(event.forkId)
+      if (!subFork) return state
+      if (!isStable(subFork)) return state
+
+      const parentId = subFork.parentForkId
+      const parentFork = state.forks.get(parentId)
+      if (!parentFork) return state
+
+      const newParentFork: ForkWorkingState = {
+        ...parentFork,
+        willContinue: true,
+        hasQueuedMessages: parentFork.hasQueuedMessages || parentFork.working,
+      }
+
+      if (shouldTrigger(newParentFork) && !shouldTrigger(parentFork)) {
+        emit.shouldTriggerChanged({
+          forkId: parentId,
+          shouldTrigger: true,
+          chainId: newParentFork.currentChainId,
+        })
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(parentId, newParentFork),
+      }
+    },
+
     subagent_user_killed: ({ event, state, emit }) => {
       const parentId = event.parentForkId
       if (!parentId) return state
