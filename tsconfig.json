@@ -21,6 +21,10 @@
       "@magnitudedev/tools": ["packages/tools/src"],
       "@magnitudedev/xml-act": ["packages/xml-act/src"],
       "@magnitudedev/telemetry": ["packages/telemetry/src"]
-    }
-  }
+    },
+    "plugins": [
+      { "name": "@effect/language-service" }
+    ]
+    },
+    "$schema": "https://raw.githubusercontent.com/Effect-TS/language-service/refs/heads/main/schema.json"
 }

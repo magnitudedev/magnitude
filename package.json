@@ -23,7 +23,9 @@
     "publish": "changeset publish",
     "pre:alpha": "changeset pre enter alpha",
     "pre:beta": "changeset pre enter beta",
-    "pre:exit": "changeset pre exit"
+    "pre:exit": "changeset pre exit",
+    "prepare": "effect-language-service patch",
+    "els": "effect-language-service"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
@@ -31,7 +33,8 @@
     "@types/bun": "^1.3.8",
     "@types/mdast": "^4.0.4",
     "turbo": "^2.5.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "@effect/language-service": "^0.84.1"
   },
   "dependencies": {
     "beautiful-mermaid": "^0.1.3",

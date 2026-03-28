@@ -23,3 +23,7 @@ Supported projections: `Memory`, `Fork`, `TaskGraph`, `Turn`, `Display`, `Compac
 Projection output is JSON — pipe to `jq` for querying. Events are 0-indexed.
 
 `bun logs` — view CLI logger output for the current session.
+
+## Effect Language Service
+
+Use `bun els overview --file <path>` to list Effect exports (services, layers, errors) and `bun els layerinfo --file <path>` for layer dependency info. Example: `bun els overview --file packages/agent/src/index.ts`.
