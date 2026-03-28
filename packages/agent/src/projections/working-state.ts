@@ -433,15 +433,16 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
   globalEventHandlers: {
     turn_unexpected_error: ({ event, state, emit }) => {
       const subFork = state.forks.get(event.forkId)
-      const parentId = subFork?.parentForkId
-      if (!parentId) return state
+      if (!subFork) return state
+      const parentId = subFork.parentForkId
 
       const parentFork = state.forks.get(parentId)
       if (!parentFork) return state
 
       const newParentFork: ForkWorkingState = {
         ...parentFork,
-        willContinue: true,
+        willContinue: parentFork.working ? parentFork.willContinue : true,
+        pendingWake: true,
       }
 
       if (shouldTrigger(newParentFork) && !shouldTrigger(parentFork)) {
