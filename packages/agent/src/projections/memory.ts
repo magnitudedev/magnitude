@@ -276,7 +276,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     },
 
-    agent_created: ({ fork }) => fork,
 
     turn_started: ({ event, fork, read }) => {
       const commsEntries = fork.queuedMessages
@@ -512,17 +511,20 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
   },
 
 
-  signalHandlers: (on) => [
-    on(AgentStatusProjection.signals.agentCreated, ({ value, state }) => {
-      const { forkId, parentForkId } = value
+  globalEventHandlers: {
+    agent_created: ({ event, state }) => {
+      const { forkId, parentForkId } = event
       const parentState = state.forks.get(parentForkId)
       if (!parentState) throw new Error(`Parent fork ${parentForkId} not found in MemoryProjection`)
 
-      const contextMessage: Message[] = value.context
-        ? [{ type: 'fork_context', source: 'system', content: textParts(value.context) }]
+      const normalizedMode: 'clone' | 'spawn' = event.mode === 'clone' ? 'clone' : 'spawn'
+      const normalizedContext = typeof event.context === 'string' ? event.context : ''
+
+      const contextMessage: Message[] = normalizedContext
+        ? [{ type: 'fork_context', source: 'system', content: textParts(normalizedContext) }]
         : []
 
-      const isSpawn = value.mode === 'spawn'
+      const isSpawn = normalizedMode === 'spawn'
       const baseMessages = isSpawn ? [] : parentState.messages
 
       const newForkState: ForkMemoryState = {
@@ -534,20 +536,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         pendingPresenceText: null,
       }
 
-      const roleDef = isValidVariant(value.role) ? getAgentDefinition(value.role) : undefined
+      const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
       const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
-      if (spawnReminder && parentState) {
+      if (spawnReminder) {
         const entry: SystemEntry = { kind: 'reminder', text: spawnReminder }
         const updatedParent = {
           ...parentState,
-          queuedMessages: [...parentState.queuedMessages, { kind: 'system' as const, timestamp: Date.now(), entry }]
+          queuedMessages: [...parentState.queuedMessages, { kind: 'system' as const, timestamp: event.timestamp, entry }]
         }
-        return { ...state, forks: new Map(state.forks).set(value.parentForkId, updatedParent).set(forkId, newForkState) }
+        return { ...state, forks: new Map(state.forks).set(parentForkId, updatedParent).set(forkId, newForkState) }
       }
 
       return { ...state, forks: new Map(state.forks).set(forkId, newForkState) }
-    }),
+    },
+  },
 
+  signalHandlers: (on) => [
     on(OutboundMessagesProjection.signals.messageCompleted, ({ value, state, read }) => {
       if (value.dest === 'user') return state
 

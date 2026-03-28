@@ -40,6 +40,7 @@ export interface PendingInboundCommunication {
 }
 
 export interface ForkWorkingState {
+  readonly parentForkId: string | null
   readonly working: boolean
   readonly willContinue: boolean
   readonly hasQueuedMessages: boolean
@@ -74,6 +75,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
   name: 'WorkingState',
 
   initialFork: {
+    parentForkId: null,
     working: false,
     willContinue: false,
     hasQueuedMessages: false,
@@ -412,6 +414,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     agent_created: ({ event, fork, emit }) => {
       const newFork: ForkWorkingState = {
         ...fork,
+        parentForkId: event.parentForkId,
         willContinue: true
       }
 
@@ -424,6 +427,61 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       return newFork
     },
 
+  },
+
+  globalEventHandlers: {
+    turn_unexpected_error: ({ event, state, emit }) => {
+      const subFork = state.forks.get(event.forkId)
+      const parentId = subFork?.parentForkId
+      if (!parentId) return state
+
+      const parentFork = state.forks.get(parentId)
+      if (!parentFork) return state
+
+      const newParentFork: ForkWorkingState = {
+        ...parentFork,
+        willContinue: true,
+      }
+
+      if (shouldTrigger(newParentFork) && !shouldTrigger(parentFork)) {
+        emit.shouldTriggerChanged({
+          forkId: parentId,
+          shouldTrigger: true,
+          chainId: newParentFork.currentChainId,
+        })
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(parentId, newParentFork),
+      }
+    },
+
+    subagent_user_killed: ({ event, state, emit }) => {
+      const parentId = event.parentForkId
+      if (!parentId) return state
+
+      const parentFork = state.forks.get(parentId)
+      if (!parentFork) return state
+
+      const newParentFork: ForkWorkingState = {
+        ...parentFork,
+        willContinue: true,
+      }
+
+      if (shouldTrigger(newParentFork) && !shouldTrigger(parentFork)) {
+        emit.shouldTriggerChanged({
+          forkId: parentId,
+          shouldTrigger: true,
+          chainId: newParentFork.currentChainId,
+        })
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(parentId, newParentFork),
+      }
+    },
   },
 
   signalHandlers: (on) => [

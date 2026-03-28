@@ -74,8 +74,15 @@ type SignalPubSubs<TSignals extends Record<string, Signal<unknown, unknown>>> = 
  * Read function for event handlers in forked projections.
  * Automatically resolves forked dependencies to the same forkId.
  */
-export type ForkedReadFn<TReads extends readonly AnyProjectionResult[]> =
-  <P extends TReads[number]>(projection: P) => StateOfProjection<P>
+export type ForkedReadFn<TReads extends readonly AnyProjectionResult[]> = {
+  <P extends TReads[number]>(projection: P): StateOfProjection<P>
+  <P extends TReads[number]>(
+    projection: P,
+    forkId: string | null
+  ): P extends ForkedProjectionResult<any, infer TForkState, any, any>
+    ? TForkState
+    : StateOfProjection<P>
+}
 
 /**
  * Read function for signal handlers in forked projections.
@@ -166,17 +173,16 @@ export interface ForkedProjectionConfig<
   }
 
   /**
-   * Broadcast event handlers - called for every fork regardless of event.forkId.
-   * Use for global events that should update all forks.
+   * Global event handlers - receive full forked state for cross-fork updates.
+   * Runs after per-fork eventHandlers and before signal flush.
    */
-  readonly broadcastEventHandlers?: {
+  readonly globalEventHandlers?: {
     [E in TEvent['type']]?: (ctx: {
       event: Timestamped<Extract<TEvent, { type: E }>>
-      forkId: string | null
-      fork: TForkState
+      state: ForkedState<TForkState>
       emit: SignalEmitters<TSignalDefs>
-      read: ForkedReadFn<TReads>
-    }) => TForkState | null
+      read: ForkedSignalReadFn<TReads>
+    }) => ForkedState<TForkState>
   }
 
   /**
@@ -337,16 +343,17 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
         )
 
         // Build read function for event handlers (fork-aware)
-        const makeEventReadFn = (forkId: string | null): ForkedReadFn<TReads> => {
-          return <P extends TReads[number]>(projection: P): StateOfProjection<P> => {
+        const makeEventReadFn = (eventForkId: string | null): ForkedReadFn<TReads> => {
+          return <P extends TReads[number]>(projection: P, forkId?: string | null): StateOfProjection<P> => {
             if (!allowedReadNames.has(projection.name)) {
               throw new Error(
                 `Projection "${config.name}" cannot read "${projection.name}" - not declared in reads`
               )
             }
-            // For forked projections, resolve to the same forkId
+            // For forked projections, resolve to specified forkId or default to event forkId
             if (forkedReadNames.has(projection.name)) {
-              return bus.getForkState(projection.name, forkId) as StateOfProjection<P>
+              const targetForkId = forkId !== undefined ? forkId : eventForkId
+              return bus.getForkState(projection.name, targetForkId) as StateOfProjection<P>
             }
             return bus.getProjectionState(projection.name) as StateOfProjection<P>
           }
@@ -432,8 +439,8 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
         // Build event handler - extracts forkId, manages Map
         const eventHandler = (event: TEvent): Effect.Effect<void> => {
           const handler = config.eventHandlers?.[event.type as TEvent['type']]
-          const broadcastHandler = config.broadcastEventHandlers?.[event.type as TEvent['type']]
-          if (!handler && !broadcastHandler) return Effect.void
+          const globalHandler = config.globalEventHandlers?.[event.type as TEvent['type']]
+          if (!handler && !globalHandler) return Effect.void
 
           return Effect.gen(function* () {
             // Per-fork handler
@@ -462,26 +469,15 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
               })
             }
 
-            // Broadcast handlers - run for every fork
-            if (broadcastHandler) {
+            // Global event handler - full state access
+            if (globalHandler) {
               yield* SubscriptionRef.update(stateRef, (currentState) => {
-                const newForks = new Map(currentState.forks)
-                for (const [forkId, fork] of newForks) {
-                  const readFn = makeEventReadFn(forkId)
-                  const newFork = broadcastHandler({
-                    event: event as Timestamped<Extract<TEvent, { type: typeof event.type }>>,
-                    forkId,
-                    fork,
-                    emit: typedEmitters,
-                    read: readFn
-                  })
-                  if (newFork === null) {
-                    newForks.delete(forkId)
-                  } else {
-                    newForks.set(forkId, newFork)
-                  }
-                }
-                return { forks: newForks }
+                return globalHandler({
+                  event: event as Timestamped<Extract<TEvent, { type: typeof event.type }>>,
+                  state: currentState,
+                  emit: typedEmitters,
+                  read: signalReadFn
+                })
               })
             }
 
@@ -492,7 +488,7 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
         // Register with projection bus
         const eventTypes = [
           ...Object.keys(config.eventHandlers ?? {}),
-          ...Object.keys(config.broadcastEventHandlers ?? {})
+          ...Object.keys(config.globalEventHandlers ?? {})
         ] as TEvent['type'][]
 
         yield* bus.register(eventHandler, eventTypes, serviceName)

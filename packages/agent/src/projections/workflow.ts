@@ -171,39 +171,40 @@ export const WorkflowProjection = Projection.defineForked<AppEvent, WorkflowCrit
     },
   },
 
-  broadcastEventHandlers: {
-    phase_criteria_verdict: ({ event, forkId, fork, emit }) => {
-      if (event.parentForkId !== forkId) return fork
-      if (fork.resolved) return fork
+  globalEventHandlers: {
+    phase_criteria_verdict: ({ event, state, emit }) => {
+      const targetForkId = event.parentForkId
+      const fork = state.forks.get(targetForkId)
+      if (!fork || fork.resolved) return state
 
       const next = applyVerdict(fork, event)
       const failed = next.criteria.some((c) => c.status === 'failed')
       if (failed) {
         const resolved = { ...next, resolved: true }
         emit.phaseResolved({
-          forkId,
+          forkId: targetForkId,
           passed: false,
           verdicts: toVerdicts(resolved),
         })
-        return resolved
+        return { ...state, forks: new Map(state.forks).set(targetForkId, resolved) }
       }
 
       if (!fork.allShellPassed && next.allShellPassed) {
-        emit.shellCriteriaPassed({ forkId })
+        emit.shellCriteriaPassed({ forkId: targetForkId })
       }
 
       const resolvedCount = next.criteria.filter((c) => c.status === 'passed' || c.status === 'failed').length
       if (resolvedCount === next.expectedCount && next.expectedCount > 0) {
         const resolved = { ...next, resolved: true }
         emit.phaseResolved({
-          forkId,
+          forkId: targetForkId,
           passed: true,
           verdicts: toVerdicts(resolved),
         })
-        return resolved
+        return { ...state, forks: new Map(state.forks).set(targetForkId, resolved) }
       }
 
-      return next
+      return { ...state, forks: new Map(state.forks).set(targetForkId, next) }
     },
   },
 })

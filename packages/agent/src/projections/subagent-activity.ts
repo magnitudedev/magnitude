@@ -134,6 +134,26 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       }
     },
 
+    turn_unexpected_error: ({ event, state }) => {
+      if (event.forkId === null) return state
+
+      const pendingProse = new Map(state.pendingProse)
+      pendingProse.delete(event.forkId)
+
+      const userMessageIdsByFork = new Map(state.userMessageIdsByFork)
+      userMessageIdsByFork.delete(event.forkId)
+
+      const pendingFiles = new Map(state.pendingFiles)
+      pendingFiles.delete(event.forkId)
+
+      return {
+        ...state,
+        pendingProse,
+        userMessageIdsByFork,
+        pendingFiles,
+      }
+    },
+
     agent_killed: ({ event, state }) => {
       const pendingProse = new Map(state.pendingProse)
       pendingProse.delete(event.forkId)
