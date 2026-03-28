@@ -1642,8 +1642,6 @@ function AppInner({
     || authFlow.apiKeySetup
     || authFlow.oauthState
 
-  if (isOverlayActive) return overlayContent
-
   const chatScrollbox = (
     <scrollbox
       ref={scrollboxRef}
@@ -1789,7 +1787,8 @@ function AppInner({
   const debugVisible = debugMode && debugPanelVisible
   return (
     <SelectedFileProvider value={selectedFile}>
-    <box style={{ flexDirection: 'row', height: '100%', paddingBottom: 0, marginBottom: 0 }}>
+    {isOverlayActive && overlayContent}
+    <box style={{ visible: !isOverlayActive, flexDirection: 'row', height: '100%', paddingBottom: 0, marginBottom: 0 }}>
       {/* Left column — debug panel (only when enabled and visible) */}
       {debugVisible && (
         <box style={{ width: '35%', flexShrink: 0, paddingLeft: 1, paddingBottom: 1 }}>
