@@ -56,7 +56,7 @@ Magnitude comes out of the box with the following subagents:
 Magnitude may use none or all of these in a given session. For a quick fix in a single file, it may edit it directly. For a very in-depth change, it may use the whole team. For most tasks, it will use some combination of explorer, planner, builder, and reviewer.
 
 <p align="center">
-  <img src="architecture.png" alt="Magnitude Architecture" width="100%" />
+  <img src="architecture-dark.png" alt="Magnitude Architecture" width="100%" />
 </p>
 
 ## Why we built this
