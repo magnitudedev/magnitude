@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.7
+
+### Patch Changes
+
+- [`94f637d`](https://github.com/magnitudedev/magnitude/commit/94f637ded5c390cca0490c43d8fe829ab9e44ae9) Thanks [@anerli](https://github.com/anerli)! - fix: lead hang on subagent idle with no message
+
 ## 0.0.1-alpha.6
 
 ### Patch Changes
