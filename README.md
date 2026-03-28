@@ -7,14 +7,13 @@
 </p>
 
 
-Magnitude is an **open source coding agent** that orchestrates a team of subagents, each specialized for a role in the development process. A lead agent breaks down your task and delegates to explorers, planners, builders, reviewers, debuggers, and a browser agent.
+Magnitude is an **open source coding agent** that orchestrates a full dev team of specialized subagents. A lead agent delegates across explorers, planners, builders, reviewers, debuggers, and a browser agent.
 
-- **Everything runs in subagents, including implementation.** The lead's context stays clean, so it remains coherent across long tasks.
-- **The agent follows a process without you enforcing it.** No praying the agent invokes your skills. No manually triggering them when it doesn't.
-- **A lead agent manages the work, not you.** You don't babysit, assign tasks, or decide what happens next. Go get a coffee.
-- **Subagents stay alive.** The lead can tell the planner to consider more angles. The same builder can fix bugs that the reviewer found.
-- **Agents share context through files, not summarization.** No output tokens burned on lossy summaries. Every handoff is a file you can view later.
-- **Mix models by role.** Fast models for exploration. Frontier models for planning and review. You control the cost-intelligence tradeoff.
+- **Everything runs in subagents.** The lead stays focused on orchestration, while subagents handle the implementation details. The lead's context stays clean.
+- **The dev process is built in.** The lead runs an explore, plan, build, review, debug cycle, iterating until checks pass or it needs your input. No manual orchestration.
+- **Subagents stay alive.** The lead can tell the planner to consider more angles, or send bugs back to the same builder, avoiding re-exploration and saving time and tokens.
+- **Agents share context through files, not summaries.** No output tokens burned on lossy summaries. Every handoff is a file you can view later.
+- **Mix models by role.** Fast models for exploration. Frontier models for planning and review. You control the cost-intelligence tradeoff.
 
 <p align="center">
   <img src="interface.png" alt="Magnitude Interface" width="100%" />
@@ -62,9 +61,9 @@ Magnitude may use none or all of these in a given session. For a quick fix in a 
 
 ## Why we built this
 
-The community clearly wants more out of Claude Code. Projects like Superpowers have hit 100k+ GitHub stars augmenting Claude Code with more skills/subagents. People want agents to follow better software development processes. 
+The community clearly wants more out of Claude Code. Projects like Superpowers have hit 100k+ GitHub stars by augmenting Claude Code with more skills/subagents. People want agents to follow better software development processes. 
 
-But they're plugging into an existing coding agent that wasn't built to use them consistently and effectively. The result is inconsistent usage and mixed results, often having to repeatedly prompt the agent to actually use the skills. 
+But they're plugging into an existing coding agent that wasn't built around them. The result is inconsistent usage and mixed results, often having to repeatedly prompt the agent to actually use the skills. 
 
 Instead of plugging into an existing primitive, we built a new one from the ground up. Imagine Claude Code was actually built around Superpowers. **That's Magnitude.**
 
