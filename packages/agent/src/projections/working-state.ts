@@ -6,6 +6,7 @@
  */
 
 import { Signal, Projection } from '@magnitudedev/event-core'
+import { logger } from '@magnitudedev/logger'
 import type { AppEvent } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
 import { createId } from '../util/id'
@@ -245,7 +246,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
     turn_started: ({ event, fork, emit }) => {
       if (fork.working) {
-        console.error(`[WorkingState] OVERLAPPING TURN DETECTED: turn_started(${event.turnId}) arrived while turn ${fork.currentTurnId} is still in-flight on fork ${event.forkId ?? 'root'}`)
+        logger.error(`[WorkingState] OVERLAPPING TURN DETECTED: turn_started(${event.turnId}) arrived while turn ${fork.currentTurnId} is still in-flight on fork ${event.forkId ?? 'root'}`)
       }
 
       if (fork.pendingInboundCommunications.length > 0) {
@@ -274,7 +275,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
 
     turn_completed: ({ event, fork, emit }) => {
       if (fork.currentTurnId !== null && fork.currentTurnId !== event.turnId) {
-        console.error(`[WorkingState] STALE TURN_COMPLETED: got turnId=${event.turnId} but currentTurnId=${fork.currentTurnId} on fork ${event.forkId ?? 'root'}`)
+        logger.error(`[WorkingState] STALE TURN_COMPLETED: got turnId=${event.turnId} but currentTurnId=${fork.currentTurnId} on fork ${event.forkId ?? 'root'}`)
         return fork
       }
 
@@ -330,7 +331,7 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     // Unexpected error during turn - clear all flags, go stable
     turn_unexpected_error: ({ event, fork, emit }) => {
       if (fork.currentTurnId !== null && fork.currentTurnId !== event.turnId) {
-        console.error(`[WorkingState] STALE TURN_UNEXPECTED_ERROR: got turnId=${event.turnId} but currentTurnId=${fork.currentTurnId} on fork ${event.forkId ?? 'root'}`)
+        logger.error(`[WorkingState] STALE TURN_UNEXPECTED_ERROR: got turnId=${event.turnId} but currentTurnId=${fork.currentTurnId} on fork ${event.forkId ?? 'root'}`)
         return fork
       }
 
