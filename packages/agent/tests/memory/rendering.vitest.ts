@@ -21,7 +21,7 @@ describe('memory rendering', () => {
 
       const userTexts = yield* getRenderedUserText(h)
       expect(userTexts).toContain('<message from="user">hello there</message>')
-      expect(userTexts).not.toContain('--- ')
+      expect(userTexts).toContain('--- ')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -173,7 +173,7 @@ describe('memory rendering', () => {
     }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
   )
 
-  it.live('attention is synthesized for buried user messages', () =>
+  it.live('attention is not shown when only user messages are present', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -192,8 +192,7 @@ describe('memory rendering', () => {
 
       const text = yield* getRenderedUserText(h)
 
-      expect(text).toContain('<attention>')
-      expect(text).toContain('user message at')
+      expect(text).not.toContain('<attention>')
     }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
   )
 

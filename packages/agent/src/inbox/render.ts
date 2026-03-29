@@ -156,10 +156,6 @@ function maybeAttentionBullet(entry: TimelineEntry, timezone: string | null): st
   return null
 }
 
-function isSimpleUserOnly(timeline: readonly TimelineEntry[]): timeline is readonly [Extract<TimelineEntry, { kind: 'user_message' }>] {
-  return timeline.length === 1 && timeline[0]?.kind === 'user_message'
-}
-
 function buildLifecycleReminderLines(
   hooks: readonly Extract<TimelineEntry, { kind: 'lifecycle_hook' }>[],
   formatters: LifecycleReminderFormatterMap,
@@ -233,13 +229,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' }> => entry.kind !== 'lifecycle_hook',
   )
 
-  if (input.results.length === 0 && lifecycleHooks.length === 0 && isSimpleUserOnly(chronological)) {
-    const parts = renderUserMessageParts(chronological[0])
-    builder.pushParts(parts)
-    return builder.build()
-  }
-
-  const bullets: string[] = []
+  const attentionItems: { bullet: string, kind: TimelineEntry['kind'] }[] = []
   let lastMinute: string | null = null
   let lastDateKey: string | null = null
 
@@ -271,7 +261,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
 
     const bullet = maybeAttentionBullet(entry, input.timezone)
     if (bullet && (chronological.length - i - 1 > 0 || lifecycleHooks.length > 0)) {
-      bullets.push(bullet)
+      attentionItems.push({ bullet, kind: entry.kind })
     }
   }
 
@@ -280,8 +270,10 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<reminders>\n${reminderLines.map(line => `- ${line}`).join('\n')}\n</reminders>`)
   }
 
-  if (bullets.length > 0) {
-    builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<attention>\n${bullets.join('\n')}\n</attention>`)
+  const trivialAttention = attentionItems.length === 1 && attentionItems[0]?.kind === 'user_message'
+
+  if (attentionItems.length > 0 && !trivialAttention) {
+    builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<attention>\n${attentionItems.map((item) => item.bullet).join('\n')}\n</attention>`)
   }
 
   return builder.build()

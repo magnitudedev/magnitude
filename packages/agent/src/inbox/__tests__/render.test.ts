@@ -35,12 +35,12 @@ describe('formatInbox', () => {
     ])
   })
 
-  test('timeline-only single user message uses progressive activation (no marker)', () => {
+  test('timeline-only single user message includes marker', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'hello', attachments: [] },
     ]
     expect(formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })).toEqual([
-      { type: 'text', text: '<message from="user">hello</message>' },
+      { type: 'text', text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>' },
     ])
   })
 
@@ -67,7 +67,7 @@ describe('formatInbox', () => {
     expect(formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })).toEqual([
       {
         type: 'text',
-        text: '<message from="user">hello</message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
+        text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
       },
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
     ])
@@ -83,7 +83,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<message from="user">a</message>\n\n--- 16:01 ---\n<message from="user">b</message>\n\n<attention>\n- user message at 16:00\n</attention>',
+          '--- 2024-03-28 16:00 ---\n<message from="user">a</message>\n\n--- 16:01 ---\n<message from="user">b</message>',
       },
     ])
   })
@@ -97,7 +97,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:01 ---\n<message from="user">second</message>\n\n--- 16:00 ---\n<message from="user">first</message>\n\n<attention>\n- user message at 16:01\n</attention>',
+        '--- 2024-03-28 16:01 ---\n<message from="user">second</message>\n\n--- 16:00 ---\n<message from="user">first</message>',
     })
   })
 
@@ -131,7 +131,7 @@ describe('formatInbox', () => {
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
       {
         type: 'text',
-        text: '\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>\n\n<attention>\n- user message at 16:00\n</attention>',
+        text: '\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>',
       },
     ])
   })
@@ -145,7 +145,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:00 ---\n<message from="user">first-input</message>\n<message from="user">second-input</message>\n\n<attention>\n- user message at 16:00\n</attention>',
+        '--- 2024-03-28 16:00 ---\n<message from="user">first-input</message>\n<message from="user">second-input</message>',
     })
   })
 
@@ -283,7 +283,7 @@ describe('formatInbox', () => {
     expect(text).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n<workflow_phase name="wf" phase="2/3">phase text</workflow_phase>\n<phase_criteria name="c1" status="passed" type="agent" agent="a1"/>\n<phase_verdict passed="true"><verdict/></phase_verdict>\n<skill name="skill" phase="p1">start</skill>\n<skill_completed name="skill"/>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>\n\n<attention>\n- user message at 16:00\n</attention>',
+        '--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n<workflow_phase name="wf" phase="2/3">phase text</workflow_phase>\n<phase_criteria name="c1" status="passed" type="agent" agent="a1"/>\n<phase_verdict passed="true"><verdict/></phase_verdict>\n<skill name="skill" phase="p1">start</skill>\n<skill_completed name="skill"/>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>',
     })
   })
 })
