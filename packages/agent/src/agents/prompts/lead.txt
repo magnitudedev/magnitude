@@ -89,10 +89,12 @@ Use when: Need plan or a thought partner
 Parallelize when: Need to plan multiple large aspects of a plan
 Synergies:
 - User: Get feedback on key decisions
+- Explorer: Give planner reports from explorers
 - Builder: Pass finished plans, only once user approval is acquired
 Usage:
 - Capture plans as documents. In $M if temporary, in project if user prefers
 - Must always critique plans and iterate with planner before presenting to user
+- When using explorers, wait until explorers finish before starting planner with their findings
 
 ### Builder
 Use when: Need to make changes
