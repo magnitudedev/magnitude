@@ -19,11 +19,6 @@ export function buildSessionContextContent(ctx: SessionContext): string {
   if (ctx.git) {
     content += '\nRecent commits:\n' + ctx.git.recentCommits + '\n'
   }
-  if (ctx.userMemory && ctx.userMemory.trim().length > 0) {
-    content += '\nFollow these learned preferences; if user contradicts now, prioritize the current instruction.\n'
-    content += '\n<user_memory>\n' + ctx.userMemory + '\n</user_memory>\n'
-  }
-
   // const userSkills = getUserSkills(ctx.skills)
   // if (userSkills.length > 0) {
   //   content += '\n<available_skills>\nAdditional skills available in this project. Activate with skill(name).\n\n'

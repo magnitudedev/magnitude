@@ -44,7 +44,6 @@ export const MagnitudeConfigSchema = Schema.Struct({
   setupComplete: Schema.optional(Schema.Boolean),
   machineId: Schema.optional(Schema.String),
   telemetry: Schema.optional(Schema.Boolean),
-  memory: Schema.optional(Schema.Boolean),
   contextLimits: Schema.optional(ContextLimitPolicySchema),
 })
 export interface MagnitudeConfig extends Omit<Schema.Schema.Type<typeof MagnitudeConfigSchema>, 'roles'> {

@@ -64,7 +64,6 @@ export interface StorageClient<TSlot extends string = string> {
     setSetupComplete(value: boolean): Promise<void>
     getTelemetryEnabled(): Promise<boolean>
     setTelemetryEnabled(value: boolean): Promise<void>
-    getMemoryEnabled(): Promise<boolean>
 
     getProviderOptions(providerId: string): Promise<ProviderOptions | undefined>
     getLocalProviderConfig(): Promise<
@@ -218,10 +217,6 @@ export async function createStorageClient<TSlot extends string = string>(options
 
       setTelemetryEnabled(value) {
         return run(Effect.flatMap(ConfigStorage, (s) => s.setTelemetryEnabled(value)))
-      },
-
-      getMemoryEnabled() {
-        return run(Effect.flatMap(ConfigStorage, (s) => s.getMemoryEnabled()))
       },
 
       async getProviderOptions(providerId) {

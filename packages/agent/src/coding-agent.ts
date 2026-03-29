@@ -68,7 +68,7 @@ import { MAGNITUDE_SLOTS, type MagnitudeSlot } from './model-slots'
 import type { StorageClient } from '@magnitudedev/storage'
 import { initLogger } from '@magnitudedev/logger'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
-import { createMemoryExtractionJob, drainPendingJobsOnStartup, spawnDetachedMemoryExtractionWorker, writePendingJob } from './memory/job-queue'
+
 import { EphemeralSessionContextTag } from './agents/types'
 
 // =============================================================================
@@ -184,23 +184,13 @@ export interface CreateClientOptions {
  * - If events exist: hydrates projections and sandbox from persisted state
  * - If no events: initializes a new session
  */
-let hasDrainedPendingMemoryJobs = false
-
 export async function createCodingAgentClient(options: CreateClientOptions) {
-  const memoryEnabled = await options.storage.config.getMemoryEnabled()
 
   // Bootstrap provider runtime from stored config / env vars unless the caller
   // supplied a pre-configured runtime (e.g. headless oneshot mode).
   const providerRuntime = options.providerRuntime ?? makeProviderRuntimeLive<MagnitudeSlot>()
   if (!options.providerRuntime) {
     await Effect.runPromise(bootstrapProviderRuntime<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS }).pipe(Effect.provide(providerRuntime)))
-  }
-
-  if (!hasDrainedPendingMemoryJobs) {
-    hasDrainedPendingMemoryJobs = true
-    if (memoryEnabled) {
-      drainPendingJobsOnStartup(options.storage).catch(() => {})
-    }
   }
 
   // Enable tracing in debug mode
@@ -257,7 +247,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // New session
       const baseContext = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext({
         cwd: process.cwd(),
-        memoryEnabled,
         storage: options.storage,
       })))
 
@@ -378,26 +367,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
   const originalDispose = client.dispose.bind(client)
 
-  // NOTE: Memory extraction trigger lives only here (wrapped dispose) so all teardown paths
-  // (CLI and server) converge through one durable marker + best-effort worker flow.
   const dispose = async () => {
-
-    let jobPath: string | null = null
-    if (memoryEnabled) {
-      try {
-        const metadata = await client.runEffect(Effect.gen(function* () {
-          const persistence = yield* ChatPersistence
-          return yield* persistence.getSessionMetadata()
-        }))
-        const cwd = metadata.workingDirectory
-        const sessionId = metadata.sessionId
-        const eventsPath = options.storage.sessions.getEventsPath(sessionId)
-        const memoryPath = options.storage.memory.getPath()
-        const job = createMemoryExtractionJob({ sessionId, cwd, eventsPath, memoryPath })
-        jobPath = await writePendingJob(options.storage, job)
-      } catch {}
-    }
-
     try {
       // Best-effort flush of pending events to disk. If the session was mid-turn,
       // hydration recovery will detect non-stable forks on next startup and emit
@@ -406,10 +376,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     } catch {}
 
     await originalDispose()
-
-    if (jobPath) {
-      spawnDetachedMemoryExtractionWorker(jobPath)
-    }
   }
 
   return {

@@ -31,7 +31,6 @@ async function initSession(client: Awaited<ReturnType<typeof TestAgent.createCli
       folderStructure: '.',
       agentsFile: null,
       skills: null,
-      userMemory: null,
     },
   })
 }

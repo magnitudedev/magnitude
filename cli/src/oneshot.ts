@@ -111,7 +111,6 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
   const cwd = process.cwd()
   const sessionContext = await collectSessionContext({
     cwd,
-    memoryEnabled: false,
     storage,
     oneshot: { prompt },
   })

@@ -59,12 +59,6 @@ const makeConfigStorageShape = <TSlot extends string>(
       }))
     }),
 
-  getMemoryEnabled: () =>
-    Effect.promise(async () => {
-      const config = await loadConfig(globalStorage.paths)
-      return config.memory !== false
-    }),
-
   getRoleConfig: (slot: TSlot) =>
     Effect.map(
       Effect.promise(() => loadConfig(globalStorage.paths)),

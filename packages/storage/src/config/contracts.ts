@@ -19,7 +19,6 @@ export interface ConfigStorageShape<TSlot extends string> {
   readonly setSetupComplete: (value: boolean) => Effect.Effect<void>
   readonly getTelemetryEnabled: () => Effect.Effect<boolean>
   readonly setTelemetryEnabled: (value: boolean) => Effect.Effect<void>
-  readonly getMemoryEnabled: () => Effect.Effect<boolean>
 
   readonly getRoleConfig: (slot: TSlot) => Effect.Effect<RoleConfig | null>
   readonly getRoleConfigs: () => Effect.Effect<Record<TSlot, RoleConfig>>

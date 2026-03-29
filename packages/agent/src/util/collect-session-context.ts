@@ -147,23 +147,12 @@ async function readAgentsFile(cwd: string): Promise<{ filename: string; content:
   return null
 }
 
-async function readUserMemory(cwd: string, storage?: StorageClient<MagnitudeSlot>): Promise<string | null> {
-  try {
-    const content = storage ? await storage.memory.read() : await readFile(join(cwd, '.magnitude', 'memory.md'), 'utf8')
-    const trimmed = content.trim()
-    return trimmed.length > 0 ? trimmed : null
-  } catch {
-    return null
-  }
-}
-
 // =============================================================================
 // Main Collection
 // =============================================================================
 
 export interface CollectSessionContextOptions {
   cwd?: string
-  memoryEnabled?: boolean
   storage?: StorageClient<MagnitudeSlot>
   oneshot?: {
     prompt: string
@@ -173,15 +162,13 @@ export interface CollectSessionContextOptions {
 export async function collectSessionContext(opts?: CollectSessionContextOptions): Promise<Omit<SessionContext, 'workspacePath'>> {
   const cwd = opts?.cwd ?? process.cwd()
   const platform = normalizePlatform(process.platform)
-  const memoryEnabled = opts?.memoryEnabled ?? true
 
-  const [git, folderStructure, userInfo, agentsFile, skills, userMemory] = await Promise.all([
+  const [git, folderStructure, userInfo, agentsFile, skills] = await Promise.all([
     collectGitContext(cwd),
     collectFolderStructure(cwd),
     collectUserInfo(platform),
     readAgentsFile(cwd),
     scanSkills(cwd),
-    memoryEnabled ? readUserMemory(cwd, opts?.storage) : Promise.resolve(null),
   ])
 
   return {
@@ -195,7 +182,6 @@ export async function collectSessionContext(opts?: CollectSessionContextOptions)
     folderStructure,
     agentsFile,
     skills: skills.length > 0 ? skills : null,
-    userMemory,
     oneshot: opts?.oneshot,
   }
 }

@@ -19,7 +19,6 @@ import { geminiGroundingEval } from './evals/gemini-grounding/index'
 import { oneShotsEval } from './evals/one-shots/index'
 import { leadDispatchEval } from './evals/lead-dispatch/index'
 import { behaviorEval } from './evals/behavior/index'
-import { memoryExtractionEval } from './evals/memory-extraction/index'
 import { approvalRuleEval } from './evals/approval-rule/index'
 import { xmlNewlinesEval } from './evals/xml-newlines/index'
 import { entityEscapingEval } from './evals/entity-escaping/index'
@@ -60,7 +59,6 @@ const EVALS: Record<string, Eval> = {
   'one-shots': oneShotsEval,
   'lead-dispatch': leadDispatchEval,
   behavior: behaviorEval,
-  'memory-extraction': memoryExtractionEval,
   'approval-rule': approvalRuleEval,
   'xml-newlines': xmlNewlinesEval,
   'entity-escaping': entityEscapingEval,

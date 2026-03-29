@@ -7,11 +7,11 @@
 </p>
 
 
-Magnitude is an **open source coding agent** that orchestrates a full dev team of specialized subagents. A lead agent delegates across explorers, planners, builders, reviewers, debuggers, and a browser agent.
+Magnitude is an **open source coding agent** that orchestrates a full dev team of subagents. A lead agent delegates across explorers, planners, builders, reviewers, debuggers, and a browser agent.
 
-- **Everything runs in subagents.** The lead stays focused on orchestration, while subagents handle the implementation details. The lead's context stays clean.
+- **Everything runs in subagents.** The lead stays focused on orchestration, while subagents handle implementation. The lead's context stays clean.
 - **The dev process is built in.** The lead runs an explore, plan, build, review, debug cycle, iterating until checks pass or it needs your input. No manual orchestration.
-- **Subagents stay alive.** The lead can tell the planner to consider more angles, or send bugs back to the same builder, avoiding re-exploration and saving time and tokens.
+- **Subagents stay alive.** The lead can tell the planner to consider more angles, or send bugs back to the same builder. No re-exploration, saving time and tokens.
 - **Agents share context through files, not summaries.** No output tokens burned on lossy summaries. Every handoff is a file you can view later.
 - **Mix models by role.** Fast models for exploration. Frontier models for planning and review. You control the cost-intelligence tradeoff.
 

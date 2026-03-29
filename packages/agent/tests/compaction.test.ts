@@ -25,7 +25,6 @@ const baseContext = (): SessionContext => ({
   folderStructure: '.',
   agentsFile: null,
   skills: null,
-  userMemory: null,
 })
 
 const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'turn_completed' }>> = {}): Extract<AppEvent, { type: 'turn_completed' }> => ({

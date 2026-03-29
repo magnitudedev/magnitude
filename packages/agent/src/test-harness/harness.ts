@@ -185,7 +185,6 @@ function defaultSessionContext(overrides: Partial<SessionContext> = {}): Session
     folderStructure: '.',
     agentsFile: null,
     skills: null,
-    userMemory: null,
     ...overrides,
   }
 }

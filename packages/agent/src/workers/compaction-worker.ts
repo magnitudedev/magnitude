@@ -33,7 +33,6 @@ import { WorkingStateProjection } from '../projections/working-state'
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
 import { getAgentDefinition } from '../agents'
 import { ModelResolver, CodingAgentCompact, ProviderState } from '@magnitudedev/providers'
-import { AppConfig } from '@magnitudedev/storage'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
 import type { SessionContext } from '../events'
@@ -172,14 +171,12 @@ function startCompaction(
     })
 
     const contextEffect = Effect.gen(function* () {
-      const config = yield* AppConfig
-      const memoryEnabled = yield* config.getMemoryEnabled()
       const sessionCtx = yield* read(SessionContextProjection)
       const workspacePath = sessionCtx.context?.workspacePath
       if (!workspacePath) throw new Error('workspacePath not available during compaction')
       return yield* Effect.tryPromise({
         try: async () => {
-          const base = await collectSessionContext({ memoryEnabled })
+          const base = await collectSessionContext()
           return { ...base, workspacePath } as SessionContext
         },
         catch: (error) => error instanceof Error ? error : new Error(String(error))
