@@ -83,12 +83,8 @@ describe('Agent test harness integration', () => {
     }
   })
 
-  test('toolOverrides option accepted', async () => {
-    const harness = await createAgentTestHarness({
-      toolOverrides: {
-        shell: () => ({ stdout: 'mocked', stderr: '', exitCode: 0 }),
-      },
-    })
+  test('harness creates without tool overrides', async () => {
+    const harness = await createAgentTestHarness()
     try {
       expect(harness).toBeTruthy()
     } finally {

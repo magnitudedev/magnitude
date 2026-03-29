@@ -8,6 +8,7 @@ import { CHARS_PER_TOKEN } from '../src/constants'
 import { textParts } from '../src/content'
 import { getAgentDefinition } from '../src/agents'
 import { renderSystemPrompt } from '../src/prompts/system-prompt'
+import { createId } from '../src/util/id'
 
 const root = null
 const leadSystemPromptTokens = Math.ceil(renderSystemPrompt(getAgentDefinition('lead')).length / CHARS_PER_TOKEN)
@@ -62,7 +63,9 @@ describe('Compaction', async () => {
 
         await h.send({
           type: 'user_message',
+          messageId: createId(),
           forkId: root,
+          timestamp: Date.now(),
           content: textParts('A'.repeat(300)),
           attachments: [],
           mode: 'text',
@@ -78,7 +81,9 @@ describe('Compaction', async () => {
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
+          messageId: createId(),
           forkId: root,
+          timestamp: Date.now(),
           content: textParts('hello'),
           attachments: [],
           mode: 'text',
@@ -230,7 +235,9 @@ describe('Compaction', async () => {
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
+          messageId: createId(),
           forkId: root,
+          timestamp: Date.now(),
           content: textParts('wake up'),
           attachments: [],
           mode: 'text',
@@ -256,7 +263,9 @@ describe('Compaction', async () => {
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
+          messageId: createId(),
           forkId: root,
+          timestamp: Date.now(),
           content: textParts('wake up'),
           attachments: [],
           mode: 'text',
@@ -324,7 +333,9 @@ describe('Compaction', async () => {
       withHarness(async (h) => {
         await h.send({
           type: 'user_message',
+          messageId: createId(),
           forkId: root,
+          timestamp: Date.now(),
           content: textParts('first message'),
           attachments: [],
           mode: 'text',
@@ -333,7 +344,9 @@ describe('Compaction', async () => {
         })
         await h.send({
           type: 'user_message',
+          messageId: createId(),
           forkId: root,
+          timestamp: Date.now(),
           content: textParts('second message'),
           attachments: [],
           mode: 'text',
@@ -391,7 +404,9 @@ describe('Compaction', async () => {
         async (h) => {
           await h.send({
             type: 'user_message',
+            messageId: createId(),
             forkId: root,
+            timestamp: Date.now(),
             content: textParts('X'.repeat(60_000)),
             attachments: [],
             mode: 'text',

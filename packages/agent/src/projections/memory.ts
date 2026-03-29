@@ -6,39 +6,92 @@
  */
 
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart, StrategyId, Attachment, ResolvedMention } from '../events'
+import type { ObservationPart } from '@magnitudedev/roles'
+import type { AppEvent, ResponsePart, StrategyId, ImageAttachment } from '../events'
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
-
-
 import { SubagentActivityProjection } from './subagent-activity'
-
 import { CanonicalTurnProjection } from './canonical-turn'
-
 import { OutboundMessagesProjection } from './outbound-messages'
-
-import {
-  compactionSummaryTag, buildSessionContextContent,
-
-  formatCommsInbox, formatSystemInbox,
-} from '../prompts'
+import { compactionSummaryTag, buildSessionContextContent } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
+import { UserMessageResolutionProjection } from './user-message-resolution'
 import { getAgentDefinition, isValidVariant } from '../agents'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { formatSkillInitialPrompt } from '../prompts/skills'
-import { ContentPart, textParts, wrapTextParts } from '../content'
-import { formatAgentIdleNotification, formatSubagentUserKilledNotification, type CommsAttachment, type CommsEntry, type SystemEntry } from '../prompts/agents'
-import { FileAwarenessProjection } from './file-awareness'
+import { ContentPart, ImageMediaType, textParts, wrapTextParts } from '../content'
+
 import { EMPTY_RESPONSE_ERROR } from '../prompts/error-states'
+import { formatInbox } from '../inbox/render'
+import type {
+  ResultEntry,
+  TimelineEntry,
+  TimelineAttachment,
+  QueuedEntry,
+  AgentAtom,
+  PhaseCriteriaPayload,
+  LifecycleReminderFormatterMap,
+} from '../inbox/types'
+import {
+  toResultToolResults,
+  toResultInterrupted,
+  toResultError,
+  toResultNoop,
+  toTimelineUserMessage,
+  toTimelineUserToAgent,
+  toTimelineUserPresence,
+  toTimelineObservation,
+  toTimelineAgentBlock,
+  toTimelineSubagentUserKilled,
+  toTimelineSkillStarted,
+  toTimelineSkillCompleted,
+  toTimelinePhaseCriteria,
+  toTimelinePhaseVerdict,
+  toTimelineWorkflowPhase,
+  toTimelineLifecycleHook,
+} from '../inbox/compose'
+import { builderRole } from '../agents/builder'
+import { explorerRole } from '../agents/explorer'
+import { plannerRole } from '../agents/planner'
+import { reviewerRole } from '../agents/reviewer'
+
+const lifecycleReminderFormatters: LifecycleReminderFormatterMap = {
+  builder: {
+    spawn: builderRole.lifecyclePrompts?.parentOnSpawn,
+    idle: builderRole.lifecyclePrompts?.parentOnIdle,
+  },
+  explorer: {
+    spawn: explorerRole.lifecyclePrompts?.parentOnSpawn,
+    idle: explorerRole.lifecyclePrompts?.parentOnIdle,
+  },
+  planner: {
+    spawn: plannerRole.lifecyclePrompts?.parentOnSpawn,
+    idle: plannerRole.lifecyclePrompts?.parentOnIdle,
+  },
+  reviewer: {
+    spawn: reviewerRole.lifecyclePrompts?.parentOnSpawn,
+    idle: reviewerRole.lifecyclePrompts?.parentOnIdle,
+  },
+}
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
 export type Message =
   | { readonly type: 'session_context'; readonly source: 'system'; readonly content: ContentPart[] }
-  | { readonly type: 'assistant_turn'; readonly source: 'agent'; readonly content: ContentPart[]; readonly strategyId: StrategyId; readonly responseParts: readonly ResponsePart[] }
+  | {
+      readonly type: 'assistant_turn'
+      readonly source: 'agent'
+      readonly content: ContentPart[]
+      readonly strategyId: StrategyId
+      readonly responseParts: readonly ResponsePart[]
+    }
   | { readonly type: 'compacted'; readonly source: 'system'; readonly content: ContentPart[] }
   | { readonly type: 'fork_context'; readonly source: 'system'; readonly content: ContentPart[] }
-  | { readonly type: 'comms_inbox'; readonly source: 'system'; readonly entries: readonly CommsEntry[] }
-  | { readonly type: 'system_inbox'; readonly source: 'system'; readonly entries: readonly SystemEntry[] }
+  | {
+      readonly type: 'inbox'
+      readonly source: 'system'
+      readonly results: readonly ResultEntry[]
+      readonly timeline: readonly TimelineEntry[]
+    }
 
 export interface LLMMessage {
   readonly role: 'user' | 'assistant'
@@ -47,27 +100,13 @@ export interface LLMMessage {
 
 export type Perspective = 'agent' | 'autopilot'
 
-export interface QueuedCommsMessage {
-  readonly kind: 'comms'
-  readonly entry: CommsEntry
-}
-
-export interface QueuedSystemMessage {
-  readonly kind: 'system'
-  readonly timestamp: number
-  readonly entry: SystemEntry
-  readonly coalesceKey?: string
-}
-
-export type QueuedMessage = QueuedCommsMessage | QueuedSystemMessage
-
 export interface ForkMemoryState {
   readonly messages: readonly Message[]
-  readonly queuedMessages: readonly QueuedMessage[]
+  readonly queuedEntries: readonly QueuedEntry[]
   readonly currentTurnId: string | null
-  readonly currentTurnToolCalls: readonly []
   readonly currentChainId: string | null
   readonly pendingPresenceText: string | null
+  readonly nextQueueSeq: number
 }
 
 function flattenResponseText(parts: readonly ResponsePart[]): string {
@@ -84,87 +123,132 @@ function extractText(parts: readonly ContentPart[]): string {
     .join('')
 }
 
-function toCommsAttachment(attachment: Attachment): CommsAttachment {
-  switch (attachment.type) {
-    case 'image':
-      return { kind: 'image', base64: attachment.base64, mediaType: attachment.mediaType, width: attachment.width, height: attachment.height }
-    case 'mention':
-      return { kind: 'mention', path: attachment.path, contentType: attachment.contentType, content: attachment.content }
+function appendNewInbox(messages: readonly Message[], options: { results?: readonly ResultEntry[], timeline?: readonly TimelineEntry[] }): readonly Message[] {
+  const results = options.results ?? []
+  const timeline = options.timeline ?? []
+  if (results.length === 0 && timeline.length === 0) return messages
+  return [...messages, { type: 'inbox', source: 'system', results: [...results], timeline: [...timeline] }]
+}
+
+function enqueueResult(
+  fork: ForkMemoryState,
+  entry: ResultEntry,
+  timestamp: number,
+  coalesceKey?: string,
+): ForkMemoryState {
+  const seq = fork.nextQueueSeq
+  const queued: QueuedEntry = { lane: 'result', timestamp, seq, entry, coalesceKey }
+  const queuedEntries = coalesceKey
+    ? [...fork.queuedEntries.filter(q => q.coalesceKey !== coalesceKey), queued]
+    : [...fork.queuedEntries, queued]
+  return { ...fork, queuedEntries, nextQueueSeq: seq + 1 }
+}
+
+function enqueueTimeline(
+  fork: ForkMemoryState,
+  entry: TimelineEntry,
+  timestamp: number,
+  coalesceKey?: string,
+): ForkMemoryState {
+  const seq = fork.nextQueueSeq
+  const queued: QueuedEntry = { lane: 'timeline', timestamp, seq, entry, coalesceKey }
+  const queuedEntries = coalesceKey
+    ? [...fork.queuedEntries.filter(q => q.coalesceKey !== coalesceKey), queued]
+    : [...fork.queuedEntries, queued]
+  return { ...fork, queuedEntries, nextQueueSeq: seq + 1 }
+}
+
+function flushQueue(fork: ForkMemoryState): ForkMemoryState {
+  const sorted = [...fork.queuedEntries].sort((a, b) => (a.timestamp - b.timestamp) || (a.seq - b.seq))
+  const results: ResultEntry[] = []
+  const timeline: TimelineEntry[] = []
+
+  for (const queued of sorted) {
+    if (queued.lane === 'result') {
+      results.push(queued.entry)
+    } else {
+      timeline.push(queued.entry)
+    }
+  }
+
+  return {
+    ...fork,
+    messages: appendNewInbox(fork.messages, { results, timeline }),
+    queuedEntries: [],
   }
 }
 
-function patchCommsEntryMentions(entry: CommsEntry, resolvedMentions: readonly ResolvedMention[]): CommsEntry {
-  if (entry.kind !== 'user' || !entry.attachments || entry.attachments.length === 0) return entry
+function enqueueAgentAtomBlock(
+  fork: ForkMemoryState,
+  args: {
+    timestamp: number
+    agentId: string
+    role: string
+    atoms: readonly AgentAtom[]
+  },
+): ForkMemoryState {
+  if (args.atoms.length === 0) return fork
 
-  const resolvedByKey = new Map(resolvedMentions.map(mention => [`${mention.contentType}:${mention.path}`, mention] as const))
-  let changed = false
+  const last = fork.queuedEntries[fork.queuedEntries.length - 1]
+  if (
+    last
+    && last.lane === 'timeline'
+    && last.entry.kind === 'agent_block'
+    && last.entry.agentId === args.agentId
+  ) {
+    const mergedEntry = toTimelineAgentBlock({
+      timestamp: last.entry.timestamp,
+      firstAtomTimestamp: last.entry.firstAtomTimestamp,
+      lastAtomTimestamp: args.atoms[args.atoms.length - 1]!.timestamp,
+      agentId: last.entry.agentId,
+      role: last.entry.role,
+      atoms: [...last.entry.atoms, ...args.atoms],
+    })
 
-  const attachments = entry.attachments.map(attachment => {
-    if (attachment.kind !== 'mention') return attachment
-    const resolved = resolvedByKey.get(`${attachment.contentType}:${attachment.path}`)
-    if (!resolved) return attachment
+    const mergedQueued: QueuedEntry = {
+      ...last,
+      timestamp: Math.min(last.timestamp, args.timestamp),
+      entry: mergedEntry,
+    }
 
-    changed = true
     return {
-      ...attachment,
-      content: resolved.content,
-      error: resolved.error,
-      truncated: resolved.truncated,
-      originalBytes: resolved.originalBytes,
-    }
-  })
-
-  return changed ? { ...entry, attachments } : entry
-}
-
-function patchCommsCollections(
-  messages: readonly Message[],
-  queuedMessages: readonly QueuedMessage[],
-  sourceMessageTimestamp: number,
-  resolvedMentions: readonly ResolvedMention[]
-): { messages: readonly Message[]; queuedMessages: readonly QueuedMessage[] } {
-  const patchedMessages = messages.map(message => {
-    if (message.type !== 'comms_inbox') return message
-    const entries = message.entries.map(entry =>
-      entry.kind === 'user' && entry.timestamp === sourceMessageTimestamp
-        ? patchCommsEntryMentions(entry, resolvedMentions)
-        : entry
-    )
-    return { ...message, entries }
-  })
-
-  const patchedQueuedMessages = queuedMessages.map(queued => {
-    if (queued.kind !== 'comms') return queued
-    if (queued.entry.kind !== 'user' || queued.entry.timestamp !== sourceMessageTimestamp) return queued
-    return { ...queued, entry: patchCommsEntryMentions(queued.entry, resolvedMentions) }
-  })
-
-  return { messages: patchedMessages, queuedMessages: patchedQueuedMessages }
-}
-
-/** Append system entries to a messages array, merging with the most recent system_inbox if no assistant message is in between */
-function appendSystemEntries(messages: readonly Message[], entries: readonly SystemEntry[]): readonly Message[] {
-  if (entries.length === 0) return messages
-  const result = [...messages]
-  for (let i = result.length - 1; i >= 0; i--) {
-    if (result[i].source === 'agent') break
-    if (result[i].type === 'system_inbox') {
-      const existing = result[i] as Message & { readonly entries: readonly SystemEntry[] }
-      result[i] = { type: 'system_inbox', source: 'system' as const, entries: [...existing.entries, ...entries] }
-      return result
+      ...fork,
+      queuedEntries: [...fork.queuedEntries.slice(0, -1), mergedQueued],
     }
   }
-  result.push({ type: 'system_inbox', source: 'system', entries })
-  return result
+
+  return enqueueTimeline(
+    fork,
+    toTimelineAgentBlock({
+      timestamp: args.timestamp,
+      firstAtomTimestamp: args.atoms[0]!.timestamp,
+      lastAtomTimestamp: args.atoms[args.atoms.length - 1]!.timestamp,
+      agentId: args.agentId,
+      role: args.role,
+      atoms: args.atoms,
+    }),
+    args.timestamp,
+  )
 }
 
+function toContentPartFromObservation(part: ObservationPart): ContentPart {
+  if (part.type === 'text') {
+    return { type: 'text', text: part.text }
+  }
+
+  return {
+    type: 'image',
+    base64: part.base64,
+    mediaType: part.mediaType as ImageMediaType,
+    width: part.width,
+    height: part.height,
+  }
+}
 
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
-  const content = message.type === 'comms_inbox'
-    ? formatCommsInbox(message.entries, timezone)
-    : message.type === 'system_inbox'
-      ? formatSystemInbox(message.entries)
-      : message.content
+  const content = message.type === 'inbox'
+    ? formatInbox({ results: message.results, timeline: message.timeline, timezone, lifecycleReminderFormatters })
+    : message.content
 
   if (message.type === 'compacted') {
     return { role: 'user', content: wrapTextParts(content, text => compactionSummaryTag(text)) }
@@ -190,15 +274,15 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
-  reads: [AgentStatusProjection, FileAwarenessProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection] as const,
+  reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection] as const,
   signals: {},
   initialFork: {
     messages: [],
-    queuedMessages: [],
+    queuedEntries: [],
     currentTurnId: null,
-    currentTurnToolCalls: [],
     currentChainId: null,
     pendingPresenceText: null,
+    nextQueueSeq: 0,
   },
 
   eventHandlers: {
@@ -215,107 +299,51 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         content: textParts(
           '<task>\n'
           + event.prompt
-          + '\n</task>\n\n<critical-reminder>Thoroughly and efficiently complete this task. Be strategic and creative, try multiple approaches in parallel when appropriate, but ensure that the task is fully complete and the environment is clean before you finish.</critical-reminder>'
+          + '\n</task>\n\n<critical-reminder>Thoroughly and efficiently complete this task. Be strategic and creative, try multiple approaches in parallel when appropriate, but ensure that the task is fully complete and the environment is clean before you finish.</critical-reminder>',
         ),
       }
-      return {
-        ...fork,
-        messages: [...fork.messages, taskMessage],
-      }
-    },
-
-    user_message: ({ event, fork }) => {
-      const text = extractText(event.content)
-      const attachments = (event.attachments ?? []).map(toCommsAttachment)
-      const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments }
-
-      if (event.forkId !== null || fork.currentTurnId !== null) {
-        return {
-          ...fork,
-          queuedMessages: [...fork.queuedMessages, { kind: 'comms', entry }],
-        }
-      }
-
-      return {
-        ...fork,
-        messages: [...fork.messages, { type: 'comms_inbox', source: 'system', entries: [entry] }],
-      }
+      return { ...fork, messages: [...fork.messages, taskMessage] }
     },
 
     skill_activated: ({ event, fork }) => {
-      // Only add to memory as user message when activated by user
       if (event.source !== 'user') return fork
-
       const text = event.message ? `/${event.skillName} ${event.message}` : `/${event.skillName}`
-      const entry: CommsEntry = { kind: 'user', timestamp: event.timestamp, text, attachments: [] }
-
-      if (event.forkId !== null || fork.currentTurnId !== null) {
-        return {
-          ...fork,
-          queuedMessages: [...fork.queuedMessages, { kind: 'comms', entry }],
-        }
-      }
-
-      return {
-        ...fork,
-        messages: [...fork.messages, { type: 'comms_inbox', source: 'system', entries: [entry] }],
-      }
+      const entry = toTimelineUserMessage({ timestamp: event.timestamp, text, attachments: [] })
+      return enqueueTimeline(fork, entry, event.timestamp)
     },
 
-    file_mention_resolved: ({ event, fork }) => {
-      const patched = patchCommsCollections(
-        fork.messages,
-        fork.queuedMessages,
-        event.sourceMessageTimestamp,
-        event.mentions
-      )
-      return {
-        ...fork,
-        messages: patched.messages,
-        queuedMessages: patched.queuedMessages,
-      }
-    },
 
 
     turn_started: ({ event, fork, read }) => {
-      const commsEntries = fork.queuedMessages
-        .filter((q): q is QueuedCommsMessage => q.kind === 'comms')
-        .map(q => q.entry)
-        .sort((a, b) => a.timestamp - b.timestamp)
+      let nextFork = fork
 
-      const systemEntries = fork.queuedMessages
-        .filter((q): q is QueuedSystemMessage => q.kind === 'system')
-        .sort((a, b) => a.timestamp - b.timestamp)
-        .map(q => q.entry)
-
-      const flushedMessages: Message[] = []
-
-      // Inject pending presence notification
-      if (event.forkId === null && fork.pendingPresenceText !== null) {
-        systemEntries.unshift({ kind: 'reminder', text: fork.pendingPresenceText })
+      if (event.forkId === null && nextFork.pendingPresenceText !== null) {
+        nextFork = enqueueTimeline(
+          nextFork,
+          toTimelineUserPresence({ timestamp: event.timestamp, text: nextFork.pendingPresenceText, confirmed: true }),
+          event.timestamp,
+        )
       } else if (event.forkId === null && read(UserPresenceProjection).currentFocusState === false) {
-        systemEntries.unshift({ kind: 'reminder', text: formatUserPresence(false) })
+        nextFork = enqueueTimeline(
+          nextFork,
+          toTimelineUserPresence({ timestamp: event.timestamp, text: formatUserPresence(false), confirmed: false }),
+          event.timestamp,
+        )
       }
 
-      if (systemEntries.length > 0) {
-        flushedMessages.push({ type: 'system_inbox', source: 'system', entries: systemEntries })
-      }
-      if (commsEntries.length > 0) {
-        flushedMessages.push({ type: 'comms_inbox', source: 'system', entries: commsEntries })
-      }
+      const hadQueuedEntries = nextFork.queuedEntries.length > 0
+      const flushed = flushQueue(nextFork)
 
-      let messages: readonly Message[] = [...fork.messages, ...flushedMessages]
+      let messages = flushed.messages
       const lastMessage = messages[messages.length - 1]
-      if (lastMessage && lastMessage.source === 'agent') {
-        messages = appendSystemEntries(messages, [{ kind: 'noop' }])
+      if (!hadQueuedEntries && lastMessage?.source === 'agent') {
+        messages = [...messages, { type: 'inbox', source: 'system', results: [toResultNoop()], timeline: [] }]
       }
 
       return {
-        ...fork,
+        ...flushed,
         messages,
-        queuedMessages: [],
         currentTurnId: event.turnId,
-        currentTurnToolCalls: [],
         currentChainId: event.chainId,
         pendingPresenceText: null,
       }
@@ -325,16 +353,12 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
     observations_captured: ({ event, fork }) => {
       if (fork.currentTurnId !== event.turnId) return fork
-
-      const observationEntries: SystemEntry[] = event.parts.map(part => ({
-        kind: 'observation' as const,
-        part,
-      }))
-
-      return {
-        ...fork,
-        messages: appendSystemEntries(fork.messages, observationEntries),
-      }
+      const nextFork = enqueueTimeline(
+        fork,
+        toTimelineObservation({ timestamp: event.timestamp, parts: event.parts.map(toContentPartFromObservation) }),
+        event.timestamp,
+      )
+      return flushQueue(nextFork)
     },
 
     turn_completed: ({ event, fork, read }) => {
@@ -358,142 +382,139 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         })
       }
 
-      const systemEntries: SystemEntry[] = []
+      let nextFork: ForkMemoryState = { ...fork, messages: newMessages, currentTurnId: null }
+
       if (event.responseParts.length === 0 && !isCancelled && event.result.success) {
-        // Empty response on a successful turn — synthesize a placeholder assistant message
-        // and queue an error so the model sees what happened and can self-correct.
-        // Skip for cancelled/failed turns where empty responseParts is expected.
-        newMessages.push({
-          type: 'assistant_turn',
-          source: 'agent',
-          content: textParts('(empty response)'),
-          strategyId: event.strategyId,
-          responseParts: [],
-        })
-        systemEntries.push({ kind: 'error', message: EMPTY_RESPONSE_ERROR })
+        nextFork = {
+          ...nextFork,
+          messages: [
+            ...nextFork.messages,
+            {
+              type: 'assistant_turn',
+              source: 'agent',
+              content: textParts('(empty response)'),
+              strategyId: event.strategyId,
+              responseParts: [],
+            },
+          ],
+        }
+        nextFork = enqueueResult(nextFork, toResultError({ message: EMPTY_RESPONSE_ERROR }), event.timestamp)
       }
 
       const hasError = !event.result.success
       const errorMessage = hasError ? event.result.error : undefined
       const observedResults = isCancelled ? [] : event.observedResults
-      if (event.toolCalls.length > 0 || observedResults.length > 0 || hasError) {
-        systemEntries.push({ kind: 'tool_results', toolCalls: event.toolCalls, observedResults, error: errorMessage })
+      if (event.toolCalls.length > 0 || observedResults.length > 0) {
+        nextFork = enqueueResult(
+          nextFork,
+          toResultToolResults({ toolCalls: event.toolCalls, observedResults }),
+          event.timestamp,
+        )
       }
-      if (event.result.success && event.result.reminder) {
-        systemEntries.push({ kind: 'reminder', text: event.result.reminder })
+      if (errorMessage) {
+        nextFork = enqueueResult(nextFork, toResultError({ message: errorMessage }), event.timestamp)
+      }
+      if (event.result.success && event.result.errors && event.result.errors.length > 0) {
+        for (const err of event.result.errors) {
+          nextFork = enqueueResult(nextFork, toResultError({ message: err.message }), event.timestamp)
+        }
+      }
+      if (event.result.success && event.result.oneshotLivenessTriggered) {
+        nextFork = enqueueResult(nextFork, { kind: 'oneshot_liveness' }, event.timestamp)
       }
       if (isCancelled) {
-        systemEntries.push({ kind: 'interrupted' })
+        nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
       }
 
-      const newQueuedMessages = systemEntries.map(entry => ({
-        kind: 'system' as const,
-        timestamp: event.timestamp,
-        entry,
-      }))
-
-      return {
-        ...fork,
-        messages: newMessages,
-        queuedMessages: [...fork.queuedMessages, ...newQueuedMessages],
-        currentTurnId: null,
-        currentTurnToolCalls: []
-      }
+      return nextFork
     },
 
     turn_unexpected_error: ({ event, fork }) => {
       if (fork.currentTurnId !== event.turnId) return fork
-      return {
-        ...fork,
-        messages: appendSystemEntries(fork.messages, [{ kind: 'error', message: event.message }]),
-        currentTurnId: null,
-        currentTurnToolCalls: []
-      }
+      const nextFork = flushQueue(enqueueResult(fork, toResultError({ message: event.message }), event.timestamp))
+      return { ...nextFork, currentTurnId: null }
     },
 
     skill_started: ({ event, fork }) => {
       const firstPhase = event.skill.phases[0]
-      const skillAttr = firstPhase
-        ? ` name="${event.skill.name}" phase="${firstPhase.name}"`
-        : ` name="${event.skill.name}"`
-      const prompt = formatSkillInitialPrompt(event.skill)
-      const entry: SystemEntry = {
-        kind: 'reminder',
-        text: `<skill${skillAttr}>\n${prompt}\n</skill>`,
-      }
-
-      return {
-        ...fork,
-        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
-      }
+      return enqueueTimeline(
+        fork,
+        toTimelineSkillStarted({
+          timestamp: event.timestamp,
+          skillName: event.skill.name,
+          firstPhase: firstPhase?.name,
+          prompt: formatSkillInitialPrompt(event.skill),
+        }),
+        event.timestamp,
+      )
     },
 
     phase_criteria_verdict: ({ event, fork }) => {
-      const attrs: string[] = [
-        `name="${event.criteriaName}"`,
-        `status="${event.status}"`,
-        `type="${event.criteriaType}"`,
-      ]
-      if (event.criteriaType === 'shell') {
-        if ('command' in event) attrs.push(`command="${event.command}"`)
-        if ('pid' in event) attrs.push(`pid="${event.pid}"`)
-        if ('reason' in event) attrs.push(`reason="${event.reason}"`)
-      }
+      let payload: PhaseCriteriaPayload
       if (event.criteriaType === 'agent') {
-        if ('agentId' in event) attrs.push(`agent="${event.agentId}"`)
-        if ('reason' in event) attrs.push(`reason="${event.reason}"`)
-      }
-      if (event.criteriaType === 'user' && 'reason' in event) {
-        attrs.push(`reason="${event.reason}"`)
+        payload = {
+          source: 'agent',
+          name: event.criteriaName,
+          status: event.status === 'running' ? 'pending' : event.status,
+          agentId: event.agentId,
+          reason: 'reason' in event ? event.reason : undefined,
+        }
+      } else if (event.criteriaType === 'shell') {
+        payload = {
+          source: 'shell',
+          name: event.criteriaName,
+          status: event.status === 'running' ? 'pending' : event.status,
+          command: event.command,
+          reason: 'reason' in event ? event.reason : undefined,
+        }
+      } else {
+        payload = {
+          source: 'user',
+          name: event.criteriaName,
+          status: event.status,
+          reason: event.reason,
+        }
       }
 
-      const entry: SystemEntry = {
-        kind: 'reminder',
-        text: `<phase_criteria ${attrs.join(' ')}/>`,
-      }
-
-      return {
-        ...fork,
-        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
-      }
+      return enqueueTimeline(fork, toTimelinePhaseCriteria({ timestamp: event.timestamp, payload }), event.timestamp)
     },
 
     phase_verdict: ({ event, fork }) => {
-      const verdictRows = event.verdicts
-        .map((v) => `  <verdict name="${v.criteriaName}" passed="${v.passed}" reason="${v.reason}"/>`)
+      const verdictText = event.verdicts
+        .map(v => `  <verdict name="${v.criteriaName}" passed="${v.passed}" reason="${v.reason}"/>`)
         .join('\n')
-      const verdictBlock = `<phase_verdict passed="${event.passed}">\n${verdictRows}\n</phase_verdict>`
 
-      const suffix = event.passed
-        ? event.workflowCompleted
-          ? `\n<workflow_completed/>`
-          : event.nextPhasePrompt
-            ? `\n<workflow_phase>\n${event.nextPhasePrompt}\n</workflow_phase>`
-            : ''
-        : ''
+      let nextFork = enqueueTimeline(
+        fork,
+        toTimelinePhaseVerdict({
+          timestamp: event.timestamp,
+          passed: event.passed,
+          verdictText,
+          workflowCompleted: event.workflowCompleted,
+        }),
+        event.timestamp,
+      )
 
-      const entry: SystemEntry = {
-        kind: 'reminder',
-        text: `${verdictBlock}${suffix}`,
+      if (event.passed && !event.workflowCompleted && event.nextPhasePrompt) {
+        nextFork = enqueueTimeline(
+          nextFork,
+          toTimelineWorkflowPhase({
+            timestamp: event.timestamp,
+            text: event.nextPhasePrompt,
+          }),
+          event.timestamp,
+        )
       }
 
-      return {
-        ...fork,
-        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
-      }
+      return nextFork
     },
 
-    skill_completed: ({ event, fork }) => {
-      const entry: SystemEntry = {
-        kind: 'reminder',
-        text: `<skill_completed name="${event.skillName}"/>`,
-      }
-
-      return {
-        ...fork,
-        queuedMessages: [...fork.queuedMessages, { kind: 'system', timestamp: event.timestamp, entry }],
-      }
-    },
+    skill_completed: ({ event, fork }) =>
+      enqueueTimeline(
+        fork,
+        toTimelineSkillCompleted({ timestamp: event.timestamp, skillName: event.skillName }),
+        event.timestamp,
+      ),
 
     interrupt: ({ fork }) => fork,
 
@@ -506,10 +527,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const summaryMessage: Message = { type: 'compacted', source: 'system', content: textParts(event.summary) }
       return { ...fork, messages: [sessionContext, summaryMessage, ...remainingMessages], currentChainId: null }
     },
-
-
   },
-
 
   globalEventHandlers: {
     agent_created: ({ event, state }) => {
@@ -517,33 +535,28 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const parentState = state.forks.get(parentForkId)
       if (!parentState) throw new Error(`Parent fork ${parentForkId} not found in MemoryProjection`)
 
-      const normalizedMode: 'clone' | 'spawn' = event.mode === 'clone' ? 'clone' : 'spawn'
       const normalizedContext = typeof event.context === 'string' ? event.context : ''
-
       const contextMessage: Message[] = normalizedContext
         ? [{ type: 'fork_context', source: 'system', content: textParts(normalizedContext) }]
         : []
 
-      const isSpawn = normalizedMode === 'spawn'
-      const baseMessages = isSpawn ? [] : parentState.messages
-
       const newForkState: ForkMemoryState = {
-        messages: [...baseMessages, ...contextMessage],
-        queuedMessages: [],
+        messages: [...contextMessage],
+        queuedEntries: [],
         currentTurnId: null,
-        currentTurnToolCalls: [],
         currentChainId: null,
         pendingPresenceText: null,
+        nextQueueSeq: 0,
       }
 
       const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
       const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
       if (spawnReminder) {
-        const entry: SystemEntry = { kind: 'reminder', text: spawnReminder }
-        const updatedParent = {
-          ...parentState,
-          queuedMessages: [...parentState.queuedMessages, { kind: 'system' as const, timestamp: event.timestamp, entry }]
-        }
+        const updatedParent = enqueueTimeline(
+          parentState,
+          toTimelineLifecycleHook({ timestamp: event.timestamp, agentId: event.agentId, role: event.role, hookType: 'spawn' }),
+          event.timestamp,
+        )
         return { ...state, forks: new Map(state.forks).set(parentForkId, updatedParent).set(forkId, newForkState) }
       }
 
@@ -551,82 +564,70 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
     },
   },
 
-  signalHandlers: (on) => [
+  signalHandlers: on => [
     on(OutboundMessagesProjection.signals.messageCompleted, ({ value, state, read }) => {
       if (value.dest === 'user') return state
-
-      const agentState = read(AgentStatusProjection)
-      const senderAgentId = value.forkId === null
-        ? 'lead'
-        : (getAgentByForkId(agentState, value.forkId)?.agentId ?? 'lead')
 
       const targetForkId = value.targetForkId
       if (targetForkId === undefined) return state
       const targetState = state.forks.get(targetForkId)
       if (!targetState) return state
 
-      const entry: CommsEntry = { kind: 'agent', from: senderAgentId, timestamp: value.timestamp, text: value.text }
+      const agentState = read(AgentStatusProjection)
+      const sender = value.forkId === null ? null : getAgentByForkId(agentState, value.forkId)
+      const senderAgentId = sender?.agentId ?? 'lead'
+
+      const atom: AgentAtom = {
+        kind: 'message',
+        timestamp: value.timestamp,
+        direction: 'to_lead',
+        text: value.text,
+      }
 
       return {
         ...state,
-        forks: new Map(state.forks).set(targetForkId, {
-          ...targetState,
-          queuedMessages: [...targetState.queuedMessages, { kind: 'comms', entry }],
-        })
+        forks: new Map(state.forks).set(
+          targetForkId,
+          enqueueAgentAtomBlock(targetState, {
+            timestamp: value.timestamp,
+            agentId: senderAgentId,
+            role: sender?.role ?? 'lead',
+            atoms: [atom],
+          }),
+        ),
       }
     }),
 
-
-    on(FileAwarenessProjection.signals.fileFirstMentioned, ({ value, state }) => {
-      const forkState = state.forks.get(value.forkId)
-      if (!forkState) return state
-      const entry: SystemEntry = { kind: 'reminder', text: `<file path="${value.path}">\n${value.content}\n</file>` }
-      return {
-        ...state,
-        forks: new Map(state.forks).set(value.forkId, {
-          ...forkState,
-          queuedMessages: [...forkState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
-        })
-      }
-    }),
-
-    on(FileAwarenessProjection.signals.fileUpdateNotification, ({ value, state }) => {
-      const forkState = state.forks.get(value.forkId)
-      if (!forkState) return state
-      const entry: SystemEntry = { kind: 'reminder', text: value.notificationText }
-      const coalesceKey = `file-update:${value.path}`
-      return {
-        ...state,
-        forks: new Map(state.forks).set(value.forkId, {
-          ...forkState,
-          queuedMessages: [
-            ...forkState.queuedMessages.filter(q => !(q.kind === 'system' && (q as QueuedSystemMessage).coalesceKey === coalesceKey)),
-            { kind: 'system', timestamp: value.timestamp, entry, coalesceKey }
-          ]
-        })
-      }
-    }),
-
-    on(SubagentActivityProjection.signals.unseenActivityAvailable, ({ value, state }) => {
+    on(SubagentActivityProjection.signals.unseenActivityAvailable, ({ value, state, read }) => {
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
 
-      const entry: SystemEntry = {
-        kind: 'agent_activity',
-        entries: value.entries.map(item => ({
+      let nextParent = parentState
+      for (const item of value.entries) {
+        const atoms: AgentAtom[] = []
+        if (item.prose) {
+          atoms.push({ kind: 'thought', timestamp: value.timestamp, text: item.prose })
+        }
+
+        // Skip empty agent blocks — nothing to show
+        if (atoms.length === 0) continue
+
+        // Resolve role from agent registry
+        const agentState = read(AgentStatusProjection)
+        const agent = agentState.agents.get(item.agentId)
+        if (!agent) continue
+
+        nextParent = enqueueAgentAtomBlock(nextParent, {
+          timestamp: value.timestamp,
           agentId: item.agentId,
-          prose: item.prose,
-          toolsCalled: item.toolsCalled,
-          filesWritten: item.filesWritten,
-        }))
+          role: agent.role,
+          atoms,
+        })
       }
 
       return {
         ...state,
-        forks: new Map(state.forks).set(value.parentForkId, {
-          ...parentState,
-          queuedMessages: [...parentState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
-        })
+        forks: new Map(state.forks).set(value.parentForkId, nextParent),
       }
     }),
 
@@ -634,39 +635,48 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
 
-      const roleDef = isValidVariant(value.type) ? getAgentDefinition(value.type) : undefined
-      const idleReminder = roleDef?.lifecyclePrompts?.parentOnIdle
-      const baseText = formatAgentIdleNotification(value.agentId, value.type, value.reason)
-      const baseEntry: SystemEntry = { kind: 'reminder', text: baseText }
-      const entries: QueuedMessage[] = [{ kind: 'system' as const, timestamp: value.timestamp, entry: baseEntry }]
+      const idleAtom: AgentAtom = {
+        kind: 'idle',
+        timestamp: value.timestamp,
+        reason: value.reason === 'error' ? 'error' : value.reason === 'interrupt' ? 'interrupt' : 'stable',
+      }
 
+      let nextParent = enqueueAgentAtomBlock(parentState, {
+        timestamp: value.timestamp,
+        agentId: value.agentId,
+        role: value.role,
+        atoms: [idleAtom],
+      })
+
+      const roleDef = isValidVariant(value.role) ? getAgentDefinition(value.role) : undefined
+      const idleReminder = roleDef?.lifecyclePrompts?.parentOnIdle
       if (idleReminder) {
-        const idleEntry: SystemEntry = { kind: 'reminder', text: idleReminder }
-        entries.push({ kind: 'system' as const, timestamp: value.timestamp, entry: idleEntry })
+        nextParent = enqueueTimeline(
+          nextParent,
+          toTimelineLifecycleHook({ timestamp: value.timestamp, agentId: value.agentId, role: value.role, hookType: 'idle' }),
+          value.timestamp,
+        )
       }
 
       return {
         ...state,
-        forks: new Map(state.forks).set(value.parentForkId, {
-          ...parentState,
-          queuedMessages: [...parentState.queuedMessages, ...entries]
-        })
+        forks: new Map(state.forks).set(value.parentForkId, nextParent),
       }
     }),
 
     on(AgentStatusProjection.signals.subagentUserKilled, ({ value, state }) => {
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
-
-      const text = formatSubagentUserKilledNotification(value.agentId, value.type)
-      const entry: SystemEntry = { kind: 'reminder', text }
-
       return {
         ...state,
-        forks: new Map(state.forks).set(value.parentForkId, {
-          ...parentState,
-          queuedMessages: [...parentState.queuedMessages, { kind: 'system', timestamp: value.timestamp, entry }]
-        })
+        forks: new Map(state.forks).set(
+          value.parentForkId,
+          enqueueTimeline(
+            parentState,
+            toTimelineSubagentUserKilled({ timestamp: value.timestamp, agentId: value.agentId, agentType: value.role }),
+            value.timestamp,
+          ),
+        ),
       }
     }),
 
@@ -678,10 +688,42 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         forks: new Map(state.forks).set(null, {
           ...rootState,
           pendingPresenceText: formatUserReturnedAfterAbsence(),
-        })
+        }),
       }
     }),
 
+    on(UserMessageResolutionProjection.signals.userMessageResolved, ({ value, state, read }) => {
+      const targetFork = state.forks.get(value.forkId)
+      if (!targetFork) return state
 
-  ]
+      const text = extractText(value.content)
+      const imageAttachments: TimelineAttachment[] = (value.attachments ?? [])
+        .filter((a): a is ImageAttachment => a.type === 'image')
+        .map(a => ({ kind: 'image' as const, image: { type: 'image' as const, base64: a.base64, mediaType: a.mediaType, width: a.width, height: a.height } }))
+      const mentionAttachments: TimelineAttachment[] = value.resolvedMentions.map(m => ({
+        kind: 'mention' as const,
+        ...m,
+      }))
+      const attachments = [...imageAttachments, ...mentionAttachments]
+      const userEntry = toTimelineUserMessage({ timestamp: value.timestamp, text, attachments })
+
+      let nextFork = enqueueTimeline(targetFork, userEntry, value.timestamp)
+
+      if (value.forkId !== null) {
+        const agent = getAgentByForkId(read(AgentStatusProjection), value.forkId)
+        if (agent) {
+          nextFork = enqueueTimeline(
+            nextFork,
+            toTimelineUserToAgent({ timestamp: value.timestamp, agentId: agent.agentId, text }),
+            value.timestamp,
+          )
+        }
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.forkId, nextFork),
+      }
+    }),
+  ],
 })

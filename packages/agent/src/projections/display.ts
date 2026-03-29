@@ -15,6 +15,7 @@ import type { AppEvent, ToolDisplay } from '../events'
 
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
+import { UserMessageResolutionProjection } from './user-message-resolution'
 import { WorkingStateProjection, type PendingInboundCommunication } from './working-state'
 
 
@@ -570,7 +571,7 @@ export function upsertStreamingCommunicationStep(
 export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>()({
   name: 'Display',
 
-  reads: [AgentRoutingProjection, AgentStatusProjection, WorkingStateProjection] as const,
+  reads: [AgentRoutingProjection, AgentStatusProjection, UserMessageResolutionProjection, WorkingStateProjection] as const,
 
   initialFork: {
     status: 'idle',
@@ -602,30 +603,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             timestamp: event.timestamp,
             taskMode: true,
             attachments: [],
-          }
-        ]
-      }
-    },
-
-    user_message: ({ event, fork }) => {
-      const messageId = generateId()
-      const content = textOf(event.content)
-      const messageType: 'user_message' | 'queued_user_message' =
-        fork.currentTurnId !== null ? 'queued_user_message' : 'user_message'
-
-      return {
-        ...fork,
-        messages: [
-          ...fork.messages,
-          {
-            id: messageId,
-            type: messageType,
-            content,
-            timestamp: event.timestamp,
-            taskMode: event.taskMode,
-            attachments: (event.attachments ?? [])
-              .filter((a): a is Extract<typeof a, { type: 'image' }> => a.type === 'image')
-              .map(a => ({ type: a.type, width: a.width, height: a.height, filename: a.filename }))
           }
         ]
       }
@@ -1139,6 +1116,41 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
   },
 
   signalHandlers: (on) => [
+    on(UserMessageResolutionProjection.signals.userMessageResolved, ({ value, state }) => {
+      const displayFork = state.forks.get(value.forkId)
+      if (!displayFork) return state
+
+      const messageId = generateId()
+      const content = textOf(value.content)
+      const messageType: 'user_message' | 'queued_user_message' =
+        displayFork.currentTurnId !== null ? 'queued_user_message' : 'user_message'
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.forkId, {
+          ...displayFork,
+          messages: [
+            ...displayFork.messages,
+            {
+              id: messageId,
+              type: messageType,
+              content,
+              timestamp: value.timestamp,
+              taskMode: value.taskMode,
+              attachments: (value.attachments ?? [])
+                .filter((attachment): attachment is Extract<typeof attachment, { type: 'image' }> => attachment.type === 'image')
+                .map(attachment => ({
+                  type: attachment.type,
+                  width: attachment.width,
+                  height: attachment.height,
+                  filename: attachment.filename,
+                })),
+            },
+          ]
+        }),
+      }
+    }),
+
     // Insert inline fork activity block in parent's display when agent is created
     on(AgentStatusProjection.signals.agentCreated, ({ value, state }) => {
       const { forkId, parentForkId, name, role } = value
@@ -1170,7 +1182,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         const step: SubagentStartedStep = {
           id: generateId(),
           type: 'subagent_started',
-          subagentType: value.type,
+          subagentType: value.role,
           subagentId: value.agentId,
           title: value.name,
           resumed: false,
@@ -1245,7 +1257,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         const step: SubagentFinishedStep = {
           id: generateId(),
           type: 'subagent_finished',
-          subagentType: value.type,
+          subagentType: value.role,
           subagentId: value.agentId,
           cumulativeTotalTimeMs,
           cumulativeTotalToolsUsed: totalToolsUsed(msg.toolCounts),
@@ -1309,7 +1321,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         const step: SubagentStartedStep = {
           id: generateId(),
           type: 'subagent_started',
-          subagentType: value.type,
+          subagentType: value.role,
           subagentId: value.agentId,
           title: message.name,
           resumed: nextResumeCount > 0,
@@ -1337,7 +1349,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const step: SubagentKilledStep = {
         id: generateId(),
         type: 'subagent_killed',
-        subagentType: value.type,
+        subagentType: value.role,
         subagentId: value.agentId,
         title: value.title,
       }
@@ -1363,7 +1375,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const step: SubagentUserKilledStep = {
         id: generateId(),
         type: 'subagent_user_killed',
-        subagentType: value.type,
+        subagentType: value.role,
         subagentId: value.agentId,
         title: value.title,
       }

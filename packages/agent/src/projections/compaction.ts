@@ -14,6 +14,7 @@ import { Projection, Signal } from '@magnitudedev/event-core'
 
 import type { AppEvent, SessionContext } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
+import { UserMessageResolutionProjection } from './user-message-resolution'
 
 import { getContextLimits } from '../constants'
 import { CHARS_PER_TOKEN } from '../constants'
@@ -151,7 +152,7 @@ export interface ForkCompactionState {
 export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompactionState>()({
   name: 'Compaction',
 
-  reads: [AgentRoutingProjection] as const,
+  reads: [AgentRoutingProjection, UserMessageResolutionProjection] as const,
 
   signals: {
     shouldCompactChanged: Signal.create<{ forkId: string | null; shouldCompact: boolean }>('Compaction/shouldCompactChanged'),
@@ -179,25 +180,6 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
         ...fork,
         tokenEstimate,
         shouldCompact: tokenEstimate > getContextLimits().softCap,
-      }
-    },
-
-    user_message: ({ event, fork, emit }) => {
-      const addedTokens = estimateContentTokens(event.content)
-      const newTokenEstimate = fork.tokenEstimate + addedTokens
-      const newShouldCompact = newTokenEstimate > getContextLimits().softCap
-      if (newShouldCompact !== fork.shouldCompact) {
-        emit.shouldCompactChanged({ forkId: event.forkId, shouldCompact: newShouldCompact })
-      }
-      const newBlocked = computeContextLimitBlocked(fork.isCompacting, fork.pendingFinalization, newTokenEstimate)
-      if (newBlocked !== fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: event.forkId, blocked: newBlocked })
-      }
-      return {
-        ...fork,
-        tokenEstimate: newTokenEstimate,
-        shouldCompact: newShouldCompact,
-        contextLimitBlocked: newBlocked,
       }
     },
 
@@ -350,6 +332,32 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
       return {
         ...state,
         forks: new Map(state.forks).set(forkId, newForkState),
+      }
+    }),
+
+    on(UserMessageResolutionProjection.signals.userMessageResolved, ({ value, state, emit }) => {
+      const fork = state.forks.get(value.forkId)
+      if (!fork) return state
+
+      const addedTokens = estimateContentTokens([...value.content], fork.modelId, fork.providerId)
+      const newTokenEstimate = fork.tokenEstimate + addedTokens
+      const newShouldCompact = newTokenEstimate > getContextLimits().softCap
+      if (newShouldCompact !== fork.shouldCompact) {
+        emit.shouldCompactChanged({ forkId: value.forkId, shouldCompact: newShouldCompact })
+      }
+      const newBlocked = computeContextLimitBlocked(fork.isCompacting, fork.pendingFinalization, newTokenEstimate)
+      if (newBlocked !== fork.contextLimitBlocked) {
+        emit.contextLimitBlockedChanged({ forkId: value.forkId, blocked: newBlocked })
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.forkId, {
+          ...fork,
+          tokenEstimate: newTokenEstimate,
+          shouldCompact: newShouldCompact,
+          contextLimitBlocked: newBlocked,
+        }),
       }
     }),
   ],

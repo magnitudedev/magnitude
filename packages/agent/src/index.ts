@@ -79,8 +79,9 @@ export type { ForkWorkingState, PendingInboundCommunication } from './projection
 
 export { MemoryProjection } from './projections/memory'
 export { getView } from './projections/memory'
-export type { Message, MessageSource, LLMMessage, Perspective, QueuedMessage, QueuedCommsMessage, QueuedSystemMessage, ForkMemoryState } from './projections/memory'
-export type { CommsAttachment, CommsEntry, SystemEntry, AgentActivityEntry } from './prompts/agents'
+export type { Message, MessageSource, LLMMessage, Perspective, ForkMemoryState } from './projections/memory'
+export type { QueuedEntry } from './inbox/types'
+
 export { CompactionProjection } from './projections/compaction'
 export type { ForkCompactionState } from './projections/compaction'
 

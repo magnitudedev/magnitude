@@ -1,0 +1,139 @@
+import { describe, expect, test } from 'vitest'
+import {
+  toResultError,
+  toResultInterrupted,
+  toResultNoop,
+  toResultToolResults,
+  toTimelineAgentBlock,
+  toTimelineObservation,
+  toTimelinePhaseCriteria,
+  toTimelinePhaseVerdict,
+  toTimelineLifecycleHook,
+  toTimelineSkillCompleted,
+  toTimelineSkillStarted,
+  toTimelineSubagentUserKilled,
+  toTimelineUserMessage,
+  toTimelineUserPresence,
+  toTimelineUserToAgent,
+  toTimelineWorkflowPhase,
+} from '../compose'
+import type { ContentPart } from '../../content'
+import type { AgentAtom, TimelineAttachment } from '../types'
+
+const TS = 1711641600000
+
+describe('inbox compose', () => {
+  test('toResult* constructors set correct kinds', () => {
+    const toolResults = toResultToolResults({ toolCalls: [], observedResults: [] })
+    const interrupted = toResultInterrupted()
+    const error = toResultError({ message: 'bad' })
+    const noop = toResultNoop()
+
+    expect(toolResults.kind).toBe('tool_results')
+    expect(interrupted.kind).toBe('interrupted')
+    expect(error.kind).toBe('error')
+    expect(noop.kind).toBe('noop')
+  })
+
+  test('toTimeline* constructors set correct kinds', () => {
+    const attachments: readonly TimelineAttachment[] = [{ kind: 'mention', path: 'a.ts', contentType: 'text' }]
+    const atoms: readonly AgentAtom[] = [{ kind: 'thought', timestamp: TS, text: 'thinking' }]
+    const parts: readonly ContentPart[] = [{ type: 'text', text: 'obs' }]
+
+    expect(toTimelineUserMessage({ timestamp: TS, text: 'u', attachments }).kind).toBe('user_message')
+    expect(toTimelineUserToAgent({ timestamp: TS, agentId: 'a1', text: 'u2a' }).kind).toBe('user_to_agent')
+    expect(toTimelineAgentBlock({
+      timestamp: TS,
+      firstAtomTimestamp: TS,
+      lastAtomTimestamp: TS,
+      agentId: 'a1',
+      role: 'builder',
+      atoms,
+    }).kind).toBe('agent_block')
+    expect(toTimelineSubagentUserKilled({ timestamp: TS, agentId: 'a1', agentType: 'builder' }).kind).toBe('subagent_user_killed')
+    expect(toTimelineUserPresence({ timestamp: TS, text: 'present', confirmed: true }).kind).toBe('user_presence')
+    expect(toTimelineWorkflowPhase({ timestamp: TS, text: 'phase' }).kind).toBe('workflow_phase')
+    expect(toTimelinePhaseCriteria({
+      timestamp: TS,
+      payload: { source: 'user', name: 'c', status: 'pending' },
+    }).kind).toBe('phase_criteria')
+    expect(toTimelinePhaseVerdict({
+      timestamp: TS,
+      passed: true,
+      verdictText: 'ok',
+      workflowCompleted: false,
+    }).kind).toBe('phase_verdict')
+    expect(toTimelineSkillStarted({ timestamp: TS, skillName: 's', prompt: 'go' }).kind).toBe('skill_started')
+    expect(toTimelineSkillCompleted({ timestamp: TS, skillName: 's' }).kind).toBe('skill_completed')
+    expect(
+      toTimelineLifecycleHook({
+        timestamp: TS,
+        agentId: 'a1',
+        role: 'builder',
+        hookType: 'spawn',
+      }).kind,
+    ).toBe('lifecycle_hook')
+    expect(toTimelineObservation({ timestamp: TS, parts }).kind).toBe('observation')
+  })
+
+  test('readonly arrays are preserved by reference', () => {
+    const attachments: readonly TimelineAttachment[] = [{ kind: 'mention', path: 'x', contentType: 'text' }]
+    const atoms: readonly AgentAtom[] = [{ kind: 'thought', timestamp: TS, text: 't' }]
+    const parts: readonly ContentPart[] = [{
+      type: 'image',
+      base64: 'abc',
+      mediaType: 'image/png',
+      width: 1,
+      height: 1,
+    }]
+
+    const msg = toTimelineUserMessage({ timestamp: TS, text: 'hello', attachments })
+    const block = toTimelineAgentBlock({
+      timestamp: TS,
+      firstAtomTimestamp: TS,
+      lastAtomTimestamp: TS,
+      agentId: 'a',
+      role: 'builder',
+      atoms,
+    })
+    const obs = toTimelineObservation({ timestamp: TS, parts })
+
+    if (msg.kind !== 'user_message') throw new Error('expected user_message')
+    if (block.kind !== 'agent_block') throw new Error('expected agent_block')
+    if (obs.kind !== 'observation') throw new Error('expected observation')
+
+    expect(msg.attachments).toBe(attachments)
+    expect(block.atoms).toBe(atoms)
+    expect(obs.parts).toBe(parts)
+  })
+
+  test('handles edge cases: empty atoms and undefined optional fields', () => {
+    const block = toTimelineAgentBlock({
+      timestamp: TS,
+      firstAtomTimestamp: TS,
+      lastAtomTimestamp: TS,
+      agentId: 'a',
+      role: 'builder',
+      atoms: [],
+    })
+    const workflow = toTimelineWorkflowPhase({ timestamp: TS, text: 'phase' })
+    const skillStarted = toTimelineSkillStarted({ timestamp: TS, skillName: 'skill', prompt: 'prompt' })
+    const verdict = toTimelinePhaseVerdict({
+      timestamp: TS,
+      passed: false,
+      verdictText: 'fail',
+      workflowCompleted: false,
+    })
+
+    if (block.kind !== 'agent_block') throw new Error('expected agent_block')
+    if (workflow.kind !== 'workflow_phase') throw new Error('expected workflow_phase')
+    if (skillStarted.kind !== 'skill_started') throw new Error('expected skill_started')
+    if (verdict.kind !== 'phase_verdict') throw new Error('expected phase_verdict')
+
+    expect(block.atoms).toEqual([])
+    expect(workflow.name).toBeUndefined()
+    expect(workflow.phase).toBeUndefined()
+    expect(skillStarted.firstPhase).toBeUndefined()
+    expect(verdict.workflowCompleted).toBe(false)
+  })
+})

@@ -29,16 +29,15 @@ export type MentionAttachment = {
   readonly type: 'mention'
   readonly path: string
   readonly contentType: 'text' | 'image' | 'directory'
-  readonly content?: string  // optional for backward compat with old sessions
 }
 
 export type ResolvedMention = {
-  path: string
-  contentType: 'text' | 'image' | 'directory'
-  content?: string
-  error?: string
-  truncated?: boolean
-  originalBytes?: number
+  readonly path: string
+  readonly contentType: 'text' | 'image' | 'directory'
+  readonly content?: string
+  readonly error?: string
+  readonly truncated?: boolean
+  readonly originalBytes?: number
 }
 // =============================================================================
 // Strategy & Response Types (defined here to avoid circular imports)
@@ -92,7 +91,9 @@ export interface SessionInitialized {
 
 export interface UserMessage {
   readonly type: 'user_message'
+  readonly messageId: string
   readonly forkId: string | null
+  readonly timestamp: number
   readonly content: ContentPart[]
   readonly attachments: Attachment[]
   readonly mode: 'text' | 'audio'
@@ -107,11 +108,11 @@ export interface ObservationsCaptured {
   readonly parts: readonly ObservationPart[]
 }
 
-export type FileMentionResolved = {
-  type: 'file_mention_resolved'
-  forkId: string | null
-  sourceMessageTimestamp: number
-  mentions: readonly ResolvedMention[]
+export interface UserMessageReady {
+  readonly type: 'user_message_ready'
+  readonly messageId: string
+  readonly forkId: string | null
+  readonly resolvedMentions: readonly ResolvedMention[]
 }
 
 // =============================================================================
@@ -177,9 +178,30 @@ export interface TurnCompleted {
 
 export type TurnDecision = 'continue' | 'yield' | 'finish'
 
+export type TurnResultErrorCode =
+  | 'unclosed_think'
+  | 'unclosed_actions'
+  | 'nonexistent_agent_destination'
+
+export interface TurnResultError {
+  readonly code: TurnResultErrorCode
+  readonly message: string
+}
+
 export type TurnResult =
-  | { readonly success: true; readonly turnDecision: 'continue' | 'yield'; readonly reminder?: string }
-  | { readonly success: true; readonly turnDecision: 'finish'; readonly reminder?: string; readonly evidence: string }
+  | {
+      readonly success: true
+      readonly turnDecision: 'continue' | 'yield'
+      readonly errors?: readonly TurnResultError[]
+      readonly oneshotLivenessTriggered?: boolean
+    }
+  | {
+      readonly success: true
+      readonly turnDecision: 'finish'
+      readonly evidence: string
+      readonly errors?: readonly TurnResultError[]
+      readonly oneshotLivenessTriggered?: boolean
+    }
   | { readonly success: false; readonly error: string; readonly cancelled: boolean }
 
 // Turn unexpected error (irrecoverable - e.g. LLM connection failure after all retries)
@@ -577,7 +599,7 @@ export type AppEvent =
   | OneshotTask
   | UserMessage
   | ObservationsCaptured
-  | FileMentionResolved
+  | UserMessageReady
   | TurnStarted
   | TurnCompleted
   | TurnUnexpectedError

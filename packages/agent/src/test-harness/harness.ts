@@ -1,10 +1,11 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
-import { defineCatalog, type ToolDefinition } from '@magnitudedev/tools'
+import { defineCatalog } from '@magnitudedev/tools'
 import { Context, Effect, Layer } from 'effect'
 import type { RoleDefinition } from '@magnitudedev/roles'
 import type { AgentCatalogEntry } from '../catalog'
 import type { AppEvent, SessionContext } from '../events'
 import { textParts } from '../content'
+import { createId } from '../util/id'
 
 
 // Projections
@@ -25,7 +26,8 @@ import { ChatTitleProjection } from '../projections/chat-title'
 import { ConversationProjection } from '../projections/conversation'
 import { UserPresenceProjection } from '../projections/user-presence'
 import { OutboundMessagesProjection } from '../projections/outbound-messages'
-import { FileAwarenessProjection } from '../projections/file-awareness'
+import { UserMessageResolutionProjection } from '../projections/user-message-resolution'
+
 
 // Workers
 import { TurnController } from '../workers/turn-controller'
@@ -36,6 +38,7 @@ import { Autopilot } from '../workers/autopilot'
 import { CompactionWorker } from '../workers/compaction-worker'
 import { ChatTitleWorker } from '../workers/chat-title-worker'
 import { UserPresenceWorker } from '../workers/user-presence-worker'
+import { FileMentionResolver } from '../workers/file-mention-resolver'
 
 // Runtime/services
 import { ExecutionManagerLive } from '../execution/execution-manager'
@@ -50,14 +53,12 @@ import { MockCortex } from './mock-cortex'
 import { MockTurnScriptTag, MockTurnScriptLive, createScriptGate, type MockTurnResponse, type MockTurnScriptResolver, type ScriptGate } from './turn-script'
 import { response as standaloneResponse } from './response-builder'
 import { createTurnsBuilder } from './scenario-builder'
-import { clearAgentOverrides, getAgentDefinition, registerAgentDefinition, type AgentVariant } from '../agents'
-import { createDefaultToolOverrides, createVirtualFs } from './virtual-fs'
+import { clearAgentOverrides } from '../agents'
+import { createVirtualFs, createVirtualFsLayer } from './virtual-fs'
 import { EphemeralSessionContextTag, type PolicyContext } from '../agents/types'
 import { ChatPersistence, PersistenceError, type ChatPersistenceService } from '../persistence/chat-persistence-service'
 import { createFaultRegistry, type FaultPlan, type FaultRegistry, type FaultScope } from './faults'
 import { createFakeClock } from './fake-clock'
-
-export type ToolOverrideHandler = (input: unknown) => unknown | Promise<unknown>
 
 export interface WaitOptions {
   timeoutMs?: number
@@ -98,87 +99,12 @@ export interface HarnessOptions {
     userPresence?: boolean
   }
   files?: Record<string, string>
-  toolOverrides?: Record<string, ToolOverrideHandler>
   extraLayers?: Layer.Layer<unknown, never, never>[]
   clock?: 'real' | 'fake'
   model?: TestModelConfig
 }
 
-const ALL_VARIANTS: AgentVariant[] = [
-  'lead',
-  'builder',
-  'explorer',
-  'planner',
-  'debugger',
-  'reviewer',
-  'browser',
-]
-
 type MagnitudeAgentDef = RoleDefinition<import('../catalog').AgentCatalog, MagnitudeSlot, PolicyContext>
-
-function makeOverrideTool(source: ToolDefinition, handler: ToolOverrideHandler): ToolDefinition {
-  if (!('execute' in source) || typeof source.execute !== 'function') {
-    return source
-  }
-
-  const execute = (input: unknown) =>
-    Effect.tryPromise({
-      try: () => Promise.resolve(handler(input)),
-      catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-    }).pipe(Effect.orDie)
-
-  return {
-    ...source,
-    execute,
-  }
-}
-
-function applyToolOverrides(
-  handlers: Record<string, ToolOverrideHandler>,
-  faultRegistry?: FaultRegistry,
-): void {
-  for (const variant of ALL_VARIANTS) {
-    const def = getAgentDefinition(variant)
-    const tools = new Map<string, ToolDefinition>()
-
-    for (const key of def.tools.keys) {
-      const entry = def.tools.entries[key] as AgentCatalogEntry
-      const concreteTool = entry.tool
-
-      const tagName = entry.binding.toXmlTagBinding().tag
-      const override = handlers[tagName]
-      const wrappedOverride = override
-        ? async (input: unknown) => {
-          await faultRegistry?.checkAsync(`tool.execute:${tagName}`)
-          return override(input)
-        }
-        : null
-
-      tools.set(
-        key,
-        wrappedOverride
-          ? makeOverrideTool(concreteTool, wrappedOverride)
-          : concreteTool,
-      )
-    }
-
-    const nextEntries: Record<string, AgentCatalogEntry> = {}
-    for (const key of def.tools.keys) {
-      const entry = def.tools.entries[key] as AgentCatalogEntry
-      nextEntries[key] = {
-        ...entry,
-        tool: tools.get(key) ?? entry.tool,
-      }
-    }
-
-    const overridden: RoleDefinition = {
-      ...def,
-      tools: defineCatalog(nextEntries),
-    }
-
-    registerAgentDefinition(variant, overridden)
-  }
-}
 
 const DEFAULT_TIMEOUT_MS = 10_000
 
@@ -273,12 +199,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
   clearAgentOverrides()
   const files = createVirtualFs(options.files)
   const faultRegistry = createFaultRegistry()
-  const defaultOverrides = createDefaultToolOverrides(files)
-  const handlers: Record<string, ToolOverrideHandler> = {
-    ...defaultOverrides,
-    ...(options.toolOverrides ?? {}),
-  }
-  applyToolOverrides(handlers, faultRegistry)
 
   try {
     const workers = [
@@ -291,6 +211,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       ...(options.workers?.compaction ? [CompactionWorker] : []),
       ...(options.workers?.chatTitle ? [ChatTitleWorker] : []),
       ...(options.workers?.userPresence ? [UserPresenceWorker] : []),
+
+      FileMentionResolver,
     ] as const
 
     const TestCodingAgent = Agent.define<AppEvent>()({
@@ -308,7 +230,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         ReplayProjection,
         SubagentActivityProjection,
         OutboundMessagesProjection,
-        FileAwarenessProjection,
+        UserMessageResolutionProjection,
         MemoryProjection,
         DisplayProjection,
         ChatTitleProjection,
@@ -374,10 +296,17 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       disableShellSafeguards: false,
       disableCwdSafeguards: false,
     })
+    const fsLayer = createVirtualFsLayer(
+      files,
+      options.sessionContext?.cwd ?? process.cwd(),
+      options.sessionContext?.workspacePath ?? '/tmp/test-workspace',
+    )
+
     const runtimeLayer = Layer.mergeAll(
       Layer.provide(ExecutionManagerLive, ephemeralSessionContextLayer),
       Layer.provide(BrowserServiceLive, providerRuntime),
       providerRuntime,
+      fsLayer,
       ...(options.model
         ? [makeTestResolver(options.model as TestModelConfig)]
         : [makeTestResolver()]),
@@ -473,15 +402,21 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       files,
       send,
       user: async (text: string) => {
+        const timestamp = Date.now()
+        const content = textParts(text)
+        const messageId = createId()
         await send({
           type: 'user_message',
+          messageId,
           forkId: null,
-          content: textParts(text),
+          timestamp,
+          content,
           attachments: [],
           mode: 'text',
           synthetic: false,
           taskMode: false,
         })
+        await waitEvent('user_message_ready', (e) => e.messageId === messageId)
       },
       events: () => transcript,
       onEvent,

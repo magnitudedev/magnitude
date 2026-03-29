@@ -12,6 +12,7 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { textOf } from '../content'
+import { UserMessageResolutionProjection } from './user-message-resolution'
 
 // =============================================================================
 // Types
@@ -37,6 +38,8 @@ export interface ConversationState {
 export const ConversationProjection = Projection.define<AppEvent, ConversationState>()({
   name: 'Conversation',
 
+  reads: [UserMessageResolutionProjection] as const,
+
   initial: {
     entries: [],
     pendingProse: '',
@@ -45,19 +48,6 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
 
   eventHandlers: {
     oneshot_task: ({ state }) => state,
-
-    user_message: ({ event, state }) => {
-      // Only track root fork (lead) conversation
-      if (event.forkId !== null) return state
-
-      const text = textOf(event.content)
-      if (!text.trim()) return state
-
-      return {
-        ...state,
-        entries: [...state.entries, { role: 'user' as const, text }],
-      }
-    },
 
     message_start: ({ event, state }) => {
       if (event.forkId !== null) return state
@@ -96,4 +86,18 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
       }
     },
   },
+
+  signalHandlers: on => [
+    on(UserMessageResolutionProjection.signals.userMessageResolved, ({ value, state }) => {
+      if (value.forkId !== null) return state
+
+      const text = textOf(value.content)
+      if (!text.trim()) return state
+
+      return {
+        ...state,
+        entries: [...state.entries, { role: 'user', text }],
+      }
+    }),
+  ],
 })

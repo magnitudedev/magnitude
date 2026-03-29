@@ -5,6 +5,7 @@ import type { AppEvent } from '../../events'
 import { WorkingStateProjection } from '../../projections/working-state'
 import { AgentStatusProjection } from '../../projections/agent-status'
 import { TurnController } from '../turn-controller'
+import { createId } from '../../util/id'
 
 const TestAgent = Agent.define<AppEvent>()({
   name: 'TurnControllerTestAgent',
@@ -161,7 +162,9 @@ describe('TurnController', () => {
 
       await client.send({
         type: 'user_message',
+        messageId: createId(),
         forkId: null,
+        timestamp: Date.now(),
         content: [{ type: 'text', text: 'trigger root turn' }],
         attachments: [],
         mode: 'text',

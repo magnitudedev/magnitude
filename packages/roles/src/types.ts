@@ -111,8 +111,8 @@ export interface RoleBase<
   readonly lenses: ThinkingLens[]
   readonly observables?: readonly ObservableConfig<RObs>[]
   readonly lifecyclePrompts?: {
-    readonly parentOnSpawn?: string
-    readonly parentOnIdle?: string
+    readonly parentOnSpawn?: (agentIds: readonly string[]) => string
+    readonly parentOnIdle?: (agentIds: readonly string[]) => string
   }
   readonly defaultRecipient: 'user' | 'parent'
   readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
@@ -157,7 +157,10 @@ export interface RoleDefinitionErased {
   readonly lenses: ThinkingLens[]
   readonly observables: readonly ObservableConfig<unknown>[]
   readonly spawnable: boolean
-  readonly lifecyclePrompts?: { readonly parentOnSpawn?: string; readonly parentOnIdle?: string }
+  readonly lifecyclePrompts?: {
+    readonly parentOnSpawn?: (agentIds: readonly string[]) => string
+    readonly parentOnIdle?: (agentIds: readonly string[]) => string
+  }
   readonly defaultRecipient: 'user' | 'parent'
   readonly protocolRole: 'lead' | 'subagent' | 'oneshot-lead'
   readonly initialContext: { parentConversation?: boolean }

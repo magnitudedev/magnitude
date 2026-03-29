@@ -6,10 +6,10 @@
 
 export function formatUserPresence(focused: boolean): string {
   return focused
-    ? '<user-presence>The terminal window has regained focus. The user is likely present.</user-presence>'
-    : '<user-presence>The terminal window has lost focus. The user may be away.</user-presence>'
+    ? 'The terminal window has regained focus. The user is likely present.'
+    : 'The terminal window has lost focus. The user may be away.'
 }
 
 export function formatUserReturnedAfterAbsence(): string {
-  return `<user-presence confirmed="true">The user has returned after being away. Subagents are actively running — consider surfacing a status update.</user-presence>`
+  return `The user has returned after being away. Subagents are actively running — consider surfacing a status update.`
 }

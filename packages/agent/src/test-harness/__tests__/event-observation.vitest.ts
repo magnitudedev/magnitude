@@ -2,6 +2,7 @@ import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../harness'
 import { textParts } from '../../content'
+import { createId } from '../../util/id'
 
 const simpleYieldXml = '<comms><message to="user">hi</message></comms><yield/>'
 
@@ -53,7 +54,9 @@ describe('event observation', () => {
 
       yield* harness.send({
         type: 'user_message',
+        messageId: createId(),
         forkId: null,
+        timestamp: Date.now(),
         content: textParts('injected'),
         attachments: [],
         mode: 'text',

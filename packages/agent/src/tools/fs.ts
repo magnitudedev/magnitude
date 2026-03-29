@@ -6,14 +6,12 @@ import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema, ToolImageSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
-import { relative, resolve } from 'path'
-import { resolveRgPath } from '@magnitudedev/ripgrep'
-import { walk } from '../util/walk'
-import { createDefaultIgnore } from '../util/gitignore'
+import { resolve } from 'path'
 import { validateAndApply } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 import { readImageFileForModel } from '../util/read-image-file'
 import { expandWorkspacePath } from '../workspace'
+import { Fs, resolveFsPath } from '../services/fs'
 
 // =============================================================================
 // Errors
@@ -51,13 +49,12 @@ export const readTool = defineTool({
   label: (input) => input.path ? `Reading ${input.path}` : 'Reading file...',
   execute: ({ path, offset, limit }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const fs = yield* Fs
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
-    const file = Bun.file(fullPath)
-    const content = yield* Effect.tryPromise({
-      try: () => file.text(),
-      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to read ${path}`),
-    })
+    const content = yield* fs.readText(fullPath).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Failed to read ${path}`)))
+    )
 
     const lines = content.split('\n')
     const startLine = offset ?? 1
@@ -123,14 +120,12 @@ export const writeTool = defineTool({
   label: (input) => input.path ? `Writing ${input.path}` : 'Writing file...',
   execute: ({ path, content }, ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const fs = yield* Fs
     const expandedPath = expandWorkspacePath(path, workspacePath)
-    yield* Effect.tryPromise({
-      try: async () => {
-        const fullPath = resolve(cwd, expandedPath)
-        await Bun.write(fullPath, content)
-      },
-      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
-    })
+    const fullPath = resolve(cwd, expandedPath)
+    yield* fs.writeFile(fullPath, content).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Failed to write ${path}`)))
+    )
     const linesWritten = content.split('\n').length
     yield* ctx.emit({ type: 'write_stats', path, linesWritten })
   })
@@ -179,12 +174,10 @@ export const editTool = defineTool({
       const path = input.path
       if (!path || !path.isFinal) return state
       const { cwd, workspacePath } = yield* WorkingDirectoryTag
+      const fs = yield* Fs
       const expandedPath = expandWorkspacePath(path.value, workspacePath)
       const fullPath = resolve(cwd, expandedPath)
-      const content = yield* Effect.tryPromise({
-        try: () => Bun.file(fullPath).text(),
-        catch: () => new Error('read failed'),
-      }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
+      const content = yield* fs.readText(fullPath).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
       if (content == null) return state
       yield* ctx.emit({ type: 'file_edit_base_content', path: path.value, baseContent: content })
       return { emitted: true }
@@ -193,14 +186,14 @@ export const editTool = defineTool({
   label: (input) => input.path ? `Editing ${input.path}` : 'Editing file...',
   execute: ({ path, oldString, newString, replaceAll }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const fs = yield* Fs
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
 
     // Read current file
-    const content = yield* Effect.tryPromise({
-      try: () => Bun.file(fullPath).text(),
-      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to read ${path}`),
-    })
+    const content = yield* fs.readText(fullPath).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Failed to read ${path}`)))
+    )
 
     // Validate and apply
     let applied
@@ -211,10 +204,9 @@ export const editTool = defineTool({
     }
 
     // Write result to disk
-    yield* Effect.tryPromise({
-      try: () => Bun.write(fullPath, applied.result),
-      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to write ${path}`),
-    })
+    yield* fs.writeFile(fullPath, applied.result).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Failed to write ${path}`)))
+    )
 
     // Build summary
     if (applied.replaceCount > 1) {
@@ -279,25 +271,22 @@ export const treeTool = defineTool({
   label: (input) => input.path ? `Listing ${input.path}` : 'Listing directory...',
   execute: ({ path, options }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
+    const fs = yield* Fs
     const expandedPath = expandWorkspacePath(path, workspacePath)
-    return yield* Effect.tryPromise({
-      try: async () => {
-        const fullPath = resolve(cwd, expandedPath)
-        const respectGitignore = options?.gitignore ?? true
-        const maxDepth = options?.maxDepth
+    const fullPath = resolve(cwd, expandedPath)
+    const respectGitignore = options?.gitignore ?? true
+    const maxDepth = options?.maxDepth
 
-        const ignore = respectGitignore ? createDefaultIgnore() : null
-        const entries = await walk(fullPath, fullPath, 0, maxDepth, ignore, respectGitignore)
+    const entries = yield* fs.walk(fullPath, { maxDepth, respectGitignore }).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Failed to list ${path}`)))
+    )
 
-        return entries.map(entry => ({
-          path: entry.relativePath,
-          name: entry.name,
-          type: entry.type,
-          depth: entry.depth
-        }))
-      },
-      catch: (e) => fsError(e instanceof Error ? e.message : `Failed to list ${path}`),
-    })
+    return entries.map(entry => ({
+      path: entry.relativePath,
+      name: entry.name,
+      type: entry.type,
+      depth: entry.depth
+    }))
   })
 })
 
@@ -329,108 +318,6 @@ const SearchMatch = Schema.Struct({
 
 type SearchMatch = Schema.Schema.Type<typeof SearchMatch>
 
-export async function grepFiles(
-  pattern: string,
-  searchPath: string,
-  globPattern: string | undefined,
-  limit: number
-): Promise<SearchMatch[]> {
-  const args = [
-    '--json',
-    '--line-number',
-    '--max-columns', '500',
-    '--max-columns-preview',
-    '-e', pattern,
-  ]
-
-  if (globPattern) {
-    args.push('--glob', globPattern)
-  }
-
-  args.push(searchPath)
-
-  const rgPath = await resolveRgPath()
-  const proc = Bun.spawn([rgPath, ...args], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-
-  const matches: SearchMatch[] = []
-  const decoder = new TextDecoder()
-  const reader = proc.stdout.getReader()
-
-  let buffer = ''
-  let timedOut = false
-  let stoppedEarly = false
-
-  const processLine = (line: string) => {
-    if (!line.trim()) return
-
-    try {
-      const msg = JSON.parse(line)
-      if (msg.type === 'match') {
-        const data = msg.data
-        const filePath = relative(searchPath, data.path.text)
-        const lineNum = data.line_number
-        const lineText = data.lines.text.replace(/\n$/, '')
-        matches.push({
-          file: filePath,
-          match: `${lineNum}|${lineText}`
-        })
-        if (matches.length >= limit) {
-          stoppedEarly = true
-          proc.kill()
-        }
-      }
-    } catch {
-      // Ignore malformed lines from rg output
-    }
-  }
-
-  const timeout = setTimeout(() => {
-    timedOut = true
-    proc.kill()
-  }, 5000)
-
-  try {
-    while (!stoppedEarly) {
-      const { value, done } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-
-      let newlineIndex = buffer.indexOf('\n')
-      while (newlineIndex !== -1) {
-        const line = buffer.slice(0, newlineIndex)
-        buffer = buffer.slice(newlineIndex + 1)
-        processLine(line)
-        if (stoppedEarly) break
-        newlineIndex = buffer.indexOf('\n')
-      }
-    }
-
-    if (!stoppedEarly) {
-      buffer += decoder.decode()
-      if (buffer) {
-        processLine(buffer)
-      }
-    }
-
-    await proc.exited
-
-    if (timedOut) {
-      throw new Error('Search timed out after 5s — try a more specific pattern or glob filter')
-    }
-
-    return matches
-  } finally {
-    clearTimeout(timeout)
-    if (!timedOut && !stoppedEarly) {
-      proc.kill()
-    }
-    reader.releaseLock()
-  }
-}
 
 export const grepTool = defineTool({
   name: 'grep',
@@ -461,20 +348,18 @@ export const grepTool = defineTool({
   label: (input) => input.pattern ? `Searching for ${input.pattern}` : 'Searching files...',
   execute: ({ pattern, path, glob, limit, options }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
-    return yield* Effect.tryPromise({
-      try: async () => {
-        const resolvedPath = expandWorkspacePath(path ?? options?.path ?? '', workspacePath) || undefined
-        const resolvedGlob = glob ?? options?.glob
-        const resolvedLimit = limit ?? options?.limit ?? 50
+    const fs = yield* Fs
+    const resolvedPath = expandWorkspacePath(path ?? options?.path ?? '', workspacePath) || undefined
+    const resolvedGlob = glob ?? options?.glob
+    const resolvedLimit = limit ?? options?.limit ?? 50
 
-        const searchPath = resolvedPath
-          ? resolve(cwd, resolvedPath)
-          : cwd
+    const searchPath = resolvedPath
+      ? resolve(cwd, resolvedPath)
+      : cwd
 
-        return await grepFiles(pattern, searchPath, resolvedGlob, resolvedLimit)
-      },
-      catch: (e) => fsError(e instanceof Error ? e.message : `Search failed for ${pattern}`),
-    })
+    return yield* fs.search({ pattern, searchPath, glob: resolvedGlob, limit: resolvedLimit }).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Search failed for ${pattern}`)))
+    )
   })
 })
 
@@ -514,8 +399,12 @@ export const viewTool = defineTool({
   label: (input) => input.path ? `Viewing ${input.path}` : 'Viewing image...',
   execute: ({ path: filePath }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
-    const expandedPath = expandWorkspacePath(filePath, workspacePath)
-    const fullPath = resolve(cwd, expandedPath)
+    const fs = yield* Fs
+    const fullPath = resolveFsPath(filePath, cwd, workspacePath)
+
+    yield* fs.readFile(fullPath).pipe(
+      Effect.catchAll(() => Effect.fail(fsError(`Failed to read image: ${filePath}`)))
+    )
 
     return yield* Effect.tryPromise({
       try: () => readImageFileForModel(fullPath),

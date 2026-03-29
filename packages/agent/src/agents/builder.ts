@@ -11,6 +11,7 @@ import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
+import { formatAgentIdList } from './lifecycle-reminder-format'
 
 
 const qualityLens = defineThinkingLens({
@@ -52,8 +53,10 @@ export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({
   spawnable: true,
   observables: [],
   lifecyclePrompts: {
-    parentOnSpawn: 'If there are other independent changes to make, spawn additional builders in parallel rather than waiting for this one.',
-    parentOnIdle: `Review the builder's work for correctness, quality, and adherance to user requirements. For nontrivial changes, spawn a reviewer. Do not present unverified work to user.`,
+    parentOnSpawn: (agentIds) =>
+      `If there are other independent changes to make, spawn additional builders in parallel rather than waiting for ${formatAgentIdList(agentIds)}.`,
+    parentOnIdle: (agentIds) =>
+      `Review ${formatAgentIdList(agentIds)}'s work for correctness, quality, and adherance to user requirements. For nontrivial changes, spawn a reviewer. Do not present unverified work to user.`,
   },
 
   policy: [

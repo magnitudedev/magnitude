@@ -5,10 +5,13 @@ import { normalizeReferencedPath } from './file-refs'
 export interface ResolvedFileRef {
   resolvedPath: string
   displayPath: string
-  sourceRoot: 'workspace' | 'project'
 }
 
-export function resolveFileRef(
+/**
+ * Pure path resolution — resolves a file reference to an absolute path
+ * without checking existence on disk.
+ */
+export function resolveFileRefPath(
   refPath: string,
   cwd: string,
   workspacePath: string,
@@ -22,20 +25,30 @@ export function resolveFileRef(
       ? normalized.slice('${M}/'.length)
       : normalized.slice('$M/'.length)
     const resolvedPath = path.resolve(workspacePath, innerPath)
-    if (!existsSync(resolvedPath)) return null
     return {
       resolvedPath,
       displayPath: innerPath,
-      sourceRoot: 'workspace',
     }
   }
 
   const projectResolved = path.resolve(cwd, normalized)
-  if (!existsSync(projectResolved)) return null
-
   return {
     resolvedPath: projectResolved,
     displayPath: normalized,
-    sourceRoot: 'project',
   }
+}
+
+/**
+ * Resolves a file reference and verifies existence on disk.
+ * Use resolveFileRefPath for pure path resolution without disk checks.
+ */
+export function resolveFileRef(
+  refPath: string,
+  cwd: string,
+  workspacePath: string,
+): ResolvedFileRef | null {
+  const resolved = resolveFileRefPath(refPath, cwd, workspacePath)
+  if (!resolved) return null
+  if (!existsSync(resolved.resolvedPath)) return null
+  return resolved
 }

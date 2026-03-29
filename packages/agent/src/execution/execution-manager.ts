@@ -19,7 +19,7 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult } from '../events'
+import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult, TurnResultError } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
@@ -33,7 +33,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, ONESHOT_LIVENESS_REMINDER, formatNonexistentAgentError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, formatNonexistentAgentError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
@@ -409,13 +409,7 @@ const makeExecutionManager = Effect.gen(function* () {
       // Accumulate observed tool output results
       const observedResults: ObservedResult[] = []
 
-      let hasStructuralParseError = false
-      let structuralParseErrorReminder: string | null = null
-
-
-      // Track messages to nonexistent agent IDs
-      let hasNonexistentAgentDest = false
-      let nonexistentAgentError: string | null = null
+      const turnErrors: TurnResultError[] = []
 
       // Store execution result
       let executionResult: TurnResult = { success: true, turnDecision: 'yield' }
@@ -716,9 +710,11 @@ const makeExecutionManager = Effect.gen(function* () {
                   const currentAgentState = yield* agentRoutingProjectionInst.get
                   const targetAgent = isActiveRoute(currentAgentState, resolvedDest)
                   if (!targetAgent) {
-                    hasNonexistentAgentDest = true
                     const destStr = `"${resolvedDest}"`
-                    nonexistentAgentError = `<error>\n${formatNonexistentAgentError(destStr)}\n</error>`
+                    turnErrors.push({
+                      code: 'nonexistent_agent_destination',
+                      message: formatNonexistentAgentError(destStr),
+                    })
                   }
                 }
 
@@ -788,13 +784,11 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'StructuralParseError': {
-                hasStructuralParseError = true
-                const msg = event.error._tag === 'UnclosedThink'
-                  ? UNCLOSED_THINK_REMINDER
-                  : event.error._tag === 'FinishWithoutEvidence'
-                  ? 'Finish tag used without evidence'
-                  : UNCLOSED_ACTIONS_REMINDER
-                structuralParseErrorReminder = `<error>\n${msg}\n</error>`
+                if (event.error._tag === 'UnclosedThink') {
+                  turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
+                } else if (event.error._tag === 'UnclosedContainer') {
+                  turnErrors.push({ code: 'unclosed_actions', message: UNCLOSED_ACTIONS_REMINDER })
+                }
                 break
               }
 
@@ -810,15 +804,11 @@ const makeExecutionManager = Effect.gen(function* () {
                   // the error feedback and can retry. The turn policy only decides for clean turns.
                   const hasToolErrors = toolCalls.some(tc => tc.result.status === 'error')
 
-                  if (hasToolErrors || hasStructuralParseError || hasNonexistentAgentDest) {
+                  if (hasToolErrors || turnErrors.length > 0) {
                     executionResult = {
                       success: true,
                       turnDecision: 'continue',
-                      ...(structuralParseErrorReminder
-                        ? { reminder: structuralParseErrorReminder }
-                        : nonexistentAgentError
-                          ? { reminder: nonexistentAgentError }
-                          : {}),
+                      ...(turnErrors.length > 0 ? { errors: turnErrors } : {}),
                     }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
@@ -833,9 +823,9 @@ const makeExecutionManager = Effect.gen(function* () {
                       state: policyCtx,
                     })
                     if (turnResult.action === 'finish') {
-                      executionResult = { success: true, turnDecision: 'finish', reminder: turnResult.reminder, evidence: '' }
+                      executionResult = { success: true, turnDecision: 'finish', evidence: '' }
                     } else {
-                      executionResult = { success: true, turnDecision: turnResult.action, reminder: turnResult.reminder }
+                      executionResult = { success: true, turnDecision: turnResult.action }
                     }
                   }
                 } else if (endResult._tag === 'Interrupted') {
@@ -862,7 +852,7 @@ const makeExecutionManager = Effect.gen(function* () {
                     executionResult = {
                       success: true,
                       turnDecision: 'continue',
-                      reminder: ONESHOT_LIVENESS_REMINDER,
+                      oneshotLivenessTriggered: true,
                     }
                   }
                 }

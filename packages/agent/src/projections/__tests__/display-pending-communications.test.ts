@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createAgentTestHarness } from '../../test-harness/harness'
 import { textParts } from '../../content'
+import { createId } from '../../util/id'
 import { DisplayProjection } from '../display'
 import { WorkingStateProjection } from '../working-state'
 
@@ -98,7 +99,21 @@ describe('display pending communications promotion', () => {
 
     try {
       await harness.send({
+        type: 'agent_created',
+        timestamp: ts(8),
+        forkId: 'fork-user',
+        parentForkId: null,
+        agentId: 'agent-user',
+        role: 'builder',
+        name: 'BuilderUser',
+        message: '',
+        mode: 'manual',
+      } as any)
+
+      const messageId = createId()
+      await harness.send({
         type: 'user_message',
+        messageId,
         timestamp: ts(9),
         forkId: 'fork-user',
         content: textParts('hello subagent'),
@@ -107,11 +122,20 @@ describe('display pending communications promotion', () => {
         taskMode: false,
         attachments: [],
       } as any)
+      await harness.send({
+        type: 'user_message_ready',
+        messageId,
+        forkId: 'fork-user',
+        resolvedMentions: [],
+      } as any)
 
       const display = await harness.projectionFork(DisplayProjection.Tag, 'fork-user')
-      const userMessages = display.messages.filter(m => m.type === 'user_message')
-      expect(userMessages.length).toBe(1)
-      expect((userMessages[0] as any).content).toContain('hello subagent')
+      const userMessages = display.messages.filter(
+        m => m.type === 'user_message' || m.type === 'queued_user_message'
+      )
+      expect(
+        userMessages.some(m => (m as any).content.includes('hello subagent'))
+      ).toBe(true)
 
       const communicationSteps = display.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
         .filter(s => s.type === 'communication' && (s as any).content?.includes('hello subagent'))

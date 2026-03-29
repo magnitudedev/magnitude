@@ -13,6 +13,7 @@ import { catalog } from '../catalog'
 
 import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
+import { formatAgentIdList } from './lifecycle-reminder-format'
 
 
 const strategyLens = defineThinkingLens({
@@ -53,8 +54,10 @@ export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>(
   spawnable: true,
   observables: [],
   lifecyclePrompts: {
-    parentOnSpawn: 'If you need context on multiple areas, spawn additional explorers in parallel rather than waiting for one at a time.',
-    parentOnIdle: 'Evaluate whether the explorer\'s findings are sufficient. If ambiguities or unknowns remain, send the explorer back with specific questions or spawn additional explorers. Do not proceed to planning or building with incomplete context.',
+    parentOnSpawn: (agentIds) =>
+      `If you need context on multiple areas, spawn additional explorers in parallel rather than waiting for ${formatAgentIdList(agentIds)}.`,
+    parentOnIdle: (agentIds) =>
+      `Evaluate whether the findings of ${formatAgentIdList(agentIds)} are sufficient. If ambiguities or unknowns remain, send ${agentIds.length === 1 ? agentIds[0] : 'them'} back with specific questions or spawn additional explorers. Do not proceed to planning or building with incomplete context.`,
   },
 
   policy: [

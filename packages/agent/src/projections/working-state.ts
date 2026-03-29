@@ -11,6 +11,7 @@ import type { AppEvent } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
 import { createId } from '../util/id'
 import { CompactionProjection } from './compaction'
+import { UserMessageResolutionProjection } from './user-message-resolution'
 
 function toPreview(text: string): string {
   const normalized = text.replace(/\s+/g, ' ').trim()
@@ -54,7 +55,6 @@ export interface ForkWorkingState {
   readonly softInterrupted: boolean
   readonly currentTurnAllowsDirectUserReply: boolean
   readonly pendingSeeVerdict: boolean
-  readonly pendingMentionTimestamps: readonly number[]
   readonly pendingInboundCommunications: readonly PendingInboundCommunication[]
 }
 
@@ -63,7 +63,7 @@ export interface ForkWorkingState {
 // =============================================================================
 
 export const shouldTrigger = (state: ForkWorkingState): boolean =>
-  !state.working && state.willContinue && !state.compactionPending && !state.contextLimitBlocked && state.pendingMentionTimestamps.length === 0
+  !state.working && state.willContinue && !state.compactionPending && !state.contextLimitBlocked
 
 export const isStable = (state: ForkWorkingState): boolean =>
   !state.working && !state.willContinue && !state.compactionPending && !state.contextLimitBlocked
@@ -74,6 +74,8 @@ export const isStable = (state: ForkWorkingState): boolean =>
 
 export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWorkingState>()({
   name: 'WorkingState',
+
+  reads: [AgentRoutingProjection, CompactionProjection, UserMessageResolutionProjection] as const,
 
   initialFork: {
     parentForkId: null,
@@ -89,7 +91,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
     softInterrupted: false,
     pendingSeeVerdict: false,
     currentTurnAllowsDirectUserReply: false,
-    pendingMentionTimestamps: [],
     pendingInboundCommunications: []
   },
 
@@ -111,50 +112,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           forkId: event.forkId,
           shouldTrigger: shouldTrigger(newFork),
           chainId: newFork.currentChainId,
-        })
-      }
-      return newFork
-    },
-
-    user_message: ({ event, fork, emit }) => {
-      const isQueued = fork.working
-      const hasMentions = (event.attachments ?? []).some(attachment => attachment.type === 'mention')
-      const isDirectToSubagent = event.forkId !== null
-      const contentText = typeof event.content === 'string'
-        ? event.content
-        : event.content.map(part => part.type === 'text' ? part.text : '').join('')
-
-      const newFork: ForkWorkingState = {
-        ...fork,
-        willContinue: true,
-        hasQueuedMessages: fork.hasQueuedMessages || isQueued,
-        pendingMentionTimestamps: hasMentions
-          ? [...fork.pendingMentionTimestamps, event.timestamp]
-          : fork.pendingMentionTimestamps,
-        pendingInboundCommunications: isDirectToSubagent
-          ? [
-              ...fork.pendingInboundCommunications,
-              {
-                id: createId(),
-                source: 'user',
-                replyPolicy: 'user_reply_once',
-                direction: 'from_agent',
-                agentId: 'user',
-                forkId: event.forkId,
-                content: contentText,
-                preview: toPreview(contentText),
-                timestamp: event.timestamp,
-                arrivedAtTurnId: fork.currentTurnId,
-              }
-            ]
-          : fork.pendingInboundCommunications
-      }
-
-      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
-        emit.shouldTriggerChanged({
-          forkId: event.forkId,
-          shouldTrigger: shouldTrigger(newFork),
-          chainId: newFork.currentChainId
         })
       }
       return newFork
@@ -182,25 +139,6 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
           chainId: newFork.currentChainId
         })
       }
-      return newFork
-    },
-
-    file_mention_resolved: ({ event, fork, emit }) => {
-      const newFork: ForkWorkingState = {
-        ...fork,
-        pendingMentionTimestamps: fork.pendingMentionTimestamps.filter(
-          timestamp => timestamp !== event.sourceMessageTimestamp
-        )
-      }
-
-      if (shouldTrigger(newFork) !== shouldTrigger(fork)) {
-        emit.shouldTriggerChanged({
-          forkId: event.forkId,
-          shouldTrigger: shouldTrigger(newFork),
-          chainId: newFork.currentChainId
-        })
-      }
-
       return newFork
     },
 
@@ -587,6 +525,50 @@ export const WorkingStateProjection = Projection.defineForked<AppEvent, ForkWork
       }
     }),
 
+
+    on(UserMessageResolutionProjection.signals.userMessageResolved, ({ value, state, emit }) => {
+      const forkState = state.forks.get(value.forkId)
+      if (!forkState) return state
+
+      const isDirectToSubagent = value.forkId !== null
+      const contentText = value.content.map(part => part.type === 'text' ? part.text : '').join('')
+
+      const newForkState: ForkWorkingState = {
+        ...forkState,
+        willContinue: true,
+        hasQueuedMessages: forkState.hasQueuedMessages || forkState.working,
+        pendingInboundCommunications: isDirectToSubagent
+          ? [
+              ...forkState.pendingInboundCommunications,
+              {
+                id: createId(),
+                source: 'user',
+                replyPolicy: 'user_reply_once',
+                direction: 'from_agent',
+                agentId: 'user',
+                forkId: value.forkId,
+                content: contentText,
+                preview: toPreview(contentText),
+                timestamp: value.timestamp,
+                arrivedAtTurnId: forkState.currentTurnId,
+              }
+            ]
+          : forkState.pendingInboundCommunications,
+      }
+
+      if (shouldTrigger(newForkState) !== shouldTrigger(forkState)) {
+        emit.shouldTriggerChanged({
+          forkId: value.forkId,
+          shouldTrigger: shouldTrigger(newForkState),
+          chainId: newForkState.currentChainId
+        })
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(value.forkId, newForkState)
+      }
+    }),
 
     // Wake orchestrator (root) when sub-agent responds
     on(AgentRoutingProjection.signals.agentResponse, ({ value, state, emit }) => {

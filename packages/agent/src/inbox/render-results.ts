@@ -9,30 +9,19 @@ import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
 import type { TurnToolCall, ObservedResult } from '../events'
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
-import { INTERRUPT_MESSAGE } from './constants'
-import { type ContentPart } from '../content'
+import { INTERRUPT_MESSAGE } from '../prompts/constants'
+import { ONESHOT_LIVENESS_REMINDER } from '../prompts/error-states'
+import { ContentPartBuilder, type ContentPart } from '../content'
 
 /** Format tool results for LLM context */
-export function formatResults(toolCalls: readonly TurnToolCall[], observedResults: readonly ObservedResult[], error?: string): ContentPart[] {
-  const parts: ContentPart[] = []
-  let textBuffer = '<results>'
-
-  const pushText = (text: string) => {
-    textBuffer += text
-  }
-  const flushText = () => {
-    if (!textBuffer) return
-    const last = parts[parts.length - 1]
-    if (last?.type === 'text') parts[parts.length - 1] = { type: 'text', text: last.text + textBuffer }
-    else parts.push({ type: 'text', text: textBuffer })
-    textBuffer = ''
-  }
+export function formatResults(toolCalls: readonly TurnToolCall[], observedResults: readonly ObservedResult[]): ContentPart[] {
+  const builder = new ContentPartBuilder()
 
   for (const tc of toolCalls) {
     if (tc.result.status === 'interrupted') {
-      pushText(`\n<tool name="${tc.toolKey}"><error>Interrupted</error></tool>`)
+      builder.pushText(`\n<tool name="${tc.toolKey}"><error>Interrupted</error></tool>`)
     } else if (tc.result.status !== 'success') {
-      pushText(`\n<tool name="${tc.toolKey}"><error>${tc.result.message}</error></tool>`)
+      builder.pushText(`\n<tool name="${tc.toolKey}"><error>${tc.result.message}</error></tool>`)
     }
   }
 
@@ -40,34 +29,22 @@ export function formatResults(toolCalls: readonly TurnToolCall[], observedResult
     const textChars = observed.content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0)
     if (textChars > INSPECT_CHAR_LIMIT) {
       const approxTokens = Math.ceil(textChars / 4)
-      pushText(`\n<${observed.tagName} observe="${observed.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${observed.tagName}>`)
+      builder.pushText(`\n<${observed.tagName} observe="${observed.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${observed.tagName}>`)
       for (const part of observed.content) {
-        if (part.type === 'image') {
-          flushText()
-          parts.push(part)
-        }
+        if (part.type === 'image') builder.pushPart(part)
       }
       continue
     }
 
-    pushText(`\n<${observed.tagName} observe="${observed.query}">`)
+    builder.pushText(`\n<${observed.tagName} observe="${observed.query}">`)
     for (const part of observed.content) {
-      if (part.type === 'text') pushText(part.text)
-      else {
-        flushText()
-        parts.push(part)
-      }
+      if (part.type === 'text') builder.pushText(part.text)
+      else builder.pushPart(part)
     }
-    pushText(`</${observed.tagName}>`)
+    builder.pushText(`</${observed.tagName}>`)
   }
 
-  if (error) {
-    pushText(`\n<error>${error}</error>`)
-  }
-
-  pushText('\n</results>')
-  flushText()
-  return parts
+  return builder.build()
 }
 
 /** Wrap interrupt message */
@@ -83,4 +60,9 @@ export function formatError(message: string): string {
 /** Noop turn — agent continued without taking any actions */
 export function formatNoop(): string {
   return `<noop>No actions were taken. Use ${TURN_CONTROL_YIELD} if you have nothing more to do, instead of ${TURN_CONTROL_NEXT}.</noop>`
+}
+
+/** Oneshot liveness reminder rendered as result feedback */
+export function formatOneshotLiveness(): string {
+  return `<error>${ONESHOT_LIVENESS_REMINDER}</error>`
 }

@@ -2,7 +2,6 @@ export { createAgentTestHarness, withHarness } from './harness'
 export type {
   AgentTestHarness,
   HarnessOptions,
-  ToolOverrideHandler,
   WaitOptions,
   WaitUntilOptions,
   HarnessSnapshot,
@@ -25,12 +24,4 @@ export type { FaultPlan, FaultScope, FaultRegistry } from './faults'
 
 export { withAgentOverrides } from './agent-overrides'
 export { runWithGlobalAgentTestGuard } from './global-test-guard'
-export {
-  createVirtualFs,
-  createFsReadHandler,
-  createFsWriteHandler,
-  createEditHandler,
-  createFsTreeHandler,
-  createFsSearchHandler,
-  createDefaultToolOverrides,
-} from './virtual-fs'
+export { createVirtualFs, createVirtualFsLayer } from './virtual-fs'

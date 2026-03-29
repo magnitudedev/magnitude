@@ -1,11 +1,11 @@
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart } from '../events'
+import type { AppEvent, ResponsePart, TurnResultError } from '../events'
 import type { ContentPart } from '../content'
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
-import { UNCLOSED_ACTIONS_REMINDER, UNCLOSED_THINK_REMINDER } from '../prompts'
+
 
 export interface ThinkBlock {
   about: string | null
@@ -51,10 +51,9 @@ function flattenResponseText(parts: readonly ResponsePart[]): string {
     .join('')
 }
 
-function isStructuralReminder(reminder?: string): boolean {
-  if (!reminder) return false
-  return reminder.includes(UNCLOSED_THINK_REMINDER)
-    || reminder.includes(UNCLOSED_ACTIONS_REMINDER)
+function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
+  if (!errors || errors.length === 0) return false
+  return errors.some((error) => error.code === 'unclosed_think' || error.code === 'unclosed_actions')
 }
 
 function resetActive(state: CanonicalTurnState): CanonicalTurnState {
@@ -227,7 +226,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
     turn_completed: ({ event, fork, read }) => {
       if (fork.turnId !== event.turnId) return fork
 
-      const hasStructuralError = fork.hasStructuralError || (event.result.success ? isStructuralReminder(event.result.reminder) : false)
+      const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
       const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
 
       const observedResults = [...event.observedResults]

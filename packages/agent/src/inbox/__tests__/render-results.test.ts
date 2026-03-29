@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'bun:test'
-import type { ContentPart } from '@magnitudedev/tools'
-import { formatResults } from './results'
+import { describe, expect, test } from 'vitest'
+import type { ContentPart } from '../../content'
+import { formatResults } from '../render-results'
 
 describe('formatResults', () => {
   test('formats observed image result with wrapper tags around inner content only', () => {
@@ -23,9 +23,9 @@ describe('formatResults', () => {
     )
 
     expect(output).toEqual([
-      { type: 'text', text: '<results>\n<view observe=".">' },
+      { type: 'text', text: '\n<view observe=".">' },
       { type: 'image', base64: 'dGVzdA==', mediaType: 'image/png', width: 100, height: 100 },
-      { type: 'text', text: '</view>\n</results>' },
+      { type: 'text', text: '</view>' },
     ] satisfies ContentPart[])
   })
 })

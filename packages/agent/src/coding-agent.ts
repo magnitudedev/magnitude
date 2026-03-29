@@ -32,7 +32,8 @@ import { ChatTitleProjection } from './projections/chat-title'
 import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
 import { OutboundMessagesProjection } from './projections/outbound-messages'
-import { FileAwarenessProjection } from './projections/file-awareness'
+import { UserMessageResolutionProjection } from './projections/user-message-resolution'
+
 
 // Workers
 import { TurnController } from './workers/turn-controller'
@@ -48,6 +49,7 @@ import type { AgentVariant } from './agents'
 import { ChatTitleWorker } from './workers/chat-title-worker'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
+import { FsLive } from './services/fs'
 
 // Execution
 import { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
@@ -89,7 +91,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     ReplayProjection,
     SubagentActivityProjection,
     OutboundMessagesProjection,
-    FileAwarenessProjection,
+    UserMessageResolutionProjection,
     MemoryProjection,
     DisplayProjection,
     ChatTitleProjection,
@@ -218,6 +220,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     Layer.provide(BrowserServiceLive, providerRuntime),
     Layer.provide(makeModelResolver<MagnitudeSlot>(), providerRuntime),
     providerRuntime,
+    FsLive,
     tracerLayer,
     options.persistence,
   )

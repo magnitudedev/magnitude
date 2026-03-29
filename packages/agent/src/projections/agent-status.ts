@@ -34,7 +34,6 @@ export interface AgentCreatedSignal {
   readonly agentId: string
   readonly name: string
   readonly role: string
-  readonly type: string
   readonly taskId: string
   readonly mode: 'clone' | 'spawn'
   readonly context: string
@@ -44,7 +43,7 @@ export interface AgentCreatedSignal {
 export interface AgentBecameIdleSignal {
   readonly agentId: string
   readonly forkId: string
-  readonly type: string
+  readonly role: string
   readonly parentForkId: string | null
   readonly reason: 'stable' | 'interrupt' | 'error'
   readonly timestamp: number
@@ -53,7 +52,7 @@ export interface AgentBecameIdleSignal {
 export interface AgentBecameWorkingSignal {
   readonly agentId: string
   readonly forkId: string
-  readonly type: string
+  readonly role: string
   readonly parentForkId: string | null
   readonly timestamp: number
 }
@@ -62,7 +61,7 @@ export interface AgentKilledSignal {
   readonly agentId: string
   readonly forkId: string
   readonly parentForkId: string | null
-  readonly type: string
+  readonly role: string
   readonly title: string
   readonly reason: string
   readonly timestamp: number
@@ -72,7 +71,7 @@ export interface SubagentUserKilledSignal {
   readonly agentId: string
   readonly forkId: string
   readonly parentForkId: string | null
-  readonly type: string
+  readonly role: string
   readonly title: string
   readonly source: 'tab_close_confirm'
   readonly timestamp: number
@@ -82,7 +81,7 @@ export interface SubagentIdleClosedSignal {
   readonly agentId: string
   readonly forkId: string
   readonly parentForkId: string | null
-  readonly type: string
+  readonly role: string
   readonly title: string
   readonly source: 'idle_tab_close'
   readonly timestamp: number
@@ -166,7 +165,6 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         agentId: event.agentId,
         name: event.name,
         role: event.role,
-        type: event.role,
         taskId: normalizedTaskId,
         mode: normalizedMode,
         context: normalizedContext,
@@ -204,7 +202,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         emit.agentBecameWorking({
           agentId: agent.agentId,
           forkId: agent.forkId,
-          type: agent.role,
+          role: agent.role,
           parentForkId: agent.parentForkId,
           timestamp: event.timestamp,
         })
@@ -226,7 +224,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         emit.agentBecameIdle({
           agentId: agent.agentId,
           forkId: agent.forkId,
-          type: agent.role,
+          role: agent.role,
           parentForkId: agent.parentForkId,
           reason: 'error',
           timestamp: event.timestamp,
@@ -249,7 +247,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         emit.agentBecameIdle({
           agentId: agent.agentId,
           forkId: agent.forkId,
-          type: agent.role,
+          role: agent.role,
           parentForkId: agent.parentForkId,
           reason: 'interrupt',
           timestamp: event.timestamp,
@@ -275,7 +273,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         agentId: removed.agent.agentId,
         forkId: removed.agent.forkId,
         parentForkId: removed.agent.parentForkId,
-        type: removed.agent.role,
+        role: removed.agent.role,
         title: removed.agent.name,
         reason: event.reason,
         timestamp: event.timestamp,
@@ -297,7 +295,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         agentId: removed.agent.agentId,
         forkId: removed.agent.forkId,
         parentForkId: removed.agent.parentForkId,
-        type: removed.agent.role,
+        role: removed.agent.role,
         title: removed.agent.name,
         source: event.source,
         timestamp: event.timestamp,
@@ -319,7 +317,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         agentId: removed.agent.agentId,
         forkId: removed.agent.forkId,
         parentForkId: removed.agent.parentForkId,
-        type: removed.agent.role,
+        role: removed.agent.role,
         title: removed.agent.name,
         source: event.source,
         timestamp: event.timestamp,
@@ -340,7 +338,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         emit.agentBecameIdle({
           agentId: agent.agentId,
           forkId: agent.forkId,
-          type: agent.role,
+          role: agent.role,
           parentForkId: agent.parentForkId,
           reason: 'stable',
           timestamp: value.timestamp,

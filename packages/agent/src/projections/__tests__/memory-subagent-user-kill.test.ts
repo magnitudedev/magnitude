@@ -9,11 +9,12 @@ import {
 import type { AppEvent } from '../../events'
 import { AgentStatusProjection } from '../agent-status'
 import { MemoryProjection, type ForkMemoryState } from '../memory'
-import { FileAwarenessProjection } from '../file-awareness'
+
 import { SubagentActivityProjection } from '../subagent-activity'
 import { CanonicalTurnProjection } from '../canonical-turn'
 import { UserPresenceProjection } from '../user-presence'
 import { OutboundMessagesProjection } from '../outbound-messages'
+import { UserMessageResolutionProjection } from '../user-message-resolution'
 
 const ts = (n: number) => 1_700_100_000_000 + n
 
@@ -29,11 +30,11 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
       Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
       projectionBusLayer,
       Layer.provide(AgentStatusProjection.Layer, projectionBusLayer),
-      Layer.provide(FileAwarenessProjection.Layer, projectionBusLayer),
       Layer.provide(SubagentActivityProjection.Layer, projectionBusLayer),
       Layer.provide(CanonicalTurnProjection.Layer, projectionBusLayer),
       Layer.provide(UserPresenceProjection.Layer, projectionBusLayer),
       Layer.provide(OutboundMessagesProjection.Layer, projectionBusLayer),
+      Layer.provide(UserMessageResolutionProjection.Layer, projectionBusLayer),
       Layer.provide(MemoryProjection.Layer, projectionBusLayer),
     )
 
@@ -89,15 +90,13 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
     const rootFork = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any) as ForkMemoryState
     expect(rootFork).toBeTruthy()
 
-    const systemInbox = rootFork!.messages.findLast((m: any) => m.type === 'system_inbox') as any
-    expect(systemInbox).toBeTruthy()
+    const inbox = rootFork!.messages.findLast((m: any) => m.type === 'inbox') as any
+    expect(inbox).toBeTruthy()
 
-    const reminder = systemInbox.entries.find((e: any) =>
-      e.kind === 'reminder' && typeof e.text === 'string' && e.text.includes('<subagent_user_killed')
-    )
-    expect(reminder).toBeTruthy()
-    expect(reminder.text).toContain('agentId="agent-sub"')
-    expect(reminder.text).toContain('agentType="builder"')
+    const userKilled = inbox.timeline.find((e: any) => e.kind === 'subagent_user_killed')
+    expect(userKilled).toBeTruthy()
+    expect(userKilled.agentId).toBe('agent-sub')
+    expect(userKilled.agentType).toBe('builder')
   })
 
   it('does not queue parent subagent_user_killed notification for subagent_idle_closed', async () => {
@@ -111,11 +110,11 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
       Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
       projectionBusLayer,
       Layer.provide(AgentStatusProjection.Layer, projectionBusLayer),
-      Layer.provide(FileAwarenessProjection.Layer, projectionBusLayer),
       Layer.provide(SubagentActivityProjection.Layer, projectionBusLayer),
       Layer.provide(CanonicalTurnProjection.Layer, projectionBusLayer),
       Layer.provide(UserPresenceProjection.Layer, projectionBusLayer),
       Layer.provide(OutboundMessagesProjection.Layer, projectionBusLayer),
+      Layer.provide(UserMessageResolutionProjection.Layer, projectionBusLayer),
       Layer.provide(MemoryProjection.Layer, projectionBusLayer),
     )
 
@@ -171,15 +170,13 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
     const rootFork = await Effect.runPromise(program.pipe(Effect.provide(runtimeLayer)) as any) as ForkMemoryState
     expect(rootFork).toBeTruthy()
 
-    const systemInbox = rootFork!.messages.findLast((m: any) => m.type === 'system_inbox') as any
-    if (!systemInbox) {
-      expect(systemInbox).toBeFalsy()
+    const inbox = rootFork!.messages.findLast((m: any) => m.type === 'inbox') as any
+    if (!inbox) {
+      expect(inbox).toBeFalsy()
       return
     }
 
-    const reminder = systemInbox.entries.find((e: any) =>
-      e.kind === 'reminder' && typeof e.text === 'string' && e.text.includes('<subagent_user_killed')
-    )
-    expect(reminder).toBeUndefined()
+    const userKilled = inbox.timeline.find((e: any) => e.kind === 'subagent_user_killed')
+    expect(userKilled).toBeUndefined()
   })
 })

@@ -1,55 +1,6 @@
-import { validateAndApply } from '../util/edit'
-
-type FsReadInput = {
-  path: string
-  offset?: number
-  limit?: number
-}
-
-type FsWriteInput = {
-  path: string
-  content: string
-}
-
-type EditInput = {
-  path: string
-  oldString: string
-  newString: string
-  replaceAll?: boolean
-}
-
-type FsTreeInput = {
-  path: string
-  options?: {
-    recursive?: boolean
-    maxDepth?: number
-    gitignore?: boolean
-  }
-}
-
-type FsSearchInput = {
-  pattern: string
-  path?: string
-  glob?: string
-  limit?: number
-  options?: {
-    path?: string
-    glob?: string
-    limit?: number
-  }
-}
-
-type TreeEntry = {
-  path: string
-  name: string
-  type: 'file' | 'dir'
-  depth: number
-}
-
-type SearchMatch = {
-  file: string
-  match: string
-}
+import { Effect, Layer } from 'effect'
+import { isAbsolute, join, normalize, relative, resolve, sep } from 'path'
+import { Fs, FsError, type FsSearchMatch, type FsWalkEntry } from '../services/fs'
 
 export function createVirtualFs(seed?: Record<string, string>): Map<string, string> {
   return new Map(Object.entries(seed ?? {}))
@@ -59,183 +10,181 @@ function normalizePath(path: string): string {
   return path.replace(/^\.?\//, '').replace(/\/+/g, '/').replace(/\/$/, '')
 }
 
-function matchesGlob(path: string, glob: string): boolean {
+
+function normalizeFsPath(path: string): string {
+  return normalize(path)
+}
+
+function toAbsolutePath(path: string, cwd: string): string {
+  return isAbsolute(path) ? normalizeFsPath(path) : normalizeFsPath(resolve(cwd, path))
+}
+
+function buildAbsoluteFileMap(files: Map<string, string>, cwd: string): Map<string, string> {
+  const absoluteFiles = new Map<string, string>()
+  for (const [path, content] of files.entries()) {
+    const normalizedVirtualPath = normalizePath(path)
+    const absolutePath = toAbsolutePath(normalizedVirtualPath, cwd)
+    absoluteFiles.set(absolutePath, content)
+  }
+  return absoluteFiles
+}
+
+function isDirectoryPath(path: string, absoluteFiles: Map<string, string>): boolean {
+  const prefix = `${path}${sep}`
+  for (const filePath of absoluteFiles.keys()) {
+    if (filePath.startsWith(prefix)) return true
+  }
+  return false
+}
+
+function toAbsoluteVirtualPath(path: string, cwd: string, workspacePath: string): string {
+  const normalized = path.replace(/\\/g, '/')
+  if (normalized.startsWith('$M/')) {
+    return normalize(resolve(workspacePath, normalized.slice('$M/'.length)))
+  }
+  if (normalized.startsWith('${M}/')) {
+    return normalize(resolve(workspacePath, normalized.slice('${M}/'.length)))
+  }
+  return toAbsolutePath(path, cwd)
+}
+
+function toRelativeVirtualKey(absolutePath: string, cwd: string): string {
+  const relPath = relative(cwd, absolutePath)
+  return normalizePath(relPath)
+}
+
+function matchesVirtualGlob(path: string, glob: string): boolean {
   const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   const regex = new RegExp(`^${escaped.replace(/\*/g, '.*').replace(/\?/g, '.')}$`)
   return regex.test(path)
 }
 
-export function createFsReadHandler(files: Map<string, string>) {
-  return (input: unknown): string => {
-    const { path, offset, limit } = input as FsReadInput
-    const normalized = normalizePath(path)
-    const content = files.get(normalized)
+export function createVirtualFsLayer(files: Map<string, string>, cwd: string, workspacePath: string): Layer.Layer<Fs> {
+  const absoluteFiles = buildAbsoluteFileMap(files, cwd)
+
+  const readFromMap = (path: string): string => {
+    const absolutePath = toAbsoluteVirtualPath(path, cwd, workspacePath)
+    const content = absoluteFiles.get(absolutePath)
     if (content === undefined) {
-      throw new Error(`Failed to read ${path}`)
+      throw new Error(`ENOENT: no such file or directory, open '${path}'`)
     }
-
-    const lines = content.split('\n')
-    const startLine = offset ?? 1
-    const maxLines = limit ?? 2000
-
-    if (startLine < 1) {
-      throw new Error('offset must be >= 1')
-    }
-
-    if (startLine > lines.length) {
-      throw new Error(`offset ${startLine} exceeds total lines ${lines.length}`)
-    }
-
-    const startIdx = startLine - 1
-    const endIdx = startIdx + maxLines
-    const slice = lines.slice(startIdx, endIdx)
-
-    const remaining = lines.length - endIdx
-    let result = slice.join('\n')
-    if (remaining > 0) {
-      result += `\n... (${remaining} more lines remaining. Use offset=${startLine + maxLines} to continue reading.)`
-    }
-
-    return result
+    return content
   }
-}
 
-export function createFsWriteHandler(files: Map<string, string>) {
-  return (input: unknown): void => {
-    const { path, content } = input as FsWriteInput
-    files.set(normalizePath(path), content)
-  }
-}
+  return Layer.succeed(Fs, {
+    readFile: (path) =>
+      Effect.try({
+        try: () => Buffer.from(readFromMap(path), 'utf8'),
+        catch: (cause) => new FsError({ operation: 'readFile', path, cause }),
+      }),
 
-export function createEditHandler(files: Map<string, string>) {
-  return (input: unknown): string => {
-    const { path, oldString, newString, replaceAll } = input as EditInput
-    const normalized = normalizePath(path)
-    const content = files.get(normalized)
-    if (content === undefined) {
-      throw new Error(`Failed to read ${path}`)
-    }
+    readText: (path) =>
+      Effect.try({
+        try: () => readFromMap(path),
+        catch: (cause) => new FsError({ operation: 'readText', path, cause }),
+      }),
 
-    const applied = validateAndApply(content, oldString, newString, replaceAll ?? false)
-    files.set(normalized, applied.result)
+    writeFile: (path, content) =>
+      Effect.try({
+        try: () => {
+          const absolutePath = toAbsoluteVirtualPath(path, cwd, workspacePath)
+          const textContent = typeof content === 'string' ? content : Buffer.from(content).toString('utf8')
+          absoluteFiles.set(absolutePath, textContent)
+          const relativeKey = toRelativeVirtualKey(absolutePath, cwd)
+          files.set(relativeKey, textContent)
+        },
+        catch: (cause) => new FsError({ operation: 'writeFile', path, cause }),
+      }),
 
-    if (applied.replaceCount > 1) {
-      return `Replaced ${applied.replaceCount} occurrences in ${path}`
-    }
-    if (applied.addedLines.length === 0) {
-      return `Deleted ${applied.removedLines.length} line(s) from ${path}`
-    }
-    return `Replaced ${applied.removedLines.length} line(s) with ${applied.addedLines.length} line(s) in ${path}`
-  }
-}
+    stat: (path) =>
+      Effect.try({
+        try: () => {
+          const absolutePath = toAbsoluteVirtualPath(path, cwd, workspacePath)
+          if (absoluteFiles.has(absolutePath)) {
+            return { isDirectory: () => false, isFile: () => true }
+          }
+          if (isDirectoryPath(absolutePath, absoluteFiles)) {
+            return { isDirectory: () => true, isFile: () => false }
+          }
+          throw new Error(`ENOENT: no such file or directory, stat '${path}'`)
+        },
+        catch: (cause) => new FsError({ operation: 'stat', path, cause }),
+      }),
 
-export function createFsTreeHandler(files: Map<string, string>) {
-  return (input: unknown): TreeEntry[] => {
-    const { path, options } = input as FsTreeInput
-    const base = normalizePath(path)
-    const recursive = options?.recursive ?? true
-    const maxDepth = options?.maxDepth
-    const dirSet = new Set<string>()
-    const entries = new Map<string, TreeEntry>()
+    walk: (rootPath, options) =>
+      Effect.try({ try: () => {
+        const absoluteRoot = toAbsoluteVirtualPath(rootPath, cwd, workspacePath)
+        const rootPrefix = `${absoluteRoot}${sep}`
+        const maxDepth = options?.maxDepth
+        const entries = new Map<string, FsWalkEntry>()
 
-    for (const filePathRaw of files.keys()) {
-      const filePath = normalizePath(filePathRaw)
-      if (base && filePath !== base && !filePath.startsWith(`${base}/`)) continue
+        for (const filePath of absoluteFiles.keys()) {
+          if (filePath !== absoluteRoot && !filePath.startsWith(rootPrefix)) continue
 
-      const rel = base ? (filePath === base ? '' : filePath.slice(base.length + 1)) : filePath
-      if (!rel) continue
+          const relFile = relative(absoluteRoot, filePath)
+          if (!relFile || relFile.startsWith('..')) continue
 
-      const parts = rel.split('/')
-      const fileDepth = parts.length
+          const fileDepth = relFile.split(sep).length
+          if (maxDepth !== undefined && fileDepth > maxDepth) continue
 
-      if (recursive === false && fileDepth > 1) continue
-      if (maxDepth !== undefined && fileDepth > maxDepth) continue
+          const fileName = filePath.split(sep).at(-1) ?? filePath
+          entries.set(filePath, {
+            fullPath: filePath,
+            relativePath: relFile,
+            name: fileName,
+            type: 'file',
+            depth: fileDepth,
+          })
 
-      let acc = ''
-      for (let i = 0; i < parts.length - 1; i++) {
-        acc = acc ? `${acc}/${parts[i]}` : parts[i]!
-        dirSet.add(acc)
-      }
-    }
+          const parts = relFile.split(sep)
+          let current = absoluteRoot
+          for (let i = 0; i < parts.length - 1; i++) {
+            current = join(current, parts[i] ?? '')
+            const relDir = relative(absoluteRoot, current)
+            const depth = relDir ? relDir.split(sep).length : 0
+            if (maxDepth !== undefined && depth > maxDepth) continue
+            if (!entries.has(current)) {
+              entries.set(current, {
+                fullPath: current,
+                relativePath: relDir,
+                name: parts[i] ?? current,
+                type: 'dir',
+                depth,
+              })
+            }
+          }
+        }
 
-    for (const dirRel of dirSet) {
-      const name = dirRel.split('/').at(-1) ?? dirRel
-      const depth = dirRel.split('/').length
-      const fullPath = base ? `${base}/${dirRel}` : dirRel
-      entries.set(fullPath, { path: fullPath, name, type: 'dir', depth })
-    }
+        return [...entries.values()].sort((a, b) => a.fullPath.localeCompare(b.fullPath))
+      }, catch: (cause) => new FsError({ operation: 'walk', path: rootPath, cause }) }),
 
-    for (const filePathRaw of files.keys()) {
-      const filePath = normalizePath(filePathRaw)
-      if (base && filePath !== base && !filePath.startsWith(`${base}/`)) continue
+    search: ({ pattern, searchPath, glob, limit }) =>
+      Effect.try({ try: () => {
+        const absoluteSearchPath = toAbsoluteVirtualPath(searchPath, cwd, workspacePath)
+        const searchPrefix = `${absoluteSearchPath}${sep}`
+        const matches: FsSearchMatch[] = []
+        const regex = new RegExp(pattern)
 
-      const rel = base ? (filePath === base ? '' : filePath.slice(base.length + 1)) : filePath
-      if (!rel) continue
+        for (const [filePath, content] of absoluteFiles.entries()) {
+          if (filePath !== absoluteSearchPath && !filePath.startsWith(searchPrefix)) continue
 
-      const parts = rel.split('/')
-      const depth = parts.length
-      if (recursive === false && depth > 1) continue
-      if (maxDepth !== undefined && depth > maxDepth) continue
+          const fileRelativeToSearch = relative(absoluteSearchPath, filePath)
+          if (glob && !matchesVirtualGlob(fileRelativeToSearch, glob)) continue
 
-      entries.set(filePath, {
-        path: filePath,
-        name: parts.at(-1) ?? filePath,
-        type: 'file',
-        depth,
-      })
-    }
+          const lines = content.split('\n')
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i] ?? ''
+            regex.lastIndex = 0
+            if (!regex.test(line)) continue
+            matches.push({
+              file: fileRelativeToSearch,
+              match: `${i + 1}|${line}`,
+            })
+            if (matches.length >= limit) return matches
+          }
+        }
 
-    return [...entries.values()].sort((a, b) => a.path.localeCompare(b.path))
-  }
-}
-
-export function createFsSearchHandler(files: Map<string, string>) {
-  return (input: unknown): SearchMatch[] => {
-    const { pattern, path, glob, limit, options } = input as FsSearchInput
-    const resolvedPath = normalizePath(path ?? options?.path ?? '')
-    const resolvedGlob = glob ?? options?.glob
-    const resolvedLimit = limit ?? options?.limit ?? 50
-
-    const regex = new RegExp(pattern)
-    const matches: SearchMatch[] = []
-
-    for (const [filePathRaw, content] of files.entries()) {
-      const filePath = normalizePath(filePathRaw)
-
-      if (resolvedPath && filePath !== resolvedPath && !filePath.startsWith(`${resolvedPath}/`)) {
-        continue
-      }
-
-      const scopedPath = resolvedPath ? filePath.slice(resolvedPath.length).replace(/^\//, '') : filePath
-      if (resolvedGlob && !matchesGlob(scopedPath, resolvedGlob)) {
-        continue
-      }
-
-      const lines = content.split('\n')
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i] ?? ''
-        if (!regex.test(line)) continue
-        matches.push({ file: filePath, match: `${i + 1}|${line}` })
-        if (matches.length >= resolvedLimit) return matches
-      }
-    }
-
-    return matches
-  }
-}
-
-export function createDefaultToolOverrides(files: Map<string, string>): Record<string, (input: unknown) => unknown> {
-  return {
-    'read': createFsReadHandler(files),
-    'write': createFsWriteHandler(files),
-    edit: createEditHandler(files),
-    'tree': createFsTreeHandler(files),
-    'grep': createFsSearchHandler(files),
-    shell: () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    'web-fetch': (input: unknown) => {
-      const { url } = input as { url: string }
-      return { url, content: '' }
-    },
-    'web-search': () => ({ text: '', sources: [] as Array<{ title: string; url: string }> }),
-  }
+        return matches
+      }, catch: (cause) => new FsError({ operation: 'search', path: searchPath, cause }) }),
+  })
 }

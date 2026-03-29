@@ -1,8 +1,6 @@
 import { continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
 import type { TurnPolicy } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
-import { agentsStatusObservable } from '../observables/agents-status-observable'
-
 import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 
@@ -79,7 +77,7 @@ export const leadTools = catalog.pick(
   'phaseSubmit',
 )
 
-export const leadObservables = [agentsStatusObservable]
+export const leadObservables: readonly [] = []
 
 export const leadPolicy = [
   denyForbiddenCommands(),

@@ -11,6 +11,7 @@ import { Worker } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 import type { AppEvent } from '../events'
 import { MemoryProjection, type ForkMemoryState } from '../projections/memory'
+import { UserMessageResolutionProjection } from '../projections/user-message-resolution'
 import { ChatPersistence } from '../persistence/chat-persistence-service'
 import { ModelResolver, GenerateChatTitle } from '@magnitudedev/providers'
 import { updateTraceMeta } from '@magnitudedev/tracing'
@@ -23,10 +24,12 @@ const MAX_USER_MESSAGES_TO_TRY = 5
 export const ChatTitleWorker = Worker.define<AppEvent>()({
   name: 'ChatTitleWorker',
 
-  eventHandlers: {
-    user_message: (event, publish, read) => Effect.gen(function* () {
+  eventHandlers: {},
+
+  signalHandlers: on => [
+    on(UserMessageResolutionProjection.signals.userMessageResolved, (value, publish, read) => Effect.gen(function* () {
       // Only handle root fork messages
-      if (event.forkId !== null) return
+      if (value.forkId !== null) return
 
       // Read memory to get conversation and count user messages
       const memoryState: ForkMemoryState = yield* read(MemoryProjection)
@@ -36,13 +39,17 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
       let userMessageCount = 0
 
       for (const msg of memoryState.messages) {
-        if (msg.type === 'comms_inbox') {
-          for (const entry of msg.entries) {
-            if (entry.kind === 'user') {
+        if (msg.type === 'inbox') {
+          for (const entry of msg.timeline) {
+            if (entry.kind === 'user_message') {
               parts.push(entry.text)
               userMessageCount++
-            } else {
-              parts.push(`<assistant>\n${entry.text}\n</assistant>`)
+            } else if (entry.kind === 'agent_block') {
+              for (const atom of entry.atoms) {
+                if (atom.kind === 'message' && atom.direction === 'to_lead') {
+                  parts.push(`<assistant>\n${atom.text}\n</assistant>`)
+                }
+              }
             }
           }
         } else if (msg.type === 'assistant_turn') {
@@ -75,7 +82,7 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
       const runtime = yield* ModelResolver
       const model = yield* runtime.resolve('explorer')
       const result = yield* withTraceScope(
-        { metadata: { callType: 'title', forkId: event.forkId ?? null } },
+        { metadata: { callType: 'title', forkId: value.forkId ?? null } },
         model.invoke(
           GenerateChatTitle,
           { conversation, defaultName: DEFAULT_CHAT_NAME },
@@ -124,6 +131,6 @@ export const ChatTitleWorker = Worker.define<AppEvent>()({
           logger.error({ cause: cause.toString() }, '[ChatTitleWorker] Unexpected error in chat title generation')
         })
       )
-    )
-  }
+    )),
+  ],
 })
