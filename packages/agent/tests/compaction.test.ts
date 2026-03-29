@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { withHarness } from '../src/test-harness'
 import { CompactionProjection } from '../src/projections/compaction'
 import { WorkingStateProjection, shouldTrigger } from '../src/projections/working-state'

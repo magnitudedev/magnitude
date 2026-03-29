@@ -1,4 +1,4 @@
-import { readFile, writeFile, stat } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
 import { relative, resolve } from 'path'
 import { Context, Data, Effect, Layer } from 'effect'
 import { resolveRgPath } from '@magnitudedev/ripgrep'
@@ -125,10 +125,11 @@ async function rgSearch(
   }
 }
 
-function tryFs<A>(operation: string, path: string, effect: Effect.Effect<A>): Effect.Effect<A, FsError> {
-  return Effect.catchAllDefect(effect, (cause) =>
-    Effect.fail(new FsError({ operation, path, cause }))
-  )
+function tryFs<A>(operation: string, path: string, fn: () => Promise<A>): Effect.Effect<A, FsError> {
+  return Effect.tryPromise({
+    try: fn,
+    catch: (cause) => new FsError({ operation, path, cause }),
+  })
 }
 
 export class Fs extends Context.Tag('Fs')<Fs, {
@@ -141,26 +142,26 @@ export class Fs extends Context.Tag('Fs')<Fs, {
 }>() {}
 
 export const FsLive = Layer.succeed(Fs, {
-  readFile: (path) => tryFs('readFile', path, Effect.promise(() => readFile(path))),
-  readText: (path) => tryFs('readText', path, Effect.promise(() => readFile(path, 'utf8'))),
-  writeFile: (path, content) => tryFs('writeFile', path, Effect.promise(() => writeFile(path, content))),
-  stat: (path) => tryFs('stat', path, Effect.promise(() => stat(path))),
+  readFile: (path) => tryFs('readFile', path, async () => await readFile(path)),
+  readText: (path) => tryFs('readText', path, async () => await readFile(path, 'utf8')),
+  // Bun.write auto-creates parent directories; node fs.writeFile does not
+  writeFile: (path, content) => tryFs('writeFile', path, async () => { await Bun.write(path, content) }),
+  stat: (path) => tryFs('stat', path, async () => await stat(path)),
   walk: (rootPath, options) =>
-    tryFs('walk', rootPath, Effect.promise(() =>
-      walk(rootPath, rootPath, 0, options?.maxDepth, null, {
+    tryFs('walk', rootPath, async () => {
+      const entries = await walk(rootPath, rootPath, 0, options?.maxDepth, null, {
         respectGitignore: options?.respectGitignore ?? true,
-      }).then((entries) =>
-        entries.map((entry) => ({
-          fullPath: entry.fullPath,
-          relativePath: entry.relativePath,
-          name: entry.name,
-          type: entry.type,
-          depth: entry.depth,
-        }))
-      )
-    )),
+      })
+      return entries.map((entry) => ({
+        fullPath: entry.fullPath,
+        relativePath: entry.relativePath,
+        name: entry.name,
+        type: entry.type,
+        depth: entry.depth,
+      }))
+    }),
   search: ({ pattern, searchPath, glob, limit }) =>
-    tryFs('search', searchPath, Effect.promise(() => rgSearch(pattern, searchPath, glob, limit))),
+    tryFs('search', searchPath, async () => await rgSearch(pattern, searchPath, glob, limit)),
 })
 
 export function resolveFsPath(path: string, cwd: string, workspacePath: string): string {
