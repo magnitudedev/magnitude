@@ -22,7 +22,12 @@ function restoreTerminalState() {
   process.stdout.write(sequences.join(''))
 }
 
-async function performCleanupAndExit(renderer: CliRenderer, exitCode: number, beforeExit?: () => Promise<void>) {
+async function performCleanupAndExit(
+  renderer: CliRenderer,
+  exitCode: number,
+  beforeExit?: () => Promise<void>,
+  afterCleanup?: () => void,
+) {
   if (cleanupRan) return
   cleanupRan = true
 
@@ -41,6 +46,7 @@ async function performCleanupAndExit(renderer: CliRenderer, exitCode: number, be
 
   restoreTerminalState()
   renderer.destroy()
+  afterCleanup?.()
   process.exit(exitCode)
 }
 
@@ -72,8 +78,12 @@ function handleCrashAndExit(renderer: CliRenderer, label: string, err: unknown) 
  * Install process-level signal handlers for graceful cleanup.
  * Handles SIGINT, SIGTERM, SIGHUP, and various exit scenarios.
  */
-export function installGracefulShutdownHandlers(renderer: CliRenderer, beforeExit?: () => Promise<void>) {
-  const cleanup = (code: number) => () => { performCleanupAndExit(renderer, code, beforeExit) }
+export function installGracefulShutdownHandlers(
+  renderer: CliRenderer,
+  beforeExit?: () => Promise<void>,
+  afterCleanup?: () => void,
+) {
+  const cleanup = (code: number) => () => { performCleanupAndExit(renderer, code, beforeExit, afterCleanup) }
 
   process.on('SIGTERM', cleanup(0))
   process.on('SIGHUP', cleanup(0))

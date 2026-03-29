@@ -1,12 +1,13 @@
 process.env.BAML_LOG = 'off';
 
+import fs from 'fs'
 import { createCliRenderer } from '@opentui/core'
 import { createRoot } from '@opentui/react'
 import { Command } from '@commander-js/extra-typings'
 import { createProviderClient } from '@magnitudedev/providers'
 import { createStorageClient } from '@magnitudedev/storage'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
-import { App } from './app'
+import { App, type SessionStart } from './app'
 import { initThemeStore, useThemeStateStore } from './hooks/use-theme'
 import { ProviderRuntimeProvider } from './providers/provider-runtime'
 import { StorageProvider } from './providers/storage-provider'
@@ -22,7 +23,7 @@ async function main() {
   const program = new Command()
     .name('magnitude')
     .version('0.0.1')
-    .option('--resume', 'Resume the most recent chat session')
+    .option('--resume [id]', 'Resume the most recent chat session or a specific session by ID')
     .option('--debug', 'Enable debug mode with debug panel')
 
     .option('--oneshot [prompt]', 'Run autonomous oneshot task and exit on completion')
@@ -33,7 +34,7 @@ async function main() {
     .argument('[prompt]')
     .action(async (promptArg, opts) => {
       if (opts.oneshot !== undefined) {
-        if (opts.resume) {
+        if (opts.resume !== undefined) {
           console.error('--resume and --oneshot cannot be used together')
           process.exit(1)
         }
@@ -64,21 +65,40 @@ async function main() {
       }).catch(() => {})
 
       let clientRef: { dispose: () => Promise<void> } | null = null
+      let activeSessionId: string | null = null
 
-      installGracefulShutdownHandlers(renderer, async () => {
-        await clientRef?.dispose()
-      })
+      installGracefulShutdownHandlers(
+        renderer,
+        async () => {
+          await clientRef?.dispose()
+        },
+        () => {
+          if (!activeSessionId) {
+            return
+          }
+          fs.writeSync(1, `\nResume this session with:\nmagnitude --resume ${activeSessionId}\n`)
+        }
+      )
 
       const storage = await createStorageClient({ cwd: process.cwd() })
       const providerRuntime = await createProviderClient<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS })
+      const sessionStart: SessionStart = opts.resume === undefined
+        ? { _tag: 'new' }
+        : opts.resume === true
+          ? { _tag: 'latest' }
+          : { _tag: 'resume', sessionId: opts.resume }
+
       createRoot(renderer).render(
         <StorageProvider client={storage}>
           <ProviderRuntimeProvider runtime={providerRuntime}>
             <App
-              resume={opts.resume ?? false}
+              sessionStart={sessionStart}
               debug={opts.debug ?? false}
               onClientReady={(client) => {
                 clientRef = client
+              }}
+              onSessionId={(id) => {
+                activeSessionId = id
               }}
             />
           </ProviderRuntimeProvider>

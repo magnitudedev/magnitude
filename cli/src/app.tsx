@@ -90,9 +90,16 @@ export const getSelectedForkContentVersion = (
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
-export function App({ resume, debug, onClientReady }: { resume: boolean; debug: boolean; onClientReady?: (client: AgentClient | null) => void }) {
+export type SessionStart =
+  | { _tag: 'new' }
+  | { _tag: 'latest' }
+  | { _tag: 'resume'; sessionId: string }
+
+export function App({ sessionStart, debug, onClientReady, onSessionId }: { sessionStart: SessionStart; debug: boolean; onClientReady?: (client: AgentClient | null) => void; onSessionId?: (id: string) => void }) {
   const [conversationKey, setConversationKey] = useState(0)
-  const [sessionSelection, setSessionSelection] = useState<string | null | undefined>(resume ? undefined : null)
+  const [sessionSelection, setSessionSelection] = useState<string | null | undefined>(
+    sessionStart._tag === 'new' ? null : sessionStart._tag === 'latest' ? undefined : sessionStart.sessionId
+  )
   const hasAnimatedRef = useRef(false)
 
   const handleReset = useCallback(() => {
@@ -116,6 +123,7 @@ export function App({ resume, debug, onClientReady }: { resume: boolean; debug: 
       onReset={handleReset}
       onResumeSession={handleResumeSession}
       onClientReady={onClientReady}
+      onSessionId={onSessionId}
     />
   )
 }
@@ -127,6 +135,7 @@ function AppInner({
   onReset,
   onResumeSession,
   onClientReady,
+  onSessionId,
 }: {
   debugMode: boolean
   skipAnimation: boolean
@@ -134,6 +143,7 @@ function AppInner({
   onReset: () => void
   onResumeSession: (sessionId: string) => void
   onClientReady?: (client: AgentClient | null) => void
+  onSessionId?: (id: string) => void
 }) {
   const renderer = useRenderer()
   const providerRuntime = useProviderRuntime()
@@ -355,6 +365,7 @@ function AppInner({
         sessionId,
       })
       const activeSessionId = persistence.getSessionId()
+      onSessionId?.(activeSessionId)
       resolvedWorkspacePath = storage.sessions.getWorkspacePath(activeSessionId) ?? null
       initLogger(persistence.getSessionId())
       clearSessionLog(persistence.getSessionId())
@@ -542,7 +553,7 @@ function AppInner({
       onClientReady?.(null)
       c?.dispose()
     }
-  }, [debugMode, onClientReady, providerRuntime, renderer, sessionSelection, setClientFactory, setLazyClient, storage])
+  }, [debugMode, onClientReady, onSessionId, providerRuntime, renderer, sessionSelection, setClientFactory, setLazyClient, storage])
 
   // Subscribe to display state for selected fork
   useEffect(() => {
