@@ -1086,10 +1086,11 @@ function AppInner({
           lead: null, explorer: null, planner: null, builder: null,
           reviewer: null, debugger: null, browser: null,
         }
+        const freshConnectedProviderIds = new Set([...connectedProviderIds, providerId])
         for (const slot of MAGNITUDE_SLOTS) {
           const selection = resolveSlotDefaultSelection({
             allProviders: PROVIDERS,
-            connectedProviderIds,
+            connectedProviderIds: freshConnectedProviderIds,
             slot,
             preferredProviderId: providerId,
             detectedAuthTypeByProviderId,
@@ -1163,7 +1164,7 @@ function AppInner({
       // Multiple auth methods — show picker
       authFlow.openAuthMethodPicker(provider)
     }
-  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders])
+  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds])
 
   const finishWizard = useCallback(() => {
     setShowSetupWizard(false)
