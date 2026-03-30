@@ -37,7 +37,7 @@ export type WorkerReadFn<TEvent extends BaseEvent> = {
   <TState>(projection: ProjectionResult<any, TState, any, any>): Effect.Effect<TState>
   <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>): Effect.Effect<TForkState>
   <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>, forkId: string | null): Effect.Effect<TForkState>
-  allForks?: <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) => Effect.Effect<Map<string | null, TForkState>>
+  allForks: <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) => Effect.Effect<Map<string | null, TForkState>>
 }
 
 // ---------------------------------------------------------------------------
@@ -149,29 +149,31 @@ export interface WorkerResult<
  * provides the correct generic signature for callers.
  */
 function makeWorkerReadFn<TEvent extends BaseEvent>(forkId: string | null): WorkerReadFn<TEvent> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const impl = (projection: any, overrideForkId?: string | null): any => {
+  const impl = ((
+    projection: ProjectionResult<any, unknown, any, any> | ForkedProjectionResult<any, unknown, any, any>,
+    overrideForkId?: string | null
+  ) => {
     const targetForkId = overrideForkId !== undefined ? overrideForkId : forkId
     if (projection.isForked) {
       return Effect.flatMap(
         projection.Tag,
-        (instance: ForkedProjectionInstance<never>) => instance.getFork(targetForkId)
+        (instance: ForkedProjectionInstance<unknown>) => instance.getFork(targetForkId)
       )
     } else {
       return Effect.flatMap(
         projection.Tag,
-        (instance: ProjectionInstance<never>) => instance.get
+        (instance: ProjectionInstance<unknown>) => instance.get
       )
     }
-  }
-  impl.allForks = (projection: any): any => {
-    if (!projection.isForked) throw new Error('allForks only works on forked projections')
-    return Effect.flatMap(
+  }) as WorkerReadFn<TEvent>
+
+  impl.allForks = ((<TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) =>
+    Effect.flatMap(
       projection.Tag,
-      (instance: ForkedProjectionInstance<never>) => instance.getAllForks()
-    )
-  }
-  return impl as WorkerReadFn<TEvent>
+      (instance: ForkedProjectionInstance<TForkState>) => instance.getAllForks()
+    )) as WorkerReadFn<TEvent>['allForks'])
+
+  return impl
 }
 
 export function define<TEvent extends BaseEvent>() {

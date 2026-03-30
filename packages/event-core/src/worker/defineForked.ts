@@ -21,8 +21,8 @@ import { InterruptPubSub } from '../core/interrupt-pubsub'
 import { extractForkIdFromEvent, extractForkIdFromSignal } from './util'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import { Signal, type SignalValue } from '../signal/define'
-import type { ProjectionInstance, StateOfProjection } from '../projection/define'
-import type { ForkedProjectionInstance, ForkableEvent } from '../projection/defineForked'
+import type { ProjectionInstance, ProjectionResult } from '../projection/define'
+import type { ForkedProjectionInstance, ForkableEvent, ForkedProjectionResult } from '../projection/defineForked'
 import type { PublishFn, WorkerReadFn, WorkerSignalHandlerBuilder, WorkerSignalHandlerPair } from './define'
 import { FrameworkErrorReporter, FrameworkError, type FrameworkErrorReporterService } from '../core/framework-error'
 
@@ -129,20 +129,30 @@ interface ForkFiber<TEvent> {
 function makeWorkerReadFn<TEvent extends BaseEvent>(
   forkId: string | null
 ): WorkerReadFn<TEvent> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const impl = (projection: any): any => {
+  const impl = ((
+    projection: ProjectionResult<any, unknown, any, any> | ForkedProjectionResult<any, unknown, any, any>,
+    overrideForkId?: string | null
+  ) => {
+    const targetForkId = overrideForkId !== undefined ? overrideForkId : forkId
     if (projection.isForked) {
       return Effect.flatMap(
         projection.Tag,
-        (instance: ForkedProjectionInstance<never>) => instance.getFork(forkId)
+        (instance: ForkedProjectionInstance<unknown>) => instance.getFork(targetForkId)
       )
     } else {
       return Effect.flatMap(
         projection.Tag,
-        (instance: ProjectionInstance<never>) => instance.get
+        (instance: ProjectionInstance<unknown>) => instance.get
       )
     }
-  }
+  }) as WorkerReadFn<TEvent>
+
+  impl.allForks = ((<TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) =>
+    Effect.flatMap(
+      projection.Tag,
+      (instance: ForkedProjectionInstance<TForkState>) => instance.getAllForks()
+    )) as WorkerReadFn<TEvent>['allForks'])
+
   return impl
 }
 

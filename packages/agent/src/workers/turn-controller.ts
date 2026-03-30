@@ -51,15 +51,11 @@ function startTurnForFork(
 export const TurnController = Worker.define<AppEvent>()({
   name: 'TurnController',
 
-  onProjectionsSettled: ({ publish }) =>
+  onProjectionsSettled: ({ publish, read }) =>
     Effect.gen(function* () {
-      const turnInstance = yield* TurnProjection.Tag
-      const compactionInstance = yield* CompactionProjection.Tag
-      const workflowInstance = yield* WorkflowProjection.Tag
-
-      const turnForks = yield* turnInstance.getAllForks()
-      const compactionForks = yield* compactionInstance.getAllForks()
-      const workflowForks = yield* workflowInstance.getAllForks()
+      const turnForks = yield* read.allForks(TurnProjection)
+      const compactionForks = yield* read.allForks(CompactionProjection)
+      const workflowForks = yield* read.allForks(WorkflowProjection)
 
       for (const [forkId, turnFork] of turnForks) {
         const compactionFork: CompactionState | undefined = compactionForks.get(forkId)
