@@ -65,7 +65,7 @@ import { collectSessionContext } from './util/collect-session-context'
 import { bootstrapProviderRuntime, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, makeTracePersister, type ProviderRuntime } from '@magnitudedev/providers'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from './model-slots'
 import type { StorageClient } from '@magnitudedev/storage'
-import { initLogger } from '@magnitudedev/logger'
+import { initLogger, logger } from '@magnitudedev/logger'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 
 import { EphemeralSessionContextTag } from './agents/types'
@@ -243,10 +243,30 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
     if (events.length === 0) {
       // New session
-      const baseContext = options.sessionContext ?? (yield* Effect.promise(() => collectSessionContext({
-        cwd: process.cwd(),
-        storage: options.storage,
-      })))
+      const baseContext = options.sessionContext ?? (yield* Effect.tryPromise(async () => {
+        try {
+          return await collectSessionContext({
+            cwd: process.cwd(),
+            storage: options.storage,
+          })
+        } catch (err) {
+          logger.error({ err }, 'Failed to collect session context')
+          // Should not happen, but return minimal context so session can still initialize
+          const cwd = process.cwd()
+          return {
+            cwd,
+            platform: process.platform === 'darwin' ? 'macos' as const : process.platform === 'win32' ? 'windows' as const : 'linux' as const,
+            shell: process.env.SHELL?.split('/').pop() || 'bash',
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            username: process.env.USER || 'unknown',
+            fullName: null,
+            git: null,
+            folderStructure: '(failed to collect folder structure)',
+            agentsFile: null,
+            skills: null,
+          }
+        }
+      }))
 
       const sessionMetadata = yield* persistence.getSessionMetadata()
       const workspacePath = yield* Effect.promise(() =>

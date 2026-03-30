@@ -75,7 +75,12 @@ export async function walk(
     }
   }
 
-  const items = await readdir(dirPath, { withFileTypes: true })
+  let items
+  try {
+    items = await readdir(dirPath, { withFileTypes: true })
+  } catch {
+    return [] // Skip unreadable directories (EPERM, EACCES, etc.)
+  }
   const entries: Entry[] = []
   const subdirs: string[] = []
   const fileStatPromises: Promise<void>[] = []

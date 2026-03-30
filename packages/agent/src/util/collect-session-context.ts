@@ -2,7 +2,7 @@
  * Session Context Collection
  */
 
-import { readFile } from 'fs/promises'
+import { access, readFile } from 'fs/promises'
 import { join } from 'path'
 import type { StorageClient } from '@magnitudedev/storage'
 import type { MagnitudeSlot } from '../model-slots'
@@ -10,6 +10,9 @@ import type { SessionContext, GitContext } from '../events'
 import { scanSkills } from './skill-scanner'
 import { runGitCommand } from './git-command'
 import { knapsackFolderTree } from './folder-tree-knapsack'
+import { truncateFolderTree } from './folder-tree-truncation'
+import { buildTree } from './tree'
+import { walk } from './walk'
 
 // =============================================================================
 // Constants
@@ -62,8 +65,20 @@ async function collectGitContext(cwd: string): Promise<GitContext | null> {
 // =============================================================================
 
 async function collectFolderStructure(cwd: string): Promise<string> {
-  const tree = await knapsackFolderTree(cwd, FOLDER_TREE_BUDGET_TOKENS)
-  return tree || '(empty or no accessible folders)'
+  try {
+    await access(join(cwd, '.git'))
+    const tree = await knapsackFolderTree(cwd, FOLDER_TREE_BUDGET_TOKENS)
+    return tree || '(empty or no accessible folders)'
+  } catch {
+    const entries = await walk(cwd, cwd, 0, 2, null, {
+      respectGitignore: true,
+      collectSizes: true,
+      collectMtimes: true,
+    })
+    const nodes = buildTree(entries)
+    const tree = truncateFolderTree(nodes, FOLDER_TREE_BUDGET_TOKENS)
+    return tree || '(empty or no accessible folders)'
+  }
 }
 
 // =============================================================================
