@@ -56,10 +56,40 @@ export function isGitAllowed(command: string): boolean {
 
 export function writesStayWithin(command: string, env: Record<string, string>, ...allowedRoots: string[]): boolean {
   const commands = parseShellCommand(command)
+  const initialCwd = allowedRoots[0] ?? process.cwd()
+  let effectiveCwd = initialCwd
+  let previousCwd: string | null = null
 
   for (const cmd of commands) {
+    if (cmd.name) {
+      const name = baseName(cmd.name)
+      if (name === 'cd') {
+        const oldCwd = effectiveCwd
+        const target = cmd.args[0]
+
+        let resolvedTarget: string
+        if (!target) {
+          const home = env.HOME ?? env.USERPROFILE
+          if (!home) return false
+          resolvedTarget = expandAndResolve(home, env, effectiveCwd)
+        } else if (target === '-') {
+          if (!previousCwd) return false
+          resolvedTarget = previousCwd
+        } else {
+          if (hasUndefinedEnvVars(target, env)) return false
+          if (target.startsWith('~') && !env.HOME && !env.USERPROFILE) return false
+          resolvedTarget = expandAndResolve(target, env, effectiveCwd)
+        }
+
+        previousCwd = oldCwd
+        effectiveCwd = resolvedTarget
+        continue
+      }
+    }
+
     for (const redir of cmd.redirects) {
-      if (!isPathWithin(redir.target, env, ...allowedRoots)) return false
+      const resolvedTarget = expandAndResolve(redir.target, env, effectiveCwd)
+      if (!isPathWithin(resolvedTarget, env, ...allowedRoots)) return false
     }
 
     if (cmd.name) {
@@ -67,7 +97,8 @@ export function writesStayWithin(command: string, env: Record<string, string>, .
       if (WRITE_PATH_COMMANDS.has(name)) {
         for (const arg of cmd.args) {
           if (arg.startsWith('-')) continue
-          if (!isPathWithin(arg, env, ...allowedRoots)) return false
+          const resolvedArg = expandAndResolve(arg, env, effectiveCwd)
+          if (!isPathWithin(resolvedArg, env, ...allowedRoots)) return false
         }
       }
     }
@@ -320,11 +351,31 @@ function baseName(cmd: string): string {
 
 const ALLOWED_OUTSIDE_PREFIXES = ['/tmp/', '/dev/null']
 
+function hasUndefinedEnvVars(str: string, env: Record<string, string>): boolean {
+  const refs = str.matchAll(/\$\{(\w+)\}|\$(\w+)/g)
+  for (const match of refs) {
+    const key = match[1] ?? match[2]
+    if (!(key in env)) return true
+  }
+  return false
+}
+
 function expandEnvVars(p: string, env: Record<string, string>): string {
   return p.replace(/\$\{(\w+)\}|\$(\w+)/g, (_, braced, bare) => {
     const key = braced ?? bare
     return env[key] ?? ''
   })
+}
+
+function expandAndResolve(path: string, env: Record<string, string>, baseCwd: string): string {
+  const expanded = expandEnvVars(path, env)
+  if (expanded.startsWith('~')) {
+    const home = env.HOME ?? env.USERPROFILE ?? ''
+    return resolve(home, expanded.slice(expanded.startsWith('~/') ? 2 : 1))
+  }
+
+  const baseCwdNoSlash = baseCwd.endsWith('/') ? baseCwd.slice(0, -1) : baseCwd
+  return resolve(baseCwdNoSlash, expanded)
 }
 
 export function isPathWithin(path: string, env: Record<string, string>, ...allowedRoots: string[]): boolean {
@@ -335,14 +386,7 @@ export function isPathWithin(path: string, env: Record<string, string>, ...allow
   const normalizedCwd = cwd.endsWith('/') ? cwd : cwd + '/'
   const cwdNoSlash = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd
 
-  let resolved: string
-  const expanded = expandEnvVars(path, env)
-  if (expanded.startsWith('~')) {
-    const home = env.HOME ?? env.USERPROFILE ?? ''
-    resolved = resolve(home, expanded.slice(expanded.startsWith('~/') ? 2 : 1))
-  } else {
-    resolved = resolve(cwdNoSlash, expanded)
-  }
+  const resolved = expandAndResolve(path, env, cwdNoSlash)
 
   if (resolved === cwdNoSlash || resolved.startsWith(normalizedCwd)) return true
 

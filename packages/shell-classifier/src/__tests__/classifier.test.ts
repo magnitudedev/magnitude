@@ -312,6 +312,232 @@ describe('shell-classifier', () => {
     })
   })
 
+  describe('writesStayWithin with cd tracking', () => {
+    test('absolute cd: cd /tmp && rm ./foo => true (tmp is allowlisted)', () => {
+      expect(writesStayWithin('cd /tmp && rm ./foo', {}, '/project')).toBe(true)
+    })
+
+    test('absolute cd: cd /etc && rm ./foo => false', () => {
+      expect(writesStayWithin('cd /etc && rm ./foo', {}, '/project')).toBe(false)
+    })
+
+    test('relative cd: cd sub && rm ./file => true', () => {
+      expect(writesStayWithin('cd sub && rm ./file', {}, '/project')).toBe(true)
+    })
+
+    test('relative cd: cd .. && rm ./file from /project/sub => false (resolves outside root)', () => {
+      expect(writesStayWithin('cd .. && rm ./file', {}, '/project/sub')).toBe(false)
+    })
+
+    test('relative cd: cd ../.. && rm ./file from /project/sub => false', () => {
+      expect(writesStayWithin('cd ../.. && rm ./file', {}, '/project/sub')).toBe(false)
+    })
+
+    test('env target cd: cd $HOME && rm foo => false when HOME outside project', () => {
+      expect(writesStayWithin('cd $HOME && rm foo', { HOME: '/Users/alice' }, '/project')).toBe(false)
+    })
+
+    test('env target cd: cd $M && rm foo => true when workspace allowlisted', () => {
+      expect(writesStayWithin('cd $M && rm foo', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+    })
+
+    test('cd foo/$UNDEFINED/bar && rm baz => false (fail-closed for undefined env var)', () => {
+      expect(writesStayWithin('cd foo/$UNDEFINED/bar && rm baz', {}, '/project')).toBe(false)
+    })
+
+    test('cd $M/sub && rm file => false when $M undefined', () => {
+      expect(writesStayWithin('cd $M/sub && rm file', {}, '/project', '/workspace')).toBe(false)
+    })
+
+    test('tilde cd target: cd ~/tmp && rm foo => false when HOME outside project', () => {
+      expect(writesStayWithin('cd ~/tmp && rm foo', { HOME: '/Users/alice' }, '/project')).toBe(false)
+    })
+
+    test('cd ~/foo && rm bar => false when HOME/USERPROFILE missing', () => {
+      expect(writesStayWithin('cd ~/foo && rm bar', {}, '/project')).toBe(false)
+    })
+
+    test('cd ~ && rm bar => false when HOME/USERPROFILE missing', () => {
+      expect(writesStayWithin('cd ~ && rm bar', {}, '/project')).toBe(false)
+    })
+
+    test('cd - returns to previous allowlisted dir', () => {
+      expect(writesStayWithin('cd /tmp && cd /project && cd - && rm foo', {}, '/project')).toBe(true)
+    })
+
+    test('cd - returns to previous non-allowlisted dir', () => {
+      expect(writesStayWithin('cd /etc && cd /project && cd - && rm foo', {}, '/project')).toBe(false)
+    })
+
+    test('cd with no args uses HOME outside project => false', () => {
+      expect(writesStayWithin('cd && rm foo', { HOME: '/Users/alice' }, '/project')).toBe(false)
+    })
+
+    test('cd with no args uses HOME inside project => true', () => {
+      expect(writesStayWithin('cd && rm foo', { HOME: '/project/home' }, '/project')).toBe(true)
+    })
+
+    test('cd with no args and no HOME/USERPROFILE => false (fail-closed)', () => {
+      expect(writesStayWithin('cd && rm foo', {}, '/project')).toBe(false)
+    })
+
+    test('cd - at start with no previous cwd => false (fail-closed)', () => {
+      expect(writesStayWithin('cd - && rm foo', {}, '/project')).toBe(false)
+    })
+
+    test('sequential cd chaining inside root => true', () => {
+      expect(writesStayWithin('cd foo && cd bar && rm baz', {}, '/project')).toBe(true)
+    })
+
+    test('sequential cd chaining escaping root => false', () => {
+      expect(writesStayWithin('cd foo && cd ../../.. && rm baz', {}, '/project')).toBe(false)
+    })
+
+    test('mixed commands: non-cd then cd then write', () => {
+      expect(writesStayWithin('ls && cd /tmp && rm foo', {}, '/project')).toBe(true)
+    })
+
+    test('mixed commands with later cd to disallowed dir => false', () => {
+      expect(writesStayWithin('cd /tmp && ls && cd /etc && rm foo', {}, '/project')).toBe(false)
+    })
+
+    test('redirects after cd: cd /tmp && echo x > out.txt => true', () => {
+      expect(writesStayWithin('cd /tmp && echo x > out.txt', {}, '/project')).toBe(true)
+    })
+
+    test('redirects after cd: cd /etc && echo x > out.txt => false', () => {
+      expect(writesStayWithin('cd /etc && echo x > out.txt', {}, '/project')).toBe(false)
+    })
+
+    test('subshell characterization: parser flattens subshell boundaries for cwd tracking', () => {
+      expect(writesStayWithin('cd /tmp; (cd /etc && rm foo)', {}, '/project')).toBe(false)
+    })
+
+    describe('$M workspace env var scenarios', () => {
+      test('cd $M && rm file => true when $M is additional root', () => {
+        expect(writesStayWithin('cd $M && rm file', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+      })
+
+      test('cd $M/sub && rm file => true when $M is additional root', () => {
+        expect(writesStayWithin('cd $M/sub && rm file', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+      })
+
+      test('cd $M && rm /project/file => true (project is primary root)', () => {
+        expect(writesStayWithin('cd $M && rm /project/file', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+      })
+
+      test('cd $M && rm ../../etc/passwd => false (escapes workspace)', () => {
+        expect(writesStayWithin('cd $M && rm ../../etc/passwd', { M: '/workspace' }, '/project', '/workspace')).toBe(false)
+      })
+
+      test('cd /project/sub && echo x > $M/out.txt => true when $M is additional root', () => {
+        expect(writesStayWithin('cd /project/sub && echo x > $M/out.txt', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+      })
+
+      test('cd $M && echo x > log.txt => true', () => {
+        expect(writesStayWithin('cd $M && echo x > log.txt', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+      })
+
+      test('cd $M && echo x > /etc/evil => false', () => {
+        expect(writesStayWithin('cd $M && echo x > /etc/evil', { M: '/workspace' }, '/project', '/workspace')).toBe(false)
+      })
+
+      test('cd $M && rm file => false when $M is NOT an additional root', () => {
+        expect(writesStayWithin('cd $M && rm file', { M: '/workspace' }, '/project')).toBe(false)
+      })
+
+      test('cd /project && rm $M/file => true when $M is additional root', () => {
+        expect(writesStayWithin('cd /project && rm $M/file', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+      })
+
+      test('cd $M && rm file => handles missing $M gracefully', () => {
+        expect(writesStayWithin('cd $M && rm file', {}, '/project')).toBe(false)
+      })
+    })
+
+    describe('composite and edge-case scenarios', () => {
+      describe('Combined shell expansion + cd', () => {
+        test('cd $HOME/projects && rm ./secret => true', () => {
+          expect(writesStayWithin('cd $HOME/projects && rm ./secret', { HOME: '/Users/alice' }, '/Users/alice/projects')).toBe(true)
+        })
+
+        test('cd $HOME/projects && rm ../secret => false', () => {
+          expect(writesStayWithin('cd $HOME/projects && rm ../secret', { HOME: '/Users/alice' }, '/Users/alice/projects')).toBe(false)
+        })
+
+        test('cd $M && rm $HOME/.ssh/key => false', () => {
+          expect(writesStayWithin('cd $M && rm $HOME/.ssh/key', { M: '/workspace', HOME: '/Users/alice' }, '/project', '/workspace')).toBe(false)
+        })
+
+        test('cd $M/sub && rm ./file => true', () => {
+          expect(writesStayWithin('cd $M/sub && rm ./file', { M: '/workspace' }, '/project', '/workspace')).toBe(true)
+        })
+      })
+
+      describe('cd + env var in write args (not just cd target)', () => {
+        test('cd /tmp && rm $HOME/.bashrc => false', () => {
+          expect(writesStayWithin('cd /tmp && rm $HOME/.bashrc', { HOME: '/Users/alice' }, '/project')).toBe(false)
+        })
+
+        test('cd /project/sub && cp $HOME/file ./dest => false (classifier checks all args including source)', () => {
+          expect(writesStayWithin('cd /project/sub && cp $HOME/file ./dest', { HOME: '/Users/alice' }, '/project')).toBe(false)
+        })
+      })
+
+      describe('Multiple write commands after cd', () => {
+        test('cd /tmp && rm foo && rm bar => true', () => {
+          expect(writesStayWithin('cd /tmp && rm foo && rm bar', {}, '/project')).toBe(true)
+        })
+
+        test('cd /tmp && rm foo && cd /etc && rm bar => false', () => {
+          expect(writesStayWithin('cd /tmp && rm foo && cd /etc && rm bar', {}, '/project')).toBe(false)
+        })
+      })
+
+      describe('cd interleaved with redirects and writes', () => {
+        test('cd /project/sub && echo x > log.txt && cd /etc && echo y > evil.txt => false', () => {
+          expect(writesStayWithin('cd /project/sub && echo x > log.txt && cd /etc && echo y > evil.txt', {}, '/project')).toBe(false)
+        })
+
+        test('cd /project/sub && echo x > log.txt && echo y > ../other.txt => true', () => {
+          expect(writesStayWithin('cd /project/sub && echo x > log.txt && echo y > ../other.txt', {}, '/project')).toBe(true)
+        })
+      })
+
+      describe('Relative cd chains with writes between', () => {
+        test('cd sub1 && rm file1 && cd sub2 && rm file2 => true', () => {
+          expect(writesStayWithin('cd sub1 && rm file1 && cd sub2 && rm file2', {}, '/project')).toBe(true)
+        })
+
+        test('cd sub1 && rm file1 && cd ../../.. && rm file2 => false', () => {
+          expect(writesStayWithin('cd sub1 && rm file1 && cd ../../.. && rm file2', {}, '/project')).toBe(false)
+        })
+      })
+
+      describe('cd with write to /dev/null (always allowed)', () => {
+        test('cd /etc && echo x > /dev/null => true', () => {
+          expect(writesStayWithin('cd /etc && echo x > /dev/null', {}, '/project')).toBe(true)
+        })
+      })
+
+      describe('cd to allowed additional root', () => {
+        test('cd /workspace/deep/dir && rm file => true', () => {
+          expect(writesStayWithin('cd /workspace/deep/dir && rm file', {}, '/project', '/workspace')).toBe(true)
+        })
+      })
+
+      describe('No-op scenarios (cd does not affect non-write commands)', () => {
+        test('cd /etc && ls => true', () => {
+          expect(writesStayWithin('cd /etc && ls', {}, '/project')).toBe(true)
+        })
+
+        test('cd /etc && echo hello => true', () => {
+          expect(writesStayWithin('cd /etc && echo hello', {}, '/project')).toBe(true)
+        })
+      })
+    })
+  })
+
   describe('env var expansion in isPathWithin', () => {
     test('$HOME outside allowed roots is rejected', () => {
       expect(isPathWithin('$HOME/.bashrc', { HOME: '/Users/alice' }, '/project')).toBe(false)
