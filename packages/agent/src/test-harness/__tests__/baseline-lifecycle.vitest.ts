@@ -2,7 +2,7 @@ import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../harness'
 import { MockTurnScriptTag } from '../turn-script'
-import { WorkingStateProjection } from '../../projections/working-state'
+import { TurnProjection } from '../../projections/turn'
 
 describe('baseline harness lifecycle', () => {
   it.live('1) initializes cleanly', () =>
@@ -27,9 +27,9 @@ describe('baseline harness lifecycle', () => {
         expect(completed.result.turnDecision).toBe('yield')
       }
 
-      const root = yield* harness.projectionFork(WorkingStateProjection.Tag, null)
-      expect(root.working).toBe(false)
-      expect(root.willContinue).toBe(false)
+      const root = yield* harness.projectionFork(TurnProjection.Tag, null)
+      expect(root._tag).toBe('idle')
+      expect(root.triggers.length).toBe(0)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 

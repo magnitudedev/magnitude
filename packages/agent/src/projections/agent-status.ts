@@ -6,7 +6,7 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { WorkingStateProjection } from './working-state'
+import { TurnProjection } from './turn'
 
 export type AgentStatus = 'starting' | 'working' | 'idle' | 'killed'
 
@@ -125,7 +125,7 @@ export function getActiveAgent(state: AgentStatusState, agentId: string): AgentI
 
 export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusState>()(({
   name: 'AgentStatus',
-  reads: [WorkingStateProjection] as const,
+
 
   initial: {
     agents: new Map(),
@@ -213,6 +213,8 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'working' }),
       }
     },
+
+
 
     turn_unexpected_error: ({ event, state, emit }) => {
       if (event.forkId === null) return state
@@ -328,8 +330,9 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
   },
 
   signalHandlers: (on) => [
-    on(WorkingStateProjection.signals.forkBecameStable, ({ value, state, emit }) => {
+    on(TurnProjection.signals.turnTerminated, ({ value, state, emit }) => {
       if (value.forkId === null) return state
+      if (value.triggersQueued) return state
 
       const agent = getAgentByForkId(state, value.forkId)
       if (!agent) return state
@@ -351,4 +354,5 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       }
     }),
   ],
+
 }))

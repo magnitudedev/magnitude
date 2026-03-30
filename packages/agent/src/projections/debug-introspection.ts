@@ -12,7 +12,7 @@ import { AgentStatusProjection } from './agent-status'
 import { TurnProjection } from './turn'
 import { MemoryProjection } from './memory'
 import { CompactionProjection } from './compaction'
-import { WorkingStateProjection } from './working-state'
+
 import { SessionContextProjection } from './session-context'
 import { ChatTitleProjection } from './chat-title'
 import { ReplayProjection } from './replay'
@@ -51,7 +51,7 @@ interface ResolvedProjections {
   turnProj: Effect.Effect.Success<typeof TurnProjection.Tag>
   memoryProj: Effect.Effect.Success<typeof MemoryProjection.Tag>
   compactionProj: Effect.Effect.Success<typeof CompactionProjection.Tag>
-  workingProj: Effect.Effect.Success<typeof WorkingStateProjection.Tag>
+
   sessionProj: Effect.Effect.Success<typeof SessionContextProjection.Tag>
   chatTitleProj: Effect.Effect.Success<typeof ChatTitleProjection.Tag>
   replayProj: Effect.Effect.Success<typeof ReplayProjection.Tag>
@@ -66,7 +66,7 @@ function resolveProjections() {
       turnProj: yield* TurnProjection.Tag,
       memoryProj: yield* MemoryProjection.Tag,
       compactionProj: yield* CompactionProjection.Tag,
-      workingProj: yield* WorkingStateProjection.Tag,
+
       sessionProj: yield* SessionContextProjection.Tag,
       chatTitleProj: yield* ChatTitleProjection.Tag,
       replayProj: yield* ReplayProjection.Tag,
@@ -87,7 +87,7 @@ function buildSnapshot(
     const turnRaw = yield* SubscriptionRef.get(projs.turnProj.state)
     const memoryRaw = yield* SubscriptionRef.get(projs.memoryProj.state)
     const compactionRaw = yield* SubscriptionRef.get(projs.compactionProj.state)
-    const workingRaw = yield* SubscriptionRef.get(projs.workingProj.state)
+
     const sessionState = yield* SubscriptionRef.get(projs.sessionProj.state)
     const chatTitleState = yield* SubscriptionRef.get(projs.chatTitleProj.state)
     const replayRaw = yield* SubscriptionRef.get(projs.replayProj.state)
@@ -96,11 +96,11 @@ function buildSnapshot(
     const turnForkState = turnRaw.forks.get(forkId)
     const memoryForkState = memoryRaw.forks.get(forkId)
     const compactionForkState = compactionRaw.forks.get(forkId)
-    const workingForkState = workingRaw.forks.get(forkId)
+
     const replayForkState = replayRaw.forks.get(forkId)
 
     const projections: ProjectionSnapshot[] = [
-      { name: 'WorkingStateProjection', state: workingForkState, timestamp },
+
       { name: 'AgentRoutingProjection', state: routingState, timestamp },
       { name: 'AgentStatusProjection', state: statusState, timestamp },
       { name: 'TurnProjection', state: turnForkState, timestamp },
@@ -122,7 +122,7 @@ function buildSnapshot(
         messageCount: memoryForkState.messages.length,
         usagePercent: Math.round((compactionForkState.tokenEstimate / limits.hardCap) * 100),
         shouldCompact: compactionForkState.shouldCompact,
-        isCompacting: compactionForkState.isCompacting,
+        isCompacting: compactionForkState._tag !== 'idle',
       }
     }
 
@@ -142,7 +142,7 @@ export function createDebugStream(forkId: string | null) {
       toTrigger(projs.turnProj.state.changes),
       toTrigger(projs.memoryProj.state.changes),
       toTrigger(projs.compactionProj.state.changes),
-      toTrigger(projs.workingProj.state.changes),
+
       toTrigger(projs.sessionProj.state.changes),
       toTrigger(projs.chatTitleProj.state.changes),
       toTrigger(projs.replayProj.state.changes),

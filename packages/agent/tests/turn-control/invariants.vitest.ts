@@ -5,7 +5,7 @@ import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { TurnProjection } from '../../src/projections/turn'
 import {
   assertNoTurnIdMismatch,
-  assertWorkingStateAligned,
+  assertTurnStateAligned,
   eventsForFork,
   mkTurnCompletedFailure,
   mkTurnCompletedSuccess,
@@ -21,7 +21,7 @@ describe('turn control invariants', () => {
 
       const events = eventsForFork(h, null)
       assertNoTurnIdMismatch(events)
-      yield* assertWorkingStateAligned(h)
+      yield* assertTurnStateAligned(h)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -45,7 +45,7 @@ describe('turn control invariants', () => {
       yield* h.send(mkTurnCompletedFailure({ turnId: 't-fail', chainId: 'c-fail' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
-      yield* assertWorkingStateAligned(h)
+      yield* assertTurnStateAligned(h)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -56,10 +56,10 @@ describe('turn control invariants', () => {
       yield* h.send({ type: 'turn_unexpected_error', forkId: null, turnId: 't-err', message: 'bad stream' })
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
-      yield* assertWorkingStateAligned(h)
+      yield* assertTurnStateAligned(h)
 
       const turn = yield* h.projectionFork(TurnProjection.Tag, null)
-      expect(turn.activeTurn === null || turn.activeTurn.turnId !== '').toBe(true)
+      expect(turn._tag === 'idle' || turn.turnId.length > 0).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -85,8 +85,8 @@ describe('turn control invariants', () => {
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
       assertNoTurnIdMismatch(eventsForFork(h, 'fork-a'), 'fork-a')
-      yield* assertWorkingStateAligned(h, null)
-      yield* assertWorkingStateAligned(h, 'fork-a')
+      yield* assertTurnStateAligned(h, null)
+      yield* assertTurnStateAligned(h, 'fork-a')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

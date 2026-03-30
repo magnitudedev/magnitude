@@ -1,7 +1,7 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
-import { getCompaction, getWorking, mkCompactionReady, mkCompactionStarted, mkContextLimitHit, mkTurnCompleted, mkTurnStarted } from './helpers'
+import { getCompaction, getTurn, mkCompactionReady, mkCompactionStarted, mkContextLimitHit, mkTurnCompleted, mkTurnStarted } from './helpers'
 
 describe('compaction/lifecycle-timing', () => {
   it.effect('turn completes during summarization window does not prevent finalization', () =>
@@ -21,8 +21,8 @@ describe('compaction/lifecycle-timing', () => {
         refreshedContext: null,
       })
       const state = yield* getCompaction(h)
-      expect(state.pendingFinalization).toBe(false)
-      expect(state.isCompacting).toBe(false)
+      expect(state._tag === 'pendingFinalization').toBe(false)
+      expect(state._tag !== 'idle').toBe(false)
     }).pipe(Effect.provide(TestHarnessLive())))
 
   it.effect('compaction_ready while turn in-flight defers finalize until turn_completed', () =>
@@ -42,14 +42,14 @@ describe('compaction/lifecycle-timing', () => {
       yield* h.send(mkTurnStarted({ turnId: 'A', chainId: 'C' }))
       yield* h.send(mkContextLimitHit())
       yield* h.wait.event('compaction_ready', (e) => e.forkId === null)
-      const whileTurnInFlight = yield* getWorking(h)
-      expect(whileTurnInFlight.compactionPending).toBe(true)
+      const compactionWhileTurnInFlight = yield* getCompaction(h)
+      expect(compactionWhileTurnInFlight._tag !== 'idle').toBe(true)
 
       yield* h.send(mkTurnCompleted({ turnId: 'A', chainId: 'C' }))
 
       yield* h.wait.event('compaction_completed', (e) => e.forkId === null)
-      const after = yield* getWorking(h)
-      expect(after.compactionPending).toBe(false)
+      const after = yield* getCompaction(h)
+      expect(after._tag !== 'idle').toBe(false)
       expect(after.contextLimitBlocked).toBe(false)
     }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true }, model: { completeResponse: 'worker summary' } }))))
 
@@ -75,47 +75,53 @@ describe('compaction/lifecycle-timing', () => {
 
   it.effect('finalize timing parity immediate vs deferred terminal state', () =>
     Effect.gen(function* () {
-      const hImmediate = yield* TestHarness
-      yield* hImmediate.send({
-        type: 'user_message',
-        messageId: 'm-parity-immediate',
-        forkId: null,
-        timestamp: Date.now(),
-        content: [{ type: 'text', text: 'X'.repeat(60_000) }],
-        attachments: [],
-        mode: 'text',
-        synthetic: false,
-        taskMode: false,
-      })
-      yield* hImmediate.send(mkContextLimitHit())
-      yield* hImmediate.wait.event('compaction_ready', (e) => e.forkId === null)
-      yield* hImmediate.wait.event('compaction_completed', (e) => e.forkId === null)
-      const immediate = yield* getWorking(hImmediate)
+      const immediate = yield* Effect.gen(function* () {
+        const hImmediate = yield* TestHarness
+        yield* hImmediate.send({
+          type: 'user_message',
+          messageId: 'm-parity-immediate',
+          forkId: null,
+          timestamp: Date.now(),
+          content: [{ type: 'text', text: 'X'.repeat(60_000) }],
+          attachments: [],
+          mode: 'text',
+          synthetic: false,
+          taskMode: false,
+        })
+        yield* hImmediate.send(mkTurnStarted({ turnId: 'parity-immediate-turn', chainId: 'parity-immediate-chain' }))
+        yield* hImmediate.send(mkTurnCompleted({ turnId: 'parity-immediate-turn', chainId: 'parity-immediate-chain' }))
+        yield* hImmediate.send(mkContextLimitHit())
+        yield* hImmediate.wait.event('compaction_ready', (e) => e.forkId === null)
+        yield* hImmediate.wait.event('compaction_completed', (e) => e.forkId === null)
+        return yield* getCompaction(hImmediate)
+      }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true, turnController: false }, model: { completeResponse: 'worker summary' } })))
 
-      const hDeferred = yield* TestHarness
-      yield* hDeferred.send({
-        type: 'user_message',
-        messageId: 'm-parity-deferred',
-        forkId: null,
-        timestamp: Date.now(),
-        content: [{ type: 'text', text: 'X'.repeat(60_000) }],
-        attachments: [],
-        mode: 'text',
-        synthetic: false,
-        taskMode: false,
-      })
-      yield* hDeferred.send(mkTurnStarted({ turnId: 'parity-turn', chainId: 'parity-chain' }))
-      yield* hDeferred.send(mkContextLimitHit())
-      yield* hDeferred.wait.event('compaction_ready', (e) => e.forkId === null)
-      yield* hDeferred.send(mkTurnCompleted({ turnId: 'parity-turn', chainId: 'parity-chain' }))
-      yield* hDeferred.wait.event('compaction_completed', (e) => e.forkId === null)
-      const deferred = yield* getWorking(hDeferred)
+      const deferred = yield* Effect.gen(function* () {
+        const hDeferred = yield* TestHarness
+        yield* hDeferred.send({
+          type: 'user_message',
+          messageId: 'm-parity-deferred',
+          forkId: null,
+          timestamp: Date.now(),
+          content: [{ type: 'text', text: 'X'.repeat(60_000) }],
+          attachments: [],
+          mode: 'text',
+          synthetic: false,
+          taskMode: false,
+        })
+        yield* hDeferred.send(mkTurnStarted({ turnId: 'parity-turn', chainId: 'parity-chain' }))
+        yield* hDeferred.send(mkContextLimitHit())
+        yield* hDeferred.wait.event('compaction_ready', (e) => e.forkId === null)
+        yield* hDeferred.send(mkTurnCompleted({ turnId: 'parity-turn', chainId: 'parity-chain' }))
+        yield* hDeferred.wait.event('compaction_completed', (e) => e.forkId === null)
+        return yield* getCompaction(hDeferred)
+      }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true, turnController: false }, model: { completeResponse: 'worker summary' } })))
 
       expect(immediate.contextLimitBlocked).toBe(false)
-      expect(immediate.compactionPending).toBe(false)
+      expect(immediate._tag !== 'idle').toBe(false)
       expect(deferred.contextLimitBlocked).toBe(immediate.contextLimitBlocked)
-      expect(deferred.compactionPending).toBe(immediate.compactionPending)
-    }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true }, model: { completeResponse: 'worker summary' } }))))
+      expect(deferred._tag !== 'idle').toBe(immediate._tag !== 'idle')
+    }))
 
   it.effect('multiple context_limit_hit are idempotent with worker', () =>
     Effect.gen(function* () {

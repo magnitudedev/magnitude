@@ -44,7 +44,7 @@ import { logger } from '@magnitudedev/logger'
 
 import { AgentRoutingProjection, type AgentRoutingState, isActiveRoute, getRoutingEntryByForkId } from '../projections/agent-routing'
 import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentByForkId } from '../projections/agent-status'
-import { WorkingStateProjection, type ForkWorkingState } from '../projections/working-state'
+import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
 import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
@@ -102,7 +102,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkWorkingState>
+    Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkTurnState>
   >
 
   /**
@@ -116,7 +116,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     void,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -143,7 +143,7 @@ export interface ExecutionManagerService {
   }) => Effect.Effect<
     string,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -180,7 +180,7 @@ function makeForkLayers(
   sessionContextProjection: Projection.ProjectionInstance<SessionContextState>,
   agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
-  workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
+  workingStateProjection: Projection.ForkedProjectionInstance<ForkTurnState>,
   workflowProjection: Projection.ForkedProjectionInstance<WorkflowCriteriaState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
@@ -319,7 +319,7 @@ const makeExecutionManager = Effect.gen(function* () {
       // Resolve agent definition for this fork
       const agentRoutingProjectionInst = yield* AgentRoutingProjection.Tag
       const agentStatusProjectionInst = yield* AgentStatusProjection.Tag
-      const workingStateProjectionInst = yield* WorkingStateProjection.Tag
+      const workingStateProjectionInst = yield* TurnProjection.Tag
       const agentState = yield* agentStatusProjectionInst.get
       let variant: AgentVariant
       if (forkId) {
@@ -424,7 +424,7 @@ const makeExecutionManager = Effect.gen(function* () {
         workspacePath,
         ephemeralSessionContext,
         yield* AgentStatusProjection.Tag,
-        yield* WorkingStateProjection.Tag,
+        yield* TurnProjection.Tag,
       )
 
 
@@ -876,7 +876,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const sessionContextProjection = yield* SessionContextProjection.Tag
       const agentProjection = yield* AgentRoutingProjection.Tag
       const agentStatusProjection = yield* AgentStatusProjection.Tag
-      const workingStateProjection = yield* WorkingStateProjection.Tag
+      const workingStateProjection = yield* TurnProjection.Tag
       const workflowProjection = yield* WorkflowProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
@@ -949,7 +949,7 @@ const makeExecutionManager = Effect.gen(function* () {
         bindObservable(obs, () => Effect.succeed(layers as Layer.Layer<unknown>))
       )
       boundObservables.set(forkId, agentObservables)
-    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkWorkingState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
+    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
 
     disposeFork: (forkId) => Effect.gen(function* () {
       // Run role teardown if defined (e.g. browser cleanup)

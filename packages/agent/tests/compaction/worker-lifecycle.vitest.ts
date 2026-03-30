@@ -1,7 +1,7 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
-import { getCompaction, getWorking, mkContextLimitHit } from './helpers'
+import { getCompaction, getTurn, mkContextLimitHit } from './helpers'
 
 const workerLayer = TestHarnessLive({ workers: { compaction: true }, model: { completeResponse: 'worker summary' } })
 
@@ -34,9 +34,9 @@ describe('compaction/worker-lifecycle', () => {
       yield* h.send(mkContextLimitHit())
       const completed = yield* h.wait.event('compaction_completed', (e) => e.forkId === null)
       expect(completed.tokensSaved).toBeGreaterThanOrEqual(0)
-      const working = yield* getWorking(h)
-      expect(working.compactionPending).toBe(false)
-      expect(working.contextLimitBlocked).toBe(false)
+      const compaction2 = yield* getCompaction(h)
+      expect(compaction2._tag).toBe('idle')
+      expect(compaction2.contextLimitBlocked).toBe(false)
     }).pipe(Effect.provide(workerLayer)))
 
   it.effect('worker failure emits compaction_failed and clears lifecycle flags', () =>
@@ -47,11 +47,8 @@ describe('compaction/worker-lifecycle', () => {
       const failed = yield* h.wait.event('compaction_failed', (e) => e.forkId === null)
       expect(failed.error.length).toBeGreaterThan(0)
       const compaction = yield* getCompaction(h)
-      const working = yield* getWorking(h)
-      expect(compaction.isCompacting).toBe(false)
-      expect(compaction.pendingFinalization).toBe(false)
-      expect(working.compactionPending).toBe(false)
-      expect(working.contextLimitBlocked).toBe(false)
+      expect(compaction._tag).toBe('idle')
+      expect(compaction.contextLimitBlocked).toBe(false)
     }).pipe(Effect.provide(TestHarnessLive({
       workers: { compaction: true },
       model: { completeResponse: () => { throw new Error('forced compaction failure') } },

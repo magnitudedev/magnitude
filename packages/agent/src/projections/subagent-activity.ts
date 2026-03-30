@@ -1,7 +1,7 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
-import { WorkingStateProjection } from './working-state'
+
 
 
 export interface TurnEntry {
@@ -61,6 +61,22 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       return {
         ...state,
         pendingProse: new Map(state.pendingProse).set(event.forkId, existing + event.text),
+      }
+    },
+
+    turn_started: ({ event, state, emit }) => {
+      const parentForkId = event.forkId
+      const entries = state.entriesByParent.get(parentForkId) ?? []
+      const cursor = state.seenCursorByParent.get(parentForkId) ?? 0
+
+      if (entries.length <= cursor) return state
+
+      const unseen = entries.slice(cursor)
+      emit.unseenActivityAvailable({ parentForkId, entries: unseen })
+
+      return {
+        ...state,
+        seenCursorByParent: new Map(state.seenCursorByParent).set(parentForkId, entries.length),
       }
     },
 
@@ -157,23 +173,4 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
     },
   },
 
-  signalHandlers: (on) => [
-    on(WorkingStateProjection.signals.shouldTriggerChanged, ({ value, state, emit }) => {
-      if (!value.shouldTrigger) return state
-
-      const parentForkId = value.forkId
-      const entries = state.entriesByParent.get(parentForkId) ?? []
-      const cursor = state.seenCursorByParent.get(parentForkId) ?? 0
-
-      if (entries.length <= cursor) return state
-
-      const unseen = entries.slice(cursor)
-      emit.unseenActivityAvailable({ parentForkId, entries: unseen })
-
-      return {
-        ...state,
-        seenCursorByParent: new Map(state.seenCursorByParent).set(parentForkId, entries.length),
-      }
-    }),
-  ],
 })

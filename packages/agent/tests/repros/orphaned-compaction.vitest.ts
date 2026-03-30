@@ -2,11 +2,7 @@ import { describe, it } from '@effect/vitest'
 import { expect } from 'vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
-import {
-  getCompaction,
-  getWorking,
-  mkContextLimitHit,
-} from '../compaction/helpers'
+import { getCompaction, getTurn, mkContextLimitHit } from '../compaction/helpers'
 
 /**
  * Reproduces the orphaned compaction bug found in session mnb0dvn5.
@@ -58,16 +54,15 @@ describe('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
 
       // Interrupt immediately (reproducing the production sequence)
       yield* h.send({ type: 'interrupt', forkId: null })
+      yield* h.wait.event('turn_completed', (e) => e.forkId === null)
 
-      // Verify working state gates are cleared after interrupt
-      const working = yield* getWorking(h)
-      expect(working.compactionPending).toBe(false)
-      expect(working.contextLimitBlocked).toBe(false)
+      const turn = yield* getTurn(h)
+      expect(turn._tag).toBe('idle')
 
       // Verify compaction projection is not stuck
       const compaction = yield* getCompaction(h)
-      expect(compaction.isCompacting).toBe(false)
-      expect(compaction.pendingFinalization).toBe(false)
+      expect(compaction._tag).toBe('idle')
+      expect(compaction.contextLimitBlocked).toBe(false)
     }).pipe(Effect.provide(workerLayer))
   )
 
@@ -82,6 +77,7 @@ describe('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
       yield* h.send(mkContextLimitHit())
       yield* h.wait.event('compaction_started', (e) => e.forkId === null)
       yield* h.send({ type: 'interrupt', forkId: null })
+      yield* h.wait.event('turn_completed', (e) => e.forkId === null)
 
       // Second compaction: trigger again — should work
       yield* h.send({ ...largeUserMessage, messageId: 'orphan-msg-2' })
@@ -96,12 +92,11 @@ describe('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
 
       // Final state should be clean
       const compaction = yield* getCompaction(h)
-      expect(compaction.isCompacting).toBe(false)
-      expect(compaction.pendingFinalization).toBe(false)
+      expect(compaction._tag).toBe('idle')
+      expect(compaction.contextLimitBlocked).toBe(false)
 
-      const working = yield* getWorking(h)
-      expect(working.compactionPending).toBe(false)
-      expect(working.contextLimitBlocked).toBe(false)
+      const turn = yield* getTurn(h)
+      expect(turn._tag).toBe('idle')
     }).pipe(Effect.provide(workerLayer))
   )
 })

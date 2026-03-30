@@ -2,7 +2,7 @@ import { describe, it } from '@effect/vitest'
 import { expect } from 'vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
-import { WorkingStateProjection } from '../../src/projections/working-state'
+import { CompactionProjection } from '../../src/projections/compaction'
 import {
   assertNoTurnIdMismatch,
   eventsForFork,
@@ -20,7 +20,7 @@ describe('turn control compaction gating interaction', () => {
       yield* h.send(mkTurnStarted({ turnId: 't-g1', chainId: 'c-g' }))
       yield* h.send(mkContextLimitHit())
 
-      const blockedDuring = yield* h.projectionFork(WorkingStateProjection.Tag, null)
+      const blockedDuring = yield* h.projectionFork(CompactionProjection.Tag, null)
       expect(blockedDuring.contextLimitBlocked).toBe(true)
 
       yield* h.send(mkTurnCompletedFailure({ turnId: 't-g1', chainId: 'c-g' }))
@@ -56,8 +56,8 @@ describe('turn control compaction gating interaction', () => {
         refreshedContext: null,
       })
 
-      const working = yield* h.projectionFork(WorkingStateProjection.Tag, null)
-      expect(working.compactionPending).toBe(true)
+      const compactionState = yield* h.projectionFork(CompactionProjection.Tag, null)
+      expect(compactionState._tag !== 'idle').toBe(true)
 
       const startedBefore = eventsForFork(h, null).filter((e) => e.type === 'turn_started').length
       yield* h.send({

@@ -7,7 +7,7 @@ import {
   FrameworkErrorReporterLive,
 } from '@magnitudedev/event-core'
 import type { AppEvent } from '../../events'
-import { WorkingStateProjection } from '../working-state'
+import { TurnProjection } from '../turn'
 import { AgentRoutingProjection } from '../agent-routing'
 import { AgentStatusProjection } from '../agent-status'
 import { DisplayProjection, type DisplayState, type DisplayMessage } from '../display'
@@ -24,7 +24,7 @@ const makeRootDisplay = async (events: AppEvent[]) => {
     FrameworkErrorPubSubLive,
     Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive),
     projectionBusLayer,
-    Layer.provide(WorkingStateProjection.Layer, projectionBusLayer),
+    Layer.provide(TurnProjection.Layer, projectionBusLayer),
     Layer.provide(AgentRoutingProjection.Layer, projectionBusLayer),
     Layer.provide(AgentStatusProjection.Layer, projectionBusLayer),
     Layer.provide(DisplayProjection.Layer, projectionBusLayer),

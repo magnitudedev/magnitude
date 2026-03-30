@@ -1,16 +1,12 @@
 /**
  * CompactionProjection (Forked)
  *
- * Owns compaction-related state per fork: token estimates, compaction lifecycle flags,
- * and context limit blocking. Extracted from MemoryProjection to break circular dependencies.
- *
- * Key behavior:
- * - Tracks token estimates and whether compaction should be triggered
- * - Gates turns via contextLimitBlocked when compaction is in progress at hard cap
- * - Stores pending compaction data between compaction_ready and compaction_completed
+ * Owns compaction-related state per fork as an FSM with ambient fields.
  */
 
-import { Projection, Signal } from '@magnitudedev/event-core'
+import { Data } from 'effect'
+import { Projection, Signal, FSM } from '@magnitudedev/event-core'
+const { defineFSM } = FSM
 
 import type { AppEvent, SessionContext } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
@@ -21,15 +17,23 @@ import { CHARS_PER_TOKEN } from '../constants'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 import { buildSessionContextContent } from '../prompts'
 import { renderSystemPrompt } from '../prompts/system-prompt'
-import { ContentPart, textOf } from '../content'
+import { ContentPart } from '../content'
 
 // =============================================================================
 // Context Limit Helpers
 // =============================================================================
 
+function isCompactionBlocking(tag: CompactionState['_tag']): boolean {
+  return tag !== 'idle'
+}
+
+function deriveShouldCompact(tag: CompactionState['_tag'], tokenEstimate: number): boolean {
+  return tag === 'idle' && tokenEstimate > getContextLimits().softCap
+}
+
 /** Compute whether turns should be blocked due to context limit */
-function computeContextLimitBlocked(isCompacting: boolean, pendingFinalization: boolean, tokenEstimate: number): boolean {
-  return (isCompacting || pendingFinalization) && tokenEstimate >= getContextLimits().hardCap
+function computeContextLimitBlocked(tag: CompactionState['_tag'], tokenEstimate: number): boolean {
+  return isCompactionBlocking(tag) && tokenEstimate >= getContextLimits().hardCap
 }
 
 /** Estimate tokens for content string or content parts */
@@ -67,7 +71,6 @@ function estimateSystemPromptTokens(variant: AgentVariant): number {
 type ImageTokenEstimator = (width: number, height: number) => number
 
 const estimators: Record<string, ImageTokenEstimator> = {
-  // Anthropic: (w * h) / 750, with 1568px long-edge resize
   anthropic: (w, h) => {
     const longEdge = Math.max(w, h)
     if (longEdge > 1568) {
@@ -78,116 +81,169 @@ const estimators: Record<string, ImageTokenEstimator> = {
     return Math.ceil((w * h) / 750)
   },
 
-  // OpenAI: tile-based (resize to 2048 max, 768 short side, 512x512 tiles)
-  // Formula: 85 base + 170 per tile
   openai: (w, h) => {
-    // Step 1: scale to fit within 2048x2048
     const maxDim = Math.max(w, h)
     if (maxDim > 2048) {
       const scale = 2048 / maxDim
       w = Math.round(w * scale)
       h = Math.round(h * scale)
     }
-    // Step 2: if BOTH dimensions > 768, scale so shortest side = 768
     const minDim = Math.min(w, h)
     if (minDim > 768) {
       const scale = 768 / minDim
       w = Math.round(w * scale)
       h = Math.round(h * scale)
     }
-    // Step 3: count 512x512 tiles
     const tilesW = Math.ceil(w / 512)
     const tilesH = Math.ceil(h / 512)
     return (tilesW * tilesH * 170) + 85
   },
 
-  // Google: fixed per image (~258-560 tokens depending on model, use 560 as safe upper bound)
   google: () => 560,
   'google-ai': () => 560,
   'vertex-ai': () => 560,
 }
 
 function getImageTokenEstimator(modelId: string | null, providerId: string | null): ImageTokenEstimator {
-  // 1. Model name heuristic (most reliable — handles cross-provider routing like OpenRouter)
   if (modelId) {
     if (/claude/i.test(modelId)) return estimators.anthropic
     if (/gpt|o[1-9]-/i.test(modelId)) return estimators.openai
     if (/gemini/i.test(modelId)) return estimators.google
   }
 
-  // 2. Fall back to provider ID for unknown model names
   if (providerId === 'anthropic' || providerId === 'aws-bedrock') return estimators.anthropic
   if (providerId === 'openai') return estimators.openai
   if (providerId === 'google' || providerId === 'google-ai' || providerId === 'vertex-ai') return estimators.google
 
-  // 3. Default to Anthropic (safe upper bound)
   return estimators.anthropic
 }
 
+function asAgentVariant(role: string): AgentVariant | null {
+  if (
+    role === 'lead'
+    || role === 'lead-oneshot'
+    || role === 'builder'
+    || role === 'explorer'
+    || role === 'planner'
+    || role === 'debugger'
+    || role === 'reviewer'
+    || role === 'browser'
+  ) {
+    return role
+  }
+  return null
+}
+
 // =============================================================================
-// Types
+// FSM State
 // =============================================================================
 
-/** Per-fork compaction state */
-export interface ForkCompactionState {
+interface AmbientCompactionFields {
   readonly tokenEstimate: number
   readonly modelId: string | null
   readonly providerId: string | null
-  readonly shouldCompact: boolean
-  readonly isCompacting: boolean
-  readonly pendingFinalization: boolean
   readonly contextLimitBlocked: boolean
-  readonly pendingCompactionData: {
-    readonly summary: string
-    readonly compactedMessageCount: number
-    readonly originalTokenEstimate: number
-    readonly refreshedContext: SessionContext | null
-  } | null
+  readonly shouldCompact: boolean
+}
+
+export class CompactionIdle extends Data.TaggedClass('idle')<AmbientCompactionFields> {}
+
+export class Compacting extends Data.TaggedClass('compacting')<AmbientCompactionFields & {
+  readonly compactedMessageCount: number
+}> {}
+
+export class PendingFinalization extends Data.TaggedClass('pendingFinalization')<AmbientCompactionFields & {
+  readonly summary: string
+  readonly compactedMessageCount: number
+  readonly originalTokenEstimate: number
+  readonly refreshedContext: SessionContext | null
+}> {}
+
+export const CompactionLifecycle = defineFSM(
+  { idle: CompactionIdle, compacting: Compacting, pendingFinalization: PendingFinalization },
+  { idle: ['compacting'], compacting: ['pendingFinalization', 'idle'], pendingFinalization: ['idle'] }
+)
+
+export type CompactionState =
+  | CompactionIdle
+  | Compacting
+  | PendingFinalization
+
+function emitLifecycleSignals(
+  oldState: CompactionState,
+  newState: CompactionState,
+  forkId: string | null,
+  emit: {
+    readonly shouldCompactChanged: (value: { forkId: string | null; shouldCompact: boolean }) => void
+    readonly compactionBlockingChanged: (value: { forkId: string | null; blocking: boolean }) => void
+    readonly contextLimitBlockedChanged: (value: { forkId: string | null; blocked: boolean }) => void
+  }
+): void {
+  if (oldState.shouldCompact !== newState.shouldCompact) {
+    emit.shouldCompactChanged({ forkId, shouldCompact: newState.shouldCompact })
+  }
+
+  const oldBlocking = isCompactionBlocking(oldState._tag)
+  const newBlocking = isCompactionBlocking(newState._tag)
+  if (oldBlocking !== newBlocking) {
+    emit.compactionBlockingChanged({ forkId, blocking: newBlocking })
+  }
+
+  if (oldState.contextLimitBlocked !== newState.contextLimitBlocked) {
+    emit.contextLimitBlockedChanged({ forkId, blocked: newState.contextLimitBlocked })
+  }
+}
+
+function withAmbient(
+  state: CompactionState,
+  updates: Partial<AmbientCompactionFields>
+): CompactionState {
+  return CompactionLifecycle.hold(state, updates)
 }
 
 // =============================================================================
 // Projection
 // =============================================================================
 
-export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompactionState>()({
+export const CompactionProjection = Projection.defineForked<AppEvent, CompactionState>()({
   name: 'Compaction',
 
   reads: [AgentRoutingProjection, UserMessageResolutionProjection] as const,
 
   signals: {
     shouldCompactChanged: Signal.create<{ forkId: string | null; shouldCompact: boolean }>('Compaction/shouldCompactChanged'),
-    compactionPendingChanged: Signal.create<{ forkId: string | null; pending: boolean }>('Compaction/compactionPendingChanged'),
+    compactionBlockingChanged: Signal.create<{ forkId: string | null; blocking: boolean }>('Compaction/compactionBlockingChanged'),
     contextLimitBlockedChanged: Signal.create<{ forkId: string | null; blocked: boolean }>('Compaction/contextLimitBlockedChanged'),
   },
 
-  initialFork: {
+  initialFork: new CompactionIdle({
     tokenEstimate: 0,
     modelId: null,
     providerId: null,
-    shouldCompact: false,
-    isCompacting: false,
-    pendingFinalization: false,
     contextLimitBlocked: false,
-    pendingCompactionData: null,
-  },
+    shouldCompact: false,
+  }),
 
   eventHandlers: {
-    session_initialized: ({ event, fork }) => {
+    session_initialized: ({ event, fork, emit }) => {
       const content = buildSessionContextContent(event.context)
       const contentTokens = estimateContentTokens(content)
       const tokenEstimate = estimateSystemPromptTokens('lead') + contentTokens
-      return {
-        ...fork,
+
+      const nextState = withAmbient(fork, {
         tokenEstimate,
-        shouldCompact: tokenEstimate > getContextLimits().softCap,
-      }
+        shouldCompact: deriveShouldCompact(fork._tag, tokenEstimate),
+        contextLimitBlocked: computeContextLimitBlocked(fork._tag, tokenEstimate),
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
     turn_completed: ({ event, fork, emit }) => {
       let addedTokens = 0
       const { modelId, providerId } = event
 
-      // Estimate tokens from response parts
       for (const part of event.responseParts) {
         if (part.type === 'text' || part.type === 'thinking') {
           addedTokens += estimateContentTokens(part.content)
@@ -204,109 +260,125 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
         addedTokens += estimateContentTokens([...observed.content], modelId, providerId)
       }
 
-      const newTokenEstimate = event.inputTokens !== null
+      const tokenEstimate = event.inputTokens !== null
         ? event.inputTokens + addedTokens
         : fork.tokenEstimate + addedTokens
-      const newShouldCompact = newTokenEstimate > getContextLimits().softCap
-      if (newShouldCompact !== fork.shouldCompact) {
-        emit.shouldCompactChanged({ forkId: event.forkId, shouldCompact: newShouldCompact })
-      }
-      const newBlocked = computeContextLimitBlocked(fork.isCompacting, fork.pendingFinalization, newTokenEstimate)
-      if (newBlocked !== fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: event.forkId, blocked: newBlocked })
-      }
-      return {
-        ...fork,
-        tokenEstimate: newTokenEstimate,
+
+      const nextState = withAmbient(fork, {
+        tokenEstimate,
         modelId: event.modelId ?? fork.modelId,
         providerId: event.providerId ?? fork.providerId,
-        shouldCompact: newShouldCompact,
-        contextLimitBlocked: newBlocked,
-      }
+        shouldCompact: deriveShouldCompact(fork._tag, tokenEstimate),
+        contextLimitBlocked: computeContextLimitBlocked(fork._tag, tokenEstimate),
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
-    turn_unexpected_error: ({ event, fork }) => {
-      const addedTokens = estimateContentTokens(event.message)
-      return {
-        ...fork,
-        tokenEstimate: fork.tokenEstimate + addedTokens,
-      }
+    turn_unexpected_error: ({ event, fork, emit }) => {
+      const tokenEstimate = fork.tokenEstimate + estimateContentTokens(event.message)
+      const nextState = withAmbient(fork, {
+        tokenEstimate,
+        shouldCompact: deriveShouldCompact(fork._tag, tokenEstimate),
+        contextLimitBlocked: computeContextLimitBlocked(fork._tag, tokenEstimate),
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
     compaction_started: ({ event, fork, emit }) => {
-      const newBlocked = computeContextLimitBlocked(true, fork.pendingFinalization, fork.tokenEstimate)
-      if (newBlocked !== fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: event.forkId, blocked: newBlocked })
-      }
-      return {
-        ...fork,
-        isCompacting: true,
-        contextLimitBlocked: newBlocked,
-      }
+      if (fork._tag !== 'idle') return fork
+
+      const nextState = CompactionLifecycle.transition(fork, 'compacting', {
+        compactedMessageCount: event.compactedMessageCount,
+        shouldCompact: false,
+        contextLimitBlocked: computeContextLimitBlocked('compacting', fork.tokenEstimate),
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
     compaction_ready: ({ event, fork, emit }) => {
-      emit.compactionPendingChanged({ forkId: event.forkId, pending: true })
-      return {
-        ...fork,
-        pendingFinalization: true,
-        pendingCompactionData: {
-          summary: event.summary,
-          compactedMessageCount: event.compactedMessageCount,
-          originalTokenEstimate: event.originalTokenEstimate,
-          refreshedContext: event.refreshedContext,
-        },
-      }
+      if (fork._tag !== 'compacting') return fork
+
+      const nextState = CompactionLifecycle.transition(fork, 'pendingFinalization', {
+        summary: event.summary,
+        compactedMessageCount: event.compactedMessageCount,
+        originalTokenEstimate: event.originalTokenEstimate,
+        refreshedContext: event.refreshedContext,
+        shouldCompact: false,
+        contextLimitBlocked: computeContextLimitBlocked('pendingFinalization', fork.tokenEstimate),
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
     compaction_completed: ({ event, fork, emit }) => {
-      emit.compactionPendingChanged({ forkId: event.forkId, pending: false })
-      if (fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: event.forkId, blocked: false })
-      }
+      if (fork._tag !== 'pendingFinalization') return fork
 
       const tokenEstimate = Math.max(0, fork.tokenEstimate - event.tokensSaved)
-      const shouldCompact = tokenEstimate > getContextLimits().softCap
-
-      if (shouldCompact) {
-        emit.shouldCompactChanged({ forkId: event.forkId, shouldCompact: true })
-      }
-
-      return {
-        ...fork,
+      const nextState = CompactionLifecycle.transition(fork, 'idle', {
         tokenEstimate,
-        shouldCompact,
-        isCompacting: false,
-        pendingFinalization: false,
+        shouldCompact: deriveShouldCompact('idle', tokenEstimate),
         contextLimitBlocked: false,
-        pendingCompactionData: null,
-      }
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
     compaction_failed: ({ event, fork, emit }) => {
-      if (fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: event.forkId, blocked: false })
+      if (fork._tag === 'idle') {
+        if (!fork.contextLimitBlocked) return fork
+        const nextState = withAmbient(fork, {
+          contextLimitBlocked: false,
+          shouldCompact: false,
+        })
+        emitLifecycleSignals(fork, nextState, event.forkId, emit)
+        return nextState
       }
-      return {
-        ...fork,
-        isCompacting: false,
-        pendingFinalization: false,
+
+      const nextState = CompactionLifecycle.transition(fork, 'idle', {
+        shouldCompact: false,
         contextLimitBlocked: false,
-        pendingCompactionData: null,
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
+    },
+
+    interrupt: ({ event, fork, emit }) => {
+      if (fork._tag === 'idle') {
+        if (!fork.contextLimitBlocked) return fork
+        const nextState = withAmbient(fork, {
+          contextLimitBlocked: false,
+          shouldCompact: false,
+        })
+        emitLifecycleSignals(fork, nextState, event.forkId, emit)
+        return nextState
       }
+
+      const nextState = CompactionLifecycle.transition(fork, 'idle', {
+        shouldCompact: false,
+        contextLimitBlocked: false,
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
 
     context_limit_hit: ({ event, fork, emit }) => {
-      if (!fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: event.forkId, blocked: true })
-      }
-      if (!fork.isCompacting && !fork.pendingFinalization) {
-        emit.shouldCompactChanged({ forkId: event.forkId, shouldCompact: true })
-      }
-      return {
-        ...fork,
+      const nextState = withAmbient(fork, {
         contextLimitBlocked: true,
-      }
+        shouldCompact: fork._tag === 'idle' ? true : fork.shouldCompact,
+      })
+
+      emitLifecycleSignals(fork, nextState, event.forkId, emit)
+      return nextState
     },
   },
 
@@ -318,16 +390,19 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
         throw new Error(`Parent fork ${parentForkId} not found in CompactionProjection`)
       }
 
-      const newForkState: ForkCompactionState = {
-        tokenEstimate: estimateSystemPromptTokens(role as AgentVariant),
+      const variant = asAgentVariant(role)
+      if (variant === null) {
+        throw new Error(`Unknown agent variant: ${role}`)
+      }
+
+      const tokenEstimate = estimateSystemPromptTokens(variant)
+      const newForkState = new CompactionIdle({
+        tokenEstimate,
         modelId: parentState.modelId,
         providerId: parentState.providerId,
-        shouldCompact: false,
-        isCompacting: false,
-        pendingFinalization: false,
+        shouldCompact: deriveShouldCompact('idle', tokenEstimate),
         contextLimitBlocked: false,
-        pendingCompactionData: null,
-      }
+      })
 
       return {
         ...state,
@@ -340,24 +415,18 @@ export const CompactionProjection = Projection.defineForked<AppEvent, ForkCompac
       if (!fork) return state
 
       const addedTokens = estimateContentTokens([...value.content], fork.modelId, fork.providerId)
-      const newTokenEstimate = fork.tokenEstimate + addedTokens
-      const newShouldCompact = newTokenEstimate > getContextLimits().softCap
-      if (newShouldCompact !== fork.shouldCompact) {
-        emit.shouldCompactChanged({ forkId: value.forkId, shouldCompact: newShouldCompact })
-      }
-      const newBlocked = computeContextLimitBlocked(fork.isCompacting, fork.pendingFinalization, newTokenEstimate)
-      if (newBlocked !== fork.contextLimitBlocked) {
-        emit.contextLimitBlockedChanged({ forkId: value.forkId, blocked: newBlocked })
-      }
+      const tokenEstimate = fork.tokenEstimate + addedTokens
+      const nextState = withAmbient(fork, {
+        tokenEstimate,
+        shouldCompact: deriveShouldCompact(fork._tag, tokenEstimate),
+        contextLimitBlocked: computeContextLimitBlocked(fork._tag, tokenEstimate),
+      })
+
+      emitLifecycleSignals(fork, nextState, value.forkId, emit)
 
       return {
         ...state,
-        forks: new Map(state.forks).set(value.forkId, {
-          ...fork,
-          tokenEstimate: newTokenEstimate,
-          shouldCompact: newShouldCompact,
-          contextLimitBlocked: newBlocked,
-        }),
+        forks: new Map(state.forks).set(value.forkId, nextState),
       }
     }),
   ],

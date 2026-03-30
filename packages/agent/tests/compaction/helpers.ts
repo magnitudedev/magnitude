@@ -5,7 +5,7 @@ import type { AppEvent, SessionContext } from '../../src/events'
 import { CHARS_PER_TOKEN } from '../../src/constants'
 import { CompactionProjection } from '../../src/projections/compaction'
 import { MemoryProjection } from '../../src/projections/memory'
-import { WorkingStateProjection, shouldTrigger } from '../../src/projections/working-state'
+import { TurnProjection } from '../../src/projections/turn'
 import { TestHarness } from '../../src/test-harness/harness'
 
 export const ROOT_FORK_ID: string | null = null
@@ -27,7 +27,6 @@ export const baseContext = (overrides: Partial<SessionContext> = {}): SessionCon
   folderStructure: '.',
   agentsFile: null,
   skills: null,
-  userMemory: null,
   ...overrides,
 })
 
@@ -126,8 +125,8 @@ export const mkInterrupt = (forkId: string | null = ROOT_FORK_ID): Extract<AppEv
 export const getCompaction = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
   h.projectionFork(CompactionProjection.Tag, forkId)
 
-export const getWorking = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
-  h.projectionFork(WorkingStateProjection.Tag, forkId)
+export const getTurn = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
+  h.projectionFork(TurnProjection.Tag, forkId)
 
 export const getMemory = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
   h.projectionFork(MemoryProjection.Tag, forkId)
@@ -135,17 +134,17 @@ export const getMemory = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
 export const expectCompactionUnblocked = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
   Effect.gen(function* () {
     const compaction = yield* getCompaction(h, forkId)
-    const working = yield* getWorking(h, forkId)
+    const turn = yield* getTurn(h, forkId)
     expect(compaction.contextLimitBlocked).toBe(false)
-    expect(working.contextLimitBlocked).toBe(false)
-    expect(working.compactionPending).toBe(false)
+    expect(turn._tag).toBe('idle')
+    expect(turn.triggers.length).toBe(0)
   })
 
 export const expectStableWorkingState = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
   Effect.gen(function* () {
-    const working = yield* getWorking(h, forkId)
-    expect(working.working).toBe(false)
-    expect(working.willContinue).toBe(false)
+    const turn = yield* getTurn(h, forkId)
+    expect(turn._tag).toBe('idle')
+    expect(turn.triggers.length).toBe(0)
   })
 
 export const startReadyCompaction = (h: Harness, forkId: string | null = ROOT_FORK_ID, readyOverrides: Partial<Extract<AppEvent, { type: 'compaction_ready' }>> = {}) =>
@@ -178,6 +177,6 @@ export const createSubagentFork = (h: Harness, role = 'builder') =>
 
 export const assertShouldTriggerBlocked = (h: Harness, forkId: string | null = ROOT_FORK_ID) =>
   Effect.gen(function* () {
-    const working = yield* getWorking(h, forkId)
-    expect(shouldTrigger(working)).toBe(false)
+    const turn = yield* getTurn(h, forkId)
+    expect(turn._tag === 'idle' && turn.triggers.length > 0).toBe(false)
   })

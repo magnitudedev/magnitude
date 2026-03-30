@@ -74,16 +74,13 @@ export type { FrontmatterResult } from './util/frontmatter'
 export * from './workspace'
 
 // Projections
-export { WorkingStateProjection, shouldTrigger, isStable } from './projections/working-state'
-export type { ForkWorkingState, PendingInboundCommunication } from './projections/working-state'
-
 export { MemoryProjection } from './projections/memory'
 export { getView } from './projections/memory'
 export type { Message, MessageSource, LLMMessage, Perspective, ForkMemoryState } from './projections/memory'
 export type { QueuedEntry } from './inbox/types'
 
 export { CompactionProjection } from './projections/compaction'
-export type { ForkCompactionState } from './projections/compaction'
+export type { CompactionState } from './projections/compaction'
 
 export {
   DisplayProjection,
@@ -109,7 +106,7 @@ export type {
 } from './projections/display'
 
 export { TurnProjection } from './projections/turn'
-export type { TurnState, ToolCall } from './projections/turn'
+export type { ToolCall, TurnTrigger, PendingInboundCommunication, ForkTurnState } from './projections/turn'
 
 export { AgentRoutingProjection } from './projections/agent-routing'
 export type {

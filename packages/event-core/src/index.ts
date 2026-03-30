@@ -34,7 +34,8 @@ export * as Projection from './projection/index'
 export * as Worker from './worker/index'
 export * as Agent from './agent/index'
 export * as Display from './display/index'
-export * as Flow from './flow/index'
+// Flow is unused legacy — commented out
+// export * as Flow from './flow/index'
 export * as Fork from './fork/index'
 
 // Convenience exports

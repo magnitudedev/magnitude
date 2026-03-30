@@ -16,7 +16,7 @@ import type { AppEvent, ToolDisplay } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 import { UserMessageResolutionProjection } from './user-message-resolution'
-import { WorkingStateProjection, type PendingInboundCommunication } from './working-state'
+import { TurnProjection, type PendingInboundCommunication } from './turn'
 
 
 
@@ -571,7 +571,7 @@ export function upsertStreamingCommunicationStep(
 export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>()({
   name: 'Display',
 
-  reads: [AgentRoutingProjection, AgentStatusProjection, UserMessageResolutionProjection, WorkingStateProjection] as const,
+  reads: [AgentRoutingProjection, AgentStatusProjection, UserMessageResolutionProjection, TurnProjection] as const,
 
   initialFork: {
     status: 'idle',
@@ -987,7 +987,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         return fork
       }
 
-      // Determine if we'll continue (same logic as WorkingState)
+      // Determine if we'll continue (same logic as TurnProjection)
       let willContinue: boolean
       if (event.result.success) {
         willContinue = event.result.turnDecision === 'continue'
@@ -1475,11 +1475,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const displayFork = state.forks.get(value.targetForkId)
       if (!displayFork) return state
       const agentState = read(AgentStatusProjection)
-      const workingState = read(WorkingStateProjection)
-      const workingFork = workingState.forks.get(value.targetForkId)
+      const turnState = read(TurnProjection)
+      const turnFork = turnState.forks.get(value.targetForkId)
       const targetAgent = getAgentByForkId(agentState, value.targetForkId)
 
-      const pending = (workingFork?.pendingInboundCommunications ?? []).map((message): PendingInboundCommunicationDisplay => ({
+      const pending = (turnFork?.pendingInboundCommunications ?? []).map((message): PendingInboundCommunicationDisplay => ({
         ...message,
         agentName: message.agentName ?? targetAgent?.name,
         agentRole: message.agentRole ?? targetAgent?.role,
@@ -1498,11 +1498,11 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       const displayFork = state.forks.get(value.targetForkId)
       if (!displayFork) return state
       const agentState = read(AgentStatusProjection)
-      const workingState = read(WorkingStateProjection)
-      const workingFork = workingState.forks.get(value.targetForkId)
+      const turnState = read(TurnProjection)
+      const turnFork = turnState.forks.get(value.targetForkId)
       const targetAgent = value.targetForkId ? getAgentByForkId(agentState, value.targetForkId) : undefined
 
-      const pending = (workingFork?.pendingInboundCommunications ?? []).map((message): PendingInboundCommunicationDisplay => ({
+      const pending = (turnFork?.pendingInboundCommunications ?? []).map((message): PendingInboundCommunicationDisplay => ({
         ...message,
         agentName: message.agentName ?? targetAgent?.name,
         agentRole: message.agentRole ?? targetAgent?.role,
@@ -1517,7 +1517,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     }),
 
-    on(WorkingStateProjection.signals.pendingInboundCommunicationsRead, ({ value, state, read }) => {
+    on(TurnProjection.signals.pendingInboundCommunicationsRead, ({ value, state, read }) => {
       const displayFork = state.forks.get(value.forkId)
       if (!displayFork) return state
 

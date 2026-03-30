@@ -1,14 +1,15 @@
 export {
-  define,
+  defineFSM,
+  type AnyTaggedState,
+  type AnyStateClass,
+  type StateClassRecord,
   type TransitionMatrix,
   type StateNames,
-  type ValidTargets,
-  type TaggedItem,
-  type TagOf,
-  type PropsOf,
-  type StateClassRecord,
   type InstanceOf,
   type StateUnion,
-  type AnyStateClass,
-  type FSMInstance
+  type PropsOf,
+  type TagOf,
+  type ValidTargets,
+  type TransitionUpdates,
+  type FSMDefinition,
 } from './define'

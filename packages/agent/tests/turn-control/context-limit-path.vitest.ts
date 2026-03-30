@@ -2,10 +2,10 @@ import { describe, it } from '@effect/vitest'
 import { expect } from 'vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
-import { WorkingStateProjection } from '../../src/projections/working-state'
+import { CompactionProjection } from '../../src/projections/compaction'
 import {
   assertNoTurnIdMismatch,
-  assertWorkingStateAligned,
+  assertTurnStateAligned,
   eventsForFork,
   mkContextLimitHit,
   mkTurnCompletedFailure,
@@ -23,7 +23,7 @@ describe('turn control context-limit path', () => {
       yield* h.send(mkTurnCompletedFailure({ turnId: 't-cl-1', chainId: 'c-cl' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
-      yield* assertWorkingStateAligned(h)
+      yield* assertTurnStateAligned(h)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -35,7 +35,7 @@ describe('turn control context-limit path', () => {
       yield* h.send(mkTurnStarted({ turnId: 't-cl-2', chainId: 'c-cl' }))
       yield* h.send(mkContextLimitHit(null, 'hard cap'))
 
-      const blockedDuring = yield* h.projectionFork(WorkingStateProjection.Tag, null)
+      const blockedDuring = yield* h.projectionFork(CompactionProjection.Tag, null)
       expect(blockedDuring.contextLimitBlocked).toBe(true)
 
       yield* h.send(mkTurnCompletedFailure({ turnId: 't-cl-2', chainId: 'c-cl' }))

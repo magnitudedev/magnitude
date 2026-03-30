@@ -10,7 +10,6 @@ import { createId } from '../util/id'
 
 // Projections
 import { SessionContextProjection } from '../projections/session-context'
-import { WorkingStateProjection } from '../projections/working-state'
 import { WorkflowProjection } from '../projections/workflow'
 import { TurnProjection } from '../projections/turn'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
@@ -93,6 +92,7 @@ export interface HarnessOptions {
     waitTimeoutMs?: number
   }
   workers?: {
+    turnController?: boolean
     autopilot?: boolean
     compaction?: boolean
     chatTitle?: boolean
@@ -201,7 +201,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
   try {
     const workers = [
-      TurnController,
+      ...(options.workers?.turnController !== false ? [TurnController] : []),
       MockCortex,
       AgentLifecycle,
       LifecycleCoordinator,
@@ -221,7 +221,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         AgentRoutingProjection,
         AgentStatusProjection,
         CompactionProjection,
-        WorkingStateProjection,
         WorkflowProjection,
         TurnProjection,
         CanonicalTurnProjection,
@@ -244,7 +243,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         },
         state: {
           display: DisplayProjection,
-          working: WorkingStateProjection,
+          turn: TurnProjection,
           memory: MemoryProjection,
           compaction: CompactionProjection,
           agentRouting: AgentRoutingProjection,
@@ -523,14 +522,14 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         projections: async (): Promise<Record<string, unknown>> => {
           const [
             compaction,
-            working,
+            turn,
             memory,
             agentRouting,
             agentStatus,
             sessionContext,
           ] = await Promise.all([
             client.runEffect(Effect.flatMap(CompactionProjection.Tag, (projection) => projection.getFork(null))),
-            client.runEffect(Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))),
+            client.runEffect(Effect.flatMap(TurnProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(MemoryProjection.Tag, (projection) => projection.getFork(null))),
             client.runEffect(Effect.flatMap(AgentRoutingProjection.Tag, (projection) => projection.get)),
             client.runEffect(Effect.flatMap(AgentStatusProjection.Tag, (projection) => projection.get)),
@@ -539,7 +538,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
           return {
             CompactionProjection: compaction,
-            WorkingStateProjection: working,
+            TurnProjection: turn,
             MemoryProjection: memory,
             AgentRoutingProjection: agentRouting,
             AgentStatusProjection: agentStatus,
@@ -573,10 +572,10 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         waitCompleted: (forkId: string | null = null) =>
           waitEvent('compaction_completed', (e) => e.forkId === forkId),
         assertNotBlocked: async (forkId: string | null = null): Promise<void> => {
-          const working = await client.runEffect(
-            Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(forkId))
+          const compaction = await client.runEffect(
+            Effect.flatMap(CompactionProjection.Tag, (projection) => projection.getFork(forkId))
           )
-          if (working.contextLimitBlocked !== false) {
+          if (compaction.contextLimitBlocked !== false) {
             throw new Error(`Expected contextLimitBlocked to be false for fork ${forkId ?? 'root'}`)
           }
         },
@@ -634,11 +633,11 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       dispose: async () => {
         unsubscribeClient()
         try {
-          const workingState = await client.runEffect(
-            Effect.flatMap(WorkingStateProjection.Tag, (projection) => projection.getFork(null))
+          const turnState = await client.runEffect(
+            Effect.flatMap(TurnProjection.Tag, (projection) => projection.getFork(null))
           )
 
-          if (workingState.working || workingState.willContinue) {
+          if (turnState._tag !== 'idle' || turnState.triggers.length > 0) {
             await send({ type: 'interrupt', forkId: null } as AppEvent)
           }
         } catch {

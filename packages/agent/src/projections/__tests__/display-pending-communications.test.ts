@@ -3,7 +3,7 @@ import { createAgentTestHarness } from '../../test-harness/harness'
 import { textParts } from '../../content'
 import { createId } from '../../util/id'
 import { DisplayProjection } from '../display'
-import { WorkingStateProjection } from '../working-state'
+import { TurnProjection } from '../turn'
 
 const ts = (n: number) => 1_700_000_000_000 + n
 
@@ -52,7 +52,7 @@ describe('display pending communications promotion', () => {
         turnId: 't-parent',
       } as any)
 
-      const workingBefore = await harness.projectionFork(WorkingStateProjection.Tag, 'fork-1')
+      const workingBefore = await harness.projectionFork(TurnProjection.Tag, 'fork-1')
       expect(workingBefore.pendingInboundCommunications.length).toBe(1)
 
       const displayBefore = await harness.projectionFork(DisplayProjection.Tag, 'fork-1')
@@ -74,7 +74,7 @@ describe('display pending communications promotion', () => {
         chainId: 'c1',
       } as any)
 
-      const workingAfter = await harness.projectionFork(WorkingStateProjection.Tag, 'fork-1')
+      const workingAfter = await harness.projectionFork(TurnProjection.Tag, 'fork-1')
       expect(workingAfter.pendingInboundCommunications.length).toBe(0)
 
       const displayAfter = await harness.projectionFork(DisplayProjection.Tag, 'fork-1')

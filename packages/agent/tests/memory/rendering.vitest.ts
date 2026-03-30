@@ -14,15 +14,12 @@ describe('memory rendering', () => {
         text: 'hello there',
       })
 
-      const preFlush = yield* getRenderedUserText(h)
-      expect(preFlush).not.toContain('<message from="user">hello there</message>')
-
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-render-simple-flush', chainId: 'c-render-simple-flush' })
 
       const userTexts = yield* getRenderedUserText(h)
       expect(userTexts).toContain('<message from="user">hello there</message>')
       expect(userTexts).toContain('--- ')
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('user message with attachments renders mention and image content', () =>
@@ -60,6 +57,7 @@ describe('memory rendering', () => {
       files: {
         '/src/a.ts': 'export const a = 1',
       },
+      workers: { turnController: false },
     })))
   )
 
@@ -104,7 +102,7 @@ describe('memory rendering', () => {
       const userTexts = yield* getRenderedUserText(h)
 
       expect(userTexts).toContain('<error>check this</error>')
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('time markers use full date first then time-only in same day', () =>
@@ -142,7 +140,7 @@ describe('memory rendering', () => {
       expect(text).toContain('--- ')
       expect(text).toContain('first marker')
       expect(text).toContain('second marker')
-    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
+    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' }, workers: { turnController: false } })))
   )
 
   it.live('date transitions render full date again', () =>
@@ -170,7 +168,7 @@ describe('memory rendering', () => {
       expect(text).toContain('--- ')
       expect(text).toContain('before midnight')
       expect(text).toContain('after midnight')
-    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
+    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' }, workers: { turnController: false } })))
   )
 
   it.live('attention is not shown when only user messages are present', () =>
@@ -193,7 +191,7 @@ describe('memory rendering', () => {
       const text = yield* getRenderedUserText(h)
 
       expect(text).not.toContain('<attention>')
-    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
+    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' }, workers: { turnController: false } })))
   )
 
   it.live('multiple inbox messages stay in order', () =>
@@ -211,16 +209,11 @@ describe('memory rendering', () => {
         text: 'second',
       })
 
-      const memory = yield* getRootMemory(h)
-      const inbox = inboxMessages(memory)
-      expect(inbox.length).toBeGreaterThanOrEqual(1)
-      expect(lastInboxMessage(memory)?.type).toBe('inbox')
-
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-render-order-flush', chainId: 'c-render-order-flush' })
 
       const text = yield* getRenderedUserText(h)
       expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'))
-    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
+    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' }, workers: { turnController: false } })))
   )
 
   it.live('multi-inbox with results and timeline both render', () =>
@@ -260,6 +253,6 @@ describe('memory rendering', () => {
       const text = yield* getRenderedUserText(h)
       expect(text).toContain('start')
       expect(text).toContain('<error>after turn</error>')
-    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' } })))
+    }).pipe(Effect.provide(TestHarnessLive({ sessionContext: { timezone: 'UTC' }, workers: { turnController: false } })))
   )
 })

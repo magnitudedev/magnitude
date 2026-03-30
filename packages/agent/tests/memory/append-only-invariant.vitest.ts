@@ -21,7 +21,7 @@ describe('memory/append-only-invariant', () => {
       const after = yield* getRootMemory(h)
       expect(after.messages.length).toBeGreaterThanOrEqual(snap.refs.length)
       assertPrefixUnchanged(snap, after)
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('after observations_captured prior messages remain unchanged', () =>
@@ -44,7 +44,7 @@ describe('memory/append-only-invariant', () => {
       const after = yield* getRootMemory(h)
       expect(after.messages.length).toBe(snap.refs.length + 1)
       assertPrefixUnchanged(snap, after)
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('after turn_unexpected_error prior messages remain unchanged', () =>
@@ -67,7 +67,7 @@ describe('memory/append-only-invariant', () => {
       const after = yield* getRootMemory(h)
       expect(after.messages.length).toBe(snap.refs.length + 1)
       assertPrefixUnchanged(snap, after)
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('no message mutation across mixed event sequence', () =>
@@ -122,7 +122,7 @@ describe('memory/append-only-invariant', () => {
       state = yield* getRootMemory(h)
       expect(state.messages.length).toBe(snap.refs.length)
       assertPrefixUnchanged(snap, state)
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('reference snapshot invariant helper catches accidental merge', () =>
@@ -146,6 +146,6 @@ describe('memory/append-only-invariant', () => {
       yield* sendUserMessageReady(h, 'msg4', 1_710_000_010_043)
       after = yield* getRootMemory(h)
       assertPrefixUnchanged(snap, after)
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 })

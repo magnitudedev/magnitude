@@ -36,6 +36,10 @@ export type FrameworkError = Data.TaggedEnum<{
     readonly signalName: string
     readonly cause: Cause.Cause<unknown>
   }
+  WorkerSettledHandlerError: {
+    readonly workerName: string
+    readonly cause: Cause.Cause<unknown>
+  }
   WorkerLifecycleError: {
     readonly workerName: string
     readonly eventType: string

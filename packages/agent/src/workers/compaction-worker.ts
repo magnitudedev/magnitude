@@ -10,7 +10,7 @@
  *
  * Design decisions:
  * - Turns are NOT blocked during BAML summarization (between compaction_started and compaction_ready)
- * - Turns ARE blocked after compaction_ready until compaction_completed (via shouldTrigger gate)
+ * - Turns ARE blocked after compaction_ready until compaction_completed (via compaction lifecycle gate)
  * - Context limit blocking: proactive (estimate >= hardCap during compaction) + reactive (context_limit_hit event)
  *
  * All compaction data is event-sourced via compaction_ready → MemoryProjection.
@@ -26,9 +26,10 @@ import type { AppEvent } from '../events'
 import { textOf, ContentPart } from '../content'
 import { MemoryProjection, getView, LLMMessage, type ForkMemoryState } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
-import type { ForkCompactionState } from '../projections/compaction'
+import type { CompactionState } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
-import { WorkingStateProjection } from '../projections/working-state'
+import { TurnProjection } from '../projections/turn'
+
 // ExecutionManager no longer needed — xml-act is stateless, no sandbox reset
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
 import { getAgentDefinition } from '../agents'
@@ -61,25 +62,28 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
   },
 
   eventHandlers: {
-    // Finalize pending compaction when a turn ends and sandbox is idle
-    turn_completed: (event, publish, read) => Effect.gen(function* () {
-      const { forkId } = event
-
-      const compactionState: ForkCompactionState = yield* read(CompactionProjection)
-      if (!compactionState.pendingFinalization || !compactionState.pendingCompactionData) return
-
-      yield* finalizeCompaction(forkId, publish, read)
-    }),
-
-    // Reactive trigger when the provider reports an actual context-limit failure
-    context_limit_hit: (event, publish, read) =>
-      startCompaction(event.forkId, publish, read),
+    turn_completed: (event, publish, read) =>
+      Effect.gen(function* () {
+        const compactionState = yield* read(CompactionProjection)
+        if (compactionState._tag !== 'pendingFinalization') return
+        yield* finalizeCompaction(event.forkId, publish, read)
+      }),
   },
 
   signalHandlers: (on) => [
     // Phase 1: Start BAML summarization when memory exceeds budget
     on(CompactionProjection.signals.shouldCompactChanged, ({ forkId, shouldCompact }, publish, read) =>
-      shouldCompact ? startCompaction(forkId, publish, read) : Effect.void
+      shouldCompact
+        ? startCompaction(forkId, publish, read).pipe(
+            Effect.onInterrupt(() =>
+              publish({
+                type: 'compaction_failed',
+                forkId,
+                error: 'Compaction interrupted',
+              })
+            )
+          )
+        : Effect.void
     )
   ]
 })
@@ -91,12 +95,11 @@ function startCompaction(
 ) {
   return Effect.gen(function* () {
     const forkMemory: ForkMemoryState = yield* read(MemoryProjection)
-    const compactionState: ForkCompactionState = yield* read(CompactionProjection)
+    const compactionState: CompactionState = yield* read(CompactionProjection)
     const sessionCtx = yield* read(SessionContextProjection)
     const timezone = sessionCtx.context?.timezone ?? null
 
-    // Skip if already compacting or pending finalization
-    if (compactionState.isCompacting || compactionState.pendingFinalization) return
+    if (compactionState._tag !== 'idle') return
 
     // Calculate how many messages to compact
     const providerState = yield* ProviderState
@@ -199,8 +202,8 @@ function startCompaction(
           refreshedContext,
         })
 
-        const workingState = yield* read(WorkingStateProjection)
-        if (!workingState.working) {
+        const turnState = yield* read(TurnProjection)
+        if (turnState._tag === 'idle') {
           yield* finalizeCompaction(forkId, publish, read)
         }
       })),
@@ -223,25 +226,25 @@ function finalizeCompaction(
   read: WorkerReadFn<AppEvent>
 ) {
   return Effect.gen(function* () {
-    const compactionState: ForkCompactionState = yield* read(CompactionProjection)
-    const pending = compactionState.pendingCompactionData
-    if (!pending) return
+    const compactionState: CompactionState = yield* read(CompactionProjection)
+    if (compactionState._tag !== 'pendingFinalization') return
 
-    const summary = pending.summary
+    const summaryTokens = Math.ceil(compactionState.summary.length / CHARS_PER_TOKEN)
+    const tokensSaved = compactionState.originalTokenEstimate - summaryTokens
 
-    const summaryTokens = Math.ceil(summary.length / CHARS_PER_TOKEN)
-    const tokensSaved = pending.originalTokenEstimate - summaryTokens
-
-    logger.info({ tokensSaved, compactedMessageCount: pending.compactedMessageCount }, '[CompactionWorker] Compaction completed')
+    logger.info(
+      { tokensSaved, compactedMessageCount: compactionState.compactedMessageCount },
+      '[CompactionWorker] Compaction completed'
+    )
 
     yield* publish({
       type: 'compaction_completed',
       forkId,
-      summary,
-      compactedMessageCount: pending.compactedMessageCount,
+      summary: compactionState.summary,
+      compactedMessageCount: compactionState.compactedMessageCount,
       tokensSaved,
       preservedVariables: [],
-      refreshedContext: pending.refreshedContext,
+      refreshedContext: compactionState.refreshedContext,
     })
   }).pipe(
     Effect.catchAllCause((cause) => Effect.gen(function* () {

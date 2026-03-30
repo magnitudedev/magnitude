@@ -1,7 +1,7 @@
 /**
  * Approval Bridge
  *
- * Bridges ApprovalState callbacks into DisplayProjection and WorkingStateProjection state.
+ * Bridges ApprovalState callbacks into DisplayProjection state.
  *
  * This runs during client initialization (before hydration) to ensure approval
  * cards appear correctly during both live execution and session replay.
@@ -16,7 +16,6 @@ import { Effect, SubscriptionRef } from 'effect'
 import { ExecutionManager } from './execution-manager'
 import { DisplayProjection, type ApprovalRequestMessage } from '../projections/display'
 import { isToolKey } from '../catalog'
-import { WorkingStateProjection } from '../projections/working-state'
 
 /**
  * Register approval state handlers that bridge into projection state.
@@ -25,7 +24,6 @@ import { WorkingStateProjection } from '../projections/working-state'
 export const registerApprovalBridge = Effect.gen(function* () {
   const executionManager = yield* ExecutionManager
   const displayProjection = yield* DisplayProjection.Tag
-  const workingStateProjection = yield* WorkingStateProjection.Tag
 
   // Display: insert/update ApprovalRequestMessage in the fork's messages
   executionManager.approvalState.registerHandler((update) => {
@@ -80,19 +78,5 @@ export const registerApprovalBridge = Effect.gen(function* () {
     }
   })
 
-  // WorkingState: set pendingApproval flag for the relevant fork
-  executionManager.approvalState.registerHandler((update) => {
-    const forkId = update.forkId
-    const pending = update._tag === 'pending'
-    Effect.runSync(SubscriptionRef.update(workingStateProjection.state, (state) => {
-      const forkState = state.forks.get(forkId)
-      if (!forkState) return state
-      const newForks = new Map(state.forks)
-      newForks.set(forkId, {
-        ...forkState,
-        pendingApproval: pending
-      })
-      return { ...state, forks: newForks }
-    }))
-  })
+
 })

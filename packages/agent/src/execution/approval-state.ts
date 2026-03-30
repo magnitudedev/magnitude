@@ -92,7 +92,7 @@ export interface ApprovalStateService {
 
   /**
    * Register a handler to receive approval updates.
-   * DisplayProjection and WorkingState use this.
+   * DisplayProjection and other runtime consumers use this.
    */
   readonly registerHandler: (handler: ApprovalHandler) => void
 }

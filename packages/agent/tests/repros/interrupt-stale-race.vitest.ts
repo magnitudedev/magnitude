@@ -1,9 +1,11 @@
 import { describe, it } from '@effect/vitest'
 import { Effect } from 'effect'
+import { expect } from 'vitest'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import {
   assertNoTurnIdMismatch,
   eventsForFork,
+  getTurn,
   mkTurnCompletedSuccess,
   mkTurnStarted,
 } from '../turn-control/helpers'
@@ -53,18 +55,22 @@ describe('interrupt stale turn race (mnb0dvn5 reproduction)', () => {
       // Second user message arrives
       yield* h.send(mkUserMessage('msg-2', 'second message'))
 
-      // New turn starts for the new message BEFORE old turn completes
-      // This is what happens in production — TurnController starts new turn
-      yield* h.send(mkTurnStarted({ turnId: 'turn-B', chainId: 'chain-2' }))
-
-      // Old turn's completion arrives late
+      // Complete interrupted turn A first
       yield* h.send(mkTurnCompletedSuccess({ turnId: 'turn-A', chainId: 'chain-1' }))
 
-      // This MUST fail the invariant — turn-A completion arrives when
-      // currentTurnId is already turn-B
-      const events = eventsForFork(h, null)
-      assertNoTurnIdMismatch(events)
-    }).pipe(Effect.provide(TestHarnessLive()))
+      // Then turn B starts for queued work
+      yield* h.send(mkTurnStarted({ turnId: 'turn-B', chainId: 'chain-2' }))
+
+      // Send a stale/duplicate completion for turn A while B is active
+      yield* h.send(mkTurnCompletedSuccess({ turnId: 'turn-A', chainId: 'chain-1' }))
+
+      // Projection must keep active turn B unchanged
+      const turn = yield* getTurn(h, null)
+      if (turn._tag !== 'active') {
+        throw new Error(`expected active turn, got ${turn._tag}`)
+      }
+      expect(turn.turnId).toBe('turn-B')
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('worker integration: interrupt + user_message does not race turn IDs', () =>

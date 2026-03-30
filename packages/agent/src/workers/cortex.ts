@@ -41,7 +41,7 @@ import { LLMMessage } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
-import { WorkingStateProjection } from '../projections/working-state'
+import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, type AgentVariant } from '../agents'
 
@@ -128,8 +128,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
         const agentState = yield* read(AgentStatusProjection)
-        const workingState = yield* read(WorkingStateProjection)
-        const allowSingleUserReplyThisTurn = forkId !== null && workingState.currentTurnAllowsDirectUserReply
+        const turnState = yield* read(TurnProjection)
+        const allowSingleUserReplyThisTurn =
+          forkId !== null && (turnState._tag === 'active' || turnState._tag === 'interrupting')
+            ? turnState.currentTurnAllowsDirectUserReply
+            : false
         const agentInstance = forkId ? getAgentByForkId(agentState, forkId) : null
 
         // Determine agent: child forks use their role, root fork is always lead.
@@ -319,7 +322,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           if (!definiteContextLimit) {
             const compactionState = yield* read(CompactionProjection)
             const { softCap } = getContextLimits()
-            probableContextLimit = compactionState.tokenEstimate >= softCap && (compactionState.isCompacting || compactionState.pendingFinalization)
+            probableContextLimit = compactionState.tokenEstimate >= softCap && compactionState._tag !== 'idle'
           }
 
           if (definiteContextLimit || probableContextLimit) {

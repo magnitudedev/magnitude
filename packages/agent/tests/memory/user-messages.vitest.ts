@@ -43,9 +43,11 @@ describe('memory/user-messages', () => {
       const memory = yield* getRootMemory(h)
       expect(memory.queuedEntries.some(q => q.lane === 'timeline' && q.entry.kind === 'user_message')).toBe(true)
 
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-user-simple-flush', chainId: 'c-user-simple-flush' })
+
       const rendered = yield* renderedUserText(h, null)
       expect(rendered).toContain('<message from="user">hello from user</message>')
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('user message with file mentions includes resolved content inline in attachments', () =>
@@ -91,6 +93,8 @@ describe('memory/user-messages', () => {
         expect(dirMention.content).toContain('file1')
       }
 
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-user-mentions-flush', chainId: 'c-user-mentions-flush' })
+
       const rendered = yield* renderedUserText(h, null)
       expect(rendered).toContain('please inspect these files')
       expect(rendered).not.toContain('&lt;')
@@ -101,6 +105,7 @@ describe('memory/user-messages', () => {
         '/src/dir/file1': '',
         '/src/dir/file2': '',
       },
+      workers: { turnController: false },
     })))
   )
 
@@ -134,7 +139,7 @@ describe('memory/user-messages', () => {
 
       const rendered = yield* renderedUserText(h, null)
       expect(rendered).toContain('queued while active')
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('user message to subagent creates user_to_agent entry', () =>
@@ -173,7 +178,7 @@ describe('memory/user-messages', () => {
 
       const rendered = yield* renderedUserText(h, subforkId)
       expect(rendered).toContain('<user-to-agent agent="builder-auth">please handle auth</user-to-agent>')
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('multiple user messages preserve chronological ordering', () =>
@@ -213,7 +218,7 @@ describe('memory/user-messages', () => {
       expect(i1).toBeGreaterThanOrEqual(0)
       expect(i2).toBeGreaterThan(i1)
       expect(i3).toBeGreaterThan(i2)
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
   it.live('append-only: each user message creates a new inbox message, no merge', () =>
@@ -244,6 +249,6 @@ describe('memory/user-messages', () => {
       const rendered = yield* renderedUserText(h, null)
       expect(rendered).toContain('alpha')
       expect(rendered).toContain('beta')
-    }).pipe(Effect.provide(TestHarnessLive()))
+    }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 })

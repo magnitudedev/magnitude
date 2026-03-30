@@ -16,7 +16,6 @@ import type { DebugSnapshot } from './projections/debug-introspection'
 
 // Projections
 import { SessionContextProjection } from './projections/session-context'
-import { WorkingStateProjection, isStable } from './projections/working-state'
 import { TurnProjection } from './projections/turn'
 import { CanonicalTurnProjection } from './projections/canonical-turn'
 import { MemoryProjection } from './projections/memory'
@@ -84,7 +83,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     AgentStatusProjection,
     CompactionProjection,
     WorkflowProjection,
-    WorkingStateProjection,
     TurnProjection,
     CanonicalTurnProjection,
 
@@ -123,7 +121,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     },
     state: {
       display: DisplayProjection,
-      working: WorkingStateProjection,
+      turn: TurnProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
       workflow: WorkflowProjection,
@@ -238,7 +236,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     const hydrationContext = yield* HydrationContext
     const eventSink = yield* EventSinkTag<AppEvent>()
 
-    // Bridge approval state into display and working-state projections
+    // Bridge approval state into display and turn projections
     yield* registerApprovalBridge
 
     const events = yield* persistence.loadEvents()
@@ -289,7 +287,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
       const executionManager = yield* ExecutionManager
       const agentStatusProjection = yield* AgentStatusProjection.Tag
-      const workingStateProjection = yield* WorkingStateProjection.Tag
+      const turnProjection = yield* TurnProjection.Tag
 
       // Create root sandbox (hydration happens lazily in execute())
       const sessionContextState = yield* (yield* SessionContextProjection.Tag).get
@@ -302,28 +300,59 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
       }
 
-      // Hydration recovery: detect agents that were in-flight when the process
-      // died. After replay, WorkingState tells us whether each agent fork is in
-      // a valid settled state. If not stable, emit an interrupt to cleanly
-      // terminate it through the normal recovery chain.
+      // Hydration recovery: detect forks that were in-flight when the process
+      // died. If a fork is still active/interrupting after replay, synthesize
+      // a cancelled terminal event to close turn lifecycle deterministically.
       for (const [, agent] of agentState.agents) {
-        const forkWorkingState = yield* workingStateProjection.getFork(agent.forkId)
-        if (!isStable(forkWorkingState)) {
+        const forkTurnState = yield* turnProjection.getFork(agent.forkId)
+        if (forkTurnState._tag === 'active' || forkTurnState._tag === 'interrupting') {
           yield* Effect.promise(() => client.send({
-            type: 'interrupt',
+            type: 'turn_completed',
             forkId: agent.forkId,
+            turnId: forkTurnState.turnId,
+            chainId: forkTurnState.chainId,
+            strategyId: 'xml-act',
+            responseParts: [],
+            toolCalls: [],
+            observedResults: [],
+            result: {
+              success: false,
+              error: 'Hydration recovery: cancelled in-flight turn',
+              cancelled: true,
+            },
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadTokens: null,
+            cacheWriteTokens: null,
+            providerId: null,
+            modelId: null,
           }))
         }
       }
 
-      // Same check for the root fork (lead, forkId=null).
-      // Root doesn't get fork_completed, but the interrupt still closes
-      // any in-flight turn via Cortex's onInterrupt → turn_completed path.
-      const rootState = yield* workingStateProjection.getFork(null)
-      if (!isStable(rootState)) {
+      // Same recovery for root fork.
+      const rootTurnState = yield* turnProjection.getFork(null)
+      if (rootTurnState._tag === 'active' || rootTurnState._tag === 'interrupting') {
         yield* Effect.promise(() => client.send({
-          type: 'interrupt',
+          type: 'turn_completed',
           forkId: null,
+          turnId: rootTurnState.turnId,
+          chainId: rootTurnState.chainId,
+          strategyId: 'xml-act',
+          responseParts: [],
+          toolCalls: [],
+          observedResults: [],
+          result: {
+            success: false,
+            error: 'Hydration recovery: cancelled in-flight turn',
+            cancelled: true,
+          },
+          inputTokens: null,
+          outputTokens: null,
+          cacheReadTokens: null,
+          cacheWriteTokens: null,
+          providerId: null,
+          modelId: null,
         }))
       }
 

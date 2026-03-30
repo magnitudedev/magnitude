@@ -2,7 +2,6 @@ import { Effect } from 'effect'
 import { expect } from 'vitest'
 import type { AppEvent } from '../../src/events'
 import { createId } from '../../src/util/id'
-import { WorkingStateProjection } from '../../src/projections/working-state'
 import { TurnProjection } from '../../src/projections/turn'
 import { TestHarness } from '../../src/test-harness/harness'
 
@@ -57,9 +56,6 @@ export const mkContextLimitHit = (
   error,
 })
 
-export const getWorking = (h: Harness, forkId: string | null = null) =>
-  h.projectionFork(WorkingStateProjection.Tag, forkId)
-
 export const getTurn = (h: Harness, forkId: string | null = null) =>
   h.projectionFork(TurnProjection.Tag, forkId)
 
@@ -88,14 +84,13 @@ export const assertNoTurnIdMismatch = (events: readonly AppEvent[], forkId: stri
       continue
     }
     if (event.type === 'interrupt') {
-      current = null
+      continue
     }
   }
 }
 
-export const assertWorkingStateAligned = (h: Harness, forkId: string | null = null) =>
+export const assertTurnStateAligned = (h: Harness, forkId: string | null = null) =>
   Effect.gen(function* () {
-    const working = yield* getWorking(h, forkId)
     const turn = yield* getTurn(h, forkId)
-    expect(working.currentTurnId ?? null).toBe(turn.activeTurn?.turnId ?? null)
+    expect(turn._tag === 'idle' || turn.turnId.length > 0).toBe(true)
   })

@@ -5,7 +5,7 @@ import type { AppEvent } from '../../src/events'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import {
   assertNoTurnIdMismatch,
-  assertWorkingStateAligned,
+  assertTurnStateAligned,
   eventsForFork,
   mkContextLimitHit,
   mkTurnCompletedFailure,
@@ -21,7 +21,7 @@ describe('turn control interrupts', () => {
       yield* h.send(mkTurnStarted({ turnId: 't-int-1', chainId: 'c-int' }))
       yield* h.send({ type: 'interrupt', forkId: null })
 
-      yield* assertWorkingStateAligned(h)
+      yield* assertTurnStateAligned(h)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 

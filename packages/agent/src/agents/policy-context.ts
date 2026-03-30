@@ -8,7 +8,7 @@
 import { Effect } from 'effect'
 import type { Projection } from '@magnitudedev/event-core'
 import type { AgentStatusState, AgentInfo } from '../projections/agent-status'
-import type { ForkWorkingState } from '../projections/working-state'
+import type { ForkTurnState } from '../projections/turn'
 
 import type { EphemeralSessionContext, PolicyContext, PolicyContextProvider } from './types'
 
@@ -19,19 +19,19 @@ export function createPolicyContextProvider(
   workspacePath: string,
   ephemeralSessionContext: EphemeralSessionContext,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
-  workingStateProjection: Projection.ForkedProjectionInstance<ForkWorkingState>,
+  turnProjection: Projection.ForkedProjectionInstance<ForkTurnState>,
 ): PolicyContextProvider {
   return {
     get: Effect.gen(function* () {
       const agentStatuses = yield* agentStatusProjection.get
-      const forkWorkingState = yield* workingStateProjection.getFork(forkId)
+      const forkTurnState = yield* turnProjection.getFork(forkId)
 
       return {
         forkId,
         cwd,
         workspacePath,
         activeAgentCount: [...agentStatuses.agents.values()].filter((a: AgentInfo) => a.status === 'working').length,
-        userMessagePending: forkWorkingState.hasQueuedMessages,
+        userMessagePending: forkTurnState.triggers.some((trigger) => trigger._tag === 'user_message'),
         disableShellSafeguards: ephemeralSessionContext.disableShellSafeguards,
         disableCwdSafeguards: ephemeralSessionContext.disableCwdSafeguards,
         agents: [...agentStatuses.agents.values()].map((a: AgentInfo) => ({

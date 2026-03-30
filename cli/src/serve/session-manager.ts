@@ -10,7 +10,7 @@ import {
   type AppEvent,
   type DisplayState,
   type AgentStatusState,
-  type ForkWorkingState,
+  type ForkTurnState,
   type ArtifactState,
   type MagnitudeSlot,
 } from '@magnitudedev/agent'
@@ -30,7 +30,7 @@ export interface SessionInfo {
 export interface SessionDetail extends SessionInfo {
   display: DisplayState
   forkState: AgentStatusState
-  workingState: ForkWorkingState
+  turnState: ForkTurnState
   artifactState: ArtifactState
 }
 
@@ -43,7 +43,7 @@ interface SessionRecord {
   status: 'idle' | 'streaming'
   display: DisplayState | null
   forkState: AgentStatusState | null
-  workingState: ForkWorkingState | null
+  turnState: ForkTurnState | null
   artifactState: ArtifactState | null
   eventSeq: number
   eventBuffer: SseEnvelope[]
@@ -55,7 +55,7 @@ interface SessionRecord {
 
 interface SseEnvelope {
   id: string
-  event: 'agent_event' | 'display_state' | 'fork_state' | 'working_state' | 'artifact_state'
+  event: 'agent_event' | 'display_state' | 'fork_state' | 'turn_state' | 'artifact_state'
   data: unknown
 }
 
@@ -78,19 +78,13 @@ const DEFAULT_FORK_STATE: AgentStatusState = {
   agentByForkId: new Map(),
 }
 
-const DEFAULT_WORKING_STATE: ForkWorkingState = {
-  working: false,
-  willContinue: false,
-  hasQueuedMessages: false,
-  pendingWake: false,
-  currentChainId: null,
-  currentTurnId: null,
-  compactionPending: false,
-  contextLimitBlocked: false,
-  pendingApproval: false,
-  softInterrupted: false,
-  pendingMentionTimestamps: [],
+const DEFAULT_TURN_STATE: ForkTurnState = {
+  _tag: 'idle',
+  triggers: [],
   pendingInboundCommunications: [],
+  softInterrupted: false,
+  parentForkId: null,
+  completedTurns: 0,
 }
 
 const DEFAULT_ARTIFACT_STATE: ArtifactState = {
@@ -161,7 +155,7 @@ export class SessionManager {
       status: 'idle',
       display: null,
       forkState: null,
-      workingState: null,
+      turnState: null,
       artifactState: null,
       eventSeq: 0,
       eventBuffer: [],
@@ -186,9 +180,9 @@ export class SessionManager {
       this.pushSessionEvent(record, 'fork_state', state)
     }))
 
-    record.unsubscribers.push(client.state.working.subscribeFork(null, (state) => {
-      record.workingState = state
-      this.pushSessionEvent(record, 'working_state', state)
+    record.unsubscribers.push(client.state.turn.subscribeFork(null, (state) => {
+      record.turnState = state
+      this.pushSessionEvent(record, 'turn_state', state)
     }))
 
     record.unsubscribers.push(client.state.artifacts.subscribe((state) => {
@@ -244,7 +238,7 @@ export class SessionManager {
       cwd: record.cwd,
       display: record.display ?? DEFAULT_DISPLAY_STATE,
       forkState: record.forkState ?? DEFAULT_FORK_STATE,
-      workingState: record.workingState ?? DEFAULT_WORKING_STATE,
+      turnState: record.turnState ?? DEFAULT_TURN_STATE,
       artifactState: record.artifactState ?? DEFAULT_ARTIFACT_STATE,
     }
   }

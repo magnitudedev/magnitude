@@ -2,14 +2,14 @@
  * LifecycleCoordinator Worker
  *
  * Automatic persistence orchestrator.
- * Triggers persistence when any fork becomes stable (debounced 100ms).
+ * Triggers persistence on turn termination (debounced 100ms).
  */
 
 import { Effect, Schedule } from 'effect'
 import { Worker, EventSinkTag } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 import type { AppEvent } from '../events'
-import { WorkingStateProjection } from '../projections/working-state'
+import { TurnProjection } from '../projections/turn'
 import { ChatPersistence } from '../persistence/chat-persistence-service'
 
 // =============================================================================
@@ -31,8 +31,7 @@ export const LifecycleCoordinator = Worker.define<AppEvent>()({
   },
 
   signalHandlers: (on) => [
-    on(WorkingStateProjection.signals.forkBecameStable, ({ forkId }, publish) => Effect.gen(function* () {
-      // Debounce: wait 100ms before persisting to batch multiple stable events
+    on(TurnProjection.signals.turnTerminated, (_value, _publish) => Effect.gen(function* () {
       yield* Effect.sleep('100 millis')
       yield* flushPendingEvents
     }))

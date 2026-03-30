@@ -1,251 +1,184 @@
-/**
- * FSM.define - Type-safe Finite State Machine
- *
- * Uses Effect's Data.TaggedClass for state classes. FSM provides typed
- * transition() and hold() functions.
- *
- * @example
- * ```typescript
- * import { Data } from 'effect'
- * import { FSM } from 'sage-core'
- *
- * class Pending extends Data.TaggedClass('pending')<{ id: string; content: string }> {}
- * class Streaming extends Data.TaggedClass('streaming')<{ id: string; content: string }> {}
- * class Completed extends Data.TaggedClass('completed')<{ id: string; content: string }> {}
- *
- * const ResponseFSM = FSM.define({
- *   transitions: {
- *     pending: ['streaming'],
- *     streaming: ['completed'],
- *     completed: []
- *   } as const,
- *   states: [Pending, Streaming, Completed]
- * })
- *
- * const p = new Pending({ id: '1', content: '' })
- * const s = ResponseFSM.transition(p, 'streaming', { content: 'hello' })
- * const s2 = ResponseFSM.hold(s, { content: s.content + ' world' })
- * ```
- */
+export type AnyTaggedState = { readonly _tag: string }
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AnyStateClass = new (props: any) => AnyTaggedState
 
-/**
- * FSM transition matrix type.
- */
+export type StateClassRecord = Record<string, AnyStateClass>
+
 export type TransitionMatrix = Record<string, readonly string[]>
 
-/**
- * Extract all state names from a transition matrix.
- */
-export type StateNames<T extends TransitionMatrix> = keyof T & string
-
-/**
- * Extract valid target states from a given source state.
- */
-export type ValidTargets<T extends TransitionMatrix, From extends StateNames<T>> =
-  T[From][number] & string
-
-/**
- * Base interface for tagged items.
- */
-export interface TaggedItem<Tag extends string = string> {
-  readonly _tag: Tag
+type TransitionMatrixForStates<TStates extends StateClassRecord> = {
+  readonly [K in keyof TStates & string]: readonly (keyof TStates & string)[]
 }
 
-/**
- * Extract the _tag literal type from a state class.
- */
-export type TagOf<C> = C extends new (...args: never[]) => { readonly _tag: infer T extends string } ? T : never
+export type StateNames<TTransitions extends TransitionMatrix> = keyof TTransitions & string
 
-/**
- * Extract props type from a state class (excluding _tag).
- */
-export type PropsOf<C> = C extends new (props: infer P) => unknown ? P : never
-
-/**
- * Build a record mapping tags to state classes from an array of classes.
- */
-export type StateClassRecord<Classes extends readonly AnyStateClass[]> = {
-  [C in Classes[number] as TagOf<C>]: C
-}
-
-/**
- * Get the instance type of a state class.
- */
 export type InstanceOf<C> = C extends new (...args: never[]) => infer I ? I : never
 
-/**
- * Union of all state instances from an array of classes.
- */
-export type StateUnion<Classes extends readonly AnyStateClass[]> =
-  InstanceOf<Classes[number]>
+export type StateUnion<TStates extends StateClassRecord> =
+  InstanceOf<TStates[keyof TStates]>
 
-/**
- * Any state class (for constraints).
- * Uses `any` for props like Effect's Data.TaggedClass does.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type AnyStateClass = new (props: any) => TaggedItem
+export type PropsOf<C> = C extends new (props: infer P) => unknown ? P : never
 
-/**
- * Compute required updates when transitioning from one state to another.
- * - Fields new to target (not on source): required
- * - Fields shared with source: optional (inherited from source instance)
- * - 'id' and '_tag' excluded (handled by framework)
- */
+export type TagOf<C> = C extends new (...args: never[]) => { readonly _tag: infer T extends string } ? T : never
+
+export type ValidTargets<
+  TTransitions extends TransitionMatrix,
+  From extends StateNames<TTransitions>
+> = TTransitions[From] extends readonly (infer TTo)[]
+  ? TTo & string
+  : never
+
 export type TransitionUpdates<From, ToProps> =
   & Omit<ToProps, keyof From | '_tag'>
   & Partial<Pick<ToProps, Extract<keyof From, keyof ToProps>>>
 
-// ---------------------------------------------------------------------------
-// FSM Instance Type
-// ---------------------------------------------------------------------------
+type ClassForTag<
+  TStates extends StateClassRecord,
+  TTag extends keyof TStates & string
+> = TStates[TTag]
 
-export interface FSMInstance<
-  T extends TransitionMatrix,
-  Classes extends readonly AnyStateClass[]
+type TagsReachableFrom<
+  TTransitions extends TransitionMatrix,
+  TFrom extends string
+> = TFrom extends keyof TTransitions
+  ? TTransitions[TFrom][number] & string
+  : never
+
+export interface FSMDefinition<
+  TStates extends StateClassRecord,
+  TTransitions extends TransitionMatrix
 > {
-  /**
-   * The transition matrix.
-   */
-  readonly transitions: T
+  readonly states: readonly (keyof TStates & string)[]
+  readonly stateClasses: TStates
+  readonly transitions: TTransitions
 
-  /**
-   * Array of all state names.
-   */
-  readonly states: StateNames<T>[]
-
-  /**
-   * Record mapping tags to state classes.
-   */
-  readonly stateClasses: StateClassRecord<Classes>
-
-  /**
-   * Transition to a new state. Validates the transition is allowed.
-   *
-   * Fields new to target state are required; fields shared with source are optional.
-   */
   transition<
-    From extends StateUnion<Classes>,
-    To extends StateNames<T> & keyof StateClassRecord<Classes>
+    From extends StateUnion<TStates>,
+    FromTag extends From['_tag'] & keyof TStates & string,
+    To extends TagsReachableFrom<TTransitions, FromTag> & keyof TStates & string
   >(
-    instance: From,
+    from: From,
     target: To,
-    updates: TransitionUpdates<From, PropsOf<StateClassRecord<Classes>[To]>>
-  ): InstanceOf<StateClassRecord<Classes>[To]>
+    updates: TransitionUpdates<From, PropsOf<ClassForTag<TStates, To>>>
+  ): InstanceOf<ClassForTag<TStates, To>>
 
-  /**
-   * Stay in current state with updated data.
-   */
-  hold<From extends StateUnion<Classes>>(
-    instance: From,
-    updates: Partial<PropsOf<Classes[number]>>
+  hold<From extends StateUnion<TStates>>(
+    from: From,
+    updates: Partial<Omit<From, '_tag'>>
   ): From
 
-  /**
-   * Check if a transition is valid.
-   */
-  canTransition(from: StateNames<T>, to: StateNames<T>): boolean
+  match<
+    TState extends StateUnion<TStates>,
+    THandlers extends {
+      [K in keyof TStates & string]: (state: InstanceOf<TStates[K]>) => unknown
+    }
+  >(
+    state: TState,
+    handlers: THandlers
+  ): ReturnType<THandlers[TState['_tag'] & keyof THandlers]>
 
-  /**
-   * Get valid target states from a source state.
-   */
-  getValidTargets(from: StateNames<T>): readonly string[]
+  is<
+    TState extends StateUnion<TStates>,
+    TTag extends keyof TStates & string
+  >(
+    state: TState,
+    tag: TTag
+  ): state is Extract<TState, InstanceOf<TStates[TTag]>>
 
-  /**
-   * Check if a state is terminal.
-   */
-  isTerminal(state: StateNames<T>): boolean
+  canTransition(
+    from: keyof TStates & string,
+    to: keyof TStates & string
+  ): boolean
 
-  /**
-   * Get all terminal states.
-   */
-  getTerminalStates(): StateNames<T>[]
+  isTerminal(state: keyof TStates & string): boolean
+
+  getTerminalStates(): (keyof TStates & string)[]
 }
 
-// ---------------------------------------------------------------------------
-// FSM Define
-// ---------------------------------------------------------------------------
+export function defineFSM<
+  const TStates extends StateClassRecord,
+  const TTransitions extends TransitionMatrixForStates<TStates>
+>(
+  states: TStates,
+  transitions: TTransitions
+): FSMDefinition<TStates, TTransitions> {
+  const stateNames = Object.keys(states) as (keyof TStates & string)[]
 
-/**
- * Define a type-safe FSM.
- */
-export function define<
-  const T extends TransitionMatrix,
-  const Classes extends readonly AnyStateClass[]
->(config: {
-  transitions: T
-  states: Classes
-}): FSMInstance<T, Classes> {
-  type StateName = StateNames<T>
+  const transition = <
+    From extends StateUnion<TStates>,
+    FromTag extends From['_tag'] & keyof TStates & string,
+    To extends TagsReachableFrom<TTransitions, FromTag> & keyof TStates & string
+  >(
+    from: From,
+    target: To,
+    updates: TransitionUpdates<From, PropsOf<ClassForTag<TStates, To>>>
+  ): InstanceOf<ClassForTag<TStates, To>> => {
+    const fromTag = from._tag as keyof TStates & string
+    const validTargets = transitions[fromTag] ?? []
 
-  // Build tag -> class mapping
-  const classRecord: Record<string, AnyStateClass> = {}
-  for (const StateClass of config.states) {
-    // Create a dummy instance to get the tag
-    try {
-      const dummy = new StateClass({})
-      classRecord[dummy._tag] = StateClass
-    } catch {
-      throw new Error(`Could not determine _tag for state class: ${StateClass.name}`)
+    if (!validTargets.includes(target)) {
+      const allowed = validTargets.length > 0 ? validTargets.join(', ') : 'none'
+      throw new Error(
+        `Invalid FSM transition: "${fromTag}" -> "${target}". Allowed targets: ${allowed}`
+      )
     }
+
+    const TargetClass = states[target]
+    return new TargetClass({ ...from, ...updates }) as InstanceOf<ClassForTag<TStates, To>>
   }
 
-  const stateNames = Object.keys(config.transitions) as StateName[]
+  const hold = <From extends StateUnion<TStates>>(
+    from: From,
+    updates: Partial<Omit<From, '_tag'>>
+  ): From => {
+    const CurrentClass = states[from._tag as keyof TStates & string]
+    return new CurrentClass({ ...from, ...updates }) as From
+  }
+
+  const match = <
+    TState extends StateUnion<TStates>,
+    THandlers extends {
+      [K in keyof TStates & string]: (state: InstanceOf<TStates[K]>) => unknown
+    }
+  >(
+    state: TState,
+    handlers: THandlers
+  ): ReturnType<THandlers[TState['_tag'] & keyof THandlers]> => {
+    return handlers[state._tag as keyof THandlers](state as never) as ReturnType<THandlers[TState['_tag'] & keyof THandlers]>
+  }
+
+  const is = <
+    TState extends StateUnion<TStates>,
+    TTag extends keyof TStates & string
+  >(
+    state: TState,
+    tag: TTag
+  ): state is Extract<TState, InstanceOf<TStates[TTag]>> => state._tag === tag
+
+  const canTransition = (
+    from: keyof TStates & string,
+    to: keyof TStates & string
+  ): boolean => (transitions[from] ?? []).includes(to)
+
+  const isTerminal = (state: keyof TStates & string): boolean =>
+    (transitions[state] ?? []).length === 0
+
+  const getTerminalStates = (): (keyof TStates & string)[] =>
+    stateNames.filter((state) => isTerminal(state))
 
   return {
-    transitions: config.transitions,
     states: stateNames,
-    stateClasses: classRecord as StateClassRecord<Classes>,
-
-    transition(instance, target, updates) {
-      const fromTag = instance._tag
-      const validTargets = config.transitions[fromTag]
-
-      if (!validTargets?.includes(target)) {
-        throw new Error(
-          `Invalid FSM transition: ${fromTag} -> ${target}\n` +
-          `Valid targets from ${fromTag}: ${validTargets?.join(', ') || 'none'}`
-        )
-      }
-
-      const TargetClass = classRecord[target]
-      if (!TargetClass) {
-        throw new Error(`No state class registered for tag: ${target}`)
-      }
-
-      return new TargetClass({ ...(instance as Record<string, unknown>), ...updates }) as InstanceOf<StateClassRecord<Classes>[typeof target]>
-    },
-
-    hold(instance, updates) {
-      const CurrentClass = classRecord[instance._tag]
-      if (!CurrentClass) {
-        throw new Error(`No state class registered for tag: ${instance._tag}`)
-      }
-      return new CurrentClass({ ...instance, ...updates }) as typeof instance
-    },
-
-    canTransition(from: StateName, to: StateName): boolean {
-      return config.transitions[from]?.includes(to) ?? false
-    },
-
-    getValidTargets(from: StateName): readonly string[] {
-      return config.transitions[from] ?? []
-    },
-
-    isTerminal(state: StateName): boolean {
-      const targets = config.transitions[state]
-      return !targets || targets.length === 0
-    },
-
-    getTerminalStates(): StateName[] {
-      return stateNames.filter(state => {
-        const targets = config.transitions[state]
-        return !targets || targets.length === 0
-      })
-    }
+    stateClasses: states,
+    transitions,
+    transition,
+    hold,
+    match,
+    is,
+    canTransition,
+    isTerminal,
+    getTerminalStates
   }
 }
+
+

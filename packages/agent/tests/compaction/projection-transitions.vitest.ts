@@ -67,8 +67,8 @@ describe('compaction/projection-transitions', () => {
       const h = yield* TestHarness
       yield* h.send(mkCompactionStarted())
       const state = yield* getCompaction(h)
-      expect(state.isCompacting).toBe(true)
-      expect(state.pendingFinalization).toBe(false)
+      expect(state._tag !== 'idle').toBe(true)
+      expect(state._tag === 'pendingFinalization').toBe(false)
     }).pipe(Effect.provide(TestHarnessLive())))
 
   it.effect('compaction_ready sets pendingFinalization and pending payload', () =>
@@ -81,11 +81,14 @@ describe('compaction/projection-transitions', () => {
         originalTokenEstimate: 500,
       }))
       const state = yield* getCompaction(h)
-      expect(state.isCompacting).toBe(true)
-      expect(state.pendingFinalization).toBe(true)
-      expect(state.pendingCompactionData?.summary).toBe('short summary')
-      expect(state.pendingCompactionData?.compactedMessageCount).toBe(2)
-      expect(state.pendingCompactionData?.originalTokenEstimate).toBe(500)
+      expect(state._tag !== 'idle').toBe(true)
+      expect(state._tag === 'pendingFinalization').toBe(true)
+      if (state._tag !== 'pendingFinalization') {
+        throw new Error('expected pendingFinalization')
+      }
+      expect(state.summary).toBe('short summary')
+      expect(state.compactedMessageCount).toBe(2)
+      expect(state.originalTokenEstimate).toBe(500)
     }).pipe(Effect.provide(TestHarnessLive())))
 
   it.effect('compaction_completed clears flags and subtracts tokensSaved', () =>
@@ -97,10 +100,9 @@ describe('compaction/projection-transitions', () => {
       yield* h.send(mkCompactionCompleted({ tokensSaved: 50 }))
       const after = yield* getCompaction(h)
       expect(after.tokenEstimate).toBe(Math.max(0, before.tokenEstimate - 50))
-      expect(after.isCompacting).toBe(false)
-      expect(after.pendingFinalization).toBe(false)
+      expect(after._tag !== 'idle').toBe(false)
+      expect(after._tag === 'pendingFinalization').toBe(false)
       expect(after.contextLimitBlocked).toBe(false)
-      expect(after.pendingCompactionData).toBeNull()
     }).pipe(Effect.provide(TestHarnessLive())))
 
   it.effect('compaction_failed clears lifecycle flags', () =>
@@ -110,10 +112,9 @@ describe('compaction/projection-transitions', () => {
       yield* h.send(mkCompactionReady())
       yield* h.send(mkCompactionFailed())
       const state = yield* getCompaction(h)
-      expect(state.isCompacting).toBe(false)
-      expect(state.pendingFinalization).toBe(false)
+      expect(state._tag !== 'idle').toBe(false)
+      expect(state._tag === 'pendingFinalization').toBe(false)
       expect(state.contextLimitBlocked).toBe(false)
-      expect(state.pendingCompactionData).toBeNull()
     }).pipe(Effect.provide(TestHarnessLive())))
 
   it.effect('context_limit_hit forces contextLimitBlocked true', () =>
@@ -124,12 +125,13 @@ describe('compaction/projection-transitions', () => {
       expect(state.contextLimitBlocked).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive())))
 
-  it.effect('context_limit_hit when idle does not mutate shouldCompact directly', () =>
+  it.effect('context_limit_hit when idle sets shouldCompact true', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
       const before = yield* getCompaction(h)
+      expect(before.shouldCompact).toBe(false)
       yield* h.send(mkContextLimitHit())
       const after = yield* getCompaction(h)
-      expect(after.shouldCompact).toBe(before.shouldCompact)
+      expect(after.shouldCompact).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive())))
 })

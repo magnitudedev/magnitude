@@ -12,8 +12,8 @@ import { InterruptPubSub } from '../core/interrupt-pubsub'
 import { extractForkIdFromEvent, extractForkIdFromSignal } from './util'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import { Signal, type SignalValue } from '../signal/define'
-import type { ProjectionInstance, StateOfProjection } from '../projection/define'
-import type { ForkedProjectionInstance, ForkableEvent } from '../projection/defineForked'
+import type { ProjectionInstance, ProjectionResult } from '../projection/define'
+import type { ForkedProjectionInstance, ForkableEvent, ForkedProjectionResult } from '../projection/defineForked'
 import { FrameworkErrorReporter, FrameworkError, type FrameworkErrorReporterService } from '../core/framework-error'
 
 
@@ -33,8 +33,12 @@ export type PublishFn<E extends BaseEvent> = (event: E) => Effect.Effect<void>
  *
  * Uses `any` for acceptance (projection parameter), StateOfProjection for extraction.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type WorkerReadFn<TEvent extends BaseEvent> = <P>(projection: P) => Effect.Effect<StateOfProjection<P>, never, any>
+export type WorkerReadFn<TEvent extends BaseEvent> = {
+  <TState>(projection: ProjectionResult<any, TState, any, any>): Effect.Effect<TState>
+  <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>): Effect.Effect<TForkState>
+  <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>, forkId: string | null): Effect.Effect<TForkState>
+  allForks?: <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) => Effect.Effect<Map<string | null, TForkState>>
+}
 
 // ---------------------------------------------------------------------------
 // Signal Handler Builder Types
@@ -85,6 +89,9 @@ export type WorkerEventHandlers<TEvent extends BaseEvent, R = any> = {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ExtractHandlerRequirements<THandlers> = THandlers extends WorkerEventHandlers<any, infer R> ? R : never
 
+type ExtractSettledRequirements<TSettled> =
+  TSettled extends ((...args: any[]) => Effect.Effect<any, any, infer R>) ? R : never
+
 /**
  * Worker config with properly typed event handlers.
  */
@@ -92,7 +99,9 @@ export interface WorkerConfig<
   TName extends string,
   TEvent extends BaseEvent,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  THandlers extends WorkerEventHandlers<TEvent> = WorkerEventHandlers<TEvent, any>
+  THandlers extends WorkerEventHandlers<TEvent> = WorkerEventHandlers<TEvent, any>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  TSettledHandler extends (ctx: { publish: PublishFn<TEvent>; read: WorkerReadFn<TEvent> }) => Effect.Effect<void, never, any> = (ctx: { publish: PublishFn<TEvent>; read: WorkerReadFn<TEvent> }) => Effect.Effect<void>
 > {
   readonly name: TName
 
@@ -112,19 +121,22 @@ export interface WorkerConfig<
   readonly signalHandlers?: (
     on: WorkerSignalHandlerBuilder<TEvent>
   ) => readonly WorkerSignalHandlerPair<TEvent>[]
+
+  readonly onProjectionsSettled?: TSettledHandler
 }
 
 export interface WorkerResult<
   TEvent extends BaseEvent,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  THandlers extends WorkerEventHandlers<TEvent> = WorkerEventHandlers<TEvent, any>
+  THandlers extends WorkerEventHandlers<TEvent> = WorkerEventHandlers<TEvent, any>,
+  TSettledHandler = undefined
 > {
   readonly Tag: Context.Tag<void, void>
   readonly Layer: Layer.Layer<
     void,
     never,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ExtractHandlerRequirements<THandlers> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
+    ExtractHandlerRequirements<THandlers> | ExtractSettledRequirements<TSettledHandler> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
   >
 }
 
@@ -136,15 +148,14 @@ export interface WorkerResult<
  * Implementation accepts any and returns any - the WorkerReadFn type
  * provides the correct generic signature for callers.
  */
-function makeWorkerReadFn<TEvent extends BaseEvent>(
-  forkId: string | null
-): WorkerReadFn<TEvent> {
+function makeWorkerReadFn<TEvent extends BaseEvent>(forkId: string | null): WorkerReadFn<TEvent> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const impl = (projection: any): any => {
+  const impl = (projection: any, overrideForkId?: string | null): any => {
+    const targetForkId = overrideForkId !== undefined ? overrideForkId : forkId
     if (projection.isForked) {
       return Effect.flatMap(
         projection.Tag,
-        (instance: ForkedProjectionInstance<never>) => instance.getFork(forkId)
+        (instance: ForkedProjectionInstance<never>) => instance.getFork(targetForkId)
       )
     } else {
       return Effect.flatMap(
@@ -153,16 +164,25 @@ function makeWorkerReadFn<TEvent extends BaseEvent>(
       )
     }
   }
-  return impl
+  impl.allForks = (projection: any): any => {
+    if (!projection.isForked) throw new Error('allForks only works on forked projections')
+    return Effect.flatMap(
+      projection.Tag,
+      (instance: ForkedProjectionInstance<never>) => instance.getAllForks()
+    )
+  }
+  return impl as WorkerReadFn<TEvent>
 }
 
 export function define<TEvent extends BaseEvent>() {
   return <
     TName extends string,
-    THandlers extends WorkerEventHandlers<TEvent>
+    THandlers extends WorkerEventHandlers<TEvent> = WorkerEventHandlers<TEvent, any>,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    TSettledHandler extends (ctx: { publish: PublishFn<TEvent>; read: WorkerReadFn<TEvent> }) => Effect.Effect<void, never, any> = (ctx: { publish: PublishFn<TEvent>; read: WorkerReadFn<TEvent> }) => Effect.Effect<void>
   >(
-    config: WorkerConfig<TName, TEvent, THandlers>
-  ): WorkerResult<TEvent, THandlers> => {
+    config: WorkerConfig<TName, TEvent, THandlers, TSettledHandler>
+  ): WorkerResult<TEvent, THandlers, TSettledHandler> => {
     const serviceName = `${config.name}Worker`
     const Tag = Context.GenericTag<void>(serviceName)
     const BusTag = WorkerBusTag<TEvent>()
@@ -245,6 +265,27 @@ export function define<TEvent extends BaseEvent>() {
         }
       }
 
+      if (config.onProjectionsSettled) {
+        const settledRead = makeWorkerReadFn<TEvent>(null)
+        const settledStream = yield* bus.subscribe()
+
+        yield* Effect.forkScoped(
+          Stream.runForEach(settledStream, () =>
+            Effect.gen(function* () {
+              yield* config.onProjectionsSettled!({ publish, read: settledRead })
+            }).pipe(
+              Effect.catchAllCause((cause) => {
+                if (Cause.isInterruptedOnly(cause)) return Effect.void
+                return reporter.report(FrameworkError.WorkerSettledHandlerError({
+                  workerName: config.name,
+                  cause
+                }))
+              })
+            )
+          )
+        )
+      }
+
       // Set up signal handlers
       if (config.signalHandlers) {
         // Create the `on` builder function
@@ -287,7 +328,7 @@ export function define<TEvent extends BaseEvent>() {
 
     // TypeScript can't track Signal<T> types through loops, so cast the Layer
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    type LayerInput = ExtractHandlerRequirements<THandlers> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
+    type LayerInput = ExtractHandlerRequirements<THandlers> | ExtractSettledRequirements<TSettledHandler> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
 
     return {
       Tag,

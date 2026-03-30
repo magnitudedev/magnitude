@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type ForkCompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -601,9 +601,9 @@ function AppInner({
   useEffect(() => {
     if (!client) return
 
-    const unsubscribe = client.state.compaction.subscribeFork(null, (state: ForkCompactionState) => {
+    const unsubscribe = client.state.compaction.subscribeFork(null, (state: CompactionState) => {
       setTokenEstimate(state.tokenEstimate)
-      setIsCompacting(state.isCompacting)
+      setIsCompacting(state._tag !== 'idle')
     })
 
     return unsubscribe
@@ -646,9 +646,9 @@ function AppInner({
       setForkIsCompacting(false)
       return
     }
-    const unsubscribe = client.state.compaction.subscribeFork(selectedForkId, (state: ForkCompactionState) => {
+    const unsubscribe = client.state.compaction.subscribeFork(selectedForkId, (state: CompactionState) => {
       setForkTokenEstimate(state.tokenEstimate)
-      setForkIsCompacting(state.isCompacting)
+      setForkIsCompacting(state._tag !== 'idle')
     })
     return unsubscribe
   }, [client, selectedForkId])
@@ -1824,7 +1824,13 @@ function AppInner({
             <WorkflowPhaseBar state={{
               skillName: workflowState.skillName,
               phases: workflowState.phases,
-              criteria: workflowState.criteria.length > 0 ? workflowState.criteria : null,
+              criteria: workflowState.criteria.length > 0 ? workflowState.criteria.map(c => ({
+                index: c.index,
+                name: c.name,
+                type: c.type,
+                status: c.lifecycle._tag,
+                reason: c.lifecycle._tag === 'failed' ? c.lifecycle.reason : undefined,
+              })) : null,
             }} />
           ) : null}
           <ChatController

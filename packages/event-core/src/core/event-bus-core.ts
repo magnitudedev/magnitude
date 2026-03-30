@@ -131,12 +131,10 @@ export function makeEventBusCoreLayer<E extends BaseEvent>(): Layer.Layer<
 
     return {
       publish: (event: E) => Effect.gen(function* () {
-        const timestamped = {
-          ...event,
-          timestamp: typeof (event as { timestamp?: unknown }).timestamp === 'number'
-            ? (event as { timestamp: number }).timestamp
-            : Date.now()
-        } as Timestamped<E>
+        const timestamp = 'timestamp' in event && typeof event.timestamp === 'number'
+          ? event.timestamp
+          : Date.now()
+        const timestamped: Timestamped<E> = Object.assign({}, event, { timestamp })
         const done = yield* Deferred.make<void, Cause.Cause<never>>()
         yield* Queue.offer(eventQueue, { event: timestamped, done })
         yield* Deferred.await(done).pipe(
