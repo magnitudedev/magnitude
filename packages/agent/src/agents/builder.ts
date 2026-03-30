@@ -38,7 +38,6 @@ const tools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
-  'phaseSubmit',
 )
 
 export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({

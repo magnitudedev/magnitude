@@ -2,8 +2,8 @@
  * Reviewer Agent Definition
  *
  * Independently verifies implemented changes meet the user's intent.
- * Read-only codebase access + shell for running tests/builds.
- * No file write access — reviewers only observe, test, and report.
+ * Codebase access + shell for running tests/builds.
+ * Can write within workspace for notes/reports; cannot write project files.
  */
 
 import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
@@ -43,6 +43,8 @@ const systemPrompt = compilePromptTemplate(reviewerPromptRaw)
 
 const tools = catalog.pick(
   'fileRead',
+  'fileWrite',
+  'fileEdit',
   'fileTree',
   'fileSearch',
   'fileView',
@@ -70,7 +72,7 @@ export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>(
   policy: [
     denyForbiddenCommands(),
     denyMutatingGit(),
-    denyWritesOutside(ctx => [ctx.cwd, ctx.workspacePath]),
+    denyWritesOutside(ctx => [ctx.workspacePath]),
     allowAll(),
   ],
 
