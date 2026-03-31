@@ -33,6 +33,7 @@ export const PROVIDERS: ProviderDefinition[] = [
     models: [
       staticModel({ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
       staticModel({ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'oauth-pkce', label: 'Claude Pro/Max subscription' },
@@ -45,6 +46,7 @@ export const PROVIDERS: ProviderDefinition[] = [
     bamlProvider: 'openai',
     oauthOnlyModelIds: ['gpt-5.3-codex-spark'],
     models: [
+      staticModel({ id: 'gpt-5.4', name: 'GPT-5.4', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
       staticModel({ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', family: 'gpt', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
       staticModel({ id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
       staticModel({ id: 'gpt-5.2', name: 'GPT-5.2', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
@@ -62,6 +64,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.githubcopilot.com',
     models: [
       staticModel({ id: 'claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'oauth-device', label: 'GitHub Copilot' },
@@ -87,6 +91,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
     models: [
       staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['OPENROUTER_API_KEY'] },
@@ -99,6 +105,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     defaultBaseUrl: 'https://ai-gateway.vercel.sh/v1',
     models: [
       staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['AI_GATEWAY_API_KEY'] },
@@ -123,6 +131,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     bamlProvider: 'vertex-ai',
     models: [
       staticModel({ id: 'claude-opus-4-6@default', name: 'Claude Opus 4.6 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-sonnet-4-6@default', name: 'Claude Sonnet 4.6 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-haiku-4-5@default', name: 'Claude Haiku 4.5 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'gcp-credentials', label: 'Service account', envKeys: ['GOOGLE_APPLICATION_CREDENTIALS'] },
@@ -134,6 +144,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     bamlProvider: 'aws-bedrock',
     models: [
       staticModel({ id: 'us.anthropic.claude-opus-4-6-v1', name: 'Claude Opus 4.6 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'us.anthropic.claude-sonnet-4-6-v1', name: 'Claude Sonnet 4.6 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'us.anthropic.claude-haiku-4-5-v1', name: 'Claude Haiku 4.5 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'aws-chain', label: 'AWS credentials', envKeys: ['AWS_ACCESS_KEY_ID', 'AWS_PROFILE', 'AWS_DEFAULT_REGION'] },
