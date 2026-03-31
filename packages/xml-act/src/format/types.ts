@@ -25,6 +25,7 @@ export type TagParseErrorDetail =
   | { readonly _tag: 'UnknownAttribute'; readonly id: string; readonly tagName: string; readonly attribute: string; readonly detail: string }
   | { readonly _tag: 'InvalidAttributeValue'; readonly id: string; readonly tagName: string; readonly attribute: string; readonly expected: string; readonly received: string; readonly detail: string }
   | { readonly _tag: 'MissingRequiredFields'; readonly id: string; readonly tagName: string; readonly fields: readonly string[]; readonly detail: string }
+  | { readonly _tag: 'ToolValidationFailed'; readonly id: string; readonly tagName: string; readonly detail: string }
 
 export type ActiveLens = {
   readonly name: string

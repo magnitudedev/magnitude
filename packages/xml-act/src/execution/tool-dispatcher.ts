@@ -38,6 +38,7 @@ function unwrapAst(ast: AST.AST): AST.AST {
 function findMissingRequiredFields(
   rawInput: Record<string, unknown>,
   schemaAst: AST.AST,
+  bodyField?: string,
 ): string[] {
   const missing: string[] = []
   const ast = unwrapAst(schemaAst)
@@ -45,8 +46,19 @@ function findMissingRequiredFields(
 
   for (const prop of ast.propertySignatures) {
     const name = String(prop.name)
-    if (!prop.isOptional && !(name in rawInput)) {
+    if (prop.isOptional) continue
+
+    if (!(name in rawInput)) {
       missing.push(name)
+      continue
+    }
+
+    if (bodyField === name) {
+      const value = rawInput[name]
+      const propType = unwrapAst(prop.type)
+      if (propType._tag === 'StringKeyword' && typeof value === 'string' && value.length === 0) {
+        missing.push(name)
+      }
     }
   }
 
@@ -76,7 +88,7 @@ function executeToolEffect(
   registered: RegisteredTool,
   input: unknown,
   toolContext?: ToolContext<unknown>,
-): Effect.Effect<Either.Either<unknown, unknown>> {
+): Effect.Effect<Either.Either<unknown, unknown>, never, never> {
   return Effect.suspend(() => {
     const exec = (registered.tool.execute as (i: unknown, ctx?: ToolContext<unknown>) => Effect.Effect<unknown, unknown, unknown>)(input, toolContext)
 
@@ -104,7 +116,7 @@ function executeToolEffect(
 export function dispatchTool(
   element: ParsedElement,
   ctx: DispatchContext,
-): Effect.Effect<DispatchResult> {
+): Effect.Effect<DispatchResult, never, never> {
   return Effect.gen(function* () {
     const registered = ctx.tools.get(element.tagName)
 
@@ -122,10 +134,10 @@ export function dispatchTool(
     }
 
     // 1. Build input from element + binding
-    let rawInput = buildInput(sanitizedElement, binding)
+    const rawInput = buildInput(sanitizedElement, binding)
 
     // 2. Check for missing required fields
-    const missingFields = findMissingRequiredFields(rawInput, tool.inputSchema.ast)
+    const missingFields = findMissingRequiredFields(rawInput, tool.inputSchema.ast, binding.body)
     if (missingFields.length > 0) {
       const fieldList = missingFields.map(f => `'${f}'`).join(', ')
       return {
@@ -149,11 +161,10 @@ export function dispatchTool(
       return {
         _tag: 'ParseError' as const,
         error: {
-          _tag: 'MissingRequiredFields' as const,
+          _tag: 'ToolValidationFailed' as const,
           id: element.toolCallId,
           tagName: element.tagName,
-          fields: [],
-          detail: `Validation failed on <${element.tagName}>: ${msg}`,
+          detail: `Schema validation failed for <${element.tagName}>: ${msg}`,
         },
       }
     }

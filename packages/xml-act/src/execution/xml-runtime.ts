@@ -95,6 +95,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             if (reg.binding.childTags) reg.binding.childTags.forEach(ct => valid.add(ct.tag))
             if (reg.binding.children) reg.binding.children.forEach(c => valid.add(c.tag ?? c.field))
             if (reg.binding.childRecord) valid.add(reg.binding.childRecord.tag)
+            if (reg.binding.attributes) reg.binding.attributes.forEach(a => valid.add(a.attr))
             childTagMap.set(tag, valid)
           }
 
@@ -295,6 +296,7 @@ function reactImpl(
             }
           }
         }
+
         break
       }
 
@@ -319,21 +321,21 @@ function reactImpl(
           })
         } else if (tagSchema && !tagSchema.acceptsBody) {
           const registered = config.tools.get(tagNameForBody)
-          if (registered) {
-            currentState = yield* emitAndFold(currentState, {
-              _tag: 'ToolInputParseError',
-              toolCallId: parseEvent.toolCallId,
+          if (!registered) break
+
+          currentState = yield* emitAndFold(currentState, {
+            _tag: 'ToolInputParseError',
+            toolCallId: parseEvent.toolCallId,
+            tagName: tagNameForBody,
+            toolName: registered.tool.name,
+            group: registered.groupName,
+            error: {
+              _tag: 'UnexpectedBody',
+              id: parseEvent.toolCallId,
               tagName: tagNameForBody,
-              toolName: registered.tool.name,
-              group: registered.groupName,
-              error: {
-                _tag: 'UnexpectedBody',
-                id: parseEvent.toolCallId,
-                tagName: tagNameForBody,
-                detail: `Tool <${tagNameForBody}> does not accept body content`,
-              },
-            })
-          }
+              detail: `Tool <${tagNameForBody}> does not accept body content`,
+            },
+          })
         }
         break
       }
@@ -410,10 +412,14 @@ function reactImpl(
         // Replay: outcome known → suppress entirely
         if (hasPriorOutcome(priorOutcomes, parseEvent.toolCallId)) break
         // Dead tool calls: skip dispatch
-        if (currentState.deadToolCalls.has(parseEvent.toolCallId)) break
+        if (currentState.deadToolCalls.has(parseEvent.toolCallId)) {
+          break
+        }
 
         const registered = config.tools.get(parseEvent.tagName)
         if (!registered) break
+
+        const input = buildInput(parseEvent.element, registered.binding)
 
         // The dispatcher emits events via this callback — state stays in sync
         // automatically because every event goes through emitAndFold.
@@ -444,11 +450,10 @@ function reactImpl(
         // Emit ToolInputReady (only if not in-flight replay — in-flight skips input events
         // but still dispatches)
         if (!isInFlight(priorToolCallIds, priorOutcomes, parseEvent.toolCallId)) {
-          const rawInput = buildInput(parseEvent.element, registered.binding)
           currentState = yield* emitAndFold(currentState, {
             _tag: 'ToolInputReady',
             toolCallId: parseEvent.toolCallId,
-            input: rawInput,
+            input,
           })
         }
 
@@ -639,8 +644,6 @@ function reactImpl(
 // =============================================================================
 // Binding resolution helpers
 // =============================================================================
-
-
 
 function resolveBodyField(
   toolCallId: string,

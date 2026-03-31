@@ -16,10 +16,9 @@ describe('binding validator — duplicate input field paths', () => {
           options: Schema.Struct({
             type: Schema.String,
           }),
-        }),
-        outputSchema: Schema.Void,
-        errorSchema: Schema.Never,
-        execute: () => Effect.void,
+        }) as Schema.Schema.Any,
+        outputSchema: Schema.Void as Schema.Schema.Any,
+        execute: (_input: unknown, _ctx: unknown) => Effect.void as Effect.Effect<unknown, unknown, unknown>,
         label: () => 'test',
       },
       binding: {

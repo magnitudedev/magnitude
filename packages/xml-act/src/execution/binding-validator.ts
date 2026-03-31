@@ -171,6 +171,8 @@ export interface TagSchema {
   readonly attributes: ReadonlyMap<string, AttributeSchema>
   /** Whether this tag accepts body content */
   readonly acceptsBody: boolean
+  /** Canonical body field path if this tool binds body content */
+  readonly bodyField?: string
   /** Valid child tag names → child schema */
   readonly children: ReadonlyMap<string, ChildTagSchema>
 }
@@ -210,6 +212,20 @@ export function validateBinding(
     for (const child of binding.children) addInputField(child.field, 'children')
   }
   if (binding.childRecord) addInputField(binding.childRecord.field, 'childRecord')
+
+  // --- Validate no XML name collision between attributes and child tags ---
+  // Reserved for potential future attr↔childTag normalization by XML name.
+  // Keeping names disjoint prevents ambiguity if that behavior is reintroduced.
+  if (binding.attributes && binding.childTags) {
+    const attrNames = new Set(binding.attributes.map(a => a.attr))
+    for (const ct of binding.childTags) {
+      if (attrNames.has(ct.tag)) {
+        throw new Error(
+          `Binding error on <${tagName}>: '${ct.tag}' is used as both an attribute name and a child tag name`
+        )
+      }
+    }
+  }
 
   // --- Validate attribute fields ---
   if (binding.attributes) {
@@ -308,7 +324,7 @@ export function validateBinding(
     attributes.set('id', { type: 'string', required: false })
   }
 
-  return { attributes, acceptsBody, children }
+  return { attributes, acceptsBody, bodyField: binding.body, children }
 }
 
 function validateChildBinding(
