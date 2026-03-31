@@ -1,4 +1,4 @@
-import { BamlClientHttpError, Collector, type ClientRegistry } from '@magnitudedev/llm-core'
+import { BamlClientHttpError, isBamlError, Collector, type ClientRegistry } from '@magnitudedev/llm-core'
 import { Effect, Stream } from 'effect'
 import { ModelConnection as ModelConnectionCtor } from '../model/model-connection'
 import type { InferenceConfig } from '../model/inference-config'
@@ -14,6 +14,7 @@ import type { AuthInfo } from '../types'
 import type { Model } from '../model/model'
 import { CollectorData } from './types'
 import { classifyHttpError, classifyUnknownError } from '../errors/classify-error'
+import { TransportError } from '../errors/model-error'
 
 import { bamlCall, bamlStream } from './baml-dispatch'
 
@@ -155,7 +156,19 @@ export const BamlDriver: ExecutableDriver = {
         const authType = req.connection._tag === 'Baml' ? (req.connection.auth?.type ?? null) : null
         const asyncIter = toNormalizedAsyncStream(toIncrementalStream(bamlStreamResult))
         return {
-          stream: Stream.fromAsyncIterable(asyncIter, (e) => classifyUnknownError(e)),
+          stream: Stream.fromAsyncIterable(asyncIter, (e) => {
+            if (e instanceof BamlClientHttpError) {
+              const text = [e.message, e.detailed_message, e.raw_response]
+                .filter(Boolean)
+                .join(' ')
+              return classifyHttpError(e.status_code, text)
+            }
+            // BAML config/construction/validation errors are non-retryable
+            if (isBamlError(e)) {
+              return new TransportError({ message: e instanceof Error ? e.message : String(e), status: 400 })
+            }
+            return classifyUnknownError(e)
+          }),
           getUsage(): CallUsage {
             return extractUsageFromCollector(collector, req.model, authType)
           },
@@ -170,6 +183,10 @@ export const BamlDriver: ExecutableDriver = {
             .filter(Boolean)
             .join(' ')
           return classifyHttpError(error.status_code, text)
+        }
+        // BAML config/construction/validation errors are non-retryable
+        if (isBamlError(error)) {
+          return new TransportError({ message: error instanceof Error ? error.message : String(error), status: 400 })
         }
         return classifyUnknownError(error)
       },
@@ -198,6 +215,10 @@ export const BamlDriver: ExecutableDriver = {
             .filter(Boolean)
             .join(' ')
           return classifyHttpError(error.status_code, text)
+        }
+        // BAML config/construction/validation errors are non-retryable
+        if (isBamlError(error)) {
+          return new TransportError({ message: error instanceof Error ? error.message : String(error), status: 400 })
         }
         return classifyUnknownError(error)
       },
