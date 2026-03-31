@@ -44,14 +44,10 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   rule(/^qwen3\.5-9b$/, ['browser']),
 
   // ZAI standard
-  rule(/^glm-5$/, ['lead'], 'zai'),
   rule(/^glm-4\.7$/, [...ALL_SLOTS], 'zai'),
-  rule(/^glm-4\.7-flash$/, ['browser'], 'zai'),
 
   // ZAI Coding Plan
-  rule(/^glm-5\.1$/, ['lead'], 'zai-coding-plan'),
   rule(/^glm-4\.7$/, [...ALL_SLOTS], 'zai-coding-plan'),
-  rule(/^glm-4\.7-flash$/, ['browser'], 'zai-coding-plan'),
 
   // MiniMax
   rule(/^MiniMax-M2\.7$/, [...ALL_SLOTS]),
