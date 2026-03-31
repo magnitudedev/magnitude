@@ -67,6 +67,14 @@ export function getLowestEffortOptions(
     }
   }
 
+  // --- Moonshot / Kimi (disable thinking — we provide our own reasoning) ---
+  if (providerId === 'moonshotai' || providerId === 'kimi-for-coding') {
+    return {
+      optionsMerge: { thinking: { type: 'disabled' } },
+      label: 'Kimi thinking=disabled',
+    }
+  }
+
   // --- Anthropic Claude (direct API, Vertex Anthropic) ---
   // Opus 4.6, Sonnet 4.6, Opus 4.5 support effort (Sonnet 4.5 does NOT)
   if (

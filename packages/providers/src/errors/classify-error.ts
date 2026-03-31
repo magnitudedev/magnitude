@@ -11,6 +11,7 @@ const CONTEXT_LIMIT_PATTERNS = [
   'token count exceeds the maximum',
   'maximum context length',
   'context_length_exceeded',
+  'exceeded model token limit',
 ]
 
 function hasContextLimitSignal(text: string): boolean {

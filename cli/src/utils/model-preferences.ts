@@ -34,6 +34,8 @@ export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'minimax': rest('MiniMax-M2.7'),
   'zai': rest('glm-4.7'),
   'zai-coding-plan': rest('glm-4.7'),
+  'moonshotai': rest('kimi-k2.5'),
+  'kimi-for-coding': rest('k2p5'),
 }
 
 /** OAuth-specific overrides */

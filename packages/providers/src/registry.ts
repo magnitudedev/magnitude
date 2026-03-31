@@ -179,6 +179,30 @@ export const PROVIDERS: ProviderDefinition[] = [
     ],
   },
   {
+    id: 'moonshotai',
+    name: 'Moonshot AI',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'https://api.moonshot.ai/v1',
+    models: [
+      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+    ],
+    authMethods: [
+      { type: 'api-key', label: 'API key', envKeys: ['MOONSHOT_API_KEY'] },
+    ],
+  },
+  {
+    id: 'kimi-for-coding',
+    name: 'Kimi for Coding',
+    bamlProvider: 'anthropic',
+    defaultBaseUrl: 'https://api.kimi.com/coding',
+    models: [
+      staticModel({ id: 'k2p5', name: 'K2p5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+    ],
+    authMethods: [
+      { type: 'api-key', label: 'API key', envKeys: ['KIMI_API_KEY'] },
+    ],
+  },
+  {
     id: 'cerebras',
     name: 'Cerebras',
     bamlProvider: 'openai-generic',
