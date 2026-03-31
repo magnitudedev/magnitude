@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.8
+
+### Patch Changes
+
+- [`283de77`](https://github.com/magnitudedev/magnitude/commit/283de77fbf444a4fb3608bc915cb6209b9694c39) Thanks [@anerli](https://github.com/anerli)! - compaction fixes
+
 ## 0.0.1-alpha.7
 
 ### Patch Changes
