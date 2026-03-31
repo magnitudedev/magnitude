@@ -155,7 +155,7 @@ export const agentKillTool = defineTool({
 export const agentCreateXmlBinding = defineXmlBinding(agentCreateTool, {
   input: {
     attributes: [
-      { field: 'agentId', attr: 'agentId' },
+      { field: 'agentId', attr: 'id' },
       { field: 'options.type', attr: 'type' },
     ],
     childTags: [
