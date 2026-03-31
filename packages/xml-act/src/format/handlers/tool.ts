@@ -26,7 +26,14 @@ function validateAttrs(
     if (result.ok) {
       out.set(key, result.value)
     } else {
-      if (result.error._tag === 'UnknownAttribute') {
+      if (
+        result.error._tag === 'UnknownAttribute'
+        && schema.children.has(key)
+        && !schema.attributes.has(key)
+      ) {
+        // Allow attr→childTag normalization path: accept and do not emit UnknownAttribute.
+        out.set(key, value)
+      } else if (result.error._tag === 'UnknownAttribute') {
         errors.push({
           _tag: 'ParseError',
           error: { _tag: 'UnknownAttribute', id, tagName: tag, attribute: key, detail: `Unknown attribute '${key}' on <${tag}>` },

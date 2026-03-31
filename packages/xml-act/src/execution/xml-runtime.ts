@@ -13,7 +13,7 @@ import type { ToolContext } from '@magnitudedev/tools'
 
 import { createStreamingXmlParser, defaultIdGenerator, type IdGenerator } from '../parser'
 import { createShortId } from '../util'
-import type { ParseEvent } from '../format/types'
+import type { ParseEvent, ParsedElement } from '../format/types'
 import type {
   XmlRuntimeConfig,
   XmlRuntimeEvent,
@@ -28,6 +28,7 @@ import { buildInput } from './input-builder'
 import { observeOutput } from '../output-query'
 import { validateBinding, type TagSchema } from './binding-validator'
 import { initialReactorState, foldReactorState } from './reactor-state'
+import { coerceAttributeValue } from '../format/coerce'
 
 // =============================================================================
 // Sentinel for end-of-stream
@@ -123,6 +124,9 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
 
           const createMessageId = createShortId
           let activeProseMessageId: string | null = null
+          const emittedFields = new Map<string, Set<string>>()
+          const pendingAttrNormalizationChildren = new Map<string, Set<number>>()
+
           function react(
             state: ReactorState,
             parseEvent: ParseEvent,
@@ -136,6 +140,8 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                 set: (id) => { activeProseMessageId = id },
                 create: createMessageId,
               },
+              emittedFields,
+              pendingAttrNormalizationChildren,
             )
           }
 
@@ -259,9 +265,15 @@ function reactImpl(
     readonly set: (id: string | null) => void
     readonly create: () => string
   },
+  emittedFields: Map<string, Set<string>>,
+  pendingAttrNormalizationChildren: Map<string, Set<number>>,
 ): Effect.Effect<ReactorState> {
   return Effect.gen(function* () {
     let currentState = state
+    const cleanupToolCallState = (toolCallId: string) => {
+      emittedFields.delete(toolCallId)
+      pendingAttrNormalizationChildren.delete(toolCallId)
+    }
 
     switch (parseEvent._tag) {
       case 'TagOpened': {
@@ -282,17 +294,45 @@ function reactImpl(
           group: registered.groupName,
         })
 
-        // Emit ToolInputFieldValue for each bound attribute
-        if (registered.binding.attributes) {
-          for (const attrSpec of registered.binding.attributes) {
-            const value = parseEvent.attributes.get(attrSpec.attr)
-            if (value !== undefined) {
+        const callEmitted = emittedFields.get(parseEvent.toolCallId) ?? new Set<string>()
+        emittedFields.set(parseEvent.toolCallId, callEmitted)
+
+        // Emit canonical streaming events from attributes:
+        // - canonical attr -> ToolInputFieldValue
+        // - attr->childTag swap -> ToolInputChildStarted + ToolInputChildComplete
+        for (const [attrName, attrValue] of parseEvent.attributes) {
+          const boundAttr = registered.binding.attributes?.find(a => a.attr === attrName)
+          if (boundAttr) {
+            if (!callEmitted.has(boundAttr.field)) {
               currentState = yield* emitAndFold(currentState, {
                 _tag: 'ToolInputFieldValue',
                 toolCallId: parseEvent.toolCallId,
-                field: attrSpec.attr,
-                value,
+                field: boundAttr.field,
+                value: attrValue,
               })
+              callEmitted.add(boundAttr.field)
+            }
+            continue
+          }
+
+          const boundChild = registered.binding.childTags?.find(ct => ct.tag === attrName)
+          if (boundChild) {
+            if (!callEmitted.has(boundChild.field)) {
+              currentState = yield* emitAndFold(currentState, {
+                _tag: 'ToolInputChildStarted',
+                toolCallId: parseEvent.toolCallId,
+                field: boundChild.field,
+                index: 0,
+                attributes: {},
+              })
+              currentState = yield* emitAndFold(currentState, {
+                _tag: 'ToolInputChildComplete',
+                toolCallId: parseEvent.toolCallId,
+                field: boundChild.field,
+                index: 0,
+                value: { [boundChild.field]: String(attrValue) },
+              })
+              callEmitted.add(boundChild.field)
             }
           }
         }
@@ -345,19 +385,36 @@ function reactImpl(
         if (hasPriorOutcome(priorOutcomes, parseEvent.parentToolCallId)) break
         if (isInFlight(priorToolCallIds, priorOutcomes, parseEvent.parentToolCallId)) break
 
-        const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
-        if (childInfo) {
-          const attrRecord: Record<string, string | number | boolean> = {}
-          for (const [k, v] of parseEvent.attributes) attrRecord[k] = v
+        const parentTagName = currentState.toolCallMap.get(parseEvent.parentToolCallId)
+        if (!parentTagName) break
+        const registered = config.tools.get(parentTagName)
+        if (!registered) break
+        const attrSpec = registered.binding.attributes?.find(a => a.attr === parseEvent.childTagName)
 
-          currentState = yield* emitAndFold(currentState, {
-            _tag: 'ToolInputChildStarted',
-            toolCallId: parseEvent.parentToolCallId,
-            field: childInfo.field,
-            index: parseEvent.childIndex,
-            attributes: attrRecord,
-          })
+        if (attrSpec) {
+          const pending = pendingAttrNormalizationChildren.get(parseEvent.parentToolCallId) ?? new Set<number>()
+          pending.add(parseEvent.childIndex)
+          pendingAttrNormalizationChildren.set(parseEvent.parentToolCallId, pending)
+          break
         }
+
+        const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
+        if (!childInfo) break
+
+        const callEmitted = emittedFields.get(parseEvent.parentToolCallId) ?? new Set<string>()
+        emittedFields.set(parseEvent.parentToolCallId, callEmitted)
+        if (callEmitted.has(childInfo.field)) break
+
+        const attrRecord: Record<string, string | number | boolean> = {}
+        for (const [k, v] of parseEvent.attributes) attrRecord[k] = v
+
+        currentState = yield* emitAndFold(currentState, {
+          _tag: 'ToolInputChildStarted',
+          toolCallId: parseEvent.parentToolCallId,
+          field: childInfo.field,
+          index: parseEvent.childIndex,
+          attributes: attrRecord,
+        })
         break
       }
 
@@ -366,8 +423,13 @@ function reactImpl(
         if (hasPriorOutcome(priorOutcomes, parseEvent.parentToolCallId)) break
         if (isInFlight(priorToolCallIds, priorOutcomes, parseEvent.parentToolCallId)) break
 
+        const pending = pendingAttrNormalizationChildren.get(parseEvent.parentToolCallId)
+        if (pending?.has(parseEvent.childIndex)) break
+
         const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
         if (childInfo?.bodyField) {
+          const callEmitted = emittedFields.get(parseEvent.parentToolCallId)
+          if (callEmitted?.has(childInfo.field)) break
           currentState = yield* emitAndFold(currentState, {
             _tag: 'ToolInputBodyChunk',
             toolCallId: parseEvent.parentToolCallId,
@@ -384,42 +446,116 @@ function reactImpl(
         if (hasPriorOutcome(priorOutcomes, parseEvent.parentToolCallId)) break
         if (isInFlight(priorToolCallIds, priorOutcomes, parseEvent.parentToolCallId)) break
 
-        const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
-        if (childInfo) {
-          const value: Record<string, unknown> = {}
-          if (childInfo.attributes) {
-            for (const attrSpec of childInfo.attributes) {
-              const v = parseEvent.attributes.get(attrSpec.attr)
-              if (v !== undefined) value[attrSpec.field] = v
-            }
-          }
-          if (childInfo.bodyField) {
-            value[childInfo.bodyField] = parseEvent.body.trim()
-          }
+        const parentTagName = currentState.toolCallMap.get(parseEvent.parentToolCallId)
+        if (!parentTagName) break
+        const registered = config.tools.get(parentTagName)
+        if (!registered) break
 
-          currentState = yield* emitAndFold(currentState, {
-            _tag: 'ToolInputChildComplete',
-            toolCallId: parseEvent.parentToolCallId,
-            field: childInfo.field,
-            index: parseEvent.childIndex,
-            value,
-          })
+        const callEmitted = emittedFields.get(parseEvent.parentToolCallId) ?? new Set<string>()
+        emittedFields.set(parseEvent.parentToolCallId, callEmitted)
+
+        const pending = pendingAttrNormalizationChildren.get(parseEvent.parentToolCallId)
+        const isPendingAttrNormalization = pending?.has(parseEvent.childIndex) ?? false
+        if (isPendingAttrNormalization) {
+          pending?.delete(parseEvent.childIndex)
+          if (pending && pending.size === 0) pendingAttrNormalizationChildren.delete(parseEvent.parentToolCallId)
+
+          const attrSpec = registered.binding.attributes?.find(a => a.attr === parseEvent.childTagName)
+          const simpleText = parseEvent.attributes.size === 0
+          if (attrSpec && simpleText && !callEmitted.has(attrSpec.field)) {
+            const trimmedBody = parseEvent.body.trim()
+            const attrSchema = tagSchemas.get(parentTagName)?.attributes.get(attrSpec.attr)
+            if (attrSchema) {
+              const coerced = coerceAttributeValue(trimmedBody, attrSchema.type)
+              if (!coerced.ok) {
+                currentState = yield* emitAndFold(currentState, {
+                  _tag: 'ToolInputParseError',
+                  toolCallId: parseEvent.parentToolCallId,
+                  tagName: parentTagName,
+                  toolName: registered.tool.name,
+                  group: registered.groupName,
+                  error: {
+                    _tag: 'InvalidAttributeValue',
+                    id: parseEvent.parentToolCallId,
+                    tagName: parentTagName,
+                    attribute: attrSpec.attr,
+                    expected: attrSchema.type,
+                    received: trimmedBody,
+                    detail: `Invalid value for attribute '${attrSpec.attr}' on <${parentTagName}>: "${trimmedBody}"`,
+                  },
+                })
+                break
+              }
+              currentState = yield* emitAndFold(currentState, {
+                _tag: 'ToolInputFieldValue',
+                toolCallId: parseEvent.parentToolCallId,
+                field: attrSpec.field,
+                value: coerced.value,
+              })
+              callEmitted.add(attrSpec.field)
+              break
+            }
+
+            currentState = yield* emitAndFold(currentState, {
+              _tag: 'ToolInputFieldValue',
+              toolCallId: parseEvent.parentToolCallId,
+              field: attrSpec.field,
+              value: trimmedBody,
+            })
+            callEmitted.add(attrSpec.field)
+          }
+          break
         }
+
+        const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
+        if (!childInfo) break
+        if (callEmitted.has(childInfo.field)) break
+
+        const value: Record<string, unknown> = {}
+        if (childInfo.attributes) {
+          for (const attrSpec of childInfo.attributes) {
+            const v = parseEvent.attributes.get(attrSpec.attr)
+            if (v !== undefined) value[attrSpec.field] = v
+          }
+        }
+        if (childInfo.bodyField) {
+          value[childInfo.bodyField] = parseEvent.body.trim()
+        }
+
+        currentState = yield* emitAndFold(currentState, {
+          _tag: 'ToolInputChildComplete',
+          toolCallId: parseEvent.parentToolCallId,
+          field: childInfo.field,
+          index: parseEvent.childIndex,
+          value,
+        })
+        callEmitted.add(childInfo.field)
         break
       }
 
       case 'TagClosed': {
         // Replay: outcome known → suppress entirely
-        if (hasPriorOutcome(priorOutcomes, parseEvent.toolCallId)) break
+        if (hasPriorOutcome(priorOutcomes, parseEvent.toolCallId)) {
+          cleanupToolCallState(parseEvent.toolCallId)
+          break
+        }
         // Dead tool calls: skip dispatch
         if (currentState.deadToolCalls.has(parseEvent.toolCallId)) {
+          cleanupToolCallState(parseEvent.toolCallId)
           break
         }
 
         const registered = config.tools.get(parseEvent.tagName)
-        if (!registered) break
+        if (!registered) {
+          cleanupToolCallState(parseEvent.toolCallId)
+          break
+        }
 
-        const input = buildInput(parseEvent.element, registered.binding)
+        const tagSchema = tagSchemas.get(parseEvent.tagName)
+        const canonicalElement = tagSchema
+          ? canonicalizeAttrChildTagSwaps(parseEvent.element, registered.binding, tagSchema)
+          : parseEvent.element
+        const input = buildInput(canonicalElement, registered.binding)
 
         // The dispatcher emits events via this callback — state stays in sync
         // automatically because every event goes through emitAndFold.
@@ -458,7 +594,7 @@ function reactImpl(
         }
 
         // Dispatch tool — events emitted via callback, state folded automatically
-        const result: DispatchResult = yield* dispatchTool(parseEvent.element, dispatchCtx)
+        const result: DispatchResult = yield* dispatchTool(canonicalElement, dispatchCtx)
 
         if (result._tag === 'ParseError') {
           currentState = yield* emitAndFold(currentState, {
@@ -479,6 +615,7 @@ function reactImpl(
             })
           }
         }
+        cleanupToolCallState(parseEvent.toolCallId)
         break
       }
 
@@ -653,6 +790,66 @@ function resolveBodyField(
   const tagName = state.toolCallMap.get(toolCallId)
   if (!tagName) return undefined
   return tools.get(tagName)?.binding.body
+}
+
+function canonicalizeAttrChildTagSwaps(
+  element: ParsedElement,
+  binding: RegisteredTool['binding'],
+  tagSchema: TagSchema,
+): ParsedElement {
+  let attributes = new Map(element.attributes)
+  let children = [...element.children]
+
+  if (binding.attributes) {
+    for (const attrBinding of binding.attributes) {
+      const hasCanonicalAttr = attributes.has(attrBinding.attr)
+      if (hasCanonicalAttr) continue
+      const matchingChildren = children.filter(
+        (child) => child.tagName === attrBinding.attr && child.attributes.size === 0,
+      )
+      if (matchingChildren.length !== 1) continue
+      const child = matchingChildren[0]
+      const trimmedBody = child.body.trim()
+      const attrType = tagSchema.attributes.get(attrBinding.attr)?.type
+      if (attrType) {
+        const coerced = coerceAttributeValue(trimmedBody, attrType)
+        attributes.set(attrBinding.attr, coerced.ok ? coerced.value : trimmedBody)
+      } else {
+        attributes.set(attrBinding.attr, trimmedBody)
+      }
+      let removedOne = false
+      children = children.filter((c) => {
+        if (!removedOne && c === child) {
+          removedOne = true
+          return false
+        }
+        return true
+      })
+    }
+  }
+
+  if (binding.childTags) {
+    for (const childBinding of binding.childTags) {
+      const hasCanonicalChild = children.some((child) => child.tagName === childBinding.tag)
+      if (hasCanonicalChild) continue
+      const attrValue = attributes.get(childBinding.tag)
+      if (attrValue === undefined) continue
+      children = [...children, {
+        tagName: childBinding.tag,
+        attributes: new Map(),
+        body: String(attrValue),
+      }]
+      attributes.delete(childBinding.tag)
+    }
+  }
+
+  return {
+    tagName: element.tagName,
+    toolCallId: element.toolCallId,
+    attributes,
+    body: element.body,
+    children,
+  }
 }
 
 interface ResolvedChildBinding {

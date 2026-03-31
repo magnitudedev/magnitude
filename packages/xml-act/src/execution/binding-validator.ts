@@ -213,9 +213,9 @@ export function validateBinding(
   }
   if (binding.childRecord) addInputField(binding.childRecord.field, 'childRecord')
 
-  // --- Validate no XML name collision between attributes and child tags ---
-  // Reserved for potential future attr↔childTag normalization by XML name.
-  // Keeping names disjoint prevents ambiguity if that behavior is reintroduced.
+  // --- Validate no XML name collision between explicitly-declared attributes and child tags ---
+  // Runtime supports attr↔child normalization, including synthetic attr-name child tags.
+  // Explicit childTags that reuse attribute XML names are still disallowed to avoid ambiguity.
   if (binding.attributes && binding.childTags) {
     const attrNames = new Set(binding.attributes.map(a => a.attr))
     for (const ct of binding.childTags) {
@@ -322,6 +322,16 @@ export function validateBinding(
   // Tool tags always accept an optional `id` attribute for stable toolCall identity.
   if (!attributes.has('id')) {
     attributes.set('id', { type: 'string', required: false })
+  }
+
+  // Attr-name child tags are accepted for normalization (child text -> attribute value).
+  for (const attrName of attributes.keys()) {
+    if (!children.has(attrName)) {
+      children.set(attrName, {
+        attributes: new Map(),
+        acceptsBody: true,
+      })
+    }
   }
 
   return { attributes, acceptsBody, bodyField: binding.body, children }

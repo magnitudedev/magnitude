@@ -100,6 +100,7 @@ const shellLikeTool = defineTool({
   inputSchema: Schema.Struct({
     command: Schema.String,
     timeout: Schema.optional(Schema.Number),
+    recursive: Schema.optional(Schema.Boolean),
   }),
   outputSchema: Schema.Struct({
     stdout: Schema.String,
@@ -112,7 +113,32 @@ const shellLikeTool = defineTool({
 const shellLikeBinding: XmlTagBinding = {
   tag: 'shell_like',
   body: 'command',
-  attributes: [{ field: 'timeout', attr: 'timeout' }],
+  attributes: [
+    { field: 'timeout', attr: 'timeout' },
+    { field: 'recursive', attr: 'recursive' },
+  ],
+}
+
+const grepLikeTool = defineTool({
+  name: 'grep_like',
+  description: 'attribute-only grep-like tool',
+  inputSchema: Schema.Struct({
+    pattern: Schema.String,
+    path: Schema.String,
+  }),
+  outputSchema: Schema.Struct({
+    ok: Schema.Boolean,
+  }),
+  execute: () => Effect.succeed({ ok: true }),
+  label: ({ pattern, path }) => `grep_like:${pattern}:${path}`,
+})
+
+const grepLikeBinding: XmlTagBinding = {
+  tag: 'grep_like',
+  attributes: [
+    { field: 'pattern', attr: 'pattern' },
+    { field: 'path', attr: 'path' },
+  ],
 }
 
 const strictTitleTool = defineTool({
@@ -157,8 +183,51 @@ describe('tool validation scenarios (attr↔childTag normalization)', () => {
     })
   })
 
-  // Tests 2 and 3 (attr↔childTag normalization) removed — normalization is deferred.
-  // See packages/xml-act/NORMALIZATION.md for future reintroduction plan.
+  test('2) swapped: child for attr target is normalized', async () => {
+    const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
+    const xml = responseWithActions(
+      `<agent_create_like><id>a1</id><type>explorer</type><title>Hello</title><message>Do work</message></agent_create_like>`,
+    )
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+
+    const fieldValues = eventsOfType(events, 'ToolInputFieldValue')
+    expect(fieldValues.some(e => e.field === 'id' && e.value === 'a1')).toBe(true)
+
+    const ready = eventsOfType(events, 'ToolInputReady')
+    expect(ready).toHaveLength(1)
+    expect(ready[0].input).toMatchObject({
+      id: 'a1',
+      type: 'explorer',
+      title: 'Hello',
+      message: 'Do work',
+    })
+  })
+
+  test('3) swapped: attr for childTag target is normalized', async () => {
+    const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
+    const xml = responseWithActions(
+      `<agent_create_like id="a1" type="explorer"><title>Hello</title><message>Do work</message></agent_create_like>`,
+    )
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+
+    const childCompletes = eventsOfType(events, 'ToolInputChildComplete')
+    expect(childCompletes.some(e => e.field === 'type')).toBe(true)
+
+    const ready = eventsOfType(events, 'ToolInputReady')
+    expect(ready).toHaveLength(1)
+    expect(ready[0].input).toMatchObject({
+      id: 'a1',
+      type: 'explorer',
+      title: 'Hello',
+      message: 'Do work',
+    })
+  })
 
   test('4) both canonical and swapped present → canonical wins', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
@@ -242,5 +311,57 @@ describe('tool validation scenarios (attr↔childTag normalization)', () => {
     expect(parseErrors.length).toBeGreaterThan(0)
     expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
     expect(eventsOfType(events, 'ToolExecutionEnded')).toHaveLength(0)
+  })
+
+  test('11) child->attr normalization coerces number fields', async () => {
+    const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
+    const xml = responseWithActions(`<shell_like><timeout>5</timeout>echo hi</shell_like>`)
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    const ready = eventsOfType(events, 'ToolInputReady')
+    expect(ready).toHaveLength(1)
+    expect((ready[0].input as { timeout?: unknown }).timeout).toBe(5)
+
+    const timeoutField = eventsOfType(events, 'ToolInputFieldValue').find(e => e.field === 'timeout')
+    expect(timeoutField?.value).toBe(5)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+  })
+
+  test('12) child->attr normalization emits InvalidAttributeValue on coercion failure', async () => {
+    const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
+    const xml = responseWithActions(`<shell_like><timeout>abc</timeout>echo hi</shell_like>`)
+    const events = await runStream(cfg, xml)
+
+    const parseErrors = eventsOfType(events, 'ToolInputParseError')
+    expect(parseErrors).toHaveLength(1)
+    expect(parseErrors[0].error._tag).toBe('InvalidAttributeValue')
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
+  })
+
+  test('13) child->attr normalization coerces boolean fields', async () => {
+    const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
+    const xml = responseWithActions(`<shell_like><recursive>true</recursive>echo hi</shell_like>`)
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    const ready = eventsOfType(events, 'ToolInputReady')
+    expect(ready).toHaveLength(1)
+    expect((ready[0].input as { recursive?: unknown }).recursive).toBe(true)
+
+    const recursiveField = eventsOfType(events, 'ToolInputFieldValue').find(e => e.field === 'recursive')
+    expect(recursiveField?.value).toBe(true)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+  })
+
+  test('14) attr-name child tags on attr-only tools are recognized for normalization', async () => {
+    const cfg = config([registered(grepLikeTool, 'grep_like', grepLikeBinding)])
+    const xml = responseWithActions(`<grep_like><pattern>foo</pattern><path>src</path></grep_like>`)
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    const ready = eventsOfType(events, 'ToolInputReady')
+    expect(ready).toHaveLength(1)
+    expect(ready[0].input).toMatchObject({ pattern: 'foo', path: 'src' })
   })
 })
