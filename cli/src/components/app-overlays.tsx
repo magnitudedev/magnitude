@@ -15,6 +15,8 @@ import { OAuthOverlay } from './oauth-overlay'
 import type { RecentChat } from '../data/recent-chats'
 import type { useAuthFlow } from '../hooks/use-auth-flow'
 
+import type { Preset } from '@magnitudedev/storage'
+
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
 export type AppOverlaysProps = {
@@ -65,7 +67,11 @@ export type AppOverlaysProps = {
   handleProviderDetailAction: (idx: number) => void
   handleProviderDetailBack: () => void
   onBackFromModelPicker: () => void
-  onResetToDefaults: (providerId: string) => void | Promise<void>
+  presets: Preset[]
+  systemDefaultsPresetToken: string
+  onSavePreset: (name: string) => void | Promise<void>
+  onLoadPreset: (name: string, preferredProviderId?: string) => void | Promise<void>
+  onDeletePreset: (name: string) => void | Promise<void>
   handleChangeSlot: (slot: MagnitudeSlot) => void
   modelTabHandleKeyEvent: (key: KeyEvent) => boolean
   providerTabHandleKeyEvent: (key: KeyEvent) => boolean
@@ -136,7 +142,11 @@ export function AppOverlays({
   handleProviderDetailAction,
   handleProviderDetailBack,
   onBackFromModelPicker,
-  onResetToDefaults,
+  presets,
+  systemDefaultsPresetToken,
+  onSavePreset,
+  onLoadPreset,
+  onDeletePreset,
   handleChangeSlot,
   modelTabHandleKeyEvent,
   providerTabHandleKeyEvent,
@@ -285,7 +295,11 @@ export function AppOverlays({
           onProviderHandleKeyEvent={providerTabHandleKeyEvent}
           onBackFromModelPicker={onBackFromModelPicker}
           onBackFromProviderDetail={handleProviderDetailBack}
-          onResetToDefaults={onResetToDefaults}
+          presets={presets}
+          systemDefaultsPresetToken={systemDefaultsPresetToken}
+          onSavePreset={onSavePreset}
+          onLoadPreset={onLoadPreset}
+          onDeletePreset={onDeletePreset}
         />
       </box>
     )

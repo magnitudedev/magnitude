@@ -91,6 +91,52 @@ const makeConfigStorageShape = <TSlot extends string>(
       undefined,
     ),
 
+  getPresets: () =>
+    Effect.map(
+      Effect.promise(() => loadConfig(globalStorage.paths)),
+      (config) =>
+        config.presets.map((preset) => ({
+          name: preset.name,
+          models: preset.models as Record<TSlot, ModelSelection | null>,
+        })),
+    ),
+
+  savePreset: (name: string, models: Record<TSlot, ModelSelection | null>) =>
+    Effect.promise(async () => {
+      const trimmedName = name.trim()
+      if (!trimmedName) return
+
+      await updateConfig(globalStorage.paths, (config) => {
+        const existingIndex = config.presets.findIndex((preset) => preset.name === trimmedName)
+        const nextPreset = {
+          name: trimmedName,
+          models,
+        }
+
+        if (existingIndex === -1) {
+          return {
+            ...config,
+            presets: [...config.presets, nextPreset],
+          }
+        }
+
+        const nextPresets = [...config.presets]
+        nextPresets[existingIndex] = nextPreset
+        return {
+          ...config,
+          presets: nextPresets,
+        }
+      })
+    }),
+
+  deletePreset: (name: string) =>
+    Effect.promise(async () => {
+      await updateConfig(globalStorage.paths, (config) => ({
+        ...config,
+        presets: config.presets.filter((preset) => preset.name !== name),
+      }))
+    }),
+
   getProviderOptions: (providerId: string) =>
     Effect.map(
       Effect.promise(() => loadConfig(globalStorage.paths)),

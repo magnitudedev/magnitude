@@ -54,6 +54,12 @@ export interface StorageClient<TSlot extends string = string> {
       slot: TSlot,
       selection: ModelSelection | null
     ): Promise<void>
+    getPresets(): Promise<Array<{ name: string; models: Record<TSlot, ModelSelection | null> }>>
+    savePreset(
+      name: string,
+      models: Record<TSlot, ModelSelection | null>
+    ): Promise<void>
+    deletePreset(name: string): Promise<void>
 
     getContextLimitPolicy(): Promise<ResolvedContextLimitPolicy>
     setContextLimitPolicy(
@@ -193,6 +199,24 @@ export async function createStorageClient<TSlot extends string = string>(options
 
       setModelSelection(slot, selection) {
         return run(Effect.flatMap(ConfigStorage, (s) => s.setModelSelection(slot, selection)))
+      },
+
+      async getPresets() {
+        return (await run(
+          Effect.flatMap(ConfigStorage, (s) => s.getPresets())
+        )) as Array<{ name: string; models: Record<TSlot, ModelSelection | null> }>
+      },
+
+      savePreset(name, models) {
+        return run(
+          Effect.flatMap(ConfigStorage, (s) =>
+            s.savePreset(name, models as Record<string, ModelSelection | null>)
+          )
+        )
+      },
+
+      deletePreset(name) {
+        return run(Effect.flatMap(ConfigStorage, (s) => s.deletePreset(name)))
       },
 
       getContextLimitPolicy() {

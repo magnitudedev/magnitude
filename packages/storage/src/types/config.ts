@@ -33,10 +33,20 @@ export interface ContextLimitPolicy extends Omit<Schema.Schema.Type<typeof Conte
   softCapMaxTokens: number | null
 }
 
+export const PresetSchema = Schema.Struct({
+  name: Schema.String,
+  models: Schema.Record({
+    key: Schema.String,
+    value: Schema.NullishOr(ModelSelectionSchema),
+  }),
+})
+export type Preset = Schema.Schema.Type<typeof PresetSchema>
+
 export const MagnitudeConfigSchema = Schema.Struct({
   roles: Schema.optional(
     Schema.Record({ key: Schema.String, value: RoleConfigSchema })
   ),
+  presets: Schema.optional(Schema.Array(PresetSchema)),
   // used for provider options and local provider options like base URLs, API key etc., not used for oauth atm
   providers: Schema.optional(
     Schema.Record({ key: Schema.String, value: ProviderOptionsSchema })
@@ -46,6 +56,7 @@ export const MagnitudeConfigSchema = Schema.Struct({
   telemetry: Schema.optional(Schema.Boolean),
   contextLimits: Schema.optional(ContextLimitPolicySchema),
 })
-export interface MagnitudeConfig extends Omit<Schema.Schema.Type<typeof MagnitudeConfigSchema>, 'roles'> {
+export interface MagnitudeConfig extends Omit<Schema.Schema.Type<typeof MagnitudeConfigSchema>, 'roles' | 'presets'> {
   roles: Record<string, RoleConfig>
+  presets: Preset[]
 }

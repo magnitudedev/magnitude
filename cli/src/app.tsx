@@ -68,6 +68,10 @@ import { useFilePanel } from './hooks/use-file-panel'
 import { useLazyClient } from './hooks/use-lazy-client'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
 
+import type { Preset } from '@magnitudedev/storage'
+
+const SYSTEM_DEFAULTS_PRESET = '__system_defaults__'
+
 export const getEffectiveSelectedForkId = (
   selectedTabForkId: string | null,
   subagentTabs: ReadonlyArray<{ forkId: string }>
@@ -174,6 +178,7 @@ function AppInner({
     lead: null, explorer: null, planner: null, builder: null,
     reviewer: null, debugger: null, browser: null,
   })
+  const [presets, setPresets] = useState<Preset[]>([])
 
   const [preferencesSelectedIndex, setPreferencesSelectedIndex] = useState(0)
   const [showAllProviders, setShowAllProviders] = useState(false)
@@ -281,13 +286,18 @@ function AppInner({
     if (!providerUiState) return
 
     setSlotModels(providerUiState.slotModels)
+    storage.config.getPresets().then((loaded: Preset[]) => {
+      setPresets(loaded)
+    }).catch((error: unknown) => {
+      logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Failed to load presets')
+    })
 
     initTelemetry({ telemetryEnabled: providerUiState.telemetryEnabled })
 
     if (!providerUiState.setupComplete) {
       setShowSetupWizard(true)
     }
-  }, [providerUiState])
+  }, [providerUiState, storage])
 
   useEffect(() => {
     providerRuntime.state.contextLimits('lead').then((limits) => {
@@ -894,32 +904,74 @@ function AppInner({
     setSelectingModelFor(null)
   }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderState, storage])
 
-  const handleResetToDefaults = useCallback(async (preferredProviderId: string) => {
-    if (!providerUiState) return
-    const connectedProviderIds = new Set(providerUiState.detectedProviders.map(d => d.provider.id))
-    const detectedAuthTypeByProviderId = new Map<string, string | null>()
-    for (const detected of providerUiState.detectedProviders) {
-      detectedAuthTypeByProviderId.set(detected.provider.id, detected.auth?.type ?? null)
-    }
-    const newSlotModels: Partial<Record<MagnitudeSlot, ModelSelection>> = {}
+  const applySlotModelMap = useCallback(async (models: Preset['models']) => {
     for (const slot of MAGNITUDE_SLOTS) {
-      const selection = resolveSlotDefaultSelection({
-        allProviders: PROVIDERS,
-        connectedProviderIds,
-        slot,
-        preferredProviderId,
-        detectedAuthTypeByProviderId,
-      })
+      const selection = models[slot]
       if (selection) {
-        newSlotModels[slot] = selection
         const auth = await providerRuntime.auth.getAuth(selection.providerId)
         await providerRuntime.state.setSelection(slot, selection.providerId, selection.modelId, auth ?? null)
         await storage.config.setModelSelection(slot, selection)
+      } else {
+        await providerRuntime.state.clear(slot)
+        await storage.config.setModelSelection(slot, null)
       }
     }
-    setSlotModels(prev => ({ ...prev, ...newSlotModels }))
+    const slotMap = Object.fromEntries(
+      MAGNITUDE_SLOTS.map((slot) => [slot, models[slot] ?? null])
+    ) as Record<MagnitudeSlot, ModelSelection | null>
+    setSlotModels(slotMap)
     await reloadProviderState()
-  }, [providerUiState, providerRuntime, storage, reloadProviderState])
+  }, [providerRuntime, storage, reloadProviderState])
+
+  const refreshPresets = useCallback(async () => {
+    const loaded: Preset[] = await storage.config.getPresets()
+    setPresets(loaded)
+  }, [storage])
+
+  const handleSavePreset = useCallback(async (name: string) => {
+    await storage.config.savePreset(name, slotModels)
+    await refreshPresets()
+  }, [storage, slotModels, refreshPresets])
+
+  const handleDeletePreset = useCallback(async (name: string) => {
+    await storage.config.deletePreset(name)
+    await refreshPresets()
+  }, [storage, refreshPresets])
+
+  const handleLoadPreset = useCallback(async (name: string, preferredProviderId?: string) => {
+    if (!providerUiState) return
+
+    if (name === SYSTEM_DEFAULTS_PRESET) {
+      if (!preferredProviderId) return
+      const connectedProviderIds = new Set(providerUiState.detectedProviders.map(d => d.provider.id))
+      const detectedAuthTypeByProviderId = new Map<string, string | null>()
+      for (const detected of providerUiState.detectedProviders) {
+        detectedAuthTypeByProviderId.set(detected.provider.id, detected.auth?.type ?? null)
+      }
+
+      const defaultModels: Record<MagnitudeSlot, ModelSelection | null> = {
+        lead: null, explorer: null, planner: null, builder: null,
+        reviewer: null, debugger: null, browser: null,
+      }
+
+      for (const slot of MAGNITUDE_SLOTS) {
+        defaultModels[slot] = resolveSlotDefaultSelection({
+          allProviders: PROVIDERS,
+          connectedProviderIds,
+          slot,
+          preferredProviderId,
+          detectedAuthTypeByProviderId,
+        })
+      }
+
+      await applySlotModelMap(defaultModels)
+      return
+    }
+
+    const preset = presets.find((p) => p.name === name)
+    if (!preset) return
+    await applySlotModelMap(preset.models)
+  }, [providerUiState, presets, applySlotModelMap])
 
   const detectedProviders = providerUiState?.detectedProviders ?? []
 
@@ -1620,7 +1672,11 @@ function AppInner({
       providerNavigation={providerNavigation}
       onSettingsClose={onSettingsClose}
       onBackFromModelPicker={handleBackFromModelPicker}
-      onResetToDefaults={handleResetToDefaults}
+      presets={presets}
+      systemDefaultsPresetToken={SYSTEM_DEFAULTS_PRESET}
+      onSavePreset={handleSavePreset}
+      onLoadPreset={handleLoadPreset}
+      onDeletePreset={handleDeletePreset}
       showRecentChatsOverlay={showRecentChatsOverlay}
       recentChats={recentChats}
       recentChatsSelectedIndex={recentChatsSelectedIndex}

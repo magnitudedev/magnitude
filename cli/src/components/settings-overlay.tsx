@@ -9,6 +9,7 @@ import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuth
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
 import { SLOT_UI_ORDER } from './setup-wizard-overlay'
+import type { Preset } from '@magnitudedev/storage'
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
@@ -72,7 +73,11 @@ interface SettingsOverlayProps {
   onProviderHandleKeyEvent: (key: KeyEvent) => boolean
   onBackFromModelPicker: () => void
   onBackFromProviderDetail: () => void
-  onResetToDefaults: (providerId: string) => void | Promise<void>
+  presets: Preset[]
+  systemDefaultsPresetToken: string
+  onSavePreset: (name: string) => void | Promise<void>
+  onLoadPreset: (name: string, preferredProviderId?: string) => void | Promise<void>
+  onDeletePreset: (name: string) => void | Promise<void>
 }
 
 function FilterCheckbox({ label, checked, onToggle }: { label: string; checked: boolean; onToggle: () => void }) {
@@ -139,14 +144,23 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onProviderHandleKeyEvent,
   onBackFromModelPicker,
   onBackFromProviderDetail,
-  onResetToDefaults,
+  presets,
+  systemDefaultsPresetToken,
+  onSavePreset,
+  onLoadPreset,
+  onDeletePreset,
 }: SettingsOverlayProps) {
   const theme = useTheme()
   const [hoveredTab, setHoveredTab] = useState<SettingsTab | null>(null)
   const [closeHover, setCloseHover] = useState(false)
-  const [showResetModal, setShowResetModal] = useState(false)
-  const [resetSelectedIndex, setResetSelectedIndex] = useState(0)
-  const [resetHover, setResetHover] = useState(false)
+  const [showLoadPresetModal, setShowLoadPresetModal] = useState(false)
+  const [loadPresetSelectedIndex, setLoadPresetSelectedIndex] = useState(0)
+  const [loadPresetHover, setLoadPresetHover] = useState(false)
+  const [pendingDeletePresetName, setPendingDeletePresetName] = useState<string | null>(null)
+  const [hoveredDeletePresetName, setHoveredDeletePresetName] = useState<string | null>(null)
+  const [showSavePresetModal, setShowSavePresetModal] = useState(false)
+  const [savePresetName, setSavePresetName] = useState('')
+  const [savePresetHover, setSavePresetHover] = useState(false)
 
   // Group model items by provider for section headers
   const modelSections = useMemo(() => {
@@ -175,6 +189,40 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     SLOT_UI_ORDER.map(({ slot }) => [slot, resolveModelDisplay(slotModels[slot], modelItems, allProviders)])
   ) as Record<MagnitudeSlot, ReturnType<typeof resolveModelDisplay>>
 
+  const loadPresetRows = useMemo(() => {
+    const rows: Array<
+      | { type: 'label'; label: string }
+      | { type: 'provider'; providerId: string; label: string }
+      | { type: 'preset'; name: string }
+    > = []
+
+    rows.push({ type: 'label', label: 'Provider Defaults' })
+    for (const dp of detectedProviders) {
+      rows.push({ type: 'provider', providerId: dp.provider.id, label: `${dp.provider.name} defaults` })
+    }
+
+    if (presets.length > 0) {
+      rows.push({ type: 'label', label: 'User Presets' })
+      for (const preset of presets) {
+        rows.push({ type: 'preset', name: preset.name })
+      }
+    }
+
+    return rows
+  }, [detectedProviders, presets])
+
+  const loadPresetSelectableIndices = useMemo(() => (
+    loadPresetRows.flatMap((row, idx) => (row.type === 'label' ? [] : [idx]))
+  ), [loadPresetRows])
+
+  const firstLoadPresetSelectableIndex = loadPresetSelectableIndices[0] ?? 0
+
+  const closeLoadPresetModal = useCallback(() => {
+    setShowLoadPresetModal(false)
+    setPendingDeletePresetName(null)
+    setHoveredDeletePresetName(null)
+  }, [])
+
   const TABS: { id: SettingsTab; label: string }[] = [
     { id: 'provider', label: 'Provider' },
     { id: 'model', label: 'Model' },
@@ -183,20 +231,62 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   useKeyboard(useCallback((key: KeyEvent) => {
     const plain = !key.ctrl && !key.meta && !key.option
 
-    if (showResetModal) {
-      key.preventDefault()
-      const connectedProviders = detectedProviders
+    if (showSavePresetModal) {
       if (key.name === 'escape') {
-        setShowResetModal(false)
-      } else if (key.name === 'up' && plain) {
-        setResetSelectedIndex(i => Math.max(0, i - 1))
-      } else if (key.name === 'down' && plain) {
-        setResetSelectedIndex(i => Math.min(connectedProviders.length - 1, i + 1))
+        key.preventDefault()
+        setShowSavePresetModal(false)
+        return
+      }
+      if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+        key.preventDefault()
+        const trimmed = savePresetName.trim()
+        if (trimmed.length > 0) {
+          onSavePreset(trimmed)
+          setShowSavePresetModal(false)
+          setSavePresetName('')
+        }
+        return
+      }
+      return
+    }
+
+    if (showLoadPresetModal) {
+      key.preventDefault()
+
+      if (pendingDeletePresetName && (key.name === 'y' || ((key.name === 'return' || key.name === 'enter') && plain && !key.shift))) {
+        onDeletePreset(pendingDeletePresetName)
+        setPendingDeletePresetName(null)
+        return
+      }
+
+      if (pendingDeletePresetName && (key.name === 'n' || key.name === 'escape')) {
+        setPendingDeletePresetName(null)
+        return
+      }
+
+      if (key.name === 'escape') {
+        closeLoadPresetModal()
+      } else if ((key.name === 'up' || key.name === 'down') && plain) {
+        const delta = key.name === 'up' ? -1 : 1
+        const currentPos = loadPresetSelectableIndices.findIndex(i => i === loadPresetSelectedIndex)
+        const nextPos = currentPos === -1
+          ? (delta > 0 ? 0 : Math.max(0, loadPresetSelectableIndices.length - 1))
+          : Math.max(0, Math.min(loadPresetSelectableIndices.length - 1, currentPos + delta))
+        const nextIndex = loadPresetSelectableIndices[nextPos]
+        if (typeof nextIndex === 'number') setLoadPresetSelectedIndex(nextIndex)
       } else if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
-        const provider = connectedProviders[resetSelectedIndex]
-        if (provider) {
-          onResetToDefaults(provider.provider.id)
-          setShowResetModal(false)
+        const row = loadPresetRows[loadPresetSelectedIndex]
+        if (row?.type === 'provider') {
+          onLoadPreset(systemDefaultsPresetToken, row.providerId)
+          closeLoadPresetModal()
+        } else if (row?.type === 'preset') {
+          onLoadPreset(row.name)
+          closeLoadPresetModal()
+        }
+      } else if (plain && (key.name === 'd' || key.name === 'delete' || key.name === 'backspace')) {
+        const row = loadPresetRows[loadPresetSelectedIndex]
+        if (row?.type === 'preset') {
+          setPendingDeletePresetName(row.name)
         }
       }
       return
@@ -240,10 +330,18 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     onBackFromProviderDetail,
     onModelHandleKeyEvent,
     onProviderHandleKeyEvent,
-    showResetModal,
-    resetSelectedIndex,
-    detectedProviders,
-    onResetToDefaults,
+    showLoadPresetModal,
+    loadPresetSelectedIndex,
+    loadPresetRows,
+    loadPresetSelectableIndices,
+    showSavePresetModal,
+    savePresetName,
+    systemDefaultsPresetToken,
+    onSavePreset,
+    onLoadPreset,
+    onDeletePreset,
+    pendingDeletePresetName,
+    closeLoadPresetModal,
   ]))
 
   return (
@@ -310,21 +408,44 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           <box style={{ flexGrow: 1 }} />
         )}
         {activeTab === 'model' && !selectingModelFor && (
-          <Button
-            onClick={() => { setResetSelectedIndex(0); setShowResetModal(true) }}
-            onMouseOver={() => setResetHover(true)}
-            onMouseOut={() => setResetHover(false)}
-          >
-            <box style={{
-              borderStyle: 'single',
-              borderColor: resetHover ? theme.foreground : theme.muted,
-              customBorderChars: BOX_CHARS,
-              paddingLeft: 1,
-              paddingRight: 1,
-            }}>
-              <text style={{ fg: resetHover ? theme.foreground : theme.muted }}>Reset to default</text>
-            </box>
-          </Button>
+          <>
+            <Button
+              onClick={() => {
+                setLoadPresetSelectedIndex(firstLoadPresetSelectableIndex)
+                setPendingDeletePresetName(null)
+                setHoveredDeletePresetName(null)
+                setShowLoadPresetModal(true)
+              }}
+              onMouseOver={() => setLoadPresetHover(true)}
+              onMouseOut={() => setLoadPresetHover(false)}
+            >
+              <box style={{
+                borderStyle: 'single',
+                borderColor: loadPresetHover ? theme.foreground : theme.muted,
+                customBorderChars: BOX_CHARS,
+                paddingLeft: 1,
+                paddingRight: 1,
+              }}>
+                <text style={{ fg: loadPresetHover ? theme.foreground : theme.muted }}>Load preset</text>
+              </box>
+            </Button>
+            <box style={{ width: 1 }} />
+            <Button
+              onClick={() => setShowSavePresetModal(true)}
+              onMouseOver={() => setSavePresetHover(true)}
+              onMouseOut={() => setSavePresetHover(false)}
+            >
+              <box style={{
+                borderStyle: 'single',
+                borderColor: savePresetHover ? theme.foreground : theme.muted,
+                customBorderChars: BOX_CHARS,
+                paddingLeft: 1,
+                paddingRight: 1,
+              }}>
+                <text style={{ fg: savePresetHover ? theme.foreground : theme.muted }}>Save current as preset</text>
+              </box>
+            </Button>
+          </>
         )}
       </box>
 
@@ -723,80 +844,132 @@ export const SettingsOverlay = memo(function SettingsOverlay({
         </>
       )}
 
-      {/* Reset to default modal */}
-      {showResetModal && (() => {
-        const connectedProviders = detectedProviders
-        return (
+      {showLoadPresetModal && (
+        <box style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20,
+          alignItems: 'center', justifyContent: 'center', backgroundColor: RGBA.fromInts(0, 0, 0, 153),
+        }}>
           <box style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            zIndex: 20,
-            alignItems: 'center',
-            justifyContent: 'center',
-            backgroundColor: RGBA.fromInts(0, 0, 0, 153),
+            borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: theme.border,
+            backgroundColor: theme.surface, customBorderChars: BOX_CHARS, minWidth: 52, maxWidth: 72,
           }}>
-            <box style={{
-              borderStyle: 'single',
-              border: ['left', 'right', 'top', 'bottom'],
-              borderColor: theme.border,
-              backgroundColor: theme.surface,
-              customBorderChars: BOX_CHARS,
-              minWidth: 52,
-              maxWidth: 72,
-              paddingLeft: 0,
-              paddingRight: 0,
-              paddingTop: 0,
-              paddingBottom: 0,
-            }}>
-              <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
-                <box style={{ paddingBottom: 1 }}>
-                  <text style={{ fg: theme.primary }}>
-                    <span attributes={TextAttributes.BOLD}>Reset models to default</span>
-                  </text>
-                </box>
-                <box style={{ paddingBottom: 1 }}>
-                  <text style={{ fg: theme.foreground }}>Select a provider to use as the default for all model slots:</text>
-                </box>
-                {connectedProviders.length === 0 ? (
-                  <text style={{ fg: theme.muted }}>No connected providers found.</text>
-                ) : (
-                  connectedProviders.map((dp, index) => {
-                    const isSelected = index === resetSelectedIndex
-                    return (
+            <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
+              <box style={{ paddingBottom: 1 }}>
+                <text style={{ fg: theme.primary }}><span attributes={TextAttributes.BOLD}>Load preset</span></text>
+              </box>
+              {loadPresetRows.map((row, rowIndex) => {
+                if (row.type === 'label') {
+                  return (
+                    <box key={`label:${row.label}`} style={{ paddingLeft: 1, paddingTop: rowIndex === 0 ? 0 : 1 }}>
+                      <text style={{ fg: theme.muted }}><span attributes={TextAttributes.BOLD}>{row.label}</span></text>
+                    </box>
+                  )
+                }
+
+                const isSelected = loadPresetSelectedIndex === rowIndex
+                if (row.type === 'provider') {
+                  return (
+                    <Button
+                      key={`provider:${row.providerId}`}
+                      onClick={() => { onLoadPreset(systemDefaultsPresetToken, row.providerId); closeLoadPresetModal() }}
+                      onMouseOver={() => setLoadPresetSelectedIndex(rowIndex)}
+                      style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: isSelected ? theme.background : undefined }}
+                    >
+                      <text style={{ fg: isSelected ? theme.primary : theme.foreground }}>
+                        {isSelected ? '> ' : '  '}{row.label}
+                      </text>
+                    </Button>
+                  )
+                }
+
+                const isPendingDelete = pendingDeletePresetName === row.name
+                const isDeleteHovered = hoveredDeletePresetName === row.name
+                return (
+                  <box key={`preset:${row.name}`} style={{ flexDirection: 'row' }}>
+                    <Button
+                      onClick={() => {
+                        if (isPendingDelete) return
+                        onLoadPreset(row.name)
+                        closeLoadPresetModal()
+                      }}
+                      onMouseOver={() => setLoadPresetSelectedIndex(rowIndex)}
+                      style={{ flexGrow: 1, paddingLeft: 1, paddingRight: 1, backgroundColor: isSelected ? theme.background : undefined }}
+                    >
+                      <text style={{ fg: isSelected ? theme.primary : theme.foreground }}>
+                        {isSelected ? '> ' : '  '}
+                        {isPendingDelete ? `Delete ${row.name}? [Y/n]` : row.name}
+                      </text>
+                    </Button>
+                    {!isPendingDelete && (
                       <Button
-                        key={dp.provider.id}
                         onClick={() => {
-                          onResetToDefaults(dp.provider.id)
-                          setShowResetModal(false)
+                          setLoadPresetSelectedIndex(rowIndex)
+                          setPendingDeletePresetName(row.name)
                         }}
-                        onMouseOver={() => setResetSelectedIndex(index)}
-                        style={{
-                          flexDirection: 'row',
-                          paddingLeft: 1,
-                          paddingRight: 1,
-                          backgroundColor: isSelected ? theme.background : undefined,
+                        onMouseOver={() => {
+                          setLoadPresetSelectedIndex(rowIndex)
+                          setHoveredDeletePresetName(row.name)
                         }}
+                        onMouseOut={() => setHoveredDeletePresetName(current => current === row.name ? null : current)}
+                        style={{ paddingRight: 1, backgroundColor: isDeleteHovered ? theme.background : undefined }}
                       >
-                        <text style={{ fg: isSelected ? theme.primary : theme.foreground }}>
-                          {isSelected ? '> ' : '  '}{dp.provider.name}
+                        <text
+                          style={{ fg: isDeleteHovered ? theme.error : theme.muted }}
+                          attributes={isDeleteHovered ? TextAttributes.BOLD : 0}
+                        >
+                          [Delete]
                         </text>
                       </Button>
-                    )
-                  })
-                )}
-                <box style={{ paddingTop: 1 }}>
-                  <text style={{ fg: theme.muted }}>
-                    <span attributes={TextAttributes.DIM}>{'↑/↓ navigate  |  Enter select  |  Esc cancel'}</span>
-                  </text>
-                </box>
+                    )}
+                  </box>
+                )
+              })}
+              <box style={{ paddingTop: 1 }}>
+                <text style={{ fg: theme.muted }}>
+                  <span attributes={TextAttributes.DIM}>
+                    {pendingDeletePresetName
+                      ? 'Y/Enter confirm delete  |  N/Esc cancel'
+                      : '↑/↓ navigate  |  Enter load  |  D delete  |  Esc cancel'}
+                  </span>
+                </text>
               </box>
             </box>
           </box>
-        )
-      })()}
+        </box>
+      )}
+
+      {showSavePresetModal && (
+        <box style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20,
+          alignItems: 'center', justifyContent: 'center', backgroundColor: RGBA.fromInts(0, 0, 0, 153),
+        }}>
+          <box style={{
+            borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: theme.border,
+            backgroundColor: theme.surface, customBorderChars: BOX_CHARS, minWidth: 52, maxWidth: 72,
+          }}>
+            <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
+              <box style={{ paddingBottom: 1 }}>
+                <text style={{ fg: theme.primary }}><span attributes={TextAttributes.BOLD}>Save current as preset</span></text>
+              </box>
+              <box style={{ borderStyle: 'single', borderColor: theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1 }}>
+                <SingleLineInput value={savePresetName} onChange={setSavePresetName} placeholder="Preset name" />
+              </box>
+              <box style={{ paddingTop: 1 }}>
+                <Button onClick={() => {
+                  const trimmed = savePresetName.trim()
+                  if (!trimmed) return
+                  onSavePreset(trimmed)
+                  setShowSavePresetModal(false)
+                  setSavePresetName('')
+                }}>
+                  <text style={{ fg: theme.primary }}>[Save]</text>
+                </Button>
+                <text style={{ fg: theme.muted }}><span attributes={TextAttributes.DIM}>{'  Enter save  |  Esc cancel'}</span></text>
+              </box>
+            </box>
+          </box>
+        </box>
+      )}
     </box>
   )
 })

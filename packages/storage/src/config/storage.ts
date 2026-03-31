@@ -11,6 +11,7 @@ import {
 
 export const DEFAULT_CONFIG: MagnitudeConfig = {
   roles: {},
+  presets: [],
 }
 
 function getDefaultPaths(): GlobalStoragePaths {
@@ -24,10 +25,7 @@ export async function loadConfig(
     fallback: DEFAULT_CONFIG,
   })) as MagnitudeConfig
 
-  return {
-    ...config,
-    roles: config.roles ?? {},
-  }
+  return config
 }
 
 export async function saveConfig(
