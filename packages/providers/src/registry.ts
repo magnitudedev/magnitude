@@ -96,11 +96,12 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'vercel',
     name: 'Vercel AI Gateway',
     bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'https://ai-gateway.vercel.sh/v1',
     models: [
       staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
     ],
     authMethods: [
-      { type: 'api-key', label: 'API key', envKeys: ['VERCEL_API_KEY'] },
+      { type: 'api-key', label: 'API key', envKeys: ['AI_GATEWAY_API_KEY'] },
     ],
   },
   {
