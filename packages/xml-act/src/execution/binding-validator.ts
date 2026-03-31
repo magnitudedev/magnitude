@@ -187,6 +187,30 @@ export function validateBinding(
   const attributes = new Map<string, AttributeSchema>()
   const children = new Map<string, ChildTagSchema>()
 
+  // --- Validate duplicate input field mappings across sections ---
+  const seenInputFields = new Map<string, string>()
+  const addInputField = (field: string, section: string) => {
+    const existing = seenInputFields.get(field)
+    if (existing) {
+      throw new Error(
+        `Binding error on <${tagName}>: field '${field}' is mapped multiple times across input sections (${existing} and ${section})`
+      )
+    }
+    seenInputFields.set(field, section)
+  }
+
+  if (binding.attributes) {
+    for (const attrSpec of binding.attributes) addInputField(attrSpec.field, 'attributes')
+  }
+  if (binding.body) addInputField(binding.body, 'body')
+  if (binding.childTags) {
+    for (const ct of binding.childTags) addInputField(ct.field, 'childTags')
+  }
+  if (binding.children) {
+    for (const child of binding.children) addInputField(child.field, 'children')
+  }
+  if (binding.childRecord) addInputField(binding.childRecord.field, 'childRecord')
+
   // --- Validate attribute fields ---
   if (binding.attributes) {
     for (const attrSpec of binding.attributes) {

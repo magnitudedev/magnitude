@@ -15,7 +15,7 @@ import type { XmlActEvent } from '../format/types'
 
 const parentTags = new Set(['write', 'agent-create'])
 const parentChildMap = new Map([
-  ['agent-create', new Set(['type', 'title', 'message'])],
+  ['agent-create', new Set(['title', 'message'])],
 ])
 
 const subagentTags = new Set(['shell', 'read', 'write', 'edit'])
@@ -44,12 +44,10 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
       '</comms>',
       '<actions>',
       '<agent-create agentId="builder-1" type="builder" observe=".">',
-      '<type>builder</type>',
       '<title>Unit 1</title>',
       '<message>Do thing 1</message>',
       '</agent-create>',
       '<agent-create agentId="builder-2" type="builder" observe=".">',
-      '<type>builder</type>',
       '<title>Unit 2</title>',
       '<message>Do thing 2</message>',
       '</agent-create>',
@@ -63,7 +61,6 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
 
     const part2 = [
       '<agent-create agentId="builder-3" type="builder" observe=".">',
-      '<type>builder</type>',
       '<title>Unit 3</title>',
       '<message>Do thing 3</message>',
       '</agent-create>',
@@ -84,7 +81,7 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
     const p2 = createStreamingXmlParser(subagentTags, subagentChildMap, undefined, undefined, 'user')
     const p3 = createStreamingXmlParser(parentTags, parentChildMap, undefined, undefined, 'user')
 
-    const xml = '<actions>\n<agent-create agentId="x" type="builder" observe=".">\n<type>builder</type>\n<title>T</title>\n<message>M</message>\n</agent-create>\n</actions>\n<yield/>'
+    const xml = '<actions>\n<agent-create agentId="x" type="builder" observe=".">\n<title>T</title>\n<message>M</message>\n</agent-create>\n</actions>\n<yield/>'
 
     const e1 = [...p1.processChunk(xml), ...p1.flush()]
     const e3 = [...p3.processChunk(xml), ...p3.flush()]
