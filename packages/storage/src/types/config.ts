@@ -43,10 +43,12 @@ export const PresetSchema = Schema.Struct({
 export type Preset = Schema.Schema.Type<typeof PresetSchema>
 
 export const MagnitudeConfigSchema = Schema.Struct({
-  roles: Schema.optional(
-    Schema.Record({ key: Schema.String, value: RoleConfigSchema })
+  // All fields here should be optional or optionalWith so they can have a generated default
+  roles: Schema.optionalWith(
+    Schema.Record({ key: Schema.String, value: RoleConfigSchema }),
+    { default: () => ({}) }
   ),
-  presets: Schema.optional(Schema.Array(PresetSchema)),
+  presets: Schema.optionalWith(Schema.Array(PresetSchema), { default: () => [] }),
   // used for provider options and local provider options like base URLs, API key etc., not used for oauth atm
   providers: Schema.optional(
     Schema.Record({ key: Schema.String, value: ProviderOptionsSchema })
@@ -56,7 +58,4 @@ export const MagnitudeConfigSchema = Schema.Struct({
   telemetry: Schema.optional(Schema.Boolean),
   contextLimits: Schema.optional(ContextLimitPolicySchema),
 })
-export interface MagnitudeConfig extends Omit<Schema.Schema.Type<typeof MagnitudeConfigSchema>, 'roles' | 'presets'> {
-  roles: Record<string, RoleConfig>
-  presets: Preset[]
-}
+export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

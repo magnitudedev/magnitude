@@ -4,15 +4,11 @@ import {
   makeGlobalStoragePaths,
   type GlobalStoragePaths,
 } from '../paths'
+import { Schema } from 'effect'
 import {
   MagnitudeConfigSchema,
   type MagnitudeConfig,
 } from '../types'
-
-export const DEFAULT_CONFIG: MagnitudeConfig = {
-  roles: {},
-  presets: [],
-}
 
 function getDefaultPaths(): GlobalStoragePaths {
   return makeGlobalStoragePaths(defaultGlobalStorageRoot())
@@ -21,11 +17,9 @@ function getDefaultPaths(): GlobalStoragePaths {
 export async function loadConfig(
   paths: GlobalStoragePaths = getDefaultPaths()
 ): Promise<MagnitudeConfig> {
-  const config = (await readJsonFileWithSchema(paths.configFile, MagnitudeConfigSchema, {
-    fallback: DEFAULT_CONFIG,
-  })) as MagnitudeConfig
-
-  return config
+  return readJsonFileWithSchema(paths.configFile, MagnitudeConfigSchema, {
+    fallback: Schema.decodeUnknownSync(MagnitudeConfigSchema)({}),
+  })
 }
 
 export async function saveConfig(
