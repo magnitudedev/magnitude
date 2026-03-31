@@ -138,4 +138,32 @@ describe('tokenizer', () => {
       },
     ])
   })
+
+  it('multiline open tag tokenizes structurally', () => {
+    expect(collect('<foo\nbar="baz"\nx="y"\n>')).toEqual([
+      {
+        type: 'open',
+        tagName: 'foo',
+        attrs: new Map([
+          ['bar', 'baz'],
+          ['x', 'y'],
+        ]),
+        afterNewline: true,
+      },
+    ])
+  })
+
+  it('newline terminates unquoted attr value', () => {
+    expect(collect('<foo bar=baz\nx=y>')).toEqual([
+      {
+        type: 'open',
+        tagName: 'foo',
+        attrs: new Map([
+          ['bar', 'baz'],
+          ['x', 'y'],
+        ]),
+        afterNewline: true,
+      },
+    ])
+  })
 })

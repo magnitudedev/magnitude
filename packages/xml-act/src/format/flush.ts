@@ -4,6 +4,9 @@ import type { XmlActFrame } from './types'
 
 export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
   const ops: Fx[] = []
+  let suppressToolBodyForId: string | null = null
+  let suppressNextContainer = false
+
   for (let i = stack.length - 1; i >= 0; i--) {
     const frame = stack[i]
     switch (frame.type) {
@@ -15,6 +18,11 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         break
       }
       case 'container':
+        if (suppressNextContainer) {
+          suppressNextContainer = false
+          ops.push(pop)
+          break
+        }
         ops.push(emit({ _tag: 'ParseError', error: { _tag: 'UnclosedContainer', tag: frame.tag } }))
         ops.push(pop)
         break
@@ -29,23 +37,31 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         ops.push(emit({ _tag: 'MessageEnd', id: frame.id }))
         ops.push(pop)
         break
-      case 'tool-body':
-        ops.push(
-          emit({
-            _tag: 'ParseError',
-            error: {
-              _tag: 'IncompleteTag',
-              id: frame.id,
-              tagName: frame.tag,
-              detail: `Unclosed <${frame.tag}>`,
-            },
-          }),
-        )
+      case 'tool-body': {
+        const suppressThisToolBody = suppressToolBodyForId === frame.id
+        if (suppressThisToolBody) {
+          suppressToolBodyForId = null
+          suppressNextContainer = true
+        } else {
+          ops.push(
+            emit({
+              _tag: 'ParseError',
+              error: {
+                _tag: 'IncompleteTag',
+                id: frame.id,
+                tagName: frame.tag,
+                detail: `Unclosed <${frame.tag}>`,
+              },
+            }),
+          )
+        }
+
         if (frame.body) {
           ops.push(emit({ _tag: 'ProseChunk', patternId: 'prose', text: frame.body }))
         }
         ops.push(pop)
         break
+      }
       case 'child-body':
         ops.push(
           emit({
@@ -59,6 +75,7 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
             },
           }),
         )
+        suppressToolBodyForId = frame.parentToolId
         ops.push(pop)
         break
       case 'body-capture':

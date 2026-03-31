@@ -161,6 +161,21 @@ export function toolHandler(
 export function childHandler(): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
+      const top = ctx.stack[ctx.stack.length - 1]
+      if (top?.type === 'child-body') {
+        const raw = rawOpenTag(ctx.tagName, ctx.attrs)
+        return [
+          replace({ ...top, body: top.body + raw }),
+          emit({
+            _tag: 'ChildBodyChunk',
+            parentToolCallId: top.parentToolId,
+            childTagName: top.childTagName,
+            childIndex: top.childIndex,
+            text: raw,
+          }),
+        ]
+      }
+
       const parent = findFrame(ctx.stack, 'tool-body')
       if (!parent) return []
       const childIndex = parent.childCounts.get(ctx.tagName) ?? 0

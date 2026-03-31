@@ -256,14 +256,6 @@ export function createTokenizer(onSignal: (signal: Token) => void): Tokenizer {
   function processTagChar(ch: string): void {
     const tag = activeTag!
 
-    if (ch === '\n' || ch === '\r') {
-      failTagAsContent()
-      contentBuffer += ch
-      afterNewline = true
-      fence.lineStart = true
-      return
-    }
-
     if (ch === '<' && tag.phase !== 'attrValueQuoted') {
       failTagAsContent()
       startTag()
