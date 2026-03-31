@@ -59,10 +59,18 @@ export function getLowestEffortOptions(
     return null
   }
 
+  // --- Z.AI (disable thinking entirely — we provide our own reasoning) ---
+  if (providerId === 'zai' || providerId === 'zai-coding-plan') {
+    return {
+      optionsMerge: { thinking: { type: 'disabled' } },
+      label: 'Z.AI thinking=disabled',
+    }
+  }
+
   // --- Anthropic Claude (direct API, Vertex Anthropic) ---
   // Opus 4.6, Sonnet 4.6, Opus 4.5 support effort (Sonnet 4.5 does NOT)
   if (
-    (bamlProvider === 'anthropic' && !providerId.startsWith('minimax') && !providerId.startsWith('zai')) &&
+    (bamlProvider === 'anthropic' && !providerId.startsWith('minimax')) &&
     isClaudeWithEffort(id)
   ) {
     return {

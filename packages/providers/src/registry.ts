@@ -153,10 +153,24 @@ export const PROVIDERS: ProviderDefinition[] = [
   },
   {
     id: 'zai',
-    name: 'Z.AI (Zhipu AI)',
-    bamlProvider: 'anthropic',
-    defaultBaseUrl: 'https://api.z.ai/api/anthropic',
+    name: 'Z.AI',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'https://api.z.ai/api/paas/v4',
     models: [
+      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
+    ],
+    authMethods: [
+      { type: 'api-key', label: 'API key', envKeys: ['ZHIPU_API_KEY'] },
+    ],
+  },
+  {
+    id: 'zai-coding-plan',
+    name: 'Z.AI Coding Plan',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'https://api.z.ai/api/coding/paas/v4',
+    models: [
+      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
       staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
       staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
     ],
