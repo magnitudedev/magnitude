@@ -166,19 +166,25 @@ function createBoundModelImpl<TSlot extends string>(
           ).pipe(
             Stream.tap((chunk) => Effect.sync(() => { accumulatedOutput += chunk })),
             Stream.ensuring(
-              Effect.all([
-                Effect.sync(() => abortController.abort()),
-                Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
-                Effect.suspend(() => {
-                  const usage = result.getUsage()
-                  if (usage) {
-                    usageCache = usage
-                    return providerState.accumulateUsage(slot, usage)
-                  }
-                  return Effect.void
-                }),
-                Effect.sync(() => maybeTrace()),
-              ])
+              Effect.catchAllCause(
+                Effect.all([
+                  Effect.sync(() => abortController.abort()),
+                  Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
+                  Effect.suspend(() => {
+                    const usage = result.getUsage()
+                    if (usage) {
+                      usageCache = usage
+                      return providerState.accumulateUsage(slot, usage)
+                    }
+                    return Effect.void
+                  }),
+                  Effect.sync(() => maybeTrace()),
+                ]).pipe(Effect.asVoid),
+                (cause) =>
+                  Effect.sync(() => {
+                    logger.error({ context: 'Provider' }, `Stream cleanup failed: ${Cause.pretty(cause)}`)
+                  }),
+              ).pipe(Effect.asVoid),
             ),
           )
 

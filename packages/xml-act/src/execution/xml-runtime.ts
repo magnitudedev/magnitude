@@ -37,6 +37,20 @@ import { coerceAttributeValue } from '../format/coerce'
 const END = Symbol('END')
 type QueueItem = XmlRuntimeEvent | typeof END
 
+function describeDefect(defect: unknown): string {
+  if (defect instanceof Error) return defect.message
+  if (typeof defect === 'string') return defect
+  if (typeof defect === 'object' && defect !== null) {
+    const parts: string[] = []
+    if ('_tag' in defect) parts.push(`[${(defect as any)._tag}]`)
+    if ('name' in defect) parts.push(`${(defect as any).name}`)
+    if ('message' in defect) parts.push(`${(defect as any).message}`)
+    if (parts.length > 0) return parts.join(' ')
+    try { return JSON.stringify(defect) } catch {}
+  }
+  return String(defect)
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -204,7 +218,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             Effect.catchAllCause((cause) =>
               Effect.gen(function* () {
                 const defect = Cause.squash(cause)
-                const message = defect instanceof Error ? defect.message : String(defect)
+                const message = describeDefect(defect)
                 yield* Queue.offer(queue, {
                   _tag: 'TurnEnd',
                   result: { _tag: 'Failure', error: `Tool defect (bug — use Effect.tryPromise, not Effect.promise): ${message}` },

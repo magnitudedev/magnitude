@@ -6,6 +6,7 @@ import type { ModelError } from '../errors/model-error'
 
 import { normalizeModelOutput, normalizeQuotesInString } from '../util/output-normalization'
 import { toIncrementalStream } from '../util/incremental-stream'
+import { fromAsyncIterableSafe } from '../util/from-async-iterable-safe'
 import { buildUsage } from '../usage'
 import { buildClientRegistry } from '../client-registry-builder'
 import type { CallUsage } from '../state/provider-state'
@@ -156,7 +157,7 @@ export const BamlDriver: ExecutableDriver = {
         const authType = req.connection._tag === 'Baml' ? (req.connection.auth?.type ?? null) : null
         const asyncIter = toNormalizedAsyncStream(toIncrementalStream(bamlStreamResult))
         return {
-          stream: Stream.fromAsyncIterable(asyncIter, (e) => {
+          stream: fromAsyncIterableSafe(asyncIter, (e) => {
             if (e instanceof BamlClientHttpError) {
               const text = [e.message, e.detailed_message, e.raw_response]
                 .filter(Boolean)
