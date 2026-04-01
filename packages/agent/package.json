@@ -10,8 +10,7 @@
     "test:vitest": "bunx vitest run",
     "test:vitest:watch": "bunx vitest",
     "typecheck": "tsc --noEmit",
-    "measure-system-prompt": "bun run scripts/measure-system-prompt.ts",
-    "memory-extract": "bun run src/memory/run-extraction-job.ts"
+    "measure-system-prompt": "bun run scripts/measure-system-prompt.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
