@@ -506,7 +506,7 @@ export function ChatController(props: ChatControllerProps) {
                     onKeyIntercept={handleKeyIntercept}
                     focused={env.composerCanFocus && !env.pendingApproval}
                     highlightColor={env.bashMode ? orange[400] : undefined}
-                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the team lead...'}
+                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
                     maxHeight={10}
                     minHeight={1}
                     bulkInsertEpoch={bulkInsertEpoch}

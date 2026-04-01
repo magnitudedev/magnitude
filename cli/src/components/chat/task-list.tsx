@@ -67,7 +67,7 @@ function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, tas
   const timerStr = formatElapsedMs(elapsedMs)
 
   const taskNameStr = truncate(task.name, taskNameWidth)
-  const timerSuffix = ` · ${timerStr}`
+  const timerSuffix = task.resumeCount > 0 ? ` · ↺ ${timerStr}` : ` · ${timerStr}`
   const agentIdMaxChars = Math.max(1, agentIdWidth - timerSuffix.length)
   const subagentLabel =
     formatSubagentIdWithEmoji(task.agentId, task.role) + (task.resumeCount > 0 ? ' (resumed)' : '')
