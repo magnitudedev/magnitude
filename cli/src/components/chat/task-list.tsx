@@ -6,6 +6,7 @@ import { useTerminalWidth } from '../../hooks/use-terminal-width'
 import { Button } from '../button'
 import { formatElapsedMs } from '../../utils/format-elapsed'
 import { formatSubagentIdWithEmoji } from '../../utils/subagent-role-emoji'
+import { BOX_CHARS } from '../../utils/ui-constants'
 import type { TaskItem } from './types'
 
 const COLLAPSED_ROWS = 6
@@ -36,8 +37,6 @@ const PULSE_BLUE_SHADES = [
 type Props = {
   tasks: readonly TaskItem[]
   pushForkOverlay: (forkId: string) => void
-  modeColor: string
-  inputBg: string
 }
 
 type TaskRowProps = {
@@ -108,7 +107,7 @@ function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, tas
   )
 }
 
-export function TaskList({ tasks, pushForkOverlay, modeColor, inputBg }: Props) {
+export function TaskList({ tasks, pushForkOverlay }: Props) {
   const theme = useTheme()
   const [expanded, setExpanded] = useState(false)
   const [expandHovered, setExpandHovered] = useState(false)
@@ -149,20 +148,37 @@ export function TaskList({ tasks, pushForkOverlay, modeColor, inputBg }: Props) 
   if (tasks.length === 0) return null
 
   const visibleTasks = expanded ? tasks : tasks.slice(-COLLAPSED_ROWS)
+  const completedCount = tasks.filter(task => task.phase === 'idle').length
+  const activeCount = tasks.filter(task => task.phase === 'active').length
 
   return (
-    <box style={{ flexDirection: 'column', flexShrink: 0 }}>
+    <box
+      style={{
+        flexDirection: 'column',
+        flexShrink: 0,
+        borderStyle: 'single',
+        border: ['left', 'right', 'top', 'bottom'],
+        borderColor: slate[500],
+        customBorderChars: BOX_CHARS,
+        backgroundColor: 'transparent',
+        paddingLeft: 1,
+        paddingRight: 1,
+      }}
+    >
       {/* Header row */}
       <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
         {/* Spacer for checkbox column */}
         <box style={{ width: checkboxWidth, minWidth: checkboxWidth, maxWidth: checkboxWidth, flexShrink: 0 }} />
         {/* Task column header */}
-        <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0 }}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>Task</text>
+        <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Task</text>
+          <text style={{ fg: theme.muted }}>
+            {` (${completedCount} completed, ${activeCount} active)`}
+          </text>
         </box>
         {/* Assigned to column header — label left, expand/collapse button right */}
         <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>Assigned To</text>
+          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
           <Button
             onClick={() => setExpanded(prev => !prev)}
             onMouseOver={() => setExpandHovered(true)}
