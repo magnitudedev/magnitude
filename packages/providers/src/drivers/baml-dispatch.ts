@@ -1,4 +1,4 @@
-import { b, Collector } from '@magnitudedev/llm-core'
+import { b, Collector, type ClientRegistry } from '@magnitudedev/llm-core'
 
 // Derive types from the actual BAML client
 type BamlClient = typeof b
@@ -18,7 +18,17 @@ export interface CollectorStreamCall extends CollectorCall {
 
 // Runtime-validated dispatch helpers
 // The `as keyof` casts are guarded by the `in` check
-export function bamlStream(name: string, args: readonly unknown[], opts: object): AsyncIterable<string> {
+export interface BamlStreamOpts {
+  readonly clientRegistry?: ClientRegistry
+  readonly collector?: Collector
+  readonly signal?: AbortSignal
+}
+
+export function bamlStream(
+  name: string,
+  args: readonly unknown[],
+  opts: BamlStreamOpts,
+): AsyncIterable<string> {
   if (!(name in b.stream)) throw new Error(`Unknown BAML stream function: ${name}`)
   const fn = b.stream[name as keyof StreamClient] as (...args: unknown[]) => AsyncIterable<string>
   return fn.call(b.stream, ...args, opts)

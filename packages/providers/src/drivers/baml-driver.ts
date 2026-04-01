@@ -151,7 +151,7 @@ export const BamlDriver: ExecutableDriver = {
         }
         const clientRegistry = buildRegistry(req)
         const collector = new Collector('model-stream')
-        const opts = { clientRegistry, collector }
+        const opts = { clientRegistry, collector, signal: req.signal }
         const bamlStreamResult = bamlStream(req.functionName, req.args, opts)
         const authType = req.connection._tag === 'Baml' ? (req.connection.auth?.type ?? null) : null
         const asyncIter = toNormalizedAsyncStream(toIncrementalStream(bamlStreamResult))

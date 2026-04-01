@@ -81,6 +81,8 @@ function createBoundModelImpl<TSlot extends string>(
       return fn.execute(boundModel, input)
     },
     stream<K extends BamlStreamFunctionName>(functionName: K, args: readonly unknown[], options?: StreamOptions) {
+      const abortController = new AbortController()
+
       const requestInference: InferenceConfig = {
         ...inference,
         ...(options?.stopSequences ? { stopSequences: options.stopSequences } : {}),
@@ -97,6 +99,7 @@ function createBoundModelImpl<TSlot extends string>(
         model,
         inference: requestInference,
         providerOptions,
+        signal: abortController.signal,
       }
 
       let attempt = 0
@@ -164,6 +167,7 @@ function createBoundModelImpl<TSlot extends string>(
             Stream.tap((chunk) => Effect.sync(() => { accumulatedOutput += chunk })),
             Stream.ensuring(
               Effect.all([
+                Effect.sync(() => abortController.abort()),
                 Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
                 Effect.suspend(() => {
                   const usage = result.getUsage()
@@ -188,7 +192,9 @@ function createBoundModelImpl<TSlot extends string>(
             },
             getCollectorData: result.getCollectorData,
           } satisfies ChatStream
-        }),
+        }).pipe(
+          Effect.onInterrupt(() => Effect.sync(() => abortController.abort())),
+        ),
         {
           schedule: connectionRetrySchedule,
           while: (error) => isRetryableError(error as ModelError),
