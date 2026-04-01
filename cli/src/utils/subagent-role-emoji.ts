@@ -1,5 +1,5 @@
 const ROLE_EMOJI: Record<string, string> = {
-  explorer: '※',
+  explorer: '❖',
   planner: '⚙',
   builder: '⚒',
   reviewer: '✔',

@@ -219,6 +219,6 @@ export function useSubagentTabs({
           pendingDirect: forkPendingDirectUser[forkId],
         })
       ))
-      .sort(sortSubagentTabs)
+      .sort((a, b) => a.activeSince - b.activeSince)
   }, [forkMeta, forkMessages, forkPendingDirectUser])
 }

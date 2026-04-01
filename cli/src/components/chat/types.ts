@@ -65,7 +65,7 @@ export type ChatControllerProps = {
   displayMessages: DisplayState['messages']
   subagentTabs: SubagentTabItem[]
   selectedForkId: string | null
-  onSubagentTabSelect: (forkId: string | null) => void
+  pushForkOverlay: (forkId: string) => void
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
   onApprove: () => void

@@ -72,14 +72,6 @@ import type { Preset } from '@magnitudedev/storage'
 
 const SYSTEM_DEFAULTS_PRESET = '__system_defaults__'
 
-export const getEffectiveSelectedForkId = (
-  selectedTabForkId: string | null,
-  subagentTabs: ReadonlyArray<{ forkId: string }>
-): string | null => {
-  if (!selectedTabForkId) return null
-  return subagentTabs.some((tab) => tab.forkId === selectedTabForkId) ? selectedTabForkId : null
-}
-
 export const getSelectedForkContentVersion = (
   selectedForkId: string | null,
   forkDisplay: Pick<DisplayState, 'messages' | 'pendingInboundCommunications'> | null
@@ -159,10 +151,8 @@ function AppInner({
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
-  const [selectedTabForkId, setSelectedTabForkId] = useState<string | null>(null)
   const popForkOverlay = () => {
     setExpandedForkStack(s => s.slice(0, -1))
-    setSelectedTabForkId(null)
   }
 
   const [forkDisplay, setForkDisplay] = useState<DisplayState | null>(null)
@@ -632,10 +622,7 @@ function AppInner({
     agentStatusState,
   })
 
-  const selectedForkId = useMemo(
-    () => getEffectiveSelectedForkId(selectedTabForkId, subagentTabs),
-    [selectedTabForkId, subagentTabs]
-  )
+  const selectedForkId: string | null = null
 
   // Subscribe to selected fork's display
   useEffect(() => {
@@ -674,12 +661,7 @@ function AppInner({
     return unsubscribe
   }, [client, debugMode, debugPanelVisible])
 
-  // Auto-deselect fork tab when fork is gone
-  useEffect(() => {
-    if (selectedTabForkId !== null && selectedForkId === null) {
-      setSelectedTabForkId(null)
-    }
-  }, [selectedTabForkId, selectedForkId])
+
 
 
 
@@ -1965,7 +1947,7 @@ function AppInner({
             displayMessages={(activeDisplay ?? display).messages}
             subagentTabs={subagentTabs}
             selectedForkId={selectedForkId}
-            onSubagentTabSelect={setSelectedTabForkId}
+            pushForkOverlay={pushForkOverlay}
             selectedFileOpen={isFilePanelOpen}
             onCloseFilePanel={closeFilePanel}
             onApprove={handleApprove}

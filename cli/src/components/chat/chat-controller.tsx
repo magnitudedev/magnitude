@@ -27,7 +27,7 @@ import { applyPasteIntent } from './paste/apply'
 import { derivePasteEffects } from './paste/effects'
 import type { InputValue } from '../../types/store'
 import type { ChatControllerProps } from './types'
-import { SubagentTabBar } from './subagent-tab-bar'
+import { TaskList } from './task-list'
 import { buildSubmitDispatchEvents, shouldHandleSlashCommandInTab } from './submit-routing'
 
 const EMPTY_INPUT: InputValue = {
@@ -81,32 +81,6 @@ export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): 
   }
 }
 
-export function shouldCycleSubagentTabs(args: {
-  keyName: string
-  ctrl: boolean
-  meta: boolean
-  option: boolean
-  fileMentionOpen: boolean
-  slashMenuOpen: boolean
-}): boolean {
-  if (args.keyName !== 'tab') return false
-  if (args.ctrl || args.meta || args.option) return false
-  if (args.fileMentionOpen || args.slashMenuOpen) return false
-  return true
-}
-
-export function getCycledTabSelection(args: {
-  selectedForkId: string | null
-  subagentTabs: Array<{ forkId: string }>
-  shift: boolean
-}): string | null {
-  const tabIds: Array<string | null> = [null, ...args.subagentTabs.map((tab) => tab.forkId)]
-  if (tabIds.length === 0) return null
-  const currentIndex = Math.max(0, tabIds.indexOf(args.selectedForkId))
-  const delta = args.shift ? -1 : 1
-  const nextIndex = (currentIndex + delta + tabIds.length) % tabIds.length
-  return tabIds[nextIndex] ?? null
-}
 
 export function ChatController(props: ChatControllerProps) {
   const {
@@ -115,7 +89,7 @@ export function ChatController(props: ChatControllerProps) {
     displayMessages,
     subagentTabs,
     selectedForkId,
-    onSubagentTabSelect,
+    pushForkOverlay,
     selectedFileOpen,
     onCloseFilePanel,
     onApprove,
@@ -306,23 +280,6 @@ export function ChatController(props: ChatControllerProps) {
     const hasContent = inputValue.text.trim().length > 0 || attachments.length > 0
     if (env.widgetNavActive && !hasContent && services.handleWidgetKeyEvent(key)) return true
 
-    if (shouldCycleSubagentTabs({
-      keyName: key.name,
-      ctrl: key.ctrl,
-      meta: key.meta,
-      option: key.option,
-      fileMentionOpen: fileMentions.isOpen,
-      slashMenuOpen: slashCommands.isSlashMenuOpen,
-    })) {
-      const nextTabId = getCycledTabSelection({
-        selectedForkId,
-        subagentTabs,
-        shift: key.shift,
-      })
-      onSubagentTabSelect(nextTabId)
-      return true
-    }
-
     const isPlainArrow = !key.ctrl && !key.meta && !key.option && !key.shift
     if (!isPlainArrow) return false
 
@@ -372,7 +329,7 @@ export function ChatController(props: ChatControllerProps) {
     }
 
     return false
-  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId, subagentTabs, onSubagentTabSelect])
+  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId])
 
   const handleInputChange = useCallback((value: InputValue) => {
     if (!env.bashMode && value.text === '!') {
@@ -496,23 +453,18 @@ export function ChatController(props: ChatControllerProps) {
       />
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
+        {subagentTabs.length > 0 && (
+          <box style={{ height: 1, borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╻', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
+            <box style={{ height: 1, borderStyle: 'single', border: ['top'], borderColor: env.theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▄', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
+          </box>
+        )}
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
           <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 0, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
-            <SubagentTabBar
-              tabs={subagentTabs}
-              selectedForkId={selectedForkId}
-              onSelect={onSubagentTabSelect}
-              onCloseTab={(forkId, phase) => {
-                if (phase === 'idle') {
-                  const idleTab = subagentTabs.find((tab) => tab.forkId === forkId)
-                  services.requestIdleSubagentClose({
-                    forkId,
-                    agentId: idleTab?.agentId ?? forkId,
-                  })
-                  return
-                }
-                setPendingKillForkId(forkId)
-              }}
+            <TaskList 
+              tasks={subagentTabs} 
+              pushForkOverlay={pushForkOverlay}
+              modeColor={env.bashMode ? orange[400] : env.modeColor}
+              inputBg={env.theme.inputBg}
             />
             {!env.bashMode && fileMentions.isOpen && (
               <FileMentionMenu

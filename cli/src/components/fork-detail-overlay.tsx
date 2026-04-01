@@ -21,6 +21,8 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1)
 }
 
+const EMPTY_MESSAGES: DisplayMessage[] = []
+
 export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   forkId,
   forkName,
@@ -53,8 +55,22 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
     return unsubscribe
   }, [forkId, subscribeForkDisplay])
 
-  const messages = display?.messages ?? []
+  const messages = display?.messages ?? EMPTY_MESSAGES
   const isStreaming = display?.status === 'streaming'
+
+  // On mount — snap to bottom immediately
+  useEffect(() => {
+    const t1 = setTimeout(() => scrollboxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER), 0)
+    const t2 = setTimeout(() => scrollboxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER), 50)
+    return () => { clearTimeout(t1); clearTimeout(t2) }
+  }, [])
+
+  // On new messages — snap to bottom with double timeout
+  useEffect(() => {
+    const t1 = setTimeout(() => scrollboxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER), 0)
+    const t2 = setTimeout(() => scrollboxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER), 50)
+    return () => { clearTimeout(t1); clearTimeout(t2) }
+  }, [messages])
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
       {/* Header */}
@@ -140,14 +156,6 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
         )}
       </scrollbox>
 
-      {/* Footer */}
-      <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-        <text style={{ fg: theme.muted }}>
-          <span attributes={TextAttributes.DIM}>
-            {messages.filter(m => m.type === 'think_block').length} tool block{messages.filter(m => m.type === 'think_block').length === 1 ? '' : 's'}
-          </span>
-        </text>
-      </box>
     </box>
   )
 })
