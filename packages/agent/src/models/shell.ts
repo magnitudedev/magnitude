@@ -12,20 +12,22 @@ export interface ShellState extends BaseState {
   rejectionReason?: string
 }
 
+const initial: Omit<ShellState, 'phase' | 'toolKey'> = {
+  command: '',
+  done: null,
+  exitCode: undefined,
+  stdout: undefined,
+  stderr: undefined,
+  errorMessage: undefined,
+  rejectionReason: undefined,
+}
+
 export const shellModel = defineStateModel('shell', {
   tool: shellTool,
   binding: shellXmlBinding,
 })({
-  initial: {
-    command: '',
-    done: null,
-    exitCode: undefined,
-    stdout: undefined,
-    stderr: undefined,
-    errorMessage: undefined,
-    rejectionReason: undefined,
-  },
-  reduce: (state, event) => {
+  initial,
+  reduce: (state, event): ShellState => {
     switch (event.type) {
       case 'started':
         return { ...state, phase: 'streaming', done: null }
@@ -61,8 +63,9 @@ export const shellModel = defineStateModel('shell', {
       case 'emission':
       case 'awaitingApproval':
       case 'approvalGranted':
-      case 'parseError':
         return state
+      case 'parseError':
+        return { ...state, phase: 'error', errorMessage: event.error }
     }
   },
 })

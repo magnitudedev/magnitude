@@ -26,8 +26,9 @@ export const phaseSubmitModel = defineStateModel('phaseSubmit', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' as Phase }
+      case 'parseError':
+        return { ...state, phase: 'error' as Phase, errorMessage: event.error }
       case 'completed':
         return { ...state, phase: 'completed' as Phase, output: String(event.output), errorMessage: undefined }
       case 'error':

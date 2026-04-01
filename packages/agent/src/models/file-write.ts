@@ -51,8 +51,9 @@ export const fileWriteModel = defineStateModel('fileWrite', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' }
+      case 'parseError':
+        return { ...state, phase: 'error' }
       case 'emission':
         return event.value.type === 'write_stats'
           ? { ...state, phase: 'executing', path: event.value.path, lineCount: event.value.linesWritten }

@@ -31,8 +31,9 @@ export const fileReadModel = defineStateModel('fileRead', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' }
+      case 'parseError':
+        return { ...state, phase: 'error', errorDetail: event.error }
       case 'completed':
         return { ...state, phase: 'completed', lineCount: event.output.split('\n').length }
       case 'error':
