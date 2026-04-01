@@ -37,8 +37,9 @@ export const fileTreeModel = defineStateModel('fileTree', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' }
+      case 'parseError':
+        return { ...state, phase: 'error', errorDetail: event.error }
       case 'completed': {
         const entries = event.output as TreeEntry[]
         return {

@@ -112,8 +112,9 @@ export function createBrowserActionModel<
         case 'awaitingApproval':
         case 'approvalGranted':
         case 'approvalRejected':
-        case 'parseError':
           return { ...state, phase: 'executing' }
+        case 'parseError':
+          return { ...state, phase: 'error', errorDetail: event.error }
         case 'completed':
           return { ...state, phase: 'completed' }
         case 'error':

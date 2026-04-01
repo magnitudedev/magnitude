@@ -27,8 +27,9 @@ export const fileViewModel = defineStateModel('fileView', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' }
+      case 'parseError':
+        return { ...state, phase: 'error' }
       case 'completed':
         return { ...state, phase: 'completed' }
       case 'error':

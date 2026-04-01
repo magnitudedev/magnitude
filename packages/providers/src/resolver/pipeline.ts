@@ -81,6 +81,8 @@ function createBoundModelImpl<TSlot extends string>(
       return fn.execute(boundModel, input)
     },
     stream<K extends BamlStreamFunctionName>(functionName: K, args: readonly unknown[], options?: StreamOptions) {
+      const abortController = new AbortController()
+
       const requestInference: InferenceConfig = {
         ...inference,
         ...(options?.stopSequences ? { stopSequences: options.stopSequences } : {}),
@@ -97,6 +99,7 @@ function createBoundModelImpl<TSlot extends string>(
         model,
         inference: requestInference,
         providerOptions,
+        signal: abortController.signal,
       }
 
       let attempt = 0
@@ -163,18 +166,25 @@ function createBoundModelImpl<TSlot extends string>(
           ).pipe(
             Stream.tap((chunk) => Effect.sync(() => { accumulatedOutput += chunk })),
             Stream.ensuring(
-              Effect.all([
-                Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
-                Effect.suspend(() => {
-                  const usage = result.getUsage()
-                  if (usage) {
-                    usageCache = usage
-                    return providerState.accumulateUsage(slot, usage)
-                  }
-                  return Effect.void
-                }),
-                Effect.sync(() => maybeTrace()),
-              ])
+              Effect.catchAllCause(
+                Effect.all([
+                  Effect.sync(() => abortController.abort()),
+                  Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
+                  Effect.suspend(() => {
+                    const usage = result.getUsage()
+                    if (usage) {
+                      usageCache = usage
+                      return providerState.accumulateUsage(slot, usage)
+                    }
+                    return Effect.void
+                  }),
+                  Effect.sync(() => maybeTrace()),
+                ]).pipe(Effect.asVoid),
+                (cause) =>
+                  Effect.sync(() => {
+                    logger.error({ context: 'Provider' }, `Stream cleanup failed: ${Cause.pretty(cause)}`)
+                  }),
+              ).pipe(Effect.asVoid),
             ),
           )
 
@@ -188,7 +198,9 @@ function createBoundModelImpl<TSlot extends string>(
             },
             getCollectorData: result.getCollectorData,
           } satisfies ChatStream
-        }),
+        }).pipe(
+          Effect.onInterrupt(() => Effect.sync(() => abortController.abort())),
+        ),
         {
           schedule: connectionRetrySchedule,
           while: (error) => isRetryableError(error as ModelError),

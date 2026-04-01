@@ -131,8 +131,9 @@ export const fileEditModel = defineStateModel('fileEdit', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' }
+      case 'parseError':
+        return { ...state, phase: 'error', streamingTarget: null }
       case 'emission':
         return event.value.type === 'file_edit_base_content'
           ? applyProvisionalDiffs({

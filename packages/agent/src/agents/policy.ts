@@ -148,6 +148,35 @@ export function denyWritesOutside(
   }
 }
 
+/** Deny mass-destructive shell commands that target specific protected roots. */
+export function denyMassDestructiveIn(
+  roots: (ctx: PolicyContext) => string[],
+) {
+  return {
+    shell: (input: ShellInput, ctx: PolicyContext) => {
+      if (ctx.disableShellSafeguards) return Effect.succeed(null)
+
+      const classification = classifyShellCommand(input.command)
+      if (classification.tier !== 'mass-destructive') return Effect.succeed(null)
+
+      const env = agentEnv(ctx.cwd, ctx.workspacePath)
+      const protectedRoots = roots(ctx)
+
+      const nonProtectedRoots = [ctx.cwd, ctx.workspacePath]
+      if (writesStayWithin(input.command, env, ...nonProtectedRoots)) {
+        return Effect.succeed(null)
+      }
+
+      const allRoots = [...nonProtectedRoots, ...protectedRoots]
+      if (writesStayWithin(input.command, env, ...allRoots)) {
+        return Effect.succeed(deny('Mass-destructive operations are not allowed in protected directories'))
+      }
+
+      return Effect.succeed(null)
+    },
+  }
+}
+
 /** Catch-all allow fragment. */
 export function allowAll() {
   return {

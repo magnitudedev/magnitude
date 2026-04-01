@@ -132,6 +132,7 @@ function streamViaResponsesApi(req: DriverRequest): StreamResult {
       method: 'POST',
       headers: connection.headers,
       body: JSON.stringify(transformed),
+      signal: req.signal,
     })
 
     if (!response.ok) {

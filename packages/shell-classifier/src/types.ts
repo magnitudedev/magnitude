@@ -1,4 +1,4 @@
-export type ShellSafetyTier = 'readonly' | 'normal' | 'forbidden'
+export type ShellSafetyTier = 'readonly' | 'normal' | 'mass-destructive' | 'forbidden'
 
 export type ClassificationResult = {
   tier: ShellSafetyTier

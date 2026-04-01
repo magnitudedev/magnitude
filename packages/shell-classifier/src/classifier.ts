@@ -3,7 +3,8 @@
  *
  * Tiers:
  * - readonly: positive allowlist of read-only commands
- * - normal: everything else that isn't forbidden
+ * - normal: everything else that isn't mass-destructive/forbidden
+ * - mass-destructive: bulk/recursive deletion operations
  * - forbidden: catastrophic patterns + non-allowlisted git commands
  */
 
@@ -112,7 +113,8 @@ export function writesStayWithin(command: string, env: Record<string, string>, .
 const TIER_ORDER: Record<ShellSafetyTier, number> = {
   readonly: 0,
   normal: 1,
-  forbidden: 2
+  'mass-destructive': 2,
+  forbidden: 3
 }
 
 function worstTier(a: ShellSafetyTier, b: ShellSafetyTier): ShellSafetyTier {
@@ -149,12 +151,13 @@ function classifyCommand(cmd: SimpleCommand): ClassificationResult {
   if (name === 'sudo') {
     const innerCmd: SimpleCommand = { assignments: [], name: args[0] ?? null, args: args.slice(1), redirects: cmd.redirects }
     const innerResult = classifyCommand(innerCmd)
-    if (innerResult.tier === 'forbidden') return innerResult
+    if (innerResult.tier === 'forbidden' || innerResult.tier === 'mass-destructive') return innerResult
     return { tier: 'normal', reason: null }
   }
 
   const forbiddenReason = isForbidden(name, args)
   if (forbiddenReason) return { tier: 'forbidden', reason: forbiddenReason }
+  if (isMassDestructive(name, args)) return { tier: 'mass-destructive', reason: null }
   if (isReadOnly(name, args)) return { tier: hasRedirects ? 'normal' : 'readonly', reason: null }
   return { tier: 'normal', reason: null }
 }
@@ -220,6 +223,53 @@ const READONLY_COMMANDS = new Set([
   'jq', 'awk', 'gawk', 'mawk', 'nawk',
   'column', 'fmt', 'fold', 'comm', 'diff', 'strings', 'od', 'hexdump', 'tree',
 ])
+
+function isMassDestructive(cmd: string, args: string[]): boolean {
+  if (cmd === 'rm') return hasRecursiveRmFlag(args)
+  if (cmd === 'find') return isFindMassDestructive(args)
+  if (cmd === 'rsync') return isRsyncMassDestructive(args)
+  return false
+}
+
+function hasRecursiveRmFlag(args: string[]): boolean {
+  let optionsEnded = false
+  for (const arg of args) {
+    if (optionsEnded) continue
+    if (arg === '--') {
+      optionsEnded = true
+      continue
+    }
+    if (arg === '--recursive') return true
+    if (!arg.startsWith('-') || arg === '-') continue
+    if (arg.startsWith('--')) continue
+    const flags = arg.slice(1)
+    if (flags.includes('r') || flags.includes('R')) return true
+  }
+  return false
+}
+
+function isFindMassDestructive(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '-delete') return true
+    if (arg !== '-exec' && arg !== '-execdir') continue
+
+    const command = args[i + 1]
+    if (!command) continue
+    if (baseName(command) === 'rm') return true
+  }
+  return false
+}
+
+function isRsyncMassDestructive(args: string[]): boolean {
+  return args.some(arg =>
+    arg === '--delete' ||
+    arg === '--delete-before' ||
+    arg === '--delete-during' ||
+    arg === '--delete-delay' ||
+    arg === '--delete-after'
+  )
+}
 
 function isReadOnly(cmd: string, args: string[]): boolean {
   if (READONLY_COMMANDS.has(cmd)) return true

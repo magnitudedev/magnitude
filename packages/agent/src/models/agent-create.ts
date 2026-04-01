@@ -27,8 +27,9 @@ export const agentCreateModel = defineStateModel('agentCreate', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' }
+      case 'parseError':
+        return { ...state, phase: 'error' }
       case 'completed':
         return { ...state, phase: 'completed', agentId: event.output.agentId }
       case 'error':

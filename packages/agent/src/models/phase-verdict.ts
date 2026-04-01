@@ -21,8 +21,9 @@ export const phaseVerdictModel = defineStateModel('phaseVerdict', {
       case 'awaitingApproval':
       case 'approvalGranted':
       case 'approvalRejected':
-      case 'parseError':
         return { ...state, phase: 'executing' as Phase }
+      case 'parseError':
+        return { ...state, phase: 'error' as Phase }
       case 'completed':
         return { ...state, phase: 'completed' as Phase }
       case 'error':

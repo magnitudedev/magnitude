@@ -1,8 +1,10 @@
 import { continue_, yield_, defineThinkingLens } from '@magnitudedev/roles'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { TurnPolicy } from '@magnitudedev/roles'
 import type { PolicyContext } from './types'
 import { catalog } from '../catalog'
-import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
+import { denyForbiddenCommands, denyMassDestructiveIn, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 
 export const intentLens = defineThinkingLens({
   name: 'intent',
@@ -82,7 +84,8 @@ export const leadObservables: readonly [] = []
 export const leadPolicy = [
   denyForbiddenCommands(),
   denyMutatingGit(),
-  denyWritesOutside((ctx: PolicyContext) => [ctx.cwd, ctx.workspacePath]),
+  denyWritesOutside((ctx: PolicyContext) => [ctx.cwd, ctx.workspacePath, join(homedir(), '.magnitude')]),
+  denyMassDestructiveIn(() => [join(homedir(), '.magnitude')]),
   allowAll(),
 ]
 

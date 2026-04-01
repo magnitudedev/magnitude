@@ -9,10 +9,12 @@ import {
   TurnProjection,
   DisplayProjection,
   CompactionProjection,
-  WorkingStateProjection,
   SessionContextProjection,
   ChatTitleProjection,
-  ReplayProjection
+  ReplayProjection,
+  AgentRoutingProjection,
+  AgentStatusProjection,
+  WorkflowProjection
 } from '@magnitudedev/agent'
 
 import { Agent } from '@magnitudedev/event-core'
@@ -298,24 +300,28 @@ const InspectAgent = Agent.define<AppEvent>()({
   projections: [
     SessionContextProjection,
     ChatTitleProjection,
-    WorkingStateProjection,
     CompactionProjection,
     TurnProjection,
     MemoryProjection,
     DisplayProjection,
-    ReplayProjection
+    ReplayProjection,
+    AgentRoutingProjection,
+    AgentStatusProjection,
+    WorkflowProjection
   ],
   workers: [],
   expose: {
     state: {
       sessionContext: SessionContextProjection,
       chatTitle: ChatTitleProjection,
-      workingState: WorkingStateProjection,
       compaction: CompactionProjection,
       turn: TurnProjection,
       memory: MemoryProjection,
-display: DisplayProjection,
-      replay: ReplayProjection
+      display: DisplayProjection,
+      replay: ReplayProjection,
+      agentRouting: AgentRoutingProjection,
+      agentStatus: AgentStatusProjection,
+      workflow: WorkflowProjection
     }
   }
 })
@@ -330,22 +336,15 @@ async function replayProjections(events: any[]): Promise<Record<string, any>> {
     const result: Record<string, any> = {}
 
     // Global projections expose .get() -> state directly
-    const globalKeys = ['fork', 'taskGraph', 'sessionContext', 'proposal', 'agentRegistry', 'artifact', 'chatTitle'] as const
+    const globalKeys = ['sessionContext', 'chatTitle', 'agentRouting', 'agentStatus'] as const
     for (const key of globalKeys) {
       result[key] = await (client.state[key] as any).get()
     }
 
-    // Collect all known fork IDs (null = root fork, plus any sub-forks)
-    const forkState = result['fork'] as any
-    const forkIds: (string | null)[] = [null]
-    if (forkState?.forks instanceof Map) {
-      for (const id of forkState.forks.keys()) {
-        if (id !== null) forkIds.push(id)
-      }
-    }
-
     // Forked projections expose .getFork(forkId) -> per-fork state
-    const forkedKeys = ['workingState', 'compaction', 'turn', 'memory', 'display', 'replay', 'skillMode'] as const
+    const forkIds: (string | null)[] = [null]
+
+    const forkedKeys = ['compaction', 'turn', 'memory', 'display', 'replay', 'workflow'] as const
     for (const key of forkedKeys) {
       const inst = client.state[key] as any
       const forks: Record<string, any> = {}
@@ -388,25 +387,21 @@ async function cmdProjection(args: string[]) {
 
   const projectionKeyMap: Record<string, string> = {
     memory: 'memory',
-    fork: 'fork',
-    taskgraph: 'taskGraph',
     turn: 'turn',
     display: 'display',
     compaction: 'compaction',
-    workingstate: 'workingState',
     sessioncontext: 'sessionContext',
-    proposal: 'proposal',
-    agentregistry: 'agentRegistry',
-    artifact: 'artifact',
     chattitle: 'chatTitle',
     replay: 'replay',
-    skillmode: 'skillMode'
+    agentrouting: 'agentRouting',
+    agentstatus: 'agentStatus',
+    workflow: 'workflow'
   }
 
   const key = projectionKeyMap[projectionName.toLowerCase()]
   if (!key || !(key in allStates)) {
     console.error(`Unknown projection: ${projectionName}`)
-    console.error('Supported: Memory, Fork, TaskGraph, Turn, Display, Compaction, WorkingState, SessionContext, Proposal, AgentRegistry, Artifact, ChatTitle, Replay, all')
+    console.error('Supported: Memory, Turn, Display, Compaction, SessionContext, ChatTitle, Replay, AgentRouting, AgentStatus, Workflow, all')
     process.exit(1)
   }
 
