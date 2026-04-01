@@ -7,11 +7,13 @@
  */
 
 import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import explorerPromptRaw from './prompts/explorer.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
 
-import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
+import { allowReadonlyShell, denyForbiddenCommands, denyMassDestructiveIn, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { formatAgentIdList } from './lifecycle-reminder-format'
 
@@ -64,7 +66,8 @@ export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>(
     allowReadonlyShell(),
     denyForbiddenCommands(),
     denyMutatingGit(),
-    denyWritesOutside(ctx => [ctx.workspacePath]),
+    denyWritesOutside(ctx => [ctx.workspacePath, join(homedir(), '.magnitude')]),
+    denyMassDestructiveIn(() => [join(homedir(), '.magnitude')]),
     allowAll(),
   ],
 

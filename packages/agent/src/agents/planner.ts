@@ -8,12 +8,14 @@
  */
 
 import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import plannerPromptRaw from './prompts/planner.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
 
 // import { gatherTool } from '../tools/gather'
-import { allowReadonlyShell, denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
+import { allowReadonlyShell, denyForbiddenCommands, denyMassDestructiveIn, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 import { formatAgentIdList } from './lifecycle-reminder-format'
 
@@ -84,7 +86,8 @@ export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
     allowReadonlyShell(),
     denyForbiddenCommands(),
     denyMutatingGit(),
-    denyWritesOutside(ctx => [ctx.workspacePath]),
+    denyWritesOutside(ctx => [ctx.workspacePath, join(homedir(), '.magnitude')]),
+    denyMassDestructiveIn(() => [join(homedir(), '.magnitude')]),
     allowAll(),
   ],
 

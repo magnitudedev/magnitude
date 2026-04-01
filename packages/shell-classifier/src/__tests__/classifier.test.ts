@@ -20,7 +20,7 @@ describe('shell-classifier', () => {
     })
 
     test('formerly dangerous commands now classify as normal/forbidden', () => {
-      expect(classifyShellCommand('rm -rf foo').tier).toBe('normal')
+      expect(classifyShellCommand('rm -rf foo').tier).toBe('mass-destructive')
       expect(classifyShellCommand('git push --force').tier).toBe('forbidden')
       expect(classifyShellCommand('git reset --hard').tier).toBe('forbidden')
       expect(classifyShellCommand('git clean -f').tier).toBe('forbidden')
@@ -34,6 +34,59 @@ describe('shell-classifier', () => {
       expect(classifyShellCommand('mkfs /dev/sda').tier).toBe('forbidden')
       expect(classifyShellCommand('rm -rf /usr').tier).toBe('forbidden')
       expect(classifyShellCommand('rm -rf /').tier).toBe('forbidden')
+    })
+  })
+
+  describe('mass-destructive tier', () => {
+    test('mass-destructive cases classify as mass-destructive', () => {
+      for (const cmd of [
+        'rm -r dir',
+        'rm -R dir',
+        'rm -rf dir',
+        'rm -fr dir',
+        'rm -Rf dir',
+        'rm --recursive dir',
+        'find . -type f -delete',
+        'find . -name "*.tmp" -exec rm {} \\;',
+        'find . -execdir rm {} +',
+        'rsync -a --delete src/ dst/',
+        'rsync --delete-before src/ dst/',
+        'rsync --delete-during src/ dst/',
+        'rsync --delete-delay src/ dst/',
+        'rsync --delete-after src/ dst/',
+        'sudo rm -rf dir',
+      ]) {
+        expect(classifyShellCommand(cmd).tier).toBe('mass-destructive')
+      }
+    })
+
+    test('non-mass-destructive cases remain normal', () => {
+      for (const cmd of [
+        'rm file',
+        'rm -f file',
+        'rm -i file',
+        'truncate -s 0 file',
+        'shred file',
+        'mv -f a b',
+        'cp --remove-destination a b',
+        'ln -sf a b',
+        'echo hi > file',
+        'rsync -a src/ dst/',
+      ]) {
+        expect(classifyShellCommand(cmd).tier).toBe('normal')
+      }
+
+      expect(classifyShellCommand('find . -type f -name "*.log"').tier).toBe('readonly')
+    })
+
+    test('forbidden takes priority over mass-destructive', () => {
+      expect(classifyShellCommand('rm -rf /usr').tier).toBe('forbidden')
+      expect(classifyShellCommand('rm -rf /').tier).toBe('forbidden')
+    })
+
+    test('pipeline and substitution bubble up mass-destructive tier', () => {
+      expect(classifyShellCommand('echo hi | rm -rf dir').tier).toBe('mass-destructive')
+      expect(classifyShellCommand('x=$(rm -rf dir)').tier).toBe('mass-destructive')
     })
   })
 

@@ -6,11 +6,13 @@
  */
 
 import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import debuggerPromptRaw from './prompts/debugger.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
 
-import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
+import { denyForbiddenCommands, denyMassDestructiveIn, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 import type { PolicyContext } from './types'
 
 
@@ -67,7 +69,8 @@ export const debuggerRole = defineRole<typeof tools, 'debugger', PolicyContext>(
   policy: [
     denyForbiddenCommands(),
     denyMutatingGit(),
-    denyWritesOutside(ctx => [ctx.cwd, ctx.workspacePath]),
+    denyWritesOutside(ctx => [ctx.cwd, ctx.workspacePath, join(homedir(), '.magnitude')]),
+    denyMassDestructiveIn(() => [join(homedir(), '.magnitude')]),
     allowAll(),
   ],
 
