@@ -6,7 +6,7 @@ import { useTerminalWidth } from '../../hooks/use-terminal-width'
 import { Button } from '../button'
 import { formatElapsedMs } from '../../utils/format-elapsed'
 import { formatSubagentIdWithEmoji } from '../../utils/subagent-role-emoji'
-import type { SubagentTabItem } from './types'
+import type { TaskItem } from './types'
 
 const COLLAPSED_ROWS = 6
 const EXPANDED_ROWS = 15
@@ -34,14 +34,14 @@ const PULSE_BLUE_SHADES = [
 ] as const
 
 type Props = {
-  tasks: readonly SubagentTabItem[]
+  tasks: readonly TaskItem[]
   pushForkOverlay: (forkId: string) => void
   modeColor: string
   inputBg: string
 }
 
 type TaskRowProps = {
-  task: SubagentTabItem
+  task: TaskItem
   pushForkOverlay: (forkId: string) => void
   hovered: boolean
   onHover: (forkId: string) => void
@@ -120,7 +120,7 @@ export function TaskList({ tasks, pushForkOverlay, modeColor, inputBg }: Props) 
   const usableWidth = Math.max(1, terminalWidth - 4)
   const checkboxWidth = 2
   const remainingWidth = Math.max(1, usableWidth - checkboxWidth)
-  const taskNameWidth = Math.floor(remainingWidth * 0.6)
+  const taskNameWidth = Math.floor(remainingWidth * 0.57)
   const agentIdWidth = remainingWidth - taskNameWidth
 
   const hasActiveTasks = tasks.some(t => t.phase === 'active')
@@ -162,7 +162,7 @@ export function TaskList({ tasks, pushForkOverlay, modeColor, inputBg }: Props) 
         </box>
         {/* Assigned to column header — label left, expand/collapse button right */}
         <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>Subagent</text>
+          <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>Assigned To</text>
           <Button
             onClick={() => setExpanded(prev => !prev)}
             onMouseOver={() => setExpandHovered(true)}

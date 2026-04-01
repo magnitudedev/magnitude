@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import type { DisplayMessage, ThinkBlockStep } from '@magnitudedev/agent'
 import {
-  selectLatestLiveActivityForSubagentTab,
+  selectLatestLiveActivityForTask,
   selectLatestLiveActivityFromMessages,
   selectLatestLiveActivityFromThinkSteps,
 } from './live-activity'
@@ -26,7 +26,7 @@ describe('live-activity selector', () => {
     expect(selectLatestLiveActivityFromThinkSteps(steps)).toBe('pending inbound')
   })
 
-  it('uses most recent producible activity for subagent tab status', () => {
+  it('uses most recent producible activity for task status', () => {
     const messages = [
       {
         type: 'think_block',
@@ -35,10 +35,10 @@ describe('live-activity selector', () => {
       { type: 'agent_communication', preview: 'newer communication activity' },
     ] as any as DisplayMessage[]
 
-    expect(selectLatestLiveActivityForSubagentTab(messages)).toBe('newer communication activity')
+    expect(selectLatestLiveActivityForTask(messages)).toBe('newer communication activity')
   })
 
-  it('falls back to latest communication when subagent tab has no think activity', () => {
+  it('falls back to latest communication when task has no think activity', () => {
     const messages = [
       {
         type: 'think_block',
@@ -47,7 +47,7 @@ describe('live-activity selector', () => {
       { type: 'agent_communication', preview: 'latest communication' },
     ] as any as DisplayMessage[]
 
-    expect(selectLatestLiveActivityForSubagentTab(messages)).toBe('latest communication')
+    expect(selectLatestLiveActivityForTask(messages)).toBe('latest communication')
   })
 
   it('uses tool live-text semantics before fallback label', () => {

@@ -53,7 +53,7 @@ export function formatSubagentToolSummaryLine(toolCounts: ForkActivityMessage['t
   return tokens.join(', ')
 }
 
-export function truncateSubagentTabText(text: string, max = 44): string {
+export function truncateTaskText(text: string, max = 44): string {
   const normalized = text.trim().replace(/\s+/g, ' ')
   if (normalized.length <= max) return normalized
   return normalized.slice(0, Math.max(0, max - 1)) + '…'

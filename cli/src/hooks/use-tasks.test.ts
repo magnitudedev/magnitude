@@ -1,35 +1,35 @@
 import { describe, expect, test } from 'bun:test'
-import type { SubagentTabItem } from '../components/chat/types'
-import { buildSubagentTabItem, reconcileForkMeta, sortSubagentTabs } from './use-subagent-tabs'
+import type { TaskItem } from '../components/chat/types'
+import { buildTaskItem, reconcileForkMeta, sortTasks } from './use-tasks'
 
-describe('sortSubagentTabs', () => {
-  test('keeps active tabs first and sorts idle tabs by completedAt descending', () => {
-    const tabs: SubagentTabItem[] = [
+describe('sortTasks', () => {
+  test('keeps active tasks first and sorts idle tasks by completedAt descending', () => {
+    const tasks: TaskItem[] = [
       { forkId: 'idle-older', agentId: 'idle-older', name: 'Idle Older', activeSince: 10, accumulatedActiveMs: 1000, completedAt: 20, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
       { forkId: 'active-newer', agentId: 'active-newer', name: 'Active Newer', activeSince: 30, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active', role: 'builder' },
       { forkId: 'active-older', agentId: 'active-older', name: 'Active Older', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active', role: 'builder' },
       { forkId: 'idle-newer', agentId: 'idle-newer', name: 'Idle Newer', activeSince: 40, accumulatedActiveMs: 1000, completedAt: 50, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
     ]
 
-    const sorted = [...tabs].sort(sortSubagentTabs)
-    expect(sorted.map(tab => tab.forkId)).toEqual(['active-older', 'active-newer', 'idle-newer', 'idle-older'])
+    const sorted = [...tasks].sort(sortTasks)
+    expect(sorted.map(task => task.forkId)).toEqual(['active-older', 'active-newer', 'idle-newer', 'idle-older'])
   })
 
-  test('places idle tabs with undefined completedAt last within idle tabs', () => {
-    const tabs: SubagentTabItem[] = [
+  test('places idle tasks with undefined completedAt last within idle tasks', () => {
+    const tasks: TaskItem[] = [
       { forkId: 'idle-no-completed', agentId: 'idle-no-completed', name: 'Idle No Completed', activeSince: 5, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
       { forkId: 'idle-with-completed', agentId: 'idle-with-completed', name: 'Idle With Completed', activeSince: 20, accumulatedActiveMs: 1000, completedAt: 10, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Subagent is idle', phase: 'idle', role: 'builder' },
       { forkId: 'active', agentId: 'active', name: 'Active', activeSince: 1, accumulatedActiveMs: 1000, resumeCount: 0, toolCount: 1, toolSummaryLine: 'x', statusLine: 'Running…', phase: 'active', role: 'builder' },
     ]
 
-    const sorted = [...tabs].sort(sortSubagentTabs)
-    expect(sorted.map(tab => tab.forkId)).toEqual(['active', 'idle-with-completed', 'idle-no-completed'])
+    const sorted = [...tasks].sort(sortTasks)
+    expect(sorted.map(task => task.forkId)).toEqual(['active', 'idle-with-completed', 'idle-no-completed'])
   })
 })
 
-describe('buildSubagentTabItem', () => {
+describe('buildTaskItem', () => {
   test('shows exact pending status, forces active phase, and clears completedAt while pending', () => {
-    const tab = buildSubagentTabItem({
+    const task = buildTaskItem({
       forkId: 'fork-1',
       meta: {
         agentId: 'a',
@@ -46,15 +46,15 @@ describe('buildSubagentTabItem', () => {
       pendingDirect: { pending: true, since: 9000 },
     })
 
-    expect(tab.statusLine).toBe('User sent a message...')
-    expect(tab.phase).toBe('active')
-    expect(tab.activeSince).toBe(9000)
-    expect(tab.completedAt).toBeUndefined()
-    expect(tab.accumulatedActiveMs).toBe(3000)
+    expect(task.statusLine).toBe('User sent a message...')
+    expect(task.phase).toBe('active')
+    expect(task.activeSince).toBe(9000)
+    expect(task.completedAt).toBeUndefined()
+    expect(task.accumulatedActiveMs).toBe(3000)
   })
 
   test('keeps timer continuity across repeated pending updates via latched since', () => {
-    const first = buildSubagentTabItem({
+    const first = buildTaskItem({
       forkId: 'fork-1',
       meta: {
         agentId: 'a',
@@ -71,7 +71,7 @@ describe('buildSubagentTabItem', () => {
       pendingDirect: { pending: true, since: 9000 },
     })
 
-    const second = buildSubagentTabItem({
+    const second = buildTaskItem({
       forkId: 'fork-1',
       meta: {
         agentId: 'a',

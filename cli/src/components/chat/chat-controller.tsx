@@ -87,7 +87,7 @@ export function ChatController(props: ChatControllerProps) {
     env,
     services,
     displayMessages,
-    subagentTabs,
+    tasks,
     selectedForkId,
     pushForkOverlay,
     isBlockingOverlayActive,
@@ -425,11 +425,11 @@ export function ChatController(props: ChatControllerProps) {
 
   const selectedSubagentAgentId = selectedForkId == null
     ? null
-    : (subagentTabs.find((tab) => tab.forkId === selectedForkId)?.agentId ?? selectedForkId)
+    : (tasks.find((task) => task.forkId === selectedForkId)?.agentId ?? selectedForkId)
 
   const pendingKillTab = pendingKillForkId == null
     ? null
-    : (subagentTabs.find((tab) => tab.forkId === pendingKillForkId) ?? null)
+    : (tasks.find((task) => task.forkId === pendingKillForkId) ?? null)
 
   return (
     <>
@@ -455,7 +455,7 @@ export function ChatController(props: ChatControllerProps) {
       />
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
-        {subagentTabs.length > 0 && (
+        {tasks.length > 0 && (
           <box style={{ height: 1, borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: ' ', vertical: '╻', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }}>
             <box style={{ height: 1, borderStyle: 'single', border: ['top'], borderColor: env.theme.inputBg, customBorderChars: { topLeft: '', bottomLeft: '', topRight: '', bottomRight: '', horizontal: '▄', vertical: ' ', topT: '', bottomT: '', leftT: '', rightT: '', cross: '' } }} />
           </box>
@@ -463,7 +463,7 @@ export function ChatController(props: ChatControllerProps) {
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
           <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 0, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
             <TaskList 
-              tasks={subagentTabs} 
+              tasks={tasks} 
               pushForkOverlay={pushForkOverlay}
               modeColor={env.bashMode ? orange[400] : env.modeColor}
               inputBg={env.theme.inputBg}

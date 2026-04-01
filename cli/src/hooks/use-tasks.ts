@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentStatusState, DisplayMessage, DisplayState, ForkActivityMessage } from '@magnitudedev/agent'
-import type { SubagentTabItem } from '../components/chat/types'
+import type { TaskItem } from '../components/chat/types'
 import {
   formatSubagentToolSummaryLine,
   sumForkToolCounts,
-  truncateSubagentTabText,
+  truncateTaskText,
 } from '../utils/subagent-tabs'
-import { selectLatestLiveActivityForSubagentTab } from '../utils/live-activity'
+import { selectLatestLiveActivityForTask } from '../utils/live-activity'
 
 type AgentClientLike = {
   state: {
@@ -16,7 +16,7 @@ type AgentClientLike = {
   }
 }
 
-type UseSubagentTabsArgs = {
+type UseTasksArgs = {
   client: AgentClientLike | null
   rootDisplayMessages: readonly DisplayMessage[]
   agentStatusState: AgentStatusState | null
@@ -35,29 +35,29 @@ type ForkMeta = {
   phase: 'active' | 'idle'
 }
 
-export function buildSubagentTabItem(args: {
+export function buildTaskItem(args: {
   forkId: string
   meta: ForkMeta
   messages: readonly DisplayMessage[]
   pendingDirect: { pending: boolean; since: number | null } | undefined
-}): SubagentTabItem {
+}): TaskItem {
   const { forkId, meta, messages, pendingDirect } = args
-  const toolSummaryLine = truncateSubagentTabText(formatSubagentToolSummaryLine(meta.toolCounts))
+  const toolSummaryLine = truncateTaskText(formatSubagentToolSummaryLine(meta.toolCounts))
   const isPendingDirect = pendingDirect?.pending === true
 
-  const phase: SubagentTabItem['phase'] = isPendingDirect ? 'active' : meta.phase
+  const phase: TaskItem['phase'] = isPendingDirect ? 'active' : meta.phase
   const activeSince = phase === 'active'
     ? (meta.phase === 'active' ? meta.activeSince : (pendingDirect?.since ?? meta.activeSince))
     : meta.activeSince
   const completedAt = phase === 'active' ? undefined : meta.completedAt
   const accumulatedActiveMs = meta.accumulatedActiveMs
 
-  const statusLine = truncateSubagentTabText(
+  const statusLine = truncateTaskText(
     isPendingDirect
       ? 'User sent a message...'
       : meta.phase === 'idle'
         ? 'Subagent is idle'
-        : (selectLatestLiveActivityForSubagentTab(messages) ?? 'Running…'),
+        : (selectLatestLiveActivityForTask(messages) ?? 'Running…'),
   )
 
   return {
@@ -76,7 +76,7 @@ export function buildSubagentTabItem(args: {
   }
 }
 
-export function sortSubagentTabs(a: SubagentTabItem, b: SubagentTabItem): number {
+export function sortTasks(a: TaskItem, b: TaskItem): number {
   if (a.phase !== b.phase) return a.phase === 'active' ? -1 : 1
 
   if (a.phase === 'idle' && b.phase === 'idle') {
@@ -127,11 +127,11 @@ export function reconcileForkMeta(args: {
   return { next }
 }
 
-export function useSubagentTabs({
+export function useTasks({
   client,
   rootDisplayMessages,
   agentStatusState,
-}: UseSubagentTabsArgs): SubagentTabItem[] {
+}: UseTasksArgs): TaskItem[] {
   const [forkMessages, setForkMessages] = useState<Record<string, readonly DisplayMessage[]>>({})
   const [forkPendingDirectUser, setForkPendingDirectUser] = useState<Record<string, { pending: boolean; since: number | null }>>({})
   const [forkMeta, setForkMeta] = useState<Record<string, ForkMeta>>({})
@@ -211,8 +211,8 @@ export function useSubagentTabs({
 
   return useMemo(() => {
     return Object.entries(forkMeta)
-      .map(([forkId, meta]): SubagentTabItem => (
-        buildSubagentTabItem({
+      .map(([forkId, meta]): TaskItem => (
+        buildTaskItem({
           forkId,
           meta,
           messages: forkMessages[forkId] ?? [],

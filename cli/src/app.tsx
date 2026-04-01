@@ -52,7 +52,7 @@ import { FileViewerPanel } from './components/file-viewer-panel'
 import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
-import { useSubagentTabs } from './hooks/use-subagent-tabs'
+import { useTasks } from './hooks/use-tasks'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -616,7 +616,7 @@ function AppInner({
     })
   }, [client])
 
-  const subagentTabs = useSubagentTabs({
+  const tasks = useTasks({
     client,
     rootDisplayMessages: display?.messages ?? [],
     agentStatusState,
@@ -1953,7 +1953,7 @@ function AppInner({
               },
             }}
             displayMessages={(activeDisplay ?? display).messages}
-            subagentTabs={subagentTabs}
+            tasks={tasks}
             selectedForkId={selectedForkId}
             pushForkOverlay={pushForkOverlay}
             selectedFileOpen={isFilePanelOpen}

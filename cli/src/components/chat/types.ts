@@ -44,7 +44,7 @@ export type ChatControllerServices = {
   requestActiveSubagentKill: (payload: { forkId: string; agentId: string }) => void
 }
 
-export type SubagentTabItem = {
+export type TaskItem = {
   forkId: string
   agentId: string
   role?: string
@@ -63,7 +63,7 @@ export type ChatControllerProps = {
   env: ChatControllerEnv
   services: ChatControllerServices
   displayMessages: DisplayState['messages']
-  subagentTabs: SubagentTabItem[]
+  tasks: TaskItem[]
   selectedForkId: string | null
   pushForkOverlay: (forkId: string) => void
   isBlockingOverlayActive: boolean
