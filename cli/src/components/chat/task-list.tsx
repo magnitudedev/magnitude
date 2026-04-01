@@ -62,7 +62,7 @@ function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, tas
     PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length]
 
   const elapsedMs = isIdle
-    ? task.accumulatedActiveMs + (task.completedAt != null ? task.completedAt - task.activeSince : 0)
+    ? task.accumulatedActiveMs
     : task.accumulatedActiveMs + Math.max(0, now - task.activeSince)
   const timerStr = formatElapsedMs(elapsedMs)
 
