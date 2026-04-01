@@ -66,6 +66,7 @@ export type ChatControllerProps = {
   subagentTabs: SubagentTabItem[]
   selectedForkId: string | null
   pushForkOverlay: (forkId: string) => void
+  isBlockingOverlayActive: boolean
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
   onApprove: () => void

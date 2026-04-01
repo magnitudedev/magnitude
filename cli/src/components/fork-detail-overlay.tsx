@@ -41,7 +41,8 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
 
   useKeyboard(useCallback((key: KeyEvent) => {
     if (key.name === 'escape') {
-      key.preventDefault()
+      key.preventDefault?.()
+      key.stopPropagation?.()
       onClose()
     }
   }, [onClose]))

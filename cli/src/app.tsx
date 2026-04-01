@@ -1420,6 +1420,23 @@ function AppInner({
     }
   }, [client, agentStatusState])
 
+  const activeOverlayKind =
+    (showSetupWizard && wizardStep === 'browser') ? 'setup-browser'
+    : (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay) ? 'setup-wizard'
+    : showRecentChatsOverlay ? 'recent-chats'
+    : (expandedForkId && client) ? 'fork-detail'
+    : showBrowserSetup ? 'browser-setup'
+    : settingsTab !== null ? 'settings'
+    : (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider) ? 'auth-method'
+    : authFlow.showLocalSetup ? 'local-provider'
+    : authFlow.apiKeySetup ? 'api-key'
+    : authFlow.oauthState ? 'oauth'
+    : 'none'
+
+  const isOverlayActive = activeOverlayKind !== 'none'
+  const isBlockingOverlayActive = isOverlayActive
+  const canToggleRecentChatsWithCtrlR = activeOverlayKind === 'none' || activeOverlayKind === 'recent-chats'
+
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
@@ -1444,12 +1461,13 @@ function AppInner({
         }
 
         if (isCtrlR) {
+          if (!canToggleRecentChatsWithCtrlR) return
           key.preventDefault()
           hasAnimatedRef.current = true
           setShowRecentChatsOverlay(prev => !prev)
         }
       },
-      [composerHasContent, debugMode, activeDisplay, display],
+      [composerHasContent, debugMode, activeDisplay, display, canToggleRecentChatsWithCtrlR],
     ),
   )
 
@@ -1681,17 +1699,6 @@ function AppInner({
     />
   )
 
-  const isOverlayActive = (showSetupWizard && wizardStep === 'browser')
-    || (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay)
-    || showRecentChatsOverlay
-    || (expandedForkId && client)
-    || showBrowserSetup
-    || settingsTab !== null
-    || (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider)
-    || authFlow.showLocalSetup
-    || authFlow.apiKeySetup
-    || authFlow.oauthState
-
   const chatScrollbox = (
     <scrollbox
       ref={scrollboxRef}
@@ -1873,6 +1880,7 @@ function AppInner({
             }} />
           ) : null}
           <ChatController
+            isBlockingOverlayActive={isBlockingOverlayActive}
             env={{
               status: (activeDisplay ?? display)?.status ?? 'idle',
               pendingApproval: pendingApproval != null,

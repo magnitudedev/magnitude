@@ -90,6 +90,7 @@ export function ChatController(props: ChatControllerProps) {
     subagentTabs,
     selectedForkId,
     pushForkOverlay,
+    isBlockingOverlayActive,
     selectedFileOpen,
     onCloseFilePanel,
     onApprove,
@@ -435,6 +436,7 @@ export function ChatController(props: ChatControllerProps) {
       <ChatSurfaceKeyboard
         status={env.status}
         hasRunningForks={env.hasRunningForks}
+        isBlockingOverlayActive={isBlockingOverlayActive}
         nextEscWillKillAll={nextEscWillKillAll}
         setNextEscWillKillAll={setNextEscWillKillAll}
         killAllTimeoutRef={killAllTimeoutRef}

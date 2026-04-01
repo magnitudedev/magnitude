@@ -5,6 +5,7 @@ import { useKeyboard } from '@opentui/react'
 interface ChatSurfaceKeyboardProps {
   status: 'idle' | 'streaming'
   hasRunningForks: boolean
+  isBlockingOverlayActive: boolean
   nextEscWillKillAll: boolean
   setNextEscWillKillAll: (next: boolean) => void
   killAllTimeoutRef: RefObject<NodeJS.Timeout | null>
@@ -22,6 +23,7 @@ interface ChatSurfaceKeyboardProps {
 export function ChatSurfaceKeyboard({
   status,
   hasRunningForks,
+  isBlockingOverlayActive,
   nextEscWillKillAll,
   setNextEscWillKillAll,
   killAllTimeoutRef,
@@ -41,6 +43,8 @@ export function ChatSurfaceKeyboard({
 
       const isEscape = key.name === 'escape'
       const isCtrlC = key.ctrl && key.name === 'c' && !key.meta && !key.option
+
+      if (isBlockingOverlayActive) return
 
       if (isCtrlC && composerHasContent) {
         key.preventDefault()
@@ -100,6 +104,7 @@ export function ChatSurfaceKeyboard({
     }, [
       status,
       hasRunningForks,
+      isBlockingOverlayActive,
       nextEscWillKillAll,
       setNextEscWillKillAll,
       killAllTimeoutRef,
