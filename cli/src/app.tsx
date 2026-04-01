@@ -689,6 +689,53 @@ function AppInner({
     }
   }, [selectedForkId, agentStatusState, slotModels])
 
+  const forkSlot = useMemo(() => {
+    if (!expandedForkId || !agentStatusState) return null
+    const agentId = agentStatusState.agentByForkId.get(expandedForkId)
+    const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
+    if (!agent) return null
+    return (MAGNITUDE_SLOTS as readonly string[]).includes(agent.role)
+      ? agent.role as MagnitudeSlot
+      : 'lead' as MagnitudeSlot
+  }, [expandedForkId, agentStatusState])
+
+  const forkModelSummary = useMemo(() => {
+    if (!forkSlot) return null
+    const selection = slotModels[forkSlot]
+    if (!selection) return null
+    return {
+      provider: getProvider(selection.providerId)?.name ?? selection.providerId,
+      model: getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)?.name ?? selection.modelId,
+    }
+  }, [forkSlot, slotModels])
+
+  const [forkContextHardCap, setForkContextHardCap] = useState<number | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    if (!forkSlot) {
+      setForkContextHardCap(contextHardCap)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    providerRuntime.state.contextLimits(forkSlot).then((limits) => {
+      if (!cancelled) {
+        setForkContextHardCap(limits.hardCap)
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setForkContextHardCap(contextHardCap)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [providerRuntime, forkSlot, contextHardCap])
+
   const mainTimelineMessages = useMemo(
     () => (activeDisplay?.messages ?? []).filter(m => {
       if (m.type === 'fork_activity') return false
@@ -1687,6 +1734,8 @@ function AppInner({
       expandedForkId={expandedForkId}
       client={client}
       agentStatusState={agentStatusState}
+      forkModelSummary={forkModelSummary}
+      forkContextHardCap={forkContextHardCap}
       popForkOverlay={popForkOverlay}
       pushForkOverlay={pushForkOverlay}
       onFileClick={openFile}

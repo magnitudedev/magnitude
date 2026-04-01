@@ -89,6 +89,8 @@ export type AppOverlaysProps = {
   expandedForkId: string | null
   client: AgentClient | null
   agentStatusState: AgentStatusState | null
+  forkModelSummary: { provider: string; model: string } | null
+  forkContextHardCap: number | null
   popForkOverlay: () => void
   pushForkOverlay: (forkId: string) => void
   onFileClick?: (path: string, section?: string) => void
@@ -162,6 +164,8 @@ export function AppOverlays({
   expandedForkId,
   client,
   agentStatusState,
+  forkModelSummary,
+  forkContextHardCap,
   popForkOverlay,
   pushForkOverlay,
   onFileClick,
@@ -237,7 +241,10 @@ export function AppOverlays({
           onClose={popForkOverlay}
           onForkExpand={pushForkOverlay}
           onFileClick={onFileClick}
+          modelSummary={forkModelSummary}
+          contextHardCap={forkContextHardCap}
           subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}
+          subscribeForkCompaction={(fId, cb) => client.state.compaction.subscribeFork(fId, cb)}
         />
       </box>
     )
