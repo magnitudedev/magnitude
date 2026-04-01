@@ -1,4 +1,4 @@
-import { memo, useMemo, useState, useCallback } from 'react'
+import { memo, useMemo, useState, useCallback, useEffect, useRef } from 'react'
 import { RGBA, TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import { useTheme } from '../hooks/use-theme'
@@ -161,6 +161,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const [showSavePresetModal, setShowSavePresetModal] = useState(false)
   const [savePresetName, setSavePresetName] = useState('')
   const [savePresetHover, setSavePresetHover] = useState(false)
+  const modelPickerScrollboxRef = useRef<any>(null)
+  const modelRowRefs = useRef<Map<number, any>>(new Map())
+  const [modelPickerInputMode, setModelPickerInputMode] = useState<'mouse' | 'keyboard'>('mouse')
+  const modelPickerLastPointerRef = useRef<{ x: number; y: number } | null>(null)
 
   // Group model items by provider for section headers
   const modelSections = useMemo(() => {
@@ -227,6 +231,106 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     { id: 'provider', label: 'Provider' },
     { id: 'model', label: 'Model' },
   ]
+
+  const readPointerCoords = useCallback((event: unknown): { x: number; y: number } | null => {
+    if (!event || typeof event !== 'object') return null
+    const record = event as Record<string, unknown>
+
+    const pair = (xKey: string, yKey: string) => {
+      const x = record[xKey]
+      const y = record[yKey]
+      return typeof x === 'number' && Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y)
+        ? { x, y }
+        : null
+    }
+
+    return (
+      pair('x', 'y') ??
+      pair('clientX', 'clientY') ??
+      pair('screenX', 'screenY') ??
+      pair('col', 'row') ??
+      pair('column', 'row')
+    )
+  }, [])
+
+  const onModelPickerMouseMove = useCallback((event?: unknown) => {
+    const coords = readPointerCoords(event)
+    if (!coords) return
+
+    const last = modelPickerLastPointerRef.current
+    const moved = !last || last.x !== coords.x || last.y !== coords.y
+    modelPickerLastPointerRef.current = coords
+
+    if (modelPickerInputMode === 'keyboard' && moved) {
+      setModelPickerInputMode('mouse')
+    }
+  }, [readPointerCoords, modelPickerInputMode])
+
+  useEffect(() => {
+    if (!selectingModelFor) {
+      setModelPickerInputMode('mouse')
+      modelPickerLastPointerRef.current = null
+    }
+  }, [selectingModelFor])
+
+  useEffect(() => {
+    if (!selectingModelFor || modelItems.length === 0) return
+
+    const keepSelectedVisible = (): boolean => {
+      const scrollbox = modelPickerScrollboxRef.current
+      const contentNode = scrollbox?.content
+      const rowNode = modelRowRefs.current.get(modelSelectedIndex)
+
+      if (!scrollbox || !contentNode || !rowNode) return false
+
+      const viewportHeight =
+        scrollbox.viewport?.height ??
+        scrollbox.viewportHeight ??
+        0
+
+      if (!(viewportHeight > 0)) return false
+
+      let rowTop = 0
+      let node: any = rowNode
+      while (node && node !== contentNode) {
+        const yogaNode = node.yogaNode || node.getLayoutNode?.()
+        if (yogaNode) {
+          rowTop += yogaNode.getComputedTop()
+        }
+        node = node.parent
+      }
+
+      if (node !== contentNode) return false
+
+      const rowYogaNode = rowNode.yogaNode || rowNode.getLayoutNode?.()
+      const rowHeight = Math.max(1, rowYogaNode?.getComputedHeight?.() ?? 1)
+
+      const scrollTop = typeof scrollbox.scrollTop === 'number' ? scrollbox.scrollTop : 0
+      const visibleTop = scrollTop
+      const visibleBottom = scrollTop + viewportHeight
+      const rowBottom = rowTop + rowHeight
+
+      let targetTop: number | null = null
+      if (rowTop < visibleTop) {
+        targetTop = rowTop
+      } else if (rowBottom > visibleBottom) {
+        targetTop = rowBottom - viewportHeight
+      }
+
+      if (targetTop == null) return true
+
+      const clampedTop = Math.max(0, targetTop)
+      if (typeof scrollbox.scrollTo === 'function') {
+        scrollbox.scrollTo(clampedTop)
+      } else {
+        scrollbox.scrollTop = clampedTop
+      }
+
+      return true
+    }
+
+    keepSelectedVisible()
+  }, [selectingModelFor, modelSelectedIndex, modelItems])
 
   useKeyboard(useCallback((key: KeyEvent) => {
     const plain = !key.ctrl && !key.meta && !key.option
@@ -316,6 +420,10 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       return
     }
 
+    if (activeTab === 'model' && selectingModelFor && plain && (key.name === 'up' || key.name === 'down')) {
+      setModelPickerInputMode('keyboard')
+    }
+
     const handled = activeTab === 'model' ? onModelHandleKeyEvent(key) : onProviderHandleKeyEvent(key)
     if (handled) {
       key.preventDefault()
@@ -342,6 +450,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     onDeletePreset,
     pendingDeletePresetName,
     closeLoadPresetModal,
+    setModelPickerInputMode,
   ]))
 
   return (
@@ -455,6 +564,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           <>
             {/* Model picker sub-view */}
             <scrollbox
+              ref={modelPickerScrollboxRef}
+              onMouseMove={onModelPickerMouseMove}
               scrollX={false}
               scrollbarOptions={{ visible: false }}
               verticalScrollbarOptions={{
@@ -523,30 +634,38 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                       const selectable = item.selectable !== false
 
                       return (
-                        <Button
+                        <box
                           key={`${item.providerId}:${item.modelId}`}
-                          onClick={() => {
-                            if (selectable) onModelSelect(item.providerId, item.modelId)
-                          }}
-                          onMouseOver={() => {
-                            if (selectable) onModelHoverIndex?.(flatIndex)
-                          }}
-                          style={{
-                            flexDirection: 'column',
-                            paddingLeft: 1,
-                            paddingRight: 1,
-                            backgroundColor: isSelected ? theme.surface : undefined,
+                          ref={(node: any) => {
+                            if (node) modelRowRefs.current.set(flatIndex, node)
+                            else modelRowRefs.current.delete(flatIndex)
                           }}
                         >
-                          <text style={{ fg: !selectable ? theme.muted : isSelected ? theme.primary : theme.foreground, flexGrow: 1 }}>
-                            {isSelected ? '> ' : '  '}
-                            <span style={{ fg: item.recommended ? theme.primary : undefined }}>
-                              {item.recommended ? '[*] ' : '    '}
-                            </span>
-                            {item.modelName}
-                            <span attributes={TextAttributes.DIM}> — {item.modelId}</span>
-                          </text>
-                        </Button>
+                          <Button
+                            onClick={() => {
+                              setModelPickerInputMode('mouse')
+                              if (selectable) onModelSelect(item.providerId, item.modelId)
+                            }}
+                            onMouseOver={() => {
+                              if (selectable && modelPickerInputMode === 'mouse') onModelHoverIndex?.(flatIndex)
+                            }}
+                            style={{
+                              flexDirection: 'column',
+                              paddingLeft: 1,
+                              paddingRight: 1,
+                              backgroundColor: isSelected ? theme.surface : undefined,
+                            }}
+                          >
+                            <text style={{ fg: !selectable ? theme.muted : isSelected ? theme.primary : theme.foreground, flexGrow: 1 }}>
+                              {isSelected ? '> ' : '  '}
+                              <span style={{ fg: item.recommended ? theme.primary : undefined }}>
+                                {item.recommended ? '[*] ' : '    '}
+                              </span>
+                              {item.modelName}
+                              <span attributes={TextAttributes.DIM}> — {item.modelId}</span>
+                            </text>
+                          </Button>
+                        </box>
                       )
                     })}
                   </box>
