@@ -5,16 +5,15 @@ const STRATEGY_ADHERENCE_REINFORCEMENT =
   '**Strategy adherence is mandatory.** The user EXPECTS this process to be followed. Failure to follow this workflow is a violation of user trust.\n\nEstablish the prescribed task decomposition immediately. If you have already started tasks that correspond to steps in this strategy, move them under the appropriate structure.'
 
 /**
- * Lightweight reference table for system prompt — types + allowed assignees only.
+ * Lightweight reference table for system prompt.
  * Strategy guidance comes via inbox hooks on task creation.
  */
 export function renderTaskTypeReferenceTable(): string {
   const lines: string[] = []
-  lines.push('<task_types>')
   for (const def of listTaskTypeDefinitions()) {
-    lines.push(`  <type id="${def.id}" label="${def.label}" assignees="${def.allowedAssignees.join(', ')}" />`)
+    lines.push(`- **${def.label}** (\`${def.id}\`) — ${def.description}`)
+    lines.push(`  Assignees: ${def.allowedAssignees.join(', ')}`)
   }
-  lines.push('</task_types>')
   return lines.join('\n')
 }
 

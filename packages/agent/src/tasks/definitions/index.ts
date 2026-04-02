@@ -10,6 +10,7 @@ import reviewMd from './review.md' with { type: 'text' }
 import otherMd from './other.md' with { type: 'text' }
 import approveMd from './approve.md' with { type: 'text' }
 import groupMd from './group.md' with { type: 'text' }
+import scanMd from './scan.md' with { type: 'text' }
 
 interface RawFrontmatter {
   id: string
@@ -44,3 +45,4 @@ export const reviewTaskType = parseTaskDefinition(reviewMd)
 export const otherTaskType = parseTaskDefinition(otherMd)
 export const approveTaskType = parseTaskDefinition(approveMd)
 export const groupTaskType = parseTaskDefinition(groupMd)
+export const scanTaskType = parseTaskDefinition(scanMd)

@@ -10,11 +10,10 @@ import {
   refactorTaskType,
   researchTaskType,
   reviewTaskType,
+  scanTaskType,
 } from './definitions'
 
-export type TaskTypeId = 'feature' | 'bug' | 'refactor' | 'research' | 'plan' | 'implement' | 'review' | 'approve' | 'group' | 'other'
-
-export const TASK_TYPES: Record<TaskTypeId, TaskTypeDefinition> = {
+export const TASK_TYPES = {
   feature: featureTaskType,
   bug: bugTaskType,
   refactor: refactorTaskType,
@@ -25,7 +24,10 @@ export const TASK_TYPES: Record<TaskTypeId, TaskTypeDefinition> = {
   approve: approveTaskType,
   group: groupTaskType,
   other: otherTaskType,
-}
+  scan: scanTaskType,
+} satisfies Record<string, TaskTypeDefinition>
+
+export type TaskTypeId = keyof typeof TASK_TYPES
 
 export function isValidTaskType(value: string): value is TaskTypeId {
   return Object.hasOwn(TASK_TYPES, value)
