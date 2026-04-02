@@ -63,6 +63,13 @@ export const turnLens = defineThinkingLens({
   description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
 })
 
+export const taskLens = defineThinkingLens({
+  name: 'task',
+  trigger: 'When receiving user request or performing work of any kind',
+  description:
+    "Is all work captured as tasks? Am I about to do something that should be a task but isn't? Are there implicit subtasks I haven't created yet? Every piece of work — no matter how small — must be represented as a task.",
+})
+
 export const leadTools = catalog.pick(
   'fileRead',
   'fileWrite',
