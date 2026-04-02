@@ -89,7 +89,8 @@ function getStatusColor(
 
 function buildTaskTitleText(task: TaskListItem, opts: { archivedExpanded?: boolean }) {
   const isSummaryRow = task.taskId.startsWith('__archived__')
-  const typeLabel = isSummaryRow ? (opts.archivedExpanded ? '▾ ' : '▸ ') : `[${task.type}] `
+  const SHOWN_TYPES = new Set(['feature', 'bug', 'refactor'])
+  const typeLabel = isSummaryRow ? (opts.archivedExpanded ? '▾ ' : '▸ ') : (SHOWN_TYPES.has(task.type) ? `[${task.type}] ` : '')
   return `${typeLabel}${task.title}`
 }
 
