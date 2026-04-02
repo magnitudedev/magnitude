@@ -72,11 +72,12 @@ export interface StorageClient<TSlot extends string = string> {
     setTelemetryEnabled(value: boolean): Promise<void>
 
     getProviderOptions(providerId: string): Promise<ProviderOptions | undefined>
-    getLocalProviderConfig(): Promise<
-      { baseUrl?: string; modelId?: string } | undefined
-    >
-    setLocalProviderConfig(
-      config: { baseUrl?: string; modelId?: string } | null
+    setProviderOptions(
+      providerId: string,
+      optionsOrUpdater:
+        | ProviderOptions
+        | undefined
+        | ((current: ProviderOptions | undefined) => ProviderOptions | undefined)
     ): Promise<void>
 
     loadFull(): Promise<MagnitudeConfig>
@@ -243,18 +244,15 @@ export async function createStorageClient<TSlot extends string = string>(options
         return run(Effect.flatMap(ConfigStorage, (s) => s.setTelemetryEnabled(value)))
       },
 
-      async getProviderOptions(providerId) {
-        const config = await run(Effect.flatMap(ConfigStorage, (s) => s.load()))
-        return config.providers?.[providerId]
+      getProviderOptions(providerId) {
+        return run(Effect.flatMap(ConfigStorage, (s) => s.getProviderOptions(providerId)))
       },
 
-      getLocalProviderConfig() {
-        return run(Effect.flatMap(ConfigStorage, (s) => s.getLocalProviderConfig()))
-      },
-
-      setLocalProviderConfig(config) {
+      setProviderOptions(providerId, optionsOrUpdater) {
         return run(
-          Effect.flatMap(ConfigStorage, (s) => s.setLocalProviderConfig(config ?? undefined))
+          Effect.flatMap(ConfigStorage, (s) =>
+            s.setProviderOptions(providerId, optionsOrUpdater)
+          )
         )
       },
 

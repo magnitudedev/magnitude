@@ -9,7 +9,7 @@ type OverlayKind =
   | 'setup-wizard'
   | 'browser-setup'
   | 'auth-method'
-  | 'local-provider'
+  | 'provider-endpoint'
   | 'api-key'
   | 'oauth'
 
@@ -33,7 +33,7 @@ test('Ctrl+R is ignored for non-recent-chats overlays', () => {
     'setup-wizard',
     'browser-setup',
     'auth-method',
-    'local-provider',
+    'provider-endpoint',
     'api-key',
     'oauth',
   ]

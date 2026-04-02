@@ -10,6 +10,7 @@ import {
   resolveRecommendedModel,
 } from '@magnitudedev/providers'
 import { getDefaultModels } from './model-preferences'
+import { pickLocalBrowserModel } from './local-browser-selection'
 
 export interface ModelPickerItem {
   type: 'model'
@@ -26,7 +27,6 @@ interface BuildModelPickerItemsArgs {
   allProviders: ProviderDefinition[]
   connectedProviderIds: Set<string>
   selectingModelFor: string
-  localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null
   authStatusesByProviderId?: Map<string, ProviderAuthMethodStatus | null>
   detectedAuthTypeByProviderId?: Map<string, string | null>
 }
@@ -47,8 +47,17 @@ interface ResolveSlotDefaultSelectionArgs {
   detectedAuthTypeByProviderId?: Map<string, string | null>
 }
 
-function formatLocalModelName(localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null): string {
-  return localProviderConfig?.baseUrl?.trim() || 'Local model'
+interface ResolveWizardLocalDefaultModelIdArgs {
+  providerId: string
+  savedSlotModels: Record<string, ModelSelection | null>
+  discoveredModels?: Array<{ id: string; name?: string }>
+  rememberedModelIds?: string[]
+}
+
+const LOCAL_PROVIDER_IDS = new Set(['lmstudio', 'ollama', 'llama.cpp', 'openai-compatible-local'])
+
+function normalizeModelId(value: string): string {
+  return value.trim()
 }
 
 function normalizeForSearch(text: string): string {
@@ -69,7 +78,6 @@ export function buildModelPickerItems({
   allProviders,
   connectedProviderIds,
   selectingModelFor,
-  localProviderConfig,
   authStatusesByProviderId,
   detectedAuthTypeByProviderId,
 }: BuildModelPickerItemsArgs): ModelPickerItem[] {
@@ -77,23 +85,6 @@ export function buildModelPickerItems({
 
   for (const provider of allProviders) {
     const connected = connectedProviderIds.has(provider.id)
-
-    if (provider.id === 'local') {
-      if (localProviderConfig?.modelId?.trim()) {
-        const modelId = localProviderConfig.modelId.trim()
-        items.push({
-          type: 'model',
-          providerId: provider.id,
-          providerName: provider.name,
-          connected,
-          modelId,
-          modelName: formatLocalModelName(localProviderConfig),
-          recommended: false,
-          selectable: connected,
-        })
-      }
-      continue
-    }
 
     const oauthOnlySet = provider.oauthOnlyModelIds ? new Set(provider.oauthOnlyModelIds) : null
     const detectedAuthType = detectedAuthTypeByProviderId?.get(provider.id)
@@ -158,6 +149,32 @@ export function filterModelPickerItems({
   })
 }
 
+export function resolveWizardLocalDefaultModelId({
+  providerId,
+  savedSlotModels,
+  discoveredModels = [],
+  rememberedModelIds = [],
+}: ResolveWizardLocalDefaultModelIdArgs): string | null {
+  for (const slot of Object.keys(savedSlotModels)) {
+    const selection = savedSlotModels[slot]
+    if (selection?.providerId === providerId && normalizeModelId(selection.modelId).length > 0) {
+      return normalizeModelId(selection.modelId)
+    }
+  }
+
+  const firstDiscovered = discoveredModels
+    .map((m) => normalizeModelId(m.id))
+    .find((id) => id.length > 0)
+  if (firstDiscovered) return firstDiscovered
+
+  const firstRemembered = rememberedModelIds
+    .map(normalizeModelId)
+    .find((id) => id.length > 0)
+  if (firstRemembered) return firstRemembered
+
+  return null
+}
+
 export function resolveSlotDefaultSelection({
   allProviders,
   connectedProviderIds,
@@ -165,18 +182,37 @@ export function resolveSlotDefaultSelection({
   preferredProviderId,
   detectedAuthTypeByProviderId,
 }: ResolveSlotDefaultSelectionArgs): ModelSelection | null {
-  const connectedProviders = allProviders.filter(provider =>
-    connectedProviderIds.has(provider.id) && provider.models.length > 0,
+  const connectedProviders = allProviders.filter((provider) =>
+    connectedProviderIds.has(provider.id),
   )
 
-  const preferredFirst = [...connectedProviders].sort((a, b) => {
+  // 1. If preferred provider is local-family, stay scoped to that provider inventory.
+  const preferredProvider = preferredProviderId
+    ? connectedProviders.find((provider) => provider.id === preferredProviderId)
+    : null
+
+  const connectedProvidersWithModels = connectedProviders.filter((provider) => provider.models.length > 0)
+
+  const preferredFirst = [...connectedProvidersWithModels].sort((a, b) => {
     const aPreferred = a.id === preferredProviderId ? -1 : 0
     const bPreferred = b.id === preferredProviderId ? -1 : 0
     if (aPreferred !== bPreferred) return aPreferred - bPreferred
     return compareProviderOrder(a.id, b.id)
   })
 
-  // 1. Try hardcoded per-provider defaults first
+  if (preferredProvider && LOCAL_PROVIDER_IDS.has(preferredProvider.id)) {
+    const localFirstModel = slot === 'browser'
+      ? pickLocalBrowserModel(preferredProvider.id, preferredProvider.models)
+      : preferredProvider.models[0]
+
+    if (localFirstModel) {
+      return { providerId: preferredProvider.id, modelId: localFirstModel.id }
+    }
+
+    return null
+  }
+
+  // 2. Try hardcoded per-provider defaults first
   for (const provider of preferredFirst) {
     const isOAuth = detectedAuthTypeByProviderId?.get(provider.id) === 'oauth'
     const defaults = getDefaultModels(provider.id, isOAuth)
@@ -186,13 +222,13 @@ export function resolveSlotDefaultSelection({
     }
   }
 
-  // 2. Fall back to recommendation rules
+  // 3. Fall back to recommendation rules
   const recommended = resolveRecommendedModel(slot, allProviders, connectedProviderIds, {
     preferredProviderId: preferredProviderId ?? undefined,
   })
   if (recommended) return recommended
 
-  // 3. Fall back to browser-compatible model
+  // 4. Fall back to browser-compatible model
   if (slot === 'browser') {
     for (const provider of preferredFirst) {
       const browserModel = provider.models.find(model => isBrowserCompatible(provider.id, model.id))
@@ -200,7 +236,7 @@ export function resolveSlotDefaultSelection({
     }
   }
 
-  // 4. Fall back to first available model
+  // 5. Fall back to first available model
   for (const provider of preferredFirst) {
     const firstModel = provider.models[0]
     if (firstModel) return { providerId: provider.id, modelId: firstModel.id }

@@ -21,6 +21,12 @@ import { useTheme } from './hooks/use-theme'
 import { SelectedFileProvider } from './hooks/use-file-viewer'
 
 import { BOX_CHARS } from './utils/ui-constants'
+import {
+  localProviderAddedModelToast,
+  localProviderSavedApiKeyToast,
+  localProviderSavedEmptyApiKeyToast,
+  localProviderSavedEndpointToast,
+} from './utils/local-provider-toast-messages'
 import { AnimatedLogo } from './components/animated-logo'
 import { RecentChatsWidget } from './components/recent-chats-widget'
 import { SessionLoadingView } from './components/session-loading-view'
@@ -36,7 +42,9 @@ import { useAuthFlow } from './hooks/use-auth-flow'
 import { type WizardStep } from './components/setup-wizard-overlay'
 import { AppOverlays } from './components/app-overlays'
 
+
 import { buildModelPickerItems, filterModelPickerItems, resolveSlotDefaultSelection } from './utils/model-picker'
+import { resolveLocalWizardSlotDefaults } from './utils/wizard-flow'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
 
@@ -68,7 +76,7 @@ import { useFilePanel } from './hooks/use-file-panel'
 import { useLazyClient } from './hooks/use-lazy-client'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
 
-import type { Preset } from '@magnitudedev/storage'
+import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 
 const SYSTEM_DEFAULTS_PRESET = '__system_defaults__'
 
@@ -178,6 +186,7 @@ function AppInner({
   const [providerDetailSelectedIndex, setProviderDetailSelectedIndex] = useState(0)
   const [providerRefreshKey, setProviderRefreshKey] = useState(0)
   const [providerDetailStatus, setProviderDetailStatus] = useState<ProviderAuthMethodStatus | null>(null)
+  const [providerDetailOptions, setProviderDetailOptions] = useState<ProviderOptions | undefined>(undefined)
   const [contextHardCap, setContextHardCap] = useState<number | null>(null)
   const [agentProjectionMode, setAgentProjectionMode] = useState<string>('default')
   const [bashMode, setBashMode] = useState(false)
@@ -255,10 +264,17 @@ function AppInner({
   const [wizardConnectedProvider, setWizardConnectedProvider] = useState<string | null>(null)
   const [wizardNeedsChromium, setWizardNeedsChromium] = useState<boolean | null>(null)
 
+  const [wizardSelectedProviderId, setWizardSelectedProviderId] = useState<string | null>(null)
+  const [wizardSelectedProviderDiscoveredModels, setWizardSelectedProviderDiscoveredModels] = useState<Array<{ id: string, name: string }>>([])
+  const [wizardSelectedProviderRememberedModelIds, setWizardSelectedProviderRememberedModelIds] = useState<string[]>([])
+  const localProviderSet = useMemo(() => new Set(['lmstudio', 'ollama', 'llama.cpp', 'openai-compatible-local']), [])
+  const wizardHasProviderEndpointStep = !!wizardSelectedProviderId && localProviderSet.has(wizardSelectedProviderId)
+
   const wizardTotalSteps = useMemo(() => {
-    if (wizardNeedsChromium === false) return 2
-    return 3
-  }, [wizardNeedsChromium])
+    const baseSteps = wizardHasProviderEndpointStep ? 3 : 2 // provider (+endpoint when local) + models
+    if (wizardNeedsChromium === false) return baseSteps
+    return baseSteps + 1
+  }, [wizardNeedsChromium, wizardHasProviderEndpointStep])
 
   const [recentChats, setRecentChats] = useState<RecentChat[] | null>(null)
 
@@ -883,7 +899,17 @@ function AppInner({
   }, [clientSend, showEphemeral, theme.error])
 
   const initProject = useCallback(() => {
-    clientSend({ type: 'user_message', forkId: null, content: textParts(INIT_PROMPT), attachments: [], mode: 'text', synthetic: false, taskMode: false })
+    clientSend({
+      type: 'user_message',
+      messageId: createId(),
+      timestamp: Date.now(),
+      forkId: null,
+      content: textParts(INIT_PROMPT),
+      attachments: [],
+      mode: 'text',
+      synthetic: false,
+      taskMode: false,
+    })
     logger.info('Init project activated')
   }, [clientSend])
 
@@ -927,6 +953,22 @@ function AppInner({
     const auth = await providerRuntime.auth.getAuth(providerId)
     await providerRuntime.state.setSelection(selectingModelFor, providerId, modelId, auth ?? null)
     await storage.config.setModelSelection(selectingModelFor, selection)
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            modelId,
+            rememberedModelIds: Array.from(new Set([...remembered, modelId])),
+          },
+        },
+      }
+    })
     setSlotModels(prev => ({ ...prev, [selectingModelFor]: selection }))
 
     await reloadProviderState()
@@ -983,14 +1025,24 @@ function AppInner({
         reviewer: null, debugger: null, browser: null,
       }
 
-      for (const slot of MAGNITUDE_SLOTS) {
-        defaultModels[slot] = resolveSlotDefaultSelection({
-          allProviders: PROVIDERS,
-          connectedProviderIds,
-          slot,
-          preferredProviderId,
-          detectedAuthTypeByProviderId,
-        })
+      const preferredProvider = PROVIDERS.find((provider) => provider.id === preferredProviderId)
+      const isLocalPreferredProvider = preferredProvider?.providerFamily === 'local'
+      const firstLocalModelId = isLocalPreferredProvider ? preferredProvider?.models[0]?.id ?? null : null
+
+      if (isLocalPreferredProvider && firstLocalModelId) {
+        for (const slot of MAGNITUDE_SLOTS) {
+          defaultModels[slot] = { providerId: preferredProviderId, modelId: firstLocalModelId }
+        }
+      } else {
+        for (const slot of MAGNITUDE_SLOTS) {
+          defaultModels[slot] = resolveSlotDefaultSelection({
+            allProviders: PROVIDERS,
+            connectedProviderIds,
+            slot,
+            preferredProviderId,
+            detectedAuthTypeByProviderId,
+          })
+        }
       }
 
       await applySlotModelMap(defaultModels)
@@ -1007,9 +1059,11 @@ function AppInner({
   useEffect(() => {
     if (!providerDetailId) {
       setProviderDetailStatus(null)
+      setProviderDetailOptions(undefined)
       return
     }
     setProviderDetailStatus(null)
+    setProviderDetailOptions(undefined)
     let stale = false
 
     providerRuntime.auth.detectProviderAuthMethods(providerDetailId).then((status) => {
@@ -1021,27 +1075,40 @@ function AppInner({
       }, 'Failed to load provider auth methods')
       if (!stale) setProviderDetailStatus(null)
     })
+
+    storage.config.getProviderOptions(providerDetailId).then((options) => {
+      if (!stale) setProviderDetailOptions(options)
+    }).catch((error) => {
+      logger.warn({
+        providerId: providerDetailId,
+        error: error instanceof Error ? error.message : String(error),
+      }, 'Failed to load provider options')
+      if (!stale) setProviderDetailOptions(undefined)
+    })
+
     return () => { stale = true }
-  }, [providerDetailId, providerRefreshKey, providerRuntime])
+  }, [providerDetailId, providerRefreshKey, providerRuntime, storage])
 
   const providerDetailActions = useMemo(() => {
     if (!providerDetailStatus) return []
-    const actions: Array<{ type: 'connect' | 'disconnect' | 'update-key'; methodIndex: number; label: string }> = []
+    const actions: Array<{ type: 'connect' | 'disconnect' | 'update-key' | 'retry-discovery' | 'configure-endpoint'; methodIndex: number; label: string }> = []
+    const providerId = providerDetailStatus.provider.id
+    const isLocal = localProviderSet.has(providerId)
+
     for (const m of providerDetailStatus.methods) {
       if (m.connected) {
         if (m.method.type === 'api-key' && m.source === 'stored') {
           actions.push({ type: 'update-key', methodIndex: m.methodIndex, label: 'Update Key' })
           actions.push({ type: 'disconnect', methodIndex: m.methodIndex, label: 'Disconnect' })
-        } else if (m.source === 'stored' || m.source === 'none') {
+        } else if (!isLocal && (m.source === 'stored' || m.source === 'none')) {
           actions.push({ type: 'disconnect', methodIndex: m.methodIndex, label: 'Disconnect' })
         }
-        // env-sourced auth: no actions (can't disconnect env vars)
-      } else {
+      } else if (!isLocal) {
         actions.push({ type: 'connect', methodIndex: m.methodIndex, label: 'Connect' })
       }
     }
     return actions
-  }, [providerDetailStatus])
+  }, [providerDetailStatus, localProviderSet])
 
   const connectedProviderIds = useMemo(
     () => new Set(detectedProviders.map(d => d.provider.id)),
@@ -1075,7 +1142,7 @@ function AppInner({
       allProviders: PROVIDERS,
       connectedProviderIds,
       selectingModelFor,
-      localProviderConfig: providerUiState?.localProviderConfig,
+
       authStatusesByProviderId,
       detectedAuthTypeByProviderId,
     })
@@ -1110,6 +1177,7 @@ function AppInner({
       if (showSetupWizardRef.current) {
         // Wizard mode: advance to models step with defaults for this provider
         const provider = getProvider(providerId)
+        setWizardSelectedProviderId(providerId)
 
         const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
           lead: null, explorer: null, planner: null, builder: null,
@@ -1161,15 +1229,72 @@ function AppInner({
 
   // --- Setup wizard handlers ---
 
-  const handleWizardProviderSelected = useCallback((providerId: string) => {
+  const handleWizardProviderSelected = useCallback(async (providerId: string) => {
     const provider = getProvider(providerId)
     if (!provider) return
+    setWizardSelectedProviderId(providerId)
+
+    const isLocalProvider = localProviderSet.has(providerId)
+    if (isLocalProvider) {
+      // Local wizard path is models-first. Seed default endpoint in background if missing.
+      const existing = await storage.config.getProviderOptions(providerId)
+      const hasBaseUrl = typeof existing?.baseUrl === 'string' && existing.baseUrl.trim().length > 0
+      if (!hasBaseUrl && provider.defaultBaseUrl) {
+        await storage.config.updateFull((current) => {
+          const providerOptions = current.providers?.[providerId] ?? {}
+          return {
+            ...current,
+            providers: {
+              ...(current.providers ?? {}),
+              [providerId]: {
+                ...providerOptions,
+                baseUrl: provider.defaultBaseUrl,
+              },
+            },
+          }
+        })
+      }
+
+      await providerRuntime.catalog.refresh().catch(() => undefined)
+      await reloadProviderState().catch(() => undefined)
+
+      const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+
+      const refreshedConnectedProviderIds = new Set([
+        ...connectedProviderIds,
+        providerId,
+      ])
+
+      const newWizardSlotModels = resolveLocalWizardSlotDefaults({
+        slots: MAGNITUDE_SLOTS,
+        providerId,
+        existingSlotModels: slotModels,
+        discoveredModelIds: discoveredModels.map((m: { id: string }) => m.id),
+        rememberedModelIds,
+        applyWizardDefaults: true,
+      }) as Record<MagnitudeSlot, ModelSelection | null>
+
+      setWizardSlotModels(newWizardSlotModels)
+      setWizardConnectedProvider(provider.name)
+      setWizardStep('local-provider')
+      return
+    }
 
     const detected = detectedProviders
     const match = detected.find(d => d.provider.id === providerId)
 
     if (match) {
-      // Already authenticated — compute model defaults and go to models step
+      // Already authenticated and ready — compute model defaults and go to models step
       const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
         lead: null, explorer: null, planner: null, builder: null,
         reviewer: null, debugger: null, browser: null,
@@ -1185,6 +1310,8 @@ function AppInner({
       }
       setWizardSlotModels(newWizardSlotModels)
       setWizardConnectedProvider(provider.name)
+      setWizardSelectedProviderDiscoveredModels([])
+      setWizardSelectedProviderRememberedModelIds([])
       setWizardStep('models')
     } else if (provider.authMethods.length === 1) {
       // Single auth method — start it directly
@@ -1193,13 +1320,16 @@ function AppInner({
       // Multiple auth methods — show picker
       authFlow.openAuthMethodPicker(provider)
     }
-  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds])
+  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds, localProviderSet, storage, providerRuntime, reloadProviderState, slotModels])
 
   const finishWizard = useCallback(() => {
     setShowSetupWizard(false)
     setWizardStep('provider')
     setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardConnectedProvider(null)
+    setWizardSelectedProviderId(null)
+    setWizardSelectedProviderDiscoveredModels([])
+    setWizardSelectedProviderRememberedModelIds([])
     setProviderRefreshKey(prev => prev + 1)
   }, [])
 
@@ -1240,15 +1370,27 @@ function AppInner({
     finishWizard()
   }, [authFlow.cancelAll, finishWizard, providerUiState, reloadProviderState, storage])
 
+  const handleWizardContinueFromLocalProvider = useCallback(() => {
+    setWizardStep('models')
+  }, [])
+
   const handleWizardBack = useCallback(() => {
     if (wizardStep === 'browser') {
       setWizardStep('models')
       return
     }
+    if (wizardStep === 'models' && wizardHasProviderEndpointStep) {
+      setWizardStep('local-provider')
+      return
+    }
+    if (wizardStep === 'local-provider') {
+      setWizardStep('provider')
+      return
+    }
     setWizardStep('provider')
     setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardConnectedProvider(null)
-  }, [wizardStep])
+  }, [wizardStep, wizardHasProviderEndpointStep])
 
   // Providers shown in the wizard (exclude cloud providers that require manual credential setup)
   const WIZARD_PROVIDERS = useMemo(() =>
@@ -1286,9 +1428,13 @@ function AppInner({
         return next
       })
     }
-    if (providerId === 'local') {
-      await storage.config.setLocalProviderConfig(null)
-    }
+
+
+    await storage.config.updateFull((current) => {
+      const providers = { ...(current.providers ?? {}) }
+      delete providers[providerId]
+      return { ...current, providers }
+    })
 
     await reloadProviderState()
     setProviderDetailSelectedIndex(0)
@@ -1320,6 +1466,16 @@ function AppInner({
       handleProviderUpdateKey(providerDetailId)
     } else if (action.type === 'disconnect') {
       handleProviderDisconnect(providerDetailId)
+    } else if (action.type === 'retry-discovery') {
+      void providerRuntime.catalog.refresh()
+        .then(() => reloadProviderState())
+        .then(() => {
+          setProviderRefreshKey(prev => prev + 1)
+          showEphemeral(`Discovery refreshed for ${getProvider(providerDetailId)?.name ?? providerDetailId}`, theme.success)
+        })
+        .catch(() => {
+          showEphemeral(`Couldn't refresh models right now`, theme.warning, 5000)
+        })
     } else if (action.type === 'connect') {
       const provider = getProvider(providerDetailId)
       if (provider) {
@@ -1329,8 +1485,95 @@ function AppInner({
         authFlow.startAuthForProvider(provider, action.methodIndex)
       }
     }
-  }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider])
+  }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider, providerRuntime, reloadProviderState, showEphemeral, theme.success, theme.warning])
 
+
+  const handleLocalProviderSaveEndpoint = useCallback(async (providerId: string, url: string) => {
+    const trimmed = url.trim()
+    if (!trimmed) return
+    const normalized = /^https?:\/\//.test(trimmed) ? trimmed : `http://${trimmed}`
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            baseUrl: normalized,
+          },
+        },
+      }
+    })
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    setProviderRefreshKey(prev => prev + 1)
+    showEphemeral(localProviderSavedEndpointToast(getProvider(providerId)?.name ?? providerId), theme.success)
+  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success])
+
+  const handleLocalProviderRefreshModels = useCallback(async (_providerId: string) => {
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    setProviderRefreshKey(prev => prev + 1)
+  }, [providerRuntime, reloadProviderState])
+
+  const handleLocalProviderAddManualModel = useCallback(async (providerId: string, modelId: string) => {
+    const trimmed = modelId.trim()
+    if (!trimmed) return
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            rememberedModelIds: Array.from(new Set([...remembered, trimmed])),
+          },
+        },
+      }
+    })
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    setProviderRefreshKey(prev => prev + 1)
+    showEphemeral(localProviderAddedModelToast(trimmed), theme.success)
+  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success])
+
+  const handleLocalProviderRemoveManualModel = useCallback(async (providerId: string, modelId: string) => {
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            rememberedModelIds: remembered.filter((id) => id !== modelId),
+          },
+        },
+      }
+    })
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    setProviderRefreshKey(prev => prev + 1)
+  }, [storage, providerRuntime, reloadProviderState])
+
+  const handleLocalProviderSaveOptionalApiKey = useCallback(async (providerId: string, apiKey: string) => {
+    const trimmed = apiKey.trim()
+    if (trimmed.length === 0) {
+      await storage.auth.remove(providerId)
+      showEphemeral(localProviderSavedEmptyApiKeyToast(getProvider(providerId)?.name ?? providerId), theme.success)
+    } else {
+      await storage.auth.set(providerId, { type: 'api', key: trimmed })
+      showEphemeral(localProviderSavedApiKeyToast(getProvider(providerId)?.name ?? providerId), theme.success)
+    }
+    await reloadProviderState().catch(() => undefined)
+    setProviderRefreshKey(prev => prev + 1)
+  }, [storage, reloadProviderState, showEphemeral, theme.success])
 
   const handleChangeSlot = useCallback((slot: MagnitudeSlot) => {
     resetModelPickerState()
@@ -1469,13 +1712,13 @@ function AppInner({
 
   const activeOverlayKind =
     (showSetupWizard && wizardStep === 'browser') ? 'setup-browser'
-    : (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay) ? 'setup-wizard'
+    : (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.endpointSetup && !authFlow.showAuthMethodOverlay) ? 'setup-wizard'
     : showRecentChatsOverlay ? 'recent-chats'
     : (expandedForkId && client) ? 'fork-detail'
     : showBrowserSetup ? 'browser-setup'
     : settingsTab !== null ? 'settings'
     : (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider) ? 'auth-method'
-    : authFlow.showLocalSetup ? 'local-provider'
+    : authFlow.endpointSetup ? 'provider-endpoint'
     : authFlow.apiKeySetup ? 'api-key'
     : authFlow.oauthState ? 'oauth'
     : 'none'
@@ -1655,7 +1898,17 @@ function AppInner({
     message: string
     attachments: Attachment[]
   }) => {
-    clientSend({ type: 'user_message', forkId: payload.forkId, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
+    clientSend({
+      type: 'user_message',
+      messageId: createId(),
+      timestamp: Date.now(),
+      forkId: payload.forkId,
+      content: textParts(payload.message),
+      attachments: payload.attachments,
+      mode: 'text',
+      synthetic: false,
+      taskMode: false,
+    })
   }, [clientSend])
 
   if (!display) {
@@ -1672,8 +1925,12 @@ function AppInner({
       showSetupWizard={showSetupWizard}
       wizardStep={wizardStep}
       wizardTotalSteps={wizardTotalSteps}
+      wizardHasProviderEndpointStep={wizardHasProviderEndpointStep}
       wizardSlotModels={wizardSlotModels}
       wizardConnectedProvider={wizardConnectedProvider}
+      wizardSelectedProviderId={wizardSelectedProviderId}
+      wizardSelectedProviderDiscoveredModels={wizardSelectedProviderDiscoveredModels}
+      wizardSelectedProviderRememberedModelIds={wizardSelectedProviderRememberedModelIds}
       wizardProviderSelectedIndex={wizardProviderSelectedIndex}
       wizardModelSelectedIndex={wizardModelSelectedIndex}
       showBrowserSetup={showBrowserSetup}
@@ -1682,7 +1939,13 @@ function AppInner({
       handleWizardProviderSelected={handleWizardProviderSelected}
       handleWizardComplete={handleWizardComplete}
       handleWizardBack={handleWizardBack}
+      handleWizardContinueFromLocalProvider={handleWizardContinueFromLocalProvider}
       handleWizardSkip={handleWizardSkip}
+      onLocalProviderSaveEndpoint={handleLocalProviderSaveEndpoint}
+      onLocalProviderRefreshModels={handleLocalProviderRefreshModels}
+      onLocalProviderAddManualModel={handleLocalProviderAddManualModel}
+      onLocalProviderRemoveManualModel={handleLocalProviderRemoveManualModel}
+      onLocalProviderSaveOptionalApiKey={handleLocalProviderSaveOptionalApiKey}
       setWizardProviderSelectedIndex={setWizardProviderSelectedIndex}
       setWizardModelSelectedIndex={setWizardModelSelectedIndex}
       wizardProviders={WIZARD_PROVIDERS}
@@ -1698,6 +1961,7 @@ function AppInner({
       preferencesSelectedIndex={preferencesSelectedIndex}
       setPreferencesSelectedIndex={setPreferencesSelectedIndex}
       providerDetailStatus={providerDetailStatus}
+      providerDetailOptions={providerDetailOptions}
       providerDetailActions={providerDetailActions}
       providerDetailSelectedIndex={providerDetailSelectedIndex}
       setProviderDetailSelectedIndex={setProviderDetailSelectedIndex}
@@ -1739,12 +2003,6 @@ function AppInner({
       popForkOverlay={popForkOverlay}
       pushForkOverlay={pushForkOverlay}
       onFileClick={openFile}
-      localProviderConfig={providerUiState?.localProviderConfig
-        ? {
-            baseUrl: providerUiState.localProviderConfig.baseUrl ?? undefined,
-            modelId: providerUiState.localProviderConfig.modelId ?? undefined,
-          }
-        : null}
     />
   )
 
@@ -1886,7 +2144,7 @@ function AppInner({
     && settingsTab === null
     && !authFlow.showAuthMethodOverlay
     && !authFlow.oauthState
-    && !authFlow.showLocalSetup
+    && !authFlow.endpointSetup
     && !authFlow.apiKeySetup
     && expandedForkId === null
 

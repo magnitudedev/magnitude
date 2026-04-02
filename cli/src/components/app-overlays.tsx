@@ -9,13 +9,13 @@ import { RecentChatsOverlay } from './recent-chats-overlay'
 import { ForkDetailOverlay } from './fork-detail-overlay'
 import { SettingsOverlay } from './settings-overlay'
 import { AuthMethodOverlay } from './auth-method-overlay'
-import { LocalProviderOverlay } from './local-provider-overlay'
+import { ProviderEndpointOverlay } from './provider-endpoint-overlay'
 import { ApiKeyOverlay } from './api-key-overlay'
 import { OAuthOverlay } from './oauth-overlay'
 import type { RecentChat } from '../data/recent-chats'
 import type { useAuthFlow } from '../hooks/use-auth-flow'
 
-import type { Preset } from '@magnitudedev/storage'
+import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
@@ -23,8 +23,12 @@ export type AppOverlaysProps = {
   showSetupWizard: boolean
   wizardStep: WizardStep
   wizardTotalSteps: number
+  wizardHasProviderEndpointStep: boolean
   wizardSlotModels: Record<MagnitudeSlot, ModelSelection | null>
   wizardConnectedProvider: string | null
+  wizardSelectedProviderId: string | null
+  wizardSelectedProviderDiscoveredModels: Array<{ id: string; name?: string }>
+  wizardSelectedProviderRememberedModelIds: string[]
   wizardProviderSelectedIndex: number
   wizardModelSelectedIndex: number
   showBrowserSetup: boolean
@@ -32,8 +36,14 @@ export type AppOverlaysProps = {
   handleWizardBrowserComplete: () => void
   handleWizardProviderSelected: (...args: any[]) => void
   handleWizardComplete: (...args: any[]) => void
+  handleWizardContinueFromLocalProvider: () => void
   handleWizardBack: () => void
   handleWizardSkip: () => void
+  onLocalProviderSaveEndpoint: (providerId: string, url: string) => void
+  onLocalProviderRefreshModels: (providerId: string) => void
+  onLocalProviderAddManualModel: (providerId: string, modelId: string) => void
+  onLocalProviderRemoveManualModel: (providerId: string, modelId: string) => void
+  onLocalProviderSaveOptionalApiKey: (providerId: string, apiKey: string) => void
   setWizardProviderSelectedIndex: (n: number) => void
   setWizardModelSelectedIndex: (n: number) => void
   wizardProviders: ProviderDefinition[]
@@ -51,7 +61,8 @@ export type AppOverlaysProps = {
   preferencesSelectedIndex: number
   setPreferencesSelectedIndex: (n: number) => void
   providerDetailStatus: ProviderAuthMethodStatus | null
-  providerDetailActions: Array<{ type: 'connect' | 'disconnect' | 'update-key'; methodIndex: number; label: string }>
+  providerDetailOptions: ProviderOptions | undefined
+  providerDetailActions: Array<{ type: 'connect' | 'disconnect' | 'update-key' | 'retry-discovery' | 'configure-endpoint'; methodIndex: number; label: string }>
   providerDetailSelectedIndex: number
   setProviderDetailSelectedIndex: (n: number) => void
   settingsTab: SettingsTab | null
@@ -95,15 +106,19 @@ export type AppOverlaysProps = {
   pushForkOverlay: (forkId: string) => void
   onFileClick?: (path: string, section?: string) => void
 
-  localProviderConfig: { baseUrl?: string; modelId?: string } | null
+
 }
 
 export function AppOverlays({
   showSetupWizard,
   wizardStep,
   wizardTotalSteps,
+  wizardHasProviderEndpointStep,
   wizardSlotModels,
   wizardConnectedProvider,
+  wizardSelectedProviderId,
+  wizardSelectedProviderDiscoveredModels,
+  wizardSelectedProviderRememberedModelIds,
   wizardProviderSelectedIndex,
   wizardModelSelectedIndex,
   showBrowserSetup,
@@ -111,8 +126,14 @@ export function AppOverlays({
   handleWizardBrowserComplete,
   handleWizardProviderSelected,
   handleWizardComplete,
+  handleWizardContinueFromLocalProvider,
   handleWizardBack,
   handleWizardSkip,
+  onLocalProviderSaveEndpoint,
+  onLocalProviderRefreshModels,
+  onLocalProviderAddManualModel,
+  onLocalProviderRemoveManualModel,
+  onLocalProviderSaveOptionalApiKey,
   setWizardProviderSelectedIndex,
   setWizardModelSelectedIndex,
   wizardProviders,
@@ -128,6 +149,7 @@ export function AppOverlays({
   preferencesSelectedIndex,
   setPreferencesSelectedIndex,
   providerDetailStatus,
+  providerDetailOptions,
   providerDetailActions,
   providerDetailSelectedIndex,
   setProviderDetailSelectedIndex,
@@ -169,7 +191,6 @@ export function AppOverlays({
   popForkOverlay,
   pushForkOverlay,
   onFileClick,
-  localProviderConfig,
 }: AppOverlaysProps) {
   if (showSetupWizard && wizardStep === 'browser') {
     return (
@@ -188,7 +209,7 @@ export function AppOverlays({
     )
   }
 
-  if (showSetupWizard && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay) {
+  if (showSetupWizard && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.endpointSetup && !authFlow.showAuthMethodOverlay) {
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
         <SetupWizardOverlay
@@ -197,18 +218,28 @@ export function AppOverlays({
           detectedProviders={detectedProviders}
           slotModels={wizardSlotModels}
           connectedProviderName={wizardConnectedProvider}
+          selectedProviderId={wizardSelectedProviderId}
+          selectedProviderDiscoveredModels={wizardSelectedProviderDiscoveredModels}
+          selectedProviderRememberedModelIds={wizardSelectedProviderRememberedModelIds}
           totalSteps={wizardTotalSteps}
           onProviderSelected={handleWizardProviderSelected}
           onComplete={handleWizardComplete}
           onBack={handleWizardBack}
+          onContinueFromLocalProvider={handleWizardContinueFromLocalProvider}
           onSkip={handleWizardSkip}
           onWizardCtrlCExit={onWizardCtrlCExit}
+          onLocalProviderSaveEndpoint={onLocalProviderSaveEndpoint}
+          onLocalProviderRefreshModels={onLocalProviderRefreshModels}
+          onLocalProviderAddManualModel={onLocalProviderAddManualModel}
+          onLocalProviderRemoveManualModel={onLocalProviderRemoveManualModel}
+          onLocalProviderSaveOptionalApiKey={onLocalProviderSaveOptionalApiKey}
           providerSelectedIndex={wizardProviderSelectedIndex}
           onProviderSelectedIndexChange={setWizardProviderSelectedIndex}
           onProviderHoverIndex={setWizardProviderSelectedIndex}
           modelNavSelectedIndex={wizardModelSelectedIndex}
           onModelNavSelectedIndexChange={setWizardModelSelectedIndex}
           onModelNavHoverIndex={setWizardModelSelectedIndex}
+          hasProviderEndpointStep={wizardHasProviderEndpointStep}
         />
       </box>
     )
@@ -284,20 +315,21 @@ export function AppOverlays({
           onProviderSelect={handleProviderSelect}
           onProviderHoverIndex={providerNavigation.setSelectedIndex}
           providerDetailStatus={providerDetailStatus}
+          providerDetailOptions={providerDetailOptions}
           providerDetailActions={providerDetailActions}
           providerDetailSelectedIndex={providerDetailSelectedIndex}
           onProviderDetailAction={handleProviderDetailAction}
           onProviderDetailHoverIndex={setProviderDetailSelectedIndex}
+          onLocalProviderSaveEndpoint={onLocalProviderSaveEndpoint}
+          onLocalProviderRefreshModels={onLocalProviderRefreshModels}
+          onLocalProviderAddManualModel={onLocalProviderAddManualModel}
+          onLocalProviderRemoveManualModel={onLocalProviderRemoveManualModel}
+          onLocalProviderSaveOptionalApiKey={onLocalProviderSaveOptionalApiKey}
           slotModels={slotModels}
           selectingModelFor={selectingModelFor}
           onChangeSlot={handleChangeSlot}
           modelPrefsSelectedIndex={preferencesSelectedIndex}
           onModelPrefsHoverIndex={setPreferencesSelectedIndex}
-          localProviderConfig={localProviderConfig}
-          localProviderAuth={(() => {
-            const localDetected = detectedProviders.find((d) => d.provider.id === 'local')
-            return localDetected?.auth?.type === 'api' ? localDetected.auth : null
-          })()}
           onModelHandleKeyEvent={modelTabHandleKeyEvent}
           onProviderHandleKeyEvent={providerTabHandleKeyEvent}
           onBackFromModelPicker={onBackFromModelPicker}
@@ -334,18 +366,20 @@ export function AppOverlays({
     )
   }
 
-  if (authFlow.showLocalSetup) {
+
+  if (authFlow.endpointSetup) {
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
-        <LocalProviderOverlay
-          initialConfig={{ url: localProviderConfig?.baseUrl ?? '', modelId: localProviderConfig?.modelId ?? '' }}
-          onSubmit={authFlow.handleLocalSetupSubmit}
-          onCancel={authFlow.handleLocalSetupCancel}
+        <ProviderEndpointOverlay
+          provider={authFlow.endpointSetup.provider}
+          initialOptions={authFlow.endpointSetup.initialOptions ?? undefined}
+          onSubmit={authFlow.handleEndpointSetupSubmit}
+          onCancel={authFlow.handleEndpointSetupCancel}
           wizardMode={showSetupWizard ? {
-            stepLabel: `Providers (1 of ${wizardTotalSteps})`,
-            subtitle: 'Configure your local provider to get started.',
+            stepLabel: `Provider setup (${wizardStep === 'provider-endpoint' ? 2 : 1} of ${wizardTotalSteps})`,
+            subtitle: `Configure ${authFlow.endpointSetup.provider.name} endpoint to continue.`,
             onSkip: handleWizardSkip,
-            onBack: authFlow.handleLocalSetupCancel,
+            onBack: authFlow.handleEndpointSetupCancel,
           } : undefined}
         />
       </box>

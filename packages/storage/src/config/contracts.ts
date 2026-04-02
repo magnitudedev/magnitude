@@ -34,9 +34,12 @@ export interface ConfigStorageShape<TSlot extends string> {
   ) => Effect.Effect<void>
   readonly deletePreset: (name: string) => Effect.Effect<void>
   readonly getProviderOptions: (providerId: string) => Effect.Effect<ProviderOptions | undefined>
-  readonly getLocalProviderConfig: () => Effect.Effect<{ baseUrl?: string; modelId?: string } | undefined>
-  readonly setLocalProviderConfig: (
-    config: { baseUrl?: string; modelId?: string } | undefined
+  readonly setProviderOptions: (
+    providerId: string,
+    optionsOrUpdater:
+      | ProviderOptions
+      | undefined
+      | ((current: ProviderOptions | undefined) => ProviderOptions | undefined)
   ) => Effect.Effect<void>
 }
 
