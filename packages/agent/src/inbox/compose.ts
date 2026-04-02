@@ -170,6 +170,41 @@ export function toTimelineLifecycleHook(args: {
   }
 }
 
+export function toTimelineTaskTypeHook(args: {
+  timestamp: number
+  taskId: string
+  taskType: string
+  title: string
+}): TimelineEntry {
+  return {
+    kind: 'task_type_hook',
+    ...args,
+  }
+}
+
+export function toTimelineTaskIdleHook(args: {
+  timestamp: number
+  taskId: string
+  taskType: string
+  title: string
+  agentId: string
+}): TimelineEntry {
+  return {
+    kind: 'task_idle_hook',
+    ...args,
+  }
+}
+
+export function toTimelineTaskTreeView(args: {
+  timestamp: number
+  renderedTree: string
+}): TimelineEntry {
+  return {
+    kind: 'task_tree_view',
+    ...args,
+  }
+}
+
 export function toTimelineObservation(args: {
   timestamp: number
   parts: readonly ContentPart[]

@@ -423,13 +423,23 @@ export function ChatController(props: ChatControllerProps) {
     }
   }, [inputValue, attachments.length, handleSubmit])
 
+  const selectedTaskForFork = selectedForkId == null
+    ? null
+    : tasks.find((task) => task.workerForkId === selectedForkId)
+
   const selectedSubagentAgentId = selectedForkId == null
     ? null
-    : (tasks.find((task) => task.forkId === selectedForkId)?.agentId ?? selectedForkId)
+    : selectedTaskForFork?.assignee.kind === 'worker'
+      ? selectedTaskForFork.assignee.agentId
+      : selectedForkId
 
-  const pendingKillTab = pendingKillForkId == null
+  const pendingKillTask = pendingKillForkId == null
     ? null
-    : (tasks.find((task) => task.forkId === pendingKillForkId) ?? null)
+    : tasks.find((task) => task.workerForkId === pendingKillForkId)
+
+  const pendingKillTab = pendingKillTask?.assignee.kind === 'worker' && pendingKillTask.workerForkId
+    ? { forkId: pendingKillTask.workerForkId, agentId: pendingKillTask.assignee.agentId }
+    : null
 
   return (
     <>

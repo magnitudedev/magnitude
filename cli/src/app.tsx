@@ -618,8 +618,6 @@ function AppInner({
 
   const tasks = useTasks({
     client,
-    rootDisplayMessages: display?.messages ?? [],
-    agentStatusState,
   })
 
   const selectedForkId: string | null = null

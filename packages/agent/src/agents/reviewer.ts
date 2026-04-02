@@ -51,7 +51,7 @@ const tools = catalog.pick(
   'fileSearch',
   'fileView',
   'shell',
-  'agentCreate',
+  'assignTask',
   'phaseVerdict',
 )
 
@@ -84,7 +84,7 @@ export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>(
       if (turnCtx.cancelled) return finish()
       if (turnCtx.error) return continue_()
       if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.dest === 'parent')) return yield_()
-      if (turnCtx.toolsCalled.some(t => t === 'agentCreate')) return yield_()
+      if (turnCtx.toolsCalled.some(t => t === 'assignTask')) return yield_()
       return continue_()
     },
   },

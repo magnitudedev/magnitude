@@ -1,7 +1,7 @@
 import { test, expect, mock } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
-import type { TaskItem } from './types'
+import type { TaskListItem } from './types'
 
 mock.module('../../hooks/use-theme', () => ({
   useTheme: () => ({
@@ -27,19 +27,18 @@ function render(node: ReactNode) {
   return renderToStaticMarkup(<>{node}</>)
 }
 
-const makeTask = (overrides: Partial<TaskItem> = {}): TaskItem => ({
-  forkId: 'fork-1',
-  agentId: 'builder-1',
-  role: 'builder',
-  name: 'Investigate timer mismatch',
-  phase: 'idle',
-  activeSince: 1_000,
-  completedAt: 11_000,
-  accumulatedActiveMs: 65_000,
-  resumeCount: 0,
-  statusLine: 'Completed',
-  toolSummaryLine: '',
-  toolCount: 0,
+const makeTask = (overrides: Partial<TaskListItem> = {}): TaskListItem => ({
+  taskId: 't-1',
+  title: 'Investigate timer mismatch',
+  type: 'implement',
+  status: 'pending',
+  depth: 0,
+  parentId: null,
+  createdAt: 1_000,
+  updatedAt: 11_000,
+  completedAt: null,
+  assignee: { kind: 'lead' },
+  workerForkId: null,
   ...overrides,
 })
 
@@ -48,24 +47,13 @@ test('returns null when there are no tasks', () => {
   expect(html).toBe('')
 })
 
-test('uses rounded full border with neutral theme border color and transparent background', () => {
+test('renders task header summary from task statuses', () => {
   const html = render(
     <TaskList
-      tasks={[makeTask()]}
-      pushForkOverlay={noop}
-    />,
-  )
-
-  expect(html).toContain('border-style:single')
-  expect(html).toContain('border:left,right,top,bottom')
-  expect(html).toContain('border-color:#64748b')
-  expect(html).toContain('background-color:transparent')
-})
-
-test('renders task header with white/bold label and muted non-bold summary', () => {
-  const html = render(
-    <TaskList
-      tasks={[makeTask(), makeTask({ forkId: 'fork-2', phase: 'active' })]}
+      tasks={[
+        makeTask({ taskId: 't-1', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 't-2', status: 'working' }),
+      ]}
       pushForkOverlay={noop}
     />,
   )
@@ -74,64 +62,41 @@ test('renders task header with white/bold label and muted non-bold summary', () 
   expect(html).toContain('<text style="fg:#888888"> (1 completed, 1 active)</text>')
 })
 
-test('computes summary counts using idle as completed and active as active', () => {
+test('renders status glyphs', () => {
   const html = render(
     <TaskList
       tasks={[
-        makeTask({ forkId: 'fork-1', phase: 'idle' }),
-        makeTask({ forkId: 'fork-2', phase: 'idle' }),
-        makeTask({ forkId: 'fork-3', phase: 'active' }),
+        makeTask({ taskId: 't-pending', status: 'pending' }),
+        makeTask({ taskId: 't-working', status: 'working' }),
+        makeTask({ taskId: 't-completed', status: 'completed', completedAt: 10_000 }),
       ]}
       pushForkOverlay={noop}
     />,
   )
-
-  expect(html).toContain('(2 completed, 1 active)')
-})
-
-test('renders assigned-to header in white/bold', () => {
-  const html = render(
-    <TaskList
-      tasks={[makeTask()]}
-      pushForkOverlay={noop}
-    />,
-  )
-
-  expect(html).toContain('<text style="fg:#ffffff" attributes="1">Assigned To</text>')
-})
-
-test('maintains expected usable-width split at terminal width 120', () => {
-  const html = render(
-    <TaskList
-      tasks={[makeTask()]}
-      pushForkOverlay={noop}
-    />,
-  )
-
-  expect(html).toContain('width:64px')
-  expect(html).toContain('width:50px')
-})
-
-test('renders collapsed view by default and supports expand/collapse control labels', () => {
-  const html = render(
-    <TaskList
-      tasks={[
-        makeTask({ forkId: 'f1', name: 'Task 1' }),
-        makeTask({ forkId: 'f2', name: 'Task 2' }),
-        makeTask({ forkId: 'f3', name: 'Task 3' }),
-      ]}
-      pushForkOverlay={noop}
-    />,
-  )
-
   const text = htmlToText(html)
-  expect(text).toContain('Expand all ▲')
-  expect(text).not.toContain('Collapse all ▼')
+  expect(text).toContain('○')
+  expect(text).toContain('◉')
+  expect(text).toContain('✓')
+})
+
+test('renders type label and depth indentation', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({ taskId: 'root', title: 'Root', depth: 0 }),
+        makeTask({ taskId: 'child', title: 'Child', depth: 1, parentId: 'root' }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+  const text = htmlToText(html)
+  expect(text).toContain('[implement] Root')
+  expect(text).toContain('└─ [implement] Child')
 })
 
 test('collapsed mode renders only the latest six tasks', () => {
   const tasks = Array.from({ length: 8 }, (_, index) =>
-    makeTask({ forkId: `f${index + 1}`, name: `Task ${index + 1}` }),
+    makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
   )
 
   const html = render(<TaskList tasks={tasks} pushForkOverlay={noop} />)
@@ -143,15 +108,15 @@ test('collapsed mode renders only the latest six tasks', () => {
   expect(text).toContain('Task 8')
 })
 
-test('completed task timer uses accumulatedActiveMs directly (no final stint double-count)', () => {
+test('renders lead assignee label for unassigned/lead tasks', () => {
   const html = render(
     <TaskList
-      tasks={[makeTask()]}
+      tasks={[makeTask({ assignee: { kind: 'lead' }, workerForkId: null })]}
       pushForkOverlay={noop}
     />,
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('1:05')
-  expect(text).not.toContain('1:15')
+  expect(text).toContain('Assigned To')
+  expect(text).toContain('lead')
 })

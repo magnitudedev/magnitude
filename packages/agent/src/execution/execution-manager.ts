@@ -38,6 +38,7 @@ import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
 import { WorkflowStateReaderTag, type WorkflowStateReader } from '../tools/workflow-reader'
+import { TaskGraphStateReaderTag, canCompleteRecord, getChildRecords, canAssignRecord, collectSubtreeRecords } from '../tools/task-reader'
 import { ConversationProjection, type ConversationState } from '../projections/conversation'
 import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
@@ -48,6 +49,7 @@ import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
 import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
+import { TaskGraphProjection, type TaskGraphState } from '../projections/task-graph'
 
 import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
 import { bindObservable } from '@magnitudedev/roles'
@@ -182,6 +184,7 @@ function makeForkLayers(
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkTurnState>,
   workflowProjection: Projection.ForkedProjectionInstance<WorkflowCriteriaState>,
+  taskGraphProjection: Projection.ProjectionInstance<TaskGraphState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
   approvalState: ApprovalStateService,
@@ -216,6 +219,15 @@ function makeForkLayers(
     getAgent: (agentId: string) => Effect.map(agentStatusProjection.get, (state) => state.agents.get(agentId)),
   } satisfies AgentStateReader)
 
+  const taskGraphReaderLayer = Layer.succeed(TaskGraphStateReaderTag, {
+    getTask: (id) => Effect.map(taskGraphProjection.get, (s) => s.tasks.get(id)),
+    getState: () => taskGraphProjection.get,
+    getChildren: (id) => Effect.map(taskGraphProjection.get, (s) => getChildRecords(s, id)),
+    canComplete: (id) => Effect.map(taskGraphProjection.get, (s) => canCompleteRecord(s, id)),
+    canAssign: (id, assignee) => Effect.map(taskGraphProjection.get, (s) => canAssignRecord(s, id, assignee)),
+    getSubtree: (id) => Effect.map(taskGraphProjection.get, (s) => collectSubtreeRecords(s, id)),
+  })
+
   const policyCtxProvider = createPolicyContextProvider(
     forkId,
     cwd,
@@ -240,6 +252,7 @@ function makeForkLayers(
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
     workflowStateReaderLayer,
+    taskGraphReaderLayer,
     skillStateReaderLayer,
     agentStateReaderLayer,
 
@@ -878,6 +891,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* TurnProjection.Tag
       const workflowProjection = yield* WorkflowProjection.Tag
+      const taskGraphProjection = yield* TaskGraphProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
       const persistence = yield* ChatPersistence
@@ -898,7 +912,7 @@ const makeExecutionManager = Effect.gen(function* () {
       let layers = makeForkLayers(
         forkId,
         sessionContextProjection, agentProjection, agentStatusProjection,
-        workingStateProjection, workflowProjection,
+        workingStateProjection, workflowProjection, taskGraphProjection,
         conversationProjection,
         approvalState,
         persistenceLayer, policyInterceptor, cwd, workspacePath, ephemeralSessionContext,

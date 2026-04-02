@@ -7,6 +7,7 @@
 
 import type { SessionContext } from '../events'
 import { getUserSkills } from '../skills'
+import { renderTaskTypeReferenceTable } from '../tasks/guidance'
 
 /** Build the session context message content from a SessionContext object */
 export function buildSessionContextContent(ctx: SessionContext): string {
@@ -16,6 +17,7 @@ export function buildSessionContextContent(ctx: SessionContext): string {
   }
   content += 'Timezone: ' + ctx.timezone + '\n'
   content += buildProjectContext(ctx)
+  content += '\n' + renderTaskTypeReferenceTable()
   if (ctx.git) {
     content += '\nRecent commits:\n' + ctx.git.recentCommits + '\n'
   }

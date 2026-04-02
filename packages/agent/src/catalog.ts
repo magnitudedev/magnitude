@@ -38,11 +38,15 @@ import {
 import { webSearchTool, webSearchXmlBinding } from './tools/web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './tools/web-fetch-tool'
 import {
-  agentCreateTool,
-  agentCreateXmlBinding,
-  agentKillTool,
-  agentKillXmlBinding,
-} from './tools/agent-tools'
+  createTaskTool,
+  createTaskXmlBinding,
+  updateTaskTool,
+  updateTaskXmlBinding,
+  assignTaskTool,
+  assignTaskXmlBinding,
+  cancelTaskTool,
+  cancelTaskXmlBinding,
+} from './tools/task-tools'
 import { skillTool, skillXmlBinding } from './tools/skill'
 import { phaseSubmitTool, phaseSubmitXmlBinding } from './tools/phase-submit'
 import { phaseVerdictTool, phaseVerdictXmlBinding } from './tools/phase-verdict'
@@ -83,8 +87,10 @@ import { fileSearchModel } from './models/file-search'
 import { fileViewModel } from './models/file-view'
 import { webSearchModel } from './models/web-search'
 import { webFetchModel } from './models/web-fetch'
-import { agentCreateModel } from './models/agent-create'
-import { agentKillModel } from './models/agent-kill'
+import { createTaskModel } from './models/create-task'
+import { updateTaskModel } from './models/update-task'
+import { assignTaskModel } from './models/assign-task'
+import { cancelTaskModel } from './models/cancel-task'
 import { skillModel } from './models/skill'
 import { phaseSubmitModel } from './models/phase-submit'
 import { phaseVerdictModel } from './models/phase-verdict'
@@ -113,8 +119,10 @@ export const catalog = defineCatalog({
   fileView: { tool: viewTool, binding: viewXmlBinding, state: fileViewModel },
   webSearch: { tool: webSearchTool, binding: webSearchXmlBinding, state: webSearchModel },
   webFetch: { tool: webFetchTool, binding: webFetchXmlBinding, state: webFetchModel },
-  agentCreate: { tool: agentCreateTool, binding: agentCreateXmlBinding, state: agentCreateModel, display: false },
-  agentKill: { tool: agentKillTool, binding: agentKillXmlBinding, state: agentKillModel, display: false },
+  createTask: { tool: createTaskTool, binding: createTaskXmlBinding, state: createTaskModel, display: false },
+  updateTask: { tool: updateTaskTool, binding: updateTaskXmlBinding, state: updateTaskModel, display: false },
+  assignTask: { tool: assignTaskTool, binding: assignTaskXmlBinding, state: assignTaskModel, display: false },
+  cancelTask: { tool: cancelTaskTool, binding: cancelTaskXmlBinding, state: cancelTaskModel, display: false },
   skill: { tool: skillTool, binding: skillXmlBinding, state: skillModel },
   phaseSubmit: { tool: phaseSubmitTool, binding: phaseSubmitXmlBinding, state: phaseSubmitModel },
   workflowSubmit: { tool: phaseSubmitTool, binding: phaseSubmitXmlBinding, state: phaseSubmitModel },

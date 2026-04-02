@@ -73,8 +73,10 @@ export const leadTools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
-  'agentCreate',
-  'agentKill',
+  'createTask',
+  'updateTask',
+  'assignTask',
+  'cancelTask',
   'skill',
   'phaseSubmit',
 )
@@ -94,7 +96,7 @@ export const leadTurnPolicy: TurnPolicy<typeof leadTools, PolicyContext> = {
     if (turnCtx.cancelled) return yield_()
     if (turnCtx.error) return continue_()
     if (turnCtx.toolsCalled.length === 0) return yield_()
-    const yielders = ['agentCreate', 'agentKill']
+    const yielders = ['assignTask', 'cancelTask']
     if (turnCtx.lastTool && yielders.includes(turnCtx.lastTool)) return yield_()
     if (turnCtx.messagesSent.some((m: { dest: string }) => m.dest !== 'user')) return yield_()
     return continue_()

@@ -15,6 +15,7 @@ import { OutboundMessagesProjection } from './outbound-messages'
 import { compactionSummaryTag, buildSessionContextContent } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
 import { UserMessageResolutionProjection } from './user-message-resolution'
+import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
 import { getAgentDefinition, isValidVariant } from '../agents'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { formatSkillInitialPrompt } from '../prompts/skills'
@@ -48,6 +49,9 @@ import {
   toTimelinePhaseVerdict,
   toTimelineWorkflowPhase,
   toTimelineLifecycleHook,
+  toTimelineTaskTypeHook,
+  toTimelineTaskIdleHook,
+  toTimelineTaskTreeView,
 } from '../inbox/compose'
 import { builderRole } from '../agents/builder'
 import { explorerRole } from '../agents/explorer'
@@ -245,6 +249,49 @@ function toContentPartFromObservation(part: ObservationPart): ContentPart {
   }
 }
 
+function findRootTaskId(state: TaskGraphState, taskId: string): string {
+  let current = state.tasks.get(taskId)
+  while (current && current.parentId) {
+    const parent = state.tasks.get(current.parentId)
+    if (!parent) break
+    current = parent
+  }
+  return current?.id ?? taskId
+}
+
+function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number): string[] {
+  const task = state.tasks.get(taskId)
+  if (!task) return []
+
+  const indent = '  '.repeat(depth)
+  const status = task.status === 'completed' ? 'done' : task.status
+  const assigneeStr = task.assignee
+    ? (task.assignee === 'self' ? ', lead' : task.worker ? `, ${task.worker.agentId}` : '')
+    : ''
+  const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assigneeStr})`
+  const childLines = task.childIds.flatMap(childId => renderTaskSubtree(state, childId, depth + 1))
+  return [line, ...childLines]
+}
+
+function renderTaskTreesForTaskIds(state: TaskGraphState, taskIds: readonly string[]): string {
+  const roots = new Set<string>()
+  for (const taskId of taskIds) {
+    roots.add(findRootTaskId(state, taskId))
+  }
+
+  return Array.from(roots)
+    .map(rootId => renderTaskSubtree(state, rootId, 0).join('\n'))
+    .filter(Boolean)
+    .join('\n')
+}
+
+function findTaskForAgent(state: TaskGraphState, args: { agentId: string, forkId: string }): TaskRecord | null {
+  for (const task of Array.from(state.tasks.values())) {
+    if (task.worker?.agentId === args.agentId || task.worker?.forkId === args.forkId) return task
+  }
+  return null
+}
+
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
   const content = message.type === 'inbox'
     ? formatInbox({ results: message.results, timeline: message.timeline, timezone, lifecycleReminderFormatters })
@@ -274,7 +321,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
-  reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection] as const,
+  reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection, TaskGraphProjection] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -365,7 +412,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       if (fork.currentTurnId !== event.turnId) return fork
 
       const newMessages: Message[] = [...fork.messages]
-      const isCancelled = !event.result.success && event.result.cancelled
+      const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
 
       if (event.responseParts.length > 0) {
         const canonical = read(CanonicalTurnProjection)
@@ -402,7 +449,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
 
       const hasError = !event.result.success
-      const errorMessage = hasError ? event.result.error : undefined
+      const errorMessage = hasError && 'error' in event.result ? event.result.error : undefined
       const observedResults = isCancelled ? [] : event.observedResults
       if (event.toolCalls.length > 0 || observedResults.length > 0) {
         nextFork = enqueueResult(
@@ -631,7 +678,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
+    on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state, read }) => {
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
 
@@ -656,6 +703,31 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           toTimelineLifecycleHook({ timestamp: value.timestamp, agentId: value.agentId, role: value.role, hookType: 'idle' }),
           value.timestamp,
         )
+      }
+
+      const taskGraphState = read(TaskGraphProjection)
+      const linkedTask = findTaskForAgent(taskGraphState, { agentId: value.agentId, forkId: value.forkId })
+      if (linkedTask) {
+        nextParent = enqueueTimeline(
+          nextParent,
+          toTimelineTaskIdleHook({
+            timestamp: value.timestamp,
+            taskId: linkedTask.id,
+            taskType: linkedTask.taskType,
+            title: linkedTask.title,
+            agentId: value.agentId,
+          }),
+          value.timestamp,
+        )
+
+        const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [linkedTask.id])
+        if (renderedTree) {
+          nextParent = enqueueTimeline(
+            nextParent,
+            toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
+            value.timestamp,
+          )
+        }
       }
 
       return {
@@ -723,6 +795,80 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return {
         ...state,
         forks: new Map(state.forks).set(value.forkId, nextFork),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCreated, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const taskGraphState = read(TaskGraphProjection)
+      const task = taskGraphState.tasks.get(value.taskId)
+      if (!task) return state
+
+      let nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskTypeHook({
+          timestamp: value.timestamp,
+          taskId: task.id,
+          taskType: task.taskType,
+          title: task.title,
+        }),
+        value.timestamp,
+      )
+
+      const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [task.id])
+      if (renderedTree) {
+        nextLead = enqueueTimeline(
+          nextLead,
+          toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
+          value.timestamp,
+        )
+      }
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const taskGraphState = read(TaskGraphProjection)
+      const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [value.taskId])
+      if (!renderedTree) return state
+
+      const nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCancelled, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const taskGraphState = read(TaskGraphProjection)
+      const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [value.taskId])
+      if (!renderedTree) return state
+
+      const nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
       }
     }),
   ],

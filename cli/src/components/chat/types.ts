@@ -44,26 +44,25 @@ export type ChatControllerServices = {
   requestActiveSubagentKill: (payload: { forkId: string; agentId: string }) => void
 }
 
-export type TaskItem = {
-  forkId: string
-  agentId: string
-  role?: string
-  name: string
-  activeSince: number
-  accumulatedActiveMs: number
-  completedAt?: number
-  resumeCount: number
-  toolCount: number
-  toolSummaryLine: string
-  statusLine: string
-  phase: 'active' | 'idle'
+export type TaskListItem = {
+  taskId: string
+  title: string
+  type: string
+  status: 'pending' | 'working' | 'completed'
+  depth: number
+  parentId: string | null
+  createdAt: number
+  updatedAt: number
+  completedAt: number | null
+  assignee: { kind: 'lead' } | { kind: 'user' } | { kind: 'worker'; workerType?: string; agentId: string }
+  workerForkId: string | null
 }
 
 export type ChatControllerProps = {
   env: ChatControllerEnv
   services: ChatControllerServices
   displayMessages: DisplayState['messages']
-  tasks: TaskItem[]
+  tasks: TaskListItem[]
   selectedForkId: string | null
   pushForkOverlay: (forkId: string) => void
   isBlockingOverlayActive: boolean

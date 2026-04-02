@@ -13,6 +13,7 @@ import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { WorkflowSkill } from '@magnitudedev/skills'
+import type { TaskTypeId, TaskAssignee } from './tasks'
 
 export type Attachment = ImageAttachment | MentionAttachment
 
@@ -381,6 +382,71 @@ export interface SubagentIdleClosed {
 }
 
 // =============================================================================
+// Task Events
+// =============================================================================
+
+export interface TaskCreated {
+  readonly type: 'task_created'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly title: string
+  readonly taskType: TaskTypeId
+  readonly parentId: string | null
+  readonly after?: string
+  readonly timestamp: number
+}
+
+export interface TaskUpdated {
+  readonly type: 'task_updated'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly patch: {
+    readonly title?: string
+    readonly parentId?: string | null
+    readonly after?: string
+  }
+  readonly timestamp: number
+}
+
+export interface TaskAssigned {
+  readonly type: 'task_assigned'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly assignee: TaskAssignee
+  readonly workerRole?: string
+  readonly message: string
+  readonly workerInfo?: {
+    readonly agentId: string
+    readonly forkId: string
+    readonly role: string
+  }
+  readonly replacedWorker?: {
+    readonly agentId: string
+    readonly forkId: string
+  }
+  readonly timestamp: number
+}
+
+export interface TaskCompleted {
+  readonly type: 'task_completed'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly timestamp: number
+}
+
+export interface TaskCancelled {
+  readonly type: 'task_cancelled'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly cancelledSubtree: readonly string[]
+  readonly killedWorkers: readonly {
+    readonly agentId: string
+    readonly forkId: string
+  }[]
+  readonly timestamp: number
+}
+
+// =============================================================================
 // Compaction Events
 // =============================================================================
 
@@ -628,6 +694,12 @@ export type AppEvent =
   | ChatTitleGenerated
   | PhaseCriteriaVerdict
   | PhaseVerdict
+  // Task events
+  | TaskCreated
+  | TaskUpdated
+  | TaskAssigned
+  | TaskCompleted
+  | TaskCancelled
   // Agent events
   | AgentCreated
   | AgentKilled

@@ -6,7 +6,6 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { TurnProjection } from './turn'
 
 export type AgentStatus = 'starting' | 'working' | 'idle' | 'killed'
 
@@ -215,6 +214,29 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     },
 
 
+    turn_completed: ({ event, state, emit }) => {
+      if (event.forkId === null) return state
+      if (event.result.success && event.result.turnDecision === 'continue') return state
+
+      const agent = getAgentByForkId(state, event.forkId)
+      if (!agent) return state
+
+      if (agent.status !== 'idle') {
+        emit.agentBecameIdle({
+          agentId: agent.agentId,
+          forkId: agent.forkId,
+          role: agent.role,
+          parentForkId: agent.parentForkId,
+          reason: 'stable',
+          timestamp: event.timestamp,
+        })
+      }
+
+      return {
+        ...state,
+        agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
+      }
+    },
 
     turn_unexpected_error: ({ event, state, emit }) => {
       if (event.forkId === null) return state
@@ -328,31 +350,5 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       return removed.state
     },
   },
-
-  signalHandlers: (on) => [
-    on(TurnProjection.signals.turnTerminated, ({ value, state, emit }) => {
-      if (value.forkId === null) return state
-      if (value.triggersQueued) return state
-
-      const agent = getAgentByForkId(state, value.forkId)
-      if (!agent) return state
-
-      if (agent.status !== 'idle') {
-        emit.agentBecameIdle({
-          agentId: agent.agentId,
-          forkId: agent.forkId,
-          role: agent.role,
-          parentForkId: agent.parentForkId,
-          reason: 'stable',
-          timestamp: value.timestamp,
-        })
-      }
-
-      return {
-        ...state,
-        agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
-      }
-    }),
-  ],
 
 }))

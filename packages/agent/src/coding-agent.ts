@@ -23,6 +23,7 @@ import { SubagentActivityProjection } from './projections/subagent-activity'
 import { DisplayProjection } from './projections/display'
 import { AgentRoutingProjection } from './projections/agent-routing'
 import { AgentStatusProjection } from './projections/agent-status'
+import { TaskGraphProjection } from './projections/task-graph'
 import { CompactionProjection } from './projections/compaction'
 import { WorkflowProjection } from './projections/workflow'
 
@@ -81,6 +82,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     SessionContextProjection,
     AgentRoutingProjection,
     AgentStatusProjection,
+    TaskGraphProjection,
     CompactionProjection,
     WorkflowProjection,
     TurnProjection,
@@ -117,7 +119,11 @@ export const CodingAgent = Agent.define<AppEvent>()({
     signals: {
       restoreQueuedMessages: DisplayProjection.signals.restoreQueuedMessages,
 
-      chatTitleGenerated: ChatTitleProjection.signals.chatTitleGenerated
+      chatTitleGenerated: ChatTitleProjection.signals.chatTitleGenerated,
+      taskCreated: TaskGraphProjection.signals.taskCreated,
+      taskCompleted: TaskGraphProjection.signals.taskCompleted,
+      taskCancelled: TaskGraphProjection.signals.taskCancelled,
+      taskStatusChanged: TaskGraphProjection.signals.taskStatusChanged
     },
     state: {
       display: DisplayProjection,
@@ -127,6 +133,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
       workflow: WorkflowProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
+      taskGraph: TaskGraphProjection,
     }
   }
 })
