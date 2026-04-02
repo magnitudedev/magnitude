@@ -3,13 +3,13 @@ import type { XmlTagBinding } from '@magnitudedev/xml-act'
 import { serializeCanonicalTurn, type CanonicalTrace } from '../canonical-xml'
 
 const bindings = new Map<string, XmlTagBinding>([
-  ['shell', { body: 'command' }],
-  ['read', { attributes: [{ field: 'path', attr: 'path' }] }],
-  ['write', { attributes: [{ field: 'path', attr: 'path' }], body: 'content' }],
-  ['edit', { attributes: [{ field: 'path', attr: 'path' }], childTags: [{ tag: 'old', field: 'old' }, { tag: 'new', field: 'new' }] }],
-  ['items-tool', { children: [{ field: 'items', tag: 'item', attributes: [{ field: 'k', attr: 'k' }], body: 'v' }] }],
-  ['record-tool', { childRecord: { field: 'vars', keyAttr: 'name', tag: 'var' } }],
-  ['attr-order', { attributes: [{ field: 'z', attr: 'z' }, { field: 'a', attr: 'a' }], body: 'content' }],
+  ['shell', { tag: 'shell', body: 'command' }],
+  ['read', { tag: 'read', attributes: [{ field: 'path', attr: 'path' }] }],
+  ['write', { tag: 'write', attributes: [{ field: 'path', attr: 'path' }], body: 'content' }],
+  ['edit', { tag: 'edit', attributes: [{ field: 'path', attr: 'path' }], childTags: [{ tag: 'old', field: 'old' }, { tag: 'new', field: 'new' }] }],
+  ['items-tool', { tag: 'items-tool', children: [{ field: 'items', tag: 'item', attributes: [{ field: 'k', attr: 'k' }], body: 'v' }] }],
+  ['record-tool', { tag: 'record-tool', childRecord: { field: 'vars', keyAttr: 'name', tag: 'var' } }],
+  ['attr-order', { tag: 'attr-order', attributes: [{ field: 'z', attr: 'z' }, { field: 'a', attr: 'a' }], body: 'content' }],
 ])
 const emptyBindings = new Map<string, XmlTagBinding>()
 const withYield = (s: string) => `${s}\n<yield/>`

@@ -6,7 +6,6 @@ const STRATEGY_ADHERENCE_REINFORCEMENT =
 
 /**
  * Lightweight reference table for system prompt.
- * Strategy guidance comes via inbox hooks on task creation.
  */
 export function renderTaskTypeReferenceTable(): string {
   const lines: string[] = []
@@ -17,20 +16,22 @@ export function renderTaskTypeReferenceTable(): string {
   return lines.join('\n')
 }
 
+export function formatTaskTypeGuidanceForTool(taskType: TaskTypeId): string {
+  const def = listTaskTypeDefinitions().find((d) => d.id === taskType)
+  if (!def) return `No specific guidance for task type "${taskType}".`
+
+  const guidance = def.strategy.trim()
+  if (!guidance) return `No specific guidance for task type "${taskType}".`
+
+  return guidance
+}
+
 /**
- * Task creation reminder formatter — called by inbox system when task_type_hook
- * timeline entries are rendered. Receives consolidated taskIds grouped by type.
+ * task_type_hook reminder formatter — reinforcement only, preserves task ID context.
  */
 export function formatTaskTypeReminder(taskIds: readonly string[], taskType: TaskTypeId): string {
-  const def = listTaskTypeDefinitions().find(d => d.id === taskType)
-  if (!def) return `Tasks ${taskIds.join(', ')} created (unknown type: ${taskType}).`
+  if (!HIGHER_ORDER_TASK_TYPES.has(taskType)) return ''
 
   const idList = taskIds.length === 1 ? `Task ${taskIds[0]}` : `Tasks ${taskIds.join(', ')}`
-  const lines: string[] = []
-  lines.push(`${idList} (type: ${def.label}):`)
-  if (HIGHER_ORDER_TASK_TYPES.has(taskType)) {
-    lines.push(STRATEGY_ADHERENCE_REINFORCEMENT)
-  }
-  lines.push(def.strategy)
-  return lines.join('\n')
+  return `${idList} (type: ${taskType}):\n${STRATEGY_ADHERENCE_REINFORCEMENT}`
 }

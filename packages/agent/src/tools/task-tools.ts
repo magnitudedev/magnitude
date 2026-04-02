@@ -7,7 +7,7 @@ import { ConversationStateReaderTag } from './memory-reader'
 import { TaskGraphStateReaderTag } from './task-reader'
 import type { TaskStatus } from '../projections/task-graph'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
-import { isTaskAssigneeAllowed, isValidTaskType } from '../tasks'
+import { formatTaskTypeGuidanceForTool, isTaskAssigneeAllowed, isValidTaskType } from '../tasks'
 import { getSpawnableVariants, type AgentVariant } from '../agents'
 import type { AppEvent } from '../events'
 
@@ -17,7 +17,7 @@ const TaskErrorSchema = ToolErrorSchema('TaskError', {})
 export const createTaskTool = defineTool({
   name: 'create-task' as const,
   group: 'task' as const,
-  description: 'Create a task with a type, optional parent, and title.',
+  description: 'Create a task with a type, optional parent, and title. Returns strategic guidance based on the task type that should be followed.',
   inputSchema: Schema.Struct({
     taskId: Schema.String,
     type: Schema.String,
@@ -25,9 +25,7 @@ export const createTaskTool = defineTool({
     after: Schema.optional(Schema.String),
     title: Schema.String,
   }),
-  outputSchema: Schema.Struct({
-    taskId: Schema.String,
-  }),
+  outputSchema: Schema.String,
   errorSchema: TaskErrorSchema,
   execute: ({ taskId, type, parent, after, title }) => Effect.gen(function* () {
     const normalizedType = type.trim().toLowerCase()
@@ -65,7 +63,7 @@ export const createTaskTool = defineTool({
       timestamp: Date.now(),
     })
 
-    return { taskId }
+    return formatTaskTypeGuidanceForTool(normalizedType)
   }),
   label: (input) => input.taskId ? `Creating task ${input.taskId}` : 'Creating task…',
 })
@@ -80,9 +78,7 @@ export const createTaskXmlBinding = defineXmlBinding(createTaskTool, {
     ],
     body: 'title',
   },
-  output: {
-    childTags: [{ field: 'taskId', tag: 'taskId' }],
-  },
+  output: {},
 } as const)
 
 export const updateTaskTool = defineTool({

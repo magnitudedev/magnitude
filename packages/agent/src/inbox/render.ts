@@ -221,7 +221,8 @@ function buildTaskTypeReminderLines(
 
   const lines: string[] = []
   for (const [taskType, taskIdSet] of Array.from(byType.entries())) {
-    lines.push(formatTaskTypeReminder(Array.from(taskIdSet), taskType as TaskTypeId))
+    const line = formatTaskTypeReminder(Array.from(taskIdSet), taskType as TaskTypeId)
+    if (line) lines.push(line)
   }
 
   return lines

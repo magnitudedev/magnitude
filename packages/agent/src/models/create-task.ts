@@ -44,7 +44,6 @@ export const createTaskModel = defineStateModel('createTask', {
         return {
           ...state,
           phase: 'completed',
-          taskId: event.output.taskId,
         }
       case 'error':
         return { ...state, phase: 'error' }
