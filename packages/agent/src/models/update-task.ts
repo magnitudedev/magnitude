@@ -5,16 +5,14 @@ export interface UpdateTaskState extends BaseState {
   toolKey: 'updateTask'
   taskId?: string
   parent?: string
-  complete?: boolean
-  archived?: boolean
+  status?: string
   title?: string
 }
 
 const initial: Omit<UpdateTaskState, 'phase' | 'toolKey'> = {
   taskId: undefined,
   parent: undefined,
-  complete: undefined,
-  archived: undefined,
+  status: undefined,
   title: undefined,
 }
 
@@ -28,33 +26,15 @@ export const updateTaskModel = defineStateModel('updateTask', {
       case 'started':
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
-      case 'inputReady': {
-        const complete = event.streaming.complete?.value
-        const archived = event.streaming.archived?.value
+      case 'inputReady':
         return {
           ...state,
           phase: 'streaming',
           taskId: event.streaming.taskId?.value ?? state.taskId,
           parent: event.streaming.parent?.value ?? state.parent,
-          complete:
-            typeof complete === 'boolean'
-              ? complete
-              : complete === 'true'
-                ? true
-                : complete === 'false'
-                  ? false
-                  : state.complete,
-          archived:
-            typeof archived === 'boolean'
-              ? archived
-              : archived === 'true'
-                ? true
-                : archived === 'false'
-                  ? false
-                  : state.archived,
+          status: event.streaming.status?.value ?? state.status,
           title: event.streaming.title?.value ?? state.title,
         }
-      }
       case 'executionStarted':
       case 'emission':
       case 'awaitingApproval':

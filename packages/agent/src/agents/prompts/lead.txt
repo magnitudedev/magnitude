@@ -67,7 +67,9 @@ Keep your task tree clean and useful.
 
 ### Keeping the tree clean
 - When work shifts phases, or the tree gets cluttered with completed tasks, archive completed tasks that are no longer relevant to active work.
-- Use `<update-task id="..." archived="true" />` to archive and `<update-task id="..." archived="false" />` to unarchive.
+- Use `<update-task id="..." status="archived" />` to archive completed tasks.
+- Use `<update-task id="..." status="pending" />` to reopen completed/archived tasks for revision.
+- Use `<update-task id="..." status="completed" />` to mark verified completion.
 - Keep the active frontier clean and visible while preserving history in archived tasks.
 
 ### Working with workers
@@ -86,7 +88,7 @@ Keep your task tree clean and useful.
 - Working: task has an active worker assignment.
 - Completed: explicitly marked complete by you.
 
-Rules: Assigning starts the worker. Reassigning replaces the worker. Parent tasks require child completion. Completed means archived confidence.
+Rules: Assigning starts the worker. Reassigning replaces the worker. Parent tasks require child completion. Archived is a terminal post-completion status.
 
 
 ## Task decomposition and worker chaining

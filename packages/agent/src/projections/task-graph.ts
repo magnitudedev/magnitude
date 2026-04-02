@@ -52,14 +52,11 @@ export interface TaskStatusChangedSignal {
   readonly taskId: string
   readonly previous: TaskStatus
   readonly next: TaskStatus
-  readonly reason: 'assignment' | 'worker-working' | 'worker-idle' | 'completion' | 'cancel'
   readonly timestamp: number
 }
 
 function getTask(state: TaskGraphState, taskId: string): TaskRecord {
-  const task = state.tasks.get(taskId)
-  if (!task) throw new Error(`[TaskGraphProjection] Task not found: ${taskId}`)
-  return task
+  return state.tasks.get(taskId)!
 }
 
 export function collectSubtreeTaskIds(state: TaskGraphState, rootTaskId: string): string[] {
@@ -165,18 +162,18 @@ export function reparentTask(
   const task = getTask(state, taskId)
 
   if (nextParentId === taskId) {
-    throw new Error(`[TaskGraphProjection] Cannot parent task ${taskId} to itself`)
+    return state
   }
 
   if (nextParentId !== null) {
     const nextParent = state.tasks.get(nextParentId)
     if (!nextParent) {
-      throw new Error(`[TaskGraphProjection] Parent task not found: ${nextParentId}`)
+      return state
     }
 
     const subtreeIds = new Set(collectSubtreeTaskIds(state, taskId))
     if (subtreeIds.has(nextParentId)) {
-      throw new Error(`[TaskGraphProjection] Cannot reparent ${taskId} under descendant ${nextParentId}`)
+      return state
     }
   }
 
@@ -229,11 +226,11 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
   eventHandlers: {
     task_created: ({ event, state, emit }) => {
       if (state.tasks.has(event.taskId)) {
-        throw new Error(`[TaskGraphProjection] Task already exists: ${event.taskId}`)
+        return state
       }
 
       if (event.parentId !== null && !state.tasks.has(event.parentId)) {
-        throw new Error(`[TaskGraphProjection] Parent task not found: ${event.parentId}`)
+        return state
       }
 
       const task: TaskRecord = {
@@ -279,7 +276,7 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
       return nextState
     },
 
-    task_updated: ({ event, state }) => {
+    task_updated: ({ event, state, emit }) => {
       const existing = getTask(state, event.taskId)
       let nextState = state
 
@@ -319,33 +316,78 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
 
       if (event.patch.status !== undefined) {
         const requestedStatus = event.patch.status
+        const current = getTask(nextState, event.taskId)
+        const previousStatus = current.status
 
-        if (
-          requestedStatus !== 'pending'
-          && requestedStatus !== 'working'
-          && requestedStatus !== 'completed'
-          && requestedStatus !== 'archived'
-        ) {
-          throw new Error(`[TaskGraphProjection] Invalid status patch: ${requestedStatus}`)
+        const validStatuses = ['pending', 'working', 'completed', 'archived']
+        if (!validStatuses.includes(requestedStatus)) return nextState
+        if (requestedStatus === previousStatus) return nextState
+        if (requestedStatus === 'working') return nextState
+
+        if (requestedStatus === 'completed') {
+          if (!canCompleteTask(nextState, event.taskId)) return nextState
+
+          const completedAt = previousStatus === 'archived' ? current.completedAt : event.timestamp
+          nextState = patchTask(nextState, event.taskId, (task) => ({
+            ...task,
+            status: 'completed',
+            completedAt,
+            updatedAt: event.timestamp,
+          }))
+
+          emit.taskCompleted({
+            taskId: event.taskId,
+            timestamp: event.timestamp,
+          })
+
+          emit.taskStatusChanged({
+            taskId: event.taskId,
+            previous: previousStatus,
+            next: 'completed',
+            timestamp: event.timestamp,
+          })
+
+          return nextState
         }
 
-        if (
-          requestedStatus !== existing.status
-          && !(
-            (existing.status === 'completed' && requestedStatus === 'archived')
-            || (existing.status === 'archived' && requestedStatus === 'completed')
-          )
-        ) {
-          throw new Error(
-            `[TaskGraphProjection] Invalid status transition for task ${event.taskId}: ${existing.status} -> ${requestedStatus}`,
-          )
+        if (requestedStatus === 'archived') {
+          if (previousStatus !== 'completed') return nextState
+
+          nextState = patchTask(nextState, event.taskId, (task) => ({
+            ...task,
+            status: 'archived',
+            updatedAt: event.timestamp,
+          }))
+
+          emit.taskStatusChanged({
+            taskId: event.taskId,
+            previous: previousStatus,
+            next: 'archived',
+            timestamp: event.timestamp,
+          })
+
+          return nextState
         }
 
-        nextState = patchTask(nextState, event.taskId, (task) => ({
-          ...task,
-          status: requestedStatus,
-          updatedAt: event.timestamp,
-        }))
+        if (requestedStatus === 'pending') {
+          if (previousStatus !== 'completed' && previousStatus !== 'archived') return nextState
+
+          nextState = patchTask(nextState, event.taskId, (task) => ({
+            ...task,
+            status: 'pending',
+            completedAt: null,
+            updatedAt: event.timestamp,
+          }))
+
+          emit.taskStatusChanged({
+            taskId: event.taskId,
+            previous: previousStatus,
+            next: 'pending',
+            timestamp: event.timestamp,
+          })
+
+          return nextState
+        }
       }
 
       return nextState
@@ -355,9 +397,7 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
       const current = getTask(state, event.taskId)
 
       if (!isTaskAssigneeAllowed(current.taskType, event.assignee)) {
-        throw new Error(
-          `[TaskGraphProjection] Assignee "${event.assignee}" is not allowed for task type "${current.taskType}"`,
-        )
+        return state
       }
 
       const agentState = read(AgentStatusProjection)
@@ -390,42 +430,9 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
           taskId: event.taskId,
           previous: current.status,
           next: nextStatus,
-          reason: 'assignment',
           timestamp: event.timestamp,
         })
       }
-
-      return next
-    },
-
-    task_completed: ({ event, state, emit }) => {
-      const current = getTask(state, event.taskId)
-
-      if (!canCompleteTask(state, event.taskId)) {
-        throw new Error(`[TaskGraphProjection] Cannot complete task ${event.taskId}: incomplete child tasks`)
-      }
-
-      if (current.status === 'completed') return state
-
-      const next = patchTask(state, event.taskId, (task) => ({
-        ...task,
-        status: 'completed',
-        completedAt: event.timestamp,
-        updatedAt: event.timestamp,
-      }))
-
-      emit.taskCompleted({
-        taskId: event.taskId,
-        timestamp: event.timestamp,
-      })
-
-      emit.taskStatusChanged({
-        taskId: event.taskId,
-        previous: current.status,
-        next: 'completed',
-        reason: 'completion',
-        timestamp: event.timestamp,
-      })
 
       return next
     },
@@ -498,7 +505,6 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
         taskId: task.id,
         previous: task.status,
         next: nextStatus,
-        reason: 'worker-working',
         timestamp: value.timestamp,
       })
 
@@ -524,7 +530,6 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
         taskId: task.id,
         previous: task.status,
         next: nextStatus,
-        reason: 'worker-idle',
         timestamp: value.timestamp,
       })
 

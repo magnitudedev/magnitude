@@ -428,13 +428,6 @@ export interface TaskAssigned {
   readonly timestamp: number
 }
 
-export interface TaskCompleted {
-  readonly type: 'task_completed'
-  readonly forkId: string | null
-  readonly taskId: string
-  readonly timestamp: number
-}
-
 export interface TaskCancelled {
   readonly type: 'task_cancelled'
   readonly forkId: string | null
@@ -699,7 +692,6 @@ export type AppEvent =
   | TaskCreated
   | TaskUpdated
   | TaskAssigned
-  | TaskCompleted
   | TaskCancelled
   // Agent events
   | AgentCreated

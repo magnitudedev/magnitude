@@ -88,26 +88,25 @@ export const createTaskXmlBinding = defineXmlBinding(createTaskTool, {
 export const updateTaskTool = defineTool({
   name: 'update-task' as const,
   group: 'task' as const,
-  description: 'Rename, reparent, and/or complete a task.',
+  description: 'Rename, reparent, and/or update task status.',
   inputSchema: Schema.Struct({
     taskId: Schema.String,
     parent: Schema.optional(Schema.String),
     after: Schema.optional(Schema.String),
-    complete: Schema.optional(Schema.Boolean),
-    archived: Schema.optional(Schema.Boolean),
+    status: Schema.optional(Schema.String),
     title: Schema.optional(Schema.String),
   }),
   outputSchema: Schema.Struct({
     taskId: Schema.String,
   }),
   errorSchema: TaskErrorSchema,
-  execute: ({ taskId, parent, after, complete, archived, title }) => Effect.gen(function* () {
+  execute: ({ taskId, parent, after, status, title }) => Effect.gen(function* () {
     const hasMutation =
-      parent !== undefined || after !== undefined || complete === true || archived !== undefined || title !== undefined
+      parent !== undefined || after !== undefined || status !== undefined || title !== undefined
     if (!hasMutation) {
       return yield* Effect.fail({
         _tag: 'TaskError' as const,
-        message: 'update-task requires at least one mutation: parent, complete, archived, or title.',
+        message: 'update-task requires at least one mutation: parent, after, status, or title.',
       })
     }
 
@@ -135,23 +134,6 @@ export const updateTaskTool = defineTool({
     const { forkId } = yield* ForkContext
     const timestamp = Date.now()
 
-    if (complete === true) {
-      const canComplete = yield* taskReader.canComplete(taskId)
-      if (!canComplete) {
-        return yield* Effect.fail({
-          _tag: 'TaskError' as const,
-          message: `Task "${taskId}" cannot be completed because it has incomplete child tasks.`,
-        })
-      }
-
-      yield* bus.publish({
-        type: 'task_completed',
-        forkId,
-        taskId,
-        timestamp,
-      })
-    }
-
     const patch: {
       title?: string
       parentId?: string | null
@@ -171,24 +153,46 @@ export const updateTaskTool = defineTool({
       patch.after = after
     }
 
-    if (archived === true) {
-      if (task.status !== 'completed') {
+    if (status !== undefined) {
+      if (status !== 'pending' && status !== 'completed' && status !== 'archived') {
+        return yield* Effect.fail({
+          _tag: 'TaskError' as const,
+          message: `Invalid status "${status}". Allowed statuses: pending, completed, archived.`,
+        })
+      }
+
+      if (status === 'completed') {
+        if (task.status !== 'pending' && task.status !== 'working' && task.status !== 'archived') {
+          return yield* Effect.fail({
+            _tag: 'TaskError' as const,
+            message: `Task "${taskId}" cannot transition from "${task.status}" to "completed".`,
+          })
+        }
+
+        const canComplete = yield* taskReader.canComplete(taskId)
+        if (!canComplete) {
+          return yield* Effect.fail({
+            _tag: 'TaskError' as const,
+            message: `Task "${taskId}" cannot be completed because it has incomplete child tasks.`,
+          })
+        }
+      }
+
+      if (status === 'archived' && task.status !== 'completed') {
         return yield* Effect.fail({
           _tag: 'TaskError' as const,
           message: `Task "${taskId}" can only be archived from completed status.`,
         })
       }
-      patch.status = 'archived'
-    }
 
-    if (archived === false) {
-      if (task.status !== 'archived') {
+      if (status === 'pending' && task.status !== 'completed' && task.status !== 'archived') {
         return yield* Effect.fail({
           _tag: 'TaskError' as const,
-          message: `Task "${taskId}" can only be unarchived from archived status.`,
+          message: `Task "${taskId}" can only transition to pending from completed or archived status.`,
         })
       }
-      patch.status = 'completed'
+
+      patch.status = status
     }
 
     if (Object.keys(patch).length > 0) {
@@ -212,8 +216,7 @@ export const updateTaskXmlBinding = defineXmlBinding(updateTaskTool, {
       { field: 'taskId', attr: 'id' },
       { field: 'parent', attr: 'parent' },
       { field: 'after', attr: 'after' },
-      { field: 'complete', attr: 'complete' },
-      { field: 'archived', attr: 'archived' },
+      { field: 'status', attr: 'status' },
     ],
     body: 'title',
   },
