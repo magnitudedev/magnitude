@@ -16,9 +16,6 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
   'github-copilot': '(GitHub.com or Enterprise)',
-  lmstudio: '(Local runtime)',
-  ollama: '(Local runtime)',
-  'llama.cpp': '(Local runtime)',
   'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
@@ -845,7 +842,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                     <LocalProviderPage
                       providerName={provider.name}
                       showProviderTitle={false}
-                      endpoint={baseUrl}
+                      endpoint={baseUrl || (provider.defaultBaseUrl ?? '')}
                       endpointPlaceholder={provider.defaultBaseUrl ?? 'http://localhost:1234/v1'}
                       discoveredModels={discoveredModels}
                       manualModelIds={rememberedModelIds}
@@ -864,7 +861,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
                 {/* Auth methods */}
               {providerDetailStatus.methods
-                .filter((m) => !(isLocalProvider && m.method.type === 'api-key'))
+                .filter((m) => !(isLocalProvider && (m.method.type === 'api-key' || m.method.type === 'none')))
                 .map((m) => {
                   const isApiKey = m.method.type === 'api-key'
                   const apiKeyValue = isApiKey && m.auth?.type === 'api' ? (m.auth as { type: 'api'; key: string }).key : null
@@ -971,7 +968,12 @@ export const SettingsOverlay = memo(function SettingsOverlay({
               const isConnected = !!detected
               const isSelected = index === providerSelectedIndex
               const description = PROVIDER_DESCRIPTIONS[provider.id]
-              const sourceLabel = isConnected ? getSourceLabel(detected!.auth) : null
+              const isLocalProvider = provider.providerFamily === 'local'
+              const sourceLabel = isConnected
+                ? isLocalProvider
+                  ? (provider.defaultBaseUrl ? 'Discovered' : 'Configured')
+                  : getSourceLabel(detected!.auth)
+                : null
 
               return (
                 <Button

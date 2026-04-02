@@ -74,7 +74,8 @@ export const ModelCatalogLive = Layer.scoped(
       for (const provider of PROVIDERS) {
         if (provider.providerFamily === 'local' && provider.inventoryMode === 'dynamic') {
           const options = yield* config.getProviderOptions(provider.id)
-          const discovery = yield* discoverLocalProviderModels(provider, options?.baseUrl)
+          const effectiveBaseUrl = options?.baseUrl?.trim() || provider.defaultBaseUrl
+          const discovery = yield* discoverLocalProviderModels(provider, effectiveBaseUrl)
           const remembered = Array.isArray(options?.rememberedModelIds)
             ? options?.rememberedModelIds.filter((id): id is string => typeof id === 'string')
             : []

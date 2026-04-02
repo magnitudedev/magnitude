@@ -2,10 +2,10 @@ import { describe, expect, it } from 'bun:test'
 import { detectProviderAuthMethods, detectProviders } from '../detect'
 
 describe('provider runtime local-family detection uses config.providers', () => {
-  it('reflects local-family connectivity from provider options map', () => {
+  it('reflects first-class local connectivity from discovery status', () => {
     const storedAuth = {}
     const providerOptionsById = {
-      lmstudio: { baseUrl: 'http://localhost:1234/v1' },
+      lmstudio: { lastDiscoveryStatus: 'success_non_empty' as const },
     }
 
     const detected = detectProviders(storedAuth, providerOptionsById)

@@ -8,9 +8,6 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
   'github-copilot': '(GitHub.com or Enterprise)',
-  lmstudio: '(LM Studio local runtime)',
-  ollama: '(Ollama local runtime)',
-  'llama.cpp': '(llama.cpp local runtime)',
   'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
@@ -96,11 +93,13 @@ export const ProviderSelectOverlay = memo(function ProviderSelectOverlay({
           const description = PROVIDER_DESCRIPTIONS[provider.id]
 
           const sourceLabel = detected
-            ? detected.auth?.type === 'oauth' ? 'Subscription'
-            : detected.auth?.type === 'api' ? 'API Key'
-            : detected.auth?.type === 'aws' ? 'AWS Credentials'
-            : detected.auth?.type === 'gcp' ? 'GCP Credentials'
-            : 'No Auth Needed'
+            ? provider.providerFamily === 'local'
+              ? (provider.defaultBaseUrl ? 'Discovered' : 'Configured')
+              : detected.auth?.type === 'oauth' ? 'Subscription'
+              : detected.auth?.type === 'api' ? 'API Key'
+              : detected.auth?.type === 'aws' ? 'AWS Credentials'
+              : detected.auth?.type === 'gcp' ? 'GCP Credentials'
+              : 'No Auth Needed'
             : null
 
           return (

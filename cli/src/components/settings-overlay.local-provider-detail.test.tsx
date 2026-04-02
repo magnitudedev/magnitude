@@ -131,7 +131,8 @@ test('provider detail renders local shared page with endpoint/refresh and provid
   })
 
   expect(text).toContain('Endpoint')
-  expect(text).toContain('Set an endpoint to discover models')
+  expect(text).toContain('http://localhost:1234/v1')
+  expect(text).toContain('No discovered models yet')
   expect(text).toContain('Save endpoint')
   expect(text).toContain('[Refresh]')
 

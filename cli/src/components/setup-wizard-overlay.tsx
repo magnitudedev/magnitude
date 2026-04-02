@@ -15,9 +15,6 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
   'github-copilot': '(GitHub.com or Enterprise)',
-  lmstudio: '(LM Studio local runtime)',
-  ollama: '(Ollama local runtime)',
-  'llama.cpp': '(llama.cpp local runtime)',
   'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
@@ -129,8 +126,8 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
     .filter((id) => !discoveredProviderModelIdSet.has(id))
 
   const modelsSubtitle = connectedProviderName
-    ? `${connectedProviderName} is ready. Review role assignments below.`
-    : 'Review role assignments below.'
+    ? `${connectedProviderName} is connected! We have assigned default models for each role. You can edit these at anytime in /model.`
+    : 'We have assigned default models for each role. You can edit these at anytime in /model.'
 
   useKeyboard(useCallback((key: KeyEvent) => {
     const plain = !key.ctrl && !key.meta && !key.option
@@ -276,7 +273,7 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
                 paddingLeft: 2,
                 paddingRight: 2,
               }}>
-                <text style={{ fg: theme.success }}>Continue to role models (Enter)</text>
+                <text style={{ fg: theme.success }}>Continue to model assignment (Enter)</text>
               </box>
             </Button>
           </box>
@@ -432,14 +429,11 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
           const isSelected = index === providerSelectedIndex
           const description = PROVIDER_DESCRIPTIONS[provider.id]
 
-          const isLocalProvider = provider.id === 'lmstudio' || provider.id === 'ollama' || provider.id === 'llama.cpp' || provider.id === 'openai-compatible-local'
-
-          // Compute source label (avoid misleading "Detected" wording for local providers)
-          let detectedLabel = isLocalProvider ? 'Configured' : 'Connected'
+          // Compute source label
+          let detectedLabel = 'Connected'
           if (detected) {
-            if (isLocalProvider) {
-              if (detected.source === 'env') detectedLabel = 'Configured (Env Var)'
-              else detectedLabel = 'Configured'
+            if (provider.providerFamily === 'local') {
+              detectedLabel = provider.defaultBaseUrl ? 'Connected (Discovered)' : 'Connected (Configured)'
             } else if (detected.source === 'env') {
               detectedLabel = 'Connected (Env Var)'
             } else if (detected.source === 'stored') {

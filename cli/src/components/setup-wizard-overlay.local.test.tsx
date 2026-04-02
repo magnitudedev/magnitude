@@ -90,7 +90,7 @@ test('setup wizard provider list uses local configured semantics (not detected w
 
   const text = htmlToText(html)
   expect(text).toContain('LM Studio')
-  expect(text).toContain('Configured')
+  expect(text).toContain('Connected (Discovered)')
   expect(text).not.toContain('Detected')
   expect(text).toContain('Anthropic')
   expect(text).toContain('Connected (Env Var)')
@@ -144,7 +144,7 @@ test('models step shows discovered models for selected local provider and local 
 
   const text = htmlToText(html)
   expect(text).toContain('Models (2 of 4)')
-  expect(text).toContain('Review role assignments below.')
+  expect(text).toContain('We have assigned default models for each role.')
   expect(text).toContain('LM Studio')
   expect(text).not.toContain('Models from LM Studio')
   expect(text).not.toContain('No models listed yet')

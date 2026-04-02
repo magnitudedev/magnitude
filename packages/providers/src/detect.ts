@@ -41,7 +41,10 @@ export function detectProviders(
     if (provider.authMethods.some(m => m.type === 'none')) {
       if (provider.providerFamily === 'local') {
         const options = providerOptionsById?.[provider.id]
-        if (options?.baseUrl?.trim()) {
+        const connected = provider.defaultBaseUrl
+          ? options?.lastDiscoveryStatus === 'success_non_empty'
+          : !!options?.baseUrl?.trim()
+        if (connected) {
           detected.push({ provider, auth: null, source: 'none' })
         }
       } else {
@@ -225,7 +228,10 @@ export function detectProviderAuthMethods(
     } else if (method.type === 'none') {
       if (provider.providerFamily === 'local') {
         const options = providerOptionsById?.[provider.id]
-        if (options?.baseUrl?.trim()) {
+        const isConnected = provider.defaultBaseUrl
+          ? options?.lastDiscoveryStatus === 'success_non_empty'
+          : !!options?.baseUrl?.trim()
+        if (isConnected) {
           connected = true
           source = 'none'
         }
