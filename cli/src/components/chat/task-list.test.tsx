@@ -62,24 +62,30 @@ test('renders task header summary from task statuses', () => {
   expect(html).toContain('<text style="fg:#888888"> (1 completed, 1 active)</text>')
 })
 
-test('renders status glyphs', () => {
+test('renders status glyphs for completed, working, assigned, and pending', () => {
   const html = render(
     <TaskList
       tasks={[
-        makeTask({ taskId: 't-pending', status: 'pending' }),
-        makeTask({ taskId: 't-working', status: 'working' }),
         makeTask({ taskId: 't-completed', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 't-working', status: 'working' }),
+        makeTask({
+          taskId: 't-assigned',
+          status: 'pending',
+          assignee: { kind: 'worker', agentId: 'builder-123', workerType: 'builder' },
+          workerForkId: 'fork-123',
+        }),
+        makeTask({ taskId: 't-pending', status: 'pending' }),
       ]}
       pushForkOverlay={noop}
     />,
   )
   const text = htmlToText(html)
-  expect(text).toContain('○')
-  expect(text).toContain('◉')
   expect(text).toContain('✓')
+  expect(text).toContain('◉')
+  expect(text).toContain('○')
 })
 
-test('renders type label and depth indentation', () => {
+test('renders [type] labels and no tree connectors', () => {
   const html = render(
     <TaskList
       tasks={[
@@ -91,7 +97,10 @@ test('renders type label and depth indentation', () => {
   )
   const text = htmlToText(html)
   expect(text).toContain('[implement] Root')
-  expect(text).toContain('└─ [implement] Child')
+  expect(text).toContain('[implement] Child')
+  expect(text).toContain('○ [implement] Child')
+  expect(text).not.toContain('◉   [implement] Root')
+  expect(text).not.toContain('└─')
 })
 
 test('collapsed mode renders only the latest six tasks', () => {
@@ -108,15 +117,71 @@ test('collapsed mode renders only the latest six tasks', () => {
   expect(text).toContain('Task 8')
 })
 
-test('renders lead assignee label for unassigned/lead tasks', () => {
+test('default header shows Task (X completed, Y active)', () => {
   const html = render(
     <TaskList
-      tasks={[makeTask({ assignee: { kind: 'lead' }, workerForkId: null })]}
+      tasks={[
+        makeTask({ taskId: 'root', title: 'Root', depth: 0, status: 'pending' }),
+        makeTask({ taskId: 'child-done', title: 'Done', depth: 1, parentId: 'root', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 'child-working', title: 'Working', depth: 1, parentId: 'root', status: 'working' }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  expect(html).toContain('<text style="fg:#ffffff" attributes="1">Task</text>')
+  expect(html).toContain('<text style="fg:#888888"> (1 completed, 1 active)</text>')
+})
+
+test('renders worker assignee with expected formatted label', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          assignee: { kind: 'worker', agentId: 'builder-abc123', workerType: 'builder' },
+          workerForkId: 'fork-abc123',
+        }),
+      ]}
       pushForkOverlay={noop}
     />,
   )
 
   const text = htmlToText(html)
   expect(text).toContain('Assigned To')
-  expect(text).toContain('lead')
+  expect(text).toContain('⚒ builder-abc123')
+})
+
+test('archived summary rows render without a status glyph', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({ taskId: 'root-a', title: 'Root A', depth: 0, status: 'pending' }),
+        makeTask({ taskId: '__archived__root-a', title: '2 archived tasks', type: 'archived', depth: 1, parentId: 'root-a', status: 'archived' }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('▸ 2 archived tasks')
+})
+
+test('sticky root header shows correct subtree progress counts', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({ taskId: 'root-a', title: 'Root A', depth: 0, status: 'pending' }),
+        makeTask({ taskId: 'child-a1', title: 'Child A1', depth: 1, parentId: 'root-a', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 'child-a2', title: 'Child A2', depth: 1, parentId: 'root-a', status: 'working' }),
+        makeTask({ taskId: 'child-a3', title: 'Child A3', depth: 1, parentId: 'root-a', status: 'pending' }),
+        makeTask({ taskId: 'child-a4', title: 'Child A4', depth: 1, parentId: 'root-a', status: 'completed', completedAt: 11_000 }),
+        makeTask({ taskId: 'child-a5', title: 'Child A5', depth: 1, parentId: 'root-a', status: 'pending' }),
+        makeTask({ taskId: 'root-b', title: 'Root B', depth: 0, status: 'pending' }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  expect(html).toContain('Root A')
+  expect(html).toContain('(2 completed, 1 active)')
 })

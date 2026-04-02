@@ -6,6 +6,15 @@ import { useTerminalWidth } from '../../hooks/use-terminal-width'
 import { Button } from '../button'
 import { formatSubagentIdWithEmoji } from '../../utils/subagent-role-emoji'
 import { BOX_CHARS } from '../../utils/ui-constants'
+import {
+  computeInheritedVisualStatusMap,
+  type VisualStatus,
+} from '../../utils/task-visual-status'
+import {
+  type RootSummary,
+  buildRootSummaries,
+  findOwningRootIndex,
+} from '../../utils/task-tree'
 import type { TaskListItem } from './types'
 
 const COLLAPSED_ROWS = 6
@@ -40,6 +49,7 @@ type Props = {
 
 type TaskRowProps = {
   task: TaskListItem
+  effectiveStatus: VisualStatus
   pushForkOverlay: (forkId: string) => void
   hovered: boolean
   onHover: (taskId: string) => void
@@ -49,59 +59,157 @@ type TaskRowProps = {
   agentIdWidth: number
   onToggleArchived?: (taskId: string) => void
   archivedExpanded?: boolean
+  rootRowRef?: (node: any) => void
 }
 
-function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, taskNameWidth, agentIdWidth, onToggleArchived, archivedExpanded }: TaskRowProps) {
-  const theme = useTheme()
 
-  const truncate = (s: string, maxWidth: number) =>
-    s.length > maxWidth ? s.slice(0, maxWidth - 1) + '…' : s
 
-  const isCompleted = task.status === 'completed' || task.status === 'archived'
-  const isWorking = task.status === 'working'
+function truncate(s: string, maxWidth: number) {
+  return s.length > maxWidth ? s.slice(0, maxWidth - 1) + '…' : s
+}
+
+function getStatusGlyph(status: VisualStatus): '✓' | '◉' | '○' {
+  if (status === 'completed') return '✓'
+  if (status === 'working' || status === 'assigned') return '◉'
+  return '○'
+}
+
+function getStatusColor(
+  status: VisualStatus,
+  now: number,
+  theme: ReturnType<typeof useTheme>
+): string {
+  if (status === 'completed') return theme.success
+  if (status === 'working') {
+    return PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length]
+  }
+  if (status === 'assigned') return blue[500]
+  return theme.muted
+}
+
+function buildTaskTitleText(task: TaskListItem, opts: { archivedExpanded?: boolean }) {
   const isSummaryRow = task.taskId.startsWith('__archived__')
-  const isArchived = task.status === 'archived' || isSummaryRow
-  const pulseColor =
-    PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length]
+  const typeLabel = isSummaryRow ? (opts.archivedExpanded ? '▾ ' : '▸ ') : `[${task.type}] `
+  return `${typeLabel}${task.title}`
+}
 
-  const prefix = `${'  '.repeat(task.depth)}${task.depth > 0 ? '└─ ' : ''}`
-  const typeLabel = isSummaryRow ? (archivedExpanded ? '▾ ' : '▸ ') : `[${task.type}] `
-  const taskNameStr = truncate(`${prefix}${typeLabel}${task.title}`, taskNameWidth)
+function getTaskIndent(depth: number): string {
+  return depth > 0 ? '  '.repeat(depth) : ''
+}
 
-  const assigneeLabel = task.assignee.kind === 'lead'
+function HeaderCountsText({ completed, active, theme }: { completed: number; active: number; theme: ReturnType<typeof useTheme> }) {
+  return (
+    <text style={{ fg: theme.muted }}>
+      {` (${completed} completed, ${active} active)`}
+    </text>
+  )
+}
+
+function getAssigneeLabel(task: TaskListItem, agentIdWidth: number): string {
+  return task.assignee.kind === 'lead'
     ? 'lead'
     : task.assignee.kind === 'user'
       ? 'user'
-      : truncate(formatSubagentIdWithEmoji(task.assignee.agentId, task.assignee.workerType), agentIdWidth)
+      : truncate(
+          formatSubagentIdWithEmoji(task.assignee.agentId, task.assignee.workerType),
+          agentIdWidth
+        )
+}
+
+type TaskNameContentProps = {
+  task: TaskListItem
+  effectiveStatus: VisualStatus
+  now: number
+  taskNameWidth: number
+  archivedExpanded?: boolean
+  titleSuffix?: string
+}
+
+function TaskNameContent({
+  task,
+  effectiveStatus,
+  now,
+  taskNameWidth,
+  archivedExpanded,
+  titleSuffix,
+}: TaskNameContentProps) {
+  const theme = useTheme()
+
+  const isCompleted = task.status === 'completed' || task.status === 'archived'
+  const isSummaryRow = task.taskId.startsWith('__archived__')
+  const isArchived = task.status === 'archived' || isSummaryRow
+  const indent = getTaskIndent(task.depth)
+  const glyphText = isSummaryRow ? '' : `${getStatusGlyph(effectiveStatus)} `
+  const prefixWidth = indent.length + glyphText.length
+  const titleText = `${buildTaskTitleText(task, { archivedExpanded })}${titleSuffix ?? ''}`
+  const taskNameStr = truncate(
+    titleText,
+    Math.max(1, taskNameWidth - prefixWidth)
+  )
 
   return (
-    <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
-      {/* Status */}
-      <box style={{ width: 2, minWidth: 2, maxWidth: 2, flexShrink: 0 }}>
-        {isSummaryRow
-          ? <text style={{ fg: theme.muted }}>  </text>
-          : isCompleted
-            ? <text style={{ fg: theme.success }}>✓ </text>
-            : isWorking
-              ? <text style={{ fg: pulseColor }}>◉ </text>
-              : <text style={{ fg: theme.muted }}>○ </text>
-        }
-      </box>
+    <>
+      {indent.length > 0 && <text style={{ fg: theme.muted }}>{indent}</text>}
+      {!isSummaryRow && (
+        <text style={{ fg: getStatusColor(effectiveStatus, now, theme) }}>
+          {glyphText}
+        </text>
+      )}
+      {isArchived
+        ? <text style={{ fg: theme.muted }}>{taskNameStr}</text>
+        : isCompleted
+          ? <text attributes={TextAttributes.STRIKETHROUGH} style={{ fg: theme.muted }}>{taskNameStr}</text>
+          : <text style={{ fg: theme.foreground }}>{taskNameStr}</text>
+      }
+    </>
+  )
+}
 
+function TaskRow({
+  task,
+  effectiveStatus,
+  pushForkOverlay,
+  hovered,
+  onHover,
+  onHoverEnd,
+  now,
+  taskNameWidth,
+  agentIdWidth,
+  onToggleArchived,
+  archivedExpanded,
+  rootRowRef,
+}: TaskRowProps) {
+  const theme = useTheme()
+
+  const isSummaryRow = task.taskId.startsWith('__archived__')
+  const assigneeLabel = getAssigneeLabel(task, agentIdWidth)
+  const summaryIndent = getTaskIndent(task.depth)
+  const summaryTaskName = truncate(
+    `${summaryIndent}${buildTaskTitleText(task, { archivedExpanded })}`,
+    Math.max(1, taskNameWidth)
+  )
+
+  return (
+    <box ref={rootRowRef} style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
       {/* Task name */}
-      <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0 }}>
+      <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
         {isSummaryRow && onToggleArchived
           ? (
             <Button onClick={() => onToggleArchived(task.taskId)}>
-              <text style={{ fg: hovered ? slate[300] : theme.muted }}>{taskNameStr}</text>
+              <text style={{ fg: hovered ? slate[300] : theme.muted }}>{summaryTaskName}</text>
             </Button>
           )
-          : isArchived
-            ? <text style={{ fg: theme.muted }}>{taskNameStr}</text>
-            : isCompleted
-            ? <text attributes={TextAttributes.STRIKETHROUGH} style={{ fg: theme.muted }}>{taskNameStr}</text>
-            : <text style={{ fg: theme.foreground }}>{taskNameStr}</text>
-        }
+          : (
+            <>
+              <TaskNameContent
+                task={task}
+                effectiveStatus={effectiveStatus}
+                now={now}
+                taskNameWidth={taskNameWidth}
+                archivedExpanded={archivedExpanded}
+              />
+            </>
+          )}
       </box>
 
       {/* Assigned to */}
@@ -135,12 +243,13 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
   const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null)
   const [expandedArchived, setExpandedArchived] = useState<Set<string>>(new Set())
   const [now, setNow] = useState(() => Date.now())
+  const [stickyRootTaskId, setStickyRootTaskId] = useState<string | null>(null)
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
+  const rootRowRefs = useRef<Map<string, any>>(new Map())
 
   const terminalWidth = useTerminalWidth()
   const usableWidth = Math.max(1, terminalWidth - 4)
-  const checkboxWidth = 2
-  const remainingWidth = Math.max(1, usableWidth - checkboxWidth)
+  const remainingWidth = Math.max(1, usableWidth)
   const taskNameWidth = Math.floor(remainingWidth * 0.57)
   const agentIdWidth = remainingWidth - taskNameWidth
 
@@ -153,15 +262,12 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
     })
   }, [])
 
-  // Hide individual archived tasks unless their summary row is expanded
   const visibleAllTasks = useMemo(() => {
     const result: TaskListItem[] = []
     for (const task of tasks) {
       if (task.taskId.startsWith('__archived__')) {
-        // Summary row — always show
         result.push(task)
       } else if (task.status === 'archived') {
-        // Individual archived task — only show if parent summary is expanded
         const summaryId = `__archived__${task.parentId ?? '__root'}`
         if (expandedArchived.has(summaryId)) result.push(task)
       } else {
@@ -171,17 +277,29 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
     return result
   }, [tasks, expandedArchived])
 
-  const hasActiveTasks = visibleAllTasks.some(t => t.status === 'working')
+  const effectiveVisualStates = useMemo(
+    () => computeInheritedVisualStatusMap(visibleAllTasks),
+    [visibleAllTasks]
+  )
+
+  const rootSummaries = useMemo(
+    () => buildRootSummaries(visibleAllTasks),
+    [visibleAllTasks]
+  )
+
+  const hasWorkingTasks = useMemo(
+    () => Array.from(effectiveVisualStates.values()).some(s => s === 'working'),
+    [effectiveVisualStates]
+  )
 
   useEffect(() => {
     if (tasks.length === 0) return
-    const tickMs = hasActiveTasks ? 200 : 1000
+    const tickMs = hasWorkingTasks ? 200 : 1000
     setNow(Date.now())
     const interval = setInterval(() => setNow(Date.now()), tickMs)
     return () => clearInterval(interval)
-  }, [hasActiveTasks, tasks.length])
+  }, [hasWorkingTasks, tasks.length])
 
-  // On new tasks — snap to bottom
   useEffect(() => {
     if (!expanded) return
     const snap = () => {
@@ -192,13 +310,80 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [tasks.length, expanded])
 
-  const handleHoverEnd = useCallback(() => setHoveredTaskId(null), [])
+  useEffect(() => {
+    if (!expanded || rootSummaries.length === 0) {
+      setStickyRootTaskId(null)
+      return
+    }
 
-  if (visibleAllTasks.length === 0) return null
+    const computeYOffset = (el: any, container: any) => {
+      let offset = 0
+      let current = el
+      while (current && current !== container) {
+        const yoga = current.yogaNode ?? current.getLayoutNode?.()
+        if (yoga) offset += yoga.getComputedTop()
+        current = current.parent
+      }
+      return offset
+    }
+
+    const checkScroll = () => {
+      const scrollbox: any = scrollRef.current
+      if (!scrollbox?.content) {
+        setStickyRootTaskId(null)
+        return
+      }
+
+      const scrollTop = scrollbox.scrollTop ?? 0
+      let active: string | null = null
+
+      for (const root of rootSummaries) {
+        const el = rootRowRefs.current.get(root.task.taskId)
+        if (!el) continue
+        const offsetY = computeYOffset(el, scrollbox.content)
+        if (scrollTop > offsetY) {
+          active = root.task.taskId
+        }
+      }
+
+      setStickyRootTaskId(active)
+    }
+
+    checkScroll()
+    const interval = setInterval(checkScroll, 50)
+    return () => clearInterval(interval)
+  }, [expanded, rootSummaries])
+
+  const handleHoverEnd = useCallback(() => setHoveredTaskId(null), [])
 
   const visibleTasks = expanded ? visibleAllTasks : visibleAllTasks.slice(-COLLAPSED_ROWS)
   const completedCount = visibleAllTasks.filter(task => task.status === 'completed').length
   const activeCount = visibleAllTasks.filter(task => task.status === 'working').length
+
+  const stickyRootSummary = useMemo(() => {
+    if (expanded) {
+      if (!stickyRootTaskId) return null
+      return rootSummaries.find(root => root.task.taskId === stickyRootTaskId) ?? null
+    }
+
+    const collapsedTasks = visibleAllTasks.slice(-COLLAPSED_ROWS)
+    if (collapsedTasks.length === 0) return null
+
+    const firstVisibleTaskId = collapsedTasks[0]?.taskId
+    const firstIdx = visibleAllTasks.findIndex(t => t.taskId === firstVisibleTaskId)
+    if (firstIdx < 0) return null
+
+    const rootIdx = findOwningRootIndex(visibleAllTasks, firstIdx)
+    if (rootIdx === null) return null
+
+    const rootTask = visibleAllTasks[rootIdx]
+    if (!rootTask) return null
+    if (collapsedTasks.some(t => t.taskId === rootTask.taskId)) return null
+
+    return rootSummaries.find(root => root.task.taskId === rootTask.taskId) ?? null
+  }, [expanded, stickyRootTaskId, rootSummaries, visibleAllTasks])
+
+  if (visibleAllTasks.length === 0) return null
 
   return (
     <box
@@ -215,32 +400,59 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
       }}
     >
       {/* Header row */}
-      <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
-        {/* Spacer for checkbox column */}
-        <box style={{ width: checkboxWidth, minWidth: checkboxWidth, maxWidth: checkboxWidth, flexShrink: 0 }} />
-        {/* Task column header */}
-        <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Task</text>
-          <text style={{ fg: theme.muted }}>
-            {` (${completedCount} completed, ${activeCount} active)`}
-          </text>
-        </box>
-        {/* Assigned to column header — label left, expand/collapse button right */}
-        <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-          <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
-          <Button
-            onClick={() => setExpanded(prev => !prev)}
-            onMouseOver={() => setExpandHovered(true)}
-            onMouseOut={() => setExpandHovered(false)}
-          >
-            <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
-              {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
-            </text>
-          </Button>
-        </box>
-      </box>
+      {stickyRootSummary
+        ? (
+          <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
+            <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
+              <TaskNameContent
+                task={stickyRootSummary.task}
+                effectiveStatus={effectiveVisualStates.get(stickyRootSummary.task.taskId) ?? 'pending'}
+                now={now}
+                taskNameWidth={taskNameWidth}
+              />
+              <HeaderCountsText completed={stickyRootSummary.completed} active={stickyRootSummary.active} theme={theme} />
+            </box>
 
-      {/* Task rows */}
+            <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+              <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
+                {getAssigneeLabel(stickyRootSummary.task, agentIdWidth)}
+              </text>
+              <Button
+                onClick={() => setExpanded(prev => !prev)}
+                onMouseOver={() => setExpandHovered(true)}
+                onMouseOut={() => setExpandHovered(false)}
+              >
+                <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
+                  {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
+                </text>
+              </Button>
+            </box>
+          </box>
+        )
+        : (
+          <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
+            <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
+              <>
+                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Task</text>
+                <HeaderCountsText completed={completedCount} active={activeCount} theme={theme} />
+              </>
+            </box>
+
+            <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
+              <Button
+                onClick={() => setExpanded(prev => !prev)}
+                onMouseOver={() => setExpandHovered(true)}
+                onMouseOut={() => setExpandHovered(false)}
+              >
+                <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
+                  {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
+                </text>
+              </Button>
+            </box>
+          </box>
+        )}
+
       {expanded ? (
         <scrollbox
           ref={scrollRef}
@@ -263,21 +475,31 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
             },
           }}
         >
-          {visibleTasks.map(task => (
-            <TaskRow
-              key={task.taskId}
-              task={task}
-              pushForkOverlay={pushForkOverlay}
-              hovered={hoveredTaskId === task.taskId}
-              onHover={setHoveredTaskId}
-              onHoverEnd={handleHoverEnd}
-              now={now}
-              taskNameWidth={taskNameWidth}
-              agentIdWidth={agentIdWidth}
-              onToggleArchived={task.status === 'archived' ? toggleArchived : undefined}
-              archivedExpanded={task.status === 'archived' ? expandedArchived.has(task.taskId) : undefined}
-            />
-          ))}
+          {visibleTasks.map(task => {
+            const isRootRow = task.depth === 0 && !task.taskId.startsWith('__archived__')
+            return (
+              <TaskRow
+                key={task.taskId}
+                task={task}
+                effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
+                pushForkOverlay={pushForkOverlay}
+                hovered={hoveredTaskId === task.taskId}
+                onHover={setHoveredTaskId}
+                onHoverEnd={handleHoverEnd}
+                now={now}
+                taskNameWidth={taskNameWidth}
+                agentIdWidth={agentIdWidth}
+                onToggleArchived={task.status === 'archived' ? toggleArchived : undefined}
+                archivedExpanded={task.status === 'archived' ? expandedArchived.has(task.taskId) : undefined}
+                rootRowRef={isRootRow
+                  ? (node: any) => {
+                      if (node) rootRowRefs.current.set(task.taskId, node)
+                      else rootRowRefs.current.delete(task.taskId)
+                    }
+                  : undefined}
+              />
+            )
+          })}
         </scrollbox>
       ) : (
         <box style={{ flexDirection: 'column' }}>
@@ -285,6 +507,7 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
             <TaskRow
               key={task.taskId}
               task={task}
+              effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
               pushForkOverlay={pushForkOverlay}
               hovered={hoveredTaskId === task.taskId}
               onHover={setHoveredTaskId}

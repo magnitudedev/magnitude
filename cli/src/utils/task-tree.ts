@@ -130,3 +130,80 @@ export function flattenTaskTree(state: TaskGraphState): TaskListItem[] {
 
   return rows
 }
+
+export type RootSummary = {
+  task: TaskListItem
+  startIndex: number
+  endIndex: number
+  completed: number
+  active: number
+  total: number
+}
+
+function isArchivedSummaryRow(task: TaskListItem): boolean {
+  return task.taskId.startsWith('__archived__')
+}
+
+export function buildRootSummaries(tasks: readonly TaskListItem[]): RootSummary[] {
+  const rootStartIndexes: number[] = []
+  for (let i = 0; i < tasks.length; i++) {
+    const task = tasks[i]
+    if (!task) continue
+    if (task.depth !== 0) continue
+    if (isArchivedSummaryRow(task)) continue
+    rootStartIndexes.push(i)
+  }
+
+  const summaries: RootSummary[] = []
+  for (let i = 0; i < rootStartIndexes.length; i++) {
+    const startIndex = rootStartIndexes[i]
+    if (startIndex === undefined) continue
+
+    const nextStartIndex = rootStartIndexes[i + 1]
+    const endIndex = nextStartIndex ?? tasks.length
+
+    const rootTask = tasks[startIndex]
+    if (!rootTask) continue
+
+    let completed = 0
+    let active = 0
+    let total = 0
+    for (let rowIndex = startIndex; rowIndex < endIndex; rowIndex++) {
+      const rowTask = tasks[rowIndex]
+      if (!rowTask) continue
+      if (isArchivedSummaryRow(rowTask)) continue
+
+      total += 1
+      if (rowTask.status === 'completed' || rowTask.status === 'archived') {
+        completed += 1
+      } else if (rowTask.status === 'working') {
+        active += 1
+      }
+    }
+
+    summaries.push({
+      task: rootTask,
+      startIndex,
+      endIndex,
+      completed,
+      active,
+      total,
+    })
+  }
+
+  return summaries
+}
+
+export function findOwningRootIndex(tasks: readonly TaskListItem[], rowIndex: number): number | null {
+  if (rowIndex < 0 || rowIndex >= tasks.length) return null
+
+  for (let i = rowIndex; i >= 0; i--) {
+    const task = tasks[i]
+    if (!task) continue
+    if (task.depth !== 0) continue
+    if (isArchivedSummaryRow(task)) continue
+    return i
+  }
+
+  return null
+}
