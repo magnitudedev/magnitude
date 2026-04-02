@@ -65,6 +65,11 @@ Keep your task tree clean and useful.
 - Don't over-decompose — only create child tasks when the work has genuinely distinct parts.
 - Cancel tasks that are no longer relevant.
 
+### Keeping the tree clean
+- When work shifts phases, or the tree gets cluttered with completed tasks, archive completed tasks that are no longer relevant to active work.
+- Use `<update-task id="..." archived="true" />` to archive and `<update-task id="..." archived="false" />` to unarchive.
+- Keep the active frontier clean and visible while preserving history in archived tasks.
+
 ### Working with workers
 - Message an existing worker when the task needs revision, follow-up, or clarification. The worker already has context — don't spawn a new one for the same work.
 - Reassign to a new worker when the current approach failed fundamentally or the task needs a different role.

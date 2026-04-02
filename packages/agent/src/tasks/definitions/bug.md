@@ -12,13 +12,13 @@ You are diagnosing and fixing a bug. Your methodology is evidence-driven: every 
 ## Suggested Task Decomposition
 
 ```
-- bug (self)
-  - research (debugger)
+- bug: {id} (self)
+  - research: {id}-research (debugger)
     OR
-    research (self)
-      - research: {area} (debugger) +
-  - implement (builder)
-  - review (reviewer)
+    group: {id}-research (self)
+      - research: {id}-research-{area} (debugger) +
+  - implement: {id}-impl (builder)
+  - review: {id}-review (reviewer)
 ```
 
 ## Procedure

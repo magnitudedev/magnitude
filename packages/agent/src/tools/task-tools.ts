@@ -5,6 +5,7 @@ import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
 import { ConversationStateReaderTag } from './memory-reader'
 import { TaskGraphStateReaderTag } from './task-reader'
+import type { TaskStatus } from '../projections/task-graph'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
 import { isTaskAssigneeAllowed, isValidTaskType } from '../tasks'
 import { getSpawnableVariants, type AgentVariant } from '../agents'
@@ -93,18 +94,20 @@ export const updateTaskTool = defineTool({
     parent: Schema.optional(Schema.String),
     after: Schema.optional(Schema.String),
     complete: Schema.optional(Schema.Boolean),
+    archived: Schema.optional(Schema.Boolean),
     title: Schema.optional(Schema.String),
   }),
   outputSchema: Schema.Struct({
     taskId: Schema.String,
   }),
   errorSchema: TaskErrorSchema,
-  execute: ({ taskId, parent, after, complete, title }) => Effect.gen(function* () {
-    const hasMutation = parent !== undefined || after !== undefined || complete === true || title !== undefined
+  execute: ({ taskId, parent, after, complete, archived, title }) => Effect.gen(function* () {
+    const hasMutation =
+      parent !== undefined || after !== undefined || complete === true || archived !== undefined || title !== undefined
     if (!hasMutation) {
       return yield* Effect.fail({
         _tag: 'TaskError' as const,
-        message: 'update-task requires at least one mutation: parent, complete, or title.',
+        message: 'update-task requires at least one mutation: parent, complete, archived, or title.',
       })
     }
 
@@ -153,9 +156,10 @@ export const updateTaskTool = defineTool({
       title?: string
       parentId?: string | null
       after?: string
+      status?: TaskStatus
     } = {}
 
-    if (title !== undefined) {
+    if (title !== undefined && title.trim() !== '') {
       patch.title = title
     }
 
@@ -165,6 +169,26 @@ export const updateTaskTool = defineTool({
 
     if (after !== undefined) {
       patch.after = after
+    }
+
+    if (archived === true) {
+      if (task.status !== 'completed') {
+        return yield* Effect.fail({
+          _tag: 'TaskError' as const,
+          message: `Task "${taskId}" can only be archived from completed status.`,
+        })
+      }
+      patch.status = 'archived'
+    }
+
+    if (archived === false) {
+      if (task.status !== 'archived') {
+        return yield* Effect.fail({
+          _tag: 'TaskError' as const,
+          message: `Task "${taskId}" can only be unarchived from archived status.`,
+        })
+      }
+      patch.status = 'completed'
     }
 
     if (Object.keys(patch).length > 0) {
@@ -189,6 +213,7 @@ export const updateTaskXmlBinding = defineXmlBinding(updateTaskTool, {
       { field: 'parent', attr: 'parent' },
       { field: 'after', attr: 'after' },
       { field: 'complete', attr: 'complete' },
+      { field: 'archived', attr: 'archived' },
     ],
     body: 'title',
   },

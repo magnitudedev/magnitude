@@ -3,7 +3,7 @@ import type { AppEvent } from '../events'
 import { AgentStatusProjection, type AgentStatusState } from './agent-status'
 import { isTaskAssigneeAllowed, type TaskAssignee, type TaskTypeId } from '../tasks'
 
-export type TaskStatus = 'pending' | 'working' | 'completed'
+export type TaskStatus = 'pending' | 'working' | 'completed' | 'archived'
 
 export interface TaskWorkerInfo {
   readonly agentId: string
@@ -82,7 +82,10 @@ export function collectSubtreeTaskIds(state: TaskGraphState, rootTaskId: string)
 
 export function canCompleteTask(state: TaskGraphState, taskId: string): boolean {
   const task = getTask(state, taskId)
-  return task.childIds.every((childId) => getTask(state, childId).status === 'completed')
+  return task.childIds.every((childId) => {
+    const childStatus = getTask(state, childId).status
+    return childStatus === 'completed' || childStatus === 'archived'
+  })
 }
 
 export function patchTask(
@@ -314,6 +317,37 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
         }))
       }
 
+      if (event.patch.status !== undefined) {
+        const requestedStatus = event.patch.status
+
+        if (
+          requestedStatus !== 'pending'
+          && requestedStatus !== 'working'
+          && requestedStatus !== 'completed'
+          && requestedStatus !== 'archived'
+        ) {
+          throw new Error(`[TaskGraphProjection] Invalid status patch: ${requestedStatus}`)
+        }
+
+        if (
+          requestedStatus !== existing.status
+          && !(
+            (existing.status === 'completed' && requestedStatus === 'archived')
+            || (existing.status === 'archived' && requestedStatus === 'completed')
+          )
+        ) {
+          throw new Error(
+            `[TaskGraphProjection] Invalid status transition for task ${event.taskId}: ${existing.status} -> ${requestedStatus}`,
+          )
+        }
+
+        nextState = patchTask(nextState, event.taskId, (task) => ({
+          ...task,
+          status: requestedStatus,
+          updatedAt: event.timestamp,
+        }))
+      }
+
       return nextState
     },
 
@@ -447,7 +481,7 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
   signalHandlers: (on) => [
     on(AgentStatusProjection.signals.agentBecameWorking, ({ value, state, read, emit }) => {
       const task = findTaskByWorkerAgentId(state, value.agentId)
-      if (!task || task.status === 'completed') return state
+      if (!task || task.status === 'completed' || task.status === 'archived') return state
 
       const agentState = read(AgentStatusProjection)
       const nextStatus = deriveStatusFromWorker(task, agentState)
@@ -473,7 +507,7 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
 
     on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state, read, emit }) => {
       const task = findTaskByWorkerAgentId(state, value.agentId)
-      if (!task || task.status === 'completed') return state
+      if (!task || task.status === 'completed' || task.status === 'archived') return state
 
       const agentState = read(AgentStatusProjection)
       const nextStatus = deriveStatusFromWorker(task, agentState)

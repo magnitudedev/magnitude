@@ -12,18 +12,18 @@ You are implementing a new feature — introducing novel behavior into the codeb
 ## Suggested Task Decomposition
 
 ```
-- feature (self)
-  - research (explorer)
+- feature: {id} (self)
+  - research: {id}-research (explorer)
     OR
-    research (self)
-      - research: {area} (explorer) +
-  - plan (planner)
-    - approve (user)
-  - implement (builder)
+    group: {id}-research (self)
+      - research: {id}-research-{area} (explorer) +
+  - plan: {id}-plan (planner)
+    - approve: {id}-plan-approve (user)
+  - implement: {id}-impl (builder)
     OR
-    implement (self)
-      - implement: {scope} (builder) +
-  - review (reviewer)
+    group: {id}-impl (self)
+      - implement: {id}-impl-{scope} (builder) +
+  - review: {id}-review (reviewer)
 ```
 
 ## Procedure

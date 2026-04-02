@@ -12,15 +12,15 @@ You are refactoring code — restructuring it without changing its external beha
 ## Suggested Task Decomposition
 
 ```
-- refactor (self)
-  - research (explorer)
-  - plan (planner)
-    - approve (user)
-  - implement (builder)
+- refactor: {id} (self)
+  - research: {id}-research (explorer)
+  - plan: {id}-plan (planner)
+    - approve: {id}-plan-approve (user)
+  - implement: {id}-impl (builder)
     OR
-    implement (self)
-      - implement: {scope} (builder) +
-  - review (reviewer)
+    group: {id}-impl (self)
+      - implement: {id}-impl-{scope} (builder) +
+  - review: {id}-review (reviewer)
 ```
 
 ## Procedure

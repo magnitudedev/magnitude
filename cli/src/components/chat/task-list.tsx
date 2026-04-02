@@ -1,6 +1,6 @@
 import { TextAttributes, type ScrollBoxRenderable } from '@opentui/core'
 import { blue, slate } from '../../utils/palette'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useTerminalWidth } from '../../hooks/use-terminal-width'
 import { Button } from '../button'
@@ -47,21 +47,25 @@ type TaskRowProps = {
   now: number
   taskNameWidth: number
   agentIdWidth: number
+  onToggleArchived?: (taskId: string) => void
+  archivedExpanded?: boolean
 }
 
-function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, taskNameWidth, agentIdWidth }: TaskRowProps) {
+function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, taskNameWidth, agentIdWidth, onToggleArchived, archivedExpanded }: TaskRowProps) {
   const theme = useTheme()
 
   const truncate = (s: string, maxWidth: number) =>
     s.length > maxWidth ? s.slice(0, maxWidth - 1) + '…' : s
 
-  const isCompleted = task.status === 'completed'
+  const isCompleted = task.status === 'completed' || task.status === 'archived'
   const isWorking = task.status === 'working'
+  const isSummaryRow = task.taskId.startsWith('__archived__')
+  const isArchived = task.status === 'archived' || isSummaryRow
   const pulseColor =
     PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length]
 
   const prefix = `${'  '.repeat(task.depth)}${task.depth > 0 ? '└─ ' : ''}`
-  const typeLabel = `[${task.type}] `
+  const typeLabel = isSummaryRow ? (archivedExpanded ? '▾ ' : '▸ ') : `[${task.type}] `
   const taskNameStr = truncate(`${prefix}${typeLabel}${task.title}`, taskNameWidth)
 
   const assigneeLabel = task.assignee.kind === 'lead'
@@ -74,19 +78,29 @@ function TaskRow({ task, pushForkOverlay, hovered, onHover, onHoverEnd, now, tas
     <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
       {/* Status */}
       <box style={{ width: 2, minWidth: 2, maxWidth: 2, flexShrink: 0 }}>
-        {isCompleted
-          ? <text style={{ fg: theme.success }}>✓ </text>
-          : isWorking
-            ? <text style={{ fg: pulseColor }}>◉ </text>
-            : <text style={{ fg: theme.muted }}>○ </text>
+        {isSummaryRow
+          ? <text style={{ fg: theme.muted }}>  </text>
+          : isCompleted
+            ? <text style={{ fg: theme.success }}>✓ </text>
+            : isWorking
+              ? <text style={{ fg: pulseColor }}>◉ </text>
+              : <text style={{ fg: theme.muted }}>○ </text>
         }
       </box>
 
       {/* Task name */}
       <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0 }}>
-        {isCompleted
-          ? <text attributes={TextAttributes.STRIKETHROUGH} style={{ fg: theme.muted }}>{taskNameStr}</text>
-          : <text style={{ fg: theme.foreground }}>{taskNameStr}</text>
+        {isSummaryRow && onToggleArchived
+          ? (
+            <Button onClick={() => onToggleArchived(task.taskId)}>
+              <text style={{ fg: hovered ? slate[300] : theme.muted }}>{taskNameStr}</text>
+            </Button>
+          )
+          : isArchived
+            ? <text style={{ fg: theme.muted }}>{taskNameStr}</text>
+            : isCompleted
+            ? <text attributes={TextAttributes.STRIKETHROUGH} style={{ fg: theme.muted }}>{taskNameStr}</text>
+            : <text style={{ fg: theme.foreground }}>{taskNameStr}</text>
         }
       </box>
 
@@ -119,6 +133,7 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
   const [expanded, setExpanded] = useState(false)
   const [expandHovered, setExpandHovered] = useState(false)
   const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null)
+  const [expandedArchived, setExpandedArchived] = useState<Set<string>>(new Set())
   const [now, setNow] = useState(() => Date.now())
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
 
@@ -129,7 +144,34 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
   const taskNameWidth = Math.floor(remainingWidth * 0.57)
   const agentIdWidth = remainingWidth - taskNameWidth
 
-  const hasActiveTasks = tasks.some(t => t.status === 'working')
+  const toggleArchived = useCallback((taskId: string) => {
+    setExpandedArchived(prev => {
+      const next = new Set(prev)
+      if (next.has(taskId)) next.delete(taskId)
+      else next.add(taskId)
+      return next
+    })
+  }, [])
+
+  // Hide individual archived tasks unless their summary row is expanded
+  const visibleAllTasks = useMemo(() => {
+    const result: TaskListItem[] = []
+    for (const task of tasks) {
+      if (task.taskId.startsWith('__archived__')) {
+        // Summary row — always show
+        result.push(task)
+      } else if (task.status === 'archived') {
+        // Individual archived task — only show if parent summary is expanded
+        const summaryId = `__archived__${task.parentId ?? '__root'}`
+        if (expandedArchived.has(summaryId)) result.push(task)
+      } else {
+        result.push(task)
+      }
+    }
+    return result
+  }, [tasks, expandedArchived])
+
+  const hasActiveTasks = visibleAllTasks.some(t => t.status === 'working')
 
   useEffect(() => {
     if (tasks.length === 0) return
@@ -152,11 +194,11 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
 
   const handleHoverEnd = useCallback(() => setHoveredTaskId(null), [])
 
-  if (tasks.length === 0) return null
+  if (visibleAllTasks.length === 0) return null
 
-  const visibleTasks = expanded ? tasks : tasks.slice(-COLLAPSED_ROWS)
-  const completedCount = tasks.filter(task => task.status === 'completed').length
-  const activeCount = tasks.filter(task => task.status === 'working').length
+  const visibleTasks = expanded ? visibleAllTasks : visibleAllTasks.slice(-COLLAPSED_ROWS)
+  const completedCount = visibleAllTasks.filter(task => task.status === 'completed').length
+  const activeCount = visibleAllTasks.filter(task => task.status === 'working').length
 
   return (
     <box
@@ -221,7 +263,7 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
             },
           }}
         >
-          {tasks.map(task => (
+          {visibleTasks.map(task => (
             <TaskRow
               key={task.taskId}
               task={task}
@@ -232,6 +274,8 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
               now={now}
               taskNameWidth={taskNameWidth}
               agentIdWidth={agentIdWidth}
+              onToggleArchived={task.status === 'archived' ? toggleArchived : undefined}
+              archivedExpanded={task.status === 'archived' ? expandedArchived.has(task.taskId) : undefined}
             />
           ))}
         </scrollbox>
@@ -248,6 +292,8 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
               now={now}
               taskNameWidth={taskNameWidth}
               agentIdWidth={agentIdWidth}
+              onToggleArchived={task.status === 'archived' ? toggleArchived : undefined}
+              archivedExpanded={task.status === 'archived' ? expandedArchived.has(task.taskId) : undefined}
             />
           ))}
         </box>

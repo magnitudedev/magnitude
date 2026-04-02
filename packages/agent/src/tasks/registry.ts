@@ -3,6 +3,7 @@ import {
   approveTaskType,
   bugTaskType,
   featureTaskType,
+  groupTaskType,
   implementTaskType,
   otherTaskType,
   planTaskType,
@@ -11,7 +12,7 @@ import {
   reviewTaskType,
 } from './definitions'
 
-export type TaskTypeId = 'feature' | 'bug' | 'refactor' | 'research' | 'plan' | 'implement' | 'review' | 'approve' | 'other'
+export type TaskTypeId = 'feature' | 'bug' | 'refactor' | 'research' | 'plan' | 'implement' | 'review' | 'approve' | 'group' | 'other'
 
 export const TASK_TYPES: Record<TaskTypeId, TaskTypeDefinition> = {
   feature: featureTaskType,
@@ -22,6 +23,7 @@ export const TASK_TYPES: Record<TaskTypeId, TaskTypeDefinition> = {
   implement: implementTaskType,
   review: reviewTaskType,
   approve: approveTaskType,
+  group: groupTaskType,
   other: otherTaskType,
 }
 

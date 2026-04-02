@@ -48,7 +48,7 @@ export type TaskListItem = {
   taskId: string
   title: string
   type: string
-  status: 'pending' | 'working' | 'completed'
+  status: 'pending' | 'working' | 'completed' | 'archived'
   depth: number
   parentId: string | null
   createdAt: number

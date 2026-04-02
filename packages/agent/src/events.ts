@@ -404,6 +404,7 @@ export interface TaskUpdated {
     readonly title?: string
     readonly parentId?: string | null
     readonly after?: string
+    readonly status?: string
   }
   readonly timestamp: number
 }
