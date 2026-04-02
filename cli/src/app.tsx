@@ -219,11 +219,13 @@ function AppInner({
     }
     return `${n}`
   }
-  const contextPercent = contextHardCap ? Math.round((tokenEstimate / contextHardCap) * 100) : 0
-  const contextDisplayText = contextHardCap
-    ? `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextHardCap)}`
+  const contextPercent = contextHardCap ? Math.round((tokenEstimate / contextHardCap) * 100) : null
+  const contextDisplayText = tokenEstimate > 0
+    ? (contextHardCap
+      ? `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextHardCap)}`
+      : `${formatFooterTokens(tokenEstimate)}/Unknown`)
     : ''
-  const contextRenderedText = tokenEstimate > 0 && contextHardCap
+  const contextRenderedText = tokenEstimate > 0
     ? (isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText)
     : ''
 
@@ -306,12 +308,13 @@ function AppInner({
   }, [providerUiState, storage])
 
   useEffect(() => {
+    if (!providerUiState) return
     providerRuntime.state.contextLimits('lead').then((limits) => {
       setContextHardCap(limits.hardCap)
     }).catch((error) => {
       logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Failed to load provider context limits')
     })
-  }, [providerRuntime, slotModels.lead])
+  }, [providerRuntime, slotModels.lead, providerUiState])
 
   // Check Chromium installation when wizard opens
   useEffect(() => {

@@ -44,6 +44,7 @@ export interface ModelDefinition {
   id: string
   name: string
   contextWindow: number
+  maxContextTokens?: number | null
   supportsToolCalls: boolean
   supportsReasoning: boolean
   cost: { input: number; output: number; cache_read?: number; cache_write?: number }

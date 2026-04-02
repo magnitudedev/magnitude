@@ -87,6 +87,7 @@ export const ModelCatalogLive = Layer.scoped(
             discoveredModels: discovery.models.map((model) => ({
               id: model.id,
               name: model.name,
+              maxContextTokens: model.maxContextTokens ?? null,
               discoveredAt: now,
               source: discovery.source ?? provider.localDiscoveryStrategy ?? 'unknown',
             })),

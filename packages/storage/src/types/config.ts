@@ -27,6 +27,7 @@ export const ProviderOptionsSchema = Schema.Struct({
       Schema.Struct({
         id: Schema.String,
         name: Schema.optional(Schema.String),
+        maxContextTokens: NullableOptional(Schema.Number),
         discoveredAt: Schema.optional(Schema.String),
         source: Schema.optional(Schema.String),
       }),

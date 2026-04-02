@@ -190,7 +190,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
               <text style={{ fg: theme.muted }}> | </text>
               <ContextUsageBar
                 tokenEstimate={tokenEstimate}
-                hardCap={contextHardCap ?? tokenEstimate}
+                hardCap={contextHardCap}
                 isCompacting={isCompacting}
               />
             </box>
