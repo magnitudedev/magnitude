@@ -2,7 +2,7 @@
 id: research
 label: Research
 description: Questions about code, systems, or technology that need concrete answers before proceeding.
-allowedAssignees: [self, explorer]
+allowedAssignees: [explorer]
 ---
 
 # Research

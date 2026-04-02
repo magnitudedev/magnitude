@@ -8,7 +8,7 @@ import type { TaskTypeDefinition, TaskAssignee } from '../types'
  * id: feature
  * label: Feature
  * description: Deliver a user-facing capability
- * allowedAssignees: [self, builder]
+ * allowedAssignees: [builder]
  * ---
  *
  * # Feature

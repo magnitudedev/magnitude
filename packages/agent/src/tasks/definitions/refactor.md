@@ -2,7 +2,7 @@
 id: refactor
 label: Refactor
 description: Restructuring, reorganizing, or cleaning up code without changing its external behavior.
-allowedAssignees: [self]
+allowedAssignees: []
 ---
 
 # Refactor
@@ -12,13 +12,13 @@ You are refactoring code — restructuring it without changing its external beha
 ## Suggested Task Decomposition
 
 ```
-- refactor: {id} (self)
+- refactor: {id}
   - research: {id}-research (explorer)
   - plan: {id}-plan (planner)
     - approve: {id}-plan-approve (user)
   - implement: {id}-impl (builder)
     OR
-    group: {id}-impl (self)
+    group: {id}-impl
       - implement: {id}-impl-{scope} (builder) +
   - review: {id}-review (reviewer)
 ```

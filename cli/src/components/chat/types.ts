@@ -54,7 +54,7 @@ export type TaskListItem = {
   createdAt: number
   updatedAt: number
   completedAt: number | null
-  assignee: { kind: 'lead' } | { kind: 'user' } | { kind: 'worker'; workerType?: string; agentId: string }
+  assignee: { kind: 'lead' } | { kind: 'none' } | { kind: 'user' } | { kind: 'worker'; workerType?: string; agentId: string }
   workerForkId: string | null
 }
 

@@ -2,7 +2,7 @@
 id: feature
 label: Feature
 description: New functionality, behavior, or capabilities that don't exist yet.
-allowedAssignees: [self]
+allowedAssignees: []
 ---
 
 # Feature
@@ -12,16 +12,16 @@ You are implementing a new feature — introducing novel behavior into the codeb
 ## Suggested Task Decomposition
 
 ```
-- feature: {id} (self)
+- feature: {id}
   - research: {id}-research (explorer)
     OR
-    group: {id}-research (self)
+    group: {id}-research
       - research: {id}-research-{area} (explorer) +
   - plan: {id}-plan (planner)
     - approve: {id}-plan-approve (user)
   - implement: {id}-impl (builder)
     OR
-    group: {id}-impl (self)
+    group: {id}-impl
       - implement: {id}-impl-{scope} (builder) +
   - review: {id}-review (reviewer)
 ```

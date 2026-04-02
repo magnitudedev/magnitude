@@ -2,7 +2,7 @@
 id: review
 label: Review
 description: Completed work that needs verification for correctness, quality, and requirement coverage.
-allowedAssignees: [self, reviewer]
+allowedAssignees: [reviewer]
 ---
 
 # Review

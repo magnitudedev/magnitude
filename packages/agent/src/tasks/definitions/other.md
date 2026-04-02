@@ -2,7 +2,7 @@
 id: other
 label: Other
 description: Work that doesn't fit neatly into feature, bug, refactor, research, plan, implement, or review.
-allowedAssignees: [self, explorer, planner, builder, reviewer, debugger, browser]
+allowedAssignees: [explorer, planner, builder, reviewer, debugger, browser, user]
 ---
 
 # Other

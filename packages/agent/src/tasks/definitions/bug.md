@@ -2,7 +2,7 @@
 id: bug
 label: Bug
 description: Unexpected behavior, errors, test failures, or regressions from previously working functionality.
-allowedAssignees: [self]
+allowedAssignees: []
 ---
 
 # Bug
@@ -12,10 +12,10 @@ You are diagnosing and fixing a bug. Your methodology is evidence-driven: every 
 ## Suggested Task Decomposition
 
 ```
-- bug: {id} (self)
+- bug: {id}
   - research: {id}-research (debugger)
     OR
-    group: {id}-research (self)
+    group: {id}-research
       - research: {id}-research-{area} (debugger) +
   - implement: {id}-impl (builder)
   - review: {id}-review (reviewer)

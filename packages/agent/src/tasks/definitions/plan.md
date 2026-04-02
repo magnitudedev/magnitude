@@ -2,7 +2,7 @@
 id: plan
 label: Plan
 description: Work that needs a concrete design or implementation strategy before building.
-allowedAssignees: [self, planner]
+allowedAssignees: [planner]
 ---
 
 # Plan

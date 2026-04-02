@@ -1,6 +1,6 @@
 import type { AgentVariant } from '../agents'
 
-export type TaskAssignee = 'self' | 'user' | AgentVariant
+export type TaskAssignee = 'user' | AgentVariant
 
 export interface TaskTypeDefinition<TId extends string = string> {
   readonly id: TId

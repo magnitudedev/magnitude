@@ -11,7 +11,10 @@ export function renderTaskTypeReferenceTable(): string {
   const lines: string[] = []
   for (const def of listTaskTypeDefinitions()) {
     lines.push(`- **${def.label}** (\`${def.id}\`) — ${def.description}`)
-    lines.push(`  Assignees: ${def.allowedAssignees.join(', ')}`)
+    const assignees = def.allowedAssignees.length > 0
+      ? def.allowedAssignees.join(', ')
+      : 'none (coordinator task; create/assign child tasks)'
+    lines.push(`  Assignees: ${assignees}`)
   }
   return lines.join('\n')
 }

@@ -2,7 +2,7 @@
 id: implement
 label: Implement
 description: Concrete code changes with a clear objective or plan to follow.
-allowedAssignees: [self, builder]
+allowedAssignees: [builder]
 ---
 
 # Implement

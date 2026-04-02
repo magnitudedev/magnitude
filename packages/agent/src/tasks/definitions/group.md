@@ -2,7 +2,7 @@
 id: group
 label: Group
 description: Related tasks that should be organized together under a common objective.
-allowedAssignees: [self]
+allowedAssignees: []
 ---
 
 # Group

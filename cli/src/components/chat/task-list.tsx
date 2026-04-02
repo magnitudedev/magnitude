@@ -109,12 +109,14 @@ function HeaderCountsText({ completed, active, theme }: { completed: number; act
 function getAssigneeLabel(task: TaskListItem, agentIdWidth: number): string {
   return task.assignee.kind === 'lead'
     ? 'lead'
-    : task.assignee.kind === 'user'
-      ? 'user'
-      : truncate(
-          formatSubagentIdWithEmoji(task.assignee.agentId, task.assignee.workerType),
-          agentIdWidth
-        )
+    : task.assignee.kind === 'none'
+      ? ''
+      : task.assignee.kind === 'user'
+        ? 'user'
+        : truncate(
+            formatSubagentIdWithEmoji(task.assignee.agentId, task.assignee.workerType),
+            agentIdWidth
+          )
 }
 
 type TaskNameContentProps = {

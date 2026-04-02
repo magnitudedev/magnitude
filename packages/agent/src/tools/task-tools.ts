@@ -224,7 +224,7 @@ export const updateTaskXmlBinding = defineXmlBinding(updateTaskTool, {
 export const assignTaskTool = defineTool({
   name: 'assign-task' as const,
   group: 'task' as const,
-  description: 'Assign a task to self or a worker role. Assigning to a worker starts execution.',
+  description: 'Assign a task to a worker role or user. Assigning to a worker starts execution.',
   inputSchema: Schema.Struct({
     taskId: Schema.String,
     assignee: Schema.String,
@@ -248,7 +248,7 @@ export const assignTaskTool = defineTool({
       })
     }
 
-    if (normalizedAssignee !== 'self' && normalizedAssignee !== 'user') {
+    if (normalizedAssignee !== 'user') {
       const spawnable = getSpawnableVariants()
       if (!spawnable.includes(normalizedAssignee as AgentVariant)) {
         return yield* Effect.fail({
@@ -258,7 +258,7 @@ export const assignTaskTool = defineTool({
       }
     }
 
-    if (!isTaskAssigneeAllowed(task.taskType, normalizedAssignee as 'self' | AgentVariant)) {
+    if (!isTaskAssigneeAllowed(task.taskType, normalizedAssignee as 'user' | AgentVariant)) {
       return yield* Effect.fail({
         _tag: 'TaskError' as const,
         message: `Assignee "${assignee}" is not allowed for task type "${task.taskType}".`,
@@ -281,12 +281,12 @@ export const assignTaskTool = defineTool({
       })
     }
 
-    if (normalizedAssignee === 'self' || normalizedAssignee === 'user') {
+    if (normalizedAssignee === 'user') {
       yield* bus.publish({
         type: 'task_assigned',
         forkId: parentForkId,
         taskId,
-        assignee: normalizedAssignee,
+        assignee: 'user',
         workerRole: undefined,
         message: '',
         workerInfo: undefined,

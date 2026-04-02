@@ -401,20 +401,18 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
       }
 
       const agentState = read(AgentStatusProjection)
-      const worker: TaskWorkerInfo | null = event.assignee === 'self'
-        ? null
-        : event.workerInfo
-          ? {
-              agentId: event.workerInfo.agentId,
-              forkId: event.workerInfo.forkId,
-              role: event.workerInfo.role,
-              message: event.message,
-            }
-          : current.worker
+      const worker: TaskWorkerInfo | null = event.workerInfo
+        ? {
+            agentId: event.workerInfo.agentId,
+            forkId: event.workerInfo.forkId,
+            role: event.workerInfo.role,
+            message: event.message,
+          }
+        : null
 
-      const nextStatus = event.assignee === 'self'
-        ? 'pending'
-        : deriveStatusFromWorker({ ...current, worker, completedAt: null }, agentState)
+      const nextStatus = worker
+        ? deriveStatusFromWorker({ ...current, worker, completedAt: null }, agentState)
+        : 'pending'
 
       const next = patchTask(state, event.taskId, (task) => ({
         ...task,

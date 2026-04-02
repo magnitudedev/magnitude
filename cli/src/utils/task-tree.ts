@@ -54,7 +54,7 @@ function toTaskListItem(task: TaskRecord, depth: number): TaskListItem {
       ? { kind: 'worker', workerType: task.worker.role, agentId: task.worker.agentId }
       : task.assignee === 'user'
         ? { kind: 'user' }
-        : { kind: 'lead' },
+        : { kind: 'none' },
     workerForkId: task.worker?.forkId ?? null,
   }
 }
@@ -70,7 +70,7 @@ function makeArchivedSummaryRow(parentId: string, depth: number, archivedTasks: 
     createdAt: 0,
     updatedAt: 0,
     completedAt: null,
-    assignee: { kind: 'lead' },
+    assignee: { kind: 'none' },
     workerForkId: null,
   }
 }
