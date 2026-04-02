@@ -1510,15 +1510,41 @@ function AppInner({
     })
     await providerRuntime.catalog.refresh().catch(() => undefined)
     await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(localProviderSavedEndpointToast(getProvider(providerId)?.name ?? providerId), theme.success)
-  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success])
+  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success, wizardSelectedProviderId])
 
-  const handleLocalProviderRefreshModels = useCallback(async (_providerId: string) => {
+  const handleLocalProviderRefreshModels = useCallback(async (providerId: string) => {
     await providerRuntime.catalog.refresh().catch(() => undefined)
     await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
     setProviderRefreshKey(prev => prev + 1)
-  }, [providerRuntime, reloadProviderState])
+  }, [providerRuntime, reloadProviderState, storage, wizardSelectedProviderId])
 
   const handleLocalProviderAddManualModel = useCallback(async (providerId: string, modelId: string) => {
     const trimmed = modelId.trim()
@@ -1540,9 +1566,22 @@ function AppInner({
     })
     await providerRuntime.catalog.refresh().catch(() => undefined)
     await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(localProviderAddedModelToast(trimmed), theme.success)
-  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success])
+  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success, wizardSelectedProviderId])
 
   const handleLocalProviderRemoveManualModel = useCallback(async (providerId: string, modelId: string) => {
     await storage.config.updateFull((current) => {
@@ -1562,8 +1601,21 @@ function AppInner({
     })
     await providerRuntime.catalog.refresh().catch(() => undefined)
     await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
     setProviderRefreshKey(prev => prev + 1)
-  }, [storage, providerRuntime, reloadProviderState])
+  }, [storage, providerRuntime, reloadProviderState, wizardSelectedProviderId])
 
   const handleLocalProviderSaveOptionalApiKey = useCallback(async (providerId: string, apiKey: string) => {
     const trimmed = apiKey.trim()

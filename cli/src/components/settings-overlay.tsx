@@ -804,6 +804,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           : null
         const optionalApiKeyMethod = providerDetailStatus.methods.find((methodStatus) => methodStatus.method.type === 'api-key')
         const optionalApiKeyValue = optionalApiKeyMethod?.auth?.type === 'api' ? optionalApiKeyMethod.auth.key : ''
+        const hasSavedOptionalApiKey = optionalApiKeyMethod?.auth?.type === 'api'
 
         return (
           <>
@@ -855,73 +856,76 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                       onRemoveManualModel={(modelId) => onLocalProviderRemoveManualModel(provider.id, modelId)}
                       showOptionalApiKey={!!optionalApiKeyMethod}
                       optionalApiKeyValue={optionalApiKeyValue}
+                      hasSavedOptionalApiKey={hasSavedOptionalApiKey}
                       onSaveOptionalApiKey={(apiKey) => onLocalProviderSaveOptionalApiKey(provider.id, apiKey)}
                     />
                   </box>
                 )}
 
                 {/* Auth methods */}
-              {providerDetailStatus.methods.map((m) => {
-                const isApiKey = m.method.type === 'api-key'
-                const apiKeyValue = isApiKey && m.auth?.type === 'api' ? (m.auth as { type: 'api'; key: string }).key : null
-                const methodActions = methodActionMap.get(m.methodIndex) ?? []
+              {providerDetailStatus.methods
+                .filter((m) => !(isLocalProvider && m.method.type === 'api-key'))
+                .map((m) => {
+                  const isApiKey = m.method.type === 'api-key'
+                  const apiKeyValue = isApiKey && m.auth?.type === 'api' ? (m.auth as { type: 'api'; key: string }).key : null
+                  const methodActions = methodActionMap.get(m.methodIndex) ?? []
 
-                return (
-                  <box key={m.methodIndex} style={{ flexDirection: 'column', paddingBottom: 1 }}>
-                    {/* Method status line */}
-                    <box>
-                      <text style={{ fg: theme.foreground }}>
-                        {'  '}
-                        {m.connected ? (
-                          <span style={{ fg: theme.success }}>{'\u2713 '}</span>
-                        ) : (
-                          <span style={{ fg: theme.muted }}>{'\u00b7 '}</span>
-                        )}
-                        {m.method.label}
-                        {m.connected && (
-                          <span style={{ fg: theme.success }}>
-                            {' \u2014 Connected'}
-                            {m.source === 'env' ? ' (from environment)' : ''}
-                          </span>
-                        )}
-                      </text>
-                    </box>
-
-                    {/* Masked API key if applicable */}
-                    {apiKeyValue && (
-                      <box style={{ paddingLeft: 4 }}>
+                  return (
+                    <box key={m.methodIndex} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                      {/* Method status line */}
+                      <box>
                         <text style={{ fg: theme.foreground }}>
-                          {'Key: '}
-                          <span attributes={TextAttributes.DIM}>{maskApiKey(apiKeyValue)}</span>
+                          {'  '}
+                          {m.connected ? (
+                            <span style={{ fg: theme.success }}>{'\u2713 '}</span>
+                          ) : (
+                            <span style={{ fg: theme.muted }}>{'\u00b7 '}</span>
+                          )}
+                          {m.method.label}
+                          {m.connected && (
+                            <span style={{ fg: theme.success }}>
+                              {' \u2014 Connected'}
+                              {m.source === 'env' ? ' (from environment)' : ''}
+                            </span>
+                          )}
                         </text>
                       </box>
-                    )}
 
-                    {/* Action buttons for this method */}
-                    {methodActions.map(({ globalIdx, action }) => (
-                      <Button
-                        key={globalIdx}
-                        onClick={() => onProviderDetailAction(globalIdx)}
-                        onMouseOver={() => onProviderDetailHoverIndex?.(globalIdx)}
-                        style={{
-                          paddingLeft: 3,
-                          paddingRight: 1,
-                          backgroundColor: providerDetailSelectedIndex === globalIdx ? theme.surface : undefined,
-                        }}
-                      >
-                        <text style={{
-                          fg: action.type === 'disconnect'
-                            ? (providerDetailSelectedIndex === globalIdx ? theme.error : theme.foreground)
-                            : (providerDetailSelectedIndex === globalIdx ? theme.primary : theme.foreground)
-                        }}>
-                          {providerDetailSelectedIndex === globalIdx ? '> ' : '  '}
-                          {`[${action.label}]`}
-                        </text>
-                      </Button>
-                    ))}
-                  </box>
-                )
-              })}
+                      {/* Masked API key if applicable */}
+                      {apiKeyValue && (
+                        <box style={{ paddingLeft: 4 }}>
+                          <text style={{ fg: theme.foreground }}>
+                            {'Key: '}
+                            <span attributes={TextAttributes.DIM}>{maskApiKey(apiKeyValue)}</span>
+                          </text>
+                        </box>
+                      )}
+
+                      {/* Action buttons for this method */}
+                      {methodActions.map(({ globalIdx, action }) => (
+                        <Button
+                          key={globalIdx}
+                          onClick={() => onProviderDetailAction(globalIdx)}
+                          onMouseOver={() => onProviderDetailHoverIndex?.(globalIdx)}
+                          style={{
+                            paddingLeft: 3,
+                            paddingRight: 1,
+                            backgroundColor: providerDetailSelectedIndex === globalIdx ? theme.surface : undefined,
+                          }}
+                        >
+                          <text style={{
+                            fg: action.type === 'disconnect'
+                              ? (providerDetailSelectedIndex === globalIdx ? theme.error : theme.foreground)
+                              : (providerDetailSelectedIndex === globalIdx ? theme.primary : theme.foreground)
+                          }}>
+                            {providerDetailSelectedIndex === globalIdx ? '> ' : '  '}
+                            {`[${action.label}]`}
+                          </text>
+                        </Button>
+                      ))}
+                    </box>
+                  )
+                })}
 
 
               </box>

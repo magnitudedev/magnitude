@@ -131,7 +131,6 @@ test('provider detail renders local shared page with endpoint/refresh and provid
   })
 
   expect(text).toContain('Endpoint')
-  expect(text).toContain('http://localhost:1234/v1')
   expect(text).toContain('Set an endpoint to discover models')
   expect(text).toContain('Save endpoint')
   expect(text).toContain('[Refresh]')
@@ -193,7 +192,7 @@ test('provider detail distinguishes discovery failure from zero-model success', 
   expect(text).toContain('Note: HTTP 500 for http://localhost:1234/v1/models')
 })
 
-test('local provider detail surfaces optional API-key input when available', () => {
+test('local provider detail surfaces optional API-key input with save label when no key is saved', () => {
   const text = renderDetail({
     status: {
       ...buildLocalProviderStatus([]),
@@ -216,9 +215,43 @@ test('local provider detail surfaces optional API-key input when available', () 
     } as any,
   })
 
-  expect(text).toContain('Optional API key')
-  expect(text).toContain('Leave empty if not required')
+  expect(text).toContain('API Key (Optional)')
   expect(text).toContain('Save key')
+  expect(text).not.toContain('Delete key')
+  expect(text).not.toContain('Disconnect')
+  expect(text).not.toContain('Update')
+  expect(text).not.toContain('Key:')
+})
+
+test('local provider detail shows delete label when optional API key is already saved', () => {
+  const text = renderDetail({
+    status: {
+      ...buildLocalProviderStatus([]),
+      methods: [
+        {
+          methodIndex: 0,
+          method: { type: 'none', label: 'Local endpoint' } as any,
+          connected: true,
+          auth: null,
+          source: 'stored',
+        },
+        {
+          methodIndex: 1,
+          method: { type: 'api-key', label: 'Optional API key', envKeys: ['LMSTUDIO_API_KEY'] } as any,
+          connected: true,
+          auth: { type: 'api', key: 'saved-key' } as any,
+          source: 'stored',
+        },
+      ],
+    } as any,
+  })
+
+  expect(text).toContain('API Key (Optional)')
+  expect(text).toContain('Delete key')
+  expect(text).not.toContain('Save key')
+  expect(text).not.toContain('Disconnect')
+  expect(text).not.toContain('Update')
+  expect(text).not.toContain('Key:')
 })
 
 test('local provider detail excludes discovered model IDs from manual models section', () => {

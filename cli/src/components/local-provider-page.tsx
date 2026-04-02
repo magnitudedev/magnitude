@@ -14,6 +14,7 @@ interface LocalProviderPageProps {
   manualModelIds: string[]
   lastDiscoveryError?: string | null
   optionalApiKeyValue?: string
+  hasSavedOptionalApiKey?: boolean
   showOptionalApiKey?: boolean
   onSaveEndpoint: (url: string) => void
   onRefreshModels: () => void
@@ -34,6 +35,7 @@ export const LocalProviderPage = memo(function LocalProviderPage({
   manualModelIds,
   lastDiscoveryError,
   optionalApiKeyValue = '',
+  hasSavedOptionalApiKey = false,
   showOptionalApiKey = false,
   onSaveEndpoint,
   onRefreshModels,
@@ -69,6 +71,8 @@ export const LocalProviderPage = memo(function LocalProviderPage({
 
   const discoveredCount = discoveredModels.length
   const hasEndpoint = endpoint.trim().length > 0
+  const hasUnsavedApiKeyChanges = apiKeyDraft.trim() !== optionalApiKeyValue.trim()
+  const showDeleteApiKey = hasSavedOptionalApiKey && !hasUnsavedApiKeyChanges
 
   const statusLine = useMemo(() => {
     if (!hasEndpoint) return 'Set an endpoint to discover models'
@@ -270,7 +274,7 @@ export const LocalProviderPage = memo(function LocalProviderPage({
 
       {showOptionalApiKey && (
         <box style={{ paddingBottom: 1, flexDirection: 'column' }}>
-          <text style={{ fg: theme.muted }}>Optional API key</text>
+          <text style={{ fg: theme.muted }}>API Key (Optional)</text>
           <box style={{ flexDirection: 'row', gap: 1, alignItems: 'center' }}>
             <box
               onMouseDown={() => setActiveField('apiKey')}
@@ -294,7 +298,7 @@ export const LocalProviderPage = memo(function LocalProviderPage({
             </box>
             {showApiKeySaveButton && (
               <Button
-                onClick={() => onSaveOptionalApiKey?.(apiKeyDraft)}
+                onClick={() => onSaveOptionalApiKey?.(showDeleteApiKey ? '' : apiKeyDraft)}
                 onMouseOver={() => setSaveApiKeyHovered(true)}
                 onMouseOut={() => setSaveApiKeyHovered(false)}
               >
@@ -307,7 +311,9 @@ export const LocalProviderPage = memo(function LocalProviderPage({
                     paddingRight: 1,
                   }}
                 >
-                  <text style={{ fg: saveApiKeyHovered ? theme.foreground : theme.primary }}>Save key</text>
+                  <text style={{ fg: saveApiKeyHovered ? theme.foreground : theme.primary }}>
+                    {showDeleteApiKey ? 'Delete key' : 'Save key'}
+                  </text>
                 </box>
               </Button>
             )}

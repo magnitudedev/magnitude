@@ -1,5 +1,8 @@
 import { test, expect, mock } from 'bun:test'
+import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { act, create } from 'react-test-renderer'
+import { SingleLineInput } from './single-line-input'
 import type { ProviderDefinition, DetectedProvider } from '@magnitudedev/agent'
 import type { MagnitudeSlot, ModelSelection } from '@magnitudedev/agent'
 
@@ -20,7 +23,7 @@ mock.module('../hooks/use-theme', () => ({
 const { SetupWizardOverlay } = await import('./setup-wizard-overlay')
 
 function htmlToText(html: string): string {
-  return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+  return html.replace(/<[^>]*>/g, ' ').replace(/[{}[\]",:]/g, ' ').replace(/\s+/g, ' ').trim()
 }
 
 const noop = () => {}
@@ -191,6 +194,7 @@ test('local-provider step renders local setup page, keeps only Add button, and d
   expect(text).not.toContain('[Add]')
   expect(text).not.toContain('[Save endpoint]')
   expect(text).not.toContain('[Save key]')
+  expect(text).not.toContain('Delete key')
 })
 
 test('models step shows empty discovered inventory fallback guidance for selected local provider', () => {
@@ -220,4 +224,61 @@ test('models step shows empty discovered inventory fallback guidance for selecte
 
   const text = htmlToText(html)
   expect(text).toContain('LM Studio')
+})
+
+test('local-provider step add flow updates manual models on same wizard page', () => {
+  function WizardAddHarness() {
+    const [remembered, setRemembered] = React.useState<string[]>([])
+    return (
+      <SetupWizardOverlay
+        step="local-provider"
+        allProviders={localProviders}
+        detectedProviders={[]}
+        slotModels={emptySlots}
+        connectedProviderName="LM Studio"
+        selectedProviderId="lmstudio"
+        selectedProviderDiscoveredModels={[{ id: 'qwen2.5-coder', name: 'Qwen 2.5 Coder' }]}
+        selectedProviderRememberedModelIds={remembered}
+        totalSteps={4}
+        onProviderSelected={noop}
+        onComplete={noop}
+        onBack={noop}
+        onContinueFromLocalProvider={noop}
+        onSkip={noop}
+        onWizardCtrlCExit={noop}
+        onLocalProviderAddManualModel={(_providerId, modelId) => setRemembered((prev) => Array.from(new Set([...prev, modelId])))}
+        onLocalProviderSaveOptionalApiKey={noop}
+        providerSelectedIndex={0}
+        onProviderSelectedIndexChange={noop}
+        onProviderHoverIndex={noop}
+        modelNavSelectedIndex={0}
+        onModelNavSelectedIndexChange={noop}
+        onModelNavHoverIndex={noop}
+        hasProviderEndpointStep
+      />
+    )
+  }
+
+  let renderer!: ReturnType<typeof create>
+  act(() => {
+    renderer = create(<WizardAddHarness />)
+  })
+
+  const manualInput = renderer.root.findAllByType(SingleLineInput).find((node) => node.props.placeholder === 'Add model ID')
+  expect(manualInput).toBeDefined()
+
+  act(() => {
+    manualInput!.props.onChange('manual-only-model')
+  })
+
+  const addButtonText = renderer.root.findAll((n) => n.type === 'text' && (Array.isArray(n.props.children) ? n.props.children.join('') : String(n.props.children ?? '')) === 'Add')[0]
+  const addButtonNode = addButtonText?.parent?.parent
+  expect(addButtonNode).toBeDefined()
+
+  act(() => {
+    addButtonNode!.props.onMouseDown()
+  })
+
+  const text = htmlToText(JSON.stringify(renderer.toJSON()))
+  expect(text).toContain('manual-only-model')
 })
