@@ -8,7 +8,10 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
   'github-copilot': '(GitHub.com or Enterprise)',
-  local: '(Ollama, LM Studio, llama.cpp, vLLM)',
+  lmstudio: '(LM Studio local runtime)',
+  ollama: '(Ollama local runtime)',
+  'llama.cpp': '(llama.cpp local runtime)',
+  'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
 interface ProviderSelectOverlayProps {

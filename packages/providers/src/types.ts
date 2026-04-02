@@ -44,6 +44,7 @@ export interface ModelDefinition {
   id: string
   name: string
   contextWindow: number
+  maxContextTokens?: number | null
   supportsToolCalls: boolean
   supportsReasoning: boolean
   cost: { input: number; output: number; cache_read?: number; cache_write?: number }
@@ -60,11 +61,14 @@ export interface ModelDefinition {
 }
 
 export interface ProviderDefinition {
-  id: string                    // e.g. "anthropic", "openrouter", "local"
+  id: string                    // e.g. "anthropic", "openrouter", "lmstudio"
   name: string                  // Display name: "Anthropic", "OpenRouter", etc.
   bamlProvider: BamlProviderType
   defaultBaseUrl?: string       // For openai-generic providers
   models: ModelDefinition[]     // Known models for this provider
   authMethods: AuthMethodDef[]  // All supported auth methods, in display order
   oauthOnlyModelIds?: string[]  // Model IDs that require OAuth (hidden for API key users)
+  providerFamily?: 'local' | 'cloud'
+  inventoryMode?: 'static' | 'dynamic'
+  localDiscoveryStrategy?: 'openai-models' | 'ollama-hybrid' | 'openai-models-best-effort'
 }

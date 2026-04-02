@@ -143,27 +143,31 @@ const makeConfigStorageShape = <TSlot extends string>(
       (config): ProviderOptions | undefined => config.providers?.[providerId],
     ),
 
-  getLocalProviderConfig: () =>
-    Effect.map(Effect.promise(() => loadConfig(globalStorage.paths)), (config) => {
-      const local = config.providers?.['local']
-      if (!local) return undefined
-      return {
-        baseUrl: local.baseUrl,
-        modelId: local.modelId,
-      }
-    }),
-
-  setLocalProviderConfig: (localConfig) =>
+  setProviderOptions: (providerId, optionsOrUpdater) =>
     Effect.promise(async () => {
-      await updateConfig(globalStorage.paths, (config) => ({
-        ...config,
-        providers: localConfig
-          ? { ...config.providers, local: localConfig }
-          : (() => {
-              const { local, ...rest } = config.providers ?? {}
-              return rest
-            })(),
-      }))
+      await updateConfig(globalStorage.paths, (config) => {
+        const current = config.providers?.[providerId]
+        const next =
+          typeof optionsOrUpdater === 'function'
+            ? optionsOrUpdater(current)
+            : optionsOrUpdater
+
+        if (!next) {
+          const { [providerId]: _removed, ...rest } = config.providers ?? {}
+          return {
+            ...config,
+            providers: Object.keys(rest).length > 0 ? rest : undefined,
+          }
+        }
+
+        return {
+          ...config,
+          providers: {
+            ...(config.providers ?? {}),
+            [providerId]: next,
+          },
+        }
+      })
     }),
 })
 

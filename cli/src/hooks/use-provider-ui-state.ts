@@ -5,12 +5,9 @@ import { MAGNITUDE_SLOTS } from '@magnitudedev/agent'
 import { useProviderRuntime } from '../providers/provider-runtime'
 import { useStorage } from '../providers/storage-provider'
 
-type LocalProviderConfig = Awaited<ReturnType<ReturnType<typeof useStorage>['config']['getLocalProviderConfig']>>
-
 interface ProviderUiState {
   detectedProviders: DetectedProvider[]
   slotModels: Record<MagnitudeSlot, ModelSelection | null>
-  localProviderConfig: LocalProviderConfig
   setupComplete: boolean
   telemetryEnabled: boolean
 }
@@ -23,11 +20,10 @@ export function useProviderUiState() {
 
   const reload = useCallback(async () => {
     const version = ++versionRef.current
-    const [setupComplete, telemetryEnabled, runtimeDetectedProviders, localProviderConfig, ...slotStates] = await Promise.all([
+    const [setupComplete, telemetryEnabled, runtimeDetectedProviders, ...slotStates] = await Promise.all([
       storage.config.getSetupComplete(),
       storage.config.getTelemetryEnabled(),
       runtime.auth.detectProviders(),
-      storage.config.getLocalProviderConfig(),
       ...MAGNITUDE_SLOTS.map(slot => runtime.state.peek(slot)),
     ])
 
@@ -56,7 +52,6 @@ export function useProviderUiState() {
     setState({
       slotModels,
       detectedProviders,
-      localProviderConfig,
       setupComplete,
       telemetryEnabled,
     })

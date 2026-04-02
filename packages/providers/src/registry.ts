@@ -228,14 +228,59 @@ export const PROVIDERS: ProviderDefinition[] = [
     ],
   },
   {
-    id: 'local',
-    name: 'Local',
+    id: 'lmstudio',
+    name: 'LM Studio',
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'http://localhost:1234/v1',
     models: [],
     authMethods: [
-      { type: 'none', label: 'Local (no auth required)' },
+      { type: 'none', label: 'Local endpoint' },
+      { type: 'api-key', label: 'Optional API key', envKeys: ['LMSTUDIO_API_KEY'] },
     ],
+    providerFamily: 'local',
+    inventoryMode: 'dynamic',
+    localDiscoveryStrategy: 'openai-models',
+  },
+  {
+    id: 'ollama',
+    name: 'Ollama',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'http://localhost:11434/v1',
+    models: [],
+    authMethods: [
+      { type: 'none', label: 'Local endpoint' },
+      { type: 'api-key', label: 'Optional API key', envKeys: ['OLLAMA_API_KEY'] },
+    ],
+    providerFamily: 'local',
+    inventoryMode: 'dynamic',
+    localDiscoveryStrategy: 'ollama-hybrid',
+  },
+  {
+    id: 'llama.cpp',
+    name: 'llama.cpp',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'http://localhost:8080',
+    models: [],
+    authMethods: [
+      { type: 'none', label: 'Local endpoint' },
+      { type: 'api-key', label: 'Optional API key', envKeys: ['LLAMA_CPP_API_KEY'] },
+    ],
+    providerFamily: 'local',
+    inventoryMode: 'dynamic',
+    localDiscoveryStrategy: 'openai-models-best-effort',
+  },
+  {
+    id: 'openai-compatible-local',
+    name: 'OpenAI-compatible local',
+    bamlProvider: 'openai-generic',
+    models: [],
+    authMethods: [
+      { type: 'none', label: 'Local endpoint' },
+      { type: 'api-key', label: 'Optional API key', envKeys: ['OPENAI_COMPAT_LOCAL_API_KEY'] },
+    ],
+    providerFamily: 'local',
+    inventoryMode: 'dynamic',
+    localDiscoveryStrategy: 'openai-models-best-effort',
   },
 ]
 
@@ -266,7 +311,8 @@ export function getStaticProviderModels(providerId: string): readonly ModelDefin
 
 export function setProviderModels(providerId: string, models: ModelDefinition[]): void {
   const provider = getProvider(providerId)
-  if (provider && provider.id !== 'local') {
+  if (!provider) return
+  if (provider.inventoryMode === 'dynamic' || provider.models.length > 0) {
     provider.models = models
   }
 }

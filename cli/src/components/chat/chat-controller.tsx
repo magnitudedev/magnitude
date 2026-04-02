@@ -563,7 +563,7 @@ export function ChatController(props: ChatControllerProps) {
           {env.tokenEstimate > 0 && (
             <ContextUsageBar
               tokenEstimate={env.tokenEstimate}
-              hardCap={env.contextHardCap ?? env.tokenEstimate}
+              hardCap={env.contextHardCap}
               isCompacting={env.isCompacting}
             />
           )}

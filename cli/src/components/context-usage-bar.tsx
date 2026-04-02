@@ -4,7 +4,7 @@ import { useTheme } from '../hooks/use-theme'
 
 interface ContextUsageBarProps {
   tokenEstimate: number
-  hardCap: number
+  hardCap: number | null
   isCompacting?: boolean
 }
 
@@ -28,7 +28,6 @@ export const ContextUsageBar = ({ tokenEstimate, hardCap, isCompacting = false }
     return () => clearInterval(interval)
   }, [isCompacting])
 
-  const percent = Math.round((tokenEstimate / hardCap) * 100)
   const formatTokens = (n: number) => {
     if (n >= 1000) {
       const v = (n / 1000).toFixed(1)
@@ -37,9 +36,12 @@ export const ContextUsageBar = ({ tokenEstimate, hardCap, isCompacting = false }
     return String(n)
   }
 
-  const percentStr = percent + '%'
-  const tokensStr = formatTokens(tokenEstimate) + '/' + formatTokens(hardCap)
-  const displayText = percentStr + ' ' + tokensStr
+  const tokensStr = hardCap == null
+    ? formatTokens(tokenEstimate) + '/Unknown'
+    : formatTokens(tokenEstimate) + '/' + formatTokens(hardCap)
+  const displayText = hardCap == null
+    ? tokensStr
+    : Math.round((tokenEstimate / hardCap) * 100) + '% ' + tokensStr
 
   // Normal (non-compacting) rendering
   if (!isCompacting) {

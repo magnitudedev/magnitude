@@ -21,7 +21,25 @@ export const ProviderOptionsSchema = Schema.Struct({
   region: Schema.optional(Schema.String),
   project: Schema.optional(Schema.String),
   location: Schema.optional(Schema.String),
-  modelId: Schema.optional(Schema.String),
+  rememberedModelIds: Schema.optional(Schema.Array(Schema.String)),
+  discoveredModels: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        id: Schema.String,
+        name: Schema.optional(Schema.String),
+        maxContextTokens: NullableOptional(Schema.Number),
+        discoveredAt: Schema.optional(Schema.String),
+        source: Schema.optional(Schema.String),
+      }),
+    ),
+  ),
+  inventoryUpdatedAt: Schema.optional(Schema.String),
+  lastDiscoveryError: Schema.optional(Schema.String),
+  lastDiscoveryStatus: Schema.optional(
+    Schema.Literal('success_non_empty', 'success_empty', 'failure'),
+  ),
+  lastDiscoverySource: Schema.optional(Schema.String),
+  lastDiscoveryDiagnostics: Schema.optional(Schema.Array(Schema.String)),
 }).pipe(Schema.extend(Schema.Record({ key: Schema.String, value: Schema.Unknown })))
 export type ProviderOptions = Schema.Schema.Type<typeof ProviderOptionsSchema>
 

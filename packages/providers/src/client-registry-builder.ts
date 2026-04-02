@@ -234,8 +234,8 @@ function buildOpenAIGenericOptions(
         }
       }
     }
-    // Local provider doesn't require an API key
-    if (def.id === 'local') {
+    // Local-family / authless providers can run without API keys.
+    if (def.providerFamily === 'local' || def.authMethods.some((method) => method.type === 'none')) {
       return base
     }
     return undefined

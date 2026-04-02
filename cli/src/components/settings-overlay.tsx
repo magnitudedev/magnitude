@@ -5,17 +5,21 @@ import { useTheme } from '../hooks/use-theme'
 import { Button } from './button'
 import { SingleLineInput } from './single-line-input'
 import { BOX_CHARS } from '../utils/ui-constants'
+import { LocalProviderPage } from './local-provider-page'
 import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus, MagnitudeSlot } from '@magnitudedev/agent'
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
 import { SLOT_UI_ORDER } from './setup-wizard-overlay'
-import type { Preset } from '@magnitudedev/storage'
+import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
   'github-copilot': '(GitHub.com or Enterprise)',
-  local: '(Ollama, LM Studio, llama.cpp, vLLM)',
+  lmstudio: '(Local runtime)',
+  ollama: '(Local runtime)',
+  'llama.cpp': '(Local runtime)',
+  'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
 function maskApiKey(key: string): string {
@@ -57,18 +61,23 @@ interface SettingsOverlayProps {
   onProviderHoverIndex?: (index: number) => void
   // Provider tab — detail view
   providerDetailStatus: ProviderAuthMethodStatus | null
+  providerDetailOptions?: ProviderOptions
   providerDetailActions: Array<{ type: string; methodIndex: number; label: string }>
   providerDetailSelectedIndex: number
   onProviderDetailAction: (actionIndex: number) => void
   onProviderDetailHoverIndex?: (index: number) => void
+  onLocalProviderSaveEndpoint: (providerId: string, url: string) => void
+  onLocalProviderRefreshModels: (providerId: string) => void
+  onLocalProviderAddManualModel: (providerId: string, modelId: string) => void
+  onLocalProviderRemoveManualModel: (providerId: string, modelId: string) => void
+  onLocalProviderSaveOptionalApiKey: (providerId: string, apiKey: string) => void
   // Model tab — per-slot view
   slotModels: Record<MagnitudeSlot, ModelSelection | null>
   selectingModelFor: MagnitudeSlot | null
   onChangeSlot: (slot: MagnitudeSlot) => void
   modelPrefsSelectedIndex: number
   onModelPrefsHoverIndex?: (index: number) => void
-  localProviderConfig?: { baseUrl?: string | null; modelId?: string | null } | null
-  localProviderAuth?: { type: 'api'; key: string } | null
+
   onModelHandleKeyEvent: (key: KeyEvent) => boolean
   onProviderHandleKeyEvent: (key: KeyEvent) => boolean
   onBackFromModelPicker: () => void
@@ -129,17 +138,22 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   onProviderSelect,
   onProviderHoverIndex,
   providerDetailStatus,
+  providerDetailOptions,
   providerDetailActions,
   providerDetailSelectedIndex,
   onProviderDetailAction,
   onProviderDetailHoverIndex,
+  onLocalProviderSaveEndpoint,
+  onLocalProviderRefreshModels,
+  onLocalProviderAddManualModel,
+  onLocalProviderRemoveManualModel,
+  onLocalProviderSaveOptionalApiKey,
   slotModels,
   selectingModelFor,
   onChangeSlot,
   modelPrefsSelectedIndex,
   onModelPrefsHoverIndex,
-  localProviderConfig,
-  localProviderAuth,
+
   onModelHandleKeyEvent,
   onProviderHandleKeyEvent,
   onBackFromModelPicker,
@@ -770,111 +784,152 @@ export const SettingsOverlay = memo(function SettingsOverlay({
           methodActionMap.set(action.methodIndex, existing)
         })
 
+        const provider = providerDetailStatus.provider
+        const isLocalProvider = provider.providerFamily === 'local'
+        const baseUrl = typeof providerDetailOptions?.baseUrl === 'string' ? providerDetailOptions.baseUrl.trim() : ''
+        const hasBaseUrl = baseUrl.length > 0
+        const discoveredModels = Array.isArray(providerDetailOptions?.discoveredModels)
+          ? providerDetailOptions.discoveredModels
+            .filter((m): m is { id: string; name?: string } => typeof m?.id === 'string')
+            .map((m) => ({ id: m.id, name: typeof m.name === 'string' && m.name.trim().length > 0 ? m.name : m.id }))
+          : []
+        const discoveredCount = discoveredModels.length
+        const rememberedModelIdsRaw = Array.isArray(providerDetailOptions?.rememberedModelIds)
+          ? providerDetailOptions.rememberedModelIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          : []
+        const discoveredModelIdSet = new Set(discoveredModels.map((m) => m.id))
+        const rememberedModelIds = rememberedModelIdsRaw.filter((id) => !discoveredModelIdSet.has(id))
+        const lastDiscoveryError = typeof providerDetailOptions?.lastDiscoveryError === 'string' && providerDetailOptions.lastDiscoveryError.trim().length > 0
+          ? providerDetailOptions.lastDiscoveryError
+          : null
+        const optionalApiKeyMethod = providerDetailStatus.methods.find((methodStatus) => methodStatus.method.type === 'api-key')
+        const optionalApiKeyValue = optionalApiKeyMethod?.auth?.type === 'api' ? optionalApiKeyMethod.auth.key : ''
+        const hasSavedOptionalApiKey = optionalApiKeyMethod?.auth?.type === 'api'
+
         return (
           <>
-            <box style={{ flexDirection: 'column', paddingLeft: 2, paddingRight: 2, paddingTop: 1, flexGrow: 1 }}>
-              {/* Provider name */}
-              <box style={{ paddingBottom: 1 }}>
-                <text style={{ fg: theme.primary }}>
-                  <span attributes={TextAttributes.BOLD}>{providerDetailStatus.provider.name}</span>
-                </text>
-              </box>
+            <scrollbox
+              scrollX={false}
+              scrollbarOptions={{ visible: false }}
+              verticalScrollbarOptions={{
+                visible: true,
+                trackOptions: { width: 1 },
+              }}
+              style={{
+                flexGrow: 1,
+                rootOptions: {
+                  flexGrow: 1,
+                  backgroundColor: 'transparent',
+                },
+                wrapperOptions: {
+                  border: false,
+                  backgroundColor: 'transparent',
+                },
+                contentOptions: {
+                  paddingLeft: 2,
+                  paddingRight: 2,
+                  paddingTop: 1,
+                },
+              }}
+            >
+              <box style={{ flexDirection: 'column' }}>
+                {/* Provider name */}
+                <box style={{ paddingBottom: 1 }}>
+                  <text style={{ fg: theme.primary }}>
+                    <span attributes={TextAttributes.BOLD}>{provider.name}</span>
+                  </text>
+                </box>
 
-              {/* Auth methods */}
-              {providerDetailStatus.methods.map((m) => {
-                const isApiKey = m.method.type === 'api-key'
-                const apiKeyValue = isApiKey && m.auth?.type === 'api' ? (m.auth as { type: 'api'; key: string }).key : null
-                const methodActions = methodActionMap.get(m.methodIndex) ?? []
+                {isLocalProvider && (
+                  <box style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                    <LocalProviderPage
+                      providerName={provider.name}
+                      showProviderTitle={false}
+                      endpoint={baseUrl}
+                      endpointPlaceholder={provider.defaultBaseUrl ?? 'http://localhost:1234/v1'}
+                      discoveredModels={discoveredModels}
+                      manualModelIds={rememberedModelIds}
+                      lastDiscoveryError={lastDiscoveryError}
+                      onSaveEndpoint={(url) => onLocalProviderSaveEndpoint(provider.id, url)}
+                      onRefreshModels={() => onLocalProviderRefreshModels(provider.id)}
+                      onAddManualModel={(modelId) => onLocalProviderAddManualModel(provider.id, modelId)}
+                      onRemoveManualModel={(modelId) => onLocalProviderRemoveManualModel(provider.id, modelId)}
+                      showOptionalApiKey={!!optionalApiKeyMethod}
+                      optionalApiKeyValue={optionalApiKeyValue}
+                      hasSavedOptionalApiKey={hasSavedOptionalApiKey}
+                      onSaveOptionalApiKey={(apiKey) => onLocalProviderSaveOptionalApiKey(provider.id, apiKey)}
+                    />
+                  </box>
+                )}
 
-                return (
-                  <box key={m.methodIndex} style={{ flexDirection: 'column', paddingBottom: 1 }}>
-                    {/* Method status line */}
-                    <box>
-                      <text style={{ fg: theme.foreground }}>
-                        {'  '}
-                        {m.connected ? (
-                          <span style={{ fg: theme.success }}>{'\u2713 '}</span>
-                        ) : (
-                          <span style={{ fg: theme.muted }}>{'\u00b7 '}</span>
-                        )}
-                        {m.method.label}
-                        {m.connected && (
-                          <span style={{ fg: theme.success }}>
-                            {' \u2014 Connected'}
-                            {m.source === 'env' ? ' (from environment)' : ''}
-                          </span>
-                        )}
-                      </text>
-                    </box>
+                {/* Auth methods */}
+              {providerDetailStatus.methods
+                .filter((m) => !(isLocalProvider && m.method.type === 'api-key'))
+                .map((m) => {
+                  const isApiKey = m.method.type === 'api-key'
+                  const apiKeyValue = isApiKey && m.auth?.type === 'api' ? (m.auth as { type: 'api'; key: string }).key : null
+                  const methodActions = methodActionMap.get(m.methodIndex) ?? []
 
-                    {/* Masked API key if applicable */}
-                    {apiKeyValue && (
-                      <box style={{ paddingLeft: 4 }}>
+                  return (
+                    <box key={m.methodIndex} style={{ flexDirection: 'column', paddingBottom: 1 }}>
+                      {/* Method status line */}
+                      <box>
                         <text style={{ fg: theme.foreground }}>
-                          {'Key: '}
-                          <span attributes={TextAttributes.DIM}>{maskApiKey(apiKeyValue)}</span>
+                          {'  '}
+                          {m.connected ? (
+                            <span style={{ fg: theme.success }}>{'\u2713 '}</span>
+                          ) : (
+                            <span style={{ fg: theme.muted }}>{'\u00b7 '}</span>
+                          )}
+                          {m.method.label}
+                          {m.connected && (
+                            <span style={{ fg: theme.success }}>
+                              {' \u2014 Connected'}
+                              {m.source === 'env' ? ' (from environment)' : ''}
+                            </span>
+                          )}
                         </text>
                       </box>
-                    )}
 
-                    {/* Local provider details */}
-                    {m.connected && m.method.type === 'none' && providerDetailStatus.provider.id === 'local' && (() => {
-                      return (
-                        <>
-                          {localProviderConfig?.baseUrl && (
-                            <box style={{ paddingLeft: 4 }}>
-                              <text style={{ fg: theme.foreground }}>
-                                {'URL: '}
-                                <span attributes={TextAttributes.DIM}>{localProviderConfig.baseUrl}</span>
-                              </text>
-                            </box>
-                          )}
-                          {localProviderConfig?.modelId && (
-                            <box style={{ paddingLeft: 4 }}>
-                              <text style={{ fg: theme.foreground }}>
-                                {'Model: '}
-                                <span attributes={TextAttributes.DIM}>{localProviderConfig.modelId}</span>
-                              </text>
-                            </box>
-                          )}
-                          {localProviderAuth?.type === 'api' && (
-                            <box style={{ paddingLeft: 4 }}>
-                              <text style={{ fg: theme.foreground }}>
-                                {'Key: '}
-                                <span attributes={TextAttributes.DIM}>{maskApiKey(localProviderAuth.key)}</span>
-                              </text>
-                            </box>
-                          )}
-                        </>
-                      )
-                    })()}
+                      {/* Masked API key if applicable */}
+                      {apiKeyValue && (
+                        <box style={{ paddingLeft: 4 }}>
+                          <text style={{ fg: theme.foreground }}>
+                            {'Key: '}
+                            <span attributes={TextAttributes.DIM}>{maskApiKey(apiKeyValue)}</span>
+                          </text>
+                        </box>
+                      )}
 
-                    {/* Action buttons for this method */}
-                    {methodActions.map(({ globalIdx, action }) => (
-                      <Button
-                        key={globalIdx}
-                        onClick={() => onProviderDetailAction(globalIdx)}
-                        onMouseOver={() => onProviderDetailHoverIndex?.(globalIdx)}
-                        style={{
-                          paddingLeft: 3,
-                          paddingRight: 1,
-                          backgroundColor: providerDetailSelectedIndex === globalIdx ? theme.surface : undefined,
-                        }}
-                      >
-                        <text style={{
-                          fg: action.type === 'disconnect'
-                            ? (providerDetailSelectedIndex === globalIdx ? theme.error : theme.foreground)
-                            : (providerDetailSelectedIndex === globalIdx ? theme.primary : theme.foreground)
-                        }}>
-                          {providerDetailSelectedIndex === globalIdx ? '> ' : '  '}
-                          {`[${action.label}]`}
-                        </text>
-                      </Button>
-                    ))}
-                  </box>
-                )
-              })}
-            </box>
+                      {/* Action buttons for this method */}
+                      {methodActions.map(({ globalIdx, action }) => (
+                        <Button
+                          key={globalIdx}
+                          onClick={() => onProviderDetailAction(globalIdx)}
+                          onMouseOver={() => onProviderDetailHoverIndex?.(globalIdx)}
+                          style={{
+                            paddingLeft: 3,
+                            paddingRight: 1,
+                            backgroundColor: providerDetailSelectedIndex === globalIdx ? theme.surface : undefined,
+                          }}
+                        >
+                          <text style={{
+                            fg: action.type === 'disconnect'
+                              ? (providerDetailSelectedIndex === globalIdx ? theme.error : theme.foreground)
+                              : (providerDetailSelectedIndex === globalIdx ? theme.primary : theme.foreground)
+                          }}>
+                            {providerDetailSelectedIndex === globalIdx ? '> ' : '  '}
+                            {`[${action.label}]`}
+                          </text>
+                        </Button>
+                      ))}
+                    </box>
+                  )
+                })}
+
+
+              </box>
+            </scrollbox>
 
             {/* Detail footer */}
             <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>

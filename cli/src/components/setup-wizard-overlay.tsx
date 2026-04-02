@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/use-theme'
 import { slate } from '../utils/theme'
 import { Button } from './button'
 import { WizardHeader } from './wizard-header'
+import { LocalProviderPage } from './local-provider-page'
 import { BOX_CHARS } from '../utils/ui-constants'
 import type { ProviderDefinition, ModelSelection } from '@magnitudedev/agent'
 import type { DetectedProvider } from '@magnitudedev/agent'
@@ -14,7 +15,10 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
   'github-copilot': '(GitHub.com or Enterprise)',
-  local: '(Ollama, LM Studio, llama.cpp, vLLM)',
+  lmstudio: '(LM Studio local runtime)',
+  ollama: '(Ollama local runtime)',
+  'llama.cpp': '(llama.cpp local runtime)',
+  'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
 export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string; description: string }[] = [
@@ -27,20 +31,30 @@ export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string; description: s
   { slot: 'browser', label: 'Browser', description: '(Visually navigates a browser)' },
 ]
 
-export type WizardStep = 'provider' | 'models' | 'browser'
+export type WizardStep = 'provider' | 'local-provider' | 'models' | 'browser'
 
 interface SetupWizardOverlayProps {
   step: WizardStep
+  hasProviderEndpointStep?: boolean
   allProviders: ProviderDefinition[]
   detectedProviders: DetectedProvider[]
   // Model defaults (set by app.tsx when advancing to models step)
   slotModels: Record<MagnitudeSlot, ModelSelection | null>
   connectedProviderName?: string | null
+  selectedProviderId?: string | null
+  selectedProviderDiscoveredModels?: Array<{ id: string; name?: string }>
+  selectedProviderRememberedModelIds?: string[]
   totalSteps: number
   // Callbacks
   onProviderSelected: (providerId: string) => void
   onComplete: (result: Record<MagnitudeSlot, ModelSelection | null>) => void
   onBack: () => void
+  onContinueFromLocalProvider?: () => void
+  onLocalProviderSaveEndpoint?: (providerId: string, url: string) => void
+  onLocalProviderRefreshModels?: (providerId: string) => void
+  onLocalProviderAddManualModel?: (providerId: string, modelId: string) => void
+  onLocalProviderRemoveManualModel?: (providerId: string, modelId: string) => void
+  onLocalProviderSaveOptionalApiKey?: (providerId: string, apiKey: string) => void
   onSkip: () => void
   onWizardCtrlCExit: () => void
   providerSelectedIndex: number
@@ -57,18 +71,28 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
   detectedProviders,
   slotModels,
   connectedProviderName,
+  selectedProviderId,
+  selectedProviderDiscoveredModels = [],
+  selectedProviderRememberedModelIds = [],
   totalSteps,
   onProviderSelected,
   onComplete,
   onBack,
+  onContinueFromLocalProvider,
   onSkip,
   onWizardCtrlCExit,
+  onLocalProviderSaveEndpoint,
+  onLocalProviderRefreshModels,
+  onLocalProviderAddManualModel,
+  onLocalProviderRemoveManualModel,
+  onLocalProviderSaveOptionalApiKey,
   providerSelectedIndex,
   onProviderSelectedIndexChange,
   onProviderHoverIndex,
   modelNavSelectedIndex,
   onModelNavSelectedIndexChange,
   onModelNavHoverIndex,
+  hasProviderEndpointStep = false,
 }: SetupWizardOverlayProps) {
   const theme = useTheme()
   const [backHovered, setBackHovered] = useState(false)
@@ -91,9 +115,22 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
     ) as Record<MagnitudeSlot, { providerName: string; modelId: string } | null>
   }, [slotModels, allProviders])
 
+  const selectedProvider = selectedProviderId
+    ? allProviders.find((provider) => provider.id === selectedProviderId)
+    : null
+
+  const discoveredProviderModels = selectedProviderDiscoveredModels
+    .filter((m): m is { id: string; name?: string } => typeof m?.id === 'string' && m.id.trim().length > 0)
+    .map((m) => ({ id: m.id, name: typeof m.name === 'string' && m.name.trim().length > 0 ? m.name : m.id }))
+
+  const discoveredProviderModelIdSet = new Set(discoveredProviderModels.map((m) => m.id))
+  const rememberedProviderModelIds = selectedProviderRememberedModelIds
+    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    .filter((id) => !discoveredProviderModelIdSet.has(id))
+
   const modelsSubtitle = connectedProviderName
-    ? `You've successfully connected ${connectedProviderName}! We have configured default models for you. You can change these anytime in /models.`
-    : 'We have configured default models for you. You can change these anytime in /models.'
+    ? `${connectedProviderName} is ready. Review role assignments below.`
+    : 'Review role assignments below.'
 
   useKeyboard(useCallback((key: KeyEvent) => {
     const plain = !key.ctrl && !key.meta && !key.option
@@ -135,6 +172,20 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
       return
     }
 
+    if (step === 'local-provider') {
+      if (key.name === 'b' && plain && !key.shift) {
+        key.preventDefault()
+        onBack()
+        return
+      }
+      if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
+        key.preventDefault()
+        onContinueFromLocalProvider?.()
+        return
+      }
+      return
+    }
+
     if (step === 'models') {
       if (key.name === 'b' && plain && !key.shift) {
         key.preventDefault()
@@ -165,11 +216,94 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
     handleConfirm,
   ]))
 
+  if (step === 'local-provider') {
+    if (!selectedProvider || selectedProvider.providerFamily !== 'local') return null
+    return (
+      <box style={{ flexDirection: 'column', height: '100%' }}>
+        <WizardHeader
+          stepLabel={`Local provider setup (2 of ${totalSteps})`}
+          subtitle="Configure endpoint/models for your local provider before role assignments."
+          onSkip={onSkip}
+          theme={theme}
+        />
+
+        <scrollbox
+          scrollX={false}
+          scrollbarOptions={{ visible: false }}
+          verticalScrollbarOptions={{
+            visible: true,
+            trackOptions: { width: 1 },
+          }}
+          style={{
+            flexGrow: 1,
+            rootOptions: {
+              flexGrow: 1,
+              backgroundColor: 'transparent',
+            },
+            wrapperOptions: {
+              border: false,
+              backgroundColor: 'transparent',
+            },
+            contentOptions: {
+              paddingLeft: 2,
+              paddingRight: 2,
+              paddingTop: 1,
+            },
+          }}
+        >
+          <LocalProviderPage
+            providerName={selectedProvider.name}
+            endpoint={selectedProvider.defaultBaseUrl ?? ''}
+            endpointPlaceholder={selectedProvider.defaultBaseUrl ?? 'http://localhost:1234/v1'}
+            discoveredModels={discoveredProviderModels}
+            manualModelIds={rememberedProviderModelIds}
+            showOptionalApiKey={selectedProvider.authMethods.some((method) => method.type === 'api-key')}
+            showEndpointSaveButton={false}
+            showApiKeySaveButton={false}
+            onSaveEndpoint={(url) => onLocalProviderSaveEndpoint?.(selectedProvider.id, url)}
+            onRefreshModels={() => onLocalProviderRefreshModels?.(selectedProvider.id)}
+            onAddManualModel={(modelId) => onLocalProviderAddManualModel?.(selectedProvider.id, modelId)}
+            onRemoveManualModel={(modelId) => onLocalProviderRemoveManualModel?.(selectedProvider.id, modelId)}
+            onSaveOptionalApiKey={(apiKey) => onLocalProviderSaveOptionalApiKey?.(selectedProvider.id, apiKey)}
+          />
+
+          <box style={{ paddingTop: 1 }}>
+            <Button onClick={() => onContinueFromLocalProvider?.()} onMouseOver={() => setConfirmHovered(true)} onMouseOut={() => setConfirmHovered(false)}>
+              <box style={{
+                borderStyle: 'single',
+                borderColor: confirmHovered ? theme.success : theme.border,
+                customBorderChars: BOX_CHARS,
+                paddingLeft: 2,
+                paddingRight: 2,
+              }}>
+                <text style={{ fg: theme.success }}>Continue to role models (Enter)</text>
+              </box>
+            </Button>
+          </box>
+        </scrollbox>
+
+        <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
+          <Button onClick={onBack} onMouseOver={() => setBackHovered(true)} onMouseOut={() => setBackHovered(false)}>
+            <box style={{
+              borderStyle: 'single',
+              borderColor: backHovered ? theme.primary : theme.border,
+              customBorderChars: BOX_CHARS,
+              paddingLeft: 1,
+              paddingRight: 1,
+            }}>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+            </box>
+          </Button>
+        </box>
+      </box>
+    )
+  }
+
   if (step === 'models') {
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
         <WizardHeader
-          stepLabel={`Models (2 of ${totalSteps})`}
+          stepLabel={`Models (${hasProviderEndpointStep ? 3 : 2} of ${totalSteps})`}
           subtitle={modelsSubtitle}
           onSkip={onSkip}
           theme={theme}
@@ -298,16 +432,21 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
           const isSelected = index === providerSelectedIndex
           const description = PROVIDER_DESCRIPTIONS[provider.id]
 
-          // Compute detection source label
-          let detectedLabel = 'Detected'
+          const isLocalProvider = provider.id === 'lmstudio' || provider.id === 'ollama' || provider.id === 'llama.cpp' || provider.id === 'openai-compatible-local'
+
+          // Compute source label (avoid misleading "Detected" wording for local providers)
+          let detectedLabel = isLocalProvider ? 'Configured' : 'Connected'
           if (detected) {
-            if (detected.source === 'env') {
-              detectedLabel = 'Detected (Env Var)'
+            if (isLocalProvider) {
+              if (detected.source === 'env') detectedLabel = 'Configured (Env Var)'
+              else detectedLabel = 'Configured'
+            } else if (detected.source === 'env') {
+              detectedLabel = 'Connected (Env Var)'
             } else if (detected.source === 'stored') {
-              if (detected.auth?.type === 'api') detectedLabel = 'Detected (API Key)'
-              else if (detected.auth?.type === 'oauth') detectedLabel = 'Detected (Auth Token)'
-              else if (detected.auth?.type === 'aws') detectedLabel = 'Detected (AWS Creds)'
-              else if (detected.auth?.type === 'gcp') detectedLabel = 'Detected (GCP Creds)'
+              if (detected.auth?.type === 'api') detectedLabel = 'Connected (API Key)'
+              else if (detected.auth?.type === 'oauth') detectedLabel = 'Connected (Auth Token)'
+              else if (detected.auth?.type === 'aws') detectedLabel = 'Connected (AWS Creds)'
+              else if (detected.auth?.type === 'gcp') detectedLabel = 'Connected (GCP Creds)'
             }
           }
 
