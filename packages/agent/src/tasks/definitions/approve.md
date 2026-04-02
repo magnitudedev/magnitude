@@ -7,11 +7,10 @@ allowedAssignees: [user]
 
 # Approve
 
-This task is waiting on the user for a decision, approval, or sign-off.
+This task represents a decision point requiring user approval before proceeding.
 
-## Approach
-
-1. Create this task with a clear title describing what needs approval.
-2. Assign to `user`.
-3. Wait for the user to respond before proceeding on this branch.
-4. Once the user responds, mark complete or act on their feedback.
+## Lead responsibilities
+1. Present the user with a clear description of what needs approval.
+2. Assign to `user` and wait for response.
+3. Once the user responds, mark complete or act on their feedback.
+4. Do not proceed on this branch until approval is received.

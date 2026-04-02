@@ -7,10 +7,14 @@ allowedAssignees: [planner]
 
 # Plan
 
-You are producing a plan concrete enough for a builder to execute without guessing.
+Deploy a planner to produce a concrete implementation strategy that a builder can execute without guessing.
 
-## Deliverable
+## What to provide the worker
+- Requirements or user intent to plan against
+- Relevant research findings or explorer reports
+- Constraints, preferences, or prior decisions
 
+## What to expect back
 A plan document covering:
 - Functional behavior and design decisions
 - File-level scope of changes
@@ -18,14 +22,11 @@ A plan document covering:
 - Verification strategy
 - Open questions requiring user input
 
-## Approach
-
-1. Translate requirements into explicit implementation units.
-2. Surface tradeoffs and open questions early — seek confirmation when needed.
-3. Include file paths, function signatures, and expected behavior changes.
-4. Do not hand-wave. If a step is unclear, call it out.
+## Lead responsibilities
+1. Critique the plan — push back on vague steps, missing details, or hand-waving.
+2. Iterate with the planner until the plan is concrete enough for a builder.
+3. Surface open questions to the user before proceeding to implementation.
 
 ## Done when
-
 - Plan is concrete enough for implementation without guessing.
-- User/lead has approved the approach.
+- User has approved the approach.

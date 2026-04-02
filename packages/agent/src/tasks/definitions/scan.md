@@ -7,14 +7,15 @@ allowedAssignees: [explorer]
 
 # Scan
 
-Quick, targeted information gathering. Go look and report back.
+Deploy an explorer for quick, targeted information gathering.
 
-## Approach
+## What to provide the worker
+- What to look at (files, directories, patterns)
+- What information you need
 
-1. Read the specified files or search for the requested information.
-2. Report findings concisely — no formal deliverable needed.
-3. Capture anything noteworthy in a workspace document if findings are substantial.
+## What to expect back
+- Concise findings reported directly
+- Workspace document if findings are substantial
 
 ## Done when
-
 - The requested information has been gathered and reported.

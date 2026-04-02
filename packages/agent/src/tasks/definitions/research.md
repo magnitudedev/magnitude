@@ -7,24 +7,24 @@ allowedAssignees: [explorer]
 
 # Research
 
-You are investigating code or systems to produce concrete findings that inform decisions.
+Deploy an explorer to investigate code or systems and produce concrete findings that inform decisions.
 
-## Deliverable
+## What to provide the worker
+- The specific question(s) to answer
+- Relevant starting points (file paths, modules, URLs)
+- What the findings will be used for
 
+## What to expect back
 A structured report covering:
 - What was investigated and why
 - Concrete findings with source references (file paths, line numbers, URLs)
 - Unknowns that remain
-- Implications and recommendations for next steps
+- Implications and recommendations
 
-## Approach
-
-1. Prioritize high-signal evidence gathering. Read source code directly for concrete answers.
-2. If investigating unfamiliar libraries or APIs, use web search — do not guess at API surfaces.
-3. Record what you found, where you found it, and what it means.
-4. Prefer source-backed conclusions over assumptions.
+## Lead responsibilities
+1. Evaluate whether findings actually answer the question — send back for more depth if not.
+2. Capture substantial findings as workspace documents for use by other workers.
 
 ## Done when
-
-- The question that prompted this research has a concrete, evidence-backed answer.
-- Or: the unknowns are clearly identified with recommendations for how to resolve them.
+- The question has a concrete, evidence-backed answer.
+- Or: unknowns are clearly identified with recommendations for how to resolve them.

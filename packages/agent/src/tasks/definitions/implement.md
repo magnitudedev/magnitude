@@ -7,24 +7,24 @@ allowedAssignees: [builder]
 
 # Implement
 
-You are executing code changes against a defined plan or objective.
+Deploy a builder to execute concrete code changes against a defined plan or objective.
 
-## Deliverable
+## What to provide the worker
+- A clear plan or objective describing what to change
+- Relevant file paths and context
+- Existing patterns/conventions to follow
 
-Working code changes that:
-- Follow existing codebase patterns and conventions
-- Are validated with relevant tests/checks
-- Are scoped to the objective — no drive-by refactors
+## What to expect back
+- Working code changes scoped to the objective
+- Report of what changed and what was verified
+- Relevant tests/checks passing
 
-## Approach
-
-1. Follow the plan. If the plan has gaps, ask before guessing.
-2. Match existing code style and patterns — the changes should look like they belong.
-3. Run relevant tests/checks after changes.
-4. Report exactly what changed and what was verified.
+## Lead responsibilities
+1. Ensure the builder has a clear enough plan — if not, plan first.
+2. Review the builder's claimed changes with a reviewer.
+3. Do not accept "done" without verification.
 
 ## Done when
-
 - All planned changes are applied.
 - Relevant tests/checks pass.
 - Changes are scoped and clean.

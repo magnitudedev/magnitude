@@ -7,25 +7,23 @@ allowedAssignees: [reviewer]
 
 # Review
 
-You are evaluating work with adversarial rigor.
+Deploy a reviewer to verify completed work against requirements and quality standards.
 
-## Deliverable
+## What to provide the worker
+- The plan or requirements the work was built against
+- Specific files or areas that changed
+- Any concerns or areas to pay extra attention to
 
-A review with:
-- Pass/fail verdict
-- Concrete findings (not vague suggestions)
-- Evidence for each finding (file paths, test results, specific code references)
+## What to expect back
+- Pass/fail verdict with concrete findings
+- Evidence for each finding (file paths, test results, code references)
+- Not vague suggestions — specific, actionable issues
 
-## Approach
-
-1. Check requirement coverage — does the work do what was asked?
-2. Check correctness — edge cases, error handling, data flow.
-3. Check for regressions — did anything break?
-4. Check code quality — patterns, naming, structure.
-5. Verify claims with evidence (read the code, run the tests) — do not take assertions at face value.
-6. Iterate with the implementer until issues are resolved.
+## Lead responsibilities
+1. Don't take a pass verdict at face value — scan the findings yourself.
+2. If issues are found, feed them back to the builder and re-review.
+3. Iterate until all findings are resolved or explicitly accepted.
 
 ## Done when
-
 - All findings are resolved or explicitly accepted.
 - Work meets requirements and quality bar.

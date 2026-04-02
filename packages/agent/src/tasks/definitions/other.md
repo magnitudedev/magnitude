@@ -7,14 +7,12 @@ allowedAssignees: [explorer, planner, builder, reviewer, debugger, browser, user
 
 # Other
 
-This task does not map to a predefined type.
+This task does not map to a predefined type. Choose the most appropriate worker for the actual work.
 
-## Approach
-
-1. State intent clearly and define explicit success criteria.
-2. Choose the most appropriate assignee for the actual work.
+## Lead responsibilities
+1. Define clear intent and success criteria before assigning.
+2. Choose the most appropriate assignee for the work.
 3. Document what "done" looks like before starting.
 
 ## Done when
-
 - Success criteria are met.
