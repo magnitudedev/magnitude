@@ -80,7 +80,7 @@
                 "group": "Working with Magnitude",
                 "pages": [
                     "working-with-magnitude/interface",
-                    "working-with-magnitude/subagents",
+                    "working-with-magnitude/workers",
                     "working-with-magnitude/workspace-and-files",
                     "working-with-magnitude/commands",
                     "working-with-magnitude/sessions"
@@ -90,7 +90,7 @@
                 "group": "Core Concepts",
                 "pages": [
                     "core-concepts/agent-loop",
-                    "core-concepts/subagents",
+                    "core-concepts/workers",
                     "core-concepts/browser-agent"
                 ]
             },

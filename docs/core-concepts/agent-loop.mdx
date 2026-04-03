@@ -1,14 +1,14 @@
 ---
 title: Overview
-description: "How the team lead and subagents work together"
+description: "How the lead agent and workers work together"
 icon: workflow
 ---
 
-## The team lead
+## The lead agent
 
-The team lead is the agent you interact with directly. It coordinates your session, delegates to subagents, and keeps your intent in focus across longer tasks.
+The lead agent is the agent you interact with directly. It coordinates your session, delegates to workers, and keeps your intent in focus across longer tasks.
 
-The team lead is designed to gather context and confirm its approach before making changes, keeping you in control. Before acting, it explores, communicates its assumptions, and checks in with you — so you can redirect early rather than undo later.
+The lead agent is designed to gather context and confirm its approach before making changes, keeping you in control. Before acting, it explores, communicates its assumptions, and checks in with you — so you can redirect early rather than undo later.
 
 ## The loop
 
@@ -16,18 +16,18 @@ A typical workflow looks like:
 
 ```
 You send a message
-  → Team lead deploys an explorer to investigate
-  → Team lead discusses findings and proposes an approach
+  → Lead agent deploys an explorer to investigate
+  → Lead agent discusses findings and proposes an approach
   → You confirm (or redirect)
-  → Team lead deploys builder(s) to implement
-  → Team lead deploys a reviewer to verify
+  → Lead agent deploys builder(s) to implement
+  → Lead agent deploys a reviewer to verify
   → Back to conversation
 ```
 
-Not every task needs every step — the team lead adapts based on complexity. Simple questions get answered directly. Quick fixes may skip exploration. Large changes get the full explore → plan → build → review treatment.
+Not every task needs every step — the lead agent adapts based on complexity. Simple questions get answered directly. Quick fixes may skip exploration. Large changes get the full explore → plan → build → review treatment.
 
-## Subagents
+## Workers
 
-The team lead delegates to [six types of subagents](/core-concepts/subagents), each specialized for a different job. Multiple subagents can run in parallel, each with its own context, tools, and model.
+The lead agent delegates to [six types of workers](/core-concepts/workers), each specialized for a different job. Multiple workers can run in parallel, each with its own context, tools, and model.
 
-Subagents report back when they finish. You can watch their progress in the task list, send them direct messages, or interrupt them if needed.
+Workers report back when they finish. You can watch their progress in the task list.

@@ -15,14 +15,18 @@ Magnitude supports a wide range of LLM providers. You can configure them through
 | GitHub Copilot | Subscription (GitHub) | — |
 | Google (Gemini) | API key | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | OpenRouter | API key | `OPENROUTER_API_KEY` |
-| Vercel AI Gateway | API key | `VERCEL_API_KEY` |
+| Vercel AI Gateway | API key | `AI_GATEWAY_API_KEY` |
 | Google Vertex AI | GCP service account | `GOOGLE_APPLICATION_CREDENTIALS` |
 | Vertex AI (Anthropic) | GCP service account | `GOOGLE_APPLICATION_CREDENTIALS` |
 | Amazon Bedrock | AWS credentials | `AWS_ACCESS_KEY_ID`, `AWS_PROFILE`, `AWS_DEFAULT_REGION` |
 | MiniMax | API key | `MINIMAX_API_KEY` |
+| Moonshot AI | API key | `MOONSHOT_API_KEY` |
 | Z.AI (Zhipu AI) | API key | `ZHIPU_API_KEY` |
 | Cerebras | API key | `CEREBRAS_API_KEY` |
-| Local | None required | — |
+| LM Studio | None required | `LMSTUDIO_API_KEY` (optional) |
+| Ollama | None required | `OLLAMA_API_KEY` (optional) |
+| llama.cpp | None required | `LLAMA_CPP_API_KEY` (optional) |
+| OpenAI-compatible local | None required | N/A |
 
 ## Setting up a provider
 
@@ -79,13 +83,21 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
 ## Local models
 
-Magnitude supports local models via Ollama, LM Studio, llama.cpp, vLLM, or any OpenAI-compatible local server.
+Magnitude has first-class support for three local providers, plus a generic option for any OpenAI-compatible server:
 
-The default endpoint is `http://localhost:1234/v1` (LM Studio's default). To connect:
+| Provider | Default endpoint | API key env var |
+|----------|-----------------|-----------------|
+| LM Studio | `http://localhost:1234/v1` | `LMSTUDIO_API_KEY` (optional) |
+| Ollama | `http://localhost:11434/v1` | `OLLAMA_API_KEY` (optional) |
+| llama.cpp | `http://localhost:8080/v1` | `LLAMA_CPP_API_KEY` (optional) |
+| OpenAI-compatible local | _(configurable)_ | N/A |
 
-1. Run `/provider` or `/settings`
-2. Select "Local"
-3. Configure the base URL for your local server if different from default
+To connect a local provider:
+
+1. Start your local server (LM Studio, Ollama, llama.cpp, or another OpenAI-compatible server)
+2. Run `/provider` or `/settings`
+3. Select the matching provider (LM Studio, Ollama, llama.cpp, or OpenAI-compatible local)
+4. Configure the base URL if it differs from the default
 
 <Warning>Local models vary significantly in quality. For best results, use a near frontier model as your lead model.</Warning>
 
@@ -93,7 +105,7 @@ The default endpoint is `http://localhost:1234/v1` (LM Studio's default). To con
 
 Magnitude uses seven model slots — one for each agent role:
 
-- **Lead** — the team lead you interact with directly. Use your strongest model here.
+- **Lead** — the lead agent you interact with directly. Use your strongest model here.
 - **Explorer** — codebase investigation. Fast and capable.
 - **Planner** — converts findings into implementation plans. Fast and capable.
 - **Builder** — performs code changes. Fast and capable.
@@ -101,11 +113,11 @@ Magnitude uses seven model slots — one for each agent role:
 - **Debugger** — diagnoses failures. Fast and capable.
 - **Browser** — visual browser tasks. Must be a visually grounded model. To see the full list of supported browser agent models, [click here](#visually-grounded-models).
 
-Configure each slot independently via `/settings`. The setup wizard sets sensible defaults based on your provider: a strong model for the lead, a fast capable model for subagents (explorer, planner, builder, reviewer, debugger), and a visually capable model for the browser agent.
+Configure each slot independently via `/settings`. The setup wizard sets sensible defaults based on your provider: a strong model for the lead, a fast capable model for workers (explorer, planner, builder, reviewer, debugger), and a visually capable model for the browser agent.
 
 ## Default models by provider
 
-| Provider | Lead | Subagents | Browser |
+| Provider | Lead | Workers | Browser |
 |----------|------|-----------|---------|
 | OpenAI (OAuth) | GPT-5.4 | GPT-5.3 Codex | GPT-5.3 Codex |
 | OpenAI (API key) | GPT-5.4 | GPT-5.3 Codex | GPT-5.3 Codex |

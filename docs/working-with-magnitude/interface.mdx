@@ -10,7 +10,7 @@ Magnitude is designed so you can quickly understand what the agent is doing at e
 
 Assistant messages stream in real time, so you can follow progress as it happens.
 
-Think blocks appear inline while the agent works. They are collapsible and summarize internal reasoning and tool activity (reads, edits, searches, shell output, and more), including subagent lifecycle events. Tool results are rendered with visual views so changes and outputs are easier to scan.
+Think blocks appear inline while the agent works. They are collapsible and summarize internal reasoning and tool activity (reads, edits, searches, shell output, and more), including worker lifecycle events. Tool results are rendered with visual views so changes and outputs are easier to scan.
 
 <Info>
 Think blocks are there to help you follow execution, not just final answers.
@@ -24,15 +24,15 @@ Type `@` in the chat input to mention files or directories. A file picker appear
 
 You can paste or drag images into the chat input. Large text pastes (over 1000 characters) are automatically collapsed into paste segments.
 
-## Working with subagents
+## Working with workers
 
-When work is delegated, you'll see subagent activity in the conversation.
+When work is delegated, you'll see worker activity in the conversation.
 
-Each card shows what a subagent is doing, along with status and progress. Select **View details** to open a deeper timeline for that subagent, including its messages and think blocks. If that subagent delegates further, you can continue drilling into nested activity.
+Each card shows what a worker is doing, along with status and progress. Select **View details** to open a deeper timeline for that worker, including its messages and think blocks. If that worker delegates further, you can continue drilling into nested activity.
 
-A task list near the composer shows **Main** plus delegated subagents. Select a subagent task context to route your next message directly to that subagent. Pending routed messages are shown in the conversation until they are handled.
+A task list near the composer shows **Main** plus delegated workers, so you can monitor progress at a glance.
 
-For the full workflow, see [Subagents](/working-with-magnitude/subagents).
+For more details, see [Workers](/working-with-magnitude/workers).
 
 ## Workspace and file references
 

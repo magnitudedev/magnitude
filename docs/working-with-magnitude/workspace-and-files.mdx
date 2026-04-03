@@ -6,7 +6,7 @@ icon: folder-open
 
 Magnitude runs each session inside a workspace, referenced internally as `$M`.
 
-The workspace is per-session and ephemeral — created fresh at the start of each session. Agents use it for scratch work, plans, research notes, and sharing context between subagents. If you want to inspect generated plans or other session files directly, you can find them under `~/.magnitude`.
+The workspace is per-session and ephemeral — created fresh at the start of each session. Agents use it for scratch work, plans, research notes, and sharing context between workers. If you want to inspect generated plans or other session files directly, you can find them under `~/.magnitude`.
 
 Your project is exposed inside that workspace at `$M/project`. `project/` is a symlink to your actual project directory, so the real files stay in their original location. This gives the agent one logical root for both temporary session files and project files. Agents can also import from the project in any scripts they write in the workspace.
 

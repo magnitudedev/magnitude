@@ -1,10 +1,10 @@
 ---
-title: Subagents
-description: "Specialized agents the team lead delegates to for research, planning, implementation, debugging, and verification"
+title: Workers
+description: "Specialized agents the lead agent delegates to for research, planning, implementation, debugging, and verification"
 icon: users
 ---
 
-Magnitude uses a team lead + subagent model. The team lead delegates focused work to specialized agents, then combines their results into the next decision.
+Magnitude uses a lead agent + workers model. The lead agent delegates focused work to specialized workers, then coordinates their results into the next decision.
 
 ## Agent types
 
@@ -34,19 +34,10 @@ All agents — including read-only ones — can read and write to the session wo
 - **Purpose:** Visual browser interaction with web applications.
 - **Access:** Screenshot-based browser controls (click, type, scroll, navigate, tabs, evaluate JavaScript).
 
-## How subagents are used
+## How workers are used
 
-- The team lead chooses the right specialist for each part of a task.
-- Multiple subagents can run in parallel.
-- Subagents are reused when their context is still relevant — not always spawned fresh.
-- Each agent has tool access levels appropriate to its role.
+- The lead agent chooses the right specialist for each part of a task.
+- Multiple workers can run in parallel.
+- Workers are reused when their context is still relevant — not always spawned fresh.
+- Each worker has tool access levels appropriate to its role.
 - Activity appears inline in the interface as agent cards, so delegation is visible as it happens.
-
-## Direct collaboration with subagents
-
-You can message subagents directly when you need to clarify, redirect, or unblock delegated work. For the interaction workflow, see [Subagents](/working-with-magnitude/subagents).
-
-
-## Lifecycle controls
-
-Idle subagents can be closed. Closing an active subagent requires confirmation to kill it. For usage guidance, see [Subagents](/working-with-magnitude/subagents).
