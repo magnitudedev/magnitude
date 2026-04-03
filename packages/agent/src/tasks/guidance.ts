@@ -7,13 +7,34 @@ const STRATEGY_ADHERENCE_REINFORCEMENT =
  */
 export function renderTaskTypeReferenceTable(): string {
   const lines: string[] = []
-  for (const def of listTaskTypeDefinitions()) {
+  const defs = listTaskTypeDefinitions()
+  const compositeDefs = defs.filter((def) => def.kind === 'composite')
+  const leafDefs = defs.filter((def) => def.kind === 'leaf' || def.kind === 'generic')
+  const userDefs = defs.filter((def) => def.kind === 'user')
+
+  lines.push('### Composite tasks')
+  lines.push('Coordinator tasks that contain child tasks; not directly executed by workers.')
+  for (const def of compositeDefs) {
     lines.push(`- **${def.label}** (\`${def.id}\`) — ${def.description}`)
-    const assignees = def.allowedAssignees.length > 0
-      ? def.allowedAssignees.join(', ')
-      : 'none (coordinator task; create/assign child tasks)'
-    lines.push(`  Assignees: ${assignees}`)
   }
+
+  lines.push('')
+  lines.push('### Leaf tasks')
+  lines.push('Directly executable tasks that are assigned to a worker role.')
+  for (const def of leafDefs) {
+    lines.push(`- **${def.label}** (\`${def.id}\`) — ${def.description}`)
+    lines.push(`  Assignable to: ${def.allowedAssignees.join(', ')}`)
+  }
+
+  if (userDefs.length > 0) {
+    lines.push('')
+    lines.push('### User tasks')
+    lines.push('Tasks that require a decision or approval from the user.')
+    for (const def of userDefs) {
+      lines.push(`- **${def.label}** (\`${def.id}\`) — ${def.description}`)
+    }
+  }
+
   return lines.join('\n')
 }
 
