@@ -6,14 +6,13 @@
   <a href="https://docs.magnitude.dev" target="_blank"><img src="https://img.shields.io/badge/📕-Docs-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="Documentation" /></a> <img src="https://img.shields.io/badge/License-Apache%202.0-232f41?style=flat-square&labelColor=0369a1&color=gray" alt="License" /> <a href="https://discord.gg/VcdpMh9tTy" target="_blank"><img src="https://img.shields.io/discord/1305570963206836295?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=5865F2&color=gray" alt="Discord" /></a> <a href="https://x.com/usemagnitude" target="_blank"><img src="https://img.shields.io/badge/-Follow%20Magnitude-000000?style=flat-square&labelColor=000000&color=gray&logo=x&logoColor=white" alt="Follow Magnitude" /></a>
 </p>
 
+Magnitude is an **open source coding agent** with a built-in software development process. A lead agent breaks down your task and assigns work across explorers, planners, builders, reviewers, debuggers, and a browser agent.
 
-Magnitude is an **open source coding agent** that orchestrates a full dev team of subagents. A lead agent delegates across explorers, planners, builders, reviewers, debuggers, and a browser agent.
-
-- **Everything runs in subagents.** The lead stays focused on orchestration, while subagents handle implementation. The lead's context stays clean.
-- **The dev process is built in.** The lead runs an explore, plan, build, review, debug cycle, iterating until checks pass or it needs your input. No manual orchestration.
-- **Subagents stay alive.** The lead can tell the planner to consider more angles, or send bugs back to the same builder. No re-exploration, saving time and tokens.
-- **Agents share context through files, not summaries.** No output tokens burned on lossy summaries. Every handoff is a file you can view later.
-- **Mix models by role.** Fast models for exploration. Frontier models for planning and review. You control the cost-intelligence tradeoff.
+- **Guided by your intent.** The lead agent adapts the workflow to your intent at every step. Clarifies when needed, acts autonomously when not.
+- **Follows a real software development process.** Research, plan, build, verify. Uses different workflows for features, bugs, and refactors.
+- **Process is built into the agent, not just prompted.** A task tree drives execution, and specific instructions are injected to the right agent at the right time.
+- **Stays coherent over long tasks.** The lead agent coordinates without doing the work itself, keeping its context clean.
+- **Fine-grained model control.** Use faster models for exploration and stronger models for building and review. Supports open source and local models.
 
 <p align="center">
   <img src="interface.png" alt="Magnitude Interface" width="100%" />
@@ -43,9 +42,9 @@ See the [provider docs](https://docs.magnitude.dev/configuration/providers) for 
 
 ## How it works
 
-The lead agent manages all subagents on your behalf. It can message, stop, resume, or redirect them and run many in parallel. You can also message subagents directly.
+The lead agent manages all workers on your behalf. It can message, stop, resume, or redirect them and run many in parallel.
 
-Magnitude comes out of the box with the following subagents:
+Magnitude comes out of the box with the following workers:
 - **Explorer**: for doing codebase or web research, both broad and narrow
 - **Planner**: for evaluating various implementation strategies
 - **Builder**: for implementing code changes directly in your files
