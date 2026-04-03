@@ -7,7 +7,15 @@ import { ConversationStateReaderTag } from './memory-reader'
 import { TaskGraphStateReaderTag } from './task-reader'
 import type { TaskStatus } from '../projections/task-graph'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
-import { formatTaskTypeGuidanceForTool, isTaskAssigneeAllowed, isValidTaskType } from '../tasks'
+import {
+  formatTaskTypeGuidanceForTool,
+  getTaskTypeDefinition,
+  isTaskAssigneeAllowed,
+  isValidTaskType,
+  parseTaskAssignee,
+  type TaskTypeId,
+  type WorkerAssignee,
+} from '../tasks'
 import { getSpawnableVariants, type AgentVariant } from '../agents'
 import type { AppEvent } from '../events'
 
@@ -248,9 +256,17 @@ export const assignTaskTool = defineTool({
       })
     }
 
-    if (normalizedAssignee !== 'user') {
+    const parsedAssignee = parseTaskAssignee(normalizedAssignee)
+    if (!parsedAssignee) {
+      return yield* Effect.fail({
+        _tag: 'TaskError' as const,
+        message: `Assignee "${assignee}" is not a valid task assignee.`,
+      })
+    }
+
+    if (parsedAssignee !== 'user') {
       const spawnable = getSpawnableVariants()
-      if (!spawnable.includes(normalizedAssignee as AgentVariant)) {
+      if (!spawnable.includes(parsedAssignee)) {
         return yield* Effect.fail({
           _tag: 'TaskError' as const,
           message: `Assignee "${assignee}" is not a valid worker role.`,
@@ -258,7 +274,7 @@ export const assignTaskTool = defineTool({
       }
     }
 
-    if (!isTaskAssigneeAllowed(task.taskType, normalizedAssignee as 'user' | AgentVariant)) {
+    if (!isTaskAssigneeAllowed(task.taskType, parsedAssignee)) {
       return yield* Effect.fail({
         _tag: 'TaskError' as const,
         message: `Assignee "${assignee}" is not allowed for task type "${task.taskType}".`,
@@ -281,7 +297,7 @@ export const assignTaskTool = defineTool({
       })
     }
 
-    if (normalizedAssignee === 'user') {
+    if (parsedAssignee === 'user') {
       yield* bus.publish({
         type: 'task_assigned',
         forkId: parentForkId,
@@ -297,6 +313,8 @@ export const assignTaskTool = defineTool({
       return { taskId }
     }
 
+    const role: WorkerAssignee = parsedAssignee
+
     const trimmedMessage = message?.trim()
     if (!trimmedMessage) {
       return yield* Effect.fail({
@@ -308,7 +326,17 @@ export const assignTaskTool = defineTool({
     const conversationReader = yield* ConversationStateReaderTag
     const conversationState = yield* conversationReader.getState()
     const summary = buildConversationSummary(conversationState.entries) ?? ''
-    const prompt = buildAgentContext(task.title, trimmedMessage, summary)
+
+    const taskTypeDef = getTaskTypeDefinition(task.taskType as TaskTypeId)
+
+    let taskContract: string | undefined
+    if (taskTypeDef.kind === 'leaf') {
+      taskContract = [taskTypeDef.workerGuidance, taskTypeDef.criteria].filter(Boolean).join('\n\n')
+    } else if (taskTypeDef.kind === 'generic' && taskTypeDef.workerGuidance) {
+      taskContract = [taskTypeDef.workerGuidance, taskTypeDef.criteria].filter(Boolean).join('\n\n')
+    }
+
+    const prompt = buildAgentContext(task.title, trimmedMessage, summary, taskContract)
 
     const { ExecutionManager } = yield* Effect.tryPromise({
       try: () => import('../execution/execution-manager'),
@@ -319,7 +347,6 @@ export const assignTaskTool = defineTool({
     })
 
     const executionManager = yield* ExecutionManager
-    const role = normalizedAssignee as AgentVariant
     const agentId = `${role}-${taskId}`
 
     const forkId = yield* executionManager.fork({

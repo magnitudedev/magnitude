@@ -1,4 +1,4 @@
-import { isValidVariant } from '../agents'
+import { isValidVariant, type AgentVariant } from '../agents'
 import type { TaskAssignee } from './types'
 import { getTaskTypeDefinition, isTaskAssigneeAllowed, isValidTaskType, type TaskTypeId } from './registry'
 
@@ -12,9 +12,13 @@ export function assertTaskTypeId(value: string): TaskTypeId {
   return parsed
 }
 
+function isWorkerAssignee(value: string): value is Exclude<AgentVariant, 'lead' | 'lead-oneshot'> {
+  return isValidVariant(value) && value !== 'lead' && value !== 'lead-oneshot'
+}
+
 export function parseTaskAssignee(value: string): TaskAssignee | null {
   if (value === 'user') return 'user'
-  if (isValidVariant(value)) return value
+  if (isWorkerAssignee(value)) return value
   return null
 }
 
@@ -26,6 +30,17 @@ export function assertTaskAssignee(value: string): TaskAssignee {
 
 export function validateTaskAssigneeForType(taskType: TaskTypeId, assignee: TaskAssignee): void {
   if (isTaskAssigneeAllowed(taskType, assignee)) return
-  const allowed = getTaskTypeDefinition(taskType).allowedAssignees.join(', ')
+
+  const def = getTaskTypeDefinition(taskType)
+
+  if (def.kind === 'composite') {
+    throw new Error(`Task type "${taskType}" is a coordinator-only task and cannot be directly assigned.`)
+  }
+
+  if (def.kind === 'user') {
+    throw new Error(`Task type "${taskType}" can only be assigned to the user.`)
+  }
+
+  const allowed = def.allowedAssignees.join(', ')
   throw new Error(`Assignee "${assignee}" is not allowed for task type "${taskType}". Allowed: ${allowed}.`)
 }

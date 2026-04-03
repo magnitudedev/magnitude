@@ -1,6 +1,4 @@
-import { listTaskTypeDefinitions, type TaskTypeId } from './registry'
-
-const HIGHER_ORDER_TASK_TYPES = new Set<TaskTypeId>(['feature', 'bug', 'refactor'])
+import { getTaskTypeDefinition, isTaskTypeKind, listTaskTypeDefinitions, type TaskTypeId } from './registry'
 const STRATEGY_ADHERENCE_REINFORCEMENT =
   '**Strategy adherence is mandatory.** The user EXPECTS this process to be followed. Failure to follow this workflow is a violation of user trust.\n\nEstablish the prescribed task decomposition immediately. If you have already started tasks that correspond to steps in this strategy, move them under the appropriate structure.'
 
@@ -20,20 +18,26 @@ export function renderTaskTypeReferenceTable(): string {
 }
 
 export function formatTaskTypeGuidanceForTool(taskType: TaskTypeId): string {
-  const def = listTaskTypeDefinitions().find((d) => d.id === taskType)
-  if (!def) return `No specific guidance for task type "${taskType}".`
+  const def = getTaskTypeDefinition(taskType)
 
-  const guidance = def.strategy.trim()
-  if (!guidance) return `No specific guidance for task type "${taskType}".`
+  const leadGuidance = def.leadGuidance.trim()
+  const criteria = def.criteria.trim()
 
-  return guidance
+  if (!leadGuidance && !criteria) {
+    return `No specific guidance for task type "${taskType}".`
+  }
+
+  if (!criteria) return leadGuidance
+  if (!leadGuidance) return criteria
+
+  return `${leadGuidance}\n\n${criteria}`
 }
 
 /**
  * task_type_hook reminder formatter — reinforcement only, preserves task ID context.
  */
 export function formatTaskTypeReminder(taskIds: readonly string[], taskType: TaskTypeId): string {
-  if (!HIGHER_ORDER_TASK_TYPES.has(taskType)) return ''
+  if (!isTaskTypeKind(taskType, 'composite')) return ''
 
   const idList = taskIds.length === 1 ? `Task ${taskIds[0]}` : `Tasks ${taskIds.join(', ')}`
   return `${idList} (type: ${taskType}):\n${STRATEGY_ADHERENCE_REINFORCEMENT}`

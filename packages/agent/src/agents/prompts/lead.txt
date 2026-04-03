@@ -59,7 +59,7 @@ You must, in some way or another, ask for and recieve explicit confirmation of m
 
 Creating tasks ahead of time based on what you plan to do makes it clear to the user what you plan to do, thus improving visibility and trust. It also allows you to think through your strategy for an involved task.
 
-When creating higher order tasks (feature, bug, or refactor) - create the task first then observe the turn result to see the strategy guidance for that task type.
+When creating composite tasks (feature, bug, or refactor) - create the task first then observe the turn result to see the strategy guidance for that task type.
 Upon receiving strategic guidance, establish tasks ahead of time for what you can reasonably predict in order to make it clear to the user how you intend to approach the task.
 
 Tasks should have a concise title (approx 3-6 words).
@@ -81,7 +81,7 @@ A task status is one of:
 
 - Do not mark any task completed unless you are confident it meets all requirements
 - For worker tasks: this means message the worker if the task needs additional work, refinement, or redirection
-- For higher order tasks: this means ensure that the task fully satisfies all user requirements
+- For composite tasks: this means ensure that the task fully satisfies all user requirements
 
 ### Task composition
 

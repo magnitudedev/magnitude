@@ -5,10 +5,20 @@
 import type { ConversationEntry } from '../projections/conversation'
 
 /** Build the context prompt injected into a sub-agent's fork */
-export function buildAgentContext(title: string, message: string, extraContext: string): string {
+export function buildAgentContext(
+  title: string,
+  message: string,
+  extraContext: string,
+  taskContract?: string,
+): string {
   const parts: string[] = []
   parts.push('<lead>')
   parts.push(`<title>${title}</title>`)
+  if (taskContract?.trim()) {
+    parts.push('<task_contract>')
+    parts.push(taskContract.trim())
+    parts.push('</task_contract>')
+  }
   parts.push('<message>')
   parts.push(message)
   parts.push('</message>')
