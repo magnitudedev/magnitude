@@ -7,46 +7,25 @@ allowedAssignees: []
 
 <!-- @lead -->
 
-## Suggested decomposition
+## Workflow
 
-```
-- bug: {id}
-  - research: {id}-research (debugger)
-    OR
-    group: {id}-research
-      - research: {id}-research-{area} (debugger) +
-  - implement: {id}-impl (builder)
-  - review: {id}-review (reviewer)
-```
+Bug work goes from symptom to cause to fix to verification.
 
-## Orchestration procedure
+**Reproduction** — Get the bug to happen reliably first. A reproducible failure is the foundation for everything else — without it, diagnosis is guesswork and you can't verify the fix actually works. If reproduction is inconsistent, that tells you something: it's probably timing, environment, data shape, or shared state.
 
-1. Build an evidence chain from symptom to root cause before any implementation begins.
-   - Deploy debuggers to gather evidence: reproduce the bug, trace code paths, and collect exact error output.
-   - Ask the user for additional context: exact reproduction steps, when it started, and environment details.
-2. Require a concrete bug-fix plan grounded in proof.
-   - Document exact reproduction steps.
-   - Document the evidence chain from input to failure.
-   - Document the specific root cause with proof.
-   - Document the proposed fix and expected blast radius.
-3. Execute a minimal root-cause fix, not a symptom patch.
-   - Apply the smallest change that addresses the demonstrated cause.
-   - If proposed changes rely on untested assumptions, pause and gather more evidence.
-   - If the same root-cause pattern appears elsewhere, address those instances deliberately.
-4. Verify the fix end-to-end.
-   - Confirm the reproduction case flips from failure to success.
-   - Confirm baseline checks still pass and no regressions are introduced.
+**Diagnosis** — Collect concrete evidence: logs, traces, return values, state at each step. Each observation rules out possible causes. Test hypotheses against the code, don't just reason about them. Falsified hypotheses are valuable — they stop you from going in circles. Diagnosis is done when you can trace from the trigger to the defect mechanism with evidence at each step.
 
-## Oversight responsibilities
+**Fix** — The smallest fix that addresses the proven cause carries the least risk. Bigger "while we're here" changes make it hard to tell what actually fixed the bug. If there are multiple valid approaches with different tradeoffs, surface those to the user before picking one.
 
-- Enforce evidence discipline throughout:
-  - Reproduce first; if reproduction is not possible, require more information.
-  - Require exact error messages, return values, and stack traces.
-  - Require code-path tracing with concrete checks at each step.
-  - Require specific, falsifiable hypotheses and explicit prove/disprove outcomes.
-- Reject guesses and speculative fixes; require every claim to be backed by observation.
-- Ensure implementation remains anchored to the proven root cause.
-- Ensure verification includes both the original failure mode and regression coverage.
+**Verification** — Before writing the fix, write a test that reproduces the failure and confirm it fails. Then apply the fix and confirm the test passes. This red-green sequence proves the fix actually addresses the defect — a test written after the fix can accidentally pass for the wrong reasons. Then check that nearby behavior still works and existing tests still pass.
+
+## Decomposition
+
+Separating diagnosis from implementation works well for bugs. A debugger establishing reproduction and root cause operates differently from a builder writing the fix — combining them tends to shortcut the evidence chain. Review adds value because independent verification breaks the confirmation bias from whoever diagnosed and fixed the issue.
+
+## Completion
+
+The bug is done when the user's requirements around the failure are satisfied. The reproduction case flipping to success is necessary but not sufficient — adjacent behavior should still work, code quality should hold up, and the fix should follow codebase conventions.
 
 <!-- @criteria -->
 
@@ -56,3 +35,5 @@ allowedAssignees: []
 - [ ] A minimal fix addressing the root cause is applied.
 - [ ] The reproduction case flips from failure to success.
 - [ ] Baseline validation confirms no regressions were introduced.
+- [ ] The fix aligns with codebase conventions and does not degrade code quality.
+- [ ] User requirements related to the bug are fully satisfied.

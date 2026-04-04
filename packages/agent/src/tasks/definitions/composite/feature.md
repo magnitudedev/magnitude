@@ -7,53 +7,28 @@ allowedAssignees: []
 
 <!-- @lead -->
 
-## Suggested decomposition
+## Workflow
 
-```
-- feature: {id}
-  - research: {id}-research (explorer)
-    OR
-    group: {id}-research
-      - research: {id}-research-{area} (explorer) +
-  - plan: {id}-plan (planner)
-    - approve: {id}-plan-approve (user)
-  - implement: {id}-impl (builder)
-    OR
-    group: {id}-impl
-      - implement: {id}-impl-{scope} (builder) +
-  - review: {id}-review (reviewer)
-```
+Feature work goes through context, design, implementation, and verification.
 
-## Orchestration procedure
+**Context** — Builders who don't understand the existing code make wrong assumptions. Have explorers look at the relevant parts of the codebase first: entry points, related modules, types, conventions, and how similar things are already done. If the feature involves external APIs or libraries you haven't worked with, research those separately — guessing at API surfaces causes integration bugs.
 
-1. Establish requirements and context before design.
-   - Deploy explorers to map relevant code: entry points, related modules, types, patterns, conventions, and integration points.
-   - Clarify requirements with the user, including explicit in-scope and out-of-scope boundaries.
-   - If external APIs or unfamiliar technologies are involved, create research tasks rather than assuming API surfaces.
-2. Produce and align on an execution plan.
-   - Decompose work into child tasks with clear ownership and sequencing.
-   - Document functional behavior, integration design, file-level changes, and verification strategy.
-   - Iterate with the user until plan direction is approved.
-3. Coordinate implementation across scoped child tasks.
-   - Parallelize where safe, and sequence where dependencies require it.
-   - Ensure implementation follows discovered codebase conventions so the feature integrates naturally.
-4. Drive review and closure.
-   - Run independent review for requirement coverage, correctness, edge cases, regressions, and code quality.
-   - Route findings back to implementation and repeat review until resolved or explicitly accepted.
+**Design** — Without a plan, builders have to make design decisions while coding, which is expensive to undo. A good plan names the files that will change, the interfaces involved, what the new behavior should be, and how to verify it works. Plans get better with critique — first drafts miss edge cases that show up under scrutiny. Scope and direction decisions belong to the user. Surface these during planning, before anyone starts building — that's the cheapest place to catch misunderstood intent.
 
-## Oversight responsibilities
+**Implementation** — Builders do their best work when they have a solid plan and codebase context to work from. Workers on independent scopes can run in parallel. Workers whose scopes touch the same interfaces or state need agreed contracts before they start, or their work will conflict at merge time.
 
-- Maintain scope control: prevent accidental expansion beyond agreed feature boundaries.
-- Maintain pattern consistency: enforce alignment with existing architecture and conventions.
-- Maintain integration quality: verify all touched interfaces and dependent flows behave correctly.
-- Maintain iteration discipline: ensure reviewer findings are concrete and fully closed before completion.
-- Maintain stakeholder alignment: surface tradeoffs and decisions, and keep the user informed at key gates.
+**Verification** — The builder and the bugs in their code share the same blind spots. A reviewer working from the plan and requirements sees from a different angle — this catches things the builder structurally cannot, regardless of how careful they were. Route review findings back to implementation until they're resolved.
+
+## Completion
+
+The feature is done when the user's requirements are actually met, not when all subtasks are checked off. Verify the integrated behavior against what was originally requested — gaps are common when work is split across multiple workers. Code should follow the project's existing conventions and maintain quality. Review findings need to be genuinely resolved. The user confirming the feature works is the final signal.
 
 <!-- @criteria -->
 
 ## Completion criteria
 
-- [ ] All planned child tasks are completed and reviewed.
 - [ ] The integrated result satisfies the user's stated requirements and scope boundaries.
-- [ ] Correctness, edge cases, and regression checks meet project quality expectations.
+- [ ] Correctness, edge cases, and regression checks are verified.
+- [ ] Code changes align with codebase conventions and maintain code quality.
+- [ ] Review findings are resolved or explicitly accepted.
 - [ ] User confirms the feature works as intended.

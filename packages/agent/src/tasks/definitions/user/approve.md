@@ -7,21 +7,18 @@ allowedAssignees: [user]
 
 <!-- @lead -->
 
-## Inputs to present to the user
-- Clear description of what needs approval and why
-- Relevant context: tradeoffs, alternatives considered, recommendations
-- Impact of the decision on downstream work
-- Specific question or decision to be made
+## Purpose
 
-## Coordination loop
-1. Create this task with a title that clearly describes the decision needed.
-2. Assign to user and present the decision context in the assignment message.
-3. Wait for user response — do not proceed on dependent work until approval is received.
-4. Act on user feedback: mark complete if approved, or adjust approach based on feedback.
+Approve tasks represent decision points that only the user can resolve. Dependent work is contingent on the decision — proceeding on assumptions instead of waiting for approval risks wasted implementation if the user's answer changes direction.
+
+## Context to present
+
+What decision is pending and why it matters now. The options considered, tradeoffs involved, and recommendation if applicable. Impact of each choice on downstream work. A specific question to answer, not an open-ended status update.
 
 <!-- @criteria -->
 
 ## Completion criteria
+
 - [ ] User has provided an explicit decision or approval.
-- [ ] Lead has acted on any feedback or conditions attached to the approval.
+- [ ] Any feedback or conditions attached to the approval are acted on.
 - [ ] Dependent work is unblocked or redirected based on the decision.

@@ -7,47 +7,29 @@ allowedAssignees: []
 
 <!-- @lead -->
 
-## Suggested decomposition
+## Purpose
 
-```
-- group: {id}
-  - <task-type>: {id}-<scope-a> (<role or user>)
-  - <task-type>: {id}-<scope-b> (<role or user>)
-  - <task-type>: {id}-integration (<role>) [optional]
-  - review: {id}-review (reviewer) [recommended]
-```
+A group task is a container for related work that shares an objective. Its value is coordination — making sure the pieces add up to a coherent result, not just a collection of individually completed tasks.
 
-## Orchestration procedure
+## Decomposition
 
-1. Define the group objective and boundaries.
-   - State the concrete outcome the group must deliver.
-   - Define scope boundaries and exclusions so child tasks can be evaluated consistently.
-2. Create a complete child-task set.
-   - Decompose the objective into children that collectively cover the full scope.
-   - Assign clear ownership and expected deliverables per child.
-   - Sequence dependencies and identify candidates for parallel execution.
-3. Coordinate execution and integration.
-   - Track status across children and resolve blockers quickly.
-   - Rebalance scope or sequencing when upstream findings change downstream needs.
-   - Add integration and review tasks when cross-child coupling introduces risk.
-4. Close the group intentionally.
-   - Verify all required children are complete.
-   - Verify outputs compose into the intended objective without gaps.
-   - Confirm any deferred work or accepted risk is explicitly documented.
+Break the objective into child tasks that collectively cover the full scope. Each child should have clear ownership and a concrete deliverable. Think about dependencies: which tasks can run in parallel, which ones need to wait on others. Missing a child task means missing part of the scope — gaps tend to surface late when they're expensive to fill.
 
-## Oversight responsibilities
+## Coordination
 
-- Maintain decomposition quality so no critical scope is missing or duplicated.
-- Maintain dependency clarity so downstream work is not blocked unexpectedly.
-- Maintain progress visibility across all children and escalation paths.
-- Maintain integration quality by validating that child outputs work together, not just independently.
-- Maintain decision traceability when scope, sequencing, or acceptance decisions change.
+Track progress across children and unblock things quickly. When one child's output changes what another child needs, adjust. The biggest risk in group work is at the boundaries between children — where their outputs meet. Integration problems show up there, not inside individual tasks. If children touch shared interfaces or produce artifacts that need to compose, verify that they actually fit together.
+
+## Completion
+
+The group is done when the objective is met, not when all children are individually done. Check that the integrated result actually works as a whole. Any deferred work or accepted risk should be documented so it doesn't get lost. User requirements for the group objective are satisfied.
 
 <!-- @criteria -->
 
 ## Completion criteria
 
-- [ ] Child tasks collectively cover the full group objective and required scope.
+- [ ] Child tasks collectively cover the full group objective.
 - [ ] All required child tasks are completed or explicitly dispositioned.
-- [ ] Integrated outputs satisfy the group objective without unresolved blockers.
-- [ ] Outstanding risks, tradeoffs, and follow-ups are documented clearly.
+- [ ] Integrated outputs satisfy the group objective — not just individually correct, but working together.
+- [ ] Code quality and codebase conventions are maintained.
+- [ ] Outstanding risks and follow-ups are documented.
+- [ ] User requirements are satisfied.

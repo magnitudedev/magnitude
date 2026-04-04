@@ -7,48 +7,30 @@ allowedAssignees: [explorer]
 
 <!-- @lead -->
 
-## Inputs to provide the worker
-- The exact research question(s) to answer and the decision they inform.
-- Starting artifacts: relevant files, modules, docs, APIs, commits, or URLs.
-- Required depth (quick directional answer vs deep investigation).
-- Constraints: timeline, risk tolerance, and acceptable uncertainty level.
-- Any hypotheses to validate or disprove.
+## Scope and inputs
 
-## Output to expect from the worker
-- A structured research report covering investigated scope, findings, and implications.
-- Evidence-backed conclusions with file/line references and URLs where applicable.
-- Clear separation of confirmed facts, inferences, and unresolved unknowns.
-- Recommended next actions and whether evidence is sufficient to proceed.
-- A workspace document when findings are substantial or reused across tasks.
+The exact research question and the decision it informs. Starting points: relevant files, modules, docs, APIs, commits, or URLs. Required depth — quick directional answer vs thorough investigation. Any hypotheses to validate or disprove.
 
-## Coordination loop
-1. Check that the worker answered the stated question, not an adjacent one.
-2. Validate evidence quality; return for deeper investigation if claims are under-supported.
-3. Use findings to drive planning/implementation decisions and cite the research output.
-4. If uncertainty remains high, commission focused follow-up research on unresolved unknowns.
+## Output and coordination
+
+A structured answer separating confirmed facts from inferences from unknowns. Evidence for each key finding — file paths, line ranges, URLs. Clear recommendation on whether there's enough to proceed. Substantial findings captured in a workspace document for reuse.
+
+Verify the worker answered the actual question, not an adjacent one. Under-supported claims need deeper investigation, not acceptance.
 
 <!-- @worker -->
 
-## Objective
-- Produce decision-ready, evidence-backed answers to the research question, with explicit uncertainty handling.
+## Approach
 
-## Procedure
-1. Parse the question and success condition before starting investigation.
-2. Inspect first-party code and project docs directly for primary evidence.
-3. Use external references when needed for third-party behavior, APIs, or standards.
-4. Record findings with source citations as you go.
-5. Separate facts, conclusions, and open questions explicitly.
-6. Synthesize implications for the current decision and propose next actions.
+Understand the question and the decision it supports before investigating. First-party code and project docs are primary evidence — they carry higher confidence than secondhand interpretation. External references matter when behavior depends on third-party contracts or standards.
 
-## Output contract
-- Provide a structured report with: scope investigated, findings, implications, unknowns, and recommendations.
-- Cite evidence for each key finding (file path + line range, and/or URL).
-- State confidence level and whether evidence is sufficient to proceed now.
-- Include a workspace document link when output is substantial or cross-cutting.
+Claims without citations are hard to trust and hard to reuse. Separating facts from inferences prevents false certainty downstream. Explicit unknowns protect later work from hidden assumptions.
+
+Deliver a structured report: scope investigated, findings with evidence, implications, unknowns, and recommendations. State whether evidence is sufficient to proceed.
 
 <!-- @criteria -->
 
 ## Completion criteria
+
 - [ ] The research question is answered with concrete, evidence-backed findings.
 - [ ] Findings clearly distinguish facts, inferences, and unresolved unknowns.
 - [ ] Evidence references are provided for all key conclusions.
