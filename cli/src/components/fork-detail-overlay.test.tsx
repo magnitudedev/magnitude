@@ -1,5 +1,6 @@
-import { expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { act, create } from 'react-test-renderer'
 import type { CompactionState, DisplayState } from '@magnitudedev/agent'
 
 mock.module('../hooks/use-theme', () => ({
@@ -22,11 +23,44 @@ mock.module('./button', () => ({
   Button: ({ children }: { children?: any }) => <>{children}</>,
 }))
 
-mock.module('./message-view', () => ({
-  MessageView: ({ message }: { message: { id: string } }) => <text>[message:{message.id}]</text>,
-}))
+const openFileMock = mock(() => {})
+const closeFilePanelMock = mock(() => {})
+let filePanelState = {
+  selectedFile: null as { path: string, section?: string } | null,
+  selectedFileContent: null as string | null,
+  selectedFileStreaming: null as any,
+  canRenderPanel: false,
+}
 
-const { ForkDetailOverlay, scheduleInitialForkOverlaySnap } = await import('./fork-detail-overlay')
+let ForkDetailOverlay: typeof import('./fork-detail-overlay').ForkDetailOverlay
+let scheduleInitialForkOverlaySnap: typeof import('./fork-detail-overlay').scheduleInitialForkOverlaySnap
+
+beforeEach(async () => {
+  mock.module('../hooks/use-file-panel', () => ({
+    useFilePanel: () => ({
+      ...filePanelState,
+      openFile: openFileMock,
+      closeFilePanel: closeFilePanelMock,
+    }),
+  }))
+
+  mock.module('./message-view', () => ({
+    MessageView: ({ message, onFileClick }: { message: { id: string }, onFileClick?: (path: string, section?: string) => void }) => {
+      if (message.id === 'm1') onFileClick?.('overlay.md', 'L1-L2')
+      return <text>[message:{message.id}]</text>
+    },
+  }))
+
+  mock.module('./file-viewer-panel', () => ({
+    FileViewerPanel: ({ filePath }: { filePath: string }) => <text>[file-viewer:{filePath}]</text>,
+  }))
+
+  ;({ ForkDetailOverlay, scheduleInitialForkOverlaySnap } = await import('./fork-detail-overlay'))
+})
+
+afterEach(() => {
+  mock.restore()
+})
 
 const noop = () => {}
 const idleCompaction: CompactionState = { _tag: 'idle', tokenEstimate: 0 }
@@ -46,9 +80,10 @@ function propsWithDisplay(display: DisplayState) {
     forkRole: 'builder',
     onClose: noop,
     onForkExpand: noop,
-    onFileClick: noop,
     modelSummary: { provider: 'provider', model: 'model' },
     contextHardCap: null,
+    workspacePath: '/tmp',
+    projectRoot: '/tmp',
     subscribeForkDisplay: (_forkId: string, cb: (state: DisplayState) => void) => {
       cb(display)
       return noop
@@ -61,6 +96,7 @@ function propsWithDisplay(display: DisplayState) {
 }
 
 test('enables sticky bottom-follow semantics on the overlay scrollbox', async () => {
+  filePanelState = { selectedFile: null, selectedFileContent: null, selectedFileStreaming: null, canRenderPanel: false }
   const html = renderToStaticMarkup(
     <ForkDetailOverlay
       {...propsWithDisplay(makeDisplayState([]))}
@@ -99,6 +135,46 @@ test('mount snap helper schedules immediate + deferred bottom snaps and executes
   cleanup()
   expect(canceled).toEqual([scheduled[0]!.id, scheduled[1]!.id])
 })
+
+test('routes overlay message file clicks to overlay-local openFile handler', async () => {
+  openFileMock.mockClear()
+  filePanelState = { selectedFile: null, selectedFileContent: null, selectedFileStreaming: null, canRenderPanel: false }
+
+  await act(async () => {
+    create(
+      <ForkDetailOverlay
+        {...propsWithDisplay(makeDisplayState([{ id: 'm1', type: 'assistant_message' } as any]))}
+      />,
+    )
+  })
+
+  expect(openFileMock).toHaveBeenCalledWith('overlay.md', 'L1-L2')
+})
+
+test('keeps overlay viewer rendering scoped to overlay-local file panel state', () => {
+  filePanelState = { selectedFile: null, selectedFileContent: null, selectedFileStreaming: null, canRenderPanel: false }
+  const closedHtml = renderToStaticMarkup(
+    <ForkDetailOverlay
+      {...propsWithDisplay(makeDisplayState([]))}
+    />,
+  )
+  expect(closedHtml).not.toContain('[file-viewer:')
+
+  filePanelState = {
+    selectedFile: { path: 'overlay.md' },
+    selectedFileContent: '# Overlay',
+    selectedFileStreaming: null,
+    canRenderPanel: true,
+  }
+  const openHtml = renderToStaticMarkup(
+    <ForkDetailOverlay
+      {...propsWithDisplay(makeDisplayState([]))}
+    />,
+  )
+  expect(openHtml).toContain('[file-viewer:overlay.md]')
+})
+
+
 
 test('overlay source has no message-update-driven imperative scroll-to-bottom effect', async () => {
   const source = await Bun.file(new URL('./fork-detail-overlay.tsx', import.meta.url)).text()

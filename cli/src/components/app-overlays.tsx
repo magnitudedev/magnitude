@@ -104,9 +104,8 @@ export type AppOverlaysProps = {
   forkContextHardCap: number | null
   popForkOverlay: () => void
   pushForkOverlay: (forkId: string) => void
-  onFileClick?: (path: string, section?: string) => void
-
-
+  workspacePath: string | null
+  projectRoot: string
 }
 
 export function AppOverlays({
@@ -190,7 +189,8 @@ export function AppOverlays({
   forkContextHardCap,
   popForkOverlay,
   pushForkOverlay,
-  onFileClick,
+  workspacePath,
+  projectRoot,
 }: AppOverlaysProps) {
   if (showSetupWizard && wizardStep === 'browser') {
     return (
@@ -271,9 +271,10 @@ export function AppOverlays({
           forkRole={agent?.role ?? 'agent'}
           onClose={popForkOverlay}
           onForkExpand={pushForkOverlay}
-          onFileClick={onFileClick}
           modelSummary={forkModelSummary}
           contextHardCap={forkContextHardCap}
+          workspacePath={workspacePath}
+          projectRoot={projectRoot}
           subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}
           subscribeForkCompaction={(fId, cb) => client.state.compaction.subscribeFork(fId, cb)}
         />

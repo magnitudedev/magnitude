@@ -2055,7 +2055,8 @@ function AppInner({
       forkContextHardCap={forkContextHardCap}
       popForkOverlay={popForkOverlay}
       pushForkOverlay={pushForkOverlay}
-      onFileClick={openFile}
+      workspacePath={workspacePath}
+      projectRoot={process.cwd()}
     />
   )
 
