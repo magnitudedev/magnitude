@@ -78,19 +78,22 @@ export function taskHandler(
       const parentTask = findEnclosingTask(ctx.stack)
       const explicitParent = ctx.attrs.get('parent') ?? null
       const parent = explicitParent ?? parentTask?.id ?? null
+      const taskType = ctx.attrs.get('type') ?? null
+      const title = ctx.attrs.get('title') ?? null
 
       return [
         ...endTopProse(ctx.stack),
         emit({
-          _tag: 'TaskUpdate',
+          _tag: taskType && title ? 'TaskOpen' : 'TaskUpdate',
           id,
-          taskType: ctx.attrs.get('type') ?? null,
-          title: ctx.attrs.get('title') ?? null,
+          taskType,
+          title,
           parent,
           after: ctx.attrs.get('after') ?? null,
           status: ctx.attrs.get('status') ?? null,
           explicitParent,
         }),
+        ...(taskType && title ? [emit({ _tag: 'TaskClose', id })] : []),
       ]
     },
   }

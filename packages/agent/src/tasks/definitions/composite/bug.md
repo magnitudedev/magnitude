@@ -15,9 +15,11 @@ Bug work goes from symptom to cause to fix to verification.
 
 **Diagnosis** — Collect concrete evidence: logs, traces, return values, state at each step. Each observation rules out possible causes. Test hypotheses against the code, don't just reason about them. Falsified hypotheses are valuable — they stop you from going in circles. Diagnosis is done when you can trace from the trigger to the defect mechanism with evidence at each step.
 
+**Reproduction test** — Once the cause is identified, write a test that captures the failure and confirm it goes red. This happens *before* any fix. A failing test locks in the exact defect — it removes ambiguity about what "fixed" means, prevents the fix from being declared done when it isn't, and catches regressions permanently. A test written after the fix can accidentally pass for the wrong reasons; a test written before cannot.
+
 **Fix** — The smallest fix that addresses the proven cause carries the least risk. Bigger "while we're here" changes make it hard to tell what actually fixed the bug. If there are multiple valid approaches with different tradeoffs, surface those to the user before picking one.
 
-**Verification** — Before writing the fix, write a test that reproduces the failure and confirm it fails. Then apply the fix and confirm the test passes. This red-green sequence proves the fix actually addresses the defect — a test written after the fix can accidentally pass for the wrong reasons. Then check that nearby behavior still works and existing tests still pass.
+**Verification** — Apply the fix and confirm the reproduction test flips green. This red-green sequence is the proof that the fix addresses the defect. Then check that nearby behavior still works and existing tests still pass.
 
 ## Decomposition
 

@@ -14,12 +14,26 @@ describe('task format parsing', () => {
     expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
   })
 
-  it('parses self-closing task update', () => {
+  it('parses self-closing task update when create attrs are absent', () => {
     const events = parse('<task id="t1" status="completed" /><yield/>')
     const update = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskUpdate' }> => e._tag === 'TaskUpdate')
     expect(update).toBeDefined()
     expect(update?.id).toBe('t1')
     expect(update?.status).toBe('completed')
+  })
+
+  it('parses self-closing task create when type and title are present', () => {
+    const events = parse('<task id="t1" type="review" title="Review changes" parent="p1" /><yield/>')
+    const open = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
+    const close = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
+
+    expect(open).toBeDefined()
+    expect(open?.id).toBe('t1')
+    expect(open?.taskType).toBe('review')
+    expect(open?.title).toBe('Review changes')
+    expect(open?.parent).toBe('p1')
+    expect(close).toBeDefined()
+    expect(close?.id).toBe('t1')
   })
 
   it('assign valid only inside task', () => {
