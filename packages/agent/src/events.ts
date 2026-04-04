@@ -220,13 +220,17 @@ export interface TurnUnexpectedError {
 // Streaming Events
 // =============================================================================
 
+export type MessageDestination =
+  | { readonly kind: 'user' }
+  | { readonly kind: 'parent' }
+  | { readonly kind: 'worker'; readonly taskId: string }
+
 export interface MessageStart {
   readonly type: 'message_start'
   readonly forkId: string | null
   readonly turnId: string
   readonly id: string
-  readonly taskId: string | null
-  readonly to: string | null
+  readonly destination: MessageDestination
 }
 
 export interface ThinkingChunk {

@@ -41,7 +41,7 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
   eventHandlers: {
     message_start: ({ event, state }) => {
       if (event.forkId === null) return state
-      if (event.taskId !== null) return state
+      if (event.destination.kind !== 'parent') return state
 
       const existing = state.userMessageIdsByFork.get(event.forkId) ?? new Set<string>()
       const next = new Set(existing)

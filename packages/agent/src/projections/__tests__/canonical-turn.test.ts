@@ -36,7 +36,7 @@ describe('CanonicalTurn final content selection behavior', async () => {
     const trace: CanonicalTrace = {
       lenses: null,
       thinkBlocks: [{ about: null, content: 't' }],
-      messages: [{ text: 'm' }],
+      messages: [{ text: 'm', destination: { kind: 'user' } }],
       toolCalls: [{ tagName: 'tool', input: {}, query: '.' }],
       turnDecision: 'yield',
     }

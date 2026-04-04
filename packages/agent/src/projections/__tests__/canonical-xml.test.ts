@@ -17,7 +17,7 @@ describe('serializeCanonicalTurn unified format', () => {
   })
 
   test('messages are top-level (no comms wrapper)', () => {
-    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [{ text: 'hi' }], toolCalls: [], turnDecision: 'yield' }
+    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [{ text: 'hi', destination: { kind: 'user' } }], toolCalls: [], turnDecision: 'yield' }
     expect(serializeCanonicalTurn(trace, emptyBindings)).toBe(withYield('<message>hi</message>'))
   })
 
@@ -30,7 +30,7 @@ describe('serializeCanonicalTurn unified format', () => {
     const trace: CanonicalTrace = {
       lenses: null,
       thinkBlocks: [{ about: null, content: 'plan' }],
-      messages: [{ text: 'done' }],
+      messages: [{ text: 'done', destination: { kind: 'user' } }],
       toolCalls: [{ tagName: 'shell', input: { command: 'ls' }, query: '.' }],
       turnDecision: 'yield',
     }
@@ -40,7 +40,7 @@ describe('serializeCanonicalTurn unified format', () => {
   })
 
   test('message text trimming', () => {
-    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [{ text: '\n\nhey' }], toolCalls: [], turnDecision: 'yield' }
+    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [{ text: '\n\nhey', destination: { kind: 'user' } }], toolCalls: [], turnDecision: 'yield' }
     expect(serializeCanonicalTurn(trace, emptyBindings)).toBe(withYield('<message>hey</message>'))
   })
 })

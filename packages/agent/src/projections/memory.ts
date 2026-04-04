@@ -11,6 +11,7 @@ import type { AppEvent, ResponsePart, StrategyId, ImageAttachment } from '../eve
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
+
 import { OutboundMessagesProjection } from './outbound-messages'
 import { compactionSummaryTag, buildSessionContextContent, TASK_TREE_COMPLETION_REMINDER } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
@@ -720,10 +721,13 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const sender = value.forkId === null ? null : getAgentByForkId(agentState, value.forkId)
       const senderAgentId = sender?.agentId ?? 'lead'
 
+      // Determine direction based on destination
+      const direction: 'to_lead' | 'from_lead' = value.destination.kind === 'worker' ? 'from_lead' : 'to_lead'
+
       const atom: AgentAtom = {
         kind: 'message',
         timestamp: value.timestamp,
-        direction: 'to_lead',
+        direction,
         text: value.text,
       }
 

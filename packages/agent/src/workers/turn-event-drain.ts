@@ -28,8 +28,7 @@ export function drainTurnEventStream<R>(
               forkId,
               turnId,
               id: event.id,
-              taskId: event.taskId,
-              to: event.to,
+              destination: event.destination,
             })
             break
           case 'MessageChunk':

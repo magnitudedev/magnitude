@@ -7,7 +7,7 @@
 
 import { Effect, Stream, Queue, Deferred, Scope, Data } from 'effect'
 import type { XmlRuntimeCrash, ToolCallEvent } from '@magnitudedev/xml-act'
-import type { ResponsePart } from '../events'
+import type { ResponsePart, MessageDestination } from '../events'
 import type { ExecuteResult } from './execution-manager'
 import type { CallUsage } from '@magnitudedev/providers'
 
@@ -25,7 +25,7 @@ import type { CallUsage } from '@magnitudedev/providers'
  */
 export type TurnEvent =
   // --- Message/thinking content ---
-  | { readonly _tag: 'MessageStart'; readonly id: string; readonly taskId: string | null; readonly to: string | null }
+  | { readonly _tag: 'MessageStart'; readonly id: string; readonly destination: MessageDestination }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
   | { readonly _tag: 'ThinkingDelta'; readonly text: string }

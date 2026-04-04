@@ -19,7 +19,7 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult, TurnResultError } from '../events'
+import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
@@ -732,6 +732,10 @@ const makeExecutionManager = Effect.gen(function* () {
                 const taskState = yield* taskProjection.get
 
                 const explicitTo = typeof event.to === 'string' ? event.to : null
+
+                // Resolve destination
+                let destination: MessageDestination
+
                 if (explicitTo !== null) {
                   if (explicitTo === 'user') {
                     if (forkId !== null) {
@@ -741,6 +745,7 @@ const makeExecutionManager = Effect.gen(function* () {
                       })
                       break
                     }
+                    destination = { kind: 'user' }
                   } else if (explicitTo === 'parent') {
                     if (forkId === null) {
                       turnErrors.push({
@@ -749,6 +754,7 @@ const makeExecutionManager = Effect.gen(function* () {
                       })
                       break
                     }
+                    destination = { kind: 'parent' }
                   } else {
                     const targetTask = taskState.tasks.get(explicitTo)
                     if (!targetTask) {
@@ -765,12 +771,20 @@ const makeExecutionManager = Effect.gen(function* () {
                       })
                       break
                     }
+                    destination = { kind: 'worker', taskId: explicitTo }
+                  }
+                } else {
+                  // No explicit `to` — resolve from context
+                  if (forkId === null) {
+                    destination = { kind: 'user' }
+                  } else {
+                    destination = defaultProseDest === 'user' ? { kind: 'user' } : { kind: 'parent' }
                   }
                 }
 
-                // Skip message directive for explicit task-targeted messages —
-                // they don't affect user reply counting and are routed by the projection
-                if (explicitTo === null || explicitTo === 'user' || explicitTo === 'parent') {
+                // Skip message directive for worker-targeted messages —
+                // they don't affect user reply counting
+                if (destination.kind !== 'worker') {
                   const messageResult = yield* handleTaskDirective({
                     kind: 'message',
                     scope: event.scope,
@@ -805,8 +819,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 yield* Queue.offer(sink, {
                   _tag: 'MessageStart',
                   id: event.id,
-                  taskId: event.taskId,
-                  to: explicitTo,
+                  destination,
                 })
                 break
               }

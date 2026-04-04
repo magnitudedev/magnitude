@@ -1,5 +1,5 @@
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart, TurnResultError } from '../events'
+import type { AppEvent, ResponsePart, TurnResultError, MessageDestination } from '../events'
 import type { ContentPart } from '../content'
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
@@ -16,7 +16,7 @@ export interface CanonicalTurnState {
   turnId: string | null
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
-  messages: Array<{ id: string; scope: 'top-level' | 'task'; taskId: string | null; text: string; order: number }>
+  messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
   toolCallMap: Map<string, number>
@@ -138,11 +138,9 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
     message_start: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
       const idx = fork.messages.length
-      const scope: 'top-level' | 'task' = event.taskId !== null ? 'task' : 'top-level'
       const nextMessages = [...fork.messages, {
         id: event.id,
-        scope,
-        taskId: event.taskId,
+        destination: event.destination,
         text: '',
         order: fork.orderCounter,
       }]
@@ -245,7 +243,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           thinkBlocks: fork.thinkBlocks,
           messages: [...fork.messages]
             .sort((a, b) => a.order - b.order)
-            .map(({ text }) => ({ text })),
+            .map(({ text, destination }) => ({ text, destination })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
             .map(({ tagName, input, query }) => ({ tagName, input, query })),

@@ -81,8 +81,7 @@ describe('memory integration scenarios', () => {
         forkId: 'f-sub',
         turnId: 'sub-turn',
         id: 'm1',
-        taskId: 'task-1',
-        to: null,
+        destination: { kind: 'parent' },
       })
       yield* h.send({
         type: 'message_chunk',

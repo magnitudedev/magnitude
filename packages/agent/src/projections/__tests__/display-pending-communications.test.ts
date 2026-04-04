@@ -57,9 +57,7 @@ describe('display pending communications promotion', () => {
         timestamp: ts(2),
         forkId: null,
         turnId: 't-parent',
-        scope: 'task',
-        taskId: 'task-1',
-        to: null,
+        destination: { kind: 'worker', taskId: 'task-1' },
       } as any)
       await harness.send({
         type: 'message_chunk',
@@ -211,9 +209,7 @@ describe('display pending communications promotion', () => {
         timestamp: ts(12),
         forkId: null,
         turnId: 't-parent-2',
-        scope: 'task',
-        taskId: 'task-2',
-        to: null,
+        destination: { kind: 'worker', taskId: 'task-2' },
       } as any)
       await harness.send({
         type: 'message_chunk',
@@ -319,9 +315,7 @@ describe('display pending communications promotion', () => {
         timestamp: ts(21),
         forkId: null,
         turnId: 't-root-explicit',
-        scope: 'top-level',
-        taskId: null,
-        to: 'task-explicit',
+        destination: { kind: 'worker', taskId: 'task-explicit' },
       } as any)
       await harness.send({
         type: 'message_chunk',

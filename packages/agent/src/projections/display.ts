@@ -682,11 +682,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         return fork
       }
 
-      // Skip messages routed to workers (task scope or explicit task target)
-      if (event.taskId !== null) {
-        return fork
-      }
-      if (event.to !== null && event.to !== 'user') {
+      // Skip messages not targeting user
+      if (event.destination.kind !== 'user') {
         return fork
       }
 

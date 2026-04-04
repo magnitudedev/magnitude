@@ -1,4 +1,5 @@
 import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, type XmlTagBinding } from '@magnitudedev/xml-act'
+import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
   about: string | null
@@ -8,7 +9,7 @@ export interface ThinkBlock {
 export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
-  messages: Array<{ text: string }>
+  messages: Array<{ text: string; destination: MessageDestination }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string }>
   turnDecision: 'continue' | 'yield'
 }
@@ -149,7 +150,10 @@ export function serializeCanonicalTurn(
   if (trace.messages.length > 0) {
     for (const msg of trace.messages) {
       const trimmedText = msg.text.trim()
-      parts.push(serializeTag('message', {}, trimmedText, []))
+      const attrs: Record<string, string> = {}
+      if (msg.destination.kind === 'worker') attrs.to = msg.destination.taskId
+      else if (msg.destination.kind === 'parent') attrs.to = 'parent'
+      parts.push(serializeTag('message', attrs, trimmedText, []))
     }
   }
 
