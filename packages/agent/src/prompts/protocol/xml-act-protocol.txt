@@ -1,18 +1,16 @@
 # Response Protocol
 
-You respond in an XML-like syntax with three core sections: think, comms, and actions.
+You respond in an XML-like syntax with four core constructs: lenses, message, task blocks, and turn control.
 
 ## Required Turn format
 
 <lenses>
 {{LENSES_EXAMPLE}}
 </lenses>
-{{COMMS_OPEN}}
-<message to="<recipient>">...message</message>
-{{COMMS_CLOSE}}
-{{ACTIONS_OPEN}}
-...zero or more actions
-{{ACTIONS_CLOSE}}
+<message>...optional message to parent...</message>
+<task id="..." type="..." title="...">
+  ...zero or more task/tool operations...
+</task>
 <{{TURN_CONTROL_NEXT}}/> OR <{{TURN_CONTROL_YIELD}}/>
 
 Your response must contain exactly ONE turn, never more than one. You must end your response and wait for turn to resolve before taking another.
@@ -23,22 +21,15 @@ Leading language is a message that implies action is about to be taken.
 Conclusive language is a message that indicates finality or asks a question.
 All language is either leading or conclusive.
 
-If a message in your response is leading, then you MUST perform actions in the same response.
-If a message in your response is conclusive, then you CANNOT perform actions in the same response.
+If a message in your response is leading, then you MUST perform task/tool operations in the same response.
+If a message in your response is conclusive, then you CANNOT perform task/tool operations in the same response.
 
 ## Response parsing
 
 This is NOT a standard XML parser. It reads tag structure but treats all content as raw text — no entity processing, no escaping.
 WRONG: `&lt;div&gt;`, `&amp;`, `&quot;`
 RIGHT: `<div>`, `&`, `"`
-This applies everywhere — thinking, comms, action bodies, and action attributes. Escaping will corrupt your output (e.g., a file edit with `&lt;` instead of `<` will fail to match).
-
-## Turn order
-
-Each turn requires comms first, THEN actions.
-You cannot communicate the results of a turn in the same turn, because you don't have the results yet.
-Chain with another turn to take more actions and/or to communicate results.
-If an action fails, you will always recieve another turn to correct your mistake regardless of whether you chose to yield or not.
+This applies everywhere — thinking, message bodies, task bodies, and action attributes. Escaping will corrupt your output (e.g., a file edit with `&lt;` instead of `<` will fail to match).
 
 {{TURN_CONTROL_SECTION}}
 
@@ -59,32 +50,43 @@ You MUST include each lens with an applicable trigger condition.
 
 {{THINKING_LENSES}}
 
-## Comms
+## Message routing
 
-The comms block is used to communicate with the {{DEFAULT_RECIPIENT}} and with other agents.
-The "{{DEFAULT_RECIPIENT}}" recipient is your primary communication target. Any other recipient is interpreted as an agent ID.
-You can send multiple messages in one comms block.
-```
-{{COMMS_OPEN}}
-<message to="{{DEFAULT_RECIPIENT}}">Hello!</message>
-<message to="other-agent-id">What is the progress?</message>
-{{COMMS_CLOSE}}
-```
+Message routing is positional.
 
-If the {{DEFAULT_RECIPIENT}} has just messaged you, you should message them back immediately, even if you are also taking actions, to keep them in the loop.
+- A top-level `<message>` routes to your parent.
+- A `<message>` inside a `<task>` routes to the worker assigned to that task.
 
-### Message format
+You can send multiple messages in one turn, and messages may appear before, between, or after task blocks.
 
 Messages support GFM-style markdown syntax. Messages also support inline links to local file content or URLs. You can also link directly to your workspace e.g. [foo]($M/foo.md).
 
 When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
 
-## Actions
+## Task blocks
 
-Take 0 or more actions using tools.
-If you are asking the user a question or are waiting on subagents to complete work, taking no actions can be appropriate.
+`task` is the work container. All task operations, tool use, and worker communication happen inside task blocks.
 
-Tool calls, their parameters, and their outputs are all represented as XML-like elements.
+A new task requires `id`, `type`, and `title`. Use `parent` to place it under an existing task. Tasks can also be nested directly.
+
+Referencing an existing task by `id` alone operates on it. Self-closing tags with `status` update metadata:
+<task id="impl-parser" status="completed" />
+
+`assign` inside a task delegates it to a worker role. Only the lead can assign:
+<task id="impl-parser" type="implement" title="Implement parser updates">
+  <assign role="builder">Implement Unit A from the plan.</assign>
+</task>
+
+A `<message>` inside a task routes to that task's assigned worker. A top-level `<message>` routes to your parent.
+
+Lead agents run tools inside task blocks. Workers run tools at top level within their assigned task scope, and may create subtasks under their assigned task.
+
+## Task/tool operations
+
+Take 0 or more operations per turn.
+If you are asking a question or waiting on workers, taking no operations can be appropriate.
+
+Tool calls, their parameters, and their outputs are represented as XML-like elements.
 
 ### Observe
 

@@ -33,7 +33,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, formatNonexistentAgentError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_TASK_REMINDER, formatNonexistentAgentError, formatTaskOutsideSubtreeError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
@@ -49,7 +49,7 @@ import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
 import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
-import { TaskGraphProjection, type TaskGraphState } from '../projections/task-graph'
+import { TaskGraphProjection, type TaskGraphState, type TaskStatus } from '../projections/task-graph'
 
 import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
 import { bindObservable } from '@magnitudedev/roles'
@@ -68,6 +68,7 @@ const { ForkContext } = Fork
 type AgentDef = RoleDefinition
 
 import { mapXmlToolResult } from '../util/tool-result'
+import { assignTaskOperation, cancelTaskOperation, createTaskOperation, updateTaskOperation } from '../tools/task-tools'
 
 // =============================================================================
 // Types
@@ -104,7 +105,14 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkTurnState>
+    Projection.ProjectionInstance<AgentRoutingState>
+    | Projection.ProjectionInstance<AgentStatusState>
+    | Projection.ProjectionInstance<TaskGraphState>
+    | Projection.ForkedProjectionInstance<ReactorState>
+    | Projection.ForkedProjectionInstance<ForkTurnState>
+    | WorkerBusService<AppEvent>
+    | TaskGraphStateReaderTag
+    | ConversationStateReaderTag
   >
 
   /**
@@ -390,9 +398,22 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolsCalledKeys: ToolKey[] = []
       let lastToolKey: ToolKey | null = null
       const toolCalls: TurnToolCall[] = []
-      const messagesSent: Array<{ id: string, dest: string }> = []
+      const messagesSent: Array<{ id: string, taskId: string | null }> = []
       let hasAnyMessage = false
       let directUserRepliesSent = 0
+      const taskTouchedThisTurn = new Set<string>()
+      const isTaskInAssignedSubtree = (
+        taskState: TaskGraphState,
+        candidateParentId: string,
+        assignedTaskId: string,
+      ): boolean => {
+        let current: string | null = candidateParentId
+        while (current !== null) {
+          if (current === assignedTaskId) return true
+          current = taskState.tasks.get(current)?.parentId ?? null
+        }
+        return false
+      }
 
       // Track tool input (ToolInputReady provides the parsed input)
       const toolInputs = new Map<string, unknown>()
@@ -706,19 +727,25 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Messages / Think prose ---
               case 'MessageStart': {
-                let resolvedDest = event.dest
-                if (forkId !== null && event.dest === 'user') {
-                  if (!allowSingleUserReplyThisTurn || directUserRepliesSent >= 1) {
-                    resolvedDest = 'parent'
-                  } else {
-                    directUserRepliesSent += 1
+                let resolvedDest: string
+                if (event.scope === 'top-level') {
+                  resolvedDest = defaultProseDest
+                  if (forkId !== null && resolvedDest === 'user') {
+                    if (!allowSingleUserReplyThisTurn || directUserRepliesSent >= 1) {
+                      resolvedDest = 'parent'
+                    } else {
+                      directUserRepliesSent += 1
+                    }
                   }
+                } else {
+                  const taskState = yield* TaskGraphProjection.Tag.pipe(Effect.flatMap((p) => p.get))
+                  const task = event.taskId ? taskState.tasks.get(event.taskId) : undefined
+                  resolvedDest = task?.worker?.agentId ?? 'parent'
                 }
 
-                messagesSent.push({ id: event.id, dest: resolvedDest })
+                messagesSent.push({ id: event.id, taskId: event.taskId })
                 hasAnyMessage = true
 
-                // Validate agent message destinations inline during execution
                 if (resolvedDest !== 'user' && resolvedDest !== 'parent') {
                   const currentAgentState = yield* agentRoutingProjectionInst.get
                   const targetAgent = isActiveRoute(currentAgentState, resolvedDest)
@@ -731,7 +758,11 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
                 }
 
-                yield* Queue.offer(sink, { _tag: 'MessageStart', id: event.id, dest: resolvedDest })
+                yield* Queue.offer(sink, {
+                  _tag: 'MessageStart',
+                  id: event.id,
+                  taskId: event.taskId,
+                })
                 break
               }
 
@@ -796,11 +827,139 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
+              case 'TaskStarted': {
+                const taskProjection = yield* TaskGraphProjection.Tag
+                const taskState = yield* taskProjection.get
+                const existing = taskState.tasks.get(event.id)
+
+                if (!existing) {
+                  const parentId = event.explicitParent ?? event.parent ?? null
+
+                  if (forkId !== null) {
+                    const currentAgent = getAgentByForkId(agentState, forkId)
+                    const assignedTaskId = currentAgent?.taskId?.trim() ? currentAgent.taskId : null
+
+                    if (assignedTaskId) {
+                      const allowed =
+                        parentId !== null &&
+                        isTaskInAssignedSubtree(taskState, parentId, assignedTaskId)
+
+                      if (!allowed) {
+                        const attemptedParent = parentId ?? '(none)'
+                        turnErrors.push({
+                          code: 'task_outside_assigned_subtree',
+                          message: formatTaskOutsideSubtreeError(event.id, attemptedParent, assignedTaskId),
+                        })
+                        break
+                      }
+                    }
+                  }
+
+                  if (event.taskType && event.title) {
+                    const createResult = yield* createTaskOperation({
+                      taskId: event.id,
+                      type: event.taskType,
+                      parent: parentId,
+                      after: event.after,
+                      title: event.title,
+                    }).pipe(
+                      Effect.provideService(ForkContext, { forkId }),
+                      Effect.provide(executionLayer),
+                    )
+                    if (!createResult.success) {
+                      turnErrors.push({
+                        code: 'task_operation_error',
+                        message: createResult.error,
+                      })
+                    }
+                  }
+                }
+                break
+              }
+
+              case 'TaskPatched': {
+                const updateResult = event.status === 'cancelled'
+                  ? yield* cancelTaskOperation({
+                    taskId: event.id,
+                  }).pipe(
+                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provide(executionLayer),
+                  )
+                  : yield* updateTaskOperation({
+                    taskId: event.id,
+                    parent: event.explicitParent ?? event.parent ?? undefined,
+                    after: event.after,
+                    title: event.title,
+                    status: (event.status as TaskStatus | null) ?? undefined,
+                  }).pipe(
+                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provide(executionLayer),
+                  )
+                if (!updateResult.success) {
+                  turnErrors.push({
+                    code: 'task_operation_error',
+                    message: updateResult.error,
+                  })
+                }
+                break
+              }
+
+              case 'TaskDelegated': {
+                const taskProjection = yield* TaskGraphProjection.Tag
+                const taskState = yield* taskProjection.get
+                const task = taskState.tasks.get(event.taskId)
+                if (task?.status === 'completed' && !taskTouchedThisTurn.has(event.taskId)) {
+                  taskTouchedThisTurn.add(event.taskId)
+                  const reopenResult = yield* updateTaskOperation({
+                    taskId: event.taskId,
+                    status: 'pending',
+                  }).pipe(
+                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provide(executionLayer),
+                  )
+                  if (!reopenResult.success) {
+                    turnErrors.push({
+                      code: 'task_operation_error',
+                      message: reopenResult.error,
+                    })
+                  }
+                }
+                const assignResult = yield* assignTaskOperation({
+                  taskId: event.taskId,
+                  assignee: event.role,
+                  message: event.body,
+                  spawnWorker: (params) => service.fork({
+                    parentForkId: params.parentForkId,
+                    name: params.name,
+                    agentId: params.agentId,
+                    prompt: params.prompt,
+                    message: params.message,
+                    mode: 'spawn',
+                    role: params.role,
+                    taskId: params.taskId,
+                  }),
+                }).pipe(
+                  Effect.provideService(ForkContext, { forkId }),
+                  Effect.provide(executionLayer),
+                )
+                if (!assignResult.success) {
+                  turnErrors.push({
+                    code: 'task_operation_error',
+                    message: assignResult.error,
+                  })
+                }
+                break
+              }
+
+              case 'TaskFinished': {
+                break
+              }
+
               case 'StructuralParseError': {
                 if (event.error._tag === 'UnclosedThink') {
                   turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
-                } else if (event.error._tag === 'UnclosedContainer') {
-                  turnErrors.push({ code: 'unclosed_actions', message: UNCLOSED_ACTIONS_REMINDER })
+                } else if (event.error._tag === 'UnclosedTask') {
+                  turnErrors.push({ code: 'unclosed_task', message: UNCLOSED_TASK_REMINDER })
                 }
                 break
               }

@@ -3,7 +3,7 @@
  *
  * Tracks the clean user↔lead conversation for the root fork.
  * User messages come from user_message events.
- * Lead prose comes from message_* events filtered to dest='user'.
+ * Lead prose comes from top-level message_* events.
  * Turn boundaries flush accumulated prose into a conversation entry.
  *
  * Used by the reviewer agent to get injected with user intent context.
@@ -51,7 +51,7 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
 
     message_start: ({ event, state }) => {
       if (event.forkId !== null) return state
-      if (event.dest !== 'user') return state
+      if (event.taskId !== null) return state
       return {
         ...state,
         userMessageIds: new Set(state.userMessageIds).add(event.id),

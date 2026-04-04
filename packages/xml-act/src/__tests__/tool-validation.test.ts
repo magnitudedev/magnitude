@@ -44,7 +44,7 @@ function eventsOfType<T extends XmlRuntimeEvent['_tag']>(
 }
 
 function responseWithActions(actionsXml: string): string {
-  return `<lenses></lenses><comms></comms><actions>${actionsXml}</actions><yield/>`
+  return `<lenses></lenses><task id="t2"></task><task id="t1">${actionsXml}</task><yield/>`
 }
 
 // 1) Tool with both attrs and childTags

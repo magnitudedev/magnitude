@@ -39,10 +39,10 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
       '<lenses>',
       '<lens name="intent">planning</lens>',
       '</lenses>',
-      '<comms>',
-      '<message to="user">Implementing now.</message>',
-      '</comms>',
-      '<actions>',
+      '<task id="t2">',
+      '<message>Implementing now.</message>',
+      '</task>',
+      '<task id="t1">',
       '<agent-create agentId="builder-1" type="builder" observe=".">',
       '<title>Unit 1</title>',
       '<message>Do thing 1</message>',
@@ -64,7 +64,7 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
       '<title>Unit 3</title>',
       '<message>Do thing 3</message>',
       '</agent-create>',
-      '</actions>',
+      '</task>',
       '<yield/>',
     ].join('\n')
 
@@ -81,7 +81,7 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
     const p2 = createStreamingXmlParser(subagentTags, subagentChildMap, undefined, undefined, 'user')
     const p3 = createStreamingXmlParser(parentTags, parentChildMap, undefined, undefined, 'user')
 
-    const xml = '<actions>\n<agent-create agentId="x" type="builder" observe=".">\n<title>T</title>\n<message>M</message>\n</agent-create>\n</actions>\n<yield/>'
+    const xml = '<task id="t1">\n<agent-create agentId="x" type="builder" observe=".">\n<title>T</title>\n<message>M</message>\n</agent-create>\n</task>\n<yield/>'
 
     const e1 = [...p1.processChunk(xml), ...p1.flush()]
     const e3 = [...p3.processChunk(xml), ...p3.flush()]

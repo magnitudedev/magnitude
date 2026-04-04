@@ -4,10 +4,11 @@ import type { ParseEvent } from '../format/types'
 import {
   LENSES_OPEN,
   LENSES_CLOSE,
-  COMMS_OPEN,
-  COMMS_CLOSE,
   TURN_CONTROL_YIELD,
 } from '../constants'
+
+const TASK_OPEN = '<task id="t2">'
+const TASK_CLOSE = '</task>'
 
 function parse(xml: string): ParseEvent[] {
   const parser = createStreamingXmlParser()
@@ -23,15 +24,15 @@ function parseChunks(chunks: string[]): ParseEvent[] {
 }
 
 describe('prose whitespace trimming', () => {
-  it('no whitespace-only ProseChunk between lenses and comms', () => {
+  it('no whitespace-only ProseChunk between lenses and task blocks', () => {
     const xml = [
       LENSES_OPEN,
       '\n<lens name="intent">Just a greeting.</lens>\n',
       LENSES_CLOSE,
       '\n',
-      COMMS_OPEN,
-      '\n<message to="user">Hey!</message>\n',
-      COMMS_CLOSE,
+      TASK_OPEN,
+      '\n<message>Hey!</message>\n',
+      TASK_CLOSE,
       '\n',
       TURN_CONTROL_YIELD,
     ].join('')
@@ -52,9 +53,9 @@ describe('prose whitespace trimming', () => {
       '\n<lens name="intent">Just a greeting.</lens>\n',
       LENSES_CLOSE,
       '\n',
-      COMMS_OPEN,
-      '\n<message to="user">Hey!</message>\n',
-      COMMS_CLOSE,
+      TASK_OPEN,
+      '\n<message>Hey!</message>\n',
+      TASK_CLOSE,
       '\n',
       TURN_CONTROL_YIELD,
     ].join('')
@@ -82,11 +83,11 @@ describe('prose whitespace trimming', () => {
     expect(combined).toContain('Hello world')
   })
 
-  it('whitespace-only prose between lenses and comms across chunks', () => {
+  it('whitespace-only prose between lenses and task blocks across chunks', () => {
     const chunks = [
       LENSES_OPEN + '\n<lens name="turn">planning</lens>\n' + LENSES_CLOSE,
-      '\n' + COMMS_OPEN + '\n<message to="user">Hey Anders! What can',
-      ' I help you with?</message>\n' + COMMS_CLOSE + '\n' + TURN_CONTROL_YIELD,
+      '\n' + TASK_OPEN + '\n<message>Hey Anders! What can',
+      ' I help you with?</message>\n' + TASK_CLOSE + '\n' + TURN_CONTROL_YIELD,
     ]
 
     const events = parseChunks(chunks)

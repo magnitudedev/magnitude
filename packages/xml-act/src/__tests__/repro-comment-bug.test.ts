@@ -31,7 +31,7 @@ describe('repro: comment with <-- does not corrupt prose', () => {
 The ref ID (\`toolCallId\`) is on \`ToolEvent\` which is a streaming event, not stored on \`TurnToolCall\`. So to avoid duplication — what's your thinking? Should the ref ID just live on \`TurnToolCall\` since it's genuinely part of the tool call record, not a duplicate?`
 
     const allEvents: any[] = []
-    const knownTags = new Set(['think', 'actions', 'shell'])
+    const knownTags = new Set(['think', 'task', 'shell'])
     const childTagMap = new Map<string, Set<string>>()
     const parser = createStreamingXmlParser(knownTags, childTagMap, undefined, undefined)
 

@@ -50,7 +50,7 @@ export type Policy<T extends ToolCatalog, TCtx> = PolicyFragment<T, TCtx>[]
 export interface TurnContext<TCtx = Record<string, never>> {
   readonly toolsCalled: string[]
   readonly lastTool: string | null
-  readonly messagesSent: readonly { readonly id: string; readonly dest: string }[]
+  readonly messagesSent: readonly { readonly id: string; readonly taskId: string | null }[]
   readonly error?: unknown
   readonly cancelled?: boolean
   readonly state: TCtx

@@ -1,18 +1,18 @@
 import { xmlActContent } from './content'
 import { xmlActFlush } from './flush'
 import { finishHandler } from './handlers/finish'
-import { containerHandler } from './handlers/container'
+import { assignHandler } from './handlers/assign'
 import { messageHandler } from './handlers/message'
+import { taskHandler } from './handlers/task'
 import { lensHandler, thinkHandler } from './handlers/think'
 import { childHandler, toolHandler } from './handlers/tool'
 import { turnControlHandler } from './handlers/turn-control'
-import { HANDLE, PASS } from './types'
 import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
 
 export function createXmlActFormat(
   tools: readonly ToolDef[],
-  defaultMessageDest: string,
+  _defaultMessageDest: string,
   aliases?: ReadonlyMap<string, string>,
 ): {
   readonly format: Format<XmlActFrame, XmlActEvent>
@@ -24,14 +24,13 @@ export function createXmlActFormat(
   const aliasMap = aliases ?? new Map<string, string>([
     ['thinking', 'think'],
     ['lenses', 'lenses'],
-    ['reason', 'think'],
-    ['tooluse', 'actions'],
-    ['respond', 'comms'],
   ])
 
   const messageTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
   const insideLensTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
   const plainThinkTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
+  const topLevelTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
+  const taskFrameTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
   const betweenLensTags: TagMap = structuralTags
 
   const lens = lensHandler(betweenLensTags, insideLensTags)
@@ -40,13 +39,16 @@ export function createXmlActFormat(
   const think = thinkHandler('lenses', betweenLensTags, plainThinkTags)
   const lenses = thinkHandler('lenses', betweenLensTags, plainThinkTags)
   const thinking = thinkHandler('lenses', betweenLensTags, plainThinkTags)
+  const message = messageHandler(messageTags)
+  const assign = assignHandler(taskFrameTags)
+  const task = taskHandler(taskFrameTags)
 
-  handlers.set('actions', containerHandler('actions', structuralTags))
-  handlers.set('comms', containerHandler('comms', structuralTags))
   handlers.set('think', think)
   handlers.set('lenses', lenses)
   handlers.set('thinking', thinking)
-  handlers.set('message', messageHandler(defaultMessageDest, messageTags))
+  handlers.set('message', message)
+  handlers.set('task', task)
+  handlers.set('assign', assign)
   handlers.set('next', turnControlHandler('continue'))
   handlers.set('yield', turnControlHandler('yield'))
   handlers.set('finish', finishHandler())
@@ -61,6 +63,7 @@ export function createXmlActFormat(
       toolTags.set(tool.tag, selfToolHandler)
     }
     handlers.set(tool.tag, selfToolHandler)
+    taskFrameTags.set(tool.tag, selfToolHandler)
   }
 
   const messageEntry = handlers.get('message')
@@ -68,23 +71,30 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  const lensEntry = handlers.get('lens')
-  if (lensEntry) {
-    insideLensTags.set('lens', lensEntry)
+  for (const tag of ['message', 'task', 'assign', 'next', 'yield', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
+    const handler = handlers.get(tag)
+    if (handler) topLevelTags.set(tag, handler)
   }
-  const lensesEntry = handlers.get('lenses')
-  if (lensesEntry) {
-    insideLensTags.set('lenses', lensesEntry)
+  for (const tool of tools) {
+    const handler = handlers.get(tool.tag)
+    if (handler) topLevelTags.set(tool.tag, handler)
   }
 
+  for (const tag of ['message', 'assign', 'task', 'next', 'yield']) {
+    const handler = handlers.get(tag)
+    if (handler) taskFrameTags.set(tag, handler)
+  }
+
+  const lensEntry = handlers.get('lens')
+  if (lensEntry) insideLensTags.set('lens', lensEntry)
+  const lensesEntry = handlers.get('lenses')
+  if (lensesEntry) insideLensTags.set('lenses', lensesEntry)
+
   const thinkEntry = handlers.get('think')
-  if (thinkEntry) {
-    plainThinkTags.set('think', thinkEntry)
-  }
+  if (thinkEntry) plainThinkTags.set('think', thinkEntry)
   const thinkingEntry = handlers.get('thinking')
-  if (thinkingEntry) {
-    plainThinkTags.set('thinking', thinkingEntry)
-  }
+  if (thinkingEntry) plainThinkTags.set('thinking', thinkingEntry)
+
   for (const [alias, canonical] of aliasMap) {
     if (canonical === 'think') {
       const aliasThink = handlers.get('think')
@@ -96,7 +106,7 @@ export function createXmlActFormat(
     }
   }
 
-  for (const [tag, handler] of handlers) {
+  for (const [tag, handler] of topLevelTags) {
     structuralTags.set(tag, handler)
   }
   for (const [alias, canonical] of aliasMap) {
@@ -131,8 +141,8 @@ export function createCurrentFormat(
   readonly format: Format<XmlActFrame, XmlActEvent>
   readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
   readonly tags: {
-    readonly actions: 'actions'
-    readonly comms: 'comms'
+    readonly task: 'task'
+    readonly assign: 'assign'
     readonly think: 'think'
     readonly message: 'message'
     readonly next: 'next'
@@ -145,46 +155,9 @@ export function createCurrentFormat(
     format,
     structuralTags,
     tags: {
-      actions: 'actions',
-      comms: 'comms',
+      task: 'task',
+      assign: 'assign',
       think: 'think',
-      message: 'message',
-      next: 'next',
-      yield: 'yield',
-      finish: 'finish',
-    },
-  }
-}
-
-export function createAltFormat(
-  tools: readonly ToolDef[],
-  defaultMessageDest = 'user',
-): {
-  readonly format: Format<XmlActFrame, XmlActEvent>
-  readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
-  readonly tags: {
-    readonly actions: 'tooluse'
-    readonly comms: 'respond'
-    readonly think: 'reason'
-    readonly message: 'message'
-    readonly next: 'next'
-    readonly yield: 'yield'
-    readonly finish: 'finish'
-  }
-} {
-  const aliases = new Map<string, string>([
-    ['tooluse', 'actions'],
-    ['respond', 'comms'],
-    ['reason', 'think'],
-  ])
-  const { format, structuralTags } = createXmlActFormat(tools, defaultMessageDest, aliases)
-  return {
-    format,
-    structuralTags,
-    tags: {
-      actions: 'tooluse',
-      comms: 'respond',
-      think: 'reason',
       message: 'message',
       next: 'next',
       yield: 'yield',
@@ -211,7 +184,8 @@ export type {
 export { xmlActContent } from './content'
 export { xmlActFlush } from './flush'
 export { xmlActUnknownOpen, xmlActUnknownClose } from './unknown'
-export { containerHandler } from './handlers/container'
+export { taskHandler } from './handlers/task'
+export { assignHandler } from './handlers/assign'
 export { thinkHandler, lensHandler } from './handlers/think'
 export { messageHandler } from './handlers/message'
 export { toolHandler, childHandler } from './handlers/tool'

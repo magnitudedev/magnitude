@@ -5,12 +5,12 @@ import type { ParseEvent } from '../format/types'
 const TURN_CONTROL_NEXT = 'next'
 const TURN_CONTROL_YIELD = 'yield'
 const TURN_CONTROL_FINISH = 'finish'
-const actionsTagOpen = () => '<actions>'
-const actionsTagClose = () => '</actions>'
+const actionsTagOpen = () => '<task id="t1">'
+const actionsTagClose = () => '</task>'
 const thinkTagOpen = () => '<think>'
 const thinkTagClose = () => '</think>'
-const commsTagOpen = () => '<comms>'
-const commsTagClose = () => '</comms>'
+const commsTagOpen = () => '<task id="t2">'
+const commsTagClose = () => '</task>'
 
 const knownTags = new Set(['shell', 'read'])
 const childTagMap = new Map<string, Set<string>>()
@@ -125,7 +125,7 @@ describe('turn control after content blocks', () => {
   })
 
   it('after comms block', () => {
-    const xml = `${commsTagOpen()}\n<message to="user">hello</message>\n${commsTagClose()}\n<${TURN_CONTROL_YIELD}/>`
+    const xml = `${commsTagOpen()}\n<message>hello</message>\n${commsTagClose()}\n<${TURN_CONTROL_YIELD}/>`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -135,7 +135,7 @@ describe('turn control after content blocks', () => {
   it('after think + comms + actions', () => {
     const xml = [
       `${thinkTagOpen()}plan\n${thinkTagClose()}`,
-      `${commsTagOpen()}\n<message to="user">hi</message>\n${commsTagClose()}`,
+      `${commsTagOpen()}\n<message>hi</message>\n${commsTagClose()}`,
       `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}`,
       `<${TURN_CONTROL_NEXT}/>`,
     ].join('\n')
@@ -148,7 +148,7 @@ describe('turn control after content blocks', () => {
   it('after think + comms + actions (char-by-char)', () => {
     const xml = [
       `${thinkTagOpen()}plan\n${thinkTagClose()}`,
-      `${commsTagOpen()}\n<message to="user">hi</message>\n${commsTagClose()}`,
+      `${commsTagOpen()}\n<message>hi</message>\n${commsTagClose()}`,
       `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}`,
       `<${TURN_CONTROL_NEXT}/>`,
     ].join('\n')
@@ -256,12 +256,12 @@ describe('turn control inside blocks auto-closes and is recognized', () => {
     expect(tc[0].decision).toBe('yield')
   })
 
-  it('inside actions block with <finish>evidence</finish> — auto-closes and emits finish', () => {
+  it('inside actions block with <finish>evidence</finish> is ignored in task scope', () => {
     const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_FINISH}>verified</${TURN_CONTROL_FINISH}>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
+    expect(tc).toHaveLength(0)
+    expect(parseErrors(events)).toHaveLength(0)
   })
 })
 

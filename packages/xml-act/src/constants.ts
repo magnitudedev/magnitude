@@ -1,7 +1,7 @@
-export const ACTIONS_OPEN = '<actions>'
-export const ACTIONS_CLOSE = '</actions>'
-export const COMMS_OPEN = '<comms>'
-export const COMMS_CLOSE = '</comms>'
+export const TASK_OPEN = '<task>'
+export const TASK_CLOSE = '</task>'
+export const ASSIGN_OPEN = '<assign>'
+export const ASSIGN_CLOSE = '</assign>'
 export const LENSES_OPEN = '<lenses>'
 export const LENSES_CLOSE = '</lenses>'
 
@@ -13,6 +13,8 @@ export const AGENT_CREATE_TAG = 'agent-create'
 export const TITLE_TAG = 'title'
 export const MESSAGE_TAG = 'message'
 export const LENS_TAG = 'lens'
+export const TASK_TAG = 'task'
+export const ASSIGN_TAG = 'assign'
 
 export const AGENT_CREATE_OPEN_PREFIX = '<agent-create'
 export const AGENT_CREATE_CLOSE = '</agent-create>'
@@ -29,8 +31,11 @@ export const xmlClose = (tag: string) => `</${tag}>`
 export const lensOpen = (name: string) => xmlOpen(LENS_TAG, { name })
 export const lensClose = () => xmlClose(LENS_TAG)
 
-export const messageOpen = (to: string) => xmlOpen(MESSAGE_TAG, { to })
+export const messageOpen = () => xmlOpen(MESSAGE_TAG)
 export const messageClose = () => MESSAGE_CLOSE
+
+export const taskOpen = (attrs?: Record<string, string>) => xmlOpen(TASK_TAG, attrs)
+export const taskClose = () => xmlClose(TASK_TAG)
 
 export const agentCreateOpen = (
   attrs: { id: string; type: string; [key: string]: string },

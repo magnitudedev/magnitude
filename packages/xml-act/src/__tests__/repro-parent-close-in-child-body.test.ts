@@ -14,7 +14,7 @@ describe('parent tool close tag inside child body is passthrough', () => {
 
     // Build input with literal </edit> inside <old> body
     // Using concatenation so our own parser doesn't consume it
-    const input = '<actions>\n<edit path="foo.ts">\n<old>before <' + '/edit> after<' + '/old>\n<new>replacement<' + '/new>\n<' + '/edit>\n<' + '/actions>\n<next/>'
+    const input = '<task id="t1">\n<edit path="foo.ts">\n<old>before <' + '/edit> after<' + '/old>\n<new>replacement<' + '/new>\n<' + '/edit>\n<' + '/task>\n<next/>'
 
     const events = [...parser.processChunk(input), ...parser.flush()]
 
@@ -36,9 +36,9 @@ describe('parent tool close tag inside child body is passthrough', () => {
     const parser = createStreamingXmlParser(knownTags, childTagMap)
 
     const chunks = [
-      '<actions>\n<edit path="foo.ts">\n<old>before ',
+      '<task id="t1">\n<edit path="foo.ts">\n<old>before ',
       '<' + '/edit>',
-      ' after<' + '/old>\n<new>replacement<' + '/new>\n<' + '/edit>\n<' + '/actions>\n<next/>',
+      ' after<' + '/old>\n<new>replacement<' + '/new>\n<' + '/edit>\n<' + '/task>\n<next/>',
     ]
 
     let events: XmlActEvent[] = []
@@ -63,7 +63,7 @@ describe('parent tool close tag inside child body is passthrough', () => {
     const childTagMap = new Map([['edit', new Set(['old', 'new'])]])
     const parser = createStreamingXmlParser(knownTags, childTagMap)
 
-    const input = '<actions>\n<edit path="foo.ts">\n<old>has <' + '/edit> and <' + '/write> and <' + '/edit> inside<' + '/old>\n<new>ok<' + '/new>\n<' + '/edit>\n<' + '/actions>\n<next/>'
+    const input = '<task id="t1">\n<edit path="foo.ts">\n<old>has <' + '/edit> and <' + '/write> and <' + '/edit> inside<' + '/old>\n<new>ok<' + '/new>\n<' + '/edit>\n<' + '/task>\n<next/>'
 
     const events = [...parser.processChunk(input), ...parser.flush()]
 

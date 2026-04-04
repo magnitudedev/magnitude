@@ -29,31 +29,31 @@ function getTagOpened(events: ParseEvent[], tagName: string): Extract<ParseEvent
 
 describe('empty toolCallId repro', () => {
   it('repro: no-attributes tool tag should still have non-empty toolCallId (currently fails)', () => {
-    const events = parse('<actions>\n<shell>echo hello</shell>\n</actions>\n<next/>')
+    const events = parse('<task id="t1">\n<shell>echo hello</shell>\n</task>\n<next/>')
     const opened = getTagOpened(events, 'shell')
     expect(opened.toolCallId).toBeTruthy()
   })
 
   it('with attributes, tool tag gets non-empty toolCallId (working path)', () => {
-    const events = parse('<actions>\n<shell timeout="10">echo hello</shell>\n</actions>\n<next/>')
+    const events = parse('<task id="t1">\n<shell timeout="10">echo hello</shell>\n</task>\n<next/>')
     const opened = getTagOpened(events, 'shell')
     expect(opened.toolCallId).toBeTruthy()
   })
 
   it('self-closing read with attribute and no space before /> gets non-empty toolCallId', () => {
-    const events = parse('<actions>\n<read path="x.ts"/>\n</actions>\n<next/>')
+    const events = parse('<task id="t1">\n<read path="x.ts"/>\n</task>\n<next/>')
     const opened = getTagOpened(events, 'read')
     expect(opened.toolCallId).toBeTruthy()
   })
 
   it('self-closing read with attribute and space before /> gets non-empty toolCallId', () => {
-    const events = parse('<actions>\n<read path="x.ts" />\n</actions>\n<next/>')
+    const events = parse('<task id="t1">\n<read path="x.ts" />\n</task>\n<next/>')
     const opened = getTagOpened(events, 'read')
     expect(opened.toolCallId).toBeTruthy()
   })
 
   it('char-by-char repro: no-attributes tool tag should still have non-empty toolCallId (currently fails)', () => {
-    const events = parseCharByChar('<actions>\n<shell>echo hello</shell>\n</actions>\n<next/>')
+    const events = parseCharByChar('<task id="t1">\n<shell>echo hello</shell>\n</task>\n<next/>')
     const opened = getTagOpened(events, 'shell')
     expect(opened.toolCallId).toBeTruthy()
   })

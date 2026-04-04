@@ -1,4 +1,4 @@
-import { Effect, Stream, Schedule, Duration, Scope, Exit, Option, Sink } from 'effect'
+import { Effect, Stream, Schedule, Duration, Scope, Exit, Option, Sink, Cause } from 'effect'
 import type { Model } from '../model/model'
 import type { ModelConnection } from '../model/model-connection'
 import type { InferenceConfig } from '../model/inference-config'

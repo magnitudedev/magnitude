@@ -1,9 +1,10 @@
 import { describe, test, expect } from 'bun:test'
 
 /**
- * Tests the nonexistent agent ID validation logic used in execution-manager.ts at ExecutionEnd.
- * This mirrors the inline validation: filter sentMessages for non-user/non-parent dests,
- * check against non-completed forks, flag invalid destinations.
+ * Tests the nonexistent agent ID validation logic used in execution-manager.ts.
+ * This mirrors inline validation over resolved message targets:
+ * filter non-user/non-parent targets, check against non-completed forks,
+ * and flag invalid agent IDs.
  */
 
 interface MinimalFork {
@@ -11,47 +12,47 @@ interface MinimalFork {
   status: 'working' | 'completed'
 }
 
-function findInvalidAgentDests(
-  messagesSent: readonly { id: string; dest: string }[],
+function findInvalidAgentTargets(
+  messagesSent: readonly { id: string; target: string }[],
   forks: Map<string, MinimalFork>
 ): string[] {
-  const agentDests = messagesSent.filter(m => m.dest !== 'user' && m.dest !== 'parent')
-  if (agentDests.length === 0) return []
+  const agentTargets = messagesSent.filter(m => m.target !== 'user' && m.target !== 'parent')
+  if (agentTargets.length === 0) return []
   const knownAgentIds = new Set([...forks.values()].filter(f => f.status === 'working').map(f => f.agentId))
-  return agentDests.filter(m => !knownAgentIds.has(m.dest)).map(m => m.dest)
+  return agentTargets.filter(m => !knownAgentIds.has(m.target)).map(m => m.target)
 }
 
 describe('nonexistent agent destination validation', () => {
   test('returns empty for messages to user/parent', () => {
     const messages = [
-      { id: '1', dest: 'user' },
-      { id: '2', dest: 'parent' },
+      { id: '1', target: 'user' },
+      { id: '2', target: 'parent' },
     ]
-    expect(findInvalidAgentDests(messages, new Map())).toEqual([])
+    expect(findInvalidAgentTargets(messages, new Map())).toEqual([])
   })
 
   test('returns empty when agent exists and is working', () => {
     const forks = new Map([
       ['fork-1', { agentId: 'my-explorer', status: 'working' as const }],
     ])
-    const messages = [{ id: '1', dest: 'my-explorer' }]
-    expect(findInvalidAgentDests(messages, forks)).toEqual([])
+    const messages = [{ id: '1', target: 'my-explorer' }]
+    expect(findInvalidAgentTargets(messages, forks)).toEqual([])
   })
 
   test('returns invalid dest when agent does not exist', () => {
     const forks = new Map([
       ['fork-1', { agentId: 'my-explorer', status: 'working' as const }],
     ])
-    const messages = [{ id: '1', dest: 'nonexistent-agent' }]
-    expect(findInvalidAgentDests(messages, forks)).toEqual(['nonexistent-agent'])
+    const messages = [{ id: '1', target: 'nonexistent-agent' }]
+    expect(findInvalidAgentTargets(messages, forks)).toEqual(['nonexistent-agent'])
   })
 
   test('returns invalid dest when agent exists but is completed', () => {
     const forks = new Map([
       ['fork-1', { agentId: 'my-explorer', status: 'completed' as const }],
     ])
-    const messages = [{ id: '1', dest: 'my-explorer' }]
-    expect(findInvalidAgentDests(messages, forks)).toEqual(['my-explorer'])
+    const messages = [{ id: '1', target: 'my-explorer' }]
+    expect(findInvalidAgentTargets(messages, forks)).toEqual(['my-explorer'])
   })
 
   test('returns multiple invalid dests', () => {
@@ -59,14 +60,14 @@ describe('nonexistent agent destination validation', () => {
       ['fork-1', { agentId: 'my-explorer', status: 'working' as const }],
     ])
     const messages = [
-      { id: '1', dest: 'bad-1' },
-      { id: '2', dest: 'my-explorer' },
-      { id: '3', dest: 'bad-2' },
+      { id: '1', target: 'bad-1' },
+      { id: '2', target: 'my-explorer' },
+      { id: '3', target: 'bad-2' },
     ]
-    expect(findInvalidAgentDests(messages, forks)).toEqual(['bad-1', 'bad-2'])
+    expect(findInvalidAgentTargets(messages, forks)).toEqual(['bad-1', 'bad-2'])
   })
 
   test('returns empty when no messages sent', () => {
-    expect(findInvalidAgentDests([], new Map())).toEqual([])
+    expect(findInvalidAgentTargets([], new Map())).toEqual([])
   })
 })

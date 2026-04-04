@@ -72,7 +72,7 @@ export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({
     decide(turnCtx) {
       if (turnCtx.cancelled) return finish()
       if (turnCtx.error) return continue_()
-      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.dest === 'parent')) return yield_()
+      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return yield_()
       return continue_()
     },
   },

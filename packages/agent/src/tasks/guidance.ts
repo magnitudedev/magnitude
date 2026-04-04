@@ -1,6 +1,4 @@
-import { getTaskTypeDefinition, isTaskTypeKind, listTaskTypeDefinitions, type TaskTypeId } from './registry'
-const STRATEGY_ADHERENCE_REINFORCEMENT =
-  '**Strategy adherence is mandatory.** The user EXPECTS this process to be followed. Failure to follow this workflow is a violation of user trust.\n\nEstablish the prescribed task decomposition immediately. If you have already started tasks that correspond to steps in this strategy, move them under the appropriate structure.'
+import { getTaskTypeDefinition, listTaskTypeDefinitions, type TaskTypeId } from './registry'
 
 /**
  * Lightweight reference table for system prompt.
@@ -55,11 +53,12 @@ export function formatTaskTypeGuidanceForTool(taskType: TaskTypeId): string {
 }
 
 /**
- * task_type_hook reminder formatter — reinforcement only, preserves task ID context.
+ * task_type_hook reminder formatter — preserves task ID context and returns
+ * full per-type lead guidance + criteria.
  */
 export function formatTaskTypeReminder(taskIds: readonly string[], taskType: TaskTypeId): string {
-  if (!isTaskTypeKind(taskType, 'composite')) return ''
-
   const idList = taskIds.length === 1 ? `Task ${taskIds[0]}` : `Tasks ${taskIds.join(', ')}`
-  return `${idList} (type: ${taskType}):\n${STRATEGY_ADHERENCE_REINFORCEMENT}`
+  const guidance = formatTaskTypeGuidanceForTool(taskType)
+
+  return `${idList} (type: ${taskType}):\n${guidance}`
 }

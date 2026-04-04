@@ -6,6 +6,7 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
+import { TaskGraphProjection } from './task-graph'
 
 export interface RoutingEntry {
   readonly agentId: string
@@ -13,11 +14,23 @@ export interface RoutingEntry {
   readonly parentForkId: string | null
 }
 
+export type MessageScope = 'top-level' | 'task'
+
+export interface PendingRoutedMessage {
+  readonly forkId: string | null
+  readonly scope: MessageScope
+  readonly taskId: string | null
+  readonly text: string
+  readonly order: number
+  readonly targetAgentId: string | null
+  readonly isUserMessage: boolean
+}
+
 export interface AgentRoutingState {
   readonly agents: ReadonlyMap<string, RoutingEntry>
   readonly agentByForkId: ReadonlyMap<string, string>
-  readonly pendingMessages: ReadonlyMap<string, { forkId: string | null; dest: string; text: string }>
-  readonly deferredParentMessages: ReadonlyMap<string, readonly { text: string }[]>
+  readonly pendingMessages: ReadonlyMap<string, PendingRoutedMessage>
+  readonly deferredParentMessages: ReadonlyMap<string, readonly PendingRoutedMessage[]>
 }
 
 export function getRoutingEntry(state: AgentRoutingState, agentId: string): RoutingEntry | undefined {
@@ -65,8 +78,19 @@ export interface AgentCommunicationStreamCompletedSignal {
   readonly timestamp: number
 }
 
+function resolveMessageScope(event: { taskId: string | null }): MessageScope {
+  return event.taskId !== null ? 'task' : 'top-level'
+}
+
+function findTaskWorkerAgentId(taskGraph: { tasks: ReadonlyMap<string, { worker: { agentId: string } | null }> }, taskId: string | null): string | null {
+  if (!taskId) return null
+  const task = taskGraph.tasks.get(taskId)
+  return task?.worker?.agentId ?? null
+}
+
 export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingState>()(({
   name: 'AgentRouting',
+  reads: [TaskGraphProjection] as const,
 
   initial: {
     agents: new Map(),
@@ -112,25 +136,37 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
     },
 
 
-    message_start: ({ event, state, emit }) => {
-      const pendingMessages = new Map(state.pendingMessages)
-      pendingMessages.set(event.id, { forkId: event.forkId, dest: event.dest, text: '' })
+    message_start: ({ event, state, emit, read }) => {
+      const scope = resolveMessageScope(event)
+      const taskId = event.taskId ?? null
+      const source = event.forkId === null ? undefined : getRoutingEntryByForkId(state, event.forkId)
+      const taskGraph = read(TaskGraphProjection)
+      const targetAgentId = scope === 'task' ? findTaskWorkerAgentId(taskGraph, taskId) : null
+      const isUserMessage = scope === 'top-level' && event.forkId === null
 
-      if (event.dest !== 'user') {
-        if (event.dest === 'parent' && event.forkId !== null) {
-          const source = getRoutingEntryByForkId(state, event.forkId)
-          if (source) {
-            emit.communicationStreamStarted({
-              streamId: event.id,
-              targetForkId: source.forkId,
-              direction: 'to_agent',
-              agentId: source.agentId,
-              textDelta: '',
-              timestamp: event.timestamp,
-            })
-          }
-        } else if (isActiveRoute(state, event.dest)) {
-          const target = getRoutingEntry(state, event.dest)
+      const pendingMessages = new Map(state.pendingMessages)
+      pendingMessages.set(event.id, {
+        forkId: event.forkId,
+        scope,
+        taskId,
+        text: '',
+        order: event.timestamp,
+        targetAgentId,
+        isUserMessage,
+      })
+
+      if (!isUserMessage) {
+        if (scope === 'top-level' && event.forkId !== null && source) {
+          emit.communicationStreamStarted({
+            streamId: event.id,
+            targetForkId: source.forkId,
+            direction: 'to_agent',
+            agentId: source.agentId,
+            textDelta: '',
+            timestamp: event.timestamp,
+          })
+        } else if (scope === 'task' && targetAgentId && isActiveRoute(state, targetAgentId)) {
+          const target = getRoutingEntry(state, targetAgentId)
           if (target) {
             emit.communicationStreamStarted({
               streamId: event.id,
@@ -154,8 +190,8 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       const pendingMessages = new Map(state.pendingMessages)
       pendingMessages.set(event.id, { ...entry, text: entry.text + event.text })
 
-      if (entry.dest !== 'user' && event.text.length > 0) {
-        if (entry.dest === 'parent' && entry.forkId !== null) {
+      if (!entry.isUserMessage && event.text.length > 0) {
+        if (entry.scope === 'top-level' && entry.forkId !== null) {
           const source = getRoutingEntryByForkId(state, entry.forkId)
           if (source) {
             emit.communicationStreamChunk({
@@ -167,8 +203,8 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
               timestamp: event.timestamp,
             })
           }
-        } else if (isActiveRoute(state, entry.dest)) {
-          const target = getRoutingEntry(state, entry.dest)
+        } else if (entry.scope === 'task' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
+          const target = getRoutingEntry(state, entry.targetAgentId)
           if (target) {
             emit.communicationStreamChunk({
               streamId: event.id,
@@ -194,7 +230,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
       let nextState: AgentRoutingState = { ...state, pendingMessages }
 
-      if (entry.dest === 'parent' && entry.forkId !== null) {
+      if (entry.scope === 'top-level' && entry.forkId !== null) {
         const source = getRoutingEntryByForkId(state, entry.forkId)
         if (source) {
           emit.communicationStreamCompleted({
@@ -208,12 +244,12 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
         const existing = state.deferredParentMessages.get(entry.forkId) ?? []
         const deferredParentMessages = new Map(state.deferredParentMessages)
-        deferredParentMessages.set(entry.forkId, [...existing, { text: entry.text }])
+        deferredParentMessages.set(entry.forkId, [...existing, { ...entry, text: entry.text, order: event.timestamp }])
         nextState = { ...nextState, deferredParentMessages }
       }
 
-      if (entry.dest !== 'user' && entry.dest !== 'parent' && isActiveRoute(state, entry.dest)) {
-        const target = getRoutingEntry(state, entry.dest)
+      if (entry.scope === 'task' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
+        const target = getRoutingEntry(state, entry.targetAgentId)
         if (target) {
           emit.communicationStreamCompleted({
             streamId: event.id,
@@ -225,7 +261,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
           emit.agentMessage({
             targetForkId: target.forkId,
-            agentId: entry.dest,
+            agentId: entry.targetAgentId,
             message: entry.text,
             timestamp: event.timestamp,
           })
@@ -253,7 +289,11 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         return { ...state, deferredParentMessages }
       }
 
-      const fullText = messages.map(message => message.text).join('\n').trim()
+      const fullText = [...messages]
+        .sort((a, b) => a.order - b.order)
+        .map(message => message.text)
+        .join('\n')
+        .trim()
 
       emit.agentResponse({
         targetForkId: agent.parentForkId,
@@ -278,7 +318,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
       const pendingMessages = new Map(state.pendingMessages)
       for (const [id, pending] of pendingMessages.entries()) {
-        if (pending.forkId === event.forkId || pending.dest === event.agentId) {
+        if (pending.forkId === event.forkId || pending.targetAgentId === event.agentId) {
           pendingMessages.delete(id)
         }
       }
@@ -308,7 +348,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
       const pendingMessages = new Map(state.pendingMessages)
       for (const [id, pending] of pendingMessages.entries()) {
-        if (pending.forkId === event.forkId || pending.dest === event.agentId) {
+        if (pending.forkId === event.forkId || pending.targetAgentId === event.agentId) {
           pendingMessages.delete(id)
         }
       }
@@ -338,7 +378,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
       const pendingMessages = new Map(state.pendingMessages)
       for (const [id, pending] of pendingMessages.entries()) {
-        if (pending.forkId === event.forkId || pending.dest === event.agentId) {
+        if (pending.forkId === event.forkId || pending.targetAgentId === event.agentId) {
           pendingMessages.delete(id)
         }
       }

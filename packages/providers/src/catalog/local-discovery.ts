@@ -108,8 +108,8 @@ export function discoverOllamaHybrid(baseUrl: string): Effect.Effect<ModelDefini
         Effect.flatMap((models) =>
           Effect.tryPromise({
             try: () => enrichOllamaContext(baseUrl, models),
-            catch: () => models,
-          }),
+            catch: (error) => error instanceof Error ? error : new Error('ollama context enrichment failed'),
+          }).pipe(Effect.orElseSucceed(() => models)),
         ),
       )),
   )
@@ -640,7 +640,7 @@ async function enrichLlamaCppContext(
 
 function discoverLmStudioAware(baseUrl: string): Effect.Effect<LocalDiscoveryResult, never> {
   return Effect.tryPromise({
-    try: async () => {
+    try: async (): Promise<LocalDiscoveryResult> => {
       const diagnostics: string[] = []
       let openAiWorked = false
       let nativeV1Worked = false
@@ -709,14 +709,18 @@ function discoverLmStudioAware(baseUrl: string): Effect.Effect<LocalDiscoveryRes
         diagnostics,
       }
     },
-    catch: (error) => ({
-      models: [],
-      error: error instanceof Error ? error.message : 'discovery failed',
-      source: null,
-      status: 'failure',
-      diagnostics: ['lmstudio-discovery-unexpected-error'],
-    }),
-  })
+    catch: (error) => error instanceof Error ? error : new Error('lmstudio discovery failed'),
+  }).pipe(
+    Effect.catchAll((error) =>
+      Effect.succeed<LocalDiscoveryResult>({
+        models: [],
+        error: error.message,
+        source: null,
+        status: 'failure',
+        diagnostics: ['lmstudio-discovery-unexpected-error'],
+      }),
+    ),
+  )
 }
 
 export function discoverLocalProviderModels(
@@ -751,32 +755,34 @@ export function discoverLocalProviderModels(
               diagnostics: [],
             } as LocalDiscoveryResult
           },
-          catch: () => ({
+          catch: (error) => error instanceof Error ? error : new Error('llama.cpp context enrichment failed'),
+        }).pipe(
+          Effect.orElseSucceed((): LocalDiscoveryResult => ({
             models,
             error: null,
             source: 'openai-v1-models',
             status: models.length > 0 ? 'success_non_empty' : 'success_empty',
             diagnostics: [],
-          } as LocalDiscoveryResult),
-        }),
+          })),
+        ),
       ),
-      Effect.catchAll((error) =>
+      Effect.catchAll((error): Effect.Effect<LocalDiscoveryResult, never> =>
         Effect.succeed({
           models: [],
           error: error.message || 'discovery failed',
           source: null,
           status: 'failure',
           diagnostics: [],
-        }),
+        } satisfies LocalDiscoveryResult),
       ),
     )
   }
 
-  const run = (() => {
+  const run: Effect.Effect<LocalDiscoveryResult, Error> = (() => {
     switch (provider.localDiscoveryStrategy) {
       case 'openai-models':
         return discoverOpenAIModels(baseUrl).pipe(
-          Effect.map((models) => ({
+          Effect.map((models): LocalDiscoveryResult => ({
             models,
             error: null,
             source: 'openai-v1-models',
@@ -786,7 +792,7 @@ export function discoverLocalProviderModels(
         )
       case 'ollama-hybrid':
         return discoverOllamaHybrid(baseUrl).pipe(
-          Effect.map((models) => ({
+          Effect.map((models): LocalDiscoveryResult => ({
             models,
             error: null,
             source: 'ollama-api-tags',
@@ -796,7 +802,7 @@ export function discoverLocalProviderModels(
         )
       case 'openai-models-best-effort':
         return discoverOpenAIModels(baseUrl).pipe(
-          Effect.map((models) => ({
+          Effect.map((models): LocalDiscoveryResult => ({
             models,
             error: null,
             source: 'openai-v1-models',
@@ -805,7 +811,7 @@ export function discoverLocalProviderModels(
           })),
         )
       default:
-        return Effect.succeed({
+        return Effect.succeed<LocalDiscoveryResult>({
           models: [],
           error: null,
           source: null,
@@ -816,14 +822,14 @@ export function discoverLocalProviderModels(
   })()
 
   return run.pipe(
-    Effect.catchAll((error) =>
+    Effect.catchAll((error): Effect.Effect<LocalDiscoveryResult, never> =>
       Effect.succeed({
         models: [],
         error: error.message || 'discovery failed',
         source: null,
         status: 'failure',
         diagnostics: [],
-      }),
+      } satisfies LocalDiscoveryResult),
     ),
   )
 }

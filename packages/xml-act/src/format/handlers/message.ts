@@ -4,7 +4,13 @@ import type { TagMap, TagHandler, XmlActFrame, XmlActEvent } from '../types'
 import { findFrame } from '../types'
 import { rawCloseTag, rawOpenTag } from '../raw'
 
-export function messageHandler(defaultDest: string, tags: TagMap): TagHandler<XmlActFrame, XmlActEvent> {
+function resolveMessageScope(stack: ReadonlyArray<XmlActFrame>): { scope: 'top-level' | 'task'; taskId: string | null } {
+  const task = findFrame(stack, 'task')
+  if (task) return { scope: 'task', taskId: task.id }
+  return { scope: 'top-level', taskId: null }
+}
+
+export function messageHandler(tags: TagMap): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
       const existing = findFrame(ctx.stack, 'message')
@@ -26,16 +32,15 @@ export function messageHandler(defaultDest: string, tags: TagMap): TagHandler<Xm
       }
 
       const id = ctx.generateId()
-      const dest = ctx.attrs.get('to') ?? defaultDest
-      const artifactsRaw = ctx.attrs.get('artifacts') ?? null
+      const { scope, taskId } = resolveMessageScope(ctx.stack)
       return [
         ...endTopProse(ctx.stack),
-        emit({ _tag: 'MessageStart', id, dest, artifactsRaw }),
+        emit({ _tag: 'MessageStart', id, scope, taskId }),
         push({
           type: 'message',
           id,
-          dest,
-          artifactsRaw,
+          scope,
+          taskId,
           body: '',
           depth: 0,
           pendingNewlines: 0,
@@ -71,10 +76,9 @@ export function messageHandler(defaultDest: string, tags: TagMap): TagHandler<Xm
     },
     selfClose(ctx) {
       const id = ctx.generateId()
-      const dest = ctx.attrs.get('to') ?? defaultDest
-      const artifactsRaw = ctx.attrs.get('artifacts') ?? null
+      const { scope, taskId } = resolveMessageScope(ctx.stack)
       return [
-        emit({ _tag: 'MessageStart', id, dest, artifactsRaw }),
+        emit({ _tag: 'MessageStart', id, scope, taskId }),
         emit({ _tag: 'MessageEnd', id }),
       ]
     },

@@ -648,7 +648,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
   signalHandlers: on => [
     on(OutboundMessagesProjection.signals.messageCompleted, ({ value, state, read }) => {
-      if (value.dest === 'user') return state
+      if (value.userFacing) return state
 
       const targetForkId = value.targetForkId
       if (targetForkId === undefined) return state

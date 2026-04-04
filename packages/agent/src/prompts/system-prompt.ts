@@ -1,6 +1,6 @@
 import type { RoleDefinition } from '@magnitudedev/roles'
 
-import { ACTIONS_CLOSE, ACTIONS_OPEN, COMMS_CLOSE, COMMS_OPEN, LENSES_CLOSE, LENSES_OPEN } from '@magnitudedev/xml-act'
+import { LENSES_CLOSE, LENSES_OPEN } from '@magnitudedev/xml-act'
 
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
 import { getXmlActProtocol } from './protocol'
@@ -14,12 +14,8 @@ export function compilePromptTemplate(raw: string): string {
   return raw
     .replaceAll('{{PROSE_OPEN}}', PROSE_DELIM_OPEN)
     .replaceAll('{{PROSE_CLOSE}}', PROSE_DELIM_CLOSE)
-    .replaceAll('{{ACTIONS_OPEN}}', ACTIONS_OPEN)
-    .replaceAll('{{ACTIONS_CLOSE}}', ACTIONS_CLOSE)
     .replaceAll('{{THINK_OPEN}}', LENSES_OPEN)
     .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
-    .replaceAll('{{COMMS_OPEN}}', COMMS_OPEN)
-    .replaceAll('{{COMMS_CLOSE}}', COMMS_CLOSE)
     .replaceAll('{{TOOLING_SECTION}}', toolingSectionRaw)
 }
 
@@ -37,7 +33,7 @@ export function renderSystemPrompt(
   return roleDef.systemPrompt
     .replaceAll(
       '{{RESPONSE_PROTOCOL}}',
-      getXmlActProtocol(roleDef.defaultRecipient, roleDef.lenses, mapProtocolMode(roleDef)),
+      getXmlActProtocol(roleDef.lenses, mapProtocolMode(roleDef)),
     )
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)

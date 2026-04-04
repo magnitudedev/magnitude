@@ -57,10 +57,9 @@ export type {
   ParseErrorDetail,
   StructuralParseErrorDetail,
   UnclosedThinkDetail,
-  UnclosedContainerDetail,
+  UnclosedTaskDetail,
   FinishWithoutEvidenceDetail,
   TurnControlConflictDetail,
-  UnclosedActionsDetail,
 } from './format/types'
 
 // Core types — results

@@ -10,7 +10,7 @@ describe('interrupt cancellation latency (regression)', () => {
 
       yield* h.script.next({
         xmlChunks: ['<comms><message to="user">hello', ' world</message></comms><yield/>'],
-        hangAfterChunk: 1,
+        delayMsBetweenChunks: 10_000,
       })
 
       yield* h.user('trigger hanging turn')
@@ -20,12 +20,14 @@ describe('interrupt cancellation latency (regression)', () => {
 
       const completed = yield* h.wait.event(
         'turn_completed',
-        (e) => e.forkId === null && e.result.success === false && e.result.cancelled === true,
+        (e) => e.forkId === null && e.result.success === false && !e.result.success && e.result.cancelled === true,
         { timeoutMs: 1000 },
       )
 
       expect(completed.result.success).toBe(false)
-      expect(completed.result.cancelled).toBe(true)
+      if (!completed.result.success) {
+        expect(completed.result.cancelled).toBe(true)
+      }
 
       const unexpected = h.events().find((e) => e.type === 'turn_unexpected_error' && e.forkId === null)
       expect(unexpected).toBeUndefined()

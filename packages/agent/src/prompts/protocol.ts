@@ -1,9 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
 import {
-  ACTIONS_CLOSE,
-  ACTIONS_OPEN,
-  COMMS_CLOSE,
-  COMMS_OPEN,
   LENSES_CLOSE,
   LENSES_OPEN,
   TURN_CONTROL_YIELD,
@@ -32,7 +28,6 @@ function renderLensesExample(lenses: ThinkingLens[]): string {
 }
 
 export function getXmlActProtocol(
-  defaultRecipient: string = 'user',
   lenses: ThinkingLens[],
   role: 'lead' | 'subagent' | 'oneshot' = 'lead',
 ): string {
@@ -44,13 +39,8 @@ export function getXmlActProtocol(
 
   return XML_ACT_PROTOCOL_RAW
     .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
-    .replaceAll('{{ACTIONS_OPEN}}', ACTIONS_OPEN)
-    .replaceAll('{{ACTIONS_CLOSE}}', ACTIONS_CLOSE)
     .replaceAll('{{THINK_OPEN}}', LENSES_OPEN)
     .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
-    .replaceAll('{{COMMS_OPEN}}', COMMS_OPEN)
-    .replaceAll('{{COMMS_CLOSE}}', COMMS_CLOSE)
-    .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{TURN_CONTROL_NEXT}}', 'next')
@@ -61,9 +51,7 @@ export function getXmlActProtocol(
 export function buildAckTurn(_lenses: ThinkingLens[]): string {
   return `${LENSES_OPEN}
 ${LENSES_CLOSE}
-${COMMS_OPEN}
 <message>I understand the response format and am ready.
 </message>
-${COMMS_CLOSE}
 ${TURN_CONTROL_YIELD}`
 }

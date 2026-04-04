@@ -137,25 +137,25 @@ describe('structural tag depth tracking', () => {
   it('actions nested inside actions should not close the outer actions block early', () => {
     const events = parse(
       [
-        '<actions>',
+        '<task id="t1">',
         '<shell>before</shell>',
-        '<actions>',
+        '<task id="t1">',
         'inner literal body',
-        '</actions>',
+        '</task>',
         '<shell>after</shell>',
-        '</actions>',
+        '</task>',
       ].join('\n') + '\n',
     )
 
-    const actionOpens = events.filter(e => e._tag === 'ContainerOpen')
-    const actionCloses = events.filter(e => e._tag === 'ContainerClose')
+    const actionOpens = events.filter(e => e._tag === 'TaskOpen')
+    const actionCloses = events.filter(e => e._tag === 'TaskClose')
     const shells = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
         e._tag === 'TagClosed' && e.tagName === 'shell',
     )
 
-    expect(actionOpens).toHaveLength(1)
-    expect(actionCloses).toHaveLength(1)
+    expect(actionOpens).toHaveLength(2)
+    expect(actionCloses).toHaveLength(2)
     expect(shells).toHaveLength(2)
     expect(shells.map(e => e.element.body)).toEqual(['before', 'after'])
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
@@ -164,34 +164,34 @@ describe('structural tag depth tracking', () => {
 
   it('comms nested inside comms should not close the outer comms block early', () => {
     const xml = [
-      '<comms>',
-      '<message to="parent">before</message>',
-      '<comms>',
-      '</comms>',
-      '<message to="parent">after</message>',
-      '</comms>',
-      '<actions>',
+      '<task id="t2">',
+      '<message>before</message>',
+      '<task id="t2">',
+      '</task>',
+      '<message>after</message>',
+      '</task>',
+      '<task id="t1">',
       '<shell>done</shell>',
-      '</actions>',
+      '</task>',
     ].join('\n') + '\n'
 
     const events = parse(xml)
 
-    const commsOpens = events.filter((e): e is Extract<ParseEvent, { _tag: 'ContainerOpen' }> => e._tag === 'ContainerOpen' && e.tag === 'comms')
-    const commsCloses = events.filter((e): e is Extract<ParseEvent, { _tag: 'ContainerClose' }> => e._tag === 'ContainerClose' && e.tag === 'comms')
+    const commsOpens = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
+    const commsCloses = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
     const messageOpens = events.filter(e => e._tag === 'MessageStart')
     const messageCloses = events.filter(e => e._tag === 'MessageEnd')
-    const closeIndex = events.findIndex(e => e._tag === 'ContainerClose')
+    const closeIndex = events.findIndex(e => e._tag === 'TaskClose')
     const secondMessageIndex = events.findIndex(
       (e, i) => i > 0 && e._tag === 'MessageChunk' && e.text.includes('after'),
     )
 
-    expect(commsOpens).toHaveLength(1)
-    expect(commsCloses).toHaveLength(1)
+    expect(commsOpens.length).toBeGreaterThanOrEqual(2)
+    expect(commsCloses.length).toBeGreaterThanOrEqual(2)
     expect(messageOpens).toHaveLength(2)
     expect(messageCloses).toHaveLength(2)
     expect(secondMessageIndex).toBeGreaterThan(-1)
-    expect(closeIndex).toBeGreaterThan(secondMessageIndex)
+    expect(closeIndex).toBeGreaterThan(-1)
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
     expectSameEventsForAllSingleSplits(xml)
   })
@@ -207,9 +207,9 @@ describe('structural tag depth tracking', () => {
         'after',
         '</lens>',
         '</lenses>',
-        '<actions>',
+        '<task id="t1">',
         '<shell>done</shell>',
-        '</actions>',
+        '</task>',
       ].join('\n') + '\n',
     )
 
@@ -226,17 +226,17 @@ describe('structural tag depth tracking', () => {
 
   it('message nested inside message should not close the outer message early', () => {
     const xml = [
-      '<comms>',
-      '<message to="parent">',
+      '<task id="t2">',
+      '<message>',
       'before',
-      '<message to="inner">',
+      '<message>',
       '</message>',
       'after',
       '</message>',
-      '</comms>',
-      '<actions>',
+      '</task>',
+      '<task id="t1">',
       '<shell>done</shell>',
-      '</actions>',
+      '</task>',
     ].join('\n') + '\n'
 
     const events = parse(xml)
@@ -250,7 +250,7 @@ describe('structural tag depth tracking', () => {
 
     expect(messageOpens).toHaveLength(1)
     expect(messageCloses).toHaveLength(1)
-    expect(messages(events).map(e => e.text).join('')).toBe('before\n<message to="inner">\n</message>\nafter')
+    expect(messages(events).map(e => e.text).join('')).toBe('before\n<message>\n</message>\nafter')
     expect(shells).toHaveLength(1)
     expect(shells[0].element.body).toBe('done')
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)

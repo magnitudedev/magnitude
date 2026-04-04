@@ -1,4 +1,4 @@
-import { ACTIONS_CLOSE, ACTIONS_OPEN, COMMS_CLOSE, COMMS_OPEN, LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, type XmlTagBinding } from '@magnitudedev/xml-act'
 
 export interface ThinkBlock {
   about: string | null
@@ -8,7 +8,7 @@ export interface ThinkBlock {
 export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
-  messages: Array<{ dest: string; text: string }>
+  messages: Array<{ text: string }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string }>
   turnDecision: 'continue' | 'yield'
 }
@@ -147,23 +147,16 @@ export function serializeCanonicalTurn(
   }
 
   if (trace.messages.length > 0) {
-    const messageLines = trace.messages.map(msg => {
-      const attrs: Record<string, string> = { to: msg.dest }
+    for (const msg of trace.messages) {
       const trimmedText = msg.text.trim()
-      return `\n${serializeTag('message', attrs, trimmedText, [])}`
-    }).join('')
-    parts.push(`${COMMS_OPEN}${messageLines}\n${COMMS_CLOSE}`)
-  }
-
-  const actionLines: string[] = []
-  if (trace.toolCalls.length > 0) {
-    for (const call of trace.toolCalls) {
-      actionLines.push(serializeToolCall(call.tagName, call.input, call.query, bindings.get(call.tagName)))
+      parts.push(serializeTag('message', {}, trimmedText, []))
     }
   }
 
-  if (actionLines.length > 0) {
-    parts.push(`${ACTIONS_OPEN}\n${actionLines.join('\n')}\n${ACTIONS_CLOSE}`)
+  if (trace.toolCalls.length > 0) {
+    for (const call of trace.toolCalls) {
+      parts.push(serializeToolCall(call.tagName, call.input, call.query, bindings.get(call.tagName)))
+    }
   }
 
   const control = trace.turnDecision === 'continue' ? TURN_CONTROL_NEXT : TURN_CONTROL_YIELD

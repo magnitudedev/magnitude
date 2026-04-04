@@ -462,10 +462,6 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'newTab': return { ...counts, navigations: counts.navigations + 1 }
     case 'type': return { ...counts, inputs: counts.inputs + 1 }
     case 'evaluate': return { ...counts, evaluations: counts.evaluations + 1 }
-    case 'createTask':
-    case 'updateTask':
-    case 'assignTask':
-    case 'cancelTask':
     case 'skill':
     case 'fileView':
     case 'phaseSubmit':
@@ -686,7 +682,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         return fork
       }
 
-      if (event.dest !== 'user') {
+      if (event.taskId !== null) {
         return fork
       }
 

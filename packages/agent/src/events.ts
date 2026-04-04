@@ -181,8 +181,10 @@ export type TurnDecision = 'continue' | 'yield' | 'finish'
 
 export type TurnResultErrorCode =
   | 'unclosed_think'
-  | 'unclosed_actions'
+  | 'unclosed_task'
   | 'nonexistent_agent_destination'
+  | 'task_outside_assigned_subtree'
+  | 'task_operation_error'
 
 export interface TurnResultError {
   readonly code: TurnResultErrorCode
@@ -222,7 +224,7 @@ export interface MessageStart {
   readonly forkId: string | null
   readonly turnId: string
   readonly id: string
-  readonly dest: string
+  readonly taskId: string | null
 }
 
 export interface ThinkingChunk {

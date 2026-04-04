@@ -2,12 +2,8 @@ import { describe, expect, it } from 'bun:test'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 import {
-  ACTIONS_CLOSE,
-  ACTIONS_OPEN,
   AGENT_CREATE_OPEN_PREFIX,
   AGENT_CREATE_TAG,
-  COMMS_CLOSE,
-  COMMS_OPEN,
   LENSES_CLOSE,
   LENSES_OPEN,
   TURN_CONTROL_FINISH,
@@ -16,6 +12,11 @@ import {
   xmlClose,
   xmlOpen,
 } from '../constants'
+
+const TASK_A_OPEN = '<task id="t1">'
+const TASK_A_CLOSE = '</task>'
+const TASK_B_OPEN = '<task id="t2">'
+const TASK_B_CLOSE = '</task>'
 
 type ToolCase = {
   toolTag: string
@@ -75,7 +76,7 @@ function multilineToolOpen(tag: string, attrs: Record<string, string>) {
 
 function runActiveChildCase(tc: ToolCase, activeChild: string, interferingText: string) {
   const xml = [
-    ACTIONS_OPEN,
+    TASK_A_OPEN,
     xmlOpen(tc.toolTag, tc.attrs),
     xmlOpen(activeChild),
     'prefix',
@@ -83,7 +84,7 @@ function runActiveChildCase(tc: ToolCase, activeChild: string, interferingText: 
     'suffix',
     xmlClose(activeChild),
     xmlClose(tc.toolTag),
-    ACTIONS_CLOSE,
+    TASK_A_CLOSE,
     TURN_CONTROL_NEXT,
   ].join('\n')
 
@@ -102,10 +103,10 @@ describe('repro matrix: active child-body passthrough (multi-tool, multi-child, 
       const otherTool = tc.toolTag === AGENT_CREATE_TAG ? 'task-create' : AGENT_CREATE_TAG
 
       const tokenRows: Array<{ name: string; text: string }> = [
-        { name: 'ACTIONS_OPEN raw', text: ACTIONS_OPEN },
-        { name: 'ACTIONS_CLOSE raw', text: ACTIONS_CLOSE },
-        { name: 'COMMS_OPEN raw', text: COMMS_OPEN },
-        { name: 'COMMS_CLOSE raw', text: COMMS_CLOSE },
+        { name: 'TASK_A_OPEN raw', text: TASK_A_OPEN },
+        { name: 'TASK_A_CLOSE raw', text: TASK_A_CLOSE },
+        { name: 'TASK_B_OPEN raw', text: TASK_B_OPEN },
+        { name: 'TASK_B_CLOSE raw', text: TASK_B_CLOSE },
         { name: 'LENSES_OPEN raw', text: LENSES_OPEN },
         { name: 'LENSES_CLOSE raw', text: LENSES_CLOSE },
         { name: 'TURN_CONTROL_NEXT raw', text: TURN_CONTROL_NEXT },
@@ -150,12 +151,12 @@ describe('RED matrix: multiline tool opens should parse structurally across tool
     const [childA, childB] = tc.children
     it(`${tc.toolTag}: multiline open should still open tool and children`, () => {
       const xml = [
-        ACTIONS_OPEN,
+        TASK_A_OPEN,
         multilineToolOpen(tc.toolTag, tc.attrs),
         `${xmlOpen(childA)}a${xmlClose(childA)}`,
         `${xmlOpen(childB)}b${xmlClose(childB)}`,
         xmlClose(tc.toolTag),
-        ACTIONS_CLOSE,
+        TASK_A_CLOSE,
         TURN_CONTROL_NEXT,
       ].join('\n')
 
@@ -174,14 +175,14 @@ describe('RED matrix: missing matching child close emits only child-root-cause e
       const siblingChild = activeChild === childA ? childB : childA
       it(`${tc.toolTag}/${activeChild}: only UnclosedChild when ${activeChild} close missing`, () => {
         const xml = [
-          ACTIONS_OPEN,
+          TASK_A_OPEN,
           xmlOpen(tc.toolTag, tc.attrs),
           xmlOpen(activeChild),
           'still-open',
           xmlOpen(siblingChild),
           xmlClose(siblingChild),
-          ACTIONS_CLOSE,
-          COMMS_OPEN,
+          TASK_A_CLOSE,
+          TASK_B_OPEN,
           LENSES_OPEN,
           TURN_CONTROL_NEXT,
         ].join('\n')
@@ -189,7 +190,6 @@ describe('RED matrix: missing matching child close emits only child-root-cause e
         const errs = parseErrors(parse(xml)).map(e => e.error._tag)
         expect(errs.includes('UnclosedChild')).toBe(true)
         expect(errs.includes('IncompleteTag')).toBe(false)
-        expect(errs.includes('UnclosedContainer')).toBe(false)
       })
     }
   }

@@ -16,7 +16,7 @@ export interface CanonicalTurnState {
   turnId: string | null
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
-  messages: Array<{ id: string; dest: string; text: string; order: number }>
+  messages: Array<{ id: string; scope: 'top-level' | 'task'; taskId: string | null; text: string; order: number }>
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
   toolCallMap: Map<string, number>
@@ -53,7 +53,7 @@ function flattenResponseText(parts: readonly ResponsePart[]): string {
 
 function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
   if (!errors || errors.length === 0) return false
-  return errors.some((error) => error.code === 'unclosed_think' || error.code === 'unclosed_actions')
+  return errors.some((error) => error.code === 'unclosed_think' || error.code === 'unclosed_task')
 }
 
 function resetActive(state: CanonicalTurnState): CanonicalTurnState {
@@ -138,10 +138,11 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
     message_start: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
       const idx = fork.messages.length
+      const scope: 'top-level' | 'task' = event.taskId !== null ? 'task' : 'top-level'
       const nextMessages = [...fork.messages, {
         id: event.id,
-        dest: event.dest,
-
+        scope,
+        taskId: event.taskId,
         text: '',
         order: fork.orderCounter,
       }]
@@ -244,7 +245,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           thinkBlocks: fork.thinkBlocks,
           messages: [...fork.messages]
             .sort((a, b) => a.order - b.order)
-            .map(({ dest, text }) => ({ dest, text })),
+            .map(({ text }) => ({ text })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
             .map(({ tagName, input, query }) => ({ tagName, input, query })),

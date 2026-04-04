@@ -72,7 +72,7 @@ The plan is the product. The thoughts are the process. They don't mix.
 4. Identify the user's requirements and constraints
 5. For nontrivial changes, evaluate approaches from the three perspectives
 6. Distill your conclusions into a clean plan document in `$M/plans/`
-7. When done, message the parent with a link to the plan
+7. When done, send a top-level `<message>` to the parent with a link to the plan
 
 ## Handling critique
 

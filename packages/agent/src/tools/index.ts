@@ -59,5 +59,5 @@ export { globalTools } from './globals'
 export { shellTool } from './shell'
 export { fsTools } from './fs'
 
-export { taskTools } from './task-tools'
+
 export { webFetchTool } from './web-fetch-tool'

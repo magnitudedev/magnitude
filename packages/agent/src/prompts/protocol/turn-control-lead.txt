@@ -2,11 +2,11 @@
 
 The final tag in your response determines whether you will idle until further action from user or subagents.
 
-After `{{ACTIONS_CLOSE}}`, include exactly one terminal turn-control tag:
+After your task/tool operations, include exactly one terminal turn-control tag:
 
-`<{{TURN_CONTROL_NEXT}}/>`: Observe results from tools called and immediately take another turn
+`<{{TURN_CONTROL_NEXT}}/>`: Observe results from task/tool operations and immediately take another turn
 Use when:
-- You took actions and need to see their results to continue
+- You used tools and need to see their results to continue
 - You have more work to do that depends on the current turn's output
 
 `<{{TURN_CONTROL_YIELD}}/>`: Wait for further communications from user or subagents

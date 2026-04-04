@@ -4,7 +4,7 @@ import type { ParseEvent } from '../format/types'
 
 /**
  * Repro: <write> body contains embedded structural tags like <results>,
- * </results>, <think>, <actions>, and tool tags with observe attrs.
+ * </results>, <think>, <task id="t1">, and tool tags with observe attrs.
  *
  * The parser should treat ALL content inside the write body as literal
  * text — not as structural open/close events. But embedded structural-looking
@@ -33,7 +33,7 @@ function parseCharByChar(xml: string): ParseEvent[] {
 }
 
 // The actual content from the breaking scenario — write body contains
-// embedded structural tags like <think>, <actions>, tool tags, and </results>
+// embedded structural tags like <think>, <task id="t1">, tool tags, and </results>
 const FS_WRITE_BODY = `import type { Scenario } from '../../types'
 import { hasThinkBlock } from './checks'
 import { actionsTagOpen, actionsTagClose } from '@magnitudedev/xml-act'
@@ -103,14 +103,14 @@ export const ALL_SCENARIOS = [
 ]
 `
 
-const FULL_XML = `<actions>
+const FULL_XML = `<task id="t1">
 <write path="evals/src/evals/a5/scenarios.ts">${FS_WRITE_BODY}</write>
 <read path="evals/src/evals/a5/scenarios.ts" observe="content" />
-</actions>`
+</task>`
 
 describe('isolation: embedded tool-like tags are treated as literal text', () => {
   it('write body with an observe-bearing tool tag stays literal', () => {
-    const xml = '<actions>\n<write path="x.ts">before <read path="foo" observe="." /> after</write>\n</actions>'
+    const xml = '<task id="t1">\n<write path="x.ts">before <read path="foo" observe="." /> after</write>\n</task>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
@@ -121,7 +121,7 @@ describe('isolation: embedded tool-like tags are treated as literal text', () =>
   })
 
   it('write body with unknown tags like <foo> is fine (treated as literal)', () => {
-    const xml = '<actions>\n<write path="x.ts">before <foo bar="1">baz</foo> after</write>\n</actions>'
+    const xml = '<task id="t1">\n<write path="x.ts">before <foo bar="1">baz</foo> after</write>\n</task>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
@@ -133,7 +133,7 @@ describe('isolation: embedded tool-like tags are treated as literal text', () =>
   })
 
   it('write body with known tag <read> is fine (not valid child, flushed back)', () => {
-    const xml = '<actions>\n<write path="x.ts">before <read path="y" /> after</write>\n</actions>'
+    const xml = '<task id="t1">\n<write path="x.ts">before <read path="y" /> after</write>\n</task>'
     const events = parse(xml)
     const closed = events.filter(
       (e): e is Extract<ParseEvent, { _tag: 'TagClosed' }> =>
@@ -149,8 +149,8 @@ describe('repro: write body with embedded structural tags', () => {
     const events = parse(FULL_XML)
 
     // Should have actions open/close
-    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
 
     // write should be parsed as a complete tool
     const closed = events.filter(
@@ -179,15 +179,15 @@ describe('repro: write body with embedded structural tags', () => {
     expect(closed[0].element.body).toBe(FS_WRITE_BODY)
     expect(closed[0].element.attributes.get('path')).toBe('evals/src/evals/a5/scenarios.ts')
 
-    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
   it('embedded </results> inside write body does not corrupt the body', () => {
-    const xml = `<actions>
+    const xml = `<task id="t1">
 <write path="test.ts">some code with </results> in it and observe="." too</write>
-</actions>`
+</task>`
 
     const events = parse(xml)
 
@@ -197,15 +197,15 @@ describe('repro: write body with embedded structural tags', () => {
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toBe('some code with </results> in it and observe="." too')
-    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
   it('embedded <think> and </think> inside write body are treated as literal text', () => {
-    const xml = `<actions>
+    const xml = `<task id="t1">
 <write path="test.ts">const x = '<think>hello</think>'</write>
-</actions>`
+</task>`
 
     const events = parse(xml)
 
@@ -224,15 +224,15 @@ describe('repro: write body with embedded structural tags', () => {
     expect(thinkEnds).toHaveLength(0)
   })
 
-  it('embedded <actions> inside write body does not create nested actions block', () => {
-    const xml = `<actions>
-<write path="test.ts">code with <actions> and </actions> inside</write>
-</actions>`
+  it('embedded <task id="t1"> inside write body does not create nested actions block', () => {
+    const xml = `<task id="t1">
+<write path="test.ts">code with <task id="t1"> and </task> inside</write>
+</task>`
 
     const events = parse(xml)
 
-    // Should have exactly ONE ContainerOpen (the outer one)
-    const actionsOpens = events.filter(e => e._tag === 'ContainerOpen')
+    // Should have exactly ONE TaskOpen (the outer one)
+    const actionsOpens = events.filter(e => e._tag === 'TaskOpen')
     expect(actionsOpens).toHaveLength(1)
 
     const closed = events.filter(
@@ -240,6 +240,6 @@ describe('repro: write body with embedded structural tags', () => {
         e._tag === 'TagClosed' && e.tagName === 'write',
     )
     expect(closed).toHaveLength(1)
-    expect(closed[0].element.body).toBe('code with <actions> and </actions> inside')
+    expect(closed[0].element.body).toBe('code with <task id="t1"> and </task> inside')
   })
 })

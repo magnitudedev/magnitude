@@ -57,7 +57,7 @@ export function formatError(message: string): string {
   return `<error>${message}</error>`
 }
 
-/** Noop turn — agent continued without taking any actions */
+/** Noop turn — agent continued without taking any task/tool operations */
 export function formatNoop(): string {
   return `<noop>No actions were taken. Use ${TURN_CONTROL_YIELD} if you have nothing more to do, instead of ${TURN_CONTROL_NEXT}.</noop>`
 }

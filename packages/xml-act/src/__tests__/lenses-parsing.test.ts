@@ -2,15 +2,16 @@ import { describe, it, expect } from 'bun:test'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 import {
-  ACTIONS_OPEN,
-  ACTIONS_CLOSE,
-  COMMS_OPEN,
-  COMMS_CLOSE,
   LENSES_OPEN,
   LENSES_CLOSE,
   TURN_CONTROL_NEXT,
   TURN_CONTROL_YIELD,
 } from '../constants'
+
+const TASK_A_OPEN = '<task id="t1">'
+const TASK_A_CLOSE = '</task>'
+const TASK_B_OPEN = '<task id="t2">'
+const TASK_B_CLOSE = '</task>'
 
 const knownTags = new Set(['shell'])
 const childTagMap = new Map<string, Set<string>>()
@@ -53,7 +54,7 @@ function proseEnds(events: ParseEvent[]) {
 
 const thinkOpen = () => '<think>'
 const thinkClose = () => '</think>'
-const messageOpen = (to: string) => `<message to="${to}">`
+const messageOpen = () => `<message>`
 const messageClose = () => '</message>'
 const shellOpen = () => '<shell>'
 const shellClose = () => '</shell>'
@@ -65,8 +66,8 @@ const thinkingOpen = () => '<thinking>'
 const thinkingClose = () => '</thinking>'
 const reasonOpen = () => '<reason>'
 const reasonClose = () => '</reason>'
-const tooluseOpen = () => '<tooluse>'
-const tooluseClose = () => '</tooluse>'
+const legacyToolOpen = () => '<legacy-tool>'
+const legacyToolClose = () => '</legacy-tool>'
 const respondOpen = () => '<respond>'
 const respondClose = () => '</respond>'
 
@@ -151,27 +152,27 @@ describe('lenses parsing', () => {
     expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'task', content: 'hello world' }])
   })
 
-  it('9) full turn: lenses then comms then actions', () => {
+  it('9) full turn: lenses then task blocks', () => {
     const events = parse(
       [
         '<lenses>',
         '<lens name="task">Reason briefly.</lens>',
         '</lenses>',
-        '<comms>',
-        '<message to="parent">hello</message>',
-        '</comms>',
-        '<actions>',
+        '<task id="t2">',
+        '<message>hello</message>',
+        '</task>',
+        '<task id="t1">',
         '<shell>echo hi</shell>',
-        '</actions>',
+        '</task>',
       ].join('\n') + '\n',
     )
 
     expect(lensStarts(events).map(e => e.name)).toEqual(['task'])
     expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'task', content: 'Reason briefly.' }])
-    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
-    expect(events.some(e => e._tag === 'ContainerOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'ContainerClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
+    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
     expect(events.some(e => e._tag === 'TagClosed' && e.tagName === 'shell')).toBe(true)
   })
 
@@ -210,18 +211,18 @@ describe('tags inside lenses are passthrough', () => {
     assertNoEvents(events, ['TurnControl', 'FinishCollecting', 'FinishComplete'])
   })
 
-  it('actions inside lens is passthrough', () => {
-    const inner = `${ACTIONS_OPEN}\nsome text\n${ACTIONS_CLOSE}`
+  it('task block text inside lens is passthrough', () => {
+    const inner = `${TASK_A_OPEN}\nsome text\n${TASK_A_CLOSE}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
-    expect(lensEnds(events)[0].content).toContain(ACTIONS_OPEN)
-    assertNoEvents(events, ['ContainerOpen', 'ContainerClose'])
+    expect(lensEnds(events)[0].content).toContain(TASK_A_OPEN)
+    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
   })
 
-  it('comms inside lens is passthrough', () => {
-    const inner = `${COMMS_OPEN}\ntext\n${COMMS_CLOSE}`
+  it('task block text (alternate id) inside lens is passthrough', () => {
+    const inner = `${TASK_B_OPEN}\ntext\n${TASK_B_CLOSE}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
-    expect(lensEnds(events)[0].content).toContain(COMMS_OPEN)
-    assertNoEvents(events, ['ContainerOpen', 'ContainerClose'])
+    expect(lensEnds(events)[0].content).toContain(TASK_B_OPEN)
+    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
   })
 
   it('nested think inside lens is passthrough', () => {
@@ -233,7 +234,7 @@ describe('tags inside lenses are passthrough', () => {
   })
 
   it('message inside lens is passthrough', () => {
-    const inner = `${messageOpen('user')}hello${messageClose()}`
+    const inner = `${messageOpen()}hello${messageClose()}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(inner)
     assertNoEvents(events, ['MessageStart', 'MessageEnd', 'MessageChunk'])
@@ -245,24 +246,24 @@ describe('tags inside lenses are passthrough', () => {
     expect(lensEnds(events)[0].content).toContain(inner)
   })
 
-  it('reason alias inside lens is passthrough', () => {
+  it('reason-like tag text inside lens is passthrough', () => {
     const inner = `${reasonOpen()}stuff${reasonClose()}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(inner)
   })
 
-  it('tooluse alias inside lens is passthrough', () => {
-    const inner = `${tooluseOpen()}stuff${tooluseClose()}`
+  it('legacy tool-like tag text inside lens is passthrough', () => {
+    const inner = `${legacyToolOpen()}stuff${legacyToolClose()}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(inner)
-    assertNoEvents(events, ['ContainerOpen', 'ContainerClose'])
+    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
   })
 
-  it('respond alias inside lens is passthrough', () => {
+  it('respond-like tag text inside lens is passthrough', () => {
     const inner = `${respondOpen()}stuff${respondClose()}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(inner)
-    assertNoEvents(events, ['ContainerOpen', 'ContainerClose'])
+    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
   })
 
   it('shell tool tag inside lens is passthrough', () => {
@@ -288,11 +289,11 @@ describe('tags inside plain think are passthrough', () => {
     assertNoEvents(events, ['TurnControl'])
   })
 
-  it('actions inside plain think is passthrough', () => {
-    const events = parse(`${thinkOpen()}\n${ACTIONS_OPEN}\nstuff\n${ACTIONS_CLOSE}\n${thinkClose()}\n`)
+  it('task block text inside plain think is passthrough', () => {
+    const events = parse(`${thinkOpen()}\n${TASK_A_OPEN}\nstuff\n${TASK_A_CLOSE}\n${thinkClose()}\n`)
     const allContent = proseEnds(events).map(e => e.content).join('')
-    expect(allContent).toContain(ACTIONS_OPEN)
-    assertNoEvents(events, ['ContainerOpen', 'ContainerClose'])
+    expect(allContent).toContain(TASK_A_OPEN)
+    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
   })
 
   it('shell inside plain think is passthrough', () => {
@@ -357,11 +358,11 @@ describe('lens content trimming', () => {
 
 describe('char-by-char passthrough parity', () => {
   it('char-by-char: tags inside lenses remain passthrough', () => {
-    const xml = `${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_NEXT} ${ACTIONS_OPEN}x${ACTIONS_CLOSE} ${shellOpen()}y${shellClose()}${lensClose()}\n${LENSES_CLOSE}\n`
+    const xml = `${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_NEXT} ${TASK_A_OPEN}x${TASK_A_CLOSE} ${shellOpen()}y${shellClose()}${lensClose()}\n${LENSES_CLOSE}\n`
     const bulk = parse(xml)
     const charByChar = parseCharByChar(xml)
     expect(lensEnds(charByChar)).toEqual(lensEnds(bulk))
-    assertNoEvents(bulk, ['TurnControl', 'ContainerOpen', 'TagOpened'])
-    assertNoEvents(charByChar, ['TurnControl', 'ContainerOpen', 'TagOpened'])
+    assertNoEvents(bulk, ['TurnControl', 'TaskOpen', 'TagOpened'])
+    assertNoEvents(charByChar, ['TurnControl', 'TaskOpen', 'TagOpened'])
   })
 })

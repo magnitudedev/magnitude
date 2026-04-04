@@ -10,7 +10,7 @@ import { MockTurnScriptTag, type MockTurnResponse } from './turn-script'
 function frameToChunks(frame: MockTurnResponse): readonly string[] {
   if (frame.xmlChunks && frame.xmlChunks.length > 0) return frame.xmlChunks
   if (frame.xml !== undefined) return [frame.xml]
-  return ['<comms><message to="user">ok</message></comms><yield/>']
+  return ['<message>ok</message><yield/>']
 }
 
 function buildStream(frame: MockTurnResponse): Stream.Stream<string, import('@magnitudedev/providers').ModelError> {

@@ -21,25 +21,35 @@ function element(tag: string, attrs?: XmlAttrs, body?: string): string {
   return `${openTag(tag, attrs)}${body}</${tag}>`
 }
 
-export class ResponseBuilder {
-  private readonly comms: string[] = []
-  private readonly actions: string[] = []
+function taskOpen(id: string, attrs?: XmlAttrs): string {
+  return openTag('task', { id, ...(attrs ?? {}) })
+}
 
-  message(to: string, text: string): this {
-    this.comms.push(element('message', { to }, text))
+export class ResponseBuilder {
+  private readonly messages: string[] = []
+  private readonly explicitTaskBlocks: string[] = []
+  private readonly implicitTaskActions: string[] = []
+
+  message(text: string): this {
+    this.messages.push(element('message', undefined, text))
     return this
   }
 
-  messageUser(text: string): this {
-    return this.message('user', text)
+  task(id: string, body: string, attrs?: XmlAttrs): this {
+    this.explicitTaskBlocks.push(`${taskOpen(id, attrs)}${body}</task>`)
+    return this
   }
 
-  messageParent(text: string): this {
-    return this.message('parent', text)
+  taskMessage(taskId: string, text: string): this {
+    return this.task(taskId, element('message', undefined, text))
+  }
+
+  taskAssign(taskId: string, role: string, instructions: string): this {
+    return this.task(taskId, element('assign', { role }, instructions))
   }
 
   tool(tag: string, attrs?: XmlAttrs, body?: string): this {
-    this.actions.push(element(tag, attrs, body))
+    this.implicitTaskActions.push(element(tag, attrs, body))
     return this
   }
 
@@ -84,9 +94,16 @@ export class ResponseBuilder {
   }
 
   private build(control: 'yield' | 'next'): MockTurnResponse {
-    const comms = this.comms.length > 0 ? element('comms', undefined, this.comms.join('')) : ''
-    const actions = this.actions.length > 0 ? element('actions', undefined, this.actions.join('')) : ''
-    return { xml: `${actions}${comms}<${control}/>` }
+    const parts: string[] = []
+    parts.push(...this.messages)
+    parts.push(...this.explicitTaskBlocks)
+
+    if (this.implicitTaskActions.length > 0) {
+      parts.push(`${taskOpen('harness-task')}${this.implicitTaskActions.join('')}</task>`)
+    }
+
+    parts.push(`<${control}/>`)
+    return { xml: parts.join('') }
   }
 
   yield(): MockTurnResponse {

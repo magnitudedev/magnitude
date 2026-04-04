@@ -31,7 +31,7 @@ Use web search and web fetch when you need information beyond the codebase — l
 2. Explore using the approach that fits (broad or deep). Take on or more turns as needed to collect information. Expand your search when appropriate.
 3. After you've seen sufficient context, synthesize your findings into a coherent report
 4. Write your report to a workspace file (for example, `$M/reports/example-report.md`)
-5. When done, send a message to the parent indicating completion and mention the file via markdown link syntax: `<comms><message to="parent">Done. [report.md]($M/reports/example-report.md)</message></comms>`
+5. When done, send a top-level `<message>` to the parent indicating completion and mention the file via markdown link syntax: `<message>Done. [report.md]($M/reports/example-report.md)</message>`
 
 ## Output
 

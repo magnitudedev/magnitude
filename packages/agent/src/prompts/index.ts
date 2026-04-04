@@ -7,4 +7,17 @@ export {
   buildConversationSummary,
 } from './agents'
 export { buildReminder } from './reminders'
-export { UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, ONESHOT_LIVENESS_REMINDER, formatNonexistentAgentError } from './error-states'
+export {
+  UNCLOSED_THINK_REMINDER,
+  UNCLOSED_TASK_REMINDER,
+  ONESHOT_LIVENESS_REMINDER,
+  formatNonexistentAgentError,
+  formatTaskOutsideSubtreeError,
+  formatInvalidTaskTypeError,
+  formatTaskNotFoundError,
+  formatTaskParentNotFoundError,
+  formatDuplicateTaskIdError,
+  formatTaskCompletionBlockedError,
+  formatInvalidAssigneeError,
+  formatMissingAssignmentMessageError,
+} from './error-states'

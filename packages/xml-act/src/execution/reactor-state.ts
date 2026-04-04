@@ -1,20 +1,10 @@
-/**
- * Reactor State — pure state fold for the xml-act reactor.
- *
- * initialReactorState() creates a fresh state for first run.
- * foldReactorState() is the same function the reactor uses internally
- * and consumers use to reconstruct state from a persisted event log.
- */
-
-import type {
-  ReactorState,
-  ToolOutcome,
-  XmlRuntimeEvent,
-} from '../types'
+import type { ReactorState, ToolOutcome, XmlRuntimeEvent } from '../types'
 
 export function initialReactorState(): ReactorState {
   return {
     toolCallMap: new Map(),
+    toolTaskMap: new Map(),
+    taskStack: [],
     deadToolCalls: new Set(),
     outputTrees: new Map(),
     stopped: false,
@@ -24,10 +14,17 @@ export function initialReactorState(): ReactorState {
 
 export function foldReactorState(state: ReactorState, event: XmlRuntimeEvent): ReactorState {
   switch (event._tag) {
+    case 'TaskStarted':
+      return { ...state, taskStack: [...state.taskStack, event.id] }
+    case 'TaskFinished':
+      return { ...state, taskStack: state.taskStack.filter((id) => id !== event.id) }
+
     case 'ToolInputStarted': {
       const toolCallMap = new Map(state.toolCallMap)
       toolCallMap.set(event.toolCallId, event.tagName)
-      return { ...state, toolCallMap }
+      const toolTaskMap = new Map(state.toolTaskMap)
+      toolTaskMap.set(event.toolCallId, event.taskId)
+      return { ...state, toolCallMap, toolTaskMap }
     }
 
     case 'ToolInputParseError': {
@@ -47,9 +44,6 @@ export function foldReactorState(state: ReactorState, event: XmlRuntimeEvent): R
 
     case 'TurnEnd':
       return { ...state, stopped: true }
-
-    case 'StructuralParseError':
-      return state
 
     default:
       return state

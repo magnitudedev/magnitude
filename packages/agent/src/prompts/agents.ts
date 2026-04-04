@@ -9,11 +9,13 @@ export function buildAgentContext(
   title: string,
   message: string,
   extraContext: string,
+  taskId: string,
   taskContract?: string,
 ): string {
   const parts: string[] = []
   parts.push('<lead>')
   parts.push(`<title>${title}</title>`)
+  parts.push(`<task_id>${taskId}</task_id>`)
   if (taskContract?.trim()) {
     parts.push('<task_contract>')
     parts.push(taskContract.trim())

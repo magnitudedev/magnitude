@@ -1,10 +1,9 @@
 /**
  * Stream Guard
  *
- * Truncates an LLM output stream after a closing tag is encountered.
- * Ensures the stream terminates cleanly when </actions> closes, even if
- * the LLM keeps generating. Also injects a closing tag if the stream
- * ends without one (e.g. LLM truncation).
+ * Truncates an LLM output stream after a structural closing tag is encountered.
+ * Also injects the provided closing tag if the stream ends with an opening tag
+ * but no matching close (e.g. truncation).
  */
 
 import { Stream, Effect } from 'effect'

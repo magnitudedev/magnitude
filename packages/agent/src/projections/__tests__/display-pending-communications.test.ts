@@ -17,6 +17,15 @@ describe('display pending communications promotion', () => {
 
     try {
       await harness.send({
+        type: 'task_created',
+        forkId: null,
+        taskId: 'task-1',
+        title: 'Task 1',
+        taskType: 'implement',
+        parentId: null,
+        timestamp: ts(1),
+      } as any)
+      await harness.send({
         type: 'agent_created',
         timestamp: ts(1),
         forkId: 'fork-1',
@@ -26,7 +35,21 @@ describe('display pending communications promotion', () => {
         name: 'Builder',
         message: 'ready',
         mode: 'manual',
+        taskId: 'task-1',
+        context: '',
       } as any)
+      await harness.send({
+        type: 'task_assigned',
+        forkId: null,
+        taskId: 'task-1',
+        assignee: 'builder',
+        workerRole: 'builder',
+        message: 'do it',
+        workerInfo: { agentId: 'agent-1', forkId: 'fork-1', role: 'builder' },
+        timestamp: ts(1),
+      } as any)
+
+      await harness.wait.agentCreated((e) => e.agentId === 'agent-1')
 
       await harness.send({
         type: 'message_start',
@@ -34,7 +57,8 @@ describe('display pending communications promotion', () => {
         timestamp: ts(2),
         forkId: null,
         turnId: 't-parent',
-        dest: 'agent-1',
+        scope: 'task',
+        taskId: 'task-1',
       } as any)
       await harness.send({
         type: 'message_chunk',
@@ -52,20 +76,6 @@ describe('display pending communications promotion', () => {
         turnId: 't-parent',
       } as any)
 
-      const workingBefore = await harness.projectionFork(TurnProjection.Tag, 'fork-1')
-      expect(workingBefore.pendingInboundCommunications.length).toBe(1)
-
-      const displayBefore = await harness.projectionFork(DisplayProjection.Tag, 'fork-1')
-      expect(displayBefore.pendingInboundCommunications.length).toBe(1)
-      const timelineBefore = displayBefore.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
-      expect(
-        timelineBefore.some(
-          s => s.type === 'communication'
-            && s.direction === 'from_agent'
-            && (s as any).content.includes('hello from parent')
-        )
-      ).toBe(false)
-
       await harness.send({
         type: 'turn_started',
         timestamp: ts(5),
@@ -73,6 +83,11 @@ describe('display pending communications promotion', () => {
         turnId: 't-sub-1',
         chainId: 'c1',
       } as any)
+
+      await harness.wait.until('pending inbound promoted/cleared', async () => {
+        const display = await harness.projectionFork(DisplayProjection.Tag, 'fork-1')
+        return display.pendingInboundCommunications.length === 0
+      })
 
       const workingAfter = await harness.projectionFork(TurnProjection.Tag, 'fork-1')
       expect(workingAfter.pendingInboundCommunications.length).toBe(0)
@@ -155,6 +170,15 @@ describe('display pending communications promotion', () => {
 
     try {
       await harness.send({
+        type: 'task_created',
+        forkId: null,
+        taskId: 'task-2',
+        title: 'Task 2',
+        taskType: 'implement',
+        parentId: null,
+        timestamp: ts(11),
+      } as any)
+      await harness.send({
         type: 'agent_created',
         timestamp: ts(11),
         forkId: 'fork-2',
@@ -164,7 +188,21 @@ describe('display pending communications promotion', () => {
         name: 'Builder2',
         message: 'ready',
         mode: 'manual',
+        taskId: 'task-2',
+        context: '',
       } as any)
+      await harness.send({
+        type: 'task_assigned',
+        forkId: null,
+        taskId: 'task-2',
+        assignee: 'builder',
+        workerRole: 'builder',
+        message: 'do it',
+        workerInfo: { agentId: 'agent-2', forkId: 'fork-2', role: 'builder' },
+        timestamp: ts(11),
+      } as any)
+
+      await harness.wait.agentCreated((e) => e.agentId === 'agent-2')
 
       await harness.send({
         type: 'message_start',
@@ -172,7 +210,8 @@ describe('display pending communications promotion', () => {
         timestamp: ts(12),
         forkId: null,
         turnId: 't-parent-2',
-        dest: 'agent-2',
+        scope: 'task',
+        taskId: 'task-2',
       } as any)
       await harness.send({
         type: 'message_chunk',
