@@ -53,7 +53,7 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
           <span attributes={TextAttributes.BOLD}>✉ </span>
           {message.direction === 'from_agent' ? (
             <>
-              <span fg={theme.info} attributes={TextAttributes.BOLD}>Team lead</span>
+              <span fg={theme.info} attributes={TextAttributes.BOLD}>Lead</span>
               <span attributes={TextAttributes.BOLD}> → </span>
               <span fg={theme.secondary} attributes={TextAttributes.BOLD}>
                 {formatSubagentIdWithEmoji(message.agentId, message.agentRole)}
@@ -65,7 +65,7 @@ export const AgentCommunicationCard = memo(function AgentCommunicationCard({
                 {formatSubagentIdWithEmoji(message.agentId, message.agentRole)}
               </span>
               <span attributes={TextAttributes.BOLD}> → </span>
-              <span fg={theme.info} attributes={TextAttributes.BOLD}>Team lead</span>
+              <span fg={theme.info} attributes={TextAttributes.BOLD}>Lead</span>
             </>
           )}
         </text>

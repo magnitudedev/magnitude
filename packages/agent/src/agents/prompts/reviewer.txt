@@ -8,7 +8,7 @@ Your role is to find problems, not confirm success. Assume nothing works until y
 
 ## Context
 
-You receive the conversation between the user and the team lead. Use it to understand what was requested and what the change is supposed to do.
+You receive the conversation between the user and the lead. Use it to understand what was requested and what the change is supposed to do.
 
 ## Verification
 
