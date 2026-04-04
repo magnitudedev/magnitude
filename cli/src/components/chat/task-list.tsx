@@ -3,6 +3,7 @@ import { blue, slate } from '../../utils/palette'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useTerminalWidth } from '../../hooks/use-terminal-width'
+import { useBoxWidth } from '../../hooks/use-chat-width'
 import { Button } from '../button'
 import { formatSubagentIdWithEmoji } from '../../utils/subagent-role-emoji'
 import { BOX_CHARS } from '../../utils/ui-constants'
@@ -45,6 +46,7 @@ const PULSE_BLUE_SHADES = [
 type Props = {
   tasks: readonly TaskListItem[]
   pushForkOverlay: (forkId: string) => void
+  fileViewerOpen?: boolean
 }
 
 type TaskRowProps = {
@@ -57,6 +59,7 @@ type TaskRowProps = {
   now: number
   taskNameWidth: number
   agentIdWidth: number
+  showAssigneeColumn: boolean
   onToggleArchived?: (taskId: string) => void
   archivedExpanded?: boolean
   rootRowRef?: (node: any) => void
@@ -178,6 +181,7 @@ function TaskRow({
   now,
   taskNameWidth,
   agentIdWidth,
+  showAssigneeColumn,
   onToggleArchived,
   archivedExpanded,
   rootRowRef,
@@ -215,31 +219,35 @@ function TaskRow({
           )}
       </box>
 
-      {/* Assigned to */}
-      <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row' }}>
-        {task.assignee.kind === 'worker' && task.workerForkId
-          ? (
-            <Button
-              onClick={() => pushForkOverlay(task.workerForkId!)}
-              onMouseOver={() => onHover(task.taskId)}
-              onMouseOut={() => onHoverEnd()}
-            >
-              <text style={{ fg: hovered ? slate[300] : theme.muted }}>
-                {assigneeLabel}
-              </text>
-            </Button>
-          )
-          : (
-            <text style={{ fg: task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
-              {assigneeLabel}
-            </text>
-          )}
-      </box>
+      {showAssigneeColumn && (
+        <>
+          {/* Assigned to */}
+          <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row' }}>
+            {task.assignee.kind === 'worker' && task.workerForkId
+              ? (
+                <Button
+                  onClick={() => pushForkOverlay(task.workerForkId!)}
+                  onMouseOver={() => onHover(task.taskId)}
+                  onMouseOut={() => onHoverEnd()}
+                >
+                  <text style={{ fg: hovered ? slate[300] : theme.muted }}>
+                    {assigneeLabel}
+                  </text>
+                </Button>
+              )
+              : (
+                <text style={{ fg: task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
+                  {assigneeLabel}
+                </text>
+              )}
+          </box>
+        </>
+      )}
     </box>
   )
 }
 
-export function TaskList({ tasks, pushForkOverlay }: Props) {
+export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false }: Props) {
   const theme = useTheme()
   const [expanded, setExpanded] = useState(false)
   const [expandHovered, setExpandHovered] = useState(false)
@@ -251,10 +259,12 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
   const rootRowRefs = useRef<Map<string, any>>(new Map())
 
   const terminalWidth = useTerminalWidth()
-  const usableWidth = Math.max(1, terminalWidth - 4)
+  const box = useBoxWidth()
+  const showAssigneeColumn = !fileViewerOpen
+  const usableWidth = Math.max(1, (box.width ?? terminalWidth) - 4)
   const remainingWidth = Math.max(1, usableWidth)
-  const taskNameWidth = Math.floor(remainingWidth * 0.57)
-  const agentIdWidth = remainingWidth - taskNameWidth
+  const taskNameWidth = showAssigneeColumn ? Math.floor(remainingWidth * 0.57) : remainingWidth
+  const agentIdWidth = showAssigneeColumn ? (remainingWidth - taskNameWidth) : 0
 
   const toggleArchived = useCallback((taskId: string) => {
     setExpandedArchived(prev => {
@@ -390,6 +400,8 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
 
   return (
     <box
+      ref={box.ref}
+      onSizeChange={box.onSizeChange}
       style={{
         flexDirection: 'column',
         flexShrink: 0,
@@ -416,20 +428,22 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
               <HeaderCountsText completed={stickyRootSummary.completed} active={stickyRootSummary.active} theme={theme} />
             </box>
 
-            <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-              <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
-                {getAssigneeLabel(stickyRootSummary.task, agentIdWidth)}
-              </text>
-              <Button
-                onClick={() => setExpanded(prev => !prev)}
-                onMouseOver={() => setExpandHovered(true)}
-                onMouseOut={() => setExpandHovered(false)}
-              >
-                <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
-                  {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
+            {showAssigneeColumn && (
+              <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+                <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
+                  {getAssigneeLabel(stickyRootSummary.task, agentIdWidth)}
                 </text>
-              </Button>
-            </box>
+                <Button
+                  onClick={() => setExpanded(prev => !prev)}
+                  onMouseOver={() => setExpandHovered(true)}
+                  onMouseOut={() => setExpandHovered(false)}
+                >
+                  <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
+                    {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
+                  </text>
+                </Button>
+              </box>
+            )}
           </box>
         )
         : (
@@ -441,18 +455,20 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
               </>
             </box>
 
-            <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
-              <Button
-                onClick={() => setExpanded(prev => !prev)}
-                onMouseOver={() => setExpandHovered(true)}
-                onMouseOut={() => setExpandHovered(false)}
-              >
-                <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
-                  {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
-                </text>
-              </Button>
-            </box>
+            {showAssigneeColumn && (
+              <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+                <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
+                <Button
+                  onClick={() => setExpanded(prev => !prev)}
+                  onMouseOver={() => setExpandHovered(true)}
+                  onMouseOut={() => setExpandHovered(false)}
+                >
+                  <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>
+                    {expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}
+                  </text>
+                </Button>
+              </box>
+            )}
           </box>
         )}
 
@@ -492,6 +508,7 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
                 now={now}
                 taskNameWidth={taskNameWidth}
                 agentIdWidth={agentIdWidth}
+                showAssigneeColumn={showAssigneeColumn}
                 onToggleArchived={task.status === 'archived' ? toggleArchived : undefined}
                 archivedExpanded={task.status === 'archived' ? expandedArchived.has(task.taskId) : undefined}
                 rootRowRef={isRootRow
@@ -518,6 +535,7 @@ export function TaskList({ tasks, pushForkOverlay }: Props) {
               now={now}
               taskNameWidth={taskNameWidth}
               agentIdWidth={agentIdWidth}
+              showAssigneeColumn={showAssigneeColumn}
               onToggleArchived={task.status === 'archived' ? toggleArchived : undefined}
               archivedExpanded={task.status === 'archived' ? expandedArchived.has(task.taskId) : undefined}
             />

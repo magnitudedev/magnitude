@@ -16,6 +16,12 @@ mock.module('../../hooks/use-terminal-width', () => ({
   useTerminalWidth: () => 120,
 }))
 
+let measuredWidth: number | null = null
+
+mock.module('../../hooks/use-chat-width', () => ({
+  useBoxWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: measuredWidth }),
+}))
+
 const { TaskList } = await import('./task-list')
 
 const noop = () => {}
@@ -43,6 +49,7 @@ const makeTask = (overrides: Partial<TaskListItem> = {}): TaskListItem => ({
 })
 
 test('returns null when there are no tasks', () => {
+  measuredWidth = null
   const html = render(<TaskList tasks={[]} pushForkOverlay={noop} />)
   expect(html).toBe('')
 })
@@ -85,7 +92,7 @@ test('renders status glyphs for completed, working, assigned, and pending', () =
   expect(text).toContain('○')
 })
 
-test('renders [type] labels and no tree connectors', () => {
+test('renders no tree connectors in task rows', () => {
   const html = render(
     <TaskList
       tasks={[
@@ -96,10 +103,8 @@ test('renders [type] labels and no tree connectors', () => {
     />,
   )
   const text = htmlToText(html)
-  expect(text).toContain('[implement] Root')
-  expect(text).toContain('[implement] Child')
-  expect(text).toContain('○ [implement] Child')
-  expect(text).not.toContain('◉   [implement] Root')
+  expect(text).toContain('○ Root')
+  expect(text).toContain('○ Child')
   expect(text).not.toContain('└─')
 })
 
@@ -148,7 +153,7 @@ test('renders worker assignee with expected formatted label', () => {
 
   const text = htmlToText(html)
   expect(text).toContain('Assigned To')
-  expect(text).toContain('⚒ builder-abc123')
+  expect(text).toContain('⚒ [builder] builder-abc123')
 })
 
 test('archived summary rows render without a status glyph', () => {
@@ -164,6 +169,47 @@ test('archived summary rows render without a status glyph', () => {
 
   const text = htmlToText(html)
   expect(text).toContain('▸ 2 archived tasks')
+})
+
+test('fileViewerOpen hides assignee column and expand/collapse controls', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          taskId: 't-worker',
+          assignee: { kind: 'worker', agentId: 'builder-abc123', workerType: 'builder' },
+          workerForkId: 'fork-abc123',
+        }),
+      ]}
+      pushForkOverlay={noop}
+      fileViewerOpen
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).not.toContain('Assigned To')
+  expect(text).not.toContain('Expand all')
+  expect(text).not.toContain('Collapse all')
+  expect(text).not.toContain('⚒ [builder] builder-abc123')
+})
+
+test('fileViewerOpen uses measured width to truncate task names earlier', () => {
+  measuredWidth = 24
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          title: 'This is a very long task title that should truncate in narrow single-column mode',
+        }),
+      ]}
+      pushForkOverlay={noop}
+      fileViewerOpen
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('…')
+  measuredWidth = null
 })
 
 test('sticky root header shows correct subtree progress counts', () => {
