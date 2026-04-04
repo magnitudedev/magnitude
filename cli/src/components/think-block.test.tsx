@@ -24,7 +24,7 @@ function render(node: React.ReactNode) {
   return renderToStaticMarkup(<>{node}</>)
 }
 
-test('ThinkBlock renders subagent started/finished/killed rows with structured fields', () => {
+test('ThinkBlock renders worker started/finished/killed rows with structured fields', () => {
   const html = render(
     <ThinkBlock
       block={{
@@ -59,11 +59,11 @@ test('ThinkBlock renders subagent started/finished/killed rows with structured f
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('▶ Subagent started: ⚒ agent-7 — Investigate flaky test')
-  expect(text).toContain('✓ Subagent finished: ⚒ agent-7 · 2m 5s · 3 tools')
+  expect(text).toContain('▶ Worker started: ⚒ [builder] agent-7 — Investigate flaky test')
+  expect(text).toContain('✓ Worker finished: ⚒ [builder] agent-7 · 2m 5s · 3 tools')
 })
 
-test('ThinkBlock includes resumed marker for subagent lifecycle rows', () => {
+test('ThinkBlock includes resumed marker for worker lifecycle rows', () => {
   const html = render(
     <ThinkBlock
       block={{
@@ -98,11 +98,11 @@ test('ThinkBlock includes resumed marker for subagent lifecycle rows', () => {
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('▶ Subagent started: agent-3 (resumed) — Trace root cause')
-  expect(text).toContain('✓ Subagent finished: agent-3 (resumed) · ↺ 1m · 1 tool')
+  expect(text).toContain('▶ Worker started: [researcher] agent-3 (resumed) — Trace root cause')
+  expect(text).toContain('✓ Worker finished: [researcher] agent-3 (resumed) · ↺ 1m · 1 tool')
 })
 
-test('ThinkBlock completed summary includes singular subagent lifecycle counts', () => {
+test('ThinkBlock completed summary includes singular worker lifecycle counts', () => {
   const html = render(
     <ThinkBlock
       block={{
@@ -136,10 +136,10 @@ test('ThinkBlock completed summary includes singular subagent lifecycle counts',
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('Completed in 8s (1 subagent started, 1 subagent finished) · Show')
+  expect(text).toContain('Completed in 8s (1 worker started, 1 worker finished) · Show')
 })
 
-test('ThinkBlock completed summary includes plural subagent lifecycle counts', () => {
+test('ThinkBlock completed summary includes plural worker lifecycle counts', () => {
   const html = render(
     <ThinkBlock
       block={{
@@ -189,10 +189,10 @@ test('ThinkBlock completed summary includes plural subagent lifecycle counts', (
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('Completed in 8s (2 subagents started, 2 subagents finished) · Show')
+  expect(text).toContain('Completed in 8s (2 workers started, 2 workers finished) · Show')
 })
 
-test('ThinkBlock summary includes killed subagent counts from both kill sources', () => {
+test('ThinkBlock summary includes killed worker counts from both kill sources', () => {
   const now = Date.now()
   const markup = render(
     <ThinkBlock
@@ -238,10 +238,10 @@ test('ThinkBlock summary includes killed subagent counts from both kill sources'
   )
 
   const text = htmlToText(markup)
-  expect(text).toContain('Completed in 8s (1 subagent started, 2 subagents killed) · Show')
+  expect(text).toContain('Completed in 8s (1 worker started, 2 workers killed) · Show')
 })
 
-test('ThinkBlock renders user-killed subagent row with dedicated text', () => {
+test('ThinkBlock renders user-killed worker row with dedicated text', () => {
   const now = Date.now()
   const markup = render(
     <ThinkBlock
@@ -269,10 +269,10 @@ test('ThinkBlock renders user-killed subagent row with dedicated text', () => {
   )
 
   const text = htmlToText(markup)
-  expect(text).toContain('■ Subagent killed by user: researcher - gather evidence')
+  expect(text).toContain('■ Worker killed by user: [researcher] researcher - gather evidence')
 })
 
-test('ThinkBlock applies spacing around consecutive subagent lifecycle rows, not between each row', () => {
+test('ThinkBlock applies spacing around consecutive worker lifecycle rows, not between each row', () => {
   const html = render(
     <ThinkBlock
       block={{

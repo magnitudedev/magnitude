@@ -427,7 +427,7 @@ export function ChatController(props: ChatControllerProps) {
     ? null
     : tasks.find((task) => task.workerForkId === selectedForkId)
 
-  const selectedSubagentAgentId = selectedForkId == null
+  const selectedWorkerAgentId = selectedForkId == null
     ? null
     : selectedTaskForFork?.assignee.kind === 'worker'
       ? selectedTaskForFork.assignee.agentId
@@ -509,7 +509,7 @@ export function ChatController(props: ChatControllerProps) {
                     onKeyIntercept={handleKeyIntercept}
                     focused={env.composerCanFocus && !env.pendingApproval}
                     highlightColor={env.bashMode ? orange[400] : undefined}
-                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
+                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with worker ${selectedWorkerAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
                     maxHeight={10}
                     minHeight={1}
                     bulkInsertEpoch={bulkInsertEpoch}
@@ -550,14 +550,14 @@ export function ChatController(props: ChatControllerProps) {
           {attachments.length > 0 ? (
             <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={env.attachmentsMaxWidth} />
           ) : nextEscWillKillAll ? (
-            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all subagents</text>
+            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all workers</text>
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null}
         </box>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
           {attachments.length > 0 && (nextEscWillKillAll ? (
-            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all subagents</text>
+            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all workers</text>
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null)}
@@ -575,8 +575,8 @@ export function ChatController(props: ChatControllerProps) {
         <box style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: RGBA.fromInts(0, 0, 0, 153) }}>
           <box style={{ borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: env.theme.border, backgroundColor: env.theme.surface, customBorderChars: BOX_CHARS, minWidth: 52, maxWidth: 72, paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0 }}>
             <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
-              <text style={{ fg: env.theme.foreground }}>Kill active subagent {pendingKillTab.agentId}?</text>
-              <text style={{ fg: env.theme.muted }}>This removes all subagent progress.</text>
+              <text style={{ fg: env.theme.foreground }}>Kill active worker {pendingKillTab.agentId}?</text>
+              <text style={{ fg: env.theme.muted }}>This removes all worker progress.</text>
               <box style={{ height: 1 }} />
               <box style={{ flexDirection: 'row', justifyContent: 'flex-end', gap: 1 }}>
                 <Button onClick={() => setPendingKillForkId(null)} onMouseOver={() => setIsKillCancelHovered(true)} onMouseOut={() => setIsKillCancelHovered(false)}>
@@ -593,7 +593,7 @@ export function ChatController(props: ChatControllerProps) {
                   onMouseOut={() => setIsKillConfirmHovered(false)}
                 >
                   <box style={{ borderStyle: 'single', borderColor: isKillConfirmHovered ? env.theme.error : env.theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-                    <text style={{ fg: isKillConfirmHovered ? env.theme.error : env.theme.foreground }}>Kill subagent</text>
+                    <text style={{ fg: isKillConfirmHovered ? env.theme.error : env.theme.foreground }}>Kill worker</text>
                   </box>
                 </Button>
               </box>

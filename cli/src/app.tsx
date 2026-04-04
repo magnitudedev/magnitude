@@ -231,7 +231,7 @@ function AppInner({
 
   // Always reserve width for the longest possible escape hint so that
   // attachments don't reflow when hints appear/disappear.
-  const maxEscHintWidth = 'Press Esc again to interrupt all subagents'.length
+  const maxEscHintWidth = 'Press Esc again to interrupt all workers'.length
 
   const terminalWidth = process.stdout.columns ?? 80
   const footerRightGap = contextRenderedText ? 1 : 0
@@ -1750,7 +1750,7 @@ function AppInner({
 
   const handleInterruptAll = useCallback(() => {
     if (!client) return
-    logger.info('Interrupt all: interrupting all subagents')
+    logger.info('Interrupt all: interrupting all workers')
     // Interrupt root with allKilled flag
     client.send({ type: 'interrupt', forkId: null, allKilled: true })
     // Interrupt every running fork

@@ -19,7 +19,7 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
 }
 
 export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string; description: string }[] = [
-  { slot: 'lead', label: 'Team Lead', description: '(Coordinates all subagent usage)' },
+  { slot: 'lead', label: 'Team Lead', description: '(Coordinates all worker usage)' },
   { slot: 'explorer', label: 'Explorer', description: '(Reads lots of files and does web searches)' },
   { slot: 'planner', label: 'Planner', description: '(Plans out implementation approaches)' },
   { slot: 'builder', label: 'Builder', description: '(Implements changes in files)' },
