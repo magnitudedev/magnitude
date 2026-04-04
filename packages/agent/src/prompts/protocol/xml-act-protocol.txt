@@ -72,6 +72,13 @@ A new task requires `id`, `type`, and `title`. Use `parent` to place it under an
 Referencing an existing task by `id` alone operates on it. Self-closing tags with `status` update metadata:
 <task id="impl-parser" status="completed" />
 
+Valid status values:
+- `pending` — Reopens the task. Clears its completion timestamp. Detaches any assigned worker.
+- `working` — Cannot be set manually. Automatically derived when an assigned worker is active.
+- `completed` — Marks the task finished and sets a completion timestamp. Blocked if any child tasks are still pending or working.
+- `cancelled` — Kills the assigned worker and removes the task and its entire subtree from the task tree.
+- `archived` — Collapses the task into a summary line and hides its subtree. Only works on completed tasks.
+
 `assign` inside a task delegates it to a worker role. Only the lead can assign:
 <task id="impl-parser" type="implement" title="Implement parser updates">
   <assign role="builder">Implement Unit A from the plan.</assign>
