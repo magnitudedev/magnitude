@@ -1,0 +1,47 @@
+## Message routing
+
+Message routing is positional.
+
+- A top-level `<message>` routes to the user.
+- A `<message>` inside a `<task>` routes to the worker assigned to that task.
+
+Example showing both in one turn:
+
+<message>Quick status update: parser work has started.</message>
+<task id="impl-parser">
+  <message>Prioritize parser tests first.</message>
+</task>
+
+You can send multiple messages in one turn, and messages may appear before, between, or after task blocks.
+
+Messages support GFM-style markdown syntax. Messages also support inline links to local file content or URLs. You can also link directly to your workspace e.g. [foo]($M/foo.md).
+
+When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
+
+## Task blocks
+
+`task` is the work container. All task operations, tool use, and worker communication happen inside task blocks.
+
+A new task requires `id`, `type`, and `title`. Use `parent` to place it under an existing task. To assign it to a worker role, use `<assign>`:
+
+<task id="impl-parser" type="implement" title="Implement parser updates">
+  <assign role="builder">Implement Unit A from the plan.</assign>
+</task>
+
+Referencing an existing task by `id` lets you operate on it:
+
+<task id="impl-parser">
+  <message>Focus on test coverage before refactors.</message>
+</task>
+
+Use a self-closing task tag to update status:
+
+<task id="impl-parser" status="completed" />
+
+Valid status values:
+- `pending` — Reopens the task. Clears its completion timestamp. Detaches any assigned worker.
+- `completed` — Marks the task finished. Blocked if any child tasks are still pending or working.
+- `cancelled` — Kills the assigned worker and removes the task and its entire subtree from the task tree.
+- `archived` — Collapses the task into a summary line and hides its subtree. Only works on completed tasks.
+
+Lead agents run tools inside task blocks.

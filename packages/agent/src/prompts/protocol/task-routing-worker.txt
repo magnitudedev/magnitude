@@ -1,0 +1,26 @@
+## Message routing
+
+A top-level `<message>` routes to the lead.
+
+You can send multiple messages in one turn, and messages may appear before, between, or after task blocks.
+
+Messages support GFM-style markdown syntax. Messages also support inline links to local file content or URLs. You can also link directly to your workspace e.g. [foo]($M/foo.md).
+
+When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
+
+## Task blocks
+
+Workers can create subtasks under their assigned task by using `parent`:
+
+<task id="investigate-parser-tests" type="research" title="Investigate parser test gaps" parent="impl-parser">
+</task>
+
+You can update task status using a self-closing task tag:
+
+<task id="investigate-parser-tests" status="completed" />
+
+Valid status values:
+- `pending` — Reopens the task. Clears its completion timestamp.
+- `completed` — Marks the task finished. Blocked if any child tasks are still pending or working.
+
+Workers run tools at top level within their assigned task scope, and may create subtasks.

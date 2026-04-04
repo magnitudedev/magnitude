@@ -50,43 +50,7 @@ You MUST include each lens with an applicable trigger condition.
 
 {{THINKING_LENSES}}
 
-## Message routing
-
-Message routing is positional.
-
-- A top-level `<message>` routes to your parent.
-- A `<message>` inside a `<task>` routes to the worker assigned to that task.
-
-You can send multiple messages in one turn, and messages may appear before, between, or after task blocks.
-
-Messages support GFM-style markdown syntax. Messages also support inline links to local file content or URLs. You can also link directly to your workspace e.g. [foo]($M/foo.md).
-
-When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
-
-## Task blocks
-
-`task` is the work container. All task operations, tool use, and worker communication happen inside task blocks.
-
-A new task requires `id`, `type`, and `title`. Use `parent` to place it under an existing task. Tasks can also be nested directly.
-
-Referencing an existing task by `id` alone operates on it. Self-closing tags with `status` update metadata:
-<task id="impl-parser" status="completed" />
-
-Valid status values:
-- `pending` — Reopens the task. Clears its completion timestamp. Detaches any assigned worker.
-- `working` — Cannot be set manually. Automatically derived when an assigned worker is active.
-- `completed` — Marks the task finished and sets a completion timestamp. Blocked if any child tasks are still pending or working.
-- `cancelled` — Kills the assigned worker and removes the task and its entire subtree from the task tree.
-- `archived` — Collapses the task into a summary line and hides its subtree. Only works on completed tasks.
-
-`assign` inside a task delegates it to a worker role. Only the lead can assign:
-<task id="impl-parser" type="implement" title="Implement parser updates">
-  <assign role="builder">Implement Unit A from the plan.</assign>
-</task>
-
-A `<message>` inside a task routes to that task's assigned worker. A top-level `<message>` routes to your parent.
-
-Lead agents run tools inside task blocks. Workers run tools at top level within their assigned task scope, and may create subtasks under their assigned task.
+{{TASK_AND_ROUTING_SECTION}}
 
 ## Task/tool operations
 
