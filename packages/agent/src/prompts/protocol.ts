@@ -34,6 +34,7 @@ function renderLensesExample(lenses: ThinkingLens[]): string {
 export function getXmlActProtocol(
   lenses: ThinkingLens[],
   role: 'lead' | 'subagent' | 'oneshot' = 'lead',
+  defaultRecipient: 'user' | 'parent' = 'user',
 ): string {
   const turnControlSection = role === 'subagent'
     ? TURN_CONTROL_SUBAGENT_RAW
@@ -54,6 +55,7 @@ export function getXmlActProtocol(
     .replaceAll('{{TURN_CONTROL_NEXT}}', 'next')
     .replaceAll('{{TURN_CONTROL_YIELD}}', 'yield')
     .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
+    .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
 }
 
 export function buildAckTurn(_lenses: ThinkingLens[]): string {

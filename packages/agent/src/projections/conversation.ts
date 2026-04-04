@@ -52,6 +52,8 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
     message_start: ({ event, state }) => {
       if (event.forkId !== null) return state
       if (event.taskId !== null) return state
+      // Skip messages explicitly targeted at workers
+      if (event.to !== null && event.to !== 'user') return state
       return {
         ...state,
         userMessageIds: new Set(state.userMessageIds).add(event.id),

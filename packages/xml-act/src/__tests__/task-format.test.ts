@@ -44,6 +44,28 @@ describe('task format parsing', () => {
     expect(bad.some(e => e._tag === 'ParseError')).toBe(true)
   })
 
+  it('self-closing assign errors outside task', () => {
+    const events = parse('<assign role="builder" /><yield/>')
+    const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
+    expect(err?.error._tag).toBe('InvalidAttributeValue')
+    if (err?.error._tag === 'InvalidAttributeValue') {
+      expect(err.error.attribute).toBe('role')
+      expect(err.error.expected).toBe('non-empty string inside task frame')
+      expect(err.error.detail).toBe('Assign must be used inside a task')
+    }
+  })
+
+  it('self-closing assign errors when role missing', () => {
+    const events = parse('<task id="t1"><assign /></task><yield/>')
+    const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
+    expect(err?.error._tag).toBe('InvalidAttributeValue')
+    if (err?.error._tag === 'InvalidAttributeValue') {
+      expect(err.error.attribute).toBe('role')
+      expect(err.error.expected).toBe('non-empty string')
+      expect(err.error.detail).toBe('Assign role is required')
+    }
+  })
+
   it('nested task gets implicit parent', () => {
     const events = parse('<task id="p"><task id="c"></task></task><yield/>')
     const opens = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
@@ -55,7 +77,18 @@ describe('task format parsing', () => {
     const events = parse('<message>top</message><task id="t1"><message>inner</message></task><yield/>')
     const starts = events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageStart' }> => e._tag === 'MessageStart')
     expect(starts[0]?.scope).toBe('top-level')
+    expect(starts[0]?.to).toBeNull()
     expect(starts[1]?.scope).toBe('task')
+    expect(starts[1]?.taskId).toBe('t1')
+    expect(starts[1]?.to).toBeNull()
+  })
+
+  it('parses explicit message to attribute', () => {
+    const events = parse('<message to="parent">top</message><task id="t1"><message to="task-1">inner</message></task><yield/>')
+    const starts = events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageStart' }> => e._tag === 'MessageStart')
+    expect(starts[0]?.to).toBe('parent')
+    expect(starts[0]?.taskId).toBeNull()
+    expect(starts[1]?.to).toBe('task-1')
     expect(starts[1]?.taskId).toBe('t1')
   })
 

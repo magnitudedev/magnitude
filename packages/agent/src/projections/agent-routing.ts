@@ -16,10 +16,14 @@ export interface RoutingEntry {
 
 export type MessageScope = 'top-level' | 'task'
 
+type ResolvedRouteMode = 'user' | 'parent' | 'task'
+
 export interface PendingRoutedMessage {
   readonly forkId: string | null
   readonly scope: MessageScope
   readonly taskId: string | null
+  readonly explicitTo: string | null
+  readonly routeMode: ResolvedRouteMode
   readonly text: string
   readonly order: number
   readonly targetAgentId: string | null
@@ -78,6 +82,16 @@ export interface AgentCommunicationStreamCompletedSignal {
   readonly timestamp: number
 }
 
+export interface InvalidExplicitDestinationSignal {
+  readonly forkId: string | null
+  readonly turnId: string
+  readonly messageId: string
+  readonly taskId: string | null
+  readonly to: string
+  readonly reason: string
+  readonly timestamp: number
+}
+
 function resolveMessageScope(event: { taskId: string | null }): MessageScope {
   return event.taskId !== null ? 'task' : 'top-level'
 }
@@ -86,6 +100,31 @@ function findTaskWorkerAgentId(taskGraph: { tasks: ReadonlyMap<string, { worker:
   if (!taskId) return null
   const task = taskGraph.tasks.get(taskId)
   return task?.worker?.agentId ?? null
+}
+
+function resolveExplicitTo(
+  to: string,
+  forkId: string | null,
+  source: RoutingEntry | undefined,
+  taskGraph: { tasks: ReadonlyMap<string, { worker: { agentId: string } | null }> },
+): { ok: true; routeMode: ResolvedRouteMode; targetAgentId: string | null; isUserMessage: boolean }
+  | { ok: false; reason: string } {
+  if (to === 'user') {
+    if (forkId !== null) return { ok: false, reason: '`to="user"` is only valid from root fork' }
+    return { ok: true, routeMode: 'user', targetAgentId: null, isUserMessage: true }
+  }
+
+  if (to === 'parent') {
+    if (forkId === null || !source) return { ok: false, reason: '`to="parent"` requires a subagent source fork' }
+    return { ok: true, routeMode: 'parent', targetAgentId: null, isUserMessage: false }
+  }
+
+  const task = taskGraph.tasks.get(to)
+  if (!task) return { ok: false, reason: `task "${to}" not found` }
+  const targetAgentId = task.worker?.agentId ?? null
+  if (!targetAgentId) return { ok: false, reason: `task "${to}" has no active worker` }
+
+  return { ok: true, routeMode: 'task', targetAgentId, isUserMessage: false }
 }
 
 export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingState>()(({
@@ -106,6 +145,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
     communicationStreamStarted: Signal.create<AgentCommunicationStreamSignal>('AgentRouting/communicationStreamStarted'),
     communicationStreamChunk: Signal.create<AgentCommunicationStreamSignal>('AgentRouting/communicationStreamChunk'),
     communicationStreamCompleted: Signal.create<AgentCommunicationStreamCompletedSignal>('AgentRouting/communicationStreamCompleted'),
+    invalidExplicitDestination: Signal.create<InvalidExplicitDestinationSignal>('AgentRouting/invalidExplicitDestination'),
   },
 
   eventHandlers: {
@@ -139,16 +179,44 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
     message_start: ({ event, state, emit, read }) => {
       const scope = resolveMessageScope(event)
       const taskId = event.taskId ?? null
+      const explicitTo = event.to ?? null
       const source = event.forkId === null ? undefined : getRoutingEntryByForkId(state, event.forkId)
       const taskGraph = read(TaskGraphProjection)
-      const targetAgentId = scope === 'task' ? findTaskWorkerAgentId(taskGraph, taskId) : null
-      const isUserMessage = scope === 'top-level' && event.forkId === null
+
+      let routeMode: ResolvedRouteMode
+      let targetAgentId: string | null
+      let isUserMessage: boolean
+
+      if (explicitTo !== null) {
+        const resolved = resolveExplicitTo(explicitTo, event.forkId, source, taskGraph)
+        if (!resolved.ok) {
+          emit.invalidExplicitDestination({
+            forkId: event.forkId,
+            turnId: event.turnId,
+            messageId: event.id,
+            taskId,
+            to: explicitTo,
+            reason: resolved.reason,
+            timestamp: event.timestamp,
+          })
+          return state
+        }
+        routeMode = resolved.routeMode
+        targetAgentId = resolved.targetAgentId
+        isUserMessage = resolved.isUserMessage
+      } else {
+        routeMode = scope === 'task' ? 'task' : (event.forkId === null ? 'user' : 'parent')
+        targetAgentId = routeMode === 'task' ? findTaskWorkerAgentId(taskGraph, taskId) : null
+        isUserMessage = routeMode === 'user'
+      }
 
       const pendingMessages = new Map(state.pendingMessages)
       pendingMessages.set(event.id, {
         forkId: event.forkId,
         scope,
         taskId,
+        explicitTo,
+        routeMode,
         text: '',
         order: event.timestamp,
         targetAgentId,
@@ -156,7 +224,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       })
 
       if (!isUserMessage) {
-        if (scope === 'top-level' && event.forkId !== null && source) {
+        if (routeMode === 'parent' && event.forkId !== null && source) {
           emit.communicationStreamStarted({
             streamId: event.id,
             targetForkId: source.forkId,
@@ -165,7 +233,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
             textDelta: '',
             timestamp: event.timestamp,
           })
-        } else if (scope === 'task' && targetAgentId && isActiveRoute(state, targetAgentId)) {
+        } else if (routeMode === 'task' && targetAgentId && isActiveRoute(state, targetAgentId)) {
           const target = getRoutingEntry(state, targetAgentId)
           if (target) {
             emit.communicationStreamStarted({
@@ -191,7 +259,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       pendingMessages.set(event.id, { ...entry, text: entry.text + event.text })
 
       if (!entry.isUserMessage && event.text.length > 0) {
-        if (entry.scope === 'top-level' && entry.forkId !== null) {
+        if (entry.routeMode === 'parent' && entry.forkId !== null) {
           const source = getRoutingEntryByForkId(state, entry.forkId)
           if (source) {
             emit.communicationStreamChunk({
@@ -203,7 +271,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
               timestamp: event.timestamp,
             })
           }
-        } else if (entry.scope === 'task' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
+        } else if (entry.routeMode === 'task' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
           const target = getRoutingEntry(state, entry.targetAgentId)
           if (target) {
             emit.communicationStreamChunk({
@@ -230,7 +298,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
 
       let nextState: AgentRoutingState = { ...state, pendingMessages }
 
-      if (entry.scope === 'top-level' && entry.forkId !== null) {
+      if (entry.routeMode === 'parent' && entry.forkId !== null) {
         const source = getRoutingEntryByForkId(state, entry.forkId)
         if (source) {
           emit.communicationStreamCompleted({
@@ -248,7 +316,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         nextState = { ...nextState, deferredParentMessages }
       }
 
-      if (entry.scope === 'task' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
+      if (entry.routeMode === 'task' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
         const target = getRoutingEntry(state, entry.targetAgentId)
         if (target) {
           emit.communicationStreamCompleted({

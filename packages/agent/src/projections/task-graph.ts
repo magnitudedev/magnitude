@@ -1,7 +1,7 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentStatusProjection, type AgentStatusState } from './agent-status'
-import { isTaskAssigneeAllowed, type TaskAssignee, type TaskTypeId } from '../tasks'
+import { type TaskAssignee, type TaskTypeId } from '../tasks'
 
 export type TaskStatus = 'pending' | 'working' | 'completed' | 'archived'
 
@@ -206,6 +206,32 @@ function findTaskByWorkerAgentId(state: TaskGraphState, agentId: string): TaskRe
   return undefined
 }
 
+function isTaskStatus(value: string): value is TaskStatus {
+  return value === 'pending' || value === 'working' || value === 'completed' || value === 'archived'
+}
+
+function canTransition(current: TaskStatus, requested: TaskStatus): boolean {
+  if (current === requested) return false
+
+  switch (current) {
+    case 'pending':
+      return requested === 'working' || requested === 'completed' || requested === 'archived'
+    case 'working':
+      return requested === 'pending' || requested === 'completed' || requested === 'archived'
+    case 'completed':
+      return requested === 'pending' || requested === 'archived'
+    case 'archived':
+      return requested === 'completed'
+  }
+}
+
+function isTaskAssigneeAllowed(taskType: TaskTypeId, assignee: TaskAssignee): boolean {
+  if (assignee === 'user') {
+    return taskType === 'review'
+  }
+  return true
+}
+
 export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()(({
   name: 'TaskGraph',
 
@@ -315,78 +341,96 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
       }
 
       if (event.patch.status !== undefined) {
+        if (!isTaskStatus(event.patch.status)) {
+          return nextState
+        }
+
         const requestedStatus = event.patch.status
         const current = getTask(nextState, event.taskId)
         const previousStatus = current.status
 
-        const validStatuses = ['pending', 'working', 'completed', 'archived']
-        if (!validStatuses.includes(requestedStatus)) return nextState
-        if (requestedStatus === previousStatus) return nextState
-        if (requestedStatus === 'working') return nextState
-
-        if (requestedStatus === 'completed') {
-          if (!canCompleteTask(nextState, event.taskId)) return nextState
-
-          const completedAt = previousStatus === 'archived' ? current.completedAt : event.timestamp
-          nextState = patchTask(nextState, event.taskId, (task) => ({
-            ...task,
-            status: 'completed',
-            completedAt,
-            updatedAt: event.timestamp,
-          }))
-
-          emit.taskCompleted({
-            taskId: event.taskId,
-            timestamp: event.timestamp,
-          })
-
-          emit.taskStatusChanged({
-            taskId: event.taskId,
-            previous: previousStatus,
-            next: 'completed',
-            timestamp: event.timestamp,
-          })
-
+        if (previousStatus === requestedStatus) {
           return nextState
         }
 
-        if (requestedStatus === 'archived') {
-          if (previousStatus !== 'completed') return nextState
-
-          nextState = patchTask(nextState, event.taskId, (task) => ({
-            ...task,
-            status: 'archived',
-            updatedAt: event.timestamp,
-          }))
-
-          emit.taskStatusChanged({
-            taskId: event.taskId,
-            previous: previousStatus,
-            next: 'archived',
-            timestamp: event.timestamp,
-          })
-
+        if (!canTransition(previousStatus, requestedStatus)) {
           return nextState
         }
 
-        if (requestedStatus === 'pending') {
-          if (previousStatus !== 'completed' && previousStatus !== 'archived') return nextState
+        switch (requestedStatus) {
+          case 'completed': {
+            const completedAt = previousStatus === 'archived' ? current.completedAt : event.timestamp
+            nextState = patchTask(nextState, event.taskId, (task) => ({
+              ...task,
+              status: 'completed',
+              completedAt,
+              updatedAt: event.timestamp,
+            }))
 
-          nextState = patchTask(nextState, event.taskId, (task) => ({
-            ...task,
-            status: 'pending',
-            completedAt: null,
-            updatedAt: event.timestamp,
-          }))
+            emit.taskCompleted({
+              taskId: event.taskId,
+              timestamp: event.timestamp,
+            })
 
-          emit.taskStatusChanged({
-            taskId: event.taskId,
-            previous: previousStatus,
-            next: 'pending',
-            timestamp: event.timestamp,
-          })
+            emit.taskStatusChanged({
+              taskId: event.taskId,
+              previous: previousStatus,
+              next: 'completed',
+              timestamp: event.timestamp,
+            })
 
-          return nextState
+            return nextState
+          }
+          case 'archived': {
+            nextState = patchTask(nextState, event.taskId, (task) => ({
+              ...task,
+              status: 'archived',
+              updatedAt: event.timestamp,
+            }))
+
+            emit.taskStatusChanged({
+              taskId: event.taskId,
+              previous: previousStatus,
+              next: 'archived',
+              timestamp: event.timestamp,
+            })
+
+            return nextState
+          }
+          case 'pending': {
+            nextState = patchTask(nextState, event.taskId, (task) => ({
+              ...task,
+              status: 'pending',
+              completedAt: null,
+              updatedAt: event.timestamp,
+            }))
+
+            emit.taskStatusChanged({
+              taskId: event.taskId,
+              previous: previousStatus,
+              next: 'pending',
+              timestamp: event.timestamp,
+            })
+
+            return nextState
+          }
+          case 'working': {
+            nextState = patchTask(nextState, event.taskId, (task) => ({
+              ...task,
+              status: 'working',
+              completedAt: null,
+              updatedAt: event.timestamp,
+            }))
+
+            emit.taskStatusChanged({
+              taskId: event.taskId,
+              previous: previousStatus,
+              next: 'working',
+              timestamp: event.timestamp,
+            })
+
+            return nextState
+          }
         }
       }
 

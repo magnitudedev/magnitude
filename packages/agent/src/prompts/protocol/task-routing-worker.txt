@@ -1,6 +1,6 @@
 ## Message routing
 
-A top-level `<message>` routes to the lead.
+`<message to="parent">` routes to the lead.
 
 You can send multiple messages in one turn, and messages may appear before, between, or after task blocks.
 

@@ -25,7 +25,7 @@ import type { CallUsage } from '@magnitudedev/providers'
  */
 export type TurnEvent =
   // --- Message/thinking content ---
-  | { readonly _tag: 'MessageStart'; readonly id: string; readonly taskId: string | null }
+  | { readonly _tag: 'MessageStart'; readonly id: string; readonly taskId: string | null; readonly to: string | null }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
   | { readonly _tag: 'ThinkingDelta'; readonly text: string }

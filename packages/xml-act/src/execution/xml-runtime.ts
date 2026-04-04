@@ -645,6 +645,7 @@ function reactImpl(
               id,
               scope: 'top-level',
               taskId: null,
+              to: null,
             })
           }
           currentState = yield* emitAndFold(currentState, {
@@ -716,6 +717,7 @@ function reactImpl(
           id: parseEvent.id,
           scope: parseEvent.scope,
           taskId: parseEvent.taskId,
+          to: parseEvent.to,
         })
         break
       }

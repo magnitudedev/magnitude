@@ -24,7 +24,7 @@ describe('memory/timeline-events', () => {
       })
 
       yield* h.send({ type: 'turn_started', forkId: subforkId, turnId: 'sub-turn-1', chainId: 'sub-chain-1' })
-      yield* h.send({ type: 'message_start', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', taskId: 'task-sub-1' })
+      yield* h.send({ type: 'message_start', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', taskId: 'task-sub-1', to: null })
       yield* h.send({ type: 'message_chunk', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', text: 'working on auth flow' })
       yield* h.send({ type: 'message_end', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1' })
       yield* h.send({

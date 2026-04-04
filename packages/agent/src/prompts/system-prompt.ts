@@ -33,7 +33,7 @@ export function renderSystemPrompt(
   return roleDef.systemPrompt
     .replaceAll(
       '{{RESPONSE_PROTOCOL}}',
-      getXmlActProtocol(roleDef.lenses, mapProtocolMode(roleDef)),
+      getXmlActProtocol(roleDef.lenses, mapProtocolMode(roleDef), roleDef.defaultRecipient),
     )
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)

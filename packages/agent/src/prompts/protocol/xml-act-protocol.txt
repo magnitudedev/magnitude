@@ -7,9 +7,9 @@ You respond in an XML-like syntax with four core constructs: lenses, message, ta
 <lenses>
 {{LENSES_EXAMPLE}}
 </lenses>
-<message>...optional message to parent...</message>
+<message to="{{DEFAULT_RECIPIENT}}">...message to {{DEFAULT_RECIPIENT}}...</message>
 <task id="..." type="..." title="...">
-  ...zero or more task/tool operations...
+...zero or more task/tool operations...
 </task>
 <{{TURN_CONTROL_NEXT}}/> OR <{{TURN_CONTROL_YIELD}}/>
 

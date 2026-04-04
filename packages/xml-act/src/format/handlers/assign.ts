@@ -91,9 +91,43 @@ export function assignHandler(
     },
     selfClose(ctx) {
       const task = findFrame(ctx.stack, 'task')
-      if (!task) return []
+      if (!task) {
+        return [
+          ...endTopProse(ctx.stack),
+          emit({
+            _tag: 'ParseError',
+            error: {
+              _tag: 'InvalidAttributeValue',
+              id: ctx.generateId(),
+              tagName: 'assign',
+              attribute: 'role',
+              expected: 'non-empty string inside task frame',
+              received: '',
+              detail: 'Assign must be used inside a task',
+            },
+          }),
+        ]
+      }
+
       const role = ctx.attrs.get('role')?.trim() ?? ''
-      if (!role) return []
+      if (!role) {
+        return [
+          ...endTopProse(ctx.stack),
+          emit({
+            _tag: 'ParseError',
+            error: {
+              _tag: 'InvalidAttributeValue',
+              id: ctx.generateId(),
+              tagName: 'assign',
+              attribute: 'role',
+              expected: 'non-empty string',
+              received: '',
+              detail: 'Assign role is required',
+            },
+          }),
+        ]
+      }
+
       return [emit({ _tag: 'TaskAssign', taskId: task.id, role, body: '' })]
     },
   }

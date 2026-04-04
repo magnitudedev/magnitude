@@ -463,6 +463,7 @@ describe('xml-act end-to-end', () => {
     const starts = eventsOfType(events, 'MessageStart')
     expect(starts.length).toBeGreaterThan(0)
     expect(starts[0]).toBeDefined()
+    expect(starts[0]?.to).toBeNull()
 
     const chunks = eventsOfType(events, 'MessageChunk')
     expect(chunks.length).toBeGreaterThan(0)

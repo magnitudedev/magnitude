@@ -33,7 +33,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_TASK_REMINDER, formatNonexistentAgentError, formatTaskOutsideSubtreeError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_TASK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
@@ -43,7 +43,7 @@ import { ConversationProjection, type ConversationState } from '../projections/c
 import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
 
-import { AgentRoutingProjection, type AgentRoutingState, isActiveRoute, getRoutingEntryByForkId } from '../projections/agent-routing'
+import { AgentRoutingProjection, type AgentRoutingState, getRoutingEntryByForkId } from '../projections/agent-routing'
 import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentByForkId } from '../projections/agent-status'
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
@@ -68,7 +68,8 @@ const { ForkContext } = Fork
 type AgentDef = RoleDefinition
 
 import { mapXmlToolResult } from '../util/tool-result'
-import { assignTaskOperation, cancelTaskOperation, createTaskOperation, updateTaskOperation } from '../tools/task-tools'
+import { handleTaskDirective } from '../tasks/operations'
+import type { TaskDirectiveStatus } from '../tasks/operations/types'
 
 // =============================================================================
 // Types
@@ -727,41 +728,85 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Messages / Think prose ---
               case 'MessageStart': {
-                let resolvedDest: string
-                if (event.scope === 'top-level') {
-                  resolvedDest = defaultProseDest
-                  if (forkId !== null && resolvedDest === 'user') {
-                    if (!allowSingleUserReplyThisTurn || directUserRepliesSent >= 1) {
-                      resolvedDest = 'parent'
-                    } else {
-                      directUserRepliesSent += 1
+                const taskProjection = yield* TaskGraphProjection.Tag
+                const taskState = yield* taskProjection.get
+
+                const explicitTo = typeof event.to === 'string' ? event.to : null
+                if (explicitTo !== null) {
+                  if (explicitTo === 'user') {
+                    if (forkId !== null) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": only root fork can send to user`,
+                      })
+                      break
+                    }
+                  } else if (explicitTo === 'parent') {
+                    if (forkId === null) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": root fork has no parent`,
+                      })
+                      break
+                    }
+                  } else {
+                    const targetTask = taskState.tasks.get(explicitTo)
+                    if (!targetTask) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": task not found`,
+                      })
+                      break
+                    }
+                    if (!targetTask.worker?.agentId) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": task has no active worker`,
+                      })
+                      break
                     }
                   }
-                } else {
-                  const taskState = yield* TaskGraphProjection.Tag.pipe(Effect.flatMap((p) => p.get))
-                  const task = event.taskId ? taskState.tasks.get(event.taskId) : undefined
-                  resolvedDest = task?.worker?.agentId ?? 'parent'
+                }
+
+                // Skip message directive for explicit task-targeted messages —
+                // they don't affect user reply counting and are routed by the projection
+                if (explicitTo === null || explicitTo === 'user' || explicitTo === 'parent') {
+                  const messageResult = yield* handleTaskDirective({
+                    kind: 'message',
+                    scope: event.scope,
+                    taskId: event.taskId,
+                    defaultTopLevelDestination: defaultProseDest,
+                    allowSingleUserReplyThisTurn,
+                    directUserRepliesSent,
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
+                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provide(executionLayer),
+                  )
+
+                  if (!messageResult.success) {
+                    turnErrors.push({
+                      code: 'task_operation_error',
+                      message: messageResult.error,
+                    })
+                    break
+                  }
+
+                  if (
+                    'directUserRepliesSent' in messageResult
+                    && typeof messageResult.directUserRepliesSent === 'number'
+                  ) {
+                    directUserRepliesSent = messageResult.directUserRepliesSent
+                  }
                 }
 
                 messagesSent.push({ id: event.id, taskId: event.taskId })
                 hasAnyMessage = true
 
-                if (resolvedDest !== 'user' && resolvedDest !== 'parent') {
-                  const currentAgentState = yield* agentRoutingProjectionInst.get
-                  const targetAgent = isActiveRoute(currentAgentState, resolvedDest)
-                  if (!targetAgent) {
-                    const destStr = `"${resolvedDest}"`
-                    turnErrors.push({
-                      code: 'nonexistent_agent_destination',
-                      message: formatNonexistentAgentError(destStr),
-                    })
-                  }
-                }
-
                 yield* Queue.offer(sink, {
                   _tag: 'MessageStart',
                   id: event.id,
                   taskId: event.taskId,
+                  to: explicitTo,
                 })
                 break
               }
@@ -856,13 +901,14 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
 
                   if (event.taskType && event.title) {
-                    const createResult = yield* createTaskOperation({
+                    const createResult = yield* handleTaskDirective({
+                      kind: 'create',
                       taskId: event.id,
-                      type: event.taskType,
-                      parent: parentId,
+                      taskType: event.taskType,
+                      parentId,
                       after: event.after,
                       title: event.title,
-                    }).pipe(
+                    }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
                       Effect.provideService(ForkContext, { forkId }),
                       Effect.provide(executionLayer),
                     )
@@ -878,20 +924,24 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'TaskPatched': {
-                const updateResult = event.status === 'cancelled'
-                  ? yield* cancelTaskOperation({
+                const directiveStatus = event.status as TaskDirectiveStatus | null
+
+                const updateResult = directiveStatus === 'cancelled'
+                  ? yield* handleTaskDirective({
+                    kind: 'cancel',
                     taskId: event.id,
-                  }).pipe(
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
                     Effect.provideService(ForkContext, { forkId }),
                     Effect.provide(executionLayer),
                   )
-                  : yield* updateTaskOperation({
+                  : yield* handleTaskDirective({
+                    kind: 'update',
                     taskId: event.id,
                     parent: event.explicitParent ?? event.parent ?? undefined,
                     after: event.after,
                     title: event.title,
-                    status: (event.status as TaskStatus | null) ?? undefined,
-                  }).pipe(
+                    status: directiveStatus === null ? undefined : directiveStatus,
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
                     Effect.provideService(ForkContext, { forkId }),
                     Effect.provide(executionLayer),
                   )
@@ -910,10 +960,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 const task = taskState.tasks.get(event.taskId)
                 if (task?.status === 'completed' && !taskTouchedThisTurn.has(event.taskId)) {
                   taskTouchedThisTurn.add(event.taskId)
-                  const reopenResult = yield* updateTaskOperation({
+                  const reopenResult = yield* handleTaskDirective({
+                    kind: 'update',
                     taskId: event.taskId,
                     status: 'pending',
-                  }).pipe(
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
                     Effect.provideService(ForkContext, { forkId }),
                     Effect.provide(executionLayer),
                   )
@@ -924,7 +975,8 @@ const makeExecutionManager = Effect.gen(function* () {
                     })
                   }
                 }
-                const assignResult = yield* assignTaskOperation({
+                const assignResult = yield* handleTaskDirective({
+                  kind: 'assign',
                   taskId: event.taskId,
                   assignee: event.role,
                   message: event.body,
@@ -938,7 +990,7 @@ const makeExecutionManager = Effect.gen(function* () {
                     role: params.role,
                     taskId: params.taskId,
                   }),
-                }).pipe(
+                }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
                   Effect.provideService(ForkContext, { forkId }),
                   Effect.provide(executionLayer),
                 )

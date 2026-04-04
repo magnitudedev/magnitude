@@ -51,7 +51,7 @@ Code reading is not evidence for functional correctness. If a change is about be
 
 ## Output
 
-Send your findings to the parent via a top-level `<message>...</message>`:
+Send your findings to the parent via `<message to="parent">...</message>`:
 If your findings are substantial, also write them to `$M/reports/` and mention the file via markdown link syntax in your message (e.g., `[review.md]($M/reports/example-review.md)`).
 - What you verified and how
 - What passed, with output as evidence

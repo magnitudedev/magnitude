@@ -59,6 +59,7 @@ describe('display pending communications promotion', () => {
         turnId: 't-parent',
         scope: 'task',
         taskId: 'task-1',
+        to: null,
       } as any)
       await harness.send({
         type: 'message_chunk',
@@ -212,6 +213,7 @@ describe('display pending communications promotion', () => {
         turnId: 't-parent-2',
         scope: 'task',
         taskId: 'task-2',
+        to: null,
       } as any)
       await harness.send({
         type: 'message_chunk',
@@ -264,6 +266,94 @@ describe('display pending communications promotion', () => {
 
       const rootDisplay = await harness.projectionFork(DisplayProjection.Tag, null)
       expect(rootDisplay.pendingInboundCommunications.length).toBe(0)
+    } finally {
+      stopRouting()
+      await harness.dispose()
+    }
+  })
+
+  it('routes explicit to="<task-id>" from top-level message', async () => {
+    const harness = await createAgentTestHarness()
+    const stopRouting = await harness.script.route({
+      root: { xml: '<yield/>' },
+      subagents: { xml: '<yield/>' },
+    })
+
+    try {
+      await harness.send({
+        type: 'task_created',
+        forkId: null,
+        taskId: 'task-explicit',
+        title: 'Task explicit',
+        taskType: 'implement',
+        parentId: null,
+        timestamp: ts(20),
+      } as any)
+      await harness.send({
+        type: 'agent_created',
+        timestamp: ts(20),
+        forkId: 'fork-explicit',
+        parentForkId: null,
+        agentId: 'agent-explicit',
+        role: 'builder',
+        name: 'BuilderExplicit',
+        message: 'ready',
+        mode: 'manual',
+        taskId: 'task-explicit',
+        context: '',
+      } as any)
+      await harness.send({
+        type: 'task_assigned',
+        forkId: null,
+        taskId: 'task-explicit',
+        assignee: 'builder',
+        workerRole: 'builder',
+        message: 'do it',
+        workerInfo: { agentId: 'agent-explicit', forkId: 'fork-explicit', role: 'builder' },
+        timestamp: ts(20),
+      } as any)
+
+      await harness.send({
+        type: 'message_start',
+        id: 'm-explicit',
+        timestamp: ts(21),
+        forkId: null,
+        turnId: 't-root-explicit',
+        scope: 'top-level',
+        taskId: null,
+        to: 'task-explicit',
+      } as any)
+      await harness.send({
+        type: 'message_chunk',
+        id: 'm-explicit',
+        timestamp: ts(22),
+        forkId: null,
+        turnId: 't-root-explicit',
+        text: 'explicit route',
+      } as any)
+      await harness.send({
+        type: 'message_end',
+        id: 'm-explicit',
+        timestamp: ts(23),
+        forkId: null,
+        turnId: 't-root-explicit',
+      } as any)
+
+      await harness.send({
+        type: 'turn_started',
+        timestamp: ts(24),
+        forkId: 'fork-explicit',
+        turnId: 't-explicit-sub',
+        chainId: 'c-explicit',
+      } as any)
+
+      await harness.wait.until('explicit message promoted', async () => {
+        const display = await harness.projectionFork(DisplayProjection.Tag, 'fork-explicit')
+        const allSteps = display.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
+        return allSteps.some(
+          s => s.type === 'communication' && s.direction === 'from_agent' && (s as any).content.includes('explicit route')
+        )
+      })
     } finally {
       stopRouting()
       await harness.dispose()

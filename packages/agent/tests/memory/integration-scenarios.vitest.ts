@@ -82,6 +82,7 @@ describe('memory integration scenarios', () => {
         turnId: 'sub-turn',
         id: 'm1',
         taskId: 'task-1',
+        to: null,
       })
       yield* h.send({
         type: 'message_chunk',

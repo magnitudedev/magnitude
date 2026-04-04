@@ -15,6 +15,7 @@ import type { ObservationPart } from '@magnitudedev/roles'
 import type { WorkflowSkill } from '@magnitudedev/skills'
 import type { TaskTypeId, TaskAssignee } from './tasks'
 
+
 export type Attachment = ImageAttachment | MentionAttachment
 
 export interface ImageAttachment {
@@ -225,6 +226,7 @@ export interface MessageStart {
   readonly turnId: string
   readonly id: string
   readonly taskId: string | null
+  readonly to: string | null
 }
 
 export interface ThinkingChunk {
@@ -706,3 +708,4 @@ export type AppEvent =
   | SkillActivated
   | SkillStarted
   | SkillCompleted
+

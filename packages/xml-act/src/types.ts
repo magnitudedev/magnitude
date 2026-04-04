@@ -162,6 +162,7 @@ export interface MessageStart {
   readonly id: string
   readonly scope: 'top-level' | 'task'
   readonly taskId: string | null
+  readonly to: string | null
 }
 export interface MessageChunk { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
 export interface MessageEnd { readonly _tag: 'MessageEnd'; readonly id: string }

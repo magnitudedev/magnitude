@@ -33,9 +33,10 @@ export function messageHandler(tags: TagMap): TagHandler<XmlActFrame, XmlActEven
 
       const id = ctx.generateId()
       const { scope, taskId } = resolveMessageScope(ctx.stack)
+      const to = ctx.attrs.get('to') ?? null
       return [
         ...endTopProse(ctx.stack),
-        emit({ _tag: 'MessageStart', id, scope, taskId }),
+        emit({ _tag: 'MessageStart', id, scope, taskId, to }),
         push({
           type: 'message',
           id,
@@ -77,8 +78,9 @@ export function messageHandler(tags: TagMap): TagHandler<XmlActFrame, XmlActEven
     selfClose(ctx) {
       const id = ctx.generateId()
       const { scope, taskId } = resolveMessageScope(ctx.stack)
+      const to = ctx.attrs.get('to') ?? null
       return [
-        emit({ _tag: 'MessageStart', id, scope, taskId }),
+        emit({ _tag: 'MessageStart', id, scope, taskId, to }),
         emit({ _tag: 'MessageEnd', id }),
       ]
     },

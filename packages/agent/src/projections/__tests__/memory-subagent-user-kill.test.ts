@@ -15,6 +15,7 @@ import { CanonicalTurnProjection } from '../canonical-turn'
 import { UserPresenceProjection } from '../user-presence'
 import { OutboundMessagesProjection } from '../outbound-messages'
 import { UserMessageResolutionProjection } from '../user-message-resolution'
+import { TaskGraphProjection } from '../task-graph'
 
 const ts = (n: number) => 1_700_100_000_000 + n
 
@@ -35,6 +36,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
       Layer.provide(UserPresenceProjection.Layer, projectionBusLayer),
       Layer.provide(OutboundMessagesProjection.Layer, projectionBusLayer),
       Layer.provide(UserMessageResolutionProjection.Layer, projectionBusLayer),
+      Layer.provide(TaskGraphProjection.Layer, projectionBusLayer),
       Layer.provide(MemoryProjection.Layer, projectionBusLayer),
     )
 
@@ -115,6 +117,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
       Layer.provide(UserPresenceProjection.Layer, projectionBusLayer),
       Layer.provide(OutboundMessagesProjection.Layer, projectionBusLayer),
       Layer.provide(UserMessageResolutionProjection.Layer, projectionBusLayer),
+      Layer.provide(TaskGraphProjection.Layer, projectionBusLayer),
       Layer.provide(MemoryProjection.Layer, projectionBusLayer),
     )
 

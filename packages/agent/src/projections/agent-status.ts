@@ -144,9 +144,10 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     agent_created: ({ event, state, emit }) => {
       const normalizedMode: 'clone' | 'spawn' = event.mode === 'clone' ? 'clone' : 'spawn'
       const normalizedContext = typeof event.context === 'string' ? event.context : ''
-      const normalizedTaskId = typeof event.taskId === 'string' && event.taskId.trim().length > 0
-        ? event.taskId
-        : `legacy-${event.agentId}-${event.forkId}`
+      if (typeof event.taskId !== 'string' || event.taskId.trim().length === 0) {
+        return state
+      }
+      const normalizedTaskId = event.taskId
 
       const existingAgent = state.agents.get(event.agentId)
       if (existingAgent) {
