@@ -9,6 +9,7 @@ import { MessageView } from './message-view'
 import { ContextUsageBar } from './context-usage-bar'
 import { useCollapsedBlocks } from '../hooks/use-collapsed-blocks'
 import { FileViewerPanel } from './file-viewer-panel'
+import { SelectedFileProvider } from '../hooks/use-file-viewer'
 
 interface ForkDetailOverlayProps {
   forkId: string
@@ -145,71 +146,73 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
         </text>
       </box>
 
-      <box style={{ flexDirection: 'row', flexGrow: 1, paddingLeft: 1, paddingRight: 1, gap: 1 }}>
-        {/* Message list */}
-        <scrollbox
-          ref={scrollboxRef}
-          stickyScroll
-          stickyStart="bottom"
-          scrollX={false}
-          scrollbarOptions={{ visible: false }}
-          verticalScrollbarOptions={{
-            visible: true,
-            trackOptions: { width: 1 },
-          }}
-          style={{
-            width: canRenderPanel ? '60%' : '100%',
-            flexGrow: 1,
-            rootOptions: {
+      <SelectedFileProvider value={selectedFile}>
+        <box style={{ flexDirection: 'row', flexGrow: 1, paddingLeft: 1, paddingRight: 1, gap: 1 }}>
+          {/* Message list */}
+          <scrollbox
+            ref={scrollboxRef}
+            stickyScroll
+            stickyStart="bottom"
+            scrollX={false}
+            scrollbarOptions={{ visible: false }}
+            verticalScrollbarOptions={{
+              visible: true,
+              trackOptions: { width: 1 },
+            }}
+            style={{
+              width: canRenderPanel ? '60%' : '100%',
               flexGrow: 1,
-              backgroundColor: 'transparent',
-            },
-            wrapperOptions: {
-              border: false,
-              backgroundColor: 'transparent',
-            },
-            contentOptions: {
-              paddingLeft: 1,
-              paddingRight: 1,
-              paddingTop: 1,
-            },
-          }}
-        >
-          {messages.length === 0 ? (
-            <box style={{ paddingLeft: 1 }}>
-              <text style={{ fg: theme.muted }}>No activity yet.</text>
-            </box>
-          ) : (
-            messages.map((msg: DisplayMessage) => {
-              const isStreamingMsg = isStreaming && msg === messages[messages.length - 1] && msg.type === 'assistant_message'
-              return (
-                <MessageView
-                  key={msg.id}
-                  message={msg}
-                  isStreaming={isStreamingMsg}
-                  isCollapsed={msg.type === 'think_block' ? isCollapsed(msg.id) : undefined}
-                  onToggleCollapse={msg.type === 'think_block' ? () => toggleCollapse(msg.id) : undefined}
-                  onForkExpand={onForkExpand}
-                  onFileClick={openFile}
-                />
-              )
-            })
-          )}
-        </scrollbox>
+              rootOptions: {
+                flexGrow: 1,
+                backgroundColor: 'transparent',
+              },
+              wrapperOptions: {
+                border: false,
+                backgroundColor: 'transparent',
+              },
+              contentOptions: {
+                paddingLeft: 1,
+                paddingRight: 1,
+                paddingTop: 1,
+              },
+            }}
+          >
+            {messages.length === 0 ? (
+              <box style={{ paddingLeft: 1 }}>
+                <text style={{ fg: theme.muted }}>No activity yet.</text>
+              </box>
+            ) : (
+              messages.map((msg: DisplayMessage) => {
+                const isStreamingMsg = isStreaming && msg === messages[messages.length - 1] && msg.type === 'assistant_message'
+                return (
+                  <MessageView
+                    key={msg.id}
+                    message={msg}
+                    isStreaming={isStreamingMsg}
+                    isCollapsed={msg.type === 'think_block' ? isCollapsed(msg.id) : undefined}
+                    onToggleCollapse={msg.type === 'think_block' ? () => toggleCollapse(msg.id) : undefined}
+                    onForkExpand={onForkExpand}
+                    onFileClick={openFile}
+                  />
+                )
+              })
+            )}
+          </scrollbox>
 
-        {canRenderPanel && selectedFile && (
-          <box style={{ width: '40%', minWidth: 36, height: '100%' }}>
-            <FileViewerPanel
-              filePath={selectedFile.path}
-              content={selectedFileContent}
-              scrollToSection={selectedFile.section}
-              onClose={closeFilePanel}
-              onOpenFile={openFile}
-              streaming={selectedFileStreaming}
-            />
-          </box>
-        )}
-      </box>
+          {canRenderPanel && selectedFile && (
+            <box style={{ width: '40%', minWidth: 36, height: '100%' }}>
+              <FileViewerPanel
+                filePath={selectedFile.path}
+                content={selectedFileContent}
+                scrollToSection={selectedFile.section}
+                onClose={closeFilePanel}
+                onOpenFile={openFile}
+                streaming={selectedFileStreaming}
+              />
+            </box>
+          )}
+        </box>
+      </SelectedFileProvider>
 
       <box style={{ flexShrink: 0, paddingTop: 1, paddingLeft: 2, paddingRight: 2, flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end' }}>
         <box style={{ flexDirection: 'row', alignItems: 'center' }}>

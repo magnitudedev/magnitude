@@ -32,10 +32,21 @@ let filePanelState = {
   canRenderPanel: false,
 }
 
+const selectedFileProviderCalls: Array<any> = []
+
 let ForkDetailOverlay: typeof import('./fork-detail-overlay').ForkDetailOverlay
 let scheduleInitialForkOverlaySnap: typeof import('./fork-detail-overlay').scheduleInitialForkOverlaySnap
 
 beforeEach(async () => {
+  selectedFileProviderCalls.length = 0
+
+  mock.module('../hooks/use-file-viewer', () => ({
+    SelectedFileProvider: ({ value, children }: { value: any, children?: any }) => {
+      selectedFileProviderCalls.push(value)
+      return <>{children}</>
+    },
+  }))
+
   mock.module('../hooks/use-file-panel', () => ({
     useFilePanel: () => ({
       ...filePanelState,
@@ -175,6 +186,26 @@ test('keeps overlay viewer rendering scoped to overlay-local file panel state', 
 })
 
 
+
+test('provides overlay-local selected file context from overlay file panel state', async () => {
+  filePanelState = {
+    selectedFile: { path: 'overlay.md' },
+    selectedFileContent: '# Overlay',
+    selectedFileStreaming: null,
+    canRenderPanel: true,
+  }
+
+  await act(async () => {
+    create(
+      <ForkDetailOverlay
+        {...propsWithDisplay(makeDisplayState([{ id: 'm1', type: 'assistant_message' } as any]))}
+      />,
+    )
+  })
+
+  expect(selectedFileProviderCalls.length).toBeGreaterThan(0)
+  expect(selectedFileProviderCalls.at(-1)).toEqual({ path: 'overlay.md' })
+})
 
 test('overlay source has no message-update-driven imperative scroll-to-bottom effect', async () => {
   const source = await Bun.file(new URL('./fork-detail-overlay.tsx', import.meta.url)).text()

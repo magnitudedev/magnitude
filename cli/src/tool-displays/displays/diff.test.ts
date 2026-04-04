@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { SelectedFileProvider } from '../../hooks/use-file-viewer'
 
 mock.module('../../hooks/use-theme', () => ({
   useTheme: () => ({
@@ -57,6 +58,44 @@ describe('inline diff display streaming', () => {
 
   test('renders surrounding context from state.diffs while streaming inline edit', () => {
     function Harness() {
+      return createElement(SelectedFileProvider, { value: null },
+        diffDisplay.render({
+          state: {
+            toolKey: 'fileEdit',
+            phase: 'streaming',
+            path: 'src/a.ts',
+            oldText: 'const before = 1',
+            newText: 'const after = 2',
+            replaceAll: false,
+            streamingTarget: 'new',
+            baseContent: null,
+            diffs: [
+              {
+                contextBefore: ['function demo() {', '  // keep this'],
+                removedLines: ['  const before = 1'],
+                addedLines: ['  const after = 2'],
+                contextAfter: ['  return after', '}'],
+              },
+            ],
+          },
+          isExpanded: false,
+          onToggle: () => {},
+          onFileClick: () => {},
+        }) as any,
+      )
+    }
+
+    const text = htmlToText(renderToStaticMarkup(createElement(Harness)))
+    expect(text).toContain('Editing')
+    expect(text).toContain('function demo() {')
+    expect(text).toContain('// keep this')
+    expect(text).toContain('const before = 1')
+    expect(text).toContain('const after = 2')
+    expect(text).toContain('return after')
+  })
+
+  test('hides streaming diff body when matching file is open in viewer while keeping header', () => {
+    function ToolRender() {
       return diffDisplay.render({
         state: {
           toolKey: 'fileEdit',
@@ -69,24 +108,28 @@ describe('inline diff display streaming', () => {
           baseContent: null,
           diffs: [
             {
-              contextBefore: ['function demo() {', '  // keep this'],
+              contextBefore: ['function demo() {'],
               removedLines: ['  const before = 1'],
               addedLines: ['  const after = 2'],
-              contextAfter: ['  return after', '}'],
+              contextAfter: ['}'],
             },
           ],
-        },
+        } as any,
         isExpanded: false,
         onToggle: () => {},
         onFileClick: () => {},
       }) as any
     }
 
+    function Harness() {
+      return createElement(SelectedFileProvider, { value: { path: 'src/a.ts' } }, createElement(ToolRender))
+    }
+
     const text = htmlToText(renderToStaticMarkup(createElement(Harness)))
-    expect(text).toContain('function demo() {')
-    expect(text).toContain('// keep this')
-    expect(text).toContain('const before = 1')
-    expect(text).toContain('const after = 2')
-    expect(text).toContain('return after')
+
+    expect(text).toContain('Editing')
+    expect(text).toContain('src/a.ts')
+    expect(text).not.toContain('const before = 1')
+    expect(text).not.toContain('const after = 2')
   })
 })
