@@ -72,6 +72,7 @@ export const contentDisplay = createToolDisplay<ContentState>({
                 height: 12,
               }}>
                 <scrollbox
+                  onMouseScroll={(e) => e.stopPropagation()}
                   stickyScroll
                   stickyStart="bottom"
                   scrollX={false}
