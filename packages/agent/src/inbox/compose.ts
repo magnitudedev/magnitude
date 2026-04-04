@@ -163,6 +163,8 @@ export function toTimelineLifecycleHook(args: {
   agentId: string
   role: string
   hookType: 'spawn' | 'idle'
+  taskId?: string
+  taskTitle?: string
 }): TimelineEntry {
   return {
     kind: 'lifecycle_hook',

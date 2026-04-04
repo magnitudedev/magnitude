@@ -173,6 +173,15 @@ function buildLifecycleReminderLines(
     }
     if (current.hookType === 'spawn' && hook.hookType === 'idle') {
       byAgent.set(hook.agentId, hook)
+      continue
+    }
+    if (
+      current.hookType === 'spawn'
+      && hook.hookType === 'spawn'
+      && !current.taskId
+      && Boolean(hook.taskId)
+    ) {
+      byAgent.set(hook.agentId, hook)
     }
   }
 
@@ -190,14 +199,20 @@ function buildLifecycleReminderLines(
   const dedup = new Set<string>()
   const lines: string[] = []
   for (const group of Array.from(groups.values())) {
+    const spawnHookWithTask = group.hookType === 'spawn'
+      ? hooks.find(h => h.hookType === 'spawn' && h.role === group.role && group.agentIds.includes(h.agentId) && h.taskId && h.taskTitle)
+      : undefined
+
     const formatter = group.hookType === 'spawn'
       ? formatters[group.role]?.spawn
       : formatters[group.role]?.idle
-    const text = formatter
-      ? formatter(group.agentIds)
-      : group.hookType === 'spawn'
-        ? `Subagent(s) ${group.agentIds.join(', ')} spawned.`
-        : `Subagent(s) ${group.agentIds.join(', ')} went idle.`
+    const text = spawnHookWithTask
+      ? `Worker \`${spawnHookWithTask.role}\` assigned to and working on task ${spawnHookWithTask.taskId} ("${spawnHookWithTask.taskTitle}").`
+      : formatter
+        ? formatter(group.agentIds)
+        : group.hookType === 'spawn'
+          ? `Worker(s) ${group.agentIds.join(', ')} spawned.`
+          : `Worker(s) ${group.agentIds.join(', ')} went idle.`
     if (!dedup.has(text)) {
       dedup.add(text)
       lines.push(text)

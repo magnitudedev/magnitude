@@ -311,8 +311,11 @@ function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number)
   }
 
   const status = task.status === 'completed' ? 'done' : task.status
+  const assignedRoleStr = task.worker && task.worker.role !== 'user'
+    ? `, assigned: ${task.worker.role}`
+    : ''
   const assigneeStr = task.assignee === 'user' ? ', user' : ''
-  const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assigneeStr})`
+  const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assignedRoleStr}${assigneeStr})`
 
   const childLines = task.childIds.flatMap(childId => renderTaskSubtree(state, childId, depth + 1))
   const directCompletedNonArchivedCount = task.childIds.reduce((count, childId) => {
@@ -454,7 +457,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
     tool_event: ({ fork }) => fork,
 
-    observations_captured: ({ event, fork }) => {
+    observations_captured: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
       const nextFork = enqueueTimeline(
         fork,
@@ -532,7 +535,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return nextFork
     },
 
-    turn_unexpected_error: ({ event, fork }) => {
+    turn_unexpected_error: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
       const nextFork = flushQueue(
         enqueueResult(fork, toResultError({ message: event.message }), event.timestamp),
@@ -636,6 +639,34 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
   },
 
   globalEventHandlers: {
+    task_assigned: ({ event, state, read }) => {
+      if (!event.workerInfo) return state
+
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const task = read(TaskGraphProjection).tasks.get(event.taskId)
+      if (!task) return state
+
+      const nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineLifecycleHook({
+          timestamp: event.timestamp,
+          agentId: event.workerInfo.agentId,
+          role: event.workerInfo.role,
+          hookType: 'spawn',
+          taskId: event.taskId,
+          taskTitle: task.title,
+        }),
+        event.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    },
+
     agent_created: ({ event, state }) => {
       const { forkId, parentForkId } = event
       const parentState = state.forks.get(parentForkId)

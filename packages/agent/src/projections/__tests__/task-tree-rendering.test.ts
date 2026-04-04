@@ -352,6 +352,52 @@ describe('task tree rendering mechanics', () => {
     expect((treeViews[0] as any).renderedTree).toContain('[done] implement: Task Final (task-final)')
   })
 
+  it('shows assigned worker role for non-user worker tasks', async () => {
+    const rootFork = await runEvents([
+      {
+        type: 'session_initialized',
+        timestamp: ts(0),
+        sessionId: 's1',
+        cwd: '/tmp',
+        model: 'test',
+        mode: 'interactive',
+        approvalMode: 'on-request',
+      } as any,
+      {
+        type: 'task_created',
+        timestamp: ts(1),
+        forkId: null,
+        taskId: 'diag-1',
+        title: 'Root cause analysis',
+        taskType: 'diagnose',
+        parentId: null,
+      } as any,
+      {
+        type: 'task_assigned',
+        timestamp: ts(2),
+        forkId: null,
+        taskId: 'diag-1',
+        assignee: 'debugger',
+        workerInfo: { agentId: 'agent-1', forkId: 'fork-1', role: 'debugger', message: '' },
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(3),
+        turnId: 'turn-1',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+    ])
+
+    const inbox = getLastInbox(rootFork)
+    const treeViews = inbox.timeline.filter(e => e.kind === 'task_tree_view')
+    expect(treeViews.length).toBe(1)
+    expect((treeViews[0] as any).renderedTree).toContain(
+      '[pending] diagnose: Root cause analysis (diag-1, assigned: debugger)',
+    )
+  })
+
   it('task_tree_dirty entries are excluded from chronological timeline render', async () => {
     const rootFork = await runEvents([
       {

@@ -51,6 +51,16 @@ Tasks from the tree can be delegated to workers.
 The task tree is a visible contract of how what work you intent to perform.
 By declaring and maintaining tasks properly, you give the user future-sight as well as the ability to steer your overall approach.
 
+## Reading the task tree
+
+The task tree shows all tasks and their current state:
+
+    [status] taskType: Title (taskId, assigned: role)
+
+- **status** — `pending` (no work started), `working` (worker actively assigned and executing), `done` (completed), `archived`.
+- **assigned: role** — Shown when a worker is actively assigned (e.g. `assigned: debugger`). Not shown if no worker is assigned.
+- A task becomes `working` when you assign a worker to it. You don't need to track this separately — the tree is the source of truth for who is working on what.
+
 ## Autonomy
 
 Managing tasks and delegating to workers creates a highly visible process, but also enables clear composition of tasks between workers. Managing work this way enables you to maintain a clear strategy and have oversight into all work. Monitoring the tree and its workers enables you to reorganize the tree or resteer workers as needed to better follow true user intent.

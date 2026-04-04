@@ -136,6 +136,27 @@ describe('formatInbox', () => {
     ])
   })
 
+  test('formats task worker spawn reminder with role, task id, and title', () => {
+    const timeline: readonly TimelineEntry[] = [
+      {
+        kind: 'lifecycle_hook',
+        timestamp: TS1,
+        agentId: 'agent-debug-1',
+        role: 'debugger',
+        hookType: 'spawn',
+        taskId: 'diag-1',
+        taskTitle: 'Investigate the crash',
+      },
+    ]
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text: '<reminders>\n- Worker `debugger` assigned to and working on task diag-1 ("Investigate the crash").\n</reminders>',
+      },
+    ])
+  })
+
   test('equal timestamp entries preserve input order', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'first-input', attachments: [] },

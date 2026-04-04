@@ -109,7 +109,13 @@ export type TimelineEntry =
   | (Timestamped<'phase_verdict'> & { readonly passed: boolean; readonly verdictText: string; readonly workflowCompleted: boolean })
   | (Timestamped<'skill_started'> & { readonly skillName: string; readonly firstPhase?: string; readonly prompt: string })
   | (Timestamped<'skill_completed'> & { readonly skillName: string })
-  | (Timestamped<'lifecycle_hook'> & { readonly agentId: string; readonly role: string; readonly hookType: LifecycleHookType })
+  | (Timestamped<'lifecycle_hook'> & {
+      readonly agentId: string
+      readonly role: string
+      readonly hookType: LifecycleHookType
+      readonly taskId?: string
+      readonly taskTitle?: string
+    })
   | (Timestamped<'task_type_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string })
   | (Timestamped<'task_idle_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string; readonly agentId: string })
   | (Timestamped<'task_tree_dirty'> & { readonly taskId: string })
