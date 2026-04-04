@@ -53,6 +53,7 @@ import {
   toTimelineTaskIdleHook,
   toTimelineTaskTreeDirty,
   toTimelineTaskTreeView,
+  toTimelineTaskUpdate,
 } from '../inbox/compose'
 import { builderRole } from '../agents/builder'
 import { explorerRole } from '../agents/explorer'
@@ -436,13 +437,14 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         )
       }
 
-      const hadQueuedEntries = nextFork.queuedEntries.length > 0
+      const preFlushMessageCount = nextFork.messages.length
       const taskGraphState = read(TaskGraphProjection)
       const flushed = flushQueue(nextFork, taskGraphState)
 
       let messages = flushed.messages
+      const flushProducedInbox = messages.length > preFlushMessageCount
       const lastMessage = messages[messages.length - 1]
-      if (!hadQueuedEntries && lastMessage?.source === 'agent') {
+      if (!flushProducedInbox && lastMessage?.source === 'agent') {
         messages = [...messages, { type: 'inbox', source: 'system', results: [toResultNoop()], timeline: [] }]
       }
 
@@ -906,6 +908,18 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       nextLead = enqueueTimeline(
         nextLead,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action: 'created',
+          taskId: task.id,
+          title: task.title,
+          taskType: task.taskType,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
         toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: task.id }),
         value.timestamp,
       )
@@ -916,12 +930,26 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(TaskGraphProjection.signals.taskCompleted, ({ value, state }) => {
+    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read }) => {
       const leadFork = state.forks.get(null)
       if (!leadFork) return state
 
-      const nextLead = enqueueTimeline(
+      const task = read(TaskGraphProjection).tasks.get(value.taskId)
+
+      let nextLead = enqueueTimeline(
         leadFork,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action: 'completed',
+          taskId: value.taskId,
+          title: task?.title,
+          taskType: task?.taskType,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
         toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
         value.timestamp,
       )
@@ -936,9 +964,48 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const leadFork = state.forks.get(null)
       if (!leadFork) return state
 
+      let nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action: 'cancelled',
+          taskId: value.taskId,
+          cancelledCount: value.cancelledSubtree.length,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskStatusChanged, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+      if (value.next === 'completed') return state
+
+      const task = read(TaskGraphProjection).tasks.get(value.taskId)
+      const action = value.next === 'archived' ? 'archived' : 'status_changed'
+
       const nextLead = enqueueTimeline(
         leadFork,
-        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action,
+          taskId: value.taskId,
+          title: task?.title,
+          taskType: task?.taskType,
+          previousStatus: value.previous,
+          nextStatus: value.next,
+        }),
         value.timestamp,
       )
 

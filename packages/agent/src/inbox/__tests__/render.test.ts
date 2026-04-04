@@ -234,6 +234,57 @@ describe('formatInbox', () => {
     ])
   })
 
+  test('renders task updates block with expected lines', () => {
+    const timeline: readonly TimelineEntry[] = [
+      { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title', taskType: 'implement' },
+      { kind: 'task_update', timestamp: TS1, action: 'status_changed', taskId: 't1', previousStatus: 'pending', nextStatus: 'working' },
+      { kind: 'task_update', timestamp: TS2, action: 'completed', taskId: 't1' },
+      { kind: 'task_update', timestamp: TS3, action: 'archived', taskId: 't1' },
+      { kind: 'task_update', timestamp: TS3 + 1, action: 'cancelled', taskId: 't2', cancelledCount: 3 },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '<task_updates>\n- Task t1 created: "Title" (implement)\n- Task t1 status changed: pending -> working\n- Task t1 completed\n- Task t1 archived\n- Task t2 cancelled (3 tasks removed)\n</task_updates>',
+      },
+    ])
+  })
+
+  test('renders task updates adjacent to task tree', () => {
+    const timeline: readonly TimelineEntry[] = [
+      { kind: 'task_update', timestamp: TS0, action: 'cancelled', taskId: 't1', cancelledCount: 2 },
+      { kind: 'task_tree_view', timestamp: TS1, renderedTree: '- [ ] t3 next' },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '<task_updates>\n- Task t1 cancelled (2 tasks removed)\n</task_updates>\n\n<task_tree>\n- [ ] t3 next\n</task_tree>',
+      },
+    ])
+  })
+
+  test('does not include task_update entries in chronological stream', () => {
+    const timeline: readonly TimelineEntry[] = [
+      { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title', taskType: 'implement' },
+      { kind: 'user_message', timestamp: TS1, text: 'hello', attachments: [] },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<task_updates>\n- Task t1 created: "Title" (implement)\n</task_updates>',
+      },
+    ])
+  })
+
   test('renders agent_block atoms (thought, tool_call, message, idle, error)', () => {
     const timeline: readonly TimelineEntry[] = [
       {

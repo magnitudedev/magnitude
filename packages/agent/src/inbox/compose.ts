@@ -217,6 +217,22 @@ export function toTimelineTaskTreeView(args: {
   }
 }
 
+export function toTimelineTaskUpdate(args: {
+  timestamp: number
+  action: 'created' | 'cancelled' | 'completed' | 'archived' | 'status_changed'
+  taskId: string
+  title?: string
+  taskType?: string
+  previousStatus?: string
+  nextStatus?: string
+  cancelledCount?: number
+}): TimelineEntry {
+  return {
+    kind: 'task_update',
+    ...args,
+  }
+}
+
 export function toTimelineObservation(args: {
   timestamp: number
   parts: readonly ContentPart[]

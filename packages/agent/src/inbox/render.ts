@@ -116,7 +116,7 @@ function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_mess
   return builder.build()
 }
 
-function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' }>): string[] {
+function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }>): string[] {
   switch (entry.kind) {
     case 'user_message':
       return [`<message from="user">${entry.text}</message>`]
@@ -258,6 +258,31 @@ function buildTaskIdleReminderLines(
   )
 }
 
+function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update' }>): string {
+  if (entry.action === 'created') {
+    const title = entry.title ? `: "${entry.title}"` : ''
+    const taskType = entry.taskType ? ` (${entry.taskType})` : ''
+    return `- Task ${entry.taskId} created${title}${taskType}`
+  }
+
+  if (entry.action === 'cancelled') {
+    const cancelledSuffix = entry.cancelledCount != null ? ` (${entry.cancelledCount} tasks removed)` : ''
+    return `- Task ${entry.taskId} cancelled${cancelledSuffix}`
+  }
+
+  if (entry.action === 'completed') {
+    return `- Task ${entry.taskId} completed`
+  }
+
+  if (entry.action === 'archived') {
+    return `- Task ${entry.taskId} archived`
+  }
+
+  const previousStatus = entry.previousStatus ?? 'unknown'
+  const nextStatus = entry.nextStatus ?? 'unknown'
+  return `- Task ${entry.taskId} status changed: ${previousStatus} -> ${nextStatus}`
+}
+
 export function formatInbox(input: FormatInboxInput): ContentPart[] {
   const builder = new ContentPartBuilder()
 
@@ -287,13 +312,17 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   const treeViews = input.timeline.filter(
     (entry): entry is Extract<TimelineEntry, { kind: 'task_tree_view' }> => entry.kind === 'task_tree_view',
   )
+  const taskUpdates = input.timeline.filter(
+    (entry): entry is Extract<TimelineEntry, { kind: 'task_update' }> => entry.kind === 'task_update',
+  )
   const chronological = input.timeline.filter(
-    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' }> =>
+    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }> =>
       entry.kind !== 'lifecycle_hook'
       && entry.kind !== 'task_type_hook'
       && entry.kind !== 'task_idle_hook'
       && entry.kind !== 'task_tree_dirty'
-      && entry.kind !== 'task_tree_view',
+      && entry.kind !== 'task_tree_view'
+      && entry.kind !== 'task_update',
   )
 
   const attentionItems: { bullet: string, kind: TimelineEntry['kind'] }[] = []
@@ -339,6 +368,11 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   ]
   if (reminderLines.length > 0) {
     builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<reminders>\n${reminderLines.map(line => `- ${line}`).join('\n')}\n</reminders>`)
+  }
+
+  if (taskUpdates.length > 0) {
+    const lines = taskUpdates.map(renderTaskUpdateLine)
+    builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<task_updates>\n${lines.join('\n')}\n</task_updates>`)
   }
 
   if (treeViews.length > 0) {

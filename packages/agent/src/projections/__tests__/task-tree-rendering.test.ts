@@ -76,7 +76,7 @@ const inboxText = (inbox: Extract<ForkMemoryState['messages'][number], { type: '
     .join('')
 
 describe('task tree rendering mechanics', () => {
-  it('single task created: one dirty marker flushes one task_tree_view with that task', async () => {
+  it('single task created: emits task_update(created) and one task_tree_view', async () => {
     const rootFork = await runEvents([
       {
         type: 'session_initialized',
@@ -107,6 +107,9 @@ describe('task tree rendering mechanics', () => {
     ])
 
     const inbox = getLastInbox(rootFork)
+    const taskUpdates = inbox.timeline.filter(e => e.kind === 'task_update')
+    expect(taskUpdates.some((e: any) => e.action === 'created' && e.taskId === 'root-1')).toBe(true)
+
     const treeViews = inbox.timeline.filter(e => e.kind === 'task_tree_view')
     expect(treeViews.length).toBe(1)
     expect((treeViews[0] as any).renderedTree).toContain('[pending] implement: Root 1 (root-1)')
@@ -433,5 +436,165 @@ describe('task tree rendering mechanics', () => {
     const rendered = inboxText(inbox)
     expect(rendered).toContain('<task_tree>')
     expect(rendered).not.toContain('task_tree_dirty')
+  })
+
+  it('cancel-only mutation emits task_update(cancelled) even when task_tree_view is empty', async () => {
+    const rootFork = await runEvents([
+      {
+        type: 'session_initialized',
+        timestamp: ts(0),
+        sessionId: 's1',
+        cwd: '/tmp',
+        model: 'test',
+        mode: 'interactive',
+        approvalMode: 'on-request',
+      } as any,
+      {
+        type: 'task_created',
+        timestamp: ts(1),
+        forkId: null,
+        taskId: 'task-cancel',
+        title: 'Task Cancel',
+        taskType: 'implement',
+        parentId: null,
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(2),
+        turnId: 'turn-init',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+      {
+        type: 'task_cancelled',
+        timestamp: ts(3),
+        forkId: null,
+        taskId: 'task-cancel',
+        cancelledSubtree: ['task-cancel'],
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(4),
+        turnId: 'turn-cancel',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+    ])
+
+    const inbox = getLastInbox(rootFork)
+    expect(inbox.timeline.some((e: any) => e.kind === 'task_update' && e.action === 'cancelled' && e.taskId === 'task-cancel')).toBe(true)
+    expect(inbox.timeline.some(e => e.kind === 'task_tree_view')).toBe(false)
+  })
+
+  it('status transition to archived emits archived task_update', async () => {
+    const rootFork = await runEvents([
+      {
+        type: 'session_initialized',
+        timestamp: ts(0),
+        sessionId: 's1',
+        cwd: '/tmp',
+        model: 'test',
+        mode: 'interactive',
+        approvalMode: 'on-request',
+      } as any,
+      {
+        type: 'task_created',
+        timestamp: ts(1),
+        forkId: null,
+        taskId: 'task-archive',
+        title: 'Task Archive',
+        taskType: 'implement',
+        parentId: null,
+      } as any,
+      {
+        type: 'task_updated',
+        timestamp: ts(2),
+        forkId: null,
+        taskId: 'task-archive',
+        patch: { status: 'completed' },
+      } as any,
+      {
+        type: 'task_updated',
+        timestamp: ts(3),
+        forkId: null,
+        taskId: 'task-archive',
+        patch: { status: 'archived' },
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(4),
+        turnId: 'turn-archive',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+    ])
+
+    const inbox = getLastInbox(rootFork)
+    expect(inbox.timeline.some((e: any) => e.kind === 'task_update' && e.action === 'archived' && e.taskId === 'task-archive')).toBe(true)
+  })
+
+  it('cancel-only after assistant turn still appends inbox on next turn_started', async () => {
+    const rootFork = await runEvents([
+      {
+        type: 'session_initialized',
+        timestamp: ts(0),
+        sessionId: 's1',
+        cwd: '/tmp',
+        model: 'test',
+        mode: 'interactive',
+        approvalMode: 'on-request',
+      } as any,
+      {
+        type: 'task_created',
+        timestamp: ts(1),
+        forkId: null,
+        taskId: 'task-regression',
+        title: 'Task Regression',
+        taskType: 'implement',
+        parentId: null,
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(2),
+        turnId: 'turn-1',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+      {
+        type: 'turn_completed',
+        timestamp: ts(3),
+        turnId: 'turn-1',
+        forkId: null,
+        strategyId: 'lead',
+        responseParts: [{ type: 'text', content: 'done' }],
+        toolCalls: [],
+        observedResults: [],
+        result: { success: true, errors: [], oneshotLivenessTriggered: false },
+      } as any,
+      {
+        type: 'task_cancelled',
+        timestamp: ts(4),
+        forkId: null,
+        taskId: 'task-regression',
+        cancelledSubtree: ['task-regression'],
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(5),
+        turnId: 'turn-2',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+    ])
+
+    const lastMessage = rootFork.messages[rootFork.messages.length - 1]
+    expect(lastMessage?.type).toBe('inbox')
+    const inbox = lastMessage as Extract<ForkMemoryState['messages'][number], { type: 'inbox' }>
+    expect(inbox.timeline.some((e: any) => e.kind === 'task_update' && e.action === 'cancelled')).toBe(true)
   })
 })
