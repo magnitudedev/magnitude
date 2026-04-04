@@ -667,4 +667,16 @@ describe('type annotations', () => {
     expect(doc).toContain('optional')
     expect(doc).toContain('Glob filter')
   })
+
+  test('optional literal union from struct property type gets literal variants', () => {
+    const tool = makeTool({
+      name: 'test',
+      inputSchema: Schema.Struct({
+        status: Schema.optional(Schema.Literal('pending', 'completed', 'archived')),
+      }),
+      bindings: { xmlInput: { type: 'tag', tag: 'test', attributes: [{ field: 'status', attr: 'status' }], selfClosing: true } },
+    })
+    const doc = generateXmlToolDoc(expectTool(tool))
+    expect(doc).toContain('"pending" | "completed" | "archived"')
+  })
 })

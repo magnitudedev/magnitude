@@ -97,7 +97,7 @@ export const updateTaskTool = defineTool({
     taskId: Schema.String,
     parent: Schema.optional(Schema.String),
     after: Schema.optional(Schema.String),
-    status: Schema.optional(Schema.String),
+    status: Schema.optional(Schema.Literal('pending', 'completed', 'archived')),
     title: Schema.optional(Schema.String),
   }),
   outputSchema: Schema.Struct({
