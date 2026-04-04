@@ -7,6 +7,7 @@ export {
   buildConversationSummary,
 } from './agents'
 export { buildReminder } from './reminders'
+export { TASK_TREE_COMPLETION_REMINDER } from './task-tree'
 export {
   UNCLOSED_THINK_REMINDER,
   UNCLOSED_TASK_REMINDER,

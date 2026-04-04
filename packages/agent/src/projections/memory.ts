@@ -12,7 +12,7 @@ import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
 import { OutboundMessagesProjection } from './outbound-messages'
-import { compactionSummaryTag, buildSessionContextContent } from '../prompts'
+import { compactionSummaryTag, buildSessionContextContent, TASK_TREE_COMPLETION_REMINDER } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
@@ -338,10 +338,14 @@ function renderTaskTreesForTaskIds(state: TaskGraphState, taskIds: readonly stri
     roots.add(findRootTaskId(state, taskId))
   }
 
-  return Array.from(roots)
+  const renderedTrees = Array.from(roots)
     .map(rootId => renderTaskSubtree(state, rootId, 0).join('\n'))
     .filter(Boolean)
     .join('\n')
+
+  if (!renderedTrees) return ''
+
+  return `${renderedTrees}\n${TASK_TREE_COMPLETION_REMINDER}`
 }
 
 function findTaskForAgent(state: TaskGraphState, args: { agentId: string, forkId: string }): TaskRecord | null {
