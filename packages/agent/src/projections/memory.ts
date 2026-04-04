@@ -311,11 +311,7 @@ function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number)
   }
 
   const status = task.status === 'completed' ? 'done' : task.status
-  const assigneeStr = task.worker
-    ? `, ${task.worker.agentId}`
-    : task.assignee === 'user'
-      ? ', user'
-      : ''
+  const assigneeStr = task.assignee === 'user' ? ', user' : ''
   const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assigneeStr})`
 
   const childLines = task.childIds.flatMap(childId => renderTaskSubtree(state, childId, depth + 1))

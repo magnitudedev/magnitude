@@ -171,7 +171,4 @@ export const agentKillXmlBinding = defineXmlBinding(agentKillTool, {
 // Tool Group Export
 // =============================================================================
 
-export const agentTools = [
-  agentCreateTool,
-  agentKillTool,
-]
+export const agentTools = []

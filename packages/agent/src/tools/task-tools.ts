@@ -233,7 +233,7 @@ export const assignTaskOperation = (input: AssignTaskOperationInput) => Effect.g
   }
 
   const prompt = buildAgentContext(task.title, trimmedMessage, summary, input.taskId, taskContract)
-  const agentId = `${role}-${input.taskId}`
+  const agentId = input.taskId
 
   const forkId = yield* input.spawnWorker({
     parentForkId,

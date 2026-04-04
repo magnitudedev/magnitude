@@ -165,7 +165,6 @@ export { readTool, writeTool, editTool, treeTool, grepTool, fsTools } from './to
 export { webSearchTool } from './tools/web-search-tool'
 export { webFetchTool } from './tools/web-fetch-tool'
 
-export { agentCreateTool, agentKillTool } from './tools/agent-tools'
 export {
   clickTool, doubleClickTool, rightClickTool, typeTool, scrollTool, dragTool,
   navigateTool, goBackTool, switchTabTool, newTabTool, screenshotTool, evaluateTool,
