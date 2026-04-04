@@ -116,7 +116,7 @@ function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_mess
   return builder.build()
 }
 
-function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_view' }>): string[] {
+function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' }>): string[] {
   switch (entry.kind) {
     case 'user_message':
       return [`<message from="user">${entry.text}</message>`]
@@ -273,10 +273,11 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     (entry): entry is Extract<TimelineEntry, { kind: 'task_tree_view' }> => entry.kind === 'task_tree_view',
   )
   const chronological = input.timeline.filter(
-    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_view' }> =>
+    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' }> =>
       entry.kind !== 'lifecycle_hook'
       && entry.kind !== 'task_type_hook'
       && entry.kind !== 'task_idle_hook'
+      && entry.kind !== 'task_tree_dirty'
       && entry.kind !== 'task_tree_view',
   )
 
@@ -326,8 +327,10 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   }
 
   if (treeViews.length > 0) {
-    const allTrees = treeViews.map(e => e.renderedTree).join('\n')
-    builder.pushText(`\n\n<task_tree>\n${allTrees}\n</task_tree>`)
+    const latestTree = treeViews[treeViews.length - 1]?.renderedTree
+    if (latestTree) {
+      builder.pushText(`\n\n<task_tree>\n${latestTree}\n</task_tree>`)
+    }
   }
 
   const trivialAttention = attentionItems.length === 1 && attentionItems[0]?.kind === 'user_message'

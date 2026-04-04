@@ -51,6 +51,7 @@ import {
   toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
   toTimelineTaskIdleHook,
+  toTimelineTaskTreeDirty,
   toTimelineTaskTreeView,
 } from '../inbox/compose'
 import { builderRole } from '../agents/builder'
@@ -162,16 +163,39 @@ function enqueueTimeline(
   return { ...fork, queuedEntries, nextQueueSeq: seq + 1 }
 }
 
-function flushQueue(fork: ForkMemoryState): ForkMemoryState {
+function flushQueue(fork: ForkMemoryState, taskGraphState: TaskGraphState): ForkMemoryState {
   const sorted = [...fork.queuedEntries].sort((a, b) => (a.timestamp - b.timestamp) || (a.seq - b.seq))
   const results: ResultEntry[] = []
   const timeline: TimelineEntry[] = []
+  const dirtyTaskIds = new Set<string>()
+  let latestDirtyTimestamp: number | null = null
 
   for (const queued of sorted) {
     if (queued.lane === 'result') {
       results.push(queued.entry)
-    } else {
-      timeline.push(queued.entry)
+      continue
+    }
+
+    if (queued.entry.kind === 'task_tree_dirty') {
+      dirtyTaskIds.add(queued.entry.taskId)
+      latestDirtyTimestamp = latestDirtyTimestamp === null
+        ? queued.entry.timestamp
+        : Math.max(latestDirtyTimestamp, queued.entry.timestamp)
+      continue
+    }
+
+    timeline.push(queued.entry)
+  }
+
+  if (dirtyTaskIds.size > 0 && latestDirtyTimestamp !== null) {
+    const renderedTree = renderTaskTreesForTaskIds(taskGraphState, Array.from(dirtyTaskIds))
+    if (renderedTree) {
+      timeline.push(
+        toTimelineTaskTreeView({
+          timestamp: latestDirtyTimestamp,
+          renderedTree,
+        }),
+      )
     }
   }
 
@@ -414,7 +438,8 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
 
       const hadQueuedEntries = nextFork.queuedEntries.length > 0
-      const flushed = flushQueue(nextFork)
+      const taskGraphState = read(TaskGraphProjection)
+      const flushed = flushQueue(nextFork, taskGraphState)
 
       let messages = flushed.messages
       const lastMessage = messages[messages.length - 1]
@@ -440,7 +465,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         toTimelineObservation({ timestamp: event.timestamp, parts: event.parts.map(toContentPartFromObservation) }),
         event.timestamp,
       )
-      return flushQueue(nextFork)
+      return flushQueue(nextFork, read(TaskGraphProjection))
     },
 
     turn_completed: ({ event, fork, read }) => {
@@ -513,7 +538,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
     turn_unexpected_error: ({ event, fork }) => {
       if (fork.currentTurnId !== event.turnId) return fork
-      const nextFork = flushQueue(enqueueResult(fork, toResultError({ message: event.message }), event.timestamp))
+      const nextFork = flushQueue(
+        enqueueResult(fork, toResultError({ message: event.message }), event.timestamp),
+        read(TaskGraphProjection),
+      )
       return { ...nextFork, currentTurnId: null }
     },
 
@@ -755,14 +783,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           value.timestamp,
         )
 
-        const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [linkedTask.id])
-        if (renderedTree) {
-          nextParent = enqueueTimeline(
-            nextParent,
-            toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
-            value.timestamp,
-          )
-        }
+        nextParent = enqueueTimeline(
+          nextParent,
+          toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: linkedTask.id }),
+          value.timestamp,
+        )
       }
 
       return {
@@ -852,32 +877,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         value.timestamp,
       )
 
-      const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [task.id])
-      if (renderedTree) {
-        nextLead = enqueueTimeline(
-          nextLead,
-          toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
-          value.timestamp,
-        )
-      }
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(null, nextLead),
-      }
-    }),
-
-    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read }) => {
-      const leadFork = state.forks.get(null)
-      if (!leadFork) return state
-
-      const taskGraphState = read(TaskGraphProjection)
-      const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [value.taskId])
-      if (!renderedTree) return state
-
-      const nextLead = enqueueTimeline(
-        leadFork,
-        toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
+      nextLead = enqueueTimeline(
+        nextLead,
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: task.id }),
         value.timestamp,
       )
 
@@ -887,17 +889,29 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(TaskGraphProjection.signals.taskCancelled, ({ value, state, read }) => {
+    on(TaskGraphProjection.signals.taskCompleted, ({ value, state }) => {
       const leadFork = state.forks.get(null)
       if (!leadFork) return state
 
-      const taskGraphState = read(TaskGraphProjection)
-      const renderedTree = renderTaskTreesForTaskIds(taskGraphState, [value.taskId])
-      if (!renderedTree) return state
+      const nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCancelled, ({ value, state }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
 
       const nextLead = enqueueTimeline(
         leadFork,
-        toTimelineTaskTreeView({ timestamp: value.timestamp, renderedTree }),
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
         value.timestamp,
       )
 

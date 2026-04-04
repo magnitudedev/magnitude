@@ -112,6 +112,7 @@ export type TimelineEntry =
   | (Timestamped<'lifecycle_hook'> & { readonly agentId: string; readonly role: string; readonly hookType: LifecycleHookType })
   | (Timestamped<'task_type_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string })
   | (Timestamped<'task_idle_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string; readonly agentId: string })
+  | (Timestamped<'task_tree_dirty'> & { readonly taskId: string })
   | (Timestamped<'task_tree_view'> & { readonly renderedTree: string })
   | (Timestamped<'observation'> & { readonly parts: readonly ContentPart[] })
 

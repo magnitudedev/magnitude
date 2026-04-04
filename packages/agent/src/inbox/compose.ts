@@ -195,6 +195,16 @@ export function toTimelineTaskIdleHook(args: {
   }
 }
 
+export function toTimelineTaskTreeDirty(args: {
+  timestamp: number
+  taskId: string
+}): TimelineEntry {
+  return {
+    kind: 'task_tree_dirty',
+    ...args,
+  }
+}
+
 export function toTimelineTaskTreeView(args: {
   timestamp: number
   renderedTree: string
