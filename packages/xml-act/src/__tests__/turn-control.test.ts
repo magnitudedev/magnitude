@@ -239,21 +239,29 @@ describe('duplicate turn control tags', () => {
 // Turn control inside structural blocks auto-closes the block
 // =============================================================================
 
-describe('turn control inside blocks auto-closes and is recognized', () => {
-  it('inside actions block — auto-closes actions and emits turn control', () => {
+describe('turn control inside blocks is passthrough and not recognized', () => {
+  it('inside actions block — no turn control is emitted', () => {
     const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_NEXT}/>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('continue')
+    expect(tc).toHaveLength(0)
+    const prose = events
+      .filter((e): e is Extract<ParseEvent, { _tag: 'ProseChunk' }> => e._tag === 'ProseChunk')
+      .map(e => e.text)
+      .join('')
+    expect(prose).toContain(`<${TURN_CONTROL_NEXT}/>`)
   })
 
-  it('inside comms block — auto-closes comms and emits turn control', () => {
+  it('inside comms block — no turn control is emitted', () => {
     const xml = `${commsTagOpen()}\n<${TURN_CONTROL_YIELD}/>\n${commsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('yield')
+    expect(tc).toHaveLength(0)
+    const prose = events
+      .filter((e): e is Extract<ParseEvent, { _tag: 'ProseChunk' }> => e._tag === 'ProseChunk')
+      .map(e => e.text)
+      .join('')
+    expect(prose).toContain(`<${TURN_CONTROL_YIELD}/>`)
   })
 
   it('inside actions block with <finish>evidence</finish> is ignored in task scope', () => {

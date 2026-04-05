@@ -80,7 +80,7 @@ export function createXmlActFormat(
     if (handler) topLevelTags.set(tool.tag, handler)
   }
 
-  for (const tag of ['message', 'assign', 'task', 'next', 'yield']) {
+  for (const tag of ['message', 'assign', 'task']) {
     const handler = handlers.get(tag)
     if (handler) taskFrameTags.set(tag, handler)
   }

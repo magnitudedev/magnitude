@@ -1998,54 +1998,169 @@ describe('structural tag auto-close', () => {
   })
 
   // --- comms → next ---
-  test('unclosed comms auto-closes when next is encountered', () => {
+  test('unclosed comms keeps next as prose content (no auto-close, no turn control)', () => {
     const events = parseChunked([
       '<task id="t2">\n<message>hi</message>\n<next/>',
     ])
     expect(parseEvents(events, 'TaskOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'TaskClose')).toHaveLength(1)
-    const tc = parseEvents(events, 'TurnControl')
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('continue')
-    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    const prose = parseEvents(events, 'ProseChunk').map(e => e.text).join('')
+    expect(prose).toContain('<next/>')
+    expect(parseEvents(events, 'ParseError').some(e => e.error._tag === 'UnclosedTask')).toBe(true)
   })
 
   // --- comms → yield ---
-  test('unclosed comms auto-closes when yield is encountered', () => {
+  test('unclosed comms keeps yield as prose content (no auto-close, no turn control)', () => {
     const events = parseChunked([
       '<task id="t2">\n<message>hi</message>\n<yield/>',
     ])
     expect(parseEvents(events, 'TaskOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'TaskClose')).toHaveLength(1)
-    const tc = parseEvents(events, 'TurnControl')
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('yield')
-    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    const prose = parseEvents(events, 'ProseChunk').map(e => e.text).join('')
+    expect(prose).toContain('<yield/>')
+    expect(parseEvents(events, 'ParseError').some(e => e.error._tag === 'UnclosedTask')).toBe(true)
   })
 
   // --- actions → next ---
-  test('unclosed actions auto-closes when next is encountered', () => {
+  test('unclosed actions keeps next as prose content (no auto-close, no turn control)', () => {
     const events = parseChunked([
       '<task id="t1">\n<next/>',
     ], ['read'])
     expect(parseEvents(events, 'TaskOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'TaskClose')).toHaveLength(1)
-    const tc = parseEvents(events, 'TurnControl')
-    expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('continue')
-    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    const prose = parseEvents(events, 'ProseChunk').map(e => e.text).join('')
+    expect(prose).toContain('<next/>')
+    expect(parseEvents(events, 'ParseError').some(e => e.error._tag === 'UnclosedTask')).toBe(true)
   })
 
   // --- actions → yield ---
-  test('unclosed actions auto-closes when yield is encountered', () => {
+  test('unclosed actions keeps yield as prose content (no auto-close, no turn control)', () => {
     const events = parseChunked([
       '<task id="t1">\n<yield/>',
     ], ['read'])
     expect(parseEvents(events, 'TaskOpen')).toHaveLength(1)
-    expect(parseEvents(events, 'TaskClose')).toHaveLength(1)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    const prose = parseEvents(events, 'ProseChunk').map(e => e.text).join('')
+    expect(prose).toContain('<yield/>')
+    expect(parseEvents(events, 'ParseError').some(e => e.error._tag === 'UnclosedTask')).toBe(true)
+  })
+
+  test('turn-control inside unclosed task is passthrough, not recognized as top-level turn control', () => {
+    const events = parseChunked([
+      '<task id="t1">\n<next/>',
+    ], ['read'])
+
+    expect(parseEvents(events, 'TaskOpen')).toHaveLength(1)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+
+    const prose = parseEvents(events, 'ProseChunk').map((e) => e.text).join('')
+    expect(prose).toContain('<next/>')
+  })
+})
+
+describe('turn-control scoping across parser contexts', () => {
+  const proseText = (events: ParseEvent[]) =>
+    parseEvents(events, 'ProseChunk').map(e => e.text).join('')
+
+  const messageText = (events: ParseEvent[]) =>
+    parseEvents(events, 'MessageChunk').map(e => e.text).join('')
+
+  const lensText = (events: ParseEvent[]) =>
+    parseEvents(events, 'LensChunk').map(e => e.text).join('')
+
+  test('yield inside unclosed task is passthrough, not TurnControl', () => {
+    const events = parseChunked(['<task id="t1">\n<yield/>'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(proseText(events)).toContain('<yield/>')
+  })
+
+  test('next inside nested unclosed tasks is passthrough', () => {
+    const events = parseChunked(['<task id="t1"><task id="t2"><next/>'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(parseEvents(events, 'TaskOpen')).toHaveLength(2)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(proseText(events)).toContain('<next/>')
+  })
+
+  test('yield inside nested unclosed tasks is passthrough', () => {
+    const events = parseChunked(['<task id="t1"><task id="t2"><yield/>'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(parseEvents(events, 'TaskOpen')).toHaveLength(2)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(proseText(events)).toContain('<yield/>')
+  })
+
+  test('turn control after properly closed task is recognized at top-level', () => {
+    const events = parseChunked(['<task id="t1"></task><next/>'], ['read'])
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('yield')
-    expect(parseEvents(events, 'ParseError')).toHaveLength(0)
+    expect(tc[0].decision).toBe('continue')
+  })
+
+  test('turn control inside unclosed task with prior content remains passthrough', () => {
+    const events = parseChunked(['<task id="t1">before\n<next/>after'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    const raw = proseText(events)
+    expect(raw).toContain('<next/>')
+  })
+
+  test('turn control inside unclosed message block within task is message content', () => {
+    const events = parseChunked(['<task id="t1"><message to="parent">hi <next/>'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(messageText(events)).toContain('<next/>')
+  })
+
+  test('multiple turn-control tags inside unclosed task are passthrough', () => {
+    const events = parseChunked(['<task id="t1"><next/><yield/>'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    const raw = proseText(events)
+    expect(raw).toContain('<next/>')
+    expect(raw).toContain('<yield/>')
+  })
+
+  test('turn control inside unclosed lenses/think block is not TurnControl', () => {
+    const events = parseChunked(['<lenses><lens name="q">thinking <next/>'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(lensText(events)).toContain('<next/>')
+  })
+
+  test('turn control immediately after task open tag is passthrough', () => {
+    const events = parseChunked(['<task id="t1"><next/>'], ['read'])
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(proseText(events)).toContain('<next/>')
+  })
+
+  test('mix of closed and unclosed tasks: only turn control in unclosed task is passthrough', () => {
+    const events = parseChunked(['<task id="t1"></task><task id="t2"><yield/>'], ['read'])
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(1)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(proseText(events)).toContain('<yield/>')
+  })
+
+  test('turn control inside deeply nested unclosed tasks (3+ levels) is passthrough', () => {
+    const events = parseChunked(['<task id="a"><task id="b"><task id="c"><next/>'], ['read'])
+    expect(parseEvents(events, 'TaskOpen')).toHaveLength(3)
+    expect(parseEvents(events, 'TaskClose')).toHaveLength(0)
+    expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
+    expect(proseText(events)).toContain('<next/>')
+  })
+
+  test('both next and yield remain recognized when fully top-level', () => {
+    const nextEvents = parseChunked(['<next/>'])
+    const yieldEvents = parseChunked(['<yield/>'])
+
+    const nextTc = parseEvents(nextEvents, 'TurnControl')
+    expect(nextTc).toHaveLength(1)
+    expect(nextTc[0].decision).toBe('continue')
+
+    const yieldTc = parseEvents(yieldEvents, 'TurnControl')
+    expect(yieldTc).toHaveLength(1)
+    expect(yieldTc[0].decision).toBe('yield')
   })
 })

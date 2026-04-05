@@ -92,10 +92,11 @@ describe('task format parsing', () => {
     expect(starts[1]?.taskId).toBe('t1')
   })
 
-  it('turn control auto-closes all open tasks', () => {
+  it('turn control inside unclosed tasks does not auto-close', () => {
     const events = parse('<task id="a"><task id="b"><yield/>')
     const closes = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
-    expect(closes.map(c => c.id)).toEqual(['b', 'a'])
+    expect(closes).toHaveLength(0)
+    expect(events.some((e): e is Extract<ParseEvent, { _tag: 'TurnControl' }> => e._tag === 'TurnControl')).toBe(false)
   })
 
   it('flush emits UnclosedTask', () => {
