@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -44,8 +44,6 @@ export function getXmlActProtocol(
   return XML_ACT_PROTOCOL_RAW
     .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
     .replaceAll('{{TASK_AND_ROUTING_SECTION}}', taskAndRoutingSection)
-    .replaceAll('{{THINK_OPEN}}', LENSES_OPEN)
-    .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
@@ -55,12 +53,14 @@ export function getXmlActProtocol(
 }
 
 export function buildAckTurn(
-  _lenses: ThinkingLens[],
+  lenses: ThinkingLens[],
   defaultRecipient: 'user' | 'parent' = 'user',
 ): string {
-  return `${LENSES_OPEN}
-${LENSES_CLOSE}
-<!-- This is an example turn. I, Magnitude, did not write this and understand this assistant message exists purely to demonsrate the response format -->
+  const lensesExample = renderLensesExample(lenses)
+  const lensesPrefix = lensesExample.length > 0 ? `${lensesExample}
+` : ''
+
+  return `${lensesPrefix}<!-- This is an example turn. I, Magnitude, did not write this and understand this assistant message exists purely to demonstrate the response format -->
 <message to="${defaultRecipient}">This is how I would message the ${defaultRecipient}</message>
 <message to="tutorial">This is how I would message a worker</message>
 ${TURN_CONTROL_IDLE}

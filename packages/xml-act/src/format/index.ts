@@ -19,26 +19,19 @@ export function createXmlActFormat(
   const handlers = new Map<string, TagHandler<XmlActFrame, XmlActEvent>>()
   const structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
 
-  const aliasMap = aliases ?? new Map<string, string>([
-    ['thinking', 'think'],
-    ['lenses', 'lenses'],
-  ])
+  const aliasMap = aliases ?? new Map<string, string>([['thinking', 'think']])
 
   const messageTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
   const insideLensTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
   const plainThinkTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
   const topLevelTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
-  const betweenLensTags: TagMap = structuralTags
-
-  const lens = lensHandler(betweenLensTags, insideLensTags)
+  const lens = lensHandler(structuralTags, insideLensTags)
   handlers.set('lens', lens)
 
-  const think = thinkHandler('lenses', betweenLensTags, plainThinkTags)
-  const lenses = thinkHandler('lenses', betweenLensTags, plainThinkTags)
-  const thinking = thinkHandler('lenses', betweenLensTags, plainThinkTags)
+  const think = thinkHandler(plainThinkTags)
+  const thinking = thinkHandler(plainThinkTags)
   const message = messageHandler(messageTags)
   handlers.set('think', think)
-  handlers.set('lenses', lenses)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
   handlers.set('observe', turnControlHandler('observe'))
@@ -63,7 +56,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', 'observe', 'idle', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
+  for (const tag of ['message', 'observe', 'idle', 'finish', 'think', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -74,8 +67,6 @@ export function createXmlActFormat(
 
   const lensEntry = handlers.get('lens')
   if (lensEntry) insideLensTags.set('lens', lensEntry)
-  const lensesEntry = handlers.get('lenses')
-  if (lensesEntry) insideLensTags.set('lenses', lensesEntry)
 
   const thinkEntry = handlers.get('think')
   if (thinkEntry) plainThinkTags.set('think', thinkEntry)
@@ -86,10 +77,6 @@ export function createXmlActFormat(
     if (canonical === 'think') {
       const aliasThink = handlers.get('think')
       if (aliasThink) plainThinkTags.set(alias, aliasThink)
-    }
-    if (canonical === 'lenses') {
-      const aliasLenses = handlers.get('lenses')
-      if (aliasLenses) insideLensTags.set(alias, aliasLenses)
     }
   }
 

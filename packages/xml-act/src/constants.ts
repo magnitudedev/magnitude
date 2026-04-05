@@ -1,6 +1,3 @@
-export const LENSES_OPEN = '<lenses>'
-export const LENSES_CLOSE = '</lenses>'
-
 export const TURN_CONTROL_OBSERVE = '<observe/>'
 export const TURN_CONTROL_IDLE = '<idle/>'
 export const TURN_CONTROL_FINISH = '<finish/>'

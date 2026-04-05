@@ -19,7 +19,7 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
 
       case 'think':
         ops.push(emit({ _tag: 'ParseError', error: { _tag: 'UnclosedThink' } }))
-        if (!frame.isLenses) {
+        if (frame.tag !== 'lens') {
           ops.push(emit({ _tag: 'ProseEnd', patternId: 'think', content: frame.body, about: frame.about }))
         }
         ops.push(pop)

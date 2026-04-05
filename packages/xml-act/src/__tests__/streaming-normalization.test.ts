@@ -39,7 +39,7 @@ function config(tools: RegisteredTool[]): XmlRuntimeConfig {
 }
 
 function responseWithActions(actionsXml: string): string {
-  return `<lenses></lenses><task id="t2"></task><task id="t1">${actionsXml}</task><idle/>`
+  return `<lens name="turn">planning</lens>\n${actionsXml}<idle/>`
 }
 
 function toolEvents(events: XmlRuntimeEvent[]): XmlRuntimeEvent[] {
@@ -391,10 +391,10 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
   test('F15 chunk-split streaming yields same canonical event tag sequence as single chunk', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const chunks = [
-      `<lenses></lenses><task id="t2"></task><task id="t1"><agent_create_like id="a1" type="explorer">`,
+      `<lens name="turn">planning</lens>\n<agent_create_like id="a1" type="explorer">`,
       `<title>Hello</title>`,
       `<message>Do work</message></agent_create_like>`,
-      `</task><idle/>`,
+      `<idle/>`,
     ]
     const single = await runStream(cfg, chunks.join(''))
     const split = await runStreamChunks(cfg, chunks)

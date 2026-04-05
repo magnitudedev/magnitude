@@ -36,9 +36,7 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
     const parent = createStreamingXmlParser(parentTags, parentChildMap, undefined, undefined, 'user')
 
     const part1 = [
-      '<lenses>',
       '<lens name="intent">planning</lens>',
-      '</lenses>',
       '<task id="t2">',
       '<message>Implementing now.</message>',
       '</task>',

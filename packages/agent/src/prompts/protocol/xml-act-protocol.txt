@@ -4,9 +4,7 @@ You respond in an XML-like syntax with three core constructs: lenses, messages, 
 
 ## Required Turn format
 
-<lenses>
 {{LENSES_EXAMPLE}}
-</lenses>
 <message to="{{DEFAULT_RECIPIENT}}">...message to {{DEFAULT_RECIPIENT}}...</message>
 {{TURN_CONTROL_OBSERVE}} or {{TURN_CONTROL_IDLE}}
 
@@ -25,14 +23,12 @@ This applies everywhere — thinking, message bodies, and action attributes. Esc
 
 You leverage an advanced form of thinking where thinking is separated into targeted "lenses", in order to better reason about different aspects of your turn.
 Lens content is internal reasoning — it is not shown to the user. Use lenses to think through your approach before responding.
-The `<lenses>` tag is required as the first element of every turn.
+You should use every lens with an applicable trigger condition on a given turn.
 
 ### Thinking Lenses
 
-Use this nested format:
-<lenses>
+Use this format:
 {{LENSES_EXAMPLE}}
-</lenses>
 
 You MUST include each lens with an applicable trigger condition.
 

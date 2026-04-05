@@ -4,8 +4,7 @@ import type { ParseEvent } from '../format/types'
 import {
   AGENT_CREATE_OPEN_PREFIX,
   AGENT_CREATE_TAG,
-  LENSES_CLOSE,
-  LENSES_OPEN,
+
   TURN_CONTROL_FINISH,
   TURN_CONTROL_IDLE,
   xmlClose,
@@ -106,8 +105,8 @@ describe('repro matrix: active child-body passthrough (multi-tool, multi-child, 
         { name: 'TASK_A_CLOSE raw', text: TASK_A_CLOSE },
         { name: 'TASK_B_OPEN raw', text: TASK_B_OPEN },
         { name: 'TASK_B_CLOSE raw', text: TASK_B_CLOSE },
-        { name: 'LENSES_OPEN raw', text: LENSES_OPEN },
-        { name: 'LENSES_CLOSE raw', text: LENSES_CLOSE },
+        { name: 'LENS_OPEN raw', text: '<lens name="x">' },
+        { name: 'LENS_CLOSE raw', text: '</lens>' },
         { name: 'TURN_CONTROL_IDLE raw', text: TURN_CONTROL_IDLE },
         { name: 'TURN_CONTROL_FINISH raw', text: TURN_CONTROL_FINISH },
         { name: 'same-child open text raw', text: xmlOpen(activeChild, { nested: '1' }) },
@@ -181,7 +180,7 @@ describe('RED matrix: missing matching child close emits only child-root-cause e
           xmlClose(siblingChild),
           TASK_A_CLOSE,
           TASK_B_OPEN,
-          LENSES_OPEN,
+          '<lens name="q">x</lens>',
           TURN_CONTROL_IDLE,
         ].join('\n')
 

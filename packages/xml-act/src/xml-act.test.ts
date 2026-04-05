@@ -2122,8 +2122,8 @@ describe.skip('turn-control scoping across parser contexts', () => {
     expect(raw).toContain('<idle/>')
   })
 
-  test('turn control inside unclosed lenses/think block is not TurnControl', () => {
-    const events = parseChunked(['<lenses><lens name="q">thinking <idle/>'])
+  test('turn control inside unclosed lens block is not TurnControl', () => {
+    const events = parseChunked(['<lens name="q">thinking <idle/>'])
     expect(parseEvents(events, 'TurnControl')).toHaveLength(0)
     expect(lensText(events)).toContain('<idle/>')
   })

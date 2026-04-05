@@ -91,9 +91,7 @@ describe('message.ts: generic tag matching in message body', () => {
 
   it('exact production repro: pricing comparison with <20%', () => {
     const xml = [
-      `<lenses>`,
       `<lens name="intent">User wants a direct pricing comparison.</lens>`,
-      `</lenses>`,
       `${commsTagOpen()}`,
       `<message>It's close but roughly:`,
       `- **L4 / small GPUs:** ~$1-2/hr range per GPU.`,
@@ -142,9 +140,7 @@ describe('message.ts: generic tag matching in message body', () => {
 describe('think.ts: <lens inside lens body without closing >', () => {
   it('<lens (no >) inside lens body prevents lens from closing', () => {
     const xml = [
-      `<lenses>`,
       `<lens name="a">content has <lens without closing bracket rest of content.</lens>`,
-      `</lenses>`,
       `${commsTagOpen()}`,
       `<message>done</message>`,
       `${commsTagClose()}`,
@@ -161,9 +157,7 @@ describe('think.ts: <lens inside lens body without closing >', () => {
 
   it('<lens name=" (unclosed attr value) inside lens body eats entire stream', () => {
     const xml = [
-      `<lenses>`,
       `<lens name="a">content has <lens name="inner without closing stuff.</lens>`,
-      `</lenses>`,
       `${commsTagOpen()}`,
       `<message>done</message>`,
       `${commsTagClose()}`,

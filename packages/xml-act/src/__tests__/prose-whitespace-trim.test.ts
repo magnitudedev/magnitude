@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
-import { LENSES_OPEN, LENSES_CLOSE, TURN_CONTROL_IDLE } from '../constants'
+import { TURN_CONTROL_IDLE } from '../constants'
 
 const TASK_OPEN = '<task id="t2">'
 const TASK_CLOSE = '</task>'
@@ -22,9 +22,7 @@ function parseChunks(chunks: string[]): ParseEvent[] {
 describe('prose whitespace trimming', () => {
   it('no whitespace-only ProseChunk between lenses and task tags', () => {
     const xml = [
-      LENSES_OPEN,
-      '\n<lens name="intent">Just a greeting.</lens>\n',
-      LENSES_CLOSE,
+      '<lens name="intent">Just a greeting.</lens>\n',
       '\n',
       TASK_OPEN,
       '\n<message>Hey!</message>\n',
@@ -45,9 +43,7 @@ describe('prose whitespace trimming', () => {
 
   it.skip('no ProseEnd for whitespace-only content between structural tags', () => {
     const xml = [
-      LENSES_OPEN,
-      '\n<lens name="intent">Just a greeting.</lens>\n',
-      LENSES_CLOSE,
+      '<lens name="intent">Just a greeting.</lens>\n',
       '\n',
       TASK_OPEN,
       '\n<message>Hey!</message>\n',
@@ -65,9 +61,7 @@ describe('prose whitespace trimming', () => {
   it('actual prose content before structural tags is preserved', () => {
     const xml = [
       'Hello world\n',
-      LENSES_OPEN,
-      '\n<lens name="intent">thinking</lens>\n',
-      LENSES_CLOSE,
+      '<lens name="intent">thinking</lens>\n',
     ].join('')
 
     const events = parse(xml)
@@ -81,7 +75,7 @@ describe('prose whitespace trimming', () => {
 
   it('whitespace-only prose between lenses and task tags across chunks', () => {
     const chunks = [
-      LENSES_OPEN + '\n<lens name="turn">planning</lens>\n' + LENSES_CLOSE,
+      '<lens name="turn">planning</lens>\n',
       '\n' + TASK_OPEN + '\n<message>Hey Anders! What can',
       ' I help you with?</message>\n' + TASK_CLOSE + '\n' + TURN_CONTROL_IDLE,
     ]

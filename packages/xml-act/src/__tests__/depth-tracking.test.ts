@@ -199,14 +199,12 @@ describe('structural tag depth tracking', () => {
   it('lens nested inside lens should not close the outer lens early', () => {
     const events = parse(
       [
-        '<lenses>',
         '<lens name="outer">',
         'before',
         '<lens name="inner">',
         '</lens>',
         'after',
         '</lens>',
-        '</lenses>',
         '',
         '<shell>done</shell>',
         '',

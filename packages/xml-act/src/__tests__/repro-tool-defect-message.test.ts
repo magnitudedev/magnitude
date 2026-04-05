@@ -10,9 +10,6 @@ import {
   type XmlTagBinding,
 } from '../index'
 
-const TASK_CLOSE = '</' + 'task>'
-const LENSES_CLOSE = '</' + 'lenses>'
-
 function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlRuntimeEvent[]> {
   const runtime = createXmlRuntime(config)
   const stream = runtime.streamWith(Stream.make(xml))
@@ -28,7 +25,7 @@ function config(tools: RegisteredTool[]): XmlRuntimeConfig {
 }
 
 function responseWithActions(actionsXml: string): string {
-  return `<lenses>${LENSES_CLOSE}<task id="t2"></task><task id="t1">${actionsXml}${TASK_CLOSE}<idle/>`
+  return `<lens name="turn">planning</lens>\n${actionsXml}<idle/>`
 }
 
 function turnFailure(events: XmlRuntimeEvent[]): string {

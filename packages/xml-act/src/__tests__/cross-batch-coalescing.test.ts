@@ -12,7 +12,7 @@ describe('cross-batch coalescing', () => {
     )
 
     const batch1 = parser.processChunk(
-      '<lenses>\n<lens name="turn">planning</lens>\n</lenses>\n<task id="t2">\n<message>Hey Anders! What can',
+      '<lens name="turn">planning</lens>\n<task id="t2">\n<message>Hey Anders! What can',
     )
 
     const batch2 = parser.processChunk(

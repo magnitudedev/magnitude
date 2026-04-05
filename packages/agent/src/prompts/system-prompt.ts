@@ -1,7 +1,5 @@
 import type { RoleDefinition } from '@magnitudedev/roles'
 
-import { LENSES_CLOSE, LENSES_OPEN } from '@magnitudedev/xml-act'
-
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
 import { getXmlActProtocol } from './protocol'
 import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
@@ -14,8 +12,6 @@ export function compilePromptTemplate(raw: string): string {
   return raw
     .replaceAll('{{PROSE_OPEN}}', PROSE_DELIM_OPEN)
     .replaceAll('{{PROSE_CLOSE}}', PROSE_DELIM_CLOSE)
-    .replaceAll('{{THINK_OPEN}}', LENSES_OPEN)
-    .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
     .replaceAll('{{TOOLING_SECTION}}', toolingSectionRaw)
 }
 

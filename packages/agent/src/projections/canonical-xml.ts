@@ -1,4 +1,4 @@
-import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
@@ -136,7 +136,7 @@ export function serializeCanonicalTurn(
       const lensLines = activeLenses.map((lens) =>
         `<lens name="${lens.name}">${lens.content}</lens>`
       )
-      parts.push(`${LENSES_OPEN}\n${lensLines.join('\n')}\n${LENSES_CLOSE}`)
+      parts.push(lensLines.join('\n'))
     }
   }
 

@@ -59,7 +59,6 @@ export type XmlActFrame =
       readonly body: string
       readonly depth: number
       readonly about: string | null
-      readonly isLenses: boolean
       readonly activeLens: ActiveLens | null
       readonly lenses: readonly CompletedLens[]
       readonly tags: TagMap
