@@ -5,9 +5,14 @@ import type { TagMap, TagHandler, XmlActEvent, XmlActFrame } from '../types'
 import { findFrame } from '../types'
 
 export function assignHandler(
-  tags: TagMap,
+  _tags: TagMap,
 ): TagHandler<XmlActFrame, XmlActEvent> {
-  return {
+  // The assign body is opaque text — no tags should be parsed structurally inside it.
+  // We only need 'assign' in the tag map so that </assign> resolves to close the frame,
+  // and nested <assign> increments depth instead of opening a new structural frame.
+  const mutableTags = new Map<string, TagHandler<XmlActFrame, XmlActEvent>>()
+
+  const handler: TagHandler<XmlActFrame, XmlActEvent> = {
     open(ctx) {
       const task = findFrame(ctx.stack, 'task')
       if (!task) {
@@ -47,6 +52,23 @@ export function assignHandler(
         ]
       }
 
+      // If we're already inside an assign frame, this is nested — increment depth and capture raw
+      const existingAssign = findFrame(ctx.stack, 'assign')
+      if (existingAssign) {
+        const raw = rawOpenTag('assign', ctx.attrs)
+        const prefix = existingAssign.pendingNewlines > 0
+          ? (existingAssign.body.length > 0 ? '\n'.repeat(existingAssign.pendingNewlines) : '')
+          : ''
+        return [
+          replace({
+            ...existingAssign,
+            depth: existingAssign.depth + 1,
+            body: existingAssign.body + prefix + raw,
+            pendingNewlines: 0,
+          }),
+        ]
+      }
+
       return [
         ...endTopProse(ctx.stack),
         push({
@@ -56,7 +78,7 @@ export function assignHandler(
           body: '',
           depth: 0,
           pendingNewlines: 0,
-          tags,
+          tags: assignBodyTags,
         }),
       ]
     },
@@ -128,7 +150,23 @@ export function assignHandler(
         ]
       }
 
+      // If inside an assign frame, capture as raw text
+      const existingAssign = findFrame(ctx.stack, 'assign')
+      if (existingAssign) {
+        const raw = rawOpenTag('assign', ctx.attrs).replace(/>$/, '/>')
+        const prefix = existingAssign.pendingNewlines > 0
+          ? (existingAssign.body.length > 0 ? '\n'.repeat(existingAssign.pendingNewlines) : '')
+          : ''
+        return [replace({ ...existingAssign, body: existingAssign.body + prefix + raw, pendingNewlines: 0 })]
+      }
+
       return [emit({ _tag: 'TaskAssign', taskId: task.id, role, body: '' })]
     },
   }
+
+  // Add self-reference so </assign> resolves inside the assign frame
+  mutableTags.set('assign', handler)
+  const assignBodyTags: TagMap = mutableTags
+
+  return handler
 }
