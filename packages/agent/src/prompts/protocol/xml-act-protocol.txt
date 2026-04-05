@@ -11,7 +11,6 @@ You respond in an XML-like syntax with three core constructs: lenses, messages, 
 </lenses>
 <message to="{{DEFAULT_RECIPIENT}}">...message to {{DEFAULT_RECIPIENT}}...</message>
 [OPTIONAL] {{TURN_CONTROL_IDLE}}
-<|stop|>
 
 Your response must contain exactly ONE turn, never more than one. You must end your response and wait for turn to resolve before taking another.
 
