@@ -12,6 +12,12 @@ export const intentLens = defineThinkingLens({
   description: 'Carefully consider what the user means and what they actually want. Look past the literal request to understand the underlying goal.',
 })
 
+export const alignmentLens = defineThinkingLens({
+  name: 'alignment',
+  trigger: 'When you receive a message from the user, or when acting on user intent',
+  description: 'Think about the user intent and agent work vectors — where they are, where they might diverge, and what that means for this turn. If they need to be aligned, how? Explore, ask the user, present a plan, or something else?',
+})
+
 export const ideateLens = defineThinkingLens({
   name: 'ideate',
   trigger: 'When the problem requires creative thinking or there are multiple possible approaches',
