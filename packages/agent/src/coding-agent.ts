@@ -45,7 +45,7 @@ import { Autopilot } from './workers/autopilot'
 import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
 import { WorkflowWorker } from './workers/workflow-worker'
-import type { AgentVariant } from './agents'
+import { isValidVariant, type AgentVariant } from './agents'
 import { ChatTitleWorker } from './workers/chat-title-worker'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
@@ -324,7 +324,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // Create execution resources for all known agents.
       const agentState = yield* agentStatusProjection.get
       for (const [, agent] of agentState.agents) {
-        yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
+        if (!isValidVariant(agent.role)) {
+          continue
+        }
+        yield* executionManager.initFork(agent.forkId, agent.role)
       }
 
       // Hydration recovery: detect forks that were in-flight when the process

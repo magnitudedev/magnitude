@@ -33,7 +33,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_TASK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
@@ -58,7 +58,7 @@ import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSes
 import { createPolicyContextProvider } from '../agents/policy-context'
 import type { TurnEvent } from './types'
 import { WorkingDirectoryTag } from './working-directory'
-import type { StreamingLeaf, StreamingPartial } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -67,9 +67,16 @@ const { ForkContext } = Fork
 
 type AgentDef = RoleDefinition
 
+type AnyStreamHook = StreamHook<Record<string, unknown>, unknown, unknown, unknown, unknown>
+type StreamableTool = ToolDefinition & { stream: AnyStreamHook }
+
+function hasStreamHook<T extends ToolDefinition>(tool: T): tool is T & StreamableTool {
+  return 'stream' in tool && !!tool.stream
+}
+
 import { mapXmlToolResult } from '../util/tool-result'
 import { handleTaskDirective } from '../tasks/operations'
-import type { TaskDirectiveStatus } from '../tasks/operations/types'
+
 
 // =============================================================================
 // Types
@@ -402,7 +409,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const messagesSent: Array<{ id: string, taskId: string | null }> = []
       let hasAnyMessage = false
       let directUserRepliesSent = 0
-      const taskTouchedThisTurn = new Set<string>()
+
       const isTaskInAssignedSubtree = (
         taskState: TaskGraphState,
         candidateParentId: string,
@@ -427,14 +434,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Streaming hook state per tool call
       const streamHookStates = new Map<string, unknown>()
-      const streamHookConfigs = new Map<string, {
-        onInput: (
-          input: StreamingPartial<Record<string, unknown>>,
-          state: unknown,
-          ctx: { emit: (value: unknown) => Effect.Effect<void> }
-        ) => Effect.Effect<unknown, unknown, unknown>
-        initial: unknown
-      }>()
+      const streamHookConfigs = new Map<string, AnyStreamHook>()
       // Simple field accumulator for streaming partial input
       const streamingFields = new Map<string, Record<string, StreamingLeaf<unknown>>>()
 
@@ -487,15 +487,8 @@ const makeExecutionManager = Effect.gen(function* () {
                 // Check for stream hook
                 const toolEntry = catalog.entries[toolKey]
                 const tool = toolEntry?.tool
-                if (tool && 'stream' in tool && (tool as any).stream) {
-                  const streamConfig = (tool as any).stream as {
-                    onInput: (
-                      input: StreamingPartial<Record<string, unknown>>,
-                      state: unknown,
-                      ctx: { emit: (value: unknown) => Effect.Effect<void> }
-                    ) => Effect.Effect<unknown, unknown, unknown>
-                    initial: unknown
-                  }
+                if (tool && hasStreamHook(tool)) {
+                  const streamConfig = tool.stream
                   streamHookStates.set(event.toolCallId, streamConfig.initial)
                   streamHookConfigs.set(event.toolCallId, streamConfig)
                   streamingFields.set(event.toolCallId, {})
@@ -764,13 +757,9 @@ const makeExecutionManager = Effect.gen(function* () {
                       })
                       break
                     }
-                    if (!targetTask.worker?.agentId) {
-                      turnErrors.push({
-                        code: 'nonexistent_agent_destination',
-                        message: `Invalid message destination "${explicitTo}": task has no active worker`,
-                      })
-                      break
-                    }
+                    // Do not require worker to already be visible here.
+                    // In same-turn spawn-worker + message flows, worker assignment may be
+                    // observed by routing projection later in the event sequence.
                     destination = { kind: 'worker', taskId: explicitTo }
                   }
                 } else {
@@ -787,8 +776,6 @@ const makeExecutionManager = Effect.gen(function* () {
                 if (destination.kind !== 'worker') {
                   const messageResult = yield* handleTaskDirective({
                     kind: 'message',
-                    scope: event.scope,
-                    taskId: event.taskId,
                     defaultTopLevelDestination: defaultProseDest,
                     allowSingleUserReplyThisTurn,
                     directUserRepliesSent,
@@ -813,7 +800,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
                 }
 
-                messagesSent.push({ id: event.id, taskId: event.taskId })
+                messagesSent.push({ id: event.id, taskId: destination.kind === 'worker' ? destination.taskId : null })
                 hasAnyMessage = true
 
                 yield* Queue.offer(sink, {
@@ -885,231 +872,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              case 'TaskStarted': {
-                const taskProjection = yield* TaskGraphProjection.Tag
-                const taskState = yield* taskProjection.get
-                const existing = taskState.tasks.get(event.id)
 
-                if (!existing) {
-                  const parentId = event.explicitParent ?? event.parent ?? null
-
-                  if (forkId !== null) {
-                    const currentAgent = getAgentByForkId(agentState, forkId)
-                    const assignedTaskId = currentAgent?.taskId?.trim() ? currentAgent.taskId : null
-
-                    if (assignedTaskId) {
-                      const allowed =
-                        parentId !== null &&
-                        isTaskInAssignedSubtree(taskState, parentId, assignedTaskId)
-
-                      if (!allowed) {
-                        const attemptedParent = parentId ?? '(none)'
-                        turnErrors.push({
-                          code: 'task_outside_assigned_subtree',
-                          message: formatTaskOutsideSubtreeError(event.id, attemptedParent, assignedTaskId),
-                        })
-                        break
-                      }
-                    }
-                  }
-
-                  if (event.taskType && event.title) {
-                    const createResult = yield* handleTaskDirective({
-                      kind: 'create',
-                      taskId: event.id,
-                      taskType: event.taskType,
-                      parentId,
-                      after: event.after,
-                      title: event.title,
-                    }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                      Effect.provideService(ForkContext, { forkId }),
-                      Effect.provide(executionLayer),
-                    )
-                    if (!createResult.success) {
-                      turnErrors.push({
-                        code: 'task_operation_error',
-                        message: createResult.error,
-                      })
-                    }
-                  }
-                }
-                break
-              }
-
-              case 'TaskPatched': {
-                const directiveStatus = event.status as TaskDirectiveStatus | null
-
-                const updateResult = directiveStatus === 'cancelled'
-                  ? yield* handleTaskDirective({
-                    kind: 'cancel',
-                    taskId: event.id,
-                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                    Effect.provideService(ForkContext, { forkId }),
-                    Effect.provide(executionLayer),
-                  )
-                  : yield* handleTaskDirective({
-                    kind: 'update',
-                    taskId: event.id,
-                    parent: event.explicitParent ?? event.parent ?? undefined,
-                    after: event.after,
-                    title: event.title,
-                    status: directiveStatus === null ? undefined : directiveStatus,
-                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                    Effect.provideService(ForkContext, { forkId }),
-                    Effect.provide(executionLayer),
-                  )
-                if (!updateResult.success) {
-                  turnErrors.push({
-                    code: 'task_operation_error',
-                    message: updateResult.error,
-                  })
-                }
-                break
-              }
-
-              case 'TaskDelegated': {
-                const taskProjection = yield* TaskGraphProjection.Tag
-                const taskState = yield* taskProjection.get
-                const task = taskState.tasks.get(event.taskId)
-                if (task?.status === 'completed' && !taskTouchedThisTurn.has(event.taskId)) {
-                  taskTouchedThisTurn.add(event.taskId)
-                  const reopenResult = yield* handleTaskDirective({
-                    kind: 'update',
-                    taskId: event.taskId,
-                    status: 'pending',
-                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                    Effect.provideService(ForkContext, { forkId }),
-                    Effect.provide(executionLayer),
-                  )
-                  if (!reopenResult.success) {
-                    turnErrors.push({
-                      code: 'task_operation_error',
-                      message: reopenResult.error,
-                    })
-                  }
-                }
-
-                // Check if task has active worker before assign (for message routing)
-                const taskStateBeforeAssign = yield* taskProjection.get
-                const taskBeforeAssign = taskStateBeforeAssign.tasks.get(event.taskId)
-                const hadActiveWorker = taskBeforeAssign?.worker !== null && taskBeforeAssign?.worker !== undefined
-
-                const assignResult = yield* handleTaskDirective({
-                  kind: 'assign',
-                  taskId: event.taskId,
-                  assignee: event.role,
-                  message: event.body,
-                  spawnWorker: (params) => service.fork({
-                    parentForkId: params.parentForkId,
-                    name: params.name,
-                    agentId: params.agentId,
-                    prompt: params.prompt,
-                    message: params.message,
-                    mode: 'spawn',
-                    role: params.role,
-                    taskId: params.taskId,
-                  }),
-                }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                  Effect.provideService(ForkContext, { forkId }),
-                  Effect.provide(executionLayer),
-                )
-                if (!assignResult.success) {
-                  turnErrors.push({
-                    code: 'task_operation_error',
-                    message: assignResult.error,
-                  })
-                  break
-                }
-
-                // If there was an active worker, route assign body as message to that worker
-                if (hadActiveWorker && event.body.length > 0) {
-                  const messageId = createId()
-                  yield* Queue.offer(sink, {
-                    _tag: 'MessageStart',
-                    id: messageId,
-                    destination: { kind: 'worker', taskId: event.taskId },
-                  })
-                  yield* Queue.offer(sink, {
-                    _tag: 'MessageChunk',
-                    id: messageId,
-                    text: event.body,
-                  })
-                  yield* Queue.offer(sink, {
-                    _tag: 'MessageEnd',
-                    id: messageId,
-                  })
-                }
-                break
-              }
-
-              case 'TaskReassigned': {
-                const taskProjection = yield* TaskGraphProjection.Tag
-                const taskState = yield* taskProjection.get
-                const task = taskState.tasks.get(event.taskId)
-                if (task?.status === 'completed' && !taskTouchedThisTurn.has(event.taskId)) {
-                  taskTouchedThisTurn.add(event.taskId)
-                  const reopenResult = yield* handleTaskDirective({
-                    kind: 'update',
-                    taskId: event.taskId,
-                    status: 'pending',
-                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                    Effect.provideService(ForkContext, { forkId }),
-                    Effect.provide(executionLayer),
-                  )
-                  if (!reopenResult.success) {
-                    turnErrors.push({
-                      code: 'task_operation_error',
-                      message: reopenResult.error,
-                    })
-                  }
-                }
-
-                // Lead-only check
-                if (forkId !== null) {
-                  turnErrors.push({
-                    code: 'task_operation_error',
-                    message: 'Task reassignment rejected: only the lead can use <reassign>.',
-                  })
-                  break
-                }
-
-                const reassignResult = yield* handleTaskDirective({
-                  kind: 'reassign',
-                  taskId: event.taskId,
-                  assignee: event.role,
-                  message: event.body,
-                  spawnWorker: (params) => service.fork({
-                    parentForkId: params.parentForkId,
-                    name: params.name,
-                    agentId: params.agentId,
-                    prompt: params.prompt,
-                    message: params.message,
-                    mode: 'spawn',
-                    role: params.role,
-                    taskId: params.taskId,
-                  }),
-                }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
-                  Effect.provideService(ForkContext, { forkId }),
-                  Effect.provide(executionLayer),
-                )
-                if (!reassignResult.success) {
-                  turnErrors.push({
-                    code: 'task_operation_error',
-                    message: reassignResult.error,
-                  })
-                }
-                break
-              }
-
-              case 'TaskFinished': {
-                break
-              }
 
               case 'StructuralParseError': {
                 if (event.error._tag === 'UnclosedThink') {
                   turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
-                } else if (event.error._tag === 'UnclosedTask') {
-                  turnErrors.push({ code: 'unclosed_task', message: UNCLOSED_TASK_REMINDER })
                 }
                 break
               }
@@ -1317,6 +1084,11 @@ const makeExecutionManager = Effect.gen(function* () {
 
       yield* service.initFork(forkId, params.role)
 
+      const taskId = params.taskId.trim()
+      if (taskId.length === 0) {
+        return yield* Effect.die(new Error('ExecutionManager.fork requires a non-empty taskId'))
+      }
+
       yield* workerBus.publish({
         type: 'agent_created',
         forkId,
@@ -1326,8 +1098,8 @@ const makeExecutionManager = Effect.gen(function* () {
         role: params.role,
         context,
         mode: params.mode,
-        taskId: params.taskId ?? '',
-        message: params.message ?? params.prompt,
+        taskId,
+        message: params.message ?? null,
         outputSchema: params.outputSchema,
       })
 

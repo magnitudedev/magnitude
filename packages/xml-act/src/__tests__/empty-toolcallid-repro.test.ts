@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 

@@ -21,43 +21,47 @@ function element(tag: string, attrs?: XmlAttrs, body?: string): string {
   return `${openTag(tag, attrs)}${body}</${tag}>`
 }
 
-function taskOpen(id: string, attrs?: XmlAttrs): string {
-  return openTag('task', { id, ...(attrs ?? {}) })
-}
-
 export class ResponseBuilder {
   private readonly messages: string[] = []
-  private readonly explicitTaskBlocks: string[] = []
-  private readonly implicitTaskActions: string[] = []
+  private readonly tools: string[] = []
 
   message(text: string): this {
     this.messages.push(element('message', undefined, text))
     return this
   }
 
-  task(id: string, body: string, attrs?: XmlAttrs): this {
-    this.explicitTaskBlocks.push(`${taskOpen(id, attrs)}${body}</task>`)
+  spawnWorker(id: string, role: string): this {
+    this.tools.push(element('spawn-worker', { id, role }))
     return this
   }
 
-  taskMessage(taskId: string, text: string): this {
-    return this.task(taskId, element('message', undefined, text))
+  createTask(id: string, type: string, title: string, parent?: string): this {
+    const attrs: XmlAttrs = { id, type, title }
+    if (parent) attrs.parent = parent
+    this.tools.push(element('create-task', attrs))
+    return this
   }
 
-  taskAssign(taskId: string, role: string, instructions: string): this {
-    return this.task(taskId, element('assign', { role }, instructions))
+  updateTask(id: string, status: string): this {
+    this.tools.push(element('update-task', { id, status }))
+    return this
+  }
+
+  killWorker(id: string): this {
+    this.tools.push(element('kill-worker', { id }))
+    return this
   }
 
   tool(tag: string, attrs?: XmlAttrs, body?: string): this {
-    this.implicitTaskActions.push(element(tag, attrs, body))
+    this.tools.push(element(tag, attrs, body))
     return this
   }
 
   createAgent(agentId: string, type: string, title: string, message: string): this {
     return this.tool(
       'agent-create',
-      { agentId },
-      `${element('type', undefined, type)}${element('title', undefined, title)}${element('message', undefined, message)}`,
+      { id: agentId, type },
+      `${element('title', undefined, title)}${element('message', undefined, message)}`,
     )
   }
 
@@ -93,15 +97,10 @@ export class ResponseBuilder {
     )
   }
 
-  private build(control: 'idle'): MockTurnResponse {
+  private build(control: string): MockTurnResponse {
     const parts: string[] = []
     parts.push(...this.messages)
-    parts.push(...this.explicitTaskBlocks)
-
-    if (this.implicitTaskActions.length > 0) {
-      parts.push(`${taskOpen('harness-task')}${this.implicitTaskActions.join('')}</task>`)
-    }
-
+    parts.push(...this.tools)
     parts.push(`<${control}/>`)
     return { xml: parts.join('') }
   }

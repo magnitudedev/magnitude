@@ -7,7 +7,7 @@ import type { ConversationEntry } from '../projections/conversation'
 /** Build the context prompt injected into a sub-agent's fork */
 export function buildAgentContext(
   title: string,
-  message: string,
+  message: string | undefined,
   extraContext: string | null,
   taskId: string,
   taskContract?: string,
@@ -21,9 +21,11 @@ export function buildAgentContext(
     parts.push(taskContract.trim())
     parts.push('</task_contract>')
   }
-  parts.push('<message>')
-  parts.push(message)
-  parts.push('</message>')
+  if (message !== undefined) {
+    parts.push('<message>')
+    parts.push(message)
+    parts.push('</message>')
+  }
   if (extraContext) {
     parts.push(extraContext)
   }

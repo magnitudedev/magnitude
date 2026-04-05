@@ -86,7 +86,12 @@ export const leadTools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
-
+  'agentCreate',
+  'agentKill',
+  'createTask',
+  'updateTask',
+  'spawnWorker',
+  'killWorker',
   'skill',
   'phaseSubmit',
 )

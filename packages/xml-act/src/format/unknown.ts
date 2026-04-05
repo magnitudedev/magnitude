@@ -22,12 +22,6 @@ export function xmlActUnknownOpen(
       emit({ _tag: 'ChildBodyChunk', parentToolCallId: top.parentToolId, childTagName: top.childTagName, childIndex: top.childIndex, text: raw }),
     ]
   }
-  if (top.type === 'assign') {
-    const prefix = top.pendingNewlines > 0
-      ? (top.body.length > 0 ? '\n'.repeat(top.pendingNewlines) : '')
-      : ''
-    return [replace({ ...top, body: top.body + prefix + raw, pendingNewlines: 0 })]
-  }
   if (top.type === 'message') {
     return [
       replace({ ...top, body: top.body + raw }),
@@ -64,12 +58,6 @@ export function xmlActUnknownClose(
       replace({ ...top, body: top.body + raw }),
       emit({ _tag: 'ChildBodyChunk', parentToolCallId: top.parentToolId, childTagName: top.childTagName, childIndex: top.childIndex, text: raw }),
     ]
-  }
-  if (top.type === 'assign') {
-    const prefix = top.pendingNewlines > 0
-      ? (top.body.length > 0 ? '\n'.repeat(top.pendingNewlines) : '')
-      : ''
-    return [replace({ ...top, body: top.body + prefix + raw, pendingNewlines: 0 })]
   }
   if (top.type === 'message') {
     return [

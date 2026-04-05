@@ -92,6 +92,39 @@ function findTaskWorkerAgentId(taskGraph: { tasks: ReadonlyMap<string, { worker:
   return task?.worker?.agentId ?? null
 }
 
+function removeAgentRoutingState(
+  state: AgentRoutingState,
+  { forkId, agentId }: { forkId: string; agentId: string },
+): AgentRoutingState {
+  const routedAgentId = state.agentByForkId.get(forkId)
+  if (!routedAgentId) return state
+  if (routedAgentId !== agentId) return state
+
+  const agents = new Map(state.agents)
+  agents.delete(agentId)
+
+  const agentByForkId = new Map(state.agentByForkId)
+  agentByForkId.delete(forkId)
+
+  const pendingMessages = new Map(state.pendingMessages)
+  for (const [id, pending] of pendingMessages.entries()) {
+    if (pending.forkId === forkId || pending.targetAgentId === agentId) {
+      pendingMessages.delete(id)
+    }
+  }
+
+  const deferredParentMessages = new Map(state.deferredParentMessages)
+  deferredParentMessages.delete(forkId)
+
+  return {
+    ...state,
+    agents,
+    agentByForkId,
+    pendingMessages,
+    deferredParentMessages,
+  }
+}
+
 export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingState>()(({
   name: 'AgentRouting',
   reads: [TaskGraphProjection] as const,
@@ -225,7 +258,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       return { ...state, pendingMessages }
     },
 
-    message_end: ({ event, state, emit }) => {
+    message_end: ({ event, state, emit, read }) => {
       const entry = state.pendingMessages.get(event.id)
       if (!entry) return state
 
@@ -252,21 +285,38 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
         nextState = { ...nextState, deferredParentMessages }
       }
 
-      if (entry.destination.kind === 'worker' && entry.targetAgentId && isActiveRoute(state, entry.targetAgentId)) {
-        const target = getRoutingEntry(state, entry.targetAgentId)
-        if (target) {
-          emit.communicationStreamCompleted({
-            streamId: event.id,
-            targetForkId: target.forkId,
-            direction: 'from_agent',
-            agentId: target.agentId,
-            timestamp: event.timestamp,
-          })
+      if (entry.destination.kind === 'worker') {
+        // Re-resolve target at message_end to handle same-turn spawn-worker + message flows.
+        const taskGraph = read(TaskGraphProjection)
+        const resolvedTargetAgentId =
+          entry.targetAgentId ?? findTaskWorkerAgentId(taskGraph, entry.destination.taskId)
 
-          emit.agentMessage({
-            targetForkId: target.forkId,
-            agentId: entry.targetAgentId,
-            message: entry.text,
+        if (resolvedTargetAgentId && isActiveRoute(state, resolvedTargetAgentId)) {
+          const target = getRoutingEntry(state, resolvedTargetAgentId)
+          if (target) {
+            emit.communicationStreamCompleted({
+              streamId: event.id,
+              targetForkId: target.forkId,
+              direction: 'from_agent',
+              agentId: target.agentId,
+              timestamp: event.timestamp,
+            })
+
+            emit.agentMessage({
+              targetForkId: target.forkId,
+              agentId: resolvedTargetAgentId,
+              message: entry.text,
+              timestamp: event.timestamp,
+            })
+          }
+        } else {
+          emit.invalidExplicitDestination({
+            forkId: entry.forkId,
+            turnId: event.turnId,
+            messageId: event.id,
+            taskId: entry.destination.taskId,
+            to: entry.destination.taskId,
+            reason: 'task has no active routed worker at message_end',
             timestamp: event.timestamp,
           })
         }
@@ -309,94 +359,10 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       return { ...state, deferredParentMessages }
     },
 
-    agent_killed: ({ event, state }) => {
-      const routedAgentId = state.agentByForkId.get(event.forkId)
-      if (!routedAgentId) return state
-      if (routedAgentId !== event.agentId) return state
+    agent_killed: ({ event, state }) => removeAgentRoutingState(state, event),
 
-      const agents = new Map(state.agents)
-      agents.delete(event.agentId)
+    subagent_user_killed: ({ event, state }) => removeAgentRoutingState(state, event),
 
-      const agentByForkId = new Map(state.agentByForkId)
-      agentByForkId.delete(event.forkId)
-
-      const pendingMessages = new Map(state.pendingMessages)
-      for (const [id, pending] of pendingMessages.entries()) {
-        if (pending.forkId === event.forkId || pending.targetAgentId === event.agentId) {
-          pendingMessages.delete(id)
-        }
-      }
-
-      const deferredParentMessages = new Map(state.deferredParentMessages)
-      deferredParentMessages.delete(event.forkId)
-
-      return {
-        ...state,
-        agents,
-        agentByForkId,
-        pendingMessages,
-        deferredParentMessages,
-      }
-    },
-
-    subagent_user_killed: ({ event, state }) => {
-      const routedAgentId = state.agentByForkId.get(event.forkId)
-      if (!routedAgentId) return state
-      if (routedAgentId !== event.agentId) return state
-
-      const agents = new Map(state.agents)
-      agents.delete(event.agentId)
-
-      const agentByForkId = new Map(state.agentByForkId)
-      agentByForkId.delete(event.forkId)
-
-      const pendingMessages = new Map(state.pendingMessages)
-      for (const [id, pending] of pendingMessages.entries()) {
-        if (pending.forkId === event.forkId || pending.targetAgentId === event.agentId) {
-          pendingMessages.delete(id)
-        }
-      }
-
-      const deferredParentMessages = new Map(state.deferredParentMessages)
-      deferredParentMessages.delete(event.forkId)
-
-      return {
-        ...state,
-        agents,
-        agentByForkId,
-        pendingMessages,
-        deferredParentMessages,
-      }
-    },
-
-    subagent_idle_closed: ({ event, state }) => {
-      const routedAgentId = state.agentByForkId.get(event.forkId)
-      if (!routedAgentId) return state
-      if (routedAgentId !== event.agentId) return state
-
-      const agents = new Map(state.agents)
-      agents.delete(event.agentId)
-
-      const agentByForkId = new Map(state.agentByForkId)
-      agentByForkId.delete(event.forkId)
-
-      const pendingMessages = new Map(state.pendingMessages)
-      for (const [id, pending] of pendingMessages.entries()) {
-        if (pending.forkId === event.forkId || pending.targetAgentId === event.agentId) {
-          pendingMessages.delete(id)
-        }
-      }
-
-      const deferredParentMessages = new Map(state.deferredParentMessages)
-      deferredParentMessages.delete(event.forkId)
-
-      return {
-        ...state,
-        agents,
-        agentByForkId,
-        pendingMessages,
-        deferredParentMessages,
-      }
-    },
+    subagent_idle_closed: ({ event, state }) => removeAgentRoutingState(state, event),
   },
 }))

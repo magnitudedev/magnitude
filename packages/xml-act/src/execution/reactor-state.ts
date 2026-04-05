@@ -3,8 +3,7 @@ import type { ReactorState, ToolOutcome, XmlRuntimeEvent } from '../types'
 export function initialReactorState(): ReactorState {
   return {
     toolCallMap: new Map(),
-    toolTaskMap: new Map(),
-    taskStack: [],
+
     deadToolCalls: new Set(),
     outputTrees: new Map(),
     stopped: false,
@@ -14,17 +13,10 @@ export function initialReactorState(): ReactorState {
 
 export function foldReactorState(state: ReactorState, event: XmlRuntimeEvent): ReactorState {
   switch (event._tag) {
-    case 'TaskStarted':
-      return { ...state, taskStack: [...state.taskStack, event.id] }
-    case 'TaskFinished':
-      return { ...state, taskStack: state.taskStack.filter((id) => id !== event.id) }
-
     case 'ToolInputStarted': {
       const toolCallMap = new Map(state.toolCallMap)
       toolCallMap.set(event.toolCallId, event.tagName)
-      const toolTaskMap = new Map(state.toolTaskMap)
-      toolTaskMap.set(event.toolCallId, event.taskId)
-      return { ...state, toolCallMap, toolTaskMap }
+      return { ...state, toolCallMap }
     }
 
     case 'ToolInputParseError': {

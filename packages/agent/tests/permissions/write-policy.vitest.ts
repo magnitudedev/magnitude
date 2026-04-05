@@ -5,11 +5,9 @@ import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 // Build XML strings from chars to avoid triggering the response parser
 const WR = ['<','w','r','i','t','e',' ','p','a','t','h','='].join('')
 const WRC = ['<','/','w','r','i','t','e','>'].join('')
-const ACT_OPEN = ['<','a','c','t','i','o','n','s','>'].join('')
-const ACT_CLOSE = ['<','/','a','c','t','i','o','n','s','>'].join('')
-const YIELD = ['<','y','i','e','l','d','/','>'].join('')
-const MSG_OPEN = ['<','c','o','m','m','s','>','<','m','e','s','s','a','g','e',' ','t','o','=','"','p','a','r','e','n','t','"','>'].join('')
-const MSG_CLOSE = ['<','/','m','e','s','s','a','g','e','>','<','/','c','o','m','m','s','>'].join('')
+const YIELD = ['<','i','d','l','e','/','>'].join('')
+const MSG_OPEN = ['<','m','e','s','s','a','g','e',' ','t','o','=','"','p','a','r','e','n','t','"','>'].join('')
+const MSG_CLOSE = ['<','/','m','e','s','s','a','g','e','>'].join('')
 const AC_OPEN = ['<','a','g','e','n','t','-','c','r','e','a','t','e',' '].join('')
 const AC_CLOSE = ['<','/','a','g','e','n','t','-','c','r','e','a','t','e','>'].join('')
 
@@ -18,18 +16,17 @@ function writeTag(path: string, content: string) {
 }
 
 function agentCreate(agentId: string, type: string, title: string, message: string) {
-  const typeTag = ['<','t','y','p','e','>'].join('') + type + ['<','/','t','y','p','e','>'].join('')
   const titleTag = ['<','t','i','t','l','e','>'].join('') + title + ['<','/','t','i','t','l','e','>'].join('')
   const msgTag = ['<','m','e','s','s','a','g','e','>'].join('') + message + ['<','/','m','e','s','s','a','g','e','>'].join('')
-  return `${AC_OPEN}agentId="${agentId}" type="${type}">${typeTag}${titleTag}${msgTag}${AC_CLOSE}`
+  return `${AC_OPEN}id="${agentId}" type="${type}">${titleTag}${msgTag}${AC_CLOSE}`
 }
 
 function actions(...tools: string[]) {
-  return `${ACT_OPEN}${tools.join('')}${ACT_CLOSE}${YIELD}`
+  return `${tools.join('')}${YIELD}`
 }
 
 function actionsWithMessage(...tools: string[]) {
-  return `${ACT_OPEN}${tools.join('')}${ACT_CLOSE}${MSG_OPEN}Done${MSG_CLOSE}${YIELD}`
+  return `${tools.join('')}${MSG_OPEN}Done${MSG_CLOSE}${YIELD}`
 }
 
 describe('write policy permissions', () => {

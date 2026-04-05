@@ -60,7 +60,7 @@ export interface AssistantMessageDisplay {
 export interface ThinkingStep {
   readonly id: string
   readonly type: 'thinking'
-  readonly content?: string
+  readonly content: string
   readonly label?: string
 }
 
@@ -774,7 +774,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             thinkBlockId,
             lastStep.id,
             (s) => s.type === 'thinking'
-              ? { ...s, content: (s.content ?? '') + event.text }
+              ? { ...s, content: s.content + event.text }
               : s
           )
         }
@@ -807,7 +807,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               thinkBlockId,
               lastStep.id,
               (s) => s.type === 'thinking'
-                ? { ...s, content: (s.content ?? '') + ' ' }
+                ? { ...s, content: s.content + ' ' }
                 : s
             )
           }
@@ -838,7 +838,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           thinkBlockId,
           lastStep.id,
           (s) => s.type === 'thinking'
-            ? { ...s, content: (s.content ?? '') + event.text }
+            ? { ...s, content: s.content + event.text }
             : s
         )
       }
@@ -1084,6 +1084,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     },
 
     agent_created: ({ event, fork }) => {
+      if (event.message === null) return fork
       const content = event.message.trim()
       if (!content) return fork
       if (event.forkId === null) return fork

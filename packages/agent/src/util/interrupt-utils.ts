@@ -2,7 +2,7 @@ import { Effect } from 'effect'
 import { observeOutput, type ReactorState } from '@magnitudedev/xml-act'
 import type { ObservedResult, ResponsePart, ToolResult, TurnCompleted, TurnToolCall } from '../events'
 import { mapXmlToolResult } from './tool-result'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 import { isToolKey, type ToolKey, type AgentCatalogEntry } from '../catalog'
 import { CanonicalTurnProjection, type CanonicalTurnState } from '../projections/canonical-turn'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
@@ -67,7 +67,10 @@ export const buildInterruptedTurnCompleted = (params: {
   const agentState = yield* agentProjection.get
 
   const variant: AgentVariant = forkId
-    ? ((getAgentByForkId(agentState, forkId)?.role ?? 'builder') as AgentVariant)
+    ? (() => {
+        const role = getAgentByForkId(agentState, forkId)?.role
+        return role && isValidVariant(role) ? role : 'builder'
+      })()
     : 'lead'
 
   const agentDef = getAgentDefinition(variant)

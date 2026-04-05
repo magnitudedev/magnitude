@@ -52,17 +52,7 @@ export type TagMap = ReadonlyMap<string, TagHandler<XmlActFrame, XmlActEvent>>
 
 export type XmlActFrame =
   | { readonly type: 'prose'; readonly body: string; readonly pendingNewlines: number; readonly tags: TagMap }
-  | {
-      readonly type: 'task'
-      readonly id: string
-      readonly taskType: string | null
-      readonly title: string | null
-      readonly parent: string | null
-      readonly explicitParent: string | null
-      readonly after: string | null
-      readonly status: string | null
-      readonly tags: TagMap
-    }
+
   | {
       readonly type: 'think'
       readonly tag: string
@@ -77,31 +67,12 @@ export type XmlActFrame =
   | {
       readonly type: 'message'
       readonly id: string
-      readonly scope: 'top-level' | 'task'
-      readonly taskId: string | null
       readonly body: string
       readonly depth: number
       readonly pendingNewlines: number
       readonly tags: TagMap
     }
-  | {
-      readonly type: 'assign'
-      readonly taskId: string
-      readonly role: string | null
-      readonly body: string
-      readonly depth: number
-      readonly pendingNewlines: number
-      readonly tags: TagMap
-    }
-  | {
-      readonly type: 'reassign'
-      readonly taskId: string
-      readonly role: string
-      readonly body: string
-      readonly depth: number
-      readonly pendingNewlines: number
-      readonly tags: TagMap
-    }
+
   | {
       readonly type: 'tool-body'
       readonly tag: string
@@ -128,12 +99,12 @@ export type XmlActFrame =
 
 export type StructuralParseErrorDetail =
   | { readonly _tag: 'UnclosedThink' }
-  | { readonly _tag: 'UnclosedTask'; readonly id: string }
+
   | { readonly _tag: 'TurnControlConflict' }
   | { readonly _tag: 'FinishWithoutEvidence' }
 
 export type UnclosedThinkDetail = Extract<StructuralParseErrorDetail, { _tag: 'UnclosedThink' }>
-export type UnclosedTaskDetail = Extract<StructuralParseErrorDetail, { _tag: 'UnclosedTask' }>
+
 export type FinishWithoutEvidenceDetail = Extract<StructuralParseErrorDetail, { _tag: 'FinishWithoutEvidence' }>
 export type TurnControlConflictDetail = Extract<StructuralParseErrorDetail, { _tag: 'TurnControlConflict' }>
 
@@ -180,34 +151,10 @@ export type XmlActEvent =
   | { readonly _tag: 'LensStart'; readonly name: string }
   | { readonly _tag: 'LensChunk'; readonly text: string }
   | { readonly _tag: 'LensEnd'; readonly name: string; readonly content: string }
-  | {
-      readonly _tag: 'TaskOpen'
-      readonly id: string
-      readonly taskType: string | null
-      readonly title: string | null
-      readonly parent: string | null
-      readonly explicitParent: string | null
-      readonly after: string | null
-      readonly status: string | null
-    }
-  | { readonly _tag: 'TaskClose'; readonly id: string }
-  | {
-      readonly _tag: 'TaskUpdate'
-      readonly id: string
-      readonly taskType: string | null
-      readonly title: string | null
-      readonly parent: string | null
-      readonly explicitParent: string | null
-      readonly after: string | null
-      readonly status: string | null
-    }
-  | { readonly _tag: 'TaskAssign'; readonly taskId: string; readonly role: string | null; readonly body: string }
-  | { readonly _tag: 'TaskReassign'; readonly taskId: string; readonly role: string; readonly body: string }
+
   | {
       readonly _tag: 'MessageStart'
       readonly id: string
-      readonly scope: 'top-level' | 'task'
-      readonly taskId: string | null
       readonly to: string | null
     }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }

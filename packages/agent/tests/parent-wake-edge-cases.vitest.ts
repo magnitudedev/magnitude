@@ -14,7 +14,7 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: '<actions><agent-create agentId="error-sub"><type>explorer</type><title>err</title><message>go</message></agent-create></actions><idle/>',
+              xml: '<agent-create id="error-sub" type="explorer"><title>err</title><message>go</message></agent-create><idle/>',
             }
           }
           return { xml: '<idle/>' }
@@ -60,13 +60,13 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: '<actions><agent-create agentId="kill-sub"><type>explorer</type><title>will be killed</title><message>do work</message></agent-create></actions><idle/>',
+              xml: '<agent-create id="kill-sub" type="explorer"><title>will be killed</title><message>do work</message></agent-create><idle/>',
             }
           }
           return { xml: '<idle/>' }
         }
 
-        return { xml: '<comms><message to="parent">subagent done</message></comms><idle/>' }
+        return { xml: '<message to="parent">subagent done</message><idle/>' }
       })
 
       yield* h.user('start killable subagent')

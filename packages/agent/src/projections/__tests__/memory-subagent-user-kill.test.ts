@@ -65,7 +65,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any)
 
       yield* bus.processEvent({
@@ -146,7 +146,7 @@ describe('MemoryProjection subagent_user_killed awareness', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any)
 
       yield* bus.processEvent({

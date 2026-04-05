@@ -18,7 +18,7 @@ import { ConversationStateReaderTag } from './memory-reader'
 import { AgentStateReaderTag } from './fork'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
 import type { AppEvent } from '../events'
-import { getSpawnableVariants, type AgentVariant } from '../agents'
+import { getSpawnableVariants, isValidVariant } from '../agents'
 
 const { ForkContext } = Fork
 
@@ -38,7 +38,7 @@ function executeAgentCreate({ agentId, options }: {
 
     const normalizedType = agentType.toLowerCase()
     const spawnable = getSpawnableVariants()
-    if (!spawnable.includes(normalizedType as any)) {
+    if (!isValidVariant(normalizedType) || !spawnable.includes(normalizedType)) {
       return yield* Effect.fail({
         _tag: 'AgentError' as const,
         message: `Invalid agent type "${agentType}". Valid types: ${spawnable.join(', ')}`,
@@ -69,7 +69,7 @@ function executeAgentCreate({ agentId, options }: {
       prompt: context,
       message,
       mode: 'spawn',
-      role: normalizedType as AgentVariant,
+      role: normalizedType,
       taskId,
     })
 
@@ -125,10 +125,10 @@ export const agentKillTool = defineTool({
       })
     }
 
-    if (target.status !== 'starting' && target.status !== 'working') {
+    if (target.status !== 'working' && target.status !== 'idle') {
       return yield* Effect.fail({
         _tag: 'AgentError' as const,
-        message: `Cannot kill "${agentId}": only starting or working subagents can be killed (current status: ${target.status}).`,
+        message: `Cannot kill "${agentId}": only working or idle subagents can be killed (current status: ${target.status}).`,
       })
     }
 

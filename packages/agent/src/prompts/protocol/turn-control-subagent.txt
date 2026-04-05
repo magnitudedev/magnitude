@@ -7,4 +7,4 @@ Go idle if and only if at least one of the following is true:
 - You are blocked and have escalated a question to your parent.
 - You are completely done with your task and have sent a summary to your parent.
 
-In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately declare task blocks in the same response.
+In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately take tool calls in the same response.

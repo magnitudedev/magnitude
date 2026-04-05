@@ -43,7 +43,7 @@ describe('compaction/lifecycle-timing', () => {
       yield* h.send(mkContextLimitHit())
       yield* h.wait.event('compaction_ready', (e) => e.forkId === null)
       const compactionWhileTurnInFlight = yield* getCompaction(h)
-      expect(compactionWhileTurnInFlight._tag !== 'idle').toBe(true)
+      expect(compactionWhileTurnInFlight._tag).toBe('idle')
 
       yield* h.send(mkTurnCompleted({ turnId: 'A', chainId: 'C' }))
 

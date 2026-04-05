@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 
 describe('repro: comment with <-- does not corrupt prose', () => {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 import {
@@ -7,7 +7,6 @@ import {
   LENSES_CLOSE,
   LENSES_OPEN,
   TURN_CONTROL_FINISH,
-  TURN_CONTROL_IDLE,
   TURN_CONTROL_IDLE,
   xmlClose,
   xmlOpen,
@@ -109,7 +108,6 @@ describe('repro matrix: active child-body passthrough (multi-tool, multi-child, 
         { name: 'TASK_B_CLOSE raw', text: TASK_B_CLOSE },
         { name: 'LENSES_OPEN raw', text: LENSES_OPEN },
         { name: 'LENSES_CLOSE raw', text: LENSES_CLOSE },
-        { name: 'TURN_CONTROL_IDLE raw', text: TURN_CONTROL_IDLE },
         { name: 'TURN_CONTROL_IDLE raw', text: TURN_CONTROL_IDLE },
         { name: 'TURN_CONTROL_FINISH raw', text: TURN_CONTROL_FINISH },
         { name: 'same-child open text raw', text: xmlOpen(activeChild, { nested: '1' }) },

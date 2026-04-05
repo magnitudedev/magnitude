@@ -110,8 +110,8 @@ describe('prompt caching consistency', () => {
       const beforeMemory = yield* getRootMemory(h)
       const before = snapshotMessageRefs(beforeMemory)
 
-      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs', taskId: null } })
-      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs', taskId: null } })
+      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs',  } })
+      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs',  } })
 
       const midMemory = yield* getRootMemory(h)
       assertPrefixUnchanged(before, midMemory)

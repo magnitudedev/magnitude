@@ -1,10 +1,9 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 import {
   LENSES_OPEN,
   LENSES_CLOSE,
-  TURN_CONTROL_IDLE,
   TURN_CONTROL_IDLE,
 } from '../constants'
 
@@ -152,7 +151,7 @@ describe('lenses parsing', () => {
     expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'task', content: 'hello world' }])
   })
 
-  it('9) full turn: lenses then task blocks', () => {
+  it('9) full turn: lenses then task tags', () => {
     const events = parse(
       [
         '<lenses>',
@@ -169,10 +168,10 @@ describe('lenses parsing', () => {
 
     expect(lensStarts(events).map(e => e.name)).toEqual(['task'])
     expect(lensEnds(events)).toEqual([{ _tag: 'LensEnd', name: 'task', content: 'Reason briefly.' }])
-    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TagOpened')).toBe(true)
+    expect(events.some(e => e._tag === 'TagClosed')).toBe(true)
+    expect(events.some(e => e._tag === 'TagOpened')).toBe(true)
+    expect(events.some(e => e._tag === 'TagClosed')).toBe(true)
     expect(events.some(e => e._tag === 'TagClosed' && e.tagName === 'shell')).toBe(true)
   })
 
@@ -215,14 +214,14 @@ describe('tags inside lenses are passthrough', () => {
     const inner = `${TASK_A_OPEN}\nsome text\n${TASK_A_CLOSE}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(TASK_A_OPEN)
-    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
+    assertNoEvents(events, ['TagOpened', 'TagClosed'])
   })
 
   it('task block text (alternate id) inside lens is passthrough', () => {
     const inner = `${TASK_B_OPEN}\ntext\n${TASK_B_CLOSE}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(TASK_B_OPEN)
-    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
+    assertNoEvents(events, ['TagOpened', 'TagClosed'])
   })
 
   it('nested think inside lens is passthrough', () => {
@@ -256,14 +255,14 @@ describe('tags inside lenses are passthrough', () => {
     const inner = `${legacyToolOpen()}stuff${legacyToolClose()}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(inner)
-    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
+    assertNoEvents(events, ['TagOpened', 'TagClosed'])
   })
 
   it('respond-like tag text inside lens is passthrough', () => {
     const inner = `${respondOpen()}stuff${respondClose()}`
     const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${inner}${lensClose()}\n${LENSES_CLOSE}\n`)
     expect(lensEnds(events)[0].content).toContain(inner)
-    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
+    assertNoEvents(events, ['TagOpened', 'TagClosed'])
   })
 
   it('shell tool tag inside lens is passthrough', () => {
@@ -293,7 +292,7 @@ describe('tags inside plain think are passthrough', () => {
     const events = parse(`${thinkOpen()}\n${TASK_A_OPEN}\nstuff\n${TASK_A_CLOSE}\n${thinkClose()}\n`)
     const allContent = proseEnds(events).map(e => e.content).join('')
     expect(allContent).toContain(TASK_A_OPEN)
-    assertNoEvents(events, ['TaskOpen', 'TaskClose'])
+    assertNoEvents(events, ['TagOpened', 'TagClosed'])
   })
 
   it('shell inside plain think is passthrough', () => {
@@ -362,7 +361,7 @@ describe('char-by-char passthrough parity', () => {
     const bulk = parse(xml)
     const charByChar = parseCharByChar(xml)
     expect(lensEnds(charByChar)).toEqual(lensEnds(bulk))
-    assertNoEvents(bulk, ['TurnControl', 'TaskOpen', 'TagOpened'])
-    assertNoEvents(charByChar, ['TurnControl', 'TaskOpen', 'TagOpened'])
+    assertNoEvents(bulk, ['TurnControl', 'TagOpened', 'TagOpened'])
+    assertNoEvents(charByChar, ['TurnControl', 'TagOpened', 'TagOpened'])
   })
 })

@@ -57,7 +57,7 @@ export type {
   ParseErrorDetail,
   StructuralParseErrorDetail,
   UnclosedThinkDetail,
-  UnclosedTaskDetail,
+
   FinishWithoutEvidenceDetail,
   TurnControlConflictDetail,
 } from './format/types'

@@ -6,7 +6,7 @@ describe('fault injection', () => {
   it.live('Malformed XML', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<comms><message to="user">hi' }, null)
+      yield* harness.script.next({ xml: '<message to="user">hi' }, null)
 
       yield* harness.user('broken xml')
 
@@ -24,7 +24,7 @@ describe('fault injection', () => {
       const harness = yield* TestHarness
       yield* harness.script.next(
         {
-          xmlChunks: ['<comms>', '<message to="user">hi</message>', '</comms><idle/>'],
+          xmlChunks: ['', '<message to="user">hi</message>', '<idle/>'],
           terminateStreamEarly: true,
         },
         null,
@@ -46,7 +46,7 @@ describe('fault injection', () => {
       const harness = yield* TestHarness
       yield* harness.script.next(
         {
-          xmlChunks: ['<comms>', '<message to="user">hi</message>', '</comms><idle/>'],
+          xmlChunks: ['', '<message to="user">hi</message>', '<idle/>'],
           failAfterChunk: 1,
         },
         null,

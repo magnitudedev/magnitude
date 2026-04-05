@@ -214,6 +214,9 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
 
     agent_created: ({ event, fork }) => {
       const withParent = TurnLifecycle.hold(fork, { parentForkId: event.parentForkId })
+      if (event.message === null) {
+        return withParent
+      }
       const next = enqueueTrigger(withParent, { _tag: 'agent_created', agentId: event.agentId })
       return next
     },

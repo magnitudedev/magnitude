@@ -53,7 +53,7 @@ export function deriveWorkerExecutionSnapshot(args: {
   }
 
   const state = linkedAgent
-    ? (linkedAgent.status === 'working' || linkedAgent.status === 'starting' ? 'working' : 'idle')
+    ? (linkedAgent.status === 'working' ? 'working' : 'idle')
     : (fromDisplay?.state ?? 'idle')
 
   return {

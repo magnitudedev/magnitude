@@ -67,6 +67,22 @@ import {
   evaluateTool,
   evaluateXmlBinding,
 } from './tools/browser-tools'
+import {
+  createTaskTool,
+  createTaskXmlBinding,
+  updateTaskTool,
+  updateTaskXmlBinding,
+  spawnWorkerTool,
+  spawnWorkerXmlBinding,
+  killWorkerTool,
+  killWorkerXmlBinding,
+} from './tools/task-tools'
+import {
+  agentCreateTool,
+  agentCreateXmlBinding,
+  agentKillTool,
+  agentKillXmlBinding,
+} from './tools/agent-tools'
 
 // State models
 import { shellModel } from './models/shell'
@@ -96,6 +112,12 @@ import {
   screenshotModel,
   evaluateModel,
 } from './models/browser-action'
+import { createTaskModel } from './models/create-task'
+import { updateTaskModel } from './models/update-task'
+import { spawnWorkerModel } from './models/spawn-worker'
+import { killWorkerModel } from './models/kill-worker'
+import { agentCreateModel } from './models/agent-create'
+import { agentKillModel } from './models/agent-kill'
 
 export const catalog = defineCatalog({
   shell: { tool: shellTool, binding: shellXmlBinding, state: shellModel },
@@ -124,6 +146,14 @@ export const catalog = defineCatalog({
   newTab: { tool: newTabTool, binding: newTabXmlBinding, state: newTabModel, group: 'browser' },
   screenshot: { tool: screenshotTool, binding: screenshotXmlBinding, state: screenshotModel, group: 'browser' },
   evaluate: { tool: evaluateTool, binding: evaluateXmlBinding, state: evaluateModel, group: 'browser' },
+
+  agentCreate: { tool: agentCreateTool, binding: agentCreateXmlBinding, state: agentCreateModel },
+  agentKill: { tool: agentKillTool, binding: agentKillXmlBinding, state: agentKillModel },
+
+  createTask: { tool: createTaskTool, binding: createTaskXmlBinding, state: createTaskModel, display: false },
+  updateTask: { tool: updateTaskTool, binding: updateTaskXmlBinding, state: updateTaskModel, display: false },
+  spawnWorker: { tool: spawnWorkerTool, binding: spawnWorkerXmlBinding, state: spawnWorkerModel, display: false },
+  killWorker: { tool: killWorkerTool, binding: killWorkerXmlBinding, state: killWorkerModel, display: false },
 } as const)
 
 export type ToolKey = keyof typeof catalog.entries

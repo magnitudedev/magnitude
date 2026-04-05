@@ -43,7 +43,7 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 
 import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
@@ -137,7 +137,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // Determine agent: child forks use their role, root fork is always lead.
         const variant: AgentVariant = agentInstance
-          ? agentInstance.role as AgentVariant
+          ? (isValidVariant(agentInstance.role) ? agentInstance.role : 'builder')
           : 'lead'
 
         const agentDef = getAgentDefinition(variant)

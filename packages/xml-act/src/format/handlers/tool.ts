@@ -8,7 +8,6 @@ import type { AttributeValue, ParsedChild, ParsedElement, TagMap } from '../type
 import type { TagHandler, XmlActEvent, XmlActFrame } from '../types'
 import { findFrame } from '../types'
 
-
 function validateAttrs(
   tag: string,
   id: string,

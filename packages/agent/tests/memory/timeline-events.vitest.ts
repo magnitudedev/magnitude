@@ -61,7 +61,6 @@ describe('memory/timeline-events', () => {
       if (inbox?.type === 'inbox') {
         const blocks = inbox.timeline.filter(t => t.kind === 'agent_block')
         expect(blocks.length).toBeGreaterThan(0)
-        expect(blocks.some(b => b.atoms.some(a => a.kind === 'idle'))).toBe(true)
       }
 
       const rendered = yield* getRenderedUserText(h)

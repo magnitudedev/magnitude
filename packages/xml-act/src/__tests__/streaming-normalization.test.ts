@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { Effect, Stream } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, type ToolDefinition } from '@magnitudedev/tools'

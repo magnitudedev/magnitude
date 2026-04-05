@@ -306,7 +306,6 @@ function reactImpl(
           tagName: parseEvent.tagName,
           toolName: registered.tool.name,
           group: registered.groupName,
-          taskId: currentState.taskStack.length > 0 ? currentState.taskStack[currentState.taskStack.length - 1] : null,
         })
 
         const callEmitted = emittedFields.get(parseEvent.toolCallId) ?? new Set<string>()
@@ -643,8 +642,6 @@ function reactImpl(
             currentState = yield* emitAndFold(currentState, {
               _tag: 'MessageStart',
               id,
-              scope: 'top-level',
-              taskId: null,
               to: null,
             })
           }
@@ -715,8 +712,6 @@ function reactImpl(
         currentState = yield* emitAndFold(currentState, {
           _tag: 'MessageStart',
           id: parseEvent.id,
-          scope: parseEvent.scope,
-          taskId: parseEvent.taskId,
           to: parseEvent.to,
         })
         break
@@ -752,7 +747,7 @@ function reactImpl(
       case 'ParseError': {
         const error = parseEvent.error
 
-        if (error._tag === 'UnclosedThink' || error._tag === 'UnclosedTask') {
+        if (error._tag === 'UnclosedThink') {
           currentState = yield* emitAndFold(currentState, {
             _tag: 'StructuralParseError',
             error,
@@ -785,61 +780,7 @@ function reactImpl(
         break
       }
 
-      case 'TaskOpen': {
-        currentState = yield* emitAndFold(currentState, {
-          _tag: 'TaskStarted',
-          id: parseEvent.id,
-          taskType: parseEvent.taskType,
-          title: parseEvent.title,
-          parent: parseEvent.parent,
-          explicitParent: parseEvent.explicitParent,
-          after: parseEvent.after,
-          status: parseEvent.status,
-        })
-        break
-      }
 
-      case 'TaskClose': {
-        currentState = yield* emitAndFold(currentState, {
-          _tag: 'TaskFinished',
-          id: parseEvent.id,
-        })
-        break
-      }
-
-      case 'TaskUpdate': {
-        currentState = yield* emitAndFold(currentState, {
-          _tag: 'TaskPatched',
-          id: parseEvent.id,
-          taskType: parseEvent.taskType,
-          title: parseEvent.title,
-          parent: parseEvent.parent,
-          explicitParent: parseEvent.explicitParent,
-          after: parseEvent.after,
-          status: parseEvent.status,
-        })
-        break
-      }
-
-      case 'TaskAssign': {
-        currentState = yield* emitAndFold(currentState, {
-          _tag: 'TaskDelegated',
-          taskId: parseEvent.taskId,
-          role: parseEvent.role,
-          body: parseEvent.body,
-        })
-        break
-      }
-
-      case 'TaskReassign': {
-        currentState = yield* emitAndFold(currentState, {
-          _tag: 'TaskReassigned',
-          taskId: parseEvent.taskId,
-          role: parseEvent.role,
-          body: parseEvent.body,
-        })
-        break
-      }
     }
 
     return currentState

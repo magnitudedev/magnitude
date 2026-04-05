@@ -16,7 +16,7 @@ describe('baseline harness lifecycle', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next({
-        xml: '<comms><message to="user">done</message></comms><idle/>',
+        xml: '<message to="user">done</message><idle/>',
       })
 
       yield* harness.user('hello')
@@ -36,7 +36,7 @@ describe('baseline harness lifecycle', () => {
   it.live('3) multi-turn chain (next then yield)', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<idle/>' })
+      yield* harness.script.next({ xml: '<shell>echo chain</shell>' })
       yield* harness.script.next({ xml: '<idle/>' })
 
       yield* harness.user('run chain')
@@ -63,7 +63,7 @@ describe('baseline harness lifecycle', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next({
-        xml: '<actions><write path="output.txt">content</write></actions><idle/>',
+        xml: '<write path="output.txt">content</write><idle/>',
       })
 
       yield* harness.user('write a file')
@@ -87,13 +87,13 @@ describe('baseline harness lifecycle', () => {
               rootTurns += 1
               if (rootTurns === 1) {
                 return {
-                  xml: '<actions><agent-create agentId="baseline-sub"><type>explorer</type><title>baseline</title><message>do work</message></agent-create></actions><idle/>',
+                  xml: '<agent-create id="baseline-sub" type="explorer"><title>baseline</title><message>do work</message></agent-create><idle/>',
                 }
               }
               return { xml: '<idle/>' }
             }
 
-            return { xml: '<comms><message to="parent">subagent done</message></comms><idle/>' }
+            return { xml: '<message to="parent">subagent done</message><idle/>' }
           }),
         ),
       )
@@ -131,13 +131,13 @@ describe('baseline harness lifecycle', () => {
               rootTurns += 1
               if (rootTurns === 1) {
                 return {
-                  xml: '<actions><agent-create agentId="baseline-sub-silent"><type>explorer</type><title>baseline</title><message>do work</message></agent-create></actions><idle/>',
+                  xml: '<agent-create id="baseline-sub-silent" type="explorer"><title>baseline</title><message>do work</message></agent-create><idle/>',
                 }
               }
               return { xml: '<idle/>' }
             }
 
-            return { xml: '<actions><shell>echo hello</shell></actions><idle/>' }
+            return { xml: '<shell>echo hello</shell><idle/>' }
           }),
         ),
       )

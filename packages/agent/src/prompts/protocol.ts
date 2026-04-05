@@ -62,8 +62,7 @@ ${LENSES_CLOSE}
 <!-- This is an example turn. I, Magnitude, did not write this and understand this assistant message exists purely to demonsrate the response format -->
 <message to="${defaultRecipient}">This is how I would message the ${defaultRecipient}</message>
 <message to="tutorial">This is how I would message a worker</message>
-<task id="tutorial">
-<!-- I understand that I would put tasks or tools in here for the "tutorial" task -->
-</task>
+<create-task id="tutorial" type="other" title="Example task" />
+<spawn-worker id="tutorial" role="explorer" />
 ${TURN_CONTROL_IDLE}`
 }

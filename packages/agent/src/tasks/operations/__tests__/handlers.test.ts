@@ -6,10 +6,10 @@ import type { ConversationState } from '../../../projections/conversation'
 import type { TaskGraphState, TaskRecord } from '../../../projections/task-graph'
 import { ConversationStateReaderTag } from '../../../tools/memory-reader'
 import { TaskGraphStateReaderTag, type TaskGraphStateReader } from '../../../tools/task-reader'
-import { handleAssignDirective } from '../assign'
-import { handleReassignDirective } from '../reassign'
 import { handleMessageDirective } from '../message'
 import { handleUpdateDirective } from '../update'
+import { handleSpawnWorkerDirective } from '../spawn-worker'
+import { handleKillWorkerDirective } from '../kill-worker'
 
 const mkTaskState = (overrides?: Partial<TaskGraphState>): TaskGraphState => ({
   tasks: new Map(),
@@ -77,82 +77,37 @@ function runOp<A>(
 }
 
 describe('task operation handlers validation', () => {
-  test('task-scope message to missing task returns explicit error', async () => {
+  test('top-level message respects parent default destination', async () => {
     const result = await runOp(handleMessageDirective({
       kind: 'message',
-      scope: 'task',
-      taskId: 'missing-task',
       defaultTopLevelDestination: 'parent',
       allowSingleUserReplyThisTurn: false,
       directUserRepliesSent: 0,
     }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), mkTaskState())
 
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.code).toBe('task_message_route_failed')
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.destination).toBe('parent')
+      expect(result.directUserRepliesSent).toBe(0)
     }
   })
 
-  test('task-scope message to task with no worker returns explicit error', async () => {
-    const state = mkTaskState({
-      tasks: new Map<string, TaskRecord>([
-        ['t1', { id: 't1', title: 'Task', taskType: 'implement', status: 'pending', parentId: null, childIds: [], assignee: null, worker: null, createdAt: 0, updatedAt: 0, completedAt: null }],
-      ]),
-      rootTaskIds: ['t1'],
-    })
-
+  test('top-level message routes user reply to parent after first direct reply', async () => {
     const result = await runOp(handleMessageDirective({
       kind: 'message',
-      scope: 'task',
-      taskId: 't1',
-      defaultTopLevelDestination: 'parent',
-      allowSingleUserReplyThisTurn: false,
-      directUserRepliesSent: 0,
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
+      defaultTopLevelDestination: 'user',
+      allowSingleUserReplyThisTurn: true,
+      directUserRepliesSent: 1,
+    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), mkTaskState())
 
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.code).toBe('invalid_task_message_route')
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.destination).toBe('parent')
+      expect(result.directUserRepliesSent).toBe(1)
     }
   })
 
-  test('assign with missing message does not kill existing worker', async () => {
-    const published: AppEvent[] = []
-    const state = mkTaskState({
-      tasks: new Map<string, TaskRecord>([
-        ['t1', {
-          id: 't1',
-          title: 'Task',
-          taskType: 'implement',
-          status: 'pending',
-          parentId: null,
-          childIds: [],
-          assignee: 'builder',
-          worker: { agentId: 'worker-1', forkId: 'fork-1', role: 'builder' as const, message: 'Existing assignment' },
-          createdAt: 0,
-          updatedAt: 0,
-          completedAt: null,
-        }],
-      ]),
-      rootTaskIds: ['t1'],
-    })
-
-    const result = await runOp(handleAssignDirective({
-      kind: 'assign',
-      taskId: 't1',
-      assignee: 'builder',
-      message: '   ',
-      spawnWorker: () => Effect.succeed('fork-new'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
-
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.code).toBe('missing_assignment_message')
-    }
-    expect(published.some((e) => e.type === 'agent_killed')).toBe(false)
-  })
-
-  test('assign on unassigned task with role spawns worker', async () => {
+  test('spawn-worker on unassigned task spawns worker and publishes task_assigned', async () => {
     const published: AppEvent[] = []
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
@@ -165,11 +120,10 @@ describe('task operation handlers validation', () => {
       rootTaskIds: ['t2'],
     })
 
-    const result = await runOp(handleAssignDirective({
-      kind: 'assign',
-      taskId: 't2',
-      assignee: 'builder',
-      message: 'Do the work',
+    const result = await runOp(handleSpawnWorkerDirective({
+      kind: 'spawn-worker',
+      id: 't2',
+      role: 'builder',
       spawnWorker: () => Effect.succeed('fork-2'),
     }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
 
@@ -178,7 +132,7 @@ describe('task operation handlers validation', () => {
     expect(published.some((e) => e.type === 'agent_killed')).toBe(false)
   })
 
-  test('assign on task with active worker returns success without kill or spawn', async () => {
+  test('spawn-worker on assigned task kills existing worker first', async () => {
     const published: AppEvent[] = []
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
@@ -192,47 +146,43 @@ describe('task operation handlers validation', () => {
       rootTaskIds: ['t3'],
     })
 
-    const result = await runOp(handleAssignDirective({
-      kind: 'assign',
-      taskId: 't3',
-      assignee: null,
-      message: 'Continue working',
-      spawnWorker: () => Effect.succeed('should-not-spawn'),
+    const result = await runOp(handleSpawnWorkerDirective({
+      kind: 'spawn-worker',
+      id: 't3',
+      role: 'builder',
+      spawnWorker: () => Effect.succeed('fork-3-new'),
     }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
 
     expect(result.success).toBe(true)
-    expect(published.some((e) => e.type === 'agent_killed')).toBe(false)
-    expect(published.some((e) => e.type === 'task_assigned')).toBe(false)
+    expect(published.some((e) => e.type === 'agent_killed')).toBe(true)
+    expect(published.some((e) => e.type === 'task_assigned')).toBe(true)
   })
 
-  test('assign on active worker with same role succeeds', async () => {
-    const published: AppEvent[] = []
+  test('kill-worker on task without worker errors', async () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t4', {
           id: 't4', title: 'Task', taskType: 'implement', status: 'pending',
-          parentId: null, childIds: [], assignee: 'builder',
-          worker: { agentId: 'worker-4', forkId: 'fork-4', role: 'builder' as const, message: 'Existing' },
+          parentId: null, childIds: [], assignee: null, worker: null,
           createdAt: 0, updatedAt: 0, completedAt: null,
         }],
       ]),
       rootTaskIds: ['t4'],
     })
 
-    const result = await runOp(handleAssignDirective({
-      kind: 'assign',
-      taskId: 't4',
-      assignee: 'builder',
-      message: 'Keep going',
-      spawnWorker: () => Effect.succeed('should-not-spawn'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
+    const result = await runOp(handleKillWorkerDirective({
+      kind: 'kill-worker',
+      id: 't4',
+    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
 
-    expect(result.success).toBe(true)
-    expect(published.some((e) => e.type === 'agent_killed')).toBe(false)
-    expect(published.some((e) => e.type === 'task_assigned')).toBe(false)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.code).toBe('worker_not_found')
+    }
   })
 
-  test('assign on active worker with different role returns mismatch error', async () => {
+  test('kill-worker kills existing worker and clears assignment', async () => {
+    const published: AppEvent[] = []
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t5', {
@@ -245,104 +195,14 @@ describe('task operation handlers validation', () => {
       rootTaskIds: ['t5'],
     })
 
-    const result = await runOp(handleAssignDirective({
-      kind: 'assign',
-      taskId: 't5',
-      assignee: 'reviewer',
-      message: 'Switch role',
-      spawnWorker: () => Effect.succeed('should-not-spawn'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
-
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.error).toBe(
-        'Task assignment rejected: task "t5" already has active worker role "builder". Use <reassign> to replace the worker with role "reviewer".',
-      )
-    }
-  })
-
-  test('assign on unassigned task without role returns missing-role error', async () => {
-    const state = mkTaskState({
-      tasks: new Map<string, TaskRecord>([
-        ['t6', {
-          id: 't6', title: 'Task', taskType: 'implement', status: 'pending',
-          parentId: null, childIds: [], assignee: null, worker: null,
-          createdAt: 0, updatedAt: 0, completedAt: null,
-        }],
-      ]),
-      rootTaskIds: ['t6'],
-    })
-
-    const result = await runOp(handleAssignDirective({
-      kind: 'assign',
-      taskId: 't6',
-      assignee: null,
-      message: 'Need worker',
-      spawnWorker: () => Effect.succeed('should-not-spawn'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
-
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.error).toBe(
-        'Task assignment rejected: role is required when task "t6" has no active worker.',
-      )
-    }
-  })
-
-  test('reassign kills old worker and spawns new worker', async () => {
-    const published: AppEvent[] = []
-    const state = mkTaskState({
-      tasks: new Map<string, TaskRecord>([
-        ['t7', {
-          id: 't7', title: 'Task', taskType: 'implement', status: 'pending',
-          parentId: null, childIds: [], assignee: 'builder',
-          worker: { agentId: 'worker-7', forkId: 'fork-7', role: 'builder' as const, message: 'Existing' },
-          createdAt: 0, updatedAt: 0, completedAt: null,
-        }],
-      ]),
-      rootTaskIds: ['t7'],
-    })
-
-    const result = await runOp(handleReassignDirective({
-      kind: 'reassign',
-      taskId: 't7',
-      assignee: 'builder',
-      message: 'Replace worker',
-      spawnWorker: () => Effect.succeed('fork-7-new'),
+    const result = await runOp(handleKillWorkerDirective({
+      kind: 'kill-worker',
+      id: 't5',
     }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
 
     expect(result.success).toBe(true)
     expect(published.some((e) => e.type === 'agent_killed')).toBe(true)
     expect(published.some((e) => e.type === 'task_assigned')).toBe(true)
-  })
-
-  test('reassign without role returns missing-role error', async () => {
-    const state = mkTaskState({
-      tasks: new Map<string, TaskRecord>([
-        ['t8', {
-          id: 't8', title: 'Task', taskType: 'implement', status: 'pending',
-          parentId: null, childIds: [], assignee: 'builder',
-          worker: { agentId: 'worker-8', forkId: 'fork-8', role: 'builder' as const, message: 'Existing' },
-          createdAt: 0, updatedAt: 0, completedAt: null,
-        }],
-      ]),
-      rootTaskIds: ['t8'],
-    })
-
-    const result = await runOp(handleReassignDirective({
-      kind: 'reassign',
-      taskId: 't8',
-      assignee: null,
-      message: 'Replace worker',
-      spawnWorker: () => Effect.succeed('should-not-spawn'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
-
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.error).toBe(
-        'Task reassignment rejected: role is required for <reassign> on task "t8".',
-      )
-    }
   })
 
   test('empty update patch returns error', async () => {

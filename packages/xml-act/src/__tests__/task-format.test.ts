@@ -1,133 +1,37 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
-function parse(xml: string, knownTags = new Set(['read', 'grep'])): ParseEvent[] {
-  const parser = createStreamingXmlParser(knownTags, new Map())
+function parse(xml: string, knownTags = new Set(['create-task', 'update-task', 'spawn-worker', 'kill-worker'])): ParseEvent[] {
+  const parser = createStreamingXmlParser(
+    knownTags,
+    new Map(),
+    new Map([
+      ['create-task', { acceptsBody: false, attributes: new Map([['id', { type: 'string', required: true }]]), children: new Map() }],
+      ['update-task', { acceptsBody: false, attributes: new Map([['id', { type: 'string', required: true }], ['status', { type: 'string', required: true }]]), children: new Map() }],
+      ['spawn-worker', { acceptsBody: false, attributes: new Map([['id', { type: 'string', required: true }], ['role', { type: 'string', required: true }]]), children: new Map() }],
+      ['kill-worker', { acceptsBody: false, attributes: new Map([['id', { type: 'string', required: true }]]), children: new Map() }],
+    ]),
+  )
   return [...parser.processChunk(xml), ...parser.flush()]
 }
 
-describe('task format parsing', () => {
-  it('parses task open/close', () => {
-    const events = parse('<task id="t1" type="scan" title="Scan"><read path="x" /></task><idle/>')
-    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
+describe('flat task/worker tool parsing', () => {
+  it('treats <task> blocks as unknown (no task events)', () => {
+    const events = parse('<task id="t1"><message>nope</message></task><idle/>')
+    expect(events.some((e) => e._tag === 'TagOpened' && e.tagName === 'task')).toBe(false)
+    expect(events.some((e) => e._tag === 'ParseError')).toBe(false)
   })
 
-  it('parses self-closing task update when create attrs are absent', () => {
-    const events = parse('<task id="t1" status="completed" /><idle/>')
-    const update = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskUpdate' }> => e._tag === 'TaskUpdate')
-    expect(update).toBeDefined()
-    expect(update?.id).toBe('t1')
-    expect(update?.status).toBe('completed')
+  it('parses flat create/update/spawn/kill tags as regular tools', () => {
+    const events = parse('<create-task id="t1" />\n<update-task id="t1" status="working" />\n<spawn-worker id="t1" role="explorer" />\n<kill-worker id="t1" />\n<idle/>')
+    const opened = events.filter((e): e is Extract<ParseEvent, { _tag: 'TagOpened' }> => e._tag === 'TagOpened').map((e) => e.tagName)
+    expect(opened).toEqual(['create-task', 'update-task', 'spawn-worker', 'kill-worker'])
   })
 
-  it('parses self-closing task create when type and title are present', () => {
-    const events = parse('<task id="t1" type="review" title="Review changes" parent="p1" /><idle/>')
-    const open = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
-    const close = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
-
-    expect(open).toBeDefined()
-    expect(open?.id).toBe('t1')
-    expect(open?.taskType).toBe('review')
-    expect(open?.title).toBe('Review changes')
-    expect(open?.parent).toBe('p1')
-    expect(close).toBeDefined()
-    expect(close?.id).toBe('t1')
-  })
-
-  it('assign valid only inside task', () => {
-    const ok = parse('<task id="t1"><assign role="builder">do it</assign></task><idle/>')
-    expect(ok.some(e => e._tag === 'TaskAssign')).toBe(true)
-
-    const bad = parse('<assign role="builder">nope</assign><idle/>')
-    expect(bad.some(e => e._tag === 'ParseError')).toBe(true)
-  })
-
-  it('self-closing assign errors outside task', () => {
-    const events = parse('<assign role="builder" /><idle/>')
-    const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
-    expect(err?.error._tag).toBe('InvalidAttributeValue')
-    if (err?.error._tag === 'InvalidAttributeValue') {
-      expect(err.error.attribute).toBe('role')
-      expect(err.error.expected).toBe('non-empty string inside task frame')
-      expect(err.error.detail).toBe('Assign must be used inside a task')
-    }
-  })
-
-  it('self-closing assign without role parses with null role', () => {
-    const events = parse('<task id="t1"><assign /></task><idle/>')
-    const assign = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskAssign' }> => e._tag === 'TaskAssign')
-    expect(assign).toBeDefined()
-    expect(assign?.role).toBeNull()
-  })
-
-  it('assign without role parses with null role', () => {
-    const events = parse('<task id="t1"><assign>do it</assign></task><idle/>')
-    const assign = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskAssign' }> => e._tag === 'TaskAssign')
-    expect(assign).toBeDefined()
-    expect(assign?.role).toBeNull()
-    expect(assign?.body).toBe('do it')
-  })
-
-  it('reassign with role yields TaskReassign', () => {
-    const events = parse('<task id="t1"><reassign role="builder">restart</reassign></task><idle/>')
-    const reassign = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskReassign' }> => e._tag === 'TaskReassign')
-    expect(reassign).toBeDefined()
-    expect(reassign?.role).toBe('builder')
-    expect(reassign?.body).toBe('restart')
-  })
-
-  it('reassign valid only inside task', () => {
-    const bad = parse('<reassign role="builder">nope</reassign><idle/>')
-    expect(bad.some(e => e._tag === 'ParseError')).toBe(true)
-  })
-
-  it('reassign errors when role missing', () => {
-    const events = parse('<task id="t1"><reassign>do it</reassign></task><idle/>')
-    const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
-    expect(err?.error._tag).toBe('InvalidAttributeValue')
-    if (err?.error._tag === 'InvalidAttributeValue') {
-      expect(err.error.detail).toBe('Reassign role is required')
-    }
-  })
-
-  it('nested task gets implicit parent', () => {
-    const events = parse('<task id="p"><task id="c"></task></task><idle/>')
-    const opens = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
-    expect(opens).toHaveLength(2)
-    expect(opens[1]?.parent).toBe('p')
-  })
-
-  it('message scope metadata top-level vs task', () => {
-    const events = parse('<message>top</message><task id="t1"><message>inner</message></task><idle/>')
-    const starts = events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageStart' }> => e._tag === 'MessageStart')
-    expect(starts[0]?.scope).toBe('top-level')
-    expect(starts[0]?.to).toBeNull()
-    expect(starts[1]?.scope).toBe('task')
-    expect(starts[1]?.taskId).toBe('t1')
-    expect(starts[1]?.to).toBeNull()
-  })
-
-  it('parses explicit message to attribute', () => {
-    const events = parse('<message to="parent">top</message><task id="t1"><message to="task-1">inner</message></task><idle/>')
-    const starts = events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageStart' }> => e._tag === 'MessageStart')
-    expect(starts[0]?.to).toBe('parent')
-    expect(starts[0]?.taskId).toBeNull()
-    expect(starts[1]?.to).toBe('task-1')
-    expect(starts[1]?.taskId).toBe('t1')
-  })
-
-  it('turn control inside unclosed tasks does not auto-close', () => {
-    const events = parse('<task id="a"><task id="b"><idle/>')
-    const closes = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
-    expect(closes).toHaveLength(0)
-    expect(events.some((e): e is Extract<ParseEvent, { _tag: 'TurnControl' }> => e._tag === 'TurnControl')).toBe(false)
-  })
-
-  it('flush emits UnclosedTask', () => {
-    const events = parse('<task id="a">')
-    const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
-    expect(err?.error._tag).toBe('UnclosedTask')
+  it('spawn-worker with body is still parsed as a regular tool tag at format layer', () => {
+    const events = parse('<spawn-worker id="t1" role="explorer">body</spawn-worker>\n<idle/>')
+    expect(events.some((e) => e._tag === 'TagOpened' && e.tagName === 'spawn-worker')).toBe(true)
+    expect(events.some((e) => e._tag === 'TagClosed' && e.tagName === 'spawn-worker')).toBe(true)
   })
 })

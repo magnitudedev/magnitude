@@ -66,7 +66,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
 
       {
@@ -171,7 +171,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'agent_killed',
@@ -212,7 +212,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_user_killed',
@@ -250,7 +250,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_idle_closed',

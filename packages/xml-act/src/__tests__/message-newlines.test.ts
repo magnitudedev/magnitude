@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { createStreamingXmlParser } from '../index'
 import type { ParseEvent } from '../index'
 import { parseMarkdownToMdast } from '../../../../cli/src/markdown/parse'

@@ -182,7 +182,6 @@ export type TurnDecision = 'continue' | 'idle' | 'finish'
 
 export type TurnResultErrorCode =
   | 'unclosed_think'
-  | 'unclosed_task'
   | 'nonexistent_agent_destination'
   | 'task_outside_assigned_subtree'
   | 'task_operation_error'
@@ -358,7 +357,7 @@ export interface AgentCreated {
   readonly context: string
   readonly mode: 'clone' | 'spawn'
   readonly taskId: string
-  readonly message: string
+  readonly message: string | null
   readonly outputSchema?: unknown
 }
 
@@ -423,7 +422,7 @@ export interface TaskAssigned {
   readonly taskId: string
   readonly assignee: TaskAssignee
   readonly workerRole?: string
-  readonly message: string
+  readonly message: string | null
   readonly workerInfo?: {
     readonly agentId: string
     readonly forkId: string

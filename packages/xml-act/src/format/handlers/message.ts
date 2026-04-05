@@ -4,11 +4,8 @@ import type { TagMap, TagHandler, XmlActFrame, XmlActEvent } from '../types'
 import { findFrame } from '../types'
 import { rawCloseTag, rawOpenTag } from '../raw'
 
-function resolveMessageScope(stack: ReadonlyArray<XmlActFrame>): { scope: 'top-level' | 'task'; taskId: string | null } {
-  const task = findFrame(stack, 'task')
-  if (task) return { scope: 'task', taskId: task.id }
-  return { scope: 'top-level', taskId: null }
-}
+
+
 
 export function messageHandler(tags: TagMap): TagHandler<XmlActFrame, XmlActEvent> {
   return {
@@ -32,16 +29,13 @@ export function messageHandler(tags: TagMap): TagHandler<XmlActFrame, XmlActEven
       }
 
       const id = ctx.generateId()
-      const { scope, taskId } = resolveMessageScope(ctx.stack)
       const to = ctx.attrs.get('to') ?? null
       return [
         ...endTopProse(ctx.stack),
-        emit({ _tag: 'MessageStart', id, scope, taskId, to }),
+        emit({ _tag: 'MessageStart', id, to }),
         push({
           type: 'message',
           id,
-          scope,
-          taskId,
           body: '',
           depth: 0,
           pendingNewlines: 0,
@@ -77,10 +71,9 @@ export function messageHandler(tags: TagMap): TagHandler<XmlActFrame, XmlActEven
     },
     selfClose(ctx) {
       const id = ctx.generateId()
-      const { scope, taskId } = resolveMessageScope(ctx.stack)
       const to = ctx.attrs.get('to') ?? null
       return [
-        emit({ _tag: 'MessageStart', id, scope, taskId, to }),
+        emit({ _tag: 'MessageStart', id, to }),
         emit({ _tag: 'MessageEnd', id }),
       ]
     },

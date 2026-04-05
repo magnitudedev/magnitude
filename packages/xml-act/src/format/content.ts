@@ -63,21 +63,7 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
       }
       return ops
     }
-    case 'assign':
-    case 'reassign': {
-      const pending = frame.pendingNewlines
-      if (/^\n+$/.test(text)) {
-        return [replace({ ...frame, pendingNewlines: pending + text.length })]
-      }
 
-      let segment = frame.body.length === 0 ? text.replace(/^\n+/, '') : text
-      const trailing = segment.match(/\n+$/)?.[0] ?? ''
-      if (trailing.length > 0) segment = segment.slice(0, -trailing.length)
-
-      const prefix = pending > 0 && frame.body.length > 0 ? '\n'.repeat(pending) : ''
-      const full = prefix + segment
-      return [replace({ ...frame, body: frame.body + full, pendingNewlines: trailing.length })]
-    }
     case 'tool-body':
       return [replace({ ...frame, body: frame.body + text }), emit({ _tag: 'BodyChunk', toolCallId: frame.id, text })]
     case 'child-body':
@@ -93,8 +79,6 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
       ]
     case 'body-capture':
       return [replace({ ...frame, body: frame.body + text })]
-    case 'task':
-      return []
   }
 }
 

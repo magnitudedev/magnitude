@@ -40,7 +40,7 @@ describe('AgentStatusProjection user kill semantics', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any)
 
       yield* bus.processEvent({
@@ -88,7 +88,7 @@ describe('AgentStatusProjection user kill semantics', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any)
 
       yield* bus.processEvent({

@@ -7,7 +7,7 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 
-export type AgentStatus = 'starting' | 'working' | 'idle' | 'killed'
+export type AgentStatus = 'working' | 'idle' | 'killed'
 
 export interface AgentInfo {
   readonly agentId: string
@@ -181,7 +181,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         mode: normalizedMode,
         taskId: normalizedTaskId,
         message: event.message ?? null,
-        status: 'starting',
+        status: 'idle',
       }
 
       return {

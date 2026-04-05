@@ -2,10 +2,10 @@ import { Effect } from 'effect'
 import type { TaskOperationGraphSnapshot } from './types'
 import { handleCreateDirective, type CreateDirective } from './create'
 import { handleUpdateDirective, type UpdateDirective } from './update'
-import { handleAssignDirective, type AssignDirective } from './assign'
-import { handleReassignDirective, type ReassignDirective } from './reassign'
 import { handleCancelDirective, type CancelDirective } from './cancel'
 import { handleMessageDirective, type MessageDirective, type MessageDirectiveSuccess } from './message'
+import { handleSpawnWorkerDirective, type SpawnWorkerDirective } from './spawn-worker'
+import { handleKillWorkerDirective, type KillWorkerDirective } from './kill-worker'
 
 export interface TaskDirectiveContext {
   readonly forkId: string | null
@@ -19,18 +19,18 @@ export type TaskDirectiveResult =
 
 export type TaskDirectiveErrorResult = { success: false; code: string; error: string }
 
-export type TaskDirective =
+export type TaskDirective<R = never> =
   | CreateDirective
   | UpdateDirective
-  | AssignDirective
-  | ReassignDirective
   | CancelDirective
   | MessageDirective
+  | SpawnWorkerDirective<R>
+  | KillWorkerDirective
 
 export type HandleTaskDirectiveResult = TaskDirectiveErrorResult | { success: true } | MessageDirectiveSuccess
 
-export const handleTaskDirective = (
-  directive: TaskDirective,
+export const handleTaskDirective = <R = never>(
+  directive: TaskDirective<R>,
   context: TaskDirectiveContext,
 ) => {
   switch (directive.kind) {
@@ -38,13 +38,13 @@ export const handleTaskDirective = (
       return handleCreateDirective(directive, context)
     case 'update':
       return handleUpdateDirective(directive, context)
-    case 'assign':
-      return handleAssignDirective(directive, context)
-    case 'reassign':
-      return handleReassignDirective(directive, context)
     case 'cancel':
       return handleCancelDirective(directive, context)
     case 'message':
       return handleMessageDirective(directive, context)
+    case 'spawn-worker':
+      return handleSpawnWorkerDirective(directive, context)
+    case 'kill-worker':
+      return handleKillWorkerDirective(directive, context)
   }
 }

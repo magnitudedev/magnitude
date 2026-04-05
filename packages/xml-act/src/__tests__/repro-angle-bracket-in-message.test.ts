@@ -11,7 +11,7 @@
  *   think.ts    — LensTagAttrs / LensTagName for `<lens` inside lens body
  *   tool-body.ts — ChildTagName/ChildAttrs for valid child tag names
  */
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
@@ -113,7 +113,7 @@ describe('message.ts: generic tag matching in message body', () => {
     expect(body).toContain('<20%')
     expect(events.filter(e => e._tag === 'MessageStart')).toHaveLength(1)
     expect(events.filter(e => e._tag === 'MessageEnd')).toHaveLength(1)
-    expect(events.filter(e => e._tag === 'TaskClose')).toHaveLength(1)
+    expect(events.filter(e => e._tag === 'MessageEnd')).toHaveLength(1)
     expect(turnControls(events)).toHaveLength(1)
   })
 

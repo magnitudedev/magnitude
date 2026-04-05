@@ -8,7 +8,7 @@
  * 4. childTags runtime parsing + input building
  * 5. Input builder produces correct output for all binding patterns
  */
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect } from 'vitest'
 import { Effect, Stream } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool } from '@magnitudedev/tools'
@@ -25,8 +25,8 @@ import {
 
 } from './index'
 
-const TASK_TAG_OPEN = '<task id="t1">'
-const TASK_TAG_CLOSE = '</task>'
+const TASK_TAG_OPEN = '\n'
+const TASK_TAG_CLOSE = '\n'
 import type { ParsedElement } from './format/types'
 
 // ---------------------------------------------------------------------------
@@ -218,7 +218,7 @@ describe('childRecord.field end-to-end', () => {
   })
 
   test('full runtime execution with childRecord.field', async () => {
-    const xml = '<task id="t1"><set_env id="r1"><var name="A">1</var><var name="B">2</var></set_env></task>'
+    const xml = '<set_env id="r1"><var name="A">1</var><var name="B">2</var></set_env>'
     const events = await runStream(cfg([reg(envTool, 'set_env', envBinding)]), xml)
 
     const ready = ofType(events, 'ToolInputReady')
@@ -300,11 +300,11 @@ describe('childTags runtime', () => {
   })
 
   test('full runtime execution with childTags', async () => {
-    const xml = `<task id="t1"><create id="a1">
+    const xml = `<create id="a1">
   <type>builder</type>
   <title>Build it</title>
   <prompt>Do the thing</prompt>
-</create></task>`
+</create>`
     const events = await runStream(cfg([reg(agentTool, 'create', agentBinding)]), xml)
 
     const ready = ofType(events, 'ToolInputReady')
@@ -325,13 +325,13 @@ describe('childTags runtime', () => {
 
   test('childTags content is literal (no trimming)', async () => {
     // Content between child tags is preserved exactly — no stripping of newlines or whitespace
-    const xml = `<task id="t1"><create id="a1">
+    const xml = `<create id="a1">
   <type>
     builder
   </type>
   <title>  Build it  </title>
   <prompt>Do the thing</prompt>
-</create></task>`
+</create>`
     const events = await runStream(cfg([reg(agentTool, 'create', agentBinding)]), xml)
 
     const ready = ofType(events, 'ToolInputReady')
@@ -346,7 +346,7 @@ describe('childTags runtime', () => {
   })
 
   test('missing childTag is absent from input (not undefined)', async () => {
-    const xml = `<task id="t1"><create id="a1"><type>builder</type></create></task>`
+    const xml = `<create id="a1"><type>builder</type></create>`
     const events = await runStream(cfg([reg(agentTool, 'create', agentBinding)]), xml)
 
     const ready = ofType(events, 'ToolInputReady')

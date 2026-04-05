@@ -54,7 +54,7 @@ describe('virtual fs integration with harness', () => {
   it.live('Agent reads seeded file', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<actions><read path="src/index.ts"/></actions><idle/>' }, null)
+      yield* harness.script.next({ xml: '<read path="src/index.ts"/><idle/>' }, null)
 
       yield* harness.user('read file')
       const completed = yield* harness.wait.event('turn_completed', (e) => e.toolCalls.length > 0)
@@ -80,7 +80,7 @@ describe('virtual fs integration with harness', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next(
-        { xml: '<actions><write path="output.txt">content</write></actions><idle/>' },
+        { xml: '<write path="output.txt">content</write><idle/>' },
         null,
       )
 

@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect } from 'vitest'
 import { buildOutputTree, outputToText, outputToDOM, outputFromDOM, type OutputNode } from '../output-tree'
 import type { XmlBinding } from '@magnitudedev/tools'
 import { evaluateXPath } from 'fontoxpath'

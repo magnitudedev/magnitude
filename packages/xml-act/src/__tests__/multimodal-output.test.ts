@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { observeOutput, renderOutputParts } from '../output-query'
 import { buildOutputTree, type OutputNode } from '../output-tree'
 

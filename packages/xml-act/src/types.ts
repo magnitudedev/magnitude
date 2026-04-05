@@ -62,7 +62,6 @@ export interface ToolInputStarted {
   readonly tagName: string
   readonly toolName: string
   readonly group: string
-  readonly taskId: string | null
 }
 
 export interface ToolInputFieldValue<TInput = unknown, B = unknown> {
@@ -134,35 +133,9 @@ export interface LensStart { readonly _tag: 'LensStart'; readonly name: string }
 export interface LensChunk { readonly _tag: 'LensChunk'; readonly text: string }
 export interface LensEnd { readonly _tag: 'LensEnd'; readonly name: string; readonly content: string }
 
-export interface TaskStarted {
-  readonly _tag: 'TaskStarted'
-  readonly id: string
-  readonly taskType: string | null
-  readonly title: string | null
-  readonly parent: string | null
-  readonly explicitParent: string | null
-  readonly after: string | null
-  readonly status: string | null
-}
-export interface TaskFinished { readonly _tag: 'TaskFinished'; readonly id: string }
-export interface TaskPatched {
-  readonly _tag: 'TaskPatched'
-  readonly id: string
-  readonly taskType: string | null
-  readonly title: string | null
-  readonly parent: string | null
-  readonly explicitParent: string | null
-  readonly after: string | null
-  readonly status: string | null
-}
-export interface TaskDelegated { readonly _tag: 'TaskDelegated'; readonly taskId: string; readonly role: string | null; readonly body: string }
-export interface TaskReassigned { readonly _tag: 'TaskReassigned'; readonly taskId: string; readonly role: string; readonly body: string }
-
 export interface MessageStart {
   readonly _tag: 'MessageStart'
   readonly id: string
-  readonly scope: 'top-level' | 'task'
-  readonly taskId: string | null
   readonly to: string | null
 }
 export interface MessageChunk { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
@@ -211,7 +184,6 @@ export interface StructuralParseError { readonly _tag: 'StructuralParseError'; r
 export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown, TEmission = unknown> =
   | ToolCallEvent<TInput, TOutput, B, TEmission>
   | ProseChunk | ProseEnd | LensStart | LensChunk | LensEnd
-  | TaskStarted | TaskFinished | TaskPatched | TaskDelegated | TaskReassigned
   | MessageStart | MessageChunk | MessageEnd
   | StructuralParseError
   | TurnEnd
@@ -260,8 +232,7 @@ export type ToolOutcome =
 
 export interface ReactorState {
   readonly toolCallMap: ReadonlyMap<string, string>
-  readonly toolTaskMap: ReadonlyMap<string, string | null>
-  readonly taskStack: readonly string[]
+
   readonly deadToolCalls: ReadonlySet<string>
   readonly outputTrees: ReadonlyMap<string, readonly OutputNode[]>
   readonly stopped: boolean

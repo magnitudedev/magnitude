@@ -4,10 +4,11 @@ import type { AppEvent } from '../../events'
 import { TaskGraphStateReaderTag } from '../../tools/task-reader'
 import { buildTaskStatusChangedValidated, buildTaskUpdatedValidated } from './builders'
 import { completionBlocked, emptyUpdatePatch, parentNotFound, taskNotFound } from './errors'
-import type { TaskDirectiveContext, TaskDirectiveResult } from './handler'
+import { handleCancelDirective } from './cancel'
+import type { TaskDirectiveContext } from './handler'
 import type { TaskDirectiveStatus } from './types'
 
-type UpdateDirectiveStatus = Exclude<TaskDirectiveStatus, 'cancelled'>
+type UpdateDirectiveStatus = TaskDirectiveStatus
 
 export interface UpdateDirective {
   readonly kind: 'update'
@@ -33,6 +34,10 @@ export const handleUpdateDirective = (directive: UpdateDirective, context: TaskD
         const err = parentNotFound(directive.taskId, directive.parent)
         return { success: false, code: err.code, error: err.message } as const
       }
+    }
+
+    if (directive.status === 'cancelled') {
+      return yield* handleCancelDirective({ kind: 'cancel', taskId: directive.taskId }, context)
     }
 
     if (directive.status === 'completed') {

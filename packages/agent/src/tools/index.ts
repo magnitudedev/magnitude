@@ -61,3 +61,13 @@ export { fsTools } from './fs'
 
 
 export { webFetchTool } from './web-fetch-tool'
+export {
+  createTaskTool,
+  updateTaskTool,
+  spawnWorkerTool,
+  killWorkerTool,
+  createTaskXmlBinding,
+  updateTaskXmlBinding,
+  spawnWorkerXmlBinding,
+  killWorkerXmlBinding,
+} from './task-tools'

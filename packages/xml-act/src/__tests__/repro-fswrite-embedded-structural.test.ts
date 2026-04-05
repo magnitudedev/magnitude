@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
@@ -149,8 +149,8 @@ describe('repro: write body with embedded structural tags', () => {
     const events = parse(FULL_XML)
 
     // Should have actions open/close
-    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TagOpened')).toBe(true)
+    expect(events.some(e => e._tag === 'TagClosed')).toBe(true)
 
     // write should be parsed as a complete tool
     const closed = events.filter(
@@ -179,8 +179,8 @@ describe('repro: write body with embedded structural tags', () => {
     expect(closed[0].element.body).toBe(FS_WRITE_BODY)
     expect(closed[0].element.attributes.get('path')).toBe('evals/src/evals/a5/scenarios.ts')
 
-    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TagOpened')).toBe(true)
+    expect(events.some(e => e._tag === 'TagClosed')).toBe(true)
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
@@ -197,8 +197,8 @@ describe('repro: write body with embedded structural tags', () => {
     )
     expect(closed).toHaveLength(1)
     expect(closed[0].element.body).toBe('some code with </results> in it and observe="." too')
-    expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
-    expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
+    expect(events.some(e => e._tag === 'TagOpened')).toBe(true)
+    expect(events.some(e => e._tag === 'TagClosed')).toBe(true)
     expect(events.filter(e => e._tag === 'ParseError')).toHaveLength(0)
   })
 
@@ -231,8 +231,8 @@ describe('repro: write body with embedded structural tags', () => {
 
     const events = parse(xml)
 
-    // Should have exactly ONE TaskOpen (the outer one)
-    const actionsOpens = events.filter(e => e._tag === 'TaskOpen')
+    // Should have exactly ONE TagOpened (the outer one)
+    const actionsOpens = events.filter(e => e._tag === 'TagOpened')
     expect(actionsOpens).toHaveLength(1)
 
     const closed = events.filter(

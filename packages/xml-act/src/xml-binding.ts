@@ -20,6 +20,7 @@ type XmlOutputChildrenBinding<TOutput> = readonly {
 export interface XmlInputMappingConfig<TInput> {
   attributes?: readonly { attr: string; field: FieldPath<TInput> }[]
   body?: FieldPath<TInput>
+  selfClosing?: boolean
   childTags?: readonly { tag: string; field: FieldPath<TInput> }[]
   children?: readonly {
     field: keyof TInput & string
@@ -110,6 +111,7 @@ export function defineXmlBinding<
           attributes: input.attributes.map((a) => ({ attr: a.attr, field: a.field })),
         }),
         ...(input.body && { body: input.body }),
+        ...(input.selfClosing !== undefined && { selfClosing: input.selfClosing }),
         ...(input.childTags && {
           childTags: input.childTags.map((ct) => ({ tag: ct.tag, field: ct.field })),
         }),

@@ -85,7 +85,7 @@ describe('MemoryProjection queue ordering regressions', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_user_killed',
@@ -143,7 +143,7 @@ describe('MemoryProjection queue ordering regressions', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_user_killed',

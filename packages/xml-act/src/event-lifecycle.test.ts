@@ -6,7 +6,7 @@
  *
  * Organized by lifecycle case (spec: xml-act-event-lifecycle.md).
  */
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect } from 'vitest'
 import { Effect, Stream, Layer } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool } from '@magnitudedev/tools'
@@ -23,8 +23,8 @@ import {
 
 } from './index'
 
-const TASK_TAG_OPEN = '<task id="t1">'
-const TASK_TAG_CLOSE = '</task>'
+const TASK_TAG_OPEN = '\n'
+const TASK_TAG_CLOSE = '\n'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -314,7 +314,7 @@ describe('Case 1: normal execution', () => {
 
   test('multiple sequential tools — all succeed independently', async () => {
     const c = cfg([reg(readTool, 'read', readBinding), reg(writeTool, 'write', writeBinding)])
-    const events = await runStream(c, `${TASK_TAG_OPEN}<read id="r1" path="a.ts"/><write id="r2" path="b.ts">data</write>${TASK_TAG_CLOSE}`)
+    const events = await runStream(c, `${TASK_TAG_OPEN}<read id="r1" path="a.ts"/>\n<write id="r2" path="b.ts">data</write>${TASK_TAG_CLOSE}`)
 
     const ended = ofType(events, 'ToolExecutionEnded')
     expect(ended).toHaveLength(2)
@@ -761,7 +761,7 @@ describe('dead tool call suppression', () => {
 
   test('dead tool followed by valid tool — second tool executes', async () => {
     const c = cfg([reg(readTool, 'read', readBinding), reg(addTool, 'add', addBinding)])
-    const xml = `${TASK_TAG_OPEN}<add id="r1" a="abc" b="1"/><read id="r2" path="ok.ts"/>${TASK_TAG_CLOSE}`
+    const xml = `${TASK_TAG_OPEN}<add id="r1" a="abc" b="1"/>\n<read id="r2" path="ok.ts"/>${TASK_TAG_CLOSE}`
     const events = await runStream(c, xml)
 
     const errors = ofType(events, 'ToolInputParseError')
@@ -912,7 +912,7 @@ describe('pairing guarantee', () => {
       '<add id="r3" a="abc" b="1"/>',           // invalid value
       '<read id="r4" path="a.ts">body</read>',  // unexpected body
       '<write id="r5" path="f.ts">ok</write>',  // success
-    ].join('') + TASK_TAG_CLOSE
+    ].join('\n') + TASK_TAG_CLOSE
 
     const events = await runStream(c, xml)
 

@@ -24,7 +24,7 @@ type Step =
   | { kind: 'agents'; mapping: Record<string, MockTurnResponse> }
 
 function isResponseBuilder(frame: TurnFrame): frame is ResponseBuilder {
-  return 'idle' in frame && typeof frame.yield === 'function'
+  return 'yield' in frame && typeof frame.yield === 'function'
 }
 
 function toFrame(frame: TurnFrame): MockTurnResponse {

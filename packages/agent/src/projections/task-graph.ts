@@ -9,7 +9,7 @@ export interface TaskWorkerInfo {
   readonly agentId: string
   readonly forkId: string
   readonly role: string
-  readonly message: string
+  readonly message: string | null
 }
 
 export interface TaskRecord {
@@ -196,7 +196,7 @@ function deriveStatusFromWorker(task: TaskRecord, agentState: AgentStatusState):
   const agent = agentState.agents.get(linkedAgentId)
   if (!agent) return 'pending'
 
-  return agent.status === 'working' || agent.status === 'starting' ? 'working' : 'pending'
+  return agent.status === 'working' ? 'working' : 'pending'
 }
 
 function findTaskByWorkerAgentId(state: TaskGraphState, agentId: string): TaskRecord | undefined {

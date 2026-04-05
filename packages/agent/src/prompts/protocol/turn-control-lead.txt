@@ -8,4 +8,4 @@ Go idle if and only if at least one of the following is true:
 - You delegated tasks to workers and are waiting for their completion.
 - You are completely done with all tasks and have summarized completed work to the user.
 
-In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately declare task blocks in the same response.
+In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately take tool calls in the same response.

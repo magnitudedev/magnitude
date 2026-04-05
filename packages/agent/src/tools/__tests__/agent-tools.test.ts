@@ -9,7 +9,7 @@ import type { AppEvent } from '../../events'
 
 const { ForkContext } = Fork
 
-function makeAgentState(status: 'starting' | 'working' | 'idle', parentForkId: string | null): AgentStatusState {
+function makeAgentState(status: 'working' | 'idle', parentForkId: string | null): AgentStatusState {
   return {
     agents: new Map([
       ['agent-sub', {
@@ -92,11 +92,11 @@ describe('agent.kill tool validation matrix', () => {
     expect((await Effect.runPromise(Ref.get(eventsRef))).length).toBe(0)
   })
 
-  test('accepts starting target', async () => {
+  test('accepts idle target', async () => {
     const eventsRef = await Effect.runPromise(Ref.make<AppEvent[]>([]))
     const result = await Effect.runPromise(
       agentKillTool.execute({ agentId: 'agent-sub', reason: 'cleanup' }, noopToolContext).pipe(
-        Effect.provide(makeLayer(makeAgentState('starting', 'parent-1'), eventsRef)),
+        Effect.provide(makeLayer(makeAgentState('idle', 'parent-1'), eventsRef)),
       ) as unknown as Effect.Effect<{ readonly forkId: string; readonly agentId: string }, unknown, never>,
     )
 

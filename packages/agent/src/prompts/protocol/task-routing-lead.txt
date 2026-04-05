@@ -3,7 +3,7 @@
 Messages use explicit `to` targeting:
 
 - `<message to="user">` routes to the user.
-- `<message to="<task-id>">` routes to the worker assigned to that task.
+- `<message to="task-id">` routes to the worker spawned on that task.
 
 Example showing both in one turn:
 
@@ -16,49 +16,56 @@ Messages support GFM-style markdown syntax. Messages also support inline links t
 
 When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
 
-## Task blocks
+## Task and worker operations
 
-`task` is the work container. All task operations, tool use, and worker communication happen inside task blocks.
+Tasks and workers are managed with flat tool calls — no block syntax, no nesting.
 
-A new task requires `id`, `type`, and `title`. Use `parent` to place it under an existing task.
+### Creating tasks
 
-Use `<assign>` to direct work to a task:
-- If no worker exists, it spawns one (requires `role`).
-- If a worker is already active, it sends the content to that worker (`role` optional).
-- If `role` is provided and differs from the active worker's role, it errors — use `<reassign>`.
+<create-task id="impl-parser" type="implement" title="Implement parser updates" />
 
-<task id="impl-parser" type="implement" title="Implement parser updates">
-<assign role="builder">Implement Unit A from the plan.</assign>
-</task>
+A task requires `id`, `type`, and `title`. Use `parent` to nest under an existing task:
 
-Send follow-up instructions to an existing worker:
+<create-task id="impl-parser" type="implement" title="Implement parser updates" parent="parser-feature" />
 
-<task id="impl-parser">
-<assign>Prioritize parser tests before refactors.</assign>
-</task>
+### Spawning workers
 
-Use `<reassign>` to kill and replace a worker (always requires `role`):
+<spawn-worker id="impl-parser" role="builder" />
 
-<task id="impl-parser">
-<reassign role="debugger">...</reassign>
-</task>
+`spawn-worker` creates a worker for a task. The `id` must match an existing task. The `role` must be allowed for that task type. `spawn-worker` is always self-closing — no body. Send instructions via a separate `<message>`:
 
-Referencing an existing task by `id` lets you operate on it, for example to update status:
+<spawn-worker id="impl-parser" role="builder" />
+<message to="impl-parser">Implement Unit A from the plan.</message>
 
-<task id="impl-parser" status="completed" />
+If a worker already exists on that task, `spawn-worker` kills the old worker and spawns a new one.
 
-To message a worker on a task, use explicit `to`:
+### Killing workers
+
+<kill-worker id="impl-parser" />
+
+Explicitly kills the worker on a task. Errors if no worker exists.
+
+### Updating tasks
+
+<update-task id="impl-parser" status="completed" />
+
+Valid status values:
+- `pending` — Reopens the task. Does not affect the worker.
+- `completed` — Marks the task finished. Blocked if any child tasks are still pending or working.
+- `cancelled` — Kills the worker (if present) and removes the task and its entire subtree from the task tree.
+- `archived` — Collapses the task into a summary line and hides its subtree. Only works on completed tasks.
+
+The `working` status is derived — it reflects that a task has a live worker. You never set it manually.
+
+### Messaging workers
+
+To send instructions or follow-ups to a worker, use `<message>`:
 
 <message to="impl-parser">Focus on test coverage before refactors.</message>
 
-Use a self-closing task tag to update status:
+### Complete example turn
 
-<task id="impl-parser" status="completed" />
-
-Valid status values:
-- `pending` — Reopens the task. Clears its completion timestamp. Detaches any assigned worker.
-- `completed` — Marks the task finished. Blocked if any child tasks are still pending or working.
-- `cancelled` — Kills the assigned worker and removes the task and its entire subtree from the task tree.
-- `archived` — Collapses the task into a summary line and hides its subtree. Only works on completed tasks.
-
-Lead agents run tools inside task blocks.
+<create-task id="auth-research" type="research" title="Map auth flow" parent="auth-feature" />
+<spawn-worker id="auth-research" role="explorer" />
+<message to="auth-research">Trace the auth middleware chain and document entry points.</message>
+<update-task id="old-task" status="completed" />

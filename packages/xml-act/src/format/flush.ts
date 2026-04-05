@@ -16,10 +16,7 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         }
         break
       }
-      case 'task':
-        ops.push(emit({ _tag: 'ParseError', error: { _tag: 'UnclosedTask', id: frame.id } }))
-        ops.push(pop)
-        break
+
       case 'think':
         ops.push(emit({ _tag: 'ParseError', error: { _tag: 'UnclosedThink' } }))
         if (!frame.isLenses) {
@@ -31,14 +28,7 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         ops.push(emit({ _tag: 'MessageEnd', id: frame.id }))
         ops.push(pop)
         break
-      case 'assign':
-        ops.push(emit({ _tag: 'TaskAssign', taskId: frame.taskId, role: frame.role, body: frame.body.trim() }))
-        ops.push(pop)
-        break
-      case 'reassign':
-        ops.push(emit({ _tag: 'TaskReassign', taskId: frame.taskId, role: frame.role, body: frame.body.trim() }))
-        ops.push(pop)
-        break
+
       case 'tool-body': {
         const suppressThisToolBody = suppressToolBodyForId === frame.id
         if (suppressThisToolBody) {

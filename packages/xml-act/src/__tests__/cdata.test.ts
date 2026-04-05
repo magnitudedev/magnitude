@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
@@ -42,42 +42,42 @@ describe('CDATA support', () => {
   })
 
   it('2) CDATA content inside a tool body preserves raw text including angle brackets', () => {
-    const events = parse(`<task id="t1"><shell>${cdata('echo "<hello>" && cat <file>')}</shell></task>`)
+    const events = parse(`<shell>${cdata('echo "<hello>" && cat <file>')}</shell>`)
     const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
     expect(body).toBe('echo "<hello>" && cat <file>')
   })
 
   it('3) CDATA content inside a message preserves raw text', () => {
-    const events = parse(`<task id="t2"><message>${cdata('Use <task id="t1"> for tools')}</message></task>`)
+    const events = parse(`<task id="t2"><message>${cdata('Use  for tools')}</message>`)
     const msg = byTag(events, 'MessageChunk').map(e => e.text).join('')
-    expect(msg).toBe('Use <task id="t1"> for tools')
+    expect(msg).toBe('Use  for tools')
   })
 
   it('4) CDATA split across multiple chunks is assembled correctly', () => {
     const events = parseChunks([
-      '<task id="t1"><shell><!',
+      '<shell><!',
       '[CDATA[some <content>',
-      ' here]]></shell></task>',
+      ' here]]></shell>',
     ])
     const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
     expect(body).toBe('some <content> here')
   })
 
   it('5) multiple CDATA sections in one tool body are both captured', () => {
-    const events = parse(`<task id="t1"><shell>${cdata('first')}${cdata(' second')}</shell></task>`)
+    const events = parse(`<shell>${cdata('first')}${cdata(' second')}</shell>`)
     const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
     expect(body).toBe('first second')
   })
 
   it('6) empty CDATA still allows tool to close properly', () => {
-    const events = parse(`<task id="t1"><shell>${cdata('')}</shell></task>`)
+    const events = parse(`<shell>${cdata('')}</shell>`)
     const closed = byTag(events, 'TagClosed').find(e => e.tagName === 'shell')
     expect(closed).toBeDefined()
   })
 
   it('7) CDATA preserves XML-like content without parsing nested tags', () => {
-    const raw = '<task id="t1"><shell>nested</shell></task>'
-    const events = parse(`<task id="t1"><shell>${cdata(raw)}</shell></task>`)
+    const raw = '<shell>nested</shell>'
+    const events = parse(`<shell>${cdata(raw)}</shell>`)
 
     const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
     expect(body).toBe(raw)

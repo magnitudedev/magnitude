@@ -61,7 +61,7 @@ export interface UpdateTaskDirectiveInput {
 export interface AssignTaskDirectiveInput {
   readonly taskId: string
   readonly assignee: TaskAssignee
-  readonly message: string
+  readonly message: string | null
   readonly workerRole?: string
   readonly workerInfo?: {
     readonly agentId: string

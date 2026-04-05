@@ -120,7 +120,7 @@ describe('display pending communications promotion', () => {
         agentId: 'agent-user',
         role: 'builder',
         name: 'BuilderUser',
-        message: '',
+        message: null,
         mode: 'manual',
       } as any)
 

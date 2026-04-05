@@ -381,7 +381,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'diag-1',
         assignee: 'debugger',
-        workerInfo: { agentId: 'agent-1', forkId: 'fork-1', role: 'debugger', message: '' },
+        workerInfo: { agentId: 'agent-1', forkId: 'fork-1', role: 'debugger', message: null },
       } as any,
       {
         type: 'turn_started',

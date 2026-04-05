@@ -136,9 +136,11 @@ Interacts with web applications through a full browser. Use for visual or intera
 
 ## Worker Lifecycle
 
-`<assign>` directs work to a task — spawns a worker if none active (role required), messages existing worker if one is active (role optional). `<reassign>` kills and replaces the current worker (role required). Use `<message to="task-id">` to communicate without assignment semantics.
+`<spawn-worker id="task-id" role="..."/>` creates or replaces the worker for a task (respawns if one already exists).  
+`<kill-worker id="task-id"/>` kills the active worker (errors if none exists).  
+Use `<message to="task-id">` to send instructions; spawn does not include message body.
 
-Do not assign workers until task dependencies are met.
+Do not spawn workers until task dependencies are met.
 
 ## Workspace
 

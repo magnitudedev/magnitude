@@ -5,7 +5,7 @@ No turn-control tag means the system immediately gives you another turn.
 
 Go idle if and only if you dispatched subagents and are waiting for their completion.
 
-In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately declare task blocks in the same response.
+In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately take tool calls in the same response.
 
 `<{{TURN_CONTROL_FINISH}}>`: Declare the task fully and verifiably complete
 Provide a summary of verification evidence as body content:

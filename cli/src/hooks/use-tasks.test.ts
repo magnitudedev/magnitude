@@ -21,7 +21,7 @@ function makeTask(overrides: Partial<TaskListItem> = {}): TaskListItem {
   }
 }
 
-function makeAgentStatus(status: 'starting' | 'working' | 'idle'): AgentStatusState {
+function makeAgentStatus(status: 'working' | 'idle'): AgentStatusState {
   const agent = {
     agentId: 'builder-1',
     forkId: 'fork-1',
@@ -79,7 +79,7 @@ describe('deriveWorkerExecutionSnapshot', () => {
     expect(result?.state).toBe('idle')
   })
 
-  test('maps lifecycle working/starting to working', () => {
+  test('maps lifecycle working to working', () => {
     const task = makeTask()
     const fromDisplay: WorkerExecutionSnapshot = {
       state: 'idle',
@@ -98,7 +98,7 @@ describe('deriveWorkerExecutionSnapshot', () => {
     expect(deriveWorkerExecutionSnapshot({
       task,
       fromDisplay,
-      agentStatusState: makeAgentStatus('starting'),
+      agentStatusState: makeAgentStatus('working'),
     })?.state).toBe('working')
   })
 })

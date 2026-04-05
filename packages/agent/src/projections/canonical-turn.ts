@@ -3,7 +3,7 @@ import type { AppEvent, ResponsePart, TurnResultError, MessageDestination } from
 import type { ContentPart } from '../content'
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 
@@ -14,7 +14,7 @@ export interface ThinkBlock {
 
 export interface CanonicalTurnState {
   turnId: string | null
-  lenses: readonly { name: string; content: string | null }[] | null
+  lenses: readonly { name: string; content: string }[] | null
   thinkBlocks: ThinkBlock[]
   messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
@@ -53,7 +53,7 @@ function flattenResponseText(parts: readonly ResponsePart[]): string {
 
 function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
   if (!errors || errors.length === 0) return false
-  return errors.some((error) => error.code === 'unclosed_think' || error.code === 'unclosed_task')
+  return errors.some((error) => error.code === 'unclosed_think')
 }
 
 function resetActive(state: CanonicalTurnState): CanonicalTurnState {
@@ -108,7 +108,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     lens_start: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      const nextLenses = [...(fork.lenses ?? []), { name: event.name, content: null as string | null }]
+      const nextLenses = [...(fork.lenses ?? []), { name: event.name, content: '' }]
       return { ...fork, lenses: nextLenses }
     },
 
@@ -119,7 +119,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const last = nextLenses[nextLenses.length - 1]
       nextLenses[nextLenses.length - 1] = {
         ...last,
-        content: (last.content ?? '') + event.text,
+        content: last.content + event.text,
       }
       return { ...fork, lenses: nextLenses }
     },
@@ -130,8 +130,8 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const nextLenses = [...fork.lenses]
       const last = nextLenses[nextLenses.length - 1]
       if (last.name !== event.name) return fork
-      const trimmed = (last.content ?? '').trim()
-      nextLenses[nextLenses.length - 1] = { ...last, content: trimmed.length > 0 ? trimmed : null }
+      const trimmed = last.content.trim()
+      nextLenses[nextLenses.length - 1] = { ...last, content: trimmed }
       return { ...fork, lenses: nextLenses }
     },
 
@@ -234,7 +234,10 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       if (clean) {
         const agentState = read(AgentStatusProjection)
         const variant: AgentVariant = event.forkId
-          ? ((getAgentByForkId(agentState, event.forkId)?.role ?? 'builder') as AgentVariant)
+          ? (() => {
+              const role = getAgentByForkId(agentState, event.forkId)?.role
+              return role && isValidVariant(role) ? role : 'builder'
+            })()
           : 'lead'
         const agentDef = getAgentDefinition(variant)
         const bindings = getBindingRegistry(agentDef)
