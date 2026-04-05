@@ -19,6 +19,7 @@ function CodingAgentChat(
     {{ _.role("system") }}
     {{ systemPrompt }}
 
+    {%if ackTurn %}
     {{ _.role("user") }}
     <system-tutorial>
     Example task ID: `tutorial`.
@@ -27,6 +28,7 @@ function CodingAgentChat(
 
     {{ _.role("assistant") }}
     {{ ackTurn }}
+    {%endif%}
     {% for message in messages %}
     {% if message.role == "user" %}
     {% if loop.last %}
