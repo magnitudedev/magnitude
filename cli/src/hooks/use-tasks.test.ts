@@ -1,29 +1,104 @@
 import { describe, expect, test } from 'bun:test'
-import { flattenTaskTree, type TaskGraphState } from '../utils/task-tree'
+import type { AgentStatusState } from '@magnitudedev/agent'
+import type { TaskListItem, WorkerExecutionSnapshot } from '../components/chat/types'
+import { deriveWorkerExecutionSnapshot } from './use-tasks'
 
-const makeState = (tasks: TaskGraphState['tasks']): TaskGraphState => ({
-  tasks,
-  rootTaskIds: [],
-})
+function makeTask(overrides: Partial<TaskListItem> = {}): TaskListItem {
+  return {
+    taskId: 'task-1',
+    title: 'Task',
+    type: 'implement',
+    status: 'pending',
+    depth: 0,
+    parentId: null,
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    completedAt: null,
+    assignee: { kind: 'worker', agentId: 'builder-1', workerType: 'builder' },
+    workerForkId: 'fork-1',
+    workerExecution: null,
+    ...overrides,
+  }
+}
 
-describe('flattenTaskTree', () => {
-  test('sorts roots by createdAt then task id', () => {
-    const state = makeState(new Map([
-      ['b', { id: 'b', title: 'B', taskType: 'implement', parentId: null, childIds: [], assignee: null, worker: null, status: 'pending', createdAt: 2, updatedAt: 2, completedAt: null }],
-      ['a', { id: 'a', title: 'A', taskType: 'implement', parentId: null, childIds: [], assignee: null, worker: null, status: 'pending', createdAt: 2, updatedAt: 2, completedAt: null }],
-    ]) as any)
+function makeAgentStatus(status: 'starting' | 'working' | 'idle'): AgentStatusState {
+  const agent = {
+    agentId: 'builder-1',
+    forkId: 'fork-1',
+    parentForkId: null,
+    name: 'builder',
+    role: 'builder',
+    context: '',
+    mode: 'spawn' as const,
+    taskId: 'task-1',
+    message: null,
+    status,
+  }
+  return {
+    agents: new Map([['builder-1', agent]]),
+    agentByForkId: new Map([['fork-1', 'builder-1']]),
+  }
+}
 
-    expect(flattenTaskTree(state).map(t => t.taskId)).toEqual(['a', 'b'])
+const idleDisplay: WorkerExecutionSnapshot = {
+  state: 'idle',
+  activeSince: null,
+  accumulatedActiveMs: 83_000,
+  completedAt: 83_000,
+  resumeCount: 0,
+}
+
+describe('deriveWorkerExecutionSnapshot', () => {
+  test('task state alone does not force worker state to working', () => {
+    const task = makeTask({ status: 'working' })
+    const result = deriveWorkerExecutionSnapshot({
+      task,
+      fromDisplay: idleDisplay,
+      agentStatusState: null,
+    })
+    expect(result?.state).toBe('idle')
   })
 
-  test('applies depth for nested tasks', () => {
-    const state = makeState(new Map([
-      ['root', { id: 'root', title: 'Root', taskType: 'feature', parentId: null, childIds: ['child'], assignee: null, worker: null, status: 'pending', createdAt: 1, updatedAt: 1, completedAt: null }],
-      ['child', { id: 'child', title: 'Child', taskType: 'implement', parentId: 'root', childIds: [], assignee: null, worker: null, status: 'pending', createdAt: 2, updatedAt: 2, completedAt: null }],
-    ]) as any)
+  test('completed task + idle worker remains idle', () => {
+    const task = makeTask({ status: 'completed', completedAt: 20_000 })
+    const result = deriveWorkerExecutionSnapshot({
+      task,
+      fromDisplay: idleDisplay,
+      agentStatusState: makeAgentStatus('idle'),
+    })
+    expect(result?.state).toBe('idle')
+  })
 
-    const rows = flattenTaskTree(state)
-    expect(rows.find(r => r.taskId === 'root')?.depth).toBe(0)
-    expect(rows.find(r => r.taskId === 'child')?.depth).toBe(1)
+  test('non-completed task with lifecycle-driven idle remains idle', () => {
+    const task = makeTask({ status: 'pending' })
+    const result = deriveWorkerExecutionSnapshot({
+      task,
+      fromDisplay: { ...idleDisplay, state: 'working' },
+      agentStatusState: makeAgentStatus('idle'),
+    })
+    expect(result?.state).toBe('idle')
+  })
+
+  test('maps lifecycle working/starting to working', () => {
+    const task = makeTask()
+    const fromDisplay: WorkerExecutionSnapshot = {
+      state: 'idle',
+      activeSince: 10_000,
+      accumulatedActiveMs: 1_000,
+      completedAt: null,
+      resumeCount: 1,
+    }
+
+    expect(deriveWorkerExecutionSnapshot({
+      task,
+      fromDisplay,
+      agentStatusState: makeAgentStatus('working'),
+    })?.state).toBe('working')
+
+    expect(deriveWorkerExecutionSnapshot({
+      task,
+      fromDisplay,
+      agentStatusState: makeAgentStatus('starting'),
+    })?.state).toBe('working')
   })
 })

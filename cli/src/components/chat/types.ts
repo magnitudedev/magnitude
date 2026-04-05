@@ -44,6 +44,16 @@ export type ChatControllerServices = {
   requestActiveSubagentKill: (payload: { forkId: string; agentId: string }) => void
 }
 
+export type WorkerExecutionState = 'working' | 'idle' | 'killed'
+
+export type WorkerExecutionSnapshot = {
+  state: WorkerExecutionState
+  activeSince: number | null
+  accumulatedActiveMs: number
+  completedAt: number | null
+  resumeCount: number
+}
+
 export type TaskListItem = {
   taskId: string
   title: string
@@ -56,6 +66,7 @@ export type TaskListItem = {
   completedAt: number | null
   assignee: { kind: 'lead' } | { kind: 'none' } | { kind: 'user' } | { kind: 'worker'; workerType?: string; agentId: string }
   workerForkId: string | null
+  workerExecution?: WorkerExecutionSnapshot | null
 }
 
 export type ChatControllerProps = {

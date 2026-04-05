@@ -1,11 +1,9 @@
 import type { TaskListItem } from '../components/chat/types'
 
-export type VisualStatus = 'completed' | 'working' | 'assigned' | 'pending'
+export type VisualStatus = 'completed' | 'pending'
 
 const STATUS_PRIORITY: Record<VisualStatus, number> = {
   pending: 0,
-  assigned: 1,
-  working: 2,
   completed: -1, // completed never propagates
 }
 
@@ -15,8 +13,6 @@ function isArchivedSummaryRow(task: TaskListItem): boolean {
 
 export function getOwnVisualStatus(task: TaskListItem): VisualStatus {
   if (task.status === 'completed' || task.status === 'archived') return 'completed'
-  if (task.status === 'working') return 'working'
-  if (task.assignee.kind === 'worker' && task.workerForkId) return 'assigned'
   return 'pending'
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { DisplayState } from '@magnitudedev/agent'
-import type { TaskListItem } from '../components/chat/types'
+import type { AgentStatusState, DisplayMessage, DisplayState } from '@magnitudedev/agent'
+import type { TaskListItem, WorkerExecutionSnapshot } from '../components/chat/types'
 import { flattenTaskTree, type TaskGraphState } from '../utils/task-tree'
 
 type AgentClientLike = {
@@ -11,6 +11,9 @@ type AgentClientLike = {
     display: {
       subscribeFork: (forkId: string | null, cb: (state: DisplayState) => void) => () => void
     }
+    agentStatus: {
+      subscribe: (cb: (state: AgentStatusState) => void) => () => void
+    }
   }
 }
 
@@ -18,9 +21,54 @@ type UseTasksArgs = {
   client: AgentClientLike | null
 }
 
+function getLatestForkActivityMessage(messages: readonly DisplayMessage[], workerForkId: string) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message?.type === 'fork_activity' && message.forkId === workerForkId) return message
+  }
+  return null
+}
+
+export function deriveWorkerExecutionSnapshot(args: {
+  task: TaskListItem
+  fromDisplay: WorkerExecutionSnapshot | null
+  agentStatusState: AgentStatusState | null
+}): WorkerExecutionSnapshot | null {
+  const { task, fromDisplay, agentStatusState } = args
+  if (task.assignee.kind !== 'worker' || !task.workerForkId) return null
+
+  const linkedAgentId = agentStatusState?.agentByForkId.get(task.workerForkId)
+  const linkedAgent = linkedAgentId ? agentStatusState?.agents.get(linkedAgentId) : undefined
+  const canResolveAgent = agentStatusState !== null
+  const isKilled = canResolveAgent && (linkedAgentId === undefined || linkedAgent === undefined)
+
+  if (isKilled) {
+    return {
+      state: 'killed',
+      activeSince: fromDisplay?.activeSince ?? null,
+      accumulatedActiveMs: fromDisplay?.accumulatedActiveMs ?? 0,
+      completedAt: fromDisplay?.completedAt ?? null,
+      resumeCount: fromDisplay?.resumeCount ?? 0,
+    }
+  }
+
+  const state = linkedAgent
+    ? (linkedAgent.status === 'working' || linkedAgent.status === 'starting' ? 'working' : 'idle')
+    : (fromDisplay?.state ?? 'idle')
+
+  return {
+    state,
+    activeSince: fromDisplay?.activeSince ?? null,
+    accumulatedActiveMs: fromDisplay?.accumulatedActiveMs ?? 0,
+    completedAt: fromDisplay?.completedAt ?? null,
+    resumeCount: fromDisplay?.resumeCount ?? 0,
+  }
+}
+
 export function useTasks({ client }: UseTasksArgs): TaskListItem[] {
   const [tasks, setTasks] = useState<TaskListItem[]>([])
-  const [forkPendingDirectUser, setForkPendingDirectUser] = useState<Record<string, { pending: boolean; since: number | null }>>({})
+  const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
+  const [forkActivityByForkId, setForkActivityByForkId] = useState<Record<string, WorkerExecutionSnapshot>>({})
   const unsubscribesRef = useRef<Map<string, () => void>>(new Map())
 
   useEffect(() => {
@@ -35,37 +83,67 @@ export function useTasks({ client }: UseTasksArgs): TaskListItem[] {
   }, [client])
 
   useEffect(() => {
-    const activeForkIds = new Set(tasks.map(task => task.workerForkId).filter((id): id is string => Boolean(id)))
-
-    for (const [forkId, unsubscribe] of unsubscribesRef.current.entries()) {
-      if (activeForkIds.has(forkId)) continue
-      unsubscribe()
-      unsubscribesRef.current.delete(forkId)
-
-      setForkPendingDirectUser(prev => {
-        if (!(forkId in prev)) return prev
-        const { [forkId]: _removed, ...rest } = prev
-        return rest
-      })
+    if (!client) {
+      setAgentStatusState(null)
+      return
     }
 
-    for (const forkId of activeForkIds) {
-      if (!client || unsubscribesRef.current.has(forkId)) continue
-      const unsubscribe = client.state.display.subscribeFork(forkId, (state) => {
-        const pendingUser = state.pendingInboundCommunications.filter((message) => message.source === 'user')
-        setForkPendingDirectUser(prev => ({
+    return client.state.agentStatus.subscribe((state) => {
+      setAgentStatusState(state)
+    })
+  }, [client])
+
+  useEffect(() => {
+    const workerForkIds = tasks.map(task => task.workerForkId).filter((id): id is string => Boolean(id))
+    const activeSubscriptionKeys = new Set<string>()
+
+    for (const workerForkId of workerForkIds) {
+      const linkedAgentId = agentStatusState?.agentByForkId.get(workerForkId)
+      const linkedAgent = linkedAgentId ? agentStatusState?.agents.get(linkedAgentId) : undefined
+      const sourceForkId = linkedAgent?.parentForkId ?? null
+      const sourceKey = sourceForkId ?? '__root__'
+      const subscriptionKey = `${workerForkId}::${sourceKey}`
+      activeSubscriptionKeys.add(subscriptionKey)
+
+      if (!client || unsubscribesRef.current.has(subscriptionKey)) continue
+
+      const unsubscribe = client.state.display.subscribeFork(sourceForkId, (state) => {
+        const latest = getLatestForkActivityMessage(state.messages, workerForkId)
+        if (!latest) return
+        setForkActivityByForkId(prev => ({
           ...prev,
-          [forkId]: {
-            pending: pendingUser.length > 0,
-            since: pendingUser.length > 0
-              ? Math.min(...pendingUser.map(message => message.timestamp))
-              : null,
+          [workerForkId]: {
+            state: latest.status === 'running' ? 'working' : 'idle',
+            activeSince: latest.activeSince ?? null,
+            accumulatedActiveMs: latest.accumulatedActiveMs ?? 0,
+            completedAt: latest.completedAt ?? null,
+            resumeCount: latest.resumeCount ?? 0,
           },
         }))
       })
-      unsubscribesRef.current.set(forkId, unsubscribe)
+      unsubscribesRef.current.set(subscriptionKey, unsubscribe)
     }
-  }, [tasks, client])
+
+    for (const [key, unsubscribe] of unsubscribesRef.current.entries()) {
+      if (activeSubscriptionKeys.has(key)) continue
+      unsubscribe()
+      unsubscribesRef.current.delete(key)
+    }
+
+    const activeWorkerForkIdSet = new Set(workerForkIds)
+    setForkActivityByForkId(prev => {
+      let changed = false
+      const next: Record<string, WorkerExecutionSnapshot> = {}
+      for (const [forkId, snapshot] of Object.entries(prev)) {
+        if (!activeWorkerForkIdSet.has(forkId)) {
+          changed = true
+          continue
+        }
+        next[forkId] = snapshot
+      }
+      return changed ? next : prev
+    })
+  }, [tasks, client, agentStatusState])
 
   useEffect(() => {
     return () => {
@@ -74,10 +152,14 @@ export function useTasks({ client }: UseTasksArgs): TaskListItem[] {
     }
   }, [])
 
-  return useMemo(() => tasks.map((task) => {
-    if (task.status === 'completed') return task
-    if (!task.workerForkId) return task
-    const pending = forkPendingDirectUser[task.workerForkId]?.pending === true
-    return pending ? { ...task, status: 'working' } : task
-  }), [tasks, forkPendingDirectUser])
+  return useMemo(() => {
+    return tasks.map((task) => ({
+      ...task,
+      workerExecution: deriveWorkerExecutionSnapshot({
+        task,
+        fromDisplay: task.workerForkId ? (forkActivityByForkId[task.workerForkId] ?? null) : null,
+        agentStatusState,
+      }),
+    }))
+  }, [tasks, forkActivityByForkId, agentStatusState])
 }

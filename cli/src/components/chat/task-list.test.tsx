@@ -54,12 +54,12 @@ test('returns null when there are no tasks', () => {
   expect(html).toBe('')
 })
 
-test('renders task header summary from task statuses', () => {
+test('renders task header summary from completed vs not completed statuses', () => {
   const html = render(
     <TaskList
       tasks={[
         makeTask({ taskId: 't-1', status: 'completed', completedAt: 10_000 }),
-        makeTask({ taskId: 't-2', status: 'working' }),
+        makeTask({ taskId: 't-2', status: 'pending' }),
       ]}
       pushForkOverlay={noop}
     />,
@@ -69,18 +69,12 @@ test('renders task header summary from task statuses', () => {
   expect(html).toContain('<text style="fg:#888888"> (1 completed, 1 active)</text>')
 })
 
-test('renders status glyphs for completed, working, assigned, and pending', () => {
+test('renders task status glyphs as only completed and not completed', () => {
   const html = render(
     <TaskList
       tasks={[
         makeTask({ taskId: 't-completed', status: 'completed', completedAt: 10_000 }),
         makeTask({ taskId: 't-working', status: 'working' }),
-        makeTask({
-          taskId: 't-assigned',
-          status: 'pending',
-          assignee: { kind: 'worker', agentId: 'builder-123', workerType: 'builder' },
-          workerForkId: 'fork-123',
-        }),
         makeTask({ taskId: 't-pending', status: 'pending' }),
       ]}
       pushForkOverlay={noop}
@@ -88,7 +82,6 @@ test('renders status glyphs for completed, working, assigned, and pending', () =
   )
   const text = htmlToText(html)
   expect(text).toContain('✓')
-  expect(text).toContain('◉')
   expect(text).toContain('○')
 })
 
@@ -122,7 +115,7 @@ test('collapsed mode renders only the latest six tasks', () => {
   expect(text).toContain('Task 8')
 })
 
-test('default header shows Task (X completed, Y active)', () => {
+test('default header shows Task (X completed, Y active) using not-completed active semantics', () => {
   const html = render(
     <TaskList
       tasks={[
@@ -135,16 +128,23 @@ test('default header shows Task (X completed, Y active)', () => {
   )
 
   expect(html).toContain('<text style="fg:#ffffff" attributes="1">Task</text>')
-  expect(html).toContain('<text style="fg:#888888"> (1 completed, 1 active)</text>')
+  expect(html).toContain('<text style="fg:#888888"> (1 completed, 2 active)</text>')
 })
 
-test('renders worker assignee with expected formatted label', () => {
+test('renders worker assignee with worker status prefix and timer segment', () => {
   const html = render(
     <TaskList
       tasks={[
         makeTask({
           assignee: { kind: 'worker', agentId: 'builder-abc123', workerType: 'builder' },
           workerForkId: 'fork-abc123',
+          workerExecution: {
+            state: 'idle',
+            activeSince: null,
+            accumulatedActiveMs: 83_000,
+            completedAt: 83_000,
+            resumeCount: 0,
+          },
         }),
       ]}
       pushForkOverlay={noop}
@@ -153,7 +153,9 @@ test('renders worker assignee with expected formatted label', () => {
 
   const text = htmlToText(html)
   expect(text).toContain('Assigned To')
-  expect(text).toContain('⚒ [builder] builder-abc123')
+  expect(text).toContain('◌ [builder] builder-abc123 · 1:23')
+  expect(text).not.toContain('(resumed)')
+  expect(text).not.toContain('↺')
 })
 
 test('archived summary rows render without a status glyph', () => {
@@ -229,5 +231,100 @@ test('sticky root header shows correct subtree progress counts', () => {
   )
 
   expect(html).toContain('Root A')
-  expect(html).toContain('(2 completed, 1 active)')
+  expect(html).toContain('(2 completed, 4 active)')
+})
+
+test('renders resumed worker layout with glyph only', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          assignee: { kind: 'worker', agentId: 'planner-1', workerType: 'planner' },
+          workerForkId: 'fork-planner-1',
+          workerExecution: {
+            state: 'working',
+            activeSince: null,
+            accumulatedActiveMs: 83_000,
+            completedAt: null,
+            resumeCount: 1,
+          },
+        }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('◉ [planner] planner-1 · ↺ 1:23')
+  expect(text).not.toContain('(resumed)')
+})
+
+test('completed task keeps idle worker rendering', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          status: 'completed',
+          completedAt: 99_000,
+          assignee: { kind: 'worker', agentId: 'builder-idle', workerType: 'builder' },
+          workerForkId: 'fork-builder-idle',
+          workerExecution: {
+            state: 'idle',
+            activeSince: null,
+            accumulatedActiveMs: 10_000,
+            completedAt: 10_000,
+            resumeCount: 0,
+          },
+        }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('✓')
+  expect(text).toContain('◌ [builder] builder-idle · 0:10')
+})
+
+test('completed task text remains muted gray while checkmark stays green', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          title: 'Completed task title',
+          status: 'completed',
+          completedAt: 99_000,
+        }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  expect(html).toContain('<text style="fg:#00ff00">✓ </text>')
+  expect(html).toContain('style="fg:#888888">Completed task title</text>')
+  expect(html).not.toContain('style="fg:#00ff00">Completed task title</text>')
+})
+
+test('renders killed worker with red kill icon glyph', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          assignee: { kind: 'worker', agentId: 'builder-killed', workerType: 'builder' },
+          workerForkId: 'fork-builder-killed',
+          workerExecution: {
+            state: 'killed',
+            activeSince: null,
+            accumulatedActiveMs: 12_000,
+            completedAt: 12_000,
+            resumeCount: 0,
+          },
+        }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('✕ [builder] builder-killed · 0:12')
 })

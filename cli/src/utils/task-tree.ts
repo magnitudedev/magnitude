@@ -176,7 +176,7 @@ export function buildRootSummaries(tasks: readonly TaskListItem[]): RootSummary[
       total += 1
       if (rowTask.status === 'completed' || rowTask.status === 'archived') {
         completed += 1
-      } else if (rowTask.status === 'working') {
+      } else {
         active += 1
       }
     }
