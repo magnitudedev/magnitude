@@ -58,10 +58,17 @@ export function getXmlActProtocol(
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
 }
 
-export function buildAckTurn(_lenses: ThinkingLens[]): string {
+export function buildAckTurn(
+  _lenses: ThinkingLens[],
+  defaultRecipient: 'user' | 'parent' = 'user',
+): string {
   return `${LENSES_OPEN}
 ${LENSES_CLOSE}
-<message>I understand the response format and am ready.
-</message>
+<!-- This is an example turn. I, Magnitude, did not write this and understand this assistant message exists purely to demonsrate the response format -->
+<message to="${defaultRecipient}">This is how I would message the ${defaultRecipient}</message>
+<message to="tutorial">This is how I would message a worker</message>
+<task id="tutorial">
+<!-- I understand that I would put tasks or tools in here for the "tutorial" task -->
+</task>
 ${TURN_CONTROL_YIELD}`
 }

@@ -21,6 +21,7 @@ function CodingAgentChat(
 
     {{ _.role("user") }}
     <system-tutorial>
+    Example task ID: `tutorial`.
     Acknowledge to demonstrate understanding of response syntax
     </system-tutorial>
 
