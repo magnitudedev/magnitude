@@ -5,8 +5,7 @@ export const ASSIGN_CLOSE = '</assign>'
 export const LENSES_OPEN = '<lenses>'
 export const LENSES_CLOSE = '</lenses>'
 
-export const TURN_CONTROL_NEXT = '<next/>'
-export const TURN_CONTROL_YIELD = '<yield/>'
+export const TURN_CONTROL_IDLE = '<idle/>'
 export const TURN_CONTROL_FINISH = '<finish/>'
 
 export const AGENT_CREATE_TAG = 'agent-create'

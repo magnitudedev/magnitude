@@ -49,8 +49,7 @@ export function createXmlActFormat(
   handlers.set('message', message)
   handlers.set('task', task)
   handlers.set('assign', assign)
-  handlers.set('next', turnControlHandler('continue'))
-  handlers.set('yield', turnControlHandler('yield'))
+  handlers.set('idle', turnControlHandler('idle'))
   handlers.set('finish', finishHandler())
 
   for (const tool of tools) {
@@ -71,7 +70,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', 'task', 'assign', 'next', 'yield', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
+  for (const tag of ['message', 'task', 'assign', 'idle', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -145,8 +144,7 @@ export function createCurrentFormat(
     readonly assign: 'assign'
     readonly think: 'think'
     readonly message: 'message'
-    readonly next: 'next'
-    readonly yield: 'yield'
+    readonly idle: 'idle'
     readonly finish: 'finish'
   }
 } {
@@ -159,8 +157,7 @@ export function createCurrentFormat(
       assign: 'assign',
       think: 'think',
       message: 'message',
-      next: 'next',
-      yield: 'yield',
+      idle: 'idle',
       finish: 'finish',
     },
   }

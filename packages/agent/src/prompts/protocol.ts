@@ -1,9 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import {
-  LENSES_CLOSE,
-  LENSES_OPEN,
-  TURN_CONTROL_YIELD,
-} from '@magnitudedev/xml-act'
+import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -52,9 +48,8 @@ export function getXmlActProtocol(
     .replaceAll('{{THINK_CLOSE}}', LENSES_CLOSE)
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
-    .replaceAll('{{TURN_CONTROL_NEXT}}', 'next')
-    .replaceAll('{{TURN_CONTROL_YIELD}}', 'yield')
     .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
+    .replaceAll('{{TURN_CONTROL_IDLE}}', TURN_CONTROL_IDLE)
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
 }
 
@@ -70,5 +65,5 @@ ${LENSES_CLOSE}
 <task id="tutorial">
 <!-- I understand that I would put tasks or tools in here for the "tutorial" task -->
 </task>
-${TURN_CONTROL_YIELD}`
+${TURN_CONTROL_IDLE}`
 }

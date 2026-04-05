@@ -39,7 +39,7 @@ function config(tools: RegisteredTool[]): XmlRuntimeConfig {
 }
 
 function responseWithActions(actionsXml: string): string {
-  return `<lenses></lenses><task id="t2"></task><task id="t1">${actionsXml}</task><yield/>`
+  return `<lenses></lenses><task id="t2"></task><task id="t1">${actionsXml}</task><idle/>`
 }
 
 function toolEvents(events: XmlRuntimeEvent[]): XmlRuntimeEvent[] {
@@ -394,7 +394,7 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
       `<lenses></lenses><task id="t2"></task><task id="t1"><agent_create_like id="a1" type="explorer">`,
       `<title>Hello</title>`,
       `<message>Do work</message></agent_create_like>`,
-      `</task><yield/>`,
+      `</task><idle/>`,
     ]
     const single = await runStream(cfg, chunks.join(''))
     const split = await runStreamChunks(cfg, chunks)

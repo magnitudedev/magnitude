@@ -11,7 +11,7 @@ You respond in an XML-like syntax with four core constructs: lenses, message, ta
 <task id="..." type="..." title="...">
 ...zero or more task/tool operations...
 </task>
-<{{TURN_CONTROL_NEXT}}/> OR <{{TURN_CONTROL_YIELD}}/>
+[OPTIONAL] {{TURN_CONTROL_IDLE}}
 
 Your response must contain exactly ONE turn, never more than one. You must end your response and wait for turn to resolve before taking another.
 

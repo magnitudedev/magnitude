@@ -87,7 +87,7 @@ describe('BUG 1: child-body fallthrough — structural tags inside tool child bo
   it('turn control tags inside child body should be passthrough', () => {
     const xml = `<task id="t1">
 <edit path="foo.ts" observe=".">
-<old>code mentioning <next/> and <yield/> tags</old>
+<old>code mentioning <idle/> and <idle/> tags</old>
 <new>replaced</new>
 </edit>
 </task>`
@@ -102,7 +102,7 @@ describe('BUG 1: child-body fallthrough — structural tags inside tool child bo
 
     const oldChild = editClosed[0].element.children.find(c => c.tagName === 'old')
     expect(oldChild).toBeDefined()
-    expect(oldChild!.body).toContain('<next/>')
+    expect(oldChild!.body).toContain('<idle/>')
 
     // Turn control should NOT have been emitted from inside the child body
     const turnControls = events.filter(e => e._tag === 'TurnControl')

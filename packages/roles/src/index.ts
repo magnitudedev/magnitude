@@ -23,7 +23,7 @@ export type {
 } from './types'
 export type { ThinkingLens } from './thinking-lens'
 
-export { continue_, yield_, finish } from './helpers'
+export { continue_, idle, finish } from './helpers'
 
 export { defineRole, defineRoleSet } from './define'
 export { createObservable, bindObservable } from './observable'

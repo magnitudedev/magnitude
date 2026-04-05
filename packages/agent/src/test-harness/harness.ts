@@ -464,7 +464,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           const resolver: MockTurnScriptResolver = ({ forkId }) => {
             if (forkId === null) return mapping.root
             const entry = Array.from(forksByAgent.entries()).find(([, id]) => id === forkId)
-            if (!entry || !mapping.subagents) return { xml: '<yield/>' }
+            if (!entry || !mapping.subagents) return { xml: '<idle/>' }
 
             if ('xml' in mapping.subagents || 'xmlChunks' in mapping.subagents) {
               return mapping.subagents
@@ -472,7 +472,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
             const [agentId] = entry
             const perAgent = mapping.subagents as Record<string, MockTurnResponse>
-            return perAgent[agentId] ?? { xml: '<yield/>' }
+            return perAgent[agentId] ?? { xml: '<idle/>' }
           }
 
           await client.runEffect(

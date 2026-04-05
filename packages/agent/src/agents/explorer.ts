@@ -6,7 +6,7 @@
  * Uses secondary model. Communicates back via parent.message.
  */
 
-import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, continue_, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import explorerPromptRaw from './prompts/explorer.txt' with { type: 'text' }
@@ -75,7 +75,7 @@ export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>(
     decide(turnCtx) {
       if (turnCtx.cancelled) return finish()
       if (turnCtx.error) return continue_()
-      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return yield_()
+      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
       return continue_()
     },
   },

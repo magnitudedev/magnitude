@@ -284,7 +284,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       const deferredParentMessages = new Map(state.deferredParentMessages)
       deferredParentMessages.delete(event.forkId)
 
-      if (!event.result.success || event.result.turnDecision !== 'yield') {
+      if (!event.result.success || event.result.turnDecision !== 'idle') {
         return { ...state, deferredParentMessages }
       }
 

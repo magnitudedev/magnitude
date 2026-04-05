@@ -4,8 +4,8 @@ import type { ParseEvent } from '../format/types'
 import {
   LENSES_OPEN,
   LENSES_CLOSE,
-  TURN_CONTROL_NEXT,
-  TURN_CONTROL_YIELD,
+  TURN_CONTROL_IDLE,
+  TURN_CONTROL_IDLE,
 } from '../constants'
 
 const TASK_A_OPEN = '<task id="t1">'
@@ -192,15 +192,15 @@ describe('lenses parsing', () => {
 })
 
 describe('tags inside lenses are passthrough', () => {
-  it('next inside lens is passthrough', () => {
-    const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_NEXT}${lensClose()}\n${LENSES_CLOSE}\n`)
-    expect(lensEnds(events)[0].content).toContain(TURN_CONTROL_NEXT)
+  it('idle inside lens is passthrough', () => {
+    const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_IDLE}${lensClose()}\n${LENSES_CLOSE}\n`)
+    expect(lensEnds(events)[0].content).toContain(TURN_CONTROL_IDLE)
     assertNoEvents(events, ['TurnControl'])
   })
 
-  it('yield inside lens is passthrough', () => {
-    const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_YIELD}${lensClose()}\n${LENSES_CLOSE}\n`)
-    expect(lensEnds(events)[0].content).toContain(TURN_CONTROL_YIELD)
+  it('idle inside lens is passthrough (duplicate case)', () => {
+    const events = parse(`${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_IDLE}${lensClose()}\n${LENSES_CLOSE}\n`)
+    expect(lensEnds(events)[0].content).toContain(TURN_CONTROL_IDLE)
     assertNoEvents(events, ['TurnControl'])
   })
 
@@ -275,17 +275,17 @@ describe('tags inside lenses are passthrough', () => {
 })
 
 describe('tags inside plain think are passthrough', () => {
-  it('next inside plain think is passthrough', () => {
-    const events = parse(`${thinkOpen()}\n${TURN_CONTROL_NEXT}\n${thinkClose()}\n`)
+  it('idle inside plain think is passthrough', () => {
+    const events = parse(`${thinkOpen()}\n${TURN_CONTROL_IDLE}\n${thinkClose()}\n`)
     const allContent = proseEnds(events).map(e => e.content).join('')
-    expect(allContent).toContain(TURN_CONTROL_NEXT)
+    expect(allContent).toContain(TURN_CONTROL_IDLE)
     assertNoEvents(events, ['TurnControl'])
   })
 
-  it('yield inside plain think is passthrough', () => {
-    const events = parse(`${thinkOpen()}\n${TURN_CONTROL_YIELD}\n${thinkClose()}\n`)
+  it('idle inside plain think is passthrough (duplicate case)', () => {
+    const events = parse(`${thinkOpen()}\n${TURN_CONTROL_IDLE}\n${thinkClose()}\n`)
     const allContent = proseEnds(events).map(e => e.content).join('')
-    expect(allContent).toContain(TURN_CONTROL_YIELD)
+    expect(allContent).toContain(TURN_CONTROL_IDLE)
     assertNoEvents(events, ['TurnControl'])
   })
 
@@ -358,7 +358,7 @@ describe('lens content trimming', () => {
 
 describe('char-by-char passthrough parity', () => {
   it('char-by-char: tags inside lenses remain passthrough', () => {
-    const xml = `${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_NEXT} ${TASK_A_OPEN}x${TASK_A_CLOSE} ${shellOpen()}y${shellClose()}${lensClose()}\n${LENSES_CLOSE}\n`
+    const xml = `${LENSES_OPEN}\n${lensOpen('t')}${TURN_CONTROL_IDLE} ${TASK_A_OPEN}x${TASK_A_CLOSE} ${shellOpen()}y${shellClose()}${lensClose()}\n${LENSES_CLOSE}\n`
     const bulk = parse(xml)
     const charByChar = parseCharByChar(xml)
     expect(lensEnds(charByChar)).toEqual(lensEnds(bulk))

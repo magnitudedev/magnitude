@@ -1,16 +1,10 @@
 ## Turn control
 
-The final tag in your response determines whether you will idle until further action from parent. If the user messages you directly, treat it as an interruption/correction: you may reply to the user, then continue with normal parent-facing work. Before ending your turn, still send the required status message to your parent.
+No turn-control tag means the system immediately gives you another turn.
+`<idle/>` means execution stops until an external wake event from your parent thread. If the user messages you directly, treat it as an interruption/correction: you may reply once, then continue parent-facing communication.
 
-After your task/tool operations, include exactly one terminal turn-control tag:
+Go idle if and only if at least one of the following is true:
+- You are blocked and have escalated a question to your parent.
+- You are completely done with your task and have sent a summary to your parent.
 
-`<{{TURN_CONTROL_NEXT}}/>`: Observe results from tools and immediately take another turn
-Use when:
-- You used tools and need to see their results to continue
-- You have more work to do that depends on the current turn's output
-- You sent a progress update to parent but have more work to do
-
-`<{{TURN_CONTROL_YIELD}}/>`: Done with task or completely blocked and need escalation
-Use when:
-- You've completed your task and are reporting final results to parent
-- You need input or clarification from parent to continue
+In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately declare task blocks in the same response.

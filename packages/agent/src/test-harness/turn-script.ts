@@ -75,7 +75,7 @@ interface MockTurnScriptState {
 }
 
 const defaultFrame: MockTurnResponse = {
-  xml: '<message>ok</message><yield/>',
+  xml: '<message>ok</message><idle/>',
 }
 
 const initialState: MockTurnScriptState = {

@@ -202,7 +202,7 @@ export type XmlActEvent =
     }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' }
+  | { readonly _tag: 'TurnControl'; readonly decision: 'idle' }
   | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 

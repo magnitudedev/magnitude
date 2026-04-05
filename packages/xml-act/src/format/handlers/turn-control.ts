@@ -16,7 +16,7 @@ function autoCloseTasks(stack: ReadonlyArray<XmlActFrame>): Fx[] {
 }
 
 export function turnControlHandler(
-  decision: 'continue' | 'yield',
+  decision: 'idle',
 ): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open() {

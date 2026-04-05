@@ -5,7 +5,7 @@
  * Receives automatic screenshots before each turn.
  */
 
-import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, continue_, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
 import browserPromptRaw from './prompts/browser.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import { BrowserHarnessTag } from '../tools/browser-tools'
@@ -75,7 +75,7 @@ export const browserRole = defineRole<typeof tools, 'browser', PolicyContext, Br
     decide(turnCtx) {
       if (turnCtx.cancelled) return finish()
       if (turnCtx.error) return continue_()
-      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return yield_()
+      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
       return continue_()
     },
   },

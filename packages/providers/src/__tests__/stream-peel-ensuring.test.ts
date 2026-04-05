@@ -35,7 +35,7 @@ test('peel + ensuring: consumer stops early', async () => {
       )
     )
 
-    // Consumer stops early (like execManager.execute on <yield/>)
+    // Consumer stops early (like execManager.execute when a turn idles)
     const result = yield* fullStream.pipe(
       Stream.takeUntil(c => c === 'yield'),
       Stream.runCollect,

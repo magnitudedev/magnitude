@@ -4,7 +4,7 @@ import { TestHarness, TestHarnessLive } from '../harness'
 import { textParts } from '../../content'
 import { createId } from '../../util/id'
 
-const simpleYieldXml = '<comms><message to="user">hi</message></comms><yield/>'
+const simpleYieldXml = '<comms><message to="user">hi</message></comms><idle/>'
 
 describe('event observation', () => {
   it.live('events() captures all events', () =>

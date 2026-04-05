@@ -9,13 +9,13 @@ function parse(xml: string, knownTags = new Set(['read', 'grep'])): ParseEvent[]
 
 describe('task format parsing', () => {
   it('parses task open/close', () => {
-    const events = parse('<task id="t1" type="scan" title="Scan"><read path="x" /></task><yield/>')
+    const events = parse('<task id="t1" type="scan" title="Scan"><read path="x" /></task><idle/>')
     expect(events.some(e => e._tag === 'TaskOpen')).toBe(true)
     expect(events.some(e => e._tag === 'TaskClose')).toBe(true)
   })
 
   it('parses self-closing task update when create attrs are absent', () => {
-    const events = parse('<task id="t1" status="completed" /><yield/>')
+    const events = parse('<task id="t1" status="completed" /><idle/>')
     const update = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskUpdate' }> => e._tag === 'TaskUpdate')
     expect(update).toBeDefined()
     expect(update?.id).toBe('t1')
@@ -23,7 +23,7 @@ describe('task format parsing', () => {
   })
 
   it('parses self-closing task create when type and title are present', () => {
-    const events = parse('<task id="t1" type="review" title="Review changes" parent="p1" /><yield/>')
+    const events = parse('<task id="t1" type="review" title="Review changes" parent="p1" /><idle/>')
     const open = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
     const close = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
 
@@ -37,15 +37,15 @@ describe('task format parsing', () => {
   })
 
   it('assign valid only inside task', () => {
-    const ok = parse('<task id="t1"><assign role="builder">do it</assign></task><yield/>')
+    const ok = parse('<task id="t1"><assign role="builder">do it</assign></task><idle/>')
     expect(ok.some(e => e._tag === 'TaskAssign')).toBe(true)
 
-    const bad = parse('<assign role="builder">nope</assign><yield/>')
+    const bad = parse('<assign role="builder">nope</assign><idle/>')
     expect(bad.some(e => e._tag === 'ParseError')).toBe(true)
   })
 
   it('self-closing assign errors outside task', () => {
-    const events = parse('<assign role="builder" /><yield/>')
+    const events = parse('<assign role="builder" /><idle/>')
     const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
     expect(err?.error._tag).toBe('InvalidAttributeValue')
     if (err?.error._tag === 'InvalidAttributeValue') {
@@ -56,7 +56,7 @@ describe('task format parsing', () => {
   })
 
   it('self-closing assign errors when role missing', () => {
-    const events = parse('<task id="t1"><assign /></task><yield/>')
+    const events = parse('<task id="t1"><assign /></task><idle/>')
     const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
     expect(err?.error._tag).toBe('InvalidAttributeValue')
     if (err?.error._tag === 'InvalidAttributeValue') {
@@ -67,14 +67,14 @@ describe('task format parsing', () => {
   })
 
   it('nested task gets implicit parent', () => {
-    const events = parse('<task id="p"><task id="c"></task></task><yield/>')
+    const events = parse('<task id="p"><task id="c"></task></task><idle/>')
     const opens = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskOpen' }> => e._tag === 'TaskOpen')
     expect(opens).toHaveLength(2)
     expect(opens[1]?.parent).toBe('p')
   })
 
   it('message scope metadata top-level vs task', () => {
-    const events = parse('<message>top</message><task id="t1"><message>inner</message></task><yield/>')
+    const events = parse('<message>top</message><task id="t1"><message>inner</message></task><idle/>')
     const starts = events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageStart' }> => e._tag === 'MessageStart')
     expect(starts[0]?.scope).toBe('top-level')
     expect(starts[0]?.to).toBeNull()
@@ -84,7 +84,7 @@ describe('task format parsing', () => {
   })
 
   it('parses explicit message to attribute', () => {
-    const events = parse('<message to="parent">top</message><task id="t1"><message to="task-1">inner</message></task><yield/>')
+    const events = parse('<message to="parent">top</message><task id="t1"><message to="task-1">inner</message></task><idle/>')
     const starts = events.filter((e): e is Extract<ParseEvent, { _tag: 'MessageStart' }> => e._tag === 'MessageStart')
     expect(starts[0]?.to).toBe('parent')
     expect(starts[0]?.taskId).toBeNull()
@@ -93,7 +93,7 @@ describe('task format parsing', () => {
   })
 
   it('turn control inside unclosed tasks does not auto-close', () => {
-    const events = parse('<task id="a"><task id="b"><yield/>')
+    const events = parse('<task id="a"><task id="b"><idle/>')
     const closes = events.filter((e): e is Extract<ParseEvent, { _tag: 'TaskClose' }> => e._tag === 'TaskClose')
     expect(closes).toHaveLength(0)
     expect(events.some((e): e is Extract<ParseEvent, { _tag: 'TurnControl' }> => e._tag === 'TurnControl')).toBe(false)

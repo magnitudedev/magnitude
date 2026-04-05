@@ -1,11 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
-import {
-  LENSES_OPEN,
-  LENSES_CLOSE,
-  TURN_CONTROL_YIELD,
-} from '../constants'
+import { LENSES_OPEN, LENSES_CLOSE, TURN_CONTROL_IDLE } from '../constants'
 
 const TASK_OPEN = '<task id="t2">'
 const TASK_CLOSE = '</task>'
@@ -34,7 +30,7 @@ describe('prose whitespace trimming', () => {
       '\n<message>Hey!</message>\n',
       TASK_CLOSE,
       '\n',
-      TURN_CONTROL_YIELD,
+      TURN_CONTROL_IDLE,
     ].join('')
 
     const events = parse(xml)
@@ -57,7 +53,7 @@ describe('prose whitespace trimming', () => {
       '\n<message>Hey!</message>\n',
       TASK_CLOSE,
       '\n',
-      TURN_CONTROL_YIELD,
+      TURN_CONTROL_IDLE,
     ].join('')
 
     const events = parse(xml)
@@ -87,7 +83,7 @@ describe('prose whitespace trimming', () => {
     const chunks = [
       LENSES_OPEN + '\n<lens name="turn">planning</lens>\n' + LENSES_CLOSE,
       '\n' + TASK_OPEN + '\n<message>Hey Anders! What can',
-      ' I help you with?</message>\n' + TASK_CLOSE + '\n' + TURN_CONTROL_YIELD,
+      ' I help you with?</message>\n' + TASK_CLOSE + '\n' + TURN_CONTROL_IDLE,
     ]
 
     const events = parseChunks(chunks)

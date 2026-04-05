@@ -293,7 +293,7 @@ The parser is designed to handle messy LLM output gracefully. Rather than failin
 
 ### Structural tag auto-close
 
-- **Omitted closing tags on structural blocks** — if the model omits a closing tag for a structural block (`lenses`, `comms`, `actions`) and opens a later one in the sequence (`lenses` → `comms` → `actions` → `next`/`yield`), the earlier block is auto-closed. For example, `<lenses>...<comms>` auto-closes `lenses` before opening `comms`, and `<actions>...<yield/>` auto-closes `actions` before emitting turn control. No parse errors are emitted — this is intentional recovery.
+- **Omitted closing tags on structural blocks** — if the model omits a closing tag for a structural block (`lenses`, `comms`, `actions`) and opens a later one in the sequence (`lenses` → `comms` → `actions` → optional `idle`), the earlier block is auto-closed. For example, `<lenses>...<comms>` auto-closes `lenses` before opening `comms`, and `<actions>...<idle/>` auto-closes `actions` before emitting turn control. No parse errors are emitted — this is intentional recovery.
 
 ### Prose cleanup
 

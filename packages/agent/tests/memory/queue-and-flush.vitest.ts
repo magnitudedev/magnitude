@@ -56,7 +56,7 @@ describe('memory queue and flush', () => {
         ],
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'after turn' }],
         },
         inputTokens: null,
@@ -151,7 +151,7 @@ describe('memory queue and flush', () => {
         responseParts: [{ type: 'text', content: 'assistant' }],
         toolCalls: [],
         observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -197,7 +197,7 @@ describe('memory queue and flush', () => {
         observedResults: [],
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'remember me' }],
         },
         inputTokens: null,

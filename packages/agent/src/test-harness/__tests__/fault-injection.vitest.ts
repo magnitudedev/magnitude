@@ -24,7 +24,7 @@ describe('fault injection', () => {
       const harness = yield* TestHarness
       yield* harness.script.next(
         {
-          xmlChunks: ['<comms>', '<message to="user">hi</message>', '</comms><yield/>'],
+          xmlChunks: ['<comms>', '<message to="user">hi</message>', '</comms><idle/>'],
           terminateStreamEarly: true,
         },
         null,
@@ -46,7 +46,7 @@ describe('fault injection', () => {
       const harness = yield* TestHarness
       yield* harness.script.next(
         {
-          xmlChunks: ['<comms>', '<message to="user">hi</message>', '</comms><yield/>'],
+          xmlChunks: ['<comms>', '<message to="user">hi</message>', '</comms><idle/>'],
           failAfterChunk: 1,
         },
         null,

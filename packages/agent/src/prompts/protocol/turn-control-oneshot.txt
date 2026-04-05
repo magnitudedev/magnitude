@@ -1,18 +1,11 @@
 ## Turn control
 
-The final tag in your response determines your next action.
+No turn-control tag means the system immediately gives you another turn.
+`<idle/>` means execution stops until an external wake event (for oneshot, typically subagent completion).
 
-After your task/tool operations, include exactly one terminal turn-control tag:
+Go idle if and only if you dispatched subagents and are waiting for their completion.
 
-`<{{TURN_CONTROL_NEXT}}/>`: Observe results from task/tool operations and immediately take another turn
-Use when:
-- You used tools and need to see their results to continue
-- You have more work to do that depends on the current turn's output
-
-`<{{TURN_CONTROL_YIELD}}/>`: Wait for subagents to complete their work
-Use when:
-- You've dispatched subagents and need their results before continuing
-- You are blocked on subagent output
+In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately declare task blocks in the same response.
 
 `<{{TURN_CONTROL_FINISH}}>`: Declare the task fully and verifiably complete
 Provide a summary of verification evidence as body content:
@@ -24,4 +17,3 @@ Provide a summary of verification evidence as body content:
 </{{TURN_CONTROL_FINISH}}>
 
 Do NOT use finish if any verification step failed or was skipped.
-Do NOT yield when no subagents are active — either continue working or finish.

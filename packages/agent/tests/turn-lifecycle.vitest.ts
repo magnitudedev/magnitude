@@ -6,7 +6,7 @@ describe('turn lifecycle', () => {
   it.live('Single turn with yield', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: '<comms><message to="user">hi</message></comms><yield/>' })
+      yield* h.script.next({ xml: '<comms><message to="user">hi</message></comms><idle/>' })
 
       yield* h.user('hello')
       const completed = yield* h.wait.turnCompleted(null)
@@ -14,7 +14,7 @@ describe('turn lifecycle', () => {
       expect(completed.type).toBe('turn_completed')
       expect(completed.result.success).toBe(true)
       if (completed.result.success) {
-        expect(completed.result.turnDecision).toBe('yield')
+        expect(completed.result.turnDecision).toBe('idle')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -22,7 +22,7 @@ describe('turn lifecycle', () => {
   it.live('Single turn with next', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: '<comms><message to="user">first</message></comms><next/>' })
+      yield* h.script.next({ xml: '<comms><message to="user">first</message></comms><idle/>' })
 
       yield* h.user('run')
       const completed = yield* h.wait.turnCompleted(null)
@@ -36,11 +36,11 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      yield* h.script.next({ xml: '<comms><message to="user">response 1</message></comms><yield/>' })
+      yield* h.script.next({ xml: '<comms><message to="user">response 1</message></comms><idle/>' })
       yield* h.user('message 1')
       const first = yield* h.wait.turnCompleted(null)
 
-      yield* h.script.next({ xml: '<comms><message to="user">response 2</message></comms><yield/>' })
+      yield* h.script.next({ xml: '<comms><message to="user">response 2</message></comms><idle/>' })
       yield* h.user('message 2')
       const second = yield* h.wait.event(
         'turn_completed',

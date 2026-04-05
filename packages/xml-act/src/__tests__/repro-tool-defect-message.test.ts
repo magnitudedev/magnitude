@@ -28,7 +28,7 @@ function config(tools: RegisteredTool[]): XmlRuntimeConfig {
 }
 
 function responseWithActions(actionsXml: string): string {
-  return `<lenses>${LENSES_CLOSE}<task id="t2"></task><task id="t1">${actionsXml}${TASK_CLOSE}<yield/>`
+  return `<lenses>${LENSES_CLOSE}<task id="t2"></task><task id="t1">${actionsXml}${TASK_CLOSE}<idle/>`
 }
 
 function turnFailure(events: XmlRuntimeEvent[]): string {

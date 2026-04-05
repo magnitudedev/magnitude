@@ -6,7 +6,7 @@ describe('harness shell behavior', () => {
   it.live('shell executes successfully', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<actions><shell>echo hi</shell></actions><yield/>' }, null)
+      yield* harness.script.next({ xml: '<actions><shell>echo hi</shell></actions><idle/>' }, null)
 
       yield* harness.user('run shell')
       const completed = yield* harness.wait.turnCompleted(null)

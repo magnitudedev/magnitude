@@ -5,7 +5,7 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import type { TurnToolCall, ObservedResult } from '../events'
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
@@ -59,7 +59,7 @@ export function formatError(message: string): string {
 
 /** Noop turn — agent continued without taking any task/tool operations */
 export function formatNoop(): string {
-  return `<noop>No actions were taken. Use ${TURN_CONTROL_YIELD} if you have nothing more to do, instead of ${TURN_CONTROL_NEXT}.</noop>`
+  return `<noop>No actions were taken. Use ${TURN_CONTROL_IDLE} if you have nothing more to do.</noop>`
 }
 
 /** Oneshot liveness reminder rendered as result feedback */

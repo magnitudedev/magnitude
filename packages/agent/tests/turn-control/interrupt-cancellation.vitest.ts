@@ -9,7 +9,7 @@ describe('interrupt cancellation latency (regression)', () => {
       const h = yield* TestHarness
 
       yield* h.script.next({
-        xmlChunks: ['<comms><message to="user">hello', ' world</message></comms><yield/>'],
+        xmlChunks: ['<comms><message to="user">hello', ' world</message></comms><idle/>'],
         delayMsBetweenChunks: 10_000,
       })
 

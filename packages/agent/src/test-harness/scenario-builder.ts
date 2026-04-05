@@ -24,7 +24,7 @@ type Step =
   | { kind: 'agents'; mapping: Record<string, MockTurnResponse> }
 
 function isResponseBuilder(frame: TurnFrame): frame is ResponseBuilder {
-  return 'yield' in frame && typeof frame.yield === 'function'
+  return 'idle' in frame && typeof frame.yield === 'function'
 }
 
 function toFrame(frame: TurnFrame): MockTurnResponse {
@@ -152,7 +152,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
         }
       }
 
-      const fallback: MockTurnResponse = { xml: '<yield/>' }
+      const fallback: MockTurnResponse = { xml: '<idle/>' }
 
       const unsub = harness.onEvent((event: AppEvent) => {
         if (event.type === 'agent_created') {

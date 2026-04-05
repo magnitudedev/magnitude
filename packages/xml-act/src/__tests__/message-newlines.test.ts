@@ -35,7 +35,7 @@ describe('message parser newline preservation', () => {
 
 line2</message>
 </task>
-<yield/>`
+<idle/>`
 
     const events = parse(xml)
     const text = events
@@ -55,7 +55,7 @@ line2</message>
 |------|------|
 | a    | b    |</message>
 </task>
-<yield/>`
+<idle/>`
 
     const extracted = extractMessageText(xml)
     const doc = parseMarkdownToMdast(extracted)
@@ -77,7 +77,7 @@ line2</message>
 
 This is a separate paragraph.</message>
 </task>
-<yield/>`
+<idle/>`
 
     const extracted = extractMessageText(xml)
     const doc = parseMarkdownToMdast(extracted)
@@ -100,7 +100,7 @@ This is a separate paragraph.`)
 |------|------|
 | a    | b    |</message>
 </task>
-<yield/>`
+<idle/>`
 
     const extracted = extractMessageText(xml)
     const doc = parseMarkdownToMdast(extracted)

@@ -11,8 +11,8 @@ describe('display pending communications promotion', () => {
   it('queues inbound pending, mirrors to display, promotes on turn_started, and clears pending', async () => {
     const harness = await createAgentTestHarness()
     const stopRouting = await harness.script.route({
-      root: { xml: '<yield/>' },
-      subagents: { xml: '<yield/>' },
+      root: { xml: '<idle/>' },
+      subagents: { xml: '<idle/>' },
     })
 
     try {
@@ -107,8 +107,8 @@ describe('display pending communications promotion', () => {
   it('renders direct user→subagent message as user_message (not communication step)', async () => {
     const harness = await createAgentTestHarness()
     const stopRouting = await harness.script.route({
-      root: { xml: '<yield/>' },
-      subagents: { xml: '<yield/>' },
+      root: { xml: '<idle/>' },
+      subagents: { xml: '<idle/>' },
     })
 
     try {
@@ -163,8 +163,8 @@ describe('display pending communications promotion', () => {
   it('does not duplicate promoted inbound messages across subsequent turns and does not leak to root pending', async () => {
     const harness = await createAgentTestHarness()
     const stopRouting = await harness.script.route({
-      root: { xml: '<yield/>' },
-      subagents: { xml: '<yield/>' },
+      root: { xml: '<idle/>' },
+      subagents: { xml: '<idle/>' },
     })
 
     try {
@@ -271,8 +271,8 @@ describe('display pending communications promotion', () => {
   it('routes explicit to="<task-id>" from top-level message', async () => {
     const harness = await createAgentTestHarness()
     const stopRouting = await harness.script.route({
-      root: { xml: '<yield/>' },
-      subagents: { xml: '<yield/>' },
+      root: { xml: '<idle/>' },
+      subagents: { xml: '<idle/>' },
     })
 
     try {

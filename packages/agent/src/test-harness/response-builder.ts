@@ -93,7 +93,7 @@ export class ResponseBuilder {
     )
   }
 
-  private build(control: 'yield' | 'next'): MockTurnResponse {
+  private build(control: 'idle'): MockTurnResponse {
     const parts: string[] = []
     parts.push(...this.messages)
     parts.push(...this.explicitTaskBlocks)
@@ -107,7 +107,7 @@ export class ResponseBuilder {
   }
 
   yield(): MockTurnResponse {
-    return this.build('yield')
+    return this.build('idle')
   }
 
   next(): MockTurnResponse {

@@ -36,7 +36,7 @@ describe('memory/timeline-events', () => {
         responseParts: [{ type: 'text', content: 'done' }],
         toolCalls: [],
         observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -148,7 +148,7 @@ describe('memory/timeline-events', () => {
         observedResults: [],
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'follow up on deployment checks' }],
         },
         inputTokens: null,

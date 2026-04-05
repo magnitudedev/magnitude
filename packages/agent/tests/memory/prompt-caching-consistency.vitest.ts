@@ -127,7 +127,7 @@ describe('prompt caching consistency', () => {
         observedResults: [],
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'latest only' }],
         },
         inputTokens: null,

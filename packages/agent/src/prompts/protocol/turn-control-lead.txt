@@ -1,16 +1,11 @@
 ## Turn control
 
-The final tag in your response determines whether you will idle until further action from user or subagents.
+No turn-control tag means the system immediately gives you another turn.
+`<idle/>` means execution stops until an external wake event (such as a user message or worker completion).
 
-After your task/tool operations, include exactly one terminal turn-control tag:
+Go idle if and only if at least one of the following is true:
+- You asked the user a question and are waiting for a response.
+- You delegated tasks to workers and are waiting for their completion.
+- You are completely done with all tasks and have summarized completed work to the user.
 
-`<{{TURN_CONTROL_NEXT}}/>`: Observe results from task/tool operations and immediately take another turn
-Use when:
-- You used tools and need to see their results to continue
-- You have more work to do that depends on the current turn's output
-
-`<{{TURN_CONTROL_YIELD}}/>`: Wait for further communications from user or subagents
-Use when:
-- You've sent a message and are waiting for a response (user or subagent)
-- You've completed the current task
-- You have nothing more to do until something external happens
+In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately declare task blocks in the same response.

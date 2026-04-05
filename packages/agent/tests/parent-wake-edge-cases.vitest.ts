@@ -14,10 +14,10 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: '<actions><agent-create agentId="error-sub"><type>explorer</type><title>err</title><message>go</message></agent-create></actions><yield/>',
+              xml: '<actions><agent-create agentId="error-sub"><type>explorer</type><title>err</title><message>go</message></agent-create></actions><idle/>',
             }
           }
-          return { xml: '<yield/>' }
+          return { xml: '<idle/>' }
         }
         // Subagent resolver throws -> triggers turn_unexpected_error
         throw new Error('simulated subagent crash')
@@ -60,13 +60,13 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: '<actions><agent-create agentId="kill-sub"><type>explorer</type><title>will be killed</title><message>do work</message></agent-create></actions><yield/>',
+              xml: '<actions><agent-create agentId="kill-sub"><type>explorer</type><title>will be killed</title><message>do work</message></agent-create></actions><idle/>',
             }
           }
-          return { xml: '<yield/>' }
+          return { xml: '<idle/>' }
         }
 
-        return { xml: '<comms><message to="parent">subagent done</message></comms><yield/>' }
+        return { xml: '<comms><message to="parent">subagent done</message></comms><idle/>' }
       })
 
       yield* h.user('start killable subagent')

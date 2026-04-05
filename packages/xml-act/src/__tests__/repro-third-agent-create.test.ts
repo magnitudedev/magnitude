@@ -65,7 +65,7 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
       '<message>Do thing 3</message>',
       '</agent-create>',
       '</task>',
-      '<yield/>',
+      '<idle/>',
     ].join('\n')
 
     const events2 = parent.processChunk(part2)
@@ -81,7 +81,7 @@ describe('repro: structuralTags singleton corruption across parsers', () => {
     const p2 = createStreamingXmlParser(subagentTags, subagentChildMap, undefined, undefined, 'user')
     const p3 = createStreamingXmlParser(parentTags, parentChildMap, undefined, undefined, 'user')
 
-    const xml = '<task id="t1">\n<agent-create agentId="x" type="builder" observe=".">\n<title>T</title>\n<message>M</message>\n</agent-create>\n</task>\n<yield/>'
+    const xml = '<task id="t1">\n<agent-create agentId="x" type="builder" observe=".">\n<title>T</title>\n<message>M</message>\n</agent-create>\n</task>\n<idle/>'
 
     const e1 = [...p1.processChunk(xml), ...p1.flush()]
     const e3 = [...p3.processChunk(xml), ...p3.flush()]

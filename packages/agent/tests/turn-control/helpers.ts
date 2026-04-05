@@ -28,7 +28,7 @@ export const mkTurnCompletedSuccess = (
   responseParts: [],
   toolCalls: [],
   observedResults: [],
-  result: { success: true, turnDecision: 'yield' },
+  result: { success: true, turnDecision: 'idle' },
   inputTokens: null,
   outputTokens: null,
   cacheReadTokens: null,

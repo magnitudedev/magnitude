@@ -447,7 +447,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const turnErrors: TurnResultError[] = []
 
       // Store execution result
-      let executionResult: TurnResult = { success: true, turnDecision: 'yield' }
+      let executionResult: TurnResult = { success: true, turnDecision: 'idle' }
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
@@ -1049,9 +1049,13 @@ const makeExecutionManager = Effect.gen(function* () {
                     }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
-                  } else if (endResult.turnControl) {
-                    executionResult = { success: true, turnDecision: endResult.turnControl }
                   } else {
+                    const resolvedTurnControl = endResult.turnControl ?? 'continue'
+                    if (resolvedTurnControl === 'idle') {
+                      executionResult = { success: true, turnDecision: 'idle' }
+                    } else {
+                      executionResult = { success: true, turnDecision: 'continue' }
+                    }
                     const policyCtx = yield* policyCtxProvider.get
                     const turnResult = agentDef.getTurn({
                       toolsCalled: toolsCalledKeys,
@@ -1059,10 +1063,14 @@ const makeExecutionManager = Effect.gen(function* () {
                       messagesSent,
                       state: policyCtx,
                     })
-                    if (turnResult.action === 'finish') {
-                      executionResult = { success: true, turnDecision: 'finish', evidence: '' }
-                    } else {
-                      executionResult = { success: true, turnDecision: turnResult.action }
+                    if (endResult.turnControl === null) {
+                      if (turnResult.action === 'finish') {
+                        executionResult = { success: true, turnDecision: 'finish', evidence: '' }
+                      } else if (turnResult.action === 'continue') {
+                        executionResult = { success: true, turnDecision: 'continue' }
+                      } else {
+                        executionResult = { success: true, turnDecision: 'idle' }
+                      }
                     }
                   }
                 } else if (endResult._tag === 'Interrupted') {
@@ -1083,7 +1091,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 }
 
                 // Oneshot liveness guard: prevent stalling when nothing is active
-                if (executionResult.success && executionResult.turnDecision === 'yield' && oneshotEnabled) {
+                if (executionResult.success && executionResult.turnDecision === 'idle' && oneshotEnabled) {
                   const pCtx = yield* policyCtxProvider.get
                   if (pCtx.activeAgentCount === 0) {
                     executionResult = {
