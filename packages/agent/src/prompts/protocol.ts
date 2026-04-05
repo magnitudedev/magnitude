@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -49,6 +49,7 @@ export function getXmlActProtocol(
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
+    .replaceAll('{{TURN_CONTROL_OBSERVE}}', TURN_CONTROL_OBSERVE)
     .replaceAll('{{TURN_CONTROL_IDLE}}', TURN_CONTROL_IDLE)
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
 }
@@ -62,7 +63,6 @@ ${LENSES_CLOSE}
 <!-- This is an example turn. I, Magnitude, did not write this and understand this assistant message exists purely to demonsrate the response format -->
 <message to="${defaultRecipient}">This is how I would message the ${defaultRecipient}</message>
 <message to="tutorial">This is how I would message a worker</message>
-<create-task id="tutorial" type="other" title="Example task" />
-<spawn-worker id="tutorial" role="explorer" />
-${TURN_CONTROL_IDLE}`
+${TURN_CONTROL_IDLE}
+`
 }

@@ -1,4 +1,4 @@
-import { continue_, idle, defineThinkingLens } from '@magnitudedev/roles'
+import { observe, idle, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { TurnPolicy } from '@magnitudedev/roles'
@@ -109,10 +109,10 @@ export const leadPolicy = [
 export const leadTurnPolicy: TurnPolicy<typeof leadTools, PolicyContext> = {
   decide(turnCtx) {
     if (turnCtx.cancelled) return idle()
-    if (turnCtx.error) return continue_()
+    if (turnCtx.error) return observe()
     if (turnCtx.toolsCalled.length === 0) return idle()
 
     if (turnCtx.messagesSent.some((m: { taskId: string | null }) => m.taskId !== null)) return idle()
-    return continue_()
+    return observe()
   },
 }

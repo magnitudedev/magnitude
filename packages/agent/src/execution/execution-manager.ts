@@ -896,17 +896,17 @@ const makeExecutionManager = Effect.gen(function* () {
                   if (hasToolErrors || turnErrors.length > 0) {
                     executionResult = {
                       success: true,
-                      turnDecision: 'continue',
+                      turnDecision: 'observe',
                       ...(turnErrors.length > 0 ? { errors: turnErrors } : {}),
                     }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
                   } else {
-                    const resolvedTurnControl = endResult.turnControl ?? 'continue'
+                    const resolvedTurnControl = endResult.turnControl ?? 'observe'
                     if (resolvedTurnControl === 'idle') {
                       executionResult = { success: true, turnDecision: 'idle' }
                     } else {
-                      executionResult = { success: true, turnDecision: 'continue' }
+                      executionResult = { success: true, turnDecision: 'observe' }
                     }
                     const policyCtx = yield* policyCtxProvider.get
                     const turnResult = agentDef.getTurn({
@@ -918,8 +918,8 @@ const makeExecutionManager = Effect.gen(function* () {
                     if (endResult.turnControl === null) {
                       if (turnResult.action === 'finish') {
                         executionResult = { success: true, turnDecision: 'finish', evidence: '' }
-                      } else if (turnResult.action === 'continue') {
-                        executionResult = { success: true, turnDecision: 'continue' }
+                      } else if (turnResult.action === 'observe') {
+                        executionResult = { success: true, turnDecision: 'observe' }
                       } else {
                         executionResult = { success: true, turnDecision: 'idle' }
                       }
@@ -948,7 +948,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   if (pCtx.activeAgentCount === 0) {
                     executionResult = {
                       success: true,
-                      turnDecision: 'continue',
+                      turnDecision: 'observe',
                       oneshotLivenessTriggered: true,
                     }
                   }

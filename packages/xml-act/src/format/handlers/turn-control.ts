@@ -3,7 +3,7 @@ import { endTopProse } from '../prose'
 import type { TagHandler, XmlActEvent, XmlActFrame } from '../types'
 
 export function turnControlHandler(
-  decision: 'idle',
+  decision: 'observe' | 'idle',
 ): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open() {

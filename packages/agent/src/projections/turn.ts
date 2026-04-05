@@ -299,7 +299,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       if (fork._tag === 'idle') return fork
       if (fork.turnId !== event.turnId) return fork
 
-      const turnWantsContinue = event.result.success ? event.result.turnDecision === 'continue' : !event.result.cancelled
+      const turnWantsContinue = event.result.success ? event.result.turnDecision === 'observe' : !event.result.cancelled
       const shouldEnqueueContinue = turnWantsContinue && !fork.softInterrupted
 
       const nextTriggers = shouldEnqueueContinue

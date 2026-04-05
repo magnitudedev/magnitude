@@ -1,4 +1,4 @@
-import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
@@ -11,7 +11,7 @@ export interface CanonicalTrace {
   thinkBlocks: ThinkBlock[]
   messages: Array<{ text: string; destination: MessageDestination }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string }>
-  turnDecision: 'continue' | 'idle'
+  turnDecision: 'observe' | 'idle'
 }
 
 function attrsToString(attrs: Record<string, string>): string {
@@ -163,7 +163,9 @@ export function serializeCanonicalTurn(
     }
   }
 
-  if (trace.turnDecision === 'idle') {
+  if (trace.turnDecision === 'observe') {
+    parts.push(TURN_CONTROL_OBSERVE)
+  } else if (trace.turnDecision === 'idle') {
     parts.push(TURN_CONTROL_IDLE)
   }
   return parts.join('\n')

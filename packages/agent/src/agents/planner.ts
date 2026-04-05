@@ -7,7 +7,7 @@
  * Communicates back via parent.message.
  */
 
-import { defineRole, continue_, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import plannerPromptRaw from './prompts/planner.txt' with { type: 'text' }
@@ -94,9 +94,9 @@ export const plannerRole = defineRole<typeof tools, 'planner', PolicyContext>({
   turn: {
     decide(turnCtx) {
       if (turnCtx.cancelled) return finish()
-      if (turnCtx.error) return continue_()
+      if (turnCtx.error) return observe()
       if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
-      return continue_()
+      return observe()
     },
   },
 })

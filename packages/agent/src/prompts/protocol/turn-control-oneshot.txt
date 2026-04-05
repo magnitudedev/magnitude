@@ -1,11 +1,13 @@
 ## Turn control
 
-No turn-control tag means the system immediately gives you another turn.
+`<observe/>` ends your response so you can see the results of tool calls you made this turn.
 `<idle/>` means execution stops until an external wake event (for oneshot, typically subagent completion).
 
-Go idle if and only if you dispatched subagents and are waiting for their completion.
+Use `<observe/>` when you used tools this turn and need to see their results before continuing.
 
-In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately take tool calls in the same response.
+Use `<idle/>` if and only if you dispatched subagents and are waiting for their completion.
+
+Every response must end with exactly one of `<observe/>` or `<idle/>`.
 
 `<{{TURN_CONTROL_FINISH}}>`: Declare the task fully and verifiably complete
 Provide a summary of verification evidence as body content:

@@ -1,10 +1,12 @@
 ## Turn control
 
-No turn-control tag means the system immediately gives you another turn.
+`<observe/>` ends your response so you can see the results of tool calls you made this turn.
 `<idle/>` means execution stops until an external wake event from your parent thread. If the user messages you directly, treat it as an interruption/correction: you may reply once, then continue parent-facing communication.
 
-Go idle if and only if at least one of the following is true:
+Use `<observe/>` when you used tools this turn and need to see their results before continuing.
+
+Use `<idle/>` if and only if at least one of the following is true:
 - You are blocked and have escalated a question to your parent.
 - You are completely done with your task and have sent a summary to your parent.
 
-In all other cases, do not emit a turn-control tag. End your response if you need to see tool results, else immediately take tool calls in the same response.
+Every response must end with exactly one of `<observe/>` or `<idle/>`.

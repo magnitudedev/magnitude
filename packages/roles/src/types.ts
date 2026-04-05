@@ -56,7 +56,7 @@ export interface TurnContext<TCtx = Record<string, never>> {
   readonly state: TCtx
 }
 
-export type TurnDecision = 'continue' | 'idle' | 'finish'
+export type TurnDecision = 'observe' | 'idle' | 'finish'
 
 export type TurnResult = {
   readonly action: TurnDecision

@@ -5,7 +5,7 @@
  * and parent.message for communicating with the orchestrator. No task management tools.
  */
 
-import { defineRole, continue_, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import builderPromptRaw from './prompts/builder.txt' with { type: 'text' }
@@ -71,9 +71,9 @@ export const builderRole = defineRole<typeof tools, 'builder', PolicyContext>({
   turn: {
     decide(turnCtx) {
       if (turnCtx.cancelled) return finish()
-      if (turnCtx.error) return continue_()
+      if (turnCtx.error) return observe()
       if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
-      return continue_()
+      return observe()
     },
   },
 })

@@ -217,7 +217,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
 
     turn_completed: ({ event, state, emit }) => {
       if (event.forkId === null) return state
-      if (event.result.success && event.result.turnDecision === 'continue') return state
+      if (event.result.success && event.result.turnDecision === 'observe') return state
 
       const agent = getAgentByForkId(state, event.forkId)
       if (!agent) return state

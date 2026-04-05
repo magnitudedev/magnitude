@@ -41,6 +41,7 @@ export function createXmlActFormat(
   handlers.set('lenses', lenses)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
+  handlers.set('observe', turnControlHandler('observe'))
   handlers.set('idle', turnControlHandler('idle'))
   handlers.set('finish', finishHandler())
 
@@ -62,7 +63,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', 'idle', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
+  for (const tag of ['message', 'observe', 'idle', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -129,6 +130,7 @@ export function createCurrentFormat(
   readonly tags: {
     readonly think: 'think'
     readonly message: 'message'
+    readonly observe: 'observe'
     readonly idle: 'idle'
     readonly finish: 'finish'
   }
@@ -140,6 +142,7 @@ export function createCurrentFormat(
     tags: {
       think: 'think',
       message: 'message',
+      observe: 'observe',
       idle: 'idle',
       finish: 'finish',
     },

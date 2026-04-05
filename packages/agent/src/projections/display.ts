@@ -989,7 +989,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       // Determine if we'll continue (same logic as TurnProjection)
       let willContinue: boolean
       if (event.result.success) {
-        willContinue = event.result.turnDecision === 'continue'
+        willContinue = event.result.turnDecision === 'observe'
       } else {
         willContinue = !event.result.cancelled
       }
