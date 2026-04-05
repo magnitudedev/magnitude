@@ -8,7 +8,7 @@ import type { ConversationEntry } from '../projections/conversation'
 export function buildAgentContext(
   title: string,
   message: string,
-  extraContext: string,
+  extraContext: string | null,
   taskId: string,
   taskContract?: string,
 ): string {

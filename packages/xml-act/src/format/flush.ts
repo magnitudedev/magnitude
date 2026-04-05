@@ -35,6 +35,10 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         ops.push(emit({ _tag: 'TaskAssign', taskId: frame.taskId, role: frame.role, body: frame.body.trim() }))
         ops.push(pop)
         break
+      case 'reassign':
+        ops.push(emit({ _tag: 'TaskReassign', taskId: frame.taskId, role: frame.role, body: frame.body.trim() }))
+        ops.push(pop)
+        break
       case 'tool-body': {
         const suppressThisToolBody = suppressToolBodyForId === frame.id
         if (suppressThisToolBody) {

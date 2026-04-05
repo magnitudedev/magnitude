@@ -20,10 +20,27 @@ When mentioning files in communications, always prefer using an inline link so t
 
 `task` is the work container. All task operations, tool use, and worker communication happen inside task blocks.
 
-A new task requires `id`, `type`, and `title`. Use `parent` to place it under an existing task. To assign it to a worker role, use `<assign>`:
+A new task requires `id`, `type`, and `title`. Use `parent` to place it under an existing task.
+
+Use `<assign>` to direct work to a task:
+- If no worker exists, it spawns one (requires `role`).
+- If a worker is already active, it sends the content to that worker (`role` optional).
+- If `role` is provided and differs from the active worker's role, it errors — use `<reassign>`.
 
 <task id="impl-parser" type="implement" title="Implement parser updates">
 <assign role="builder">Implement Unit A from the plan.</assign>
+</task>
+
+Send follow-up instructions to an existing worker:
+
+<task id="impl-parser">
+<assign>Prioritize parser tests before refactors.</assign>
+</task>
+
+Use `<reassign>` to kill and replace a worker (always requires `role`):
+
+<task id="impl-parser">
+<reassign role="debugger">...</reassign>
 </task>
 
 Referencing an existing task by `id` lets you operate on it, for example to update status:

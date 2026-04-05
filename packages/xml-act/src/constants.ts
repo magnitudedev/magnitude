@@ -14,6 +14,7 @@ export const MESSAGE_TAG = 'message'
 export const LENS_TAG = 'lens'
 export const TASK_TAG = 'task'
 export const ASSIGN_TAG = 'assign'
+export const REASSIGN_TAG = 'reassign'
 
 export const AGENT_CREATE_OPEN_PREFIX = '<agent-create'
 export const AGENT_CREATE_CLOSE = '</agent-create>'

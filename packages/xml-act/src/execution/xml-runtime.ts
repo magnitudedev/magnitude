@@ -830,6 +830,16 @@ function reactImpl(
         })
         break
       }
+
+      case 'TaskReassign': {
+        currentState = yield* emitAndFold(currentState, {
+          _tag: 'TaskReassigned',
+          taskId: parseEvent.taskId,
+          role: parseEvent.role,
+          body: parseEvent.body,
+        })
+        break
+      }
     }
 
     return currentState

@@ -33,24 +33,8 @@ export function assignHandler(
         ]
       }
 
-      const role = ctx.attrs.get('role')?.trim() ?? ''
-      if (!role) {
-        return [
-          ...endTopProse(ctx.stack),
-          emit({
-            _tag: 'ParseError',
-            error: {
-              _tag: 'InvalidAttributeValue',
-              id: ctx.generateId(),
-              tagName: 'assign',
-              attribute: 'role',
-              expected: 'non-empty string',
-              received: '',
-              detail: 'Assign role is required',
-            },
-          }),
-        ]
-      }
+      const rawRole = ctx.attrs.get('role')?.trim()
+      const role = rawRole && rawRole.length > 0 ? rawRole : null
 
       // If we're already inside an assign frame, this is nested — increment depth and capture raw
       const existingAssign = findFrame(ctx.stack, 'assign')
@@ -131,24 +115,8 @@ export function assignHandler(
         ]
       }
 
-      const role = ctx.attrs.get('role')?.trim() ?? ''
-      if (!role) {
-        return [
-          ...endTopProse(ctx.stack),
-          emit({
-            _tag: 'ParseError',
-            error: {
-              _tag: 'InvalidAttributeValue',
-              id: ctx.generateId(),
-              tagName: 'assign',
-              attribute: 'role',
-              expected: 'non-empty string',
-              received: '',
-              detail: 'Assign role is required',
-            },
-          }),
-        ]
-      }
+      const rawRole = ctx.attrs.get('role')?.trim()
+      const role = rawRole && rawRole.length > 0 ? rawRole : null
 
       // If inside an assign frame, capture as raw text
       const existingAssign = findFrame(ctx.stack, 'assign')

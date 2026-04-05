@@ -55,14 +55,40 @@ describe('task format parsing', () => {
     }
   })
 
-  it('self-closing assign errors when role missing', () => {
+  it('self-closing assign without role parses with null role', () => {
     const events = parse('<task id="t1"><assign /></task><idle/>')
+    const assign = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskAssign' }> => e._tag === 'TaskAssign')
+    expect(assign).toBeDefined()
+    expect(assign?.role).toBeNull()
+  })
+
+  it('assign without role parses with null role', () => {
+    const events = parse('<task id="t1"><assign>do it</assign></task><idle/>')
+    const assign = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskAssign' }> => e._tag === 'TaskAssign')
+    expect(assign).toBeDefined()
+    expect(assign?.role).toBeNull()
+    expect(assign?.body).toBe('do it')
+  })
+
+  it('reassign with role yields TaskReassign', () => {
+    const events = parse('<task id="t1"><reassign role="builder">restart</reassign></task><idle/>')
+    const reassign = events.find((e): e is Extract<ParseEvent, { _tag: 'TaskReassign' }> => e._tag === 'TaskReassign')
+    expect(reassign).toBeDefined()
+    expect(reassign?.role).toBe('builder')
+    expect(reassign?.body).toBe('restart')
+  })
+
+  it('reassign valid only inside task', () => {
+    const bad = parse('<reassign role="builder">nope</reassign><idle/>')
+    expect(bad.some(e => e._tag === 'ParseError')).toBe(true)
+  })
+
+  it('reassign errors when role missing', () => {
+    const events = parse('<task id="t1"><reassign>do it</reassign></task><idle/>')
     const err = events.find((e): e is Extract<ParseEvent, { _tag: 'ParseError' }> => e._tag === 'ParseError')
     expect(err?.error._tag).toBe('InvalidAttributeValue')
     if (err?.error._tag === 'InvalidAttributeValue') {
-      expect(err.error.attribute).toBe('role')
-      expect(err.error.expected).toBe('non-empty string')
-      expect(err.error.detail).toBe('Assign role is required')
+      expect(err.error.detail).toBe('Reassign role is required')
     }
   })
 

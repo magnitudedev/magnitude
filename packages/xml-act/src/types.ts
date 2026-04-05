@@ -155,7 +155,8 @@ export interface TaskPatched {
   readonly after: string | null
   readonly status: string | null
 }
-export interface TaskDelegated { readonly _tag: 'TaskDelegated'; readonly taskId: string; readonly role: string; readonly body: string }
+export interface TaskDelegated { readonly _tag: 'TaskDelegated'; readonly taskId: string; readonly role: string | null; readonly body: string }
+export interface TaskReassigned { readonly _tag: 'TaskReassigned'; readonly taskId: string; readonly role: string; readonly body: string }
 
 export interface MessageStart {
   readonly _tag: 'MessageStart'
@@ -210,7 +211,7 @@ export interface StructuralParseError { readonly _tag: 'StructuralParseError'; r
 export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown, TEmission = unknown> =
   | ToolCallEvent<TInput, TOutput, B, TEmission>
   | ProseChunk | ProseEnd | LensStart | LensChunk | LensEnd
-  | TaskStarted | TaskFinished | TaskPatched | TaskDelegated
+  | TaskStarted | TaskFinished | TaskPatched | TaskDelegated | TaskReassigned
   | MessageStart | MessageChunk | MessageEnd
   | StructuralParseError
   | TurnEnd

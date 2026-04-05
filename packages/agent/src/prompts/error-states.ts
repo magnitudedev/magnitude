@@ -40,4 +40,16 @@ export function formatMissingAssignmentMessageError(taskId: string): string {
   return `Task assignment rejected: missing assignment message for task "${taskId}".`
 }
 
+export function formatMissingAssignmentRoleError(taskId: string): string {
+  return `Task assignment rejected: role is required when task "${taskId}" has no active worker.`
+}
+
+export function formatAssignRoleMismatchUseReassignError(taskId: string, activeRole: string, requestedRole: string): string {
+  return `Task assignment rejected: task "${taskId}" already has active worker role "${activeRole}". Use <reassign> to replace the worker with role "${requestedRole}".`
+}
+
+export function formatMissingReassignmentRoleError(taskId: string): string {
+  return `Task reassignment rejected: role is required for <reassign> on task "${taskId}".`
+}
+
 export const EMPTY_RESPONSE_ERROR = 'Your response was empty. You must respond with lenses/message/task blocks. Use `<idle/>` if done taking turns.'

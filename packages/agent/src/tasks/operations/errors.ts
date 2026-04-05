@@ -3,6 +3,9 @@ import {
   formatInvalidAssigneeError,
   formatInvalidTaskTypeError,
   formatMissingAssignmentMessageError,
+  formatMissingAssignmentRoleError,
+  formatAssignRoleMismatchUseReassignError,
+  formatMissingReassignmentRoleError,
   formatTaskCompletionBlockedError,
   formatTaskNotFoundError,
   formatTaskParentNotFoundError,
@@ -16,6 +19,9 @@ export type TaskOperationErrorCode =
   | 'invalid_task_type'
   | 'invalid_assignee'
   | 'missing_assignment_message'
+  | 'missing_assignment_role'
+  | 'assign_role_mismatch_use_reassign'
+  | 'missing_reassignment_role'
   | 'completion_blocked'
   | 'invalid_status_transition'
   | 'empty_update_patch'
@@ -49,6 +55,18 @@ export function invalidAssignee(taskId: string, assignee: string): TaskOperation
 
 export function missingAssignmentMessage(taskId: string): TaskOperationErrorDetails {
   return { code: 'missing_assignment_message', message: formatMissingAssignmentMessageError(taskId) }
+}
+
+export function missingAssignmentRole(taskId: string): TaskOperationErrorDetails {
+  return { code: 'missing_assignment_role', message: formatMissingAssignmentRoleError(taskId) }
+}
+
+export function assignRoleMismatchUseReassign(taskId: string, activeRole: string, requestedRole: string): TaskOperationErrorDetails {
+  return { code: 'assign_role_mismatch_use_reassign', message: formatAssignRoleMismatchUseReassignError(taskId, activeRole, requestedRole) }
+}
+
+export function missingReassignmentRole(taskId: string): TaskOperationErrorDetails {
+  return { code: 'missing_reassignment_role', message: formatMissingReassignmentRoleError(taskId) }
 }
 
 export function completionBlocked(taskId: string): TaskOperationErrorDetails {

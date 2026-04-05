@@ -63,7 +63,8 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
       }
       return ops
     }
-    case 'assign': {
+    case 'assign':
+    case 'reassign': {
       const pending = frame.pendingNewlines
       if (/^\n+$/.test(text)) {
         return [replace({ ...frame, pendingNewlines: pending + text.length })]

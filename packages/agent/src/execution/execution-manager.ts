@@ -988,6 +988,12 @@ const makeExecutionManager = Effect.gen(function* () {
                     })
                   }
                 }
+
+                // Check if task has active worker before assign (for message routing)
+                const taskStateBeforeAssign = yield* taskProjection.get
+                const taskBeforeAssign = taskStateBeforeAssign.tasks.get(event.taskId)
+                const hadActiveWorker = taskBeforeAssign?.worker !== null && taskBeforeAssign?.worker !== undefined
+
                 const assignResult = yield* handleTaskDirective({
                   kind: 'assign',
                   taskId: event.taskId,
@@ -1011,6 +1017,85 @@ const makeExecutionManager = Effect.gen(function* () {
                   turnErrors.push({
                     code: 'task_operation_error',
                     message: assignResult.error,
+                  })
+                  break
+                }
+
+                // If there was an active worker, route assign body as message to that worker
+                if (hadActiveWorker && event.body.length > 0) {
+                  const messageId = createId()
+                  yield* Queue.offer(sink, {
+                    _tag: 'MessageStart',
+                    id: messageId,
+                    destination: { kind: 'worker', taskId: event.taskId },
+                  })
+                  yield* Queue.offer(sink, {
+                    _tag: 'MessageChunk',
+                    id: messageId,
+                    text: event.body,
+                  })
+                  yield* Queue.offer(sink, {
+                    _tag: 'MessageEnd',
+                    id: messageId,
+                  })
+                }
+                break
+              }
+
+              case 'TaskReassigned': {
+                const taskProjection = yield* TaskGraphProjection.Tag
+                const taskState = yield* taskProjection.get
+                const task = taskState.tasks.get(event.taskId)
+                if (task?.status === 'completed' && !taskTouchedThisTurn.has(event.taskId)) {
+                  taskTouchedThisTurn.add(event.taskId)
+                  const reopenResult = yield* handleTaskDirective({
+                    kind: 'update',
+                    taskId: event.taskId,
+                    status: 'pending',
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
+                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provide(executionLayer),
+                  )
+                  if (!reopenResult.success) {
+                    turnErrors.push({
+                      code: 'task_operation_error',
+                      message: reopenResult.error,
+                    })
+                  }
+                }
+
+                // Lead-only check
+                if (forkId !== null) {
+                  turnErrors.push({
+                    code: 'task_operation_error',
+                    message: 'Task reassignment rejected: only the lead can use <reassign>.',
+                  })
+                  break
+                }
+
+                const reassignResult = yield* handleTaskDirective({
+                  kind: 'reassign',
+                  taskId: event.taskId,
+                  assignee: event.role,
+                  message: event.body,
+                  spawnWorker: (params) => service.fork({
+                    parentForkId: params.parentForkId,
+                    name: params.name,
+                    agentId: params.agentId,
+                    prompt: params.prompt,
+                    message: params.message,
+                    mode: 'spawn',
+                    role: params.role,
+                    taskId: params.taskId,
+                  }),
+                }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
+                  Effect.provideService(ForkContext, { forkId }),
+                  Effect.provide(executionLayer),
+                )
+                if (!reassignResult.success) {
+                  turnErrors.push({
+                    code: 'task_operation_error',
+                    message: reassignResult.error,
                   })
                 }
                 break

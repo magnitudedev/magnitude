@@ -12,17 +12,17 @@ import {
   isTaskAssigneeAllowed,
   parseTaskAssignee,
   type TaskTypeId,
-  type WorkerAssignee,
 } from '../index'
 import { getSpawnableVariants } from '../../agents'
-import { assignRoleMismatchUseReassign, invalidAssignee, missingAssignmentMessage, missingAssignmentRole, taskNotFound } from './errors'
+import { invalidAssignee, missingAssignmentMessage, missingReassignmentRole, taskNotFound } from './errors'
 import { buildTaskAssignedValidated } from './builders'
-import type { TaskDirectiveContext, TaskDirectiveResult } from './handler'
+import type { TaskDirectiveContext } from './handler'
+import type { WorkerAssignee } from '../index'
 
 const { ForkContext } = Fork
 
-export interface AssignDirective {
-  readonly kind: 'assign'
+export interface ReassignDirective {
+  readonly kind: 'reassign'
   readonly taskId: string
   readonly assignee: string | null
   readonly message?: string
@@ -37,11 +37,8 @@ export interface AssignDirective {
   }) => Effect.Effect<string, never, any>
 }
 
-export const handleAssignDirective = (directive: AssignDirective, _context: TaskDirectiveContext) =>
+export const handleReassignDirective = (directive: ReassignDirective, _context: TaskDirectiveContext) =>
   Effect.gen(function* () {
-    const normalizedAssignee = directive.assignee
-      ? directive.assignee.trim().toLowerCase()
-      : null
     const taskReader = yield* TaskGraphStateReaderTag
     const task = yield* taskReader.getTask(directive.taskId)
     if (!task) {
@@ -49,69 +46,27 @@ export const handleAssignDirective = (directive: AssignDirective, _context: Task
       return { success: false, code: err.code, error: err.message } as const
     }
 
-    // --- Active worker path: route as message, no kill/spawn ---
-    if (task.worker) {
-      const trimmedMessage = directive.message?.trim()
-      if (!trimmedMessage) {
-        const err = missingAssignmentMessage(directive.taskId)
-        return { success: false, code: err.code, error: err.message } as const
-      }
-
-      if (normalizedAssignee) {
-        const parsedAssignee = parseTaskAssignee(normalizedAssignee)
-        if (!parsedAssignee || parsedAssignee === 'user') {
-          const err = invalidAssignee(directive.taskId, normalizedAssignee)
-          return { success: false, code: err.code, error: err.message } as const
-        }
-
-        if (parsedAssignee !== task.worker.role) {
-          const err = assignRoleMismatchUseReassign(directive.taskId, task.worker.role, parsedAssignee)
-          return { success: false, code: err.code, error: err.message } as const
-        }
-      }
-
-      // Validation passed — execution manager will handle message routing
-      return { success: true } as const
-    }
-
-    // --- No active worker path: require role, spawn ---
-    if (!normalizedAssignee) {
-      const err = missingAssignmentRole(directive.taskId)
+    if (!directive.assignee) {
+      const err = missingReassignmentRole(directive.taskId)
       return { success: false, code: err.code, error: err.message } as const
     }
 
+    const normalizedAssignee = directive.assignee.trim().toLowerCase()
     const parsedAssignee = parseTaskAssignee(normalizedAssignee)
-    if (!parsedAssignee) {
+    if (!parsedAssignee || parsedAssignee === 'user') {
       const err = invalidAssignee(directive.taskId, normalizedAssignee)
       return { success: false, code: err.code, error: err.message } as const
     }
 
-    if (parsedAssignee !== 'user') {
-      const spawnable = getSpawnableVariants()
-      if (!spawnable.includes(parsedAssignee)) {
-        const err = invalidAssignee(directive.taskId, normalizedAssignee)
-        return { success: false, code: err.code, error: err.message } as const
-      }
+    const spawnable = getSpawnableVariants()
+    if (!spawnable.includes(parsedAssignee)) {
+      const err = invalidAssignee(directive.taskId, normalizedAssignee)
+      return { success: false, code: err.code, error: err.message } as const
     }
 
     if (!isTaskAssigneeAllowed(task.taskType, parsedAssignee)) {
       const err = invalidAssignee(directive.taskId, normalizedAssignee)
       return { success: false, code: err.code, error: err.message } as const
-    }
-
-    if (parsedAssignee === 'user') {
-      const bus = yield* WorkerBusTag<AppEvent>()
-      const { forkId: parentForkId } = yield* ForkContext
-      const timestamp = Date.now()
-
-      yield* bus.publish(buildTaskAssignedValidated({
-        taskId: directive.taskId,
-        assignee: 'user',
-        workerRole: undefined,
-        message: '',
-        workerInfo: undefined,
-      }, { forkId: parentForkId, timestamp, graph: { tasks: new Map() } }))
-      return { success: true } as const
     }
 
     const trimmedMessage = directive.message?.trim()
@@ -123,6 +78,19 @@ export const handleAssignDirective = (directive: AssignDirective, _context: Task
     const bus = yield* WorkerBusTag<AppEvent>()
     const { forkId: parentForkId } = yield* ForkContext
     const timestamp = Date.now()
+
+    // Kill existing worker if present
+    let replacedWorker: { agentId: string; forkId: string } | undefined
+    if (task.worker) {
+      replacedWorker = { agentId: task.worker.agentId, forkId: task.worker.forkId }
+      yield* bus.publish({
+        type: 'agent_killed',
+        forkId: task.worker.forkId,
+        parentForkId,
+        agentId: task.worker.agentId,
+        reason: `Reassigned for task "${directive.taskId}"`,
+      })
+    }
 
     const conversationReader = yield* ConversationStateReaderTag
     const conversationState = yield* conversationReader.getState()
@@ -154,6 +122,7 @@ export const handleAssignDirective = (directive: AssignDirective, _context: Task
       workerRole: parsedAssignee,
       message: trimmedMessage,
       workerInfo: { agentId, forkId, role: parsedAssignee },
+      replacedWorker,
     }, { forkId: parentForkId, timestamp, graph: { tasks: new Map() } }))
 
     return { success: true } as const

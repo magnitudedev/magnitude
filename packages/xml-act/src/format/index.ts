@@ -2,6 +2,7 @@ import { xmlActContent } from './content'
 import { xmlActFlush } from './flush'
 import { finishHandler } from './handlers/finish'
 import { assignHandler } from './handlers/assign'
+import { reassignHandler } from './handlers/reassign'
 import { messageHandler } from './handlers/message'
 import { taskHandler } from './handlers/task'
 import { lensHandler, thinkHandler } from './handlers/think'
@@ -41,6 +42,7 @@ export function createXmlActFormat(
   const thinking = thinkHandler('lenses', betweenLensTags, plainThinkTags)
   const message = messageHandler(messageTags)
   const assign = assignHandler(taskFrameTags)
+  const reassign = reassignHandler(taskFrameTags)
   const task = taskHandler(taskFrameTags)
 
   handlers.set('think', think)
@@ -49,6 +51,7 @@ export function createXmlActFormat(
   handlers.set('message', message)
   handlers.set('task', task)
   handlers.set('assign', assign)
+  handlers.set('reassign', reassign)
   handlers.set('idle', turnControlHandler('idle'))
   handlers.set('finish', finishHandler())
 
@@ -70,7 +73,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', 'task', 'assign', 'idle', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
+  for (const tag of ['message', 'task', 'assign', 'reassign', 'idle', 'finish', 'think', 'lenses', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -79,7 +82,7 @@ export function createXmlActFormat(
     if (handler) topLevelTags.set(tool.tag, handler)
   }
 
-  for (const tag of ['message', 'assign', 'task']) {
+  for (const tag of ['message', 'assign', 'reassign', 'task']) {
     const handler = handlers.get(tag)
     if (handler) taskFrameTags.set(tag, handler)
   }
@@ -183,6 +186,7 @@ export { xmlActFlush } from './flush'
 export { xmlActUnknownOpen, xmlActUnknownClose } from './unknown'
 export { taskHandler } from './handlers/task'
 export { assignHandler } from './handlers/assign'
+export { reassignHandler } from './handlers/reassign'
 export { thinkHandler, lensHandler } from './handlers/think'
 export { messageHandler } from './handlers/message'
 export { toolHandler, childHandler } from './handlers/tool'

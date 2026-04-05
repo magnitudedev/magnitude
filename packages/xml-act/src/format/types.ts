@@ -87,6 +87,15 @@ export type XmlActFrame =
   | {
       readonly type: 'assign'
       readonly taskId: string
+      readonly role: string | null
+      readonly body: string
+      readonly depth: number
+      readonly pendingNewlines: number
+      readonly tags: TagMap
+    }
+  | {
+      readonly type: 'reassign'
+      readonly taskId: string
       readonly role: string
       readonly body: string
       readonly depth: number
@@ -192,7 +201,8 @@ export type XmlActEvent =
       readonly after: string | null
       readonly status: string | null
     }
-  | { readonly _tag: 'TaskAssign'; readonly taskId: string; readonly role: string; readonly body: string }
+  | { readonly _tag: 'TaskAssign'; readonly taskId: string; readonly role: string | null; readonly body: string }
+  | { readonly _tag: 'TaskReassign'; readonly taskId: string; readonly role: string; readonly body: string }
   | {
       readonly _tag: 'MessageStart'
       readonly id: string
