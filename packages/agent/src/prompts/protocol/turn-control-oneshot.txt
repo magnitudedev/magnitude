@@ -1,21 +1,12 @@
+## Tools and Messages
+
+Tools execute some readonly or mutating operation. Tool results are visibile upon ending your response with `{{TURN_CONTROL_OBSERVE}}`.
+Messages are your communication mechanism with workers. Messages have no results - they will always send successfully as long as the recipient exists.
+
 ## Turn control
 
-`<observe/>` ends your response so you can see the results of tool calls you made this turn.
-`<idle/>` means execution stops until an external wake event (for oneshot, typically subagent completion).
+`<observe/>` triggers observation of all tools called in the response and prompts you for a new response afterward.
+Use when you've called tools (not messages) and need to see their results or confirm they went through successfully.
 
-Use `<observe/>` when you used tools this turn and need to see their results before continuing.
-
-Use `<idle/>` if and only if you dispatched subagents and are waiting for their completion.
-
-Every response must end with exactly one of `<observe/>` or `<idle/>`.
-
-`<{{TURN_CONTROL_FINISH}}>`: Declare the task fully and verifiably complete
-Provide a summary of verification evidence as body content:
-
-<{{TURN_CONTROL_FINISH}}>
-- Requirement X: verified by running `npm test` (all 42 tests pass)
-- Requirement Y: confirmed by reading back src/foo.ts (lines 10-20 match spec)
-- Build: `npm run build` exits 0
-</{{TURN_CONTROL_FINISH}}>
-
-Do NOT use finish if any verification step failed or was skipped.
+`<idle/>` prevents you from taking follow-up turns until you receive a message from a worker.
+Use when you are waiting for workers to complete a task.

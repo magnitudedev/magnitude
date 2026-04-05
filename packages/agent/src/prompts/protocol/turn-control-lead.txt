@@ -1,13 +1,12 @@
+## Tools and Messages
+
+Tools execute some readonly or mutating operation. Tool results are visibile upon ending your response with `{{TURN_CONTROL_OBSERVE}}`.
+Messages are your communication mechanism with the user and workers. Messages have no results - they will always send successfully as long as the recipient exists.
+
 ## Turn control
 
-`<observe/>` ends your response so you can see the results of tool calls you made this turn.
-`<idle/>` means execution stops until an external wake event (such as a user message or worker completion).
+`<observe/>` triggers observation of all tools called in the response and prompts you for a new response afterward.
+Use when you've called tools (not messages) and need to see their results or confirm they went through successfully.
 
-Use `<observe/>` when you used tools this turn and need to see their results before continuing.
-
-Use `<idle/>` if and only if at least one of the following is true:
-- You asked the user a question and are waiting for a response.
-- You delegated tasks to workers and are waiting for their completion.
-- You are completely done with all tasks and have summarized completed work to the user.
-
-Every response must end with exactly one of `<observe/>` or `<idle/>`.
+`<idle/>` prevents you from taking follow-up turns until you receive a message from the user or from a worker.
+Use when you are waiting for a response from the user or waiting for workers to complete a task.
