@@ -7,8 +7,8 @@
   "types": "src/index.ts",
   "scripts": {
     "test": "bun test",
-    "test:vitest": "bunx vitest run",
-    "test:vitest:watch": "bunx vitest",
+    "test:vitest": "bunx --bun vitest run",
+    "test:vitest:watch": "bunx --bun vitest",
     "typecheck": "tsc --noEmit",
     "measure-system-prompt": "bun run scripts/measure-system-prompt.ts"
   },

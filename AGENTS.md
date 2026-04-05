@@ -24,6 +24,15 @@ Projection output is JSON — pipe to `jq` for querying. Events are 0-indexed.
 
 `bun logs` — view CLI logger output for the current session.
 
+## Testing
+
+Run tests with `bunx --bun vitest` (not `bun vitest` — without `--bun`, vitest workers run under Node and Bun globals aren't available).
+
+```bash
+cd packages/agent && bunx --bun vitest run    # single run
+cd packages/agent && bunx --bun vitest        # watch mode
+```
+
 ## Effect Language Service
 
 Use `bun els overview --file <path>` to list Effect exports (services, layers, errors) and `bun els layerinfo --file <path>` for layer dependency info. Example: `bun els overview --file packages/agent/src/index.ts`.
