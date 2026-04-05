@@ -118,6 +118,7 @@ export type TimelineEntry =
     })
   | (Timestamped<'task_type_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string })
   | (Timestamped<'task_idle_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string; readonly agentId: string })
+  | (Timestamped<'spawn_no_message'> & { readonly taskId: string; readonly taskTitle: string; readonly role: string })
   | (Timestamped<'task_tree_dirty'> & { readonly taskId: string })
   | (Timestamped<'task_tree_view'> & { readonly renderedTree: string })
   | (Timestamped<'task_update'> & {

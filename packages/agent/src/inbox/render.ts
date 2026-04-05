@@ -3,6 +3,7 @@ import { formatTaskTypeReminder } from '../tasks/guidance'
 import type { TaskTypeId } from '../tasks'
 import type { AgentAtom, LifecycleReminderFormatterMap, PhaseCriteriaPayload, ResultEntry, TimelineEntry } from './types'
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults } from './render-results'
+import { formatSpawnNoMessageReminder } from '../prompts/error-states'
 import { renderCompactToolCall } from './render-tool-call'
 
 export interface FormatInboxInput {
@@ -116,7 +117,7 @@ function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_mess
   return builder.build()
 }
 
-function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }>): string[] {
+function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'spawn_no_message' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }>): string[] {
   switch (entry.kind) {
     case 'user_message':
       return [`<message from="user">${entry.text}</message>`]
@@ -258,6 +259,12 @@ function buildTaskIdleReminderLines(
   )
 }
 
+function buildSpawnNoMessageReminderLines(
+  entries: readonly Extract<TimelineEntry, { kind: 'spawn_no_message' }>[],
+): string[] {
+  return entries.map(entry => formatSpawnNoMessageReminder(entry.taskId, entry.taskTitle, entry.role))
+}
+
 function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update' }>): string {
   if (entry.action === 'created') {
     const title = entry.title ? `: "${entry.title}"` : ''
@@ -309,6 +316,9 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   const taskIdleHooks = input.timeline.filter(
     (entry): entry is Extract<TimelineEntry, { kind: 'task_idle_hook' }> => entry.kind === 'task_idle_hook',
   )
+  const spawnNoMessageEntries = input.timeline.filter(
+    (entry): entry is Extract<TimelineEntry, { kind: 'spawn_no_message' }> => entry.kind === 'spawn_no_message',
+  )
   const treeViews = input.timeline.filter(
     (entry): entry is Extract<TimelineEntry, { kind: 'task_tree_view' }> => entry.kind === 'task_tree_view',
   )
@@ -316,10 +326,11 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     (entry): entry is Extract<TimelineEntry, { kind: 'task_update' }> => entry.kind === 'task_update',
   )
   const chronological = input.timeline.filter(
-    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }> =>
+    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'spawn_no_message' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }> =>
       entry.kind !== 'lifecycle_hook'
       && entry.kind !== 'task_type_hook'
       && entry.kind !== 'task_idle_hook'
+      && entry.kind !== 'spawn_no_message'
       && entry.kind !== 'task_tree_dirty'
       && entry.kind !== 'task_tree_view'
       && entry.kind !== 'task_update',
@@ -365,6 +376,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     ...buildLifecycleReminderLines(lifecycleHooks, input.lifecycleReminderFormatters),
     ...buildTaskTypeReminderLines(taskTypeHooks),
     ...buildTaskIdleReminderLines(taskIdleHooks),
+    ...buildSpawnNoMessageReminderLines(spawnNoMessageEntries),
   ]
   if (reminderLines.length > 0) {
     builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<reminders>\n${reminderLines.map(line => `- ${line}`).join('\n')}\n</reminders>`)
