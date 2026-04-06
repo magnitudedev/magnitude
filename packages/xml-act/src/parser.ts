@@ -20,6 +20,7 @@ export interface StreamingParser {
 export function createParser<F extends { readonly type: string }, E>(config: {
   format: Format<F, E>
   initialFrame: F
+  knownToolTags?: ReadonlySet<string>
   generateId?: () => string
   emit?: (event: E) => void
   filter?: (event: E) => boolean
@@ -125,7 +126,7 @@ export function createParser<F extends { readonly type: string }, E>(config: {
         break
       }
     }
-  })
+  }, config.knownToolTags)
 
   const processChunk = (chunk: string): readonly E[] => {
     const start = events.length
@@ -178,6 +179,7 @@ export function createStreamingXmlParser(
   return createParser<XmlActFrame, XmlActEvent>({
     format,
     initialFrame: { type: 'prose', body: '', pendingNewlines: 0, tags: structuralTags },
+    knownToolTags: knownTags,
     generateId,
     filter(event) {
       if (event._tag !== 'TurnControl') return true

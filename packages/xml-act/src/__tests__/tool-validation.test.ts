@@ -364,4 +364,30 @@ describe('tool validation scenarios (attr↔childTag normalization)', () => {
     expect(ready).toHaveLength(1)
     expect(ready[0].input).toMatchObject({ pattern: 'foo', path: 'src' })
   })
+
+  test('15) malformed top-level known tool syntax should surface ToolInputParseError (not prose fallback)', async () => {
+    const cfg = config([registered(grepLikeTool, 'grep_like', grepLikeBinding)])
+    const xml = responseWithActions(`<grep_like pattern="from ['"]foo['"]" path="src/**/*.{ts,tsx}"/>`)
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError').length).toBeGreaterThan(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
+
+    const prose = eventsOfType(events, 'ProseChunk').map(e => e.text).join('')
+    const messages = eventsOfType(events, 'MessageChunk').map(e => e.text).join('')
+    expect(prose).not.toContain('<grep_like')
+    expect(messages).not.toContain('<grep_like')
+  })
+
+  test('16) malformed known tool remains a tool-parse error when streamed across chunks', async () => {
+    const cfg = config([registered(grepLikeTool, 'grep_like', grepLikeBinding)])
+    const xml = `<lens name="turn">planning</lens>\n<grep_like pattern="from ['"]foo['"]" path="src"\n/><idle/>`
+    const events = await runStream(cfg, xml)
+
+    expect(eventsOfType(events, 'ToolInputParseError').length).toBeGreaterThan(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
+
+    const prose = eventsOfType(events, 'ProseChunk').map(e => e.text).join('')
+    expect(prose).not.toContain('<grep_like')
+  })
 })

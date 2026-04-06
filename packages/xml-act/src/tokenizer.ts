@@ -34,6 +34,7 @@ type TagPhase =
   | 'attrBeforeValue'
   | 'attrValueQuoted'
   | 'attrValueUnquoted'
+  | 'malformed'
 
 type ActiveTag = {
   raw: string
@@ -81,7 +82,10 @@ function withAfterNewline(signal: Token): Token {
   }
 }
 
-export function createTokenizer(onSignal: (signal: Token) => void): Tokenizer {
+export function createTokenizer(
+  onSignal: (signal: Token) => void,
+  knownToolTags?: ReadonlySet<string>,
+): Tokenizer {
   let contentBuffer = ''
   let afterNewline = true
 
@@ -121,8 +125,15 @@ export function createTokenizer(onSignal: (signal: Token) => void): Tokenizer {
 
   function failTagAsContent(): void {
     if (!activeTag) return
-    contentBuffer += activeTag.raw
+    const tag = activeTag
+
+    if (tag.name.length > 0 && knownToolTags?.has(tag.name)) {
+      tag.phase = 'malformed'
+      return
+    }
+
     activeTag = null
+    contentBuffer += tag.raw
   }
 
   function emitTag(tag: ActiveTag): void {
@@ -256,8 +267,24 @@ export function createTokenizer(onSignal: (signal: Token) => void): Tokenizer {
   function processTagChar(ch: string): void {
     const tag = activeTag!
 
+    if (tag.phase === 'malformed') {
+      // Known tool tags commit to tag parsing and never fall back to content.
+      // If attribute parsing breaks, we consume through the tag boundary and still emit
+      // the tag so the normal tool validation pipeline can surface the error to the LLM.
+      tag.raw += ch
+      if (ch === '>') {
+        if (!tag.isClose && tag.raw.length >= 2 && tag.raw[tag.raw.length - 2] === '/') {
+          tag.pendingSelfClose = true
+        }
+        emitTag(tag)
+        activeTag = null
+      }
+      return
+    }
+
     if (ch === '<' && tag.phase !== 'attrValueQuoted') {
       failTagAsContent()
+      if (activeTag) return
       startTag()
       return
     }
@@ -556,7 +583,10 @@ export function createTokenizer(onSignal: (signal: Token) => void): Tokenizer {
 
     end(): void {
       if (activeTag) {
-        if (!activeTag.isClose && activeTag.name.length > 0 && activeTag.phase !== 'attrValueQuoted') {
+        if (activeTag.name.length > 0 && knownToolTags?.has(activeTag.name)) {
+          emitTag(activeTag)
+          activeTag = null
+        } else if (!activeTag.isClose && activeTag.name.length > 0 && activeTag.phase !== 'attrValueQuoted') {
           emitTag(activeTag)
           activeTag = null
         } else {
