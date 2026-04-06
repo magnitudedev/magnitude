@@ -1,3 +1,5 @@
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+
 export const UNCLOSED_THINK_REMINDER = 'Your response had an unclosed thinking block. Be careful to use structural tags correctly and avoid referencing them in your thinking or prose.'
 
 export const UNCLOSED_TASK_REMINDER = 'Your response had an unclosed task block. Be careful to use structural tags correctly and avoid referencing them in your thinking or prose.'
@@ -48,4 +50,4 @@ export function formatMissingAssignmentRoleError(taskId: string): string {
   return `Task assignment rejected: role is required when task "${taskId}" has no active worker.`
 }
 
-export const EMPTY_RESPONSE_ERROR = 'Your response was empty. You must respond with lenses/messages/tool calls. Use `<idle/>` if done taking turns.'
+export const EMPTY_RESPONSE_ERROR = `Your response was empty. You must respond with lenses/messages/tool calls. Use \`${TURN_CONTROL_IDLE}\` if done taking turns.`

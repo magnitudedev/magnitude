@@ -1,6 +1,10 @@
-export const TURN_CONTROL_OBSERVE = '<observe/>'
-export const TURN_CONTROL_IDLE = '<idle/>'
-export const TURN_CONTROL_FINISH = '<finish/>'
+export const TURN_CONTROL_OBSERVE_TAG = 'observe'
+export const TURN_CONTROL_IDLE_TAG = 'idle'
+export const TURN_CONTROL_FINISH_TAG = 'finish'
+
+export const TURN_CONTROL_OBSERVE = `<${TURN_CONTROL_OBSERVE_TAG}/>`
+export const TURN_CONTROL_IDLE = `<${TURN_CONTROL_IDLE_TAG}/>`
+export const TURN_CONTROL_FINISH = `<${TURN_CONTROL_FINISH_TAG}/>`
 
 export const AGENT_CREATE_TAG = 'agent-create'
 export const TITLE_TAG = 'title'

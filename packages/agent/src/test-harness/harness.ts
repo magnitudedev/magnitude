@@ -1,6 +1,7 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
 import { defineCatalog } from '@magnitudedev/tools'
 import { Context, Effect, Layer } from 'effect'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import type { RoleDefinition } from '@magnitudedev/roles'
 import type { AgentCatalogEntry } from '../catalog'
 import type { AppEvent, SessionContext } from '../events'
@@ -464,7 +465,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           const resolver: MockTurnScriptResolver = ({ forkId }) => {
             if (forkId === null) return mapping.root
             const entry = Array.from(forksByAgent.entries()).find(([, id]) => id === forkId)
-            if (!entry || !mapping.subagents) return { xml: '<idle/>' }
+            if (!entry || !mapping.subagents) return { xml: TURN_CONTROL_IDLE }
 
             if ('xml' in mapping.subagents || 'xmlChunks' in mapping.subagents) {
               return mapping.subagents
@@ -472,7 +473,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
             const [agentId] = entry
             const perAgent = mapping.subagents as Record<string, MockTurnResponse>
-            return perAgent[agentId] ?? { xml: '<idle/>' }
+            return perAgent[agentId] ?? { xml: TURN_CONTROL_IDLE }
           }
 
           await client.runEffect(

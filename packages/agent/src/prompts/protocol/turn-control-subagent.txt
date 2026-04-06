@@ -1,12 +1,4 @@
-## Tools and Messages
-
-Tools execute some readonly or mutating operation. Tool results are visibile upon ending your response with `{{TURN_CONTROL_OBSERVE}}`.
-Messages are your communication mechanism with the the parent. Messages have no results - they will always send successfully.
 
 ## Turn control
 
-`<observe/>` triggers observation of all tools called in the response and prompts you for a new response afterward.
-Use when you've called tools (not messages) and need to see their results or confirm they went through successfully.
-
-`<idle/>` prevents you from taking follow-up turns until you receive a message from the parent.
-Use when you are completely done and have sent the parent all required information, or when you are blocked and need a response from the parent.
+Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the parent. Use `{{TURN_CONTROL_OBSERVE}}` otherwise.

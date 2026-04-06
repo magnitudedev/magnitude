@@ -5,6 +5,7 @@ import type { AgentAtom, LifecycleReminderFormatterMap, PhaseCriteriaPayload, Re
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults } from './render-results'
 import { formatSpawnNoMessageReminder } from '../prompts/error-states'
 import { renderCompactToolCall } from './render-tool-call'
+import { TURN_CONTROL_IDLE, TURN_CONTROL_IDLE_TAG } from '@magnitudedev/xml-act'
 
 export interface FormatInboxInput {
   results: readonly ResultEntry[]
@@ -74,7 +75,9 @@ function renderAgentAtom(atom: AgentAtom): string {
     case 'error':
       return `<error>${atom.message}</error>`
     case 'idle':
-      return atom.reason && atom.reason !== 'stable' ? `<idle reason="${atom.reason}"/>` : '<idle/>'
+      return atom.reason && atom.reason !== 'stable'
+        ? `<${TURN_CONTROL_IDLE_TAG} reason="${atom.reason}"/>`
+        : TURN_CONTROL_IDLE
   }
 }
 

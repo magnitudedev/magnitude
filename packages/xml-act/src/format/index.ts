@@ -5,6 +5,7 @@ import { messageHandler } from './handlers/message'
 import { lensHandler, thinkHandler } from './handlers/think'
 import { childHandler, toolHandler } from './handlers/tool'
 import { turnControlHandler } from './handlers/turn-control'
+import { TURN_CONTROL_OBSERVE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG } from '../constants'
 import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
 
@@ -34,9 +35,9 @@ export function createXmlActFormat(
   handlers.set('think', think)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
-  handlers.set('observe', turnControlHandler('observe'))
-  handlers.set('idle', turnControlHandler('idle'))
-  handlers.set('finish', finishHandler())
+  handlers.set(TURN_CONTROL_OBSERVE_TAG, turnControlHandler('observe'))
+  handlers.set(TURN_CONTROL_IDLE_TAG, turnControlHandler('idle'))
+  handlers.set(TURN_CONTROL_FINISH_TAG, finishHandler())
 
   for (const tool of tools) {
     const toolTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
@@ -56,7 +57,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', 'observe', 'idle', 'finish', 'think', 'thinking', 'lens']) {
+  for (const tag of ['message', TURN_CONTROL_OBSERVE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG, 'think', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }

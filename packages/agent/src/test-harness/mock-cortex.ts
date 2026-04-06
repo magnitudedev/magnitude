@@ -6,11 +6,12 @@ import { ExecutionManager } from '../execution/execution-manager'
 import { createTurnStream } from '../execution/types'
 import { drainTurnEventStream } from '../workers/turn-event-drain'
 import { MockTurnScriptTag, type MockTurnResponse } from './turn-script'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 
 function frameToChunks(frame: MockTurnResponse): readonly string[] {
   if (frame.xmlChunks && frame.xmlChunks.length > 0) return frame.xmlChunks
   if (frame.xml !== undefined) return [frame.xml]
-  return ['<message>ok</message><idle/>']
+  return [`<message>ok</message>${TURN_CONTROL_IDLE}`]
 }
 
 function buildStream(frame: MockTurnResponse): Stream.Stream<string, import('@magnitudedev/providers').ModelError> {
