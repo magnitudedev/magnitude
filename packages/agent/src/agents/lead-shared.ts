@@ -6,54 +6,71 @@ import type { PolicyContext } from './types'
 import { catalog } from '../catalog'
 import { denyForbiddenCommands, denyMassDestructiveIn, denyMutatingGit, denyWritesOutside, allowAll } from './policy'
 
-export const intentLens = defineThinkingLens({
-  name: 'intent',
-  trigger: 'When you receive a message from the user',
-  description: 'Carefully consider what the user means and what they actually want. Look past the literal request to understand the underlying goal.',
-})
-
 export const alignmentLens = defineThinkingLens({
   name: 'alignment',
-  trigger: 'When you receive a message from the user, or when acting on user intent',
-  description: 'Think about the user intent and agent work vectors — where they are, where they might diverge, and what that means for this turn. If they need to be aligned, how? Explore, ask the user, present a plan, or something else?',
+  trigger: 'When acting on user intent or making decisions that affect direction',
+  description: 'What assumptions am I making? What decisions am I about to make that the user might want input on? Should I surface my reasoning or ask before proceeding?',
 })
 
-export const ideateLens = defineThinkingLens({
-  name: 'ideate',
-  trigger: 'When the problem requires creative thinking or there are multiple possible approaches',
-  description: 'Think freely about the problem space. Generate and consider different approaches, ideas, or solutions before committing to one. Explore tradeoffs and implications.',
+export const tasksLens = defineThinkingLens({
+  name: 'tasks',
+  trigger: 'When receiving a user request or performing work of any kind',
+  description: 'Is all work captured as tasks? Is the tree organized, nested, and clean? Should I create, archive, or restructure tasks?',
 })
 
 export const strategyLens = defineThinkingLens({
   name: 'strategy',
-  trigger: 'When deciding how to execute work',
-  description: 'Consider how to best tackle work - subagents, parallelism, sequencing, workspace usage.',
+  trigger: 'When planning or progressing composite tasks with prescribed workflows',
+  description: 'How does the task strategy guidance apply to my current situation? What does it suggest given where I am and what I know?',
 })
 
-export const traitsLens = defineThinkingLens({
-  name: 'traits',
-  trigger: 'Whenever one or more traits are applicable to the current situation',
-  description: 'Assess how one or traits might apply in the current situation',
+export const diligenceLens = defineThinkingLens({
+  name: 'diligence',
+  trigger: 'When receiving worker output or evaluating whether work is ready to present',
+  description: 'Is the work my workers produced actually meeting the bar? Am I confident enough to own this output? What would I push back on?',
 })
 
-export const workflowLens = defineThinkingLens({
-  name: 'workflow',
-  trigger: 'When deciding how to tackle work',
-  description: 'How should I execute this? Which subagents, what parallelism, what sequencing, what workspace usage?',
+export const pivotLens = defineThinkingLens({
+  name: 'pivot',
+  trigger: 'When progress has stalled or results are unexpected',
+  description: 'Is the current approach working? Should I change direction, re-scope, or escalate?',
 })
+
+export const turnLens = defineThinkingLens({
+  name: 'turn',
+  trigger: 'When the turn involves multiple messages/tools',
+  description: 'What to communicate, what actions to take, which turn control to use.',
+})
+
+// export const intentLens = defineThinkingLens({
+//   name: 'intent',
+//   trigger: 'When you receive a message from the user',
+//   description: 'Carefully consider what the user means and what they actually want. Look past the literal request to understand the underlying goal.',
+// })
+
+// export const ideateLens = defineThinkingLens({
+//   name: 'ideate',
+//   trigger: 'When the problem requires creative thinking or there are multiple possible approaches',
+//   description: 'Think freely about the problem space. Generate and consider different approaches, ideas, or solutions before committing to one. Explore tradeoffs and implications.',
+// })
+
+// export const traitsLens = defineThinkingLens({
+//   name: 'traits',
+//   trigger: 'Whenever one or more traits are applicable to the current situation',
+//   description: 'Assess how one or traits might apply in the current situation',
+// })
+
+// export const workflowLens = defineThinkingLens({
+//   name: 'workflow',
+//   trigger: 'When deciding how to tackle work',
+//   description: 'How should I execute this? Which subagents, what parallelism, what sequencing, what workspace usage?',
+// })
 
 export const constraintsLens = defineThinkingLens({
   name: 'constraints',
   trigger: 'When planning work, delegating to subagents, or evaluating progress',
   description:
     'What are the exact requirements? Have I extracted all testable constraints? Which have I verified? Which remain? Am I missing any implicit requirements?',
-})
-
-export const pivotLens = defineThinkingLens({
-  name: 'pivot',
-  trigger: 'When an approach is not making progress or results are unexpected',
-  description:
-    'Is my current approach working? Are my subagents stuck or spinning? Should I try a different strategy, parallelize an alternative, or cut losses on this path? What signals indicate I should change direction?',
 })
 
 export const validationLens = defineThinkingLens({
@@ -63,18 +80,12 @@ export const validationLens = defineThinkingLens({
     'Have I empirically tested my complete solution, not just individual pieces? Are there edge cases or details I haven\'t checked? Am I accepting results that look wrong or suspicious?',
 })
 
-export const turnLens = defineThinkingLens({
-  name: 'turn',
-  trigger: 'When your turn involves communications and actions that could benefit from planning',
-  description: 'Plan what to communicate, what actions to take, and which turn control to use. If acting this turn, remember that you cannot communicate the results of those actions until next turn.',
-})
-
-export const taskLens = defineThinkingLens({
-  name: 'task',
-  trigger: 'When receiving user request or performing work of any kind',
-  description:
-    "Is all work captured as tasks? Am I about to do something that should be a task but isn't? Are there implicit subtasks I haven't created yet? Every piece of work — no matter how small — must be represented as a task.",
-})
+// export const taskLens = defineThinkingLens({
+//   name: 'task',
+//   trigger: 'When receiving user request or performing work of any kind',
+//   description:
+//     "Is all work captured as tasks? Am I about to do something that should be a task but isn't? Are there implicit subtasks I haven't created yet? Every piece of work — no matter how small — must be represented as a task.",
+// })
 
 export const leadTools = catalog.pick(
   'fileRead',
