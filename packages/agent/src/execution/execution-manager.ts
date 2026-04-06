@@ -82,6 +82,8 @@ import { handleTaskDirective } from '../tasks/operations'
 // Types
 // =============================================================================
 
+export const IDENTICAL_RESPONSE_BREAKER_THRESHOLD = 5
+
 export interface ExecuteOptions {
   readonly forkId: string | null
   readonly turnId: string
@@ -313,6 +315,9 @@ const makeExecutionManager = Effect.gen(function* () {
   // Pre-built idle release effects (repeatable; run each time fork goes idle)
   const forkIdleReleases = new Map<string, Effect.Effect<void>>()
 
+  // Per-fork consecutive identical continue-response tracker
+  const identicalContinueTracker = new Map<string | null, { lastResponseText: string; consecutiveCount: number }>()
+
 
 
   /**
@@ -464,8 +469,16 @@ const makeExecutionManager = Effect.gen(function* () {
       )
 
 
+      // Capture raw model response text for identical-response circuit breaker.
+      let rawResponseText = ''
+      const trackedXmlStream = xmlStream.pipe(
+        Stream.tap((chunk) => Effect.sync(() => {
+          rawResponseText += chunk
+        })),
+      )
+
       // Run xml-act runtime
-      const eventStream = runtime.streamWith(xmlStream, { initialState: replayState })
+      const eventStream = runtime.streamWith(trackedXmlStream, { initialState: replayState })
 
       // Track toolCallId → toolKey mapping for event forwarding
       const toolCallKeys = new Map<string, ToolKey>()
@@ -956,6 +969,30 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
                 }
 
+                // Circuit breaker: stop tight loops of identical consecutive continue responses.
+                if (executionResult.success && executionResult.turnDecision === 'continue') {
+                  const previous = identicalContinueTracker.get(forkId)
+                  const nextCount = previous && previous.lastResponseText === rawResponseText
+                    ? previous.consecutiveCount + 1
+                    : 1
+
+                  identicalContinueTracker.set(forkId, {
+                    lastResponseText: rawResponseText,
+                    consecutiveCount: nextCount,
+                  })
+
+                  if (nextCount >= IDENTICAL_RESPONSE_BREAKER_THRESHOLD) {
+                    executionResult = {
+                      success: false,
+                      error: `Circuit breaker tripped after ${nextCount} identical consecutive responses.`,
+                      cancelled: false,
+                    }
+                    identicalContinueTracker.delete(forkId)
+                  }
+                } else {
+                  identicalContinueTracker.delete(forkId)
+                }
+
                 // Oneshot liveness guard: prevent stalling when nothing is active
                 if (executionResult.success && executionResult.turnDecision === 'idle' && oneshotEnabled) {
                   const pCtx = yield* policyCtxProvider.get
@@ -1078,6 +1115,7 @@ const makeExecutionManager = Effect.gen(function* () {
       boundObservables.delete(forkId)
       forkAgentVariants.delete(forkId)
       forkIdleReleases.delete(forkId)
+      identicalContinueTracker.delete(forkId)
     }),
 
     fork: (params: {
