@@ -955,6 +955,36 @@ describe('pairing guarantee', () => {
 // =============================================================================
 
 describe('TurnEnd', () => {
+  test('drains upstream chunks after TurnEnd without emitting post-end runtime events', async () => {
+    const runtime = createXmlRuntime(cfg([reg(readTool, 'read', readBinding)]))
+    const chunks = ['<idle/>', '<read path="late.ts"/>', 'trailing prose']
+    let nextCalls = 0
+    const xmlStream = Stream.fromAsyncIterable(
+      {
+        [Symbol.asyncIterator]() {
+          let index = 0
+          return {
+            async next() {
+              nextCalls += 1
+              if (index >= chunks.length) return { done: true as const, value: undefined }
+              return { done: false as const, value: chunks[index++] }
+            },
+          }
+        },
+      },
+      () => new Error('stream error'),
+    )
+
+    const events = await Effect.runPromise(Stream.runCollect(runtime.streamWith(xmlStream))).then((c) => Array.from(c))
+    const ends = ofType(events, 'TurnEnd')
+
+    expect(ends).toHaveLength(1)
+    expect(events).toHaveLength(1)
+    expect(events[0]._tag).toBe('TurnEnd')
+    // one call per chunk + one terminal done() call
+    expect(nextCalls).toBe(chunks.length + 1)
+  })
+
   test('always emitted exactly once at the end', async () => {
     const c = cfg([reg(readTool, 'read', readBinding)])
 

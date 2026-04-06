@@ -168,7 +168,6 @@ function createBoundModelImpl<TSlot extends string>(
             Stream.ensuring(
               Effect.catchAllCause(
                 Effect.all([
-                  Effect.sync(() => abortController.abort()),
                   Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
                   Effect.suspend(() => {
                     const usage = result.getUsage()
@@ -199,7 +198,9 @@ function createBoundModelImpl<TSlot extends string>(
             getCollectorData: result.getCollectorData,
           } satisfies ChatStream
         }).pipe(
-          Effect.onInterrupt(() => Effect.sync(() => abortController.abort())),
+          Effect.onInterrupt(() => Effect.sync(() => {
+            abortController.abort()
+          })),
         ),
         {
           schedule: connectionRetrySchedule,

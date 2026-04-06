@@ -165,10 +165,14 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
           const producer = Effect.gen(function* () {
             yield* xmlStream.pipe(
               Stream.mapError((e) => new XmlRuntimeCrash(e.message, e)),
-              Stream.runForEachWhile((chunk) =>
+              Stream.runForEach((chunk) =>
                 Effect.gen(function* () {
                   let state = yield* Ref.get(stateRef)
-                  if (state.stopped) return false
+
+                  // After TurnEnd, keep draining upstream chunks to EOF so provider
+                  // transports can finalize terminal metadata (usage, completion),
+                  // but do not parse/react/emit further runtime events.
+                  if (state.stopped) return
 
                   const parseEvents = parser.processChunk(chunk)
                   for (const pe of parseEvents) {
@@ -176,7 +180,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                     state = yield* react(state, pe)
                   }
                   yield* Ref.set(stateRef, state)
-                  return !state.stopped
                 }),
               ),
             )
