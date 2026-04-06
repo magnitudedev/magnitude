@@ -176,6 +176,35 @@ export interface TurnCompleted {
   readonly providerId: string | null
   /** Model ID used for this turn. Null when unavailable. */
   readonly modelId: string | null
+  /** Debug-only usage finalization diagnostics for proving stream timing races. */
+  readonly usageDebug?: {
+    readonly prePublishAtMs: number
+    readonly prePublishUsage: {
+      readonly inputTokens: number | null
+      readonly outputTokens: number | null
+      readonly cacheReadTokens: number | null
+      readonly cacheWriteTokens: number | null
+    }
+    readonly providerLifecycle?: {
+      readonly streamStartAtMs: number
+      readonly firstChunkAtMs: number | null
+      readonly cleanupStartAtMs: number | null
+      readonly abortCalledAtMs: number | null
+      readonly cleanupDoneAtMs: number | null
+      readonly usageBeforeCleanup: {
+        readonly inputTokens: number | null
+        readonly outputTokens: number | null
+        readonly cacheReadTokens: number | null
+        readonly cacheWriteTokens: number | null
+      } | null
+      readonly usageAfterCleanup: {
+        readonly inputTokens: number | null
+        readonly outputTokens: number | null
+        readonly cacheReadTokens: number | null
+        readonly cacheWriteTokens: number | null
+      } | null
+    } | null
+  }
 }
 
 export type TurnDecision = 'continue' | 'idle' | 'finish'

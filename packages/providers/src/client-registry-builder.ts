@@ -87,7 +87,7 @@ function buildOptions(
       if (def.id === 'github-copilot') {
         return buildCopilotCodexOptions(modelId, auth, stopSequences, maxOutputTokens)
       }
-      return buildOpenAIResponsesOptions(modelId, auth, stopSequences, maxOutputTokens)
+      return buildOpenAIResponsesOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
     case 'openai-generic':
       return buildOpenAIGenericOptions(def, modelId, auth, providerOpts, stopSequences, maxOutputTokens)
     case 'aws-bedrock':
@@ -163,7 +163,13 @@ function buildOpenAIOptions(modelId: string, auth: AuthInfo | null, stopSequence
 // NOTE: The Responses API (/v1/responses) does NOT support stop sequences or any equivalent parameter.
 // Unlike Chat Completions, there is no `stop` field. Passing it causes a 400 error.
 // Stop sequences are also excluded in the direct HTTP path in model-proxy.ts#transformForResponsesApi.
-function buildOpenAIResponsesOptions(modelId: string, auth: AuthInfo | null, stopSequences?: string[], _maxOutputTokens?: number): Record<string, any> | undefined {
+function buildOpenAIResponsesOptions(
+  modelId: string,
+  auth: AuthInfo | null,
+  providerOpts?: ProviderOptions,
+  stopSequences?: string[],
+  _maxOutputTokens?: number,
+): Record<string, any> | undefined {
   // NOTE: max_output_tokens not supported — Codex/Copilot Responses API endpoints reject it with 400.
   const base: Record<string, any> = {
     model: modelId,
@@ -173,18 +179,34 @@ function buildOpenAIResponsesOptions(modelId: string, auth: AuthInfo | null, sto
   if (auth?.type === 'oauth') {
     base.api_key = auth.accessToken
     base.base_url = 'https://chatgpt.com/backend-api/codex'
+    base.store = false
     base.headers = {
       ...(auth.accountId ? { 'ChatGPT-Account-Id': auth.accountId } : {}),
     }
   } else if (auth?.type === 'api') {
     base.api_key = auth.key
+    if (providerOpts?.baseUrl) {
+      base.base_url = providerOpts.baseUrl
+    }
   } else {
     const envKey = process.env.OPENAI_API_KEY
     if (!envKey) return undefined
     base.api_key = envKey
+    if (providerOpts?.baseUrl) {
+      base.base_url = providerOpts.baseUrl
+    }
   }
 
-  return base
+  const passthrough = extractProviderOptionPassthrough(providerOpts)
+  if (passthrough.headers && typeof passthrough.headers === 'object' && !Array.isArray(passthrough.headers)) {
+    base.headers = {
+      ...(base.headers ?? {}),
+      ...(passthrough.headers as Record<string, string>),
+    }
+    delete passthrough.headers
+  }
+
+  return { ...base, ...passthrough }
 }
 
 /** OpenAI-generic (OpenRouter, Local, Cerebras, Vercel, GitHub Copilot) */
@@ -413,6 +435,28 @@ function buildGoogleAIOptions(modelId: string, auth: AuthInfo | null, stopSequen
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
+
+function extractProviderOptionPassthrough(providerOpts?: ProviderOptions): Record<string, unknown> {
+  if (!providerOpts) return {}
+
+  // Keep passthrough for openai-responses extremely tight to avoid leaking
+  // internal app/provider metadata (e.g. rememberedModelIds) into request bodies.
+  const passthrough: Record<string, unknown> = {}
+
+  if (typeof providerOpts.instructions === 'string') {
+    passthrough.instructions = providerOpts.instructions
+  }
+
+  if (typeof providerOpts.store === 'boolean') {
+    passthrough.store = providerOpts.store
+  }
+
+  if (providerOpts.headers && typeof providerOpts.headers === 'object' && !Array.isArray(providerOpts.headers)) {
+    passthrough.headers = providerOpts.headers
+  }
+
+  return passthrough
+}
 
 /** Deep-merge source into target. Arrays are replaced, not concatenated. */
 function deepMerge(target: Record<string, any>, source: Record<string, any>): Record<string, any> {

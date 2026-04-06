@@ -107,7 +107,7 @@ export { normalizeModelOutput, normalizeQuotesInString } from './util/output-nor
 
 // Drivers
 export { BamlDriver } from './drivers/baml-driver'
-export { ResponsesDriver } from './drivers/responses-driver'
+export type { CollectorData } from './drivers/types'
 
 // Browser-compatible models
 export {

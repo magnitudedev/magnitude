@@ -32,11 +32,7 @@ describeLive('live integration: trace', () => {
       const trace = harness!.traces.traces.at(-1)!
       assertCommon(trace, target)
 
-      if (target.expectedDriver === 'openai-responses') {
-        expect(trace.request.input).toBeTruthy()
-      } else {
-        expect(trace.request.messages ?? trace.request.input).toBeTruthy()
-      }
+      expect(trace.request.messages ?? trace.request.input).toBeTruthy()
 
       expect(trace.response.rawBody).toBeTruthy()
     }, 30000)

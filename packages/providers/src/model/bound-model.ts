@@ -6,12 +6,16 @@ import type { CollectorData } from '../drivers/types'
 import type { TraceEmitter } from '../resolver/tracing'
 import type { BamlFunctionName, BamlResult, BamlStreamFunctionName } from '../drivers/baml-types'
 import type { ModelError } from '../errors/model-error'
+import type { ProviderOptions } from '../types'
 
 export interface StreamOptions {
   readonly stopSequences?: string[]
+  readonly providerOptions?: ProviderOptions
 }
 
-export interface CompleteOptions {}
+export interface CompleteOptions {
+  readonly providerOptions?: ProviderOptions
+}
 
 export interface ChatStream {
   readonly stream: Stream.Stream<string, ModelError>

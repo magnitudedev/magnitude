@@ -242,16 +242,28 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             ? [{ type: 'text', content: rawCode }]
             : []
 
+          const collectorData = cs.getCollectorData()
+
           // Offer final result
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, responseParts, rawCodeChunks } })
+          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, collectorData, responseParts, rawCodeChunks } })
         }))
 
         // 3a. Drain turn stream, publishing events and collecting the final result
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)
 
-        const { executeResult, usage, responseParts } = drained.finalResult
+        const { executeResult, usage, collectorData, responseParts } = drained.finalResult
 
         const inputTokens = usage.inputTokens
+        const prePublishAtMs = Date.now()
+        const prePublishUsage = {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          cacheReadTokens: usage.cacheReadTokens,
+          cacheWriteTokens: usage.cacheWriteTokens,
+        }
+        const providerLifecycle = collectorData._tag === 'Baml'
+          ? (collectorData.diagnostics?.streamLifecycle ?? null)
+          : null
         logger.info(
           {
             context: 'CortexTurnUsageEmission',
@@ -265,6 +277,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             cacheReadTokens: usage.cacheReadTokens,
             cacheWriteTokens: usage.cacheWriteTokens,
             usageAbsent: usage.inputTokens === null && usage.outputTokens === null,
+            prePublishAtMs,
+            providerLifecycle,
           },
           '[Cortex] Emitting turn_completed usage payload',
         )
@@ -296,6 +310,13 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           cacheWriteTokens: usage.cacheWriteTokens,
           providerId: boundModel.model.providerId,
           modelId: boundModel.model.id,
+          ...(forkId === null ? {
+            usageDebug: {
+              prePublishAtMs,
+              prePublishUsage,
+              providerLifecycle,
+            },
+          } : {}),
         })
 
 

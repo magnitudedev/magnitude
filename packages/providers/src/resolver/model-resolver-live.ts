@@ -1,7 +1,7 @@
 import { Effect, Layer } from 'effect'
 import { AppConfig } from '@magnitudedev/storage'
 import type { InferenceConfig } from '../model/inference-config'
-import { BamlDriver, ResponsesDriver } from '../drivers'
+import { BamlDriver } from '../drivers'
 import { ensureAuth } from './ensure-auth'
 import { createBoundModel } from './pipeline'
 import { ModelResolver, type ModelResolverShape } from './model-resolver'
@@ -46,9 +46,7 @@ export function makeModelResolver<TSlot extends string>(): Layer.Layer<ModelReso
             }
 
             const { model, auth: currentAuth } = current
-            const isCodex = model.providerId === 'openai' && currentAuth?.type === 'oauth'
-            const isCopilotCodex = model.providerId === 'github-copilot' && model.id.includes('codex')
-            const driver = (isCodex || isCopilotCodex) ? ResponsesDriver : BamlDriver
+            const driver = BamlDriver
             const inference: InferenceConfig = {}
             const connection = yield* driver.connect(model, currentAuth, inference)
             const config = yield* appConfig.load()

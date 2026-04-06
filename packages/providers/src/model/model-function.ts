@@ -7,18 +7,29 @@ function includesClaudeSpoof(model: BoundModel): boolean {
   return model.model.providerId === 'anthropic' && model.connection.auth?.type === 'oauth'
 }
 
+function shouldUseInstructionsForSystemPrompt(model: BoundModel): boolean {
+  const isOpenAICodexOauth = model.model.providerId === 'openai' && model.connection.auth?.type === 'oauth'
+  const isCopilotCodex = model.model.providerId === 'github-copilot' && model.model.id.includes('codex')
+  return isOpenAICodexOauth || isCopilotCodex
+}
+
 export const CodingAgentChat: StreamingFn<
   { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] }; ackTurn: string },
   ChatStream
 > = {
   name: 'CodingAgentChat',
   mode: 'stream',
-  execute: (model, input) =>
-    model.stream(
+  execute: (model, input) => {
+    const useInstructions = shouldUseInstructionsForSystemPrompt(model)
+    return model.stream(
       'CodingAgentChat',
-      [input.systemPrompt, input.messages, input.ackTurn, includesClaudeSpoof(model)],
-      { stopSequences: input.options?.stopSequences },
-    ),
+      [input.systemPrompt, input.messages, input.ackTurn, includesClaudeSpoof(model), !useInstructions],
+      {
+        stopSequences: input.options?.stopSequences,
+        providerOptions: useInstructions ? { instructions: input.systemPrompt } : undefined,
+      },
+    )
+  },
 }
 
 export const SimpleChat: StreamingFn<

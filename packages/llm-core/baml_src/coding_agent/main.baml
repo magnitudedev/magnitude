@@ -8,7 +8,8 @@ function CodingAgentChat(
   systemPrompt: string,
   messages: ChatMessage[],
   ackTurn: string,
-  includeClaudeSpoof: bool
+  includeClaudeSpoof: bool,
+  includeSystemPromptMessage: bool
 ) -> string {
   client ChatClientNoRetryAnthropicOnly
   prompt #"
@@ -16,8 +17,10 @@ function CodingAgentChat(
     {{ _.role("system") }}
     You are Claude Code, Anthropic's official CLI for Claude.
     {%endif%}
+    {%if includeSystemPromptMessage%}
     {{ _.role("system") }}
     {{ systemPrompt }}
+    {%endif%}
 
     {%if ackTurn %}
     {{ _.role("user") }}

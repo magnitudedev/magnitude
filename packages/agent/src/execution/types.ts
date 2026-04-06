@@ -9,7 +9,7 @@ import { Effect, Stream, Queue, Deferred, Scope, Data } from 'effect'
 import type { XmlRuntimeCrash, ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ResponsePart, MessageDestination } from '../events'
 import type { ExecuteResult } from './execution-manager'
-import type { CallUsage } from '@magnitudedev/providers'
+import type { CallUsage, CollectorData } from '@magnitudedev/providers'
 
 
 // =============================================================================
@@ -102,6 +102,7 @@ export function createTurnStream<R>(
 export interface TurnStrategyResult {
   readonly executeResult: ExecuteResult
   readonly usage: CallUsage
+  readonly collectorData?: CollectorData
   /** Provider-native representation of the model's response */
   readonly responseParts: readonly ResponsePart[]
   /** Raw XML chunks accumulated during streaming (for interrupt preservation) */
