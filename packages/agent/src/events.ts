@@ -357,7 +357,7 @@ export interface AgentCreated {
   readonly context: string
   readonly mode: 'clone' | 'spawn'
   readonly taskId: string
-  readonly message: string | null
+  readonly message: string
   readonly outputSchema?: unknown
 }
 
@@ -422,7 +422,7 @@ export interface TaskAssigned {
   readonly taskId: string
   readonly assignee: TaskAssignee
   readonly workerRole?: string
-  readonly message: string | null
+  readonly message: string
   readonly workerInfo?: {
     readonly agentId: string
     readonly forkId: string

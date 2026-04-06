@@ -124,6 +124,7 @@ describe('task operation handlers validation', () => {
       kind: 'spawn-worker',
       id: 't2',
       role: 'builder',
+      message: 'Test instruction',
       spawnWorker: () => Effect.succeed('fork-2'),
     }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
 
@@ -150,6 +151,7 @@ describe('task operation handlers validation', () => {
       kind: 'spawn-worker',
       id: 't3',
       role: 'builder',
+      message: 'Test instruction',
       spawnWorker: () => Effect.succeed('fork-3-new'),
     }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
 

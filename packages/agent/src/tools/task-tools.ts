@@ -142,10 +142,11 @@ export const updateTaskTool = defineTool({
 export const spawnWorkerTool = defineTool({
   name: 'spawn-worker' as const,
   group: 'task' as const,
-  description: 'Spawn a worker for a task id. Use <message to="task-id"> to send the worker its initial instruction, as well as any follow-up communications. Only use spawn-worker to create a new worker or replace the current one.',
+  description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <message to="task-id"> for follow-up communications. Only use spawn-worker to create a new worker or replace the current one.',
   inputSchema: Schema.Struct({
     id: Schema.String,
     role: Schema.String,
+    message: Schema.String,
   }),
   outputSchema: Schema.Struct({
     id: Schema.String,
@@ -159,6 +160,7 @@ export const spawnWorkerTool = defineTool({
         kind: 'spawn-worker',
         id: input.id,
         role: input.role,
+        message: input.message,
         spawnWorker: (params): ReturnType<typeof execManager.fork> =>
           execManager.fork({
             parentForkId: params.parentForkId,
@@ -233,7 +235,7 @@ export const spawnWorkerXmlBinding = defineXmlBinding(spawnWorkerTool, {
       { field: 'id', attr: 'id' },
       { field: 'role', attr: 'role' },
     ],
-    selfClosing: true,
+    body: 'message',
   },
   output: {
     childTags: [

@@ -44,7 +44,7 @@ export const handleKillWorkerDirective = (directive: KillWorkerDirective, _conte
       taskId: directive.id,
       assignee: task.assignee ?? 'user',
       workerRole: undefined,
-      message: null,
+      message: '',
       workerInfo: undefined,
       replacedWorker,
     }, { forkId: parentForkId, timestamp, graph: { tasks: new Map() } }))

@@ -22,12 +22,13 @@ export interface SpawnWorkerDirective<R = never> {
   readonly kind: 'spawn-worker'
   readonly id: string
   readonly role: string
+  readonly message: string
   readonly spawnWorker: (params: {
     parentForkId: string | null
     name: string
     agentId: string
     prompt: string
-    message?: string
+    message: string
     role: WorkerAssignee
     taskId: string
   }) => Effect.Effect<string, never, R>
@@ -106,7 +107,7 @@ export const handleSpawnWorkerDirective = <R>(
       name: task.title,
       agentId,
       prompt,
-      message: undefined,
+      message: directive.message,
       role: parsedAssignee,
       taskId: directive.id,
     })
@@ -115,7 +116,7 @@ export const handleSpawnWorkerDirective = <R>(
       taskId: directive.id,
       assignee: parsedAssignee,
       workerRole: parsedAssignee,
-      message: null,
+      message: directive.message,
       workerInfo: { agentId, forkId, role: parsedAssignee },
       replacedWorker,
     }, { forkId: parentForkId, timestamp, graph: { tasks: new Map() } }))

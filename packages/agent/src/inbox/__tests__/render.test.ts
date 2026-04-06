@@ -152,7 +152,7 @@ describe('formatInbox', () => {
     expect(out).toEqual([
       {
         type: 'text',
-        text: '<reminders>\n- Worker `debugger` assigned to and working on task diag-1 ("Investigate the crash").\n</reminders>',
+        text: '<reminders>\n- Worker `debugger` spawned and working on task diag-1 ("Investigate the crash").\n</reminders>',
       },
     ])
   })

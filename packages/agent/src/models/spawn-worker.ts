@@ -5,11 +5,13 @@ export interface SpawnWorkerState extends BaseState {
   toolKey: 'spawnWorker'
   id?: string
   role?: string
+  message?: string
 }
 
 const initial: Omit<SpawnWorkerState, 'phase' | 'toolKey'> = {
   id: undefined,
   role: undefined,
+  message: undefined,
 }
 
 export const spawnWorkerModel = defineStateModel('spawnWorker', {
@@ -28,6 +30,7 @@ export const spawnWorkerModel = defineStateModel('spawnWorker', {
           phase: 'streaming',
           id: event.streaming.id?.value ?? state.id,
           role: event.streaming.role?.value ?? state.role,
+          message: event.streaming.message?.value ?? state.message,
         }
       case 'executionStarted':
       case 'emission':

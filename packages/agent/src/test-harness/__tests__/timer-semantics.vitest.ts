@@ -14,7 +14,7 @@ describe('subagent timer semantics', () => {
       context: 'ctx',
       mode: 'spawn',
       taskId: 'task-1',
-      message: null,
+      message: '',
     }
 
     const created: ForkActivityMessage = {

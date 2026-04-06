@@ -30,8 +30,8 @@ export class ResponseBuilder {
     return this
   }
 
-  spawnWorker(id: string, role: string): this {
-    this.tools.push(element('spawn-worker', { id, role }))
+  spawnWorker(id: string, role: string, message: string): this {
+    this.tools.push(element('spawn-worker', { id, role }, message))
     return this
   }
 

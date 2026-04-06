@@ -52,7 +52,6 @@ import {
   toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
   toTimelineTaskIdleHook,
-  toTimelineSpawnNoMessage,
   toTimelineTaskTreeDirty,
   toTimelineTaskTreeView,
   toTimelineTaskUpdate,
@@ -115,7 +114,6 @@ export interface ForkMemoryState {
   readonly currentChainId: string | null
   readonly pendingPresenceText: string | null
   readonly nextQueueSeq: number
-  readonly spawnedAwaitingMessage: ReadonlySet<string>
 }
 
 function flattenResponseText(parts: readonly ResponsePart[]): string {
@@ -367,7 +365,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
     currentChainId: null,
     pendingPresenceText: null,
     nextQueueSeq: 0,
-    spawnedAwaitingMessage: new Set(),
   },
 
   eventHandlers: {
@@ -513,25 +510,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
       }
 
-      if (event.forkId === null && nextFork.spawnedAwaitingMessage.size > 0) {
-        const taskGraph = read(TaskGraphProjection)
-        for (const taskId of nextFork.spawnedAwaitingMessage) {
-          const task = taskGraph.tasks.get(taskId)
-          if (!task) continue
-          nextFork = enqueueTimeline(
-            nextFork,
-            toTimelineSpawnNoMessage({
-              timestamp: event.timestamp,
-              taskId,
-              taskTitle: task.title,
-              role: task.worker?.role ?? 'unknown',
-            }),
-            event.timestamp,
-          )
-        }
-        nextFork = { ...nextFork, spawnedAwaitingMessage: new Set() }
-      }
-
       return nextFork
     },
 
@@ -661,10 +639,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         event.timestamp,
       )
 
-      const spawnedAwaitingMessage = new Set(nextLead.spawnedAwaitingMessage)
-      spawnedAwaitingMessage.add(event.taskId)
-      nextLead = { ...nextLead, spawnedAwaitingMessage }
-
       return {
         ...state,
         forks: new Map(state.forks).set(null, nextLead),
@@ -688,7 +662,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         currentChainId: null,
         pendingPresenceText: null,
         nextQueueSeq: 0,
-        spawnedAwaitingMessage: new Set(),
       }
 
       const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
@@ -740,18 +713,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
             atoms: [atom],
           }),
         ),
-      }
-
-      if (value.destination.kind === 'worker') {
-        const leadFork = nextState.forks.get(null)
-        if (leadFork?.spawnedAwaitingMessage.has(value.destination.taskId)) {
-          const spawnedAwaitingMessage = new Set(leadFork.spawnedAwaitingMessage)
-          spawnedAwaitingMessage.delete(value.destination.taskId)
-          nextState = {
-            ...nextState,
-            forks: new Map(nextState.forks).set(null, { ...leadFork, spawnedAwaitingMessage }),
-          }
-        }
       }
 
       return nextState

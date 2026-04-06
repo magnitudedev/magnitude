@@ -153,7 +153,7 @@ export interface ExecutionManagerService {
     name: string
     agentId: string
     prompt: string
-    message?: string
+    message: string
     outputSchema?: JsonSchema | undefined
     mode: 'clone' | 'spawn'
     role: AgentVariant
@@ -1071,7 +1071,7 @@ const makeExecutionManager = Effect.gen(function* () {
       name: string
       agentId: string
       prompt: string
-      message?: string
+      message: string
       outputSchema?: JsonSchema | undefined
       mode: 'clone' | 'spawn'
       role: AgentVariant
@@ -1099,7 +1099,7 @@ const makeExecutionManager = Effect.gen(function* () {
         context,
         mode: params.mode,
         taskId,
-        message: params.message ?? null,
+        message: params.message,
         outputSchema: params.outputSchema,
       })
 

@@ -30,12 +30,9 @@ A task requires `id`, `type`, and `title`. Use `parent` to nest under an existin
 
 ### Spawning workers
 
-<spawn-worker id="impl-parser" role="builder" />
+<spawn-worker id="impl-parser" role="builder">Implement Unit A from the [plan]($M/plans/the-plan.md).</spawn-worker>
 
-`spawn-worker` creates a worker for a task. The `id` must match an existing task. The `role` must be allowed for that task type. `spawn-worker` is always self-closing — no body. Send instructions via a separate `<message>`:
-
-<spawn-worker id="impl-parser" role="builder" />
-<message to="impl-parser">Implement Unit A from the plan.</message>
+`spawn-worker` creates a worker for a task. The `id` must match an existing task. The `role` must be allowed for that task type. `spawn-worker` requires a body, and the body is the worker's initial instruction message with the same semantics as a normal `<message to="task-id">...</message>`.
 
 If a worker already exists on that task, `spawn-worker` kills the old worker and spawns a new one.
 
@@ -65,6 +62,5 @@ To send instructions or follow-ups to a worker, use `<message>`:
 ### Complete example turn
 
 <create-task id="auth-research" type="research" title="Map auth flow" parent="auth-feature" />
-<spawn-worker id="auth-research" role="explorer" />
-<message to="auth-research">Trace the auth middleware chain and document entry points.</message>
+<spawn-worker id="auth-research" role="explorer">Trace the auth middleware chain and document entry points.</spawn-worker>
 <update-task id="old-task" status="completed" />

@@ -197,18 +197,6 @@ export function toTimelineTaskIdleHook(args: {
   }
 }
 
-export function toTimelineSpawnNoMessage(args: {
-  timestamp: number
-  taskId: string
-  taskTitle: string
-  role: string
-}): TimelineEntry {
-  return {
-    kind: 'spawn_no_message',
-    ...args,
-  }
-}
-
 export function toTimelineTaskTreeDirty(args: {
   timestamp: number
   taskId: string
