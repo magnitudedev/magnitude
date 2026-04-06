@@ -62,6 +62,6 @@ export function buildAckTurn(
 
   return `<lens name="turn">Send message to "demo" and idle</lens>
 <message to="demo">Hello, I understand how to respond</message>
-${TURN_CONTROL_IDLE}
+${TURN_CONTROL_CONTINUE}
 `
 }

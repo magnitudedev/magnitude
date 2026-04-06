@@ -1,4 +1,4 @@
-import { TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_CONTINUE, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
@@ -166,6 +166,8 @@ export function serializeCanonicalTurn(
 
   if (trace.turnDecision === 'idle') {
     parts.push(TURN_CONTROL_IDLE)
+  } else if (trace.turnDecision === 'continue') {
+    parts.push(TURN_CONTROL_CONTINUE)
   }
   return parts.join('\n')
 }
