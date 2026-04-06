@@ -1,4 +1,4 @@
-import { TURN_CONTROL_OBSERVE, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
@@ -153,6 +153,7 @@ export function serializeCanonicalTurn(
       const attrs: Record<string, string> = {}
       if (msg.destination.kind === 'worker') attrs.to = msg.destination.taskId
       else if (msg.destination.kind === 'parent') attrs.to = 'parent'
+      else if (msg.destination.kind === 'user') attrs.to = 'user'
       parts.push(serializeTag('message', attrs, trimmedText, []))
     }
   }
@@ -163,9 +164,7 @@ export function serializeCanonicalTurn(
     }
   }
 
-  if (trace.turnDecision === 'observe') {
-    parts.push(TURN_CONTROL_OBSERVE)
-  } else if (trace.turnDecision === 'idle') {
+  if (trace.turnDecision === 'idle') {
     parts.push(TURN_CONTROL_IDLE)
   }
   return parts.join('\n')

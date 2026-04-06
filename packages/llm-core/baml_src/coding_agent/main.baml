@@ -21,10 +21,9 @@ function CodingAgentChat(
 
     {%if ackTurn %}
     {{ _.role("user") }}
-    <system-tutorial>
-    Example task ID: `tutorial`.
-    Acknowledge to demonstrate understanding of response syntax
-    </system-tutorial>
+    <system>
+    To demonstrate understanding of the response format, send a message to the recipient "demo" saying "Hello, I understand how to respond" and then idle.
+    </system>
 
     {{ _.role("assistant") }}
     {{ ackTurn }}

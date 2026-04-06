@@ -1,4 +1,4 @@
 
 ## Turn control
 
-Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the user or a worker. Use `{{TURN_CONTROL_OBSERVE}}` otherwise.
+Write `{{TURN_CONTROL_IDLE}}` when you are finished and waiting on the user or a worker. If you don't write it, you will get another turn.

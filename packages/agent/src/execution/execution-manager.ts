@@ -901,29 +901,12 @@ const makeExecutionManager = Effect.gen(function* () {
                     }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
+                  } else if (endResult.turnControl === 'idle') {
+                    executionResult = { success: true, turnDecision: 'idle' }
+                  } else if (endResult.turnControl === null) {
+                    executionResult = { success: true, turnDecision: 'observe' }
                   } else {
-                    const resolvedTurnControl = endResult.turnControl ?? 'observe'
-                    if (resolvedTurnControl === 'idle') {
-                      executionResult = { success: true, turnDecision: 'idle' }
-                    } else {
-                      executionResult = { success: true, turnDecision: 'observe' }
-                    }
-                    const policyCtx = yield* policyCtxProvider.get
-                    const turnResult = agentDef.getTurn({
-                      toolsCalled: toolsCalledKeys,
-                      lastTool: lastToolKey,
-                      messagesSent,
-                      state: policyCtx,
-                    })
-                    if (endResult.turnControl === null) {
-                      if (turnResult.action === 'finish') {
-                        executionResult = { success: true, turnDecision: 'finish', evidence: '' }
-                      } else if (turnResult.action === 'observe') {
-                        executionResult = { success: true, turnDecision: 'observe' }
-                      } else {
-                        executionResult = { success: true, turnDecision: 'idle' }
-                      }
-                    }
+                    executionResult = { success: true, turnDecision: 'observe' }
                   }
                 } else if (endResult._tag === 'Interrupted') {
                   executionResult = { success: false, error: 'Interrupted', cancelled: true }

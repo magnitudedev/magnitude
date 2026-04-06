@@ -35,7 +35,6 @@ export function createXmlActFormat(
   handlers.set('think', think)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
-  handlers.set(TURN_CONTROL_OBSERVE_TAG, turnControlHandler('observe'))
   handlers.set(TURN_CONTROL_IDLE_TAG, turnControlHandler('idle'))
   handlers.set(TURN_CONTROL_FINISH_TAG, finishHandler())
 
@@ -57,7 +56,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', TURN_CONTROL_OBSERVE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG, 'think', 'thinking', 'lens']) {
+  for (const tag of ['message', TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG, 'think', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
