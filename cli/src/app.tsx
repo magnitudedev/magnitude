@@ -165,6 +165,8 @@ function AppInner({
 
   const [forkDisplay, setForkDisplay] = useState<DisplayState | null>(null)
   const [forkTokenEstimate, setForkTokenEstimate] = useState(0)
+  const [forkLastActualInputTokens, setForkLastActualInputTokens] = useState<number | null>(null)
+  const [forkHasCompletedTurn, setForkHasCompletedTurn] = useState(false)
   const [forkIsCompacting, setForkIsCompacting] = useState(false)
 
   const [systemMessages, setSystemMessages] = useState<Array<{ id: string; text: string; timestamp: number }>>([])
@@ -198,6 +200,8 @@ function AppInner({
   const [composerHasContent, setComposerHasContent] = useState(false)
   const [restoredQueuedInputText, setRestoredQueuedInputText] = useState<string | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
+  const [lastActualInputTokens, setLastActualInputTokens] = useState<number | null>(null)
+  const [hasCompletedTurn, setHasCompletedTurn] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
   const [workflowState, setWorkflowState] = useState<WorkflowCriteriaState | null>(null)
   const returnToProviderDetailRef = useRef<string | null>(null)
@@ -219,15 +223,14 @@ function AppInner({
     }
     return `${n}`
   }
-  const contextPercent = contextHardCap ? Math.round((tokenEstimate / contextHardCap) * 100) : null
-  const contextDisplayText = tokenEstimate > 0
-    ? (contextHardCap
-      ? `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextHardCap)}`
-      : `${formatFooterTokens(tokenEstimate)}/Unknown`)
-    : ''
-  const contextRenderedText = tokenEstimate > 0
-    ? (isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText)
-    : ''
+  const tokenUsage = lastActualInputTokens ?? (hasCompletedTurn ? tokenEstimate : null)
+  const contextPercent = (tokenUsage != null && contextHardCap) ? Math.round((tokenUsage / contextHardCap) * 100) : null
+  const contextDisplayText = tokenUsage == null
+    ? '-'
+    : (contextHardCap
+      ? `${contextPercent}% ${formatFooterTokens(tokenUsage)}/${formatFooterTokens(contextHardCap)}`
+      : `${formatFooterTokens(tokenUsage)}/Unknown`)
+  const contextRenderedText = isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText
 
   // Always reserve width for the longest possible escape hint so that
   // attachments don't reflow when hints appear/disappear.
@@ -622,6 +625,8 @@ function AppInner({
 
     const unsubscribe = client.state.compaction.subscribeFork(null, (state: CompactionState) => {
       setTokenEstimate(state.tokenEstimate)
+      setLastActualInputTokens(state.lastActualInputTokens)
+      setHasCompletedTurn(state.hasCompletedTurn)
       setIsCompacting(state._tag !== 'idle')
     })
 
@@ -657,11 +662,15 @@ function AppInner({
   useEffect(() => {
     if (!client || !selectedForkId) {
       setForkTokenEstimate(0)
+      setForkLastActualInputTokens(null)
+      setForkHasCompletedTurn(false)
       setForkIsCompacting(false)
       return
     }
     const unsubscribe = client.state.compaction.subscribeFork(selectedForkId, (state: CompactionState) => {
       setForkTokenEstimate(state.tokenEstimate)
+      setForkLastActualInputTokens(state.lastActualInputTokens)
+      setForkHasCompletedTurn(state.hasCompletedTurn)
       setForkIsCompacting(state._tag !== 'idle')
     })
     return unsubscribe
@@ -2249,7 +2258,9 @@ function AppInner({
               bashMode,
               modelsConfigured: !!slotModels.lead,
               modelSummary: activeModelSummary,
-              tokenEstimate: selectedForkId ? forkTokenEstimate : tokenEstimate,
+              tokenUsage: selectedForkId
+                ? (forkLastActualInputTokens ?? (forkHasCompletedTurn ? forkTokenEstimate : null))
+                : (lastActualInputTokens ?? (hasCompletedTurn ? tokenEstimate : null)),
               contextHardCap,
               isCompacting: selectedForkId ? forkIsCompacting : isCompacting,
               theme,

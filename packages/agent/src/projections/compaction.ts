@@ -140,6 +140,8 @@ function asAgentVariant(role: string): AgentVariant | null {
 
 interface AmbientCompactionFields {
   readonly tokenEstimate: number
+  readonly lastActualInputTokens: number | null
+  readonly hasCompletedTurn: boolean
   readonly modelId: string | null
   readonly providerId: string | null
   readonly contextLimitBlocked: boolean
@@ -218,6 +220,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
 
   initialFork: new CompactionIdle({
     tokenEstimate: 0,
+    lastActualInputTokens: null,
+    hasCompletedTurn: false,
     modelId: null,
     providerId: null,
     contextLimitBlocked: false,
@@ -266,6 +270,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
 
       const nextState = withAmbient(fork, {
         tokenEstimate,
+        lastActualInputTokens: event.inputTokens ?? fork.lastActualInputTokens,
+        hasCompletedTurn: true,
         modelId: event.modelId ?? fork.modelId,
         providerId: event.providerId ?? fork.providerId,
         shouldCompact: deriveShouldCompact(fork._tag, tokenEstimate),
@@ -398,6 +404,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const tokenEstimate = estimateSystemPromptTokens(variant)
       const newForkState = new CompactionIdle({
         tokenEstimate,
+        lastActualInputTokens: null,
+        hasCompletedTurn: false,
         modelId: parentState.modelId,
         providerId: parentState.providerId,
         shouldCompact: deriveShouldCompact('idle', tokenEstimate),

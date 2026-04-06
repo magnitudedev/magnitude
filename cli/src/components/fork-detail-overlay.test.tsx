@@ -74,7 +74,16 @@ afterEach(() => {
 })
 
 const noop = () => {}
-const idleCompaction: CompactionState = { _tag: 'idle', tokenEstimate: 0 }
+const idleCompaction: CompactionState = {
+  _tag: 'idle',
+  tokenEstimate: 0,
+  lastActualInputTokens: null,
+  hasCompletedTurn: false,
+  modelId: null,
+  providerId: null,
+  contextLimitBlocked: false,
+  shouldCompact: false,
+}
 
 function makeDisplayState(messages: DisplayState['messages']): DisplayState {
   return {

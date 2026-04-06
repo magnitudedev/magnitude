@@ -59,6 +59,8 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   const [closeHover, setCloseHover] = useState(false)
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
+  const [lastActualInputTokens, setLastActualInputTokens] = useState<number | null>(null)
+  const [hasCompletedTurn, setHasCompletedTurn] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
 
   const scrollboxRef = useRef<any>(null)
@@ -83,6 +85,8 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   useEffect(() => {
     const unsubscribe = subscribeForkCompaction(forkId, (state) => {
       setTokenEstimate(state.tokenEstimate)
+      setLastActualInputTokens(state.lastActualInputTokens)
+      setHasCompletedTurn(state.hasCompletedTurn)
       setIsCompacting(state._tag !== 'idle')
     })
     return unsubscribe
@@ -108,6 +112,8 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   useEffect(() => scheduleInitialForkOverlaySnap(
     () => scrollboxRef.current?.scrollTo(Number.MAX_SAFE_INTEGER),
   ), [])
+
+  const tokenUsage = lastActualInputTokens ?? (hasCompletedTurn ? tokenEstimate : null)
 
   return (
     <box style={{ flexDirection: 'column', height: '100%' }}>
@@ -221,16 +227,14 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
             <span fg={theme.muted}> {'\u00b7'} </span>
             <span fg={theme.foreground}>{modelSummary?.model ?? '—'}</span>
           </text>
-          {tokenEstimate > 0 && (
-            <box style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <text style={{ fg: theme.muted }}> | </text>
-              <ContextUsageBar
-                tokenEstimate={tokenEstimate}
-                hardCap={contextHardCap}
-                isCompacting={isCompacting}
-              />
-            </box>
-          )}
+          <box style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <text style={{ fg: theme.muted }}> | </text>
+            <ContextUsageBar
+              tokenUsage={tokenUsage}
+              hardCap={contextHardCap}
+              isCompacting={isCompacting}
+            />
+          </box>
         </box>
       </box>
     </box>
