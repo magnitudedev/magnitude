@@ -77,7 +77,7 @@ function makeProps(): ChatControllerProps {
       bashMode: false,
       modelsConfigured: true,
       modelSummary: { provider: 'provider', model: 'model' },
-      tokenEstimate: 0,
+      contextTokens: 0,
       contextHardCap: null,
       isCompacting: false,
       theme: {

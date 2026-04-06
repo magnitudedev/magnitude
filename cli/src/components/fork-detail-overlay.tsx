@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useCallback, useRef } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
-import type { CompactionState, DisplayState, DisplayMessage } from '@magnitudedev/agent'
+import type { CompactionState, ContextUsageForkState, DisplayState, DisplayMessage } from '@magnitudedev/agent'
 import { useTheme } from '../hooks/use-theme'
 import { useFilePanel } from '../hooks/use-file-panel'
 import { Button } from './button'
@@ -22,6 +22,7 @@ interface ForkDetailOverlayProps {
   workspacePath: string | null
   projectRoot: string
   subscribeForkDisplay: (forkId: string, cb: (state: DisplayState) => void) => () => void
+  subscribeForkContextUsage: (forkId: string, cb: (state: ContextUsageForkState) => void) => () => void
   subscribeForkCompaction: (forkId: string, cb: (state: CompactionState) => void) => () => void
 }
 
@@ -53,12 +54,13 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   workspacePath,
   projectRoot,
   subscribeForkDisplay,
+  subscribeForkContextUsage,
   subscribeForkCompaction,
 }: ForkDetailOverlayProps) {
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
   const [display, setDisplay] = useState<DisplayState | null>(null)
-  const [tokenEstimate, setTokenEstimate] = useState(0)
+  const [contextTokens, setContextTokens] = useState(0)
   const [isCompacting, setIsCompacting] = useState(false)
 
   const scrollboxRef = useRef<any>(null)
@@ -81,8 +83,14 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   }, [forkId, subscribeForkDisplay])
 
   useEffect(() => {
+    const unsubscribe = subscribeForkContextUsage(forkId, (state) => {
+      setContextTokens(state.retainedTokens)
+    })
+    return unsubscribe
+  }, [forkId, subscribeForkContextUsage])
+
+  useEffect(() => {
     const unsubscribe = subscribeForkCompaction(forkId, (state) => {
-      setTokenEstimate(state.tokenEstimate)
       setIsCompacting(state._tag !== 'idle')
     })
     return unsubscribe
@@ -221,16 +229,14 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
             <span fg={theme.muted}> {'\u00b7'} </span>
             <span fg={theme.foreground}>{modelSummary?.model ?? '—'}</span>
           </text>
-          {tokenEstimate > 0 && (
-            <box style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <text style={{ fg: theme.muted }}> | </text>
-              <ContextUsageBar
-                tokenEstimate={tokenEstimate}
-                hardCap={contextHardCap}
-                isCompacting={isCompacting}
-              />
-            </box>
-          )}
+          <box style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <text style={{ fg: theme.muted }}> | </text>
+            <ContextUsageBar
+              contextTokens={contextTokens}
+              hardCap={contextHardCap}
+              isCompacting={isCompacting}
+            />
+          </box>
         </box>
       </box>
     </box>

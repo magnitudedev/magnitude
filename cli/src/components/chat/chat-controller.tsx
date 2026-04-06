@@ -561,13 +561,11 @@ export function ChatController(props: ChatControllerProps) {
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null)}
-          {env.tokenEstimate > 0 && (
-            <ContextUsageBar
-              tokenEstimate={env.tokenEstimate}
-              hardCap={env.contextHardCap}
-              isCompacting={env.isCompacting}
-            />
-          )}
+          <ContextUsageBar
+            contextTokens={env.contextTokens}
+            hardCap={env.contextHardCap}
+            isCompacting={env.isCompacting}
+          />
         </box>
       </box>
 

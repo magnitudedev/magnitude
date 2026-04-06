@@ -82,6 +82,9 @@ export type { QueuedEntry } from './inbox/types'
 export { CompactionProjection } from './projections/compaction'
 export type { CompactionState } from './projections/compaction'
 
+export { ContextUsageProjection } from './projections/context-usage'
+export type { ContextUsageForkState, ContextUsageSource } from './projections/context-usage'
+
 export {
   DisplayProjection,
 } from './projections/display'

@@ -39,14 +39,16 @@ function extractTraceRequest(
 function extractTraceResponse(
   collectorData: CollectorData,
   rawOutput: string | null,
-): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string } {
+): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string; diagnostics?: unknown | null } {
   const rawBody = collectorData.rawResponseBody ?? null
   const sseEvents = ('sseEvents' in collectorData && Array.isArray(collectorData.sseEvents))
     ? collectorData.sseEvents
     : null
+  const diagnostics = ('diagnostics' in collectorData) ? collectorData.diagnostics ?? null : null
   return {
     rawBody,
     sseEvents,
+    diagnostics,
     ...(rawOutput != null ? { rawOutput } : {}),
   }
 }

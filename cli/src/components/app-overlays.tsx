@@ -276,6 +276,7 @@ export function AppOverlays({
           workspacePath={workspacePath}
           projectRoot={projectRoot}
           subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}
+          subscribeForkContextUsage={(fId, cb) => client.state.contextUsage.subscribeFork(fId, cb)}
           subscribeForkCompaction={(fId, cb) => client.state.compaction.subscribeFork(fId, cb)}
         />
       </box>

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { act, create } from 'react-test-renderer'
-import type { CompactionState, DisplayState } from '@magnitudedev/agent'
+import type { CompactionState, ContextUsageForkState, DisplayState } from '@magnitudedev/agent'
 
 mock.module('../hooks/use-theme', () => ({
   useTheme: () => ({
@@ -97,6 +97,15 @@ function propsWithDisplay(display: DisplayState) {
     projectRoot: '/tmp',
     subscribeForkDisplay: (_forkId: string, cb: (state: DisplayState) => void) => {
       cb(display)
+      return noop
+    },
+    subscribeForkContextUsage: (_forkId: string, cb: (state: ContextUsageForkState) => void) => {
+      cb({
+        retainedTokens: 1234,
+        source: 'provider',
+        hardCapTokens: 200_000,
+        lastProviderInputTokens: 1234,
+      })
       return noop
     },
     subscribeForkCompaction: (_forkId: string, cb: (state: CompactionState) => void) => {

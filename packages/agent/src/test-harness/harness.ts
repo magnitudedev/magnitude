@@ -21,6 +21,7 @@ import { DisplayProjection } from '../projections/display'
 import { AgentRoutingProjection } from '../projections/agent-routing'
 import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
+import { ContextUsageProjection } from '../projections/context-usage'
 
 import { ReplayProjection } from '../projections/replay'
 import { ChatTitleProjection } from '../projections/chat-title'
@@ -223,6 +224,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         AgentRoutingProjection,
         AgentStatusProjection,
         CompactionProjection,
+        ContextUsageProjection,
         WorkflowProjection,
         TaskGraphProjection,
         TurnProjection,
@@ -249,6 +251,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           turn: TurnProjection,
           memory: MemoryProjection,
           compaction: CompactionProjection,
+          contextUsage: ContextUsageProjection,
           agentRouting: AgentRoutingProjection,
           agentStatus: AgentStatusProjection,
 

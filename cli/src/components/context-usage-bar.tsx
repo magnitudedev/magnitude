@@ -3,7 +3,7 @@ import { TextAttributes } from '@opentui/core'
 import { useTheme } from '../hooks/use-theme'
 
 interface ContextUsageBarProps {
-  tokenEstimate: number
+  contextTokens: number
   hardCap: number | null
   isCompacting?: boolean
 }
@@ -15,7 +15,7 @@ interface ContextUsageBarProps {
  * During compaction, inward-pointing arrows animate on each side of
  * the percent and token count.
  */
-export const ContextUsageBar = ({ tokenEstimate, hardCap, isCompacting = false }: ContextUsageBarProps) => {
+export const ContextUsageBar = ({ contextTokens, hardCap, isCompacting = false }: ContextUsageBarProps) => {
   const theme = useTheme()
   const [frame, setFrame] = useState(0)
 
@@ -36,12 +36,14 @@ export const ContextUsageBar = ({ tokenEstimate, hardCap, isCompacting = false }
     return String(n)
   }
 
+  const showUnknownCurrent = contextTokens <= 0
+  const currentStr = showUnknownCurrent ? '-' : formatTokens(contextTokens)
   const tokensStr = hardCap == null
-    ? formatTokens(tokenEstimate) + '/Unknown'
-    : formatTokens(tokenEstimate) + '/' + formatTokens(hardCap)
-  const displayText = hardCap == null
+    ? currentStr + '/Unknown'
+    : currentStr + '/' + formatTokens(hardCap)
+  const displayText = hardCap == null || showUnknownCurrent
     ? tokensStr
-    : Math.round((tokenEstimate / hardCap) * 100) + '% ' + tokensStr
+    : Math.round((contextTokens / hardCap) * 100) + '% ' + tokensStr
 
   // Normal (non-compacting) rendering
   if (!isCompacting) {

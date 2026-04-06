@@ -17,18 +17,24 @@ function render(node: React.ReactNode) {
 }
 
 test('shows used/max and percent when used and max are known', () => {
-  const text = htmlToText(render(<ContextUsageBar tokenEstimate={5000} hardCap={10000} />))
+  const text = htmlToText(render(<ContextUsageBar contextTokens={5000} hardCap={10000} />))
   expect(text).toContain('50% 5k/10k')
 })
 
 test('shows used/Unknown and hides percent when used known and max unknown', () => {
-  const text = htmlToText(render(<ContextUsageBar tokenEstimate={5000} hardCap={null} />))
+  const text = htmlToText(render(<ContextUsageBar contextTokens={5000} hardCap={null} />))
   expect(text).toContain('5k/Unknown')
   expect(text).not.toContain('%')
 })
 
-test('unknown used preserves existing behavior (parent does not render when used is unknown)', () => {
-  const text = htmlToText(render(<ContextUsageBar tokenEstimate={0} hardCap={null} />))
-  expect(text).toContain('0/Unknown')
+test('shows -/full-window and hides percent when current context is zero', () => {
+  const text = htmlToText(render(<ContextUsageBar contextTokens={0} hardCap={10000} />))
+  expect(text).toContain('-/10k')
+  expect(text).not.toContain('%')
+})
+
+test('shows -/Unknown and hides percent when current context is zero and max unknown', () => {
+  const text = htmlToText(render(<ContextUsageBar contextTokens={0} hardCap={null} />))
+  expect(text).toContain('-/Unknown')
   expect(text).not.toContain('%')
 })

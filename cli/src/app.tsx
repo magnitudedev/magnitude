@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState, type ContextUsageForkState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence } from './persistence'
 
@@ -164,7 +164,7 @@ function AppInner({
   }
 
   const [forkDisplay, setForkDisplay] = useState<DisplayState | null>(null)
-  const [forkTokenEstimate, setForkTokenEstimate] = useState(0)
+  const [forkContextTokens, setForkContextTokens] = useState(0)
   const [forkIsCompacting, setForkIsCompacting] = useState(false)
 
   const [systemMessages, setSystemMessages] = useState<Array<{ id: string; text: string; timestamp: number }>>([])
@@ -197,7 +197,7 @@ function AppInner({
   const [debugLogs, setDebugLogs] = useState<LogEntry[]>([])
   const [composerHasContent, setComposerHasContent] = useState(false)
   const [restoredQueuedInputText, setRestoredQueuedInputText] = useState<string | null>(null)
-  const [tokenEstimate, setTokenEstimate] = useState(0)
+  const [contextTokens, setContextTokens] = useState(0)
   const [isCompacting, setIsCompacting] = useState(false)
   const [workflowState, setWorkflowState] = useState<WorkflowCriteriaState | null>(null)
   const returnToProviderDetailRef = useRef<string | null>(null)
@@ -219,15 +219,13 @@ function AppInner({
     }
     return `${n}`
   }
-  const contextPercent = contextHardCap ? Math.round((tokenEstimate / contextHardCap) * 100) : null
-  const contextDisplayText = tokenEstimate > 0
-    ? (contextHardCap
-      ? `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextHardCap)}`
-      : `${formatFooterTokens(tokenEstimate)}/Unknown`)
-    : ''
-  const contextRenderedText = tokenEstimate > 0
-    ? (isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText)
-    : ''
+  const contextPercent = contextHardCap ? Math.round((contextTokens / contextHardCap) * 100) : null
+  const contextDisplayText = contextTokens <= 0
+    ? (contextHardCap ? `-${'/' + formatFooterTokens(contextHardCap)}` : '-/Unknown')
+    : (contextHardCap
+      ? `${contextPercent}% ${formatFooterTokens(contextTokens)}/${formatFooterTokens(contextHardCap)}`
+      : `${formatFooterTokens(contextTokens)}/Unknown`)
+  const contextRenderedText = isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText
 
   // Always reserve width for the longest possible escape hint so that
   // attachments don't reflow when hints appear/disappear.
@@ -616,12 +614,22 @@ function AppInner({
     }
   }, [renderer, client])
 
-  // Subscribe to compaction state for context usage bar
+  // Subscribe to user-facing context usage state for context usage bar
+  useEffect(() => {
+    if (!client) return
+
+    const unsubscribe = client.state.contextUsage.subscribeFork(null, (state: ContextUsageForkState) => {
+      setContextTokens(state.retainedTokens)
+    })
+
+    return unsubscribe
+  }, [client])
+
+  // Subscribe to compaction state for animation only
   useEffect(() => {
     if (!client) return
 
     const unsubscribe = client.state.compaction.subscribeFork(null, (state: CompactionState) => {
-      setTokenEstimate(state.tokenEstimate)
       setIsCompacting(state._tag !== 'idle')
     })
 
@@ -653,15 +661,25 @@ function AppInner({
     return unsubscribe
   }, [client, selectedForkId])
 
-  // Subscribe to selected fork's compaction state
+  // Subscribe to selected fork's context usage state
   useEffect(() => {
     if (!client || !selectedForkId) {
-      setForkTokenEstimate(0)
+      setForkContextTokens(0)
+      return
+    }
+    const unsubscribe = client.state.contextUsage.subscribeFork(selectedForkId, (state: ContextUsageForkState) => {
+      setForkContextTokens(state.retainedTokens)
+    })
+    return unsubscribe
+  }, [client, selectedForkId])
+
+  // Subscribe to selected fork's compaction state for animation only
+  useEffect(() => {
+    if (!client || !selectedForkId) {
       setForkIsCompacting(false)
       return
     }
     const unsubscribe = client.state.compaction.subscribeFork(selectedForkId, (state: CompactionState) => {
-      setForkTokenEstimate(state.tokenEstimate)
       setForkIsCompacting(state._tag !== 'idle')
     })
     return unsubscribe
@@ -2249,7 +2267,7 @@ function AppInner({
               bashMode,
               modelsConfigured: !!slotModels.lead,
               modelSummary: activeModelSummary,
-              tokenEstimate: selectedForkId ? forkTokenEstimate : tokenEstimate,
+              contextTokens: selectedForkId ? forkContextTokens : contextTokens,
               contextHardCap,
               isCompacting: selectedForkId ? forkIsCompacting : isCompacting,
               theme,

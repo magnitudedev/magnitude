@@ -34,7 +34,7 @@ export interface TraceInput {
   provider: string | null
   slot: ModelSlot
   request: { messages?: unknown[]; input?: unknown }
-  response: { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string }
+  response: { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string; diagnostics?: unknown | null }
   usage: CallUsage
   durationMs: number
 }

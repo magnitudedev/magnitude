@@ -11,7 +11,7 @@ export type ChatControllerEnv = {
   bashMode: boolean
   modelsConfigured: boolean
   modelSummary: { provider: string; model: string } | null
-  tokenEstimate: number
+  contextTokens: number
   contextHardCap: number | null
   isCompacting: boolean
   theme: ChatTheme

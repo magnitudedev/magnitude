@@ -252,9 +252,22 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const { executeResult, usage, responseParts } = drained.finalResult
 
         const inputTokens = usage.inputTokens
-        if (inputTokens !== null) {
-          logger.info({ inputTokens, usage, forkId, turnId }, '[Cortex] Captured usage from LLM response')
-        }
+        logger.info(
+          {
+            context: 'CortexTurnUsageEmission',
+            forkId,
+            turnId,
+            chainId,
+            providerId: boundModel.model.providerId,
+            modelId: boundModel.model.id,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cacheReadTokens: usage.cacheReadTokens,
+            cacheWriteTokens: usage.cacheWriteTokens,
+            usageAbsent: usage.inputTokens === null && usage.outputTokens === null,
+          },
+          '[Cortex] Emitting turn_completed usage payload',
+        )
 
         // 4. Detect output truncation — if output tokens hit the model limit,
         // the response was cut short (incomplete XML, broken tool calls, etc.)

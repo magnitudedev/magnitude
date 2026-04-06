@@ -26,6 +26,7 @@ import { AgentStatusProjection } from './projections/agent-status'
 import { TaskGraphProjection } from './projections/task-graph'
 import { CompactionProjection } from './projections/compaction'
 import { WorkflowProjection } from './projections/workflow'
+import { ContextUsageProjection } from './projections/context-usage'
 
 import { ReplayProjection } from './projections/replay'
 import { ChatTitleProjection } from './projections/chat-title'
@@ -84,6 +85,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     AgentStatusProjection,
     TaskGraphProjection,
     CompactionProjection,
+    ContextUsageProjection,
     WorkflowProjection,
     TurnProjection,
     CanonicalTurnProjection,
@@ -130,6 +132,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
       turn: TurnProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
+      contextUsage: ContextUsageProjection,
       workflow: WorkflowProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
