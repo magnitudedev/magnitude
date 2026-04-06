@@ -32,7 +32,7 @@ const mkTaskReader = (state: TaskGraphState): TaskGraphStateReader => ({
     if (!task) return Effect.succeed(false)
     return Effect.succeed(task.childIds.every((childId) => {
       const child = state.tasks.get(childId)
-      return child && (child.status === 'completed' || child.status === 'archived')
+      return child && child.status === 'completed'
     }))
   },
   canAssign: () => Effect.succeed(true),

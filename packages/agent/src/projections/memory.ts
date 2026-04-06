@@ -287,32 +287,11 @@ function findRootTaskId(state: TaskGraphState, taskId: string): string {
   return current?.id ?? taskId
 }
 
-function countDescendants(state: TaskGraphState, taskId: string): number {
-  const task = state.tasks.get(taskId)
-  if (!task) return 0
-  let count = 0
-  const stack = [...task.childIds]
-  while (stack.length > 0) {
-    const currentId = stack.pop()
-    if (!currentId) continue
-    const current = state.tasks.get(currentId)
-    if (!current) continue
-    count += 1
-    stack.push(...current.childIds)
-  }
-  return count
-}
-
 function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number): string[] {
   const task = state.tasks.get(taskId)
   if (!task) return []
 
   const indent = '  '.repeat(depth)
-
-  if (task.status === 'archived') {
-    const archivedCount = countDescendants(state, task.id)
-    return [`${indent}[archived] ${task.title} (${archivedCount} tasks)`]
-  }
 
   const status = task.status === 'completed' ? 'done' : task.status
   const assignedRoleStr = task.worker && task.worker.role !== 'user'
@@ -322,15 +301,7 @@ function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number)
   const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assignedRoleStr}${assigneeStr})`
 
   const childLines = task.childIds.flatMap(childId => renderTaskSubtree(state, childId, depth + 1))
-  const directCompletedNonArchivedCount = task.childIds.reduce((count, childId) => {
-    const child = state.tasks.get(childId)
-    if (!child) return count
-    return count + (child.status === 'completed' ? 1 : 0)
-  }, 0)
 
-  if (directCompletedNonArchivedCount > 8) {
-    childLines.push(`${indent}  Consider archiving completed tasks`)
-  }
 
   return [line, ...childLines]
 }
@@ -1042,7 +1013,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       if (value.next === 'completed') return state
 
       const task = read(TaskGraphProjection).tasks.get(value.taskId)
-      const action = value.next === 'archived' ? 'archived' : 'status_changed'
+      const action = 'status_changed'
 
       const nextLead = enqueueTimeline(
         leadFork,

@@ -158,21 +158,6 @@ test('renders worker assignee with worker status prefix and timer segment', () =
   expect(text).not.toContain('↺')
 })
 
-test('archived summary rows render without a status glyph', () => {
-  const html = render(
-    <TaskList
-      tasks={[
-        makeTask({ taskId: 'root-a', title: 'Root A', depth: 0, status: 'pending' }),
-        makeTask({ taskId: '__archived__root-a', title: '2 archived tasks', type: 'archived', depth: 1, parentId: 'root-a', status: 'archived' }),
-      ]}
-      pushForkOverlay={noop}
-    />,
-  )
-
-  const text = htmlToText(html)
-  expect(text).toContain('▸ 2 archived tasks')
-})
-
 test('fileViewerOpen hides assignee column and expand/collapse controls', () => {
   const html = render(
     <TaskList

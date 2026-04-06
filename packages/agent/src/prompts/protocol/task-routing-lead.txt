@@ -53,7 +53,6 @@ Valid status values:
 - `pending` — Reopens the task. Does not affect the worker.
 - `completed` — Marks the task finished. Blocked if any child tasks are still pending or working.
 - `cancelled` — Kills the worker (if present) and removes the task and its entire subtree from the task tree.
-- `archived` — Collapses the task into a summary line and hides its subtree. Only works on completed tasks.
 
 The `working` status is derived — it reflects that a task has a live worker. You never set it manually.
 

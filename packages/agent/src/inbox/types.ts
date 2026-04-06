@@ -122,7 +122,7 @@ export type TimelineEntry =
   | (Timestamped<'task_tree_dirty'> & { readonly taskId: string })
   | (Timestamped<'task_tree_view'> & { readonly renderedTree: string })
   | (Timestamped<'task_update'> & {
-      readonly action: 'created' | 'cancelled' | 'completed' | 'archived' | 'status_changed'
+      readonly action: 'created' | 'cancelled' | 'completed' | 'status_changed'
       readonly taskId: string
       readonly title?: string
       readonly taskType?: string

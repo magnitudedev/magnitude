@@ -42,10 +42,10 @@ export interface CreateTaskDirectiveInput {
   readonly after?: string
 }
 
-export type TaskDirectiveStatus = 'pending' | 'completed' | 'archived' | 'cancelled'
+export type TaskDirectiveStatus = 'pending' | 'completed' | 'cancelled'
 
 export function isTaskDirectiveStatus(value: string): value is TaskDirectiveStatus {
-  return value === 'pending' || value === 'completed' || value === 'archived' || value === 'cancelled'
+  return value === 'pending' || value === 'completed' || value === 'cancelled'
 }
 
 export interface UpdateTaskDirectiveInput {

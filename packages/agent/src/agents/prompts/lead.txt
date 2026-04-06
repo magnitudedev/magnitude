@@ -77,7 +77,6 @@ A task status is one of:
 - `pending`: Not started or assigned but idle worker
 - `working`: Has assigned, active worker
 - `completed`: Marked finished by you
-- `archived`: Done but no longer relevant
 
 - Do not mark any task completed unless you are confident it meets all requirements
 - For worker tasks: this means message the worker if the task needs additional work, refinement, or redirection
@@ -101,11 +100,6 @@ Keep tasks in execution order under their parent.
 #### Nesting tasks
 
 When several tasks cover a related area, move them under a common task that represents their cumulative work.
-
-#### Archiving tasks
-
-When you have many tasks in an active task tree, consider archiving irrelevant tasks to stop seeing them and hide them for the user.
-Keep the active frontier clean and visible while preserving history in archived tasks.
 
 #### Cancelling tasks
 

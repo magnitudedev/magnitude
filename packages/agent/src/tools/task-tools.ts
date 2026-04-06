@@ -86,7 +86,7 @@ const runDirective = (directive: Parameters<typeof handleTaskDirective>[0]) =>
     return result
   })
 
-const UpdateTaskStatusSchema = Schema.Literal('pending', 'completed', 'cancelled', 'archived')
+const UpdateTaskStatusSchema = Schema.Literal('pending', 'completed', 'cancelled')
 
 export const createTaskTool = defineTool({
   name: 'create-task' as const,

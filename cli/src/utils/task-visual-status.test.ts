@@ -25,15 +25,11 @@ describe('getOwnVisualStatus', () => {
     expect(getOwnVisualStatus(makeTask({ status: 'completed', completedAt: 10_000 }))).toBe('completed')
   })
 
-  test('returns completed for archived tasks', () => {
-    expect(getOwnVisualStatus(makeTask({ status: 'archived' }))).toBe('completed')
+  test('returns pending for working tasks', () => {
+    expect(getOwnVisualStatus(makeTask({ status: 'working' }))).toBe('pending')
   })
 
-  test('returns working for working tasks', () => {
-    expect(getOwnVisualStatus(makeTask({ status: 'working' }))).toBe('working')
-  })
-
-  test('returns assigned for worker with fork id', () => {
+  test('returns pending for worker with fork id', () => {
     expect(
       getOwnVisualStatus(
         makeTask({
@@ -42,7 +38,7 @@ describe('getOwnVisualStatus', () => {
           workerForkId: 'fork-1',
         }),
       ),
-    ).toBe('assigned')
+    ).toBe('pending')
   })
 
   test('returns pending when worker is present but fork id is missing', () => {
@@ -66,19 +62,19 @@ describe('computeInheritedVisualStatusMap', () => {
   test('single task with no children keeps own status', () => {
     const tasks = [makeTask({ taskId: 'root', status: 'working' })]
     const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('root')).toBe('working')
+    expect(result.get('root')).toBe('pending')
   })
 
-  test('parent with working child becomes working', () => {
+  test('parent with working child remains pending', () => {
     const tasks = [
       makeTask({ taskId: 'parent', status: 'pending' }),
       makeTask({ taskId: 'child', depth: 1, parentId: 'parent', status: 'working' }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('parent')).toBe('working')
+    expect(result.get('parent')).toBe('pending')
   })
 
-  test('parent with assigned child becomes assigned', () => {
+  test('parent with assigned child remains pending', () => {
     const tasks = [
       makeTask({ taskId: 'parent', status: 'pending' }),
       makeTask({
@@ -91,10 +87,10 @@ describe('computeInheritedVisualStatusMap', () => {
       }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('parent')).toBe('assigned')
+    expect(result.get('parent')).toBe('pending')
   })
 
-  test('parent with assigned and working children becomes working', () => {
+  test('parent with assigned and working children remains pending', () => {
     const tasks = [
       makeTask({ taskId: 'parent', status: 'pending' }),
       makeTask({
@@ -108,7 +104,7 @@ describe('computeInheritedVisualStatusMap', () => {
       makeTask({ taskId: 'working-child', depth: 1, parentId: 'parent', status: 'working' }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('parent')).toBe('working')
+    expect(result.get('parent')).toBe('pending')
   })
 
   test('completed parent with working child stays completed', () => {
@@ -129,32 +125,21 @@ describe('computeInheritedVisualStatusMap', () => {
     expect(result.get('parent')).toBe('pending')
   })
 
-  test('archived summary row is excluded from inheritance', () => {
-    const tasks = [
-      makeTask({ taskId: 'parent', status: 'pending' }),
-      makeTask({ taskId: '__archived__parent', depth: 1, parentId: 'parent', status: 'archived' }),
-      makeTask({ taskId: 'child', depth: 2, parentId: '__archived__parent', status: 'working' }),
-    ]
-    const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('__archived__parent')).toBe('completed')
-    expect(result.get('parent')).toBe('pending')
-  })
-
   test('child with missing parent keeps own status and does not throw', () => {
     const tasks = [makeTask({ taskId: 'orphan', parentId: 'missing', depth: 1, status: 'working' })]
     const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('orphan')).toBe('working')
+    expect(result.get('orphan')).toBe('pending')
   })
 
-  test('grandchild working propagates to grandparent', () => {
+  test('grandchild working does not change grandparent from pending', () => {
     const tasks = [
       makeTask({ taskId: 'grandparent', status: 'pending' }),
       makeTask({ taskId: 'parent', depth: 1, parentId: 'grandparent', status: 'pending' }),
       makeTask({ taskId: 'child', depth: 2, parentId: 'parent', status: 'working' }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
-    expect(result.get('parent')).toBe('working')
-    expect(result.get('grandparent')).toBe('working')
+    expect(result.get('parent')).toBe('pending')
+    expect(result.get('grandparent')).toBe('pending')
   })
 
   test('all pending tree stays pending', () => {

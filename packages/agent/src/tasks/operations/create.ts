@@ -43,7 +43,7 @@ export const handleCreateDirective = (directive: CreateDirective, context: TaskD
     const events: AppEvent[] = []
     if (directive.parentId) {
       const parentTask = yield* taskReader.getTask(directive.parentId)
-      if (parentTask && (parentTask.status === 'completed' || parentTask.status === 'archived')) {
+      if (parentTask && parentTask.status === 'completed') {
         const reopen = buildTaskStatusChangedValidated(
           {
             taskId: parentTask.id,

@@ -488,54 +488,6 @@ describe('task tree rendering mechanics', () => {
     expect(inbox.timeline.some(e => e.kind === 'task_tree_view')).toBe(false)
   })
 
-  it('status transition to archived emits archived task_update', async () => {
-    const rootFork = await runEvents([
-      {
-        type: 'session_initialized',
-        timestamp: ts(0),
-        sessionId: 's1',
-        cwd: '/tmp',
-        model: 'test',
-        mode: 'interactive',
-        approvalMode: 'on-request',
-      } as any,
-      {
-        type: 'task_created',
-        timestamp: ts(1),
-        forkId: null,
-        taskId: 'task-archive',
-        title: 'Task Archive',
-        taskType: 'implement',
-        parentId: null,
-      } as any,
-      {
-        type: 'task_updated',
-        timestamp: ts(2),
-        forkId: null,
-        taskId: 'task-archive',
-        patch: { status: 'completed' },
-      } as any,
-      {
-        type: 'task_updated',
-        timestamp: ts(3),
-        forkId: null,
-        taskId: 'task-archive',
-        patch: { status: 'archived' },
-      } as any,
-      {
-        type: 'turn_started',
-        timestamp: ts(4),
-        turnId: 'turn-archive',
-        forkId: null,
-        strategyId: 'lead',
-        chainId: null,
-      } as any,
-    ])
-
-    const inbox = getLastInbox(rootFork)
-    expect(inbox.timeline.some((e: any) => e.kind === 'task_update' && e.action === 'archived' && e.taskId === 'task-archive')).toBe(true)
-  })
-
   it('cancel-only after assistant turn still appends inbox on next turn_started', async () => {
     const rootFork = await runEvents([
       {

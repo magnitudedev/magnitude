@@ -7,12 +7,8 @@ const STATUS_PRIORITY: Record<VisualStatus, number> = {
   completed: -1, // completed never propagates
 }
 
-function isArchivedSummaryRow(task: TaskListItem): boolean {
-  return task.taskId.startsWith('__archived__')
-}
-
 export function getOwnVisualStatus(task: TaskListItem): VisualStatus {
-  if (task.status === 'completed' || task.status === 'archived') return 'completed'
+  if (task.status === 'completed') return 'completed'
   return 'pending'
 }
 
@@ -30,9 +26,6 @@ export function computeInheritedVisualStatusMap(
   for (let i = tasks.length - 1; i >= 0; i--) {
     const task = tasks[i]
 
-    // Archived summary rows are excluded from inheritance participation
-    if (isArchivedSummaryRow(task)) continue
-
     const childStatus = result.get(task.taskId)
     if (!childStatus) continue
 
@@ -47,7 +40,7 @@ export function computeInheritedVisualStatusMap(
     // Missing parent in visible list: safe no-op
     if (parentStatus === undefined) continue
 
-    // Completed/archived parents are terminal and never inherit
+    // Completed parents are terminal and never inherit
     if (parentStatus === 'completed') continue
 
     if (STATUS_PRIORITY[childStatus] > STATUS_PRIORITY[parentStatus]) {

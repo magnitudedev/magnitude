@@ -4,7 +4,7 @@ import { updateTaskTool, updateTaskXmlBinding } from '../tools/task-tools'
 export interface UpdateTaskState extends BaseState {
   toolKey: 'updateTask'
   id?: string
-  status?: 'pending' | 'completed' | 'cancelled' | 'archived'
+  status?: 'pending' | 'completed' | 'cancelled'
 }
 
 const initial: Omit<UpdateTaskState, 'phase' | 'toolKey'> = {
@@ -13,7 +13,7 @@ const initial: Omit<UpdateTaskState, 'phase' | 'toolKey'> = {
 }
 
 function isValidUpdateTaskStatus(value: string | undefined): value is NonNullable<UpdateTaskState['status']> {
-  return value === 'pending' || value === 'completed' || value === 'cancelled' || value === 'archived'
+  return value === 'pending' || value === 'completed' || value === 'cancelled'
 }
 
 export const updateTaskModel = defineStateModel('updateTask', {

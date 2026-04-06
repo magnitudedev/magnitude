@@ -231,7 +231,7 @@ export function toTimelineTaskTreeView(args: {
 
 export function toTimelineTaskUpdate(args: {
   timestamp: number
-  action: 'created' | 'cancelled' | 'completed' | 'archived' | 'status_changed'
+  action: 'created' | 'cancelled' | 'completed' | 'status_changed'
   taskId: string
   title?: string
   taskType?: string

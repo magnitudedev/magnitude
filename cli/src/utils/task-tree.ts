@@ -8,7 +8,7 @@ type TaskRecord = {
   childIds: readonly string[]
   assignee: unknown
   worker: { agentId: string; forkId: string; role: string } | null
-  status: 'pending' | 'working' | 'completed' | 'archived'
+  status: 'pending' | 'working' | 'completed'
   createdAt: number
   updatedAt: number
   completedAt: number | null
@@ -59,74 +59,21 @@ function toTaskListItem(task: TaskRecord, depth: number): TaskListItem {
   }
 }
 
-function makeArchivedSummaryRow(parentId: string, depth: number, archivedTasks: TaskRecord[]): TaskListItem {
-  return {
-    taskId: `__archived__${parentId}`,
-    title: `${archivedTasks.length} archived tasks`,
-    type: 'archived',
-    status: 'archived',
-    depth,
-    parentId,
-    createdAt: 0,
-    updatedAt: 0,
-    completedAt: null,
-    assignee: { kind: 'none' },
-    workerForkId: null,
-  }
-}
-
 export function flattenTaskTree(state: TaskGraphState): TaskListItem[] {
   const rows: TaskListItem[] = []
 
-  const visitChildren = (childIds: readonly string[], depth: number, parentId: string | null) => {
-    const archivedTasks: TaskRecord[] = []
-    const nonArchivedIds: string[] = []
-
-    for (const childId of childIds) {
-      const task = state.tasks.get(childId)
-      if (!task) continue
-      if (task.status === 'archived') archivedTasks.push(task)
-      else nonArchivedIds.push(childId)
-    }
-
-    // Archived summary row first
-    if (archivedTasks.length > 0) {
-      rows.push(makeArchivedSummaryRow(parentId ?? '__root', depth, archivedTasks))
-      // Include individual archived tasks as children of the summary
-      for (const task of archivedTasks) {
-        rows.push(toTaskListItem(task, depth + 1))
-      }
-    }
-
-    // Then non-archived tasks
-    for (const childId of nonArchivedIds) visit(childId, depth)
+  const visitChildren = (childIds: readonly string[], depth: number) => {
+    for (const childId of childIds) visit(childId, depth)
   }
 
   const visit = (taskId: string, depth: number) => {
     const task = state.tasks.get(taskId)
     if (!task) return
     rows.push(toTaskListItem(task, depth))
-    visitChildren(task.childIds, depth + 1, task.id)
+    visitChildren(task.childIds, depth + 1)
   }
 
-  // Handle roots
-  const archivedRoots: TaskRecord[] = []
-  const nonArchivedRootIds: string[] = []
-  for (const rootId of state.rootTaskIds) {
-    const task = state.tasks.get(rootId)
-    if (!task) continue
-    if (task.status === 'archived') archivedRoots.push(task)
-    else nonArchivedRootIds.push(rootId)
-  }
-
-  if (archivedRoots.length > 0) {
-    rows.push(makeArchivedSummaryRow('__root', 0, archivedRoots))
-    for (const task of archivedRoots) {
-      rows.push(toTaskListItem(task, 1))
-    }
-  }
-
-  for (const rootId of nonArchivedRootIds) visit(rootId, 0)
+  for (const rootId of state.rootTaskIds) visit(rootId, 0)
 
   return rows
 }
@@ -140,17 +87,12 @@ export type RootSummary = {
   total: number
 }
 
-function isArchivedSummaryRow(task: TaskListItem): boolean {
-  return task.taskId.startsWith('__archived__')
-}
-
 export function buildRootSummaries(tasks: readonly TaskListItem[]): RootSummary[] {
   const rootStartIndexes: number[] = []
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i]
     if (!task) continue
     if (task.depth !== 0) continue
-    if (isArchivedSummaryRow(task)) continue
     rootStartIndexes.push(i)
   }
 
@@ -171,10 +113,9 @@ export function buildRootSummaries(tasks: readonly TaskListItem[]): RootSummary[
     for (let rowIndex = startIndex; rowIndex < endIndex; rowIndex++) {
       const rowTask = tasks[rowIndex]
       if (!rowTask) continue
-      if (isArchivedSummaryRow(rowTask)) continue
 
       total += 1
-      if (rowTask.status === 'completed' || rowTask.status === 'archived') {
+      if (rowTask.status === 'completed') {
         completed += 1
       } else {
         active += 1
@@ -201,7 +142,6 @@ export function findOwningRootIndex(tasks: readonly TaskListItem[], rowIndex: nu
     const task = tasks[i]
     if (!task) continue
     if (task.depth !== 0) continue
-    if (isArchivedSummaryRow(task)) continue
     return i
   }
 

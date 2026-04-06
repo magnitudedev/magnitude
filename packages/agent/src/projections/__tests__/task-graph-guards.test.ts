@@ -84,7 +84,7 @@ describe('TaskGraphProjection defensive guards', () => {
         timestamp: ts(2),
         forkId: null,
         taskId: 't2',
-        patch: { status: 'archived' },
+        patch: { status: 'completed' },
       } satisfies TaskUpdated,
       {
         type: 'task_updated',
@@ -95,7 +95,7 @@ describe('TaskGraphProjection defensive guards', () => {
       } satisfies TaskUpdated,
     ])
 
-    expect(state.tasks.get('t2')?.status).toBe('archived')
+    expect(state.tasks.get('t2')?.status).toBe('completed')
   })
 
   it('ignores invalid assignee for task type', async () => {

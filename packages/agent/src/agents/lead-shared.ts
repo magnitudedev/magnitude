@@ -15,7 +15,7 @@ export const alignmentLens = defineThinkingLens({
 export const tasksLens = defineThinkingLens({
   name: 'tasks',
   trigger: 'When receiving a user request or performing work of any kind',
-  description: 'Is all work captured as tasks? Is the tree organized, nested, and clean? Should I create, archive, or restructure tasks?',
+  description: 'Is all work captured as tasks? Is the tree organized, nested, and clean? Should I create, complete/cancel, or restructure tasks?',
 })
 
 export const strategyLens = defineThinkingLens({

@@ -239,7 +239,6 @@ describe('formatInbox', () => {
       { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title', taskType: 'implement' },
       { kind: 'task_update', timestamp: TS1, action: 'status_changed', taskId: 't1', previousStatus: 'pending', nextStatus: 'working' },
       { kind: 'task_update', timestamp: TS2, action: 'completed', taskId: 't1' },
-      { kind: 'task_update', timestamp: TS3, action: 'archived', taskId: 't1' },
       { kind: 'task_update', timestamp: TS3 + 1, action: 'cancelled', taskId: 't2', cancelledCount: 3 },
     ]
 
@@ -248,7 +247,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '<task_updates>\n- Task t1 created: "Title" (implement)\n- Task t1 status changed: pending -> working\n- Task t1 completed\n- Task t1 archived\n- Task t2 cancelled (3 tasks removed)\n</task_updates>',
+          '<task_updates>\n- Task t1 created: "Title" (implement)\n- Task t1 status changed: pending -> working\n- Task t1 completed\n- Task t2 cancelled (3 tasks removed)\n</task_updates>',
       },
     ])
   })

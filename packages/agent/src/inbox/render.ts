@@ -281,10 +281,6 @@ function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update
     return `- Task ${entry.taskId} completed`
   }
 
-  if (entry.action === 'archived') {
-    return `- Task ${entry.taskId} archived`
-  }
-
   const previousStatus = entry.previousStatus ?? 'unknown'
   const nextStatus = entry.nextStatus ?? 'unknown'
   return `- Task ${entry.taskId} status changed: ${previousStatus} -> ${nextStatus}`
