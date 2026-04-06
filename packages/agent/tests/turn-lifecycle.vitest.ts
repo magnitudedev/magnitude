@@ -71,4 +71,29 @@ describe('turn lifecycle', () => {
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
+
+  it.live('Empty response retriggers root turn instead of idling', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+      yield* h.script.next({ xml: '' })
+      yield* h.script.next({ xml: '<idle/>' })
+
+      yield* h.user('trigger empty response')
+      const first = yield* h.wait.turnCompleted(null)
+      const second = yield* h.wait.event(
+        'turn_completed',
+        (e) => e.forkId === null && e.turnId !== first.turnId,
+      )
+
+      expect(first.result.success).toBe(true)
+      if (first.result.success) {
+        expect(first.result.turnDecision).toBe('continue')
+      }
+
+      expect(second.result.success).toBe(true)
+      if (second.result.success) {
+        expect(second.result.turnDecision).toBe('idle')
+      }
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
 })

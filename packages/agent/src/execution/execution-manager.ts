@@ -408,6 +408,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolCalls: TurnToolCall[] = []
       const messagesSent: Array<{ id: string, taskId: string | null }> = []
       let hasAnyMessage = false
+      let hasAnyResponseContent = false
       let directUserRepliesSent = 0
 
       const isTaskInAssignedSubtree = (
@@ -476,6 +477,7 @@ const makeExecutionManager = Effect.gen(function* () {
             switch (event._tag) {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
+                hasAnyResponseContent = true
                 const toolKey = resolveKey(event.tagName)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Failed to resolve tool key for tag ${event.tagName} (toolCallId: ${event.toolCallId}).`)
@@ -551,6 +553,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Tool Input Parse Error ---
               case 'ToolInputParseError': {
+                hasAnyResponseContent = true
                 const toolKey = resolveKey(event.tagName)
                 if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
@@ -721,6 +724,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Messages / Think prose ---
               case 'MessageStart': {
+                hasAnyResponseContent = true
                 const taskProjection = yield* TaskGraphProjection.Tag
                 const taskState = yield* taskProjection.get
 
@@ -822,6 +826,7 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'ProseChunk': {
+                hasAnyResponseContent = true
                 if (event.patternId === 'think') {
                   yield* Queue.offer(sink, { _tag: 'ThinkingDelta', text: event.text })
                 }
@@ -829,6 +834,7 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'ProseEnd': {
+                hasAnyResponseContent = true
                 if (event.patternId === 'think') {
                   yield* Queue.offer(sink, { _tag: 'ThinkingEnd', about: event.about })
                 }
@@ -836,22 +842,26 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'LensStart': {
+                hasAnyResponseContent = true
                 yield* Queue.offer(sink, { _tag: 'LensStarted', name: event.name })
                 break
               }
 
               case 'LensChunk': {
+                hasAnyResponseContent = true
                 yield* Queue.offer(sink, { _tag: 'LensDelta', text: event.text })
                 break
               }
 
               case 'LensEnd': {
+                hasAnyResponseContent = true
                 yield* Queue.offer(sink, { _tag: 'LensEnded', name: event.name })
                 break
               }
 
 
               case 'ToolObservation': {
+                hasAnyResponseContent = true
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
@@ -899,6 +909,10 @@ const makeExecutionManager = Effect.gen(function* () {
                       turnDecision: 'continue',
                       ...(turnErrors.length > 0 ? { errors: turnErrors } : {}),
                     }
+                  } else if (endResult.turnControl === null && !hasAnyResponseContent) {
+                    // Empty LLM response (no messages/tools/think/lens output).
+                    // Always retrigger so memory-injected corrective feedback is visible next turn.
+                    executionResult = { success: true, turnDecision: 'continue' }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
                   } else {
