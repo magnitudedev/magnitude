@@ -25,7 +25,7 @@ export interface CanonicalTurnState {
   hasStructuralError: boolean
   orderCounter: number
   lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
-  resolvedTurnDecision: 'observe' | 'idle' | null
+  resolvedTurnDecision: 'continue' | 'idle' | null
 }
 
 export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
@@ -250,7 +250,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
             .map(({ tagName, input, query }) => ({ tagName, input, query })),
-          turnDecision: event.result.turnDecision === 'idle' ? 'idle' : 'observe',
+          turnDecision: event.result.turnDecision === 'idle' ? 'idle' : 'continue',
         }
         canonicalXml = serializeCanonicalTurn(trace, bindings)
       } else {

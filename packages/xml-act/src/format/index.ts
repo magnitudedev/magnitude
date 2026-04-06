@@ -5,7 +5,7 @@ import { messageHandler } from './handlers/message'
 import { lensHandler, thinkHandler } from './handlers/think'
 import { childHandler, toolHandler } from './handlers/tool'
 import { turnControlHandler } from './handlers/turn-control'
-import { TURN_CONTROL_OBSERVE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG } from '../constants'
+import { TURN_CONTROL_CONTINUE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG } from '../constants'
 import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
 
@@ -35,6 +35,7 @@ export function createXmlActFormat(
   handlers.set('think', think)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
+  handlers.set(TURN_CONTROL_CONTINUE_TAG, turnControlHandler('continue'))
   handlers.set(TURN_CONTROL_IDLE_TAG, turnControlHandler('idle'))
   handlers.set(TURN_CONTROL_FINISH_TAG, finishHandler())
 
@@ -56,7 +57,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG, 'think', 'thinking', 'lens']) {
+  for (const tag of ['message', TURN_CONTROL_CONTINUE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG, 'think', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -117,7 +118,7 @@ export function createCurrentFormat(
   readonly tags: {
     readonly think: 'think'
     readonly message: 'message'
-    readonly observe: 'observe'
+    readonly continue: 'continue'
     readonly idle: 'idle'
     readonly finish: 'finish'
   }
@@ -129,7 +130,7 @@ export function createCurrentFormat(
     tags: {
       think: 'think',
       message: 'message',
-      observe: 'observe',
+      continue: 'continue',
       idle: 'idle',
       finish: 'finish',
     },

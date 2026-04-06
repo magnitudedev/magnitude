@@ -896,17 +896,34 @@ const makeExecutionManager = Effect.gen(function* () {
                   if (hasToolErrors || turnErrors.length > 0) {
                     executionResult = {
                       success: true,
-                      turnDecision: 'observe',
+                      turnDecision: 'continue',
                       ...(turnErrors.length > 0 ? { errors: turnErrors } : {}),
                     }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
-                  } else if (endResult.turnControl === 'idle') {
-                    executionResult = { success: true, turnDecision: 'idle' }
-                  } else if (endResult.turnControl === null) {
-                    executionResult = { success: true, turnDecision: 'observe' }
                   } else {
-                    executionResult = { success: true, turnDecision: 'observe' }
+                    const resolvedTurnControl = endResult.turnControl ?? 'continue'
+                    if (resolvedTurnControl === 'idle') {
+                      executionResult = { success: true, turnDecision: 'idle' }
+                    } else {
+                      executionResult = { success: true, turnDecision: 'continue' }
+                    }
+                    const policyCtx = yield* policyCtxProvider.get
+                    const turnResult = agentDef.getTurn({
+                      toolsCalled: toolsCalledKeys,
+                      lastTool: lastToolKey,
+                      messagesSent,
+                      state: policyCtx,
+                    })
+                    if (endResult.turnControl === null) {
+                      if (turnResult.action === 'finish') {
+                        executionResult = { success: true, turnDecision: 'finish', evidence: '' }
+                      } else if (turnResult.action === 'continue') {
+                        executionResult = { success: true, turnDecision: 'continue' }
+                      } else {
+                        executionResult = { success: true, turnDecision: 'idle' }
+                      }
+                    }
                   }
                 } else if (endResult._tag === 'Interrupted') {
                   executionResult = { success: false, error: 'Interrupted', cancelled: true }
@@ -931,7 +948,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   if (pCtx.activeAgentCount === 0) {
                     executionResult = {
                       success: true,
-                      turnDecision: 'observe',
+                      turnDecision: 'continue',
                       oneshotLivenessTriggered: true,
                     }
                   }

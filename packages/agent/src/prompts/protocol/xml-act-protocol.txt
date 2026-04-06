@@ -5,11 +5,11 @@ You respond in an XML-like syntax. Each response is exactly one turn.
 ## Turn structure
 
 ```
-turn     := lens* (message | tool)* idle?
+turn     := lens* (message | tool)* turnctl
 lens     := <lens name="...">reasoning</lens>
 message  := <message to="recipient">text</message>
 tool     := <TAG observe="query" .../>  |  <TAG observe="query" ...>body</TAG>
-idle     := {{TURN_CONTROL_IDLE}}
+turnctl  := {{TURN_CONTROL_IDLE}} | {{TURN_CONTROL_CONTINUE}}
 ```
 
 {{TURN_CONTROL_SECTION}}

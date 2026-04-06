@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_IDLE, TURN_CONTROL_CONTINUE } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -48,6 +48,7 @@ export function getXmlActProtocol(
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
     .replaceAll('{{TURN_CONTROL_IDLE}}', TURN_CONTROL_IDLE)
+    .replaceAll('{{TURN_CONTROL_CONTINUE}}', TURN_CONTROL_CONTINUE)
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
 }
 

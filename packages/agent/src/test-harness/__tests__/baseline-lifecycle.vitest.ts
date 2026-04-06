@@ -49,7 +49,7 @@ describe('baseline harness lifecycle', () => {
 
       expect(first.result.success).toBe(true)
       if (first.result.success) {
-        expect(first.result.turnDecision).toBe('observe')
+        expect(first.result.turnDecision).toBe('continue')
       }
 
       expect(second.result.success).toBe(true)

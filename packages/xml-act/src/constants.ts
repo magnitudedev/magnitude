@@ -1,8 +1,8 @@
-export const TURN_CONTROL_OBSERVE_TAG = 'observe'
+export const TURN_CONTROL_CONTINUE_TAG = 'continue'
 export const TURN_CONTROL_IDLE_TAG = 'idle'
 export const TURN_CONTROL_FINISH_TAG = 'finish'
 
-export const TURN_CONTROL_OBSERVE = `<${TURN_CONTROL_OBSERVE_TAG}/>`
+export const TURN_CONTROL_CONTINUE = `<${TURN_CONTROL_CONTINUE_TAG}/>`
 export const TURN_CONTROL_IDLE = `<${TURN_CONTROL_IDLE_TAG}/>`
 export const TURN_CONTROL_FINISH = `<${TURN_CONTROL_FINISH_TAG}/>`
 

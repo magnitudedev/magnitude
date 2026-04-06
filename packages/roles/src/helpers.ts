@@ -5,7 +5,7 @@ import type { TurnResult } from './types'
 // =============================================================================
 
 export function observe(reminder: string | null = null): TurnResult {
-  return reminder ? { action: 'observe', reminder } : { action: 'observe' }
+  return reminder ? { action: 'continue', reminder } : { action: 'continue' }
 }
 
 export function idle(reminder: string | null = null): TurnResult {

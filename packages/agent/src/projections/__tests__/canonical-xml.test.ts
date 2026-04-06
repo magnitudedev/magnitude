@@ -44,11 +44,11 @@ describe('serializeCanonicalTurn unified format', () => {
     expect(serializeCanonicalTurn(trace, emptyBindings)).toBe(withYield('<message>hey</message>'))
   })
 
-  test("turnDecision 'observe' emits <observe/> tag", () => {
-    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [{ text: 'next', destination: { kind: 'user' } }], toolCalls: [], turnDecision: 'observe' }
+  test("turnDecision 'continue' emits no turn control tag", () => {
+    const trace: CanonicalTrace = { lenses: null, thinkBlocks: [], messages: [{ text: 'next', destination: { kind: 'user' } }], toolCalls: [], turnDecision: 'continue' }
     const xml = serializeCanonicalTurn(trace, emptyBindings)
-    expect(xml).toBe('<message>next</message>\n<observe/>')
-    expect(xml).toContain('<observe/>')
+    expect(xml).toBe('<message>next</message>')
     expect(xml).not.toContain('<idle/>')
+    expect(xml).not.toContain('<continue/>')
   })
 })

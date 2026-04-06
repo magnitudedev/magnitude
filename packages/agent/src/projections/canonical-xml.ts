@@ -11,7 +11,7 @@ export interface CanonicalTrace {
   thinkBlocks: ThinkBlock[]
   messages: Array<{ text: string; destination: MessageDestination }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string }>
-  turnDecision: 'observe' | 'idle'
+  turnDecision: 'continue' | 'idle'
 }
 
 function attrsToString(attrs: Record<string, string>): string {

@@ -195,7 +195,7 @@ export type XmlToolResult<TOutput = unknown> =
   | { readonly _tag: 'Interrupted' }
 
 export type XmlExecutionResult =
-  | { readonly _tag: 'Success'; readonly turnControl: 'observe' | 'idle' | null }
+  | { readonly _tag: 'Success'; readonly turnControl: 'continue' | 'idle' | null }
   | { readonly _tag: 'Success'; readonly turnControl: 'finish'; readonly evidence: string }
   | { readonly _tag: 'Failure'; readonly error: string }
   | { readonly _tag: 'Interrupted' }
