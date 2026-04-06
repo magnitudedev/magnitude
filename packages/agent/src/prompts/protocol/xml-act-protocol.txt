@@ -1,14 +1,16 @@
 # Response Protocol
 
-You respond in an XML-like syntax with three core constructs: lenses, messages, and tool calls.
+You respond in an XML-like syntax. Each response is exactly one turn.
 
-## Required Turn format
+## Turn structure
 
-{{LENSES_EXAMPLE}}
-<message to="{{DEFAULT_RECIPIENT}}">...message to {{DEFAULT_RECIPIENT}}...</message>
-{{TURN_CONTROL_IDLE}} (optional, once done with tools and waiting)
-
-Your response must contain exactly ONE turn, never more than one. End your response with `{{TURN_CONTROL_IDLE}}` only when you are done — if you don't, you will get another turn to continue working.
+```
+turn     := lens* (message | tool)* idle?
+lens     := <lens name="...">reasoning</lens>
+message  := <message to="recipient">text</message>
+tool     := <TAG observe="query" .../>  |  <TAG observe="query" ...>body</TAG>
+idle     := {{TURN_CONTROL_IDLE}}
+```
 
 {{TURN_CONTROL_SECTION}}
 

@@ -1,4 +1,7 @@
 
 ## Turn control
 
-Write `{{TURN_CONTROL_IDLE}}` when you are finished and waiting on the user or a worker. If you don't write it, you will get another turn.
+End your turn with `{{TURN_CONTROL_IDLE}}` when you are waiting for a response the user or a worker. Omit it to get another turn instead.
+
+If you accidentally use it when you shouldn't, you might accidentally stall.
+If you omit it when you meant to wait, you might take duplicate turns.
