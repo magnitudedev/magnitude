@@ -1,7 +1,7 @@
 import { Effect, Layer, ManagedRuntime, Stream } from 'effect'
 import type { ChatMessage } from '@magnitudedev/llm-core'
 import type { StreamResult, CompleteResult, ExecutableDriver } from '../drivers/types'
-import { BamlDriver, ResponsesDriver } from '../drivers'
+import { BamlDriver } from '../drivers'
 import {
   bootstrapProviderRuntime,
   CodingAgentChat,
@@ -19,7 +19,7 @@ import type { Model } from '../model/model'
 import type { BoundModel } from '../model/bound-model'
 import type { TraceInput } from '../resolver/tracing'
 
-export type ExpectedDriver = 'baml' | 'openai-responses'
+export type ExpectedDriver = 'baml'
 
 export interface LiveTraceStore {
   readonly traces: TraceInput[]
@@ -62,10 +62,8 @@ export function getLiveProviderTestSkipReason(): string | null {
     : 'Set MAGNITUDE_RUN_LIVE_PROVIDER_TESTS=1 to run live provider integration tests'
 }
 
-export function expectedDriverForSelection(model: Model, auth: AuthInfo | null): ExpectedDriver {
-  const isCodex = model.providerId === 'openai' && auth?.type === 'oauth'
-  const isCopilotCodex = model.providerId === 'github-copilot' && model.id.includes('codex')
-  return (isCodex || isCopilotCodex) ? 'openai-responses' : 'baml'
+export function expectedDriverForSelection(_model: Model, _auth: AuthInfo | null): ExpectedDriver {
+  return 'baml'
 }
 
 export function makeGenerateChatTitleInput() {
@@ -87,8 +85,8 @@ export function makeCodingAgentChatInput(): {
   }
 }
 
-function driverForExpected(expectedDriver: ExpectedDriver): ExecutableDriver {
-  return expectedDriver === 'openai-responses' ? ResponsesDriver : BamlDriver
+function driverForExpected(_expectedDriver: ExpectedDriver): ExecutableDriver {
+  return BamlDriver
 }
 
 function makeTraceStore(): LiveTraceStore {
@@ -204,7 +202,7 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
       driver.stream({
         slot: target.slot,
         functionName: 'CodingAgentChat',
-        args: [input.systemPrompt, input.messages, input.ackTurn, false],
+        args: [input.systemPrompt, input.messages, input.ackTurn, false, true],
         connection,
         model: target.model,
         inference: {},

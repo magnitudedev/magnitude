@@ -35,10 +35,9 @@ const zeroUsage: CallUsage = {
 }
 
 const collectorData: CollectorData = {
-  _tag: 'Responses',
+  _tag: 'Baml',
   rawRequestBody: null,
   rawResponseBody: null,
-  sseEvents: null,
 }
 
 function resolveCompleteResponse(
@@ -77,10 +76,8 @@ export function makeTestResolver(config: TestModelConfig = {}): Layer.Layer<Mode
 
   const fakeBoundModel: BoundModel = {
     model: fakeModel,
-    connection: ModelConnection.Responses({
+    connection: ModelConnection.Baml({
       auth: null,
-      endpoint: 'https://example.test/responses',
-      headers: {},
     }),
     stream: <K extends BamlStreamFunctionName>(functionName: K, args: readonly unknown[]) =>
       Effect.succeed({

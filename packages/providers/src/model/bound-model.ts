@@ -7,11 +7,17 @@ import type { TraceEmitter } from '../resolver/tracing'
 import type { BamlFunctionName, BamlResult, BamlStreamFunctionName } from '../drivers/baml-types'
 import type { ModelError } from '../errors/model-error'
 
-export interface StreamOptions {
+import type { ProviderOptions } from '../types'
+
+export interface CallOptions {
+  readonly providerOptions?: ProviderOptions
+}
+
+export interface StreamOptions extends CallOptions {
   readonly stopSequences?: string[]
 }
 
-export interface CompleteOptions {}
+export interface CompleteOptions extends CallOptions {}
 
 export interface ChatStream {
   readonly stream: Stream.Stream<string, ModelError>

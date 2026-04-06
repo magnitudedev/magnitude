@@ -85,9 +85,9 @@ function buildOptions(
       return buildOpenAIOptions(modelId, auth, stopSequences, maxOutputTokens)
     case 'openai-responses':
       if (def.id === 'github-copilot') {
-        return buildCopilotCodexOptions(modelId, auth, stopSequences, maxOutputTokens)
+        return buildCopilotCodexOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
       }
-      return buildOpenAIResponsesOptions(modelId, auth, stopSequences, maxOutputTokens)
+      return buildOpenAIResponsesOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
     case 'openai-generic':
       return buildOpenAIGenericOptions(def, modelId, auth, providerOpts, stopSequences, maxOutputTokens)
     case 'aws-bedrock':
@@ -163,7 +163,13 @@ function buildOpenAIOptions(modelId: string, auth: AuthInfo | null, stopSequence
 // NOTE: The Responses API (/v1/responses) does NOT support stop sequences or any equivalent parameter.
 // Unlike Chat Completions, there is no `stop` field. Passing it causes a 400 error.
 // Stop sequences are also excluded in the direct HTTP path in model-proxy.ts#transformForResponsesApi.
-function buildOpenAIResponsesOptions(modelId: string, auth: AuthInfo | null, stopSequences?: string[], _maxOutputTokens?: number): Record<string, any> | undefined {
+function buildOpenAIResponsesOptions(
+  modelId: string,
+  auth: AuthInfo | null,
+  providerOpts?: ProviderOptions,
+  stopSequences?: string[],
+  _maxOutputTokens?: number,
+): Record<string, any> | undefined {
   // NOTE: max_output_tokens not supported — Codex/Copilot Responses API endpoints reject it with 400.
   const base: Record<string, any> = {
     model: modelId,
@@ -175,16 +181,22 @@ function buildOpenAIResponsesOptions(modelId: string, auth: AuthInfo | null, sto
     base.base_url = 'https://chatgpt.com/backend-api/codex'
     base.headers = {
       ...(auth.accountId ? { 'ChatGPT-Account-Id': auth.accountId } : {}),
+      ...extractOpenAIResponsesHeaders(providerOpts),
     }
+    base.store = false
   } else if (auth?.type === 'api') {
     base.api_key = auth.key
+    const headers = extractOpenAIResponsesHeaders(providerOpts)
+    if (Object.keys(headers).length > 0) base.headers = headers
   } else {
     const envKey = process.env.OPENAI_API_KEY
     if (!envKey) return undefined
     base.api_key = envKey
+    const headers = extractOpenAIResponsesHeaders(providerOpts)
+    if (Object.keys(headers).length > 0) base.headers = headers
   }
 
-  return base
+  return mergeOpenAIResponsesOverrides(base, providerOpts)
 }
 
 /** OpenAI-generic (OpenRouter, Local, Cerebras, Vercel, GitHub Copilot) */
@@ -368,11 +380,17 @@ function buildAnthropicCompatibleOptions(
 }
 /** GitHub Copilot with Codex model — uses openai-responses BAML provider */
 // NOTE: Also uses the Responses API, which does not support stop sequences (see buildOpenAIResponsesOptions).
-function buildCopilotCodexOptions(modelId: string, auth: AuthInfo | null, stopSequences?: string[], _maxOutputTokens?: number): Record<string, any> | undefined {
+function buildCopilotCodexOptions(
+  modelId: string,
+  auth: AuthInfo | null,
+  providerOpts?: ProviderOptions,
+  stopSequences?: string[],
+  _maxOutputTokens?: number,
+): Record<string, any> | undefined {
   // NOTE: max_output_tokens not supported — Codex/Copilot Responses API endpoints reject it with 400.
   if (auth?.type !== 'oauth') return undefined
 
-  return {
+  const base = {
     model: modelId,
     // stop sequences intentionally omitted — not supported by Responses API
     api_key: auth.accessToken,
@@ -384,8 +402,11 @@ function buildCopilotCodexOptions(modelId: string, auth: AuthInfo | null, stopSe
       'Editor-Version': 'vscode/1.107.0',
       'Editor-Plugin-Version': 'copilot-chat/0.35.0',
       'Copilot-Integration-Id': 'vscode-chat',
+      ...extractOpenAIResponsesHeaders(providerOpts),
     },
   }
+
+  return mergeOpenAIResponsesOverrides(base, providerOpts)
 }
 
 /** Google AI (Gemini API) — direct API key */
@@ -408,6 +429,60 @@ function buildGoogleAIOptions(modelId: string, auth: AuthInfo | null, stopSequen
   }
 
   return base
+}
+
+function extractOpenAIResponsesHeaders(providerOpts?: ProviderOptions): Record<string, string> {
+  const value = providerOpts?.headers
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const pairs = Object.entries(value as Record<string, unknown>).filter(
+    ([, v]) => typeof v === 'string',
+  )
+  return Object.fromEntries(pairs) as Record<string, string>
+}
+
+function mergeOpenAIResponsesOverrides(
+  base: Record<string, any>,
+  providerOpts?: ProviderOptions,
+): Record<string, any> {
+  if (!providerOpts) return base
+  const overrides: Record<string, unknown> = {}
+
+  if (typeof providerOpts.instructions === 'string') {
+    overrides.instructions = providerOpts.instructions
+  }
+  if (typeof providerOpts.store === 'boolean') {
+    overrides.store = providerOpts.store
+  }
+
+  if (Object.keys(overrides).length === 0) return base
+  return deepMerge(base, overrides)
+}
+
+export function __testOnly_buildProviderOptions(
+  providerId: string,
+  modelId: string,
+  auth: AuthInfo | null,
+  providerOptions?: ProviderOptions,
+  stopSequences?: string[],
+): Record<string, any> | undefined {
+  const def = getProvider(providerId)
+  if (!def) return undefined
+
+  const bamlProvider = (providerId === 'openai' && (auth?.type === 'oauth' || auth?.type === 'api'))
+    ? 'openai-responses' as const
+    : (providerId === 'github-copilot' && modelId.includes('codex'))
+      ? 'openai-responses' as const
+      : def.bamlProvider
+
+  const modelDef = def.models.find(m => m.id === modelId)
+  return buildOptions(
+    { ...def, bamlProvider },
+    modelId,
+    auth,
+    providerOptions,
+    stopSequences,
+    modelDef?.maxOutputTokens,
+  )
 }
 
 // ---------------------------------------------------------------------------

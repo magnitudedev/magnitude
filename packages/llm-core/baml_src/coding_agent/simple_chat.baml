@@ -3,12 +3,15 @@
 
 function SimpleChat(
   systemPrompt: string,
-  messages: ChatMessage[]
+  messages: ChatMessage[],
+  includeSystemPromptMessage: bool
 ) -> string {
   client ChatClientNoRetryAnthropicOnly
   prompt #"
+    {%if includeSystemPromptMessage%}
     {{ _.role("system") }}
     {{ systemPrompt }}
+    {%endif%}
 
     {% for message in messages %}
     {% if message.role == "user" %}

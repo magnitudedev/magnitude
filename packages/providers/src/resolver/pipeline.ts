@@ -31,7 +31,7 @@ function extractTraceRequest(
   if (!raw) return fallback
   // BAML driver: raw request has `messages` array
   if (Array.isArray(raw.messages)) return { messages: raw.messages }
-  // Responses driver: BAML request body uses `input` instead of `messages`
+  // Some providers may use `input` instead of `messages` in request payloads
   if (Array.isArray(raw.input)) return { messages: raw.input }
   return fallback
 }
@@ -41,12 +41,9 @@ function extractTraceResponse(
   rawOutput: string | null,
 ): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string } {
   const rawBody = collectorData.rawResponseBody ?? null
-  const sseEvents = ('sseEvents' in collectorData && Array.isArray(collectorData.sseEvents))
-    ? collectorData.sseEvents
-    : null
   return {
     rawBody,
-    sseEvents,
+    sseEvents: null,
     ...(rawOutput != null ? { rawOutput } : {}),
   }
 }
@@ -98,7 +95,10 @@ function createBoundModelImpl<TSlot extends string>(
         connection,
         model,
         inference: requestInference,
-        providerOptions,
+        providerOptions: {
+          ...(providerOptions ?? {}),
+          ...(options?.providerOptions ?? {}),
+        },
         signal: abortController.signal,
       }
 
@@ -225,7 +225,10 @@ function createBoundModelImpl<TSlot extends string>(
           connection,
           model,
           inference,
-          providerOptions,
+          providerOptions: {
+            ...(providerOptions ?? {}),
+            ...(_options?.providerOptions ?? {}),
+          },
         })
 
         // Extract raw output text for tracing

@@ -14,7 +14,7 @@ describeLive('live integration: bound model', () => {
       expect(resolved.expectedDriver).toBe(target.expectedDriver)
       expect(resolved.model.id).toBe(target.model.id)
       expect(resolved.model.providerId).toBe(target.model.providerId)
-      expect(resolved.bound.connection._tag).toBe(target.expectedDriver === 'openai-responses' ? 'Responses' : 'Baml')
+      expect(resolved.bound.connection._tag).toBe('Baml')
     }, 15000)
 
     test(`bound complete GenerateChatTitle for ${label}`, async () => {
