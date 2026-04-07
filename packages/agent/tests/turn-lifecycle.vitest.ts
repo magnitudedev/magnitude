@@ -98,6 +98,39 @@ describe('turn lifecycle', () => {
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
+  it.live('message to task without spawned worker surfaces destination error', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+      const taskId = 'task-no-worker'
+
+      yield* h.send({
+        type: 'task_created',
+        forkId: null,
+        taskId,
+        title: 'Task without worker',
+        taskType: 'implement',
+        parentId: null,
+        timestamp: Date.now(),
+      })
+
+      yield* h.script.next({ xml: `<message to="${taskId}">hello</message><idle/>` })
+
+      yield* h.user('trigger workerless task message')
+      const completed = yield* h.wait.turnCompleted(null)
+
+      expect(completed.result.success).toBe(true)
+      if (completed.result.success) {
+        expect(completed.result.turnDecision).toBe('continue')
+        expect(completed.result.errors).toEqual([
+          {
+            code: 'nonexistent_agent_destination',
+            message: `Invalid message destination "${taskId}": task has no active worker`,
+          },
+        ])
+      }
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
   it.live(`Circuit breaker trips after N identical consecutive continue responses`, () =>
     Effect.gen(function* () {
       const h = yield* TestHarness

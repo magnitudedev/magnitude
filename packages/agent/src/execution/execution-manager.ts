@@ -774,9 +774,13 @@ const makeExecutionManager = Effect.gen(function* () {
                       })
                       break
                     }
-                    // Do not require worker to already be visible here.
-                    // In same-turn spawn-worker + message flows, worker assignment may be
-                    // observed by routing projection later in the event sequence.
+                    if (!targetTask.worker) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": task has no active worker`,
+                      })
+                      break
+                    }
                     destination = { kind: 'worker', taskId: explicitTo }
                   }
                 } else {
