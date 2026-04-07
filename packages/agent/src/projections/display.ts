@@ -1305,16 +1305,25 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
 
       const nextResumeCount = (message.resumeCount ?? 0) + 1
-      const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
-        ...msg,
+      const resumedBlock: ForkActivityMessage = {
+        id: generateId(),
+        type: 'fork_activity',
+        forkId,
+        name: message.name,
+        role: message.role,
         status: 'running',
+        createdAt: value.timestamp,
         activeSince: value.timestamp,
-        completedAt: undefined,
+        accumulatedActiveMs: message.accumulatedActiveMs,
         resumeCount: nextResumeCount,
-        timestamp: value.timestamp,
-      }))
+        toolCounts: message.toolCounts,
+        timestamp: value.timestamp
+      }
 
-      let nextParentState: DisplayState = { ...parentState, messages: moved }
+      let nextParentState: DisplayState = {
+        ...parentState,
+        messages: insertBeforeQueuedMessages(parentState.messages, resumedBlock)
+      }
 
       if (parentForkId === null) {
         const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
@@ -1324,7 +1333,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           subagentType: value.role,
           subagentId: value.agentId,
           title: message.name,
-          resumed: nextResumeCount > 0,
+          resumed: true,
         }
         nextParentState = {
           ...withBlock.fork,
