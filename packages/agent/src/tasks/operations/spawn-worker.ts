@@ -101,7 +101,7 @@ export const handleSpawnWorkerDirective = <R>(
     }
 
     const agentId = directive.id
-    const prompt = buildAgentContext(task.title, undefined, summary, directive.id, taskContract)
+    const prompt = buildAgentContext(task.title, summary, directive.id, taskContract)
     const forkId = yield* directive.spawnWorker({
       parentForkId,
       name: task.title,

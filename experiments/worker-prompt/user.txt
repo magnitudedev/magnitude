@@ -1,0 +1,8 @@
+Explore the `packages/event-core/` package thoroughly. Read its source files, understand its purpose, architecture, exports, and how it's used by other packages in the monorepo. Write a comprehensive report to `$M/reports/event-core.md` covering:
+
+- Purpose and overview
+- Key types and interfaces
+- Main exports and API surface
+- Architecture and design patterns
+- How other packages depend on it
+- Any notable implementation details

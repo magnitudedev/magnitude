@@ -44,15 +44,17 @@ export function buildCloneContext(taskDescription: string, outputSchema?: JsonSc
 export function buildSpawnContext(taskDescription: string, sessionContext?: SessionContext | null, outputSchema?: JsonSchema): string {
   const parts: string[] = []
 
+  parts.push('<session-start>')
+
   // Project context (if available)
   if (sessionContext) {
-    parts.push('<project_context>')
+    parts.push('<project-context>')
     parts.push(buildProjectContext(sessionContext))
-    parts.push('</project_context>')
+    parts.push('</project-context>')
     parts.push('')
   }
 
-  // Task description (already wrapped in <orchestrator> XML)
+  // Task description
   parts.push(taskDescription)
 
   if (outputSchema) {
@@ -61,6 +63,8 @@ export function buildSpawnContext(taskDescription: string, sessionContext?: Sess
     parts.push(outputFormatString(outputSchema))
     parts.push('</output_format>')
   }
+
+  parts.push('</session-start>')
 
   return parts.join('\n')
 }

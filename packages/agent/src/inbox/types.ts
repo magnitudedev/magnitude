@@ -94,6 +94,7 @@ export type ResultEntry =
 
 export type TimelineEntry =
   | (TimestampedText<'user_message'> & { readonly attachments: readonly TimelineAttachment[] })
+  | (TimestampedText<'parent_message'>)
   | (Timestamped<'user_bash_command'> & {
       readonly command: string
       readonly cwd: string

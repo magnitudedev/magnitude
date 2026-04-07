@@ -123,6 +123,8 @@ function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observat
   switch (entry.kind) {
     case 'user_message':
       return [`<message from="user">${entry.text}</message>`]
+    case 'parent_message':
+      return [`<message from="parent">${entry.text}</message>`]
     case 'user_bash_command':
       return [
         `<user_bash_command cwd="${entry.cwd}" exit_code="${entry.exitCode}">\n<command>${entry.command}</command>\n<stdout>${entry.stdout}</stdout>\n<stderr>${entry.stderr}</stderr>\n</user_bash_command>`,

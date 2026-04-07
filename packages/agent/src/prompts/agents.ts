@@ -7,29 +7,20 @@ import type { ConversationEntry } from '../projections/conversation'
 /** Build the context prompt injected into a sub-agent's fork */
 export function buildAgentContext(
   title: string,
-  message: string | undefined,
   extraContext: string | null,
   taskId: string,
   taskContract?: string,
 ): string {
   const parts: string[] = []
-  parts.push('<lead>')
   parts.push(`<task>${title}</task>`)
-  // parts.push(`<task_id>${taskId}</task_id>`)
   if (taskContract?.trim()) {
     parts.push('<task-guidance>')
     parts.push(taskContract.trim())
     parts.push('</task-guidance>')
   }
-  if (message !== undefined) {
-    parts.push('<message>')
-    parts.push(message)
-    parts.push('</message>')
-  }
   if (extraContext) {
     parts.push(extraContext)
   }
-  parts.push('</lead>')
   return parts.join('\n')
 }
 
@@ -68,5 +59,5 @@ export function buildConversationSummary(entries: readonly ConversationEntry[]):
 
   result = result.concat(included)
 
-  return `<conversation_context>\n${result.join('\n\n')}\n</conversation_context>`
+  return `<conversation-context>\n${result.join('\n\n')}\n</conversation-context>`
 }

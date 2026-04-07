@@ -59,8 +59,8 @@ function executeAgentCreate({ agentId, options }: {
     // Use a synthetic task ID for the fork (agents no longer require pre-existing tasks)
     const taskId = `agent-${agentId}`
 
-    // Build context from title + message + conversation
-    const context = buildAgentContext(title, message, conversationContext, taskId)
+    // Build context from title + conversation
+    const context = buildAgentContext(title, conversationContext, taskId)
 
     const forkId = yield* execManager.fork({
       parentForkId,

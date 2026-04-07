@@ -39,6 +39,7 @@ import {
   toResultError,
   toResultNoop,
   toTimelineUserMessage,
+  toTimelineParentMessage,
   toTimelineUserToAgent,
   toTimelineUserBashCommand,
   toTimelineUserPresence,
@@ -668,7 +669,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         ? [{ type: 'fork_context', source: 'system', content: textParts(normalizedContext) }]
         : []
 
-      const newForkState: ForkMemoryState = {
+      let newForkState: ForkMemoryState = {
         messages: [...contextMessage],
         queuedEntries: [],
         currentTurnId: null,
@@ -676,6 +677,12 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         pendingPresenceText: null,
         nextQueueSeq: 0,
       }
+
+      newForkState = enqueueTimeline(
+        newForkState,
+        toTimelineParentMessage({ timestamp: event.timestamp, text: event.message }),
+        event.timestamp,
+      )
 
       const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
       const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
@@ -705,17 +712,28 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const sender = value.forkId === null ? null : getAgentByForkId(agentState, value.forkId)
       const senderAgentId = sender?.agentId ?? 'lead'
 
-      // Determine direction based on destination
-      const direction: 'to_lead' | 'from_lead' = value.destination.kind === 'worker' ? 'from_lead' : 'to_lead'
+      if (value.destination.kind === 'worker') {
+        return {
+          ...state,
+          forks: new Map(state.forks).set(
+            targetForkId,
+            enqueueTimeline(
+              targetState,
+              toTimelineParentMessage({ timestamp: value.timestamp, text: value.text }),
+              value.timestamp,
+            ),
+          ),
+        }
+      }
 
       const atom: AgentAtom = {
         kind: 'message',
         timestamp: value.timestamp,
-        direction,
+        direction: 'to_lead',
         text: value.text,
       }
 
-      let nextState = {
+      return {
         ...state,
         forks: new Map(state.forks).set(
           targetForkId,
@@ -727,8 +745,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           }),
         ),
       }
-
-      return nextState
     }),
 
     on(SubagentActivityProjection.signals.unseenActivityAvailable, ({ value, state, read }) => {

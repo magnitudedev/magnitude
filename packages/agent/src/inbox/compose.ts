@@ -54,6 +54,16 @@ export function toTimelineUserMessage(args: {
   }
 }
 
+export function toTimelineParentMessage(args: {
+  timestamp: number
+  text: string
+}): TimelineEntry {
+  return {
+    kind: 'parent_message',
+    ...args,
+  }
+}
+
 export function toTimelineUserBashCommand(args: {
   timestamp: number
   command: string
