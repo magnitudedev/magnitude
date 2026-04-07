@@ -87,7 +87,7 @@ export const FileViewerPanel = memo(function FileViewerPanel({
       <scrollbox
         ref={scrollboxRef}
         stickyScroll={!scrollToSection}
-        stickyStart="top"
+        stickyStart={isActivelyStreaming && !scrollToSection ? 'bottom' : 'top'}
         scrollX={false}
         scrollbarOptions={{ visible: false }}
         verticalScrollbarOptions={{ visible: false }}
