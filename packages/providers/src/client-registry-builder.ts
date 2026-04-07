@@ -214,6 +214,7 @@ function buildOpenAIGenericOptions(
     ...(maxOutputTokens ? { max_tokens: maxOutputTokens } : {}),
     ...(baseUrl ? { base_url: baseUrl } : {}),
     ...(stopSequences && stopSequences.length > 0 ? { stop: stopSequences } : {}),
+    stream_options: { include_usage: true },
   }
 
   // Provider-specific headers
