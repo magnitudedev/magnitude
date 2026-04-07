@@ -313,3 +313,41 @@ test('renders killed worker with red kill icon glyph', () => {
   const text = htmlToText(html)
   expect(text).toContain('✕ [builder] builder-killed · 0:12')
 })
+
+test('renders --- in assigned to column for composite tasks', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          taskId: 't-feature',
+          type: 'feature',
+          assignee: { kind: 'none' },
+        }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('Assigned To')
+  expect(text).toContain('---')
+})
+
+test('keeps assigned to column blank for non-composite unassigned tasks', () => {
+  const html = render(
+    <TaskList
+      tasks={[
+        makeTask({
+          taskId: 't-implement-none',
+          type: 'implement',
+          assignee: { kind: 'none' },
+        }),
+      ]}
+      pushForkOverlay={noop}
+    />,
+  )
+
+  const text = htmlToText(html)
+  expect(text).toContain('Assigned To')
+  expect(text).not.toContain('---')
+})

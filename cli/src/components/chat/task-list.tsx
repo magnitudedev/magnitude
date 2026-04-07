@@ -80,7 +80,12 @@ function getWorkerStatusIcon(task: TaskListItem, now: number): { text: string; c
   return null
 }
 
+function isCompositeTask(task: TaskListItem): boolean {
+  return task.type === 'bug' || task.type === 'feature' || task.type === 'refactor' || task.type === 'group'
+}
+
 function getAssigneeLabel(task: TaskListItem): string {
+  if (isCompositeTask(task)) return '---'
   if (task.assignee.kind === 'lead') return 'lead'
   if (task.assignee.kind === 'none') return ''
   if (task.assignee.kind === 'user') return 'user'
