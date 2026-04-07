@@ -244,7 +244,7 @@ Use `observe="."` for the full output:
 Use an XPath/XQuery expression to select a subset of the tool's output tree:
 
 ```xml
-<grep pattern="TODO" observe="//item[1]/@file"/>
+<grep observe="//item[1]/@file"><pattern>TODO</pattern></grep>
 ```
 
 Observation is execution-driven:

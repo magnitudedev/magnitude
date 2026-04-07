@@ -101,8 +101,8 @@ class TurnBuilderImpl implements TurnBuilder {
   fsSearch(pattern: string, path?: string): TurnBuilder {
     this.actions.push(
       path
-        ? `<grep pattern="${pattern}" path="${path}" />`
-        : `<grep pattern="${pattern}" />`
+        ? `<grep path="${path}"><pattern>${pattern}</pattern></grep>`
+        : `<grep><pattern>${pattern}</pattern></grep>`
     )
     return this
   }
