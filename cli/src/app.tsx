@@ -21,6 +21,7 @@ import { useTheme } from './hooks/use-theme'
 import { SelectedFileProvider } from './hooks/use-file-viewer'
 
 import { BOX_CHARS } from './utils/ui-constants'
+import { hasConversationActivity } from './utils/start-state'
 import {
   localProviderAddedModelToast,
   localProviderSavedApiKeyToast,
@@ -941,8 +942,13 @@ function AppInner({
     onResumeSession(chat.id)
   }, [onResumeSession])
 
-  // Navigation for startup widget (active when no messages, overlay closed, and input empty)
-  const widgetNavActive = !showRecentChatsOverlay && (display?.messages ?? []).length === 0 && !composerHasContent
+  const hasActivity = hasConversationActivity({
+    displayMessageCount: (display?.messages ?? []).length,
+    bashOutputCount: bashOutputs.length,
+  })
+
+  // Navigation for startup widget (active when no activity, overlay closed, and input empty)
+  const widgetNavActive = !showRecentChatsOverlay && !hasActivity && !composerHasContent
   const widgetNavigation = useRecentChatsNavigation(
     recentChats ? recentChats.slice(0, 5) : [],
     handleResumeChat,
@@ -2109,14 +2115,14 @@ function AppInner({
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>{process.cwd().replace(process.env.HOME || '', '~')}</text>
       </box>
 
-      <box style={{ paddingLeft: 1, paddingBottom: ((display?.messages ?? []).length > 0 || (recentChats !== null && recentChats.length === 0)) ? 1 : 0, flexDirection: 'row' }}>
+      <box style={{ paddingLeft: 1, paddingBottom: (hasActivity || (recentChats !== null && recentChats.length === 0)) ? 1 : 0, flexDirection: 'row' }}>
         <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Tip: </text>
         <text style={{ fg: theme.muted }}>Use </text>
         <text style={{ fg: theme.foreground }}>/settings</text>
         <text style={{ fg: theme.muted }}> to configure providers and models!</text>
       </box>
 
-      {(display?.messages ?? []).length === 0 && (
+      {!hasActivity && (
         <box style={{ paddingLeft: 1 }}>
           <RecentChatsWidget
             chats={recentChats ? recentChats.slice(0, 5) : []}
