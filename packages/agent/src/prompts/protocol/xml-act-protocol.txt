@@ -1,6 +1,6 @@
 # Response Protocol
 
-You respond in an XML-like syntax. Each response is exactly one turn.
+You respond in an XML-like syntax. Each response must be exactly one turn.
 
 ## Turn structure
 
@@ -11,6 +11,8 @@ message  := <message to="recipient">text</message>
 tool     := <TAG observe="query" .../>  |  <TAG observe="query" ...>body</TAG>
 turnctl  := {{TURN_CONTROL_IDLE}} | {{TURN_CONTROL_CONTINUE}}
 ```
+
+Your response MUST end in either {{TURN_CONTROL_IDLE}} or {{TURN_CONTROL_CONTINUE}}, and you MUST stop your response immediately after that.
 
 {{TURN_CONTROL_SECTION}}
 
