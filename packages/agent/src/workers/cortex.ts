@@ -195,7 +195,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // 3. Build and consume the turn event stream
         const turnStream = createTurnStream((queue) => Effect.gen(function* () {
           // Ack turn disabled
-          const ackTurn = buildAckTurn(agentDef.lenses, agentDef.defaultRecipient)
+          const ackTurn = '';//buildAckTurn(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
             {
               metadata: { callType: 'chat', forkId, forkName: agentInstance?.name ?? 'root', turnId, chainId },

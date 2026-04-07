@@ -20,14 +20,14 @@ import { formatAgentIdList } from './lifecycle-reminder-format'
 
 const strategyLens = defineThinkingLens({
   name: 'strategy',
-  trigger: 'When deciding what to investigate next',
-  description: "How can you gather the needed information quickly and efficiently? What tools and techniques will get you there fastest — tree, search, read, shell, web? Prioritize high-signal sources. Don't read aimlessly.",
+  trigger: 'On new session, or on new direction from parent',
+  description: "Consider overall approach",
 })
 
 const turnLens = defineThinkingLens({
   name: 'turn',
-  trigger: 'When planning your next actions',
-  description: 'Plan what to read, search, or explore this turn. Maximize coverage per turn by reading multiple files in parallel.',
+  trigger: 'When taking making one or more tool calls',
+  description: 'How to structure this specific response, what tools and/or messages to use and how',
 })
 
 const systemPrompt = compilePromptTemplate(explorerPromptRaw)

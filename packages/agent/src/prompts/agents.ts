@@ -14,12 +14,12 @@ export function buildAgentContext(
 ): string {
   const parts: string[] = []
   parts.push('<lead>')
-  parts.push(`<title>${title}</title>`)
-  parts.push(`<task_id>${taskId}</task_id>`)
+  parts.push(`<task>${title}</task>`)
+  // parts.push(`<task_id>${taskId}</task_id>`)
   if (taskContract?.trim()) {
-    parts.push('<task_contract>')
+    parts.push('<task-guidance>')
     parts.push(taskContract.trim())
-    parts.push('</task_contract>')
+    parts.push('</task-guidance>')
   }
   if (message !== undefined) {
     parts.push('<message>')

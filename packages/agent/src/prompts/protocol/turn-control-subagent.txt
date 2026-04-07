@@ -1,7 +1,4 @@
 
 ## Turn control
 
-End your turn with `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the parent. Use `{{TURN_CONTROL_CONTINUE}}` otherwise to take another turn.
-
-If you accidentally idle when you shouldn't, you might accidentally stall.
-If you accidentally continue when you meant to wait, you might take duplicate turns.
+End your response with `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the parent. End your response with `{{TURN_CONTROL_CONTINUE}}` otherwise.

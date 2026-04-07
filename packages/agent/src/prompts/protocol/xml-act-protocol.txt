@@ -42,9 +42,6 @@ You MUST include each lens with an applicable trigger condition.
 
 ## Tool calls
 
-Take 0 or more tool calls per turn. All tool calls are top-level — no nesting or scoping.
-If you are asking a question or waiting on workers, taking no actions can be appropriate.
-
 Tool calls, their parameters, and their outputs are represented as XML-like elements.
 
 ### Observe
