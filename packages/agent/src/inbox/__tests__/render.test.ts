@@ -319,6 +319,29 @@ describe('formatInbox', () => {
     })
   })
 
+  test('renders user_bash_command timeline entry', () => {
+    const timeline: readonly TimelineEntry[] = [
+      {
+        kind: 'user_bash_command',
+        timestamp: TS0,
+        command: 'ls -la',
+        cwd: '/tmp',
+        exitCode: 0,
+        stdout: 'file-a',
+        stderr: '',
+      },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '--- 2024-03-28 16:00 ---\n<user_bash_command cwd="/tmp" exit_code="0">\n<command>ls -la</command>\n<stdout>file-a</stdout>\n<stderr></stderr>\n</user_bash_command>',
+      },
+    ])
+  })
+
   test('renders all non-observation timeline kinds', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'u', attachments: [] },

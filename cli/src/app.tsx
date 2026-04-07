@@ -2281,6 +2281,18 @@ function AppInner({
                 })
               },
               appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
+              recordBashCommand: (result) => {
+                clientSend({
+                  type: 'user_bash_command',
+                  forkId: null,
+                  timestamp: result.timestamp,
+                  command: result.command,
+                  cwd: result.cwd,
+                  exitCode: result.exitCode,
+                  stdout: result.stdout,
+                  stderr: result.stderr,
+                })
+              },
               clearSystemBanners: () => {
                 setSystemMessages([])
                 for (const timeoutId of systemMessageTimeoutsRef.current.values()) {

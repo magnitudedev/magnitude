@@ -104,6 +104,7 @@ function makeProps(): ChatControllerProps {
       runSlashCommand: () => false,
       executeBash: () => ({ command: '', output: '', exitCode: 0 }),
       appendBashOutput: noop,
+      recordBashCommand: noop,
       clearSystemBanners: noop,
       interruptFork: noop,
       interruptAll: noop,

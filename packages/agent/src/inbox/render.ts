@@ -123,6 +123,10 @@ function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observat
   switch (entry.kind) {
     case 'user_message':
       return [`<message from="user">${entry.text}</message>`]
+    case 'user_bash_command':
+      return [
+        `<user_bash_command cwd="${entry.cwd}" exit_code="${entry.exitCode}">\n<command>${entry.command}</command>\n<stdout>${entry.stdout}</stdout>\n<stderr>${entry.stderr}</stderr>\n</user_bash_command>`,
+      ]
     case 'user_to_agent':
       return [`<user-to-agent agent="${entry.agentId}">${entry.text}</user-to-agent>`]
     case 'agent_block': {
@@ -154,6 +158,7 @@ function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observat
 
 function maybeAttentionBullet(entry: TimelineEntry, timezone: string | null): string | null {
   if (entry.kind === 'user_message') return `- user message at ${formatTime(entry.timestamp, timezone)}`
+  if (entry.kind === 'user_bash_command') return `- user ran bash command at ${formatTime(entry.timestamp, timezone)}`
   if (entry.kind === 'agent_block') {
     if (entry.atoms.some((a) => a.kind === 'error')) return `- ${entry.agentId} errored at ${formatTime(entry.timestamp, timezone)}`
     if (entry.atoms[entry.atoms.length - 1]?.kind === 'idle') return `- ${entry.agentId} went idle at ${formatTime(entry.timestamp, timezone)}`

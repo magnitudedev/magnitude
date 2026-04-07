@@ -40,6 +40,7 @@ import {
   toResultNoop,
   toTimelineUserMessage,
   toTimelineUserToAgent,
+  toTimelineUserBashCommand,
   toTimelineUserPresence,
   toTimelineObservation,
   toTimelineAgentBlock,
@@ -394,7 +395,19 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return enqueueTimeline(fork, entry, event.timestamp)
     },
 
-
+    user_bash_command: ({ event, fork }) =>
+      enqueueTimeline(
+        fork,
+        toTimelineUserBashCommand({
+          timestamp: event.timestamp,
+          command: event.command,
+          cwd: event.cwd,
+          exitCode: event.exitCode,
+          stdout: event.stdout,
+          stderr: event.stderr,
+        }),
+        event.timestamp,
+      ),
 
     turn_started: ({ event, fork, read }) => {
       let nextFork = fork

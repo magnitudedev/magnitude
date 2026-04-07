@@ -54,6 +54,20 @@ export function toTimelineUserMessage(args: {
   }
 }
 
+export function toTimelineUserBashCommand(args: {
+  timestamp: number
+  command: string
+  cwd: string
+  exitCode: number
+  stdout: string
+  stderr: string
+}): TimelineEntry {
+  return {
+    kind: 'user_bash_command',
+    ...args,
+  }
+}
+
 export function toTimelineUserToAgent(args: {
   timestamp: number
   agentId: string

@@ -109,6 +109,17 @@ export interface ObservationsCaptured {
   readonly parts: readonly ObservationPart[]
 }
 
+export interface UserBashCommand {
+  readonly type: 'user_bash_command'
+  readonly forkId: null
+  readonly timestamp: number
+  readonly command: string
+  readonly cwd: string
+  readonly exitCode: number
+  readonly stdout: string
+  readonly stderr: string
+}
+
 export interface UserMessageReady {
   readonly type: 'user_message_ready'
   readonly messageId: string
@@ -666,6 +677,7 @@ export type AppEvent =
   | OneshotTask
   | UserMessage
   | ObservationsCaptured
+  | UserBashCommand
   | UserMessageReady
   | TurnStarted
   | TurnCompleted

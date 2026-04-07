@@ -33,6 +33,7 @@ export type ChatControllerServices = {
   runSlashCommand: (commandText: string) => boolean | void
   executeBash: (command: string) => BashResult | Promise<BashResult>
   appendBashOutput: (result: BashResult) => void
+  recordBashCommand: (result: BashResult) => void
   clearSystemBanners: () => void
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void

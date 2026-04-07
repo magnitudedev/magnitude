@@ -94,6 +94,13 @@ export type ResultEntry =
 
 export type TimelineEntry =
   | (TimestampedText<'user_message'> & { readonly attachments: readonly TimelineAttachment[] })
+  | (Timestamped<'user_bash_command'> & {
+      readonly command: string
+      readonly cwd: string
+      readonly exitCode: number
+      readonly stdout: string
+      readonly stderr: string
+    })
   | (TimestampedText<'user_to_agent'> & { readonly agentId: string })
   | (Timestamped<'agent_block'> & {
       readonly firstAtomTimestamp: number

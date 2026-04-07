@@ -379,6 +379,7 @@ export function ChatController(props: ChatControllerProps) {
       if (!trimmed) return
       const result = await Promise.resolve(services.executeBash(trimmed))
       services.appendBashOutput(result)
+      services.recordBashCommand(result)
       services.exitBashMode()
       setInputValue(EMPTY_INPUT)
       setHistoryIndex(null)

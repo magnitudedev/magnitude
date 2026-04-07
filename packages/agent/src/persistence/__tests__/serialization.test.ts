@@ -136,6 +136,22 @@ describe('Event Serialization', () => {
       expect(JSON.parse(JSON.stringify(toolEvent))).toEqual(toolEvent)
     })
 
+    test('serializes and deserializes user_bash_command', () => {
+      const event: AppEvent = {
+        type: 'user_bash_command',
+        forkId: null,
+        timestamp: Date.now(),
+        command: 'ls -la',
+        cwd: '/tmp',
+        exitCode: 0,
+        stdout: 'a\nb',
+        stderr: '',
+      }
+
+      const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent
+      expect(deserialized).toEqual(event)
+    })
+
     test('serializes and deserializes streaming events', () => {
       const events: AppEvent[] = [
         {
