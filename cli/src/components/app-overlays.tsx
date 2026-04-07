@@ -16,6 +16,8 @@ import type { RecentChat } from '../data/recent-chats'
 import type { useAuthFlow } from '../hooks/use-auth-flow'
 
 import type { Preset, ProviderOptions } from '@magnitudedev/storage'
+import { useTheme } from '../hooks/use-theme'
+import { BOX_CHARS } from '../utils/ui-constants'
 
 type AgentClient = Awaited<ReturnType<typeof createCodingAgentClient>>
 
@@ -106,6 +108,7 @@ export type AppOverlaysProps = {
   pushForkOverlay: (forkId: string) => void
   workspacePath: string | null
   projectRoot: string
+  showCopiedToast: boolean
 }
 
 export function AppOverlays({
@@ -191,7 +194,9 @@ export function AppOverlays({
   pushForkOverlay,
   workspacePath,
   projectRoot,
+  showCopiedToast,
 }: AppOverlaysProps) {
+  const theme = useTheme()
   if (showSetupWizard && wizardStep === 'browser') {
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
@@ -264,7 +269,7 @@ export function AppOverlays({
     const agentId = agentStatusState?.agentByForkId.get(expandedForkId)
     const agent = agentId ? agentStatusState?.agents.get(agentId) : undefined
     return (
-      <box style={{ flexDirection: 'column', height: '100%' }}>
+      <box style={{ flexDirection: 'column', height: '100%', position: 'relative' }}>
         <ForkDetailOverlay
           forkId={expandedForkId}
           forkName={agent?.name ?? 'Agent'}
@@ -278,6 +283,27 @@ export function AppOverlays({
           subscribeForkDisplay={(fId, cb) => client.state.display.subscribeFork(fId, cb)}
           subscribeForkCompaction={(fId, cb) => client.state.compaction.subscribeFork(fId, cb)}
         />
+
+        {showCopiedToast && (
+          <box style={{ position: 'absolute', bottom: 1, right: 2 }}>
+            <box style={{
+              borderStyle: 'single',
+              border: ['left'],
+              borderColor: theme.success,
+              customBorderChars: { ...BOX_CHARS, vertical: '┃' },
+            }}>
+              <box style={{
+                backgroundColor: theme.surface,
+                paddingTop: 1,
+                paddingBottom: 1,
+                paddingLeft: 2,
+                paddingRight: 2,
+              }}>
+                <text style={{ fg: theme.success }}>Copied to clipboard</text>
+              </box>
+            </box>
+          </box>
+        )}
       </box>
     )
   }

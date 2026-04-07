@@ -2066,6 +2066,7 @@ function AppInner({
       pushForkOverlay={pushForkOverlay}
       workspacePath={workspacePath}
       projectRoot={process.cwd()}
+      showCopiedToast={clipboardToast}
     />
   )
 
@@ -2358,7 +2359,6 @@ function AppInner({
               border: ['left'],
               borderColor: theme.success,
               customBorderChars: { ...BOX_CHARS, vertical: '┃' },
-              backgroundColor: theme.surface,
             }}>
               <box style={{
                 backgroundColor: theme.surface,

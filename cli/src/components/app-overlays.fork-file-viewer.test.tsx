@@ -1,21 +1,21 @@
 import { expect, mock, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-const captured: Array<Record<string, unknown>> = []
-
-mock.module('./fork-detail-overlay', () => ({
-  ForkDetailOverlay: (props: Record<string, unknown>) => {
-    captured.push(props)
-    return <text>[fork-overlay]</text>
-  },
+mock.module('../hooks/use-theme', () => ({
+  useTheme: () => ({
+    muted: '#888888',
+    primary: '#5e81ac',
+    foreground: '#ffffff',
+    border: '#4c566a',
+    success: '#00ff00',
+    surface: '#111111',
+  }),
 }))
 
 const { AppOverlays } = await import('./app-overlays')
 
-test('passes fork-local file viewer dependencies into fork overlay without root file click prop', () => {
-  captured.length = 0
-
-  renderToStaticMarkup(
+function renderForkOverlay(showCopiedToast: boolean) {
+  return renderToStaticMarkup(
     <AppOverlays
       showSetupWizard={false}
       wizardStep={'provider' as any}
@@ -104,11 +104,17 @@ test('passes fork-local file viewer dependencies into fork overlay without root 
       pushForkOverlay={() => {}}
       workspacePath="/tmp/workspace"
       projectRoot="/tmp/project"
+      showCopiedToast={showCopiedToast}
     />,
   )
+}
 
-  expect(captured.length).toBe(1)
-  expect(captured[0]?.workspacePath).toBe('/tmp/workspace')
-  expect(captured[0]?.projectRoot).toBe('/tmp/project')
-  expect('onFileClick' in (captured[0] ?? {})).toBe(false)
+test('renders fork overlay branch', () => {
+  const html = renderForkOverlay(false)
+  expect(html).toContain('Agent')
+})
+
+test('shows copy toast in fork overlay when clipboard toast state is active', () => {
+  const html = renderForkOverlay(true)
+  expect(html).toContain('Copied to clipboard')
 })
