@@ -8,9 +8,12 @@
 
 Magnitude is an **open source coding agent** with a built-in engineering process. A lead agent understands your intent, maps it into engineering tasks, and delegates to specialized workers.
 
-- **Better code**. Real engineering workflows with verification throughout.
+- **Follows your intent**. The process stays accountable to your goal and clarifies when it isn't clear.
 - **Less babysitting**. The lead drives the process so you don't have to.
-- **Holds up on long tasks**. The lead doesn't code, so its context stays focused.
+- **Holds up on long tasks**. The lead coordinates but doesn't code, so its context stays focused.
+- **Verifies everything**. Plans get challenged, code gets reviewed, UI gets checked in the browser.
+- **Full model control**. Balance cost, speed, and intelligence across the lead and each worker.
+
 <p align="center">
   <img src="interface.png" alt="Magnitude Interface" width="100%" />
 </p>
@@ -56,6 +59,16 @@ Magnitude may use none or all of these in a given session. For a quick fix in a 
 <p align="center">
   <img src="architecture-dark.png" alt="Magnitude Architecture" width="100%" />
 </p>
+
+### Under the hood
+There's a lot of *harness engineering* that makes this all possible:
+- Robust agent lifecycle control with multiple context injection points
+- Topic-specific reasoning traces to improve task adherence
+- Two way communication between the lead and workers
+- Long-lived workers that can be resumed when context is still relevant
+- Shared workspace between the lead and workers (outside the project)
+- Sensible permissions system for safer shell execution
+- True model agnostic XML syntax
 
 ## Why we built this
 
