@@ -32,7 +32,6 @@ export {
   CodingAgentChat,
   SimpleChat,
   CodingAgentCompact,
-  GenerateChatTitle,
   ExtractMemoryDiff,
   GatherSplit,
   PatchFile,

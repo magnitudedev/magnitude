@@ -2,9 +2,9 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
-import { JsonChatPersistence } from './persistence'
+import { JsonChatPersistence, loadSessionSummary } from './persistence'
 
 import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
@@ -371,6 +371,7 @@ function AppInner({
     })
 
     let resolvedWorkspacePath: string | null = null
+    let resolvedSessionId: string | null = null
 
     const createClient = async () => {
       let sessionId: string | undefined
@@ -388,6 +389,7 @@ function AppInner({
         sessionId,
       })
       const activeSessionId = persistence.getSessionId()
+      resolvedSessionId = activeSessionId
       onSessionId?.(activeSessionId)
       resolvedWorkspacePath = storage.sessions.getWorkspacePath(activeSessionId) ?? null
       initLogger(persistence.getSessionId())
@@ -533,11 +535,12 @@ function AppInner({
       })
 
 
-      client.on.chatTitleGenerated(({ title }) => {
-        if (mounted) {
-          logger.info({ title }, 'Chat title generated')
-          renderer.setTerminalTitle(title)
-        }
+      client.state.taskGraph.subscribe((state) => {
+        if (!mounted) return
+        const title = getSessionTitleFromTaskGraph(state)
+        if (!title) return
+        logger.info({ title }, 'Session title derived from task graph')
+        renderer.setTerminalTitle(title)
       })
     }
 
@@ -564,9 +567,16 @@ function AppInner({
       createClient().catch((err) => {
         logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client');
         throw err;
-      }).then((client) => {
+      }).then(async (client) => {
         logger.info('Agent client created successfully');
         setupClient(client)
+
+        if (!resolvedSessionId) return
+
+        const summary = await loadSessionSummary(storage, resolvedSessionId)
+        if (summary?.title) {
+          renderer.setTerminalTitle(summary.title)
+        }
       })
     }
 

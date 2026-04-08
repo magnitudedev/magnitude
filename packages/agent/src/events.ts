@@ -524,17 +524,6 @@ export interface ToolRejected {
 }
 
 // =============================================================================
-// Chat Title Events
-// =============================================================================
-
-/** Chat title auto-generated from conversation */
-export interface ChatTitleGenerated {
-  readonly type: 'chat_title_generated'
-  readonly forkId: null  // Always root
-  readonly title: string
-}
-
-// =============================================================================
 // Union Type
 // =============================================================================
 export interface Wake {
@@ -704,7 +693,6 @@ export type AppEvent =
   | ContextLimitHit
   | ToolApproved
   | ToolRejected
-  | ChatTitleGenerated
   | PhaseCriteriaVerdict
   | PhaseVerdict
   // Task events

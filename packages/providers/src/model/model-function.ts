@@ -80,19 +80,6 @@ export const CodingAgentCompact: CompleteFn<
     ),
 }
 
-export const GenerateChatTitle: CompleteFn<
-  { conversation: string; defaultName: string },
-  { title: string } | null
-> = {
-  name: 'GenerateChatTitle',
-  mode: 'complete',
-  execute: (model, input) =>
-    Effect.map(
-      model.complete('GenerateChatTitle', [input.conversation, input.defaultName, includesClaudeSpoof(model)]),
-      ({ result }) => result,
-    ),
-}
-
 export const ExtractMemoryDiff: CompleteFn<
   { transcript: string; currentMemory: string },
   ExtractMemoryDiffResult

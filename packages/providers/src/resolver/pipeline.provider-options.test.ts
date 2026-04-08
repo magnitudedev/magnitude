@@ -92,7 +92,7 @@ describe('pipeline providerOptions overrides', () => {
     )
 
     await Effect.runPromise(
-      bound.complete('GenerateChatTitle', ['conv', 'default', false], {
+      bound.complete('ExtractMemoryDiff', ['transcript', 'memory'], {
         providerOptions: { instructions: 'call2', headers: { 'X-Test': '1' } },
       }).pipe(Effect.provideService(TraceEmitter, traceEmitter as any)),
     )

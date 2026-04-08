@@ -6,6 +6,7 @@ import {
   createCodingAgentClient,
   collectSessionContext,
   ChatPersistence,
+  getSessionTitleFromTaskGraph,
   textParts,
   type AppEvent,
   type DisplayState,
@@ -91,6 +92,8 @@ const DEFAULT_ARTIFACT_STATE: ArtifactState = {
   artifacts: new Map(),
 }
 
+const DEFAULT_SESSION_TITLE = 'New Chat'
+
 export class SessionNotFoundError extends Error {
   constructor(id: string) {
     super(`Session not found: ${id}`)
@@ -149,7 +152,7 @@ export class SessionManager {
     const record: SessionRecord = {
       id,
       createdAt,
-      title: 'New Chat',
+      title: DEFAULT_SESSION_TITLE,
       cwd: sessionContext.cwd,
       client,
       status: 'idle',
@@ -190,8 +193,8 @@ export class SessionManager {
       this.pushSessionEvent(record, 'artifact_state', state)
     }))
 
-    record.unsubscribers.push(client.on.chatTitleGenerated(({ title }) => {
-      record.title = title
+    record.unsubscribers.push(client.state.taskGraph.subscribe((state) => {
+      record.title = getSessionTitleFromTaskGraph(state) ?? DEFAULT_SESSION_TITLE
     }))
 
     this.sessions.set(id, record)

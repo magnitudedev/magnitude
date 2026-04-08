@@ -83,15 +83,14 @@ describe('memory transcript', () => {
         message: 'scan',
       },
       {
-        type: 'chat_title_generated',
+        type: 'wake',
         forkId: null,
-        title: 'Implement feature',
       },
     ]
 
     const t = buildExtractionTranscript(events)
     expect(t).toContain('agent_created')
-    expect(t).not.toContain('chat_title_generated')
+    expect(t).not.toContain('wake')
   })
 
   test('truncation keeps temporal order and drops oldest lines first', () => {

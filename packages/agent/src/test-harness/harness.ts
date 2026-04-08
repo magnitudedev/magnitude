@@ -23,7 +23,6 @@ import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
 
 import { ReplayProjection } from '../projections/replay'
-import { ChatTitleProjection } from '../projections/chat-title'
 import { ConversationProjection } from '../projections/conversation'
 import { UserPresenceProjection } from '../projections/user-presence'
 import { OutboundMessagesProjection } from '../projections/outbound-messages'
@@ -37,9 +36,9 @@ import { LifecycleCoordinator } from '../workers/lifecycle-coordinator'
 import { ApprovalWorker } from '../workers/approval-worker'
 import { Autopilot } from '../workers/autopilot'
 import { CompactionWorker } from '../workers/compaction-worker'
-import { ChatTitleWorker } from '../workers/chat-title-worker'
 import { UserPresenceWorker } from '../workers/user-presence-worker'
 import { FileMentionResolver } from '../workers/file-mention-resolver'
+import { SessionTitleWorker } from '../workers/session-title-worker'
 
 // Runtime/services
 import { ExecutionManagerLive } from '../execution/execution-manager'
@@ -89,6 +88,11 @@ export interface HarnessOptions {
   sessionContext?: Partial<SessionContext>
   persistence?: {
     seedEvents?: AppEvent[]
+    metadata?: {
+      chatName?: string
+      workingDirectory?: string
+      gitBranch?: string | null
+    }
   }
   defaults?: {
     waitTimeoutMs?: number
@@ -97,7 +101,6 @@ export interface HarnessOptions {
     turnController?: boolean
     autopilot?: boolean
     compaction?: boolean
-    chatTitle?: boolean
     userPresence?: boolean
   }
   files?: Record<string, string>
@@ -210,10 +213,10 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       ApprovalWorker,
       ...(options.workers?.autopilot ? [Autopilot] : []),
       ...(options.workers?.compaction ? [CompactionWorker] : []),
-      ...(options.workers?.chatTitle ? [ChatTitleWorker] : []),
       ...(options.workers?.userPresence ? [UserPresenceWorker] : []),
 
       FileMentionResolver,
+      SessionTitleWorker,
     ] as const
 
     const TestCodingAgent = Agent.define<AppEvent>()({
@@ -234,7 +237,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         UserMessageResolutionProjection,
         MemoryProjection,
         DisplayProjection,
-        ChatTitleProjection,
         ConversationProjection,
         UserPresenceProjection,
       ],
@@ -242,7 +244,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       expose: {
         signals: {
           restoreQueuedMessages: DisplayProjection.signals.restoreQueuedMessages,
-          chatTitleGenerated: ChatTitleProjection.signals.chatTitleGenerated,
         },
         state: {
           display: DisplayProjection,
@@ -258,6 +259,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
     const basePersistenceLayer = makeInMemoryChatPersistenceLayer({
       events: options.persistence?.seedEvents ?? [],
+      metadata: options.persistence?.metadata,
     })
 
     const faultWrappedPersistenceLayer = Layer.effect(

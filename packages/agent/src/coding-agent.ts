@@ -28,7 +28,6 @@ import { CompactionProjection } from './projections/compaction'
 import { WorkflowProjection } from './projections/workflow'
 
 import { ReplayProjection } from './projections/replay'
-import { ChatTitleProjection } from './projections/chat-title'
 import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
 import { OutboundMessagesProjection } from './projections/outbound-messages'
@@ -46,9 +45,9 @@ import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
 import { WorkflowWorker } from './workers/workflow-worker'
 import { isValidVariant, type AgentVariant } from './agents'
-import { ChatTitleWorker } from './workers/chat-title-worker'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
+import { SessionTitleWorker } from './workers/session-title-worker'
 import { FsLive } from './services/fs'
 
 // Execution
@@ -94,7 +93,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     UserMessageResolutionProjection,
     MemoryProjection,
     DisplayProjection,
-    ChatTitleProjection,
     ConversationProjection,
     UserPresenceProjection,
   ],
@@ -111,15 +109,14 @@ export const CodingAgent = Agent.define<AppEvent>()({
 
     FileMentionResolver,
 
-    ChatTitleWorker,
     UserPresenceWorker,
+    SessionTitleWorker,
   ],
 
   expose: {
     signals: {
       restoreQueuedMessages: DisplayProjection.signals.restoreQueuedMessages,
 
-      chatTitleGenerated: ChatTitleProjection.signals.chatTitleGenerated,
       taskCreated: TaskGraphProjection.signals.taskCreated,
       taskCompleted: TaskGraphProjection.signals.taskCompleted,
       taskCancelled: TaskGraphProjection.signals.taskCancelled,

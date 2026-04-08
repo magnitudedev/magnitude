@@ -48,24 +48,13 @@ export async function loadSessionSummary(storage: StorageClient, sessionId: stri
 }
 
 function buildSessionSummary(meta: MetadataFile): SessionSummary {
-  const title = deriveTitle(meta.chatName, meta.firstUserMessage)
   const timestamp = Date.parse(meta.updated)
 
   return {
     sessionId: meta.sessionId,
-    title,
+    title: meta.chatName,
     lastMessage: meta.lastMessage ?? 'No messages yet',
     timestamp: Number.isNaN(timestamp) ? Date.parse(meta.created) : timestamp,
     messageCount: meta.messageCount,
   }
-}
-
-/**
- * Derive title from chat name or first user message
- */
-function deriveTitle(chatName: string, _firstUserMessage: string | null): string {
-  if (chatName.trim().length > 0 && chatName !== DEFAULT_CHAT_NAME) {
-    return chatName
-  }
-  return DEFAULT_CHAT_NAME
 }
