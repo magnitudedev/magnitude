@@ -1,4 +1,4 @@
-import { TURN_CONTROL_CONTINUE, TURN_CONTROL_IDLE, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_IDLE, TURN_CONTROL_CONTINUE, type XmlTagBinding } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {

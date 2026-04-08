@@ -169,10 +169,11 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                 Effect.gen(function* () {
                   let state = yield* Ref.get(stateRef)
 
-                  // After TurnEnd, keep draining upstream chunks to EOF so provider
-                  // transports can finalize terminal metadata (usage, completion),
-                  // but do not parse/react/emit further runtime events.
-                  if (state.stopped) return
+                  // After TurnEnd, stop consuming. Parser observing mode
+                  // handles termination classification before TurnEnd is emitted.
+                  if (state.stopped) {
+                    return yield* Effect.fail(new XmlRuntimeCrash('__runaway_abort__'))
+                  }
 
                   const parseEvents = parser.processChunk(chunk)
                   for (const pe of parseEvents) {
@@ -198,7 +199,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             if (!state.stopped) {
               yield* Queue.offer(queue, {
                 _tag: 'TurnEnd',
-                result: { _tag: 'Success', turnControl: null },
+                result: { _tag: 'Success', turnControl: null, termination: 'natural' },
               } satisfies XmlRuntimeEvent)
             }
 
@@ -208,6 +209,11 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             Effect.catchAll((crash) =>
               Effect.gen(function* () {
                 if (crash instanceof XmlRuntimeCrash) {
+                  // Sentinel for runaway abort — TurnEnd already emitted by parser/reactor
+                  if (crash.message === '__runaway_abort__') {
+                    yield* Queue.offer(queue, END)
+                    return
+                  }
                   yield* Queue.offer(queue, {
                     _tag: 'TurnEnd',
                     result: { _tag: 'Failure', error: crash.message },
@@ -741,8 +747,8 @@ function reactImpl(
         currentState = yield* emitAndFold(currentState, {
           _tag: 'TurnEnd',
           result: parseEvent.decision === 'finish'
-            ? { _tag: 'Success', turnControl: 'finish', evidence: parseEvent.evidence }
-            : { _tag: 'Success', turnControl: parseEvent.decision },
+            ? { _tag: 'Success', turnControl: 'finish', evidence: parseEvent.evidence, termination: parseEvent.termination }
+            : { _tag: 'Success', turnControl: parseEvent.decision, termination: parseEvent.termination },
         })
         break
       }

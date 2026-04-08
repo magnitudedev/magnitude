@@ -1275,7 +1275,7 @@ describe('foldReactorState', () => {
     const state = initialReactorState()
     const next = foldReactorState(state, {
       _tag: 'TurnEnd',
-      result: { _tag: 'Success', turnControl: null },
+      result: { _tag: 'Success', turnControl: null, termination: 'natural' },
     })
     expect(next.stopped).toBe(true)
   })

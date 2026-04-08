@@ -70,8 +70,13 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         ops.push(pop)
         break
       case 'body-capture':
-        ops.push(emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim() }))
+        ops.push(emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim(), termination: 'natural' }))
         ops.push(done)
+        break
+      case 'end-turn':
+        ops.push(emit({ _tag: 'TurnControl', decision: frame.decision ?? 'idle', termination: 'natural' }))
+        ops.push(done)
+        ops.push(pop)
         break
     }
   }

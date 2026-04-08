@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { TURN_CONTROL_IDLE, TURN_CONTROL_CONTINUE } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_IDLE, TURN_CONTROL_CONTINUE, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_CONTINUE_TAG, TURN_CONTROL_FINISH_TAG, END_TURN_TAG, MESSAGE_TAG, LENS_TAG } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -23,7 +23,7 @@ ${lens.description}`).join('\n\n')
 
 function renderLensesExample(lenses: ThinkingLens[]): string {
   return lenses
-    .map((lens) => `<lens name="${lens.name}">...${lens.name} reasoning if relevant</lens>`)
+    .map((lens) => `<${LENS_TAG} name="${lens.name}">...${lens.name} reasoning if relevant</${LENS_TAG}>`)
     .join('\n')
 }
 
@@ -46,7 +46,12 @@ export function getXmlActProtocol(
     .replaceAll('{{TASK_AND_ROUTING_SECTION}}', taskAndRoutingSection)
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
-    .replaceAll('{{TURN_CONTROL_FINISH}}', 'finish')
+    .replaceAll('{{LENS_TAG}}', LENS_TAG)
+    .replaceAll('{{MESSAGE_TAG}}', MESSAGE_TAG)
+    .replaceAll('{{END_TURN_TAG}}', END_TURN_TAG)
+    .replaceAll('{{IDLE_TAG}}', TURN_CONTROL_IDLE_TAG)
+    .replaceAll('{{CONTINUE_TAG}}', TURN_CONTROL_CONTINUE_TAG)
+    .replaceAll('{{TURN_CONTROL_FINISH}}', TURN_CONTROL_FINISH_TAG)
     .replaceAll('{{TURN_CONTROL_IDLE}}', TURN_CONTROL_IDLE)
     .replaceAll('{{TURN_CONTROL_CONTINUE}}', TURN_CONTROL_CONTINUE)
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
@@ -56,12 +61,8 @@ export function buildAckTurn(
   lenses: ThinkingLens[],
   defaultRecipient: 'user' | 'parent' = 'user',
 ): string {
-  const lensesExample = renderLensesExample(lenses)
-  const lensesPrefix = lensesExample.length > 0 ? `${lensesExample}
-` : ''
-
-  return `<lens name="turn">Send message to "demo" and idle</lens>
-<message to="demo">Hello, I understand how to respond</message>
+  return `<${LENS_TAG} name="turn">Send message to "demo" and idle</${LENS_TAG}>
+<${MESSAGE_TAG} to="demo">Hello, I understand how to respond</${MESSAGE_TAG}>
 ${TURN_CONTROL_CONTINUE}
 `
 }

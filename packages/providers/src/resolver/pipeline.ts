@@ -178,6 +178,7 @@ function createBoundModelImpl<TSlot extends string>(
                     return Effect.void
                   }),
                   Effect.sync(() => maybeTrace()),
+                  Effect.sync(() => abortController.abort()),
                 ]).pipe(Effect.asVoid),
                 (cause) =>
                   Effect.sync(() => {

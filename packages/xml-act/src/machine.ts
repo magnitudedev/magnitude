@@ -6,12 +6,14 @@ export type Op<F, E> =
   | { readonly type: 'replace'; readonly frame: F }
   | { readonly type: 'emit'; readonly event: E }
   | { readonly type: 'done' }
+  | { readonly type: 'observe' }
 
 export interface StackMachine<F, E> {
   apply(ops: ReadonlyArray<Op<F, E>>): void
   peek(): F | undefined
   readonly stack: ReadonlyArray<F>
-  readonly done: boolean
+  readonly mode: 'active' | 'observing' | 'done'
+  finalize(): void
 }
 
 export function createStackMachine<F extends { readonly type: string }, E>(
@@ -19,11 +21,11 @@ export function createStackMachine<F extends { readonly type: string }, E>(
   emit: (event: E) => void,
 ): StackMachine<F, E> {
   const stack: F[] = [initialFrame]
-  let isDone = false
+  let currentMode: 'active' | 'observing' | 'done' = 'active'
 
   return {
     apply(ops) {
-      if (isDone) return
+      if (currentMode !== 'active') return
       for (const op of ops) {
         switch (op.type) {
           case 'push':
@@ -44,7 +46,10 @@ export function createStackMachine<F extends { readonly type: string }, E>(
             emit(op.event)
             break
           case 'done':
-            isDone = true
+            currentMode = 'done'
+            return
+          case 'observe':
+            currentMode = 'observing'
             return
         }
       }
@@ -53,8 +58,11 @@ export function createStackMachine<F extends { readonly type: string }, E>(
     get stack() {
       return stack
     },
-    get done() {
-      return isDone
+    get mode() {
+      return currentMode
+    },
+    finalize() {
+      currentMode = 'done'
     },
   }
 }

@@ -15,7 +15,7 @@ import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
 
-const TURN_CONTROL_IDLE = 'idle'
+const END_TURN_IDLE = '<end-turn>\n<idle/>\n</end-turn>'
 const commsTagOpen = () => '<task id="t2">'
 const commsTagClose = () => '</task>'
 const actionsTagOpen = () => '<task id="t1">'
@@ -61,7 +61,7 @@ describe('message.ts: generic tag matching in message body', () => {
       `${commsTagOpen()}`,
       `<message>The difference is **<20%** between them.</message>`,
       `${commsTagClose()}`,
-      `<${TURN_CONTROL_IDLE}/>`,
+      `${END_TURN_IDLE}`,
     ].join('\n')
 
     const events = parse(xml)
@@ -78,7 +78,7 @@ describe('message.ts: generic tag matching in message body', () => {
       `${commsTagOpen()}`,
       `<message>The difference is **<20%** between them.</message>`,
       `${commsTagClose()}`,
-      `<${TURN_CONTROL_IDLE}/>`,
+      `${END_TURN_IDLE}`,
     ].join('\n')
 
     const events = parseCharByChar(xml)
@@ -99,7 +99,7 @@ describe('message.ts: generic tag matching in message body', () => {
       `The pricing difference is usually **<20%** and shifts by region.`,
       `Don't pick your cloud based on GPU list price.</message>`,
       `${commsTagClose()}`,
-      `<${TURN_CONTROL_IDLE}/>`,
+      `${END_TURN_IDLE}`,
     ].join('\n')
 
     const events = parse(xml)
@@ -120,7 +120,7 @@ describe('message.ts: generic tag matching in message body', () => {
       `${commsTagOpen()}`,
       `<message>Price is <expensive for most users. Buy now!</message>`,
       `${commsTagClose()}`,
-      `<${TURN_CONTROL_IDLE}/>`,
+      `${END_TURN_IDLE}`,
     ].join('\n')
 
     const events = parse(xml)
@@ -202,7 +202,7 @@ describe('tool-body.ts: valid child tag name without closing >', () => {
       `${actionsTagOpen()}`,
       `<shell>echo <stdin without ever closing the angle bracket and the rest</shell>`,
       `${actionsTagClose()}`,
-      `<${TURN_CONTROL_IDLE}/>`,
+      `${END_TURN_IDLE}`,
     ].join('\n')
 
     const events = parse(xml)

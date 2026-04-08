@@ -12,7 +12,7 @@ export function finishHandler(): TagHandler<XmlActFrame, XmlActEvent> {
       const frame = findFrame(ctx.stack, 'body-capture')
       if (!frame) return []
       return [
-        emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim() }),
+        emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim(), termination: 'natural' }),
         pop,
         done,
       ]

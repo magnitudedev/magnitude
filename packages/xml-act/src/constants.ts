@@ -1,10 +1,13 @@
 export const TURN_CONTROL_CONTINUE_TAG = 'continue'
 export const TURN_CONTROL_IDLE_TAG = 'idle'
 export const TURN_CONTROL_FINISH_TAG = 'finish'
+export const END_TURN_TAG = 'end-turn'
 
-export const TURN_CONTROL_CONTINUE = `<${TURN_CONTROL_CONTINUE_TAG}/>`
-export const TURN_CONTROL_IDLE = `<${TURN_CONTROL_IDLE_TAG}/>`
+export const TURN_CONTROL_CONTINUE = `<${END_TURN_TAG}>\n<${TURN_CONTROL_CONTINUE_TAG}/>\n</${END_TURN_TAG}>`
+export const TURN_CONTROL_IDLE = `<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG}/>\n</${END_TURN_TAG}>`
 export const TURN_CONTROL_FINISH = `<${TURN_CONTROL_FINISH_TAG}/>`
+
+export const END_TURN_STOP_SEQUENCE = `\n</${END_TURN_TAG}>`
 
 export const AGENT_CREATE_TAG = 'agent-create'
 export const TITLE_TAG = 'title'

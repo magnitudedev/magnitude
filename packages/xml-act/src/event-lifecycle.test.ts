@@ -955,9 +955,9 @@ describe('pairing guarantee', () => {
 // =============================================================================
 
 describe('TurnEnd', () => {
-  test('drains upstream chunks after TurnEnd without emitting post-end runtime events', async () => {
+  test('aborts upstream on runaway content after TurnEnd', async () => {
     const runtime = createXmlRuntime(cfg([reg(readTool, 'read', readBinding)]))
-    const chunks = ['<idle/>', '<read path="late.ts"/>', 'trailing prose']
+    const chunks = ['<end-turn>\n<idle/>\n</end-turn>', '<read path="late.ts"/>', 'trailing prose']
     let nextCalls = 0
     const xmlStream = Stream.fromAsyncIterable(
       {
@@ -981,8 +981,9 @@ describe('TurnEnd', () => {
     expect(ends).toHaveLength(1)
     expect(events).toHaveLength(1)
     expect(events[0]._tag).toBe('TurnEnd')
-    // one call per chunk + one terminal done() call
-    expect(nextCalls).toBe(chunks.length + 1)
+    // Runaway content after end-turn should abort — not drain all chunks
+    expect(nextCalls).toBeLessThan(chunks.length + 1)
+    expect((ends[0].result as any).termination).toBe('runaway')
   })
 
   test('always emitted exactly once at the end', async () => {

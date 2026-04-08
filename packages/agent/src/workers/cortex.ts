@@ -18,7 +18,7 @@
 import { Effect, Stream, Queue, Either } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 
-import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -207,7 +207,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               {
                 systemPrompt,
                 messages: chatMessages,
-                options: {},
+                options: { stopSequences: [END_TURN_STOP_SEQUENCE] },
                 ackTurn,
               },
             ),

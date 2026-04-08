@@ -1,4 +1,5 @@
 
 ## Turn control
 
-End your response with `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the parent. End your response with `{{TURN_CONTROL_CONTINUE}}` otherwise.
+Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the parent. Use `{{TURN_CONTROL_CONTINUE}}` otherwise.
+

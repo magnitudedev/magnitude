@@ -13,7 +13,7 @@ export function turnControlHandler(
       return []
     },
     selfClose(ctx) {
-      return [...endTopProse(ctx.stack), emit({ _tag: 'TurnControl', decision }), done]
+      return [...endTopProse(ctx.stack), emit({ _tag: 'TurnControl', decision, termination: 'natural' }), done]
     },
   }
 }

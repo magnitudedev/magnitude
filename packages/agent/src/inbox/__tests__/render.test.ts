@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest'
+import { TURN_CONTROL_IDLE, END_TURN_TAG, TURN_CONTROL_IDLE_TAG } from '@magnitudedev/xml-act'
 import type { ContentPart } from '../../content'
 import type { ResultEntry, TimelineEntry } from '../types'
 import { formatInbox } from '../render'
@@ -189,7 +190,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n<idle/>\n</agent>\n\n<reminders>\n- Builder idle: builder-a\n</reminders>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>',
+        `--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n${TURN_CONTROL_IDLE}\n</agent>\n\n<reminders>\n- Builder idle: builder-a\n</reminders>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
     })
   })
 
@@ -315,7 +316,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<idle reason="error"/>\n</agent>\n\n<reminders>\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>',
+        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="error"/>\n</${END_TURN_TAG}>\n</agent>\n\n<reminders>\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
     })
   })
 

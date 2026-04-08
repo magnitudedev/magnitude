@@ -54,7 +54,7 @@ describe('createStackMachine', () => {
       { type: 'push', frame: frame('x') },
     ])
 
-    expect(machine.done).toBe(true)
+    expect(machine.mode).toBe('done')
     expect(events).toEqual(['before'])
     expect(machine.stack).toEqual([frame('root')])
 
@@ -78,7 +78,7 @@ describe('createStackMachine', () => {
     const machine = createStackMachine<Frame, string>(frame('root'), () => {})
     machine.apply([])
     expect(machine.stack).toEqual([frame('root')])
-    expect(machine.done).toBe(false)
+    expect(machine.mode).toBe('active')
   })
 
   test('replace on stack with only initial frame works', () => {

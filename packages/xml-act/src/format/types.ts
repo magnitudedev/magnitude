@@ -95,6 +95,7 @@ export type XmlActFrame =
       readonly tags: TagMap
     }
   | { readonly type: 'body-capture'; readonly tag: string; readonly body: string; readonly tags: TagMap }
+  | { readonly type: 'end-turn'; readonly decision: 'continue' | 'idle' | null; readonly tags: TagMap }
 
 export type StructuralParseErrorDetail =
   | { readonly _tag: 'UnclosedThink' }
@@ -158,8 +159,12 @@ export type XmlActEvent =
     }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'idle' }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string }
+  | {
+      readonly _tag: 'TurnControl'
+      readonly decision: 'continue' | 'idle'
+      readonly termination: 'natural' | 'runaway'
+    }
+  | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string; readonly termination: 'natural' | 'runaway' }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
 export type ParseEvent = XmlActEvent

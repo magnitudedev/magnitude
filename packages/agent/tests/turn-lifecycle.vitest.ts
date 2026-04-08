@@ -1,5 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../src/test-harness/harness'
 import { IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from '../src/execution/execution-manager'
 
@@ -7,7 +8,7 @@ describe('turn lifecycle', () => {
   it.live('Single turn with yield', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: '<message to="user">hi</message><idle/>' })
+      yield* h.script.next({ xml: `<message to="user">hi</message>\n${TURN_CONTROL_IDLE}` })
 
       yield* h.user('hello')
       const completed = yield* h.wait.turnCompleted(null)
@@ -23,7 +24,7 @@ describe('turn lifecycle', () => {
   it.live('Single turn with next', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: '<message to="user">first</message><idle/>' })
+      yield* h.script.next({ xml: `<message to="user">first</message>\n${TURN_CONTROL_IDLE}` })
 
       yield* h.user('run')
       const completed = yield* h.wait.turnCompleted(null)
@@ -37,11 +38,11 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      yield* h.script.next({ xml: '<message to="user">response 1</message><idle/>' })
+      yield* h.script.next({ xml: `<message to="user">response 1</message>\n${TURN_CONTROL_IDLE}` })
       yield* h.user('message 1')
       const first = yield* h.wait.turnCompleted(null)
 
-      yield* h.script.next({ xml: '<message to="user">response 2</message><idle/>' })
+      yield* h.script.next({ xml: `<message to="user">response 2</message>\n${TURN_CONTROL_IDLE}` })
       yield* h.user('message 2')
       const second = yield* h.wait.event(
         'turn_completed',
@@ -77,7 +78,7 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.script.next({ xml: '' })
-      yield* h.script.next({ xml: '<idle/>' })
+      yield* h.script.next({ xml: TURN_CONTROL_IDLE })
 
       yield* h.user('trigger empty response')
       const first = yield* h.wait.turnCompleted(null)
@@ -113,7 +114,7 @@ describe('turn lifecycle', () => {
         timestamp: Date.now(),
       })
 
-      yield* h.script.next({ xml: `<message to="${taskId}">hello</message><idle/>` })
+      yield* h.script.next({ xml: `<message to="${taskId}">hello</message>\n${TURN_CONTROL_IDLE}` })
 
       yield* h.user('trigger workerless task message')
       const completed = yield* h.wait.turnCompleted(null)
@@ -182,7 +183,7 @@ describe('turn lifecycle', () => {
       yield* h.script.next({ xml: a })
       yield* h.script.next({ xml: b })
       yield* h.script.next({ xml: a })
-      yield* h.script.next({ xml: '<idle/>' })
+      yield* h.script.next({ xml: TURN_CONTROL_IDLE })
 
       yield* h.user('trigger reset on different response sequence')
 
@@ -220,12 +221,12 @@ describe('turn lifecycle', () => {
       const h = yield* TestHarness
 
       const a = '<read>foo</read>'
-      const idleWithMessage = '<message to="user">boundary</message><idle/>'
+      const idleWithMessage = `<message to="user">boundary</message>\n${TURN_CONTROL_IDLE}`
       yield* h.script.next({ xml: a })                 // continue
       yield* h.script.next({ xml: a })                 // continue
       yield* h.script.next({ xml: idleWithMessage })   // idle boundary (reset)
       yield* h.script.next({ xml: a })                 // continue after reset
-      yield* h.script.next({ xml: '<idle/>' })         // stop
+      yield* h.script.next({ xml: TURN_CONTROL_IDLE })              // stop
 
       yield* h.user('trigger reset on idle boundary sequence')
 
@@ -235,6 +236,10 @@ describe('turn lifecycle', () => {
         'turn_completed',
         (e) => e.forkId === null && e.turnId !== first.turnId && e.turnId !== second.turnId,
       )
+
+      // After idle boundary, need a new user message to resume
+      yield* h.user('continue after idle')
+
       const fourth = yield* h.wait.event(
         'turn_completed',
         (e) => e.forkId === null && ![first.turnId, second.turnId, third.turnId].includes(e.turnId),

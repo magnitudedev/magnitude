@@ -4,8 +4,9 @@ import { finishHandler } from './handlers/finish'
 import { messageHandler } from './handlers/message'
 import { lensHandler, thinkHandler } from './handlers/think'
 import { childHandler, toolHandler } from './handlers/tool'
-import { turnControlHandler } from './handlers/turn-control'
-import { TURN_CONTROL_CONTINUE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG } from '../constants'
+
+import { endTurnHandler } from './handlers/end-turn'
+import { TURN_CONTROL_FINISH_TAG, END_TURN_TAG } from '../constants'
 import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
 
@@ -35,9 +36,9 @@ export function createXmlActFormat(
   handlers.set('think', think)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
-  handlers.set(TURN_CONTROL_CONTINUE_TAG, turnControlHandler('continue'))
-  handlers.set(TURN_CONTROL_IDLE_TAG, turnControlHandler('idle'))
   handlers.set(TURN_CONTROL_FINISH_TAG, finishHandler())
+
+  handlers.set(END_TURN_TAG, endTurnHandler())
 
   for (const tool of tools) {
     const toolTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
@@ -57,7 +58,7 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', TURN_CONTROL_CONTINUE_TAG, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_FINISH_TAG, 'think', 'thinking', 'lens']) {
+  for (const tag of ['message', TURN_CONTROL_FINISH_TAG, END_TURN_TAG, 'think', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -158,6 +159,6 @@ export { xmlActUnknownOpen, xmlActUnknownClose } from './unknown'
 export { thinkHandler, lensHandler } from './handlers/think'
 export { messageHandler } from './handlers/message'
 export { toolHandler, childHandler } from './handlers/tool'
-export { turnControlHandler } from './handlers/turn-control'
+
 export { finishHandler } from './handlers/finish'
 export { HANDLE, PASS } from './types'

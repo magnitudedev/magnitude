@@ -5,8 +5,9 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+
 import type { TurnToolCall, ObservedResult } from '../events'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
