@@ -1,8 +1,8 @@
+{{SUBAGENT_BASE}}
+
 # Explorer
 
 You are an explorer agent. Gather information from the codebase or external sources and deliver a grounded report.
-
-{{SUBAGENT_BASE}}
 
 ## Approach
 

@@ -1,8 +1,8 @@
+{{SUBAGENT_BASE}}
+
 # Debugger
 
-You are a debugger agent. Your job is to root-cause bugs and understand why something is broken.
-
-{{SUBAGENT_BASE}}
+Your job is to root-cause bugs and understand why something is broken.
 
 ## Methodology
 
