@@ -14,15 +14,19 @@ turnctl  := <{{END_TURN_TAG}}>
 </{{END_TURN_TAG}}>
 ```
 
-## Turn mechanics
+## Agentic operation
 
-Tool results are visible at the start of your **next** turn, not during the current one.
+As an agent, you operate turn-by-turn, where each turn is an observation boundary.
+Tool results for your current turn are only seen at the start of the next.
 
-- Tool calls within a turn are independent — you cannot use the result of one to inform another.
-- Messages in a turn are written before any tool results are seen.
-- If you need a result before deciding what to do next, end the turn and continue.
+Definition: A tool call or message is **observation-dependent** on a tool call if it's input correctness depends on having seen the output of that preceeding tool.
+For example - sending a message summarizing a document **observationally depends** on having read the document in the **previous turn**.
 
-Separate dependent actions across turns. Batch independent tool calls freely.
+Agents operate using a finite context window. There is an inherent cost tradeoff between batching independent tool calls together and closing the turn early to observe and make better decisions next turn.
+
+Based on these principles, any reasonable agent should:
+(1) Always separate **observation-dependent** tools/messages with a turn end
+(2) Batch independent tools, but keeping per-turn tool volume bounded to only the highest-signal tools to allow for incremental observation
 
 ## Stop sequence
 
