@@ -14,6 +14,16 @@ turnctl  := <{{END_TURN_TAG}}>
 </{{END_TURN_TAG}}>
 ```
 
+## Turn mechanics
+
+Tool results are visible at the start of your **next** turn, not during the current one.
+
+- Tool calls within a turn are independent — you cannot use the result of one to inform another.
+- Messages in a turn are written before any tool results are seen.
+- If you need a result before deciding what to do next, end the turn and continue.
+
+Separate dependent actions across turns. Batch independent tool calls freely.
+
 ## Stop sequence
 
 The sequence "\n</{{END_TURN_TAG}}>" is configured as a stop sequence. Use this sequence exclusively at the end of your response.
