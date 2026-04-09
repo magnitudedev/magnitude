@@ -43,8 +43,15 @@ describe('spawn-worker lifecycle integration', () => {
 
       const created = yield* h.wait.event('agent_created', (e) => e.agentId === 'flow-task')
       const workerCompleted = yield* h.wait.turnCompleted(created.forkId)
+      const workerWrite = yield* h.wait.event(
+        'tool_event',
+        (e) => e.forkId === created.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
       expect(workerCompleted.result.success).toBe(true)
-      expect(workerCompleted.toolCalls.some((c) => c.toolName === 'write')).toBe(true)
+      if (workerWrite.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(workerWrite.event.result._tag).toBe('Success')
 
       const rootFollowUp = yield* h.wait.event(
         'turn_completed',

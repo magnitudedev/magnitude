@@ -1,5 +1,5 @@
 import type { ContentPart } from '../content'
-import type { ObservedResult, ResolvedMention, TurnToolCall } from '../events'
+import type { ResolvedMention, ToolResultStatus } from '../events'
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -78,11 +78,36 @@ export type PhaseCriteriaPayload =
   | PhaseCriteriaBase<'user'>
 
 // ---------------------------------------------------------------------------
-// ResultEntry
+// TurnResultItem / ResultEntry
 // ---------------------------------------------------------------------------
 
+export type ToolErrorResultItem = {
+  readonly kind: 'tool_error'
+  readonly toolKey: string
+  readonly status: Exclude<ToolResultStatus, 'success'>
+  readonly message?: string
+}
+
+export type ToolObservationResultItem = {
+  readonly kind: 'tool_observation'
+  readonly tagName: string
+  readonly query: string
+  readonly content: readonly ContentPart[]
+}
+
+export type MessageAckResultItem = {
+  readonly kind: 'message_ack'
+  readonly destination: 'parent'
+  readonly chars: number
+}
+
+export type TurnResultItem =
+  | ToolErrorResultItem
+  | ToolObservationResultItem
+  | MessageAckResultItem
+
 export type ResultEntry =
-  | { readonly kind: 'tool_results'; readonly toolCalls: readonly TurnToolCall[]; readonly observedResults: readonly ObservedResult[] }
+  | { readonly kind: 'turn_results'; readonly items: readonly TurnResultItem[] }
   | { readonly kind: 'interrupted' }
   | { readonly kind: 'error'; readonly message: string }
   | { readonly kind: 'noop' }

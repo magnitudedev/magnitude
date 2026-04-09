@@ -227,21 +227,16 @@ describe('ChatPersistenceService - JSON Backend', () => {
         forkId: null,
         turnId: 'turn-1',
         chainId: 'chain-1',
-        code: 'console.log("test")',
-        toolCalls: [
-          {
-            toolSlug: 'shell',
-            result: {
-              status: 'success',
-              output: { stdout: 'test', stderr: '', exitCode: 0 }
-            }
-          }
-        ],
+        strategyId: 'xml-act',
+
         result: {
           success: true,
-          calledActionTools: true, calledDone: false,
-          lastToolSlug: 'shell'
+          turnDecision: 'idle'
         },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
         providerId: null,
         modelId: null
       }

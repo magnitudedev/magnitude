@@ -1,6 +1,6 @@
 import { Cause, Duration, Effect, Queue, Stream } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart } from '../events'
+import type { AppEvent } from '../events'
 import { TransportError } from '@magnitudedev/providers'
 import { ExecutionManager } from '../execution/execution-manager'
 import { createTurnStream } from '../execution/types'
@@ -78,17 +78,11 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             totalCost: null,
           }
 
-          const rawCode = rawCodeChunks.join('')
-
-          const responseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage, responseParts, rawCodeChunks } })
+          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage, rawCodeChunks } })
         }))
 
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)
-        const { executeResult, usage, responseParts } = drained.finalResult
+        const { executeResult, usage } = drained.finalResult
 
         yield* publish({
           type: 'turn_completed',
@@ -96,9 +90,6 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
           turnId,
           chainId,
           strategyId: 'xml-act',
-          responseParts,
-          toolCalls: executeResult.toolCalls,
-          observedResults: executeResult.observedResults,
           result: executeResult.result,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
@@ -109,20 +100,12 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
         })
       }).pipe(
         Effect.onInterrupt(() => {
-          const rawCode = rawCodeChunks.join('')
-          const responseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-
           return publish({
             type: 'turn_completed',
             forkId,
             turnId,
             chainId,
             strategyId: 'xml-act',
-            responseParts,
-            toolCalls: [],
-            observedResults: [],
             result: { success: false, error: 'Interrupted', cancelled: true },
             inputTokens: null,
             outputTokens: null,

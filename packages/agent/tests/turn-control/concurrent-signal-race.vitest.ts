@@ -40,9 +40,6 @@ describe('turn-control/concurrent-signal-race', () => {
         turnId: firstTurn.turnId,
         chainId: 'race-chain',
         strategyId: 'xml-act',
-        responseParts: [],
-        toolCalls: [],
-        observedResults: [],
         result: {
           success: true,
           turnDecision: 'continue',

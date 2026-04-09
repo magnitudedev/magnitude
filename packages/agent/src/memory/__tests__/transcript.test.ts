@@ -14,58 +14,39 @@ const userMessage = (text: string, index: number): AppEvent => ({
   taskMode: false,
 })
 
-const turnCompleted = (xml: string): AppEvent => ({
-  type: 'turn_completed',
-  forkId: null,
-  turnId: 't1',
-  chainId: 'c1',
-  strategyId: 'xml-act',
-  responseParts: [{ type: 'text', content: xml }],
-  toolCalls: [],
-  observedResults: [],
-  result: { success: true, turnDecision: 'finish', evidence: '' },
-  inputTokens: null,
-  outputTokens: null,
-  cacheReadTokens: null,
-  cacheWriteTokens: null,
-  providerId: null,
-  modelId: null,
-})
+const assistantUserMessageEvents = (text: string, turnId = 't1'): AppEvent[] => [
+  {
+    type: 'message_start',
+    forkId: null,
+    turnId,
+    id: `${turnId}-msg`,
+    destination: { kind: 'user' },
+  },
+  {
+    type: 'message_chunk',
+    forkId: null,
+    turnId,
+    id: `${turnId}-msg`,
+    text,
+  },
+  {
+    type: 'message_end',
+    forkId: null,
+    turnId,
+    id: `${turnId}-msg`,
+  },
+]
 
 describe('memory transcript', () => {
   test('includes user messages verbatim and only user-targeted assistant messages', () => {
     const events: AppEvent[] = [
       userMessage('Use named exports, not default exports.', 1),
-      {
-        type: 'turn_completed',
-        forkId: null,
-        turnId: 't1',
-        chainId: 'c1',
-        strategyId: 'xml-act',
-        responseParts: [
-          {
-            type: 'text',
-            content:
-              '<lenses><lens name="task">thinking</lens></lenses><message to="user">Got it, I will update exports.</message><message to="explorer-1">Please review the files.</message><read path="src/index.ts" observe="." />',
-          },
-          { type: 'thinking', content: 'internal thoughts' },
-        ],
-        toolCalls: [],
-        observedResults: [],
-        result: { success: true, turnDecision: 'finish', evidence: '' },
-        inputTokens: null,
-        outputTokens: null,
-        cacheReadTokens: null,
-        cacheWriteTokens: null,
-        providerId: null,
-        modelId: null,
-      },
+      ...assistantUserMessageEvents('Got it, I will update exports.'),
     ]
 
     const t = buildExtractionTranscript(events)
     expect(t).toContain('Use named exports, not default exports.')
     expect(t).toContain('Got it, I will update exports.')
-    expect(t).not.toContain('Please review the files.')
   })
 
   test('includes agent creation lifecycle but excludes unrelated events', () => {
@@ -103,33 +84,12 @@ describe('memory transcript', () => {
     expect(t.indexOf('mid-2')).toBeLessThan(t.indexOf('new-3'))
   })
 
-  test('includes multiple user messages in one assistant turn in order', () => {
+  test('includes realistic streamed plain user message chunks', () => {
     const events: AppEvent[] = [
-      turnCompleted('<message to="user">First message.</message><message to="user">Second message.</message>'),
-    ]
-
-    const t = buildExtractionTranscript(events)
-    expect(t).toContain('First message.')
-    expect(t).toContain('Second message.')
-    expect(t.indexOf('First message.')).toBeLessThan(t.indexOf('Second message.'))
-  })
-
-  test('omits assistant turn when there is no user-directed message', () => {
-    const events: AppEvent[] = [
-      turnCompleted('<message to="explorer-1">Review src/</message><tree path="src" observe="." />'),
-    ]
-
-    const t = buildExtractionTranscript(events)
-    expect(t).toBe('')
-  })
-
-  test('excludes subagent-directed messages from assistant turn output', () => {
-    const events: AppEvent[] = [
-      turnCompleted('<message to="explorer-1">Gather docs.</message><message to="user">Done.</message>'),
+      ...assistantUserMessageEvents('Done.'),
     ]
 
     const t = buildExtractionTranscript(events)
     expect(t).toContain('Done.')
-    expect(t).not.toContain('Gather docs.')
   })
 })

@@ -19,7 +19,7 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult, TurnResultError, MessageDestination } from '../events'
+import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
@@ -94,8 +94,6 @@ export interface ExecuteOptions {
 
 export interface ExecuteResult {
   readonly result: TurnResult
-  readonly toolCalls: readonly TurnToolCall[]
-  readonly observedResults: readonly ObservedResult[]
 }
 
 // =============================================================================
@@ -410,7 +408,7 @@ const makeExecutionManager = Effect.gen(function* () {
       // Track tools called (by definition key) for turn policy
       const toolsCalledKeys: ToolKey[] = []
       let lastToolKey: ToolKey | null = null
-      const toolCalls: TurnToolCall[] = []
+      let hasToolErrors = false
       const messagesSent: Array<{ id: string, taskId: string | null }> = []
       let hasAnyMessage = false
       let hasAnyResponseContent = false
@@ -446,9 +444,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Track tag names for ToolStarted events
       const toolCallTagNames = new Map<string, string>()
-
-      // Accumulate observed tool output results
-      const observedResults: ObservedResult[] = []
 
       const turnErrors: TurnResultError[] = []
 
@@ -576,7 +571,9 @@ const makeExecutionManager = Effect.gen(function* () {
                 lastToolKey = toolKey
 
                 const errorResult: ToolResult = { status: 'error', message: event.error.detail }
-                toolCalls.push({ toolKey, group: event.group, toolName: event.toolName, result: errorResult })
+                if (errorResult.status === 'error') {
+                  hasToolErrors = true
+                }
 
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
@@ -645,15 +642,10 @@ const makeExecutionManager = Effect.gen(function* () {
                 streamHookConfigs.delete(event.toolCallId)
                 streamingFields.delete(event.toolCallId)
 
-                // Map XmlToolResult → ToolResult for TurnToolCall accumulation
                 const toolResult: ToolResult = mapXmlToolResult(event.result)
-
-                toolCalls.push({
-                  toolKey,
-                  group: event.group,
-                  toolName: event.toolName,
-                  result: toolResult,
-                })
+                if (toolResult.status === 'error') {
+                  hasToolErrors = true
+                }
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -884,12 +876,6 @@ const makeExecutionManager = Effect.gen(function* () {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                observedResults.push({
-                  toolCallId: event.toolCallId,
-                  tagName: event.tagName,
-                  query: event.query,
-                  content: event.content,
-                })
                 yield* Queue.offer(sink, {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
@@ -918,8 +904,6 @@ const makeExecutionManager = Effect.gen(function* () {
                   //
                   // Errors within the turn always force continuation so the agent sees
                   // the error feedback and can retry. The turn policy only decides for clean turns.
-                  const hasToolErrors = toolCalls.some(tc => tc.result.status === 'error')
-
                   if (hasToolErrors || turnErrors.length > 0) {
                     executionResult = {
                       success: true,
@@ -1017,8 +1001,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       return {
         result: executionResult,
-        toolCalls,
-        observedResults,
       }
     }),
 

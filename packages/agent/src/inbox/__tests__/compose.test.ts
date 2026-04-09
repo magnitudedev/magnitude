@@ -3,7 +3,7 @@ import {
   toResultError,
   toResultInterrupted,
   toResultNoop,
-  toResultToolResults,
+  toResultTurnResults,
   toTimelineAgentBlock,
   toTimelineObservation,
   toTimelinePhaseCriteria,
@@ -25,12 +25,12 @@ const TS = 1711641600000
 
 describe('inbox compose', () => {
   test('toResult* constructors set correct kinds', () => {
-    const toolResults = toResultToolResults({ toolCalls: [], observedResults: [] })
+    const turnResults = toResultTurnResults({ items: [] })
     const interrupted = toResultInterrupted()
     const error = toResultError({ message: 'bad' })
     const noop = toResultNoop()
 
-    expect(toolResults.kind).toBe('tool_results')
+    expect(turnResults.kind).toBe('turn_results')
     expect(interrupted.kind).toBe('interrupted')
     expect(error.kind).toBe('error')
     expect(noop.kind).toBe('noop')

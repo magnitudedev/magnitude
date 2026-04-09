@@ -15,6 +15,7 @@ import {
   mkCompactionStarted,
   mkContextLimitHit,
   mkTurnCompleted,
+  mkTurnStarted,
   mkUserMessage,
 } from './helpers'
 
@@ -42,24 +43,28 @@ describe('compaction/projection-transitions', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.send(mkUserMessage({ text: 'hello' }))
+      yield* h.send(mkTurnStarted({ turnId: 'turn-compaction-a', chainId: 'chain-compaction' }))
       yield* h.send(mkTurnCompleted({
+        turnId: 'turn-compaction-a',
+        chainId: 'chain-compaction',
         inputTokens: 1234,
-        responseParts: [{ type: 'text', content: 'A'.repeat(300) }],
       }))
       const state = yield* getCompaction(h)
-      expect(state.tokenEstimate).toBe(1234 + estimateTokens('A'.repeat(300)))
+      expect(state.tokenEstimate).toBe(1234)
     }).pipe(Effect.provide(TestHarnessLive())))
 
-  it.effect('turn_completed without inputTokens accumulates estimate', () =>
+  it.effect('turn_completed without inputTokens preserves estimate when no canonical output is present', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
       const before = yield* getCompaction(h)
+      yield* h.send(mkTurnStarted({ turnId: 'turn-compaction-b', chainId: 'chain-compaction' }))
       yield* h.send(mkTurnCompleted({
+        turnId: 'turn-compaction-b',
+        chainId: 'chain-compaction',
         inputTokens: null,
-        responseParts: [{ type: 'text', content: 'B'.repeat(150) }],
       }))
       const after = yield* getCompaction(h)
-      expect(after.tokenEstimate).toBe(before.tokenEstimate + estimateTokens('B'.repeat(150)))
+      expect(after.tokenEstimate).toBe(before.tokenEstimate)
     }).pipe(Effect.provide(TestHarnessLive())))
 
   it.effect('compaction_started sets isCompacting and leaves pendingFinalization false', () =>

@@ -4,11 +4,10 @@ import { formatResults } from '../render-results'
 
 describe('formatResults', () => {
   test('formats observed image result with wrapper tags around inner content only', () => {
-    const output = formatResults(
-      [] as const,
-      [{
+    const output = formatResults([
+      {
+        kind: 'tool_observation',
         tagName: 'view',
-        toolCallId: 'test-1',
         query: '.',
         content: [
           {
@@ -19,8 +18,8 @@ describe('formatResults', () => {
             height: 100,
           },
         ],
-      }],
-    )
+      },
+    ])
 
     expect(output).toEqual([
       { type: 'text', text: '\n<view observe=".">' },

@@ -122,9 +122,6 @@ describe('prompt caching consistency', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
         result: {
           success: true,
           turnDecision: 'idle',

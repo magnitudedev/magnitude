@@ -1,6 +1,6 @@
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart, TurnResultError, MessageDestination } from '../events'
-import type { ContentPart } from '../content'
+import type { AppEvent, TurnResultError, MessageDestination } from '../events'
+
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
 import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
@@ -20,7 +20,6 @@ export interface CanonicalTurnState {
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
   toolCallMap: Map<string, number>
-  observedResults: Array<{ toolCallId: string; tagName: string; query: string; content: ContentPart[] }>
   hasParseError: boolean
   hasStructuralError: boolean
   orderCounter: number
@@ -36,7 +35,6 @@ export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   messageMap: new Map(),
   toolCalls: [],
   toolCallMap: new Map(),
-  observedResults: [],
   hasParseError: false,
   hasStructuralError: false,
   orderCounter: 0,
@@ -44,11 +42,22 @@ export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   resolvedTurnDecision: null,
 })
 
-function flattenResponseText(parts: readonly ResponsePart[]): string {
-  return parts
-    .filter((p): p is Extract<ResponsePart, { type: 'text' }> => p.type === 'text')
-    .map(p => p.content)
-    .join('')
+export function deriveCanonicalFallbackText(state: Pick<CanonicalTurnState, 'lenses' | 'messages' | 'thinkBlocks'>): string {
+  const chunks: string[] = []
+
+  for (const block of state.thinkBlocks) {
+    if (block.content) chunks.push(block.content)
+  }
+
+  for (const lens of state.lenses ?? []) {
+    if (lens.content) chunks.push(lens.content)
+  }
+
+  for (const message of [...state.messages].sort((a, b) => a.order - b.order)) {
+    if (message.text) chunks.push(message.text)
+  }
+
+  return chunks.join('')
 }
 
 function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
@@ -66,7 +75,6 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     messageMap: new Map(),
     toolCalls: [],
     toolCallMap: new Map(),
-    observedResults: [],
     hasParseError: false,
     hasStructuralError: false,
     orderCounter: 0,
@@ -198,20 +206,10 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
         case 'ToolObservation': {
           const idx = fork.toolCallMap.get(event.toolCallId)
+          if (idx === undefined) return fork
           const nextToolCalls = [...fork.toolCalls]
-          if (idx !== undefined) {
-            nextToolCalls[idx] = { ...nextToolCalls[idx], query: event.event.query }
-          }
-          return {
-            ...fork,
-            toolCalls: nextToolCalls,
-            observedResults: [...fork.observedResults, {
-              toolCallId: event.toolCallId,
-              tagName: event.event.tagName,
-              query: event.event.query,
-              content: event.event.content,
-            }],
-          }
+          nextToolCalls[idx] = { ...nextToolCalls[idx], query: event.event.query }
+          return { ...fork, toolCalls: nextToolCalls }
         }
 
         case 'ToolInputParseError':
@@ -227,8 +225,6 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
       const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
       const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
-
-      const observedResults = [...event.observedResults]
 
       let canonicalXml: string
       if (clean) {
@@ -254,12 +250,11 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         }
         canonicalXml = serializeCanonicalTurn(trace, bindings)
       } else {
-        canonicalXml = flattenResponseText(event.responseParts)
+        canonicalXml = deriveCanonicalFallbackText(fork)
       }
 
       const finalized: CanonicalTurnState = {
         ...fork,
-        observedResults,
         hasStructuralError,
         lastCompleted: {
           turnId: event.turnId,

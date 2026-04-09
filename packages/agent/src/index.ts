@@ -28,7 +28,6 @@ export type {
   TurnResult,
   TurnDecision,
   TurnToolCall,
-  ResponsePart,
   StrategyId,
   MessageStart,
   ThinkingChunk,

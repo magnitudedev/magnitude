@@ -77,9 +77,8 @@ describe('memory rendering', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: {
           success: true,
           turnDecision: 'idle',
@@ -233,9 +232,8 @@ describe('memory rendering', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'assistant' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: {
           success: true,
           turnDecision: 'idle',

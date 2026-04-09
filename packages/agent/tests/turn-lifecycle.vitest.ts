@@ -62,15 +62,14 @@ describe('turn lifecycle', () => {
 
       yield* h.user('no script queued')
       const completed = yield* h.wait.turnCompleted(null)
+      const chunk = yield* h.wait.event(
+        'message_chunk',
+        (e) => e.forkId === null && e.turnId === completed.turnId,
+      )
 
       expect(completed.type).toBe('turn_completed')
       expect(completed.result.success).toBe(true)
-
-      const text = completed.responseParts.find((p) => p.type === 'text')
-      expect(text?.type).toBe('text')
-      if (text?.type === 'text') {
-        expect(text.content).toContain('ok')
-      }
+      expect(chunk.text).toContain('ok')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 

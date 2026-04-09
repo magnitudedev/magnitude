@@ -11,6 +11,7 @@ const { defineFSM } = FSM
 import type { AppEvent, SessionContext } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
 import { UserMessageResolutionProjection } from './user-message-resolution'
+import { CanonicalTurnProjection } from './canonical-turn'
 
 import { getContextLimits } from '../constants'
 import { CHARS_PER_TOKEN } from '../constants'
@@ -210,7 +211,7 @@ function withAmbient(
 export const CompactionProjection = Projection.defineForked<AppEvent, CompactionState>()({
   name: 'Compaction',
 
-  reads: [AgentRoutingProjection, UserMessageResolutionProjection] as const,
+  reads: [AgentRoutingProjection, UserMessageResolutionProjection, CanonicalTurnProjection] as const,
 
   signals: {
     shouldCompactChanged: Signal.create<{ forkId: string | null; shouldCompact: boolean }>('Compaction/shouldCompactChanged'),
@@ -244,26 +245,13 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       return nextState
     },
 
-    turn_completed: ({ event, fork, emit }) => {
-      let addedTokens = 0
+    turn_completed: ({ event, fork, emit, read }) => {
       const { modelId, providerId } = event
-
-      for (const part of event.responseParts) {
-        if (part.type === 'text' || part.type === 'thinking') {
-          addedTokens += estimateContentTokens(part.content)
-        }
-      }
-      for (const tc of event.toolCalls) {
-        if (tc.result.status === 'error') {
-          addedTokens += estimateContentTokens(tc.result.message)
-        } else if (tc.result.status === 'rejected') {
-          addedTokens += estimateContentTokens(tc.result.message)
-        }
-      }
-      for (const observed of event.observedResults) {
-        addedTokens += estimateContentTokens([...observed.content], modelId, providerId)
-      }
-
+      const canonical = read(CanonicalTurnProjection)
+      const completedText = canonical.lastCompleted?.turnId === event.turnId
+        ? canonical.lastCompleted.canonicalXml
+        : ''
+      const addedTokens = estimateContentTokens(completedText)
       const tokenEstimate = event.inputTokens !== null
         ? event.inputTokens + addedTokens
         : fork.tokenEstimate + addedTokens

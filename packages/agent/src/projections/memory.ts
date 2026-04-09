@@ -7,7 +7,7 @@
 
 import { Projection } from '@magnitudedev/event-core'
 import type { ObservationPart } from '@magnitudedev/roles'
-import type { AppEvent, ResponsePart, StrategyId, ImageAttachment } from '../events'
+import type { AppEvent, StrategyId, ImageAttachment } from '../events'
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
@@ -32,9 +32,10 @@ import type {
   AgentAtom,
   PhaseCriteriaPayload,
   LifecycleReminderFormatterMap,
+  TurnResultItem,
 } from '../inbox/types'
 import {
-  toResultToolResults,
+  toResultTurnResults,
   toResultInterrupted,
   toResultError,
   toResultNoop,
@@ -91,7 +92,6 @@ export type Message =
       readonly source: 'agent'
       readonly content: ContentPart[]
       readonly strategyId: StrategyId
-      readonly responseParts: readonly ResponsePart[]
     }
   | { readonly type: 'compacted'; readonly source: 'system'; readonly content: ContentPart[] }
   | { readonly type: 'fork_context'; readonly source: 'system'; readonly content: ContentPart[] }
@@ -109,6 +109,11 @@ export interface LLMMessage {
 
 export type Perspective = 'agent' | 'autopilot'
 
+type PendingParentMessage = {
+  readonly body: string
+  readonly destination: 'parent'
+}
+
 export interface ForkMemoryState {
   readonly messages: readonly Message[]
   readonly queuedEntries: readonly QueuedEntry[]
@@ -116,14 +121,19 @@ export interface ForkMemoryState {
   readonly currentChainId: string | null
   readonly pendingPresenceText: string | null
   readonly nextQueueSeq: number
+  readonly pendingResultItems: readonly TurnResultItem[]
+  readonly pendingParentMessages: ReadonlyMap<string, PendingParentMessage>
 }
 
-function flattenResponseText(parts: readonly ResponsePart[]): string {
-  return parts
-    .filter((p): p is Extract<ResponsePart, { type: 'text' }> => p.type === 'text')
-    .map(p => p.content)
-    .join('')
+function resetPendingTurnState(fork: ForkMemoryState): ForkMemoryState {
+  return {
+    ...fork,
+    pendingResultItems: [],
+    pendingParentMessages: new Map(),
+  }
 }
+
+
 
 function extractText(parts: readonly ContentPart[]): string {
   return parts
@@ -367,6 +377,8 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
     currentChainId: null,
     pendingPresenceText: null,
     nextQueueSeq: 0,
+    pendingResultItems: [],
+    pendingParentMessages: new Map(),
   },
 
   eventHandlers: {
@@ -439,7 +451,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
 
       return {
-        ...flushed,
+        ...resetPendingTurnState(flushed),
         messages,
         currentTurnId: event.turnId,
         currentChainId: event.chainId,
@@ -447,7 +459,122 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     },
 
-    tool_event: ({ fork }) => fork,
+    tool_event: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+
+      switch (event.event._tag) {
+        case 'ToolExecutionEnded': {
+          const result = event.event.result
+          switch (result._tag) {
+            case 'Success':
+              return fork
+            case 'Error':
+              return {
+                ...fork,
+                pendingResultItems: [
+                  ...fork.pendingResultItems,
+                  {
+                    kind: 'tool_error',
+                    toolKey: event.toolKey,
+                    status: 'error',
+                    message: result.error,
+                  },
+                ],
+              }
+            case 'Rejected':
+              return {
+                ...fork,
+                pendingResultItems: [
+                  ...fork.pendingResultItems,
+                  {
+                    kind: 'tool_error',
+                    toolKey: event.toolKey,
+                    status: 'rejected',
+                    message: typeof result.rejection === 'string' ? result.rejection : undefined,
+                  },
+                ],
+              }
+            case 'Interrupted':
+              return {
+                ...fork,
+                pendingResultItems: [
+                  ...fork.pendingResultItems,
+                  {
+                    kind: 'tool_error',
+                    toolKey: event.toolKey,
+                    status: 'interrupted',
+                  },
+                ],
+              }
+          }
+        }
+
+        case 'ToolObservation':
+          return {
+            ...fork,
+            pendingResultItems: [
+              ...fork.pendingResultItems,
+              {
+                kind: 'tool_observation',
+                tagName: event.event.tagName,
+                query: event.event.query,
+                content: event.event.content,
+              },
+            ],
+          }
+
+        default:
+          return fork
+      }
+    },
+
+    message_start: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+      if (event.forkId === null || event.destination.kind !== 'parent') return fork
+      return {
+        ...fork,
+        pendingParentMessages: new Map(fork.pendingParentMessages).set(event.id, {
+          body: '',
+          destination: 'parent',
+        }),
+      }
+    },
+
+    message_chunk: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+      const pending = fork.pendingParentMessages.get(event.id)
+      if (!pending) return fork
+
+      return {
+        ...fork,
+        pendingParentMessages: new Map(fork.pendingParentMessages).set(event.id, {
+          ...pending,
+          body: pending.body + event.text,
+        }),
+      }
+    },
+
+    message_end: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+      const pending = fork.pendingParentMessages.get(event.id)
+      if (!pending) return fork
+
+      const pendingParentMessages = new Map(fork.pendingParentMessages)
+      pendingParentMessages.delete(event.id)
+
+      return {
+        ...fork,
+        pendingParentMessages,
+        pendingResultItems: [
+          ...fork.pendingResultItems,
+          {
+            kind: 'message_ack',
+            destination: pending.destination,
+            chars: pending.body.length,
+          },
+        ],
+      }
+    },
 
     observations_captured: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
@@ -464,25 +591,24 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       const newMessages: Message[] = [...fork.messages]
       const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
+      const canonical = read(CanonicalTurnProjection)
+      const canonicalText = canonical.lastCompleted?.turnId === event.turnId
+        ? canonical.lastCompleted.canonicalXml
+        : ''
+      const hasAssistantContent = canonicalText.trim().length > 0
 
-      if (event.responseParts.length > 0) {
-        const canonical = read(CanonicalTurnProjection)
-        const canonicalText = canonical.lastCompleted?.turnId === event.turnId && canonical.lastCompleted.clean
-          ? canonical.lastCompleted.canonicalXml
-          : flattenResponseText(event.responseParts)
-
+      if (hasAssistantContent) {
         newMessages.push({
           type: 'assistant_turn',
           source: 'agent',
           content: textParts(canonicalText),
           strategyId: event.strategyId,
-          responseParts: event.responseParts,
         })
       }
 
       let nextFork: ForkMemoryState = { ...fork, messages: newMessages, currentTurnId: null }
 
-      if (event.responseParts.length === 0 && !isCancelled && event.result.success) {
+      if (!hasAssistantContent && !isCancelled && event.result.success) {
         nextFork = {
           ...nextFork,
           messages: [
@@ -492,7 +618,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
               source: 'agent',
               content: textParts('(empty response)'),
               strategyId: event.strategyId,
-              responseParts: [],
             },
           ],
         }
@@ -501,11 +626,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       const hasError = !event.result.success
       const errorMessage = hasError && 'error' in event.result ? event.result.error : undefined
-      const observedResults = isCancelled ? [] : event.observedResults
-      if (event.toolCalls.length > 0 || observedResults.length > 0) {
+      if (fork.pendingResultItems.length > 0) {
         nextFork = enqueueResult(
           nextFork,
-          toResultToolResults({ toolCalls: event.toolCalls, observedResults }),
+          toResultTurnResults({ items: fork.pendingResultItems }),
           event.timestamp,
         )
       }
@@ -524,7 +648,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
       }
 
-      return nextFork
+      return resetPendingTurnState(nextFork)
     },
 
     turn_unexpected_error: ({ event, fork, read }) => {
@@ -533,7 +657,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         enqueueResult(fork, toResultError({ message: event.message }), event.timestamp),
         read(TaskGraphProjection),
       )
-      return { ...nextFork, currentTurnId: null }
+      return resetPendingTurnState({ ...nextFork, currentTurnId: null })
     },
 
     skill_started: ({ event, fork }) => {
@@ -676,6 +800,8 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         currentChainId: null,
         pendingPresenceText: null,
         nextQueueSeq: 0,
+        pendingResultItems: [],
+        pendingParentMessages: new Map(),
       }
 
       newForkState = enqueueTimeline(

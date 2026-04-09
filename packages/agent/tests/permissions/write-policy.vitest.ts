@@ -39,11 +39,16 @@ describe('write policy permissions', () => {
 
       yield* harness.user('write a report')
       const completed = yield* harness.wait.turnCompleted(null)
+      const writeEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
       expect(completed.result.success).toBe(true)
-      const writeCall = completed.toolCalls.find((c) => c.toolName === 'write')
-      expect(writeCall).toBeDefined()
-      expect(writeCall?.result.status).toBe('success')
+      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(writeEnded.event.result._tag).toBe('Success')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -56,11 +61,16 @@ describe('write policy permissions', () => {
 
       yield* harness.user('write a file')
       const completed = yield* harness.wait.turnCompleted(null)
+      const writeEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
       expect(completed.result.success).toBe(true)
-      const writeCall = completed.toolCalls.find((c) => c.toolName === 'write')
-      expect(writeCall).toBeDefined()
-      expect(writeCall?.result.status).toBe('success')
+      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(writeEnded.event.result._tag).toBe('Success')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -85,11 +95,16 @@ describe('write policy permissions', () => {
       }, agentCreated.forkId)
 
       const completed = yield* harness.wait.turnCompleted(agentCreated.forkId)
+      const writeEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === agentCreated.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
       expect(completed.result.success).toBe(true)
-      const writeCall = completed.toolCalls.find((c) => c.toolName === 'write')
-      expect(writeCall).toBeDefined()
-      expect(writeCall?.result.status).toBe('success')
+      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(writeEnded.event.result._tag).toBe('Success')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -114,11 +129,20 @@ describe('write policy permissions', () => {
       }, agentCreated.forkId)
 
       const completed = yield* harness.wait.turnCompleted(agentCreated.forkId)
+      const writeEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === agentCreated.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
-      const writeCall = completed.toolCalls.find((c) => c.toolName === 'write')
-      expect(writeCall).toBeDefined()
-      // Should be rejected by policy
-      expect(writeCall?.result.status).not.toBe('success')
+      if (writeEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(writeEnded.event.result._tag).not.toBe('Success')
+      if (completed.result.success) {
+        expect(completed.result.turnDecision).toBe('continue')
+      } else {
+        expect(completed.result.cancelled).toBe(false)
+      }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

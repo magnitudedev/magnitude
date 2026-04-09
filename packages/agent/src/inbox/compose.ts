@@ -1,11 +1,11 @@
 import type { ContentPart } from '../content'
-import type { ObservedResult, TurnToolCall } from '../events'
 import type {
   AgentAtom,
   PhaseCriteriaPayload,
   ResultEntry,
   TimelineAttachment,
   TimelineEntry,
+  TurnResultItem,
 } from './types'
 
 export interface ComposeContextDeps {
@@ -14,12 +14,11 @@ export interface ComposeContextDeps {
   ): { agentId: string; role: string; parentForkId: string | null } | null
 }
 
-export function toResultToolResults(args: {
-  toolCalls: readonly TurnToolCall[]
-  observedResults: readonly ObservedResult[]
+export function toResultTurnResults(args: {
+  items: readonly TurnResultItem[]
 }): ResultEntry {
   return {
-    kind: 'tool_results',
+    kind: 'turn_results',
     ...args,
   }
 }

@@ -31,7 +31,7 @@ import type { ObservationPart } from '@magnitudedev/roles'
 import { buildAckTurn } from '../prompts/protocol'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
-import type { AppEvent, ResponsePart } from '../events'
+import type { AppEvent } from '../events'
 
 import { createTurnStream, TurnError as TurnErrorCtor } from '../execution/types'
 import type { TurnError } from '../execution/types'
@@ -236,20 +236,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const usage = cs.getUsage()
           const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
 
-          // Build response parts — single text part containing the raw XML
-          const rawCode = rawCodeChunks.join('')
-          const responseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-
           // Offer final result
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, responseParts, rawCodeChunks } })
+          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, rawCodeChunks } })
         }))
 
         // 3a. Drain turn stream, publishing events and collecting the final result
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)
 
-        const { executeResult, usage, responseParts } = drained.finalResult
+        const { executeResult, usage } = drained.finalResult
 
         const inputTokens = usage.inputTokens
         if (inputTokens !== null) {
@@ -273,9 +267,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           turnId,
           chainId,
           strategyId: 'xml-act',
-          responseParts,
-          toolCalls: executeResult.toolCalls,
-          observedResults: executeResult.observedResults,
           result: turnResult,
           inputTokens,
           outputTokens: usage.outputTokens,
@@ -348,9 +339,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               turnId,
               chainId,
               strategyId: 'xml-act',
-              responseParts: [],
-              toolCalls: [],
-              observedResults: [],
               result: { success: false, error: `Context limit exceeded, waiting for compaction: ${errorMessage}`, cancelled: false },
               inputTokens: null,
               outputTokens: null,

@@ -418,6 +418,9 @@ function AppInner({
       const sessionTracker = new SessionTracker()
       setSessionTracker(sessionTracker)
       const forkRoles = new Map<string, { role: string; startTime: number }>()
+      const turnToolCounts = new Map<string, number>()
+
+      const turnKey = (forkId: string | null, turnId: string) => `${forkId ?? 'root'}:${turnId}`
 
 
       // Log all events to event log file + collect for debug panel
@@ -454,10 +457,33 @@ function AppInner({
           sessionTracker.recordAgentSpawned()
         }
 
+        if (event.type === 'tool_event') {
+          const key = turnKey(event.forkId, event.turnId)
+
+          if (event.event._tag === 'ToolInputStarted') {
+            turnToolCounts.set(key, (turnToolCounts.get(key) ?? 0) + 1)
+          }
+
+          if (event.event._tag === 'ToolExecutionEnded') {
+            const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
+            const agentRole = forkInfo?.role ?? 'lead'
+
+            trackToolUsage({
+              toolName: event.event.toolName,
+              group: event.event.group,
+              status: event.event.result._tag === 'Success' ? 'success' : 'error',
+              forkId: event.forkId,
+              agentRole,
+            })
+          }
+        }
+
         if (event.type === 'turn_completed') {
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'lead'
           const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agentRole) ? agentRole as MagnitudeSlot : 'lead' as MagnitudeSlot
+          const key = turnKey(event.forkId, event.turnId)
+          const toolCount = turnToolCounts.get(key) ?? 0
 
           trackTurnCompleted({
             providerId: event.providerId ?? null,
@@ -468,32 +494,14 @@ function AppInner({
             outputTokens: event.outputTokens,
             cacheReadTokens: event.cacheReadTokens,
             cacheWriteTokens: event.cacheWriteTokens,
-            toolCount: event.toolCalls.length,
+            toolCount,
             success: event.result.success,
             forkId: event.forkId,
             agentRole,
           })
 
-          // Track individual tool calls
-          for (const tc of event.toolCalls) {
-            let linesWritten: number | undefined
-
-            if (tc.result.status === 'success' && tc.result.display?.type === 'write_stats') {
-              linesWritten = tc.result.display.linesWritten
-              sessionTracker.recordLinesWritten(linesWritten)
-            }
-
-            trackToolUsage({
-              toolName: tc.toolName,
-              group: tc.group,
-              status: tc.result.status,
-              linesWritten,
-              forkId: event.forkId,
-              agentRole,
-            })
-          }
-
-          sessionTracker.recordTurn(event.inputTokens, event.outputTokens, event.toolCalls.length)
+          sessionTracker.recordTurn(event.inputTokens, event.outputTokens, toolCount)
+          turnToolCounts.delete(key)
         }
 
         if (event.type === 'compaction_completed') {

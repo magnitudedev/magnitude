@@ -150,14 +150,6 @@ export interface TurnToolCall {
 // Response Representation
 // =============================================================================
 
-/**
- * Durable record of what the model produced in a turn.
- * Used for memory reconstruction. Single text part containing the raw XML.
- */
-export type ResponsePart =
-  | { readonly type: 'text'; readonly content: string }
-  | { readonly type: 'thinking'; readonly content: string }
-
 export interface ObservedResult {
   readonly toolCallId: string
   readonly tagName: string
@@ -171,9 +163,6 @@ export interface TurnCompleted {
   readonly turnId: string
   readonly chainId: string
   readonly strategyId: StrategyId
-  readonly responseParts: readonly ResponsePart[]
-  readonly toolCalls: readonly TurnToolCall[]
-  readonly observedResults: readonly ObservedResult[]
   readonly result: TurnResult
   /** Actual input token count from LLM provider (via BAML Collector). Null when unavailable (e.g. Codex path, interrupted turns). */
   readonly inputTokens: number | null
@@ -317,6 +306,8 @@ export type ToolResult =
   | { readonly status: 'error'; readonly message: string }
   | { readonly status: 'rejected'; readonly message: string; readonly reason?: string }
   | { readonly status: 'interrupted' }
+
+export type ToolResultStatus = ToolResult['status']
 
 
 

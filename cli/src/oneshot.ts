@@ -198,13 +198,14 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
     }
   }
 
-  function formatTurnInfo(event: Extract<AppEvent, { type: 'turn_completed' }>): string {
+  const turnToolCounts = new Map<string, Map<string, number>>()
+  const turnKey = (forkId: string | null, turnId: string) => `${forkId ?? 'root'}:${turnId}`
+
+  function formatTurnInfo(
+    event: Extract<AppEvent, { type: 'turn_completed' }>,
+    toolCounts: Map<string, number>,
+  ): string {
     const tokens = event.outputTokens
-    const toolCounts = new Map<string, number>()
-    for (const tc of event.toolCalls ?? []) {
-      const name = tc.group ? `${tc.group}:${tc.toolName}` : tc.toolName
-      toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1)
-    }
     const toolSummary = [...toolCounts.entries()]
       .map(([n, c]) => c > 1 ? `${n}×${c}` : n)
       .join(', ')
@@ -236,9 +237,22 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
         break
       }
 
+      case 'tool_event': {
+        if (event.event._tag === 'ToolInputStarted') {
+          const key = turnKey(event.forkId, event.turnId)
+          const counts = new Map(turnToolCounts.get(key) ?? [])
+          const name = event.event.group ? `${event.event.group}:${event.event.toolName}` : event.event.toolName
+          counts.set(name, (counts.get(name) ?? 0) + 1)
+          turnToolCounts.set(key, counts)
+        }
+        break
+      }
+
       case 'turn_completed': {
         const isRoot = event.forkId === null
-        const info = formatTurnInfo(event)
+        const key = turnKey(event.forkId, event.turnId)
+        const info = formatTurnInfo(event, turnToolCounts.get(key) ?? new Map())
+        turnToolCounts.delete(key)
 
         if (isRoot) {
           if (info) line(dim(info))

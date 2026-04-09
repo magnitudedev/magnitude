@@ -68,9 +68,16 @@ describe('baseline harness lifecycle', () => {
 
       yield* harness.user('write a file')
       const completed = yield* harness.wait.turnCompleted(null)
+      const toolEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
       expect(completed.result.success).toBe(true)
-      expect(completed.toolCalls.length).toBeGreaterThan(0)
+      if (toolEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(toolEnded.event.result._tag).toBe('Success')
       expect(harness.files.get('output.txt')).toBe('content')
     }).pipe(Effect.provide(TestHarnessLive()))
   )

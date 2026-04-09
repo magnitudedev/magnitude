@@ -22,9 +22,9 @@ describe('formatInbox', () => {
     expect(formatInbox({ results: [], timeline: [], timezone: 'UTC', lifecycleReminderFormatters })).toEqual([])
   })
 
-  test('renders results-only entries (tool_results, interrupted, error, noop)', () => {
+  test('renders results-only entries (turn_results, interrupted, error, noop)', () => {
     const results: readonly ResultEntry[] = [
-      { kind: 'tool_results', toolCalls: [], observedResults: [] },
+      { kind: 'turn_results', items: [] },
       { kind: 'interrupted' },
       { kind: 'error', message: 'boom' },
       { kind: 'noop' },

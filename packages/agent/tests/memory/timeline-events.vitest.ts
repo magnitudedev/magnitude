@@ -33,9 +33,8 @@ describe('memory/timeline-events', () => {
         turnId: 'sub-turn-1',
         chainId: 'sub-chain-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
@@ -142,9 +141,8 @@ describe('memory/timeline-events', () => {
         turnId: 't-rem-1',
         chainId: 'c-rem-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'ok' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: {
           success: true,
           turnDecision: 'idle',

@@ -295,7 +295,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   if (input.results.length > 0) {
     builder.pushText('<turn_result>')
     for (const result of input.results) {
-      if (result.kind === 'tool_results') builder.pushParts(formatResults(result.toolCalls, result.observedResults))
+      if (result.kind === 'turn_results') builder.pushParts(formatResults(result.items))
       else if (result.kind === 'interrupted') builder.pushText(formatInterrupted())
       else if (result.kind === 'error') builder.pushText(formatError(result.message))
       else if (result.kind === 'oneshot_liveness') builder.pushText(formatOneshotLiveness())
