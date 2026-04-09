@@ -7,7 +7,7 @@
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
-import { Effect, Stream, Queue, Context, Layer, Ref } from 'effect'
+import { Effect, Stream, Context, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
@@ -56,7 +56,7 @@ import { bindObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
-import type { TurnEvent } from './types'
+import type { TurnEvent, TurnEventSink } from './types'
 import { WorkingDirectoryTag } from './working-directory'
 import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
@@ -109,7 +109,7 @@ export interface ExecutionManagerService {
   readonly execute: (
     xmlStream: Stream.Stream<string, ModelError>,
     options: ExecuteOptions,
-    sink: Queue.Queue<TurnEvent>,
+    sink: TurnEventSink,
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
@@ -504,7 +504,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   streamingFields.set(event.toolCallId, {})
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -535,7 +535,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   const currentState = streamHookStates.get(event.toolCallId)
                   const partialInput = streamingFields.get(event.toolCallId) ?? {}
                   const streamCtx = {
-                    emit: (value: unknown) => Queue.offer(sink, {
+                    emit: (value: unknown) => sink.emit( {
                       _tag: 'ToolEvent' as const,
                       toolCallId: event.toolCallId,
                       toolKey,
@@ -550,7 +550,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   streamHookStates.set(event.toolCallId, newState)
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -575,7 +575,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   hasToolErrors = true
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -595,7 +595,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -610,7 +610,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -646,7 +646,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 if (toolResult.status === 'error') {
                   hasToolErrors = true
                 }
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -703,7 +703,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   const currentState = streamHookStates.get(event.toolCallId)
                   const partialInput = streamingFields.get(event.toolCallId) ?? {}
                   const streamCtx = {
-                    emit: (value: unknown) => Queue.offer(sink, {
+                    emit: (value: unknown) => sink.emit( {
                       _tag: 'ToolEvent' as const,
                       toolCallId: event.toolCallId,
                       toolKey,
@@ -718,7 +718,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   streamHookStates.set(event.toolCallId, newState)
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -816,7 +816,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 messagesSent.push({ id: event.id, taskId: destination.kind === 'worker' ? destination.taskId : null })
                 hasAnyMessage = true
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'MessageStart',
                   id: event.id,
                   destination,
@@ -825,19 +825,19 @@ const makeExecutionManager = Effect.gen(function* () {
               }
 
               case 'MessageChunk': {
-                yield* Queue.offer(sink, { _tag: 'MessageChunk', id: event.id, text: event.text })
+                yield* sink.emit( { _tag: 'MessageChunk', id: event.id, text: event.text })
                 break
               }
 
               case 'MessageEnd': {
-                yield* Queue.offer(sink, { _tag: 'MessageEnd', id: event.id })
+                yield* sink.emit( { _tag: 'MessageEnd', id: event.id })
                 break
               }
 
               case 'ProseChunk': {
                 hasAnyResponseContent = true
                 if (event.patternId === 'think') {
-                  yield* Queue.offer(sink, { _tag: 'ThinkingDelta', text: event.text })
+                  yield* sink.emit( { _tag: 'ThinkingDelta', text: event.text })
                 }
                 break
               }
@@ -845,26 +845,26 @@ const makeExecutionManager = Effect.gen(function* () {
               case 'ProseEnd': {
                 hasAnyResponseContent = true
                 if (event.patternId === 'think') {
-                  yield* Queue.offer(sink, { _tag: 'ThinkingEnd', about: event.about })
+                  yield* sink.emit( { _tag: 'ThinkingEnd', about: event.about })
                 }
                 break
               }
 
               case 'LensStart': {
                 hasAnyResponseContent = true
-                yield* Queue.offer(sink, { _tag: 'LensStarted', name: event.name })
+                yield* sink.emit( { _tag: 'LensStarted', name: event.name })
                 break
               }
 
               case 'LensChunk': {
                 hasAnyResponseContent = true
-                yield* Queue.offer(sink, { _tag: 'LensDelta', text: event.text })
+                yield* sink.emit( { _tag: 'LensDelta', text: event.text })
                 break
               }
 
               case 'LensEnd': {
                 hasAnyResponseContent = true
-                yield* Queue.offer(sink, { _tag: 'LensEnded', name: event.name })
+                yield* sink.emit( { _tag: 'LensEnded', name: event.name })
                 break
               }
 
@@ -876,7 +876,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,

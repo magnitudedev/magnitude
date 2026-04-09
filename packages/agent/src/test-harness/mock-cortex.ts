@@ -1,9 +1,9 @@
-import { Cause, Duration, Effect, Queue, Stream } from 'effect'
+import { Cause, Duration, Effect, Stream } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { TransportError } from '@magnitudedev/providers'
 import { ExecutionManager } from '../execution/execution-manager'
-import { createTurnStream } from '../execution/types'
+import { createTurnStream } from '../execution/turn-stream'
 import { drainTurnEventStream } from '../workers/turn-event-drain'
 import { MockTurnScriptTag, type MockTurnResponse } from './turn-script'
 import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
@@ -50,9 +50,9 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
         const execManager = yield* ExecutionManager
         const frame = yield* script.dequeue({ forkId, turnId })
 
-        const turnStream = createTurnStream((queue) => Effect.gen(function* () {
+        const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const xmlStream = buildStream(frame).pipe(
-            Stream.tap((chunk) => Queue.offer(queue, { _tag: 'RawResponseChunk', text: chunk }))
+            Stream.tap((chunk) => sink.emit({ _tag: 'RawResponseChunk', text: chunk }))
           )
 
           const executeResult = yield* execManager.execute(
@@ -64,7 +64,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
               defaultProseDest: forkId === null ? 'user' : 'parent',
               allowSingleUserReplyThisTurn: false,
             },
-            queue,
+            sink,
           )
 
           const usage = {
@@ -77,7 +77,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             totalCost: null,
           }
 
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage } })
+          yield* sink.emit({ _tag: 'TurnResult', value: { executeResult, usage } })
         }))
 
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)

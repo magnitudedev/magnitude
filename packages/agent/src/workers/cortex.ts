@@ -15,7 +15,7 @@
  * 5. Publishing turn_completed
  */
 
-import { Effect, Stream, Queue, Either } from 'effect'
+import { Effect, Stream, Either } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 
 import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
@@ -33,7 +33,8 @@ import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
 import type { AppEvent } from '../events'
 
-import { createTurnStream, TurnError as TurnErrorCtor } from '../execution/types'
+import { createTurnStream } from '../execution/turn-stream'
+import { TurnError as TurnErrorCtor } from '../execution/types'
 import type { TurnError } from '../execution/types'
 import { MemoryProjection, getView } from '../projections/memory'
 
@@ -192,7 +193,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         resolvedModelId = boundModel.model.id
 
         // 3. Build and consume the turn event stream
-        const turnStream = createTurnStream((queue) => Effect.gen(function* () {
+        const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           // Ack turn disabled
           const ackTurn = '';//buildAckTurn(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
@@ -216,7 +217,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           // Collect raw chunks and execute via xml-act runtime
           const xmlStream = cs.stream.pipe(
-            Stream.tap(chunk => Queue.offer(queue, { _tag: 'RawResponseChunk', text: chunk })),
+            Stream.tap(chunk => sink.emit({ _tag: 'RawResponseChunk', text: chunk })),
           )
 
           const executeResult = yield* execManager.execute(
@@ -228,7 +229,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               defaultProseDest: agentDef.defaultRecipient,
               allowSingleUserReplyThisTurn,
             },
-            queue,
+            sink,
           )
 
           // Extract usage — tag as partial if execution failed
@@ -236,7 +237,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
 
           // Offer final result
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus } })
+          yield* sink.emit({ _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus } })
         }))
 
         // 3a. Drain turn stream, publishing events and collecting the final result

@@ -5,8 +5,8 @@
  * Relocated from strategies/types.ts after strategy abstraction removal.
  */
 
-import { Effect, Stream, Queue, Deferred, Scope, Data } from 'effect'
-import type { XmlRuntimeCrash, ToolCallEvent } from '@magnitudedev/xml-act'
+import { Effect, Data } from 'effect'
+import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 import type { ExecuteResult } from './execution-manager'
 import type { CallUsage } from '@magnitudedev/providers'
@@ -41,6 +41,10 @@ export type TurnEvent =
   // --- Terminal (always last event in the stream) ---
   | { readonly _tag: 'TurnResult'; readonly value: TurnStrategyResult }
 
+export interface TurnEventSink {
+  readonly emit: (event: TurnEvent) => Effect.Effect<void>
+}
+
 // =============================================================================
 // Turn Error
 // =============================================================================
@@ -59,42 +63,6 @@ export type TurnError = Data.TaggedEnum<{
 }>
 
 export const TurnError = Data.taggedEnum<TurnError>()
-
-// =============================================================================
-// Turn Stream Helper
-// =============================================================================
-
-/**
- * Create a turn event stream from an effectful producer.
- *
- * The producer receives a Queue to offer events into.
- * The stream completes when the producer returns.
- * Errors propagate through the stream via a Deferred.
- *
- * The producer MUST offer a TurnResult event before returning.
- */
-export function createTurnStream<R>(
-  producer: (queue: Queue.Queue<TurnEvent>) => Effect.Effect<void, XmlRuntimeCrash | TurnError, R>
-): Stream.Stream<TurnEvent, XmlRuntimeCrash | TurnError, R | Scope.Scope> {
-  return Stream.unwrapScoped(
-    Effect.gen(function* () {
-      const queue = yield* Queue.unbounded<TurnEvent>()
-      const done = yield* Deferred.make<void, XmlRuntimeCrash | TurnError>()
-
-      yield* Effect.forkScoped(
-        producer(queue).pipe(
-          Effect.exit,
-          Effect.flatMap((exit) => Deferred.done(done, exit)),
-          Effect.ensuring(Effect.yieldNow().pipe(Effect.andThen(Queue.shutdown(queue)))),
-        )
-      )
-
-      const queueStream = Stream.fromQueue(queue)
-      const doneCheck = Stream.fromEffect(Deferred.await(done)).pipe(Stream.drain)
-      return Stream.concat(queueStream, doneCheck)
-    })
-  )
-}
 
 // =============================================================================
 // Turn Result
