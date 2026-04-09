@@ -1,5 +1,0 @@
-{
-  "name": "Error",
-  "message": "Unsupported tool type: provider",
-  "stack": "Error: Unsupported tool type: provider\n    at <anonymous> (/Users/trg/magnitude/node_modules/ai/dist/index.mjs:3912:21)\n    at map (native:1:11)\n    at prepareToolsAndToolChoice (/Users/trg/magnitude/node_modules/ai/dist/index.mjs:3892:26)\n    at <anonymous> (/Users/trg/magnitude/node_modules/ai/dist/index.mjs:4279:14)\n    at processTicksAndRejections (native:7:39)"
-}

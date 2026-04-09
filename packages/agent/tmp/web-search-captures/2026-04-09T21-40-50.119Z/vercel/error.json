@@ -1,5 +1,0 @@
-{
-  "name": "AI_APICallError",
-  "message": "Provider tool id must be in format: <provider-name>.<unique-tool-name>",
-  "stack": "AI_APICallError: Provider tool id must be in format: <provider-name>.<unique-tool-name>\n    at <anonymous> (/Users/trg/magnitude/node_modules/@ai-sdk/provider-utils/dist/index.mjs:2551:18)\n    at processTicksAndRejections (native:7:39)"
-}

@@ -1,5 +1,0 @@
-{
-  "name": "TypeError",
-  "message": "provider.tools.webSearch is not a function. (In 'provider.tools.webSearch({})', 'provider.tools.webSearch' is undefined)",
-  "stack": "TypeError: provider.tools.webSearch is not a function. (In 'provider.tools.webSearch({})', 'provider.tools.webSearch' is undefined)\n    at runVercelAiSdkCapture (/Users/trg/magnitude/packages/agent/scripts/web-search-capture/vercel-ai-sdk-capture.ts:70:34)\n    at processTicksAndRejections (native:7:39)"
-}

@@ -9,4 +9,4 @@ dist
 .DS_Store
 release-artifacts
 /jobs
-
+packages/agent/tmp

@@ -1,5 +1,0 @@
-{
-  "name": "(FiberFailure) TypeError",
-  "message": "authService.refresh is not a function. (In 'authService.refresh(\"github-copilot\", current.refreshToken)', 'authService.refresh' is undefined)",
-  "stack": "TypeError: authService.refresh is not a function. (In 'authService.refresh(\"github-copilot\", current.refreshToken)', 'authService.refresh' is undefined)\n    at <anonymous> (/Users/trg/magnitude/packages/agent/src/tools/web-search.ts:241:67)\n    at processTicksAndRejections (native:7:39)"
-}
