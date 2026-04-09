@@ -8,7 +8,7 @@
   },
   "files": ["dist", "bin"],
   "scripts": {
-    "dev": "bun run src/index.tsx",
+    "dev": "bun run scripts/generate-version.ts && bun run src/index.tsx",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "logs": "mkdir -p ~/.magnitude/logs && touch ~/.magnitude/logs/cli.jsonl && tail -F ~/.magnitude/logs/cli.jsonl",

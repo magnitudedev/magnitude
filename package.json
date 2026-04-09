@@ -4,7 +4,7 @@
   "packageManager": "bun@1.3.10",
   "workspaces": ["cli", "evals", "packages/*"],
   "scripts": {
-    "dev": "bun run --cwd packages/llm-core baml && bun run cli/src/index.tsx --debug",
+    "dev": "bun run --cwd packages/llm-core baml && bun run cli/scripts/generate-version.ts && bun run cli/src/index.tsx --debug",
     "build": "turbo build && bun run cli/scripts/build-binary.ts",
     "typecheck": "turbo typecheck",
     "test": "bun test",
