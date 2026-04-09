@@ -1,0 +1,10 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [],
+  "textResponse": "",
+  "usage": {
+    "input_tokens": 8659,
+    "output_tokens": 706,
+    "web_search_requests": 0
+  }
+}

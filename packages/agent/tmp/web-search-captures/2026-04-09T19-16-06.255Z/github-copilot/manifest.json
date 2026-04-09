@@ -1,0 +1,14 @@
+{
+  "runId": "github-copilot",
+  "provider": "github-copilot",
+  "authMode": "oauth",
+  "query": "What are the top AI news headlines today? Include sources.",
+  "timestamp": "2026-04-09T19:16:06.258Z",
+  "notes": [
+    "mode:router"
+  ],
+  "prerequisites": {
+    "authPresent": true
+  },
+  "status": "provider-error"
+}

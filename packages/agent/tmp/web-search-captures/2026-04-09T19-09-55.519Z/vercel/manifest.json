@@ -1,0 +1,15 @@
+{
+  "runId": "vercel",
+  "provider": "vercel",
+  "authMode": "api",
+  "query": "What are the top AI news headlines today? Include sources.",
+  "timestamp": "2026-04-09T19:09:55.520Z",
+  "notes": [
+    "mode:direct-adapter",
+    "vercel:missing-structured-sources"
+  ],
+  "prerequisites": {
+    "authPresent": true
+  },
+  "status": "capture-error"
+}

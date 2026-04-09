@@ -3,12 +3,13 @@ import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Effect, Layer } from "effect";
 import { ProviderAuth, ProviderState, type AuthInfo } from "@magnitudedev/providers";
+import { exchangeCopilotToken } from "../../providers/src/auth/copilot-oauth";
 import { webSearch, webSearchStream, type SearchAuth, type SearchOptions } from "../src/tools/web-search";
 import { openaiWebSearch } from "../src/tools/web-search-openai";
 import { openrouterWebSearch } from "../src/tools/web-search-openrouter";
 import { vercelWebSearch } from "../src/tools/web-search-vercel";
 import { copilotWebSearch } from "../src/tools/web-search-copilot";
-import { runVercelAiSdkCapture } from "./web-search-capture/vercel-ai-sdk-capture";
+
 import { geminiWebSearch } from "../src/tools/web-search-gemini";
 import { anthropicWebSearch } from "../src/tools/web-search-anthropic";
 import {
@@ -147,12 +148,17 @@ function getSearchOptions(config: CliConfig): SearchOptions | undefined {
   return Object.keys(options).length > 0 ? options : undefined;
 }
 
-function oauthAuth(accessToken: string, accountId?: string): AuthInfo {
+function oauthAuth(
+  accessToken: string,
+  accountId?: string,
+  refreshToken = "capture-script",
+  expiresAt = Date.now() + 60 * 60 * 1000,
+): AuthInfo {
   return {
     type: "oauth",
     accessToken,
-    refreshToken: "capture-script",
-    expiresAt: Date.now() + 60 * 60 * 1000,
+    refreshToken,
+    expiresAt,
     ...(accountId ? { accountId } : {}),
   };
 }
@@ -218,13 +224,15 @@ function buildRunSpecs(config: CliConfig): RunSpec[] {
     }
 
     if (config.openaiAuth === "oauth" || config.openaiAuth === "both") {
+      const refreshToken = openaiAuthInfo?.type === "oauth" ? openaiAuthInfo.refreshToken : "capture-script";
+      const expiresAt = openaiAuthInfo?.type === "oauth" ? openaiAuthInfo.expiresAt : Date.now() + 60 * 60 * 1000;
       specs.push(openaiOauthToken
         ? {
             runId: "openai-oauth",
             providerSlot: "openai",
             providerLabel: "openai",
             authMode: "oauth",
-            authInfo: oauthAuth(openaiOauthToken, openaiAccountId),
+            authInfo: oauthAuth(openaiOauthToken, openaiAccountId, refreshToken, expiresAt),
           }
         : {
             runId: "openai-oauth",
@@ -253,8 +261,16 @@ function buildRunSpecs(config: CliConfig): RunSpec[] {
   if (include("github-copilot")) {
     const copilotAuthInfo = globalAuth["github-copilot"];
     const token = process.env.GITHUB_COPILOT_TOKEN ?? process.env.COPILOT_OAUTH_TOKEN ?? oauthTokenFromAuthInfo(copilotAuthInfo);
+    const refreshToken = copilotAuthInfo?.type === "oauth" ? copilotAuthInfo.refreshToken : "capture-script";
+    const expiresAt = copilotAuthInfo?.type === "oauth" ? copilotAuthInfo.expiresAt : Date.now() + 60 * 60 * 1000;
     specs.push(token
-      ? { runId: "github-copilot", providerSlot: "github-copilot", providerLabel: "github-copilot", authMode: "oauth", authInfo: oauthAuth(token) }
+      ? {
+          runId: "github-copilot",
+          providerSlot: "github-copilot",
+          providerLabel: "github-copilot",
+          authMode: "oauth",
+          authInfo: oauthAuth(token, undefined, refreshToken, expiresAt),
+        }
       : { runId: "github-copilot", providerSlot: "github-copilot", providerLabel: "github-copilot", authMode: "oauth", authError: "Missing Copilot auth (GITHUB_COPILOT_TOKEN/COPILOT_OAUTH_TOKEN or ~/.magnitude/auth.json:github-copilot)" });
   }
 
@@ -297,6 +313,20 @@ function createProviderAuthLayer(spec: RunSpec) {
 
   return Layer.succeed(ProviderAuth, {
     getAuth: (providerId: string) => Effect.succeed(authMap[providerId]),
+    setAuth: (providerId: string, auth: AuthInfo) =>
+      Effect.sync(() => {
+        authMap[providerId] = auth;
+      }),
+    refresh: (providerId: string, refreshToken: string) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (providerId === "github-copilot") {
+            return await exchangeCopilotToken(refreshToken);
+          }
+          return null;
+        },
+        catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+      }),
   } as any);
 }
 
@@ -365,13 +395,12 @@ async function withInterceptorsForSpec<T>(spec: RunSpec, run: () => Promise<T>):
   const fetchWrapped =
     spec.providerSlot === "openai" && spec.authMode === "oauth" ||
     spec.providerSlot === "openrouter" ||
-    spec.providerSlot === "github-copilot" ||
     spec.providerSlot === "vercel"
       ? () => withFetchInterceptor(fetchState, base)
       : base;
 
   const openaiWrapped =
-    spec.providerSlot === "openai" && spec.authMode === "api"
+    (spec.providerSlot === "openai" && spec.authMode === "api") || spec.providerSlot === "vercel"
       ? () => withOpenAISdkInterceptor(openaiState, fetchWrapped)
       : fetchWrapped;
 
@@ -417,6 +446,108 @@ function getStatusFromError(error: unknown): CaptureStatus {
   return "provider-error";
 }
 
+function hasNonEmptyToolsPayload(request: unknown): boolean {
+  const args = (request as any)?.args;
+  if (args && typeof args === "object") {
+    const tools = (args as any).tools;
+    if (tools && typeof tools === "object" && !Array.isArray(tools)) {
+      return Object.keys(tools).length > 0;
+    }
+  }
+
+  const bodyJsonTools = (request as any)?.bodyJson?.tools;
+  if (Array.isArray(bodyJsonTools)) {
+    return bodyJsonTools.length > 0;
+  }
+
+  return false;
+}
+
+function hasStructuredSources(normalizedResult: unknown): boolean {
+  const results = (normalizedResult as any)?.results;
+  if (!Array.isArray(results) || results.length === 0) return false;
+  for (const entry of results) {
+    const content = (entry as any)?.content;
+    if (!Array.isArray(content)) continue;
+    if (content.some((source) => typeof source?.url === "string" && source.url.length > 0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getWebSearchRequests(normalizedResult: unknown): number {
+  const value = (normalizedResult as any)?.usage?.web_search_requests;
+  return typeof value === "number" ? value : 0;
+}
+
+function getVercelSpecialCaseStatusAndNotes(value: unknown): { status: CaptureStatus; notes: string[] } {
+  const diagnostics = (value as any)?.diagnostics as
+    | {
+        unsupportedToolWarning?: boolean;
+        requestToolsDropped?: boolean;
+        requestedWebSearchTool?: boolean;
+        hasCitations?: boolean;
+        warningTypes?: string[];
+      }
+    | undefined;
+  const request = (value as any)?.request;
+  const response = (value as any)?.response;
+  const normalizedResult = (value as any)?.normalizedResult;
+
+  const warningTypes: string[] = [];
+  if (Array.isArray(diagnostics?.warningTypes)) {
+    warningTypes.push(...diagnostics.warningTypes);
+  }
+  const responseWarnings = (response as any)?.bodyJson?.warnings;
+  if (Array.isArray(responseWarnings)) {
+    for (const warning of responseWarnings) {
+      const type = typeof warning?.type === "string" ? warning.type : null;
+      if (type && !warningTypes.includes(type)) warningTypes.push(type);
+    }
+  }
+
+  const unsupportedToolWarning =
+    Boolean(diagnostics?.unsupportedToolWarning) || warningTypes.includes("unsupported-tool");
+
+  const requestToolsDropped = Boolean(diagnostics?.requestToolsDropped) || (
+    Array.isArray((request as any)?.bodyJson?.tools) && (request as any).bodyJson.tools.length === 0
+  );
+
+  const notes: string[] = [];
+  if (unsupportedToolWarning) {
+    notes.push("vercel:unsupported-tool-warning");
+  }
+  if (requestToolsDropped) {
+    notes.push("vercel:request-tools-dropped");
+  }
+  if (warningTypes.length > 0) {
+    notes.push(`vercel:warning-types=${warningTypes.join(",")}`);
+  }
+
+  if (!hasNonEmptyToolsPayload(request)) {
+    notes.push("vercel:missing-tool-payload");
+  }
+  if (!hasStructuredSources(normalizedResult)) {
+    notes.push("vercel:missing-structured-sources");
+  }
+  if (getWebSearchRequests(normalizedResult) < 1) {
+    notes.push("vercel:web-search-requests-lt-1");
+  }
+
+  const hasFailureSignal =
+    unsupportedToolWarning ||
+    requestToolsDropped ||
+    !hasNonEmptyToolsPayload(request) ||
+    !hasStructuredSources(normalizedResult) ||
+    getWebSearchRequests(normalizedResult) < 1;
+
+  return {
+    status: hasFailureSignal ? "capture-error" : "success",
+    notes,
+  };
+}
+
 async function runOne(
   rootDir: string,
   spec: RunSpec,
@@ -457,13 +588,9 @@ async function runOne(
   }
 
   try {
-    const vercelSpecialCase =
-      spec.providerSlot === "vercel" && spec.authInfo?.type === "api" && !config.directAdapter;
+    const vercelSpecialCase = spec.providerSlot === "vercel";
 
     const { value, request, response, responseRawText, streamEvents } = await withInterceptorsForSpec(spec, async () => {
-      if (vercelSpecialCase) {
-        return runVercelAiSdkCapture(config.query, spec.authInfo!.key, options);
-      }
       if (spec.providerSlot === "anthropic" && config.streamAnthropic) {
         return executeAnthropicStream(spec, config.query, options);
       }
@@ -473,39 +600,44 @@ async function runOne(
       return executeViaRouter(spec, config.query, options);
     });
 
+    const normalizedResult =
+      spec.providerSlot === "anthropic" && config.streamAnthropic
+        ? (value as any).normalizedResult ?? sentinel("missing-done-response")
+        : value;
+
+    const vercelAssessment = vercelSpecialCase
+      ? getVercelSpecialCaseStatusAndNotes({
+          diagnostics: (value as any)?.diagnostics,
+          request,
+          response,
+          normalizedResult,
+        })
+      : { status: "success" as const, notes: [] };
+
     const artifacts: ProviderRunArtifacts = {
       manifest: {
         ...manifestBase,
-        status: "success",
+        status: vercelAssessment.status,
         ...(vercelSpecialCase
-          ? { notes: [...(manifestBase.notes ?? []), "vercel:ai-sdk-capture-path"] }
+          ? {
+              notes: [
+                ...(manifestBase.notes ?? []),
+                ...vercelAssessment.notes,
+              ],
+            }
           : {}),
       },
-      request: vercelSpecialCase
-        ? ((value as any).request as any)
-        : (request as any)?.present === false
-          ? request as any
-          : ({ present: true, ...(request as any) } as any),
-      response: vercelSpecialCase
-        ? ((value as any).response as any)
-        : (response as any)?.present === false
-          ? response as any
-          : ({ present: true, ...(response as any) } as any),
-      responseRawText: vercelSpecialCase
-        ? ((value as any).responseRawText ?? sentinel("not-text-response"))
-        : responseRawText ?? sentinel("not-text-response"),
-      streamEvents: vercelSpecialCase
-        ? (((value as any).streamEvents?.length ?? 0) > 0
-          ? (value as any).streamEvents
-          : sentinel("non-streaming-provider-or-no-events"))
-        : streamEvents.length > 0
-          ? streamEvents
-          : sentinel("non-streaming-provider-or-no-events"),
-      normalizedResult: vercelSpecialCase
-        ? (value as any).normalizedResult
-        : spec.providerSlot === "anthropic" && config.streamAnthropic
-          ? (value as any).normalizedResult ?? sentinel("missing-done-response")
-          : value,
+      request: (request as any)?.present === false
+        ? request as any
+        : ({ present: true, ...(request as any) } as any),
+      response: (response as any)?.present === false
+        ? response as any
+        : ({ present: true, ...(response as any) } as any),
+      responseRawText: responseRawText ?? sentinel("not-text-response"),
+      streamEvents: streamEvents.length > 0
+        ? streamEvents
+        : sentinel("non-streaming-provider-or-no-events"),
+      normalizedResult,
       error: sentinel("none"),
     };
 
@@ -514,7 +646,7 @@ async function runOne(
       runId: spec.runId,
       provider: spec.providerLabel,
       authMode: spec.authMode,
-      status: "success",
+      status: vercelAssessment.status,
       artifactDir,
     };
   } catch (error) {
@@ -570,3 +702,7 @@ async function main(): Promise<void> {
 if (import.meta.main) {
   await main();
 }
+
+export const __testOnly = {
+  getVercelSpecialCaseStatusAndNotes,
+};

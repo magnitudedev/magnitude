@@ -1,0 +1,31 @@
+{
+  "present": true,
+  "url": "https://chatgpt.com/backend-api/codex/responses",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer eyJh…mxiY",
+    "ChatGPT-Account-Id": "9dfa…1d34"
+  },
+  "bodyText": "{\"model\":\"gpt-5.2\",\"instructions\":\"\",\"input\":[{\"role\":\"user\",\"content\":\"What are the top AI news headlines today? Include sources.\"}],\"tools\":[{\"type\":\"web_search\"}],\"include\":[\"web_search_call.action.sources\"],\"stream\":true,\"store\":false}",
+  "bodyJson": {
+    "model": "gpt-5.2",
+    "instructions": "",
+    "input": [
+      {
+        "role": "user",
+        "content": "What are the top AI news headlines today? Include sources."
+      }
+    ],
+    "tools": [
+      {
+        "type": "web_search"
+      }
+    ],
+    "include": [
+      "web_search_call.action.sources"
+    ],
+    "stream": true,
+    "store": false
+  }
+}

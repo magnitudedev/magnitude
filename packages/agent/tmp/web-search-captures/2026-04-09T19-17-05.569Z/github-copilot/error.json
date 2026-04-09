@@ -1,0 +1,5 @@
+{
+  "name": "(FiberFailure) Error",
+  "message": "GitHub Copilot web search timed out after 90000ms",
+  "stack": "Error: GitHub Copilot web search timed out after 90000ms\n    at executeCopilotRequest (/Users/trg/magnitude/packages/agent/src/tools/web-search-copilot.ts:145:17)\n    at processTicksAndRejections (native:7:39)"
+}

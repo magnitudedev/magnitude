@@ -1,0 +1,5 @@
+{
+  "name": "(FiberFailure) AI_NoSuchToolError",
+  "message": "Model tried to call unavailable tool 'web_search_preview'. Available tools: web_search.",
+  "stack": "AI_NoSuchToolError: Model tried to call unavailable tool 'web_search_preview'. Available tools: web_search.\n    at doParseToolCall (/Users/trg/magnitude/node_modules/ai/dist/index.mjs:4054:15)\n    at parseToolCall (/Users/trg/magnitude/node_modules/ai/dist/index.mjs:4020:18)\n    at map (native:1:11)\n    at <anonymous> (/Users/trg/magnitude/node_modules/ai/dist/index.mjs:4377:69)\n    at processTicksAndRejections (native:7:39)"
+}

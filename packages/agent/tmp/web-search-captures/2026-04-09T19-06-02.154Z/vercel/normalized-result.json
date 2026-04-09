@@ -1,0 +1,10 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [],
+  "textResponse": "I don’t have live web access in this chat, so I can’t reliably tell you **today’s** top AI headlines without risking stale or made-up news.\n\nHere are two good options:\n\n1. **I can give you a fast, trustworthy list of the best sources to check right now**, or  \n2. **If you paste links/headlines from today**, I can summarize them into a clean “top AI news” briefing.\n\n### Best sources for today’s AI headlines\n- **Reuters Technology / AI** — https://www.reuters.com/technology/  \n- **Bloomberg Technology / AI** — https://www.bloomberg.com/technology  \n- **The Verge AI** — https://www.theverge.com/ai-artificial-intelligence  \n- **TechCrunch AI** — https://techcrunch.com/category/artificial-intelligence/  \n- **MIT Technology Review – AI** — https://www.technologyreview.com/topic/artificial-intelligence/  \n- **Financial Times Technology** — https://www.ft.com/technology  \n- **The Information** — https://www.theinformation.com/  \n- **Semafor Tech** — https://www.semafor.com/tech  \n- **OpenAI News** — https://openai.com/news  \n- **Google DeepMind Blog** — https://deepmind.google/discover/blog/  \n- **Anthropic News** — https://www.anthropic.com/news  \n- **NVIDIA Blog / AI** — https://blogs.nvidia.com/  \n\n### If you want, I can still help right now\nPaste:\n- 5–10 article links, or\n- screenshots/headlines, or\n- the output of a Google News search for “AI”\n\nand I’ll turn it into:\n- **Top headlines**\n- **1-line summary of each**\n- **Why it matters**\n- **Sources**\n- optional **bullish / bearish / policy / product** categorization\n\n### Quick way to find them yourself\nSearch on Google News:\n- **site:reuters.com AI**\n- **site:techcrunch.com AI**\n- **site:theverge.com AI**\n- or just **AI news today**\n\nIf you want, I can also provide a **sample AI news briefing format** you can reuse every day.",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "web_search_requests": 0
+  }
+}

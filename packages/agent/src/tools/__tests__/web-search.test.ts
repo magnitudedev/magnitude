@@ -150,10 +150,10 @@ describe('web search OpenRouter integration', () => {
     expect(capturedUrl).toBe('https://chatgpt.com/backend-api/codex/responses')
   })
 
-  test('openai oauth assembles source-bearing output items from SSE when completed output is empty', async () => {
+  test('openai oauth merges annotation citations first, then unseen web_search_call sources', async () => {
     const encoder = new TextEncoder()
     const sseBody = [
-      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","action":{"sources":[{"url":"https://example.com/source-a"},{"url":"https://example.com/source-b"}]}}}\n',
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","action":{"sources":[{"url":"https://example.com/source-b"},{"url":"https://example.com/source-c"}]}}}\n',
       'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"Answer with sources","annotations":[{"type":"url_citation","title":"Example A","url":"https://example.com/source-a"},{"type":"url_citation","title":"Example B","url":"https://example.com/source-b"}]}]}}\n',
       'data: {"type":"response.completed","response":{"output_text":"Answer with sources","output":[],"usage":{"input_tokens":5,"output_tokens":7}}}\n',
       'data: [DONE]\n',
@@ -177,12 +177,123 @@ describe('web search OpenRouter integration', () => {
         content: [
           { title: 'Example A', url: 'https://example.com/source-a' },
           { title: 'Example B', url: 'https://example.com/source-b' },
+          { title: 'https://example.com/source-c', url: 'https://example.com/source-c' },
         ],
       },
     ])
     expect(result.usage).toEqual({
       input_tokens: 5,
       output_tokens: 7,
+      web_search_requests: 1,
+    })
+  })
+
+  test('openai oauth extracts citations from streamed message annotations when completed output is empty', async () => {
+    const encoder = new TextEncoder()
+    const sseBody = [
+      'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"Answer with annotation-only sources","annotations":[{"type":"url_citation","title":"Example A","url":"https://example.com/source-a"},{"type":"url_citation","title":"Example B","url":"https://example.com/source-b"}]}]}}\n',
+      'data: {"type":"response.completed","response":{"output_text":"Answer with annotation-only sources","output":[],"usage":{"input_tokens":9,"output_tokens":11}}}\n',
+      'data: [DONE]\n',
+    ].join('\n')
+
+    const result = await withPatchedFetch(
+      (async () =>
+        new Response(encoder.encode(sseBody), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })) as any,
+      () => runWebSearch('latest news', 'openai', {
+        openai: { type: 'oauth', accessToken: 'oauth-token' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('Answer with annotation-only sources')
+    expect(result.results).toEqual([
+      {
+        tool_use_id: 'openai-search',
+        content: [
+          { title: 'Example A', url: 'https://example.com/source-a' },
+          { title: 'Example B', url: 'https://example.com/source-b' },
+        ],
+      },
+    ])
+    expect(result.usage).toEqual({
+      input_tokens: 9,
+      output_tokens: 11,
+      web_search_requests: 0,
+    })
+  })
+
+  test('openai oauth dedupes merged sources by URL with annotation entries winning order/title', async () => {
+    const encoder = new TextEncoder()
+    const sseBody = [
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","action":{"sources":[{"url":"https://example.com/source-a"},{"url":"https://example.com/source-a"},{"url":"https://example.com/source-b"},{"url":"https://example.com/source-c"}]}}}\n',
+      'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"Answer with mixed sources","annotations":[{"type":"url_citation","title":"Annotated A","url":"https://example.com/source-a"},{"type":"url_citation","title":"Annotated B","url":"https://example.com/source-b"}]}]}}\n',
+      'data: {"type":"response.completed","response":{"output_text":"Answer with mixed sources","output":[],"usage":{"input_tokens":6,"output_tokens":8}}}\n',
+      'data: [DONE]\n',
+    ].join('\n')
+
+    const result = await withPatchedFetch(
+      (async () =>
+        new Response(encoder.encode(sseBody), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })) as any,
+      () => runWebSearch('latest news', 'openai', {
+        openai: { type: 'oauth', accessToken: 'oauth-token' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('Answer with mixed sources')
+    expect(result.results).toEqual([
+      {
+        tool_use_id: 'openai-search',
+        content: [
+          { title: 'Annotated A', url: 'https://example.com/source-a' },
+          { title: 'Annotated B', url: 'https://example.com/source-b' },
+          { title: 'https://example.com/source-c', url: 'https://example.com/source-c' },
+        ],
+      },
+    ])
+    expect(result.usage).toEqual({
+      input_tokens: 6,
+      output_tokens: 8,
+      web_search_requests: 1,
+    })
+  })
+
+  test('openai oauth falls back to web_search_call.action.sources when annotations are absent and completed output is empty', async () => {
+    const encoder = new TextEncoder()
+    const sseBody = [
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","action":{"sources":[{"url":"https://example.com/source-a"},{"url":"https://example.com/source-b"}]}}}\n',
+      'data: {"type":"response.completed","response":{"output_text":"Answer with call-only sources","output":[],"usage":{"input_tokens":6,"output_tokens":8}}}\n',
+      'data: [DONE]\n',
+    ].join('\n')
+
+    const result = await withPatchedFetch(
+      (async () =>
+        new Response(encoder.encode(sseBody), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })) as any,
+      () => runWebSearch('latest news', 'openai', {
+        openai: { type: 'oauth', accessToken: 'oauth-token' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('Answer with call-only sources')
+    expect(result.results).toEqual([
+      {
+        tool_use_id: 'openai-search',
+        content: [
+          { title: 'https://example.com/source-a', url: 'https://example.com/source-a' },
+          { title: 'https://example.com/source-b', url: 'https://example.com/source-b' },
+        ],
+      },
+    ])
+    expect(result.usage).toEqual({
+      input_tokens: 6,
+      output_tokens: 8,
       web_search_requests: 1,
     })
   })

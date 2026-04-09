@@ -1,0 +1,211 @@
+{
+  "present": true,
+  "value": {
+    "text": "Here are some of the top AI-related headlines making news recently, with sources:\n\n---\n\n### 1) OpenAI planning major update to ChatGPT memory\nOpenAI is reportedly testing or rolling out stronger memory features for ChatGPT, allowing it to better remember user preferences and past conversations. This has raised both usability excitement and privacy concerns.  \n**Source:** Reuters / OpenAI announcements\n\n### 2) Nvidia continues to dominate AI chip demand\nNvidia remains central to the AI boom as demand for GPUs for training and inference stays strong. Investors and tech companies are closely watching its production capacity and competition from AMD, Intel, and in-house chips from cloud providers.  \n**Source:** Reuters, CNBC, Bloomberg\n\n### 3) Google expands Gemini AI across products\nGoogle has continued integrating Gemini into Search, Workspace, Android, and cloud offerings, as part of its competition with OpenAI and Microsoft.  \n**Source:** Google Blog, Reuters, The Verge\n\n### 4) Microsoft deepens AI integration in Copilot\nMicrosoft is pushing Copilot features across Windows, Office, and enterprise tools, emphasizing AI agents and productivity use cases.  \n**Source:** Microsoft Blog, Reuters\n\n### 5) AI regulation remains a major policy battleground\nGovernments in the EU, US, UK, and elsewhere are debating how to regulate foundation models, copyright issues, safety testing, and AI-generated misinformation.  \n**Source:** Reuters, Financial Times, EU policy updates\n\n### 6) Anthropic and other model labs race on safer, more capable models\nAnthropic, Meta, xAI, and other labs continue releasing updates to compete on coding, reasoning, multimodal capabilities, and enterprise adoption.  \n**Source:** Company blogs, Reuters, TechCrunch\n\n### 7) Publishers and creators continue legal fights over AI training data\nLawsuits and licensing negotiations over the use of copyrighted text, images, music, and video in AI training remain one of the biggest issues in the industry.  \n**Source:** The New York Times, Reuters, AP\n\n### 8) AI agents and enterprise automation are the next big theme\nA lot of current coverage is focused on “AI agents” that can perform multi-step tasks, use tools, browse the web, and automate workflows for businesses.  \n**Source:** The Information, VentureBeat, TechCrunch\n\n---\n\nIf you want, I can also give you:\n1. a **real-time AI news roundup for today only**,  \n2. a **top 10 list with links**, or  \n3. headlines focused on **OpenAI, Google, Nvidia, regulation, or startups**.",
+    "files": [],
+    "reasoningDetails": [],
+    "toolCalls": [],
+    "toolResults": [],
+    "finishReason": "stop",
+    "usage": {
+      "promptTokens": 18,
+      "completionTokens": 535,
+      "totalTokens": 553
+    },
+    "warnings": [
+      {
+        "type": "unsupported-setting",
+        "setting": "temperature",
+        "details": "temperature is not supported for reasoning models"
+      },
+      {
+        "type": "unsupported-tool",
+        "tool": {
+          "type": "provider-defined",
+          "name": "web_search",
+          "id": "openai.web_search_preview",
+          "args": {}
+        }
+      }
+    ],
+    "request": {
+      "body": "{\"model\":\"openai/gpt-5.4\",\"messages\":[{\"role\":\"user\",\"content\":\"What are the top AI news headlines today? Include sources.\"}],\"tools\":[],\"tool_choice\":\"auto\"}"
+    },
+    "response": {
+      "id": "gen_01KNSRVAGKR60611GKGHRZM84X",
+      "timestamp": "2026-04-09T18:42:47.000Z",
+      "modelId": "openai/gpt-5.4",
+      "headers": {
+        "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+        "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "access-control-allow-origin": "*",
+        "cache-control": "public, max-age=0, must-revalidate",
+        "content-encoding": "br",
+        "content-type": "application/json",
+        "date": "Thu, 09 Apr 2026 18:42:47 GMT",
+        "server": "Vercel",
+        "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+        "transfer-encoding": "chunked",
+        "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+        "x-matched-path": "/v1/chat/completions",
+        "x-vercel-cache": "MISS",
+        "x-vercel-id": "sfo1::cle1::bws7f-1775760157163-54406a5c2a96"
+      },
+      "body": {
+        "id": "gen_01KNSRVAGKR60611GKGHRZM84X",
+        "object": "chat.completion",
+        "created": 1775760167,
+        "model": "openai/gpt-5.4",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Here are some of the top AI-related headlines making news recently, with sources:\n\n---\n\n### 1) OpenAI planning major update to ChatGPT memory\nOpenAI is reportedly testing or rolling out stronger memory features for ChatGPT, allowing it to better remember user preferences and past conversations. This has raised both usability excitement and privacy concerns.  \n**Source:** Reuters / OpenAI announcements\n\n### 2) Nvidia continues to dominate AI chip demand\nNvidia remains central to the AI boom as demand for GPUs for training and inference stays strong. Investors and tech companies are closely watching its production capacity and competition from AMD, Intel, and in-house chips from cloud providers.  \n**Source:** Reuters, CNBC, Bloomberg\n\n### 3) Google expands Gemini AI across products\nGoogle has continued integrating Gemini into Search, Workspace, Android, and cloud offerings, as part of its competition with OpenAI and Microsoft.  \n**Source:** Google Blog, Reuters, The Verge\n\n### 4) Microsoft deepens AI integration in Copilot\nMicrosoft is pushing Copilot features across Windows, Office, and enterprise tools, emphasizing AI agents and productivity use cases.  \n**Source:** Microsoft Blog, Reuters\n\n### 5) AI regulation remains a major policy battleground\nGovernments in the EU, US, UK, and elsewhere are debating how to regulate foundation models, copyright issues, safety testing, and AI-generated misinformation.  \n**Source:** Reuters, Financial Times, EU policy updates\n\n### 6) Anthropic and other model labs race on safer, more capable models\nAnthropic, Meta, xAI, and other labs continue releasing updates to compete on coding, reasoning, multimodal capabilities, and enterprise adoption.  \n**Source:** Company blogs, Reuters, TechCrunch\n\n### 7) Publishers and creators continue legal fights over AI training data\nLawsuits and licensing negotiations over the use of copyrighted text, images, music, and video in AI training remain one of the biggest issues in the industry.  \n**Source:** The New York Times, Reuters, AP\n\n### 8) AI agents and enterprise automation are the next big theme\nA lot of current coverage is focused on “AI agents” that can perform multi-step tasks, use tools, browse the web, and automate workflows for businesses.  \n**Source:** The Information, VentureBeat, TechCrunch\n\n---\n\nIf you want, I can also give you:\n1. a **real-time AI news roundup for today only**,  \n2. a **top 10 list with links**, or  \n3. headlines focused on **OpenAI, Google, Nvidia, regulation, or startups**.",
+              "phase": "final_answer",
+              "provider_metadata": {
+                "openai": {
+                  "responseId": "resp_00a2c050151086370169d7f31d442481939310525016b29bb7",
+                  "serviceTier": "default"
+                },
+                "gateway": {
+                  "routing": {
+                    "originalModelId": "openai/gpt-5.4",
+                    "resolvedProvider": "openai",
+                    "resolvedProviderApiModelId": "gpt-5.4",
+                    "fallbacksAvailable": [
+                      "azure"
+                    ],
+                    "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+                    "canonicalSlug": "openai/gpt-5.4",
+                    "finalProvider": "openai",
+                    "modelAttemptCount": 1,
+                    "modelAttempts": [
+                      {
+                        "modelId": "openai:gpt-5.4",
+                        "canonicalSlug": "openai/gpt-5.4",
+                        "success": true,
+                        "providerAttemptCount": 1,
+                        "providerAttempts": [
+                          {
+                            "provider": "openai",
+                            "internalModelId": "openai:gpt-5.4",
+                            "providerApiModelId": "gpt-5.4",
+                            "credentialType": "system",
+                            "success": true,
+                            "startTime": 444597.49847,
+                            "endTime": 455237.730648,
+                            "statusCode": 200,
+                            "providerResponseId": "resp_00a2c050151086370169d7f31d442481939310525016b29bb7"
+                          }
+                        ]
+                      }
+                    ],
+                    "totalProviderAttemptCount": 1
+                  },
+                  "cost": "0.00807",
+                  "marketCost": "0.00807",
+                  "inferenceCost": "0.00807",
+                  "inputInferenceCost": "0.000045",
+                  "outputInferenceCost": "0.008025",
+                  "enabledZeroDataRetention": false,
+                  "enabledDisallowPromptTraining": false,
+                  "generationId": "gen_01KNSRVAGKR60611GKGHRZM84X"
+                }
+              }
+            },
+            "logprobs": null,
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 18,
+          "completion_tokens": 535,
+          "total_tokens": 553,
+          "cost": 0.00807,
+          "is_byok": false,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": 0,
+            "video_tokens": 0
+          },
+          "cost_details": {
+            "upstream_inference_cost": null,
+            "upstream_inference_prompt_cost": 0,
+            "upstream_inference_completions_cost": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0,
+            "image_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "market_cost": 0.00807
+        },
+        "system_fingerprint": "fp_8kyximiyso",
+        "service_tier": "default",
+        "generationId": "gen_01KNSRVAGKR60611GKGHRZM84X"
+      },
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "Here are some of the top AI-related headlines making news recently, with sources:\n\n---\n\n### 1) OpenAI planning major update to ChatGPT memory\nOpenAI is reportedly testing or rolling out stronger memory features for ChatGPT, allowing it to better remember user preferences and past conversations. This has raised both usability excitement and privacy concerns.  \n**Source:** Reuters / OpenAI announcements\n\n### 2) Nvidia continues to dominate AI chip demand\nNvidia remains central to the AI boom as demand for GPUs for training and inference stays strong. Investors and tech companies are closely watching its production capacity and competition from AMD, Intel, and in-house chips from cloud providers.  \n**Source:** Reuters, CNBC, Bloomberg\n\n### 3) Google expands Gemini AI across products\nGoogle has continued integrating Gemini into Search, Workspace, Android, and cloud offerings, as part of its competition with OpenAI and Microsoft.  \n**Source:** Google Blog, Reuters, The Verge\n\n### 4) Microsoft deepens AI integration in Copilot\nMicrosoft is pushing Copilot features across Windows, Office, and enterprise tools, emphasizing AI agents and productivity use cases.  \n**Source:** Microsoft Blog, Reuters\n\n### 5) AI regulation remains a major policy battleground\nGovernments in the EU, US, UK, and elsewhere are debating how to regulate foundation models, copyright issues, safety testing, and AI-generated misinformation.  \n**Source:** Reuters, Financial Times, EU policy updates\n\n### 6) Anthropic and other model labs race on safer, more capable models\nAnthropic, Meta, xAI, and other labs continue releasing updates to compete on coding, reasoning, multimodal capabilities, and enterprise adoption.  \n**Source:** Company blogs, Reuters, TechCrunch\n\n### 7) Publishers and creators continue legal fights over AI training data\nLawsuits and licensing negotiations over the use of copyrighted text, images, music, and video in AI training remain one of the biggest issues in the industry.  \n**Source:** The New York Times, Reuters, AP\n\n### 8) AI agents and enterprise automation are the next big theme\nA lot of current coverage is focused on “AI agents” that can perform multi-step tasks, use tools, browse the web, and automate workflows for businesses.  \n**Source:** The Information, VentureBeat, TechCrunch\n\n---\n\nIf you want, I can also give you:\n1. a **real-time AI news roundup for today only**,  \n2. a **top 10 list with links**, or  \n3. headlines focused on **OpenAI, Google, Nvidia, regulation, or startups**."
+            }
+          ],
+          "id": "msg-Yhf30UILD0iVfiTc5TIrbonO"
+        }
+      ]
+    },
+    "steps": [
+      {
+        "stepType": "initial",
+        "text": "Here are some of the top AI-related headlines making news recently, with sources:\n\n---\n\n### 1) OpenAI planning major update to ChatGPT memory\nOpenAI is reportedly testing or rolling out stronger memory features for ChatGPT, allowing it to better remember user preferences and past conversations. This has raised both usability excitement and privacy concerns.  \n**Source:** Reuters / OpenAI announcements\n\n### 2) Nvidia continues to dominate AI chip demand\nNvidia remains central to the AI boom as demand for GPUs for training and inference stays strong. Investors and tech companies are closely watching its production capacity and competition from AMD, Intel, and in-house chips from cloud providers.  \n**Source:** Reuters, CNBC, Bloomberg\n\n### 3) Google expands Gemini AI across products\nGoogle has continued integrating Gemini into Search, Workspace, Android, and cloud offerings, as part of its competition with OpenAI and Microsoft.  \n**Source:** Google Blog, Reuters, The Verge\n\n### 4) Microsoft deepens AI integration in Copilot\nMicrosoft is pushing Copilot features across Windows, Office, and enterprise tools, emphasizing AI agents and productivity use cases.  \n**Source:** Microsoft Blog, Reuters\n\n### 5) AI regulation remains a major policy battleground\nGovernments in the EU, US, UK, and elsewhere are debating how to regulate foundation models, copyright issues, safety testing, and AI-generated misinformation.  \n**Source:** Reuters, Financial Times, EU policy updates\n\n### 6) Anthropic and other model labs race on safer, more capable models\nAnthropic, Meta, xAI, and other labs continue releasing updates to compete on coding, reasoning, multimodal capabilities, and enterprise adoption.  \n**Source:** Company blogs, Reuters, TechCrunch\n\n### 7) Publishers and creators continue legal fights over AI training data\nLawsuits and licensing negotiations over the use of copyrighted text, images, music, and video in AI training remain one of the biggest issues in the industry.  \n**Source:** The New York Times, Reuters, AP\n\n### 8) AI agents and enterprise automation are the next big theme\nA lot of current coverage is focused on “AI agents” that can perform multi-step tasks, use tools, browse the web, and automate workflows for businesses.  \n**Source:** The Information, VentureBeat, TechCrunch\n\n---\n\nIf you want, I can also give you:\n1. a **real-time AI news roundup for today only**,  \n2. a **top 10 list with links**, or  \n3. headlines focused on **OpenAI, Google, Nvidia, regulation, or startups**.",
+        "reasoningDetails": "[Circular]",
+        "files": [],
+        "sources": [],
+        "toolCalls": "[Circular]",
+        "toolResults": "[Circular]",
+        "finishReason": "stop",
+        "usage": {
+          "promptTokens": 18,
+          "completionTokens": 535,
+          "totalTokens": 553
+        },
+        "warnings": "[Circular]",
+        "request": "[Circular]",
+        "response": {
+          "id": "gen_01KNSRVAGKR60611GKGHRZM84X",
+          "timestamp": "2026-04-09T18:42:47.000Z",
+          "modelId": "openai/gpt-5.4",
+          "headers": "[Circular]",
+          "body": "[Circular]",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Here are some of the top AI-related headlines making news recently, with sources:\n\n---\n\n### 1) OpenAI planning major update to ChatGPT memory\nOpenAI is reportedly testing or rolling out stronger memory features for ChatGPT, allowing it to better remember user preferences and past conversations. This has raised both usability excitement and privacy concerns.  \n**Source:** Reuters / OpenAI announcements\n\n### 2) Nvidia continues to dominate AI chip demand\nNvidia remains central to the AI boom as demand for GPUs for training and inference stays strong. Investors and tech companies are closely watching its production capacity and competition from AMD, Intel, and in-house chips from cloud providers.  \n**Source:** Reuters, CNBC, Bloomberg\n\n### 3) Google expands Gemini AI across products\nGoogle has continued integrating Gemini into Search, Workspace, Android, and cloud offerings, as part of its competition with OpenAI and Microsoft.  \n**Source:** Google Blog, Reuters, The Verge\n\n### 4) Microsoft deepens AI integration in Copilot\nMicrosoft is pushing Copilot features across Windows, Office, and enterprise tools, emphasizing AI agents and productivity use cases.  \n**Source:** Microsoft Blog, Reuters\n\n### 5) AI regulation remains a major policy battleground\nGovernments in the EU, US, UK, and elsewhere are debating how to regulate foundation models, copyright issues, safety testing, and AI-generated misinformation.  \n**Source:** Reuters, Financial Times, EU policy updates\n\n### 6) Anthropic and other model labs race on safer, more capable models\nAnthropic, Meta, xAI, and other labs continue releasing updates to compete on coding, reasoning, multimodal capabilities, and enterprise adoption.  \n**Source:** Company blogs, Reuters, TechCrunch\n\n### 7) Publishers and creators continue legal fights over AI training data\nLawsuits and licensing negotiations over the use of copyrighted text, images, music, and video in AI training remain one of the biggest issues in the industry.  \n**Source:** The New York Times, Reuters, AP\n\n### 8) AI agents and enterprise automation are the next big theme\nA lot of current coverage is focused on “AI agents” that can perform multi-step tasks, use tools, browse the web, and automate workflows for businesses.  \n**Source:** The Information, VentureBeat, TechCrunch\n\n---\n\nIf you want, I can also give you:\n1. a **real-time AI news roundup for today only**,  \n2. a **top 10 list with links**, or  \n3. headlines focused on **OpenAI, Google, Nvidia, regulation, or startups**."
+                }
+              ],
+              "id": "msg-Yhf30UILD0iVfiTc5TIrbonO"
+            }
+          ]
+        },
+        "providerMetadata": {
+          "openai": {
+            "reasoningTokens": 0,
+            "cachedPromptTokens": 0
+          }
+        },
+        "experimental_providerMetadata": "[Circular]",
+        "isContinued": false
+      }
+    ],
+    "experimental_providerMetadata": "[Circular]",
+    "providerMetadata": "[Circular]",
+    "sources": []
+  }
+}

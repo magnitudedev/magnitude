@@ -94,6 +94,7 @@ describe("web-search-copilot request and normalization", () => {
       tools: [{ type: "web_search", filters: { allowed_domains: ["github.com"] } }],
       include: ["web_search_call.action.sources"],
       instructions: "be concise",
+      stream: false,
     });
   });
 
@@ -110,6 +111,7 @@ describe("web-search-copilot request and normalization", () => {
       tools: [{ type: "web_search", filters: { allowed_domains: ["github.com"] } }],
       include: ["web_search_call.action.sources"],
       instructions: "be concise",
+      stream: false,
     });
   });
 
@@ -244,6 +246,138 @@ describe("web-search-copilot request and normalization", () => {
     ).toBe("A\nB");
   });
 
+  test("retries once on 401 and succeeds with refreshed auth", async () => {
+    const fetchMock = mock(async (_url: string, init?: RequestInit) => {
+      const auth = String((init?.headers as Record<string, string>)?.Authorization ?? "");
+      if (auth === "Bearer stale-token") {
+        return {
+          ok: false,
+          status: 401,
+          text: async () => "IDE token expired: unauthorized: token expired",
+          json: async () => ({}),
+        } as any;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "refreshed result",
+                  annotations: [{ type: "url_citation", title: "Docs", url: "https://docs.example.com" }],
+                },
+              ],
+            },
+            { type: "web_search_call", action: { sources: [{ url: "https://docs.example.com" }] } },
+          ],
+          usage: { input_tokens: 1, output_tokens: 2 },
+        }),
+        text: async () => "",
+      } as any;
+    }) as typeof fetch;
+
+    await withFetchMock(fetchMock, async () => {
+      const resolver = mock(async () => ({ type: "oauth-token" as const, value: "fresh-token" }));
+      const result = await copilotWebSearch(
+        "query",
+        { type: "oauth-token", value: "stale-token" },
+        undefined,
+        resolver,
+      );
+
+      expect(resolver).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.results).toEqual([
+        {
+          tool_use_id: "copilot-search",
+          content: [{ title: "Docs", url: "https://docs.example.com" }],
+        },
+      ]);
+    });
+  });
+
+  test("fails clearly when 401 persists after one refresh retry", async () => {
+    const fetchMock = mock(async () => ({
+      ok: false,
+      status: 401,
+      text: async () => "unauthorized: token expired",
+      json: async () => ({}),
+    })) as typeof fetch;
+
+    await withFetchMock(fetchMock, async () => {
+      await expect(
+        copilotWebSearch(
+          "query",
+          { type: "oauth-token", value: "stale-token" },
+          undefined,
+          async () => ({ type: "oauth-token", value: "still-bad-token" }),
+        ),
+      ).rejects.toThrow("GitHub Copilot web search unauthorized (401) after auth refresh retry.");
+    });
+  });
+
+  test("retries once when first attempt times out and then succeeds", async () => {
+    let calls = 0;
+    const fetchMock = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("aborted");
+        (error as Error & { name: string }).name = "AbortError";
+        throw error;
+      }
+
+      return {
+        ok: true,
+        json: async () => ({
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "retry success",
+                  annotations: [{ type: "url_citation", title: "Docs", url: "https://docs.example.com" }],
+                },
+              ],
+            },
+            { type: "web_search_call", action: { sources: [{ url: "https://docs.example.com" }] } },
+          ],
+          usage: { input_tokens: 1, output_tokens: 2 },
+        }),
+        text: async () => "",
+      } as any;
+    }) as typeof fetch;
+
+    await withFetchMock(fetchMock, async () => {
+      const result = await copilotWebSearch("query", { type: "oauth-token", value: "copilot-token" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.results).toEqual([
+        {
+          tool_use_id: "copilot-search",
+          content: [{ title: "Docs", url: "https://docs.example.com" }],
+        },
+      ]);
+      expect(result.usage.web_search_requests).toBe(1);
+    });
+  });
+
+  test("fails clearly after timeout retry is exhausted", async () => {
+    const abortingFetch = mock(async () => {
+      const error = new Error("aborted");
+      (error as Error & { name: string }).name = "AbortError";
+      throw error;
+    }) as typeof fetch;
+
+    await withFetchMock(abortingFetch, async () => {
+      await expect(
+        copilotWebSearch("query", { type: "oauth-token", value: "copilot-token" }),
+      ).rejects.toThrow("GitHub Copilot web search timed out after 90000ms");
+      expect(abortingFetch).toHaveBeenCalledTimes(2);
+    });
+  });
 });
 
 
@@ -307,6 +441,50 @@ describe("web-search Copilot routing", () => {
       const [, init] = fetchMock.mock.calls[0]!;
       const body = JSON.parse(String(init?.body));
       expect(body.model).toBe("gpt-5.4");
+    });
+  });
+
+  test("webSearch pre-refreshes Copilot auth before first request when refresh token exists", async () => {
+    const fetchMock = createFetchMock();
+    const refresh = mock(async () => ({ type: "oauth", accessToken: "fresh-token", refreshToken: "refresh-2" } as any));
+    const setAuth = mock(async () => undefined);
+
+    await withFetchMock(fetchMock, async () => {
+      await Effect.runPromise(
+        webSearch("query").pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              makeProviderStateLayer("github-copilot", "claude-sonnet-4.6"),
+              Layer.succeed(
+                ProviderAuth,
+                {
+                  loadAuth: () => Effect.succeed({}),
+                  getAuth: () =>
+                    Effect.succeed({
+                      type: "oauth",
+                      accessToken: "stale-token",
+                      refreshToken: "refresh-1",
+                    } as any),
+                  setAuth: (_providerId: string, auth: any) => Effect.promise(() => setAuth(auth)),
+                  removeAuth: () => Effect.die("unused"),
+                  refresh: (_providerId: string, refreshToken: string) =>
+                    Effect.promise(() => refresh(refreshToken)),
+                  detectProviders: () => Effect.die("unused"),
+                  detectDefaultProvider: () => Effect.die("unused"),
+                  detectProviderAuthMethods: () => Effect.die("unused"),
+                  connectedProviderIds: () => Effect.succeed(new Set(["github-copilot"])),
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(setAuth).toHaveBeenCalledTimes(1);
+
+      const [, init] = fetchMock.mock.calls[0]!;
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer fresh-token");
     });
   });
 

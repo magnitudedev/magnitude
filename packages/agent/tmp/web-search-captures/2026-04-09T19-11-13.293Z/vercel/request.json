@@ -1,0 +1,30 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/responses",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer vck_…V26k"
+  },
+  "bodyText": "{\"model\":\"openai/gpt-5.4\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"What are the top AI news headlines today? Include sources.\"}]}],\"tools\":[{\"type\":\"web_search_preview\"}],\"tool_choice\":\"auto\"}",
+  "bodyJson": {
+    "model": "openai/gpt-5.4",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "What are the top AI news headlines today? Include sources."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "type": "web_search_preview"
+      }
+    ],
+    "tool_choice": "auto"
+  }
+}

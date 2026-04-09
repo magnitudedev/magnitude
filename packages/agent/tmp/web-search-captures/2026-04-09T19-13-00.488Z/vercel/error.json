@@ -1,0 +1,5 @@
+{
+  "name": "(FiberFailure) Error",
+  "message": "Vercel OpenAI webSearch helper not available in @ai-sdk/openai version",
+  "stack": "Error: Vercel OpenAI webSearch helper not available in @ai-sdk/openai version\n    at resolveOpenAIWebSearchTool (/Users/trg/magnitude/packages/agent/src/tools/web-search-vercel.ts:45:15)\n    at vercelWebSearch (/Users/trg/magnitude/packages/agent/src/tools/web-search-vercel.ts:105:25)\n    at <anonymous> (/Users/trg/magnitude/node_modules/effect/dist/esm/internal/core-effect.js:423:5)"
+}

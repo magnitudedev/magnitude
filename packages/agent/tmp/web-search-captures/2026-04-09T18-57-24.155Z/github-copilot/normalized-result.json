@@ -1,0 +1,40 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "copilot-search",
+      "content": [
+        {
+          "title": "Appeals court rebuffs Anthropic in latest round of its AI battle with the Trump administration | AP News",
+          "url": "https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3"
+        },
+        {
+          "title": "Pentagon’s ouster of Anthropic opens doors for small AI rivals | 1330 & 101.5 WHBL",
+          "url": "https://whbl.com/2026/04/09/pentagons-ouster-of-anthropic-opens-doors-for-small-ai-rivals/"
+        },
+        {
+          "title": "Project Glasswing \\ Anthropic",
+          "url": "https://www.anthropic.com/project/glasswing"
+        },
+        {
+          "title": "Scoop: OpenAI plans new product for cybersecurity use",
+          "url": "https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic"
+        },
+        {
+          "title": "OpenAI projects $100 billion in ad revenue by 2030",
+          "url": "https://www.axios.com/2026/04/09/openai-100-billion-in-ad-revenue"
+        },
+        {
+          "title": "Industrial policy for the Intelligence Age | OpenAI",
+          "url": "https://openai.com/index/industrial-policy-for-the-intelligence-age/"
+        }
+      ]
+    }
+  ],
+  "textResponse": "As of **Thursday, April 9, 2026 (U.S.)**, the biggest AI headlines I’m seeing are:\n\n- **Anthropic lost an appeals-court round in its fight with the Trump administration.** AP reports that the D.C. Circuit declined to issue its own order blocking the administration’s “supply chain risk” actions against Anthropic, even though a federal judge in San Francisco had earlier said the government overstepped; the next appeals hearing is scheduled for **May 19, 2026**. *Source: AP.* ([apnews.com](https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3))\n\n- **The Pentagon-Anthropic split is opening the door for smaller defense-AI players.** Reuters reports that startups such as Smack Technologies and EdgeRunner AI are getting increased calls from generals, commanders, and investors after Anthropic’s fallout with the Pentagon highlighted the military’s need to diversify AI suppliers. *Source: Reuters (via WHBL syndication).* ([whbl.com](https://whbl.com/2026/04/09/pentagons-ouster-of-anthropic-opens-doors-for-small-ai-rivals/))\n\n- **Anthropic has launched a gated cybersecurity push around its new Mythos model.** In its official announcement for **Project Glasswing**, Anthropic says **Claude Mythos Preview** is its most capable model yet for coding and agentic work, has already identified **thousands of zero-day vulnerabilities**, and is being offered only as a **gated research preview** to partners including AWS, Apple, Google, Microsoft, Nvidia, CrowdStrike, JPMorganChase, the Linux Foundation, and Palo Alto Networks. *Source: Anthropic.* ([anthropic.com](https://www.anthropic.com/project/glasswing))\n\n- **OpenAI is reportedly preparing its own limited-release cybersecurity product.** Axios reports that OpenAI is finalizing an advanced cyber product for a small set of partners, and OpenAI’s own February post says its **Trusted Access for Cyber** program gives vetted users access to more cyber-capable models while committing **$10 million in API credits** for defensive work. *Sources: Axios, OpenAI.* ([axios.com](https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic))\n\n- **OpenAI is signaling that advertising could become a major business line.** Axios reports that OpenAI told investors it expects **$2.5 billion in ad revenue in 2026** and **$100 billion by 2030**, which would make ads a core part of its long-term revenue model if those projections hold. *Source: Axios.* ([axios.com](https://www.axios.com/2026/04/09/openai-100-billion-in-ad-revenue))\n\n- **OpenAI also made a fresh policy push this week.** In a new post titled **“Industrial policy for the Intelligence Age,”** OpenAI says incremental policy updates will not be enough as AI advances, and it announced plans for fellowships, research grants of up to **$100,000**, and up to **$1 million in API credits**, plus discussions at a new Washington, D.C. workshop opening in May. *Source: OpenAI.* ([openai.com](https://openai.com/index/industrial-policy-for-the-intelligence-age/))\n\nIf you want, I can also turn this into a **clean morning-news briefing** format with:\n1. **Top 5 headlines only**,  \n2. **market impact**, or  \n3. **consumer-focused AI product news only**.",
+  "usage": {
+    "input_tokens": 73066,
+    "output_tokens": 5244,
+    "web_search_requests": 18
+  }
+}

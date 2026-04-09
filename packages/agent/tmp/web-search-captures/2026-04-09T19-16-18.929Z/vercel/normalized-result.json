@@ -1,0 +1,28 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "vercel-search",
+      "content": [
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/category/artificial-intelligence/?utm_source=openai"
+        },
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/2026/04/03/...?utm_source=openai"
+        },
+        {
+          "title": "blog.google",
+          "url": "https://blog.google/innovation-and-ai/products/google-ai-updates-april-2025/?utm_source=openai"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Here are a few of the **top AI-related headlines showing up today, Thursday, April 9, 2026**, based on currently indexed tech/news pages I could verify:\n\n- **Poke makes using AI agents as easy as sending a text** — TechCrunch, posted **13 hours ago**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n- **AWS boss explains why investing billions in both Anthropic and OpenAI is an OK conflict** — TechCrunch, posted **14 hours ago**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n- **Tubi is the first streamer to launch a native app within ChatGPT** — TechCrunch, posted **16 hours ago**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n- **OpenAI alums have been quietly investing from a new, potentially $100M fund** — TechCrunch, posted **3 days ago**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n- **Iran threatens ‘Stargate’ AI data centers** — TechCrunch, posted **3 days ago**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n- **OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek** — TechCrunch, posted **3 days ago**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n- **AI companies are building huge natural gas plants to power data centers** — TechCrunch, published **April 3, 2026**. ([techcrunch.com](https://techcrunch.com/2026/04/03/...?utm_source=openai))\n\nA few broader AI items I also found, though they are **not from today specifically**, include:\n- Google’s recap of major AI updates, including Gemini, AI Mode, Cloud Next, and AI education initiatives. ([blog.google](https://blog.google/innovation-and-ai/products/google-ai-updates-april-2025/?utm_source=openai))\n- TechCrunch’s broader AI section, which is currently surfacing today’s AI coverage. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\nIf you want, I can do a **cleaner roundup from major outlets only** — for example **Reuters + Bloomberg + TechCrunch + The Verge** — with **1-line summaries and links/sources for each headline**.",
+  "usage": {
+    "input_tokens": 12564,
+    "output_tokens": 797,
+    "web_search_requests": 3
+  }
+}

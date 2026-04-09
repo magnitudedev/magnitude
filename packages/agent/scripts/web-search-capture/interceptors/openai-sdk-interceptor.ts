@@ -26,15 +26,16 @@ export async function withOpenAISdkInterceptor<T>(
 
     const result = originalPost.call(this, path, options);
 
-    if (!shouldCapture) return result;
-
-    return Promise.resolve(result).then((value: unknown) => {
-      state.response = safeJson({
-        present: true,
-        value,
+    if (shouldCapture) {
+      Promise.resolve(result).then((value: unknown) => {
+        state.response = safeJson({
+          present: true,
+          value,
+        });
       });
-      return value;
-    });
+    }
+
+    return result;
   }) as typeof OpenAI.prototype.post;
 
   try {

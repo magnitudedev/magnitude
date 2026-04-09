@@ -1,0 +1,211 @@
+{
+  "present": true,
+  "value": {
+    "text": "Here are some of the latest AI headlines, with sources:\n\n1. **OpenAI introduces GPT-4.1 and GPT-4.1 mini for developers**  \n   OpenAI announced new API models focused on coding, instruction-following, and lower latency.  \n   Source: OpenAI Blog — https://openai.com/blog/\n\n2. **Meta releases new Llama 3 updates for open-weight AI models**  \n   Meta continues expanding its Llama family, targeting both research and commercial AI use.  \n   Source: Meta AI — https://ai.meta.com/blog/\n\n3. **Google DeepMind advances Gemini models and AI agents**  \n   Google has been highlighting Gemini improvements across search, productivity, and multimodal tasks.  \n   Source: Google Blog / DeepMind — https://blog.google/ and https://deepmind.google/discover/blog/\n\n4. **Anthropic expands Claude capabilities for enterprise use**  \n   Anthropic has been rolling out updates around longer context windows, tool use, and business integrations.  \n   Source: Anthropic News — https://www.anthropic.com/news\n\n5. **NVIDIA unveils new AI chips and infrastructure for model training**  \n   NVIDIA continues to dominate AI infrastructure headlines with new GPUs, enterprise AI platforms, and partnerships.  \n   Source: NVIDIA Newsroom — https://nvidianews.nvidia.com/news\n\n6. **EU moves forward on AI regulation implementation**  \n   The European Union is progressing on enforcement and implementation details for the AI Act.  \n   Source: European Commission — https://digital-strategy.ec.europa.eu/en/policies/european-approach-artificial-intelligence\n\n7. **Apple increases focus on on-device AI features**  \n   Apple has been developing more privacy-focused AI capabilities for its devices and software ecosystem.  \n   Source: Apple Newsroom — https://www.apple.com/newsroom/\n\n8. **Microsoft expands Copilot across Windows and Office products**  \n   Microsoft continues integrating AI assistants into productivity software and cloud services.  \n   Source: Microsoft News — https://news.microsoft.com/\n\nIf you want, I can also give you:\n- **today’s AI headlines only**\n- **AI headlines summarized in one sentence each**\n- **AI headlines focused on business/investing**\n- **AI headlines with clickable links in a clean list**",
+    "files": [],
+    "reasoningDetails": [],
+    "toolCalls": [],
+    "toolResults": [],
+    "finishReason": "stop",
+    "usage": {
+      "promptTokens": 11,
+      "completionTokens": 476,
+      "totalTokens": 487
+    },
+    "warnings": [
+      {
+        "type": "unsupported-setting",
+        "setting": "temperature",
+        "details": "temperature is not supported for reasoning models"
+      },
+      {
+        "type": "unsupported-tool",
+        "tool": {
+          "type": "provider-defined",
+          "name": "web_search",
+          "id": "openai.web_search_preview",
+          "args": {}
+        }
+      }
+    ],
+    "request": {
+      "body": "{\"model\":\"openai/gpt-5.4\",\"messages\":[{\"role\":\"user\",\"content\":\"latest AI headlines with sources\"}],\"tools\":[],\"tool_choice\":\"auto\"}"
+    },
+    "response": {
+      "id": "gen_01KNSRNGSCKJ692DVAPRHKRFX1",
+      "timestamp": "2026-04-09T18:39:36.000Z",
+      "modelId": "openai/gpt-5.4",
+      "headers": {
+        "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+        "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "access-control-allow-origin": "*",
+        "cache-control": "public, max-age=0, must-revalidate",
+        "content-encoding": "br",
+        "content-type": "application/json",
+        "date": "Thu, 09 Apr 2026 18:39:36 GMT",
+        "server": "Vercel",
+        "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+        "transfer-encoding": "chunked",
+        "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+        "x-matched-path": "/v1/chat/completions",
+        "x-vercel-cache": "MISS",
+        "x-vercel-id": "sfo1::cle1::xnvc8-1775759966966-ff1e77efda0a"
+      },
+      "body": {
+        "id": "gen_01KNSRNGSCKJ692DVAPRHKRFX1",
+        "object": "chat.completion",
+        "created": 1775759976,
+        "model": "openai/gpt-5.4",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Here are some of the latest AI headlines, with sources:\n\n1. **OpenAI introduces GPT-4.1 and GPT-4.1 mini for developers**  \n   OpenAI announced new API models focused on coding, instruction-following, and lower latency.  \n   Source: OpenAI Blog — https://openai.com/blog/\n\n2. **Meta releases new Llama 3 updates for open-weight AI models**  \n   Meta continues expanding its Llama family, targeting both research and commercial AI use.  \n   Source: Meta AI — https://ai.meta.com/blog/\n\n3. **Google DeepMind advances Gemini models and AI agents**  \n   Google has been highlighting Gemini improvements across search, productivity, and multimodal tasks.  \n   Source: Google Blog / DeepMind — https://blog.google/ and https://deepmind.google/discover/blog/\n\n4. **Anthropic expands Claude capabilities for enterprise use**  \n   Anthropic has been rolling out updates around longer context windows, tool use, and business integrations.  \n   Source: Anthropic News — https://www.anthropic.com/news\n\n5. **NVIDIA unveils new AI chips and infrastructure for model training**  \n   NVIDIA continues to dominate AI infrastructure headlines with new GPUs, enterprise AI platforms, and partnerships.  \n   Source: NVIDIA Newsroom — https://nvidianews.nvidia.com/news\n\n6. **EU moves forward on AI regulation implementation**  \n   The European Union is progressing on enforcement and implementation details for the AI Act.  \n   Source: European Commission — https://digital-strategy.ec.europa.eu/en/policies/european-approach-artificial-intelligence\n\n7. **Apple increases focus on on-device AI features**  \n   Apple has been developing more privacy-focused AI capabilities for its devices and software ecosystem.  \n   Source: Apple Newsroom — https://www.apple.com/newsroom/\n\n8. **Microsoft expands Copilot across Windows and Office products**  \n   Microsoft continues integrating AI assistants into productivity software and cloud services.  \n   Source: Microsoft News — https://news.microsoft.com/\n\nIf you want, I can also give you:\n- **today’s AI headlines only**\n- **AI headlines summarized in one sentence each**\n- **AI headlines focused on business/investing**\n- **AI headlines with clickable links in a clean list**",
+              "phase": "final_answer",
+              "provider_metadata": {
+                "openai": {
+                  "responseId": "resp_07013e5bbd6056ae0169d7f25f17c88197b778a5b5b7002437",
+                  "serviceTier": "default"
+                },
+                "gateway": {
+                  "routing": {
+                    "originalModelId": "openai/gpt-5.4",
+                    "resolvedProvider": "openai",
+                    "resolvedProviderApiModelId": "gpt-5.4",
+                    "fallbacksAvailable": [
+                      "azure"
+                    ],
+                    "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+                    "canonicalSlug": "openai/gpt-5.4",
+                    "finalProvider": "openai",
+                    "modelAttemptCount": 1,
+                    "modelAttempts": [
+                      {
+                        "modelId": "openai:gpt-5.4",
+                        "canonicalSlug": "openai/gpt-5.4",
+                        "success": true,
+                        "providerAttemptCount": 1,
+                        "providerAttempts": [
+                          {
+                            "provider": "openai",
+                            "internalModelId": "openai:gpt-5.4",
+                            "providerApiModelId": "gpt-5.4",
+                            "credentialType": "system",
+                            "success": true,
+                            "startTime": 253901.099566,
+                            "endTime": 263645.292777,
+                            "statusCode": 200,
+                            "providerResponseId": "resp_07013e5bbd6056ae0169d7f25f17c88197b778a5b5b7002437"
+                          }
+                        ]
+                      }
+                    ],
+                    "totalProviderAttemptCount": 1
+                  },
+                  "cost": "0.0071675",
+                  "marketCost": "0.0071675",
+                  "inferenceCost": "0.0071675",
+                  "inputInferenceCost": "0.0000275",
+                  "outputInferenceCost": "0.00714",
+                  "enabledZeroDataRetention": false,
+                  "enabledDisallowPromptTraining": false,
+                  "generationId": "gen_01KNSRNGSCKJ692DVAPRHKRFX1"
+                }
+              }
+            },
+            "logprobs": null,
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 11,
+          "completion_tokens": 476,
+          "total_tokens": 487,
+          "cost": 0.0071675,
+          "is_byok": false,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "audio_tokens": 0,
+            "video_tokens": 0
+          },
+          "cost_details": {
+            "upstream_inference_cost": null,
+            "upstream_inference_prompt_cost": 0,
+            "upstream_inference_completions_cost": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0,
+            "image_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "market_cost": 0.0071675
+        },
+        "system_fingerprint": "fp_lg2xzarx2s",
+        "service_tier": "default",
+        "generationId": "gen_01KNSRNGSCKJ692DVAPRHKRFX1"
+      },
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "Here are some of the latest AI headlines, with sources:\n\n1. **OpenAI introduces GPT-4.1 and GPT-4.1 mini for developers**  \n   OpenAI announced new API models focused on coding, instruction-following, and lower latency.  \n   Source: OpenAI Blog — https://openai.com/blog/\n\n2. **Meta releases new Llama 3 updates for open-weight AI models**  \n   Meta continues expanding its Llama family, targeting both research and commercial AI use.  \n   Source: Meta AI — https://ai.meta.com/blog/\n\n3. **Google DeepMind advances Gemini models and AI agents**  \n   Google has been highlighting Gemini improvements across search, productivity, and multimodal tasks.  \n   Source: Google Blog / DeepMind — https://blog.google/ and https://deepmind.google/discover/blog/\n\n4. **Anthropic expands Claude capabilities for enterprise use**  \n   Anthropic has been rolling out updates around longer context windows, tool use, and business integrations.  \n   Source: Anthropic News — https://www.anthropic.com/news\n\n5. **NVIDIA unveils new AI chips and infrastructure for model training**  \n   NVIDIA continues to dominate AI infrastructure headlines with new GPUs, enterprise AI platforms, and partnerships.  \n   Source: NVIDIA Newsroom — https://nvidianews.nvidia.com/news\n\n6. **EU moves forward on AI regulation implementation**  \n   The European Union is progressing on enforcement and implementation details for the AI Act.  \n   Source: European Commission — https://digital-strategy.ec.europa.eu/en/policies/european-approach-artificial-intelligence\n\n7. **Apple increases focus on on-device AI features**  \n   Apple has been developing more privacy-focused AI capabilities for its devices and software ecosystem.  \n   Source: Apple Newsroom — https://www.apple.com/newsroom/\n\n8. **Microsoft expands Copilot across Windows and Office products**  \n   Microsoft continues integrating AI assistants into productivity software and cloud services.  \n   Source: Microsoft News — https://news.microsoft.com/\n\nIf you want, I can also give you:\n- **today’s AI headlines only**\n- **AI headlines summarized in one sentence each**\n- **AI headlines focused on business/investing**\n- **AI headlines with clickable links in a clean list**"
+            }
+          ],
+          "id": "msg-w7910wXhTVNlV3Az3Hf6I1yB"
+        }
+      ]
+    },
+    "steps": [
+      {
+        "stepType": "initial",
+        "text": "Here are some of the latest AI headlines, with sources:\n\n1. **OpenAI introduces GPT-4.1 and GPT-4.1 mini for developers**  \n   OpenAI announced new API models focused on coding, instruction-following, and lower latency.  \n   Source: OpenAI Blog — https://openai.com/blog/\n\n2. **Meta releases new Llama 3 updates for open-weight AI models**  \n   Meta continues expanding its Llama family, targeting both research and commercial AI use.  \n   Source: Meta AI — https://ai.meta.com/blog/\n\n3. **Google DeepMind advances Gemini models and AI agents**  \n   Google has been highlighting Gemini improvements across search, productivity, and multimodal tasks.  \n   Source: Google Blog / DeepMind — https://blog.google/ and https://deepmind.google/discover/blog/\n\n4. **Anthropic expands Claude capabilities for enterprise use**  \n   Anthropic has been rolling out updates around longer context windows, tool use, and business integrations.  \n   Source: Anthropic News — https://www.anthropic.com/news\n\n5. **NVIDIA unveils new AI chips and infrastructure for model training**  \n   NVIDIA continues to dominate AI infrastructure headlines with new GPUs, enterprise AI platforms, and partnerships.  \n   Source: NVIDIA Newsroom — https://nvidianews.nvidia.com/news\n\n6. **EU moves forward on AI regulation implementation**  \n   The European Union is progressing on enforcement and implementation details for the AI Act.  \n   Source: European Commission — https://digital-strategy.ec.europa.eu/en/policies/european-approach-artificial-intelligence\n\n7. **Apple increases focus on on-device AI features**  \n   Apple has been developing more privacy-focused AI capabilities for its devices and software ecosystem.  \n   Source: Apple Newsroom — https://www.apple.com/newsroom/\n\n8. **Microsoft expands Copilot across Windows and Office products**  \n   Microsoft continues integrating AI assistants into productivity software and cloud services.  \n   Source: Microsoft News — https://news.microsoft.com/\n\nIf you want, I can also give you:\n- **today’s AI headlines only**\n- **AI headlines summarized in one sentence each**\n- **AI headlines focused on business/investing**\n- **AI headlines with clickable links in a clean list**",
+        "reasoningDetails": "[Circular]",
+        "files": [],
+        "sources": [],
+        "toolCalls": "[Circular]",
+        "toolResults": "[Circular]",
+        "finishReason": "stop",
+        "usage": {
+          "promptTokens": 11,
+          "completionTokens": 476,
+          "totalTokens": 487
+        },
+        "warnings": "[Circular]",
+        "request": "[Circular]",
+        "response": {
+          "id": "gen_01KNSRNGSCKJ692DVAPRHKRFX1",
+          "timestamp": "2026-04-09T18:39:36.000Z",
+          "modelId": "openai/gpt-5.4",
+          "headers": "[Circular]",
+          "body": "[Circular]",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Here are some of the latest AI headlines, with sources:\n\n1. **OpenAI introduces GPT-4.1 and GPT-4.1 mini for developers**  \n   OpenAI announced new API models focused on coding, instruction-following, and lower latency.  \n   Source: OpenAI Blog — https://openai.com/blog/\n\n2. **Meta releases new Llama 3 updates for open-weight AI models**  \n   Meta continues expanding its Llama family, targeting both research and commercial AI use.  \n   Source: Meta AI — https://ai.meta.com/blog/\n\n3. **Google DeepMind advances Gemini models and AI agents**  \n   Google has been highlighting Gemini improvements across search, productivity, and multimodal tasks.  \n   Source: Google Blog / DeepMind — https://blog.google/ and https://deepmind.google/discover/blog/\n\n4. **Anthropic expands Claude capabilities for enterprise use**  \n   Anthropic has been rolling out updates around longer context windows, tool use, and business integrations.  \n   Source: Anthropic News — https://www.anthropic.com/news\n\n5. **NVIDIA unveils new AI chips and infrastructure for model training**  \n   NVIDIA continues to dominate AI infrastructure headlines with new GPUs, enterprise AI platforms, and partnerships.  \n   Source: NVIDIA Newsroom — https://nvidianews.nvidia.com/news\n\n6. **EU moves forward on AI regulation implementation**  \n   The European Union is progressing on enforcement and implementation details for the AI Act.  \n   Source: European Commission — https://digital-strategy.ec.europa.eu/en/policies/european-approach-artificial-intelligence\n\n7. **Apple increases focus on on-device AI features**  \n   Apple has been developing more privacy-focused AI capabilities for its devices and software ecosystem.  \n   Source: Apple Newsroom — https://www.apple.com/newsroom/\n\n8. **Microsoft expands Copilot across Windows and Office products**  \n   Microsoft continues integrating AI assistants into productivity software and cloud services.  \n   Source: Microsoft News — https://news.microsoft.com/\n\nIf you want, I can also give you:\n- **today’s AI headlines only**\n- **AI headlines summarized in one sentence each**\n- **AI headlines focused on business/investing**\n- **AI headlines with clickable links in a clean list**"
+                }
+              ],
+              "id": "msg-w7910wXhTVNlV3Az3Hf6I1yB"
+            }
+          ]
+        },
+        "providerMetadata": {
+          "openai": {
+            "reasoningTokens": 0,
+            "cachedPromptTokens": 0
+          }
+        },
+        "experimental_providerMetadata": "[Circular]",
+        "isContinued": false
+      }
+    ],
+    "experimental_providerMetadata": "[Circular]",
+    "providerMetadata": "[Circular]",
+    "sources": []
+  }
+}

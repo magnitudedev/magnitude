@@ -1,0 +1,3 @@
+{
+  "message": "Missing OpenAI API auth (OPENAI_API_KEY or ~/.magnitude/auth.json:openai)"
+}

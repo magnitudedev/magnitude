@@ -7,6 +7,8 @@ const COPILOT_RESPONSES_ENDPOINT = "https://api.githubcopilot.com/responses";
  */
 const FIXED_COPILOT_SEARCH_MODEL = "gpt-5.4";
 const COPILOT_SEARCH_TOOL_ID = "copilot-search";
+// Copilot Responses calls can legitimately run longer than 30s under load.
+const COPILOT_REQUEST_TIMEOUT_MS = 90_000;
 
 const COPILOT_HEADERS: Record<string, string> = {
   "Openai-Intent": "conversation-edits",
@@ -34,6 +36,7 @@ export function buildCopilotWebSearchRequest(
     ],
     include: ["web_search_call.action.sources"],
     ...(options?.system ? { instructions: options.system } : {}),
+    stream: false,
   };
 }
 
@@ -104,32 +107,113 @@ export function extractCopilotTextResponse(response: any): string {
   return chunks.join("\n").trim();
 }
 
+function isCopilotTimeoutError(error: unknown): boolean {
+  return error instanceof Error && /timed out after/i.test(error.message);
+}
+
+async function executeCopilotRequest(
+  authToken: string,
+  body: Record<string, unknown>,
+): Promise<any> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), COPILOT_REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(COPILOT_RESPONSES_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${authToken}`,
+        ...COPILOT_HEADERS,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      const error = new Error(`GitHub Copilot web search error ${response.status}: ${errorText}`) as Error & {
+        status?: number;
+        unauthorized?: boolean;
+      };
+      error.status = response.status;
+      error.unauthorized =
+        response.status === 401 &&
+        /unauthorized|token expired|token_expired|expired/i.test(errorText);
+      throw error;
+    }
+
+    return await response.json();
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`GitHub Copilot web search timed out after ${COPILOT_REQUEST_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function copilotWebSearch(
   query: string,
   auth: SearchAuth,
   options?: SearchOptions,
+  resolveRefreshedAuth?: () => Promise<SearchAuth | null>,
 ): Promise<WebSearchResponse> {
   if (auth.type !== "oauth-token" || !auth.value) {
     throw new Error("No GitHub Copilot OAuth session available for web search. Authenticate GitHub Copilot in the app.");
   }
 
   const body = buildCopilotWebSearchRequest(query, options);
-  const response = await fetch(COPILOT_RESPONSES_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${auth.value}`,
-      ...COPILOT_HEADERS,
-    },
-    body: JSON.stringify(body),
-  });
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(`GitHub Copilot web search error ${response.status}: ${errorText}`);
+  const executeWith401Retry = async (token: string): Promise<any> => {
+    try {
+      return await executeCopilotRequest(token, body);
+    } catch (error) {
+      const err = error as Error & { unauthorized?: boolean; status?: number };
+      const shouldRetry = err.status === 401 || err.unauthorized === true;
+      if (!shouldRetry || !resolveRefreshedAuth) throw error;
+
+      const refreshedAuth = await resolveRefreshedAuth();
+      if (!refreshedAuth || refreshedAuth.type !== "oauth-token" || !refreshedAuth.value) {
+        throw new Error("GitHub Copilot web search unauthorized (401). Failed to refresh Copilot auth.");
+      }
+
+      try {
+        return await executeCopilotRequest(refreshedAuth.value, body);
+      } catch (retryError) {
+        const retryErr = retryError as Error & { status?: number; unauthorized?: boolean };
+        if (retryErr.status === 401 || retryErr.unauthorized === true) {
+          throw new Error("GitHub Copilot web search unauthorized (401) after auth refresh retry.");
+        }
+        throw retryError;
+      }
+    }
+  };
+
+  let payload: any;
+  try {
+    payload = await executeWith401Retry(auth.value);
+  } catch (error) {
+    if (!isCopilotTimeoutError(error)) {
+      throw error;
+    }
+
+    let retryToken = auth.value;
+    if (resolveRefreshedAuth) {
+      const refreshedForTimeoutRetry = await resolveRefreshedAuth().catch(() => null);
+      if (
+        refreshedForTimeoutRetry &&
+        refreshedForTimeoutRetry.type === "oauth-token" &&
+        refreshedForTimeoutRetry.value
+      ) {
+        retryToken = refreshedForTimeoutRetry.value;
+      }
+    }
+
+    payload = await executeWith401Retry(retryToken);
   }
 
-  const payload: any = await response.json();
   const output = Array.isArray(payload?.output) ? payload.output : [];
   const textResponse = extractCopilotTextResponse(payload);
   const results = extractCopilotCitations(output);

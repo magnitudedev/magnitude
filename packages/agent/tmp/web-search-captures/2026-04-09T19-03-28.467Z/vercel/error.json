@@ -1,0 +1,5 @@
+{
+  "name": "SyntaxError",
+  "message": "JSON Parse error: Unexpected identifier \"undefined\"",
+  "stack": "SyntaxError: JSON Parse error: Unexpected identifier \"undefined\"\n    at <parse> (:0)\n    at parse (unknown)\n    at writeJson (/Users/trg/magnitude/packages/agent/scripts/web-search-capture/capture-harness.ts:158:43)\n    at writeRunArtifacts (/Users/trg/magnitude/packages/agent/scripts/web-search-capture/capture-harness.ts:164:9)\n    at processTicksAndRejections (native:7:39)"
+}

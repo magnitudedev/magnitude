@@ -1,0 +1,117 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-encoding": "br",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 18:42:59 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/chat/completions",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::vxq9q-1775760168253-33ad140f9808"
+  },
+  "bodyText": "{\"id\":\"gen_01KNSRVNB1XMZ2GYRM674QP7P2\",\"object\":\"chat.completion\",\"created\":1775760179,\"model\":\"openai/gpt-5.4\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Here are some of the biggest AI headlines making news **today (2026‑04‑09)**, with brief summaries and sources:\\n\\n1. **OpenAI sues Elon Musk to stop “further unlawful and unfair action”**  \\n   OpenAI filed a countersuit against Elon Musk in federal court, accusing him of bad‑faith attempts to undermine the company as it transitions to a public‑benefit structure. The filing asks the court to block further interference and seeks damages.  \\n   Sources: Reuters; AP News; The New York Times  \\n   citeturn1search8turn1search4turn1news13\\n\\n2. **OpenAI to release a more “open” model in response to pressure from Meta and DeepSeek**  \\n   OpenAI says it plans to launch a new open‑weight language model in the coming months—its first such release since GPT‑2—as competition intensifies around more accessible AI systems.  \\n   Sources: Reuters; TechCrunch  \\n   citeturn1search3turn1search6\\n\\n3. **Google unveils “Ironwood,” its 7th‑gen TPU focused on inference**  \\n   At Cloud Next, Google introduced Ironwood, a new AI chip designed specifically for inference workloads, plus updates to Gemini integration and cloud AI services. The move is part of Google’s push to compete more aggressively in enterprise AI infrastructure.  \\n   Sources: Reuters; Google Cloud blog  \\n   citeturn1search2turn1search7\\n\\n4. **Microsoft says AI is writing a growing share of code in GitHub/engineering workflows**  \\n   Microsoft executives said AI now generates a meaningful portion of code in some internal and GitHub‑related workflows, underscoring the growing role of coding copilots in software development.  \\n   Sources: Reuters; Microsoft/GitHub event coverage  \\n   citeturn1search0\\n\\n5. **U.S. and China race to secure rare earths as AI and robotics demand rises**  \\n   AI’s hardware boom is increasing geopolitical pressure around rare earth supply chains needed for semiconductors, robotics, and advanced manufacturing. This broader AI infrastructure story is drawing increased attention.  \\n   Source: Reuters  \\n   citeturn1news12\\n\\n6. **AI safety and regulation remain in focus as lawmakers examine industry concentration**  \\n   Policymakers in the U.S. and Europe are continuing to scrutinize the concentration of AI power among a handful of large labs and cloud providers, especially as frontier models expand and open‑model alternatives spread.  \\n   Sources: Reuters; policy/event coverage  \\n   citeturn1search1\\n\\nIf you want, I can also give you:\\n- a **top 10 AI news digest**\\n- a **startup/funding-focused AI news roundup**\\n- or **only major headlines from Reuters, FT, WSJ, and The Information**.\",\"phase\":\"final_answer\",\"provider_metadata\":{\"openai\":{\"responseId\":\"resp_0687370438d9a62a0169d7f32859cc8194ad1691b52d75f53a\",\"serviceTier\":\"default\"},\"gateway\":{\"routing\":{\"originalModelId\":\"openai/gpt-5.4\",\"resolvedProvider\":\"openai\",\"resolvedProviderApiModelId\":\"gpt-5.4\",\"fallbacksAvailable\":[\"azure\"],\"planningReasoning\":\"System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)\",\"canonicalSlug\":\"openai/gpt-5.4\",\"finalProvider\":\"openai\",\"modelAttemptCount\":1,\"modelAttempts\":[{\"modelId\":\"openai:gpt-5.4\",\"canonicalSlug\":\"openai/gpt-5.4\",\"success\":true,\"providerAttemptCount\":1,\"providerAttempts\":[{\"provider\":\"openai\",\"internalModelId\":\"openai:gpt-5.4\",\"providerApiModelId\":\"gpt-5.4\",\"credentialType\":\"system\",\"success\":true,\"startTime\":456182.951153,\"endTime\":467546.217356,\"statusCode\":200,\"providerResponseId\":\"resp_0687370438d9a62a0169d7f32859cc8194ad1691b52d75f53a\"}]}],\"totalProviderAttemptCount\":1},\"cost\":\"0.00969\",\"marketCost\":\"0.00969\",\"inferenceCost\":\"0.00969\",\"inputInferenceCost\":\"0.000045\",\"outputInferenceCost\":\"0.009645\",\"enabledZeroDataRetention\":false,\"enabledDisallowPromptTraining\":false,\"generationId\":\"gen_01KNSRVNB1XMZ2GYRM674QP7P2\"}}},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":643,\"total_tokens\":661,\"cost\":0.00969,\"is_byok\":false,\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0,\"video_tokens\":0},\"cost_details\":{\"upstream_inference_cost\":null,\"upstream_inference_prompt_cost\":0,\"upstream_inference_completions_cost\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0,\"image_tokens\":0},\"cache_creation_input_tokens\":0,\"market_cost\":0.00969},\"system_fingerprint\":\"fp_8fi3528fek\",\"service_tier\":\"default\",\"generationId\":\"gen_01KNSRVNB1XMZ2GYRM674QP7P2\"}",
+  "bodyJson": {
+    "id": "gen_01KNSRVNB1XMZ2GYRM674QP7P2",
+    "object": "chat.completion",
+    "created": 1775760179,
+    "model": "openai/gpt-5.4",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Here are some of the biggest AI headlines making news **today (2026‑04‑09)**, with brief summaries and sources:\n\n1. **OpenAI sues Elon Musk to stop “further unlawful and unfair action”**  \n   OpenAI filed a countersuit against Elon Musk in federal court, accusing him of bad‑faith attempts to undermine the company as it transitions to a public‑benefit structure. The filing asks the court to block further interference and seeks damages.  \n   Sources: Reuters; AP News; The New York Times  \n   citeturn1search8turn1search4turn1news13\n\n2. **OpenAI to release a more “open” model in response to pressure from Meta and DeepSeek**  \n   OpenAI says it plans to launch a new open‑weight language model in the coming months—its first such release since GPT‑2—as competition intensifies around more accessible AI systems.  \n   Sources: Reuters; TechCrunch  \n   citeturn1search3turn1search6\n\n3. **Google unveils “Ironwood,” its 7th‑gen TPU focused on inference**  \n   At Cloud Next, Google introduced Ironwood, a new AI chip designed specifically for inference workloads, plus updates to Gemini integration and cloud AI services. The move is part of Google’s push to compete more aggressively in enterprise AI infrastructure.  \n   Sources: Reuters; Google Cloud blog  \n   citeturn1search2turn1search7\n\n4. **Microsoft says AI is writing a growing share of code in GitHub/engineering workflows**  \n   Microsoft executives said AI now generates a meaningful portion of code in some internal and GitHub‑related workflows, underscoring the growing role of coding copilots in software development.  \n   Sources: Reuters; Microsoft/GitHub event coverage  \n   citeturn1search0\n\n5. **U.S. and China race to secure rare earths as AI and robotics demand rises**  \n   AI’s hardware boom is increasing geopolitical pressure around rare earth supply chains needed for semiconductors, robotics, and advanced manufacturing. This broader AI infrastructure story is drawing increased attention.  \n   Source: Reuters  \n   citeturn1news12\n\n6. **AI safety and regulation remain in focus as lawmakers examine industry concentration**  \n   Policymakers in the U.S. and Europe are continuing to scrutinize the concentration of AI power among a handful of large labs and cloud providers, especially as frontier models expand and open‑model alternatives spread.  \n   Sources: Reuters; policy/event coverage  \n   citeturn1search1\n\nIf you want, I can also give you:\n- a **top 10 AI news digest**\n- a **startup/funding-focused AI news roundup**\n- or **only major headlines from Reuters, FT, WSJ, and The Information**.",
+          "phase": "final_answer",
+          "provider_metadata": {
+            "openai": {
+              "responseId": "resp_0687370438d9a62a0169d7f32859cc8194ad1691b52d75f53a",
+              "serviceTier": "default"
+            },
+            "gateway": {
+              "routing": {
+                "originalModelId": "openai/gpt-5.4",
+                "resolvedProvider": "openai",
+                "resolvedProviderApiModelId": "gpt-5.4",
+                "fallbacksAvailable": [
+                  "azure"
+                ],
+                "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+                "canonicalSlug": "openai/gpt-5.4",
+                "finalProvider": "openai",
+                "modelAttemptCount": 1,
+                "modelAttempts": [
+                  {
+                    "modelId": "openai:gpt-5.4",
+                    "canonicalSlug": "openai/gpt-5.4",
+                    "success": true,
+                    "providerAttemptCount": 1,
+                    "providerAttempts": [
+                      {
+                        "provider": "openai",
+                        "internalModelId": "openai:gpt-5.4",
+                        "providerApiModelId": "gpt-5.4",
+                        "credentialType": "system",
+                        "success": true,
+                        "startTime": 456182.951153,
+                        "endTime": 467546.217356,
+                        "statusCode": 200,
+                        "providerResponseId": "resp_0687370438d9a62a0169d7f32859cc8194ad1691b52d75f53a"
+                      }
+                    ]
+                  }
+                ],
+                "totalProviderAttemptCount": 1
+              },
+              "cost": "0.00969",
+              "marketCost": "0.00969",
+              "inferenceCost": "0.00969",
+              "inputInferenceCost": "0.000045",
+              "outputInferenceCost": "0.009645",
+              "enabledZeroDataRetention": false,
+              "enabledDisallowPromptTraining": false,
+              "generationId": "gen_01KNSRVNB1XMZ2GYRM674QP7P2"
+            }
+          }
+        },
+        "logprobs": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 18,
+      "completion_tokens": 643,
+      "total_tokens": 661,
+      "cost": 0.00969,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": null,
+        "upstream_inference_prompt_cost": 0,
+        "upstream_inference_completions_cost": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "market_cost": 0.00969
+    },
+    "system_fingerprint": "fp_8fi3528fek",
+    "service_tier": "default",
+    "generationId": "gen_01KNSRVNB1XMZ2GYRM674QP7P2"
+  }
+}

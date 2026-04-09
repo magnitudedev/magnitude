@@ -1,0 +1,5 @@
+{
+  "name": "TypeError",
+  "message": "Body already used",
+  "stack": "TypeError: Body already used\n    at json (unknown)\n    at <anonymous> (/Users/trg/magnitude/node_modules/openai/internal/parse.mjs:32:41)\n    at defaultParseResponse (/Users/trg/magnitude/node_modules/openai/internal/parse.mjs:35:42)\n    at <anonymous> (/Users/trg/magnitude/node_modules/openai/core/api-promise.mjs:23:167)\n    at processTicksAndRejections (native:7:39)"
+}

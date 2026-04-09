@@ -1,0 +1,174 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/responses",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-encoding": "br",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 19:14:29 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/responses",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::hjk8g-1775762046165-02aca5e55ce9"
+  },
+  "bodyText": "{\"id\":\"gen_01KNSTMZ7ZR21DA10SXXY8FM1N\",\"object\":\"response\",\"created_at\":1775762069,\"status\":\"completed\",\"completed_at\":1775762069,\"incomplete_details\":null,\"error\":null,\"output\":[{\"type\":\"message\",\"id\":\"msg_1775762069595_kl9w8rzlqm\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Here are some of the **top AI headlines for today, Thursday, April 9, 2026**, based on recent reporting and official announcements:\\n\\n1. **Google rolls out Veo 3.1 Lite for AI video generation**\\n   Google said Veo 3.1 Lite is rolling out to paid users via the Gemini API and Google AI Studio, with pricing changes for Veo 3.1 Fast starting April 7. This is a notable generative-video update from one of the biggest AI platforms. ([blog.google](https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/?utm_source=openai))\\n\\n2. **NVIDIA and OpenAI announce a strategic partnership on AI infrastructure**\\n   NVIDIA said OpenAI will work with it as a preferred strategic compute and networking partner for AI factory growth plans, with the first gigawatt of NVIDIA systems slated for deployment in the second half of 2026. This is a major infrastructure story in the AI race. ([nvidianews.nvidia.com](https://nvidianews.nvidia.com/_gallery/download_pdf/68d173273d633288cb44040b/?utm_source=openai))\\n\\n3. **NVIDIA pushes its next-gen Vera Rubin platform for agentic AI**\\n   At GTC-related announcements in March, NVIDIA introduced Vera Rubin as a platform aimed at the “agentic AI frontier,” promising large gains in inference efficiency and lower cost per token versus prior systems. That remains one of the biggest recent AI hardware headlines. ([investor.nvidia.com](https://investor.nvidia.com/news/press-release-details/2026/NVIDIA-Vera-Rubin-Opens-Agentic-AI-Frontier/default.aspx?utm_source=openai))\\n\\n4. **Meta highlights broader use of AI to fight scams**\\n   Meta announced new anti-scam tools across WhatsApp, Facebook, and Messenger, saying it is using advanced AI to detect impersonation and fraudulent behavior at scale. This is a meaningful example of AI deployment beyond chatbots and image generation. ([about.fb.com](https://about.fb.com/news/2026/03/meta-launches-new-anti-scam-tools-deploys-ai-technology-to-fight-scammers-and-protect-people/?utm_source=openai))\\n\\n5. **Anthropic continues enterprise expansion and infrastructure buildout**\\n   Anthropic recently said it is expanding use of Google Cloud TPUs and services in a deal it described as worth tens of billions of dollars, while also reporting strong growth in business customers. That keeps Anthropic in the center of the enterprise-AI and infrastructure story. ([anthropic.com](https://www.anthropic.com/news/expanding-our-use-of-google-cloud-tpus-and-services?utm_source=openai))\\n\\n6. **AI remains a major live news beat today**\\n   The Guardian’s AI news hub shows fresh AI coverage published today, indicating the topic is still moving quickly across policy, products, and business developments. ([theguardian.com](https://www.theguardian.com/technology/artificialintelligenceai/2026/apr/09/all?utm_source=openai))\\n\\nIf you want, I can also turn this into:\\n- a **5-bullet morning briefing**\\n- a **“big tech only” AI news roundup**\\n- or a **market-focused AI news summary** with who it matters to and why.\",\"annotations\":[],\"logprobs\":[]}],\"phase\":\"final_answer\"},{\"type\":\"function_call\",\"id\":\"fc_1775762069595_dit1wbuvqdt\",\"call_id\":\"ws_0cacf464169d434c0169d7fa7fd7ac819383fc60f8a0daf8b3\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1775762069595_yy93mrgcbf\",\"call_id\":\"ws_0cacf464169d434c0169d7fa83b9548193a804f4bf77e387a9\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1775762069595_b841vcygarw\",\"call_id\":\"ws_0cacf464169d434c0169d7fa8645f08193bdef44a510f07447\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1775762069595_5azphqynd0j\",\"call_id\":\"ws_0cacf464169d434c0169d7fa8995f48193a36901f3c855f6a1\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":20441,\"output_tokens\":990,\"total_tokens\":21431,\"input_tokens_details\":{\"cached_tokens\":4352},\"output_tokens_details\":{\"reasoning_tokens\":432}},\"model\":\"gpt-5.4\",\"instructions\":null,\"previous_response_id\":null,\"temperature\":1,\"top_p\":1,\"max_output_tokens\":null,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"tools\":[{\"type\":\"web_search\"}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"max_tool_calls\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"truncation\":\"disabled\",\"reasoning\":null,\"store\":false,\"background\":false,\"service_tier\":\"default\",\"metadata\":{},\"safety_identifier\":null,\"prompt_cache_key\":null,\"prompt_cache_retention\":null,\"provider_metadata\":{\"openai\":{\"responseId\":\"resp_0cacf464169d434c0169d7fa7e6a1c819382fc54dbe2060eeb\",\"serviceTier\":\"default\"},\"gateway\":{\"routing\":{\"originalModelId\":\"openai/gpt-5.4\",\"resolvedProvider\":\"openai\",\"resolvedProviderApiModelId\":\"gpt-5.4\",\"fallbacksAvailable\":[\"azure\"],\"planningReasoning\":\"System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)\",\"canonicalSlug\":\"openai/gpt-5.4\",\"finalProvider\":\"openai\",\"modelAttemptCount\":1,\"modelAttempts\":[{\"modelId\":\"openai:gpt-5.4\",\"canonicalSlug\":\"openai/gpt-5.4\",\"success\":true,\"providerAttemptCount\":1,\"providerAttempts\":[{\"provider\":\"openai\",\"internalModelId\":\"openai:gpt-5.4\",\"providerApiModelId\":\"gpt-5.4\",\"credentialType\":\"system\",\"success\":true,\"startTime\":231689.907305,\"endTime\":254988.592529,\"statusCode\":200,\"providerResponseId\":\"resp_0cacf464169d434c0169d7fa7e6a1c819382fc54dbe2060eeb\"}]}],\"totalProviderAttemptCount\":1},\"cost\":\"0.0961605\",\"marketCost\":\"0.0961605\",\"inferenceCost\":\"0.0561605\",\"inputInferenceCost\":\"0.0413105\",\"outputInferenceCost\":\"0.01485\",\"enabledZeroDataRetention\":false,\"enabledDisallowPromptTraining\":false,\"generationId\":\"gen_01KNSTMZ7ZR21DA10SXXY8FM1N\",\"billableWebSearchCalls\":4}}}",
+  "bodyJson": {
+    "id": "gen_01KNSTMZ7ZR21DA10SXXY8FM1N",
+    "object": "response",
+    "created_at": 1775762069,
+    "status": "completed",
+    "completed_at": 1775762069,
+    "incomplete_details": null,
+    "error": null,
+    "output": [
+      {
+        "type": "message",
+        "id": "msg_1775762069595_kl9w8rzlqm",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Here are some of the **top AI headlines for today, Thursday, April 9, 2026**, based on recent reporting and official announcements:\n\n1. **Google rolls out Veo 3.1 Lite for AI video generation**\n   Google said Veo 3.1 Lite is rolling out to paid users via the Gemini API and Google AI Studio, with pricing changes for Veo 3.1 Fast starting April 7. This is a notable generative-video update from one of the biggest AI platforms. ([blog.google](https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/?utm_source=openai))\n\n2. **NVIDIA and OpenAI announce a strategic partnership on AI infrastructure**\n   NVIDIA said OpenAI will work with it as a preferred strategic compute and networking partner for AI factory growth plans, with the first gigawatt of NVIDIA systems slated for deployment in the second half of 2026. This is a major infrastructure story in the AI race. ([nvidianews.nvidia.com](https://nvidianews.nvidia.com/_gallery/download_pdf/68d173273d633288cb44040b/?utm_source=openai))\n\n3. **NVIDIA pushes its next-gen Vera Rubin platform for agentic AI**\n   At GTC-related announcements in March, NVIDIA introduced Vera Rubin as a platform aimed at the “agentic AI frontier,” promising large gains in inference efficiency and lower cost per token versus prior systems. That remains one of the biggest recent AI hardware headlines. ([investor.nvidia.com](https://investor.nvidia.com/news/press-release-details/2026/NVIDIA-Vera-Rubin-Opens-Agentic-AI-Frontier/default.aspx?utm_source=openai))\n\n4. **Meta highlights broader use of AI to fight scams**\n   Meta announced new anti-scam tools across WhatsApp, Facebook, and Messenger, saying it is using advanced AI to detect impersonation and fraudulent behavior at scale. This is a meaningful example of AI deployment beyond chatbots and image generation. ([about.fb.com](https://about.fb.com/news/2026/03/meta-launches-new-anti-scam-tools-deploys-ai-technology-to-fight-scammers-and-protect-people/?utm_source=openai))\n\n5. **Anthropic continues enterprise expansion and infrastructure buildout**\n   Anthropic recently said it is expanding use of Google Cloud TPUs and services in a deal it described as worth tens of billions of dollars, while also reporting strong growth in business customers. That keeps Anthropic in the center of the enterprise-AI and infrastructure story. ([anthropic.com](https://www.anthropic.com/news/expanding-our-use-of-google-cloud-tpus-and-services?utm_source=openai))\n\n6. **AI remains a major live news beat today**\n   The Guardian’s AI news hub shows fresh AI coverage published today, indicating the topic is still moving quickly across policy, products, and business developments. ([theguardian.com](https://www.theguardian.com/technology/artificialintelligenceai/2026/apr/09/all?utm_source=openai))\n\nIf you want, I can also turn this into:\n- a **5-bullet morning briefing**\n- a **“big tech only” AI news roundup**\n- or a **market-focused AI news summary** with who it matters to and why.",
+            "annotations": [],
+            "logprobs": []
+          }
+        ],
+        "phase": "final_answer"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775762069595_dit1wbuvqdt",
+        "call_id": "ws_0cacf464169d434c0169d7fa7fd7ac819383fc60f8a0daf8b3",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775762069595_yy93mrgcbf",
+        "call_id": "ws_0cacf464169d434c0169d7fa83b9548193a804f4bf77e387a9",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775762069595_b841vcygarw",
+        "call_id": "ws_0cacf464169d434c0169d7fa8645f08193bdef44a510f07447",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775762069595_5azphqynd0j",
+        "call_id": "ws_0cacf464169d434c0169d7fa8995f48193a36901f3c855f6a1",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      }
+    ],
+    "usage": {
+      "input_tokens": 20441,
+      "output_tokens": 990,
+      "total_tokens": 21431,
+      "input_tokens_details": {
+        "cached_tokens": 4352
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 432
+      }
+    },
+    "model": "gpt-5.4",
+    "instructions": null,
+    "previous_response_id": null,
+    "temperature": 1,
+    "top_p": 1,
+    "max_output_tokens": null,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "tools": [
+      {
+        "type": "web_search"
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_tool_calls": null,
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "truncation": "disabled",
+    "reasoning": null,
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "prompt_cache_retention": null,
+    "provider_metadata": {
+      "openai": {
+        "responseId": "resp_0cacf464169d434c0169d7fa7e6a1c819382fc54dbe2060eeb",
+        "serviceTier": "default"
+      },
+      "gateway": {
+        "routing": {
+          "originalModelId": "openai/gpt-5.4",
+          "resolvedProvider": "openai",
+          "resolvedProviderApiModelId": "gpt-5.4",
+          "fallbacksAvailable": [
+            "azure"
+          ],
+          "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+          "canonicalSlug": "openai/gpt-5.4",
+          "finalProvider": "openai",
+          "modelAttemptCount": 1,
+          "modelAttempts": [
+            {
+              "modelId": "openai:gpt-5.4",
+              "canonicalSlug": "openai/gpt-5.4",
+              "success": true,
+              "providerAttemptCount": 1,
+              "providerAttempts": [
+                {
+                  "provider": "openai",
+                  "internalModelId": "openai:gpt-5.4",
+                  "providerApiModelId": "gpt-5.4",
+                  "credentialType": "system",
+                  "success": true,
+                  "startTime": 231689.907305,
+                  "endTime": 254988.592529,
+                  "statusCode": 200,
+                  "providerResponseId": "resp_0cacf464169d434c0169d7fa7e6a1c819382fc54dbe2060eeb"
+                }
+              ]
+            }
+          ],
+          "totalProviderAttemptCount": 1
+        },
+        "cost": "0.0961605",
+        "marketCost": "0.0961605",
+        "inferenceCost": "0.0561605",
+        "inputInferenceCost": "0.0413105",
+        "outputInferenceCost": "0.01485",
+        "enabledZeroDataRetention": false,
+        "enabledDisallowPromptTraining": false,
+        "generationId": "gen_01KNSTMZ7ZR21DA10SXXY8FM1N",
+        "billableWebSearchCalls": 4
+      }
+    }
+  }
+}

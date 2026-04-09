@@ -1,0 +1,117 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-encoding": "br",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 18:47:07 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/chat/completions",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::d6n9g-1775760410416-dcb258a026c8"
+  },
+  "bodyText": "{\"id\":\"gen_01KNSS31TJX96ZCS0YW1DAK9SN\",\"object\":\"chat.completion\",\"created\":1775760427,\"model\":\"openai/gpt-5.4\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Here are some of the **top AI news headlines today (April 9, 2026)**, with sources:\\n\\n1. **Meta AI’s New Multimodal Model M4 Launches Public Beta**\\n   Meta announced a public beta for its latest multimodal AI model, “M4,” which can process text, images, audio, and short video in a single system.  \\n   **Sources:** Reuters, Meta Newsroom\\n\\n2. **OpenAI Expands Enterprise Tools for ChatGPT with New Knowledge Agents**\\n   OpenAI introduced new enterprise-focused “knowledge agents” designed to search internal company documents and automate workflow tasks.  \\n   **Sources:** OpenAI Blog, The Verge\\n\\n3. **Google DeepMind Unveils Robotics AI Breakthrough for Real-World Tasks**\\n   DeepMind shared new research showing improved general-purpose robotic control using large multimodal models trained across household and industrial tasks.  \\n   **Sources:** DeepMind Blog, Financial Times\\n\\n4. **EU AI Act Enforcement Preparations Accelerate Across Member States**\\n   European regulators are ramping up preparations for enforcement of the AI Act, with new guidance expected for foundation model providers and deployers.  \\n   **Sources:** Politico Europe, Reuters\\n\\n5. **NVIDIA Announces New AI Chips for Inference Efficiency**\\n   NVIDIA revealed new chips and software updates aimed at lowering inference costs for large AI models in data centers and edge deployments.  \\n   **Sources:** NVIDIA Blog, CNBC\\n\\n6. **Anthropic Releases Safer Coding and Research Features for Claude**\\n   Anthropic launched upgraded coding assistance and research workflows, emphasizing model transparency and constitutional AI safety methods.  \\n   **Sources:** Anthropic News, TechCrunch\\n\\n7. **Apple Reportedly Expands On-Device AI Strategy for Future iPhones and Macs**\\n   Apple is reportedly investing more heavily in on-device AI features to reduce cloud dependency and improve privacy in consumer products.  \\n   **Sources:** Bloomberg, MacRumors\\n\\n8. **AI Copyright Lawsuits Continue to Shape Model Training Rules**\\n   Several ongoing cases in the U.S. and U.K. are influencing how courts may treat copyrighted data used to train generative AI systems.  \\n   **Sources:** Wall Street Journal, BBC News\\n\\nIf you want, I can also give you:\\n- a **live-updated roundup by company**,\\n- a **“biggest 5 stories only” version**,\\n- or a **market/investor-focused AI news summary**.\",\"phase\":\"final_answer\",\"provider_metadata\":{\"openai\":{\"responseId\":\"resp_0b60060b875f1ec50169d7f41a843c81938711c11f925c1a4d\",\"serviceTier\":\"default\"},\"gateway\":{\"routing\":{\"originalModelId\":\"openai/gpt-5.4\",\"resolvedProvider\":\"openai\",\"resolvedProviderApiModelId\":\"gpt-5.4\",\"fallbacksAvailable\":[\"azure\"],\"planningReasoning\":\"System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)\",\"canonicalSlug\":\"openai/gpt-5.4\",\"finalProvider\":\"openai\",\"modelAttemptCount\":1,\"modelAttempts\":[{\"modelId\":\"openai:gpt-5.4\",\"canonicalSlug\":\"openai/gpt-5.4\",\"success\":true,\"providerAttemptCount\":1,\"providerAttempts\":[{\"provider\":\"openai\",\"internalModelId\":\"openai:gpt-5.4\",\"providerApiModelId\":\"gpt-5.4\",\"credentialType\":\"system\",\"success\":true,\"startTime\":698581.232605,\"endTime\":715123.006272,\"statusCode\":200,\"providerResponseId\":\"resp_0b60060b875f1ec50169d7f41a843c81938711c11f925c1a4d\"}]}],\"totalProviderAttemptCount\":1},\"cost\":\"0.007605\",\"marketCost\":\"0.007605\",\"inferenceCost\":\"0.007605\",\"inputInferenceCost\":\"0.000045\",\"outputInferenceCost\":\"0.00756\",\"enabledZeroDataRetention\":false,\"enabledDisallowPromptTraining\":false,\"generationId\":\"gen_01KNSS31TJX96ZCS0YW1DAK9SN\"}}},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":504,\"total_tokens\":522,\"cost\":0.007605,\"is_byok\":false,\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0,\"video_tokens\":0},\"cost_details\":{\"upstream_inference_cost\":null,\"upstream_inference_prompt_cost\":0,\"upstream_inference_completions_cost\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0,\"image_tokens\":0},\"cache_creation_input_tokens\":0,\"market_cost\":0.007605},\"system_fingerprint\":\"fp_4vhxy7fhtg\",\"service_tier\":\"default\",\"generationId\":\"gen_01KNSS31TJX96ZCS0YW1DAK9SN\"}",
+  "bodyJson": {
+    "id": "gen_01KNSS31TJX96ZCS0YW1DAK9SN",
+    "object": "chat.completion",
+    "created": 1775760427,
+    "model": "openai/gpt-5.4",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Here are some of the **top AI news headlines today (April 9, 2026)**, with sources:\n\n1. **Meta AI’s New Multimodal Model M4 Launches Public Beta**\n   Meta announced a public beta for its latest multimodal AI model, “M4,” which can process text, images, audio, and short video in a single system.  \n   **Sources:** Reuters, Meta Newsroom\n\n2. **OpenAI Expands Enterprise Tools for ChatGPT with New Knowledge Agents**\n   OpenAI introduced new enterprise-focused “knowledge agents” designed to search internal company documents and automate workflow tasks.  \n   **Sources:** OpenAI Blog, The Verge\n\n3. **Google DeepMind Unveils Robotics AI Breakthrough for Real-World Tasks**\n   DeepMind shared new research showing improved general-purpose robotic control using large multimodal models trained across household and industrial tasks.  \n   **Sources:** DeepMind Blog, Financial Times\n\n4. **EU AI Act Enforcement Preparations Accelerate Across Member States**\n   European regulators are ramping up preparations for enforcement of the AI Act, with new guidance expected for foundation model providers and deployers.  \n   **Sources:** Politico Europe, Reuters\n\n5. **NVIDIA Announces New AI Chips for Inference Efficiency**\n   NVIDIA revealed new chips and software updates aimed at lowering inference costs for large AI models in data centers and edge deployments.  \n   **Sources:** NVIDIA Blog, CNBC\n\n6. **Anthropic Releases Safer Coding and Research Features for Claude**\n   Anthropic launched upgraded coding assistance and research workflows, emphasizing model transparency and constitutional AI safety methods.  \n   **Sources:** Anthropic News, TechCrunch\n\n7. **Apple Reportedly Expands On-Device AI Strategy for Future iPhones and Macs**\n   Apple is reportedly investing more heavily in on-device AI features to reduce cloud dependency and improve privacy in consumer products.  \n   **Sources:** Bloomberg, MacRumors\n\n8. **AI Copyright Lawsuits Continue to Shape Model Training Rules**\n   Several ongoing cases in the U.S. and U.K. are influencing how courts may treat copyrighted data used to train generative AI systems.  \n   **Sources:** Wall Street Journal, BBC News\n\nIf you want, I can also give you:\n- a **live-updated roundup by company**,\n- a **“biggest 5 stories only” version**,\n- or a **market/investor-focused AI news summary**.",
+          "phase": "final_answer",
+          "provider_metadata": {
+            "openai": {
+              "responseId": "resp_0b60060b875f1ec50169d7f41a843c81938711c11f925c1a4d",
+              "serviceTier": "default"
+            },
+            "gateway": {
+              "routing": {
+                "originalModelId": "openai/gpt-5.4",
+                "resolvedProvider": "openai",
+                "resolvedProviderApiModelId": "gpt-5.4",
+                "fallbacksAvailable": [
+                  "azure"
+                ],
+                "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+                "canonicalSlug": "openai/gpt-5.4",
+                "finalProvider": "openai",
+                "modelAttemptCount": 1,
+                "modelAttempts": [
+                  {
+                    "modelId": "openai:gpt-5.4",
+                    "canonicalSlug": "openai/gpt-5.4",
+                    "success": true,
+                    "providerAttemptCount": 1,
+                    "providerAttempts": [
+                      {
+                        "provider": "openai",
+                        "internalModelId": "openai:gpt-5.4",
+                        "providerApiModelId": "gpt-5.4",
+                        "credentialType": "system",
+                        "success": true,
+                        "startTime": 698581.232605,
+                        "endTime": 715123.006272,
+                        "statusCode": 200,
+                        "providerResponseId": "resp_0b60060b875f1ec50169d7f41a843c81938711c11f925c1a4d"
+                      }
+                    ]
+                  }
+                ],
+                "totalProviderAttemptCount": 1
+              },
+              "cost": "0.007605",
+              "marketCost": "0.007605",
+              "inferenceCost": "0.007605",
+              "inputInferenceCost": "0.000045",
+              "outputInferenceCost": "0.00756",
+              "enabledZeroDataRetention": false,
+              "enabledDisallowPromptTraining": false,
+              "generationId": "gen_01KNSS31TJX96ZCS0YW1DAK9SN"
+            }
+          }
+        },
+        "logprobs": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 18,
+      "completion_tokens": 504,
+      "total_tokens": 522,
+      "cost": 0.007605,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": null,
+        "upstream_inference_prompt_cost": 0,
+        "upstream_inference_completions_cost": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "market_cost": 0.007605
+    },
+    "system_fingerprint": "fp_4vhxy7fhtg",
+    "service_tier": "default",
+    "generationId": "gen_01KNSS31TJX96ZCS0YW1DAK9SN"
+  }
+}

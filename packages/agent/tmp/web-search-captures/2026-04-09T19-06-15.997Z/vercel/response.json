@@ -1,0 +1,117 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-encoding": "br",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 19:06:31 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/chat/completions",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::rn655-1775761576066-90cf98731494"
+  },
+  "bodyText": "{\"id\":\"gen_01KNST6M4HF71Q23MM4M5P1KHP\",\"object\":\"chat.completion\",\"created\":1775761591,\"model\":\"openai/gpt-5.4\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Here are some of the top **AI news headlines today** based on recent major developments. I’m including the **source** for each.\\n\\n### 1. OpenAI rolls out GPT-4.1 to ChatGPT\\nOpenAI has begun bringing **GPT-4.1** into ChatGPT, expanding access to a model family aimed at better coding, instruction following, and lower-cost API use.  \\n**Sources:** OpenAI blog, The Verge\\n\\n### 2. OpenAI is reportedly developing a social network\\nMultiple reports say OpenAI is experimenting with an **X-like social platform**, possibly tied to ChatGPT’s image generation and sharing features.  \\n**Sources:** The Verge, Reuters\\n\\n### 3. Google expands Gemini and AI features across Search and Workspace\\nGoogle continues pushing **Gemini-powered features** into core products, including Search, Workspace, Android, and cloud tools, as competition with OpenAI and Microsoft intensifies.  \\n**Sources:** Google Blog, CNBC, Reuters\\n\\n### 4. Microsoft deepens Copilot integration across Windows and enterprise tools\\nMicrosoft is expanding **Copilot** across Microsoft 365, security, developer, and Windows products, signaling continued focus on AI as a central productivity layer.  \\n**Sources:** Microsoft blog, The Wall Street Journal, Reuters\\n\\n### 5. Nvidia remains central to the AI boom as demand for chips stays high\\nNvidia continues dominating headlines as hyperscalers and AI labs race to secure **GPUs and AI infrastructure**, making the company a key barometer of the AI economy.  \\n**Sources:** Reuters, Financial Times, Bloomberg\\n\\n### 6. Meta pushes forward with open-weight Llama models\\nMeta is continuing to build around its **Llama** family, reinforcing its strategy of offering powerful open-weight models to compete with proprietary systems from OpenAI and Google.  \\n**Sources:** Meta AI blog, Reuters, TechCrunch\\n\\n### 7. Regulators keep increasing scrutiny of AI safety, copyright, and competition\\nGovernments in the U.S., EU, and elsewhere are pressing ahead on **AI regulation**, especially around training data, transparency, antitrust concerns, and model risks.  \\n**Sources:** Reuters, The New York Times, European Commission updates\\n\\n### 8. Media and publishers continue legal fights over AI training data\\nLawsuits and licensing disputes between AI companies and publishers remain a major story, especially concerning whether models were trained on copyrighted material without permission.  \\n**Sources:** The New York Times, Reuters, Associated Press\\n\\n### 9. Apple is under pressure to show stronger AI progress\\nApple remains in the AI spotlight as investors and analysts watch for bigger moves in generative AI, Siri upgrades, and on-device intelligence strategy.  \\n**Sources:** Bloomberg, Reuters, CNBC\\n\\n### 10. AI agents become the next big battleground\\nThe industry is increasingly shifting from chatbots to **AI agents** that can take actions, use tools, browse, code, and complete workflows more autonomously.  \\n**Sources:** MIT Technology Review, The Information, The Verge\\n\\nIf you want, I can also give you:\\n1. a **live-style roundup from the last 24 hours**,  \\n2. a **“big tech only” AI news digest**, or  \\n3. a **market/investor-focused AI headlines summary**.\",\"phase\":\"final_answer\",\"provider_metadata\":{\"openai\":{\"responseId\":\"resp_0e4220d28ac87e530169d7f8a82f308195ae9d55cd5de0298a\",\"serviceTier\":\"default\"},\"gateway\":{\"routing\":{\"originalModelId\":\"openai/gpt-5.4\",\"resolvedProvider\":\"openai\",\"resolvedProviderApiModelId\":\"gpt-5.4\",\"fallbacksAvailable\":[\"azure\"],\"planningReasoning\":\"System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)\",\"canonicalSlug\":\"openai/gpt-5.4\",\"finalProvider\":\"openai\",\"modelAttemptCount\":1,\"modelAttempts\":[{\"modelId\":\"openai:gpt-5.4\",\"canonicalSlug\":\"openai/gpt-5.4\",\"success\":true,\"providerAttemptCount\":1,\"providerAttempts\":[{\"provider\":\"openai\",\"internalModelId\":\"openai:gpt-5.4\",\"providerApiModelId\":\"gpt-5.4\",\"credentialType\":\"system\",\"success\":true,\"startTime\":1862986.493166,\"endTime\":1878147.655949,\"statusCode\":200,\"providerResponseId\":\"resp_0e4220d28ac87e530169d7f8a82f308195ae9d55cd5de0298a\"}]}],\"totalProviderAttemptCount\":1},\"cost\":\"0.010305\",\"marketCost\":\"0.010305\",\"inferenceCost\":\"0.010305\",\"inputInferenceCost\":\"0.000045\",\"outputInferenceCost\":\"0.01026\",\"enabledZeroDataRetention\":false,\"enabledDisallowPromptTraining\":false,\"generationId\":\"gen_01KNST6M4HF71Q23MM4M5P1KHP\"}}},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":684,\"total_tokens\":702,\"cost\":0.010305,\"is_byok\":false,\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0,\"video_tokens\":0},\"cost_details\":{\"upstream_inference_cost\":null,\"upstream_inference_prompt_cost\":0,\"upstream_inference_completions_cost\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0,\"image_tokens\":0},\"cache_creation_input_tokens\":0,\"market_cost\":0.010305},\"system_fingerprint\":\"fp_cvbz020vsj\",\"service_tier\":\"default\",\"generationId\":\"gen_01KNST6M4HF71Q23MM4M5P1KHP\"}",
+  "bodyJson": {
+    "id": "gen_01KNST6M4HF71Q23MM4M5P1KHP",
+    "object": "chat.completion",
+    "created": 1775761591,
+    "model": "openai/gpt-5.4",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Here are some of the top **AI news headlines today** based on recent major developments. I’m including the **source** for each.\n\n### 1. OpenAI rolls out GPT-4.1 to ChatGPT\nOpenAI has begun bringing **GPT-4.1** into ChatGPT, expanding access to a model family aimed at better coding, instruction following, and lower-cost API use.  \n**Sources:** OpenAI blog, The Verge\n\n### 2. OpenAI is reportedly developing a social network\nMultiple reports say OpenAI is experimenting with an **X-like social platform**, possibly tied to ChatGPT’s image generation and sharing features.  \n**Sources:** The Verge, Reuters\n\n### 3. Google expands Gemini and AI features across Search and Workspace\nGoogle continues pushing **Gemini-powered features** into core products, including Search, Workspace, Android, and cloud tools, as competition with OpenAI and Microsoft intensifies.  \n**Sources:** Google Blog, CNBC, Reuters\n\n### 4. Microsoft deepens Copilot integration across Windows and enterprise tools\nMicrosoft is expanding **Copilot** across Microsoft 365, security, developer, and Windows products, signaling continued focus on AI as a central productivity layer.  \n**Sources:** Microsoft blog, The Wall Street Journal, Reuters\n\n### 5. Nvidia remains central to the AI boom as demand for chips stays high\nNvidia continues dominating headlines as hyperscalers and AI labs race to secure **GPUs and AI infrastructure**, making the company a key barometer of the AI economy.  \n**Sources:** Reuters, Financial Times, Bloomberg\n\n### 6. Meta pushes forward with open-weight Llama models\nMeta is continuing to build around its **Llama** family, reinforcing its strategy of offering powerful open-weight models to compete with proprietary systems from OpenAI and Google.  \n**Sources:** Meta AI blog, Reuters, TechCrunch\n\n### 7. Regulators keep increasing scrutiny of AI safety, copyright, and competition\nGovernments in the U.S., EU, and elsewhere are pressing ahead on **AI regulation**, especially around training data, transparency, antitrust concerns, and model risks.  \n**Sources:** Reuters, The New York Times, European Commission updates\n\n### 8. Media and publishers continue legal fights over AI training data\nLawsuits and licensing disputes between AI companies and publishers remain a major story, especially concerning whether models were trained on copyrighted material without permission.  \n**Sources:** The New York Times, Reuters, Associated Press\n\n### 9. Apple is under pressure to show stronger AI progress\nApple remains in the AI spotlight as investors and analysts watch for bigger moves in generative AI, Siri upgrades, and on-device intelligence strategy.  \n**Sources:** Bloomberg, Reuters, CNBC\n\n### 10. AI agents become the next big battleground\nThe industry is increasingly shifting from chatbots to **AI agents** that can take actions, use tools, browse, code, and complete workflows more autonomously.  \n**Sources:** MIT Technology Review, The Information, The Verge\n\nIf you want, I can also give you:\n1. a **live-style roundup from the last 24 hours**,  \n2. a **“big tech only” AI news digest**, or  \n3. a **market/investor-focused AI headlines summary**.",
+          "phase": "final_answer",
+          "provider_metadata": {
+            "openai": {
+              "responseId": "resp_0e4220d28ac87e530169d7f8a82f308195ae9d55cd5de0298a",
+              "serviceTier": "default"
+            },
+            "gateway": {
+              "routing": {
+                "originalModelId": "openai/gpt-5.4",
+                "resolvedProvider": "openai",
+                "resolvedProviderApiModelId": "gpt-5.4",
+                "fallbacksAvailable": [
+                  "azure"
+                ],
+                "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+                "canonicalSlug": "openai/gpt-5.4",
+                "finalProvider": "openai",
+                "modelAttemptCount": 1,
+                "modelAttempts": [
+                  {
+                    "modelId": "openai:gpt-5.4",
+                    "canonicalSlug": "openai/gpt-5.4",
+                    "success": true,
+                    "providerAttemptCount": 1,
+                    "providerAttempts": [
+                      {
+                        "provider": "openai",
+                        "internalModelId": "openai:gpt-5.4",
+                        "providerApiModelId": "gpt-5.4",
+                        "credentialType": "system",
+                        "success": true,
+                        "startTime": 1862986.493166,
+                        "endTime": 1878147.655949,
+                        "statusCode": 200,
+                        "providerResponseId": "resp_0e4220d28ac87e530169d7f8a82f308195ae9d55cd5de0298a"
+                      }
+                    ]
+                  }
+                ],
+                "totalProviderAttemptCount": 1
+              },
+              "cost": "0.010305",
+              "marketCost": "0.010305",
+              "inferenceCost": "0.010305",
+              "inputInferenceCost": "0.000045",
+              "outputInferenceCost": "0.01026",
+              "enabledZeroDataRetention": false,
+              "enabledDisallowPromptTraining": false,
+              "generationId": "gen_01KNST6M4HF71Q23MM4M5P1KHP"
+            }
+          }
+        },
+        "logprobs": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 18,
+      "completion_tokens": 684,
+      "total_tokens": 702,
+      "cost": 0.010305,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": null,
+        "upstream_inference_prompt_cost": 0,
+        "upstream_inference_completions_cost": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "market_cost": 0.010305
+    },
+    "system_fingerprint": "fp_cvbz020vsj",
+    "service_tier": "default",
+    "generationId": "gen_01KNST6M4HF71Q23MM4M5P1KHP"
+  }
+}

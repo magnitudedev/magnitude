@@ -1,0 +1,40 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "vercel-search",
+      "content": [
+        {
+          "title": "money.usnews.com",
+          "url": "https://money.usnews.com/investing/news/articles/2026-04-09/openai-projects-2-5-billion-in-ad-revenue-this-year-100-billion-by-2030-axios-reports"
+        },
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/2026/04/08/meta-debuts-the-muse-spark-model-in-a-ground-up-overhaul-of-its-ai/"
+        },
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/2026/04/07/anthropic-compute-deal-google-broadcom-tpus/"
+        },
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/2026/04/07/anthropic-mythos-ai-model-preview-security/"
+        },
+        {
+          "title": "openai.com",
+          "url": "https://openai.com/index/industrial-policy-for-the-intelligence-age/"
+        },
+        {
+          "title": "cdn.openai.com",
+          "url": "https://cdn.openai.com/pdf/9886ee82-5a5e-4f0a-acaa-a47b01b0a68e/Child-Protection-Blueprint.pdf"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Here are some of the **top AI headlines for today, April 9, 2026**:\n\n1. **OpenAI reportedly projects major ad business growth**  \n   Reuters reports that OpenAI expects **$2.5 billion in advertising revenue in 2026**, with a projection of **$100 billion by 2030**, according to Axios citing investor materials. ([money.usnews.com](https://money.usnews.com/investing/news/articles/2026-04-09/openai-projects-2-5-billion-in-ad-revenue-this-year-100-billion-by-2030-axios-reports))\n\n2. **Meta unveils Muse Spark in a broader AI overhaul**  \n   Meta released **Muse Spark**, which TechCrunch describes as the first step in a broader revamp of Meta’s AI efforts through its Meta Superintelligence Labs. ([techcrunch.com](https://techcrunch.com/2026/04/08/meta-debuts-the-muse-spark-model-in-a-ground-up-overhaul-of-its-ai/))\n\n3. **Anthropic expands compute deal with Google and Broadcom**  \n   Anthropic has increased its compute commitment with Google and Broadcom as demand for Claude grows rapidly; TechCrunch says Anthropic’s run-rate revenue has surged and the company is scaling infrastructure aggressively. ([techcrunch.com](https://techcrunch.com/2026/04/07/anthropic-compute-deal-google-broadcom-tpus/))\n\n4. **Anthropic introduces Claude Mythos Preview for cybersecurity work**  \n   Anthropic announced **Claude Mythos Preview**, a new general-purpose model being piloted with a limited group of partner organizations for cybersecurity applications. Anthropic’s technical write-up says the model is especially capable at computer security tasks. ([techcrunch.com](https://techcrunch.com/2026/04/07/anthropic-mythos-ai-model-preview-security/))\n\n5. **OpenAI publishes a new AI economic policy blueprint**  \n   OpenAI released **“Industrial Policy for the Intelligence Age,”** outlining proposals such as broader prosperity-sharing mechanisms and institution-building for an AI-heavy economy. TechCrunch highlighted ideas including public wealth funds, robot taxes, and a four-day workweek. ([openai.com](https://openai.com/index/industrial-policy-for-the-intelligence-age/))\n\n6. **OpenAI releases a child safety blueprint for generative AI**  \n   OpenAI posted a new policy document focused on preventing and disrupting **online child sexual exploitation and abuse involving generative AI**. ([cdn.openai.com](https://cdn.openai.com/pdf/9886ee82-5a5e-4f0a-acaa-a47b01b0a68e/Child-Protection-Blueprint.pdf))\n\nIf you want, I can also turn this into a **clean morning news brief** with:\n- **5 bullet summaries**\n- **why each story matters**\n- **links grouped by company: OpenAI / Anthropic / Meta / Microsoft**",
+  "usage": {
+    "input_tokens": 12493,
+    "output_tokens": 716,
+    "web_search_requests": 2
+  }
+}

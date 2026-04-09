@@ -12,52 +12,40 @@ const CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
  * 2. web_search_call action sources (url only, requires include param)
  */
 function extractCitations(output: any[]): WebSearchToolResult[] {
-  const results: WebSearchToolResult[] = [];
+  const merged: { title: string; url: string }[] = [];
+  const seen = new Set<string>();
 
-  // 1. Extract url_citation annotations from message output
+  // 1. Extract url_citation annotations from message output first
   for (const item of output) {
     if (item.type === "message") {
       for (const content of item.content ?? []) {
         if (content.type === "output_text" && content.annotations) {
-          const citations = content.annotations
-            .filter((a: any) => a.type === "url_citation")
-            .map((a: any) => ({ title: a.title ?? a.url, url: a.url }));
-          if (citations.length > 0) {
-            // Deduplicate by URL
-            const seen = new Set<string>();
-            const unique = citations.filter((c: { url: string }) => {
-              if (seen.has(c.url)) return false;
-              seen.add(c.url);
-              return true;
-            });
-            results.push({ tool_use_id: "openai-search", content: unique });
-          }
-        }
-      }
-    }
-  }
-
-  // 2. Fallback: extract from web_search_call action sources
-  if (results.length === 0) {
-    const seen = new Set<string>();
-    const fallback: { title: string; url: string }[] = [];
-    for (const item of output) {
-      if (item.type === "web_search_call" && item.action?.sources) {
-        for (const source of item.action.sources) {
-          const url = typeof source === "string" ? source : source.url;
-          if (url && !seen.has(url)) {
+          for (const annotation of content.annotations) {
+            if (annotation.type !== "url_citation") continue;
+            const url = annotation.url;
+            if (!url || seen.has(url)) continue;
             seen.add(url);
-            fallback.push({ title: url, url });
+            merged.push({ title: annotation.title ?? url, url });
           }
         }
       }
     }
-    if (fallback.length > 0) {
-      results.push({ tool_use_id: "openai-search", content: fallback });
+  }
+
+  // 2. Enrich with unseen web_search_call action sources
+  for (const item of output) {
+    if (item.type === "web_search_call" && item.action?.sources) {
+      for (const source of item.action.sources) {
+        const url = typeof source === "string" ? source : source.url;
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        merged.push({ title: url, url });
+      }
     }
   }
 
-  return results;
+  if (merged.length === 0) return [];
+  return [{ tool_use_id: "openai-search", content: merged }];
 }
 
 /**

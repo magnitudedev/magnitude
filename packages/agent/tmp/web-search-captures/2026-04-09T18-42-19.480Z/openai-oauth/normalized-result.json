@@ -1,0 +1,36 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "openai-search",
+      "content": [
+        {
+          "title": "OpenAI pulls out of landmark £31bn UK investment | OpenAI | The Guardian",
+          "url": "https://www.theguardian.com/technology/2026/apr/09/openai-pulls-out-of-landmark-31bn-uk-investment?utm_source=openai"
+        },
+        {
+          "title": "OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek | TechCrunch",
+          "url": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"
+        },
+        {
+          "title": "Broadcom to supply Anthropic with 3.5 gigawatts of Google TPU capacity from 2027 - Claude pioneer says its annual revenue run rate has passed $30 billion",
+          "url": "https://www.tomshardware.com/tech-industry/broadcom-expands-anthropic-deal-to-3-5gw-of-google-tpu-capacity-from-2027?utm_source=openai"
+        },
+        {
+          "title": "Claude was having some problems, again - here's everything we know",
+          "url": "https://www.techradar.com/news/live/claude-anthropic-down-outage-april-6-2026?utm_source=openai"
+        },
+        {
+          "title": "Nvidia launches enterprise AI agent platform with Adobe, Salesforce, SAP among 17 adopters at GTC 2026 | VentureBeat",
+          "url": "https://venturebeat.com/technology/nvidia-launches-enterprise-ai-agent-platform-with-adobe-salesforce-sap-among?utm_source=openai"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Today is **Thursday, April 9, 2026** (US). Here are major **AI news headlines from the last ~24–72 hours**, with sources:\n\n1) **OpenAI pulls out of a landmark UK investment deal (reported as ~£31bn)**  \nSource: The Guardian (Apr 9, 2026). ([theguardian.com](https://www.theguardian.com/technology/2026/apr/09/openai-pulls-out-of-landmark-31bn-uk-investment?utm_source=openai))\n\n2) **OpenAI publishes a policy blueprint for the “AI economy” (e.g., wealth funds / robot taxes / four-day workweek ideas)**  \nSource: TechCrunch (Apr 6, 2026). ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))\n\n3) **Anthropic / Google / Broadcom expand TPU-compute arrangements (multi‑gigawatt capacity discussed)**  \nSources: Tom’s Hardware (Apr 7, 2026); IT Pro (Apr 7, 2026). ([tomshardware.com](https://www.tomshardware.com/tech-industry/broadcom-expands-anthropic-deal-to-3-5gw-of-google-tpu-capacity-from-2027?utm_source=openai))\n\n4) **Claude service disruptions: Anthropic confirms another outage / elevated errors**  \nSource: TechRadar live coverage (Apr 6–7, 2026 updates). ([techradar.com](https://www.techradar.com/news/live/claude-anthropic-down-outage-april-6-2026?utm_source=openai))\n\n5) **Nvidia announcements continue to drive “agentic AI” positioning in enterprise (GTC 2026 follow-ons/coverage)**  \nSource: VentureBeat (Apr 3, 2026). ([venturebeat.com](https://venturebeat.com/technology/nvidia-launches-enterprise-ai-agent-platform-with-adobe-salesforce-sap-among?utm_source=openai))\n\nIf you tell me your preferred angle—**business/markets**, **policy/regulation**, or **research/product launches**—I can filter this down to the top 5 in that category and add a 1–2 sentence “why it matters” for each.",
+  "usage": {
+    "input_tokens": 17672,
+    "output_tokens": 693,
+    "web_search_requests": 4
+  }
+}

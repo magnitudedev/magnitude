@@ -90,5 +90,6 @@ Run root:
 
 - Default mode runs through `webSearch()` routing with temporary one-provider `ProviderState`/`ProviderAuth` layers.
 - Vercel default capture uses a dedicated AI SDK path (`ai` + `@ai-sdk/openai`) against AI Gateway to avoid OpenAI SDK interception incompatibilities on this provider.
+- Vercel runs are flagged as `capture-error` (not green) when diagnostics show requested web-search tools were unsupported or dropped by downstream execution.
 - `--direct-adapter` bypasses router selection and calls each provider adapter directly for targeted debugging (including legacy Vercel adapter path).
 - Secrets are redacted in persisted artifacts (`Authorization`, API keys, OAuth tokens, ChatGPT account id).

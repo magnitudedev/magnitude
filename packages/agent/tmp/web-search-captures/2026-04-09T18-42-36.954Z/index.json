@@ -1,0 +1,13 @@
+{
+  "root": "2026-04-09T18-42-36.954Z",
+  "generatedAt": "2026-04-09T18:42:47.791Z",
+  "runs": [
+    {
+      "runId": "vercel",
+      "provider": "vercel",
+      "authMode": "api",
+      "status": "capture-error",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T18-42-36.954Z/vercel"
+    }
+  ]
+}

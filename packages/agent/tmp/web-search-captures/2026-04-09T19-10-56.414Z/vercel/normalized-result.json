@@ -1,0 +1,40 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "vercel-search",
+      "content": [
+        {
+          "title": "openai.com",
+          "url": "https://openai.com/index/accelerating-the-next-phase-ai/?utm_source=openai"
+        },
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"
+        },
+        {
+          "title": "blog.google",
+          "url": "https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/?utm_source=openai"
+        },
+        {
+          "title": "blog.google",
+          "url": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-updates-march-2026/?utm_source=openai"
+        },
+        {
+          "title": "anthropic.com",
+          "url": "https://www.anthropic.com/news/sydney-fourth-office-asia-pacific?utm_source=openai"
+        },
+        {
+          "title": "anthropic.com",
+          "url": "https://www.anthropic.com/responsible-scaling-policy/roadmap?utm_source=openai"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Here are some of the **top AI headlines today, Thursday, April 9, 2026**, based on recent reporting and official company announcements:\n\n1. **OpenAI closes a massive $122 billion funding round at an $852 billion valuation.** OpenAI said the new capital will fund compute, research, product expansion, and broader AI infrastructure, making this one of the biggest funding rounds in tech history. ([openai.com](https://openai.com/index/accelerating-the-next-phase-ai/?utm_source=openai))\n\n2. **OpenAI lays out a policy vision for the “AI economy,” including robot taxes, public wealth funds, and a four-day workweek.** A new report on OpenAI’s policy proposals highlights how the company says governments may need to rethink taxation, social safety nets, and infrastructure as AI reshapes labor markets. ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))\n\n3. **Google expands its AI push with new Gemini and Veo updates.** Google announced Veo 3.1 Lite, a lower-cost AI video model for developers, and separately recapped a broader March wave of Gemini updates across Search, Workspace, Maps, Chrome, and Pixel devices. ([blog.google](https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/?utm_source=openai))\n\n4. **Google makes Gemini more personalized and easier to switch to.** Google says U.S. users can now import chat history from other AI tools and use “Personal Intelligence” features that connect Gemini with Gmail, Photos, and YouTube for more tailored responses. ([blog.google](https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-updates-march-2026/?utm_source=openai))\n\n5. **Anthropic continues international expansion, opening in Sydney.** Anthropic announced Sydney will become its fourth Asia-Pacific office, reflecting continued enterprise demand and regional AI investment. ([anthropic.com](https://www.anthropic.com/news/sydney-fourth-office-asia-pacific?utm_source=openai))\n\n6. **AI safety and governance remain a major theme.** Anthropic updated its Frontier Safety Roadmap with security targets for 2026, while OpenAI’s recent public-policy and government-engagement moves show that regulation, national security, and deployment safeguards remain central industry storylines. ([anthropic.com](https://www.anthropic.com/responsible-scaling-policy/roadmap?utm_source=openai))\n\nIf you want, I can also turn this into:\n- a **5-bullet morning briefing**,\n- a **table with headline + why it matters + source**, or\n- a **“big tech vs startups vs policy” AI news roundup**.",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "web_search_requests": 3
+  }
+}
