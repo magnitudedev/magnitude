@@ -100,7 +100,6 @@ export function defineXmlBinding<
   config: TMapping,
 ): XmlBindingResult<TInput, TOutput, TMapping> {
   return {
-    _tool: undefined,
     tool: { name: tool.name, group: config.group ?? tool.group },
     config,
     toXmlTagBinding(): XmlTagBinding {

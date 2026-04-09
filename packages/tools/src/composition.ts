@@ -1,4 +1,5 @@
 import type { StateModel } from './state-model';
+import type { ToolBinding } from './tool-binding';
 
 export interface ToolChain<
   TInput,
@@ -10,9 +11,7 @@ export interface ToolChain<
     outputSchema?: unknown;
     emissionSchema?: unknown;
   };
-  readonly binding: {
-    _tool?: TInput;
-  };
+  readonly binding: ToolBinding<TInput>;
 }
 
 export function attachModel<
