@@ -11,6 +11,7 @@ import { ProviderAuth, ProviderState, makeProviderRuntimeLive } from '@magnitude
 import { createStorageClient } from '@magnitudedev/storage'
 import { initLogger } from '@magnitudedev/logger'
 import { JsonChatPersistence } from './persistence'
+import { CLI_VERSION } from './version'
 import ansis from 'ansis'
 
 // =============================================================================
@@ -71,7 +72,7 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
   line(`${dim('provider')} ${providerId}  ${dim('model')} ${modelId}`)
   line('')
 
-  const storage = await createStorageClient({ cwd: process.cwd() })
+  const storage = await createStorageClient({ cwd: process.cwd(), currentVersion: CLI_VERSION })
   const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>()
 
   await Effect.runPromise(

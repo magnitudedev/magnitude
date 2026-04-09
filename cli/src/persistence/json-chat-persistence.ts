@@ -1,21 +1,10 @@
 import { Effect } from 'effect'
 import * as path from 'path'
-import type { StorageClient } from '@magnitudedev/storage'
+import type { StorageClient, StoredSessionMeta } from '@magnitudedev/storage'
 import type { AppEvent, SessionMetadata, ChatPersistenceService } from '@magnitudedev/agent'
 import { DEFAULT_CHAT_NAME, PersistenceError } from '@magnitudedev/agent'
 import { textOf } from '@magnitudedev/agent'
-
-interface MetadataFile {
-  sessionId: string
-  created: string
-  updated: string
-  chatName: string
-  workingDirectory: string
-  gitBranch: string | null
-  firstUserMessage: string | null
-  lastMessage: string | null
-  messageCount: number
-}
+import { CLI_VERSION } from '../version'
 
 export class JsonChatPersistence implements ChatPersistenceService {
   private sessionId: string
@@ -33,8 +22,8 @@ export class JsonChatPersistence implements ChatPersistenceService {
     this.sessionId = options.sessionId ?? options.storage.sessions.createId()
   }
 
-  private async readMetadata(): Promise<MetadataFile | null> {
-    return await this.storage.sessions.readMeta(this.sessionId) as MetadataFile | null
+  private async readMetadata(): Promise<StoredSessionMeta | null> {
+    return await this.storage.sessions.readMeta(this.sessionId)
   }
 
   /**
@@ -67,25 +56,19 @@ export class JsonChatPersistence implements ChatPersistenceService {
           if (metadata) {
             await this.storage.sessions.appendEvents(this.sessionId, events)
             await this.storage.sessions.updateMeta(this.sessionId, (current) => {
-              const next = { ...(current as MetadataFile) }
-              this.updateSummaryFromEvents(next, events)
-              next.updated = new Date().toISOString()
-              return next
+              const next = this.updateSummaryFromEvents(
+                current ?? this.buildMetadata(new Date().toISOString()),
+                events
+              )
+              return {
+                ...next,
+                updated: new Date().toISOString(),
+                lastActiveVersion: CLI_VERSION,
+              }
             })
           } else {
             const now = new Date().toISOString()
-            const newMetadata: MetadataFile = {
-              sessionId: this.sessionId,
-              created: now,
-              updated: now,
-              chatName: DEFAULT_CHAT_NAME,
-              workingDirectory: this.workingDirectory,
-              gitBranch: null,
-              firstUserMessage: null,
-              lastMessage: null,
-              messageCount: 0
-            }
-            this.updateSummaryFromEvents(newMetadata, events)
+            const newMetadata = this.updateSummaryFromEvents(this.buildMetadata(now), events)
             await this.storage.sessions.writeMeta(this.sessionId, newMetadata)
             await this.storage.sessions.appendEvents(this.sessionId, events)
           }
@@ -97,7 +80,7 @@ export class JsonChatPersistence implements ChatPersistenceService {
   readonly getSessionMetadata = (): Effect.Effect<SessionMetadata, PersistenceError> =>
     Effect.tryPromise({
       try: async () => {
-        const metadata = await this.storage.sessions.readMeta(this.sessionId) as MetadataFile | null
+        const metadata = await this.storage.sessions.readMeta(this.sessionId)
 
         if (!metadata) {
           const now = new Date().toISOString()
@@ -107,7 +90,9 @@ export class JsonChatPersistence implements ChatPersistenceService {
             workingDirectory: this.workingDirectory,
             gitBranch: null,
             created: now,
-            updated: now
+            updated: now,
+            initialVersion: CLI_VERSION,
+            lastActiveVersion: CLI_VERSION,
           }
         }
 
@@ -117,22 +102,25 @@ export class JsonChatPersistence implements ChatPersistenceService {
           workingDirectory: metadata.workingDirectory,
           gitBranch: metadata.gitBranch,
           created: metadata.created,
-          updated: metadata.updated
+          updated: metadata.updated,
+          initialVersion: metadata.initialVersion,
+          lastActiveVersion: metadata.lastActiveVersion,
         }
       },
       catch: (error) => new PersistenceError({ reason: 'LoadFailed', message: error instanceof Error ? error.message : String(error) })
     })
 
   readonly saveSessionMetadata = (
-    update: Partial<Omit<SessionMetadata, 'sessionId' | 'created'>>
+    update: Partial<Omit<SessionMetadata, 'sessionId' | 'created' | 'initialVersion' | 'lastActiveVersion'>>
   ): Effect.Effect<void, PersistenceError> =>
     Effect.tryPromise({
       try: async () => {
         await this.queueWrite(async () => {
           await this.storage.sessions.updateMeta(this.sessionId, (metadata) => ({
-            ...(metadata as MetadataFile),
+            ...(metadata ?? this.buildMetadata(new Date().toISOString())),
             ...update,
             updated: new Date().toISOString(),
+            lastActiveVersion: CLI_VERSION,
           }))
         })
       },
@@ -142,22 +130,50 @@ export class JsonChatPersistence implements ChatPersistenceService {
   /**
    * Update summary fields on metadata from new events
    */
-  private updateSummaryFromEvents(metadata: MetadataFile, events: AppEvent[]): void {
+  private buildMetadata(now: string): StoredSessionMeta {
+    return {
+      sessionId: this.sessionId,
+      created: now,
+      updated: now,
+      chatName: DEFAULT_CHAT_NAME,
+      workingDirectory: this.workingDirectory,
+      initialVersion: CLI_VERSION,
+      lastActiveVersion: CLI_VERSION,
+      gitBranch: null,
+      firstUserMessage: null,
+      lastMessage: null,
+      messageCount: 0,
+    }
+  }
+
+  private updateSummaryFromEvents(metadata: StoredSessionMeta, events: AppEvent[]): StoredSessionMeta {
+    let next = metadata
+
     for (const event of events) {
       const e = event as any
       if (e.type === 'user_message') {
         const text = textOf(e.content).trim()
         if (!text) continue
-        metadata.messageCount += 1
-        if (!metadata.firstUserMessage) metadata.firstUserMessage = text
-        metadata.lastMessage = text
+        next = {
+          ...next,
+          messageCount: next.messageCount + 1,
+          firstUserMessage: next.firstUserMessage ?? text,
+          lastMessage: text,
+        }
         continue
       }
       if (e.type === 'text_chunk' && typeof e.text === 'string') {
         const text = e.text.trim()
-        if (text) metadata.lastMessage = text
+        if (text) {
+          next = {
+            ...next,
+            lastMessage: text,
+          }
+        }
       }
     }
+
+    return next
   }
 
   getSessionId(): string {

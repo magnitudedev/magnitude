@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { listAllSessions, loadSessionSummary } from './session-utils'
 
 describe('session-utils', () => {
@@ -12,6 +12,8 @@ describe('session-utils', () => {
           updated: id === 'a' ? '2026-01-02T00:00:00.000Z' : '2026-01-03T00:00:00.000Z',
           chatName: id === 'a' ? 'Alpha' : 'Beta',
           workingDirectory: '/tmp',
+          initialVersion: '0.0.1',
+          lastActiveVersion: '0.0.1',
           gitBranch: null,
           firstUserMessage: null,
           lastMessage: 'hello',
@@ -37,6 +39,8 @@ describe('session-utils', () => {
           updated: '2026-01-02T00:00:00.000Z',
           chatName: 'Stored Title',
           workingDirectory: '/tmp',
+          initialVersion: '0.0.1',
+          lastActiveVersion: '0.0.1',
           gitBranch: null,
           firstUserMessage: null,
           lastMessage: null,

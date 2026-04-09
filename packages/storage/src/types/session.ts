@@ -1,21 +1,52 @@
-import { Schema } from 'effect'
+import { Effect, Schema } from 'effect'
 
-export const StoredSessionMetaSchema = Schema.Struct({
+import { Version } from '../services/version'
+
+const RawStoredSessionMetaSchema = Schema.Struct({
   sessionId: Schema.String,
   created: Schema.String,
   updated: Schema.String,
   chatName: Schema.String,
   workingDirectory: Schema.String,
+  initialVersion: Schema.optional(Schema.String),
+  lastActiveVersion: Schema.optional(Schema.String),
   gitBranch: Schema.optionalWith(Schema.NullishOr(Schema.String), { default: () => null }),
   firstUserMessage: Schema.optionalWith(Schema.NullishOr(Schema.String), { default: () => null }),
   lastMessage: Schema.optionalWith(Schema.NullishOr(Schema.String), { default: () => null }),
   messageCount: Schema.Number,
 })
-export interface StoredSessionMeta extends Omit<Schema.Schema.Type<typeof StoredSessionMetaSchema>, 'gitBranch' | 'firstUserMessage' | 'lastMessage'> {
-  gitBranch: string | null
-  firstUserMessage: string | null
-  lastMessage: string | null
-}
+
+const DecodedStoredSessionMetaSchema = Schema.Struct({
+  sessionId: Schema.String,
+  created: Schema.String,
+  updated: Schema.String,
+  chatName: Schema.String,
+  workingDirectory: Schema.String,
+  initialVersion: Schema.String,
+  lastActiveVersion: Schema.String,
+  gitBranch: Schema.NullOr(Schema.String),
+  firstUserMessage: Schema.NullOr(Schema.String),
+  lastMessage: Schema.NullOr(Schema.String),
+  messageCount: Schema.Number,
+})
+
+export const StoredSessionMetaSchema = Schema.transformOrFail(
+  RawStoredSessionMetaSchema,
+  DecodedStoredSessionMetaSchema,
+  {
+    decode: (raw) =>
+      Effect.map(Version, (version) => ({
+        ...raw,
+        initialVersion: raw.initialVersion ?? version.getVersion(),
+        lastActiveVersion: raw.lastActiveVersion ?? version.getVersion(),
+        gitBranch: raw.gitBranch ?? null,
+        firstUserMessage: raw.firstUserMessage ?? null,
+        lastMessage: raw.lastMessage ?? null,
+      })),
+    encode: (meta) => Effect.succeed({ ...meta }),
+  }
+)
+export type StoredSessionMeta = Schema.Schema.Type<typeof StoredSessionMetaSchema>
 
 export const MemoryExtractionJobRecordSchema = Schema.Struct({
   jobId: Schema.String,

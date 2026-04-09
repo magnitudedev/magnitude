@@ -18,6 +18,7 @@ import { MemoryStorage, MemoryStorageLive } from './memory'
 import {
   ProjectStorageLiveFromCwd,
   GlobalStorageLive,
+  VersionLive,
 } from './services'
 import { makeProjectStoragePaths } from './paths'
 import { SessionStorage, SessionStorageLive } from './sessions'
@@ -102,8 +103,8 @@ export interface StorageClient<TSlot extends string = string> {
     writeMeta(sessionId: string, meta: StoredSessionMeta): Promise<void>
     updateMeta(
       sessionId: string,
-      updater: (m: StoredSessionMeta) => StoredSessionMeta
-    ): Promise<void>
+      updater: (m: StoredSessionMeta | null) => StoredSessionMeta
+    ): Promise<StoredSessionMeta>
     readEvents<T>(sessionId: string): Promise<T[]>
     appendEvents<T>(sessionId: string, events: T[]): Promise<void>
     getEventsPath(sessionId: string): string
@@ -162,18 +163,22 @@ export interface StorageClient<TSlot extends string = string> {
 
 export async function createStorageClient<TSlot extends string = string>(options?: {
   cwd?: string
+  currentVersion?: string
 }): Promise<StorageClient<TSlot>> {
   const cwd = options?.cwd ?? process.cwd()
+  const currentVersion = options?.currentVersion ?? 'unknown'
   const projectPaths = makeProjectStoragePaths(cwd)
 
   const globalLayer = Layer.mergeAll(
     ConfigStorageLive,
     AuthStorageLive,
     CatalogCacheLive,
-    SessionStorageLive,
+    SessionStorageLive(),
     LogStorageLive,
     TraceStorageLive
-  ).pipe(Layer.provide(GlobalStorageLive))
+  ).pipe(
+    Layer.provide(Layer.mergeAll(GlobalStorageLive, VersionLive(currentVersion)))
+  )
 
   const projectLayer = Layer.mergeAll(
     MemoryStorageLive,
@@ -302,13 +307,12 @@ export async function createStorageClient<TSlot extends string = string>(options
         run(Effect.flatMap(SessionStorage, (s) => s.readMeta(sessionId))),
       writeMeta: (sessionId, meta) =>
         run(Effect.flatMap(SessionStorage, (s) => s.writeMeta(sessionId, meta))),
-      updateMeta: async (sessionId, updater) => {
-        await run(
+      updateMeta: (sessionId, updater) =>
+        run(
           Effect.flatMap(SessionStorage, (s) =>
-            s.updateMeta(sessionId, (current) => updater(current as StoredSessionMeta))
+            s.updateMeta(sessionId, (current) => updater(current))
           )
-        )
-      },
+        ),
       readEvents: <T>(sessionId: string) =>
         run(Effect.flatMap(SessionStorage, (s) => s.readEvents<T>(sessionId))),
       appendEvents: <T>(sessionId: string, events: T[]) =>

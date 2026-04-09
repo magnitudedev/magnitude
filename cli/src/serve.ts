@@ -7,6 +7,7 @@ import { handleSessionsRoute } from './serve/routes/sessions'
 import { handleEventsRoute } from './serve/routes/events'
 import { handleHealthRoute } from './serve/routes/health'
 import { authenticateRequest } from './serve/middleware/auth'
+import { CLI_VERSION } from './version'
 
 export interface ServeOptions {
   port: number
@@ -48,7 +49,7 @@ export async function startServer(options: ServeOptions): Promise<void> {
     throw new Error('Invalid host')
   }
 
-  const storage = await createStorageClient({ cwd: process.cwd() })
+  const storage = await createStorageClient({ cwd: process.cwd(), currentVersion: CLI_VERSION })
   const providerRuntime = makeProviderRuntimeLive<MagnitudeSlot>()
   await Effect.runPromise(
     bootstrapProviderRuntime<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS }).pipe(

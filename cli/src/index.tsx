@@ -81,7 +81,7 @@ async function main() {
         }
       )
 
-      const storage = await createStorageClient({ cwd: process.cwd() })
+      const storage = await createStorageClient({ cwd: process.cwd(), currentVersion: CLI_VERSION })
       const providerRuntime = await createProviderClient<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS })
       const sessionStart: SessionStart = opts.resume === undefined
         ? { _tag: 'new' }
