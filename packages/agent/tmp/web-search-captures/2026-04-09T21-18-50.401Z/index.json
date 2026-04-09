@@ -1,0 +1,13 @@
+{
+  "root": "2026-04-09T21-18-50.401Z",
+  "generatedAt": "2026-04-09T21:18:57.974Z",
+  "runs": [
+    {
+      "runId": "gemini",
+      "provider": "gemini",
+      "authMode": "api",
+      "status": "success",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T21-18-50.401Z/gemini"
+    }
+  ]
+}

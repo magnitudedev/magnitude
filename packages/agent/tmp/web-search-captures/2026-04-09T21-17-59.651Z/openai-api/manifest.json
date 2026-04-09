@@ -1,0 +1,15 @@
+{
+  "runId": "openai-api",
+  "provider": "openai",
+  "authMode": "api",
+  "query": "What are the top AI news headlines today? Include sources.",
+  "timestamp": "2026-04-09T21:17:59.652Z",
+  "notes": [
+    "mode:router",
+    "Missing OpenAI API auth (OPENAI_API_KEY or ~/.magnitude/auth.json:openai)"
+  ],
+  "prerequisites": {
+    "authPresent": false
+  },
+  "status": "auth-missing"
+}

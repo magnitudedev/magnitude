@@ -231,35 +231,7 @@ export function webSearch(
       }
       case "github-copilot": {
         const { copilotWebSearch } = yield* Effect.promise(() => import("./web-search-copilot"));
-
-        const resolveRefreshedAuth = async (): Promise<SearchAuth> => {
-          const current = await Effect.runPromise(authService.getAuth("github-copilot"));
-          if (current?.type !== "oauth" || !current.refreshToken) {
-            return resolveCopilotAuth(current);
-          }
-
-          const refreshed = await Effect.runPromise(authService.refresh("github-copilot", current.refreshToken));
-          if (refreshed) {
-            await Effect.runPromise(authService.setAuth("github-copilot", refreshed));
-            return resolveCopilotAuth(refreshed);
-          }
-
-          return resolveCopilotAuth(current);
-        };
-
-        let initialAuth = auth;
-        try {
-          const current = yield* authService.getAuth("github-copilot");
-          if (current?.type === "oauth" && current.refreshToken) {
-            initialAuth = yield* Effect.promise(() => resolveRefreshedAuth());
-          }
-        } catch {
-          initialAuth = auth;
-        }
-
-        return yield* Effect.promise(() =>
-          copilotWebSearch(query, initialAuth, options, resolveRefreshedAuth),
-        );
+        return yield* Effect.promise(() => copilotWebSearch(query, auth, options));
       }
     }
   });

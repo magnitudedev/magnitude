@@ -5,13 +5,7 @@ import { Effect, Layer } from "effect";
 import { ProviderAuth, ProviderState, type AuthInfo } from "@magnitudedev/providers";
 import { exchangeCopilotToken } from "../../providers/src/auth/copilot-oauth";
 import { webSearch, webSearchStream, type SearchAuth, type SearchOptions } from "../src/tools/web-search";
-import { openaiWebSearch } from "../src/tools/web-search-openai";
-import { openrouterWebSearch } from "../src/tools/web-search-openrouter";
-import { vercelWebSearch } from "../src/tools/web-search-vercel";
-import { copilotWebSearch } from "../src/tools/web-search-copilot";
-
-import { geminiWebSearch } from "../src/tools/web-search-gemini";
-import { anthropicWebSearch } from "../src/tools/web-search-anthropic";
+import { runDirectAdapter } from "./web-search-capture/runners";
 import {
   sentinel,
   timestampedCaptureRoot,
@@ -49,6 +43,7 @@ interface RunSpec {
   authMode: "api" | "oauth";
   authInfo?: AuthInfo;
   authError?: string;
+  authSource?: "env" | "stored";
 }
 
 function parseArgs(argv: string[]): CliConfig {
@@ -260,7 +255,9 @@ function buildRunSpecs(config: CliConfig): RunSpec[] {
 
   if (include("github-copilot")) {
     const copilotAuthInfo = globalAuth["github-copilot"];
-    const token = process.env.GITHUB_COPILOT_TOKEN ?? process.env.COPILOT_OAUTH_TOKEN ?? oauthTokenFromAuthInfo(copilotAuthInfo);
+    const envToken = process.env.GITHUB_COPILOT_TOKEN ?? process.env.COPILOT_OAUTH_TOKEN;
+    const storedToken = oauthTokenFromAuthInfo(copilotAuthInfo);
+    const token = envToken ?? storedToken;
     const refreshToken = copilotAuthInfo?.type === "oauth" ? copilotAuthInfo.refreshToken : "capture-script";
     const expiresAt = copilotAuthInfo?.type === "oauth" ? copilotAuthInfo.expiresAt : Date.now() + 60 * 60 * 1000;
     specs.push(token
@@ -270,6 +267,7 @@ function buildRunSpecs(config: CliConfig): RunSpec[] {
           providerLabel: "github-copilot",
           authMode: "oauth",
           authInfo: oauthAuth(token, undefined, refreshToken, expiresAt),
+          authSource: envToken ? "env" : "stored",
         }
       : { runId: "github-copilot", providerSlot: "github-copilot", providerLabel: "github-copilot", authMode: "oauth", authError: "Missing Copilot auth (GITHUB_COPILOT_TOKEN/COPILOT_OAUTH_TOKEN or ~/.magnitude/auth.json:github-copilot)" });
   }
@@ -348,21 +346,7 @@ async function executeViaRouter(spec: RunSpec, query: string, options?: SearchOp
 }
 
 async function executeViaDirectAdapter(spec: RunSpec, query: string, options?: SearchOptions) {
-  const auth = toSearchAuth(spec);
-  switch (spec.providerSlot) {
-    case "openai":
-      return openaiWebSearch(query, auth, options);
-    case "openrouter":
-      return openrouterWebSearch(query, auth, options);
-    case "vercel":
-      return vercelWebSearch(query, auth, options);
-    case "github-copilot":
-      return copilotWebSearch(query, auth, options);
-    case "google":
-      return geminiWebSearch(query, auth, options);
-    case "anthropic":
-      return anthropicWebSearch(query, auth, options);
-  }
+  return runDirectAdapter(spec.providerSlot, query, toSearchAuth(spec), options);
 }
 
 async function executeAnthropicStream(spec: RunSpec, query: string, options?: SearchOptions) {
@@ -377,6 +361,17 @@ async function executeAnthropicStream(spec: RunSpec, query: string, options?: Se
   }
   return { streamEvents, normalizedResult: doneResponse };
 }
+
+type InterceptorCapture = {
+  request: unknown;
+  response: unknown;
+  responseRawText: string | null;
+  streamEvents: unknown[];
+};
+
+type CaptureWrappedError = Error & {
+  capture?: InterceptorCapture;
+};
 
 async function withInterceptorsForSpec<T>(spec: RunSpec, run: () => Promise<T>): Promise<{
   value: T;
@@ -395,7 +390,8 @@ async function withInterceptorsForSpec<T>(spec: RunSpec, run: () => Promise<T>):
   const fetchWrapped =
     spec.providerSlot === "openai" && spec.authMode === "oauth" ||
     spec.providerSlot === "openrouter" ||
-    spec.providerSlot === "vercel"
+    spec.providerSlot === "vercel" ||
+    spec.providerSlot === "github-copilot"
       ? () => withFetchInterceptor(fetchState, base)
       : base;
 
@@ -414,36 +410,54 @@ async function withInterceptorsForSpec<T>(spec: RunSpec, run: () => Promise<T>):
       ? () => withAnthropicSdkInterceptor(anthropicState, googleWrapped)
       : googleWrapped;
 
-  const value = await anthropicWrapped();
+  const buildCapture = (): InterceptorCapture => {
+    const mergedStream = [
+      ...fetchState.streamEvents,
+      ...anthropicState.streamEvents,
+    ];
 
-  const mergedStream = [
-    ...fetchState.streamEvents,
-    ...anthropicState.streamEvents,
-  ];
+    const request =
+      fetchState.request ??
+      openaiState.request ??
+      googleState.request ??
+      anthropicState.request ??
+      sentinel("no-captured-request");
 
-  const request =
-    fetchState.request ??
-    openaiState.request ??
-    googleState.request ??
-    anthropicState.request ??
-    sentinel("no-captured-request");
+    const response =
+      fetchState.response ??
+      openaiState.response ??
+      googleState.response ??
+      anthropicState.response ??
+      sentinel("no-captured-response");
 
-  const response =
-    fetchState.response ??
-    openaiState.response ??
-    googleState.response ??
-    anthropicState.response ??
-    sentinel("no-captured-response");
+    const responseRawText = fetchState.responseRawText ?? null;
 
-  const responseRawText = fetchState.responseRawText ?? null;
+    return { request, response, responseRawText, streamEvents: mergedStream };
+  };
 
-  return { value, request, response, responseRawText, streamEvents: mergedStream };
+  try {
+    const value = await anthropicWrapped();
+    const capture = buildCapture();
+    return { value, ...capture };
+  } catch (error) {
+    const wrapped = (error instanceof Error ? error : new Error(String(error))) as CaptureWrappedError;
+    wrapped.capture = buildCapture();
+    throw wrapped;
+  }
 }
 
 function getStatusFromError(error: unknown): CaptureStatus {
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes("No ") && message.toLowerCase().includes("auth")) return "auth-missing";
   return "provider-error";
+}
+
+function isCopilotTokenExpiredError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("GitHub Copilot web search error 401") &&
+    message.toLowerCase().includes("token expired")
+  );
 }
 
 function hasNonEmptyToolsPayload(request: unknown): boolean {
@@ -548,6 +562,78 @@ function getVercelSpecialCaseStatusAndNotes(value: unknown): { status: CaptureSt
   };
 }
 
+function hasCopilotWebSearchTool(request: unknown): boolean {
+  const tools = (request as any)?.bodyJson?.tools;
+  if (!Array.isArray(tools)) return false;
+  return tools.some((tool) => tool && typeof tool === "object" && (tool as any).type === "web_search");
+}
+
+function hasCopilotSourcesInclude(request: unknown): boolean {
+  const include = (request as any)?.bodyJson?.include;
+  return Array.isArray(include) && include.includes("web_search_call.action.sources");
+}
+
+function getCopilotSignals(response: unknown) {
+  const output = Array.isArray((response as any)?.bodyJson?.output) ? (response as any).bodyJson.output : [];
+  let hasWebSearchCallSources = false;
+  let hasUrlCitation = false;
+
+  for (const item of output) {
+    if (item?.type === "web_search_call") {
+      const sources = item?.action?.sources;
+      if (Array.isArray(sources) && sources.length > 0) {
+        hasWebSearchCallSources = true;
+      }
+    }
+    if (item?.type === "message") {
+      const content = Array.isArray(item?.content) ? item.content : [];
+      for (const entry of content) {
+        const annotations = Array.isArray(entry?.annotations) ? entry.annotations : [];
+        if (annotations.some((annotation) => annotation?.type === "url_citation")) {
+          hasUrlCitation = true;
+        }
+      }
+    }
+  }
+
+  return { hasWebSearchCallSources, hasUrlCitation };
+}
+
+function getCopilotStatusAndNotes(value: {
+  request: unknown;
+  response: unknown;
+  normalizedResult: unknown;
+  authSource?: "env" | "stored";
+}): { status: CaptureStatus; notes: string[] } {
+  const notes: string[] = [
+    `copilot:auth-source=${value.authSource ?? "unknown"}`,
+  ];
+
+  const hasTool = hasCopilotWebSearchTool(value.request);
+  const hasInclude = hasCopilotSourcesInclude(value.request);
+  const webSearchRequests = getWebSearchRequests(value.normalizedResult);
+  const signals = getCopilotSignals(value.response);
+
+  notes.push(`copilot:returned-web-search-sources=${String(signals.hasWebSearchCallSources)}`);
+  notes.push(`copilot:returned-url-citation=${String(signals.hasUrlCitation)}`);
+
+  if (!hasTool) notes.push("copilot:missing-web-search-tool");
+  if (!hasInclude) notes.push("copilot:missing-include-sources");
+  if (!signals.hasWebSearchCallSources && !signals.hasUrlCitation) notes.push("copilot:missing-response-sources");
+  if (webSearchRequests < 1) notes.push("copilot:web-search-requests-lt-1");
+
+  const hasFailure =
+    !hasTool ||
+    !hasInclude ||
+    (!signals.hasWebSearchCallSources && !signals.hasUrlCitation) ||
+    webSearchRequests < 1;
+
+  return {
+    status: hasFailure ? "capture-error" : "success",
+    notes,
+  };
+}
+
 async function runOne(
   rootDir: string,
   spec: RunSpec,
@@ -589,8 +675,9 @@ async function runOne(
 
   try {
     const vercelSpecialCase = spec.providerSlot === "vercel";
+    const copilotSpecialCase = spec.providerSlot === "github-copilot";
 
-    const { value, request, response, responseRawText, streamEvents } = await withInterceptorsForSpec(spec, async () => {
+    const executeWithMode = async () => {
       if (spec.providerSlot === "anthropic" && config.streamAnthropic) {
         return executeAnthropicStream(spec, config.query, options);
       }
@@ -598,7 +685,30 @@ async function runOne(
         return executeViaDirectAdapter(spec, config.query, options);
       }
       return executeViaRouter(spec, config.query, options);
-    });
+    };
+
+    let captured: Awaited<ReturnType<typeof withInterceptorsForSpec<unknown>>>;
+    try {
+      captured = await withInterceptorsForSpec(spec, executeWithMode);
+    } catch (error) {
+      const shouldRefreshCopilotToken =
+        spec.providerSlot === "github-copilot" &&
+        spec.authInfo?.type === "oauth" &&
+        spec.authSource !== "env" &&
+        typeof spec.authInfo.refreshToken === "string" &&
+        spec.authInfo.refreshToken.length > 0 &&
+        isCopilotTokenExpiredError(error);
+
+      if (!shouldRefreshCopilotToken) {
+        throw error;
+      }
+
+      const refreshedAuth = await exchangeCopilotToken(spec.authInfo.refreshToken);
+      spec.authInfo = refreshedAuth;
+      captured = await withInterceptorsForSpec(spec, executeWithMode);
+    }
+
+    const { value, request, response, responseRawText, streamEvents } = captured;
 
     const normalizedResult =
       spec.providerSlot === "anthropic" && config.streamAnthropic
@@ -612,20 +722,27 @@ async function runOne(
           response,
           normalizedResult,
         })
-      : { status: "success" as const, notes: [] };
+      : null;
+
+    const copilotAssessment = copilotSpecialCase
+      ? getCopilotStatusAndNotes({
+          request,
+          response,
+          normalizedResult,
+          authSource: spec.authSource,
+        })
+      : null;
+
+    const assessment = vercelAssessment ?? copilotAssessment ?? { status: "success" as const, notes: [] };
 
     const artifacts: ProviderRunArtifacts = {
       manifest: {
         ...manifestBase,
-        status: vercelAssessment.status,
-        ...(vercelSpecialCase
-          ? {
-              notes: [
-                ...(manifestBase.notes ?? []),
-                ...vercelAssessment.notes,
-              ],
-            }
-          : {}),
+        status: assessment.status,
+        notes: [
+          ...(manifestBase.notes ?? []),
+          ...assessment.notes,
+        ],
       },
       request: (request as any)?.present === false
         ? request as any
@@ -646,17 +763,18 @@ async function runOne(
       runId: spec.runId,
       provider: spec.providerLabel,
       authMode: spec.authMode,
-      status: vercelAssessment.status,
+      status: assessment.status,
       artifactDir,
     };
   } catch (error) {
     const status = getStatusFromError(error);
+    const wrapped = error as CaptureWrappedError;
     const artifacts: ProviderRunArtifacts = {
       manifest: { ...manifestBase, status },
-      request: sentinel("capture-request-unavailable-due-to-error"),
-      response: sentinel("capture-response-unavailable-due-to-error"),
-      responseRawText: sentinel("capture-response-unavailable-due-to-error"),
-      streamEvents: sentinel("capture-stream-unavailable-due-to-error"),
+      request: wrapped.capture?.request ?? sentinel("capture-request-unavailable-due-to-error"),
+      response: wrapped.capture?.response ?? sentinel("capture-response-unavailable-due-to-error"),
+      responseRawText: wrapped.capture?.responseRawText ?? sentinel("capture-response-unavailable-due-to-error"),
+      streamEvents: wrapped.capture?.streamEvents ?? sentinel("capture-stream-unavailable-due-to-error"),
       normalizedResult: sentinel("no-normalized-result"),
       error: {
         name: error instanceof Error ? error.name : "Error",
@@ -705,4 +823,8 @@ if (import.meta.main) {
 
 export const __testOnly = {
   getVercelSpecialCaseStatusAndNotes,
+  getCopilotStatusAndNotes,
+  hasCopilotWebSearchTool,
+  hasCopilotSourcesInclude,
+  getCopilotSignals,
 };

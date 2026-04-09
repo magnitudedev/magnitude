@@ -69,7 +69,7 @@ async function withEnv<T>(patch: Record<string, string | undefined>, run: () => 
   }
 }
 
-describe('web search OpenRouter integration', () => {
+describe('web search integration', () => {
   test('lead=openrouter uses the OpenRouter adapter', async () => {
     let captured: { url?: string; init?: RequestInit } = {}
 
@@ -323,11 +323,14 @@ describe('web search OpenRouter integration', () => {
     })
   })
 
-  test('invalid override value lists openrouter', async () => {
+  test('invalid override value lists openrouter and github-copilot', async () => {
     await withEnv({ MAGNITUDE_SEARCH_PROVIDER: 'bad-provider' }, async () => {
       await expect(runWebSearch('latest news', 'openrouter', {
         openrouter: { type: 'api', key: 'stored-openrouter-key' },
       })).rejects.toThrow('openrouter')
+      await expect(runWebSearch('latest news', 'openrouter', {
+        openrouter: { type: 'api', key: 'stored-openrouter-key' },
+      })).rejects.toThrow('github-copilot')
     })
   })
 

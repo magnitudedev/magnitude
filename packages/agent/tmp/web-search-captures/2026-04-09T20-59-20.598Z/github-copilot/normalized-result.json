@@ -1,0 +1,1044 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "copilot-search",
+      "content": [
+        {
+          "title": "Appeals court rebuffs Anthropic in latest round of its AI battle with the Trump administration | AP News",
+          "url": "https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3"
+        },
+        {
+          "title": "Scoop: OpenAI plans new product for cybersecurity use",
+          "url": "https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic"
+        },
+        {
+          "title": "Project Glasswing \\ Anthropic",
+          "url": "https://www.anthropic.com/project/glasswing"
+        },
+        {
+          "title": "Industrial policy for the Intelligence Age | OpenAI",
+          "url": "https://openai.com/index/industrial-policy-for-the-intelligence-age"
+        },
+        {
+          "title": "Google’s mental health work and support for organizations",
+          "url": "https://blog.google/innovation-and-ai/technology/health/mental-health-updates/"
+        },
+        {
+          "title": "Gemma 4: Our most capable open models to date",
+          "url": "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/"
+        },
+        {
+          "title": "https://apnews.com/article/a3e4d6ba75f475eb130d91c81e522f93",
+          "url": "https://apnews.com/article/a3e4d6ba75f475eb130d91c81e522f93"
+        },
+        {
+          "title": "https://arstechnica.com/ai/2025/09/report-microsoft-taps-rival-anthropics-ai-for-office-after-it-beats-openai-at-some-tasks/",
+          "url": "https://arstechnica.com/ai/2025/09/report-microsoft-taps-rival-anthropics-ai-for-office-after-it-beats-openai-at-some-tasks/"
+        },
+        {
+          "title": "https://www.axios.com/2026/02/27/google-openai-workers-push-for-military-ai-limits",
+          "url": "https://www.axios.com/2026/02/27/google-openai-workers-push-for-military-ai-limits"
+        },
+        {
+          "title": "https://apnews.com/article/b5e99d485d08ed1ced68a701723c3843",
+          "url": "https://apnews.com/article/b5e99d485d08ed1ced68a701723c3843"
+        },
+        {
+          "title": "https://fortune.com/2026/03/31/microsoft-revamps-copilot-with-anthropic//",
+          "url": "https://fortune.com/2026/03/31/microsoft-revamps-copilot-with-anthropic//"
+        },
+        {
+          "title": "https://m.investing.com/news/stock-market-news/microsoft-brings-anthropic-ai-models-to-365-copilot-diversifies-beyond-openai-4253806?ampMode=1",
+          "url": "https://m.investing.com/news/stock-market-news/microsoft-brings-anthropic-ai-models-to-365-copilot-diversifies-beyond-openai-4253806?ampMode=1"
+        },
+        {
+          "title": "https://www.pcgamer.com/software/ai/microsoft-shows-support-for-anthropics-legal-case-against-the-us-department-of-defense/",
+          "url": "https://www.pcgamer.com/software/ai/microsoft-shows-support-for-anthropics-legal-case-against-the-us-department-of-defense/"
+        },
+        {
+          "title": "https://www.yahoo.com/news/articles/anthropic-open-india-office-2026-011406670.html",
+          "url": "https://www.yahoo.com/news/articles/anthropic-open-india-office-2026-011406670.html"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026",
+          "url": "https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026"
+        },
+        {
+          "title": "https://www.windowscentral.com/artificial-intelligence/microsoft-copilot/ai-chief-warns-frontier-ai-could-demand-hundreds-of-billions",
+          "url": "https://www.windowscentral.com/artificial-intelligence/microsoft-copilot/ai-chief-warns-frontier-ai-could-demand-hundreds-of-billions"
+        },
+        {
+          "title": "https://popularaitools.ai/ai-news-this-week-march-2026/",
+          "url": "https://popularaitools.ai/ai-news-this-week-march-2026/"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute",
+          "url": "https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute"
+        },
+        {
+          "title": "https://time.com/7339685/person-of-the-year-2025-ai-architects/",
+          "url": "https://time.com/7339685/person-of-the-year-2025-ai-architects/"
+        },
+        {
+          "title": "https://arxiv.org/abs/2603.08993",
+          "url": "https://arxiv.org/abs/2603.08993"
+        },
+        {
+          "title": "https://mml-studio.com/blog/ai-weekly-march-23-29-2026/",
+          "url": "https://mml-studio.com/blog/ai-weekly-march-23-29-2026/"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/AI_Action_Summit",
+          "url": "https://en.wikipedia.org/wiki/AI_Action_Summit"
+        },
+        {
+          "title": "https://techcrunch.com/2025/04/09/",
+          "url": "https://techcrunch.com/2025/04/09/"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy",
+          "url": "https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy"
+        },
+        {
+          "title": "https://www.ai-roundup.dev/roundup/2026-04-07/",
+          "url": "https://www.ai-roundup.dev/roundup/2026-04-07/"
+        },
+        {
+          "title": "https://aitoolly.com/ai-news/2026-04-01",
+          "url": "https://aitoolly.com/ai-news/2026-04-01"
+        },
+        {
+          "title": "https://www.techrepublic.com/article/news-microsoft-to-use-ai-from-anthropic",
+          "url": "https://www.techrepublic.com/article/news-microsoft-to-use-ai-from-anthropic"
+        },
+        {
+          "title": "https://techcrunch.com/2025/12/08/openai-boasts-enterprise-win-days-after-internal-code-red-on-google-threat/",
+          "url": "https://techcrunch.com/2025/12/08/openai-boasts-enterprise-win-days-after-internal-code-red-on-google-threat/"
+        },
+        {
+          "title": "https://www.distillintelligence.com/briefings/ai-leaders-2026-04-03",
+          "url": "https://www.distillintelligence.com/briefings/ai-leaders-2026-04-03"
+        },
+        {
+          "title": "https://www.theguardian.com/technology/artificialintelligenceai/2026/apr/09/all",
+          "url": "https://www.theguardian.com/technology/artificialintelligenceai/2026/apr/09/all"
+        },
+        {
+          "title": "https://arxiv.org/abs/2604.02912",
+          "url": "https://arxiv.org/abs/2604.02912"
+        },
+        {
+          "title": "https://arxiv.org/abs/2603.24621",
+          "url": "https://arxiv.org/abs/2603.24621"
+        },
+        {
+          "title": "https://techstartups.com/2026/04/07/top-tech-news-today-april-7-2026/",
+          "url": "https://techstartups.com/2026/04/07/top-tech-news-today-april-7-2026/"
+        },
+        {
+          "title": "https://af.net/realtime/major-developments-in-ai-over-the-weekend-april-4-5-2026/",
+          "url": "https://af.net/realtime/major-developments-in-ai-over-the-weekend-april-4-5-2026/"
+        },
+        {
+          "title": "https://www.aol.com/finance/openai-encourages-firms-trial-four-120106793.html",
+          "url": "https://www.aol.com/finance/openai-encourages-firms-trial-four-120106793.html"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Claude_%28language_model%29",
+          "url": "https://en.wikipedia.org/wiki/Claude_%28language_model%29"
+        },
+        {
+          "title": "https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html",
+          "url": "https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html"
+        },
+        {
+          "title": "https://www.promptinjection.net/p/ai-llm-news-roundup-march-23-april-05-2026",
+          "url": "https://www.promptinjection.net/p/ai-llm-news-roundup-march-23-april-05-2026"
+        },
+        {
+          "title": "https://investor.wedbush.com/wedbush/article/marketminute-2026-4-1-alphabets-ai-renaissance-gemini-3-success-drives-51-surge-to-record-highs",
+          "url": "https://investor.wedbush.com/wedbush/article/marketminute-2026-4-1-alphabets-ai-renaissance-gemini-3-success-drives-51-surge-to-record-highs"
+        },
+        {
+          "title": "https://jasonrobert.dev/news/2026-04-07/",
+          "url": "https://jasonrobert.dev/news/2026-04-07/"
+        },
+        {
+          "title": "https://www.reddit.com/r/Anthropic/comments/1rnie5x/weekly_limit_reset_date_pushed_back_again/",
+          "url": "https://www.reddit.com/r/Anthropic/comments/1rnie5x/weekly_limit_reset_date_pushed_back_again/"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/METR",
+          "url": "https://en.wikipedia.org/wiki/METR"
+        },
+        {
+          "title": "https://srnnews.com/alphabet-hits-near-three-month-high-on-new-ai-updates/",
+          "url": "https://srnnews.com/alphabet-hits-near-three-month-high-on-new-ai-updates/"
+        },
+        {
+          "title": "https://arxiv.org/abs/2511.15080",
+          "url": "https://arxiv.org/abs/2511.15080"
+        },
+        {
+          "title": "https://arxiv.org/abs/2601.14242",
+          "url": "https://arxiv.org/abs/2601.14242"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Anthropic",
+          "url": "https://en.wikipedia.org/wiki/Anthropic"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/AI_bubble",
+          "url": "https://en.wikipedia.org/wiki/AI_bubble"
+        },
+        {
+          "title": "https://www.reddit.com/r/AIToolsTipsNews/comments/1rmesjl/anthropics_legal_ai_plugin_triggered_a_285b_stock/",
+          "url": "https://www.reddit.com/r/AIToolsTipsNews/comments/1rmesjl/anthropics_legal_ai_plugin_triggered_a_285b_stock/"
+        },
+        {
+          "title": "https://www.reddit.com/r/OpenAI/comments/1sf9a6j/removed/",
+          "url": "https://www.reddit.com/r/OpenAI/comments/1sf9a6j/removed/"
+        },
+        {
+          "title": "https://www.reddit.com/r/singularity/comments/1s57lqa/exclusive_anthropic_left_details_of_an_unreleased/",
+          "url": "https://www.reddit.com/r/singularity/comments/1s57lqa/exclusive_anthropic_left_details_of_an_unreleased/"
+        },
+        {
+          "title": "https://www.reddit.com/r/OpenAI/comments/1sf03ea/removed/",
+          "url": "https://www.reddit.com/r/OpenAI/comments/1sf03ea/removed/"
+        },
+        {
+          "title": "https://www.reddit.com/r/OpenAI/comments/1sf1xus/removed/",
+          "url": "https://www.reddit.com/r/OpenAI/comments/1sf1xus/removed/"
+        },
+        {
+          "title": "https://www.reddit.com/r/Anthropic/comments/1s57mbt/exclusive_anthropic_left_details_of_an_unreleased/",
+          "url": "https://www.reddit.com/r/Anthropic/comments/1s57mbt/exclusive_anthropic_left_details_of_an_unreleased/"
+        },
+        {
+          "title": "https://www.reddit.com/r/ArtificialInteligence/comments/1qyde7v/what_happened_in_ai_today_feb_07_2026_7_minute/",
+          "url": "https://www.reddit.com/r/ArtificialInteligence/comments/1qyde7v/what_happened_in_ai_today_feb_07_2026_7_minute/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-flash-live/",
+          "url": "https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-flash-live/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/",
+          "url": "https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/technology/ai/nano-banana-2/",
+          "url": "https://blog.google/innovation-and-ai/technology/ai/nano-banana-2/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-updates-march-2026/",
+          "url": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-updates-march-2026/"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/products/education/khan-academy-partnership/",
+          "url": "https://blog.google/products-and-platforms/products/education/khan-academy-partnership/"
+        },
+        {
+          "title": "https://apnews.com/article/275df9e291bbb361962dfc6ba868506c",
+          "url": "https://apnews.com/article/275df9e291bbb361962dfc6ba868506c"
+        },
+        {
+          "title": "https://blog.google/intl/en-mena/company-news/outreach-initiatives/ai-film-award-powered-by-google-gemini/",
+          "url": "https://blog.google/intl/en-mena/company-news/outreach-initiatives/ai-film-award-powered-by-google-gemini/"
+        },
+        {
+          "title": "https://blog.google/intl/en-in/products/explore-communicate/new-ways-google-is-using-ai-to-make-shopping-easier/",
+          "url": "https://blog.google/intl/en-in/products/explore-communicate/new-ways-google-is-using-ai-to-make-shopping-easier/"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/products/education/chromeos-chromebooks-bett-2026/",
+          "url": "https://blog.google/products-and-platforms/products/education/chromeos-chromebooks-bett-2026/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/products/google-ai-updates-march-2025/",
+          "url": "https://blog.google/innovation-and-ai/products/google-ai-updates-march-2025/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/technology/ai/google-gemini-ai/",
+          "url": "https://blog.google/innovation-and-ai/technology/ai/google-gemini-ai/"
+        },
+        {
+          "title": "https://apnews.com/article/65c08aa4fab90cde952f37d32625394a",
+          "url": "https://apnews.com/article/65c08aa4fab90cde952f37d32625394a"
+        },
+        {
+          "title": "https://apnews.com/article/071e752773dee5713c8b1a10039d08aa",
+          "url": "https://apnews.com/article/071e752773dee5713c8b1a10039d08aa"
+        },
+        {
+          "title": "https://apnews.com/article/c4210e7eddd9ad90161e7fa2da9736e2",
+          "url": "https://apnews.com/article/c4210e7eddd9ad90161e7fa2da9736e2"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/platforms/android/samsung-unpacked-2026/",
+          "url": "https://blog.google/products-and-platforms/platforms/android/samsung-unpacked-2026/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-february-2026/",
+          "url": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-february-2026/"
+        },
+        {
+          "title": "https://apnews.com/article/c19e0cca22c37190cc4e0dc08e889ef0",
+          "url": "https://apnews.com/article/c19e0cca22c37190cc4e0dc08e889ef0"
+        },
+        {
+          "title": "https://assets.apnews.com/19/1b/545643064e0caecf2c92d2897ce0/ap-ncaa-bracket-men.pdf",
+          "url": "https://assets.apnews.com/19/1b/545643064e0caecf2c92d2897ce0/ap-ncaa-bracket-men.pdf"
+        },
+        {
+          "title": "https://assets.apnews.com/14/3d/676decd64f808025bd6e9e9263be/ap-ncaa-bracket-women.pdf",
+          "url": "https://assets.apnews.com/14/3d/676decd64f808025bd6e9e9263be/ap-ncaa-bracket-women.pdf"
+        },
+        {
+          "title": "https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf",
+          "url": "https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf"
+        },
+        {
+          "title": "https://www.tomshardware.com/tech-industry/broadcom-expands-anthropic-deal-to-3-5gw-of-google-tpu-capacity-from-2027",
+          "url": "https://www.tomshardware.com/tech-industry/broadcom-expands-anthropic-deal-to-3-5gw-of-google-tpu-capacity-from-2027"
+        },
+        {
+          "title": "https://www.itpro.com/technology/artificial-intelligence/project-glasswing-anthropic-announces-big-tech-consortium-to-test-claude-mythos-ai-model-that-could-reshape-cybersecurity",
+          "url": "https://www.itpro.com/technology/artificial-intelligence/project-glasswing-anthropic-announces-big-tech-consortium-to-test-claude-mythos-ai-model-that-could-reshape-cybersecurity"
+        },
+        {
+          "title": "https://www.axios.com/2026/04/08/anthropic-mythos-model-ai-cyberattack-warning",
+          "url": "https://www.axios.com/2026/04/08/anthropic-mythos-model-ai-cyberattack-warning"
+        },
+        {
+          "title": "https://www.itpro.com/infrastructure/anthropic-pens-multi-gigawatt-tpu-deal-with-google-and-broadcom-as-claude-demand-picks-up",
+          "url": "https://www.itpro.com/infrastructure/anthropic-pens-multi-gigawatt-tpu-deal-with-google-and-broadcom-as-claude-demand-picks-up"
+        },
+        {
+          "title": "https://www.techradar.com/news/live/claude-anthropic-down-outage-april-6-2026",
+          "url": "https://www.techradar.com/news/live/claude-anthropic-down-outage-april-6-2026"
+        },
+        {
+          "title": "https://www.global-economy-news.com/2026/01/30/microsofts-ai-spending-shock-is-the-market-rethinking-the-ai-boom/",
+          "url": "https://www.global-economy-news.com/2026/01/30/microsofts-ai-spending-shock-is-the-market-rethinking-the-ai-boom/"
+        },
+        {
+          "title": "https://www.investing.com/news/stock-market-news/wolters-kluwer-relx-shares-slip-after-anthropic-unveils-aienhanced-legal-tool-4481124",
+          "url": "https://www.investing.com/news/stock-market-news/wolters-kluwer-relx-shares-slip-after-anthropic-unveils-aienhanced-legal-tool-4481124"
+        },
+        {
+          "title": "https://creati.ai/ai-news/2026-04-08/",
+          "url": "https://creati.ai/ai-news/2026-04-08/"
+        },
+        {
+          "title": "https://arxiv.org/abs/2604.04759",
+          "url": "https://arxiv.org/abs/2604.04759"
+        },
+        {
+          "title": "https://www.straitstimes.com/business/companies-markets/microsoft-racks-up-over-600m-in-ai-savings-while-slashing-jobs-bloomberg-news-reports",
+          "url": "https://www.straitstimes.com/business/companies-markets/microsoft-racks-up-over-600m-in-ai-savings-while-slashing-jobs-bloomberg-news-reports"
+        },
+        {
+          "title": "https://www.investing.com/news/economy-news/anthropic-holds-firm-on-military-ai-restrictions-after-pentagon-meeting--reuters-93CH-4522534",
+          "url": "https://www.investing.com/news/economy-news/anthropic-holds-firm-on-military-ai-restrictions-after-pentagon-meeting--reuters-93CH-4522534"
+        },
+        {
+          "title": "https://senx.ai/news/2026-04-08-daily-ai-news",
+          "url": "https://senx.ai/news/2026-04-08-daily-ai-news"
+        },
+        {
+          "title": "https://news.cgtn.com/news/2026-02-21/OpenAI-sees-600-billion-in-compute-spending-through-2030-Reuters-1KWAar1MJLW/p.html",
+          "url": "https://news.cgtn.com/news/2026-02-21/OpenAI-sees-600-billion-in-compute-spending-through-2030-Reuters-1KWAar1MJLW/p.html"
+        },
+        {
+          "title": "https://www.thomsonreuters.com/en/press-releases/2026/january/thomson-reuters-convenes-global-ai-leaders-to-advance-trust-in-the-age-of-intelligent-systems",
+          "url": "https://www.thomsonreuters.com/en/press-releases/2026/january/thomson-reuters-convenes-global-ai-leaders-to-advance-trust-in-the-age-of-intelligent-systems"
+        },
+        {
+          "title": "https://finance.yahoo.com/news/anthropic-tells-judge-billions-stake-233500564.html",
+          "url": "https://finance.yahoo.com/news/anthropic-tells-judge-billions-stake-233500564.html"
+        },
+        {
+          "title": "https://neuralwired.com/2026/04/03/microsoft-japan-ai-investment-2026/",
+          "url": "https://neuralwired.com/2026/04/03/microsoft-japan-ai-investment-2026/"
+        },
+        {
+          "title": "https://www.investing.com/news/stock-market-news/anthropic-touts-new-ai-tools-weeks-after-legal-plugin-spurred-market-rout-4521742",
+          "url": "https://www.investing.com/news/stock-market-news/anthropic-touts-new-ai-tools-weeks-after-legal-plugin-spurred-market-rout-4521742"
+        },
+        {
+          "title": "https://www.morningstar.com/stocks/reuters-relx-wolters-stocks-crushed-after-anthropic-debuts-claude-legal-plug-in",
+          "url": "https://www.morningstar.com/stocks/reuters-relx-wolters-stocks-crushed-after-anthropic-debuts-claude-legal-plug-in"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/The_Patil_Effect",
+          "url": "https://en.wikipedia.org/wiki/The_Patil_Effect"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Public_First_Action",
+          "url": "https://en.wikipedia.org/wiki/Public_First_Action"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Manus_%28AI_agent%29",
+          "url": "https://en.wikipedia.org/wiki/Manus_%28AI_agent%29"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Stargate_LLC",
+          "url": "https://en.wikipedia.org/wiki/Stargate_LLC"
+        },
+        {
+          "title": "https://arxiv.org/abs/2604.06217",
+          "url": "https://arxiv.org/abs/2604.06217"
+        },
+        {
+          "title": "https://openai.com/index/stargate-advances-with-partnership-with-oracle/",
+          "url": "https://openai.com/index/stargate-advances-with-partnership-with-oracle/"
+        },
+        {
+          "title": "https://openai.com/index/aws-and-openai-partnership/",
+          "url": "https://openai.com/index/aws-and-openai-partnership/"
+        },
+        {
+          "title": "https://openai.com/index/openai-acquires-tbpn/",
+          "url": "https://openai.com/index/openai-acquires-tbpn/"
+        },
+        {
+          "title": "https://openai.com/index/figma-partnership/",
+          "url": "https://openai.com/index/figma-partnership/"
+        },
+        {
+          "title": "https://openai.com/index/stargate-sb-energy-partnership/",
+          "url": "https://openai.com/index/stargate-sb-energy-partnership/"
+        },
+        {
+          "title": "https://openai.com/fil-PH/index/amazon-partnership/",
+          "url": "https://openai.com/fil-PH/index/amazon-partnership/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/introducing-openai-for-government/",
+          "url": "https://openai.com/global-affairs/introducing-openai-for-government/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/openai-for-australia",
+          "url": "https://openai.com/global-affairs/openai-for-australia"
+        },
+        {
+          "title": "https://openai.com/index/openai-for-ireland/",
+          "url": "https://openai.com/index/openai-for-ireland/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/openai-for-germany/",
+          "url": "https://openai.com/global-affairs/openai-for-germany/"
+        },
+        {
+          "title": "https://openai.com/index/providing-chatgpt-to-the-entire-us-federal-workforce/",
+          "url": "https://openai.com/index/providing-chatgpt-to-the-entire-us-federal-workforce/"
+        },
+        {
+          "title": "https://openai.com/index/updating-our-preparedness-framework/",
+          "url": "https://openai.com/index/updating-our-preparedness-framework/"
+        },
+        {
+          "title": "https://cdn.openai.com/global-affairs/openai-doe-rfi-5-7-2025.pdf",
+          "url": "https://cdn.openai.com/global-affairs/openai-doe-rfi-5-7-2025.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/global-affairs/61b341bc-56eb-46dc-b356-a621e02cb82d/openai-australia-economic-blueprint-july-2025.pdf",
+          "url": "https://cdn.openai.com/global-affairs/61b341bc-56eb-46dc-b356-a621e02cb82d/openai-australia-economic-blueprint-july-2025.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/signals/openai-signals-global-report.pdf",
+          "url": "https://cdn.openai.com/signals/openai-signals-global-report.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/global-affairs/f319686f-cf21-4b8e-b8bc-84dd9bbfb999/oai-workforce-blueprint-oct-2025.pdf",
+          "url": "https://cdn.openai.com/global-affairs/f319686f-cf21-4b8e-b8bc-84dd9bbfb999/oai-workforce-blueprint-oct-2025.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/API/docs/deep_research_blog.pdf",
+          "url": "https://cdn.openai.com/API/docs/deep_research_blog.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/pdf/045aa967-ee96-4a09-94ee-3098ddf6db2c/OpenAI-US-House-Select-Cmte-Update-%5B021226%5D.pdf",
+          "url": "https://cdn.openai.com/pdf/045aa967-ee96-4a09-94ee-3098ddf6db2c/OpenAI-US-House-Select-Cmte-Update-%5B021226%5D.pdf"
+        },
+        {
+          "title": "https://www.techradar.com/ai-platforms-assistants/openai/openai-says-ai-could-mean-a-4-day-week-with-no-loss-in-pay-but-warns-jobs-and-wealth-are-at-risk",
+          "url": "https://www.techradar.com/ai-platforms-assistants/openai/openai-says-ai-could-mean-a-4-day-week-with-no-loss-in-pay-but-warns-jobs-and-wealth-are-at-risk"
+        },
+        {
+          "title": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/",
+          "url": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/"
+        },
+        {
+          "title": "https://www.investing.com/news/stock-market-news/openai-to-nearly-double-workforce-to-8000-by-end2026-ft-reports-4574054",
+          "url": "https://www.investing.com/news/stock-market-news/openai-to-nearly-double-workforce-to-8000-by-end2026-ft-reports-4574054"
+        },
+        {
+          "title": "https://finance.yahoo.com/news/softbank-profit-more-doubles-16-063545827.html",
+          "url": "https://finance.yahoo.com/news/softbank-profit-more-doubles-16-063545827.html"
+        },
+        {
+          "title": "https://www.bloomberg.com/news/articles/2025-03-05/ai-run-funds-four-day-work-weeks-investors-say-hype-is-real",
+          "url": "https://www.bloomberg.com/news/articles/2025-03-05/ai-run-funds-four-day-work-weeks-investors-say-hype-is-real"
+        },
+        {
+          "title": "https://blog.mean.ceo/new-ai-model-releases-news-april-2026/",
+          "url": "https://blog.mean.ceo/new-ai-model-releases-news-april-2026/"
+        },
+        {
+          "title": "https://www.washingtonpost.com/business/2025/12/31/ai-four-day-workweek/",
+          "url": "https://www.washingtonpost.com/business/2025/12/31/ai-four-day-workweek/"
+        },
+        {
+          "title": "https://champaignmagazine.com/2026/03/08/ai-by-ai-weekly-top-5-march-2-8-2026/",
+          "url": "https://champaignmagazine.com/2026/03/08/ai-by-ai-weekly-top-5-march-2-8-2026/"
+        },
+        {
+          "title": "https://sg.finance.yahoo.com/news/tech-stocks-today-anthropic-sues-defense-department-over-ban-openais-robotics-leader-resigns-152722809.html",
+          "url": "https://sg.finance.yahoo.com/news/tech-stocks-today-anthropic-sues-defense-department-over-ban-openais-robotics-leader-resigns-152722809.html"
+        },
+        {
+          "title": "https://www.forbes.com/sites/the-prompt/2026/04/08/four-day-work-weeks-public-wealth-fund-openais-ideas-for-our-ai-future/",
+          "url": "https://www.forbes.com/sites/the-prompt/2026/04/08/four-day-work-weeks-public-wealth-fund-openais-ideas-for-our-ai-future/"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/OpenAI",
+          "url": "https://en.wikipedia.org/wiki/OpenAI"
+        },
+        {
+          "title": "https://www.reddit.com/r/PithyCyborg/comments/1seyk86/todays_ai_news_no_fluff_oracle_openais_robot_tax/",
+          "url": "https://www.reddit.com/r/PithyCyborg/comments/1seyk86/todays_ai_news_no_fluff_oracle_openais_robot_tax/"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/SoftBank_Group",
+          "url": "https://en.wikipedia.org/wiki/SoftBank_Group"
+        },
+        {
+          "title": "https://stepmark.ai/wp-content/uploads/2026/03/stepmark-february-ai-financing-report-vf.pdf",
+          "url": "https://stepmark.ai/wp-content/uploads/2026/03/stepmark-february-ai-financing-report-vf.pdf"
+        },
+        {
+          "title": "https://hk.allianzgi.com/-/media/AllianzGI/AP/HongKong/Documents/Presentation/eventpresentation/2025/09/25/01/48/20250930-Stephen-Luncheon",
+          "url": "https://hk.allianzgi.com/-/media/AllianzGI/AP/HongKong/Documents/Presentation/eventpresentation/2025/09/25/01/48/20250930-Stephen-Luncheon"
+        },
+        {
+          "title": "https://techxplore.com/news/2025-12-softbank-openai-stake-41bln-investment.pdf",
+          "url": "https://techxplore.com/news/2025-12-softbank-openai-stake-41bln-investment.pdf"
+        },
+        {
+          "title": "https://www.anthropic.com/news/sydney-fourth-office-asia-pacific",
+          "url": "https://www.anthropic.com/news/sydney-fourth-office-asia-pacific"
+        },
+        {
+          "title": "https://www.anthropic.com/news/expanding-our-use-of-google-cloud-tpus-and-services",
+          "url": "https://www.anthropic.com/news/expanding-our-use-of-google-cloud-tpus-and-services"
+        },
+        {
+          "title": "https://www.anthropic.com/news/introducing-the-anthropic-national-security-and-public-sector-advisory-council",
+          "url": "https://www.anthropic.com/news/introducing-the-anthropic-national-security-and-public-sector-advisory-council"
+        },
+        {
+          "title": "https://www.anthropic.com/news/disrupting-AI-espionage/",
+          "url": "https://www.anthropic.com/news/disrupting-AI-espionage/"
+        },
+        {
+          "title": "https://www.anthropic.com/news/claude-opus-4-6",
+          "url": "https://www.anthropic.com/news/claude-opus-4-6"
+        },
+        {
+          "title": "https://www.anthropic.com/events/anthropic-partner-kickoff-2026",
+          "url": "https://www.anthropic.com/events/anthropic-partner-kickoff-2026"
+        },
+        {
+          "title": "https://www.anthropic.com/glasswing",
+          "url": "https://www.anthropic.com/glasswing"
+        },
+        {
+          "title": "https://www.anthropic.com/news/announcing-our-updated-responsible-scaling-policy",
+          "url": "https://www.anthropic.com/news/announcing-our-updated-responsible-scaling-policy"
+        },
+        {
+          "title": "https://www.anthropic.com/research/economic-index-primitives/",
+          "url": "https://www.anthropic.com/research/economic-index-primitives/"
+        },
+        {
+          "title": "https://www.anthropic.com/news/a-new-initiative-for-developing-third-party-model-evaluations/",
+          "url": "https://www.anthropic.com/news/a-new-initiative-for-developing-third-party-model-evaluations/"
+        },
+        {
+          "title": "https://www.anthropic.com/events/aws-summit-london",
+          "url": "https://www.anthropic.com/events/aws-summit-london"
+        },
+        {
+          "title": "https://assets.anthropic.com/m/4e20a4ab6512e217/original/anthropic-response-to-ostp-rfi-march-2025-final-final-sunmision-v3.pdf",
+          "url": "https://assets.anthropic.com/m/4e20a4ab6512e217/original/anthropic-response-to-ostp-rfi-march-2025-final-final-sunmision-v3.pdf"
+        },
+        {
+          "title": "https://www-cdn.anthropic.com/0dc382a2086f6a054eeb17e8a531bd9625b8e6e5.pdf",
+          "url": "https://www-cdn.anthropic.com/0dc382a2086f6a054eeb17e8a531bd9625b8e6e5.pdf"
+        },
+        {
+          "title": "https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf?hsLang=en",
+          "url": "https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf?hsLang=en"
+        },
+        {
+          "title": "https://www-cdn.anthropic.com/08eca2757081e850ed2ad490e5253e940240ca4f.pdf",
+          "url": "https://www-cdn.anthropic.com/08eca2757081e850ed2ad490e5253e940240ca4f.pdf"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/products/search/personal-intelligence-expansion/",
+          "url": "https://blog.google/products-and-platforms/products/search/personal-intelligence-expansion/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/",
+          "url": "https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/products/workspace/gemini-workspace-updates-march-2026/",
+          "url": "https://blog.google/products-and-platforms/products/workspace/gemini-workspace-updates-march-2026/"
+        },
+        {
+          "title": "https://blog.google/products/google-cloud/ironwood-tpu-age-of-inference/",
+          "url": "https://blog.google/products/google-cloud/ironwood-tpu-age-of-inference/"
+        },
+        {
+          "title": "https://blog.google/products/search/ai-mode-updates-may-2025/",
+          "url": "https://blog.google/products/search/ai-mode-updates-may-2025/"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/products/search/search-live-ai-mode/",
+          "url": "https://blog.google/products-and-platforms/products/search/search-live-ai-mode/"
+        },
+        {
+          "title": "https://blog.google/products/search/ai-mode-multimodal-search/",
+          "url": "https://blog.google/products/search/ai-mode-multimodal-search/"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/models-and-research/google-deepmind/google-gemini-ai-update-december-2024/",
+          "url": "https://blog.google/innovation-and-ai/models-and-research/google-deepmind/google-gemini-ai-update-december-2024/"
+        },
+        {
+          "title": "https://blog.google/products/gemini/google-gemini-update-may-2024",
+          "url": "https://blog.google/products/gemini/google-gemini-update-may-2024"
+        },
+        {
+          "title": "https://blog.google/innovation-and-ai/technology/health/med-gemma-impact-challenge/",
+          "url": "https://blog.google/innovation-and-ai/technology/health/med-gemma-impact-challenge/"
+        },
+        {
+          "title": "https://blog.google/products/search/ai-mode-agentic-personalized/",
+          "url": "https://blog.google/products/search/ai-mode-agentic-personalized/"
+        },
+        {
+          "title": "https://blog.google/intl/en-in/company-news/our-first-ai-hub-in-india-powered-by-a-15-billion-investment/",
+          "url": "https://blog.google/intl/en-in/company-news/our-first-ai-hub-in-india-powered-by-a-15-billion-investment/"
+        },
+        {
+          "title": "https://blog.google/documents/37/How_Google_Fights_Disinformation.pdf",
+          "url": "https://blog.google/documents/37/How_Google_Fights_Disinformation.pdf"
+        },
+        {
+          "title": "https://blog.google/documents/213/AI_Sprinters_Report.pdf",
+          "url": "https://blog.google/documents/213/AI_Sprinters_Report.pdf"
+        },
+        {
+          "title": "https://blog.google/documents/99/US_Google_Infographics_0208.pdf",
+          "url": "https://blog.google/documents/99/US_Google_Infographics_0208.pdf"
+        },
+        {
+          "title": "https://openai.com/global-affairs/introducing-the-intelligence-age",
+          "url": "https://openai.com/global-affairs/introducing-the-intelligence-age"
+        },
+        {
+          "title": "https://openai.com/index/aarp-partnership-older-adults-online-safety",
+          "url": "https://openai.com/index/aarp-partnership-older-adults-online-safety"
+        },
+        {
+          "title": "https://openai.com/global-affairs/openai-proposals-for-the-us-ai-action-plan/",
+          "url": "https://openai.com/global-affairs/openai-proposals-for-the-us-ai-action-plan/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/ai-stories-daily-benefits-bigger-opportunities/",
+          "url": "https://openai.com/global-affairs/ai-stories-daily-benefits-bigger-opportunities/"
+        },
+        {
+          "title": "https://openai.com/index/strengthening-the-us-ai-supply-chain/",
+          "url": "https://openai.com/index/strengthening-the-us-ai-supply-chain/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/openai-for-greece/",
+          "url": "https://openai.com/global-affairs/openai-for-greece/"
+        },
+        {
+          "title": "https://forum.openai.com/home/videos/openais-super-bowl-ad-introducing-the-intelligence-age",
+          "url": "https://forum.openai.com/home/videos/openais-super-bowl-ad-introducing-the-intelligence-age"
+        },
+        {
+          "title": "https://openai.com/index/ai-education-opportunity",
+          "url": "https://openai.com/index/ai-education-opportunity"
+        },
+        {
+          "title": "https://cdn.openai.com/global-affairs/ostp-rfi/ec680b75-d539-4653-b297-8bcf6e5f7686/openai-response-ostp-nsf-rfi-notice-request-for-information-on-the-development-of-an-artificial-intelligence-ai-action-plan.pdf",
+          "url": "https://cdn.openai.com/global-affairs/ostp-rfi/ec680b75-d539-4653-b297-8bcf6e5f7686/openai-response-ostp-nsf-rfi-notice-request-for-information-on-the-development-of-an-artificial-intelligence-ai-action-plan.pdf"
+        },
+        {
+          "title": "https://openai.com/index/supporting-nonprofit-and-community-innovation/",
+          "url": "https://openai.com/index/supporting-nonprofit-and-community-innovation/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/seizing-the-ai-opportunity/",
+          "url": "https://openai.com/global-affairs/seizing-the-ai-opportunity/"
+        },
+        {
+          "title": "https://openai.com/global-affairs/eu-code-of-practice/",
+          "url": "https://openai.com/global-affairs/eu-code-of-practice/"
+        },
+        {
+          "title": "https://cdn.openai.com/global-affairs/06025361-1ede-4402-97d2-daf1e5918b43/jobs-in-the-intelligence-age-sept-2025.pdf",
+          "url": "https://cdn.openai.com/global-affairs/06025361-1ede-4402-97d2-daf1e5918b43/jobs-in-the-intelligence-age-sept-2025.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/pdf/21b88bb5-10a3-4566-919d-f9a6b9c3e632/openai-ostp-rfi-oct-27-2025.pdf",
+          "url": "https://cdn.openai.com/pdf/21b88bb5-10a3-4566-919d-f9a6b9c3e632/openai-ostp-rfi-oct-27-2025.pdf"
+        },
+        {
+          "title": "https://cdn.openai.com/pdf/2cb29276-68cd-4ec6-a5f4-c01c5e7a36e9/OpenAI-AI-as-a-Healthcare-Ally-Jan-2026.pdf",
+          "url": "https://cdn.openai.com/pdf/2cb29276-68cd-4ec6-a5f4-c01c5e7a36e9/OpenAI-AI-as-a-Healthcare-Ally-Jan-2026.pdf"
+        },
+        {
+          "title": "https://www.breakingviews.com/columns/big-view/ai-dreams-crash-into-stark-7-trln-reality-2026-04-07/",
+          "url": "https://www.breakingviews.com/columns/big-view/ai-dreams-crash-into-stark-7-trln-reality-2026-04-07/"
+        },
+        {
+          "title": "https://followin.io/en/feed/24488247",
+          "url": "https://followin.io/en/feed/24488247"
+        },
+        {
+          "title": "https://arxiv.org/abs/2603.09209",
+          "url": "https://arxiv.org/abs/2603.09209"
+        },
+        {
+          "title": "https://www.thedailystar.net/business/economy/news/ai-dreams-crash-stark-7tn-reality-4145981",
+          "url": "https://www.thedailystar.net/business/economy/news/ai-dreams-crash-stark-7tn-reality-4145981"
+        },
+        {
+          "title": "https://www.breakingviews.com/columns/considered-view/ai-apocalypse-trade-has-buggy-logic-2026-02-04/",
+          "url": "https://www.breakingviews.com/columns/considered-view/ai-apocalypse-trade-has-buggy-logic-2026-02-04/"
+        },
+        {
+          "title": "https://www.forbes.com/sites/petercohan/2026/02/25/ai-doomsday-fears-are-rising-heres-what-they-really-mean-for-nvidia-stock//",
+          "url": "https://www.forbes.com/sites/petercohan/2026/02/25/ai-doomsday-fears-are-rising-heres-what-they-really-mean-for-nvidia-stock//"
+        },
+        {
+          "title": "https://www.fool.com/investing/2026/03/28/did-investors-get-too-far-ahead-of-the-artificial//",
+          "url": "https://www.fool.com/investing/2026/03/28/did-investors-get-too-far-ahead-of-the-artificial//"
+        },
+        {
+          "title": "https://www.investing.com/news/economy-news/ais-rise-stirs-excitement-sparks-job-worries-4392165",
+          "url": "https://www.investing.com/news/economy-news/ais-rise-stirs-excitement-sparks-job-worries-4392165"
+        },
+        {
+          "title": "https://www.forbes.com/sites/gilpress/2026/02/27/the-state-of-the-17-trillion-ai-bubble-the-end-of-thinking/",
+          "url": "https://www.forbes.com/sites/gilpress/2026/02/27/the-state-of-the-17-trillion-ai-bubble-the-end-of-thinking/"
+        },
+        {
+          "title": "https://www.thomsonreuters.com/en/press-releases/2025/june/the-ai-adoption-reality-check-firms-with-ai-strategies-are-twice-as-likely-to-see-ai-driven-revenue-growth-those-without-risk-falling-behind",
+          "url": "https://www.thomsonreuters.com/en/press-releases/2025/june/the-ai-adoption-reality-check-firms-with-ai-strategies-are-twice-as-likely-to-see-ai-driven-revenue-growth-those-without-risk-falling-behind"
+        },
+        {
+          "title": "https://www.gurufocus.com/stock/NVDA/summary",
+          "url": "https://www.gurufocus.com/stock/NVDA/summary"
+        },
+        {
+          "title": "https://cmsrkv.rgukt.in/storage/notices/files/th.th_international.06_01_2026_1767673550.pdf",
+          "url": "https://cmsrkv.rgukt.in/storage/notices/files/th.th_international.06_01_2026_1767673550.pdf"
+        },
+        {
+          "title": "https://earthnews.blob.core.windows.net/earthnewsladakh/files/42025100941955.pdf",
+          "url": "https://earthnews.blob.core.windows.net/earthnewsladakh/files/42025100941955.pdf"
+        },
+        {
+          "title": "https://www.intro-act.com/uploads/disruptivetech/202503271204111169357902.pdf",
+          "url": "https://www.intro-act.com/uploads/disruptivetech/202503271204111169357902.pdf"
+        },
+        {
+          "title": "https://liontree.com/wp-content/uploads/2025/04/LT-Weekly-17-04-25.pdf",
+          "url": "https://liontree.com/wp-content/uploads/2025/04/LT-Weekly-17-04-25.pdf"
+        },
+        {
+          "title": "https://share.refinitiv.com/assets/newsletters/Morning_News_Call/MNCGeneric_US_10242024.pdf",
+          "url": "https://share.refinitiv.com/assets/newsletters/Morning_News_Call/MNCGeneric_US_10242024.pdf"
+        },
+        {
+          "title": "https://ufdcimages.uflib.ufl.edu/UF/00/02/83/15/09075/2025-11-10.pdf",
+          "url": "https://ufdcimages.uflib.ufl.edu/UF/00/02/83/15/09075/2025-11-10.pdf"
+        },
+        {
+          "title": "https://www.reddit.com/r/Daytrading/comments/1npaoxr",
+          "url": "https://www.reddit.com/r/Daytrading/comments/1npaoxr"
+        },
+        {
+          "title": "https://www.reddit.com/r/singularity/comments/1jtsqww",
+          "url": "https://www.reddit.com/r/singularity/comments/1jtsqww"
+        },
+        {
+          "title": "https://www.reddit.com/r/Daytrading/comments/1ou7vfj",
+          "url": "https://www.reddit.com/r/Daytrading/comments/1ou7vfj"
+        },
+        {
+          "title": "https://www.reddit.com/r/u_TearRepresentative56/comments/1rpw3vy/all_the_market_moving_news_from_premarket/",
+          "url": "https://www.reddit.com/r/u_TearRepresentative56/comments/1rpw3vy/all_the_market_moving_news_from_premarket/"
+        },
+        {
+          "title": "https://blog.google/company-news/inside-google/around-the-globe/google-europe/ai-works-for-europe/",
+          "url": "https://blog.google/company-news/inside-google/around-the-globe/google-europe/ai-works-for-europe/"
+        },
+        {
+          "title": "https://blog.google/technology/google-deepmind/gemini-model-thinking-updates-march-2025/",
+          "url": "https://blog.google/technology/google-deepmind/gemini-model-thinking-updates-march-2025/"
+        },
+        {
+          "title": "https://blog.google/company-news/outreach-and-initiatives/google-org/global-impact-challenge-ai-government-2026/",
+          "url": "https://blog.google/company-news/outreach-and-initiatives/google-org/global-impact-challenge-ai-government-2026/"
+        },
+        {
+          "title": "https://blog.google/company-news/outreach-and-initiatives/sustainability/2026-water-stewardship-portfolio/",
+          "url": "https://blog.google/company-news/outreach-and-initiatives/sustainability/2026-water-stewardship-portfolio/"
+        },
+        {
+          "title": "https://blog.google/company-news/inside-google/around-the-globe/google-asia/google-singapore-2026/",
+          "url": "https://blog.google/company-news/inside-google/around-the-globe/google-asia/google-singapore-2026/"
+        },
+        {
+          "title": "https://blog.google/company-news/outreach-and-initiatives/google-org/google-org-generative-ai-accelerator-2025/",
+          "url": "https://blog.google/company-news/outreach-and-initiatives/google-org/google-org-generative-ai-accelerator-2025/"
+        },
+        {
+          "title": "https://blog.google/products-and-platforms/products/education/national-teachers-day-2026-googleplex/",
+          "url": "https://blog.google/products-and-platforms/products/education/national-teachers-day-2026-googleplex/"
+        },
+        {
+          "title": "https://blog.google/documents/222/Open_Call_Response_-_catalog.pdf",
+          "url": "https://blog.google/documents/222/Open_Call_Response_-_catalog.pdf"
+        },
+        {
+          "title": "https://techcrunch.com/2026/01/20/humans-a-human-centric-ai-startup-founded-by-anthropic-xai-google-alums-raised-480m-seed-round/",
+          "url": "https://techcrunch.com/2026/01/20/humans-a-human-centric-ai-startup-founded-by-anthropic-xai-google-alums-raised-480m-seed-round/"
+        },
+        {
+          "title": "https://www.wired.com/story/anthropic-sues-department-of-defense-over-supply-chain-risk-designation/",
+          "url": "https://www.wired.com/story/anthropic-sues-department-of-defense-over-supply-chain-risk-designation/"
+        },
+        {
+          "title": "https://www.axios.com/2026/03/05/openai-gpt-54-chatgpt-office/",
+          "url": "https://www.axios.com/2026/03/05/openai-gpt-54-chatgpt-office/"
+        },
+        {
+          "title": "https://www.wired.com/story/openai-announces-4-1-ai-model-coding/",
+          "url": "https://www.wired.com/story/openai-announces-4-1-ai-model-coding/"
+        },
+        {
+          "title": "https://www.axios.com/2026/02/27/pentagon-openai-safety-red-lines-anthropic",
+          "url": "https://www.axios.com/2026/02/27/pentagon-openai-safety-red-lines-anthropic"
+        },
+        {
+          "title": "https://www.axios.com/2026/03/11/anthropic-dc-presence",
+          "url": "https://www.axios.com/2026/03/11/anthropic-dc-presence"
+        },
+        {
+          "title": "https://www.axios.com/2025/11/18/anthropic-microsoft-nvidia-15-billion",
+          "url": "https://www.axios.com/2025/11/18/anthropic-microsoft-nvidia-15-billion"
+        },
+        {
+          "title": "https://es.wired.com/articulos/nvidia-deja-de-ser-solo-el-proveedor-de-chips-y-podria-buscar-el-trono-de-openai",
+          "url": "https://es.wired.com/articulos/nvidia-deja-de-ser-solo-el-proveedor-de-chips-y-podria-buscar-el-trono-de-openai"
+        },
+        {
+          "title": "https://www.axios.com/2026/02/26/the-race-to-catch-claude",
+          "url": "https://www.axios.com/2026/02/26/the-race-to-catch-claude"
+        },
+        {
+          "title": "https://www.axios.com/2026/01/01/ai-2026-money-openai-google-anthropic-agents",
+          "url": "https://www.axios.com/2026/01/01/ai-2026-money-openai-google-anthropic-agents"
+        },
+        {
+          "title": "https://www.axios.com/2026/03/02/anthropic-ai-openai-trump",
+          "url": "https://www.axios.com/2026/03/02/anthropic-ai-openai-trump"
+        },
+        {
+          "title": "https://www.wired.com/story/anthropic-world-first-hybrid-reasoning-ai-model/",
+          "url": "https://www.wired.com/story/anthropic-world-first-hybrid-reasoning-ai-model/"
+        },
+        {
+          "title": "https://www.wired.com/story/openai-contractor-upload-real-work-documents-ai-agents/",
+          "url": "https://www.wired.com/story/openai-contractor-upload-real-work-documents-ai-agents/"
+        },
+        {
+          "title": "https://www.axios.com/2025/08/08/openai-aims-gpt-5-at-anthropics-coding-crown",
+          "url": "https://www.axios.com/2025/08/08/openai-aims-gpt-5-at-anthropics-coding-crown"
+        },
+        {
+          "title": "https://www.wired.com/story/openai-anthropic-and-block-are-teaming-up-on-ai-agent-standards/",
+          "url": "https://www.wired.com/story/openai-anthropic-and-block-are-teaming-up-on-ai-agent-standards/"
+        },
+        {
+          "title": "https://www.wired.com/story/ai-industry-rivals-are-teaming-up-on-a-startup-accelerator/",
+          "url": "https://www.wired.com/story/ai-industry-rivals-are-teaming-up-on-a-startup-accelerator/"
+        },
+        {
+          "title": "https://es.wired.com/articulos/openai-anthropic-y-block-se-alian-para-estandarizar-la-nueva-era-de-agentes-de-ia",
+          "url": "https://es.wired.com/articulos/openai-anthropic-y-block-se-alian-para-estandarizar-la-nueva-era-de-agentes-de-ia"
+        },
+        {
+          "title": "https://techcrunch.com/wp-content/uploads/2026/03/anthropic-amicus-brief.pdf",
+          "url": "https://techcrunch.com/wp-content/uploads/2026/03/anthropic-amicus-brief.pdf"
+        },
+        {
+          "title": "https://techcrunch.com/wp-content/uploads/2026/03/2026.03.04-Filed-Gavalas-Google-Complaint.pdf",
+          "url": "https://techcrunch.com/wp-content/uploads/2026/03/2026.03.04-Filed-Gavalas-Google-Complaint.pdf"
+        },
+        {
+          "title": "https://platform.theverge.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/24782736/2023.07.11_Letter_to_IRS__TIGTA__FTC__DOJ_on_tax_prep_pixel_data_sharing.pdf",
+          "url": "https://platform.theverge.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/24782736/2023.07.11_Letter_to_IRS__TIGTA__FTC__DOJ_on_tax_prep_pixel_data_sharing.pdf"
+        },
+        {
+          "title": "https://apnews.com/article/3d86c9296fe953ec0591fcde6a613aba",
+          "url": "https://apnews.com/article/3d86c9296fe953ec0591fcde6a613aba"
+        },
+        {
+          "title": "https://apnews.com/article/4b55aabf7ea018e38ffdccb66e37cf26",
+          "url": "https://apnews.com/article/4b55aabf7ea018e38ffdccb66e37cf26"
+        },
+        {
+          "title": "https://elpais.com/economia/2026-04-09/meta-trata-de-reaccionar-en-la-ia-como-un-nuevo-modelo-frente-a-google-openai-y-anthropic.html",
+          "url": "https://elpais.com/economia/2026-04-09/meta-trata-de-reaccionar-en-la-ia-como-un-nuevo-modelo-frente-a-google-openai-y-anthropic.html"
+        },
+        {
+          "title": "https://www.readaboutai.com/april-9-2026/",
+          "url": "https://www.readaboutai.com/april-9-2026/"
+        },
+        {
+          "title": "https://aiweekly.co/issues/481",
+          "url": "https://aiweekly.co/issues/481"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Meta_Superintelligence_Labs",
+          "url": "https://en.wikipedia.org/wiki/Meta_Superintelligence_Labs"
+        },
+        {
+          "title": "https://dentro.de/ai/news/",
+          "url": "https://dentro.de/ai/news/"
+        },
+        {
+          "title": "https://www.linkedin.com/pulse/ai-updates-roundup-march-1017-2026-dhanushkumar-r-izqzc",
+          "url": "https://www.linkedin.com/pulse/ai-updates-roundup-march-1017-2026-dhanushkumar-r-izqzc"
+        },
+        {
+          "title": "https://champaignmagazine.com/2026/03/15/ai-by-ai-weekly-top-5-march-9-15-2026/",
+          "url": "https://champaignmagazine.com/2026/03/15/ai-by-ai-weekly-top-5-march-9-15-2026/"
+        },
+        {
+          "title": "https://www.singularitysoup.com/latest-ai-news-2026-02-25.html",
+          "url": "https://www.singularitysoup.com/latest-ai-news-2026-02-25.html"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/A_National_Policy_Framework_for_Artificial_Intelligence",
+          "url": "https://en.wikipedia.org/wiki/A_National_Policy_Framework_for_Artificial_Intelligence"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/Global_call_for_AI_red_lines",
+          "url": "https://en.wikipedia.org/wiki/Global_call_for_AI_red_lines"
+        },
+        {
+          "title": "https://arxiv.org/abs/2602.23679",
+          "url": "https://arxiv.org/abs/2602.23679"
+        },
+        {
+          "title": "https://www.axios.com/2026/04/09/trump-white-house-gop-states-ai-rules",
+          "url": "https://www.axios.com/2026/04/09/trump-white-house-gop-states-ai-rules"
+        },
+        {
+          "title": "https://www.whitehouse.gov/releases/2026/03/president-donald-j-trump-unveils-national-ai-legislative-framework/",
+          "url": "https://www.whitehouse.gov/releases/2026/03/president-donald-j-trump-unveils-national-ai-legislative-framework/"
+        },
+        {
+          "title": "https://www.whitehouse.gov/releases/2026/02/u-s-promotes-ai-adoption-sovereignty-and-exports-at-india-ai-impact-summit/",
+          "url": "https://www.whitehouse.gov/releases/2026/02/u-s-promotes-ai-adoption-sovereignty-and-exports-at-india-ai-impact-summit/"
+        },
+        {
+          "title": "https://www.whitehouse.gov/briefings-statements/2026/03/first-lady-melania-trump-convenes-record-45-nations-at-the-white-house-and-introduces-american-built-humanoid/",
+          "url": "https://www.whitehouse.gov/briefings-statements/2026/03/first-lady-melania-trump-convenes-record-45-nations-at-the-white-house-and-introduces-american-built-humanoid/"
+        },
+        {
+          "title": "https://www.whitehouse.gov/briefings-statements/2026/03/65th-anniversary-of-the-peace-corps/",
+          "url": "https://www.whitehouse.gov/briefings-statements/2026/03/65th-anniversary-of-the-peace-corps/"
+        },
+        {
+          "title": "https://www.whitehouse.gov/articles/2026/03/president-trump-secures-historic-commitment-to-keep-electricity-costs-down-amid-data-center-boom/",
+          "url": "https://www.whitehouse.gov/articles/2026/03/president-trump-secures-historic-commitment-to-keep-electricity-costs-down-amid-data-center-boom/"
+        },
+        {
+          "title": "https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a",
+          "url": "https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a"
+        },
+        {
+          "title": "https://www.whitehouse.gov/presidential-actions/2026/03/ratepayer-protection-pledge-proclamation/",
+          "url": "https://www.whitehouse.gov/presidential-actions/2026/03/ratepayer-protection-pledge-proclamation/"
+        },
+        {
+          "title": "https://www.whitehouse.gov/presidential-actions/2025/11/launching-the-genesis-mission/",
+          "url": "https://www.whitehouse.gov/presidential-actions/2025/11/launching-the-genesis-mission/"
+        },
+        {
+          "title": "https://www.govexec.com/technology/2026/03/white-house-releases-regulatory-vision-ai/412285/",
+          "url": "https://www.govexec.com/technology/2026/03/white-house-releases-regulatory-vision-ai/412285/"
+        },
+        {
+          "title": "https://www.axios.com/2026/03/23/conservative-group-tougher-ai-rules",
+          "url": "https://www.axios.com/2026/03/23/conservative-group-tougher-ai-rules"
+        },
+        {
+          "title": "https://www.whitehouse.gov/briefings-statements/2026/01/first-lady-melania-trump-inspires-americas-children-to-be-curious-use-ai-to-achieve-their-career-ambitions/",
+          "url": "https://www.whitehouse.gov/briefings-statements/2026/01/first-lady-melania-trump-inspires-americas-children-to-be-curious-use-ai-to-achieve-their-career-ambitions/"
+        },
+        {
+          "title": "https://www.whitehouse.gov/articles/2026/03/white-house-unveils-president-trumps-cyber-strategy-for-america/",
+          "url": "https://www.whitehouse.gov/articles/2026/03/white-house-unveils-president-trumps-cyber-strategy-for-america/"
+        },
+        {
+          "title": "https://www.washingtonpost.com/politics/2026/03/20/white-house-donald-trump-artificial-intelligence/70f2f230-245d-11f1-954a-6300919c9854_story.html?itid=agg_ticker",
+          "url": "https://www.washingtonpost.com/politics/2026/03/20/white-house-donald-trump-artificial-intelligence/70f2f230-245d-11f1-954a-6300919c9854_story.html?itid=agg_ticker"
+        },
+        {
+          "title": "https://www.whitehouse.gov/presidential-actions/2025/04/advancing-artificial-intelligence-education-for-american-youth/",
+          "url": "https://www.whitehouse.gov/presidential-actions/2025/04/advancing-artificial-intelligence-education-for-american-youth/"
+        },
+        {
+          "title": "https://apnews.com/article/65651bd28c3d911d18eeb46cd54f4c75",
+          "url": "https://apnews.com/article/65651bd28c3d911d18eeb46cd54f4c75"
+        },
+        {
+          "title": "https://www.axios.com/2026/03/25/hawley-ai-chatbots-congress-guard-act",
+          "url": "https://www.axios.com/2026/03/25/hawley-ai-chatbots-congress-guard-act"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/AI_Action_Plan",
+          "url": "https://en.wikipedia.org/wiki/AI_Action_Plan"
+        },
+        {
+          "title": "https://en.wikipedia.org/wiki/No_Fakes_Act",
+          "url": "https://en.wikipedia.org/wiki/No_Fakes_Act"
+        }
+      ]
+    }
+  ],
+  "textResponse": "As of **Thursday, April 9, 2026 (U.S.)**, these look like the **top AI headlines today**:\n\n- **Anthropic loses an appeals-court round in its fight with the Trump administration.** A federal appeals court declined to immediately undo the government’s “supply chain risk” designation, even after a lower-court judge had said the administration likely overstepped. The case now heads toward a **May 19** hearing, so this remains one of the biggest AI-policy/legal stories in the U.S. right now. ([apnews.com](https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3))\n\n- **OpenAI is reportedly preparing a limited-release cybersecurity product for trusted partners.** Axios reports OpenAI is finalizing a cyber-focused offering for a small group of partners, a sign that frontier labs are becoming much more cautious about releasing models with strong hacking capabilities. The story explicitly ties this to Anthropic’s recent gated rollout strategy. ([axios.com](https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic))\n\n- **Anthropic launches Project Glasswing and gates access to Claude Mythos Preview.** Anthropic says its new **Claude Mythos Preview** model has already identified **thousands of zero-day vulnerabilities** and is being released only as a **gated research preview** through Project Glasswing, alongside partners including AWS, Apple, Google, Microsoft, NVIDIA, and others. Anthropic also says it has committed **$100 million** in model-usage credits for the initiative. ([anthropic.com](https://www.anthropic.com/project/glasswing))\n\n- **OpenAI pushes a new “industrial policy” agenda for the AI era.** In a new post published **April 6**, OpenAI says incremental policy changes won’t be enough as AI advances, and it is floating “people-first” ideas to spread AI’s economic gains more broadly. It is also launching feedback channels, policy fellowships/research grants, and discussions at a new Washington, D.C. workshop opening in **May 2026**. ([openai.com](https://openai.com/index/industrial-policy-for-the-intelligence-age))\n\n- **Google adds stronger crisis-support features to Gemini and commits $30 million to hotlines.** Google says Gemini will now surface redesigned mental-health support prompts and a simplified **one-touch** path to crisis hotlines when conversations indicate possible self-harm risk. Separately, Google.org says it will provide **$30 million over three years** to help crisis-support organizations globally. ([blog.google](https://blog.google/innovation-and-ai/technology/health/mental-health-updates/))\n\n- **Google’s latest open-model push is still making waves: Gemma 4.** Google DeepMind introduced **Gemma 4** on **April 2**, calling it its most capable open-model family “byte for byte.” While not a same-day breaking item, it remains one of the most important recent product releases shaping today’s AI conversation, especially for developers and open-model competition. ([blog.google](https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/))\n\nIf you want, I can also turn this into a **“Top 10 AI headlines today”** version with **one-line summaries + source names only**.",
+  "usage": {
+    "input_tokens": 67771,
+    "output_tokens": 3998,
+    "web_search_requests": 17
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "present": true,
+  "url": "https://openrouter.ai/api/v1/responses",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-origin": "*",
+    "access-control-expose-headers": "X-Generation-Id,cf-ray",
+    "cf-ray": "9e9c8b14cbfd327e-SJC",
+    "connection": "keep-alive",
+    "content-encoding": "gzip",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 21:18:16 GMT",
+    "permissions-policy": "payment=(self \"https://checkout.stripe.com\" \"https://connect-js.stripe.com\" \"https://js.stripe.com\" \"https://*.js.stripe.com\" \"https://hooks.stripe.com\")",
+    "referrer-policy": "no-referrer, strict-origin-when-cross-origin",
+    "server": "cloudflare",
+    "transfer-encoding": "chunked",
+    "x-content-type-options": "nosniff",
+    "x-generation-id": "gen-1775769495-Be0BGml4uPpCZrTFpn9f"
+  },
+  "bodyText": "\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n\n         \n{\"id\":\"gen-1775769495-Be0BGml4uPpCZrTFpn9f\",\"object\":\"response\",\"created_at\":1775769495,\"model\":\"openai/gpt-5.4-20260305\",\"status\":\"completed\",\"completed_at\":1775769510,\"output\":[{\"id\":\"msg_tmp_volzwsq2obp\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Here are some of the biggest **AI headlines circulating today, Thursday, April 9, 2026**, based on recent coverage and official announcements I could verify:\\n\\n- **Microsoft pushes enterprise AI further with its new “Frontier Suite.”** Microsoft announced Wave 3 of Microsoft 365 Copilot, broader model options including Claude and next-gen OpenAI models, and general availability dates for Agent 365 and Microsoft 365 E7. ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\\n- **Google DeepMind publishes a new framework for measuring progress toward AGI.** Google says its new paper proposes a cognitive taxonomy for evaluating AI systems and opened submissions tied to the benchmark effort. ([blog.google](https://blog.google/innovation-and-ai/models-and-research/google-deepmind/measuring-agi-cognitive-framework?utm_source=openai))\\n- **OpenAI Foundation gives an update on its social-impact AI work.** OpenAI said the Foundation is beginning to deploy support through its People-First AI Fund and announced leadership additions for civil society and philanthropy efforts. ([openai.com](https://openai.com/index/update-on-the-openai-foundation//?utm_source=openai))\\n- **TechCrunch is highlighting OpenAI leadership changes as a notable AI story this week.** Its April 3 roundup included a report that COO Brad Lightcap is taking on a new “special projects” role. ([techcrunch.com](https://techcrunch.com/2026/04/03/...?utm_source=openai))\\n- **AI infrastructure remains a major storyline.** Recent reporting and company posts continue to emphasize the race for compute and power, including OpenAI’s previously announced AWS partnership and ongoing coverage of how AI companies are securing the energy needed for data centers. ([openai.com](https://openai.com/index/aws-and-openai-partnership//?utm_source=openai))\\n- **Amazon’s AI chips are gaining more attention in the market.** TechCrunch’s current AI coverage page lists “Uber is the latest to be won over by Amazon’s AI chips” among the newest AI stories. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\\n\\n**Sources used:** Microsoft official blog, Google blog, OpenAI official site, and TechCrunch current AI coverage pages. ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\\n\\nIf you want, I can also turn this into a **clean “top 10 AI news today” digest with one-line summaries and direct source names**, or make it **more mainstream-outlet-only** (Reuters/AP/WSJ-style).\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai\",\"title\":\"Introducing the First Frontier Suite built on Intelligence + Trust - The Official Microsoft Blog\",\"start_index\":422,\"end_index\":574},{\"type\":\"url_citation\",\"url\":\"https://blog.google/innovation-and-ai/models-and-research/google-deepmind/measuring-agi-cognitive-framework?utm_source=openai\",\"title\":\"Measuring Progress Towards AGI: A Cognitive Framework\",\"start_index\":793,\"end_index\":935},{\"type\":\"url_citation\",\"url\":\"https://openai.com/index/update-on-the-openai-foundation//?utm_source=openai\",\"title\":\"Update on the OpenAI Foundation | OpenAI\",\"start_index\":1176,\"end_index\":1268},{\"type\":\"url_citation\",\"url\":\"https://techcrunch.com/2026/04/03/...?utm_source=openai\",\"title\":\"April 3, 2026 | TechCrunch\",\"start_index\":1466,\"end_index\":1541},{\"type\":\"url_citation\",\"url\":\"https://openai.com/index/aws-and-openai-partnership//?utm_source=openai\",\"title\":\"AWS and OpenAI announce multi-year strategic partnership | OpenAI\",\"start_index\":1828,\"end_index\":1915},{\"type\":\"url_citation\",\"url\":\"https://techcrunch.com/category/artificial-intelligence/?utm_source=openai\",\"title\":\"AI News & Artificial Intelligence | TechCrunch\",\"start_index\":2112,\"end_index\":2206}],\"logprobs\":[]}],\"phase\":\"final_answer\"}],\"error\":null,\"incomplete_details\":null,\"tools\":[],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"max_output_tokens\":null,\"temperature\":1,\"top_p\":1,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"max_tool_calls\":null,\"metadata\":{},\"background\":false,\"previous_response_id\":null,\"service_tier\":\"default\",\"truncation\":\"disabled\",\"store\":false,\"instructions\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"reasoning\":null,\"safety_identifier\":null,\"prompt_cache_key\":null,\"usage\":{\"input_tokens\":12587,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":839,\"output_tokens_details\":{\"reasoning_tokens\":307},\"total_tokens\":13426,\"cost\":0.0740525,\"is_byok\":false,\"cost_details\":{\"upstream_inference_cost\":0.0740525,\"upstream_inference_input_cost\":0.0314675,\"upstream_inference_output_cost\":0.012585}}}",
+  "bodyJson": {
+    "id": "gen-1775769495-Be0BGml4uPpCZrTFpn9f",
+    "object": "response",
+    "created_at": 1775769495,
+    "model": "openai/gpt-5.4-20260305",
+    "status": "completed",
+    "completed_at": 1775769510,
+    "output": [
+      {
+        "id": "msg_tmp_volzwsq2obp",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Here are some of the biggest **AI headlines circulating today, Thursday, April 9, 2026**, based on recent coverage and official announcements I could verify:\n\n- **Microsoft pushes enterprise AI further with its new “Frontier Suite.”** Microsoft announced Wave 3 of Microsoft 365 Copilot, broader model options including Claude and next-gen OpenAI models, and general availability dates for Agent 365 and Microsoft 365 E7. ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\n- **Google DeepMind publishes a new framework for measuring progress toward AGI.** Google says its new paper proposes a cognitive taxonomy for evaluating AI systems and opened submissions tied to the benchmark effort. ([blog.google](https://blog.google/innovation-and-ai/models-and-research/google-deepmind/measuring-agi-cognitive-framework?utm_source=openai))\n- **OpenAI Foundation gives an update on its social-impact AI work.** OpenAI said the Foundation is beginning to deploy support through its People-First AI Fund and announced leadership additions for civil society and philanthropy efforts. ([openai.com](https://openai.com/index/update-on-the-openai-foundation//?utm_source=openai))\n- **TechCrunch is highlighting OpenAI leadership changes as a notable AI story this week.** Its April 3 roundup included a report that COO Brad Lightcap is taking on a new “special projects” role. ([techcrunch.com](https://techcrunch.com/2026/04/03/...?utm_source=openai))\n- **AI infrastructure remains a major storyline.** Recent reporting and company posts continue to emphasize the race for compute and power, including OpenAI’s previously announced AWS partnership and ongoing coverage of how AI companies are securing the energy needed for data centers. ([openai.com](https://openai.com/index/aws-and-openai-partnership//?utm_source=openai))\n- **Amazon’s AI chips are gaining more attention in the market.** TechCrunch’s current AI coverage page lists “Uber is the latest to be won over by Amazon’s AI chips” among the newest AI stories. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n**Sources used:** Microsoft official blog, Google blog, OpenAI official site, and TechCrunch current AI coverage pages. ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\n\nIf you want, I can also turn this into a **clean “top 10 AI news today” digest with one-line summaries and direct source names**, or make it **more mainstream-outlet-only** (Reuters/AP/WSJ-style).",
+            "annotations": [
+              {
+                "type": "url_citation",
+                "url": "https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai",
+                "title": "Introducing the First Frontier Suite built on Intelligence + Trust - The Official Microsoft Blog",
+                "start_index": 422,
+                "end_index": 574
+              },
+              {
+                "type": "url_citation",
+                "url": "https://blog.google/innovation-and-ai/models-and-research/google-deepmind/measuring-agi-cognitive-framework?utm_source=openai",
+                "title": "Measuring Progress Towards AGI: A Cognitive Framework",
+                "start_index": 793,
+                "end_index": 935
+              },
+              {
+                "type": "url_citation",
+                "url": "https://openai.com/index/update-on-the-openai-foundation//?utm_source=openai",
+                "title": "Update on the OpenAI Foundation | OpenAI",
+                "start_index": 1176,
+                "end_index": 1268
+              },
+              {
+                "type": "url_citation",
+                "url": "https://techcrunch.com/2026/04/03/...?utm_source=openai",
+                "title": "April 3, 2026 | TechCrunch",
+                "start_index": 1466,
+                "end_index": 1541
+              },
+              {
+                "type": "url_citation",
+                "url": "https://openai.com/index/aws-and-openai-partnership//?utm_source=openai",
+                "title": "AWS and OpenAI announce multi-year strategic partnership | OpenAI",
+                "start_index": 1828,
+                "end_index": 1915
+              },
+              {
+                "type": "url_citation",
+                "url": "https://techcrunch.com/category/artificial-intelligence/?utm_source=openai",
+                "title": "AI News & Artificial Intelligence | TechCrunch",
+                "start_index": 2112,
+                "end_index": 2206
+              }
+            ],
+            "logprobs": []
+          }
+        ],
+        "phase": "final_answer"
+      }
+    ],
+    "error": null,
+    "incomplete_details": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_output_tokens": null,
+    "temperature": 1,
+    "top_p": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "max_tool_calls": null,
+    "metadata": {},
+    "background": false,
+    "previous_response_id": null,
+    "service_tier": "default",
+    "truncation": "disabled",
+    "store": false,
+    "instructions": null,
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "reasoning": null,
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "usage": {
+      "input_tokens": 12587,
+      "input_tokens_details": {
+        "cached_tokens": 0
+      },
+      "output_tokens": 839,
+      "output_tokens_details": {
+        "reasoning_tokens": 307
+      },
+      "total_tokens": 13426,
+      "cost": 0.0740525,
+      "is_byok": false,
+      "cost_details": {
+        "upstream_inference_cost": 0.0740525,
+        "upstream_inference_input_cost": 0.0314675,
+        "upstream_inference_output_cost": 0.012585
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "(FiberFailure) Error",
+  "message": "GitHub Copilot web search error 401: IDE token expired: unauthorized: token expired\n",
+  "stack": "Error: GitHub Copilot web search error 401: IDE token expired: unauthorized: token expired\n\n    at copilotWebSearch (/Users/trg/magnitude/packages/agent/src/tools/web-search-copilot.ts:189:17)\n    at processTicksAndRejections (native:7:39)"
+}

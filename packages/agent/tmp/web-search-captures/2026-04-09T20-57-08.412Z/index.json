@@ -1,0 +1,13 @@
+{
+  "root": "2026-04-09T20-57-08.412Z",
+  "generatedAt": "2026-04-09T20:58:39.182Z",
+  "runs": [
+    {
+      "runId": "github-copilot",
+      "provider": "github-copilot",
+      "authMode": "oauth",
+      "status": "provider-error",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T20-57-08.412Z/github-copilot"
+    }
+  ]
+}

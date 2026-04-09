@@ -1,0 +1,1666 @@
+{
+  "present": true,
+  "url": "https://api.githubcopilot.com/responses",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "content-security-policy": "default-src 'none'; sandbox",
+    "content-type": "application/json",
+    "copilot-edits-session": "1775768361.196fb0855c04a89fb71acd69fed76414d3bc9cb74e32019511a55a9d375aab8a",
+    "date": "Thu, 09 Apr 2026 21:01:04 GMT",
+    "strict-transport-security": "max-age=31536000",
+    "transfer-encoding": "chunked",
+    "x-copilot-api-exp-assignment-context": "5133j383:1109202;",
+    "x-github-backend": "Kubernetes",
+    "x-github-request-id": "DD3E:2B4F1D:B9907B:CE5B00:69D81328",
+    "x-request-id": "00000-2b54b3a9-4572-4fa4-b5a1-d3c7df3997c4"
+  },
+  "bodyText": "{\"created_at\":1775768300,\"id\":\"g/RESIjSBUVYaRECv2Q/LtPlQirMZbzKmCG8OB5mz7PjpVFnUblwZ9VB6KDkOcGip9zZW7vRwCgEg38KCV9eOsRjGmhvvdPtpyvnF2X46wQ6ddFlPSaKQHYTpu7TKvcm8oFsc3cstuJ/aFpgSJWILNOMA4edo3YMcb23IOmCkbGGVqEz05IP6GSob0usQbbC9zpRDdRce8Xnd48ySchPJBvJrce7yVxWzbPmVwZE71dfp+rhvqq/7E/zT04gXIvbfec1809ept23W7MRqFXIJpFdJWvOXCyjz5PxBe40oGre4+UhLl+seh45VaHZi+r24pllLXTEl7mXy0hkjfbH/6cFyRrBIS5uPoiaYHD3Wtu1SI4FKylzWodg96lTNlBX+xVdtp01vkrnXt5xhADEBHhI\",\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-5.4-2026-03-05\",\"object\":\"response\",\"output\":[{\"id\":\"JIO1+sK7/Vm6QXv6L6RBixKI9p5csDXuCZoPuMGV30jhuFyi+5evq5LaTmsbcqyJzI+hw/87IcosM9Z6b5OEUgumI9aV0P3eavheMBqryaxb9DmdJ7RWcBV7+W5NUCbjptgG3VVsx/IklsTmWdd7jKgMLzLzrYdwbKV1ycZnEVjjShof/KMoDZ2zjQWW+8cvVNQA0+NhJqff02p9xQoprshC6gZUrKIcIotcO22XYF3TSGtzBJcdyMuos+xy9rnta4fD+tvxR/cdLWk1q5xjNqVXJR9i08UwNgZ3cFfSdeOTFIavCSf1Lzwhsv83PScuju5esNy/5Hh6xTRmVowi8L6es5j61dYxrU2jyh+xYMiFwad9IhGOgxIwjF17eNwY0XkycNTkrMQi1hOYiOmf4A==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"AI news April 9 2026 Reuters AI Microsoft OpenAI Google Anthropic recent\",\"site:reuters.com AI April 9 2026 Reuters artificial intelligence\",\"site:techcrunch.com AI April 9 2026 TechCrunch\",\"site:theverge.com AI April 9 2026 AI news\"],\"query\":\"AI news April 9 2026 Reuters AI Microsoft OpenAI Google Anthropic recent\",\"sources\":[{\"type\":\"url\",\"url\":\"https://apnews.com/article/a3e4d6ba75f475eb130d91c81e522f93\"},{\"type\":\"url\",\"url\":\"https://arstechnica.com/ai/2025/09/report-microsoft-taps-rival-anthropics-ai-for-office-after-it-beats-openai-at-some-tasks/\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/02/27/google-openai-workers-push-for-military-ai-limits\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/b5e99d485d08ed1ced68a701723c3843\"},{\"type\":\"url\",\"url\":\"https://fortune.com/2026/03/31/microsoft-revamps-copilot-with-anthropic//\"},{\"type\":\"url\",\"url\":\"https://m.investing.com/news/stock-market-news/microsoft-brings-anthropic-ai-models-to-365-copilot-diversifies-beyond-openai-4253806?ampMode=1\"},{\"type\":\"url\",\"url\":\"https://www.pcgamer.com/software/ai/microsoft-shows-support-for-anthropics-legal-case-against-the-us-department-of-defense/\"},{\"type\":\"url\",\"url\":\"https://www.yahoo.com/news/articles/anthropic-open-india-office-2026-011406670.html\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026\"},{\"type\":\"url\",\"url\":\"https://www.windowscentral.com/artificial-intelligence/microsoft-copilot/ai-chief-warns-frontier-ai-could-demand-hundreds-of-billions\"},{\"type\":\"url\",\"url\":\"https://popularaitools.ai/ai-news-this-week-march-2026/\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute\"},{\"type\":\"url\",\"url\":\"https://time.com/7339685/person-of-the-year-2025-ai-architects/\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2603.08993\"},{\"type\":\"url\",\"url\":\"https://mml-studio.com/blog/ai-weekly-march-23-29-2026/\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/AI_Action_Summit\"},{\"type\":\"url\",\"url\":\"https://techcrunch.com/2025/04/09/\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy\"},{\"type\":\"url\",\"url\":\"https://www.ai-roundup.dev/roundup/2026-04-07/\"},{\"type\":\"url\",\"url\":\"https://aitoolly.com/ai-news/2026-04-01\"},{\"type\":\"url\",\"url\":\"https://www.techrepublic.com/article/news-microsoft-to-use-ai-from-anthropic\"}],\"type\":\"search\"},\"id\":\"KVZAVnJ7JqsbQRL2Qz3yZ89OpovjUE5rsa8Xjsr9Cwf0+/rrG10vlMvOLsAlSXCHDBjzTb4i2XBp7T1Da4605q1snzvt2fVPfv3f3McXhRL/y+7SEIXDuYvHNEg+W5PElVU9JJj/j5woCnWRgE/FrYivO7Ss74cP1f1UlhZ5DZ0GYHVgrpTxqADbqbkJ01R+Fb9qg6KKXLXo6JdriDnyHfe8pDE5rgCadYErXIH/PZ6WmWaK9Pa1Nhooq8rm4kYmGJK1/GTQtXC6T6F2QCpBKkcY1082im7kl3eCfNqLKuQGFR2G5m5OQwwYPphyb+n4Etdlbs6KYdzwxUFHbShkCLMF1j52dSHKXcApLqocEeZsdJ5/r9wo+g5UfDUqvLTBzsOFh/e4tMNFhjS1vf2h+w==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"rZxODA67loPPD2XvBjAK594mCZXj3iz+z9Tau1iqNSEiomEVS/qRb+Bu6xZmKj076gaFS8YQSTcvqdK9/rmR705E9OlF9PAm7QsrgFgKGc7uQduyjnLWDzUvbPiip8LUg19TEyeyCYCMR9GRU8v5KhPZSVa7cnPGIyK7olLw/4alEPk16J/M2KeMCjcDPw6DY/j/o8RaVXTCzijISIMml8Fs5B0NvqTmZurlND04ZQflnp1JO4vU0c7G0uENFEVE7nmS2ZHFye5vQSChY+IwNvZjB7vngiKkn05AX1FTOPo7gyZHCLRa8cUNNfYCrx+0oCxLCFVPNEXRk2Rl51Q21tnn00paf9riW6rXsAzqTDka3BNsMxvBv8pDyngzv5l+hYBnWRNGo3psvV2BgMm3yw==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"AI news today April 9 2026 Reuters recency 2 days\",\"OpenAI Reuters April 2026 AI recency 7 days\",\"Anthropic Reuters April 2026 AI recency 7 days\",\"Google AI Reuters April 2026 recency 7 days\"],\"query\":\"AI news today April 9 2026 Reuters recency 2 days\",\"sources\":[{\"type\":\"url\",\"url\":\"https://www.ai-roundup.dev/roundup/2026-04-07/\"},{\"type\":\"url\",\"url\":\"https://techcrunch.com/2025/12/08/openai-boasts-enterprise-win-days-after-internal-code-red-on-google-threat/\"},{\"type\":\"url\",\"url\":\"https://www.distillintelligence.com/briefings/ai-leaders-2026-04-03\"},{\"type\":\"url\",\"url\":\"https://www.theguardian.com/technology/artificialintelligenceai/2026/apr/09/all\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2604.02912\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2603.24621\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy\"},{\"type\":\"url\",\"url\":\"https://techstartups.com/2026/04/07/top-tech-news-today-april-7-2026/\"},{\"type\":\"url\",\"url\":\"https://af.net/realtime/major-developments-in-ai-over-the-weekend-april-4-5-2026/\"},{\"type\":\"url\",\"url\":\"https://www.aol.com/finance/openai-encourages-firms-trial-four-120106793.html\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Claude_%28language_model%29\"},{\"type\":\"url\",\"url\":\"https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html\"},{\"type\":\"url\",\"url\":\"https://www.promptinjection.net/p/ai-llm-news-roundup-march-23-april-05-2026\"},{\"type\":\"url\",\"url\":\"https://investor.wedbush.com/wedbush/article/marketminute-2026-4-1-alphabets-ai-renaissance-gemini-3-success-drives-51-surge-to-record-highs\"},{\"type\":\"url\",\"url\":\"https://jasonrobert.dev/news/2026-04-07/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/Anthropic/comments/1rnie5x/weekly_limit_reset_date_pushed_back_again/\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/METR\"},{\"type\":\"url\",\"url\":\"https://srnnews.com/alphabet-hits-near-three-month-high-on-new-ai-updates/\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2511.15080\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2601.14242\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/AI_bubble\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/AIToolsTipsNews/comments/1rmesjl/anthropics_legal_ai_plugin_triggered_a_285b_stock/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/OpenAI/comments/1sf9a6j/removed/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/singularity/comments/1s57lqa/exclusive_anthropic_left_details_of_an_unreleased/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/OpenAI/comments/1sf03ea/removed/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/OpenAI/comments/1sf1xus/removed/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/Anthropic/comments/1s57mbt/exclusive_anthropic_left_details_of_an_unreleased/\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/ArtificialInteligence/comments/1qyde7v/what_happened_in_ai_today_feb_07_2026_7_minute/\"}],\"type\":\"search\"},\"id\":\"HbFzlaWB2luwxi/4LWfhGzbmsm/XnbUmsnmfmE5gvpbUrxTUJ7ADNdULWgxGAgpM99gQQSqybkTkOW8f60a4rvcEZbQzMVK06ey0bDnXTPjUh4fVyqi3EJ6m4WSoNBLEFydoMP8CjS1l8PF9HklHYicibR03lTgRVMElDr381IOUUB2nKu+nxtY5aw/q0kVT4pOdyQZZiIM2CSB7ertpyBp2dHMxbeQXmioE5Q3jrXm2emtXHNMDGHrprq5aqrns4Gnr0zZRhQLbEZgWJMKg+SlAOsFJM2nJKhQrpFb+WfyuYT0Eb+JAXMGINHtFTqD2JJN7bbj7XN2y322H94Aieiuec8yT/P3MZX50YyB2KvAy7OMSwK8lL1fyzuN1T2hQlY3x3dwDxQQUZ/IpT2bGaA==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"Kr0SArV8cHjJH3NSzQa8dgUTDnHIbqChBSpFquJM36QePRZz+D1W7G+04oAGgwd8U/jHpRVrb9qlurjdBgxrncM8xTIvhPR4gaN4WyFNL5D5oHJZGOhohp3zaffho2am/d2C5VZifvHA3wlWGkvaL8u7xDYUM+O8dPuMAAym7ZoVgFYGx9VP3p5fmGF1LEbp3ZwYg/JUsWaKigRKSZsbmzgslojIWy4GQVd3ZRJ+9g/d61h+rBalRwK+2KpkzO866qVKmKgXvx9m6per6iJHTnXeYIMyHxb5UultQxLEEorpjG/R59uuFdGPer/hKT/9O8bIc+MjgsMduKbTvhdc82KJsXcJyAVg5zQAdWo+df36XiJbJVRQW18oPMyH1+Em6SjWcvVCAvgQkugCbWgrkw==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:reuters.com/artificial-intelligence April 2026 OpenAI Reuters\",\"site:reuters.com/technology April 2026 AI OpenAI Anthropic Google Microsoft\",\"site:apnews.com AI April 2026 OpenAI Google Anthropic Microsoft\",\"site:blog.google AI April 2026 Gemini launch\"],\"query\":\"site:reuters.com/artificial-intelligence April 2026 OpenAI Reuters\",\"sources\":[{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-flash-live/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/ai/nano-banana-2/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-updates-march-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/products/education/khan-academy-partnership/\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/275df9e291bbb361962dfc6ba868506c\"},{\"type\":\"url\",\"url\":\"https://blog.google/intl/en-mena/company-news/outreach-initiatives/ai-film-award-powered-by-google-gemini/\"},{\"type\":\"url\",\"url\":\"https://blog.google/intl/en-in/products/explore-communicate/new-ways-google-is-using-ai-to-make-shopping-easier/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/products/education/chromeos-chromebooks-bett-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/products/google-ai-updates-march-2025/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/ai/google-gemini-ai/\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/65c08aa4fab90cde952f37d32625394a\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/071e752773dee5713c8b1a10039d08aa\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/c4210e7eddd9ad90161e7fa2da9736e2\"},{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/platforms/android/samsung-unpacked-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-february-2026/\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/a3e4d6ba75f475eb130d91c81e522f93\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/c19e0cca22c37190cc4e0dc08e889ef0\"},{\"type\":\"url\",\"url\":\"https://assets.apnews.com/19/1b/545643064e0caecf2c92d2897ce0/ap-ncaa-bracket-men.pdf\"},{\"type\":\"url\",\"url\":\"https://assets.apnews.com/14/3d/676decd64f808025bd6e9e9263be/ap-ncaa-bracket-women.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf\"}],\"type\":\"search\"},\"id\":\"i5vmjfruoghj4N1URno5iLBoa6TS43fo+GfpUXDekwUP583/FuUPqCFDRxP+X0v+p7e/rHAnD+nMC4qlJAqpFrOAZ9eiqE2V+LomeZQPGEdyDfUa5KPe5WfslA/Ub3q6413ZJUMo0RqTPngYvAgzE7l+W65c6tO5ratT7k9o9eoihiqG/dR29IIKoN5yO538sSwEs0lt0BF1e/rHz5RKAdO/0PXKgkX1xSxnS3ynwcm6MEuRlXPZl1jxcn0a8kIAxYUPxFEgEXd5XWPpt5MFVaaEuZ6RpLnRPTUklos/z83HRoCUYXxe+/7hHzQ8hPmR7jtkrTf/ny23IpSFlv/YoEXiMAik0wrNektisrPB32jPLNJ1R3HbucSTpLxCFpyig9SIWm+pv3eRJS8YHiuU2Q==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"S7OaeiIlqTRmwgh9Qjbfm4QeTs991HVaRV8luXiDUuuFihQe7RWUiXbKmvCACv6TtzNjQOPZB6IL0dBi+22PSMbq4mc6knpzD8FBfeLrE0qOpfaMI5atK64gmIx1l+LCFRVdV4Ec3jpXa5lXsg02G8vwLuoYVEhqfsG0HFLFdQYU7P1WXDJ2jXdnbZZ6i71k8idFr8YpZkMpFyioIxo12a2ksHe0fWWMqnxK2TVSVVgnZigy8xOxjDAwKq5wTY8l4Ej+fuI1VSZ0HtCRetC9bFp6g0ro4UzYqmX2WEj/JRTav42MWtJ/uBaX4mJYBbypJOogiyq7Gi+ZPGTslEsjWNsirIT4K8s+7jiPszyIN5co99zyp+0QnLIkRnlTeIQ+XCwd8PR3GSNFjqU9cepJbw==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:reuters.com April 8 2026 artificial intelligence Reuters OpenAI\",\"site:reuters.com April 8 2026 artificial intelligence Reuters Anthropic\",\"site:reuters.com April 8 2026 artificial intelligence Reuters Google AI\",\"site:reuters.com April 8 2026 artificial intelligence Reuters Microsoft AI\"],\"query\":\"site:reuters.com April 8 2026 artificial intelligence Reuters OpenAI\",\"type\":\"search\"},\"id\":\"LrttM1vQqmrQhCewHDhBxGFIFROzAYknSTKEp6ur2XRKiZFgBD9upWTZBpsdx/o6THP+UVxdWTnFBpAaLAoFnxODp5M8ak/+9qyECOIjdv1prU2vF2uB1oKLxIM7MDaF+HMYFOl9Nsp86q1TvXP9f5E5EsXhG6aUzbC5U6K8ueoyebqU5rgEMWV3EJekO5/2teG5pjLQ7VIeTH9UO8QrZaV9nBpsAl/1QEpOUZ0LNIb7zfbcFIXPVmURjND6dIKeTxdLTpXzDmUCrmEzQLt6XEZGj2H5w4R941pFU7TtRZGvlUGJMnsZTFQoe8tYqAke3q3FwqAIuyQ427R2/jM5KbRTLuYsqXYf9rVDuq8eP/R+T48zEWui99FccDDjXBnQca9F2f/4wycJRQE2hN+S+w==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"F+DkbvkEr7eyAO/63Qto+uV1HtYj20PDl87A7jgk8Gf+XSFxWBlXS57Lz4oNYgjoSyrkhC9ywwf0IyAKQzVCqFCc9RQmQIms88v8/o+fJy77VHKEGCclEP2q2b2nkoix2U2UEpIiugfrNNPTPifj2Nvem73Hb2+VbmvBJqge+y9wwNGsgTX3x15bDNS5ClHMd1uWPQeFIuPg+LDfBFNdilMyp4uVrCZkDYM69re7VdQIfEdgCNLaM8yrMDkOTah3XXPdQ36ddg9vwwBExzTyrUtoDnCjjxR6y56MqQY/2/vDC71WoqJth4KSFWqI7jF9EIW9MJiFxiV9yN6BiSj7HVwnhbVDWv4LgacFaE8bkmK59JHatn9wjgfD5+sKvpGj1wfN5544cDnk8P4DWP7hBg==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"Reuters April 8 2026 OpenAI AI\",\"Reuters April 8 2026 Anthropic AI\",\"Reuters April 8 2026 Google AI\",\"Reuters April 8 2026 Microsoft AI\"],\"query\":\"Reuters April 8 2026 OpenAI AI\",\"sources\":[{\"type\":\"url\",\"url\":\"https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3\"},{\"type\":\"url\",\"url\":\"https://www.tomshardware.com/tech-industry/broadcom-expands-anthropic-deal-to-3-5gw-of-google-tpu-capacity-from-2027\"},{\"type\":\"url\",\"url\":\"https://www.itpro.com/technology/artificial-intelligence/project-glasswing-anthropic-announces-big-tech-consortium-to-test-claude-mythos-ai-model-that-could-reshape-cybersecurity\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/04/08/anthropic-mythos-model-ai-cyberattack-warning\"},{\"type\":\"url\",\"url\":\"https://www.itpro.com/infrastructure/anthropic-pens-multi-gigawatt-tpu-deal-with-google-and-broadcom-as-claude-demand-picks-up\"},{\"type\":\"url\",\"url\":\"https://www.techradar.com/news/live/claude-anthropic-down-outage-april-6-2026\"},{\"type\":\"url\",\"url\":\"https://www.global-economy-news.com/2026/01/30/microsofts-ai-spending-shock-is-the-market-rethinking-the-ai-boom/\"},{\"type\":\"url\",\"url\":\"https://www.investing.com/news/stock-market-news/wolters-kluwer-relx-shares-slip-after-anthropic-unveils-aienhanced-legal-tool-4481124\"},{\"type\":\"url\",\"url\":\"https://creati.ai/ai-news/2026-04-08/\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2604.04759\"},{\"type\":\"url\",\"url\":\"https://www.straitstimes.com/business/companies-markets/microsoft-racks-up-over-600m-in-ai-savings-while-slashing-jobs-bloomberg-news-reports\"},{\"type\":\"url\",\"url\":\"https://www.investing.com/news/economy-news/anthropic-holds-firm-on-military-ai-restrictions-after-pentagon-meeting--reuters-93CH-4522534\"},{\"type\":\"url\",\"url\":\"https://senx.ai/news/2026-04-08-daily-ai-news\"},{\"type\":\"url\",\"url\":\"https://news.cgtn.com/news/2026-02-21/OpenAI-sees-600-billion-in-compute-spending-through-2030-Reuters-1KWAar1MJLW/p.html\"},{\"type\":\"url\",\"url\":\"https://www.thomsonreuters.com/en/press-releases/2026/january/thomson-reuters-convenes-global-ai-leaders-to-advance-trust-in-the-age-of-intelligent-systems\"},{\"type\":\"url\",\"url\":\"https://finance.yahoo.com/news/anthropic-tells-judge-billions-stake-233500564.html\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy\"},{\"type\":\"url\",\"url\":\"https://neuralwired.com/2026/04/03/microsoft-japan-ai-investment-2026/\"},{\"type\":\"url\",\"url\":\"https://www.investing.com/news/stock-market-news/anthropic-touts-new-ai-tools-weeks-after-legal-plugin-spurred-market-rout-4521742\"},{\"type\":\"url\",\"url\":\"https://www.morningstar.com/stocks/reuters-relx-wolters-stocks-crushed-after-anthropic-debuts-claude-legal-plug-in\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/The_Patil_Effect\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Public_First_Action\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Manus_%28AI_agent%29\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Stargate_LLC\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2603.08993\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2604.02912\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2604.06217\"}],\"type\":\"search\"},\"id\":\"cKVMZ6l0wgkKonVIJ4ipuykQpJcGGVT6dr0EWcd49I6aaWO5jODGyDjS7Zhiknz+PBROWq2ytvynSAduIPoboR2aGipTP0OWDcUXlHE2tkEEI0kvGOkuPWJs0jx1R7jrFjfj3ofqfs6ARka2Kc6nuo5D2OD2bkc8E1Rxq2WR/pVLCeLsJQ2gQEwWFYLfK5YRc48l7pdMBIAiqrIRM3tAJczsKhP43XBeif4u9UfKln2tYyNYIa8w1ecuSB9LzfQbn4JOaJIFnREAfMBGxxzW04F+oVi1topw84cqopZCyFt9tVX1cBQ+UCbZomOc8Kcrr1cQfyaQNS5V8eqWbKGl0Rv6s7cwF+m+DqgQA5J6+0kk1t7wG35qCr3SunPFzW8sP4P4MYTZxbae/1m7oIRWNQ==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"tGFx3lYfBE0MTfdp+yqc88Vy2g11QvUOio91pHJh7EdLnFYmfdTSrb4SHREr8R9ZrxmbHtlkwa2yUcs6+Gch2QRFUbZZbNMqPcABfAtR2kUqlM7QVpALZZ0WK6HSc3cNxRNf2ystL623EffCU5UTznisdgqOUKQEPWZXm9H1V4LRNn6qh8uIU4pUj29NFg7Hhz0SwB5MdeQiCXQzT5sdh92U9AJ8333AFTE1tZh9FkbkWqDvh17X5O7QZc4cq87Lwo3N3Hv8wRKKS2vjXrbCbegySd3d/WlRDqolQ43/cquiZBC2Uosv+dHjVdvy5jFW7EePEYQNmtBLCEmlKWhC3CziYf4IpVnUbsKrUlCD6SAPS7Ch3tR57VL39uMmr5rQPH0XQ0O1YwL1Xpua3+m6GA==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:openai.com/news April 2026 OpenAI announced\",\"site:openai.com/index April 2026 OpenAI work week AI economy\",\"site:openai.com April 7 2026 OpenAI proposals superintelligence\",\"site:openai.com April 2026 OpenAI latest news\"],\"query\":\"site:openai.com/news April 2026 OpenAI announced\",\"sources\":[{\"type\":\"url\",\"url\":\"https://openai.com/index/stargate-advances-with-partnership-with-oracle/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/aws-and-openai-partnership/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/openai-acquires-tbpn/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/figma-partnership/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/stargate-sb-energy-partnership/\"},{\"type\":\"url\",\"url\":\"https://openai.com/fil-PH/index/amazon-partnership/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/introducing-openai-for-government/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/openai-for-australia\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/openai-for-ireland/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/openai-for-germany/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/providing-chatgpt-to-the-entire-us-federal-workforce/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/updating-our-preparedness-framework/\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/global-affairs/openai-doe-rfi-5-7-2025.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/global-affairs/61b341bc-56eb-46dc-b356-a621e02cb82d/openai-australia-economic-blueprint-july-2025.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/signals/openai-signals-global-report.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/global-affairs/f319686f-cf21-4b8e-b8bc-84dd9bbfb999/oai-workforce-blueprint-oct-2025.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/API/docs/deep_research_blog.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/pdf/045aa967-ee96-4a09-94ee-3098ddf6db2c/OpenAI-US-House-Select-Cmte-Update-%5B021226%5D.pdf\"}],\"type\":\"search\"},\"id\":\"4NTr4mNBW6hHU5NAAXhTlSqe/Wqh15cdj0ZYFF0E9HL0QwRSYUPC301HRxsUk+ITMpC69IUEoYbMbzEzYTaN8E+6e6KnrQOENU+V3H9FpN4aqCyC0qho549TMaAA7kjNGbV54D4WPREJuHVSip1dR24fr39LMGrBZTzKkYOHlfja7/wqKxxv+XK8m9KQIMpAZdvA6JMmu27XLDKzXL5hlK4t4sQOZMh75txA3U4VTSk/KI3oGauhZcJiwavu3WpgaIefMhSp73l0qFfntIQfDJOSIzNq/1BmaTBqNo6HUFRV9EZqF5qhY/x8/qKPx9/ayXXynMdwBtuX73xZVCsiYgsAcIUHyQ+XXv+rieoCsRss+1T/9JjpPHYj/D9ErU/d8Vv/hWRMA+QRCwUOIMt0lw==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"knA7wah4XTTUlvOwTSabDlj0fYLpEEb1GuwgVqzPfejAYqxKXYDDJupk1nuBU3YkIt+GYuhdsdIs3C8e4EY3P6L/3oSukZp6CNLFqUFn/hvJoMTPB9LQg6zyUW0ZXoDLdyOITsP7Mdo4weohPaGy0cIkXvUzVLjmApixKMkZU/i/Jk1ZbkZgBdSbHs4RFnBd5OjPvCL6R68AlKn9ZgyA5fehWGMG8HhuISdgu6QGLrWABivDVw0IpRHl+I5Vh/Kzu3NLjJx7PmjVbRm/3HOE9FDmLeQxDcEUZTWxeHfG5PzFgnqRFbcuDOZNuGslnj2fE/2rEkIucaeQ7YOiET3XXUqdNi+VQKYE9cM/1yrXBzVq98HI0uBsMtJ/xe+FanIadd+rXWq8CqryabVXI5G9/Q==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"AOL Reuters April 7 2026 OpenAI four-day work week\",\"Yahoo Reuters April 7 2026 OpenAI wealth fund AI\",\"Reuters April 7 2026 OpenAI 4-day work week wealth fund\",\"OpenAI trial four-day week Reuters April 2026\"],\"query\":\"AOL Reuters April 7 2026 OpenAI four-day work week\",\"sources\":[{\"type\":\"url\",\"url\":\"https://www.techradar.com/ai-platforms-assistants/openai/openai-says-ai-could-mean-a-4-day-week-with-no-loss-in-pay-but-warns-jobs-and-wealth-are-at-risk\"},{\"type\":\"url\",\"url\":\"https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/\"},{\"type\":\"url\",\"url\":\"https://www.investing.com/news/stock-market-news/openai-to-nearly-double-workforce-to-8000-by-end2026-ft-reports-4574054\"},{\"type\":\"url\",\"url\":\"https://mml-studio.com/blog/ai-weekly-march-23-29-2026/\"},{\"type\":\"url\",\"url\":\"https://finance.yahoo.com/news/softbank-profit-more-doubles-16-063545827.html\"},{\"type\":\"url\",\"url\":\"https://www.bloomberg.com/news/articles/2025-03-05/ai-run-funds-four-day-work-weeks-investors-say-hype-is-real\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Stargate_LLC\"},{\"type\":\"url\",\"url\":\"https://blog.mean.ceo/new-ai-model-releases-news-april-2026/\"},{\"type\":\"url\",\"url\":\"https://www.washingtonpost.com/business/2025/12/31/ai-four-day-workweek/\"},{\"type\":\"url\",\"url\":\"https://champaignmagazine.com/2026/03/08/ai-by-ai-weekly-top-5-march-2-8-2026/\"},{\"type\":\"url\",\"url\":\"https://www.aol.com/finance/openai-encourages-firms-trial-four-120106793.html\"},{\"type\":\"url\",\"url\":\"https://sg.finance.yahoo.com/news/tech-stocks-today-anthropic-sues-defense-department-over-ban-openais-robotics-leader-resigns-152722809.html\"},{\"type\":\"url\",\"url\":\"https://www.forbes.com/sites/the-prompt/2026/04/08/four-day-work-weeks-public-wealth-fund-openais-ideas-for-our-ai-future/\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/OpenAI\"},{\"type\":\"url\",\"url\":\"https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/PithyCyborg/comments/1seyk86/todays_ai_news_no_fluff_oracle_openais_robot_tax/\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/SoftBank_Group\"},{\"type\":\"url\",\"url\":\"https://stepmark.ai/wp-content/uploads/2026/03/stepmark-february-ai-financing-report-vf.pdf\"},{\"type\":\"url\",\"url\":\"https://hk.allianzgi.com/-/media/AllianzGI/AP/HongKong/Documents/Presentation/eventpresentation/2025/09/25/01/48/20250930-Stephen-Luncheon\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/AI_bubble\"},{\"type\":\"url\",\"url\":\"https://techxplore.com/news/2025-12-softbank-openai-stake-41bln-investment.pdf\"}],\"type\":\"search\"},\"id\":\"w5TlPIp9Cvts818W/hgjvwOiUg5+9a76RH9WW1RsmjrYhxMGF63QmyEXLQGSTrbuBZcsZWKIHfvzMt7h5WZG35jFcauPZ9+9HLHfyBe/8yX4wZcxBkiOGaMkc1nxIYPszOrHtWMSnPFKO4rJFoXOAR3yIV2tmlsezXFtsx/DeiJTNnN3y/225r6Fl8HY0PuB8Sdy01H4xhAoT06b7z2XaCMhBc8lRfq3BItIPMqlxgrEhvCRBv6aF4DldV4pYU+Ogs08P/1QjAXCysc4YQlOPvhDj1poIOmvGV5gI2zJW1zyRis4jiMlLiqu18DvWaDIR0IFGAlo9S0VEjtmN8Do76Pmt82uMG8XlqtK0PJx25p8KqwmD8e45X4SGLNRmGg3PDIR9evsVnpIwOEMCT5Drw==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"vW+B/JwOyNpN04sETVSQnz3ihiJrqvB0+4IMgcfFt5dDiE0Dry5kJJwKaE1Gq9iKtoG4WjN03P7+a8W4H/Vwtfnqv1tfd9J2NEssHNX9qHbM5bdnvRN2z8gPIZo+Ri/UnUMdVF/M1cllPro/zVa0K12I539ckAbBokyJfZi3mIrJ6lnN9DZXFjzdI5Mhqd3FI6T7cqBi2/E8yw5zyxxELPZD1Y2DcpuCZm2UDStGxArCoCF9492lyhE29msgBE5zRXKoUmX0NV3/Qw+mcmudtd3bQH75e29mxzNYaaS+3kJZw8NUvUymB94j51G9tP9gqKwhdF0ulMZQtyIEwf2hno6WAQYJdstoRSP9w29N2KdWL76KLfP7S66EwzRrCoy1P+dLo7wAYi27rlTUmbqFYw==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:anthropic.com/news April 7 2026 Mythos Preview\",\"site:anthropic.com/news April 2026 Anthropic new model cybersecurity\",\"site:anthropic.com/news April 2026 Anthropic Google Broadcom capacity\",\"site:anthropic.com/news April 2026 Anthropic latest\"],\"query\":\"site:anthropic.com/news April 7 2026 Mythos Preview\",\"sources\":[{\"type\":\"url\",\"url\":\"https://www.anthropic.com/project/glasswing\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/sydney-fourth-office-asia-pacific\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/expanding-our-use-of-google-cloud-tpus-and-services\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/introducing-the-anthropic-national-security-and-public-sector-advisory-council\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/disrupting-AI-espionage/\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/claude-opus-4-6\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/events/anthropic-partner-kickoff-2026\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/glasswing\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/announcing-our-updated-responsible-scaling-policy\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/research/economic-index-primitives/\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/news/a-new-initiative-for-developing-third-party-model-evaluations/\"},{\"type\":\"url\",\"url\":\"https://www.anthropic.com/events/aws-summit-london\"},{\"type\":\"url\",\"url\":\"https://assets.anthropic.com/m/4e20a4ab6512e217/original/anthropic-response-to-ostp-rfi-march-2025-final-final-sunmision-v3.pdf\"},{\"type\":\"url\",\"url\":\"https://www-cdn.anthropic.com/0dc382a2086f6a054eeb17e8a531bd9625b8e6e5.pdf\"},{\"type\":\"url\",\"url\":\"https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf?hsLang=en\"},{\"type\":\"url\",\"url\":\"https://www-cdn.anthropic.com/08eca2757081e850ed2ad490e5253e940240ca4f.pdf\"}],\"type\":\"search\"},\"id\":\"wbiBvp2gGxBddgTSraXzACL/XVaV8PD5b9i5i/y4J76xgHz2Hvf1dh05WCN7PdM6nu9gjO4sBhXHxV7Dbow1U9bV+gFAidosc9e+yZ7sPwI5kgNcC+tgHcUEw2IVz48QN42il/6EeSLz+gb3tJ3n9/a5kA55T8MRd4sSxOANrNDQJM0ifMXz/jK+nnHEWkb+6pHYzSnmhVe03CKHspXX8vZOSmf0lAmymSCcFQZSThxiEm4Efo9N7YVoyGL/XUeUhrtvIA1ValzA8UYwwY7DNVr2HUr1TrOLq4ixNSZWr6/4yKabo5n+3YWvywohbG5OvuGmBjP9mvpxorYI3vGRh+/llkbJUZU7MSwTg/hd/2nXesTzgvcHbWKDb7F6a9AGqLuhrBkc7i1+VN9fZoUjFg==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"OnEevhqxeR2t1elGi7m79qIu2EriA+NFhJP+qPqVf7izk4rNYWBaPHz8eYmaP7PpT0YjtEK3Bh6/iPWYDO7GLZItQ2bWk6yei7U9BEInoS8Ko4H38VVCnvnglo7kZmUSmtOQ0E3c2bxLk9dVYQa+j8Chu/p1xXUfwHxmfWogcNnFneyINXE9Cp4q3LUrDbI3Rd+e1J8mw8RumIFkv9N+wzL4M7L7joYOovr1GgUwClVbbdwh8YuuSYmiLFkLXO7GI/793RmQhY8EuO5ynOauFXwyyRNNNJJ57WjFEoIt8x3E8L6MV8bfUGnlbr6PsAvfys5eJySgPDHOZFEhaiDWibNcQhlF2GnpWajRQUlQ4IiecGbjH4awS6FmEWH882BVxJImCjD5tdsvPFhG3LShzg==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:blog.google April 7 2026 AI Edge Eloquent\",\"site:blog.google April 2026 Gemini AI Mode all U.S users\",\"site:blog.google April 2026 AI Mode U.S all users\",\"site:blog.google April 2026 Google AI Edge app\"],\"query\":\"site:blog.google April 7 2026 AI Edge Eloquent\",\"sources\":[{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/products/search/personal-intelligence-expansion/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/products/workspace/gemini-workspace-updates-march-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products/google-cloud/ironwood-tpu-age-of-inference/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products/search/ai-mode-updates-may-2025/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/products/search/search-live-ai-mode/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products/search/ai-mode-multimodal-search/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/models-and-research/google-deepmind/google-gemini-ai-update-december-2024/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products/gemini/google-gemini-update-may-2024\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/health/med-gemma-impact-challenge/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products/search/ai-mode-agentic-personalized/\"},{\"type\":\"url\",\"url\":\"https://blog.google/intl/en-in/company-news/our-first-ai-hub-in-india-powered-by-a-15-billion-investment/\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/37/How_Google_Fights_Disinformation.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/213/AI_Sprinters_Report.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/99/US_Google_Infographics_0208.pdf\"}],\"type\":\"search\"},\"id\":\"g6JseAuoxg3xIXGrslerl2tzJKtWCO8Fi7ZWlDZXKNWMxaz1A9P+oZjbw/jvL7cPfwqJSRq54tS+p2gvUmrm/CJ23zxPXqSiBTg/NBRogxVVwQjsBrQGy4flzAfnkNU3b8ZHrakkAx5N68rYECOZOTxKAQ3Nita8HAp1uT2kguPjiozPZgU8ruUtwehsQH0ruhywTCm45sCJt8muhBOMJdl7khYybo+ip8LUtrRW1415bfxryyztKsAe1DajjFu8LeB9IeM76DAc9jLU5B/mSHyMqTbuvIJJZdQq8PzxHRcROBQUAgd254LszpJcpUGVJGZSqsvabIBBbbPs5l0FsMVI/92OI5zxEtNOR1H0jrHJqkMg05MxIl/wx0+qHjmZK6dD4D+VjcguI2uqephTQQ==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"NTjB2edneTTepoz0EMxm5tGdhyuV/s9tINbga2PVIEQRv6DhqSD9Y0znrhciKvZtTcFg1v0fahgkJ8CPNUKKAj1VIP7KE7XqBSGgGu+kZ7fVncnURWp89icHdiHc9fwjNBdLNjXZEPH6qVCXj7nyu9cir6ZQkhOjpWuXTKxlXmAHcf/A5x92gJdRpNOlcqIzdhlf2bbm75sRDaVmPO7I0y9eiiMh5afFH17UVm0fnrwI3W2M10XpyYJ9HOs7c7WcqWWJPmC4qJ6TwhPmsuiALDnGWfQj8CBtEa81ygVd1nliHPWCEYM5ILrIdhCUMwEIGI27IUJwJftirOudcZuWf6Sz3bLvGaZFAutsSJCVZ4JrFSqFb/X5sGdDKcgLrxA1sa1gX6iuGtOhZcoPoLJ7TQ==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:openai.com \\\"Industrial Policy for the Intelligence Age\\\"\",\"site:openai.com \\\"four-day work week\\\" OpenAI\",\"site:openai.com \\\"public wealth fund\\\" OpenAI\",\"site:openai.com \\\"Intelligence Age\\\" OpenAI pdf\"],\"query\":\"site:openai.com \\\"Industrial Policy for the Intelligence Age\\\"\",\"sources\":[{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/introducing-the-intelligence-age\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/aarp-partnership-older-adults-online-safety\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/openai-proposals-for-the-us-ai-action-plan/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/ai-stories-daily-benefits-bigger-opportunities/\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/industrial-policy-for-the-intelligence-age\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/strengthening-the-us-ai-supply-chain/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/openai-for-greece/\"},{\"type\":\"url\",\"url\":\"https://forum.openai.com/home/videos/openais-super-bowl-ad-introducing-the-intelligence-age\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/ai-education-opportunity\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/global-affairs/ostp-rfi/ec680b75-d539-4653-b297-8bcf6e5f7686/openai-response-ostp-nsf-rfi-notice-request-for-information-on-the-development-of-an-artificial-intelligence-ai-action-plan.pdf\"},{\"type\":\"url\",\"url\":\"https://openai.com/index/supporting-nonprofit-and-community-innovation/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/seizing-the-ai-opportunity/\"},{\"type\":\"url\",\"url\":\"https://openai.com/global-affairs/eu-code-of-practice/\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/global-affairs/06025361-1ede-4402-97d2-daf1e5918b43/jobs-in-the-intelligence-age-sept-2025.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/pdf/21b88bb5-10a3-4566-919d-f9a6b9c3e632/openai-ostp-rfi-oct-27-2025.pdf\"},{\"type\":\"url\",\"url\":\"https://cdn.openai.com/pdf/2cb29276-68cd-4ec6-a5f4-c01c5e7a36e9/OpenAI-AI-as-a-Healthcare-Ally-Jan-2026.pdf\"}],\"type\":\"search\"},\"id\":\"MghGGujfBMjkfzWm8YU39+y+0WTbAjKE2nau0WPgPQcgXjOmCsreQQ9szMa/R5ZKJOl7vvzHsaLIwXnrc/2VM8mjAbHuZhqsMnXy8ea3hAtTogsbSNuhAomn0QBXgtAss7O4YZHwbptH1B7Pe8ee0VA5bOHgEgq9/PqxhMy7Jk0pRQKZj/HucyZtmLxRJSlTpVQaKn8nHCuVDBptPJgZ4KUvpsFjwSP3BV5PmeRQZQLdlbceT0k+AUqVVyXZZjQO9dv5M1aHffSstk4ZelJypXjrpKT/0xBoIyV0RnRICvb3yIpTC1DeCzW38qbfG+rWhtd4zEKyEnWBJE9mPw0yzR0f+F8Y+igbAbdFFIvrDvbDqmTOwX+ZOJtkFP+NGL5qUrGJ4LpRhymwoHoqSmmAIQ==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"6G99Syf/RIjNXAnA0HYYGL/2oAJjegMhvVF/nsfzSjv/UVjcjNVi/LcP6etkfw2ig/6gTdyypETnd+LR0rK1iua5ZpCsrYA86B9MtocBAQvPJ7Z6vql2b0YhIuxcFwi4Bk5jt9kfxNCq/5CNZa8jmuFRJWC5sAIXw02ZpVMOnV66OFzj2J97zOjbuoqOAfnyGowoSOZbsSCrmioWNgIvU0/Onz+A/zU7uNjKb77fAcyN1Egndj/VCoIiBGZyL7oSSoJTdHvhO0NoB7m2+MaxrqwlrDCbFzcejoOL3bEmd2W7zT9xz9ttavivtBho5X57kBQSBUoKxhbKp81OxrGWxgV9m9arknCxwgaOPyEmyvH8vloXL+/90SzKKgGXDmM0hLp2cpLjMernN85YgebMzQ==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"Reuters April 7 2026 AI dreams crash into stark $7 trln reality\",\"Reuters April 2026 AI dreams crash into stark 7 trln reality\",\"site:reuters.com April 7 2026 AI dreams crash into stark reality\"],\"query\":\"Reuters April 7 2026 AI dreams crash into stark $7 trln reality\",\"sources\":[{\"type\":\"url\",\"url\":\"https://www.breakingviews.com/columns/big-view/ai-dreams-crash-into-stark-7-trln-reality-2026-04-07/\"},{\"type\":\"url\",\"url\":\"https://followin.io/en/feed/24488247\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/AI_bubble\"},{\"type\":\"url\",\"url\":\"https://techstartups.com/2026/04/07/top-tech-news-today-april-7-2026/\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2603.09209\"},{\"type\":\"url\",\"url\":\"https://www.thedailystar.net/business/economy/news/ai-dreams-crash-stark-7tn-reality-4145981\"},{\"type\":\"url\",\"url\":\"https://www.breakingviews.com/columns/considered-view/ai-apocalypse-trade-has-buggy-logic-2026-02-04/\"},{\"type\":\"url\",\"url\":\"https://www.forbes.com/sites/petercohan/2026/02/25/ai-doomsday-fears-are-rising-heres-what-they-really-mean-for-nvidia-stock//\"},{\"type\":\"url\",\"url\":\"https://www.fool.com/investing/2026/03/28/did-investors-get-too-far-ahead-of-the-artificial//\"},{\"type\":\"url\",\"url\":\"https://www.investing.com/news/economy-news/ais-rise-stirs-excitement-sparks-job-worries-4392165\"},{\"type\":\"url\",\"url\":\"https://www.forbes.com/sites/gilpress/2026/02/27/the-state-of-the-17-trillion-ai-bubble-the-end-of-thinking/\"},{\"type\":\"url\",\"url\":\"https://www.thomsonreuters.com/en/press-releases/2025/june/the-ai-adoption-reality-check-firms-with-ai-strategies-are-twice-as-likely-to-see-ai-driven-revenue-growth-those-without-risk-falling-behind\"},{\"type\":\"url\",\"url\":\"https://www.gurufocus.com/stock/NVDA/summary\"},{\"type\":\"url\",\"url\":\"https://cmsrkv.rgukt.in/storage/notices/files/th.th_international.06_01_2026_1767673550.pdf\"},{\"type\":\"url\",\"url\":\"https://earthnews.blob.core.windows.net/earthnewsladakh/files/42025100941955.pdf\"},{\"type\":\"url\",\"url\":\"https://www.intro-act.com/uploads/disruptivetech/202503271204111169357902.pdf\"},{\"type\":\"url\",\"url\":\"https://liontree.com/wp-content/uploads/2025/04/LT-Weekly-17-04-25.pdf\"},{\"type\":\"url\",\"url\":\"https://share.refinitiv.com/assets/newsletters/Morning_News_Call/MNCGeneric_US_10242024.pdf\"},{\"type\":\"url\",\"url\":\"https://ufdcimages.uflib.ufl.edu/UF/00/02/83/15/09075/2025-11-10.pdf\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/Daytrading/comments/1npaoxr\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/singularity/comments/1jtsqww\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/Daytrading/comments/1ou7vfj\"},{\"type\":\"url\",\"url\":\"https://www.reddit.com/r/u_TearRepresentative56/comments/1rpw3vy/all_the_market_moving_news_from_premarket/\"}],\"type\":\"search\"},\"id\":\"g7UnS9z/0PXZ84h9iNdBpgr6Qtq2tCeofk5ibUMy88epYLQlAgkudk7cmO5bPz2QsJgMkhjjpC0HXZdyzYhUZfd0S7qhXGSts/nZiCqwremB/WLoouU8oku3zyO5Gp1HlD/SAWvhgdjLykQHLcr2svvFYPhkA6f0GG/qAnZyg4B6zG7h3EwCipz8Rd3HsPIvv8896woqLIIorqizhVTFThBCHU/Jn25sUHaZ+BZHLP4JDHuPQqX8Ye8FD51ShuRv+OI477B6mlIejuay9viRIEG62ZSAyS6+jXYs0j9iHO4UWoKB54MtcMDkf30bMOfbu0lMnorNhfhGT5wfSeYaAncrkM32+2keNhLsCGk85OmGr2MXUrikUUpfOsxDyUNuMGd7VB6MrjPF+H7cjlRK2g==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"eq/oNmf+0kpmsuv1lrga+NoaiP8IYivip+A/EMh/+VW8BAhN9XDqk5u+VTfVoAerRjH1My06sjIcJy8wsCuYC0q1PI/stlZO6Uo3/B5GKt4RQQg5e2PvWChlocGilLy2oVeEX0q+JkD8CBWWunsX12BrpvXdWkdAm9Q86mi8sHJpU6sO9wr77dCwqBeVSOJ3+AnUXAyoV7UDBnO9pdMffQ9nc91B4SMU23NrzKQ6nVM/JyPcxOmjI5c1jGMXQChTuLVKhfEasjhT6k4APUr4gK9uwNrElfbJ+c3+1edmI6JjyE0voLTiVItKSA47ie/L4dJ5WATT/Nt9J1P9uAhR6yxxI+oYCDsr7CepJtSRR+4CSumZpzMV/+Q8oCztM38MWFd62/CNeuisiqEA+/Wyfw==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:blog.google 2026-04-07 AI Google official\",\"site:blog.google Apr 7 2026 Gemini official\",\"site:blog.google April 8 2026 Google AI official\",\"site:blog.google April 9 2026 Google AI official\"],\"query\":\"site:blog.google 2026-04-07 AI Google official\",\"sources\":[{\"type\":\"url\",\"url\":\"https://blog.google/company-news/inside-google/around-the-globe/google-europe/ai-works-for-europe/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/\"},{\"type\":\"url\",\"url\":\"https://blog.google/intl/en-in/products/explore-communicate/new-ways-google-is-using-ai-to-make-shopping-easier/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/technology/google-deepmind/gemini-model-thinking-updates-march-2025/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/health/mental-health-updates/\"},{\"type\":\"url\",\"url\":\"https://blog.google/company-news/outreach-and-initiatives/google-org/global-impact-challenge-ai-government-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/company-news/outreach-and-initiatives/sustainability/2026-water-stewardship-portfolio/\"},{\"type\":\"url\",\"url\":\"https://blog.google/company-news/inside-google/around-the-globe/google-asia/google-singapore-2026/\"},{\"type\":\"url\",\"url\":\"https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/\"},{\"type\":\"url\",\"url\":\"https://blog.google/company-news/outreach-and-initiatives/google-org/google-org-generative-ai-accelerator-2025/\"},{\"type\":\"url\",\"url\":\"https://blog.google/products-and-platforms/products/education/national-teachers-day-2026-googleplex/\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/222/Open_Call_Response_-_catalog.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/37/How_Google_Fights_Disinformation.pdf\"},{\"type\":\"url\",\"url\":\"https://blog.google/documents/99/US_Google_Infographics_0208.pdf\"}],\"type\":\"search\"},\"id\":\"aEYrT29+tiEmfk7bVG42B3tDjtupnYw4BBKxS/0jNN/+jNoHUBPnmploSUGNYK6F7kyYjcMq0Bh0wzSiagIX34jCezemviX58P5lQ5NhtXojG6PNxForgyMa7D46UAIukmFZkO1DpMRESrDb1Ks8scmJRnmdNImIhMuwd1R0e0StbVHdQaGZMXc2zVcypaudveLqLfDvhIarL6MbAh1xIyRP928kZJI9C7e5a3EbC5YWaiyIEp07oOIaUwuwZoGKCcz84kb3hXj1kIVw30njtl1KF11FTxhXQQ2RBeVMaymYqlJPPDfpej23aa62Ae7akJ/isi/swC5WMopSKaUFVKnc7v2Nl+rUa1EySchySufuVWw3rmmlBoqMI7lNsRAXR7RY36hvN2RxQpqZwkJXsA==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"Em/QAxWzL2boDYYO92cXLEiUfDOqiUJNHjfKeb2Fy5+Y2poMhoVM9awrd9h2xrDRnlolwwC5W/yMewxFRrxdf5LqgMns3Nrj+98fchgP6V9p49mrr/UGZm0DsFli1klSAT4UEEnhpUwbho/+msBUDKIunFFKb3WlbSrdRCmjCL2HpYcQZxl8sDukS5voeiwttxt6itirhxyTNpgqlWzJ4R2cFfhskwr8g0DS0dFvd2RP8I3rwN4FoomwsT9Wdw0LaRVM2Lru7GqdyOdN5KVMuJU4DciTxQ908nm2Hm4Ao8Q39kQVtBKJS+TD55A8itcPn2h6gzbYv3fpxN/vS34Q/Qn8SA+lMwsdEHDSk74bDNVz2ExaePe2YgeaQPZDDQALeShjzZVOVW+BLthtMLcc7g==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:techcrunch.com AI April 8 2026 OpenAI Google Anthropic Meta xAI\",\"site:theverge.com AI April 8 2026 OpenAI Google Anthropic Meta\",\"site:wired.com AI April 8 2026 OpenAI Google Anthropic\",\"site:axios.com AI April 8 2026 OpenAI Google Anthropic\"],\"query\":\"site:techcrunch.com AI April 8 2026 OpenAI Google Anthropic Meta xAI\",\"sources\":[{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/02/27/google-openai-workers-push-for-military-ai-limits\"},{\"type\":\"url\",\"url\":\"https://techcrunch.com/2026/01/20/humans-a-human-centric-ai-startup-founded-by-anthropic-xai-google-alums-raised-480m-seed-round/\"},{\"type\":\"url\",\"url\":\"https://www.wired.com/story/anthropic-sues-department-of-defense-over-supply-chain-risk-designation/\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/03/05/openai-gpt-54-chatgpt-office/\"},{\"type\":\"url\",\"url\":\"https://www.wired.com/story/openai-announces-4-1-ai-model-coding/\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/02/27/pentagon-openai-safety-red-lines-anthropic\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/03/11/anthropic-dc-presence\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2025/11/18/anthropic-microsoft-nvidia-15-billion\"},{\"type\":\"url\",\"url\":\"https://es.wired.com/articulos/nvidia-deja-de-ser-solo-el-proveedor-de-chips-y-podria-buscar-el-trono-de-openai\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/02/26/the-race-to-catch-claude\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/01/01/ai-2026-money-openai-google-anthropic-agents\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/03/02/anthropic-ai-openai-trump\"},{\"type\":\"url\",\"url\":\"https://www.wired.com/story/anthropic-world-first-hybrid-reasoning-ai-model/\"},{\"type\":\"url\",\"url\":\"https://www.wired.com/story/openai-contractor-upload-real-work-documents-ai-agents/\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2025/08/08/openai-aims-gpt-5-at-anthropics-coding-crown\"},{\"type\":\"url\",\"url\":\"https://www.wired.com/story/openai-anthropic-and-block-are-teaming-up-on-ai-agent-standards/\"},{\"type\":\"url\",\"url\":\"https://www.wired.com/story/ai-industry-rivals-are-teaming-up-on-a-startup-accelerator/\"},{\"type\":\"url\",\"url\":\"https://es.wired.com/articulos/openai-anthropic-y-block-se-alian-para-estandarizar-la-nueva-era-de-agentes-de-ia\"},{\"type\":\"url\",\"url\":\"https://techcrunch.com/wp-content/uploads/2026/03/anthropic-amicus-brief.pdf\"},{\"type\":\"url\",\"url\":\"https://techcrunch.com/wp-content/uploads/2026/03/2026.03.04-Filed-Gavalas-Google-Complaint.pdf\"},{\"type\":\"url\",\"url\":\"https://platform.theverge.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/24782736/2023.07.11_Letter_to_IRS__TIGTA__FTC__DOJ_on_tax_prep_pixel_data_sharing.pdf\"}],\"type\":\"search\"},\"id\":\"Nnigq9CI9XnHk85MXWIXiHBXJQBOWBhda7FbVq+PdvPzzzB3Km+RkXrRCVEV26i7BsIlc4TgUKPN84APDpSENUY8ffnlkECz8RkFYzZ5fYNb9AUKbKKKNEfp1K+grNi9l9dzjMSfdehsGpsJcFGNZ8UwNzBAS2cjG+jqtQn+odo//LBfrsd+w+NsEA2ZGNMk+a4qlHhrNPoIViI8ppeoysnjEnsWZ45OITH2Bs0ZOiJ52FeFYj5IInfqDvsZJEhQcbyD2+uSqcNk/w1Zl8rVAwPvYwrHwaPMcpEbAVcjK11kLUFJCrqwZwGRiDcDE2mTJglTS6QNnyNiyNm6oQsocd1a+v1mxoAFBcs96BrS4qRiJ8ckWcxaSqYEQhKkfDMK6obwk1H/lCtKyVWCqaxCDQ==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"6Qsi/eTYST3oLLjgGwuQ9LG//ZXRjasMJWcWSLBo26HeQZoaTqzE/vQuSydv0e/SAbMkK44ARhQP5mhAqo4VWZbq9Aa4MwL9MV1xYK62f9kS78cs/i5TKFNZsMLdOY3xOWmeiu6jnnyga5QD+M2IYyZWyfxPBICi2MQwaf/u7Cpz6WHhMzEvBr8KBd9q1j0RdgvaO8CdvwGshtSXAcTAuopVbbOd4D/T+5+9ZmGeUqEYHI0Lc7y+lCu+BncLKRuLnvZ0b0JcfQug6CZxeW9aWff0JUDH3jSeMEVcqhJrD/zGKy3QAEm0SClNhDjqnh6E2cJnxD5c2zh7lXBFNFU7IBCHtYb1a4p0iKKp+CkWHhJnrQ3n4YTtz1mRffu68QNe5i2kLOPOTzLFNRCzpARxuw==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"type\":\"open_page\",\"url\":\"https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3\"},\"id\":\"w5PEvxZa5gCG8it0n30pbE4v2sxBagQWxWo7TfVb2oQDXkl/CSFsdwJNqSQ8xyqefDJM7c9OWXtnpX6XurRJ6+eROWR0W60a1GUqZR5oefeN26y9bOaQHpYNbEO6tmHZ5xm50VTkwsB3itKkB9F9ErpnkeWwyzgh5eMnvnuP2zlCWtHqDuSkgEbJzrUTHb8NEUsrWMq9gngPU8s6wjb5a4ELJL9gyZZ2uZe2hcZB/Tb1fglT9L5VBk58e5LWk5UiU+3bLVguI07ZlxUMEIQresCEShyHSZgoNlskcU2dEunaxQJtTyogiz5zpbWmz4dOztCxbCQjNzM+kUoEqkO0mhUA0vWPU9XM4HON+q91HW92OI8kt+0uz3Et7Jr2iZ6mX/pmGqUnYwzgoruJoXrwwA==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"xqGTQGjyKXP1ktLGeK6U/VX71NeL0wMLa/pPfe+eJ90gSE313iNEAA/zbKeDDEgXg1sfCEhMf9ARO1Xah4Bpi1tPRr3QLKZt822BHYsx3u90bhxUNhZSVK8xTh5mWk+df1orgd+yAD7130upR9ptKVJ8p4svrUGEGFX6+aUTzxqnFVosGZdIztninX2+OvFLXhnsE84NVvMHxAvRNiQgJAivfKfe4LaLGkPBa8u1t5Hx0tjN0bc0xZH3o0GrJ7+i6JJar32m5hyJWGWSIRBYpFGISTWTFNX2/RUdv8aeqZHjH48pjVgPRHJ5nL4Js7+aHs2LXSwvVnMerFo81lMZAFLO12htDVnygR4PhQi6grVU9mWFi1KfLNokHI7Fn/6Gie1R94KC8mu2wqY8fE8tog==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:reuters.com April 2026 OpenAI artificial intelligence product announcement\",\"site:reuters.com April 2026 Google artificial intelligence announcement Reuters\",\"site:reuters.com April 2026 Anthropic Reuters artificial intelligence announcement\",\"site:reuters.com April 2026 Meta AI Reuters announcement\"],\"query\":\"site:reuters.com April 2026 OpenAI artificial intelligence product announcement\",\"type\":\"search\"},\"id\":\"APvIUYqAgtwdd41MgBNbtQRhnr8eSl7uVEVoFnlKoK31qSnbziSDyG27NqhyYSc1niJBt3R8NMKIb7dl2fkNpV4RLaixkv+OiH2He5omck8eQvkSQ5ew8dTHP9r0TMBKTfdfWCU2JDgM0QN65c7Zow9LxA07amE1dXl7afazeidtdHzn2naffMggIRS/LFRYW1KZPrF+4+0v3OwbMmnUtFN5OQ6J8/B0WupuAvb8/PHfe+4KpU4PY1t33kotxY1suDY100XHk9eeewdt3e5pnf8LqKp70kZgv1Rs8QJ4Ylmj/DAEiB4MvIFZHP/O5SZSb1+L6T1VvpRSk8SHC3zk6ZqhjlsK9KkNniuPihFrwyQdmEOcFypVv9dqOdegJqTAzFb6U043Dd8EiNqnLEWnRA==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"KtxGKwGeK6vS+B5H43JrxM9xqpr4mTdn7wZHTnix+mXPHi25VeubHZwtJsWfIi8DinBsAytx7ESBHIeHGPrUy14CvsN9r7os3LSJj7Q+dkv16DBwTydYgNj3pBMOB+giQBK44wIamilkaW51uPKxeQ0vK7CpY4K2L334KnMKYrU/gA648axrdhqobxh4s9FUBrjxsH+CCEnJzRS3m0Wzvivbrk+hyRm3lcS/tK8PsKHHj/w8bHkHNDPBFPyN/a6XApKtePzWSqHQmhvy1Wyq+DQnc3I+PbXoo2iWqq51glQSO9cReLSR2lj2mWStvYF9UF6Fg2PAcn79T0Z4S0ksHoIUoAhTJwEGDuGvgaHwv8tIY7w0Xt3dkllXPfPt37zachZQBorvARJ92RMQlyx04A==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"AI April 9 2026 latest headlines AP Reuters TechCrunch The Verge OpenAI Anthropic Google Meta xAI\",\"artificial intelligence April 9 2026 headline OpenAI Anthropic Google Meta\",\"AI headlines today April 9 2026 latest\",\"site:apnews.com April 2026 AI OpenAI Google Anthropic Meta xAI\"],\"query\":\"AI April 9 2026 latest headlines AP Reuters TechCrunch The Verge OpenAI Anthropic Google Meta xAI\",\"sources\":[{\"type\":\"url\",\"url\":\"https://apnews.com/article/275df9e291bbb361962dfc6ba868506c\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/3d86c9296fe953ec0591fcde6a613aba\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/65c08aa4fab90cde952f37d32625394a\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/4b55aabf7ea018e38ffdccb66e37cf26\"},{\"type\":\"url\",\"url\":\"https://elpais.com/economia/2026-04-09/meta-trata-de-reaccionar-en-la-ia-como-un-nuevo-modelo-frente-a-google-openai-y-anthropic.html\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/b5e99d485d08ed1ced68a701723c3843\"},{\"type\":\"url\",\"url\":\"https://www.readaboutai.com/april-9-2026/\"},{\"type\":\"url\",\"url\":\"https://aiweekly.co/issues/481\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Meta_Superintelligence_Labs\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2604.02912\"},{\"type\":\"url\",\"url\":\"https://popularaitools.ai/ai-news-this-week-march-2026/\"},{\"type\":\"url\",\"url\":\"https://dentro.de/ai/news/\"},{\"type\":\"url\",\"url\":\"https://aitoolly.com/ai-news/2026-04-01\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2604.06217\"},{\"type\":\"url\",\"url\":\"https://www.linkedin.com/pulse/ai-updates-roundup-march-1017-2026-dhanushkumar-r-izqzc\"},{\"type\":\"url\",\"url\":\"https://champaignmagazine.com/2026/03/15/ai-by-ai-weekly-top-5-march-9-15-2026/\"},{\"type\":\"url\",\"url\":\"https://www.singularitysoup.com/latest-ai-news-2026-02-25.html\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/A_National_Policy_Framework_for_Artificial_Intelligence\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Global_call_for_AI_red_lines\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2602.23679\"}],\"type\":\"search\"},\"id\":\"6fVlXzDfxef+LN+0z698CnZr4GfZaQPhdaMcuqDpjD1ZTwtAHoGBmM8O43CVGEZNVYTozvqjmgltYrR7RtUWedVQfxIrofXKEdwQO4NTstK5tYtUE9nedIEt1y33wpv4+htlgYzrQGNoI18rNUQu2V1lixnn6nlJsoJ2JSzfayk6SwiO+j0sux8ZW4lqQ/RHtNP6//0y/RaNU+6qP/X1F2WdT8IJU/oJjiIwdTOjtticGTQA52Vjp+nkcr3IEdq9cdwZv//g+zgMinvKXoO5X28N+n0rneAy46eTo6S1GjyMNsx6ARHuYgBqdlr2oIMFdu2f6h9VsWRxK3NPDPHTG4MTkBdv1q24AFFrtLML5ba9nphgJFy97qlFK0srjeC9YLqFd7HQS1Y5OPgj9NPYuQ==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"hE/gy3/PFC0E2lfA1NMJ3+8EDh0RwVW4j+q6n/dhJ3u7Haku32ZzKmEfRZOyGf9fKXxSp1cjYDIAlF6oNgrFDVatt7x6CGiTQWLKMeob6yMbjpBzBkLqHkj8oTuJQSjhSJwGIeVKRmwljWOjjoAFL/CSWU5/vumTR6meS6kttgIs9q4cONanAfFheM18K/abAXDpXFL6miRTQ43XqrVAxqfDWtqW6sbrErv827I+tQ0SA35evbmipXHi+ftBzwW6kSNyB29xPxULzWUD38bVFrsU969bWs29K9zMn9Vz5UrB77zVTbwLFEDxsPBJrm3vNnJedtoTBHx+CCenaAUq2bXcTZRV0fCTUmxXOYjGt2pHK7eYiwKHP6rpvYPydNN0Ssr6kseXriZLVyFuvzj2Ag==\",\"summary\":[],\"type\":\"reasoning\"},{\"action\":{\"queries\":[\"site:whitehouse.gov March 2026 national policy framework artificial intelligence\",\"White House March 2026 AI framework legislation\",\"site:whitehouse.gov April 2026 AI action plan White House\",\"site:whitehouse.gov 2026 artificial intelligence legislative recommendations March\"],\"query\":\"site:whitehouse.gov March 2026 national policy framework artificial intelligence\",\"sources\":[{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/04/09/trump-white-house-gop-states-ai-rules\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/releases/2026/03/president-donald-j-trump-unveils-national-ai-legislative-framework/\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/releases/2026/02/u-s-promotes-ai-adoption-sovereignty-and-exports-at-india-ai-impact-summit/\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/briefings-statements/2026/03/first-lady-melania-trump-convenes-record-45-nations-at-the-white-house-and-introduces-american-built-humanoid/\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/briefings-statements/2026/03/65th-anniversary-of-the-peace-corps/\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/articles/2026/03/president-trump-secures-historic-commitment-to-keep-electricity-costs-down-amid-data-center-boom/\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/presidential-actions/2026/03/ratepayer-protection-pledge-proclamation/\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/presidential-actions/2025/11/launching-the-genesis-mission/\"},{\"type\":\"url\",\"url\":\"https://www.govexec.com/technology/2026/03/white-house-releases-regulatory-vision-ai/412285/\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/03/23/conservative-group-tougher-ai-rules\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/briefings-statements/2026/01/first-lady-melania-trump-inspires-americas-children-to-be-curious-use-ai-to-achieve-their-career-ambitions/\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/articles/2026/03/white-house-unveils-president-trumps-cyber-strategy-for-america/\"},{\"type\":\"url\",\"url\":\"https://www.washingtonpost.com/politics/2026/03/20/white-house-donald-trump-artificial-intelligence/70f2f230-245d-11f1-954a-6300919c9854_story.html?itid=agg_ticker\"},{\"type\":\"url\",\"url\":\"https://www.whitehouse.gov/presidential-actions/2025/04/advancing-artificial-intelligence-education-for-american-youth/\"},{\"type\":\"url\",\"url\":\"https://apnews.com/article/65651bd28c3d911d18eeb46cd54f4c75\"},{\"type\":\"url\",\"url\":\"https://www.axios.com/2026/03/25/hawley-ai-chatbots-congress-guard-act\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/AI_Action_Plan\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/No_Fakes_Act\"},{\"type\":\"url\",\"url\":\"https://arxiv.org/abs/2603.24621\"},{\"type\":\"url\",\"url\":\"https://en.wikipedia.org/wiki/A_National_Policy_Framework_for_Artificial_Intelligence\"}],\"type\":\"search\"},\"id\":\"CMCUBAPfUMfKomFdMV4gfdunBWqTTlkgmSbW9xvop68Ht9WbJwVdzZ56JSxha+kHxiN9Msf+5QaksTY4KryxvkqdQLaT2IhAALD8LRhlljb2Aaxj92ItyNiKC/v5xxZdDEuVuOFACL5PP7+wUBm5iC6RNWBac3JPtyGyYd7kpGb9QqiOZARE23pRwV5yNYk424RG3sVvaa861iaX73jMxPYfsLYlydb3f3Lig/AOLmkt8djoMG7IcueY7OzixGyDgRzOpqmJX7XUx1m7PaQonkjOmnc8I/M9pw8XMYV3kDhZsjFex20PTMM85I8lN6Q2ziCGNz10OwpEtTb2uF3JxQqKf2qc/6DpuIW6iyZhQvcFg77aPArtEjQC1lssEHq5/y5slKxgtwHzMMAvjuxujA==\",\"status\":\"completed\",\"type\":\"web_search_call\"},{\"id\":\"X7Lcu2+I8jry96mnSYpH4+oYZA9qFPd2WSR4P6bNHhG2T1+shokq6EIuMbOZrYIMFUr70YA8vJ/Nbmt9+IuQ0MeqIawI46k66S7XeB90mNEvrwDXzJsu0FqOCv1sk+glYT1PxlR1PrlCzfmQpuW1EoSO7J6vvKVP3piRHP2qSJAzpShu0taf6lV9fEjZQ2+0kKEf8QFTA+4jqDIB5seVN9AqiSlVgTAkE2ltVkcrlUUsVi6OzEJhhOEIaYDnvLLYUizpUcFVpvVc1eXRXI7vsb8mCNBn0u9MbXFenAVY5TDZgv1bK2iT6g9WgmU7icLS4TqXY7D4WDEUCv8fTZbuGdFNrysIEiQJ2KwAvKH7uNTQsUAflvLJO5B946PED8bcOwLYqLKh0tpfqYer0NHPVA==\",\"summary\":[],\"type\":\"reasoning\"},{\"content\":[{\"annotations\":[{\"end_index\":567,\"start_index\":492,\"title\":\"Appeals court rebuffs Anthropic in latest round of its AI battle with the Trump administration | AP News\",\"type\":\"url_citation\",\"url\":\"https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3\"},{\"end_index\":1037,\"start_index\":951,\"title\":\"Scoop: OpenAI plans new product for cybersecurity use\",\"type\":\"url_citation\",\"url\":\"https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic\"},{\"end_index\":1570,\"start_index\":1508,\"title\":\"Project Glasswing \\\\ Anthropic\",\"type\":\"url_citation\",\"url\":\"https://www.anthropic.com/project/glasswing\"},{\"end_index\":2068,\"start_index\":1985,\"title\":\"Industrial policy for the Intelligence Age | OpenAI\",\"type\":\"url_citation\",\"url\":\"https://openai.com/index/industrial-policy-for-the-intelligence-age\"},{\"end_index\":2572,\"start_index\":2477,\"title\":\"Google’s mental health work and support for organizations\",\"type\":\"url_citation\",\"url\":\"https://blog.google/innovation-and-ai/technology/health/mental-health-updates/\"},{\"end_index\":3037,\"start_index\":2946,\"title\":\"Gemma 4: Our most capable open models to date\",\"type\":\"url_citation\",\"url\":\"https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/\"}],\"logprobs\":[],\"text\":\"As of **Thursday, April 9, 2026 (U.S.)**, these look like the **top AI headlines today**:\\n\\n- **Anthropic loses an appeals-court round in its fight with the Trump administration.** A federal appeals court declined to immediately undo the government’s “supply chain risk” designation, even after a lower-court judge had said the administration likely overstepped. The case now heads toward a **May 19** hearing, so this remains one of the biggest AI-policy/legal stories in the U.S. right now. ([apnews.com](https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3))\\n\\n- **OpenAI is reportedly preparing a limited-release cybersecurity product for trusted partners.** Axios reports OpenAI is finalizing a cyber-focused offering for a small group of partners, a sign that frontier labs are becoming much more cautious about releasing models with strong hacking capabilities. The story explicitly ties this to Anthropic’s recent gated rollout strategy. ([axios.com](https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic))\\n\\n- **Anthropic launches Project Glasswing and gates access to Claude Mythos Preview.** Anthropic says its new **Claude Mythos Preview** model has already identified **thousands of zero-day vulnerabilities** and is being released only as a **gated research preview** through Project Glasswing, alongside partners including AWS, Apple, Google, Microsoft, NVIDIA, and others. Anthropic also says it has committed **$100 million** in model-usage credits for the initiative. ([anthropic.com](https://www.anthropic.com/project/glasswing))\\n\\n- **OpenAI pushes a new “industrial policy” agenda for the AI era.** In a new post published **April 6**, OpenAI says incremental policy changes won’t be enough as AI advances, and it is floating “people-first” ideas to spread AI’s economic gains more broadly. It is also launching feedback channels, policy fellowships/research grants, and discussions at a new Washington, D.C. workshop opening in **May 2026**. ([openai.com](https://openai.com/index/industrial-policy-for-the-intelligence-age))\\n\\n- **Google adds stronger crisis-support features to Gemini and commits $30 million to hotlines.** Google says Gemini will now surface redesigned mental-health support prompts and a simplified **one-touch** path to crisis hotlines when conversations indicate possible self-harm risk. Separately, Google.org says it will provide **$30 million over three years** to help crisis-support organizations globally. ([blog.google](https://blog.google/innovation-and-ai/technology/health/mental-health-updates/))\\n\\n- **Google’s latest open-model push is still making waves: Gemma 4.** Google DeepMind introduced **Gemma 4** on **April 2**, calling it its most capable open-model family “byte for byte.” While not a same-day breaking item, it remains one of the most important recent product releases shaping today’s AI conversation, especially for developers and open-model competition. ([blog.google](https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/))\\n\\nIf you want, I can also turn this into a **“Top 10 AI headlines today”** version with **one-line summaries + source names only**.\",\"type\":\"output_text\"}],\"id\":\"xG3ehjZ5EHPfxV6d40ezwe+48nj2c5xjHITAiCjwEAfbMvLrO+b2oIa1CthKXscR/5yPoHOHwAqoXQ15Vk9mQ8//yiCrX2JvQ9zl8FjvE3q58Q/chfuFkE0JehclCDPoqDT5qU01EbP97ktm7/vuz9qIrbsIaNyYWzo6EotzU58cazkwFXPvTBuarVHXZgS2/7VBAPh/XwvRChh2EEIDuF8heh73ilSBSrf7tCln7AqfYCKoMySPEBUfL+lrYOd6Dyge2gGOW4RH4Dxsqqmxqb1CkL9xCq4ymp5cRnAbfNre5PDjKM1pmKruq3G6vMC3uM0tcHJGpLZJ5u4jy+O57IogXDlVW8Mu1tXlaC7R3in5kUmEAeYvN+pp5yrhHL5/N1cbK9C6dUK6WUCjy5cSNuQ=\",\"phase\":\"final_answer\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"output_text\":null,\"parallel_tool_calls\":true,\"previous_response_id\":null,\"reasoning\":{\"effort\":\"medium\",\"summary\":null},\"safety_identifier\":\"fb51eb1de7dfbe46ce9bc92ba911d2cac7364c5372d6cbda115a0b017f6a1ac2\",\"service_tier\":\"default\",\"status\":\"completed\",\"temperature\":1,\"text\":{\"format\":{\"type\":\"text\"},\"verbosity\":\"medium\"},\"tool_choice\":\"auto\",\"tools\":[{\"type\":\"web_search\",\"search_context_size\":\"medium\",\"user_location\":{\"type\":\"approximate\",\"city\":null,\"country\":\"US\",\"region\":null,\"timezone\":null}}],\"top_p\":0.98,\"truncation\":\"disabled\",\"usage\":{\"input_tokens\":67771,\"input_tokens_details\":{\"cached_tokens\":4352},\"output_tokens\":3998,\"output_tokens_details\":{\"reasoning_tokens\":3335},\"total_tokens\":71769}}\n",
+  "bodyJson": {
+    "created_at": 1775768300,
+    "id": "g/RESIjSBUVYaRECv2Q/LtPlQirMZbzKmCG8OB5mz7PjpVFnUblwZ9VB6KDkOcGip9zZW7vRwCgEg38KCV9eOsRjGmhvvdPtpyvnF2X46wQ6ddFlPSaKQHYTpu7TKvcm8oFsc3cstuJ/aFpgSJWILNOMA4edo3YMcb23IOmCkbGGVqEz05IP6GSob0usQbbC9zpRDdRce8Xnd48ySchPJBvJrce7yVxWzbPmVwZE71dfp+rhvqq/7E/zT04gXIvbfec1809ept23W7MRqFXIJpFdJWvOXCyjz5PxBe40oGre4+UhLl+seh45VaHZi+r24pllLXTEl7mXy0hkjfbH/6cFyRrBIS5uPoiaYHD3Wtu1SI4FKylzWodg96lTNlBX+xVdtp01vkrnXt5xhADEBHhI",
+    "incomplete_details": null,
+    "instructions": null,
+    "max_output_tokens": null,
+    "model": "gpt-5.4-2026-03-05",
+    "object": "response",
+    "output": [
+      {
+        "id": "JIO1+sK7/Vm6QXv6L6RBixKI9p5csDXuCZoPuMGV30jhuFyi+5evq5LaTmsbcqyJzI+hw/87IcosM9Z6b5OEUgumI9aV0P3eavheMBqryaxb9DmdJ7RWcBV7+W5NUCbjptgG3VVsx/IklsTmWdd7jKgMLzLzrYdwbKV1ycZnEVjjShof/KMoDZ2zjQWW+8cvVNQA0+NhJqff02p9xQoprshC6gZUrKIcIotcO22XYF3TSGtzBJcdyMuos+xy9rnta4fD+tvxR/cdLWk1q5xjNqVXJR9i08UwNgZ3cFfSdeOTFIavCSf1Lzwhsv83PScuju5esNy/5Hh6xTRmVowi8L6es5j61dYxrU2jyh+xYMiFwad9IhGOgxIwjF17eNwY0XkycNTkrMQi1hOYiOmf4A==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "AI news April 9 2026 Reuters AI Microsoft OpenAI Google Anthropic recent",
+            "site:reuters.com AI April 9 2026 Reuters artificial intelligence",
+            "site:techcrunch.com AI April 9 2026 TechCrunch",
+            "site:theverge.com AI April 9 2026 AI news"
+          ],
+          "query": "AI news April 9 2026 Reuters AI Microsoft OpenAI Google Anthropic recent",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/a3e4d6ba75f475eb130d91c81e522f93"
+            },
+            {
+              "type": "url",
+              "url": "https://arstechnica.com/ai/2025/09/report-microsoft-taps-rival-anthropics-ai-for-office-after-it-beats-openai-at-some-tasks/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/02/27/google-openai-workers-push-for-military-ai-limits"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/b5e99d485d08ed1ced68a701723c3843"
+            },
+            {
+              "type": "url",
+              "url": "https://fortune.com/2026/03/31/microsoft-revamps-copilot-with-anthropic//"
+            },
+            {
+              "type": "url",
+              "url": "https://m.investing.com/news/stock-market-news/microsoft-brings-anthropic-ai-models-to-365-copilot-diversifies-beyond-openai-4253806?ampMode=1"
+            },
+            {
+              "type": "url",
+              "url": "https://www.pcgamer.com/software/ai/microsoft-shows-support-for-anthropics-legal-case-against-the-us-department-of-defense/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.yahoo.com/news/articles/anthropic-open-india-office-2026-011406670.html"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026"
+            },
+            {
+              "type": "url",
+              "url": "https://www.windowscentral.com/artificial-intelligence/microsoft-copilot/ai-chief-warns-frontier-ai-could-demand-hundreds-of-billions"
+            },
+            {
+              "type": "url",
+              "url": "https://popularaitools.ai/ai-news-this-week-march-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute"
+            },
+            {
+              "type": "url",
+              "url": "https://time.com/7339685/person-of-the-year-2025-ai-architects/"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2603.08993"
+            },
+            {
+              "type": "url",
+              "url": "https://mml-studio.com/blog/ai-weekly-march-23-29-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/AI_Action_Summit"
+            },
+            {
+              "type": "url",
+              "url": "https://techcrunch.com/2025/04/09/"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy"
+            },
+            {
+              "type": "url",
+              "url": "https://www.ai-roundup.dev/roundup/2026-04-07/"
+            },
+            {
+              "type": "url",
+              "url": "https://aitoolly.com/ai-news/2026-04-01"
+            },
+            {
+              "type": "url",
+              "url": "https://www.techrepublic.com/article/news-microsoft-to-use-ai-from-anthropic"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "KVZAVnJ7JqsbQRL2Qz3yZ89OpovjUE5rsa8Xjsr9Cwf0+/rrG10vlMvOLsAlSXCHDBjzTb4i2XBp7T1Da4605q1snzvt2fVPfv3f3McXhRL/y+7SEIXDuYvHNEg+W5PElVU9JJj/j5woCnWRgE/FrYivO7Ss74cP1f1UlhZ5DZ0GYHVgrpTxqADbqbkJ01R+Fb9qg6KKXLXo6JdriDnyHfe8pDE5rgCadYErXIH/PZ6WmWaK9Pa1Nhooq8rm4kYmGJK1/GTQtXC6T6F2QCpBKkcY1082im7kl3eCfNqLKuQGFR2G5m5OQwwYPphyb+n4Etdlbs6KYdzwxUFHbShkCLMF1j52dSHKXcApLqocEeZsdJ5/r9wo+g5UfDUqvLTBzsOFh/e4tMNFhjS1vf2h+w==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "rZxODA67loPPD2XvBjAK594mCZXj3iz+z9Tau1iqNSEiomEVS/qRb+Bu6xZmKj076gaFS8YQSTcvqdK9/rmR705E9OlF9PAm7QsrgFgKGc7uQduyjnLWDzUvbPiip8LUg19TEyeyCYCMR9GRU8v5KhPZSVa7cnPGIyK7olLw/4alEPk16J/M2KeMCjcDPw6DY/j/o8RaVXTCzijISIMml8Fs5B0NvqTmZurlND04ZQflnp1JO4vU0c7G0uENFEVE7nmS2ZHFye5vQSChY+IwNvZjB7vngiKkn05AX1FTOPo7gyZHCLRa8cUNNfYCrx+0oCxLCFVPNEXRk2Rl51Q21tnn00paf9riW6rXsAzqTDka3BNsMxvBv8pDyngzv5l+hYBnWRNGo3psvV2BgMm3yw==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "AI news today April 9 2026 Reuters recency 2 days",
+            "OpenAI Reuters April 2026 AI recency 7 days",
+            "Anthropic Reuters April 2026 AI recency 7 days",
+            "Google AI Reuters April 2026 recency 7 days"
+          ],
+          "query": "AI news today April 9 2026 Reuters recency 2 days",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://www.ai-roundup.dev/roundup/2026-04-07/"
+            },
+            {
+              "type": "url",
+              "url": "https://techcrunch.com/2025/12/08/openai-boasts-enterprise-win-days-after-internal-code-red-on-google-threat/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.distillintelligence.com/briefings/ai-leaders-2026-04-03"
+            },
+            {
+              "type": "url",
+              "url": "https://www.theguardian.com/technology/artificialintelligenceai/2026/apr/09/all"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2604.02912"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2603.24621"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy"
+            },
+            {
+              "type": "url",
+              "url": "https://techstartups.com/2026/04/07/top-tech-news-today-april-7-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://af.net/realtime/major-developments-in-ai-over-the-weekend-april-4-5-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.aol.com/finance/openai-encourages-firms-trial-four-120106793.html"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Claude_%28language_model%29"
+            },
+            {
+              "type": "url",
+              "url": "https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html"
+            },
+            {
+              "type": "url",
+              "url": "https://www.promptinjection.net/p/ai-llm-news-roundup-march-23-april-05-2026"
+            },
+            {
+              "type": "url",
+              "url": "https://investor.wedbush.com/wedbush/article/marketminute-2026-4-1-alphabets-ai-renaissance-gemini-3-success-drives-51-surge-to-record-highs"
+            },
+            {
+              "type": "url",
+              "url": "https://jasonrobert.dev/news/2026-04-07/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/Anthropic/comments/1rnie5x/weekly_limit_reset_date_pushed_back_again/"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/METR"
+            },
+            {
+              "type": "url",
+              "url": "https://srnnews.com/alphabet-hits-near-three-month-high-on-new-ai-updates/"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2511.15080"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2601.14242"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/AI_bubble"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/AIToolsTipsNews/comments/1rmesjl/anthropics_legal_ai_plugin_triggered_a_285b_stock/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/OpenAI/comments/1sf9a6j/removed/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/singularity/comments/1s57lqa/exclusive_anthropic_left_details_of_an_unreleased/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/OpenAI/comments/1sf03ea/removed/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/OpenAI/comments/1sf1xus/removed/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/Anthropic/comments/1s57mbt/exclusive_anthropic_left_details_of_an_unreleased/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/ArtificialInteligence/comments/1qyde7v/what_happened_in_ai_today_feb_07_2026_7_minute/"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "HbFzlaWB2luwxi/4LWfhGzbmsm/XnbUmsnmfmE5gvpbUrxTUJ7ADNdULWgxGAgpM99gQQSqybkTkOW8f60a4rvcEZbQzMVK06ey0bDnXTPjUh4fVyqi3EJ6m4WSoNBLEFydoMP8CjS1l8PF9HklHYicibR03lTgRVMElDr381IOUUB2nKu+nxtY5aw/q0kVT4pOdyQZZiIM2CSB7ertpyBp2dHMxbeQXmioE5Q3jrXm2emtXHNMDGHrprq5aqrns4Gnr0zZRhQLbEZgWJMKg+SlAOsFJM2nJKhQrpFb+WfyuYT0Eb+JAXMGINHtFTqD2JJN7bbj7XN2y322H94Aieiuec8yT/P3MZX50YyB2KvAy7OMSwK8lL1fyzuN1T2hQlY3x3dwDxQQUZ/IpT2bGaA==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "Kr0SArV8cHjJH3NSzQa8dgUTDnHIbqChBSpFquJM36QePRZz+D1W7G+04oAGgwd8U/jHpRVrb9qlurjdBgxrncM8xTIvhPR4gaN4WyFNL5D5oHJZGOhohp3zaffho2am/d2C5VZifvHA3wlWGkvaL8u7xDYUM+O8dPuMAAym7ZoVgFYGx9VP3p5fmGF1LEbp3ZwYg/JUsWaKigRKSZsbmzgslojIWy4GQVd3ZRJ+9g/d61h+rBalRwK+2KpkzO866qVKmKgXvx9m6per6iJHTnXeYIMyHxb5UultQxLEEorpjG/R59uuFdGPer/hKT/9O8bIc+MjgsMduKbTvhdc82KJsXcJyAVg5zQAdWo+df36XiJbJVRQW18oPMyH1+Em6SjWcvVCAvgQkugCbWgrkw==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:reuters.com/artificial-intelligence April 2026 OpenAI Reuters",
+            "site:reuters.com/technology April 2026 AI OpenAI Anthropic Google Microsoft",
+            "site:apnews.com AI April 2026 OpenAI Google Anthropic Microsoft",
+            "site:blog.google AI April 2026 Gemini launch"
+          ],
+          "query": "site:reuters.com/artificial-intelligence April 2026 OpenAI Reuters",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-flash-live/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/ai/nano-banana-2/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-updates-march-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/products/education/khan-academy-partnership/"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/275df9e291bbb361962dfc6ba868506c"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/intl/en-mena/company-news/outreach-initiatives/ai-film-award-powered-by-google-gemini/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/intl/en-in/products/explore-communicate/new-ways-google-is-using-ai-to-make-shopping-easier/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/products/education/chromeos-chromebooks-bett-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/products/google-ai-updates-march-2025/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/ai/google-gemini-ai/"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/65c08aa4fab90cde952f37d32625394a"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/071e752773dee5713c8b1a10039d08aa"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/c4210e7eddd9ad90161e7fa2da9736e2"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/platforms/android/samsung-unpacked-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/products/gemini-app/gemini-drop-february-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/a3e4d6ba75f475eb130d91c81e522f93"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/c19e0cca22c37190cc4e0dc08e889ef0"
+            },
+            {
+              "type": "url",
+              "url": "https://assets.apnews.com/19/1b/545643064e0caecf2c92d2897ce0/ap-ncaa-bracket-men.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://assets.apnews.com/14/3d/676decd64f808025bd6e9e9263be/ap-ncaa-bracket-women.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "i5vmjfruoghj4N1URno5iLBoa6TS43fo+GfpUXDekwUP583/FuUPqCFDRxP+X0v+p7e/rHAnD+nMC4qlJAqpFrOAZ9eiqE2V+LomeZQPGEdyDfUa5KPe5WfslA/Ub3q6413ZJUMo0RqTPngYvAgzE7l+W65c6tO5ratT7k9o9eoihiqG/dR29IIKoN5yO538sSwEs0lt0BF1e/rHz5RKAdO/0PXKgkX1xSxnS3ynwcm6MEuRlXPZl1jxcn0a8kIAxYUPxFEgEXd5XWPpt5MFVaaEuZ6RpLnRPTUklos/z83HRoCUYXxe+/7hHzQ8hPmR7jtkrTf/ny23IpSFlv/YoEXiMAik0wrNektisrPB32jPLNJ1R3HbucSTpLxCFpyig9SIWm+pv3eRJS8YHiuU2Q==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "S7OaeiIlqTRmwgh9Qjbfm4QeTs991HVaRV8luXiDUuuFihQe7RWUiXbKmvCACv6TtzNjQOPZB6IL0dBi+22PSMbq4mc6knpzD8FBfeLrE0qOpfaMI5atK64gmIx1l+LCFRVdV4Ec3jpXa5lXsg02G8vwLuoYVEhqfsG0HFLFdQYU7P1WXDJ2jXdnbZZ6i71k8idFr8YpZkMpFyioIxo12a2ksHe0fWWMqnxK2TVSVVgnZigy8xOxjDAwKq5wTY8l4Ej+fuI1VSZ0HtCRetC9bFp6g0ro4UzYqmX2WEj/JRTav42MWtJ/uBaX4mJYBbypJOogiyq7Gi+ZPGTslEsjWNsirIT4K8s+7jiPszyIN5co99zyp+0QnLIkRnlTeIQ+XCwd8PR3GSNFjqU9cepJbw==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:reuters.com April 8 2026 artificial intelligence Reuters OpenAI",
+            "site:reuters.com April 8 2026 artificial intelligence Reuters Anthropic",
+            "site:reuters.com April 8 2026 artificial intelligence Reuters Google AI",
+            "site:reuters.com April 8 2026 artificial intelligence Reuters Microsoft AI"
+          ],
+          "query": "site:reuters.com April 8 2026 artificial intelligence Reuters OpenAI",
+          "type": "search"
+        },
+        "id": "LrttM1vQqmrQhCewHDhBxGFIFROzAYknSTKEp6ur2XRKiZFgBD9upWTZBpsdx/o6THP+UVxdWTnFBpAaLAoFnxODp5M8ak/+9qyECOIjdv1prU2vF2uB1oKLxIM7MDaF+HMYFOl9Nsp86q1TvXP9f5E5EsXhG6aUzbC5U6K8ueoyebqU5rgEMWV3EJekO5/2teG5pjLQ7VIeTH9UO8QrZaV9nBpsAl/1QEpOUZ0LNIb7zfbcFIXPVmURjND6dIKeTxdLTpXzDmUCrmEzQLt6XEZGj2H5w4R941pFU7TtRZGvlUGJMnsZTFQoe8tYqAke3q3FwqAIuyQ427R2/jM5KbRTLuYsqXYf9rVDuq8eP/R+T48zEWui99FccDDjXBnQca9F2f/4wycJRQE2hN+S+w==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "F+DkbvkEr7eyAO/63Qto+uV1HtYj20PDl87A7jgk8Gf+XSFxWBlXS57Lz4oNYgjoSyrkhC9ywwf0IyAKQzVCqFCc9RQmQIms88v8/o+fJy77VHKEGCclEP2q2b2nkoix2U2UEpIiugfrNNPTPifj2Nvem73Hb2+VbmvBJqge+y9wwNGsgTX3x15bDNS5ClHMd1uWPQeFIuPg+LDfBFNdilMyp4uVrCZkDYM69re7VdQIfEdgCNLaM8yrMDkOTah3XXPdQ36ddg9vwwBExzTyrUtoDnCjjxR6y56MqQY/2/vDC71WoqJth4KSFWqI7jF9EIW9MJiFxiV9yN6BiSj7HVwnhbVDWv4LgacFaE8bkmK59JHatn9wjgfD5+sKvpGj1wfN5544cDnk8P4DWP7hBg==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "Reuters April 8 2026 OpenAI AI",
+            "Reuters April 8 2026 Anthropic AI",
+            "Reuters April 8 2026 Google AI",
+            "Reuters April 8 2026 Microsoft AI"
+          ],
+          "query": "Reuters April 8 2026 OpenAI AI",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3"
+            },
+            {
+              "type": "url",
+              "url": "https://www.tomshardware.com/tech-industry/broadcom-expands-anthropic-deal-to-3-5gw-of-google-tpu-capacity-from-2027"
+            },
+            {
+              "type": "url",
+              "url": "https://www.itpro.com/technology/artificial-intelligence/project-glasswing-anthropic-announces-big-tech-consortium-to-test-claude-mythos-ai-model-that-could-reshape-cybersecurity"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/04/08/anthropic-mythos-model-ai-cyberattack-warning"
+            },
+            {
+              "type": "url",
+              "url": "https://www.itpro.com/infrastructure/anthropic-pens-multi-gigawatt-tpu-deal-with-google-and-broadcom-as-claude-demand-picks-up"
+            },
+            {
+              "type": "url",
+              "url": "https://www.techradar.com/news/live/claude-anthropic-down-outage-april-6-2026"
+            },
+            {
+              "type": "url",
+              "url": "https://www.global-economy-news.com/2026/01/30/microsofts-ai-spending-shock-is-the-market-rethinking-the-ai-boom/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.investing.com/news/stock-market-news/wolters-kluwer-relx-shares-slip-after-anthropic-unveils-aienhanced-legal-tool-4481124"
+            },
+            {
+              "type": "url",
+              "url": "https://creati.ai/ai-news/2026-04-08/"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2604.04759"
+            },
+            {
+              "type": "url",
+              "url": "https://www.straitstimes.com/business/companies-markets/microsoft-racks-up-over-600m-in-ai-savings-while-slashing-jobs-bloomberg-news-reports"
+            },
+            {
+              "type": "url",
+              "url": "https://www.investing.com/news/economy-news/anthropic-holds-firm-on-military-ai-restrictions-after-pentagon-meeting--reuters-93CH-4522534"
+            },
+            {
+              "type": "url",
+              "url": "https://senx.ai/news/2026-04-08-daily-ai-news"
+            },
+            {
+              "type": "url",
+              "url": "https://news.cgtn.com/news/2026-02-21/OpenAI-sees-600-billion-in-compute-spending-through-2030-Reuters-1KWAar1MJLW/p.html"
+            },
+            {
+              "type": "url",
+              "url": "https://www.thomsonreuters.com/en/press-releases/2026/january/thomson-reuters-convenes-global-ai-leaders-to-advance-trust-in-the-age-of-intelligent-systems"
+            },
+            {
+              "type": "url",
+              "url": "https://finance.yahoo.com/news/anthropic-tells-judge-billions-stake-233500564.html"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy"
+            },
+            {
+              "type": "url",
+              "url": "https://neuralwired.com/2026/04/03/microsoft-japan-ai-investment-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.investing.com/news/stock-market-news/anthropic-touts-new-ai-tools-weeks-after-legal-plugin-spurred-market-rout-4521742"
+            },
+            {
+              "type": "url",
+              "url": "https://www.morningstar.com/stocks/reuters-relx-wolters-stocks-crushed-after-anthropic-debuts-claude-legal-plug-in"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/The_Patil_Effect"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Public_First_Action"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Manus_%28AI_agent%29"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Stargate_LLC"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2603.08993"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2604.02912"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2604.06217"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "cKVMZ6l0wgkKonVIJ4ipuykQpJcGGVT6dr0EWcd49I6aaWO5jODGyDjS7Zhiknz+PBROWq2ytvynSAduIPoboR2aGipTP0OWDcUXlHE2tkEEI0kvGOkuPWJs0jx1R7jrFjfj3ofqfs6ARka2Kc6nuo5D2OD2bkc8E1Rxq2WR/pVLCeLsJQ2gQEwWFYLfK5YRc48l7pdMBIAiqrIRM3tAJczsKhP43XBeif4u9UfKln2tYyNYIa8w1ecuSB9LzfQbn4JOaJIFnREAfMBGxxzW04F+oVi1topw84cqopZCyFt9tVX1cBQ+UCbZomOc8Kcrr1cQfyaQNS5V8eqWbKGl0Rv6s7cwF+m+DqgQA5J6+0kk1t7wG35qCr3SunPFzW8sP4P4MYTZxbae/1m7oIRWNQ==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "tGFx3lYfBE0MTfdp+yqc88Vy2g11QvUOio91pHJh7EdLnFYmfdTSrb4SHREr8R9ZrxmbHtlkwa2yUcs6+Gch2QRFUbZZbNMqPcABfAtR2kUqlM7QVpALZZ0WK6HSc3cNxRNf2ystL623EffCU5UTznisdgqOUKQEPWZXm9H1V4LRNn6qh8uIU4pUj29NFg7Hhz0SwB5MdeQiCXQzT5sdh92U9AJ8333AFTE1tZh9FkbkWqDvh17X5O7QZc4cq87Lwo3N3Hv8wRKKS2vjXrbCbegySd3d/WlRDqolQ43/cquiZBC2Uosv+dHjVdvy5jFW7EePEYQNmtBLCEmlKWhC3CziYf4IpVnUbsKrUlCD6SAPS7Ch3tR57VL39uMmr5rQPH0XQ0O1YwL1Xpua3+m6GA==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:openai.com/news April 2026 OpenAI announced",
+            "site:openai.com/index April 2026 OpenAI work week AI economy",
+            "site:openai.com April 7 2026 OpenAI proposals superintelligence",
+            "site:openai.com April 2026 OpenAI latest news"
+          ],
+          "query": "site:openai.com/news April 2026 OpenAI announced",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://openai.com/index/stargate-advances-with-partnership-with-oracle/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/aws-and-openai-partnership/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/openai-acquires-tbpn/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/figma-partnership/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/stargate-sb-energy-partnership/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/fil-PH/index/amazon-partnership/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/introducing-openai-for-government/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/openai-for-australia"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/openai-for-ireland/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/openai-for-germany/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/providing-chatgpt-to-the-entire-us-federal-workforce/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/updating-our-preparedness-framework/"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/global-affairs/openai-doe-rfi-5-7-2025.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/global-affairs/61b341bc-56eb-46dc-b356-a621e02cb82d/openai-australia-economic-blueprint-july-2025.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/signals/openai-signals-global-report.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/global-affairs/f319686f-cf21-4b8e-b8bc-84dd9bbfb999/oai-workforce-blueprint-oct-2025.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/API/docs/deep_research_blog.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/pdf/045aa967-ee96-4a09-94ee-3098ddf6db2c/OpenAI-US-House-Select-Cmte-Update-%5B021226%5D.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "4NTr4mNBW6hHU5NAAXhTlSqe/Wqh15cdj0ZYFF0E9HL0QwRSYUPC301HRxsUk+ITMpC69IUEoYbMbzEzYTaN8E+6e6KnrQOENU+V3H9FpN4aqCyC0qho549TMaAA7kjNGbV54D4WPREJuHVSip1dR24fr39LMGrBZTzKkYOHlfja7/wqKxxv+XK8m9KQIMpAZdvA6JMmu27XLDKzXL5hlK4t4sQOZMh75txA3U4VTSk/KI3oGauhZcJiwavu3WpgaIefMhSp73l0qFfntIQfDJOSIzNq/1BmaTBqNo6HUFRV9EZqF5qhY/x8/qKPx9/ayXXynMdwBtuX73xZVCsiYgsAcIUHyQ+XXv+rieoCsRss+1T/9JjpPHYj/D9ErU/d8Vv/hWRMA+QRCwUOIMt0lw==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "knA7wah4XTTUlvOwTSabDlj0fYLpEEb1GuwgVqzPfejAYqxKXYDDJupk1nuBU3YkIt+GYuhdsdIs3C8e4EY3P6L/3oSukZp6CNLFqUFn/hvJoMTPB9LQg6zyUW0ZXoDLdyOITsP7Mdo4weohPaGy0cIkXvUzVLjmApixKMkZU/i/Jk1ZbkZgBdSbHs4RFnBd5OjPvCL6R68AlKn9ZgyA5fehWGMG8HhuISdgu6QGLrWABivDVw0IpRHl+I5Vh/Kzu3NLjJx7PmjVbRm/3HOE9FDmLeQxDcEUZTWxeHfG5PzFgnqRFbcuDOZNuGslnj2fE/2rEkIucaeQ7YOiET3XXUqdNi+VQKYE9cM/1yrXBzVq98HI0uBsMtJ/xe+FanIadd+rXWq8CqryabVXI5G9/Q==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "AOL Reuters April 7 2026 OpenAI four-day work week",
+            "Yahoo Reuters April 7 2026 OpenAI wealth fund AI",
+            "Reuters April 7 2026 OpenAI 4-day work week wealth fund",
+            "OpenAI trial four-day week Reuters April 2026"
+          ],
+          "query": "AOL Reuters April 7 2026 OpenAI four-day work week",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://www.techradar.com/ai-platforms-assistants/openai/openai-says-ai-could-mean-a-4-day-week-with-no-loss-in-pay-but-warns-jobs-and-wealth-are-at-risk"
+            },
+            {
+              "type": "url",
+              "url": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.investing.com/news/stock-market-news/openai-to-nearly-double-workforce-to-8000-by-end2026-ft-reports-4574054"
+            },
+            {
+              "type": "url",
+              "url": "https://mml-studio.com/blog/ai-weekly-march-23-29-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://finance.yahoo.com/news/softbank-profit-more-doubles-16-063545827.html"
+            },
+            {
+              "type": "url",
+              "url": "https://www.bloomberg.com/news/articles/2025-03-05/ai-run-funds-four-day-work-weeks-investors-say-hype-is-real"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Stargate_LLC"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.mean.ceo/new-ai-model-releases-news-april-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.washingtonpost.com/business/2025/12/31/ai-four-day-workweek/"
+            },
+            {
+              "type": "url",
+              "url": "https://champaignmagazine.com/2026/03/08/ai-by-ai-weekly-top-5-march-2-8-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.aol.com/finance/openai-encourages-firms-trial-four-120106793.html"
+            },
+            {
+              "type": "url",
+              "url": "https://sg.finance.yahoo.com/news/tech-stocks-today-anthropic-sues-defense-department-over-ban-openais-robotics-leader-resigns-152722809.html"
+            },
+            {
+              "type": "url",
+              "url": "https://www.forbes.com/sites/the-prompt/2026/04/08/four-day-work-weeks-public-wealth-fund-openais-ideas-for-our-ai-future/"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/OpenAI"
+            },
+            {
+              "type": "url",
+              "url": "https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/PithyCyborg/comments/1seyk86/todays_ai_news_no_fluff_oracle_openais_robot_tax/"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/SoftBank_Group"
+            },
+            {
+              "type": "url",
+              "url": "https://stepmark.ai/wp-content/uploads/2026/03/stepmark-february-ai-financing-report-vf.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://hk.allianzgi.com/-/media/AllianzGI/AP/HongKong/Documents/Presentation/eventpresentation/2025/09/25/01/48/20250930-Stephen-Luncheon"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/AI_bubble"
+            },
+            {
+              "type": "url",
+              "url": "https://techxplore.com/news/2025-12-softbank-openai-stake-41bln-investment.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "w5TlPIp9Cvts818W/hgjvwOiUg5+9a76RH9WW1RsmjrYhxMGF63QmyEXLQGSTrbuBZcsZWKIHfvzMt7h5WZG35jFcauPZ9+9HLHfyBe/8yX4wZcxBkiOGaMkc1nxIYPszOrHtWMSnPFKO4rJFoXOAR3yIV2tmlsezXFtsx/DeiJTNnN3y/225r6Fl8HY0PuB8Sdy01H4xhAoT06b7z2XaCMhBc8lRfq3BItIPMqlxgrEhvCRBv6aF4DldV4pYU+Ogs08P/1QjAXCysc4YQlOPvhDj1poIOmvGV5gI2zJW1zyRis4jiMlLiqu18DvWaDIR0IFGAlo9S0VEjtmN8Do76Pmt82uMG8XlqtK0PJx25p8KqwmD8e45X4SGLNRmGg3PDIR9evsVnpIwOEMCT5Drw==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "vW+B/JwOyNpN04sETVSQnz3ihiJrqvB0+4IMgcfFt5dDiE0Dry5kJJwKaE1Gq9iKtoG4WjN03P7+a8W4H/Vwtfnqv1tfd9J2NEssHNX9qHbM5bdnvRN2z8gPIZo+Ri/UnUMdVF/M1cllPro/zVa0K12I539ckAbBokyJfZi3mIrJ6lnN9DZXFjzdI5Mhqd3FI6T7cqBi2/E8yw5zyxxELPZD1Y2DcpuCZm2UDStGxArCoCF9492lyhE29msgBE5zRXKoUmX0NV3/Qw+mcmudtd3bQH75e29mxzNYaaS+3kJZw8NUvUymB94j51G9tP9gqKwhdF0ulMZQtyIEwf2hno6WAQYJdstoRSP9w29N2KdWL76KLfP7S66EwzRrCoy1P+dLo7wAYi27rlTUmbqFYw==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:anthropic.com/news April 7 2026 Mythos Preview",
+            "site:anthropic.com/news April 2026 Anthropic new model cybersecurity",
+            "site:anthropic.com/news April 2026 Anthropic Google Broadcom capacity",
+            "site:anthropic.com/news April 2026 Anthropic latest"
+          ],
+          "query": "site:anthropic.com/news April 7 2026 Mythos Preview",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/project/glasswing"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/sydney-fourth-office-asia-pacific"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/expanding-our-use-of-google-cloud-tpus-and-services"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/introducing-the-anthropic-national-security-and-public-sector-advisory-council"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/disrupting-AI-espionage/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/claude-opus-4-6"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/events/anthropic-partner-kickoff-2026"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/glasswing"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/announcing-our-updated-responsible-scaling-policy"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/research/economic-index-primitives/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/news/a-new-initiative-for-developing-third-party-model-evaluations/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.anthropic.com/events/aws-summit-london"
+            },
+            {
+              "type": "url",
+              "url": "https://assets.anthropic.com/m/4e20a4ab6512e217/original/anthropic-response-to-ostp-rfi-march-2025-final-final-sunmision-v3.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://www-cdn.anthropic.com/0dc382a2086f6a054eeb17e8a531bd9625b8e6e5.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf?hsLang=en"
+            },
+            {
+              "type": "url",
+              "url": "https://www-cdn.anthropic.com/08eca2757081e850ed2ad490e5253e940240ca4f.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "wbiBvp2gGxBddgTSraXzACL/XVaV8PD5b9i5i/y4J76xgHz2Hvf1dh05WCN7PdM6nu9gjO4sBhXHxV7Dbow1U9bV+gFAidosc9e+yZ7sPwI5kgNcC+tgHcUEw2IVz48QN42il/6EeSLz+gb3tJ3n9/a5kA55T8MRd4sSxOANrNDQJM0ifMXz/jK+nnHEWkb+6pHYzSnmhVe03CKHspXX8vZOSmf0lAmymSCcFQZSThxiEm4Efo9N7YVoyGL/XUeUhrtvIA1ValzA8UYwwY7DNVr2HUr1TrOLq4ixNSZWr6/4yKabo5n+3YWvywohbG5OvuGmBjP9mvpxorYI3vGRh+/llkbJUZU7MSwTg/hd/2nXesTzgvcHbWKDb7F6a9AGqLuhrBkc7i1+VN9fZoUjFg==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "OnEevhqxeR2t1elGi7m79qIu2EriA+NFhJP+qPqVf7izk4rNYWBaPHz8eYmaP7PpT0YjtEK3Bh6/iPWYDO7GLZItQ2bWk6yei7U9BEInoS8Ko4H38VVCnvnglo7kZmUSmtOQ0E3c2bxLk9dVYQa+j8Chu/p1xXUfwHxmfWogcNnFneyINXE9Cp4q3LUrDbI3Rd+e1J8mw8RumIFkv9N+wzL4M7L7joYOovr1GgUwClVbbdwh8YuuSYmiLFkLXO7GI/793RmQhY8EuO5ynOauFXwyyRNNNJJ57WjFEoIt8x3E8L6MV8bfUGnlbr6PsAvfys5eJySgPDHOZFEhaiDWibNcQhlF2GnpWajRQUlQ4IiecGbjH4awS6FmEWH882BVxJImCjD5tdsvPFhG3LShzg==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:blog.google April 7 2026 AI Edge Eloquent",
+            "site:blog.google April 2026 Gemini AI Mode all U.S users",
+            "site:blog.google April 2026 AI Mode U.S all users",
+            "site:blog.google April 2026 Google AI Edge app"
+          ],
+          "query": "site:blog.google April 7 2026 AI Edge Eloquent",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/products/search/personal-intelligence-expansion/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/products/workspace/gemini-workspace-updates-march-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products/google-cloud/ironwood-tpu-age-of-inference/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products/search/ai-mode-updates-may-2025/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/products/search/search-live-ai-mode/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products/search/ai-mode-multimodal-search/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/models-and-research/google-deepmind/google-gemini-ai-update-december-2024/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products/gemini/google-gemini-update-may-2024"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/health/med-gemma-impact-challenge/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products/search/ai-mode-agentic-personalized/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/intl/en-in/company-news/our-first-ai-hub-in-india-powered-by-a-15-billion-investment/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/37/How_Google_Fights_Disinformation.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/213/AI_Sprinters_Report.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/99/US_Google_Infographics_0208.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "g6JseAuoxg3xIXGrslerl2tzJKtWCO8Fi7ZWlDZXKNWMxaz1A9P+oZjbw/jvL7cPfwqJSRq54tS+p2gvUmrm/CJ23zxPXqSiBTg/NBRogxVVwQjsBrQGy4flzAfnkNU3b8ZHrakkAx5N68rYECOZOTxKAQ3Nita8HAp1uT2kguPjiozPZgU8ruUtwehsQH0ruhywTCm45sCJt8muhBOMJdl7khYybo+ip8LUtrRW1415bfxryyztKsAe1DajjFu8LeB9IeM76DAc9jLU5B/mSHyMqTbuvIJJZdQq8PzxHRcROBQUAgd254LszpJcpUGVJGZSqsvabIBBbbPs5l0FsMVI/92OI5zxEtNOR1H0jrHJqkMg05MxIl/wx0+qHjmZK6dD4D+VjcguI2uqephTQQ==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "NTjB2edneTTepoz0EMxm5tGdhyuV/s9tINbga2PVIEQRv6DhqSD9Y0znrhciKvZtTcFg1v0fahgkJ8CPNUKKAj1VIP7KE7XqBSGgGu+kZ7fVncnURWp89icHdiHc9fwjNBdLNjXZEPH6qVCXj7nyu9cir6ZQkhOjpWuXTKxlXmAHcf/A5x92gJdRpNOlcqIzdhlf2bbm75sRDaVmPO7I0y9eiiMh5afFH17UVm0fnrwI3W2M10XpyYJ9HOs7c7WcqWWJPmC4qJ6TwhPmsuiALDnGWfQj8CBtEa81ygVd1nliHPWCEYM5ILrIdhCUMwEIGI27IUJwJftirOudcZuWf6Sz3bLvGaZFAutsSJCVZ4JrFSqFb/X5sGdDKcgLrxA1sa1gX6iuGtOhZcoPoLJ7TQ==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:openai.com \"Industrial Policy for the Intelligence Age\"",
+            "site:openai.com \"four-day work week\" OpenAI",
+            "site:openai.com \"public wealth fund\" OpenAI",
+            "site:openai.com \"Intelligence Age\" OpenAI pdf"
+          ],
+          "query": "site:openai.com \"Industrial Policy for the Intelligence Age\"",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/introducing-the-intelligence-age"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/aarp-partnership-older-adults-online-safety"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/openai-proposals-for-the-us-ai-action-plan/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/ai-stories-daily-benefits-bigger-opportunities/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/industrial-policy-for-the-intelligence-age"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/strengthening-the-us-ai-supply-chain/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/openai-for-greece/"
+            },
+            {
+              "type": "url",
+              "url": "https://forum.openai.com/home/videos/openais-super-bowl-ad-introducing-the-intelligence-age"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/ai-education-opportunity"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/global-affairs/ostp-rfi/ec680b75-d539-4653-b297-8bcf6e5f7686/openai-response-ostp-nsf-rfi-notice-request-for-information-on-the-development-of-an-artificial-intelligence-ai-action-plan.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/index/supporting-nonprofit-and-community-innovation/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/seizing-the-ai-opportunity/"
+            },
+            {
+              "type": "url",
+              "url": "https://openai.com/global-affairs/eu-code-of-practice/"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/global-affairs/06025361-1ede-4402-97d2-daf1e5918b43/jobs-in-the-intelligence-age-sept-2025.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/pdf/21b88bb5-10a3-4566-919d-f9a6b9c3e632/openai-ostp-rfi-oct-27-2025.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://cdn.openai.com/pdf/2cb29276-68cd-4ec6-a5f4-c01c5e7a36e9/OpenAI-AI-as-a-Healthcare-Ally-Jan-2026.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "MghGGujfBMjkfzWm8YU39+y+0WTbAjKE2nau0WPgPQcgXjOmCsreQQ9szMa/R5ZKJOl7vvzHsaLIwXnrc/2VM8mjAbHuZhqsMnXy8ea3hAtTogsbSNuhAomn0QBXgtAss7O4YZHwbptH1B7Pe8ee0VA5bOHgEgq9/PqxhMy7Jk0pRQKZj/HucyZtmLxRJSlTpVQaKn8nHCuVDBptPJgZ4KUvpsFjwSP3BV5PmeRQZQLdlbceT0k+AUqVVyXZZjQO9dv5M1aHffSstk4ZelJypXjrpKT/0xBoIyV0RnRICvb3yIpTC1DeCzW38qbfG+rWhtd4zEKyEnWBJE9mPw0yzR0f+F8Y+igbAbdFFIvrDvbDqmTOwX+ZOJtkFP+NGL5qUrGJ4LpRhymwoHoqSmmAIQ==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "6G99Syf/RIjNXAnA0HYYGL/2oAJjegMhvVF/nsfzSjv/UVjcjNVi/LcP6etkfw2ig/6gTdyypETnd+LR0rK1iua5ZpCsrYA86B9MtocBAQvPJ7Z6vql2b0YhIuxcFwi4Bk5jt9kfxNCq/5CNZa8jmuFRJWC5sAIXw02ZpVMOnV66OFzj2J97zOjbuoqOAfnyGowoSOZbsSCrmioWNgIvU0/Onz+A/zU7uNjKb77fAcyN1Egndj/VCoIiBGZyL7oSSoJTdHvhO0NoB7m2+MaxrqwlrDCbFzcejoOL3bEmd2W7zT9xz9ttavivtBho5X57kBQSBUoKxhbKp81OxrGWxgV9m9arknCxwgaOPyEmyvH8vloXL+/90SzKKgGXDmM0hLp2cpLjMernN85YgebMzQ==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "Reuters April 7 2026 AI dreams crash into stark $7 trln reality",
+            "Reuters April 2026 AI dreams crash into stark 7 trln reality",
+            "site:reuters.com April 7 2026 AI dreams crash into stark reality"
+          ],
+          "query": "Reuters April 7 2026 AI dreams crash into stark $7 trln reality",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://www.breakingviews.com/columns/big-view/ai-dreams-crash-into-stark-7-trln-reality-2026-04-07/"
+            },
+            {
+              "type": "url",
+              "url": "https://followin.io/en/feed/24488247"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/AI_bubble"
+            },
+            {
+              "type": "url",
+              "url": "https://techstartups.com/2026/04/07/top-tech-news-today-april-7-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2603.09209"
+            },
+            {
+              "type": "url",
+              "url": "https://www.thedailystar.net/business/economy/news/ai-dreams-crash-stark-7tn-reality-4145981"
+            },
+            {
+              "type": "url",
+              "url": "https://www.breakingviews.com/columns/considered-view/ai-apocalypse-trade-has-buggy-logic-2026-02-04/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.forbes.com/sites/petercohan/2026/02/25/ai-doomsday-fears-are-rising-heres-what-they-really-mean-for-nvidia-stock//"
+            },
+            {
+              "type": "url",
+              "url": "https://www.fool.com/investing/2026/03/28/did-investors-get-too-far-ahead-of-the-artificial//"
+            },
+            {
+              "type": "url",
+              "url": "https://www.investing.com/news/economy-news/ais-rise-stirs-excitement-sparks-job-worries-4392165"
+            },
+            {
+              "type": "url",
+              "url": "https://www.forbes.com/sites/gilpress/2026/02/27/the-state-of-the-17-trillion-ai-bubble-the-end-of-thinking/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.thomsonreuters.com/en/press-releases/2025/june/the-ai-adoption-reality-check-firms-with-ai-strategies-are-twice-as-likely-to-see-ai-driven-revenue-growth-those-without-risk-falling-behind"
+            },
+            {
+              "type": "url",
+              "url": "https://www.gurufocus.com/stock/NVDA/summary"
+            },
+            {
+              "type": "url",
+              "url": "https://cmsrkv.rgukt.in/storage/notices/files/th.th_international.06_01_2026_1767673550.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://earthnews.blob.core.windows.net/earthnewsladakh/files/42025100941955.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://www.intro-act.com/uploads/disruptivetech/202503271204111169357902.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://liontree.com/wp-content/uploads/2025/04/LT-Weekly-17-04-25.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://share.refinitiv.com/assets/newsletters/Morning_News_Call/MNCGeneric_US_10242024.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://ufdcimages.uflib.ufl.edu/UF/00/02/83/15/09075/2025-11-10.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/Daytrading/comments/1npaoxr"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/singularity/comments/1jtsqww"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/Daytrading/comments/1ou7vfj"
+            },
+            {
+              "type": "url",
+              "url": "https://www.reddit.com/r/u_TearRepresentative56/comments/1rpw3vy/all_the_market_moving_news_from_premarket/"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "g7UnS9z/0PXZ84h9iNdBpgr6Qtq2tCeofk5ibUMy88epYLQlAgkudk7cmO5bPz2QsJgMkhjjpC0HXZdyzYhUZfd0S7qhXGSts/nZiCqwremB/WLoouU8oku3zyO5Gp1HlD/SAWvhgdjLykQHLcr2svvFYPhkA6f0GG/qAnZyg4B6zG7h3EwCipz8Rd3HsPIvv8896woqLIIorqizhVTFThBCHU/Jn25sUHaZ+BZHLP4JDHuPQqX8Ye8FD51ShuRv+OI477B6mlIejuay9viRIEG62ZSAyS6+jXYs0j9iHO4UWoKB54MtcMDkf30bMOfbu0lMnorNhfhGT5wfSeYaAncrkM32+2keNhLsCGk85OmGr2MXUrikUUpfOsxDyUNuMGd7VB6MrjPF+H7cjlRK2g==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "eq/oNmf+0kpmsuv1lrga+NoaiP8IYivip+A/EMh/+VW8BAhN9XDqk5u+VTfVoAerRjH1My06sjIcJy8wsCuYC0q1PI/stlZO6Uo3/B5GKt4RQQg5e2PvWChlocGilLy2oVeEX0q+JkD8CBWWunsX12BrpvXdWkdAm9Q86mi8sHJpU6sO9wr77dCwqBeVSOJ3+AnUXAyoV7UDBnO9pdMffQ9nc91B4SMU23NrzKQ6nVM/JyPcxOmjI5c1jGMXQChTuLVKhfEasjhT6k4APUr4gK9uwNrElfbJ+c3+1edmI6JjyE0voLTiVItKSA47ie/L4dJ5WATT/Nt9J1P9uAhR6yxxI+oYCDsr7CepJtSRR+4CSumZpzMV/+Q8oCztM38MWFd62/CNeuisiqEA+/Wyfw==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:blog.google 2026-04-07 AI Google official",
+            "site:blog.google Apr 7 2026 Gemini official",
+            "site:blog.google April 8 2026 Google AI official",
+            "site:blog.google April 9 2026 Google AI official"
+          ],
+          "query": "site:blog.google 2026-04-07 AI Google official",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://blog.google/company-news/inside-google/around-the-globe/google-europe/ai-works-for-europe/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/ai/veo-3-1-lite/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/intl/en-in/products/explore-communicate/new-ways-google-is-using-ai-to-make-shopping-easier/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/technology/google-deepmind/gemini-model-thinking-updates-march-2025/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/health/mental-health-updates/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/company-news/outreach-and-initiatives/google-org/global-impact-challenge-ai-government-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/company-news/outreach-and-initiatives/sustainability/2026-water-stewardship-portfolio/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/company-news/inside-google/around-the-globe/google-asia/google-singapore-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/company-news/outreach-and-initiatives/google-org/google-org-generative-ai-accelerator-2025/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/products-and-platforms/products/education/national-teachers-day-2026-googleplex/"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/222/Open_Call_Response_-_catalog.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/77/Googles_submission_to_EC_AI_consultation_1.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/37/How_Google_Fights_Disinformation.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://blog.google/documents/99/US_Google_Infographics_0208.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "aEYrT29+tiEmfk7bVG42B3tDjtupnYw4BBKxS/0jNN/+jNoHUBPnmploSUGNYK6F7kyYjcMq0Bh0wzSiagIX34jCezemviX58P5lQ5NhtXojG6PNxForgyMa7D46UAIukmFZkO1DpMRESrDb1Ks8scmJRnmdNImIhMuwd1R0e0StbVHdQaGZMXc2zVcypaudveLqLfDvhIarL6MbAh1xIyRP928kZJI9C7e5a3EbC5YWaiyIEp07oOIaUwuwZoGKCcz84kb3hXj1kIVw30njtl1KF11FTxhXQQ2RBeVMaymYqlJPPDfpej23aa62Ae7akJ/isi/swC5WMopSKaUFVKnc7v2Nl+rUa1EySchySufuVWw3rmmlBoqMI7lNsRAXR7RY36hvN2RxQpqZwkJXsA==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "Em/QAxWzL2boDYYO92cXLEiUfDOqiUJNHjfKeb2Fy5+Y2poMhoVM9awrd9h2xrDRnlolwwC5W/yMewxFRrxdf5LqgMns3Nrj+98fchgP6V9p49mrr/UGZm0DsFli1klSAT4UEEnhpUwbho/+msBUDKIunFFKb3WlbSrdRCmjCL2HpYcQZxl8sDukS5voeiwttxt6itirhxyTNpgqlWzJ4R2cFfhskwr8g0DS0dFvd2RP8I3rwN4FoomwsT9Wdw0LaRVM2Lru7GqdyOdN5KVMuJU4DciTxQ908nm2Hm4Ao8Q39kQVtBKJS+TD55A8itcPn2h6gzbYv3fpxN/vS34Q/Qn8SA+lMwsdEHDSk74bDNVz2ExaePe2YgeaQPZDDQALeShjzZVOVW+BLthtMLcc7g==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:techcrunch.com AI April 8 2026 OpenAI Google Anthropic Meta xAI",
+            "site:theverge.com AI April 8 2026 OpenAI Google Anthropic Meta",
+            "site:wired.com AI April 8 2026 OpenAI Google Anthropic",
+            "site:axios.com AI April 8 2026 OpenAI Google Anthropic"
+          ],
+          "query": "site:techcrunch.com AI April 8 2026 OpenAI Google Anthropic Meta xAI",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/02/27/google-openai-workers-push-for-military-ai-limits"
+            },
+            {
+              "type": "url",
+              "url": "https://techcrunch.com/2026/01/20/humans-a-human-centric-ai-startup-founded-by-anthropic-xai-google-alums-raised-480m-seed-round/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.wired.com/story/anthropic-sues-department-of-defense-over-supply-chain-risk-designation/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/03/05/openai-gpt-54-chatgpt-office/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.wired.com/story/openai-announces-4-1-ai-model-coding/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/02/27/pentagon-openai-safety-red-lines-anthropic"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/03/11/anthropic-dc-presence"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2025/11/18/anthropic-microsoft-nvidia-15-billion"
+            },
+            {
+              "type": "url",
+              "url": "https://es.wired.com/articulos/nvidia-deja-de-ser-solo-el-proveedor-de-chips-y-podria-buscar-el-trono-de-openai"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/02/26/the-race-to-catch-claude"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/01/01/ai-2026-money-openai-google-anthropic-agents"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/03/02/anthropic-ai-openai-trump"
+            },
+            {
+              "type": "url",
+              "url": "https://www.wired.com/story/anthropic-world-first-hybrid-reasoning-ai-model/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.wired.com/story/openai-contractor-upload-real-work-documents-ai-agents/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2025/08/08/openai-aims-gpt-5-at-anthropics-coding-crown"
+            },
+            {
+              "type": "url",
+              "url": "https://www.wired.com/story/openai-anthropic-and-block-are-teaming-up-on-ai-agent-standards/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.wired.com/story/ai-industry-rivals-are-teaming-up-on-a-startup-accelerator/"
+            },
+            {
+              "type": "url",
+              "url": "https://es.wired.com/articulos/openai-anthropic-y-block-se-alian-para-estandarizar-la-nueva-era-de-agentes-de-ia"
+            },
+            {
+              "type": "url",
+              "url": "https://techcrunch.com/wp-content/uploads/2026/03/anthropic-amicus-brief.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://techcrunch.com/wp-content/uploads/2026/03/2026.03.04-Filed-Gavalas-Google-Complaint.pdf"
+            },
+            {
+              "type": "url",
+              "url": "https://platform.theverge.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/24782736/2023.07.11_Letter_to_IRS__TIGTA__FTC__DOJ_on_tax_prep_pixel_data_sharing.pdf"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "Nnigq9CI9XnHk85MXWIXiHBXJQBOWBhda7FbVq+PdvPzzzB3Km+RkXrRCVEV26i7BsIlc4TgUKPN84APDpSENUY8ffnlkECz8RkFYzZ5fYNb9AUKbKKKNEfp1K+grNi9l9dzjMSfdehsGpsJcFGNZ8UwNzBAS2cjG+jqtQn+odo//LBfrsd+w+NsEA2ZGNMk+a4qlHhrNPoIViI8ppeoysnjEnsWZ45OITH2Bs0ZOiJ52FeFYj5IInfqDvsZJEhQcbyD2+uSqcNk/w1Zl8rVAwPvYwrHwaPMcpEbAVcjK11kLUFJCrqwZwGRiDcDE2mTJglTS6QNnyNiyNm6oQsocd1a+v1mxoAFBcs96BrS4qRiJ8ckWcxaSqYEQhKkfDMK6obwk1H/lCtKyVWCqaxCDQ==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "6Qsi/eTYST3oLLjgGwuQ9LG//ZXRjasMJWcWSLBo26HeQZoaTqzE/vQuSydv0e/SAbMkK44ARhQP5mhAqo4VWZbq9Aa4MwL9MV1xYK62f9kS78cs/i5TKFNZsMLdOY3xOWmeiu6jnnyga5QD+M2IYyZWyfxPBICi2MQwaf/u7Cpz6WHhMzEvBr8KBd9q1j0RdgvaO8CdvwGshtSXAcTAuopVbbOd4D/T+5+9ZmGeUqEYHI0Lc7y+lCu+BncLKRuLnvZ0b0JcfQug6CZxeW9aWff0JUDH3jSeMEVcqhJrD/zGKy3QAEm0SClNhDjqnh6E2cJnxD5c2zh7lXBFNFU7IBCHtYb1a4p0iKKp+CkWHhJnrQ3n4YTtz1mRffu68QNe5i2kLOPOTzLFNRCzpARxuw==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "type": "open_page",
+          "url": "https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3"
+        },
+        "id": "w5PEvxZa5gCG8it0n30pbE4v2sxBagQWxWo7TfVb2oQDXkl/CSFsdwJNqSQ8xyqefDJM7c9OWXtnpX6XurRJ6+eROWR0W60a1GUqZR5oefeN26y9bOaQHpYNbEO6tmHZ5xm50VTkwsB3itKkB9F9ErpnkeWwyzgh5eMnvnuP2zlCWtHqDuSkgEbJzrUTHb8NEUsrWMq9gngPU8s6wjb5a4ELJL9gyZZ2uZe2hcZB/Tb1fglT9L5VBk58e5LWk5UiU+3bLVguI07ZlxUMEIQresCEShyHSZgoNlskcU2dEunaxQJtTyogiz5zpbWmz4dOztCxbCQjNzM+kUoEqkO0mhUA0vWPU9XM4HON+q91HW92OI8kt+0uz3Et7Jr2iZ6mX/pmGqUnYwzgoruJoXrwwA==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "xqGTQGjyKXP1ktLGeK6U/VX71NeL0wMLa/pPfe+eJ90gSE313iNEAA/zbKeDDEgXg1sfCEhMf9ARO1Xah4Bpi1tPRr3QLKZt822BHYsx3u90bhxUNhZSVK8xTh5mWk+df1orgd+yAD7130upR9ptKVJ8p4svrUGEGFX6+aUTzxqnFVosGZdIztninX2+OvFLXhnsE84NVvMHxAvRNiQgJAivfKfe4LaLGkPBa8u1t5Hx0tjN0bc0xZH3o0GrJ7+i6JJar32m5hyJWGWSIRBYpFGISTWTFNX2/RUdv8aeqZHjH48pjVgPRHJ5nL4Js7+aHs2LXSwvVnMerFo81lMZAFLO12htDVnygR4PhQi6grVU9mWFi1KfLNokHI7Fn/6Gie1R94KC8mu2wqY8fE8tog==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:reuters.com April 2026 OpenAI artificial intelligence product announcement",
+            "site:reuters.com April 2026 Google artificial intelligence announcement Reuters",
+            "site:reuters.com April 2026 Anthropic Reuters artificial intelligence announcement",
+            "site:reuters.com April 2026 Meta AI Reuters announcement"
+          ],
+          "query": "site:reuters.com April 2026 OpenAI artificial intelligence product announcement",
+          "type": "search"
+        },
+        "id": "APvIUYqAgtwdd41MgBNbtQRhnr8eSl7uVEVoFnlKoK31qSnbziSDyG27NqhyYSc1niJBt3R8NMKIb7dl2fkNpV4RLaixkv+OiH2He5omck8eQvkSQ5ew8dTHP9r0TMBKTfdfWCU2JDgM0QN65c7Zow9LxA07amE1dXl7afazeidtdHzn2naffMggIRS/LFRYW1KZPrF+4+0v3OwbMmnUtFN5OQ6J8/B0WupuAvb8/PHfe+4KpU4PY1t33kotxY1suDY100XHk9eeewdt3e5pnf8LqKp70kZgv1Rs8QJ4Ylmj/DAEiB4MvIFZHP/O5SZSb1+L6T1VvpRSk8SHC3zk6ZqhjlsK9KkNniuPihFrwyQdmEOcFypVv9dqOdegJqTAzFb6U043Dd8EiNqnLEWnRA==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "KtxGKwGeK6vS+B5H43JrxM9xqpr4mTdn7wZHTnix+mXPHi25VeubHZwtJsWfIi8DinBsAytx7ESBHIeHGPrUy14CvsN9r7os3LSJj7Q+dkv16DBwTydYgNj3pBMOB+giQBK44wIamilkaW51uPKxeQ0vK7CpY4K2L334KnMKYrU/gA648axrdhqobxh4s9FUBrjxsH+CCEnJzRS3m0Wzvivbrk+hyRm3lcS/tK8PsKHHj/w8bHkHNDPBFPyN/a6XApKtePzWSqHQmhvy1Wyq+DQnc3I+PbXoo2iWqq51glQSO9cReLSR2lj2mWStvYF9UF6Fg2PAcn79T0Z4S0ksHoIUoAhTJwEGDuGvgaHwv8tIY7w0Xt3dkllXPfPt37zachZQBorvARJ92RMQlyx04A==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "AI April 9 2026 latest headlines AP Reuters TechCrunch The Verge OpenAI Anthropic Google Meta xAI",
+            "artificial intelligence April 9 2026 headline OpenAI Anthropic Google Meta",
+            "AI headlines today April 9 2026 latest",
+            "site:apnews.com April 2026 AI OpenAI Google Anthropic Meta xAI"
+          ],
+          "query": "AI April 9 2026 latest headlines AP Reuters TechCrunch The Verge OpenAI Anthropic Google Meta xAI",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/275df9e291bbb361962dfc6ba868506c"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/3d86c9296fe953ec0591fcde6a613aba"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/65c08aa4fab90cde952f37d32625394a"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/4b55aabf7ea018e38ffdccb66e37cf26"
+            },
+            {
+              "type": "url",
+              "url": "https://elpais.com/economia/2026-04-09/meta-trata-de-reaccionar-en-la-ia-como-un-nuevo-modelo-frente-a-google-openai-y-anthropic.html"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/b5e99d485d08ed1ced68a701723c3843"
+            },
+            {
+              "type": "url",
+              "url": "https://www.readaboutai.com/april-9-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://aiweekly.co/issues/481"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Meta_Superintelligence_Labs"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%E2%80%93United_States_Department_of_Defense_dispute"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2604.02912"
+            },
+            {
+              "type": "url",
+              "url": "https://popularaitools.ai/ai-news-this-week-march-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://dentro.de/ai/news/"
+            },
+            {
+              "type": "url",
+              "url": "https://aitoolly.com/ai-news/2026-04-01"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2604.06217"
+            },
+            {
+              "type": "url",
+              "url": "https://www.linkedin.com/pulse/ai-updates-roundup-march-1017-2026-dhanushkumar-r-izqzc"
+            },
+            {
+              "type": "url",
+              "url": "https://champaignmagazine.com/2026/03/15/ai-by-ai-weekly-top-5-march-9-15-2026/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.singularitysoup.com/latest-ai-news-2026-02-25.html"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/A_National_Policy_Framework_for_Artificial_Intelligence"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Global_call_for_AI_red_lines"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2602.23679"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "6fVlXzDfxef+LN+0z698CnZr4GfZaQPhdaMcuqDpjD1ZTwtAHoGBmM8O43CVGEZNVYTozvqjmgltYrR7RtUWedVQfxIrofXKEdwQO4NTstK5tYtUE9nedIEt1y33wpv4+htlgYzrQGNoI18rNUQu2V1lixnn6nlJsoJ2JSzfayk6SwiO+j0sux8ZW4lqQ/RHtNP6//0y/RaNU+6qP/X1F2WdT8IJU/oJjiIwdTOjtticGTQA52Vjp+nkcr3IEdq9cdwZv//g+zgMinvKXoO5X28N+n0rneAy46eTo6S1GjyMNsx6ARHuYgBqdlr2oIMFdu2f6h9VsWRxK3NPDPHTG4MTkBdv1q24AFFrtLML5ba9nphgJFy97qlFK0srjeC9YLqFd7HQS1Y5OPgj9NPYuQ==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "hE/gy3/PFC0E2lfA1NMJ3+8EDh0RwVW4j+q6n/dhJ3u7Haku32ZzKmEfRZOyGf9fKXxSp1cjYDIAlF6oNgrFDVatt7x6CGiTQWLKMeob6yMbjpBzBkLqHkj8oTuJQSjhSJwGIeVKRmwljWOjjoAFL/CSWU5/vumTR6meS6kttgIs9q4cONanAfFheM18K/abAXDpXFL6miRTQ43XqrVAxqfDWtqW6sbrErv827I+tQ0SA35evbmipXHi+ftBzwW6kSNyB29xPxULzWUD38bVFrsU969bWs29K9zMn9Vz5UrB77zVTbwLFEDxsPBJrm3vNnJedtoTBHx+CCenaAUq2bXcTZRV0fCTUmxXOYjGt2pHK7eYiwKHP6rpvYPydNN0Ssr6kseXriZLVyFuvzj2Ag==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "action": {
+          "queries": [
+            "site:whitehouse.gov March 2026 national policy framework artificial intelligence",
+            "White House March 2026 AI framework legislation",
+            "site:whitehouse.gov April 2026 AI action plan White House",
+            "site:whitehouse.gov 2026 artificial intelligence legislative recommendations March"
+          ],
+          "query": "site:whitehouse.gov March 2026 national policy framework artificial intelligence",
+          "sources": [
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/04/09/trump-white-house-gop-states-ai-rules"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/releases/2026/03/president-donald-j-trump-unveils-national-ai-legislative-framework/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/releases/2026/02/u-s-promotes-ai-adoption-sovereignty-and-exports-at-india-ai-impact-summit/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/briefings-statements/2026/03/first-lady-melania-trump-convenes-record-45-nations-at-the-white-house-and-introduces-american-built-humanoid/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/briefings-statements/2026/03/65th-anniversary-of-the-peace-corps/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/articles/2026/03/president-trump-secures-historic-commitment-to-keep-electricity-costs-down-amid-data-center-boom/"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/presidential-actions/2026/03/ratepayer-protection-pledge-proclamation/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/presidential-actions/2025/11/launching-the-genesis-mission/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.govexec.com/technology/2026/03/white-house-releases-regulatory-vision-ai/412285/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/03/23/conservative-group-tougher-ai-rules"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/briefings-statements/2026/01/first-lady-melania-trump-inspires-americas-children-to-be-curious-use-ai-to-achieve-their-career-ambitions/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/articles/2026/03/white-house-unveils-president-trumps-cyber-strategy-for-america/"
+            },
+            {
+              "type": "url",
+              "url": "https://www.washingtonpost.com/politics/2026/03/20/white-house-donald-trump-artificial-intelligence/70f2f230-245d-11f1-954a-6300919c9854_story.html?itid=agg_ticker"
+            },
+            {
+              "type": "url",
+              "url": "https://www.whitehouse.gov/presidential-actions/2025/04/advancing-artificial-intelligence-education-for-american-youth/"
+            },
+            {
+              "type": "url",
+              "url": "https://apnews.com/article/65651bd28c3d911d18eeb46cd54f4c75"
+            },
+            {
+              "type": "url",
+              "url": "https://www.axios.com/2026/03/25/hawley-ai-chatbots-congress-guard-act"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/AI_Action_Plan"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/No_Fakes_Act"
+            },
+            {
+              "type": "url",
+              "url": "https://arxiv.org/abs/2603.24621"
+            },
+            {
+              "type": "url",
+              "url": "https://en.wikipedia.org/wiki/A_National_Policy_Framework_for_Artificial_Intelligence"
+            }
+          ],
+          "type": "search"
+        },
+        "id": "CMCUBAPfUMfKomFdMV4gfdunBWqTTlkgmSbW9xvop68Ht9WbJwVdzZ56JSxha+kHxiN9Msf+5QaksTY4KryxvkqdQLaT2IhAALD8LRhlljb2Aaxj92ItyNiKC/v5xxZdDEuVuOFACL5PP7+wUBm5iC6RNWBac3JPtyGyYd7kpGb9QqiOZARE23pRwV5yNYk424RG3sVvaa861iaX73jMxPYfsLYlydb3f3Lig/AOLmkt8djoMG7IcueY7OzixGyDgRzOpqmJX7XUx1m7PaQonkjOmnc8I/M9pw8XMYV3kDhZsjFex20PTMM85I8lN6Q2ziCGNz10OwpEtTb2uF3JxQqKf2qc/6DpuIW6iyZhQvcFg77aPArtEjQC1lssEHq5/y5slKxgtwHzMMAvjuxujA==",
+        "status": "completed",
+        "type": "web_search_call"
+      },
+      {
+        "id": "X7Lcu2+I8jry96mnSYpH4+oYZA9qFPd2WSR4P6bNHhG2T1+shokq6EIuMbOZrYIMFUr70YA8vJ/Nbmt9+IuQ0MeqIawI46k66S7XeB90mNEvrwDXzJsu0FqOCv1sk+glYT1PxlR1PrlCzfmQpuW1EoSO7J6vvKVP3piRHP2qSJAzpShu0taf6lV9fEjZQ2+0kKEf8QFTA+4jqDIB5seVN9AqiSlVgTAkE2ltVkcrlUUsVi6OzEJhhOEIaYDnvLLYUizpUcFVpvVc1eXRXI7vsb8mCNBn0u9MbXFenAVY5TDZgv1bK2iT6g9WgmU7icLS4TqXY7D4WDEUCv8fTZbuGdFNrysIEiQJ2KwAvKH7uNTQsUAflvLJO5B946PED8bcOwLYqLKh0tpfqYer0NHPVA==",
+        "summary": [],
+        "type": "reasoning"
+      },
+      {
+        "content": [
+          {
+            "annotations": [
+              {
+                "end_index": 567,
+                "start_index": 492,
+                "title": "Appeals court rebuffs Anthropic in latest round of its AI battle with the Trump administration | AP News",
+                "type": "url_citation",
+                "url": "https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3"
+              },
+              {
+                "end_index": 1037,
+                "start_index": 951,
+                "title": "Scoop: OpenAI plans new product for cybersecurity use",
+                "type": "url_citation",
+                "url": "https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic"
+              },
+              {
+                "end_index": 1570,
+                "start_index": 1508,
+                "title": "Project Glasswing \\ Anthropic",
+                "type": "url_citation",
+                "url": "https://www.anthropic.com/project/glasswing"
+              },
+              {
+                "end_index": 2068,
+                "start_index": 1985,
+                "title": "Industrial policy for the Intelligence Age | OpenAI",
+                "type": "url_citation",
+                "url": "https://openai.com/index/industrial-policy-for-the-intelligence-age"
+              },
+              {
+                "end_index": 2572,
+                "start_index": 2477,
+                "title": "Google’s mental health work and support for organizations",
+                "type": "url_citation",
+                "url": "https://blog.google/innovation-and-ai/technology/health/mental-health-updates/"
+              },
+              {
+                "end_index": 3037,
+                "start_index": 2946,
+                "title": "Gemma 4: Our most capable open models to date",
+                "type": "url_citation",
+                "url": "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/"
+              }
+            ],
+            "logprobs": [],
+            "text": "As of **Thursday, April 9, 2026 (U.S.)**, these look like the **top AI headlines today**:\n\n- **Anthropic loses an appeals-court round in its fight with the Trump administration.** A federal appeals court declined to immediately undo the government’s “supply chain risk” designation, even after a lower-court judge had said the administration likely overstepped. The case now heads toward a **May 19** hearing, so this remains one of the biggest AI-policy/legal stories in the U.S. right now. ([apnews.com](https://apnews.com/article/8478be7d5e275dee43d9814ebb2a69d3))\n\n- **OpenAI is reportedly preparing a limited-release cybersecurity product for trusted partners.** Axios reports OpenAI is finalizing a cyber-focused offering for a small group of partners, a sign that frontier labs are becoming much more cautious about releasing models with strong hacking capabilities. The story explicitly ties this to Anthropic’s recent gated rollout strategy. ([axios.com](https://www.axios.com/2026/04/09/openai-new-model-cyber-mythos-anthopic))\n\n- **Anthropic launches Project Glasswing and gates access to Claude Mythos Preview.** Anthropic says its new **Claude Mythos Preview** model has already identified **thousands of zero-day vulnerabilities** and is being released only as a **gated research preview** through Project Glasswing, alongside partners including AWS, Apple, Google, Microsoft, NVIDIA, and others. Anthropic also says it has committed **$100 million** in model-usage credits for the initiative. ([anthropic.com](https://www.anthropic.com/project/glasswing))\n\n- **OpenAI pushes a new “industrial policy” agenda for the AI era.** In a new post published **April 6**, OpenAI says incremental policy changes won’t be enough as AI advances, and it is floating “people-first” ideas to spread AI’s economic gains more broadly. It is also launching feedback channels, policy fellowships/research grants, and discussions at a new Washington, D.C. workshop opening in **May 2026**. ([openai.com](https://openai.com/index/industrial-policy-for-the-intelligence-age))\n\n- **Google adds stronger crisis-support features to Gemini and commits $30 million to hotlines.** Google says Gemini will now surface redesigned mental-health support prompts and a simplified **one-touch** path to crisis hotlines when conversations indicate possible self-harm risk. Separately, Google.org says it will provide **$30 million over three years** to help crisis-support organizations globally. ([blog.google](https://blog.google/innovation-and-ai/technology/health/mental-health-updates/))\n\n- **Google’s latest open-model push is still making waves: Gemma 4.** Google DeepMind introduced **Gemma 4** on **April 2**, calling it its most capable open-model family “byte for byte.” While not a same-day breaking item, it remains one of the most important recent product releases shaping today’s AI conversation, especially for developers and open-model competition. ([blog.google](https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/))\n\nIf you want, I can also turn this into a **“Top 10 AI headlines today”** version with **one-line summaries + source names only**.",
+            "type": "output_text"
+          }
+        ],
+        "id": "xG3ehjZ5EHPfxV6d40ezwe+48nj2c5xjHITAiCjwEAfbMvLrO+b2oIa1CthKXscR/5yPoHOHwAqoXQ15Vk9mQ8//yiCrX2JvQ9zl8FjvE3q58Q/chfuFkE0JehclCDPoqDT5qU01EbP97ktm7/vuz9qIrbsIaNyYWzo6EotzU58cazkwFXPvTBuarVHXZgS2/7VBAPh/XwvRChh2EEIDuF8heh73ilSBSrf7tCln7AqfYCKoMySPEBUfL+lrYOd6Dyge2gGOW4RH4Dxsqqmxqb1CkL9xCq4ymp5cRnAbfNre5PDjKM1pmKruq3G6vMC3uM0tcHJGpLZJ5u4jy+O57IogXDlVW8Mu1tXlaC7R3in5kUmEAeYvN+pp5yrhHL5/N1cbK9C6dUK6WUCjy5cSNuQ=",
+        "phase": "final_answer",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      }
+    ],
+    "output_text": null,
+    "parallel_tool_calls": true,
+    "previous_response_id": null,
+    "reasoning": {
+      "effort": "medium",
+      "summary": null
+    },
+    "safety_identifier": "fb51eb1de7dfbe46ce9bc92ba911d2cac7364c5372d6cbda115a0b017f6a1ac2",
+    "service_tier": "default",
+    "status": "completed",
+    "temperature": 1,
+    "text": {
+      "format": {
+        "type": "text"
+      },
+      "verbosity": "medium"
+    },
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "type": "web_search",
+        "search_context_size": "medium",
+        "user_location": {
+          "type": "approximate",
+          "city": null,
+          "country": "US",
+          "region": null,
+          "timezone": null
+        }
+      }
+    ],
+    "top_p": 0.98,
+    "truncation": "disabled",
+    "usage": {
+      "input_tokens": 67771,
+      "input_tokens_details": {
+        "cached_tokens": 4352
+      },
+      "output_tokens": 3998,
+      "output_tokens_details": {
+        "reasoning_tokens": 3335
+      },
+      "total_tokens": 71769
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "runId": "gemini",
+  "provider": "gemini",
+  "authMode": "api",
+  "query": "What are the top AI news headlines today? Include sources.",
+  "timestamp": "2026-04-09T21:18:50.403Z",
+  "notes": [
+    "mode:router"
+  ],
+  "prerequisites": {
+    "authPresent": true
+  },
+  "status": "success"
+}

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { __testOnly } from "../scripts/web-search-capture";
 
-describe("web-search-capture vercel special-case status", () => {
+describe("web-search-capture status assessments", () => {
   it("marks capture-error when tool is unsupported and dropped", () => {
     const assessed = __testOnly.getVercelSpecialCaseStatusAndNotes({
       diagnostics: {
@@ -73,5 +73,62 @@ describe("web-search-capture vercel special-case status", () => {
     expect(assessed.notes).toContain("vercel:missing-tool-payload");
     expect(assessed.notes).toContain("vercel:missing-structured-sources");
     expect(assessed.notes).toContain("vercel:web-search-requests-lt-1");
+  });
+
+  it("marks copilot success when request/response include direct web-search signals", () => {
+    const assessed = __testOnly.getCopilotStatusAndNotes({
+      authSource: "stored",
+      request: {
+        bodyJson: {
+          tools: [{ type: "web_search" }],
+          include: ["web_search_call.action.sources"],
+        },
+      },
+      response: {
+        bodyJson: {
+          output: [
+            {
+              type: "web_search_call",
+              action: {
+                sources: [{ title: "Example", url: "https://example.com" }],
+              },
+            },
+          ],
+        },
+      },
+      normalizedResult: {
+        usage: { web_search_requests: 1 },
+      },
+    });
+
+    expect(assessed.status).toBe("success");
+    expect(assessed.notes).toContain("copilot:auth-source=stored");
+    expect(assessed.notes).toContain("copilot:returned-web-search-sources=true");
+  });
+
+  it("marks copilot capture-error when web-search evidence is missing", () => {
+    const assessed = __testOnly.getCopilotStatusAndNotes({
+      authSource: "env",
+      request: {
+        bodyJson: {
+          tools: [{ type: "file_search" }],
+          include: [],
+        },
+      },
+      response: {
+        bodyJson: {
+          output: [{ type: "message", content: [{ type: "output_text", text: "No citations" }] }],
+        },
+      },
+      normalizedResult: {
+        usage: { web_search_requests: 0 },
+      },
+    });
+
+    expect(assessed.status).toBe("capture-error");
+    expect(assessed.notes).toContain("copilot:missing-web-search-tool");
+    expect(assessed.notes).toContain("copilot:missing-include-sources");
+    expect(assessed.notes).toContain("copilot:missing-response-sources");
+    expect(assessed.notes).toContain("copilot:web-search-requests-lt-1");
   });
 });
