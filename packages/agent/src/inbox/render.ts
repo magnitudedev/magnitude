@@ -381,7 +381,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   )
 
   const reminderLines = [
-    ...(hasUserMessage ? [USER_MESSAGE_RESPONSE_REMINDER] : []),
+    //...(hasUserMessage ? [USER_MESSAGE_RESPONSE_REMINDER] : []),
     ...(hasWorkerMessage ? [WORKER_PROGRESS_USER_MESSAGE_REMINDER] : []),
     ...buildLifecycleReminderLines(lifecycleHooks, input.lifecycleReminderFormatters),
     ...buildTaskTypeReminderLines(taskTypeHooks),
