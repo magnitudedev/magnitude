@@ -378,7 +378,7 @@ describe('web search OpenRouter integration', () => {
     })
   })
 
-  test('OpenRouter response normalization extracts text, deduplicates citations, and falls back usage', async () => {
+  test('OpenRouter response normalization merges annotation + markdown + additional sources with stable dedupe', async () => {
     let requestBody: any
 
     const result = await withPatchedFetch(
@@ -388,20 +388,30 @@ describe('web search OpenRouter integration', () => {
           output: [
             {
               type: 'message',
+              sources: [
+                { title: 'Additional B', url: 'https://example.com/b' },
+                { title: 'Duplicate C from additional', href: 'https://example.com/c' },
+              ],
               content: [
                 {
                   type: 'output_text',
-                  text: 'Search summary',
+                  text: 'Search summary with [Extra C](https://example.com/c) and [Duplicate A](https://example.com/a)',
                   annotations: [
                     { type: 'url_citation', title: 'Example', url: 'https://example.com/a' },
                     { type: 'url_citation', title: 'Duplicate', url: 'https://example.com/a' },
                   ],
+                  sources: [{ title: 'Additional D', url: 'https://example.com/d' }],
                 },
               ],
             },
             {
-              type: 'message',
-              annotations: [{ type: 'url_citation', url: 'https://example.com/b' }],
+              type: 'web_search_call',
+              action: {
+                sources: [
+                  { title: 'Additional E', url: 'https://example.com/e' },
+                  'https://example.com/d',
+                ],
+              },
             },
           ],
           usage: {
@@ -424,10 +434,13 @@ describe('web search OpenRouter integration', () => {
         tool_use_id: 'openrouter-search',
         content: [
           { title: 'Example', url: 'https://example.com/a' },
-          { title: 'https://example.com/b', url: 'https://example.com/b' },
+          { title: 'Extra C', url: 'https://example.com/c' },
+          { title: 'Additional B', url: 'https://example.com/b' },
+          { title: 'Additional D', url: 'https://example.com/d' },
+          { title: 'Additional E', url: 'https://example.com/e' },
         ],
       }],
-      textResponse: 'Search summary',
+      textResponse: 'Search summary with [Extra C](https://example.com/c) and [Duplicate A](https://example.com/a)',
       usage: {
         input_tokens: 11,
         output_tokens: 22,
@@ -447,6 +460,66 @@ describe('web search OpenRouter integration', () => {
         },
       }],
     })
+  })
+
+  test('OpenRouter normalization keeps annotation-only behavior unchanged', async () => {
+    const result = await withPatchedFetch(
+      (async () => new Response(JSON.stringify({
+        output: [
+          {
+            type: 'message',
+            content: [{
+              type: 'output_text',
+              text: 'Search summary',
+              annotations: [
+                { type: 'url_citation', title: 'Example', url: 'https://example.com/a' },
+                { type: 'url_citation', title: 'Another', url: 'https://example.com/b' },
+              ],
+            }],
+          },
+        ],
+        usage: { input_tokens: 1, output_tokens: 2 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as any,
+      () => openrouterWebSearch('best editor', { type: 'api-key', value: 'key' }),
+    )
+
+    expect(result.results).toEqual([{
+      tool_use_id: 'openrouter-search',
+      content: [
+        { title: 'Example', url: 'https://example.com/a' },
+        { title: 'Another', url: 'https://example.com/b' },
+      ],
+    }])
+  })
+
+  test('OpenRouter normalization ignores unknown and empty source buckets safely', async () => {
+    const result = await withPatchedFetch(
+      (async () => new Response(JSON.stringify({
+        output: [
+          {
+            type: 'message',
+            unknown_sources: [{ title: 'Ignored', url: 'https://example.com/ignored' }],
+            action: { sources: [null, 42, {}, { href: 'https://example.com/f' }] },
+            content: [{
+              type: 'output_text',
+              text: 'Search summary',
+              annotations: [],
+              sources: [null, { title: 'Additional G', url: 'https://example.com/g' }, { foo: 'bar' }],
+            }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 6 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as any,
+      () => openrouterWebSearch('best editor', { type: 'api-key', value: 'key' }),
+    )
+
+    expect(result.results).toEqual([{
+      tool_use_id: 'openrouter-search',
+      content: [
+        { title: 'https://example.com/f', url: 'https://example.com/f' },
+        { title: 'Additional G', url: 'https://example.com/g' },
+      ],
+    }])
   })
 
   test('OpenRouter adapter surfaces HTTP failures', async () => {
@@ -531,8 +604,8 @@ describe('web search OpenRouter integration', () => {
     expect(requestBody.tools[0]).not.toHaveProperty('parameters')
   })
 
-  test('normalization helpers deduplicate and count fallback search usage', async () => {
-    const results = __testOnly.extractCitations([
+  test('normalization helpers merge buckets with first-seen title and count fallback search usage', async () => {
+    const fromAnnotations = __testOnly.extractCitations([
       {
         type: 'message',
         content: [{
@@ -544,17 +617,26 @@ describe('web search OpenRouter integration', () => {
           ],
         }],
       },
+    ] as any)
+
+    const fromMarkdown = __testOnly.extractMarkdownSources(
+      'See [A markdown duplicate](https://example.com/a) and [C](https://example.com/c)',
+    )
+    const fromAdditional = __testOnly.extractAdditionalSources([
       {
         type: 'message',
-        annotations: [{ type: 'url_citation', url: 'https://example.com/b' }],
+        sources: [{ title: 'B from additional', url: 'https://example.com/b' }],
       },
     ] as any)
+
+    const results = __testOnly.mergeSourceBuckets(fromAnnotations, fromMarkdown, fromAdditional)
 
     expect(results).toEqual([{
       tool_use_id: 'openrouter-search',
       content: [
         { title: 'Example', url: 'https://example.com/a' },
-        { title: 'https://example.com/b', url: 'https://example.com/b' },
+        { title: 'C', url: 'https://example.com/c' },
+        { title: 'B from additional', url: 'https://example.com/b' },
       ],
     }])
 

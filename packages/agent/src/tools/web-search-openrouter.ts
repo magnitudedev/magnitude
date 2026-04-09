@@ -48,14 +48,11 @@ function extractText(output: OpenRouterOutputItem[], fallback = ""): string {
 }
 
 function extractCitations(output: OpenRouterOutputItem[]): WebSearchToolResult[] {
-  const seen = new Set<string>();
   const citations: { title: string; url: string }[] = [];
 
   const visitAnnotations = (annotations?: OpenRouterAnnotation[]) => {
     for (const annotation of annotations ?? []) {
       if (annotation.type !== "url_citation" || !annotation.url) continue;
-      if (seen.has(annotation.url)) continue;
-      seen.add(annotation.url);
       citations.push({
         title: annotation.title ?? annotation.url,
         url: annotation.url,
@@ -72,6 +69,88 @@ function extractCitations(output: OpenRouterOutputItem[]): WebSearchToolResult[]
 
   if (citations.length === 0) return [];
   return [{ tool_use_id: "openrouter-search", content: citations }];
+}
+
+function extractMarkdownSources(text: string): WebSearchToolResult[] {
+  if (!text) return [];
+  const citations: { title: string; url: string }[] = [];
+  const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  let match: RegExpExecArray | null = markdownLinkRegex.exec(text);
+  while (match) {
+    const title = match[1]?.trim();
+    const url = match[2];
+    if (url) {
+      citations.push({
+        title: title && title.length > 0 ? title : url,
+        url,
+      });
+    }
+    match = markdownLinkRegex.exec(text);
+  }
+  return citations.length > 0 ? [{ tool_use_id: "openrouter-search", content: citations }] : [];
+}
+
+function extractAdditionalSources(output: OpenRouterOutputItem[]): WebSearchToolResult[] {
+  const citations: { title: string; url: string }[] = [];
+
+  const visitSourceArray = (sources: unknown) => {
+    if (!Array.isArray(sources)) return;
+    for (const source of sources) {
+      if (typeof source === "string") {
+        citations.push({ title: source, url: source });
+        continue;
+      }
+      if (!source || typeof source !== "object") continue;
+      const entry = source as Record<string, unknown>;
+      const url =
+        typeof entry.url === "string"
+          ? entry.url
+          : typeof entry.href === "string"
+            ? entry.href
+            : null;
+      if (!url) continue;
+      citations.push({
+        title: typeof entry.title === "string" && entry.title.length > 0 ? entry.title : url,
+        url,
+      });
+    }
+  };
+
+  for (const item of output as Array<OpenRouterOutputItem & Record<string, unknown>>) {
+    visitSourceArray(item.sources);
+    const action = item.action;
+    if (action && typeof action === "object") {
+      visitSourceArray((action as Record<string, unknown>).sources);
+    }
+
+    for (const content of (item.content ?? []) as Array<Record<string, unknown>>) {
+      visitSourceArray(content.sources);
+    }
+  }
+
+  return citations.length > 0 ? [{ tool_use_id: "openrouter-search", content: citations }] : [];
+}
+
+function mergeSourceBuckets(...buckets: WebSearchToolResult[][]): WebSearchToolResult[] {
+  const seen = new Set<string>();
+  const merged: { title: string; url: string }[] = [];
+
+  for (const bucket of buckets) {
+    for (const result of bucket) {
+      if (!result || !Array.isArray(result.content)) continue;
+      for (const citation of result.content) {
+        if (!citation || typeof citation.url !== "string" || citation.url.length === 0) continue;
+        if (seen.has(citation.url)) continue;
+        seen.add(citation.url);
+        merged.push({
+          title: typeof citation.title === "string" && citation.title.length > 0 ? citation.title : citation.url,
+          url: citation.url,
+        });
+      }
+    }
+  }
+
+  return merged.length > 0 ? [{ tool_use_id: "openrouter-search", content: merged }] : [];
 }
 
 function countSearchRequests(response: OpenRouterResponse, results: WebSearchToolResult[]): number {
@@ -127,8 +206,12 @@ export async function openrouterWebSearch(
 
   const json = await response.json() as OpenRouterResponse;
   const output = Array.isArray(json.output) ? json.output : [];
-  const results = extractCitations(output);
   const textResponse = extractText(output, json.output_text ?? "");
+  const results = mergeSourceBuckets(
+    extractCitations(output),
+    extractMarkdownSources(textResponse),
+    extractAdditionalSources(output),
+  );
 
   return {
     query,
@@ -144,6 +227,9 @@ export async function openrouterWebSearch(
 
 export const __testOnly = {
   extractCitations,
+  extractMarkdownSources,
+  extractAdditionalSources,
+  mergeSourceBuckets,
   extractText,
   countSearchRequests,
   buildOpenRouterWebSearchParameters,
