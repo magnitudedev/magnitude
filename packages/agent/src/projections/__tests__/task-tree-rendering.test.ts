@@ -522,8 +522,6 @@ describe('task tree rendering mechanics', () => {
         turnId: 'turn-1',
         forkId: null,
         strategyId: 'lead',
-
-
         result: { success: true, errors: [], oneshotLivenessTriggered: false },
       } as any,
       {

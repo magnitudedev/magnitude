@@ -30,6 +30,7 @@ export type TurnEvent =
   | { readonly _tag: 'MessageEnd'; readonly id: string }
   | { readonly _tag: 'ThinkingDelta'; readonly text: string }
   | { readonly _tag: 'ThinkingEnd'; readonly about: string | null }
+  | { readonly _tag: 'RawResponseChunk'; readonly text: string }
   | { readonly _tag: 'LensStarted'; readonly name: string }
   | { readonly _tag: 'LensDelta'; readonly text: string }
   | { readonly _tag: 'LensEnded'; readonly name: string }
@@ -102,6 +103,4 @@ export function createTurnStream<R>(
 export interface TurnStrategyResult {
   readonly executeResult: ExecuteResult
   readonly usage: CallUsage
-  /** Raw XML chunks accumulated during streaming (for interrupt preservation) */
-  readonly rawCodeChunks: string[]
 }

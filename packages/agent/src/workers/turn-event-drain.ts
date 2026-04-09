@@ -43,6 +43,9 @@ export function drainTurnEventStream<R>(
           case 'ThinkingEnd':
             yield* publish({ type: 'thinking_end', forkId, turnId, about: event.about })
             break
+          case 'RawResponseChunk':
+            yield* publish({ type: 'raw_response_chunk', forkId, turnId, text: event.text })
+            break
           case 'LensStarted':
             yield* publish({ type: 'lens_start', forkId, turnId, name: event.name })
             break

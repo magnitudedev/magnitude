@@ -57,6 +57,7 @@ describe('memory queue and flush', () => {
       })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
@@ -152,6 +153,7 @@ describe('memory queue and flush', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
@@ -194,6 +196,7 @@ describe('memory queue and flush', () => {
       })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',

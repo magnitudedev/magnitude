@@ -22,6 +22,7 @@ export interface CanonicalTurnState {
   toolCallMap: Map<string, number>
   hasParseError: boolean
   hasStructuralError: boolean
+  rawResponse: string
   orderCounter: number
   lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
   resolvedTurnDecision: 'continue' | 'idle' | null
@@ -37,28 +38,11 @@ export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   toolCallMap: new Map(),
   hasParseError: false,
   hasStructuralError: false,
+  rawResponse: '',
   orderCounter: 0,
   lastCompleted: null,
   resolvedTurnDecision: null,
 })
-
-export function deriveCanonicalFallbackText(state: Pick<CanonicalTurnState, 'lenses' | 'messages' | 'thinkBlocks'>): string {
-  const chunks: string[] = []
-
-  for (const block of state.thinkBlocks) {
-    if (block.content) chunks.push(block.content)
-  }
-
-  for (const lens of state.lenses ?? []) {
-    if (lens.content) chunks.push(lens.content)
-  }
-
-  for (const message of [...state.messages].sort((a, b) => a.order - b.order)) {
-    if (message.text) chunks.push(message.text)
-  }
-
-  return chunks.join('')
-}
 
 function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
   if (!errors || errors.length === 0) return false
@@ -77,6 +61,7 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     toolCallMap: new Map(),
     hasParseError: false,
     hasStructuralError: false,
+    rawResponse: '',
     orderCounter: 0,
     resolvedTurnDecision: null,
   }
@@ -173,6 +158,11 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     message_end: ({ fork }) => fork,
 
+    raw_response_chunk: ({ event, fork }) => {
+      if (fork.turnId !== event.turnId) return fork
+      return { ...fork, rawResponse: fork.rawResponse + event.text }
+    },
+
     tool_event: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
 
@@ -250,7 +240,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         }
         canonicalXml = serializeCanonicalTurn(trace, bindings)
       } else {
-        canonicalXml = deriveCanonicalFallbackText(fork)
+        canonicalXml = fork.rawResponse
       }
 
       const finalized: CanonicalTurnState = {

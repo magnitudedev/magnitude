@@ -118,6 +118,7 @@ describe('prompt caching consistency', () => {
 
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',

@@ -348,8 +348,6 @@ describe('MemoryProjection queue ordering regressions', () => {
         forkId: null,
         turnId: 'turn-1',
         strategyId: 'lead',
-
-
         result: { success: false, error: 'turn failed', cancelled: false },
       } as any,
       {

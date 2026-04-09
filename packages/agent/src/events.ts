@@ -283,6 +283,28 @@ export interface MessageEnd {
   readonly id: string
 }
 
+/**
+ * Raw provider output streamed during a turn. Intentionally redundant with parsed
+ * streaming events (message_chunk, thinking_chunk, etc.) — the parsed events carry
+ * the same content in structured form. This event exists because:
+ *
+ * 1. Dirty turns (parse failures, truncation) need the original raw text to show
+ *    the model what it actually produced so it can correct mistakes.
+ * 2. Raw chunks are persisted as they stream, so they survive process crashes.
+ *    Without this, crash recovery would lose the raw response entirely since
+ *    turn_completed (which arrives after streaming) may never be persisted.
+ *
+ * If the redundancy cost becomes unacceptable, these events can be filtered out
+ * of persistence or stopped — but raw text from past sessions cannot be added
+ * retroactively.
+ */
+export interface RawResponseChunk {
+  readonly type: 'raw_response_chunk'
+  readonly forkId: string | null
+  readonly turnId: string
+  readonly text: string
+}
+
 // =============================================================================
 // Tool Events
 // =============================================================================
@@ -670,6 +692,7 @@ export type AppEvent =
   | LensChunk
   | LensEnd
   | MessageEnd
+  | RawResponseChunk
   | ToolEvent
   | AutopilotMessageGenerated
   | AutopilotToggled

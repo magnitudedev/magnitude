@@ -29,6 +29,7 @@ describe('memory/timeline-events', () => {
       yield* h.send({ type: 'message_end', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: subforkId,
         turnId: 'sub-turn-1',
         chainId: 'sub-chain-1',
@@ -137,6 +138,7 @@ describe('memory/timeline-events', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-rem-1', chainId: 'c-rem-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-rem-1',
         chainId: 'c-rem-1',

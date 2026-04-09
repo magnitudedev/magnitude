@@ -44,18 +44,17 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
   eventHandlers: {
     turn_started: (event, publish) => {
       const { forkId, turnId, chainId } = event
-      const rawCodeChunks: string[] = []
 
       return Effect.gen(function* () {
         const script = yield* MockTurnScriptTag
         const execManager = yield* ExecutionManager
         const frame = yield* script.dequeue({ forkId, turnId })
 
-        const xmlStream = buildStream(frame).pipe(
-          Stream.tap((chunk) => Effect.sync(() => { rawCodeChunks.push(chunk) }))
-        )
-
         const turnStream = createTurnStream((queue) => Effect.gen(function* () {
+          const xmlStream = buildStream(frame).pipe(
+            Stream.tap((chunk) => Queue.offer(queue, { _tag: 'RawResponseChunk', text: chunk }))
+          )
+
           const executeResult = yield* execManager.execute(
             xmlStream,
             {
@@ -78,7 +77,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             totalCost: null,
           }
 
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage, rawCodeChunks } })
+          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage } })
         }))
 
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)

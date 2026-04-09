@@ -22,6 +22,7 @@ describe('memory integration scenarios', () => {
       yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-t1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
@@ -132,6 +133,7 @@ describe('memory integration scenarios', () => {
       yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-obs' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
@@ -226,6 +228,7 @@ describe('memory integration scenarios', () => {
       yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-done' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',

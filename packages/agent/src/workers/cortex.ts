@@ -122,7 +122,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
     turn_started: (event, publish, read) => {
       const { forkId, turnId, chainId } = event
 
-      const rawCodeChunks: string[] = []
       let resolvedProviderId: string | null = null
       let resolvedModelId: string | null = null
       return Effect.gen(function* () {
@@ -217,7 +216,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           // Collect raw chunks and execute via xml-act runtime
           const xmlStream = cs.stream.pipe(
-            Stream.tap(chunk => Effect.sync(() => { rawCodeChunks.push(chunk) })),
+            Stream.tap(chunk => Queue.offer(queue, { _tag: 'RawResponseChunk', text: chunk })),
           )
 
           const executeResult = yield* execManager.execute(
@@ -237,7 +236,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
 
           // Offer final result
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, rawCodeChunks } })
+          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus } })
         }))
 
         // 3a. Drain turn stream, publishing events and collecting the final result

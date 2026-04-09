@@ -72,6 +72,7 @@ export const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'tu
   providerId: null,
   modelId: null,
   result: { success: true, turnDecision: 'idle' },
+
   ...overrides,
 })
 
