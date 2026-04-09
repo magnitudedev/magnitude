@@ -1,0 +1,420 @@
+import { describe, expect, test } from 'bun:test'
+import { Effect, Layer } from 'effect'
+import { noopToolContext } from '@magnitudedev/tools'
+import { ProviderAuth, ProviderState } from '@magnitudedev/providers'
+import * as webSearchModule from '../web-search'
+import { webSearchTool } from '../web-search-tool'
+import { __testOnly, openrouterWebSearch } from '../web-search-openrouter'
+
+type ProviderId = string | null
+type SlotModels = Record<string, { providerId: ProviderId; modelId?: string } | undefined>
+
+function makeProviderState(providerIdOrSlots: ProviderId | SlotModels, modelId?: string) {
+  const slots: SlotModels =
+    typeof providerIdOrSlots === 'object' && providerIdOrSlots !== null
+      ? providerIdOrSlots
+      : { lead: { providerId: providerIdOrSlots, modelId } }
+
+  return Layer.succeed(ProviderState, {
+    peek: (slot: string) => {
+      const entry = slots[slot]
+      return Effect.succeed(entry?.providerId ? { model: { providerId: entry.providerId, id: entry.modelId } } : null)
+    },
+  } as any)
+}
+
+function makeProviderAuth(authByProvider: Record<string, any | undefined>) {
+  return Layer.succeed(ProviderAuth, {
+    getAuth: (providerId: string) => Effect.succeed(authByProvider[providerId]),
+  } as any)
+}
+
+function runWebSearch(
+  query: string,
+  providerIdOrSlots: ProviderId | SlotModels,
+  authByProvider: Record<string, any | undefined> = {},
+  modelId?: string,
+) {
+  return Effect.runPromise(
+    webSearchModule.webSearch(query).pipe(
+      Effect.provide(Layer.mergeAll(makeProviderState(providerIdOrSlots, modelId), makeProviderAuth(authByProvider))),
+    ) as any,
+  )
+}
+
+async function withPatchedFetch<T>(fetchImpl: typeof fetch, run: () => Promise<T>): Promise<T> {
+  const originalFetch = globalThis.fetch
+  ;(globalThis as any).fetch = fetchImpl
+  try {
+    return await run()
+  } finally {
+    ;(globalThis as any).fetch = originalFetch
+  }
+}
+
+async function withEnv<T>(patch: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+  const previous = Object.fromEntries(Object.keys(patch).map((key) => [key, process.env[key]]))
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+
+  try {
+    return await run()
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+describe('web search OpenRouter integration', () => {
+  test('lead=openrouter uses the OpenRouter adapter', async () => {
+    let captured: { url?: string; init?: RequestInit } = {}
+
+    const result = await withPatchedFetch(
+      (async (url: string | URL | Request, init?: RequestInit) => {
+        captured = { url: String(url), init }
+        return new Response(JSON.stringify({
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'OpenRouter answer' }] }],
+          usage: { input_tokens: 12, output_tokens: 34, server_tool_use: { web_search_requests: 1 } },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }) as any,
+      () => runWebSearch('latest news', 'openrouter', {
+        openrouter: { type: 'api', key: 'stored-openrouter-key' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('OpenRouter answer')
+    expect(captured.url).toBe('https://openrouter.ai/api/v1/responses')
+    expect(captured.init?.headers).toMatchObject({
+      Authorization: 'Bearer stored-openrouter-key',
+    })
+  })
+
+  test('unsupported lead + worker=openrouter falls through to worker', async () => {
+    let captured: { url?: string; init?: RequestInit } = {}
+
+    const result = await withPatchedFetch(
+      (async (url: string | URL | Request, init?: RequestInit) => {
+        captured = { url: String(url), init }
+        return new Response(JSON.stringify({
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'Worker OpenRouter answer' }] }],
+          usage: { input_tokens: 1, output_tokens: 2, server_tool_use: { web_search_requests: 1 } },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }) as any,
+      () => runWebSearch('latest news', {
+        lead: { providerId: 'amazon-bedrock' },
+        builder: { providerId: 'openrouter' },
+      }, {
+        openrouter: { type: 'api', key: 'worker-openrouter-key' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('Worker OpenRouter answer')
+    expect(captured.url).toBe('https://openrouter.ai/api/v1/responses')
+    expect(captured.init?.headers).toMatchObject({
+      Authorization: 'Bearer worker-openrouter-key',
+    })
+  })
+
+  test('lead=openai, worker=openrouter prefers lead', async () => {
+    let capturedUrl = ''
+
+    const encoder = new TextEncoder()
+    const sseBody = [
+      'data: {"type":"response.output_text.delta","delta":"Lead OpenAI answer"}\n',
+      'data: {"type":"response.completed","response":{"output_text":"Lead OpenAI answer","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}\n',
+      'data: [DONE]\n',
+    ].join('\n')
+
+    const result = await withPatchedFetch(
+      (async (url: string | URL | Request) => {
+        capturedUrl = String(url)
+        return new Response(encoder.encode(sseBody), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }) as any,
+      () => runWebSearch('latest news', {
+        lead: { providerId: 'openai' },
+        builder: { providerId: 'openrouter' },
+      }, {
+        openai: { type: 'oauth', accessToken: 'lead-openai-oauth' },
+        openrouter: { type: 'api', key: 'worker-openrouter-key' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('Lead OpenAI answer')
+    expect(capturedUrl).toBe('https://chatgpt.com/backend-api/codex/responses')
+  })
+
+  test('no search-capable lead/workers errors clearly', async () => {
+    await expect(runWebSearch('latest news', {
+      lead: { providerId: 'amazon-bedrock' },
+      explorer: { providerId: 'google-vertex-anthropic' },
+      builder: { providerId: null },
+    })).rejects.toThrow('No supported web-search backend is configured on the lead or worker slots')
+  })
+
+  test('MAGNITUDE_SEARCH_PROVIDER=openrouter overrides provider detection', async () => {
+    await withEnv({ MAGNITUDE_SEARCH_PROVIDER: 'openrouter' }, async () => {
+      const result = await withPatchedFetch(
+        (async () => new Response(JSON.stringify({
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'Override answer' }] }],
+          usage: { input_tokens: 1, output_tokens: 2 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as any,
+        () => runWebSearch('latest news', 'google', {
+          openrouter: { type: 'api', key: 'override-key' },
+          google: { type: 'api', key: 'google-key' },
+        }),
+      )
+
+      expect(result.textResponse).toBe('Override answer')
+    })
+  })
+
+  test('invalid override value lists openrouter', async () => {
+    await withEnv({ MAGNITUDE_SEARCH_PROVIDER: 'bad-provider' }, async () => {
+      await expect(runWebSearch('latest news', 'openrouter', {
+        openrouter: { type: 'api', key: 'stored-openrouter-key' },
+      })).rejects.toThrow('openrouter')
+    })
+  })
+
+  test('stored auth is preferred over OPENROUTER_API_KEY', async () => {
+    await withEnv({ OPENROUTER_API_KEY: 'env-openrouter-key' }, async () => {
+      let capturedAuth = ''
+
+      await withPatchedFetch(
+        (async (_url: string | URL | Request, init?: RequestInit) => {
+          capturedAuth = (init?.headers as Record<string, string>).Authorization
+          return new Response(JSON.stringify({
+            output: [{ type: 'message', content: [{ type: 'output_text', text: 'Stored auth answer' }] }],
+            usage: { input_tokens: 1, output_tokens: 2, server_tool_use: { web_search_requests: 1 } },
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }) as any,
+        () => runWebSearch('latest news', 'openrouter', {
+          openrouter: { type: 'api', key: 'stored-openrouter-key' },
+        }),
+      )
+
+      expect(capturedAuth).toBe('Bearer stored-openrouter-key')
+    })
+  })
+
+  test('OPENROUTER_API_KEY env fallback works', async () => {
+    await withEnv({ OPENROUTER_API_KEY: 'env-openrouter-key' }, async () => {
+      let capturedAuth = ''
+
+      const result = await withPatchedFetch(
+        (async (_url: string | URL | Request, init?: RequestInit) => {
+          capturedAuth = (init?.headers as Record<string, string>).Authorization
+          return new Response(JSON.stringify({
+            output: [{ type: 'message', content: [{ type: 'output_text', text: 'Env auth answer' }] }],
+            usage: { input_tokens: 1, output_tokens: 2 },
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }) as any,
+        () => runWebSearch('latest news', 'openrouter'),
+      )
+
+      expect(result.textResponse).toBe('Env auth answer')
+      expect(capturedAuth).toBe('Bearer env-openrouter-key')
+    })
+  })
+
+  test('missing OpenRouter auth errors clearly', async () => {
+    await withEnv({ OPENROUTER_API_KEY: undefined }, async () => {
+      await expect(runWebSearch('latest news', 'openrouter')).rejects.toThrow('OPENROUTER_API_KEY')
+    })
+  })
+
+  test('OpenRouter response normalization extracts text, deduplicates citations, and falls back usage', async () => {
+    let requestBody: any
+
+    const result = await withPatchedFetch(
+      (async (_url: string | URL | Request, init?: RequestInit) => {
+        requestBody = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify({
+          output: [
+            {
+              type: 'message',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'Search summary',
+                  annotations: [
+                    { type: 'url_citation', title: 'Example', url: 'https://example.com/a' },
+                    { type: 'url_citation', title: 'Duplicate', url: 'https://example.com/a' },
+                  ],
+                },
+              ],
+            },
+            {
+              type: 'message',
+              annotations: [{ type: 'url_citation', url: 'https://example.com/b' }],
+            },
+          ],
+          usage: {
+            input_tokens: 11,
+            output_tokens: 22,
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }) as any,
+      () => openrouterWebSearch('best editor', { type: 'api-key', value: 'key' }, {
+        system: 'answer tersely',
+        allowed_domains: ['example.com'],
+        blocked_domains: ['blocked.com'],
+        model: 'anthropic/claude-3.5-sonnet',
+      }),
+    )
+
+    expect(result).toEqual({
+      query: 'best editor',
+      results: [{
+        tool_use_id: 'openrouter-search',
+        content: [
+          { title: 'Example', url: 'https://example.com/a' },
+          { title: 'https://example.com/b', url: 'https://example.com/b' },
+        ],
+      }],
+      textResponse: 'Search summary',
+      usage: {
+        input_tokens: 11,
+        output_tokens: 22,
+        web_search_requests: 1,
+      },
+    })
+
+    expect(requestBody).toMatchObject({
+      model: 'openai/gpt-5.4',
+      input: 'best editor',
+      instructions: 'answer tersely',
+      tools: [{
+        type: 'openrouter:web_search',
+        parameters: {
+          allowed_domains: ['example.com'],
+          excluded_domains: ['blocked.com'],
+        },
+      }],
+    })
+  })
+
+  test('OpenRouter adapter surfaces HTTP failures', async () => {
+    await withPatchedFetch(
+      (async () => new Response('bad gateway', { status: 502 })) as any,
+      async () => {
+        await expect(
+          openrouterWebSearch('best editor', { type: 'api-key', value: 'key' }),
+        ).rejects.toThrow('OpenRouter web search error 502: bad gateway')
+      },
+    )
+  })
+
+  test('tool contract remains compatible with normalized OpenRouter response', async () => {
+    await withEnv({ OPENROUTER_API_KEY: 'env-openrouter-key' }, async () => {
+      const result = await withPatchedFetch(
+        (async () => new Response(JSON.stringify({
+          output: [
+            {
+              type: 'message',
+              content: [{
+                type: 'output_text',
+                text: 'Search summary',
+                annotations: [
+                  { type: 'url_citation', title: 'Example', url: 'https://example.com/a' },
+                  { type: 'url_citation', title: 'Another', url: 'https://example.com/b' },
+                ],
+              }],
+            },
+          ],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 2,
+            server_tool_use: { web_search_requests: 1 },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as any,
+        () =>
+          Effect.runPromise(
+            webSearchTool.execute({ query: 'best editor' }, noopToolContext).pipe(
+              Effect.provide(Layer.mergeAll(
+                makeProviderState('openrouter'),
+                makeProviderAuth({}),
+              )),
+            ) as any,
+          ),
+      )
+
+      expect(result).toEqual({
+        text: 'Search summary',
+        sources: [
+          { title: 'Example', url: 'https://example.com/a' },
+          { title: 'Another', url: 'https://example.com/b' },
+        ],
+      })
+    })
+  })
+
+  test('OpenRouter always uses fixed gpt-5.4 model and omits empty parameters', async () => {
+    let requestBody: any
+    await withPatchedFetch(
+      (async (_input, init) => {
+        requestBody = JSON.parse(String(init?.body ?? '{}'))
+        return new Response(JSON.stringify({
+          output_text: 'Search summary',
+          usage: {
+            input_tokens: 3,
+            output_tokens: 4,
+            server_tool_use: { web_search_requests: 0 },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }) as any,
+      () => openrouterWebSearch('best editor', { type: 'api-key', value: 'key' }, {
+        model: 'google/gemini-2.5-pro',
+      }),
+    )
+
+    expect(requestBody).toMatchObject({
+      model: 'openai/gpt-5.4',
+      input: 'best editor',
+      tools: [{ type: 'openrouter:web_search' }],
+    })
+    expect(requestBody.tools[0]).not.toHaveProperty('parameters')
+  })
+
+  test('normalization helpers deduplicate and count fallback search usage', async () => {
+    const results = __testOnly.extractCitations([
+      {
+        type: 'message',
+        content: [{
+          type: 'output_text',
+          text: 'Search summary',
+          annotations: [
+            { type: 'url_citation', title: 'Example', url: 'https://example.com/a' },
+            { type: 'url_citation', title: 'Duplicate', url: 'https://example.com/a' },
+          ],
+        }],
+      },
+      {
+        type: 'message',
+        annotations: [{ type: 'url_citation', url: 'https://example.com/b' }],
+      },
+    ] as any)
+
+    expect(results).toEqual([{
+      tool_use_id: 'openrouter-search',
+      content: [
+        { title: 'Example', url: 'https://example.com/a' },
+        { title: 'https://example.com/b', url: 'https://example.com/b' },
+      ],
+    }])
+
+    expect(__testOnly.extractText([
+      { type: 'message', content: [{ type: 'output_text', text: 'hello ' }, { type: 'output_text', text: 'world' }] },
+    ] as any)).toBe('hello world')
+
+    expect(__testOnly.countSearchRequests({ usage: {} } as any, results)).toBe(1)
+    expect(__testOnly.countSearchRequests({ usage: { server_tool_use: { web_search_requests: 3 } } } as any, results)).toBe(3)
+  })
+})
