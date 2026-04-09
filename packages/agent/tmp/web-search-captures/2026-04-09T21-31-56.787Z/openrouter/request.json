@@ -1,0 +1,22 @@
+{
+  "present": true,
+  "url": "https://openrouter.ai/api/v1/responses",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer sk-o…84c0"
+  },
+  "bodyText": "{\"model\":\"openai/gpt-5.4\",\"input\":\"What are the top AI news headlines today? Include sources.\",\"tools\":[{\"type\":\"openrouter:web_search\"}],\"reasoning\":{\"effort\":\"none\"}}",
+  "bodyJson": {
+    "model": "openai/gpt-5.4",
+    "input": "What are the top AI news headlines today? Include sources.",
+    "tools": [
+      {
+        "type": "openrouter:web_search"
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    }
+  }
+}

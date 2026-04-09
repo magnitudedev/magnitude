@@ -1,0 +1,36 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "vercel-search",
+      "content": [
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"
+        },
+        {
+          "title": "techcrunch.com",
+          "url": "https://techcrunch.com/category/artificial-intelligence/?utm_source=openai"
+        },
+        {
+          "title": "about.fb.com",
+          "url": "https://about.fb.com/news/2026/01/meta-nuclear-energy-projects-power-american-ai-leadership/?utm_source=openai"
+        },
+        {
+          "title": "apnews.com",
+          "url": "https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a?utm_source=openai"
+        },
+        {
+          "title": "apnews.com",
+          "url": "https://apnews.com/article/8936f242689792be7a7ab97e841cade8?utm_source=openai"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Here are some of the **top AI headlines for today, Thursday, April 9, 2026**, based on recent coverage from major tech and news outlets:\n\n1. **OpenAI pushes an AI-economy policy agenda**\n   - TechCrunch reports OpenAI outlined proposals including public wealth funds, robot taxes, and even a four-day workweek as part of its vision for how AI could reshape labor and the broader economy. ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))\n\n2. **OpenAI releases a new safety blueprint aimed at child protection**\n   - TechCrunch’s AI news page lists a new OpenAI safety initiative focused on addressing the rise of child sexual exploitation risks tied to AI systems. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n3. **AWS CEO defends backing both Anthropic and OpenAI**\n   - TechCrunch reports Amazon Web Services’ chief said investing billions in both AI firms is not necessarily a conflict, highlighting the strategic jockeying among major cloud and AI players. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n4. **Tubi launches a native app inside ChatGPT**\n   - TechCrunch says Tubi became the first streaming service to launch a native app within ChatGPT, a sign of AI assistants becoming new distribution platforms. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n5. **Meta continues tying AI expansion to energy infrastructure**\n   - Meta said earlier this year it had struck nuclear-energy agreements supporting up to 6.6 GW to help power U.S. AI infrastructure, underscoring how energy supply is becoming a central AI story. This remains a major background headline in the sector. ([about.fb.com](https://about.fb.com/news/2026/01/meta-nuclear-energy-projects-power-american-ai-leadership/?utm_source=openai))\n\n6. **Policy fights over AI regulation are intensifying**\n   - AP recently reported the White House urged Congress to take a lighter-touch approach to AI regulation and to preempt some state AI laws, showing that AI governance remains one of the biggest ongoing stories in Washington. ([apnews.com](https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a?utm_source=openai))\n\n7. **Global AI governance is moving forward at the U.N.**\n   - AP reported the U.N. General Assembly approved a 40-member scientific panel on AI’s risks and impacts, a notable step in international AI oversight. ([apnews.com](https://apnews.com/article/8936f242689792be7a7ab97e841cade8?utm_source=openai))\n\nIf you want, I can also turn this into a **clean “Top 10 AI News Today” news brief** with:\n- headline\n- 1-sentence summary\n- source\n- why it matters\n\n",
+  "usage": {
+    "input_tokens": 16484,
+    "output_tokens": 833,
+    "web_search_requests": 3
+  }
+}

@@ -187,6 +187,9 @@ export async function openrouterWebSearch(
         ...(parameters ? { parameters } : {}),
       },
     ],
+    reasoning: {
+      effort: "none",
+    },
     ...(options?.system ? { instructions: options.system } : {}),
   };
 

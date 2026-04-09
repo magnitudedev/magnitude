@@ -455,6 +455,7 @@ describe('web search integration', () => {
       model: 'openai/gpt-5.4',
       input: 'best editor',
       instructions: 'answer tersely',
+      reasoning: { effort: 'none' },
       tools: [{
         type: 'openrouter:web_search',
         parameters: {
@@ -602,6 +603,7 @@ describe('web search integration', () => {
     expect(requestBody).toMatchObject({
       model: 'openai/gpt-5.4',
       input: 'best editor',
+      reasoning: { effort: 'none' },
       tools: [{ type: 'openrouter:web_search' }],
     })
     expect(requestBody.tools[0]).not.toHaveProperty('parameters')

@@ -1,0 +1,1 @@
+{"error":{"type":"invalid_request_error","message":"Provider tool id must be in format: <provider-name>.<unique-tool-name>"}}

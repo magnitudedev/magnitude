@@ -1,0 +1,28 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/responses",
+  "status": 400,
+  "statusText": "Bad Request",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 21:40:50 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/responses",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::hsbpq-1775770850249-fbf57b0c42fb"
+  },
+  "bodyText": "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Provider tool id must be in format: <provider-name>.<unique-tool-name>\"}}",
+  "bodyJson": {
+    "error": {
+      "type": "invalid_request_error",
+      "message": "Provider tool id must be in format: <provider-name>.<unique-tool-name>"
+    }
+  }
+}

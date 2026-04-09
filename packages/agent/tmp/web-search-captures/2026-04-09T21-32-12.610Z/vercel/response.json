@@ -1,0 +1,158 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/responses",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-encoding": "br",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 21:32:25 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/responses",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::4rd4h-1775770332780-588d4f19492c"
+  },
+  "bodyText": "{\"id\":\"gen_01KNT2HVMEPZG4BS3EW1KVGRXN\",\"object\":\"response\",\"created_at\":1775770345,\"status\":\"completed\",\"completed_at\":1775770345,\"incomplete_details\":null,\"error\":null,\"output\":[{\"type\":\"message\",\"id\":\"msg_1775770345086_ps03yx4vi2\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Here are some of the **top AI headlines I could verify as current around today, Thursday, April 9, 2026**:\\n\\n1. **Microsoft pushes enterprise AI harder with “Frontier Suite” and Agent 365**\\n   - Microsoft announced Wave 3 of Microsoft 365 Copilot, broader model options including Anthropic Claude and next-gen OpenAI models, plus general availability timing for Agent 365 and its new Microsoft 365 E7 “Frontier Suite.” ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\\n\\n2. **Google DeepMind publishes a new framework for measuring progress toward AGI**\\n   - Google DeepMind said it released a paper proposing a cognitive framework for evaluating progress toward AGI, outlining 10 cognitive abilities it believes matter for general intelligence in AI systems. ([blog.google](https://blog.google/innovation-and-ai/models-and-research/google-deepmind/measuring-agi-cognitive-framework?utm_source=openai))\\n\\n3. **Google recaps a wave of March AI launches**\\n   - Google published a roundup of its biggest March 2026 AI updates, including Search Live expansion, broader “Personal Intelligence” access, and Gemini-related migration tools. ([blog.google](https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/?utm_source=openai))\\n\\n4. **TechCrunch’s current AI coverage highlights policy, infrastructure, and labor themes**\\n   - TechCrunch’s AI section, crawled today, prominently features stories such as OpenAI’s vision for the AI economy and broader reporting on AI’s impact on work and infrastructure. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\\n\\n5. **OpenAI research/news remains focused on science and infrastructure**\\n   - OpenAI’s recent official pages highlight scientific research efforts and major infrastructure partnerships, including its science initiative and its previously announced AWS strategic partnership. ([openai.com](https://openai.com/science//?utm_source=openai))\\n\\n**A quick caveat:** I wasn’t able to reliably pull a clean, comprehensive “April 9, 2026 AI headlines” list from major general-news wires in the tool results, so this is a **best verified snapshot from authoritative company blogs and current tech coverage**, not a definitive top-10 newswire digest. ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\\n\\nIf you want, I can do a **second pass limited to Reuters/AP/major newspapers only** and give you a cleaner **“top 5 AI headlines today”** roundup with stricter journalism-only sourcing.\",\"annotations\":[],\"logprobs\":[]}],\"phase\":\"final_answer\"},{\"type\":\"function_call\",\"id\":\"fc_1775770345086_h662yqo693\",\"call_id\":\"ws_0cf7ee78f54957ec0169d81addb8888195831d6121c26c6604\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1775770345086_ua2c7686eve\",\"call_id\":\"ws_0cf7ee78f54957ec0169d81ae007988195b33f70dbcbe4b9d2\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":12414,\"output_tokens\":752,\"total_tokens\":13166,\"input_tokens_details\":{\"cached_tokens\":4096},\"output_tokens_details\":{\"reasoning_tokens\":220}},\"model\":\"gpt-5.4\",\"instructions\":null,\"previous_response_id\":null,\"temperature\":1,\"top_p\":1,\"max_output_tokens\":null,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"tools\":[{\"type\":\"web_search\"}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"max_tool_calls\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"truncation\":\"disabled\",\"reasoning\":null,\"store\":false,\"background\":false,\"service_tier\":\"default\",\"metadata\":{},\"safety_identifier\":null,\"prompt_cache_key\":null,\"prompt_cache_retention\":null,\"provider_metadata\":{\"openai\":{\"responseId\":\"resp_0cf7ee78f54957ec0169d81adcf010819596636755e6e8b6a3\",\"serviceTier\":\"default\"},\"gateway\":{\"routing\":{\"originalModelId\":\"openai/gpt-5.4\",\"resolvedProvider\":\"openai\",\"resolvedProviderApiModelId\":\"gpt-5.4\",\"fallbacksAvailable\":[\"azure\"],\"planningReasoning\":\"System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)\",\"canonicalSlug\":\"openai/gpt-5.4\",\"finalProvider\":\"openai\",\"modelAttemptCount\":1,\"modelAttempts\":[{\"modelId\":\"openai:gpt-5.4\",\"canonicalSlug\":\"openai/gpt-5.4\",\"success\":true,\"providerAttemptCount\":1,\"providerAttempts\":[{\"provider\":\"openai\",\"internalModelId\":\"openai:gpt-5.4\",\"providerApiModelId\":\"gpt-5.4\",\"credentialType\":\"system\",\"success\":true,\"startTime\":791881.52074,\"endTime\":804077.75829,\"statusCode\":200,\"providerResponseId\":\"resp_0cf7ee78f54957ec0169d81adcf010819596636755e6e8b6a3\"}]}],\"totalProviderAttemptCount\":1},\"cost\":\"0.053099\",\"marketCost\":\"0.053099\",\"inferenceCost\":\"0.033099\",\"inputInferenceCost\":\"0.021819\",\"outputInferenceCost\":\"0.01128\",\"enabledZeroDataRetention\":false,\"enabledDisallowPromptTraining\":false,\"generationId\":\"gen_01KNT2HVMEPZG4BS3EW1KVGRXN\",\"billableWebSearchCalls\":2}}}",
+  "bodyJson": {
+    "id": "gen_01KNT2HVMEPZG4BS3EW1KVGRXN",
+    "object": "response",
+    "created_at": 1775770345,
+    "status": "completed",
+    "completed_at": 1775770345,
+    "incomplete_details": null,
+    "error": null,
+    "output": [
+      {
+        "type": "message",
+        "id": "msg_1775770345086_ps03yx4vi2",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Here are some of the **top AI headlines I could verify as current around today, Thursday, April 9, 2026**:\n\n1. **Microsoft pushes enterprise AI harder with “Frontier Suite” and Agent 365**\n   - Microsoft announced Wave 3 of Microsoft 365 Copilot, broader model options including Anthropic Claude and next-gen OpenAI models, plus general availability timing for Agent 365 and its new Microsoft 365 E7 “Frontier Suite.” ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\n\n2. **Google DeepMind publishes a new framework for measuring progress toward AGI**\n   - Google DeepMind said it released a paper proposing a cognitive framework for evaluating progress toward AGI, outlining 10 cognitive abilities it believes matter for general intelligence in AI systems. ([blog.google](https://blog.google/innovation-and-ai/models-and-research/google-deepmind/measuring-agi-cognitive-framework?utm_source=openai))\n\n3. **Google recaps a wave of March AI launches**\n   - Google published a roundup of its biggest March 2026 AI updates, including Search Live expansion, broader “Personal Intelligence” access, and Gemini-related migration tools. ([blog.google](https://blog.google/innovation-and-ai/technology/ai/google-ai-updates-march-2026/?utm_source=openai))\n\n4. **TechCrunch’s current AI coverage highlights policy, infrastructure, and labor themes**\n   - TechCrunch’s AI section, crawled today, prominently features stories such as OpenAI’s vision for the AI economy and broader reporting on AI’s impact on work and infrastructure. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n5. **OpenAI research/news remains focused on science and infrastructure**\n   - OpenAI’s recent official pages highlight scientific research efforts and major infrastructure partnerships, including its science initiative and its previously announced AWS strategic partnership. ([openai.com](https://openai.com/science//?utm_source=openai))\n\n**A quick caveat:** I wasn’t able to reliably pull a clean, comprehensive “April 9, 2026 AI headlines” list from major general-news wires in the tool results, so this is a **best verified snapshot from authoritative company blogs and current tech coverage**, not a definitive top-10 newswire digest. ([blogs.microsoft.com](https://blogs.microsoft.com/blog/2026/03/09/introducing-the-first-frontier-suite-built-on-intelligence-trust/?utm_source=openai))\n\nIf you want, I can do a **second pass limited to Reuters/AP/major newspapers only** and give you a cleaner **“top 5 AI headlines today”** roundup with stricter journalism-only sourcing.",
+            "annotations": [],
+            "logprobs": []
+          }
+        ],
+        "phase": "final_answer"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775770345086_h662yqo693",
+        "call_id": "ws_0cf7ee78f54957ec0169d81addb8888195831d6121c26c6604",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775770345086_ua2c7686eve",
+        "call_id": "ws_0cf7ee78f54957ec0169d81ae007988195b33f70dbcbe4b9d2",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      }
+    ],
+    "usage": {
+      "input_tokens": 12414,
+      "output_tokens": 752,
+      "total_tokens": 13166,
+      "input_tokens_details": {
+        "cached_tokens": 4096
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 220
+      }
+    },
+    "model": "gpt-5.4",
+    "instructions": null,
+    "previous_response_id": null,
+    "temperature": 1,
+    "top_p": 1,
+    "max_output_tokens": null,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "tools": [
+      {
+        "type": "web_search"
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_tool_calls": null,
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "truncation": "disabled",
+    "reasoning": null,
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "prompt_cache_retention": null,
+    "provider_metadata": {
+      "openai": {
+        "responseId": "resp_0cf7ee78f54957ec0169d81adcf010819596636755e6e8b6a3",
+        "serviceTier": "default"
+      },
+      "gateway": {
+        "routing": {
+          "originalModelId": "openai/gpt-5.4",
+          "resolvedProvider": "openai",
+          "resolvedProviderApiModelId": "gpt-5.4",
+          "fallbacksAvailable": [
+            "azure"
+          ],
+          "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+          "canonicalSlug": "openai/gpt-5.4",
+          "finalProvider": "openai",
+          "modelAttemptCount": 1,
+          "modelAttempts": [
+            {
+              "modelId": "openai:gpt-5.4",
+              "canonicalSlug": "openai/gpt-5.4",
+              "success": true,
+              "providerAttemptCount": 1,
+              "providerAttempts": [
+                {
+                  "provider": "openai",
+                  "internalModelId": "openai:gpt-5.4",
+                  "providerApiModelId": "gpt-5.4",
+                  "credentialType": "system",
+                  "success": true,
+                  "startTime": 791881.52074,
+                  "endTime": 804077.75829,
+                  "statusCode": 200,
+                  "providerResponseId": "resp_0cf7ee78f54957ec0169d81adcf010819596636755e6e8b6a3"
+                }
+              ]
+            }
+          ],
+          "totalProviderAttemptCount": 1
+        },
+        "cost": "0.053099",
+        "marketCost": "0.053099",
+        "inferenceCost": "0.033099",
+        "inputInferenceCost": "0.021819",
+        "outputInferenceCost": "0.01128",
+        "enabledZeroDataRetention": false,
+        "enabledDisallowPromptTraining": false,
+        "generationId": "gen_01KNT2HVMEPZG4BS3EW1KVGRXN",
+        "billableWebSearchCalls": 2
+      }
+    }
+  }
+}

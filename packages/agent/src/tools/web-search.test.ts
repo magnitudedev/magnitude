@@ -187,6 +187,12 @@ describe("web-search-vercel normalization", () => {
           filters: { allowed_domains: ["example.com"] },
         },
       },
+      providerOptions: {
+        openai: {
+          forceReasoning: true,
+          reasoningEffort: "none",
+        },
+      },
     });
   });
 

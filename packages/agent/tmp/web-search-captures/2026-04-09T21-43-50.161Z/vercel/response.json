@@ -1,0 +1,169 @@
+{
+  "present": true,
+  "url": "https://ai-gateway.vercel.sh/v1/responses",
+  "status": 200,
+  "statusText": "OK",
+  "headers": {
+    "access-control-allow-headers": "Content-Type, Authorization, ai-gateway-auth-method, ai-gateway-protocol-version, ai-model-id, ai-language-model-id, ai-language-model-specification-version, ai-image-model-specification-version, ai-embedding-model-specification-version, ai-language-model-streaming, http-referer, x-title, anthropic-beta",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "public, max-age=0, must-revalidate",
+    "content-encoding": "br",
+    "content-type": "application/json",
+    "date": "Thu, 09 Apr 2026 21:44:07 GMT",
+    "server": "Vercel",
+    "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
+    "transfer-encoding": "chunked",
+    "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "x-matched-path": "/v1/responses",
+    "x-vercel-cache": "MISS",
+    "x-vercel-id": "sfo1::cle1::gcc94-1775771030270-c044ff49048b",
+    "set-cookie": "_vcrr_9ae7f6aec35bf5b1=dpl_BU7Hi2Qbnn4T5XL8TFRbUVLNCoYg|0.2592; Path=/; Secure; HttpOnly; SameSite=None"
+  },
+  "bodyText": "{\"id\":\"gen_01KNT374RSHD12EA4S0G4Y7BGB\",\"object\":\"response\",\"created_at\":1775771047,\"status\":\"completed\",\"completed_at\":1775771047,\"incomplete_details\":null,\"error\":null,\"output\":[{\"type\":\"message\",\"id\":\"msg_1775771047924_x8hxyhyi6ce\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Here are some of the **top AI headlines for today, Thursday, April 9, 2026**, based on recent coverage from major tech and news outlets:\\n\\n1. **OpenAI pushes an AI-economy policy agenda**\\n   - TechCrunch reports OpenAI outlined proposals including public wealth funds, robot taxes, and even a four-day workweek as part of its vision for how AI could reshape labor and the broader economy. ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))\\n\\n2. **OpenAI releases a new safety blueprint aimed at child protection**\\n   - TechCrunch’s AI news page lists a new OpenAI safety initiative focused on addressing the rise of child sexual exploitation risks tied to AI systems. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\\n\\n3. **AWS CEO defends backing both Anthropic and OpenAI**\\n   - TechCrunch reports Amazon Web Services’ chief said investing billions in both AI firms is not necessarily a conflict, highlighting the strategic jockeying among major cloud and AI players. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\\n\\n4. **Tubi launches a native app inside ChatGPT**\\n   - TechCrunch says Tubi became the first streaming service to launch a native app within ChatGPT, a sign of AI assistants becoming new distribution platforms. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\\n\\n5. **Meta continues tying AI expansion to energy infrastructure**\\n   - Meta said earlier this year it had struck nuclear-energy agreements supporting up to 6.6 GW to help power U.S. AI infrastructure, underscoring how energy supply is becoming a central AI story. This remains a major background headline in the sector. ([about.fb.com](https://about.fb.com/news/2026/01/meta-nuclear-energy-projects-power-american-ai-leadership/?utm_source=openai))\\n\\n6. **Policy fights over AI regulation are intensifying**\\n   - AP recently reported the White House urged Congress to take a lighter-touch approach to AI regulation and to preempt some state AI laws, showing that AI governance remains one of the biggest ongoing stories in Washington. ([apnews.com](https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a?utm_source=openai))\\n\\n7. **Global AI governance is moving forward at the U.N.**\\n   - AP reported the U.N. General Assembly approved a 40-member scientific panel on AI’s risks and impacts, a notable step in international AI oversight. ([apnews.com](https://apnews.com/article/8936f242689792be7a7ab97e841cade8?utm_source=openai))\\n\\nIf you want, I can also turn this into a **clean “Top 10 AI News Today” news brief** with:\\n- headline\\n- 1-sentence summary\\n- source\\n- why it matters\\n\\n\",\"annotations\":[],\"logprobs\":[]}],\"phase\":\"final_answer\"},{\"type\":\"function_call\",\"id\":\"fc_1775771047924_zd7ms7msly\",\"call_id\":\"ws_0cbf1c6bb66476b80169d81d97e0788196a0e722125b224fc5\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1775771047924_36kh9pmqtto\",\"call_id\":\"ws_0cbf1c6bb66476b80169d81d9a7f588196934f5cdc922043ff\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1775771047924_4f733bdrc6p\",\"call_id\":\"ws_0cbf1c6bb66476b80169d81d9e7a28819698e98a43a1688d70\",\"name\":\"web_search\",\"arguments\":\"{}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":16484,\"output_tokens\":833,\"total_tokens\":17317,\"input_tokens_details\":{\"cached_tokens\":4352},\"output_tokens_details\":{\"reasoning_tokens\":288}},\"model\":\"gpt-5.4\",\"instructions\":null,\"previous_response_id\":null,\"temperature\":1,\"top_p\":1,\"max_output_tokens\":null,\"presence_penalty\":0,\"frequency_penalty\":0,\"top_logprobs\":0,\"tools\":[{\"type\":\"web_search\"}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"max_tool_calls\":null,\"text\":{\"format\":{\"type\":\"text\"}},\"truncation\":\"disabled\",\"reasoning\":{\"effort\":\"none\"},\"store\":false,\"background\":false,\"service_tier\":\"default\",\"metadata\":{},\"safety_identifier\":null,\"prompt_cache_key\":null,\"prompt_cache_retention\":null,\"provider_metadata\":{\"openai\":{\"responseId\":\"resp_0cbf1c6bb66476b80169d81d965fcc8196aa3bd0d4050962b5\",\"serviceTier\":\"default\"},\"gateway\":{\"routing\":{\"originalModelId\":\"openai/gpt-5.4\",\"resolvedProvider\":\"openai\",\"resolvedProviderApiModelId\":\"gpt-5.4\",\"fallbacksAvailable\":[\"azure\"],\"planningReasoning\":\"System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)\",\"canonicalSlug\":\"openai/gpt-5.4\",\"finalProvider\":\"openai\",\"modelAttemptCount\":1,\"modelAttempts\":[{\"modelId\":\"openai:gpt-5.4\",\"canonicalSlug\":\"openai/gpt-5.4\",\"success\":true,\"providerAttemptCount\":1,\"providerAttempts\":[{\"provider\":\"openai\",\"internalModelId\":\"openai:gpt-5.4\",\"providerApiModelId\":\"gpt-5.4\",\"credentialType\":\"system\",\"success\":true,\"startTime\":1479739.237164,\"endTime\":1497343.935989,\"statusCode\":200,\"providerResponseId\":\"resp_0cbf1c6bb66476b80169d81d965fcc8196aa3bd0d4050962b5\"}]}],\"totalProviderAttemptCount\":1},\"cost\":\"0.073913\",\"marketCost\":\"0.073913\",\"inferenceCost\":\"0.043913\",\"inputInferenceCost\":\"0.031418\",\"outputInferenceCost\":\"0.012495\",\"enabledZeroDataRetention\":false,\"enabledDisallowPromptTraining\":false,\"generationId\":\"gen_01KNT374RSHD12EA4S0G4Y7BGB\",\"billableWebSearchCalls\":3}}}",
+  "bodyJson": {
+    "id": "gen_01KNT374RSHD12EA4S0G4Y7BGB",
+    "object": "response",
+    "created_at": 1775771047,
+    "status": "completed",
+    "completed_at": 1775771047,
+    "incomplete_details": null,
+    "error": null,
+    "output": [
+      {
+        "type": "message",
+        "id": "msg_1775771047924_x8hxyhyi6ce",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Here are some of the **top AI headlines for today, Thursday, April 9, 2026**, based on recent coverage from major tech and news outlets:\n\n1. **OpenAI pushes an AI-economy policy agenda**\n   - TechCrunch reports OpenAI outlined proposals including public wealth funds, robot taxes, and even a four-day workweek as part of its vision for how AI could reshape labor and the broader economy. ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))\n\n2. **OpenAI releases a new safety blueprint aimed at child protection**\n   - TechCrunch’s AI news page lists a new OpenAI safety initiative focused on addressing the rise of child sexual exploitation risks tied to AI systems. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n3. **AWS CEO defends backing both Anthropic and OpenAI**\n   - TechCrunch reports Amazon Web Services’ chief said investing billions in both AI firms is not necessarily a conflict, highlighting the strategic jockeying among major cloud and AI players. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n4. **Tubi launches a native app inside ChatGPT**\n   - TechCrunch says Tubi became the first streaming service to launch a native app within ChatGPT, a sign of AI assistants becoming new distribution platforms. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n5. **Meta continues tying AI expansion to energy infrastructure**\n   - Meta said earlier this year it had struck nuclear-energy agreements supporting up to 6.6 GW to help power U.S. AI infrastructure, underscoring how energy supply is becoming a central AI story. This remains a major background headline in the sector. ([about.fb.com](https://about.fb.com/news/2026/01/meta-nuclear-energy-projects-power-american-ai-leadership/?utm_source=openai))\n\n6. **Policy fights over AI regulation are intensifying**\n   - AP recently reported the White House urged Congress to take a lighter-touch approach to AI regulation and to preempt some state AI laws, showing that AI governance remains one of the biggest ongoing stories in Washington. ([apnews.com](https://apnews.com/article/479eb3d0a50fe7237678a9bfb146ac7a?utm_source=openai))\n\n7. **Global AI governance is moving forward at the U.N.**\n   - AP reported the U.N. General Assembly approved a 40-member scientific panel on AI’s risks and impacts, a notable step in international AI oversight. ([apnews.com](https://apnews.com/article/8936f242689792be7a7ab97e841cade8?utm_source=openai))\n\nIf you want, I can also turn this into a **clean “Top 10 AI News Today” news brief** with:\n- headline\n- 1-sentence summary\n- source\n- why it matters\n\n",
+            "annotations": [],
+            "logprobs": []
+          }
+        ],
+        "phase": "final_answer"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775771047924_zd7ms7msly",
+        "call_id": "ws_0cbf1c6bb66476b80169d81d97e0788196a0e722125b224fc5",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775771047924_36kh9pmqtto",
+        "call_id": "ws_0cbf1c6bb66476b80169d81d9a7f588196934f5cdc922043ff",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "fc_1775771047924_4f733bdrc6p",
+        "call_id": "ws_0cbf1c6bb66476b80169d81d9e7a28819698e98a43a1688d70",
+        "name": "web_search",
+        "arguments": "{}",
+        "status": "completed"
+      }
+    ],
+    "usage": {
+      "input_tokens": 16484,
+      "output_tokens": 833,
+      "total_tokens": 17317,
+      "input_tokens_details": {
+        "cached_tokens": 4352
+      },
+      "output_tokens_details": {
+        "reasoning_tokens": 288
+      }
+    },
+    "model": "gpt-5.4",
+    "instructions": null,
+    "previous_response_id": null,
+    "temperature": 1,
+    "top_p": 1,
+    "max_output_tokens": null,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "tools": [
+      {
+        "type": "web_search"
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_tool_calls": null,
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "truncation": "disabled",
+    "reasoning": {
+      "effort": "none"
+    },
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "prompt_cache_retention": null,
+    "provider_metadata": {
+      "openai": {
+        "responseId": "resp_0cbf1c6bb66476b80169d81d965fcc8196aa3bd0d4050962b5",
+        "serviceTier": "default"
+      },
+      "gateway": {
+        "routing": {
+          "originalModelId": "openai/gpt-5.4",
+          "resolvedProvider": "openai",
+          "resolvedProviderApiModelId": "gpt-5.4",
+          "fallbacksAvailable": [
+            "azure"
+          ],
+          "planningReasoning": "System credentials planned for: openai, azure. Total execution order: openai(system) → azure(system)",
+          "canonicalSlug": "openai/gpt-5.4",
+          "finalProvider": "openai",
+          "modelAttemptCount": 1,
+          "modelAttempts": [
+            {
+              "modelId": "openai:gpt-5.4",
+              "canonicalSlug": "openai/gpt-5.4",
+              "success": true,
+              "providerAttemptCount": 1,
+              "providerAttempts": [
+                {
+                  "provider": "openai",
+                  "internalModelId": "openai:gpt-5.4",
+                  "providerApiModelId": "gpt-5.4",
+                  "credentialType": "system",
+                  "success": true,
+                  "startTime": 1479739.237164,
+                  "endTime": 1497343.935989,
+                  "statusCode": 200,
+                  "providerResponseId": "resp_0cbf1c6bb66476b80169d81d965fcc8196aa3bd0d4050962b5"
+                }
+              ]
+            }
+          ],
+          "totalProviderAttemptCount": 1
+        },
+        "cost": "0.073913",
+        "marketCost": "0.073913",
+        "inferenceCost": "0.043913",
+        "inputInferenceCost": "0.031418",
+        "outputInferenceCost": "0.012495",
+        "enabledZeroDataRetention": false,
+        "enabledDisallowPromptTraining": false,
+        "generationId": "gen_01KNT374RSHD12EA4S0G4Y7BGB",
+        "billableWebSearchCalls": 3
+      }
+    }
+  }
+}
