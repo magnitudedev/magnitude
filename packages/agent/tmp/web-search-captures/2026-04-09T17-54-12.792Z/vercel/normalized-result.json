@@ -1,0 +1,10 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [],
+  "textResponse": "**Top AI news headlines today (April 9, 2026) focus on advancements in AI accessibility, enterprise tools, robotics, and security, drawn from recent reports.**\n\nHere are the most prominent ones from the latest available sources, prioritized by recency:\n\n- **Thailand becomes one of the first in Asia to get the Sora app**: The app now offers creators AI-generated videos, cameos, character features, and Thai language support.[1]\n- **Google makes its industrial robotics AI play official**: Google has integrated Intrinsic in-house to advance physical AI in manufacturing, signaling a major enterprise robotics shift.[1]\n- **Microsoft open-source toolkit secures AI agents at runtime**: The new toolkit enforces strict governance on enterprise AI agents for enhanced security.[1]\n\n**Recent supporting headlines (within the past week):**\n- AI workflows for software developers emphasize oversight needs, with surveys showing top effectiveness in development over general efficiency.[1]\n- Google's Veo 3 AI video tools are now widely available on Vertex AI for broad use.[1] (from early March, but noted in recent aggregation)\n\n**Additional context**: Other notable recent developments include Malaysia's launch of Ryt Bank as its first AI-powered bank with multilingual features and bill assistance (March 2026),[1] and KPMG insights on AI agents driving enterprise margins despite widening value gaps (March 2026).[1] Earlier 2026 stories highlight investments like xAI's $20bn Mississippi data center, NVIDIA partnerships for physical AI in manufacturing, and ethical updates to Musk's Grok AI.[2] Sources like TechCrunch note ongoing AI dictation apps and awards but lack specifics for today.[3] Coverage is current as of search indices up to April 8, 2026.[1][2]",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "web_search_requests": 0
+  }
+}

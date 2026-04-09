@@ -1,0 +1,302 @@
+{
+  "present": true,
+  "value": {
+    "sdkHttpResponse": {
+      "headers": {
+        "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000",
+        "content-encoding": "gzip",
+        "content-type": "application/json; charset=UTF-8",
+        "date": "Thu, 09 Apr 2026 17:33:48 GMT",
+        "server": "scaffolding on HTTPServer2",
+        "server-timing": "gfet4t7; dur=8240",
+        "transfer-encoding": "chunked",
+        "vary": "Origin, X-Origin, Referer",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "SAMEORIGIN",
+        "x-gemini-service-tier": "standard",
+        "x-xss-protection": "0"
+      }
+    },
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "text": "Today’s AI news is dominated by massive infrastructure investments, the rise of \"agentic\" AI, and strategic global partnerships. Here are the top headlines for Thursday, April 9, 2026:\n\n### **1. Meta and CoreWeave Ink Massive $21 Billion AI Cloud Deal**\nIn one of the largest single-customer infrastructure commitments to date, **Meta** has expanded its agreement with **CoreWeave** for dedicated AI cloud capacity through 2032. This $21 billion deal brings Meta’s total commitment to CoreWeave to $35.2 billion. The capacity is earmarked for inference workloads and will include early deployments of Nvidia’s next-generation \"Vera Rubin\" platform.\n*   **Source:** *24/7 Wall St.*\n\n### **2. Google and Intel Deepen Collaboration on AI Systems**\n**Intel** and **Google** announced a multiyear partnership focused on scaling modern, heterogeneous AI systems. The collaboration emphasizes that AI doesn't run on accelerators (GPUs) alone; it requires robust CPUs for orchestration. Google Cloud will continue to deploy Intel Xeon processors for its AI and inference workloads while co-developing custom ASIC-based infrastructure processing units (IPUs).\n*   **Source:** *Intel Newsroom*\n\n### **3. IDC Forecasts $22.5 Trillion AI Economy by 2031**\nAt its \"Directions 2026\" event, research firm **IDC** unveiled data showing that AI is entering a \"supercycle\" defined by infrastructure buildout and enterprise adoption. IDC predicts AI will generate **$22.5 trillion** in cumulative global economic value by 2031. A key trend highlighted is the shift from human-led buying processes to \"agentic\" decision systems.\n*   **Source:** *Morningstar / IDC Research*\n\n### **4. Canada Launches AI-Powered Hybrid Weather Model**\nThe Canadian government has officially launched a groundbreaking hybrid weather forecasting model that combines traditional physics-based methods with AI. This new system is expected to provide warnings for major events like winter storms and heat waves **8 to 24 hours earlier** than previous models, significantly improving public safety and emergency readiness.\n*   **Source:** *Government of Canada (canada.ca)*\n\n### **5. Motorola Solutions Acquires \"Hyper\" to Automate 911 Calls**\n**Motorola Solutions** has acquired **Hyper**, a leader in conversational, agentic AI. The goal is to address staffing shortages at emergency call centers by using AI agents to handle non-emergency calls, allowing human dispatchers to focus on critical life-saving interventions.\n*   **Source:** *Motorola Solutions Newsroom*\n\n### **6. China Cracks Down on AI-Modified Videos**\nChina’s National Radio and Television Administration reported a major enforcement action against \"unauthorized\" AI-altered content. Following a targeted campaign, regulators removed over **29,000 videos** involving historical figures and classic TV dramas that were modified using AI without proper authorization.\n*   **Source:** *Caixin Global*\n\n### **7. BMO Establishes Institute for Applied AI & Quantum**\n**Bank of Montreal (BMO)** has launched a new enterprise-wide Centre of Excellence focused on the responsible innovation and governance of AI and Quantum technologies. The institute aims to embed AI more deeply into banking operations to enhance client experiences and productivity.\n*   **Source:** *PR Newswire*",
+              "thoughtSignature": "EjQKMgG+Pvb7rw57f6UgOzaV6o1JutW0YiozigJ5nGpetvGDhUyIHNtM2r32Bv6QAwNwp1GK"
+            }
+          ],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "groundingMetadata": {
+          "searchEntryPoint": {
+            "renderedContent": "<style>\n.container {\n  align-items: center;\n  border-radius: 8px;\n  display: flex;\n  font-family: Google Sans, Roboto, sans-serif;\n  font-size: 14px;\n  line-height: 20px;\n  padding: 8px 12px;\n}\n.chip {\n  display: inline-block;\n  border: solid 1px;\n  border-radius: 16px;\n  min-width: 14px;\n  padding: 5px 16px;\n  text-align: center;\n  user-select: none;\n  margin: 0 8px;\n  -webkit-tap-highlight-color: transparent;\n}\n.carousel {\n  overflow: auto;\n  scrollbar-width: none;\n  white-space: nowrap;\n  margin-right: -12px;\n}\n.headline {\n  display: flex;\n  margin-right: 4px;\n}\n.gradient-container {\n  position: relative;\n}\n.gradient {\n  position: absolute;\n  transform: translate(3px, -9px);\n  height: 36px;\n  width: 9px;\n}\n@media (prefers-color-scheme: light) {\n  .container {\n    background-color: #fafafa;\n    box-shadow: 0 0 0 1px #0000000f;\n  }\n  .headline-label {\n    color: #1f1f1f;\n  }\n  .chip {\n    background-color: #ffffff;\n    border-color: #d2d2d2;\n    color: #5e5e5e;\n    text-decoration: none;\n  }\n  .chip:hover {\n    background-color: #f2f2f2;\n  }\n  .chip:focus {\n    background-color: #f2f2f2;\n  }\n  .chip:active {\n    background-color: #d8d8d8;\n    border-color: #b6b6b6;\n  }\n  .logo-dark {\n    display: none;\n  }\n  .gradient {\n    background: linear-gradient(90deg, #fafafa 15%, #fafafa00 100%);\n  }\n}\n@media (prefers-color-scheme: dark) {\n  .container {\n    background-color: #1f1f1f;\n    box-shadow: 0 0 0 1px #ffffff26;\n  }\n  .headline-label {\n    color: #fff;\n  }\n  .chip {\n    background-color: #2c2c2c;\n    border-color: #3c4043;\n    color: #fff;\n    text-decoration: none;\n  }\n  .chip:hover {\n    background-color: #353536;\n  }\n  .chip:focus {\n    background-color: #353536;\n  }\n  .chip:active {\n    background-color: #464849;\n    border-color: #53575b;\n  }\n  .logo-light {\n    display: none;\n  }\n  .gradient {\n    background: linear-gradient(90deg, #1f1f1f 15%, #1f1f1f00 100%);\n  }\n}\n</style>\n<div class=\"container\">\n  <div class=\"headline\">\n    <svg class=\"logo-light\" width=\"18\" height=\"18\" viewBox=\"9 9 35 35\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M42.8622 27.0064C42.8622 25.7839 42.7525 24.6084 42.5487 23.4799H26.3109V30.1568H35.5897C35.1821 32.3041 33.9596 34.1222 32.1258 35.3448V39.6864H37.7213C40.9814 36.677 42.8622 32.2571 42.8622 27.0064V27.0064Z\" fill=\"#4285F4\"/>\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M26.3109 43.8555C30.9659 43.8555 34.8687 42.3195 37.7213 39.6863L32.1258 35.3447C30.5898 36.3792 28.6306 37.0061 26.3109 37.0061C21.8282 37.0061 18.0195 33.9811 16.6559 29.906H10.9194V34.3573C13.7563 39.9841 19.5712 43.8555 26.3109 43.8555V43.8555Z\" fill=\"#34A853\"/>\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M16.6559 29.8904C16.3111 28.8559 16.1074 27.7588 16.1074 26.6146C16.1074 25.4704 16.3111 24.3733 16.6559 23.3388V18.8875H10.9194C9.74388 21.2072 9.06992 23.8247 9.06992 26.6146C9.06992 29.4045 9.74388 32.022 10.9194 34.3417L15.3864 30.8621L16.6559 29.8904V29.8904Z\" fill=\"#FBBC05\"/>\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M26.3109 16.2386C28.85 16.2386 31.107 17.1164 32.9095 18.8091L37.8466 13.8719C34.853 11.082 30.9659 9.3736 26.3109 9.3736C19.5712 9.3736 13.7563 13.245 10.9194 18.8875L16.6559 23.3388C18.0195 19.2636 21.8282 16.2386 26.3109 16.2386V16.2386Z\" fill=\"#EA4335\"/>\n    </svg>\n    <svg class=\"logo-dark\" width=\"18\" height=\"18\" viewBox=\"0 0 48 48\" xmlns=\"http://www.w3.org/2000/svg\">\n      <circle cx=\"24\" cy=\"23\" fill=\"#FFF\" r=\"22\"/>\n      <path d=\"M33.76 34.26c2.75-2.56 4.49-6.37 4.49-11.26 0-.89-.08-1.84-.29-3H24.01v5.99h8.03c-.4 2.02-1.5 3.56-3.07 4.56v.75l3.91 2.97h.88z\" fill=\"#4285F4\"/>\n      <path d=\"M15.58 25.77A8.845 8.845 0 0 0 24 31.86c1.92 0 3.62-.46 4.97-1.31l4.79 3.71C31.14 36.7 27.65 38 24 38c-5.93 0-11.01-3.4-13.45-8.36l.17-1.01 4.06-2.85h.8z\" fill=\"#34A853\"/>\n      <path d=\"M15.59 20.21a8.864 8.864 0 0 0 0 5.58l-5.03 3.86c-.98-2-1.53-4.25-1.53-6.64 0-2.39.55-4.64 1.53-6.64l1-.22 3.81 2.98.22 1.08z\" fill=\"#FBBC05\"/>\n      <path d=\"M24 14.14c2.11 0 4.02.75 5.52 1.98l4.36-4.36C31.22 9.43 27.81 8 24 8c-5.93 0-11.01 3.4-13.45 8.36l5.03 3.85A8.86 8.86 0 0 1 24 14.14z\" fill=\"#EA4335\"/>\n    </svg>\n    <div class=\"gradient-container\"><div class=\"gradient\"></div></div>\n  </div>\n  <div class=\"carousel\">\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFD_Kncsb0_QKawPksMTuXzInEE0Jx8REbhs2G-su9W7wydITkfNfdakROF7I6jog5-KNSDL7mz3op0RW5yTxh4fkh3pC_UFms606cEeCp6aluBlGexbaR67VFiI4qUkEBIUXkrSx9Pi979X9N_aqNuAaoCmzzGe9gcCg7d_aapBT8_DbucpyTpyhSWmcxlIDFNA1lgisDwqSbwV-pWk_IE8IWiGNY0Oo-sYIUCQhBujHIa\">latest artificial intelligence news April 9 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQF_cZXdFgAEOZtBfpVL2_bnWUB6P0kdi_peVUEvB3jxM-nfjxMtr1FgSkXwTaMfvL764g4xNLL4bmz9ywB7PX3QNzIF6wUKiKaeKHBmXVgAfxa-fckcz2ivcMVltO3AJGfeMzXhmH2mu95qpBUNEvO_Sw6wYnVKuDiwhxdW9KFHd-78chp0sYRuj2eySS76SCvpy9nkeJKtUTzW1WR9Qiq8GukYGgRoxut53w==\">top AI news headlines today April 9 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGpSMXW957mIu3MK1_n_Zk71CavXT7WVmokpVJn6JO5_PVjJOEsPOKOaQ2zgB1BTxQP_Q630gxVg5VyZie0VU_dutK8vK-Zm7700H53IqiPsrO-xC2beEkRmEHXLd-QcP1vAqIUpjcz6XmOOCb-_tySlAXvT8OvaOvM-9vD4-KtxuMlGaMVlJIBGtZwciXTfBwvfYdqNhPNQut6hVZeUlMHWElhDpI0Qw==\">AI industry news April 9 2026 sources</a>\n  </div>\n</div>\n"
+          },
+          "groundingChunks": [
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHZ7yKjeI_OGaf4wa1TEQIGuI8d7CyGRIFBXqK8jP2BTrOKVGa-azic_sT1Y3i6WS2U920OD9mOjWVzmx-OhxknC0Nfnz-Axukt144lrKRIVUq6v8k8cWw_uir0QhXy_ym0yJYW4hHlFv32NkAnKu6vrWF_4S0_jmjtkLmmoicCCnbdXyYSsMmT2b2N9f8Vs_MX_kKa86P9csSee1ID7IjalTYCtvZnX0h48njFncC1r6UXXCij6Fh0jw==",
+                "title": "247wallst.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGj3pxKK6xoAiQ24kBI4Yc6NuZ5eZ0l_b6ePwj1hQKCFDKbJ_CDEjXRgP0olukGFsScrqhC0Eox8l5DhtL5EU9Kbv1OZ1t7OIUR4fhVozpMySmMjIy31oXyKE34LY4IBzAWFAsDO9c5iaQ6_DMkTXlCUOaan_uYhAkzAE54GAfqyAG7zNo5kBem6afhNlq8JQ9DKY01phK1WX3_1u_Ik-2zrq6M-MCdc2vRruLckC4D-iUuy3PlVT6FuIgR7RVrAw==",
+                "title": "247wallst.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHxcBSeNp68jvNjn26Jf2PVhhsilUnjsTErNOUxfObV3tpRUEr2J6HtkFT_ExxZOB3PYgljW_Icg-mUwDFjv2xxpoUMaudaLjmfurgxFQvIOpGRGCAIgTGqoR6AZkcGPQd6JLe03YvTi7_hOZyVDA2vnxjMbtbOtfiL2fgowhBDco7A9wPRiEselcDiC7u4ON8jq5opZ_D4f--OiN-OmZw=",
+                "title": "intel.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQH4hgB7HNTrJ-bUTOKoSf626LOyLPX8II8ZjJDkdL-q16SmNwkvUvTHi6SQY6YCbT8unpYTyb8Dxzaf0F3MkJEpCnE7j8_roxKDAY4bfpY5Icc9cHcrsnrpCCWsSj2347vh8ElJm6sanUJBdxEYYR80393SUlCzst3g_GM9e-ZJaaCucK9YqR7EMJc7KoTNxn4uMshILkNe-KTptbtcubVLr1skNmAHrgayhoryCV2kMnrWnaQon4kkkv73b0TF2PxOYdXx_fAnZONjgeydh2CCMqBRv8e_jqED03E83ZhI",
+                "title": "morningstar.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFDcfg0leIztQyPpiAEcnPY8XNFdyZoxxslWenW-L-j1VpwhgKUzxzAETYFkOg57uH_2QzD4OYLzLyvR0jsgUnUkLmjk0eD_LZmqqLM35ueuky0wRPdI5tMRJHZpZ_WjmiwBMsc_-N2K5ZUN68EuGitWQKTGX6qof-gX35kSG6xFibhPSAestWtx6yAbAneyug63bTYuyqtdWLaoa88xjn-W3ZtDTaNTvhIH50KAKbd8kGnI3j2iTwzyfJ44sJKgaQF9E3shoSI-awniO18qd7Gyj8u13vd",
+                "title": "canada.ca"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQG53TQxXF_E-A3Y5H8Bd9ZiPGitLisHPDwu9-DzsmDOfR80yAmO1o0ZUGk2jYMGWuN9SkP0EA4GKj1uPAtkQepmzFQXUFAiSJtB0SyoGJBko0B5eRWwx0BTbdBZ6Ee97tx8xiWU9gh4jLLmaG17eRoeYwypR-UGoKRXgeNg6Wtb2ChkdQr8bRaBbNlDWMDorQM4rxlotOsXZO-SoT-JQ92XWHBt_jUP9bU=",
+                "title": "motorolasolutions.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHlsg8QQw1MjRVeGbisBT4ERiU87BLwaAw5l8mWSwfCU7hKWj1Bdu9w6_J8viYom6MKeoSaMH4-b4-ALa4usWDYSvPgug4DfhoYH7RKKLztWTbFyQ_6OhvzA9LwC4hnq2MxdD3RU34fxsLzCqWslfuqvru6jPi03OKT6EZhldSxpk3h87yhJjPsTJkdvQHxKNGEbdGqVNGEal85rOPgRefOsipHxLSiGEtAk6idPTeP4Fm93w==",
+                "title": "caixinglobal.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGI4Hb7kailfIwNlYcm050PYmQM55BJE-rpGusD4iQSP2QJNbCKqZJqcuMsTdp80AZzg3pCDpaBQFD6fcPVcEpncgEPSx1bmTuCbhTKhbaLyPk07Ym0pJEBUzGTwHExSWuSmo2U2-Ep0K5g8Qtosrcixt7yoiUTGYxGWzoNkiK8Rmscn4oaMmPxCF75-ECeRA0El9Nv2W7dzx62EhEYO8e6vfiwJnKQIn40erTLepCGbJGpaR0rnbwo",
+                "title": "prnewswire.com"
+              }
+            }
+          ],
+          "groundingSupports": [
+            {
+              "segment": {
+                "startIndex": 197,
+                "endIndex": 430,
+                "text": "Meta and CoreWeave Ink Massive $21 Billion AI Cloud Deal**\nIn one of the largest single-customer infrastructure commitments to date, **Meta** has expanded its agreement with **CoreWeave** for dedicated AI cloud capacity through 2032."
+              },
+              "groundingChunkIndices": [
+                0
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 431,
+                "endIndex": 516,
+                "text": "This $21 billion deal brings Meta’s total commitment to CoreWeave to $35.2 billion."
+              },
+              "groundingChunkIndices": [
+                0
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 655,
+                "endIndex": 686,
+                "text": "*   **Source:** *24/7 Wall St.*"
+              },
+              "groundingChunkIndices": [
+                0,
+                1
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 697,
+                "endIndex": 862,
+                "text": "Google and Intel Deepen Collaboration on AI Systems**\n**Intel** and **Google** announced a multiyear partnership focused on scaling modern, heterogeneous AI systems."
+              },
+              "groundingChunkIndices": [
+                2
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 863,
+                "endIndex": 984,
+                "text": "The collaboration emphasizes that AI doesn't run on accelerators (GPUs) alone; it requires robust CPUs for orchestration."
+              },
+              "groundingChunkIndices": [
+                2
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 985,
+                "endIndex": 1156,
+                "text": "Google Cloud will continue to deploy Intel Xeon processors for its AI and inference workloads while co-developing custom ASIC-based infrastructure processing units (IPUs)."
+              },
+              "groundingChunkIndices": [
+                2
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1421,
+                "endIndex": 1514,
+                "text": "IDC predicts AI will generate **$22.5 trillion** in cumulative global economic value by 2031."
+              },
+              "groundingChunkIndices": [
+                3
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1515,
+                "endIndex": 1614,
+                "text": "A key trend highlighted is the shift from human-led buying processes to \"agentic\" decision systems."
+              },
+              "groundingChunkIndices": [
+                3
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1615,
+                "endIndex": 1659,
+                "text": "*   **Source:** *Morningstar / IDC Research*"
+              },
+              "groundingChunkIndices": [
+                3
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1670,
+                "endIndex": 1874,
+                "text": "Canada Launches AI-Powered Hybrid Weather Model**\nThe Canadian government has officially launched a groundbreaking hybrid weather forecasting model that combines traditional physics-based methods with AI."
+              },
+              "groundingChunkIndices": [
+                4
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1875,
+                "endIndex": 2084,
+                "text": "This new system is expected to provide warnings for major events like winter storms and heat waves **8 to 24 hours earlier** than previous models, significantly improving public safety and emergency readiness."
+              },
+              "groundingChunkIndices": [
+                4
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2146,
+                "endIndex": 2292,
+                "text": "Motorola Solutions Acquires \"Hyper\" to Automate 911 Calls**\n**Motorola Solutions** has acquired **Hyper**, a leader in conversational, agentic AI."
+              },
+              "groundingChunkIndices": [
+                5
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2486,
+                "endIndex": 2531,
+                "text": "*   **Source:** *Motorola Solutions Newsroom*"
+              },
+              "groundingChunkIndices": [
+                5
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2542,
+                "endIndex": 2717,
+                "text": "China Cracks Down on AI-Modified Videos**\nChina’s National Radio and Television Administration reported a major enforcement action against \"unauthorized\" AI-altered content."
+              },
+              "groundingChunkIndices": [
+                6
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2718,
+                "endIndex": 2899,
+                "text": "Following a targeted campaign, regulators removed over **29,000 videos** involving historical figures and classic TV dramas that were modified using AI without proper authorization."
+              },
+              "groundingChunkIndices": [
+                6
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2900,
+                "endIndex": 2931,
+                "text": "*   **Source:** *Caixin Global*"
+              },
+              "groundingChunkIndices": [
+                6
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2942,
+                "endIndex": 3162,
+                "text": "BMO Establishes Institute for Applied AI & Quantum**\n**Bank of Montreal (BMO)** has launched a new enterprise-wide Centre of Excellence focused on the responsible innovation and governance of AI and Quantum technologies."
+              },
+              "groundingChunkIndices": [
+                7
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 3163,
+                "endIndex": 3277,
+                "text": "The institute aims to embed AI more deeply into banking operations to enhance client experiences and productivity."
+              },
+              "groundingChunkIndices": [
+                7
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 3278,
+                "endIndex": 3307,
+                "text": "*   **Source:** *PR Newswire*"
+              },
+              "groundingChunkIndices": [
+                7
+              ]
+            }
+          ],
+          "webSearchQueries": [
+            "latest artificial intelligence news April 9 2026",
+            "top AI news headlines today April 9 2026",
+            "AI industry news April 9 2026 sources"
+          ]
+        },
+        "index": 0
+      }
+    ],
+    "modelVersion": "gemini-3-flash-preview",
+    "responseId": "_OLXadOsEMGh1MkPwv760AM",
+    "usageMetadata": {
+      "promptTokenCount": 13,
+      "candidatesTokenCount": 730,
+      "totalTokenCount": 743,
+      "promptTokensDetails": [
+        {
+          "modality": "TEXT",
+          "tokenCount": 13
+        }
+      ]
+    }
+  }
+}

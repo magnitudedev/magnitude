@@ -1,0 +1,28 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "openrouter-search",
+      "content": [
+        {
+          "title": "AI News & Artificial Intelligence | TechCrunch",
+          "url": "https://techcrunch.com/category/artificial-intelligence/?utm_source=openai"
+        },
+        {
+          "title": "OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek | TechCrunch",
+          "url": "https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"
+        },
+        {
+          "title": "Why Snowflake is no longer just a data warehouse | TechCrunch",
+          "url": "https://techcrunch.com/video/why-snowflake-is-no-longer-just-a-data-warehouse/?utm_source=openai"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Here are some of the **top AI-related headlines I found for today, Thursday, April 9, 2026** — with sources:\n\n1. **OpenAI releases a new safety blueprint to address the rise in child sexual exploitation** — TechCrunch reports OpenAI published a new safety framework focused on child sexual exploitation risks tied to AI systems. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n2. **Poke makes using AI agents as easy as sending a text** — TechCrunch highlights a startup trying to simplify access to AI agents via messaging-style interactions. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n3. **AWS boss explains why investing billions in both Anthropic and OpenAI is an OK conflict** — TechCrunch covers Amazon Web Services’ rationale for backing multiple leading AI firms at once. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n4. **Tubi is the first streamer to launch a native app within ChatGPT** — TechCrunch says Tubi has launched a native app experience inside ChatGPT, showing continued AI-platform integration in media. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\n5. **OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek** — A widely discussed recent story from April 6 says OpenAI outlined policy proposals around redistribution, automation, and AI’s economic effects. ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))\n\n6. **Why Snowflake is no longer just a data warehouse** — TechCrunch’s April 8 coverage says Snowflake is repositioning toward AI agents and applications, reflecting the broader enterprise AI shift. ([techcrunch.com](https://techcrunch.com/video/why-snowflake-is-no-longer-just-a-data-warehouse/?utm_source=openai))\n\nA quick note: search results today were dominated by **TechCrunch’s AI coverage**, and I did **not** get clean same-day Reuters/AP/The Verge AI headline results from the search index I checked. So the list above is accurate to what I could verify quickly, but it is **not a perfect cross-outlet “most important in the world” ranking**. ([techcrunch.com](https://techcrunch.com/category/artificial-intelligence/?utm_source=openai))\n\nIf you want, I can do a **deeper roundup from Reuters, AP, The Verge, and official company blogs only** and turn this into a cleaner **“Top 10 AI headlines today”** digest.",
+  "usage": {
+    "input_tokens": 15,
+    "output_tokens": 676,
+    "web_search_requests": 1
+  }
+}

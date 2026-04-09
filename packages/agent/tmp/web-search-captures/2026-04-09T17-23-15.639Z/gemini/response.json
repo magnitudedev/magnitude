@@ -1,0 +1,267 @@
+{
+  "present": true,
+  "value": {
+    "sdkHttpResponse": {
+      "headers": {
+        "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000",
+        "content-encoding": "gzip",
+        "content-type": "application/json; charset=UTF-8",
+        "date": "Thu, 09 Apr 2026 17:23:24 GMT",
+        "server": "scaffolding on HTTPServer2",
+        "server-timing": "gfet4t7; dur=9024",
+        "transfer-encoding": "chunked",
+        "vary": "Origin, X-Origin, Referer",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "SAMEORIGIN",
+        "x-gemini-service-tier": "standard",
+        "x-xss-protection": "0"
+      }
+    },
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "text": "The first full week of April 2026 has seen a major shift from \"experimentation\" to \"production\" in the AI agent space. Major cloud providers and AI labs have released the core infrastructure required to move autonomous agents into enterprise environments, specifically focusing on orchestration, security, and specialized financial stacks.\n\nHere are the top AI agent infrastructure announcements for the week:\n\n### 1. Microsoft’s Production-Ready Agent Stack\nMicrosoft solidified its position as a leader in enterprise agent infrastructure with two major releases:\n*   **Microsoft Agent Framework 1.0:** Released on April 3 (GA status confirmed this week), this marks the official production-ready milestone for its open-source SDK. It unifies **Semantic Kernel** (for enterprise connectors) and **AutoGen** (for multi-agent orchestration) into a single stack for .NET and Python. Key features include stable APIs, checkpointing for long-running workflows, and \"human-in-the-loop\" approval gates.\n*   **Agent Governance Toolkit:** An open-source security shield released on April 8. It provides a runtime layer to block \"rogue agent\" behavior and address the **OWASP Top 10** risks for agentic AI (like goal hijacking and memory poisoning) with sub-millisecond policy enforcement.\n\n### 2. Anthropic’s \"Claude Managed Agents\" & Project Glasswing\nAnthropic moved aggressively into managed infrastructure to lower the barrier for businesses:\n*   **Claude Managed Agents:** Launched on April 9, this service provides out-of-the-box infrastructure including sandboxed code execution, credential management, and automated container scaling. Anthropic claims this allows enterprises to deploy agents **10 times faster** by handling the backend complexity (tracing, recovery, and session management) themselves.\n*   **Project Glasswing:** Announced on April 7, this is a large-scale initiative using a specialized model, **Claude Mythos Preview**, to autonomously identify and fix critical software vulnerabilities. It represents a \"sovereign infrastructure\" for cybersecurity, currently restricted to a group of 40+ high-stakes partners like AWS, NVIDIA, and the Linux Foundation.\n\n### 3. OpenAI’s \"Frontier\" & Super App Strategy\nOpenAI revealed its \"next phase of enterprise AI\" on April 8, following its massive $122 billion funding round:\n*   **OpenAI Frontier:** This is positioned as a \"unified operating layer\" for business, allowing agents to move across a company's disparate internal systems rather than being trapped in a single app. \n*   **The AI Super App:** OpenAI is merging ChatGPT, Codex, and agentic browsing into a unified interface designed to act as the primary \"command center\" for human-agent teams. \n\n### 4. Specialised & Financial Infrastructure\n*   **B.AI Financial Infrastructure:** Launched globally on April 9, B.AI provides the \"plumbing\" for the agent economy—integrating blockchain-based identity (the 8004 protocol) and payments (x402 standard). This allows agents to pay for their own compute, data, and API access without human credit cards.\n*   **Forgentiq.ai (Perpetuals.com):** Announced a new strategic initiative to deploy on-premises agentic infrastructure specifically for hedge funds and digital asset managers, allowing them to run autonomous trading agents without sending proprietary \"alpha\" data to the cloud.\n\n### 5. Hardware & Physical AI\n*   **NVIDIA \"NemoClaw\":** NVIDIA introduced this open-source stack to optimize \"OpenClaw\" experiences on local RTX hardware. It is designed as a secure, local alternative for enterprises that want the flexibility of open agents but need the speed and privacy of local GPU execution.\n*   **CoreWeave & Meta $21B Expansion:** Meta signed a massive agreement on April 9 to secure AI cloud capacity through 2032, specifically for the initial deployments of the **NVIDIA Vera Rubin** platform, which is expected to power the next generation of large-scale agentic training.",
+              "thoughtSignature": "EjQKMgG+Pvb7CzTDbIeXeV+LHT2D8kDT3hg/HYQRYUWxYSXPznRbYcNsmzegx8ed0ZT0DOWr"
+            }
+          ],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "groundingMetadata": {
+          "searchEntryPoint": {
+            "renderedContent": "<style>\n.container {\n  align-items: center;\n  border-radius: 8px;\n  display: flex;\n  font-family: Google Sans, Roboto, sans-serif;\n  font-size: 14px;\n  line-height: 20px;\n  padding: 8px 12px;\n}\n.chip {\n  display: inline-block;\n  border: solid 1px;\n  border-radius: 16px;\n  min-width: 14px;\n  padding: 5px 16px;\n  text-align: center;\n  user-select: none;\n  margin: 0 8px;\n  -webkit-tap-highlight-color: transparent;\n}\n.carousel {\n  overflow: auto;\n  scrollbar-width: none;\n  white-space: nowrap;\n  margin-right: -12px;\n}\n.headline {\n  display: flex;\n  margin-right: 4px;\n}\n.gradient-container {\n  position: relative;\n}\n.gradient {\n  position: absolute;\n  transform: translate(3px, -9px);\n  height: 36px;\n  width: 9px;\n}\n@media (prefers-color-scheme: light) {\n  .container {\n    background-color: #fafafa;\n    box-shadow: 0 0 0 1px #0000000f;\n  }\n  .headline-label {\n    color: #1f1f1f;\n  }\n  .chip {\n    background-color: #ffffff;\n    border-color: #d2d2d2;\n    color: #5e5e5e;\n    text-decoration: none;\n  }\n  .chip:hover {\n    background-color: #f2f2f2;\n  }\n  .chip:focus {\n    background-color: #f2f2f2;\n  }\n  .chip:active {\n    background-color: #d8d8d8;\n    border-color: #b6b6b6;\n  }\n  .logo-dark {\n    display: none;\n  }\n  .gradient {\n    background: linear-gradient(90deg, #fafafa 15%, #fafafa00 100%);\n  }\n}\n@media (prefers-color-scheme: dark) {\n  .container {\n    background-color: #1f1f1f;\n    box-shadow: 0 0 0 1px #ffffff26;\n  }\n  .headline-label {\n    color: #fff;\n  }\n  .chip {\n    background-color: #2c2c2c;\n    border-color: #3c4043;\n    color: #fff;\n    text-decoration: none;\n  }\n  .chip:hover {\n    background-color: #353536;\n  }\n  .chip:focus {\n    background-color: #353536;\n  }\n  .chip:active {\n    background-color: #464849;\n    border-color: #53575b;\n  }\n  .logo-light {\n    display: none;\n  }\n  .gradient {\n    background: linear-gradient(90deg, #1f1f1f 15%, #1f1f1f00 100%);\n  }\n}\n</style>\n<div class=\"container\">\n  <div class=\"headline\">\n    <svg class=\"logo-light\" width=\"18\" height=\"18\" viewBox=\"9 9 35 35\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M42.8622 27.0064C42.8622 25.7839 42.7525 24.6084 42.5487 23.4799H26.3109V30.1568H35.5897C35.1821 32.3041 33.9596 34.1222 32.1258 35.3448V39.6864H37.7213C40.9814 36.677 42.8622 32.2571 42.8622 27.0064V27.0064Z\" fill=\"#4285F4\"/>\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M26.3109 43.8555C30.9659 43.8555 34.8687 42.3195 37.7213 39.6863L32.1258 35.3447C30.5898 36.3792 28.6306 37.0061 26.3109 37.0061C21.8282 37.0061 18.0195 33.9811 16.6559 29.906H10.9194V34.3573C13.7563 39.9841 19.5712 43.8555 26.3109 43.8555V43.8555Z\" fill=\"#34A853\"/>\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M16.6559 29.8904C16.3111 28.8559 16.1074 27.7588 16.1074 26.6146C16.1074 25.4704 16.3111 24.3733 16.6559 23.3388V18.8875H10.9194C9.74388 21.2072 9.06992 23.8247 9.06992 26.6146C9.06992 29.4045 9.74388 32.022 10.9194 34.3417L15.3864 30.8621L16.6559 29.8904V29.8904Z\" fill=\"#FBBC05\"/>\n      <path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M26.3109 16.2386C28.85 16.2386 31.107 17.1164 32.9095 18.8091L37.8466 13.8719C34.853 11.082 30.9659 9.3736 26.3109 9.3736C19.5712 9.3736 13.7563 13.245 10.9194 18.8875L16.6559 23.3388C18.0195 19.2636 21.8282 16.2386 26.3109 16.2386V16.2386Z\" fill=\"#EA4335\"/>\n    </svg>\n    <svg class=\"logo-dark\" width=\"18\" height=\"18\" viewBox=\"0 0 48 48\" xmlns=\"http://www.w3.org/2000/svg\">\n      <circle cx=\"24\" cy=\"23\" fill=\"#FFF\" r=\"22\"/>\n      <path d=\"M33.76 34.26c2.75-2.56 4.49-6.37 4.49-11.26 0-.89-.08-1.84-.29-3H24.01v5.99h8.03c-.4 2.02-1.5 3.56-3.07 4.56v.75l3.91 2.97h.88z\" fill=\"#4285F4\"/>\n      <path d=\"M15.58 25.77A8.845 8.845 0 0 0 24 31.86c1.92 0 3.62-.46 4.97-1.31l4.79 3.71C31.14 36.7 27.65 38 24 38c-5.93 0-11.01-3.4-13.45-8.36l.17-1.01 4.06-2.85h.8z\" fill=\"#34A853\"/>\n      <path d=\"M15.59 20.21a8.864 8.864 0 0 0 0 5.58l-5.03 3.86c-.98-2-1.53-4.25-1.53-6.64 0-2.39.55-4.64 1.53-6.64l1-.22 3.81 2.98.22 1.08z\" fill=\"#FBBC05\"/>\n      <path d=\"M24 14.14c2.11 0 4.02.75 5.52 1.98l4.36-4.36C31.22 9.43 27.81 8 24 8c-5.93 0-11.01 3.4-13.45 8.36l5.03 3.85A8.86 8.86 0 0 1 24 14.14z\" fill=\"#EA4335\"/>\n    </svg>\n    <div class=\"gradient-container\"><div class=\"gradient\"></div></div>\n  </div>\n  <div class=\"carousel\">\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQEwu9YF10xGttKJAY-fvBboOIFM8tK1KznnKUvJ1qtkUZ_XeB1RQguu11ILL0EduPZYJyj_5roF1mnNXDCmgF2Cho9IiUj9ogj4R0SRhrNCdKtvMtwh8KwY0p_gnSO30F9RNauKU0xmPB-2Uw-ZeZFpwSn7XCqWa2RyWeU232trosO83a2CiG_8MIwx03u3mUP05EoFDn_fkCuaTeLtMg5CaRFSF-eiEV-uOknW2U2hU2-Qm73HhF_Qq4f9BFE=\">Anthropic agentic infrastructure announcements April 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHcR6rLs8DnYKDrRqVxNZI9_c22x1XH0xwMjmviSungN2o3BQc6Trg2fFzye7n3cFUL9JMJBEgbRHKkC-gDU_lRJyViEuklT3pxJOEZPqEEMB3eTIE9KQHx220prFf_awnwk-NkTCL9iV-W8Mc5pDXKLcDws0tkMsskLAIBEMgFpkPDgYGcq0IYPPbt_cdJkAvHC1AO-gRy5gTD3RL6pFrSYAuNv9GWE6w33w==\">AI agent infrastructure news April 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFC6Bqa2-zrNLEY6rTjQRJ1Up5W8pX0ogEe5UDPXn33koQreOmhIn6u835fEqtWcmz0PtzqGmJB3A8d0NtqnvV8UNJpIxaWe_V3gNBb3bMp5YTAnrxMc90JqzvmzMeU1k532fxGgABLdjcKEa6Gxh6F4yjjiOcR0IBAmua99PpmmwLgYl3hcL3AQbgrrmFFgDjXNrYT4qk_P9-Ast3Nv3syrZxT7_5M9lp5WWUrEgH1FF8nGUk_r2qcMyeUB6Guww==\">top AI agent infrastructure announcements April 2026 week 1</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQEw4mQftAYLiEfnA55WLCHT79FrI6jKzeNV_qnMPzOx3in9n9irPewRK89_SZH46R0UdiTnQZHQS_vQHAkrryKik0Pwb4fEwrxEAeoW4L06--FUsYyInckPzMerJaQ3ZBEGkc6ZvOSxGtde7v9RXQ8pk_ICO8DfzCkwIhuRFm4Lr5sqq7gWmk3JCoaK0zNFLSIJdrA2D55QrDzaor8TzhoZgTDWyEgp8-owd_uTnf_fjA==\">recent AI agent framework releases April 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGkKl4EhXZYb90R7pKvPa6wHn5PFgfPiEQZwLD43Anag3UOa-4KNUKlrwUGWuvduaf_q9pghe5r044xBs5x5LhYNJ6xL5NfGnxf8yalf4sh63YOWuGVcM3IY73I5OVhHmycrxyLk3OWT6-Cg9HvXHnlNKqfnvDBlUBZcEneKdE3ZSsrQeYu0_4f_j-AK4bL2jzkRxrPpReHZE1FWs99HrmnCC8bORPntriH6bQK883MAEaI3rM=\">Microsoft AI agent infrastructure news April 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFtpb1Y1tC5YdJE_yxjScetdXCwqc2N9XX30k_cOw65zjCn_oU-E8ArTvjDkUrDoYPcEGeAoF0lmMRBFNltAIjOwMn59RLVAbn5f01gWGSUOkL0xFKnksW3TPYD-kJvXqaoz11MkElq73blwe-b56hXLYcH48KYeJRQzj8eig_31jKlDjy7zSf09AfbaiWIoCe0CF6jNbKjjTCoJZFgsARfeybjbmYJFfmEdzqJNfxy1PA=\">OpenAI agent infrastructure updates April 2026</a>\n    <a class=\"chip\" href=\"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQEPoi6owVccYG-qyjgM18BLcp3AeH8_pZoX1XN1fe2Yw6Mo7L3jP2UABwR1TPwbU5HtXYPfvE93CqFpJqSym4bOgKHBmpdTjLGI-gw5nkschYUqaB9Fs8Pijuwk-viRvafZTrplIVyLYeFoJV67mC9VdKImZnIfyRgTJwntWsC7T6A83q2zDs7eWCxoxVI34Dw7Kxq57uHktK0QrekGdU956oDUyRCdb_TAqeSkCnOzZKHjNzNGVo6rseI3\">NVIDIA AI agent infrastructure announcements April 2026</a>\n  </div>\n</div>\n"
+          },
+          "groundingChunks": [
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFyJiUeCrik1P61qz6EJemXNFYtLisLVtce_O1QGR96yDj35Q22ZecLV0jAAKD-B7aZcyk71kpu8snOcSgEHpN-20fwFNLrgEaBsUV9bMYBDT9yIbvAx_Cy4e8Z_6dVB1i6unO0NDjv7O0KhA==",
+                "title": "aiagentstore.ai"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQF2lvuVEd5XATF2_ub8ECBYKyJe2ckUkndABHu2bQQgPs3SISyozua_8_xfJveOaupNFFIp5WRywJpoyma4k0uaTaP6IoGO5CArWxoDhHo_bUzlGrUPlV5xLbwFEzlZc9FYR3BEC32oRFmEpkRCfbWqSH9-55kf0VE2Z3iEC2q3Qz_EGhM6MvFaUDBvpcI6amvsCqxjoa-lF4Pd2Vii_eWf9XuRl4qi_YlFS8s8tNYSOjdMjNohkNhOu_lyiWw=",
+                "title": "visualstudiomagazine.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFLCdsd7Lo9StPajFw0BiB0klWjXik0h6Axp6vsHI543OIPNGLtDZgwU9OLQ9nuJ4lLs2W6yaYMJME7PsbkoQeztaSB10dAnv3eWA_k4dRX72z_mINkEu238EWbCEnKdV0wVpzTPZAx_m8tMjzAJ7BzK8SaKcY-DWmwMEmAeyYBl-vux_kjC2Mi3mG2FeCGSnc=",
+                "title": "microsoft.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFpoWodp4e_3uIlCHY7HvHoXPQHJP7KArRZ-OUwSsIE6DloZkbFRgtHRIA9ClLmm1ExuqP_3NtqKBYYUrOUp8vIJ4MToUfrV-C1B75Dg97hNyGENIAJrgIcNDUCTC_pf5xv4M5A3OrcVpRiJAx-DvD9neKJzRLXJk6kttnAr6BmoEOe60lXBizyQOYwiUM8uWS49Oyu2f69trPX2tJgm80f_L1LijatmnjBpJDJf_5fofdA3A5Bd00=",
+                "title": "infoworld.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFHG1Vi715ObS0nf5wekkYAYzBt1-SJEqs75d40_3NIlpjda1HKnjoGHsEUme-dqe6Emf2-7kGZbO2pArdrTo5Y3Es9XVaKm15inQR57oW6FyV0kKyvKRAlOm2kJg3Nc3CLsFlLPcdC6OesNQZ5bvvwtE0r8e7_dAg55v3UAz3yZAIIdest6lyXKA==",
+                "title": "infosecurity-magazine.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQH83zq-L31g45f7fLuEJYUsE9fH4aICDxtgPckI_DbZcf2ZOSNZudZ2Qel8v-XRai3UJjVzyxlaDuRnkM_OYKJItTEosczAnm8OqaxOoBdyhugS_bLACB3-CpnXI0FnlSIUO-slt1A7g8mqmSz045iR",
+                "title": "openai.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGqf6DZfhuyMEWy-2GjC47p6pexhFp9Y4s2awJ7wf44i8o8ZGSogeydIDwApSqT-JPSeev5cwMDttvGCxD_aFlkvoODvOlfnS6MvyqSzvPIdNSXyNRDIQerS9gVSvqhbS0hDXxiqoKLa2YQtvY8WEjkQ32d",
+                "title": "openai.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHDEoaNPXCLGUfLNVM4DbOuVX4JJCiBd8Tmr6zI5PgECrneO5gNUSQfSxFFdCrmRTUa5OUPbvL4GDGr4R696POfovv5FVNuGBQC9okdUlUmpYOfoIeaxlFZuIAPz9ooKDY62fhrCkd9jkQ2qrDAl7km9o8pzRUFgWgthvKiK86Svgcp41g5f0ouAXnH4PMbc5cLxClljPHKyQlU-DBiYmu71NS7K1Y6-oK_4jNzvw43al32j3xAC6MWn6zRRSw4yiE=",
+                "title": "gurufocus.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFtNDEkKT0oFaoozQnVmneYLgQB-XoN6gvYGRQqEstMTjKFN4-ZYtO-YEjClrbND7UMfri1-FSxr4mn-kVFDLYtlkgQABOJ7M-fCq_Cxjq5f5ubdoeE4tvsg-jTNpfcugB1zImSyJgLSLvF-IR55WER7NZZEIgfhScJDREXc8lPLg3jMvr4n1gp2FTazEvDXfoYfegEf_HqCrCePFsfhEvkU4Mrx437FdqAbr5H7OmSvVZ0Qevk8d0s2lu5PwF-xxu7VduvuFjOF-1iJ5XL2_8JWo0OKXxD7noKgk52fAWAzc4X",
+                "title": "nvidia.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGHmxFz9wdAbU4DDtXS3swI5C1-_3NL66OhhMfpmTsBX_LHu-3QKCeKUO4v3Kl8W0hgHRdsJSUe9ZKuU6_8nnZmGyp6kgUnHKBqVy6cf9ZnYDWWLIz2VZqBMr26ol8j8-MtqFe7LPbfQifwCRcTsU3UMny9XPyM9U3HXNTxSajKeAEf",
+                "title": "nvidia.com"
+              }
+            },
+            {
+              "web": {
+                "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQF0fviVGAtw999bE0-gflX197NMMGdXML4FYZGEzZxz6vwMSU_-qi8pfoibrUORGC6WdRMPDLvCqg8mNMJxHKbZxZA2H0pBy5gWhiuZXj5dT8AShttNuBqP9Kma-i4hYQ6gmZUslbVCZ2pVpcKaJ0FOJObgcnHUyCeWocVvQP8yKYRdpM2BCEuAPPH9ZVW03lAb-klXhKyaeBVG8uEqsg6R4j7eNqQ=",
+                "title": "coreweave.com"
+              }
+            }
+          ],
+          "groundingSupports": [
+            {
+              "segment": {
+                "endIndex": 118,
+                "text": "The first full week of April 2026 has seen a major shift from \"experimentation\" to \"production\" in the AI agent space."
+              },
+              "groundingChunkIndices": [
+                0
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 567,
+                "endIndex": 734,
+                "text": "*   **Microsoft Agent Framework 1.0:** Released on April 3 (GA status confirmed this week), this marks the official production-ready milestone for its open-source SDK."
+              },
+              "groundingChunkIndices": [
+                1,
+                2
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 735,
+                "endIndex": 882,
+                "text": "It unifies **Semantic Kernel** (for enterprise connectors) and **AutoGen** (for multi-agent orchestration) into a single stack for .NET and Python."
+              },
+              "groundingChunkIndices": [
+                2,
+                1
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 883,
+                "endIndex": 998,
+                "text": "Key features include stable APIs, checkpointing for long-running workflows, and \"human-in-the-loop\" approval gates."
+              },
+              "groundingChunkIndices": [
+                2
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 999,
+                "endIndex": 1084,
+                "text": "*   **Agent Governance Toolkit:** An open-source security shield released on April 8."
+              },
+              "groundingChunkIndices": [
+                0,
+                3
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1085,
+                "endIndex": 1282,
+                "text": "It provides a runtime layer to block \"rogue agent\" behavior and address the **OWASP Top 10** risks for agentic AI (like goal hijacking and memory poisoning) with sub-millisecond policy enforcement."
+              },
+              "groundingChunkIndices": [
+                0
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 1808,
+                "endIndex": 2011,
+                "text": "*   **Project Glasswing:** Announced on April 7, this is a large-scale initiative using a specialized model, **Claude Mythos Preview**, to autonomously identify and fix critical software vulnerabilities."
+              },
+              "groundingChunkIndices": [
+                4
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2341,
+                "endIndex": 2542,
+                "text": "*   **OpenAI Frontier:** This is positioned as a \"unified operating layer\" for business, allowing agents to move across a company's disparate internal systems rather than being trapped in a single app."
+              },
+              "groundingChunkIndices": [
+                5
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2544,
+                "endIndex": 2720,
+                "text": "*   **The AI Super App:** OpenAI is merging ChatGPT, Codex, and agentic browsing into a unified interface designed to act as the primary \"command center\" for human-agent teams."
+              },
+              "groundingChunkIndices": [
+                5,
+                6
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2730,
+                "endIndex": 2768,
+                "text": "Specialised & Financial Infrastructure"
+              },
+              "groundingChunkIndices": [
+                7
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 2769,
+                "endIndex": 2978,
+                "text": "*   **B.AI Financial Infrastructure:** Launched globally on April 9, B.AI provides the \"plumbing\" for the agent economy—integrating blockchain-based identity (the 8004 protocol) and payments (x402 standard)."
+              },
+              "groundingChunkIndices": [
+                7
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 3365,
+                "endIndex": 3387,
+                "text": "Hardware & Physical AI"
+              },
+              "groundingChunkIndices": [
+                8,
+                9
+              ]
+            },
+            {
+              "segment": {
+                "startIndex": 3672,
+                "endIndex": 3957,
+                "text": "*   **CoreWeave & Meta $21B Expansion:** Meta signed a massive agreement on April 9 to secure AI cloud capacity through 2032, specifically for the initial deployments of the **NVIDIA Vera Rubin** platform, which is expected to power the next generation of large-scale agentic training."
+              },
+              "groundingChunkIndices": [
+                10
+              ]
+            }
+          ],
+          "webSearchQueries": [
+            "recent AI agent framework releases April 2026",
+            "AI agent infrastructure news April 2026",
+            "Microsoft AI agent infrastructure news April 2026",
+            "NVIDIA AI agent infrastructure announcements April 2026",
+            "OpenAI agent infrastructure updates April 2026",
+            "Anthropic agentic infrastructure announcements April 2026",
+            "top AI agent infrastructure announcements April 2026 week 1"
+          ]
+        },
+        "index": 0
+      }
+    ],
+    "modelVersion": "gemini-3-flash-preview",
+    "responseId": "jODXafK4M7Kb_uMPvpvjgAQ",
+    "usageMetadata": {
+      "promptTokenCount": 12,
+      "candidatesTokenCount": 858,
+      "totalTokenCount": 870,
+      "promptTokensDetails": [
+        {
+          "modality": "TEXT",
+          "tokenCount": 12
+        }
+      ]
+    }
+  }
+}

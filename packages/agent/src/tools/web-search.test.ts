@@ -6,28 +6,27 @@ const originalEnv = {
   VERCEL_API_KEY: process.env.VERCEL_API_KEY,
 };
 
-const createResponseMock = mock(async (_request: unknown) => ({
-  output: [],
-  output_text: "",
-  usage: { input_tokens: 0, output_tokens: 0 },
+const generateTextMock = mock(async (_request: unknown) => ({
+  sources: [],
+  text: "",
+  usage: { inputTokens: 0, outputTokens: 0 },
 }));
 
-mock.module("openai", () => {
-  class MockOpenAI {
-    responses: { create: typeof createResponseMock };
-
-    constructor(_config: { apiKey: string; baseURL?: string }) {
-      this.responses = { create: createResponseMock };
-    }
-  }
-
-  return { default: MockOpenAI };
+const perplexitySearchMock = mock((_options?: unknown) => ({ type: "perplexity-search-tool", _options }));
+const gatewayTools = { perplexitySearch: perplexitySearchMock };
+const providerModelMock = mock((_modelId: string) => ({ id: _modelId }));
+const createOpenAIMock = mock((_config: { apiKey: string; baseURL?: string }) => {
+  const provider = ((modelId: string) => providerModelMock(modelId)) as any;
+  return provider;
 });
+
+mock.module("ai", () => ({ generateText: generateTextMock }));
+mock.module("@ai-sdk/gateway", () => ({ gateway: { tools: gatewayTools } }));
+mock.module("@ai-sdk/openai", () => ({ createOpenAI: createOpenAIMock }));
 
 const { detectSearchProvider, resolveVercelAuth } = await import("./web-search");
 const {
-  countVercelSearchCalls,
-  extractVercelCitations,
+  extractVercelSources,
   vercelWebSearch,
 } = await import("./web-search-vercel");
 
@@ -35,12 +34,18 @@ beforeEach(() => {
   process.env.MAGNITUDE_SEARCH_PROVIDER = originalEnv.MAGNITUDE_SEARCH_PROVIDER;
   process.env.AI_GATEWAY_API_KEY = originalEnv.AI_GATEWAY_API_KEY;
   process.env.VERCEL_API_KEY = originalEnv.VERCEL_API_KEY;
-  createResponseMock.mockReset();
-  createResponseMock.mockImplementation(async (_request: unknown) => ({
-    output: [],
-    output_text: "",
-    usage: { input_tokens: 0, output_tokens: 0 },
+  generateTextMock.mockReset();
+  generateTextMock.mockImplementation(async (_request: unknown) => ({
+    sources: [],
+    text: "",
+    usage: { inputTokens: 0, outputTokens: 0 },
   }));
+
+  perplexitySearchMock.mockReset();
+  perplexitySearchMock.mockImplementation((_options?: unknown) => ({ type: "perplexity-search-tool", _options }));
+
+  providerModelMock.mockReset();
+  createOpenAIMock.mockClear();
 });
 
 afterEach(() => {
@@ -101,118 +106,33 @@ describe("web-search vercel auth resolution", () => {
 });
 
 describe("web-search-vercel normalization", () => {
-  test("extracts url_citation annotations with deduplication", () => {
-    const result = extractVercelCitations([
-      {
-        type: "message",
-        content: [
-          {
-            type: "output_text",
-            annotations: [
-              { type: "url_citation", title: "Example", url: "https://example.com" },
-              { type: "url_citation", title: "Example duplicate", url: "https://example.com" },
-              { type: "other", title: "Ignore", url: "https://ignored.com" },
-            ],
-          },
-        ],
-      },
-    ]);
-
-    expect(result).toEqual([
-      {
-        tool_use_id: "vercel-search",
-        content: [{ title: "Example", url: "https://example.com" }],
-      },
-    ]);
-  });
-
-  test("falls back to web_search_call sources and preserves titles when present", () => {
-    const result = extractVercelCitations([
-      {
-        type: "web_search_call",
-        action: {
-          sources: [
-            { title: "Alpha", url: "https://alpha.test" },
-            "https://beta.test",
-            { title: "Alpha duplicate", url: "https://alpha.test" },
-          ],
-        },
-      },
+  test("extracts normalized AI SDK sources with deduplication", () => {
+    const result = extractVercelSources([
+      { title: "Example", url: "https://example.com" },
+      { title: "Example duplicate", url: "https://example.com" },
+      { title: "Href fallback", href: "https://href.test" },
+      { title: "No URL" },
     ]);
 
     expect(result).toEqual([
       {
         tool_use_id: "vercel-search",
         content: [
-          { title: "Alpha", url: "https://alpha.test" },
-          { title: "https://beta.test", url: "https://beta.test" },
+          { title: "Example", url: "https://example.com" },
+          { title: "Href fallback", url: "https://href.test" },
         ],
       },
     ]);
   });
 
-  test("prefers url_citation annotations over fallback action sources", () => {
-    const result = extractVercelCitations([
-      {
-        type: "message",
-        content: [
-          {
-            type: "output_text",
-            annotations: [
-              { type: "url_citation", title: "Canonical", url: "https://example.com" },
-            ],
-          },
-        ],
-      },
-      {
-        type: "web_search_call",
-        action: {
-          sources: [{ title: "Ignored fallback", url: "https://fallback.test" }],
-        },
-      },
-    ]);
-
-    expect(result).toEqual([
-      {
-        tool_use_id: "vercel-search",
-        content: [{ title: "Canonical", url: "https://example.com" }],
-      },
-    ]);
-  });
-
-  test("counts web search calls", () => {
-    expect(
-      countVercelSearchCalls([
-        { type: "message" },
-        { type: "web_search_call" },
-        { type: "web_search_call" },
-      ]),
-    ).toBe(2);
-  });
-
-  test("normalizes a successful Vercel response and always uses fixed gpt-5.4", async () => {
-    createResponseMock.mockImplementation(async () => ({
-      output: [
-        {
-          type: "message",
-          content: [
-            {
-              type: "output_text",
-              annotations: [
-                { type: "url_citation", title: "Example", url: "https://example.com" },
-              ],
-            },
-          ],
-        },
-        {
-          type: "web_search_call",
-          action: {
-            sources: [{ title: "Ignored by annotation precedence", url: "https://example.com" }],
-          },
-        },
+  test("normalizes a successful Vercel AI SDK response and uses gateway perplexity search tool", async () => {
+    generateTextMock.mockImplementation(async () => ({
+      sources: [
+        { title: "Example", url: "https://example.com" },
+        { title: "Duplicate", url: "https://example.com" },
       ],
-      output_text: "Answer text",
-      usage: { input_tokens: 21, output_tokens: 9 },
+      text: "Answer text",
+      usage: { inputTokens: 21, outputTokens: 9 },
     }));
 
     const result = await vercelWebSearch("query", { type: "api-key", value: "vercel-key" }, {
@@ -237,35 +157,55 @@ describe("web-search-vercel normalization", () => {
       },
     });
 
-    expect(createResponseMock.mock.calls[0]?.[0]).toMatchObject({
-      model: "openai/gpt-5.4",
-      input: "query",
-      instructions: "Be concise",
-      include: ["web_search_call.action.sources"],
-      tools: [
-        {
-          type: "web_search",
-          filters: { allowed_domains: ["example.com"] },
-        },
-      ],
+    expect(createOpenAIMock.mock.calls[0]?.[0]).toEqual({
+      apiKey: "vercel-key",
+      baseURL: "https://ai-gateway.vercel.sh/v1",
+    });
+
+    expect(providerModelMock.mock.calls[0]?.[0]).toBe("anthropic/claude-sonnet-4.6");
+    expect(generateTextMock.mock.calls[0]?.[0]).toMatchObject({
+      prompt: "query",
+      system: "Be concise",
+      tools: {
+        perplexity_search: { type: "perplexity-search-tool", _options: { searchDomainFilter: ["example.com"] } },
+      },
+    });
+
+    expect(perplexitySearchMock.mock.calls[0]?.[0]).toEqual({ searchDomainFilter: ["example.com"] });
+  });
+
+  test("defaults model when options.model is not provided", async () => {
+    await vercelWebSearch("query", { type: "api-key", value: "vercel-key" });
+
+    expect(providerModelMock.mock.calls[0]?.[0]).toBe("openai/gpt-5.4");
+  });
+
+  test("maps blocked domains to deny-list searchDomainFilter", async () => {
+    await vercelWebSearch("query", { type: "api-key", value: "vercel-key" }, {
+      blocked_domains: ["reddit.com", "x.com"],
+    });
+
+    expect(perplexitySearchMock.mock.calls[0]?.[0]).toEqual({
+      searchDomainFilter: ["-reddit.com", "-x.com"],
     });
   });
 
-  test("ignores options.model for Vercel search requests", async () => {
+  test("prefers allowed domains when both allowed and blocked are provided", async () => {
     await vercelWebSearch("query", { type: "api-key", value: "vercel-key" }, {
-      model: "anthropic/claude-haiku-4.5",
+      allowed_domains: ["example.com"],
+      blocked_domains: ["reddit.com"],
     });
 
-    expect(createResponseMock.mock.calls[0]?.[0]).toMatchObject({
-      model: "openai/gpt-5.4",
+    expect(perplexitySearchMock.mock.calls[0]?.[0]).toEqual({
+      searchDomainFilter: ["example.com"],
     });
   });
 
   test("handles responses with no citations gracefully", async () => {
-    createResponseMock.mockImplementation(async () => ({
-      output: [{ type: "message", content: [{ type: "output_text", annotations: [] }] }],
-      output_text: "No sources found",
-      usage: { input_tokens: 5, output_tokens: 3 },
+    generateTextMock.mockImplementation(async () => ({
+      sources: [],
+      text: "No sources found",
+      usage: { inputTokens: 5, outputTokens: 3 },
     }));
 
     const result = await vercelWebSearch("query", { type: "api-key", value: "vercel-key" });
@@ -273,5 +213,32 @@ describe("web-search-vercel normalization", () => {
     expect(result.results).toEqual([]);
     expect(result.textResponse).toBe("No sources found");
     expect(result.usage.web_search_requests).toBe(0);
+  });
+
+  test("falls back to step and tool-result sources when top-level sources are empty", async () => {
+    generateTextMock.mockImplementation(async () => ({
+      sources: [],
+      steps: [
+        {
+          sources: [{ title: "From step", url: "https://step.example" }],
+          toolResults: [{ sources: [{ title: "From tool", url: "https://tool.example" }] }],
+        },
+      ],
+      text: "Answer with sources",
+      usage: { inputTokens: 8, outputTokens: 4 },
+    }));
+
+    const result = await vercelWebSearch("query", { type: "api-key", value: "vercel-key" });
+
+    expect(result.results).toEqual([
+      {
+        tool_use_id: "vercel-search",
+        content: [
+          { title: "From step", url: "https://step.example" },
+          { title: "From tool", url: "https://tool.example" },
+        ],
+      },
+    ]);
+    expect(result.usage.web_search_requests).toBe(1);
   });
 });

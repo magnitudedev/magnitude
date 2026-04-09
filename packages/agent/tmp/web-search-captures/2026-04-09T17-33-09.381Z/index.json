@@ -1,0 +1,55 @@
+{
+  "root": "2026-04-09T17-33-09.381Z",
+  "generatedAt": "2026-04-09T17:33:57.029Z",
+  "runs": [
+    {
+      "runId": "openai-api",
+      "provider": "openai",
+      "authMode": "api",
+      "status": "auth-missing",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/openai-api"
+    },
+    {
+      "runId": "openai-oauth",
+      "provider": "openai",
+      "authMode": "oauth",
+      "status": "success",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/openai-oauth"
+    },
+    {
+      "runId": "openrouter",
+      "provider": "openrouter",
+      "authMode": "api",
+      "status": "success",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/openrouter"
+    },
+    {
+      "runId": "vercel",
+      "provider": "vercel",
+      "authMode": "api",
+      "status": "provider-error",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/vercel"
+    },
+    {
+      "runId": "github-copilot",
+      "provider": "github-copilot",
+      "authMode": "oauth",
+      "status": "provider-error",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/github-copilot"
+    },
+    {
+      "runId": "gemini",
+      "provider": "gemini",
+      "authMode": "api",
+      "status": "success",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/gemini"
+    },
+    {
+      "runId": "anthropic-api",
+      "provider": "anthropic",
+      "authMode": "api",
+      "status": "success",
+      "artifactDir": "/Users/trg/magnitude/packages/agent/tmp/web-search-captures/2026-04-09T17-33-09.381Z/anthropic-api"
+    }
+  ]
+}

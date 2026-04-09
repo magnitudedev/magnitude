@@ -1,0 +1,15 @@
+{
+  "runId": "anthropic-oauth",
+  "provider": "anthropic",
+  "authMode": "oauth",
+  "query": "What are the top AI agent infrastructure announcements this week?",
+  "timestamp": "2026-04-09T17:23:15.385Z",
+  "notes": [
+    "mode:router",
+    "Missing ANTHROPIC_OAUTH_TOKEN"
+  ],
+  "prerequisites": {
+    "authPresent": false
+  },
+  "status": "auth-missing"
+}

@@ -1,0 +1,318 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_0bc9f8329b256d9a0169d7e2d5d00c8195a5ea4ea2340da64a","object":"response","created_at":1775755989,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.2-2025-12-11","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"16d48b45-384e-4771-b939-67872643d512","prompt_cache_retention":null,"reasoning":{"effort":"none","summary":null},"safety_identifier":"user-12bZLyl8v9AgHTzQD2neyED1","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"web_search","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_0bc9f8329b256d9a0169d7e2d5d00c8195a5ea4ea2340da64a","object":"response","created_at":1775755989,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.2-2025-12-11","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"16d48b45-384e-4771-b939-67872643d512","prompt_cache_retention":null,"reasoning":{"effort":"none","summary":null},"safety_identifier":"user-12bZLyl8v9AgHTzQD2neyED1","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"web_search","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"ws_0bc9f8329b256d9a0169d7e2d63eb4819585847de3a6e44729","type":"web_search_call","status":"in_progress"},"output_index":0,"sequence_number":2}
+
+event: response.web_search_call.in_progress
+data: {"type":"response.web_search_call.in_progress","item_id":"ws_0bc9f8329b256d9a0169d7e2d63eb4819585847de3a6e44729","output_index":0,"sequence_number":3}
+
+event: response.web_search_call.searching
+data: {"type":"response.web_search_call.searching","item_id":"ws_0bc9f8329b256d9a0169d7e2d63eb4819585847de3a6e44729","output_index":0,"sequence_number":4}
+
+event: response.web_search_call.completed
+data: {"type":"response.web_search_call.completed","item_id":"ws_0bc9f8329b256d9a0169d7e2d63eb4819585847de3a6e44729","output_index":0,"sequence_number":5}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"ws_0bc9f8329b256d9a0169d7e2d63eb4819585847de3a6e44729","type":"web_search_call","status":"completed","action":{"type":"search","queries":["AI news headlines April 9 2026","artificial intelligence regulation news April 9 2026","OpenAI news April 9 2026","NVIDIA AI news April 9 2026"],"query":"AI news headlines April 9 2026","sources":[{"type":"url","url":"https://en.wikipedia.org/wiki/No_Fakes_Act"},{"type":"url","url":"https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real"},{"type":"url","url":"https://en.wikipedia.org/wiki/Rubin_%28microarchitecture%29"},{"type":"url","url":"https://aiforum.org.uk/the-ai-forum-weekly-briefing-april-06-2026/"},{"type":"url","url":"https://investor.nvidia.com/news/press-release-details/2025/NVIDIA-Announces-Financial-Results-for-First-Quarter-Fiscal-2026/default.aspx"},{"type":"url","url":"https://www.mediapost.com/publications/article/414071/openai-becomes-the-voice-of-ai.html"},{"type":"url","url":"https://aiweekly.co/learning-ai/artificial-intelligence/ai-business-news-openai-122b-round-anthropic-acquisition-oracle"},{"type":"url","url":"https://en.wikipedia.org/wiki/India_AI_Impact_Summit_2026"},{"type":"url","url":"https://en.wikipedia.org/wiki/GPT-5.4"},{"type":"url","url":"https://de.wikipedia.org/wiki/Rubin_%28Grafikprozessor%29"},{"type":"url","url":"https://en.wikipedia.org/wiki/Responsible_AI_Safety_and_Education_Act"},{"type":"url","url":"https://www.readaboutai.com/april-9-2026/"},{"type":"url","url":"https://blogs.nvidia.com/blog/2026-ces-special-presentation/"},{"type":"url","url":"https://blogs.nvidia.com/blog/gtc-2026-news/"},{"type":"url","url":"https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html"},{"type":"url","url":"https://arxiv.org/abs/2601.08869"},{"type":"url","url":"https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/"},{"type":"url","url":"https://www.networkworld.com/article/3562856/nvidia-latest-news-and-insights.html"},{"type":"url","url":"https://arxiv.org/abs/2604.06215"},{"type":"url","url":"https://www.morningstar.com/news/business-wire/20260325206649/nvidia-google-and-oracle-take-center-stage-at-data-center-world-2026-as-ai-drives-unprecedented-infrastructure-and-power-demands"},{"type":"url","url":"https://arxiv.org/abs/2604.00237"},{"type":"url","url":"https://arxiv.org/abs/2603.27785"},{"type":"url","url":"https://www.reddit.com/r/u_enoumen/comments/1rmoavs/ai_daily_news_rundown_march_06th_2026_gpt54_beats/"},{"type":"url","url":"https://www.reddit.com/r/u_enoumen/comments/1s9s8eq/ai_daily_news_rundown_openais_122b_megaraise/"},{"type":"url","url":"https://nvidianews.nvidia.com/_gallery/download_pdf/6837703d3d63320fddb3a9ee/"},{"type":"url","url":"https://amos37.com/wp-content/uploads/2025/04/NEWS-UPDATE-APRIL-9-2025.pdf"}]}},"output_index":0,"sequence_number":6}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"ws_0bc9f8329b256d9a0169d7e2d9289c8195a3d818170697f022","type":"web_search_call","status":"in_progress"},"output_index":1,"sequence_number":7}
+
+event: response.web_search_call.in_progress
+data: {"type":"response.web_search_call.in_progress","item_id":"ws_0bc9f8329b256d9a0169d7e2d9289c8195a3d818170697f022","output_index":1,"sequence_number":8}
+
+event: response.web_search_call.searching
+data: {"type":"response.web_search_call.searching","item_id":"ws_0bc9f8329b256d9a0169d7e2d9289c8195a3d818170697f022","output_index":1,"sequence_number":9}
+
+event: response.web_search_call.completed
+data: {"type":"response.web_search_call.completed","item_id":"ws_0bc9f8329b256d9a0169d7e2d9289c8195a3d818170697f022","output_index":1,"sequence_number":10}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"ws_0bc9f8329b256d9a0169d7e2d9289c8195a3d818170697f022","type":"web_search_call","status":"completed","action":{"type":"search","queries":["site:reuters.com artificial intelligence April 9 2026","site:apnews.com artificial intelligence April 9 2026","site:theverge.com AI April 9 2026","EU AI Act latest April 2026 frontier models enforcement"],"query":"site:reuters.com artificial intelligence April 9 2026","sources":[{"type":"url","url":"https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai"},{"type":"url","url":"https://arxiv.org/abs/2601.11916"},{"type":"url","url":"https://aiwire.ai/articles/eu-ai-act-enforcement-first-fines-2026"},{"type":"url","url":"https://en.wikipedia.org/wiki/Anthropic%27s_Responsible_Scaling_Policy"},{"type":"url","url":"https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act"},{"type":"url","url":"https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670"},{"type":"url","url":"https://arxiv.org/abs/2510.14053"},{"type":"url","url":"https://arxiv.org/abs/2601.04094"},{"type":"url","url":"https://arxiv.org/abs/2512.12443"},{"type":"url","url":"https://www.consilium.europa.eu/en/press/press-releases/2024/05/21/artificial-intelligence-ai-act-council-gives-final-green-light-to-the-first-worldwide-rules-on-ai/"},{"type":"url","url":"https://digital-strategy.ec.europa.eu/en/policies/regulatory-framework-ai"},{"type":"url","url":"https://euairisk.com/news/2025-10-03"},{"type":"url","url":"https://openai.com/global-affairs/a-primer-on-the-eu-ai-act/"},{"type":"url","url":"https://en.wikipedia.org/wiki/Responsible_AI_Safety_and_Education_Act"},{"type":"url","url":"https://en.wikipedia.org/wiki/Transparency_in_Frontier_Artificial_Intelligence_Act"},{"type":"url","url":"https://euairisk.com/news/2025-09-06"},{"type":"url","url":"https://commission.europa.eu/news-and-media/news/ai-act-enters-force-2024-08-01_en"},{"type":"url","url":"https://artificialintelligenceact.eu/enforcement-of-chapter-v-under-the-eu-ai-act/"},{"type":"url","url":"https://www.consilium.europa.eu/en/press/press-releases/2024/05/21/artificial-intelligence-ai-act-council-gives-final-green-light-to-the-first-worldwide-rules-on-ai/pdf?trk=public_post_comment-text"},{"type":"url","url":"https://en.wikipedia.org/wiki/General-Purpose_AI_Code_of_Practice"},{"type":"url","url":"https://en.wikipedia.org/wiki/European_Artificial_Intelligence_Office"},{"type":"url","url":"https://axis-intelligence.com/eu-ai-act-news-2026/"}]}},"output_index":1,"sequence_number":11}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":2,"sequence_number":12}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":13}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Here are **top AI headlines","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"ELbeT","output_index":2,"sequence_number":14}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" for today (Thu, April ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"qDYvMdUH3","output_index":2,"sequence_number":15}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"9, 202","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"Xeo95LFlVY","output_index":2,"sequence_number":16}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"6)**, with sources.","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"zuXd2Y2cQRg8C","output_index":2,"sequence_number":17}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" (Because “today” is time-sensitive","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"7pwhXgk3Vhm1E","output_index":2,"sequence_number":18}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":", I pulled items published within","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"ZWyaiPqhBPnV6nk","output_index":2,"sequence_number":19}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" the past few days","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"k75xv9qGLTWK4C","output_index":2,"sequence_number":20}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" where possible.)\n\n1","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"25RfcgSxmDZJ","output_index":2,"sequence_number":21}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":") **EU Commission","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"EPXoOerkcyUsSzS","output_index":2,"sequence_number":22}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" opens call for experts","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"UG0TYpMn7","output_index":2,"sequence_number":23}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" for a “Front","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"vEI","output_index":2,"sequence_number":24}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"ier AI” forum","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"xJ3","output_index":2,"sequence_number":25}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" (first meeting","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"s","output_index":2,"sequence_number":26}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" April 23,","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"I7kYMt","output_index":2,"sequence_number":27}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 2026)","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"ePRYP2G6EO","output_index":2,"sequence_number":28}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**\n   -","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"tPi9CPRTm","output_index":2,"sequence_number":29}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Source: European Commission","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"3DeF","output_index":2,"sequence_number":30}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" — Shaping Europe","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"TLV0w9tMlfkg7Rb","output_index":2,"sequence_number":31}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"’s Digital Future","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"v9jhtY83PabUH8r","output_index":2,"sequence_number":32}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":". ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"LMmCebt95zCyue","output_index":2,"sequence_number":33}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai))\n","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"2w","output_index":2,"sequence_number":34}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","end_index":490,"start_index":349,"title":"Commission seeks experts for forum on Frontier AI | Shaping Europe’s digital future","url":"https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai"},"annotation_index":0,"content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"sequence_number":35}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"\n2) **Open","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"rFhAlH","output_index":2,"sequence_number":36}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"AI publishes a policy","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"KvMwyZ87PZF","output_index":2,"sequence_number":37}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" vision for the","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"a","output_index":2,"sequence_number":38}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" AI economy (e","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"Ng","output_index":2,"sequence_number":39}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".g., public wealth","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"bh4L0wTQrswDs3","output_index":2,"sequence_number":40}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" funds, robot taxes","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"gMDwzDGQqCbjO","output_index":2,"sequence_number":41}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":", four-day","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"7Rlg2i","output_index":2,"sequence_number":42}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" workweek)**","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"W8YL","output_index":2,"sequence_number":43}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"\n   - Source:","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"k1h","output_index":2,"sequence_number":44}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" TechCrunch (","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"IoZ","output_index":2,"sequence_number":45}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Apr 6,","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"DS6xYwd21P","output_index":2,"sequence_number":46}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 2026).","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"uJ8ZnTm0w","output_index":2,"sequence_number":47}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"p5AARS9D1QUS0F2","output_index":2,"sequence_number":48}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))  \n   -","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"QlNCR3","output_index":2,"sequence_number":49}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","end_index":813,"start_index":650,"title":"OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek | TechCrunch","url":"https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"},"annotation_index":1,"content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"sequence_number":50}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Additional coverage: Yahoo","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"pG88Y","output_index":2,"sequence_number":51}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"/Tech (","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"xsnPlhgKm","output_index":2,"sequence_number":52}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Apr 6,","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"a7WYQnyANf","output_index":2,"sequence_number":53}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 2026).","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"mbnxeFRXS","output_index":2,"sequence_number":54}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"btKIqDyJFxpuG0w","output_index":2,"sequence_number":55}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"([tech.yahoo.com](https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai))\n\n3) **NVIDIA/AI chips","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"XV31M2rZM3T","output_index":2,"sequence_number":56}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","end_index":979,"start_index":868,"title":"OpenAI Touts 4-Day Work Week, Wealth Fund to Sell Public on Next-Gen AI","url":"https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai"},"annotation_index":2,"content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"sequence_number":57}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" + robotics:","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"QU5v","output_index":2,"sequence_number":58}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Serve Robotics unveils an AI conversational robot (“","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"HH5y0NINFW3","output_index":2,"sequence_number":59}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Maggie”) at NVIDIA G","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"JjgoDR8SDcgc","output_index":2,"sequence_number":60}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"TC 2026","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"1HjcoYR2q","output_index":2,"sequence_number":61}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**\n   -","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"f3zTiYNld","output_index":2,"sequence_number":62}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Source: Simply","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"L","output_index":2,"sequence_number":63}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Wall St (Apr 8, 2026).","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"SP2dTOPcK","output_index":2,"sequence_number":64}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"RfZc2CEjnCIVmaj","output_index":2,"sequence_number":65}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"([simplywall.st](https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai))","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"CIzy9aJV","output_index":2,"sequence_number":66}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","end_index":1307,"start_index":1139,"title":"This Week In AI Chips - AI Meets Robotics Revolutionizing Real-World Interactions - Simply Wall St News","url":"https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai"},"annotation_index":3,"content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"sequence_number":67}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"\n\n4) **EU AI Act timeline clarification: full application","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"UGG1G0B","output_index":2,"sequence_number":68}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" date and staggered","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"VYqlQQd6rL6jp","output_index":2,"sequence_number":69}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" provisions**\n   - Source","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"yiobIGS","output_index":2,"sequence_number":70}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":": EU Commission FAQ (“","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"1r5lJVl6Du","output_index":2,"sequence_number":71}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Navigating the AI Act”) noting","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"KB","output_index":2,"sequence_number":72}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" broad application **2","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"Dy7a5vJFMI","output_index":2,"sequence_number":73}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" years after entry into force","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"qFz","output_index":2,"sequence_number":74}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" (Aug 2","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"IuOfCkqhq","output_index":2,"sequence_number":75}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":", 202","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"ErXrGmeMTW7","output_index":2,"sequence_number":76}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"6)** with exceptions.","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"Eb7WrjPbG7E","output_index":2,"sequence_number":77}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"f5wzSqCM1UlUViS","output_index":2,"sequence_number":78}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai))  \n   -","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"OZ2sj","output_index":2,"sequence_number":79}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","end_index":1661,"start_index":1545,"title":"Navigating the AI Act | Shaping Europe’s digital future","url":"https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai"},"annotation_index":4,"content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"sequence_number":80}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Background on enforcement model","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"","output_index":2,"sequence_number":81}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":": European Parliament","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"hANybQn2n1Z","output_index":2,"sequence_number":82}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Research Service (Mar","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"fgdIHWYlns","output_index":2,"sequence_number":83}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 17, ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"yfmF3Uzy9Ly","output_index":2,"sequence_number":84}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"2026).","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"aTnQug6hPq","output_index":2,"sequence_number":85}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"dwnXvadsVb4AQO9","output_index":2,"sequence_number":86}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"([europarl.europa.eu](https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai))","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"W75Kti8YS","output_index":2,"sequence_number":87}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","end_index":1874,"start_index":1755,"title":"Enforcement of the AI Act | Think Tank | European Parliament","url":"https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai"},"annotation_index":5,"content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"sequence_number":88}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"\n\nIf you tell","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"qIn","output_index":2,"sequence_number":89}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" me whether you want","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"1BimCooKwJ7v","output_index":2,"sequence_number":90}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **business/investing","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"rnhjRjx1zz9","output_index":2,"sequence_number":91}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**, **policy/reg","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"","output_index":2,"sequence_number":92}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"ulation**, or","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"odP","output_index":2,"sequence_number":93}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **research-only**","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"4vLA6cZUzDzRiB","output_index":2,"sequence_number":94}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" headlines (and how","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"m8qhJbXvRnEQ3","output_index":2,"sequence_number":95}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" many—e.g","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"BievcYD","output_index":2,"sequence_number":96}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"., top ","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"Z2Jxu12rR","output_index":2,"sequence_number":97}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"10), I can","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"4t5cVK","output_index":2,"sequence_number":98}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" refine the list to","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"ArHwrYyF5qAlw","output_index":2,"sequence_number":99}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" that slice of AI","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"hlsVEN8DJKqkZOE","output_index":2,"sequence_number":100}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" news.","item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"obfuscation":"Eku5F2BvwX","output_index":2,"sequence_number":101}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","logprobs":[],"output_index":2,"sequence_number":102,"text":"Here are **top AI headlines for today (Thu, April 9, 2026)**, with sources. (Because “today” is time-sensitive, I pulled items published within the past few days where possible.)\n\n1) **EU Commission opens call for experts for a “Frontier AI” forum (first meeting April 23, 2026)**\n   - Source: European Commission — Shaping Europe’s Digital Future. ([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai))\n\n2) **OpenAI publishes a policy vision for the AI economy (e.g., public wealth funds, robot taxes, four-day workweek)**\n   - Source: TechCrunch (Apr 6, 2026). ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))  \n   - Additional coverage: Yahoo/Tech (Apr 6, 2026). ([tech.yahoo.com](https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai))\n\n3) **NVIDIA/AI chips + robotics: Serve Robotics unveils an AI conversational robot (“Maggie”) at NVIDIA GTC 2026**\n   - Source: Simply Wall St (Apr 8, 2026). ([simplywall.st](https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai))\n\n4) **EU AI Act timeline clarification: full application date and staggered provisions**\n   - Source: EU Commission FAQ (“Navigating the AI Act”) noting broad application **2 years after entry into force (Aug 2, 2026)** with exceptions. ([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai))  \n   - Background on enforcement model: European Parliament Research Service (Mar 17, 2026). ([europarl.europa.eu](https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai))\n\nIf you tell me whether you want **business/investing**, **policy/regulation**, or **research-only** headlines (and how many—e.g., top 10), I can refine the list to that slice of AI news."}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","output_index":2,"part":{"type":"output_text","annotations":[{"type":"url_citation","end_index":490,"start_index":349,"title":"Commission seeks experts for forum on Frontier AI | Shaping Europe’s digital future","url":"https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai"},{"type":"url_citation","end_index":813,"start_index":650,"title":"OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek | TechCrunch","url":"https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"},{"type":"url_citation","end_index":979,"start_index":868,"title":"OpenAI Touts 4-Day Work Week, Wealth Fund to Sell Public on Next-Gen AI","url":"https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai"},{"type":"url_citation","end_index":1307,"start_index":1139,"title":"This Week In AI Chips - AI Meets Robotics Revolutionizing Real-World Interactions - Simply Wall St News","url":"https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai"},{"type":"url_citation","end_index":1661,"start_index":1545,"title":"Navigating the AI Act | Shaping Europe’s digital future","url":"https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai"},{"type":"url_citation","end_index":1874,"start_index":1755,"title":"Enforcement of the AI Act | Think Tank | European Parliament","url":"https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai"}],"logprobs":[],"text":"Here are **top AI headlines for today (Thu, April 9, 2026)**, with sources. (Because “today” is time-sensitive, I pulled items published within the past few days where possible.)\n\n1) **EU Commission opens call for experts for a “Frontier AI” forum (first meeting April 23, 2026)**\n   - Source: European Commission — Shaping Europe’s Digital Future. ([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai))\n\n2) **OpenAI publishes a policy vision for the AI economy (e.g., public wealth funds, robot taxes, four-day workweek)**\n   - Source: TechCrunch (Apr 6, 2026). ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))  \n   - Additional coverage: Yahoo/Tech (Apr 6, 2026). ([tech.yahoo.com](https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai))\n\n3) **NVIDIA/AI chips + robotics: Serve Robotics unveils an AI conversational robot (“Maggie”) at NVIDIA GTC 2026**\n   - Source: Simply Wall St (Apr 8, 2026). ([simplywall.st](https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai))\n\n4) **EU AI Act timeline clarification: full application date and staggered provisions**\n   - Source: EU Commission FAQ (“Navigating the AI Act”) noting broad application **2 years after entry into force (Aug 2, 2026)** with exceptions. ([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai))  \n   - Background on enforcement model: European Parliament Research Service (Mar 17, 2026). ([europarl.europa.eu](https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai))\n\nIf you tell me whether you want **business/investing**, **policy/regulation**, or **research-only** headlines (and how many—e.g., top 10), I can refine the list to that slice of AI news."},"sequence_number":103}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_0bc9f8329b256d9a0169d7e2dbf5748195897410ca7295f74b","type":"message","status":"completed","content":[{"type":"output_text","annotations":[{"type":"url_citation","end_index":490,"start_index":349,"title":"Commission seeks experts for forum on Frontier AI | Shaping Europe’s digital future","url":"https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai"},{"type":"url_citation","end_index":813,"start_index":650,"title":"OpenAI’s vision for the AI economy: public wealth funds, robot taxes, and a four-day workweek | TechCrunch","url":"https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai"},{"type":"url_citation","end_index":979,"start_index":868,"title":"OpenAI Touts 4-Day Work Week, Wealth Fund to Sell Public on Next-Gen AI","url":"https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai"},{"type":"url_citation","end_index":1307,"start_index":1139,"title":"This Week In AI Chips - AI Meets Robotics Revolutionizing Real-World Interactions - Simply Wall St News","url":"https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai"},{"type":"url_citation","end_index":1661,"start_index":1545,"title":"Navigating the AI Act | Shaping Europe’s digital future","url":"https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai"},{"type":"url_citation","end_index":1874,"start_index":1755,"title":"Enforcement of the AI Act | Think Tank | European Parliament","url":"https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai"}],"logprobs":[],"text":"Here are **top AI headlines for today (Thu, April 9, 2026)**, with sources. (Because “today” is time-sensitive, I pulled items published within the past few days where possible.)\n\n1) **EU Commission opens call for experts for a “Frontier AI” forum (first meeting April 23, 2026)**\n   - Source: European Commission — Shaping Europe’s Digital Future. ([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/news/commission-seeks-experts-forum-frontier-ai?utm_source=openai))\n\n2) **OpenAI publishes a policy vision for the AI economy (e.g., public wealth funds, robot taxes, four-day workweek)**\n   - Source: TechCrunch (Apr 6, 2026). ([techcrunch.com](https://techcrunch.com/2026/04/06/openais-vision-for-the-ai-economy-public-wealth-funds-robot-taxes-and-a-four-day-work-week/?utm_source=openai))  \n   - Additional coverage: Yahoo/Tech (Apr 6, 2026). ([tech.yahoo.com](https://tech.yahoo.com/ai/articles/openai-touts-4-day-week-181924589.html?utm_source=openai))\n\n3) **NVIDIA/AI chips + robotics: Serve Robotics unveils an AI conversational robot (“Maggie”) at NVIDIA GTC 2026**\n   - Source: Simply Wall St (Apr 8, 2026). ([simplywall.st](https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/news/this-week-in-ai-chips-ai-meets-robotics-revolutionizing-real?utm_source=openai))\n\n4) **EU AI Act timeline clarification: full application date and staggered provisions**\n   - Source: EU Commission FAQ (“Navigating the AI Act”) noting broad application **2 years after entry into force (Aug 2, 2026)** with exceptions. ([digital-strategy.ec.europa.eu](https://digital-strategy.ec.europa.eu/en/faqs/navigating-ai-act?utm_source=openai))  \n   - Background on enforcement model: European Parliament Research Service (Mar 17, 2026). ([europarl.europa.eu](https://www.europarl.europa.eu/thinktank/en/document/EPRS_ATA%282026%29785670?utm_source=openai))\n\nIf you tell me whether you want **business/investing**, **policy/regulation**, or **research-only** headlines (and how many—e.g., top 10), I can refine the list to that slice of AI news."}],"role":"assistant"},"output_index":2,"sequence_number":104}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_0bc9f8329b256d9a0169d7e2d5d00c8195a5ea4ea2340da64a","object":"response","created_at":1775755989,"status":"completed","background":false,"completed_at":1775756002,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.2-2025-12-11","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"16d48b45-384e-4771-b939-67872643d512","prompt_cache_retention":null,"reasoning":{"effort":"none","summary":null},"safety_identifier":"user-12bZLyl8v9AgHTzQD2neyED1","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"web_search","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"input_tokens":12633,"input_tokens_details":{"cached_tokens":4352},"output_tokens":604,"output_tokens_details":{"reasoning_tokens":193},"total_tokens":13237},"user":null,"metadata":{}},"sequence_number":105}
+

@@ -1,0 +1,21 @@
+{
+  "present": true,
+  "client": {
+    "provider": "google",
+    "apiKeyConfigured": true
+  },
+  "args": {
+    "model": "gemini-3-flash-preview",
+    "contents": "What are the top AI agent infrastructure announcements this week?",
+    "config": {
+      "tools": [
+        {
+          "googleSearch": {}
+        }
+      ],
+      "thinkingConfig": {
+        "thinkingLevel": "LOW"
+      }
+    }
+  }
+}

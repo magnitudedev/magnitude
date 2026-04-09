@@ -120,6 +120,8 @@ async function codexWebSearch(
   let buffer = "";
   let completedResponse: any = null;
   let textResponse = "";
+  const streamedOutputItems = new Map<number, any>();
+  const streamedOutputItemsWithoutIndex: any[] = [];
 
   while (true) {
     const { done, value } = await reader.read();
@@ -138,6 +140,18 @@ async function codexWebSearch(
         const event = JSON.parse(data);
         if (event.type === "response.output_text.delta") {
           textResponse += event.delta ?? "";
+        } else if (event.type === "response.output_item.done" && event.item) {
+          const outputIndex =
+            typeof event.output_index === "number"
+              ? event.output_index
+              : typeof event.item.output_index === "number"
+                ? event.item.output_index
+                : null;
+          if (typeof outputIndex === "number") {
+            streamedOutputItems.set(outputIndex, event.item);
+          } else {
+            streamedOutputItemsWithoutIndex.push(event.item);
+          }
         } else if (event.type === "response.completed") {
           completedResponse = event.response;
         }
@@ -147,8 +161,14 @@ async function codexWebSearch(
     }
   }
 
-  // Extract citations from the completed response
-  const outputItems = completedResponse?.output ?? [];
+  const completedOutputItems = completedResponse?.output ?? [];
+  const assembledOutputItems = [
+    ...Array.from(streamedOutputItems.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([, item]) => item),
+    ...streamedOutputItemsWithoutIndex,
+  ];
+  const outputItems = completedOutputItems.length > 0 ? completedOutputItems : assembledOutputItems;
   const results = extractCitations(outputItems);
 
   return {

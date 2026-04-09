@@ -1,0 +1,14 @@
+{
+  "runId": "anthropic-api",
+  "provider": "anthropic",
+  "authMode": "api",
+  "query": "What are the top AI news headlines today? Include sources.",
+  "timestamp": "2026-04-09T17:33:48.260Z",
+  "notes": [
+    "mode:router"
+  ],
+  "prerequisites": {
+    "authPresent": true
+  },
+  "status": "success"
+}

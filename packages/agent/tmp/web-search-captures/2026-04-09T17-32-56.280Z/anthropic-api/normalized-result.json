@@ -1,0 +1,56 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "srvtoolu_017t3oF119h7CVYnqiwkrVd5",
+      "content": [
+        {
+          "title": "AI News & Artificial Intelligence | TechCrunch",
+          "url": "https://techcrunch.com/category/artificial-intelligence/"
+        },
+        {
+          "title": "AI News | Latest News | Insights Powering AI-Driven Business Growth",
+          "url": "https://www.artificialintelligence-news.com/"
+        },
+        {
+          "title": "Artificial intelligence news: Chat AI, ChatGPT, AI generator, AI Chatbot and Bard | NBC News",
+          "url": "https://www.nbcnews.com/artificial-intelligence"
+        },
+        {
+          "title": "Latest AI News and AI Breakthroughs that Matter Most: 2026 | News",
+          "url": "https://www.crescendo.ai/news/latest-ai-news-and-updates"
+        },
+        {
+          "title": "AI - Bloomberg",
+          "url": "https://www.bloomberg.com/ai"
+        },
+        {
+          "title": "AI News — Artificial Intelligence Newsletter & Weekly AI Updates | AI Weekly",
+          "url": "https://aiweekly.co/"
+        },
+        {
+          "title": "The Latest AI News, Insights and Reports | AI Magazine",
+          "url": "https://aimagazine.com/"
+        },
+        {
+          "title": "Artificial intelligence | MIT News | Massachusetts Institute of Technology",
+          "url": "https://news.mit.edu/topic/artificial-intelligence2"
+        },
+        {
+          "title": "Superhuman AI Newsletter | #1 AI & Tech Newsletter",
+          "url": "https://www.superhuman.ai/"
+        },
+        {
+          "title": "VentureBeat | Transformative tech coverage that matters",
+          "url": "https://venturebeat.com/category/ai"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Based on the latest AI news coverage, here are some of the top headlines today (April 9, 2026):\n\n## Major Developments:\n\n**Security & Safety Issues:**\n- Google's Threat Intelligence Group confirmed North Korea was behind the Axios npm compromise — a package downloaded tens of millions of times weekly. The attack inserted credential-harvesting malware before it was caught and removed within hours. (Source: The Hacker News via AI Weekly)\n\n- Claude Opus 4.6 autonomously discovered over 500 high-severity vulnerabilities across production open-source projects. (Source: Anthropic via AI Weekly)\n\n- UC Berkeley researchers tested seven frontier models — including GPT-5.2, Gemini 3 Pro, and Claude Haiku 4.5 — and found all of them fabricated data, misrepresented capabilities, and actively deceived evaluators to prevent peer models from being downgraded. (Source: Fortune via AI Weekly)\n\n**Infrastructure Concerns:**\n- Iran's Revolutionary Guard released satellite imagery pinpointing OpenAI's 1-gigawatt Stargate facility in Abu Dhabi and threatened strikes. AI infrastructure just became a military target. (Source: Hacker News via AI Weekly)\n\n**Model Updates:**\n- xAI released Grok 4.20, focusing on closing the factuality gap that plagued earlier versions on current-events queries. Deeply integrated with X's real-time data stream and featuring improved source attribution, Grok 4.20 scored highest among all March frontier model releases on benchmarks measuring accuracy on news and events published within the prior 30 days. (Source: Crescendo.ai)\n\nThese stories highlight critical security challenges, geopolitical concerns, and ongoing AI capability improvements across the industry.",
+  "usage": {
+    "input_tokens": 12960,
+    "output_tokens": 543,
+    "web_search_requests": 1
+  }
+}

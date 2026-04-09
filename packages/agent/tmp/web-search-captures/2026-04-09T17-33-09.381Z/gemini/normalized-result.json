@@ -1,0 +1,48 @@
+{
+  "query": "What are the top AI news headlines today? Include sources.",
+  "results": [
+    {
+      "tool_use_id": "gemini-search",
+      "content": [
+        {
+          "title": "247wallst.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHZ7yKjeI_OGaf4wa1TEQIGuI8d7CyGRIFBXqK8jP2BTrOKVGa-azic_sT1Y3i6WS2U920OD9mOjWVzmx-OhxknC0Nfnz-Axukt144lrKRIVUq6v8k8cWw_uir0QhXy_ym0yJYW4hHlFv32NkAnKu6vrWF_4S0_jmjtkLmmoicCCnbdXyYSsMmT2b2N9f8Vs_MX_kKa86P9csSee1ID7IjalTYCtvZnX0h48njFncC1r6UXXCij6Fh0jw=="
+        },
+        {
+          "title": "247wallst.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGj3pxKK6xoAiQ24kBI4Yc6NuZ5eZ0l_b6ePwj1hQKCFDKbJ_CDEjXRgP0olukGFsScrqhC0Eox8l5DhtL5EU9Kbv1OZ1t7OIUR4fhVozpMySmMjIy31oXyKE34LY4IBzAWFAsDO9c5iaQ6_DMkTXlCUOaan_uYhAkzAE54GAfqyAG7zNo5kBem6afhNlq8JQ9DKY01phK1WX3_1u_Ik-2zrq6M-MCdc2vRruLckC4D-iUuy3PlVT6FuIgR7RVrAw=="
+        },
+        {
+          "title": "intel.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHxcBSeNp68jvNjn26Jf2PVhhsilUnjsTErNOUxfObV3tpRUEr2J6HtkFT_ExxZOB3PYgljW_Icg-mUwDFjv2xxpoUMaudaLjmfurgxFQvIOpGRGCAIgTGqoR6AZkcGPQd6JLe03YvTi7_hOZyVDA2vnxjMbtbOtfiL2fgowhBDco7A9wPRiEselcDiC7u4ON8jq5opZ_D4f--OiN-OmZw="
+        },
+        {
+          "title": "morningstar.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQH4hgB7HNTrJ-bUTOKoSf626LOyLPX8II8ZjJDkdL-q16SmNwkvUvTHi6SQY6YCbT8unpYTyb8Dxzaf0F3MkJEpCnE7j8_roxKDAY4bfpY5Icc9cHcrsnrpCCWsSj2347vh8ElJm6sanUJBdxEYYR80393SUlCzst3g_GM9e-ZJaaCucK9YqR7EMJc7KoTNxn4uMshILkNe-KTptbtcubVLr1skNmAHrgayhoryCV2kMnrWnaQon4kkkv73b0TF2PxOYdXx_fAnZONjgeydh2CCMqBRv8e_jqED03E83ZhI"
+        },
+        {
+          "title": "canada.ca",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFDcfg0leIztQyPpiAEcnPY8XNFdyZoxxslWenW-L-j1VpwhgKUzxzAETYFkOg57uH_2QzD4OYLzLyvR0jsgUnUkLmjk0eD_LZmqqLM35ueuky0wRPdI5tMRJHZpZ_WjmiwBMsc_-N2K5ZUN68EuGitWQKTGX6qof-gX35kSG6xFibhPSAestWtx6yAbAneyug63bTYuyqtdWLaoa88xjn-W3ZtDTaNTvhIH50KAKbd8kGnI3j2iTwzyfJ44sJKgaQF9E3shoSI-awniO18qd7Gyj8u13vd"
+        },
+        {
+          "title": "motorolasolutions.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQG53TQxXF_E-A3Y5H8Bd9ZiPGitLisHPDwu9-DzsmDOfR80yAmO1o0ZUGk2jYMGWuN9SkP0EA4GKj1uPAtkQepmzFQXUFAiSJtB0SyoGJBko0B5eRWwx0BTbdBZ6Ee97tx8xiWU9gh4jLLmaG17eRoeYwypR-UGoKRXgeNg6Wtb2ChkdQr8bRaBbNlDWMDorQM4rxlotOsXZO-SoT-JQ92XWHBt_jUP9bU="
+        },
+        {
+          "title": "caixinglobal.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQHlsg8QQw1MjRVeGbisBT4ERiU87BLwaAw5l8mWSwfCU7hKWj1Bdu9w6_J8viYom6MKeoSaMH4-b4-ALa4usWDYSvPgug4DfhoYH7RKKLztWTbFyQ_6OhvzA9LwC4hnq2MxdD3RU34fxsLzCqWslfuqvru6jPi03OKT6EZhldSxpk3h87yhJjPsTJkdvQHxKNGEbdGqVNGEal85rOPgRefOsipHxLSiGEtAk6idPTeP4Fm93w=="
+        },
+        {
+          "title": "prnewswire.com",
+          "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGI4Hb7kailfIwNlYcm050PYmQM55BJE-rpGusD4iQSP2QJNbCKqZJqcuMsTdp80AZzg3pCDpaBQFD6fcPVcEpncgEPSx1bmTuCbhTKhbaLyPk07Ym0pJEBUzGTwHExSWuSmo2U2-Ep0K5g8Qtosrcixt7yoiUTGYxGWzoNkiK8Rmscn4oaMmPxCF75-ECeRA0El9Nv2W7dzx62EhEYO8e6vfiwJnKQIn40erTLepCGbJGpaR0rnbwo"
+        }
+      ]
+    }
+  ],
+  "textResponse": "Today’s AI news is dominated by massive infrastructure investments, the rise of \"agentic\" AI, and strategic global partnerships. Here are the top headlines for Thursday, April 9, 2026:\n\n### **1. Meta and CoreWeave Ink Massive $21 Billion AI Cloud Deal**\nIn one of the largest single-customer infrastructure commitments to date, **Meta** has expanded its agreement with **CoreWeave** for dedicated AI cloud capacity through 2032. This $21 billion deal brings Meta’s total commitment to CoreWeave to $35.2 billion. The capacity is earmarked for inference workloads and will include early deployments of Nvidia’s next-generation \"Vera Rubin\" platform.\n*   **Source:** *24/7 Wall St.*\n\n### **2. Google and Intel Deepen Collaboration on AI Systems**\n**Intel** and **Google** announced a multiyear partnership focused on scaling modern, heterogeneous AI systems. The collaboration emphasizes that AI doesn't run on accelerators (GPUs) alone; it requires robust CPUs for orchestration. Google Cloud will continue to deploy Intel Xeon processors for its AI and inference workloads while co-developing custom ASIC-based infrastructure processing units (IPUs).\n*   **Source:** *Intel Newsroom*\n\n### **3. IDC Forecasts $22.5 Trillion AI Economy by 2031**\nAt its \"Directions 2026\" event, research firm **IDC** unveiled data showing that AI is entering a \"supercycle\" defined by infrastructure buildout and enterprise adoption. IDC predicts AI will generate **$22.5 trillion** in cumulative global economic value by 2031. A key trend highlighted is the shift from human-led buying processes to \"agentic\" decision systems.\n*   **Source:** *Morningstar / IDC Research*\n\n### **4. Canada Launches AI-Powered Hybrid Weather Model**\nThe Canadian government has officially launched a groundbreaking hybrid weather forecasting model that combines traditional physics-based methods with AI. This new system is expected to provide warnings for major events like winter storms and heat waves **8 to 24 hours earlier** than previous models, significantly improving public safety and emergency readiness.\n*   **Source:** *Government of Canada (canada.ca)*\n\n### **5. Motorola Solutions Acquires \"Hyper\" to Automate 911 Calls**\n**Motorola Solutions** has acquired **Hyper**, a leader in conversational, agentic AI. The goal is to address staffing shortages at emergency call centers by using AI agents to handle non-emergency calls, allowing human dispatchers to focus on critical life-saving interventions.\n*   **Source:** *Motorola Solutions Newsroom*\n\n### **6. China Cracks Down on AI-Modified Videos**\nChina’s National Radio and Television Administration reported a major enforcement action against \"unauthorized\" AI-altered content. Following a targeted campaign, regulators removed over **29,000 videos** involving historical figures and classic TV dramas that were modified using AI without proper authorization.\n*   **Source:** *Caixin Global*\n\n### **7. BMO Establishes Institute for Applied AI & Quantum**\n**Bank of Montreal (BMO)** has launched a new enterprise-wide Centre of Excellence focused on the responsible innovation and governance of AI and Quantum technologies. The institute aims to embed AI more deeply into banking operations to enhance client experiences and productivity.\n*   **Source:** *PR Newswire*",
+  "usage": {
+    "input_tokens": 13,
+    "output_tokens": 730,
+    "web_search_requests": 1
+  }
+}

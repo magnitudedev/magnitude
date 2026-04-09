@@ -150,6 +150,43 @@ describe('web search OpenRouter integration', () => {
     expect(capturedUrl).toBe('https://chatgpt.com/backend-api/codex/responses')
   })
 
+  test('openai oauth assembles source-bearing output items from SSE when completed output is empty', async () => {
+    const encoder = new TextEncoder()
+    const sseBody = [
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","action":{"sources":[{"url":"https://example.com/source-a"},{"url":"https://example.com/source-b"}]}}}\n',
+      'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"Answer with sources","annotations":[{"type":"url_citation","title":"Example A","url":"https://example.com/source-a"},{"type":"url_citation","title":"Example B","url":"https://example.com/source-b"}]}]}}\n',
+      'data: {"type":"response.completed","response":{"output_text":"Answer with sources","output":[],"usage":{"input_tokens":5,"output_tokens":7}}}\n',
+      'data: [DONE]\n',
+    ].join('\n')
+
+    const result = await withPatchedFetch(
+      (async () =>
+        new Response(encoder.encode(sseBody), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })) as any,
+      () => runWebSearch('latest news', 'openai', {
+        openai: { type: 'oauth', accessToken: 'oauth-token' },
+      }),
+    )
+
+    expect(result.textResponse).toBe('Answer with sources')
+    expect(result.results).toEqual([
+      {
+        tool_use_id: 'openai-search',
+        content: [
+          { title: 'Example A', url: 'https://example.com/source-a' },
+          { title: 'Example B', url: 'https://example.com/source-b' },
+        ],
+      },
+    ])
+    expect(result.usage).toEqual({
+      input_tokens: 5,
+      output_tokens: 7,
+      web_search_requests: 1,
+    })
+  })
+
   test('no search-capable lead/workers errors clearly', async () => {
     await expect(runWebSearch('latest news', {
       lead: { providerId: 'amazon-bedrock' },

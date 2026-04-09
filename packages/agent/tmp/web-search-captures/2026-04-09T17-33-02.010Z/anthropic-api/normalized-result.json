@@ -1,0 +1,56 @@
+{
+  "query": "What are the top AI agent infrastructure announcements this week?",
+  "results": [
+    {
+      "tool_use_id": "srvtoolu_01C47SbzSEihqrdktHxJ5Zsb",
+      "content": [
+        {
+          "title": "Daily AI Agent News - Last 7 Days",
+          "url": "https://aiagentstore.ai/ai-agent-news/this-week"
+        },
+        {
+          "title": "Latest AI News and AI Breakthroughs that Matter Most: 2026 | News",
+          "url": "https://www.crescendo.ai/news/latest-ai-news-and-updates"
+        },
+        {
+          "title": "AI agents that automatically prevent, detect and fix software issues are here as NeuBird AI launches Falcon, FalconClaw | VentureBeat",
+          "url": "https://venturebeat.com/security/ai-agents-that-automatically-prevent-detect-and-fix-software-issues-are-here"
+        },
+        {
+          "title": "Visa, Mastercard expand agentic AI deployments | PaymentsSource | American Banker",
+          "url": "https://www.americanbanker.com/payments/news/visa-mastercard-expand-agentic-ai-deployments"
+        },
+        {
+          "title": "Infrastructure & City Planning Agentic AI News - Week Ending 2026-04-07 (Detailed)",
+          "url": "https://aiagentstore.ai/ai-agent-news/topic/infrastructure-city/2026-04-07/detailed"
+        },
+        {
+          "title": "Daily AI Agent News - October 2025",
+          "url": "https://aiagentstore.ai/ai-agent-news/2025-october"
+        },
+        {
+          "title": "Top 5 AI Announcements Reshaping the Global Artificial Intelligence Market",
+          "url": "https://www.astuteanalytica.com/news/top-5-ai-announcements-global-artificial-intelligence-market"
+        },
+        {
+          "title": "Announcing Azure Copilot agents and AI infrastructure innovations | Microsoft Azure Blog",
+          "url": "https://azure.microsoft.com/en-us/blog/announcing-azure-copilot-agents-and-ai-infrastructure-innovations/"
+        },
+        {
+          "title": "Agentic AI recent news | AI Business",
+          "url": "https://aibusiness.com/generative-ai/agentic-ai"
+        },
+        {
+          "title": "Daily AI Agent News Roundup — March 20, 2026",
+          "url": "https://harness-engineering.ai/blog/daily-ai-agent-news-roundup-march-20-2026-3/"
+        }
+      ]
+    }
+  ],
+  "textResponse": "I'll search for recent AI agent infrastructure announcements this week.Based on the latest news, here are the top AI agent infrastructure announcements this week:\n\n## Key Announcements\n\n**Microsoft's Agent Governance Toolkit**: Microsoft released the Agent Governance Toolkit, an open-source security shield for AI agents protecting against 10 critical attack types—goal hijacking, memory poisoning, and rogue agents. The toolkit works instantly (under 0.1 milliseconds) to block dangerous agent actions before they execute.\n\n**NeuBird AI's Falcon Agent**: NeuBird AI announced its next-generation agent, codenamed Falcon, which is three times faster than its predecessor and is averaging around 92% in confidence scores. Falcon represents a significant leap in its ability to forecast failure and is particularly good at preventive prediction. The company raised $19.3 million in funding.\n\n**Microsoft and MYOB Partnership**: Microsoft and MYOB announced a five-year partnership to bring AI agents directly into small business tools, with MYOB using Microsoft's Agent 365 for governance and deploying customer-facing agents that forecast cash flow and guide compliance.\n\n**Automation Anywhere IT Support Results**: Automation Anywhere revealed that AI agents auto-resolve over 80% of IT support requests, cutting IT service management costs by up to 50%—potentially saving large enterprises over $5 million annually.\n\n**MCP Protocol Becoming Industry Standard**: Every major AI provider now ships MCP-compatible tooling, and the Linux Foundation announced it would take Anthropic's MCP under open governance, further cementing its status as industry-wide shared infrastructure.\n\n**Payment Network Expansions**: Visa has deployed advanced artificial intelligence to help solve payment disputes and expedite corporate bill pay; while Mastercard adds Hong Kong to its global agentic commerce network.",
+  "usage": {
+    "input_tokens": 16818,
+    "output_tokens": 606,
+    "web_search_requests": 1
+  }
+}
