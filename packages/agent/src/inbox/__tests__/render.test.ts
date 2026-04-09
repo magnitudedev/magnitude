@@ -4,6 +4,10 @@ import type { ContentPart } from '../../content'
 import type { ResultEntry, TimelineEntry } from '../types'
 import { formatInbox } from '../render'
 import { formatInterrupted, formatNoop } from '../render-results'
+import {
+  USER_MESSAGE_RESPONSE_REMINDER,
+  WORKER_PROGRESS_USER_MESSAGE_REMINDER,
+} from '../../prompts/lead-communication-reminders'
 
 const lifecycleReminderFormatters = {
   builder: {
@@ -36,12 +40,16 @@ describe('formatInbox', () => {
     ])
   })
 
-  test('timeline-only single user message includes marker', () => {
+  test('timeline-only single user message includes marker and user reply reminder', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'hello', attachments: [] },
     ]
     expect(formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })).toEqual([
-      { type: 'text', text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>' },
+      {
+        type: 'text',
+        text:
+          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n</reminders>`,
+      },
     ])
   })
 
@@ -71,6 +79,11 @@ describe('formatInbox', () => {
         text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
       },
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
+      {
+        type: 'text',
+        text:
+          `\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n</reminders>`,
+      },
     ])
   })
 
@@ -84,7 +97,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<message from="user">a</message>\n\n--- 16:01 ---\n<message from="user">b</message>',
+          `--- 2024-03-28 16:00 ---\n<message from="user">a</message>\n\n--- 16:01 ---\n<message from="user">b</message>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n</reminders>`,
       },
     ])
   })
@@ -98,7 +111,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:01 ---\n<message from="user">second</message>\n\n--- 16:00 ---\n<message from="user">first</message>',
+        `--- 2024-03-28 16:01 ---\n<message from="user">second</message>\n\n--- 16:00 ---\n<message from="user">first</message>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n</reminders>`,
     })
   })
 
@@ -132,7 +145,8 @@ describe('formatInbox', () => {
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
       {
         type: 'text',
-        text: '\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>',
+        text:
+          `\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n- Builder spawned: builder-z\n</reminders>`,
       },
     ])
   })
@@ -167,7 +181,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:00 ---\n<message from="user">first-input</message>\n<message from="user">second-input</message>',
+        `--- 2024-03-28 16:00 ---\n<message from="user">first-input</message>\n<message from="user">second-input</message>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n</reminders>`,
     })
   })
 
@@ -190,7 +204,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n${TURN_CONTROL_IDLE}\n</agent>\n\n<reminders>\n- Builder idle: builder-a\n</reminders>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n${TURN_CONTROL_IDLE}\n</agent>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n- Builder idle: builder-a\n</reminders>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
     })
   })
 
@@ -280,7 +294,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<task_updates>\n- Task t1 created: "Title" (implement)\n</task_updates>',
+          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n</reminders>\n\n<task_updates>\n- Task t1 created: "Title" (implement)\n</task_updates>`,
       },
     ])
   })
@@ -316,7 +330,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="error"/>\n</${END_TURN_TAG}>\n</agent>\n\n<reminders>\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="error"/>\n</${END_TURN_TAG}>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
     })
   })
 
@@ -378,7 +392,98 @@ describe('formatInbox', () => {
     expect(text).toEqual({
       type: 'text',
       text:
-        '--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n<workflow_phase name="wf" phase="2/3">phase text</workflow_phase>\n<phase_criteria name="c1" status="passed" type="agent" agent="a1"/>\n<phase_verdict passed="true"><verdict/></phase_verdict>\n<skill name="skill" phase="p1">start</skill>\n<skill_completed name="skill"/>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>',
+        `--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n<workflow_phase name="wf" phase="2/3">phase text</workflow_phase>\n<phase_criteria name="c1" status="passed" type="agent" agent="a1"/>\n<phase_verdict passed="true"><verdict/></phase_verdict>\n<skill name="skill" phase="p1">start</skill>\n<skill_completed name="skill"/>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n- Builder spawned: builder-z\n</reminders>`,
     })
+  })
+
+  test('does not render user reply reminder when no user_message is present', () => {
+    const timeline: readonly TimelineEntry[] = [
+      { kind: 'parent_message', timestamp: TS0, text: 'from parent' },
+      { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '--- 2024-03-28 16:00 ---\n<message from="parent">from parent</message>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>',
+      },
+    ])
+  })
+
+  test('does not render worker progress reminder for agent_block without to_lead message atom', () => {
+    const timeline: readonly TimelineEntry[] = [
+      {
+        kind: 'agent_block',
+        timestamp: TS0,
+        firstAtomTimestamp: TS0,
+        lastAtomTimestamp: TS2,
+        agentId: 'builder-x',
+        role: 'builder',
+        atoms: [
+          { kind: 'thought', timestamp: TS0, text: 'thinking' },
+          {
+            kind: 'tool_call',
+            timestamp: TS1,
+            toolCallId: 'tc1',
+            tagName: 'read',
+            attributes: { path: 'src/a.ts' },
+            status: 'success',
+          },
+          { kind: 'error', timestamp: TS2, message: 'oops' },
+        ],
+      },
+      { kind: 'lifecycle_hook', timestamp: TS3, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="working">\nthinking\n<read path="src/a.ts"/>\n<error>oops</error>\n</agent>\n\n<reminders>\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>',
+      },
+    ])
+  })
+
+  test('does not render worker progress reminder for lifecycle_hook/task_idle_hook alone', () => {
+    const timeline: readonly TimelineEntry[] = [
+      { kind: 'lifecycle_hook', timestamp: TS0, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
+      { kind: 'task_idle_hook', timestamp: TS1, taskId: 't1', taskType: 'implement', title: 'Build thing', agentId: 'builder-z' },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          '<reminders>\n- Builder spawned: builder-z\n- Worker builder-z for task t1 ("Build thing") has finished. Review output and either send feedback or mark complete.\n</reminders>',
+      },
+    ])
+  })
+
+  test('renders both communication reminders together when user and worker messages are present', () => {
+    const timeline: readonly TimelineEntry[] = [
+      { kind: 'user_message', timestamp: TS0, text: 'hello', attachments: [] },
+      {
+        kind: 'agent_block',
+        timestamp: TS1,
+        firstAtomTimestamp: TS1,
+        lastAtomTimestamp: TS1,
+        agentId: 'builder-x',
+        role: 'builder',
+        atoms: [{ kind: 'message', timestamp: TS1, direction: 'to_lead', text: 'progress update' }],
+      },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text:
+          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<agent id="builder-x" role="builder" status="working">\n<message to="lead">progress update</message>\n</agent>\n\n<reminders>\n- ${USER_MESSAGE_RESPONSE_REMINDER}\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>`,
+      },
+    ])
   })
 })

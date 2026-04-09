@@ -1,4 +1,8 @@
 import { ContentPartBuilder, type ContentPart } from '../content'
+import {
+  USER_MESSAGE_RESPONSE_REMINDER,
+  WORKER_PROGRESS_USER_MESSAGE_REMINDER,
+} from '../prompts'
 import { formatTaskTypeReminder } from '../tasks/guidance'
 import type { TaskTypeId } from '../tasks'
 import type { AgentAtom, LifecycleReminderFormatterMap, PhaseCriteriaPayload, ResultEntry, TimelineEntry } from './types'
@@ -268,6 +272,10 @@ function buildTaskIdleReminderLines(
   )
 }
 
+function hasWorkerToLeadMessage(entry: Extract<TimelineEntry, { kind: 'agent_block' }>): boolean {
+  return entry.atoms.some(atom => atom.kind === 'message' && atom.direction === 'to_lead')
+}
+
 function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update' }>): string {
   if (entry.action === 'created') {
     const title = entry.title ? `: "${entry.title}"` : ''
@@ -367,7 +375,14 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     }
   }
 
+  const hasUserMessage = chronological.some((entry) => entry.kind === 'user_message')
+  const hasWorkerMessage = chronological.some(
+    (entry) => entry.kind === 'agent_block' && hasWorkerToLeadMessage(entry),
+  )
+
   const reminderLines = [
+    ...(hasUserMessage ? [USER_MESSAGE_RESPONSE_REMINDER] : []),
+    ...(hasWorkerMessage ? [WORKER_PROGRESS_USER_MESSAGE_REMINDER] : []),
     ...buildLifecycleReminderLines(lifecycleHooks, input.lifecycleReminderFormatters),
     ...buildTaskTypeReminderLines(taskTypeHooks),
     ...buildTaskIdleReminderLines(taskIdleHooks),
