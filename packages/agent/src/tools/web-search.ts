@@ -127,7 +127,7 @@ export function detectSearchProvider(providerId: string | null): SearchProvider 
     default:
       throw new Error(
         `Web search is not supported with the "${providerId}" provider. ` +
-        `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
+        `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
       );
   }
 }
@@ -163,8 +163,8 @@ function tryDetectSearchProvider(providerId: string | null): SearchProvider | nu
 
 function getUnsupportedSearchError(): Error {
   return new Error(
-    `No supported web-search backend is configured on the lead or worker slots. ` +
-    `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
+    `Current provider does not support web search. ` +
+    `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
   );
 }
 

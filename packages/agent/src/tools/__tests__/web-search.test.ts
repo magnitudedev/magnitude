@@ -298,12 +298,14 @@ describe('web search integration', () => {
     })
   })
 
-  test('no search-capable lead/workers errors clearly', async () => {
+  test('no search-capable lead/workers errors clearly with full provider guidance', async () => {
     await expect(runWebSearch('latest news', {
       lead: { providerId: 'amazon-bedrock' },
       explorer: { providerId: 'google-vertex-anthropic' },
       builder: { providerId: null },
-    })).rejects.toThrow('No supported web-search backend is configured on the lead or worker slots')
+    })).rejects.toThrow(
+      'Current provider does not support web search. To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: anthropic, openai, gemini, openrouter, vercel, github-copilot.',
+    )
   })
 
   test('MAGNITUDE_SEARCH_PROVIDER=openrouter overrides provider detection', async () => {
