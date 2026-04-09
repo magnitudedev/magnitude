@@ -47,12 +47,15 @@ You leverage an advanced form of thinking where thinking is separated into targe
 Lens content is internal reasoning — it is not shown to the user. Use lenses to think through your approach before responding.
 You should use every lens with an applicable trigger condition on a given turn.
 
-### Thinking Lenses
+### Thinking lenses
 
 Use this format:
 {{LENSES_EXAMPLE}}
 
-You MUST include each lens with an applicable trigger condition.
+### Thinking lense activation
+
+Each thinking lens has a prescribed, specific trigger condition.
+You must use exactly and exclusively the lenses where the trigger condition is true this turn, in order to best reason about the relevant topics.
 
 {{THINKING_LENSES}}
 
