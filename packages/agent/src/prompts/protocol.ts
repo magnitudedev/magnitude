@@ -61,8 +61,10 @@ export function buildAckTurn(
   lenses: ThinkingLens[],
   defaultRecipient: 'user' | 'parent' = 'user',
 ): string {
-  return `<${LENS_TAG} name="turn">Send message to "demo" and idle</${LENS_TAG}>
-<${MESSAGE_TAG} to="demo">Hello, I understand how to respond</${MESSAGE_TAG}>
+  const lensName = lenses.find(lens => lens.name === 'turn')?.name ?? lenses[0]?.name ?? 'turn'
+
+  return `<${LENS_TAG} name="${lensName}">Acknowledge readiness and continue.</${LENS_TAG}>
+<${MESSAGE_TAG} to="${defaultRecipient}">Ready.</${MESSAGE_TAG}>
 ${TURN_CONTROL_CONTINUE}
 `
 }

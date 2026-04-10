@@ -6,6 +6,7 @@ import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
 import toolingSectionRaw from '../agents/prompts/lead-tooling.txt' with { type: 'text' }
 import subagentBaseRaw from '../agents/prompts/subagent-base.txt' with { type: 'text' }
 import { renderTaskTypeReferenceTable } from '../tasks/guidance'
+import fewShotNoteRaw from './protocol/few-shot-note.txt' with { type: 'text' }
 //import workspaceRaw from '../agents/prompts/workspace.txt' with { type: 'text' }
 
 export function compilePromptTemplate(raw: string): string {
@@ -35,4 +36,5 @@ export function renderSystemPrompt(
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)
     .replaceAll('{{TASK_TYPES}}', renderTaskTypeReferenceTable())
     //.replaceAll('{{WORKSPACE_SECTION}}', workspaceRaw)
+    + '\n\n' + fewShotNoteRaw
 }

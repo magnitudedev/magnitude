@@ -24,12 +24,16 @@ function CodingAgentChat(
 
     {%if ackTurn %}
     {{ _.role("user") }}
+    --- FEW-SHOT EXAMPLE START ---
     <system>
-    To demonstrate understanding of the response format, send a message to the recipient "demo" saying "Hello, I understand how to respond" and then idle.
+    Respond using the required turn format. Send a brief readiness message to your default recipient and continue.
     </system>
 
     {{ _.role("assistant") }}
     {{ ackTurn }}
+
+    {{ _.role("user") }}
+    --- FEW-SHOT EXAMPLE END ---
     {%endif%}
     {% for message in messages %}
     {% if message.role == "user" %}
