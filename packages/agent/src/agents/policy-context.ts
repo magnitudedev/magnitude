@@ -31,7 +31,9 @@ export function createPolicyContextProvider(
         cwd,
         workspacePath,
         activeAgentCount: [...agentStatuses.agents.values()].filter((a: AgentInfo) => a.status === 'working').length,
-        userMessagePending: forkTurnState.triggers.some((trigger) => trigger._tag === 'user_message'),
+        userMessagePending: forkTurnState.pendingInboundCommunications.some(
+          (message) => message.source === 'user'
+        ),
         disableShellSafeguards: ephemeralSessionContext.disableShellSafeguards,
         disableCwdSafeguards: ephemeralSessionContext.disableCwdSafeguards,
         agents: [...agentStatuses.agents.values()].map((a: AgentInfo) => ({
