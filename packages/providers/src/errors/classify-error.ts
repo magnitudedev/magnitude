@@ -14,8 +14,23 @@ const CONTEXT_LIMIT_PATTERNS = [
   'exceeded model token limit',
 ]
 
+const AUTH_SIGNAL_PATTERNS = [
+  'missing_scope',
+  'insufficient_scope',
+  'invalid_token',
+  'token expired',
+  'expired token',
+  'unauthorized',
+  'forbidden',
+  'authentication',
+]
+
 function hasContextLimitSignal(text: string): boolean {
   return CONTEXT_LIMIT_PATTERNS.some(pattern => text.includes(pattern))
+}
+
+function hasAuthSignal(text: string): boolean {
+  return AUTH_SIGNAL_PATTERNS.some(pattern => text.includes(pattern))
 }
 
 function parseRetryAfterMs(message: string): number | null {
@@ -36,7 +51,7 @@ export function classifyHttpError(status: number, message: string): ModelError {
   if (hasContextLimitSignal(lower)) {
     return new ContextLimitExceeded({ message })
   }
-  if (status === 401 || status === 403) {
+  if (status === 401 || status === 403 || hasAuthSignal(lower)) {
     return new AuthFailed({ message })
   }
   if (status === 429) {

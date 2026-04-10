@@ -50,7 +50,12 @@ import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
-
+import {
+  authReconnectMessage,
+  classifyRetryability,
+  isAuthReconnectMessage,
+  resolveFailureMessage,
+} from './cortex-auth'
 
 type TaggedCause = {
   readonly _tag: string
@@ -76,36 +81,6 @@ function toBamlMessages(messages: LLMMessage[]): ChatMessage[] {
     content: toLLMContent(m.content)
   }))
 }
-
-// =============================================================================
-// Error Classification
-// =============================================================================
-
-type NonRetryableReason = 'context-limit' | 'auth' | 'parse' | 'client-error' | 'not-configured' | 'disconnected' | null
-
-function classifyRetryability(error: unknown): NonRetryableReason {
-  if (error instanceof ContextLimitExceeded) return 'context-limit'
-  if (error instanceof AuthFailed) return 'auth'
-  if (error instanceof ProviderParseError) return 'parse'
-  if (error instanceof ProviderTransportError) {
-    const s = error.status
-    if (s !== null && s >= 400 && s < 500 && s !== 408 && s !== 429) return 'client-error'
-    return null
-  }
-  // Legacy BAML error fallback
-  if (error instanceof BamlClientHttpError) {
-    const s = error.status_code
-    if (s !== undefined && s >= 400 && s < 500 && s !== 408 && s !== 429) return 'client-error'
-    return null
-  }
-  if (error instanceof BamlValidationError) return 'parse'
-  return null
-}
-
-
-// =============================================================================
-// System Prompt Builder
-// =============================================================================
 
 // =============================================================================
 // Worker
@@ -184,11 +159,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const resolveResult = yield* runtime.resolve(modelSlot).pipe(Effect.either)
         if (Either.isLeft(resolveResult)) {
           const e = resolveResult.left
-          const message = e._tag === 'NotConfigured'
-            ? 'No model configured. Please connect a provider and select a model in /settings.'
-            : e._tag === 'ProviderDisconnected'
-            ? e.message
-            : `Authentication failed: ${e.message}`
+          const message = resolveFailureMessage(e)
           yield* publish({ type: 'turn_unexpected_error', forkId, turnId, message })
           return
         }
@@ -294,11 +265,19 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               const errorType = cause._tag
               const errorMessage = cause.message ?? error.message
               logger.error({ context: 'Cortex', forkId, turnId, errorType }, `Cortex: Mid-stream ModelError (${errorType}): ${errorMessage}`)
+
+              const message =
+                errorType === 'AuthFailed'
+                  ? authReconnectMessage()
+                  : errorType === 'ProviderDisconnected' && isAuthReconnectMessage(errorMessage)
+                    ? errorMessage
+                    : `Stream error (${errorType}): ${errorMessage}`
+
               yield* publish({
                 type: 'turn_unexpected_error',
                 forkId,
                 turnId,
-                message: `Stream error (${errorType}): ${errorMessage}`,
+                message,
               })
               return
             }
@@ -352,6 +331,13 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               cacheWriteTokens: null,
               providerId: resolvedProviderId,
               modelId: resolvedModelId,
+            })
+          } else if (classifyRetryability(errorCause) === 'auth') {
+            yield* publish({
+              type: 'turn_unexpected_error',
+              forkId,
+              turnId,
+              message: authReconnectMessage(),
             })
           } else {
             logger.error({

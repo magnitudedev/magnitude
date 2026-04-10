@@ -139,24 +139,34 @@ export function ensureAuth<TSlot extends string>(
 
               const refreshToken = getOAuthRefreshToken(lockedDiskAuth) ?? currentAuth.refreshToken
 
-              try {
-                const newAuth = yield* Effect.tryPromise({
-                  try: () => refreshForProvider(providerId, refreshToken),
-                  catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-                })
-                if (!newAuth) {
-                  return { action: 'unsupported' } as const
-                }
+              const refreshed = yield* Effect.tryPromise({
+                try: () => refreshForProvider(providerId, refreshToken),
+                catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+              }).pipe(
+                Effect.flatMap((newAuth) => {
+                  if (!newAuth) {
+                    return Effect.succeed({ action: 'unsupported' } as const)
+                  }
 
-                yield* auth.setAuth(providerId, newAuth)
-                return { action: 'refreshed', auth: newAuth } as const
-              } catch (error) {
-                const retryDiskAuth = yield* auth.getAuth(providerId)
-                if (isFreshOAuthAuth(retryDiskAuth)) {
-                  return { action: 'use-disk', auth: retryDiskAuth } as const
-                }
-                throw error
-              }
+                  return auth.setAuth(providerId, newAuth).pipe(
+                    Effect.as({ action: 'refreshed', auth: newAuth } as const),
+                  )
+                }),
+                Effect.catchAll((error) =>
+                  Effect.gen(function* () {
+                    logger.warn(
+                      `[ensureAuth] Refresh failed for ${providerId}; checking disk for a token refreshed by another session`,
+                    )
+                    const retryDiskAuth = yield* auth.getAuth(providerId)
+                    if (isFreshOAuthAuth(retryDiskAuth)) {
+                      return { action: 'use-disk', auth: retryDiskAuth } as const
+                    }
+                    return yield* Effect.fail(error)
+                  }),
+                ),
+              )
+
+              return refreshed
             }),
           ),
         ),
