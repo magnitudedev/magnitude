@@ -1,6 +1,6 @@
 import { TextAttributes } from '@opentui/core'
 import { blue, orange, red, slate } from '../../utils/palette'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTheme } from '../../hooks/use-theme'
 import { useTerminalWidth } from '../../hooks/use-terminal-width'
 import { useBoxWidth } from '../../hooks/use-chat-width'
@@ -18,7 +18,21 @@ import {
 import type { TaskListItem } from './types'
 
 const COLLAPSED_ROWS = 6
-const EXPANDED_ROWS = 15
+const EXPANDED_ROWS = 25
+
+export function getVisibleTasks(tasks: readonly TaskListItem[], expanded: boolean): readonly TaskListItem[] {
+  return expanded ? tasks : tasks.slice(-COLLAPSED_ROWS)
+}
+
+export function scheduleInitialTaskListSnap(
+  scrollToBottom: () => void,
+  schedule: typeof setTimeout = setTimeout,
+  cancel: typeof clearTimeout = clearTimeout,
+): () => void {
+  const t1 = schedule(scrollToBottom, 0)
+  const t2 = schedule(scrollToBottom, 50)
+  return () => { cancel(t1); cancel(t2) }
+}
 
 const PULSE_BLUE_SHADES = [
   blue[50], blue[100], blue[200], blue[300], blue[400], blue[500], blue[600], blue[700], blue[800], blue[900],
@@ -29,6 +43,7 @@ type Props = {
   tasks: readonly TaskListItem[]
   pushForkOverlay: (forkId: string) => void
   fileViewerOpen?: boolean
+  scrollRefOverride?: { current: { scrollTo: (offset: number) => void } | null }
 }
 
 type TaskRowProps = {
@@ -172,12 +187,13 @@ function TaskRow({
   )
 }
 
-export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false }: Props) {
+export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrollRefOverride }: Props) {
   const theme = useTheme()
   const [expanded, setExpanded] = useState(false)
   const [expandHovered, setExpandHovered] = useState(false)
   const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
+  const taskScrollRef = useRef<any>(null)
 
   const terminalWidth = useTerminalWidth()
   const box = useBoxWidth()
@@ -205,7 +221,11 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false }: Pro
   }, [hasWorkingTasks, tasks.length])
 
   const handleHoverEnd = useCallback(() => setHoveredTaskId(null), [])
-  const visibleTasks = expanded ? visibleAllTasks : visibleAllTasks.slice(-COLLAPSED_ROWS)
+  const snapExpandedToBottom = useCallback(() => {
+    const scrollTarget = scrollRefOverride?.current ?? taskScrollRef.current
+    scrollTarget?.scrollTo(Number.MAX_SAFE_INTEGER)
+  }, [scrollRefOverride])
+  const visibleTasks = getVisibleTasks(visibleAllTasks, expanded)
   const completedCount = visibleAllTasks.filter(task => task.status === 'completed').length
   const activeCount = visibleAllTasks.filter(task => task.status !== 'completed').length
 
@@ -222,6 +242,16 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false }: Pro
     if (!rootTask || collapsedTasks.some(t => t.taskId === rootTask.taskId)) return null
     return rootSummaries.find(root => root.task.taskId === rootTask.taskId) ?? null
   }, [expanded, rootSummaries, visibleAllTasks])
+
+  useEffect(() => {
+    if (!expanded) return
+    return scheduleInitialTaskListSnap(snapExpandedToBottom)
+  }, [expanded, snapExpandedToBottom])
+
+  useEffect(() => {
+    if (!expanded) return
+    snapExpandedToBottom()
+  }, [expanded, tasks.length, snapExpandedToBottom])
 
   if (visibleAllTasks.length === 0) return null
 
@@ -265,23 +295,65 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false }: Pro
         </box>
       )}
 
-      <box style={{ flexDirection: 'column' }}>
-        {visibleTasks.map(task => (
-          <TaskRow
-            key={task.taskId}
-            task={task}
-            effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
-            pushForkOverlay={pushForkOverlay}
-            hovered={hoveredTaskId === task.taskId}
-            onHover={setHoveredTaskId}
-            onHoverEnd={handleHoverEnd}
-            now={now}
-            taskNameWidth={taskNameWidth}
-            agentIdWidth={agentIdWidth}
-            showAssigneeColumn={showAssigneeColumn}
-          />
-        ))}
-      </box>
+      {expanded ? (
+        <scrollbox
+          ref={taskScrollRef}
+          stickyScroll
+          stickyStart="bottom"
+          scrollX={false}
+          scrollbarOptions={{ visible: false }}
+          verticalScrollbarOptions={{ visible: true, trackOptions: { width: 1 } }}
+          style={{
+            flexShrink: 0,
+            rootOptions: {
+              height: EXPANDED_ROWS,
+              flexShrink: 0,
+              backgroundColor: 'transparent',
+            },
+            wrapperOptions: {
+              border: false,
+              backgroundColor: 'transparent',
+            },
+            contentOptions: {
+              flexDirection: 'column',
+            },
+          }}
+        >
+          {visibleTasks.map(task => (
+            <TaskRow
+              key={task.taskId}
+              task={task}
+              effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
+              pushForkOverlay={pushForkOverlay}
+              hovered={hoveredTaskId === task.taskId}
+              onHover={setHoveredTaskId}
+              onHoverEnd={handleHoverEnd}
+              now={now}
+              taskNameWidth={taskNameWidth}
+              agentIdWidth={agentIdWidth}
+              showAssigneeColumn={showAssigneeColumn}
+            />
+          ))}
+        </scrollbox>
+      ) : (
+        <box style={{ flexDirection: 'column' }}>
+          {visibleTasks.map(task => (
+            <TaskRow
+              key={task.taskId}
+              task={task}
+              effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
+              pushForkOverlay={pushForkOverlay}
+              hovered={hoveredTaskId === task.taskId}
+              onHover={setHoveredTaskId}
+              onHoverEnd={handleHoverEnd}
+              now={now}
+              taskNameWidth={taskNameWidth}
+              agentIdWidth={agentIdWidth}
+              showAssigneeColumn={showAssigneeColumn}
+            />
+          ))}
+        </box>
+      )}
     </box>
   )
 }

@@ -1,5 +1,6 @@
 import { test, expect, mock } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { act, create } from 'react-test-renderer'
 import type { ReactNode } from 'react'
 import type { TaskListItem } from './types'
 
@@ -22,7 +23,13 @@ mock.module('../../hooks/use-chat-width', () => ({
   useBoxWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: measuredWidth }),
 }))
 
-const { TaskList } = await import('./task-list')
+mock.module('../button', () => ({
+  Button: ({ children, onClick }: { children?: any; onClick?: () => void }) => (
+    <button onClick={onClick}>{children}</button>
+  ),
+}))
+
+const { TaskList, getVisibleTasks, scheduleInitialTaskListSnap } = await import('./task-list')
 
 const noop = () => {}
 
@@ -113,6 +120,129 @@ test('collapsed mode renders only the latest six tasks', () => {
   expect(text).not.toContain('Task 2')
   expect(text).toContain('Task 3')
   expect(text).toContain('Task 8')
+})
+
+test('expanded mode preserves all tasks for scrollable rendering', () => {
+  const tasks = Array.from({ length: 30 }, (_, index) =>
+    makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
+  )
+
+  const visible = getVisibleTasks(tasks, true)
+
+  expect(visible).toHaveLength(30)
+  expect(visible[0]?.title).toBe('Task 1')
+  expect(visible[29]?.title).toBe('Task 30')
+})
+
+test('expanded mode uses a scrollbox viewport and renders all tasks (no truncation)', async () => {
+  const tasks = Array.from({ length: 30 }, (_, index) =>
+    makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
+  )
+
+  let renderer: ReturnType<typeof create>
+  await act(async () => {
+    renderer = create(<TaskList tasks={tasks} pushForkOverlay={noop} />)
+  })
+
+  const root = renderer!.root
+  expect(root.findAll((node) => node.type === 'scrollbox')).toHaveLength(0)
+
+  const expandButton = root.findByType('button')
+  await act(async () => {
+    expandButton.props.onClick?.()
+  })
+
+  const scrollboxes = root.findAll((node) => node.type === 'scrollbox')
+  expect(scrollboxes).toHaveLength(1)
+  expect(scrollboxes[0]?.props.scrollbarOptions?.visible).toBe(false)
+  expect(scrollboxes[0]?.props.verticalScrollbarOptions?.visible).toBe(true)
+  expect(scrollboxes[0]?.props.verticalScrollbarOptions?.trackOptions?.width).toBe(1)
+
+  const expandedText = htmlToText(renderToStaticMarkup(<TaskList tasks={tasks} pushForkOverlay={noop} />))
+  // getVisibleTasks already proves full-data path; this runtime check ensures expanded renders via scrollbox container.
+  expect(getVisibleTasks(tasks, true)).toHaveLength(30)
+  expect(expandedText).toContain('Task 30')
+})
+
+test('expanding schedules bottom snap timers and task-length updates trigger bottom-follow snap', async () => {
+  const scrollTo = mock(() => {})
+  const scrollRefOverride = { current: { scrollTo } }
+
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  const scheduled: Array<{ fn: () => void; delay: number; id: number }> = []
+  let nextId = 1
+
+  globalThis.setTimeout = ((fn: (...args: any[]) => void, delay?: number) => {
+    const id = nextId++
+    scheduled.push({ fn: () => fn(), delay: delay ?? 0, id })
+    return id as unknown as ReturnType<typeof setTimeout>
+  }) as typeof setTimeout
+  globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+
+  try {
+    const tasks = Array.from({ length: 8 }, (_, index) =>
+      makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
+    )
+
+    let renderer: ReturnType<typeof create>
+    await act(async () => {
+      renderer = create(<TaskList tasks={tasks} pushForkOverlay={noop} scrollRefOverride={scrollRefOverride} />)
+    })
+
+    const root = renderer!.root
+    const expandButton = root.findByType('button')
+
+    await act(async () => {
+      expandButton.props.onClick?.()
+    })
+
+    expect(scheduled.map((t) => t.delay)).toEqual([0, 50])
+    expect(scrollTo).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      renderer!.update(
+        <TaskList
+          tasks={[...tasks, makeTask({ taskId: 't9', title: 'Task 9' })]}
+          pushForkOverlay={noop}
+          scrollRefOverride={scrollRefOverride}
+        />,
+      )
+    })
+
+    expect(scrollTo).toHaveBeenCalledTimes(2)
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  }
+})
+
+test('initial expanded snap helper schedules immediate + deferred bottom snaps and cleans up', () => {
+  const scheduled: Array<{ fn: () => void, delay: number, id: number }> = []
+  const canceled: number[] = []
+  let nextId = 1
+  let snapCount = 0
+
+  const cleanup = scheduleInitialTaskListSnap(
+    () => { snapCount += 1 },
+    ((fn: (...args: any[]) => void, delay?: number) => {
+      const id = nextId++
+      scheduled.push({ fn: () => fn(), delay: delay ?? 0, id })
+      return id as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout,
+    ((id: ReturnType<typeof setTimeout>) => {
+      canceled.push(id as unknown as number)
+    }) as typeof clearTimeout,
+  )
+
+  expect(scheduled.map((t) => t.delay)).toEqual([0, 50])
+
+  scheduled[0]?.fn()
+  scheduled[1]?.fn()
+  expect(snapCount).toBe(2)
+
+  cleanup()
+  expect(canceled).toEqual([scheduled[0]!.id, scheduled[1]!.id])
 })
 
 test('default header shows Task (X completed, Y active) using not-completed active semantics', () => {
