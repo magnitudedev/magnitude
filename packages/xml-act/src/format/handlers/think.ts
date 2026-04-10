@@ -4,23 +4,13 @@ import { rawCloseTag, rawOpenTag } from '../raw'
 import type { TagMap, TagHandler, XmlActFrame, XmlActEvent } from '../types'
 import { findFrame } from '../types'
 
-export function thinkHandler(
-  lensesTag: string,
-  betweenLensTags: TagMap,
-  plainThinkTags: TagMap,
-): TagHandler<XmlActFrame, XmlActEvent> {
+export function thinkHandler(plainThinkTags: TagMap): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
       const raw = rawOpenTag(ctx.tagName, ctx.attrs)
       if (!ctx.afterNewline) {
         const currentThink = findFrame(ctx.stack, 'think')
         if (currentThink && currentThink.tag === ctx.tagName) {
-          if (currentThink.activeLens) {
-            return [
-              replace({ ...currentThink, activeLens: { ...currentThink.activeLens, body: currentThink.activeLens.body + raw } }),
-              emit({ _tag: 'LensChunk', text: raw }),
-            ]
-          }
           return [
             replace({ ...currentThink, body: currentThink.body + raw }),
             emit({ _tag: 'ProseChunk', patternId: 'think', text: raw }),
@@ -29,7 +19,6 @@ export function thinkHandler(
         return appendTopProse(ctx.stack, raw)
       }
 
-      const isLenses = ctx.tagName === lensesTag
       const currentThink = findFrame(ctx.stack, 'think')
       if (currentThink && currentThink.tag === ctx.tagName) {
         return [
@@ -45,11 +34,10 @@ export function thinkHandler(
           tag: ctx.tagName,
           body: '',
           depth: 0,
-          about: isLenses ? null : (ctx.attrs.get('about') ?? null),
-          isLenses,
+          about: ctx.attrs.get('about') ?? null,
           activeLens: null,
           lenses: [],
-          tags: isLenses ? betweenLensTags : plainThinkTags,
+          tags: plainThinkTags,
         }),
       ]
     },
@@ -59,30 +47,11 @@ export function thinkHandler(
       const rawClose = rawCloseTag(ctx.tagName)
 
       if (!ctx.afterNewline) {
-        if (think.activeLens) {
-          return [
-            replace({ ...think, activeLens: { ...think.activeLens, body: think.activeLens.body + rawClose } }),
-            emit({ _tag: 'LensChunk', text: rawClose }),
-          ]
-        }
         return [replace({ ...think, body: think.body + rawClose }), emit({ _tag: 'ProseChunk', patternId: 'think', text: rawClose })]
       }
 
       if (think.depth > 0) {
-        if (think.activeLens) {
-          return [
-            replace({ ...think, depth: think.depth - 1, activeLens: { ...think.activeLens, body: think.activeLens.body + rawClose } }),
-            emit({ _tag: 'LensChunk', text: rawClose }),
-          ]
-        }
         return [replace({ ...think, depth: think.depth - 1, body: think.body + rawClose }), emit({ _tag: 'ProseChunk', patternId: 'think', text: rawClose })]
-      }
-
-      if (think.isLenses) {
-        if (think.activeLens) {
-          return [emit({ _tag: 'LensEnd', name: think.activeLens.name, content: think.activeLens.body.trim() }), pop]
-        }
-        return [pop]
       }
 
       return [emit({ _tag: 'ProseEnd', patternId: 'think', content: think.body, about: think.about }), pop]
@@ -100,9 +69,9 @@ export function lensHandler(
   return {
     open(ctx) {
       const think = findFrame(ctx.stack, 'think')
-      if (!think?.isLenses) return []
       const nextName = ctx.attrs.get('name') ?? ''
-      if (think.activeLens) {
+
+      if (think?.tag === 'lens' && think.activeLens) {
         const raw = rawOpenTag('lens', ctx.attrs)
         return [
           replace({
@@ -116,14 +85,25 @@ export function lensHandler(
           emit({ _tag: 'LensChunk', text: raw }),
         ]
       }
+
       return [
+        ...endTopProse(ctx.stack),
         emit({ _tag: 'LensStart', name: nextName }),
-        replace({ ...think, activeLens: { name: nextName, body: '', depth: 0 }, tags: insideLensTags }),
+        push({
+          type: 'think',
+          tag: 'lens',
+          body: '',
+          depth: 0,
+          about: null,
+          activeLens: { name: nextName, body: '', depth: 0 },
+          lenses: [],
+          tags: insideLensTags,
+        }),
       ]
     },
     close(ctx) {
       const think = findFrame(ctx.stack, 'think')
-      if (!think?.isLenses || !think.activeLens) return []
+      if (think?.tag !== 'lens' || !think.activeLens) return []
       if (think.activeLens.depth > 0) {
         const raw = rawCloseTag('lens')
         return [
@@ -139,19 +119,11 @@ export function lensHandler(
         ]
       }
       const content = think.activeLens.body.trim()
-      return [
-        emit({ _tag: 'LensEnd', name: think.activeLens.name, content }),
-        replace({
-          ...think,
-          activeLens: null,
-          lenses: [...think.lenses, { name: think.activeLens.name, body: content }],
-          tags: betweenLensTags,
-        }),
-      ]
+      return [emit({ _tag: 'LensEnd', name: think.activeLens.name, content }), pop]
     },
     selfClose(ctx) {
       const name = ctx.attrs.get('name') ?? ''
-      return [emit({ _tag: 'LensStart', name }), emit({ _tag: 'LensEnd', name, content: '' })]
+      return [...endTopProse(ctx.stack), emit({ _tag: 'LensStart', name }), emit({ _tag: 'LensEnd', name, content: '' })]
     },
   }
 }

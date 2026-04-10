@@ -7,6 +7,73 @@
 
 import type { ModelSelection } from './types'
 
+const LOCAL_PROVIDER_IDS = new Set(['lmstudio', 'ollama', 'llama.cpp', 'openai-compatible-local'])
+
+const LOCAL_COMPATIBLE_FAMILY_PATTERNS: RegExp[] = [
+  /qwen/,
+  /gpt[-_. ]?oss/,
+  /gpt[-_. ]?\d/,
+  /claude/,
+  /gemini/,
+  /gemma/,
+  /glm/,
+  /kimi/,
+  /minimax/,
+  /grok/,
+  /deepseek/,
+  /mistral/,
+]
+
+function isLocalProvider(providerId: string): boolean {
+  return LOCAL_PROVIDER_IDS.has(providerId)
+}
+
+function normalizeLocalModelId(modelId: string): string {
+  let value = modelId.trim().toLowerCase()
+
+  // trim query/hash fragments occasionally present in copied IDs
+  value = value.split('?')[0]?.split('#')[0] ?? value
+
+  // strip common file suffixes
+  value = value.replace(/\.gguf$/g, '')
+
+  // strip ollama/local tag suffixes after ":" while keeping root model name
+  // e.g. qwen3:latest -> qwen3, gpt-oss:120b -> gpt-oss
+  value = value.replace(/:([a-z0-9._-]+)$/g, '')
+
+  // remove common local quant/build tokens
+  value = value
+    .replace(/[-_.](q\d+(_k_[a-z0-9]+)?|iq\d+|fp16|fp8|f16|f32)\b/g, '')
+    .replace(/[-_.](instruct|chat|preview|latest)\b/g, '')
+
+  return value
+}
+
+function collectKnownCompatiblePrefixes(): string[] {
+  const all = Object.values(BROWSER_COMPATIBLE_MODELS).flat()
+  const unique = new Set(all.map((entry) => entry.toLowerCase()))
+  return Array.from(unique)
+}
+
+function extractCanonicalFamilyCandidates(modelId: string): string[] {
+  const original = modelId.trim().toLowerCase()
+  const normalized = normalizeLocalModelId(original)
+  const bare = normalized.split('/').at(-1) ?? normalized
+  const noSeparators = bare.replace(/[-_.]/g, '')
+  return Array.from(new Set([original, normalized, bare, noSeparators]))
+}
+
+function matchesKnownCompatibleFamily(candidates: string[]): boolean {
+  const knownCompatiblePrefixes = collectKnownCompatiblePrefixes()
+
+  return candidates.some((candidate) => {
+    if (knownCompatiblePrefixes.some((prefix) => candidate.startsWith(prefix) || prefix.includes(candidate))) {
+      return true
+    }
+    return LOCAL_COMPATIBLE_FAMILY_PATTERNS.some((pattern) => pattern.test(candidate))
+  })
+}
+
 /**
  * Browser-compatible models keyed by provider ID.
  * Values are model ID prefixes — a model matches if its ID starts with any entry.
@@ -113,8 +180,14 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
 /** Check if a provider+model combination is browser-compatible */
 export function isBrowserCompatible(providerId: string, modelId: string): boolean {
   const models = BROWSER_COMPATIBLE_MODELS[providerId]
-  if (!models) return false
-  return models.some(prefix => modelId.startsWith(prefix))
+  if (models?.some(prefix => modelId.startsWith(prefix))) return true
+
+  if (!isLocalProvider(providerId)) {
+    return false
+  }
+
+  const candidates = extractCanonicalFamilyCandidates(modelId)
+  return matchesKnownCompatibleFamily(candidates)
 }
 
 /** Get all browser-compatible model ID prefixes for a provider */

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { createStreamingXmlParser } from '../index'
 import type { ParseEvent } from '../index'
 import { parseMarkdownToMdast } from '../../../../cli/src/markdown/parse'
@@ -30,12 +30,12 @@ function collectNodeTypes(node: any, out: string[] = []): string[] {
 
 describe('message parser newline preservation', () => {
   test('preserves double newlines in message body', () => {
-    const xml = `<comms>
-<message to="user">line1
+    const xml = `<task id="t2">
+<message>line1
 
 line2</message>
-</comms>
-<yield/>`
+</task>
+<idle/>`
 
     const events = parse(xml)
     const text = events
@@ -48,14 +48,14 @@ line2</message>
   })
 
   test('paragraph before table merges when blank line is collapsed', () => {
-    const xml = `<comms>
-<message to="user">Some intro text
+    const xml = `<task id="t2">
+<message>Some intro text
 
 | Col1 | Col2 |
 |------|------|
 | a    | b    |</message>
-</comms>
-<yield/>`
+</task>
+<idle/>`
 
     const extracted = extractMessageText(xml)
     const doc = parseMarkdownToMdast(extracted)
@@ -70,14 +70,14 @@ line2</message>
   })
 
   test('content after table merges into last row when blank line is collapsed', () => {
-    const xml = `<comms>
-<message to="user">| Col1 | Col2 |
+    const xml = `<task id="t2">
+<message>| Col1 | Col2 |
 |------|------|
 | a    | b    |
 
 This is a separate paragraph.</message>
-</comms>
-<yield/>`
+</task>
+<idle/>`
 
     const extracted = extractMessageText(xml)
     const doc = parseMarkdownToMdast(extracted)
@@ -92,15 +92,15 @@ This is a separate paragraph.`)
   })
 
   test("list followed by table doesn't parse as table", () => {
-    const xml = `<comms>
-<message to="user">- item 1
+    const xml = `<task id="t2">
+<message>- item 1
 - item 2
 
 | Col1 | Col2 |
 |------|------|
 | a    | b    |</message>
-</comms>
-<yield/>`
+</task>
+<idle/>`
 
     const extracted = extractMessageText(xml)
     const doc = parseMarkdownToMdast(extracted)

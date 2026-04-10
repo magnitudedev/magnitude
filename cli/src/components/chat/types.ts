@@ -11,7 +11,7 @@ export type ChatControllerEnv = {
   bashMode: boolean
   modelsConfigured: boolean
   modelSummary: { provider: string; model: string } | null
-  tokenEstimate: number
+  tokenUsage: number | null
   contextHardCap: number | null
   isCompacting: boolean
   theme: ChatTheme
@@ -33,6 +33,7 @@ export type ChatControllerServices = {
   runSlashCommand: (commandText: string) => boolean | void
   executeBash: (command: string) => BashResult | Promise<BashResult>
   appendBashOutput: (result: BashResult) => void
+  recordBashCommand: (result: BashResult) => void
   clearSystemBanners: () => void
   interruptFork: (forkId: string | null) => void
   interruptAll: () => void
@@ -44,28 +45,39 @@ export type ChatControllerServices = {
   requestActiveSubagentKill: (payload: { forkId: string; agentId: string }) => void
 }
 
-export type SubagentTabItem = {
-  forkId: string
-  agentId: string
-  role?: string
-  name: string
-  activeSince: number
+export type WorkerExecutionState = 'working' | 'idle' | 'killed'
+
+export type WorkerExecutionSnapshot = {
+  state: WorkerExecutionState
+  activeSince: number | null
   accumulatedActiveMs: number
-  completedAt?: number
+  completedAt: number | null
   resumeCount: number
-  toolCount: number
-  toolSummaryLine: string
-  statusLine: string
-  phase: 'active' | 'idle'
+}
+
+export type TaskListItem = {
+  taskId: string
+  title: string
+  type: string
+  status: 'pending' | 'working' | 'completed'
+  depth: number
+  parentId: string | null
+  createdAt: number
+  updatedAt: number
+  completedAt: number | null
+  assignee: { kind: 'lead' } | { kind: 'none' } | { kind: 'user' } | { kind: 'worker'; workerType?: string; agentId: string }
+  workerForkId: string | null
+  workerExecution?: WorkerExecutionSnapshot | null
 }
 
 export type ChatControllerProps = {
   env: ChatControllerEnv
   services: ChatControllerServices
   displayMessages: DisplayState['messages']
-  subagentTabs: SubagentTabItem[]
+  tasks: TaskListItem[]
   selectedForkId: string | null
-  onSubagentTabSelect: (forkId: string | null) => void
+  pushForkOverlay: (forkId: string) => void
+  isBlockingOverlayActive: boolean
   selectedFileOpen: boolean
   onCloseFilePanel: () => void
   onApprove: () => void

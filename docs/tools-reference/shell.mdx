@@ -56,7 +56,7 @@ Not all agents have the same access:
 - **Explorer** and **Planner** are read-only (read-only shell only, no file writes)
 - **Builder** and **Debugger** can write files and run standard shell commands within the working directory
 - **Reviewer** has read-only shell access (like Explorer/Planner), but can also spawn browser agents for visual verification
-- The **team lead** has the broadest access, but is still subject to shell safety rules
+- The **lead agent** has the broadest access, but is still subject to shell safety rules
 
 All agents can read and write to the session workspace (`$M`) regardless of their file access level. "Read-only" refers to project files only.
 

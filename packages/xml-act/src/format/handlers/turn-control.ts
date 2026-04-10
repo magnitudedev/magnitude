@@ -1,19 +1,9 @@
-import { done, emit, pop } from '../ops'
+import { done, emit } from '../ops'
 import { endTopProse } from '../prose'
 import type { TagHandler, XmlActEvent, XmlActFrame } from '../types'
 
-function autoCloseContainer(stack: ReadonlyArray<XmlActFrame>) {
-  for (let i = stack.length - 1; i >= 0; i--) {
-    const frame = stack[i]
-    if (frame.type === 'container') {
-      return [emit({ _tag: 'ContainerClose', tag: frame.tag }), pop]
-    }
-  }
-  return []
-}
-
 export function turnControlHandler(
-  decision: 'continue' | 'yield',
+  decision: 'continue' | 'idle',
 ): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open() {
@@ -23,7 +13,7 @@ export function turnControlHandler(
       return []
     },
     selfClose(ctx) {
-      return [...endTopProse(ctx.stack), ...autoCloseContainer(ctx.stack), emit({ _tag: 'TurnControl', decision }), done]
+      return [...endTopProse(ctx.stack), emit({ _tag: 'TurnControl', decision, termination: 'natural' }), done]
     },
   }
 }

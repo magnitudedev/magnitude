@@ -5,43 +5,53 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import { TURN_CONTROL_NEXT, TURN_CONTROL_YIELD } from '@magnitudedev/xml-act'
-import type { TurnToolCall, ObservedResult } from '../events'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
 import { ONESHOT_LIVENESS_REMINDER } from '../prompts/error-states'
 import { ContentPartBuilder, type ContentPart } from '../content'
+import type { MessageAckResultItem, TurnResultItem } from './types'
 
-/** Format tool results for LLM context */
-export function formatResults(toolCalls: readonly TurnToolCall[], observedResults: readonly ObservedResult[]): ContentPart[] {
+function formatMessageAck(item: MessageAckResultItem): string {
+  return `\n<message-sent to="${item.destination}" chars="${item.chars}"/>`
+}
+
+/** Format ordered turn results for LLM context */
+export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
   const builder = new ContentPartBuilder()
 
-  for (const tc of toolCalls) {
-    if (tc.result.status === 'interrupted') {
-      builder.pushText(`\n<tool name="${tc.toolKey}"><error>Interrupted</error></tool>`)
-    } else if (tc.result.status !== 'success') {
-      builder.pushText(`\n<tool name="${tc.toolKey}"><error>${tc.result.message}</error></tool>`)
-    }
-  }
-
-  for (const observed of observedResults) {
-    const textChars = observed.content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0)
-    if (textChars > INSPECT_CHAR_LIMIT) {
-      const approxTokens = Math.ceil(textChars / 4)
-      builder.pushText(`\n<${observed.tagName} observe="${observed.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${observed.tagName}>`)
-      for (const part of observed.content) {
-        if (part.type === 'image') builder.pushPart(part)
+  for (const item of items) {
+    if (item.kind === 'tool_error') {
+      if (item.status === 'interrupted') {
+        builder.pushText(`\n<tool name="${item.toolKey}"><error>Interrupted</error></tool>`)
+      } else {
+        builder.pushText(`\n<tool name="${item.toolKey}"><error>${item.message ?? 'Unknown error'}</error></tool>`)
       }
       continue
     }
 
-    builder.pushText(`\n<${observed.tagName} observe="${observed.query}">`)
-    for (const part of observed.content) {
-      if (part.type === 'text') builder.pushText(part.text)
-      else builder.pushPart(part)
+    if (item.kind === 'tool_observation') {
+      const textChars = item.content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0)
+      if (textChars > INSPECT_CHAR_LIMIT) {
+        const approxTokens = Math.ceil(textChars / 4)
+        builder.pushText(`\n<${item.tagName} observe="${item.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${item.tagName}>`)
+        for (const part of item.content) {
+          if (part.type === 'image') builder.pushPart(part)
+        }
+        continue
+      }
+
+      builder.pushText(`\n<${item.tagName} observe="${item.query}">`)
+      for (const part of item.content) {
+        if (part.type === 'text') builder.pushText(part.text)
+        else builder.pushPart(part)
+      }
+      builder.pushText(`</${item.tagName}>`)
+      continue
     }
-    builder.pushText(`</${observed.tagName}>`)
+
+    builder.pushText(formatMessageAck(item))
   }
 
   return builder.build()
@@ -57,9 +67,9 @@ export function formatError(message: string): string {
   return `<error>${message}</error>`
 }
 
-/** Noop turn — agent continued without taking any actions */
+/** Noop turn — agent continued without taking any task/tool operations */
 export function formatNoop(): string {
-  return `<noop>No actions were taken. Use ${TURN_CONTROL_YIELD} if you have nothing more to do, instead of ${TURN_CONTROL_NEXT}.</noop>`
+  return `<noop>No actions were taken. Use ${TURN_CONTROL_IDLE} if you have nothing more to do.</noop>`
 }
 
 /** Oneshot liveness reminder rendered as result feedback */

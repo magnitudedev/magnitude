@@ -5,7 +5,6 @@ import type { XmlActFrame } from './types'
 export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
   const ops: Fx[] = []
   let suppressToolBodyForId: string | null = null
-  let suppressNextContainer = false
 
   for (let i = stack.length - 1; i >= 0; i--) {
     const frame = stack[i]
@@ -17,18 +16,10 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         }
         break
       }
-      case 'container':
-        if (suppressNextContainer) {
-          suppressNextContainer = false
-          ops.push(pop)
-          break
-        }
-        ops.push(emit({ _tag: 'ParseError', error: { _tag: 'UnclosedContainer', tag: frame.tag } }))
-        ops.push(pop)
-        break
+
       case 'think':
         ops.push(emit({ _tag: 'ParseError', error: { _tag: 'UnclosedThink' } }))
-        if (!frame.isLenses) {
+        if (frame.tag !== 'lens') {
           ops.push(emit({ _tag: 'ProseEnd', patternId: 'think', content: frame.body, about: frame.about }))
         }
         ops.push(pop)
@@ -37,11 +28,11 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         ops.push(emit({ _tag: 'MessageEnd', id: frame.id }))
         ops.push(pop)
         break
+
       case 'tool-body': {
         const suppressThisToolBody = suppressToolBodyForId === frame.id
         if (suppressThisToolBody) {
           suppressToolBodyForId = null
-          suppressNextContainer = true
         } else {
           ops.push(
             emit({
@@ -79,8 +70,13 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         ops.push(pop)
         break
       case 'body-capture':
-        ops.push(emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim() }))
+        ops.push(emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim(), termination: 'natural' }))
         ops.push(done)
+        break
+      case 'end-turn':
+        ops.push(emit({ _tag: 'TurnControl', decision: frame.decision ?? 'idle', termination: 'natural' }))
+        ops.push(done)
+        ops.push(pop)
         break
     }
   }

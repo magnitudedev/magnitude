@@ -1,9 +1,9 @@
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart, TurnResultError } from '../events'
-import type { ContentPart } from '../content'
+import type { AppEvent, TurnResultError, MessageDestination } from '../events'
+
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 
@@ -14,18 +14,18 @@ export interface ThinkBlock {
 
 export interface CanonicalTurnState {
   turnId: string | null
-  lenses: readonly { name: string; content: string | null }[] | null
+  lenses: readonly { name: string; content: string }[] | null
   thinkBlocks: ThinkBlock[]
-  messages: Array<{ id: string; dest: string; text: string; order: number }>
+  messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
   toolCallMap: Map<string, number>
-  observedResults: Array<{ toolCallId: string; tagName: string; query: string; content: ContentPart[] }>
   hasParseError: boolean
   hasStructuralError: boolean
+  rawResponse: string
   orderCounter: number
   lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
-  resolvedTurnDecision: 'continue' | 'yield' | null
+  resolvedTurnDecision: 'continue' | 'idle' | null
 }
 
 export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
@@ -36,24 +36,17 @@ export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   messageMap: new Map(),
   toolCalls: [],
   toolCallMap: new Map(),
-  observedResults: [],
   hasParseError: false,
   hasStructuralError: false,
+  rawResponse: '',
   orderCounter: 0,
   lastCompleted: null,
   resolvedTurnDecision: null,
 })
 
-function flattenResponseText(parts: readonly ResponsePart[]): string {
-  return parts
-    .filter((p): p is Extract<ResponsePart, { type: 'text' }> => p.type === 'text')
-    .map(p => p.content)
-    .join('')
-}
-
 function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
   if (!errors || errors.length === 0) return false
-  return errors.some((error) => error.code === 'unclosed_think' || error.code === 'unclosed_actions')
+  return errors.some((error) => error.code === 'unclosed_think')
 }
 
 function resetActive(state: CanonicalTurnState): CanonicalTurnState {
@@ -66,9 +59,9 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     messageMap: new Map(),
     toolCalls: [],
     toolCallMap: new Map(),
-    observedResults: [],
     hasParseError: false,
     hasStructuralError: false,
+    rawResponse: '',
     orderCounter: 0,
     resolvedTurnDecision: null,
   }
@@ -108,7 +101,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     lens_start: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      const nextLenses = [...(fork.lenses ?? []), { name: event.name, content: null as string | null }]
+      const nextLenses = [...(fork.lenses ?? []), { name: event.name, content: '' }]
       return { ...fork, lenses: nextLenses }
     },
 
@@ -119,7 +112,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const last = nextLenses[nextLenses.length - 1]
       nextLenses[nextLenses.length - 1] = {
         ...last,
-        content: (last.content ?? '') + event.text,
+        content: last.content + event.text,
       }
       return { ...fork, lenses: nextLenses }
     },
@@ -130,8 +123,8 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const nextLenses = [...fork.lenses]
       const last = nextLenses[nextLenses.length - 1]
       if (last.name !== event.name) return fork
-      const trimmed = (last.content ?? '').trim()
-      nextLenses[nextLenses.length - 1] = { ...last, content: trimmed.length > 0 ? trimmed : null }
+      const trimmed = last.content.trim()
+      nextLenses[nextLenses.length - 1] = { ...last, content: trimmed }
       return { ...fork, lenses: nextLenses }
     },
 
@@ -140,8 +133,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const idx = fork.messages.length
       const nextMessages = [...fork.messages, {
         id: event.id,
-        dest: event.dest,
-
+        destination: event.destination,
         text: '',
         order: fork.orderCounter,
       }]
@@ -165,6 +157,11 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
     },
 
     message_end: ({ fork }) => fork,
+
+    raw_response_chunk: ({ event, fork }) => {
+      if (fork.turnId !== event.turnId) return fork
+      return { ...fork, rawResponse: fork.rawResponse + event.text }
+    },
 
     tool_event: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
@@ -199,20 +196,10 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
         case 'ToolObservation': {
           const idx = fork.toolCallMap.get(event.toolCallId)
+          if (idx === undefined) return fork
           const nextToolCalls = [...fork.toolCalls]
-          if (idx !== undefined) {
-            nextToolCalls[idx] = { ...nextToolCalls[idx], query: event.event.query }
-          }
-          return {
-            ...fork,
-            toolCalls: nextToolCalls,
-            observedResults: [...fork.observedResults, {
-              toolCallId: event.toolCallId,
-              tagName: event.event.tagName,
-              query: event.event.query,
-              content: event.event.content,
-            }],
-          }
+          nextToolCalls[idx] = { ...nextToolCalls[idx], query: event.event.query }
+          return { ...fork, toolCalls: nextToolCalls }
         }
 
         case 'ToolInputParseError':
@@ -229,13 +216,14 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
       const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
 
-      const observedResults = [...event.observedResults]
-
       let canonicalXml: string
       if (clean) {
         const agentState = read(AgentStatusProjection)
         const variant: AgentVariant = event.forkId
-          ? ((getAgentByForkId(agentState, event.forkId)?.role ?? 'builder') as AgentVariant)
+          ? (() => {
+              const role = getAgentByForkId(agentState, event.forkId)?.role
+              return role && isValidVariant(role) ? role : 'builder'
+            })()
           : 'lead'
         const agentDef = getAgentDefinition(variant)
         const bindings = getBindingRegistry(agentDef)
@@ -244,20 +232,19 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           thinkBlocks: fork.thinkBlocks,
           messages: [...fork.messages]
             .sort((a, b) => a.order - b.order)
-            .map(({ dest, text }) => ({ dest, text })),
+            .map(({ text, destination }) => ({ text, destination })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
             .map(({ tagName, input, query }) => ({ tagName, input, query })),
-          turnDecision: event.result.turnDecision === 'continue' ? 'continue' : 'yield',
+          turnDecision: event.result.turnDecision === 'idle' ? 'idle' : 'continue',
         }
         canonicalXml = serializeCanonicalTurn(trace, bindings)
       } else {
-        canonicalXml = flattenResponseText(event.responseParts)
+        canonicalXml = fork.rawResponse
       }
 
       const finalized: CanonicalTurnState = {
         ...fork,
-        observedResults,
         hasStructuralError,
         lastCompleted: {
           turnId: event.turnId,

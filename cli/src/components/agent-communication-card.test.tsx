@@ -37,6 +37,6 @@ describe('AgentCommunicationCard', () => {
     )
 
     const text = htmlToText(html)
-    expect(text).toContain('⚙ agent-2 → Team lead')
+    expect(text).toContain('⚙ agent-2 → Lead')
   })
 })

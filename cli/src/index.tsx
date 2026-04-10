@@ -9,6 +9,7 @@ import { createStorageClient } from '@magnitudedev/storage'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
 import { App, type SessionStart } from './app'
 import { initThemeStore, useThemeStateStore } from './hooks/use-theme'
+import { CLI_VERSION } from './version'
 import { ProviderRuntimeProvider } from './providers/provider-runtime'
 import { StorageProvider } from './providers/storage-provider'
 import { isLightBackground } from './utils/theme'
@@ -22,7 +23,7 @@ async function main() {
 
   const program = new Command()
     .name('magnitude')
-    .version('0.0.1')
+    .version(CLI_VERSION)
     .option('--resume [id]', 'Resume the most recent chat session or a specific session by ID')
     .option('--debug', 'Enable debug mode with debug panel')
 
@@ -80,7 +81,7 @@ async function main() {
         }
       )
 
-      const storage = await createStorageClient({ cwd: process.cwd() })
+      const storage = await createStorageClient({ cwd: process.cwd(), currentVersion: CLI_VERSION })
       const providerRuntime = await createProviderClient<MagnitudeSlot>({ slots: MAGNITUDE_SLOTS })
       const sessionStart: SessionStart = opts.resume === undefined
         ? { _tag: 'new' }

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { Schema } from '@effect/schema'
 import { Effect } from 'effect'
 import { createXmlRuntime } from '../execution/xml-runtime'

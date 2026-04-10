@@ -1,6 +1,7 @@
 import type { AppEvent } from '../events'
 import type { ResponseBuilder } from './response-builder'
 import type { MockTurnResponse } from './turn-script'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 
 export type TurnFrame = MockTurnResponse | ResponseBuilder
 
@@ -152,7 +153,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
         }
       }
 
-      const fallback: MockTurnResponse = { xml: '<yield/>' }
+      const fallback: MockTurnResponse = { xml: TURN_CONTROL_IDLE }
 
       const unsub = harness.onEvent((event: AppEvent) => {
         if (event.type === 'agent_created') {

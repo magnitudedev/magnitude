@@ -1,0 +1,66 @@
+## Message routing
+
+Messages use explicit `to` targeting:
+
+- `<message to="user">` routes to the user.
+- `<message to="task-id">` routes to the worker spawned on that task.
+
+Example showing both in one turn:
+
+<message to="user">Quick status update: parser work has started.</message>
+<message to="impl-parser">Prioritize parser tests first.</message>
+
+You can send multiple messages in one turn. If `to` specifies an invalid or unresolvable target, it is an error.
+
+Messages support GFM-style markdown syntax. Messages also support inline links to local file content or URLs. You can also link directly to your workspace e.g. [foo]($M/foo.md).
+
+When mentioning files in communications, always prefer using an inline link so that the file is unambiguous and accessible.
+
+## Task and worker operations
+
+Tasks and workers are managed with flat tool calls — no block syntax, no nesting.
+
+### Creating tasks
+
+<create-task id="impl-parser" type="implement" title="Implement parser updates" />
+
+A task requires `id`, `type`, and `title`. Use `parent` to nest under an existing task:
+
+<create-task id="impl-parser" type="implement" title="Implement parser updates" parent="parser-feature" />
+
+### Spawning workers
+
+<spawn-worker id="impl-parser" role="builder">Implement Unit A from the [plan]($M/plans/the-plan.md).</spawn-worker>
+
+`spawn-worker` creates a worker for a task. The `id` must match an existing task. The `role` must be allowed for that task type. `spawn-worker` requires a body, and the body is the worker's initial instruction message with the same semantics as a normal `<message to="task-id">...</message>`.
+
+If a worker already exists on that task, `spawn-worker` kills the old worker and spawns a new one.
+
+### Killing workers
+
+<kill-worker id="impl-parser" />
+
+Explicitly kills the worker on a task. Errors if no worker exists.
+
+### Updating tasks
+
+<update-task id="impl-parser" status="completed" />
+
+Valid status values:
+- `pending` — Reopens the task. Does not affect the worker.
+- `completed` — Marks the task finished. Blocked if any child tasks are still pending or working.
+- `cancelled` — Kills the worker (if present) and removes the task and its entire subtree from the task tree.
+
+The `working` status is derived — it reflects that a task has a live worker. You never set it manually.
+
+### Messaging workers
+
+To send instructions or follow-ups to a worker, use `<message>`:
+
+<message to="impl-parser">Focus on test coverage before refactors.</message>
+
+### Complete example turn
+
+<create-task id="auth-research" type="research" title="Map auth flow" parent="auth-feature" />
+<spawn-worker id="auth-research" role="explorer">Trace the auth middleware chain and document entry points.</spawn-worker>
+<update-task id="old-task" status="completed" />

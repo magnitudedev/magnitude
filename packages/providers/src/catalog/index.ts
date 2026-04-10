@@ -13,6 +13,8 @@ import { fetchOpenRouterModels, normalizeOpenRouterModels } from './openrouter-s
 import { makeRefreshSchedule } from './refresh'
 import { getProvider, getStaticProviderModels, PROVIDERS, setProviderModels } from '../registry'
 import type { ModelDefinition } from '../types'
+import { discoverLocalProviderModels, mergeDiscoveredAndRemembered } from './local-discovery'
+import { AppConfig } from '@magnitudedev/storage'
 import type { ModelsDevResponse, OpenRouterResponse } from './types'
 
 function resolveSource<T>(
@@ -53,6 +55,7 @@ export const ModelCatalogLive = Layer.scoped(
   ModelCatalog,
   Effect.gen(function* () {
     const cache = yield* CatalogCache
+    const config = yield* AppConfig
 
     const refresh: Effect.Effect<void> = Effect.gen(function* () {
       const modelsDevData = yield* resolveSource<ModelsDevResponse>(
@@ -69,7 +72,35 @@ export const ModelCatalogLive = Layer.scoped(
       )
 
       for (const provider of PROVIDERS) {
-        if (provider.id === 'local') continue
+        if (provider.providerFamily === 'local' && provider.inventoryMode === 'dynamic') {
+          const options = yield* config.getProviderOptions(provider.id)
+          const effectiveBaseUrl = options?.baseUrl?.trim() || provider.defaultBaseUrl
+          const discovery = yield* discoverLocalProviderModels(provider, effectiveBaseUrl)
+          const remembered = Array.isArray(options?.rememberedModelIds)
+            ? options?.rememberedModelIds.filter((id): id is string => typeof id === 'string')
+            : []
+          const merged = mergeDiscoveredAndRemembered(discovery.models, remembered)
+          setProviderModels(provider.id, merged)
+
+          const now = new Date().toISOString()
+          yield* config.setProviderOptions(provider.id, (current) => ({
+            ...(current ?? {}),
+            discoveredModels: discovery.models.map((model) => ({
+              id: model.id,
+              name: model.name,
+              maxContextTokens: model.maxContextTokens ?? null,
+              discoveredAt: now,
+              source: discovery.source ?? provider.localDiscoveryStrategy ?? 'unknown',
+            })),
+            inventoryUpdatedAt: now,
+            lastDiscoveryStatus: discovery.status,
+            lastDiscoverySource: discovery.source ?? undefined,
+            lastDiscoveryDiagnostics: discovery.diagnostics.length > 0 ? discovery.diagnostics : undefined,
+            ...(discovery.error ? { lastDiscoveryError: discovery.error } : { lastDiscoveryError: undefined }),
+          }))
+
+          continue
+        }
 
         const staticModels = [...getStaticProviderModels(provider.id)]
 

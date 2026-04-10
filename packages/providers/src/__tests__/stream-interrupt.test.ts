@@ -1,5 +1,5 @@
-import { describe, it } from 'vitest'
-import { Effect, Stream, Duration, Fiber, Scope, Sink } from 'effect'
+import { describe, it, expect } from 'vitest'
+import { Effect, Stream, Duration, Fiber, Scope } from 'effect'
 import { createBoundModel } from '../resolver/pipeline'
 import type { ExecutableDriver, DriverRequest, StreamResult, CompleteResult } from '../drivers/types'
 import { CollectorData } from '../drivers/types'
@@ -119,5 +119,67 @@ describe('provider stream interrupt cancellation', () => {
 
     // Success = completes within 1 second without TimeoutException
     await Effect.runPromise(program)
+  })
+
+  it('normal completion should preserve late usage finalization (no cleanup abort)', async () => {
+    const model = new Model({
+      id: 'test-model',
+      providerId: 'test-provider',
+      name: 'Test Model',
+      contextWindow: 100_000,
+      maxOutputTokens: 8_192,
+      costs: null,
+    })
+
+    const connection = ModelConnection.Baml({ auth: null })
+
+    let finalizedUsage: CallUsage = nullUsage
+    const lateUsageDriver: ExecutableDriver = {
+      id: 'baml',
+      connect: () => Effect.succeed(connection),
+      stream: (req: DriverRequest): Effect.Effect<StreamResult, ModelError> =>
+        Effect.succeed({
+          stream: Stream.unwrapScoped(
+            Effect.gen(function* () {
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  finalizedUsage = req.signal?.aborted
+                    ? nullUsage
+                    : {
+                      inputTokens: 123,
+                      outputTokens: 45,
+                      cacheReadTokens: null,
+                      cacheWriteTokens: null,
+                      inputCost: null,
+                      outputCost: null,
+                      totalCost: null,
+                    }
+                }),
+              )
+              return Stream.make('chunk')
+            }),
+          ),
+          getUsage: () => finalizedUsage,
+          getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null }),
+        }),
+      complete: () => Effect.die('not used in this test'),
+    }
+
+    const bound = await Effect.runPromise(
+      createBoundModel('primary', model, connection, lateUsageDriver).pipe(
+        Effect.provideService(ProviderState, createProviderState()),
+        Effect.provideService(TraceEmitter, traceEmitter),
+      ),
+    )
+
+    const chatStream = await Effect.runPromise(
+      bound.stream('CodingAgentChat', [{}]).pipe(
+        Effect.provideService(TraceEmitter, traceEmitter),
+      ),
+    )
+
+    await Effect.runPromise(Stream.runDrain(chatStream.stream))
+
+    expect(chatStream.getUsage().inputTokens).toBe(123)
   })
 })

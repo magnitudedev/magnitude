@@ -37,8 +37,8 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
           emit({ _tag: 'LensChunk', text }),
         ]
       }
-      if (frame.isLenses && !frame.activeLens) {
-        // In lenses mode outside an active lens, inter-lens text is structural whitespace — accumulate but don't emit
+      if (frame.tag === 'lens' && !frame.activeLens) {
+        // In lens frames outside an active lens, inter-lens text is structural whitespace — accumulate but don't emit
         return [replace({ ...frame, body: frame.body + text })]
       }
       return [replace({ ...frame, body: frame.body + text }), emit({ _tag: 'ProseChunk', patternId: 'think', text })]
@@ -63,6 +63,7 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
       }
       return ops
     }
+
     case 'tool-body':
       return [replace({ ...frame, body: frame.body + text }), emit({ _tag: 'BodyChunk', toolCallId: frame.id, text })]
     case 'child-body':
@@ -78,10 +79,8 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
       ]
     case 'body-capture':
       return [replace({ ...frame, body: frame.body + text })]
-    case 'container':
-      if (frame.tag === 'comms' && text.trim().length > 0) {
-        return [emit({ _tag: 'ProseChunk', patternId: 'prose', text })]
-      }
+    case 'end-turn':
+      // Whitespace/content inside <end-turn> is ignored (only <idle/> and <continue/> matter)
       return []
   }
 }

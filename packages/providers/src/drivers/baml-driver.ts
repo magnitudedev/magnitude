@@ -19,10 +19,7 @@ import { TransportError } from '../errors/model-error'
 
 import { bamlCall, bamlStream } from './baml-dispatch'
 
-function validateTokenCount(tokens: number): number | null {
-  if (tokens <= 0) return null
-  return tokens
-}
+import { extractUsageFromCollectorData } from './usage-extraction'
 
 /** Build a ClientRegistry on demand from the driver request */
 function buildRegistry(req: DriverRequest): ClientRegistry | undefined {
@@ -35,82 +32,20 @@ function buildRegistry(req: DriverRequest): ClientRegistry | undefined {
   )
 }
 
-function extractUsageFromCollector(collector: Collector, model: Model | null, authType: string | null): CallUsage {
-  let inputTokens: number | null = null
-  let outputTokens: number | null = null
-  let cacheReadTokens: number | null = null
-  let cacheWriteTokens: number | null = null
-
-  const lastCall = collector.last?.calls.at(-1)
-
-  if (lastCall) {
-    // Strategy 1: Extract from HTTP response body JSON
-    try {
-      const rawUsage = lastCall.httpResponse?.body.json()?.usage
-      if (rawUsage) {
-        if (typeof rawUsage.input_tokens === 'number') {
-          const total = rawUsage.input_tokens
-            + (rawUsage.cache_creation_input_tokens ?? 0)
-            + (rawUsage.cache_read_input_tokens ?? 0)
-          inputTokens = validateTokenCount(total)
-          cacheReadTokens = rawUsage.cache_read_input_tokens ?? null
-          cacheWriteTokens = rawUsage.cache_creation_input_tokens ?? null
-        }
-        if (typeof rawUsage.output_tokens === 'number') {
-          outputTokens = rawUsage.output_tokens
-        }
-      }
-    } catch {}
-
-    // Strategy 2: Extract from SSE events (Anthropic streaming)
-    if (inputTokens === null) {
-      try {
-        // sseResponses() is present on streaming collector calls but not in the base type
-        const sseResponses = 'sseResponses' in lastCall
-          ? (lastCall as { sseResponses(): Array<{ json?(): unknown }> }).sseResponses()
-          : null
-        if (Array.isArray(sseResponses)) {
-          for (const sse of sseResponses) {
-            // SSE data is parsed JSON from the provider — untyped by nature
-            const data = sse.json?.() as { type?: string; message?: { usage?: any }; usage?: any } | null
-            if (!data) continue
-
-            if (data.type === 'message_start' && data.message?.usage) {
-              const usage = data.message.usage
-              if (typeof usage.input_tokens === 'number') {
-                const total = usage.input_tokens
-                  + (usage.cache_creation_input_tokens ?? 0)
-                  + (usage.cache_read_input_tokens ?? 0)
-                inputTokens = validateTokenCount(total)
-                cacheReadTokens = usage.cache_read_input_tokens ?? null
-                cacheWriteTokens = usage.cache_creation_input_tokens ?? null
-              }
-            }
-            if (data.type === 'message_delta' && data.usage) {
-              if (typeof data.usage.output_tokens === 'number') {
-                outputTokens = data.usage.output_tokens
-              }
-            }
-          }
-        }
-      } catch {}
-    }
-  }
-
-  // Strategy 3: Fallback to collector-level usage
-  if (inputTokens === null) {
-    const usage = collector.usage
-    if (usage) {
-      const total = (usage.inputTokens ?? 0) + (usage.cachedInputTokens ?? 0)
-      inputTokens = validateTokenCount(total)
-    }
-  }
-  if (outputTokens === null) {
-    const usage = collector.usage
-    if (usage && typeof usage.outputTokens === 'number') outputTokens = usage.outputTokens
-  }
-
-  return buildUsage(model, authType, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens)
+function extractUsageFromCollector(
+  collector: Collector,
+  model: Model | null,
+  authType: string | null,
+): CallUsage {
+  const extracted = extractUsageFromCollectorData(collector)
+  return buildUsage(
+    model,
+    authType,
+    extracted.inputTokens,
+    extracted.outputTokens,
+    extracted.cacheReadTokens,
+    extracted.cacheWriteTokens,
+  )
 }
 
 function extractCollectorData(collector: Collector): ReturnType<typeof CollectorData.Baml> {

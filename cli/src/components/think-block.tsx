@@ -41,12 +41,12 @@ const formatDuration = (seconds: number): string => {
   return s > 0 ? `${m}m ${s}s` : `${m}m`
 }
 
-const SubagentStartedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_started' }> }) => {
+const WorkerStartedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_started' }> }) => {
   const theme = useTheme()
   return (
     <text>
       <span style={{ fg: violet[300] }}>▶ </span>
-      <span style={{ fg: theme.muted }}>Subagent </span>
+      <span style={{ fg: theme.muted }}>Worker </span>
       <span style={{ fg: theme.muted }}>started</span>
       <span style={{ fg: theme.muted }}>: </span>
       <span style={{ fg: theme.foreground }}>{formatSubagentIdWithEmoji(step.subagentId, step.subagentType)}</span>
@@ -56,14 +56,14 @@ const SubagentStartedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 's
   )
 }
 
-const SubagentFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_finished' }> }) => {
+const WorkerFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_finished' }> }) => {
   const theme = useTheme()
   const duration = formatDuration(Math.floor(step.cumulativeTotalTimeMs / 1000))
   const tools = step.cumulativeTotalToolsUsed
   return (
     <text>
       <span style={{ fg: theme.success }}>✓ </span>
-      <span style={{ fg: theme.muted }}>Subagent </span>
+      <span style={{ fg: theme.muted }}>Worker </span>
       <span style={{ fg: theme.muted }}>finished</span>
       <span style={{ fg: theme.muted }}>: </span>
       <span style={{ fg: theme.foreground }}>{formatSubagentIdWithEmoji(step.subagentId, step.subagentType)}</span>
@@ -75,9 +75,9 @@ const SubagentFinishedRow = ({ step }: { step: Extract<ThinkBlockStep, { type: '
   )
 }
 
-const SubagentKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_killed' | 'subagent_user_killed' }> }) => {
+const WorkerKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'subagent_killed' | 'subagent_user_killed' }> }) => {
   const theme = useTheme()
-  const message = step.type === 'subagent_user_killed' ? 'Subagent killed by user: ' : 'Subagent killed: '
+  const message = step.type === 'subagent_user_killed' ? 'Worker killed by user: ' : 'Worker killed: '
   return (
     <text>
       <span style={{ fg: theme.error }}>■ </span>
@@ -100,20 +100,20 @@ function buildSummary(steps: readonly { type: string; toolKey?: ToolKey }[]): st
   let navigations = 0
   let inputs = 0
   let evaluations = 0
-  let subagentStarted = 0
-  let subagentFinished = 0
-  let subagentKilled = 0
+  let workerStarted = 0
+  let workerFinished = 0
+  let workerKilled = 0
   for (const step of steps) {
     if (step.type === 'subagent_started') {
-      subagentStarted++
+      workerStarted++
       continue
     }
     if (step.type === 'subagent_finished') {
-      subagentFinished++
+      workerFinished++
       continue
     }
     if (step.type === 'subagent_killed' || step.type === 'subagent_user_killed') {
-      subagentKilled++
+      workerKilled++
       continue
     }
     if (step.type !== 'tool') continue
@@ -140,9 +140,9 @@ function buildSummary(steps: readonly { type: string; toolKey?: ToolKey }[]): st
   if (navigations > 0) parts.push(`${navigations} ${navigations === 1 ? 'navigation' : 'navigations'}`)
   if (inputs > 0) parts.push(`${inputs} ${inputs === 1 ? 'input' : 'inputs'}`)
   if (evaluations > 0) parts.push(`${evaluations} ${evaluations === 1 ? 'eval' : 'evals'}`)
-  if (subagentStarted > 0) parts.push(`${subagentStarted} ${subagentStarted === 1 ? 'subagent started' : 'subagents started'}`)
-  if (subagentFinished > 0) parts.push(`${subagentFinished} ${subagentFinished === 1 ? 'subagent finished' : 'subagents finished'}`)
-  if (subagentKilled > 0) parts.push(`${subagentKilled} ${subagentKilled === 1 ? 'subagent killed' : 'subagents killed'}`)
+  if (workerStarted > 0) parts.push(`${workerStarted} ${workerStarted === 1 ? 'worker started' : 'workers started'}`)
+  if (workerFinished > 0) parts.push(`${workerFinished} ${workerFinished === 1 ? 'worker finished' : 'workers finished'}`)
+  if (workerKilled > 0) parts.push(`${workerKilled} ${workerKilled === 1 ? 'worker killed' : 'workers killed'}`)
   return parts.length > 0 ? ` (${parts.join(', ')})` : ''
 }
 
@@ -340,15 +340,15 @@ const StepGroupView = memo(function StepGroupView({
         }
 
         if (step.type === 'subagent_started') {
-          return <SubagentStartedRow key={step.id} step={step} />
+          return <WorkerStartedRow key={step.id} step={step} />
         }
 
         if (step.type === 'subagent_finished') {
-          return <SubagentFinishedRow key={step.id} step={step} />
+          return <WorkerFinishedRow key={step.id} step={step} />
         }
 
         if (step.type === 'subagent_killed' || step.type === 'subagent_user_killed') {
-          return <SubagentKilledRow key={step.id} step={step} />
+          return <WorkerKilledRow key={step.id} step={step} />
         }
 
         if (step.type === 'communication') {

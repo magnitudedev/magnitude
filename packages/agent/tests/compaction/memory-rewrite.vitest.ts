@@ -4,6 +4,13 @@ import { expect } from 'vitest'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { baseContext, getMemory, mkCompactionCompleted, mkTurnCompleted, mkTurnStarted, mkUserMessage } from './helpers'
 
+const sendAssistantText = (h: Effect.Effect.Success<typeof TestHarness>, turnId: string, text: string) =>
+  Effect.gen(function* () {
+    yield* h.send({ type: 'message_start', forkId: null, turnId, id: `${turnId}-msg`, destination: { kind: 'user' } })
+    yield* h.send({ type: 'message_chunk', forkId: null, turnId, id: `${turnId}-msg`, text })
+    yield* h.send({ type: 'message_end', forkId: null, turnId, id: `${turnId}-msg` })
+  })
+
 describe('compaction/memory-rewrite', () => {
   it.effect('compaction_completed rewrites head as [session_context, compacted, ...remaining]', () =>
     Effect.gen(function* () {
@@ -33,8 +40,10 @@ describe('compaction/memory-rewrite', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       for (const id of [1, 2, 3]) {
-        yield* h.send(mkTurnStarted({ turnId: `t-${id}`, chainId: 'chain-order' }))
-        yield* h.send(mkTurnCompleted({ turnId: `t-${id}`, chainId: 'chain-order', responseParts: [{ type: 'text', content: `assistant-${id}` }] }))
+        const turnId = `t-${id}`
+        yield* h.send(mkTurnStarted({ turnId, chainId: 'chain-order' }))
+        yield* sendAssistantText(h, turnId, `assistant-${id}`)
+        yield* h.send(mkTurnCompleted({ turnId, chainId: 'chain-order' }))
       }
       const before = yield* getMemory(h)
       const compactedMessageCount = 2

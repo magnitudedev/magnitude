@@ -54,19 +54,20 @@ describe('virtual fs integration with harness', () => {
   it.live('Agent reads seeded file', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<actions><read path="src/index.ts"/></actions><yield/>' }, null)
+      yield* harness.script.next({ xml: '<read path="src/index.ts"/><idle/>' }, null)
 
       yield* harness.user('read file')
-      const completed = yield* harness.wait.event('turn_completed', (e) => e.toolCalls.length > 0)
+      const completed = yield* harness.wait.turnCompleted(null)
+      const observation = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === null && e.event._tag === 'ToolObservation' && e.event.tagName === 'read',
+      )
 
       expect(completed.result.success).toBe(true)
-      const readCall = completed.toolCalls.find(
-        (c) => c.toolKey === 'fileRead' || (c.group === 'fs' && c.toolName === 'read'),
-      )
-      expect(readCall?.result.status).toBe('success')
-      if (readCall?.result.status === 'success') {
-        expect(readCall.result.output).toBe('export const x = 1')
+      if (observation.event._tag !== 'ToolObservation') {
+        throw new Error('Expected ToolObservation')
       }
+      expect(observation.event.content).toEqual([{ type: 'text', text: 'export const x = 1' }])
     }).pipe(
       Effect.provide(
         TestHarnessLive({
@@ -80,18 +81,22 @@ describe('virtual fs integration with harness', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next(
-        { xml: '<actions><write path="output.txt">content</write></actions><yield/>' },
+        { xml: '<write path="output.txt">content</write><idle/>' },
         null,
       )
 
       yield* harness.user('write file')
-      const completed = yield* harness.wait.event('turn_completed', (e) => e.toolCalls.length > 0)
+      const completed = yield* harness.wait.turnCompleted(null)
+      const toolEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
       expect(completed.result.success).toBe(true)
-      const writeCall = completed.toolCalls.find(
-        (c) => c.toolKey === 'fileWrite' || (c.group === 'fs' && c.toolName === 'write'),
-      )
-      expect(writeCall?.result.status).toBe('success')
+      if (toolEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(toolEnded.event.result._tag).toBe('Success')
       expect(harness.files.get('output.txt')).toBe('content')
     }).pipe(Effect.provide(TestHarnessLive()))
   )

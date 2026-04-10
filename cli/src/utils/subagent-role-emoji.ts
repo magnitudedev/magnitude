@@ -1,5 +1,5 @@
 const ROLE_EMOJI: Record<string, string> = {
-  explorer: '※',
+  explorer: '❖',
   planner: '⚙',
   builder: '⚒',
   reviewer: '✔',
@@ -13,6 +13,7 @@ export function getSubagentRoleEmoji(role?: string): string | null {
 }
 
 export function formatSubagentIdWithEmoji(agentId: string, role?: string): string {
+  if (!role) return agentId
   const emoji = getSubagentRoleEmoji(role)
-  return emoji ? `${emoji} ${agentId}` : agentId
+  return emoji ? `${emoji} [${role}] ${agentId}` : `[${role}] ${agentId}`
 }

@@ -28,7 +28,7 @@ import { buildInput } from './input-builder'
 import { observeOutput } from '../output-query'
 import { validateBinding, type TagSchema } from './binding-validator'
 import { initialReactorState, foldReactorState } from './reactor-state'
-import { coerceAttributeValue } from '../format/coerce'
+
 
 // =============================================================================
 // Sentinel for end-of-stream
@@ -110,7 +110,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             if (reg.binding.childTags) reg.binding.childTags.forEach(ct => valid.add(ct.tag))
             if (reg.binding.children) reg.binding.children.forEach(c => valid.add(c.tag ?? c.field))
             if (reg.binding.childRecord) valid.add(reg.binding.childRecord.tag)
-            if (reg.binding.attributes) reg.binding.attributes.forEach(a => valid.add(a.attr))
             childTagMap.set(tag, valid)
           }
 
@@ -139,7 +138,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
           const createMessageId = createShortId
           let activeProseMessageId: string | null = null
           const emittedFields = new Map<string, Set<string>>()
-          const pendingAttrNormalizationChildren = new Map<string, Set<number>>()
 
           function react(
             state: ReactorState,
@@ -155,7 +153,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                 create: createMessageId,
               },
               emittedFields,
-              pendingAttrNormalizationChildren,
             )
           }
 
@@ -165,10 +162,15 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
           const producer = Effect.gen(function* () {
             yield* xmlStream.pipe(
               Stream.mapError((e) => new XmlRuntimeCrash(e.message, e)),
-              Stream.runForEachWhile((chunk) =>
+              Stream.runForEach((chunk) =>
                 Effect.gen(function* () {
                   let state = yield* Ref.get(stateRef)
-                  if (state.stopped) return false
+
+                  // After TurnEnd, stop consuming. Parser observing mode
+                  // handles termination classification before TurnEnd is emitted.
+                  if (state.stopped) {
+                    return yield* Effect.fail(new XmlRuntimeCrash('__runaway_abort__'))
+                  }
 
                   const parseEvents = parser.processChunk(chunk)
                   for (const pe of parseEvents) {
@@ -176,7 +178,6 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
                     state = yield* react(state, pe)
                   }
                   yield* Ref.set(stateRef, state)
-                  return !state.stopped
                 }),
               ),
             )
@@ -195,7 +196,7 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             if (!state.stopped) {
               yield* Queue.offer(queue, {
                 _tag: 'TurnEnd',
-                result: { _tag: 'Success', turnControl: null },
+                result: { _tag: 'Success', turnControl: null, termination: 'natural' },
               } satisfies XmlRuntimeEvent)
             }
 
@@ -205,6 +206,11 @@ export function createXmlRuntime(config: XmlRuntimeConfig): XmlRuntime {
             Effect.catchAll((crash) =>
               Effect.gen(function* () {
                 if (crash instanceof XmlRuntimeCrash) {
+                  // Sentinel for runaway abort — TurnEnd already emitted by parser/reactor
+                  if (crash.message === '__runaway_abort__') {
+                    yield* Queue.offer(queue, END)
+                    return
+                  }
                   yield* Queue.offer(queue, {
                     _tag: 'TurnEnd',
                     result: { _tag: 'Failure', error: crash.message },
@@ -280,13 +286,11 @@ function reactImpl(
     readonly create: () => string
   },
   emittedFields: Map<string, Set<string>>,
-  pendingAttrNormalizationChildren: Map<string, Set<number>>,
 ): Effect.Effect<ReactorState> {
   return Effect.gen(function* () {
     let currentState = state
     const cleanupToolCallState = (toolCallId: string) => {
       emittedFields.delete(toolCallId)
-      pendingAttrNormalizationChildren.delete(toolCallId)
     }
 
     switch (parseEvent._tag) {
@@ -403,14 +407,6 @@ function reactImpl(
         if (!parentTagName) break
         const registered = config.tools.get(parentTagName)
         if (!registered) break
-        const attrSpec = registered.binding.attributes?.find(a => a.attr === parseEvent.childTagName)
-
-        if (attrSpec) {
-          const pending = pendingAttrNormalizationChildren.get(parseEvent.parentToolCallId) ?? new Set<number>()
-          pending.add(parseEvent.childIndex)
-          pendingAttrNormalizationChildren.set(parseEvent.parentToolCallId, pending)
-          break
-        }
 
         const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
         if (!childInfo) break
@@ -436,9 +432,6 @@ function reactImpl(
         if (currentState.deadToolCalls.has(parseEvent.parentToolCallId)) break
         if (hasPriorOutcome(priorOutcomes, parseEvent.parentToolCallId)) break
         if (isInFlight(priorToolCallIds, priorOutcomes, parseEvent.parentToolCallId)) break
-
-        const pending = pendingAttrNormalizationChildren.get(parseEvent.parentToolCallId)
-        if (pending?.has(parseEvent.childIndex)) break
 
         const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
         if (childInfo?.bodyField) {
@@ -467,59 +460,6 @@ function reactImpl(
 
         const callEmitted = emittedFields.get(parseEvent.parentToolCallId) ?? new Set<string>()
         emittedFields.set(parseEvent.parentToolCallId, callEmitted)
-
-        const pending = pendingAttrNormalizationChildren.get(parseEvent.parentToolCallId)
-        const isPendingAttrNormalization = pending?.has(parseEvent.childIndex) ?? false
-        if (isPendingAttrNormalization) {
-          pending?.delete(parseEvent.childIndex)
-          if (pending && pending.size === 0) pendingAttrNormalizationChildren.delete(parseEvent.parentToolCallId)
-
-          const attrSpec = registered.binding.attributes?.find(a => a.attr === parseEvent.childTagName)
-          const simpleText = parseEvent.attributes.size === 0
-          if (attrSpec && simpleText && !callEmitted.has(attrSpec.field)) {
-            const trimmedBody = parseEvent.body.trim()
-            const attrSchema = tagSchemas.get(parentTagName)?.attributes.get(attrSpec.attr)
-            if (attrSchema) {
-              const coerced = coerceAttributeValue(trimmedBody, attrSchema.type)
-              if (!coerced.ok) {
-                currentState = yield* emitAndFold(currentState, {
-                  _tag: 'ToolInputParseError',
-                  toolCallId: parseEvent.parentToolCallId,
-                  tagName: parentTagName,
-                  toolName: registered.tool.name,
-                  group: registered.groupName,
-                  error: {
-                    _tag: 'InvalidAttributeValue',
-                    id: parseEvent.parentToolCallId,
-                    tagName: parentTagName,
-                    attribute: attrSpec.attr,
-                    expected: attrSchema.type,
-                    received: trimmedBody,
-                    detail: `Invalid value for attribute '${attrSpec.attr}' on <${parentTagName}>: "${trimmedBody}"`,
-                  },
-                })
-                break
-              }
-              currentState = yield* emitAndFold(currentState, {
-                _tag: 'ToolInputFieldValue',
-                toolCallId: parseEvent.parentToolCallId,
-                field: attrSpec.field,
-                value: coerced.value,
-              })
-              callEmitted.add(attrSpec.field)
-              break
-            }
-
-            currentState = yield* emitAndFold(currentState, {
-              _tag: 'ToolInputFieldValue',
-              toolCallId: parseEvent.parentToolCallId,
-              field: attrSpec.field,
-              value: trimmedBody,
-            })
-            callEmitted.add(attrSpec.field)
-          }
-          break
-        }
 
         const childInfo = resolveChildBinding(parseEvent.parentToolCallId, parseEvent.childTagName, currentState, config.tools)
         if (!childInfo) break
@@ -565,11 +505,7 @@ function reactImpl(
           break
         }
 
-        const tagSchema = tagSchemas.get(parseEvent.tagName)
-        const canonicalElement = tagSchema
-          ? canonicalizeAttrChildTagSwaps(parseEvent.element, registered.binding, tagSchema)
-          : parseEvent.element
-        const input = buildInput(canonicalElement, registered.binding)
+        const input = buildInput(parseEvent.element, registered.binding)
 
         // The dispatcher emits events via this callback — state stays in sync
         // automatically because every event goes through emitAndFold.
@@ -608,7 +544,7 @@ function reactImpl(
         }
 
         // Dispatch tool — events emitted via callback, state folded automatically
-        const result: DispatchResult = yield* dispatchTool(canonicalElement, dispatchCtx)
+        const result: DispatchResult = yield* dispatchTool(parseEvent.element, dispatchCtx)
 
         if (result._tag === 'ParseError') {
           currentState = yield* emitAndFold(currentState, {
@@ -642,8 +578,7 @@ function reactImpl(
             currentState = yield* emitAndFold(currentState, {
               _tag: 'MessageStart',
               id,
-              dest: config.defaultProseDest ?? 'user',
-              artifactsRaw: null,
+              to: null,
             })
           }
           currentState = yield* emitAndFold(currentState, {
@@ -713,8 +648,7 @@ function reactImpl(
         currentState = yield* emitAndFold(currentState, {
           _tag: 'MessageStart',
           id: parseEvent.id,
-          dest: parseEvent.dest,
-          artifactsRaw: parseEvent.artifactsRaw,
+          to: parseEvent.to,
         })
         break
       }
@@ -740,8 +674,8 @@ function reactImpl(
         currentState = yield* emitAndFold(currentState, {
           _tag: 'TurnEnd',
           result: parseEvent.decision === 'finish'
-            ? { _tag: 'Success', turnControl: 'finish', evidence: parseEvent.evidence }
-            : { _tag: 'Success', turnControl: parseEvent.decision },
+            ? { _tag: 'Success', turnControl: 'finish', evidence: parseEvent.evidence, termination: parseEvent.termination }
+            : { _tag: 'Success', turnControl: parseEvent.decision, termination: parseEvent.termination },
         })
         break
       }
@@ -749,7 +683,7 @@ function reactImpl(
       case 'ParseError': {
         const error = parseEvent.error
 
-        if (error._tag === 'UnclosedThink' || error._tag === 'UnclosedContainer') {
+        if (error._tag === 'UnclosedThink') {
           currentState = yield* emitAndFold(currentState, {
             _tag: 'StructuralParseError',
             error,
@@ -782,10 +716,7 @@ function reactImpl(
         break
       }
 
-      case 'ContainerOpen':
-      case 'ContainerClose':
-        // Structural — no runtime events
-        break
+
     }
 
     return currentState
@@ -804,66 +735,6 @@ function resolveBodyField(
   const tagName = state.toolCallMap.get(toolCallId)
   if (!tagName) return undefined
   return tools.get(tagName)?.binding.body
-}
-
-function canonicalizeAttrChildTagSwaps(
-  element: ParsedElement,
-  binding: RegisteredTool['binding'],
-  tagSchema: TagSchema,
-): ParsedElement {
-  let attributes = new Map(element.attributes)
-  let children = [...element.children]
-
-  if (binding.attributes) {
-    for (const attrBinding of binding.attributes) {
-      const hasCanonicalAttr = attributes.has(attrBinding.attr)
-      if (hasCanonicalAttr) continue
-      const matchingChildren = children.filter(
-        (child) => child.tagName === attrBinding.attr && child.attributes.size === 0,
-      )
-      if (matchingChildren.length !== 1) continue
-      const child = matchingChildren[0]
-      const trimmedBody = child.body.trim()
-      const attrType = tagSchema.attributes.get(attrBinding.attr)?.type
-      if (attrType) {
-        const coerced = coerceAttributeValue(trimmedBody, attrType)
-        attributes.set(attrBinding.attr, coerced.ok ? coerced.value : trimmedBody)
-      } else {
-        attributes.set(attrBinding.attr, trimmedBody)
-      }
-      let removedOne = false
-      children = children.filter((c) => {
-        if (!removedOne && c === child) {
-          removedOne = true
-          return false
-        }
-        return true
-      })
-    }
-  }
-
-  if (binding.childTags) {
-    for (const childBinding of binding.childTags) {
-      const hasCanonicalChild = children.some((child) => child.tagName === childBinding.tag)
-      if (hasCanonicalChild) continue
-      const attrValue = attributes.get(childBinding.tag)
-      if (attrValue === undefined) continue
-      children = [...children, {
-        tagName: childBinding.tag,
-        attributes: new Map(),
-        body: String(attrValue),
-      }]
-      attributes.delete(childBinding.tag)
-    }
-  }
-
-  return {
-    tagName: element.tagName,
-    toolCallId: element.toolCallId,
-    attributes,
-    body: element.body,
-    children,
-  }
 }
 
 interface ResolvedChildBinding {

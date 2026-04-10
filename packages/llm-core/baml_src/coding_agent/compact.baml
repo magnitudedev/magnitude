@@ -4,7 +4,8 @@
 function CodingAgentCompact(
   systemPrompt: string,
   messages: ChatMessage[],
-  includeClaudeSpoof: bool
+  includeClaudeSpoof: bool,
+  includeSystemPromptMessage: bool
 ) -> string {
   client ChatClientWithRetry
   prompt #"
@@ -12,8 +13,10 @@ function CodingAgentCompact(
     {{ _.role("system") }}
     You are Claude Code, Anthropic's official CLI for Claude.
     {%endif%}
+    {%if includeSystemPromptMessage%}
     {{ _.role("system") }}
     {{ systemPrompt }}
+    {%endif%}
 
     {% for message in messages %}
       {{ _.role(message.role) }}

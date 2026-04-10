@@ -15,10 +15,10 @@
  * 5. Publishing turn_completed
  */
 
-import { Effect, Stream, Queue, Either } from 'effect'
+import { Effect, Stream, Either } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 
-import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -31,9 +31,10 @@ import type { ObservationPart } from '@magnitudedev/roles'
 import { buildAckTurn } from '../prompts/protocol'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
-import type { AppEvent, ResponsePart } from '../events'
+import type { AppEvent } from '../events'
 
-import { createTurnStream, TurnError as TurnErrorCtor } from '../execution/types'
+import { createTurnStream } from '../execution/turn-stream'
+import { TurnError as TurnErrorCtor } from '../execution/types'
 import type { TurnError } from '../execution/types'
 import { MemoryProjection, getView } from '../projections/memory'
 
@@ -43,7 +44,7 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, type AgentVariant } from '../agents'
+import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
 
 import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
@@ -122,7 +123,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
     turn_started: (event, publish, read) => {
       const { forkId, turnId, chainId } = event
 
-      const rawCodeChunks: string[] = []
       let resolvedProviderId: string | null = null
       let resolvedModelId: string | null = null
       return Effect.gen(function* () {
@@ -137,7 +137,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // Determine agent: child forks use their role, root fork is always lead.
         const variant: AgentVariant = agentInstance
-          ? agentInstance.role as AgentVariant
+          ? (isValidVariant(agentInstance.role) ? agentInstance.role : 'builder')
           : 'lead'
 
         const agentDef = getAgentDefinition(variant)
@@ -193,9 +193,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         resolvedModelId = boundModel.model.id
 
         // 3. Build and consume the turn event stream
-        const turnStream = createTurnStream((queue) => Effect.gen(function* () {
-
-          const ackTurn = buildAckTurn(agentDef.lenses)
+        const turnStream = createTurnStream((sink) => Effect.gen(function* () {
+          const ackTurn = buildAckTurn(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
             {
               metadata: { callType: 'chat', forkId, forkName: agentInstance?.name ?? 'root', turnId, chainId },
@@ -207,7 +206,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               {
                 systemPrompt,
                 messages: chatMessages,
-                options: {},
+                options: { stopSequences: [END_TURN_STOP_SEQUENCE] },
                 ackTurn,
               },
             ),
@@ -217,7 +216,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           // Collect raw chunks and execute via xml-act runtime
           const xmlStream = cs.stream.pipe(
-            Stream.tap(chunk => Effect.sync(() => { rawCodeChunks.push(chunk) })),
+            Stream.tap(chunk => sink.emit({ _tag: 'RawResponseChunk', text: chunk })),
           )
 
           const executeResult = yield* execManager.execute(
@@ -229,27 +228,21 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               defaultProseDest: agentDef.defaultRecipient,
               allowSingleUserReplyThisTurn,
             },
-            queue,
+            sink,
           )
 
           // Extract usage — tag as partial if execution failed
           const usage = cs.getUsage()
           const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
 
-          // Build response parts — single text part containing the raw XML
-          const rawCode = rawCodeChunks.join('')
-          const responseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-
           // Offer final result
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus, responseParts, rawCodeChunks } })
+          yield* sink.emit({ _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus } })
         }))
 
         // 3a. Drain turn stream, publishing events and collecting the final result
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)
 
-        const { executeResult, usage, responseParts } = drained.finalResult
+        const { executeResult, usage } = drained.finalResult
 
         const inputTokens = usage.inputTokens
         if (inputTokens !== null) {
@@ -273,9 +266,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           turnId,
           chainId,
           strategyId: 'xml-act',
-          responseParts,
-          toolCalls: executeResult.toolCalls,
-          observedResults: executeResult.observedResults,
           result: turnResult,
           inputTokens,
           outputTokens: usage.outputTokens,
@@ -348,9 +338,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               turnId,
               chainId,
               strategyId: 'xml-act',
-              responseParts: [],
-              toolCalls: [],
-              observedResults: [],
               result: { success: false, error: `Context limit exceeded, waiting for compaction: ${errorMessage}`, cancelled: false },
               inputTokens: null,
               outputTokens: null,

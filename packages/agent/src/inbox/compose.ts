@@ -1,11 +1,11 @@
 import type { ContentPart } from '../content'
-import type { ObservedResult, TurnToolCall } from '../events'
 import type {
   AgentAtom,
   PhaseCriteriaPayload,
   ResultEntry,
   TimelineAttachment,
   TimelineEntry,
+  TurnResultItem,
 } from './types'
 
 export interface ComposeContextDeps {
@@ -14,12 +14,11 @@ export interface ComposeContextDeps {
   ): { agentId: string; role: string; parentForkId: string | null } | null
 }
 
-export function toResultToolResults(args: {
-  toolCalls: readonly TurnToolCall[]
-  observedResults: readonly ObservedResult[]
+export function toResultTurnResults(args: {
+  items: readonly TurnResultItem[]
 }): ResultEntry {
   return {
-    kind: 'tool_results',
+    kind: 'turn_results',
     ...args,
   }
 }
@@ -50,6 +49,30 @@ export function toTimelineUserMessage(args: {
 }): TimelineEntry {
   return {
     kind: 'user_message',
+    ...args,
+  }
+}
+
+export function toTimelineParentMessage(args: {
+  timestamp: number
+  text: string
+}): TimelineEntry {
+  return {
+    kind: 'parent_message',
+    ...args,
+  }
+}
+
+export function toTimelineUserBashCommand(args: {
+  timestamp: number
+  command: string
+  cwd: string
+  exitCode: number
+  stdout: string
+  stderr: string
+}): TimelineEntry {
+  return {
+    kind: 'user_bash_command',
     ...args,
   }
 }
@@ -163,9 +186,72 @@ export function toTimelineLifecycleHook(args: {
   agentId: string
   role: string
   hookType: 'spawn' | 'idle'
+  taskId?: string
+  taskTitle?: string
 }): TimelineEntry {
   return {
     kind: 'lifecycle_hook',
+    ...args,
+  }
+}
+
+export function toTimelineTaskTypeHook(args: {
+  timestamp: number
+  taskId: string
+  taskType: string
+  title: string
+}): TimelineEntry {
+  return {
+    kind: 'task_type_hook',
+    ...args,
+  }
+}
+
+export function toTimelineTaskIdleHook(args: {
+  timestamp: number
+  taskId: string
+  taskType: string
+  title: string
+  agentId: string
+}): TimelineEntry {
+  return {
+    kind: 'task_idle_hook',
+    ...args,
+  }
+}
+
+export function toTimelineTaskTreeDirty(args: {
+  timestamp: number
+  taskId: string
+}): TimelineEntry {
+  return {
+    kind: 'task_tree_dirty',
+    ...args,
+  }
+}
+
+export function toTimelineTaskTreeView(args: {
+  timestamp: number
+  renderedTree: string
+}): TimelineEntry {
+  return {
+    kind: 'task_tree_view',
+    ...args,
+  }
+}
+
+export function toTimelineTaskUpdate(args: {
+  timestamp: number
+  action: 'created' | 'cancelled' | 'completed' | 'status_changed'
+  taskId: string
+  title?: string
+  taskType?: string
+  previousStatus?: string
+  nextStatus?: string
+  cancelledCount?: number
+}): TimelineEntry {
+  return {
+    kind: 'task_update',
     ...args,
   }
 }

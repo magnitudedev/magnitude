@@ -19,15 +19,28 @@ describe('memory tool results', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
+        type: 'tool_event',
+        forkId: null,
+        turnId: 't-1',
+        toolCallId: 'tc-1',
+        toolKey: 'shell',
+        event: {
+          _tag: 'ToolObservation',
+          toolCallId: 'tc-1',
+          tagName: 'shell',
+          query: '.',
+          content: [{ type: 'text', text: '<stdout>hi</stdout>' }],
+        },
+      })
+      yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [{ toolKey: 'shell', group: 'shell', toolName: 'shell', result: { status: 'success', output: { ok: true } } }],
-        observedResults: [{ toolCallId: 'tc-1', tagName: 'shell', query: '.', content: [{ type: 'text', text: '<stdout>hi</stdout>' }] }],
-        result: { success: true, turnDecision: 'yield' },
+
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -50,21 +63,42 @@ describe('memory tool results', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
+        type: 'tool_event',
+        forkId: null,
+        turnId: 't-1',
+        toolCallId: 'tc-a',
+        toolKey: 'shell',
+        event: {
+          _tag: 'ToolObservation',
+          toolCallId: 'tc-a',
+          tagName: 'shell',
+          query: '.',
+          content: [{ type: 'text', text: '<stdout>a</stdout>' }],
+        },
+      })
+      yield* h.send({
+        type: 'tool_event',
+        forkId: null,
+        turnId: 't-1',
+        toolCallId: 'tc-b',
+        toolKey: 'shell',
+        event: {
+          _tag: 'ToolObservation',
+          toolCallId: 'tc-b',
+          tagName: 'shell',
+          query: '.',
+          content: [{ type: 'text', text: '<stdout>b</stdout>' }],
+        },
+      })
+      yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [
-          { toolKey: 'shell', group: 'shell', toolName: 'shell', result: { status: 'success', output: {} } },
-          { toolKey: 'shell', group: 'shell', toolName: 'shell', result: { status: 'success', output: {} } },
-        ],
-        observedResults: [
-          { toolCallId: 'tc-a', tagName: 'shell', query: '.', content: [{ type: 'text', text: '<stdout>a</stdout>' }] },
-          { toolCallId: 'tc-b', tagName: 'shell', query: '.', content: [{ type: 'text', text: '<stdout>b</stdout>' }] },
-        ],
-        result: { success: true, turnDecision: 'yield' },
+
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -88,13 +122,12 @@ describe('memory tool results', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
+
         result: { success: false, error: 'boom', cancelled: false },
         inputTokens: null,
         outputTokens: null,
@@ -109,7 +142,7 @@ describe('memory tool results', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        const tr = inbox.results.find(r => r.kind === 'tool_results')
+        const tr = inbox.results.find(r => r.kind === 'turn_results')
         const err = inbox.results.find(r => r.kind === 'error')
         expect(tr).toBeUndefined()
         expect(err?.kind).toBe('error')
@@ -127,13 +160,12 @@ describe('memory tool results', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
+
         result: { success: false, error: 'cancelled', cancelled: true },
         inputTokens: null,
         outputTokens: null,
@@ -160,14 +192,13 @@ describe('memory tool results', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'assistant text' }],
-        toolCalls: [],
-        observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -193,15 +224,28 @@ describe('memory tool results', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
+        type: 'tool_event',
+        forkId: null,
+        turnId: 't-1',
+        toolCallId: 'tc-large',
+        toolKey: 'shell',
+        event: {
+          _tag: 'ToolObservation',
+          toolCallId: 'tc-large',
+          tagName: 'shell',
+          query: '.',
+          content: [{ type: 'text', text: large }],
+        },
+      })
+      yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [{ toolKey: 'shell', group: 'shell', toolName: 'shell', result: { status: 'success', output: {} } }],
-        observedResults: [{ toolCallId: 'tc-large', tagName: 'shell', query: '.', content: [{ type: 'text', text: large }] }],
-        result: { success: true, turnDecision: 'yield' },
+
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,

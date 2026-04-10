@@ -7,14 +7,16 @@
 
 import { Projection } from '@magnitudedev/event-core'
 import type { ObservationPart } from '@magnitudedev/roles'
-import type { AppEvent, ResponsePart, StrategyId, ImageAttachment } from '../events'
+import type { AppEvent, StrategyId, ImageAttachment } from '../events'
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
+
 import { OutboundMessagesProjection } from './outbound-messages'
-import { compactionSummaryTag, buildSessionContextContent } from '../prompts'
+import { compactionSummaryTag, buildSessionContextContent, TASK_TREE_COMPLETION_REMINDER } from '../prompts'
 import { UserPresenceProjection } from './user-presence'
 import { UserMessageResolutionProjection } from './user-message-resolution'
+import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
 import { getAgentDefinition, isValidVariant } from '../agents'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
 import { formatSkillInitialPrompt } from '../prompts/skills'
@@ -30,14 +32,17 @@ import type {
   AgentAtom,
   PhaseCriteriaPayload,
   LifecycleReminderFormatterMap,
+  TurnResultItem,
 } from '../inbox/types'
 import {
-  toResultToolResults,
+  toResultTurnResults,
   toResultInterrupted,
   toResultError,
   toResultNoop,
   toTimelineUserMessage,
+  toTimelineParentMessage,
   toTimelineUserToAgent,
+  toTimelineUserBashCommand,
   toTimelineUserPresence,
   toTimelineObservation,
   toTimelineAgentBlock,
@@ -48,6 +53,11 @@ import {
   toTimelinePhaseVerdict,
   toTimelineWorkflowPhase,
   toTimelineLifecycleHook,
+  toTimelineTaskTypeHook,
+  toTimelineTaskIdleHook,
+  toTimelineTaskTreeDirty,
+  toTimelineTaskTreeView,
+  toTimelineTaskUpdate,
 } from '../inbox/compose'
 import { builderRole } from '../agents/builder'
 import { explorerRole } from '../agents/explorer'
@@ -82,7 +92,6 @@ export type Message =
       readonly source: 'agent'
       readonly content: ContentPart[]
       readonly strategyId: StrategyId
-      readonly responseParts: readonly ResponsePart[]
     }
   | { readonly type: 'compacted'; readonly source: 'system'; readonly content: ContentPart[] }
   | { readonly type: 'fork_context'; readonly source: 'system'; readonly content: ContentPart[] }
@@ -100,6 +109,11 @@ export interface LLMMessage {
 
 export type Perspective = 'agent' | 'autopilot'
 
+type PendingParentMessage = {
+  readonly body: string
+  readonly destination: 'parent'
+}
+
 export interface ForkMemoryState {
   readonly messages: readonly Message[]
   readonly queuedEntries: readonly QueuedEntry[]
@@ -107,14 +121,19 @@ export interface ForkMemoryState {
   readonly currentChainId: string | null
   readonly pendingPresenceText: string | null
   readonly nextQueueSeq: number
+  readonly pendingResultItems: readonly TurnResultItem[]
+  readonly pendingParentMessages: ReadonlyMap<string, PendingParentMessage>
 }
 
-function flattenResponseText(parts: readonly ResponsePart[]): string {
-  return parts
-    .filter((p): p is Extract<ResponsePart, { type: 'text' }> => p.type === 'text')
-    .map(p => p.content)
-    .join('')
+function resetPendingTurnState(fork: ForkMemoryState): ForkMemoryState {
+  return {
+    ...fork,
+    pendingResultItems: [],
+    pendingParentMessages: new Map(),
+  }
 }
+
+
 
 function extractText(parts: readonly ContentPart[]): string {
   return parts
@@ -158,16 +177,39 @@ function enqueueTimeline(
   return { ...fork, queuedEntries, nextQueueSeq: seq + 1 }
 }
 
-function flushQueue(fork: ForkMemoryState): ForkMemoryState {
+function flushQueue(fork: ForkMemoryState, taskGraphState: TaskGraphState): ForkMemoryState {
   const sorted = [...fork.queuedEntries].sort((a, b) => (a.timestamp - b.timestamp) || (a.seq - b.seq))
   const results: ResultEntry[] = []
   const timeline: TimelineEntry[] = []
+  const dirtyTaskIds = new Set<string>()
+  let latestDirtyTimestamp: number | null = null
 
   for (const queued of sorted) {
     if (queued.lane === 'result') {
       results.push(queued.entry)
-    } else {
-      timeline.push(queued.entry)
+      continue
+    }
+
+    if (queued.entry.kind === 'task_tree_dirty') {
+      dirtyTaskIds.add(queued.entry.taskId)
+      latestDirtyTimestamp = latestDirtyTimestamp === null
+        ? queued.entry.timestamp
+        : Math.max(latestDirtyTimestamp, queued.entry.timestamp)
+      continue
+    }
+
+    timeline.push(queued.entry)
+  }
+
+  if (dirtyTaskIds.size > 0 && latestDirtyTimestamp !== null) {
+    const renderedTree = renderTaskTreesForTaskIds(taskGraphState, Array.from(dirtyTaskIds))
+    if (renderedTree) {
+      timeline.push(
+        toTimelineTaskTreeView({
+          timestamp: latestDirtyTimestamp,
+          renderedTree,
+        }),
+      )
     }
   }
 
@@ -245,6 +287,58 @@ function toContentPartFromObservation(part: ObservationPart): ContentPart {
   }
 }
 
+function findRootTaskId(state: TaskGraphState, taskId: string): string {
+  let current = state.tasks.get(taskId)
+  while (current && current.parentId) {
+    const parent = state.tasks.get(current.parentId)
+    if (!parent) break
+    current = parent
+  }
+  return current?.id ?? taskId
+}
+
+function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number): string[] {
+  const task = state.tasks.get(taskId)
+  if (!task) return []
+
+  const indent = '  '.repeat(depth)
+
+  const status = task.status === 'completed' ? 'done' : task.status
+  const assignedRoleStr = task.worker && task.worker.role !== 'user'
+    ? `, assigned: ${task.worker.role}`
+    : ''
+  const assigneeStr = task.assignee === 'user' ? ', user' : ''
+  const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assignedRoleStr}${assigneeStr})`
+
+  const childLines = task.childIds.flatMap(childId => renderTaskSubtree(state, childId, depth + 1))
+
+
+  return [line, ...childLines]
+}
+
+function renderTaskTreesForTaskIds(state: TaskGraphState, taskIds: readonly string[]): string {
+  const roots = new Set<string>()
+  for (const taskId of taskIds) {
+    roots.add(findRootTaskId(state, taskId))
+  }
+
+  const renderedTrees = Array.from(roots)
+    .map(rootId => renderTaskSubtree(state, rootId, 0).join('\n'))
+    .filter(Boolean)
+    .join('\n')
+
+  if (!renderedTrees) return ''
+
+  return `${renderedTrees}\n${TASK_TREE_COMPLETION_REMINDER}`
+}
+
+function findTaskForAgent(state: TaskGraphState, args: { agentId: string, forkId: string }): TaskRecord | null {
+  for (const task of Array.from(state.tasks.values())) {
+    if (task.worker?.agentId === args.agentId || task.worker?.forkId === args.forkId) return task
+  }
+  return null
+}
+
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
   const content = message.type === 'inbox'
     ? formatInbox({ results: message.results, timeline: message.timeline, timezone, lifecycleReminderFormatters })
@@ -274,7 +368,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
-  reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection] as const,
+  reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection, TaskGraphProjection] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -283,6 +377,8 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
     currentChainId: null,
     pendingPresenceText: null,
     nextQueueSeq: 0,
+    pendingResultItems: [],
+    pendingParentMessages: new Map(),
   },
 
   eventHandlers: {
@@ -312,7 +408,19 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return enqueueTimeline(fork, entry, event.timestamp)
     },
 
-
+    user_bash_command: ({ event, fork }) =>
+      enqueueTimeline(
+        fork,
+        toTimelineUserBashCommand({
+          timestamp: event.timestamp,
+          command: event.command,
+          cwd: event.cwd,
+          exitCode: event.exitCode,
+          stdout: event.stdout,
+          stderr: event.stderr,
+        }),
+        event.timestamp,
+      ),
 
     turn_started: ({ event, fork, read }) => {
       let nextFork = fork
@@ -331,17 +439,19 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         )
       }
 
-      const hadQueuedEntries = nextFork.queuedEntries.length > 0
-      const flushed = flushQueue(nextFork)
+      const preFlushMessageCount = nextFork.messages.length
+      const taskGraphState = read(TaskGraphProjection)
+      const flushed = flushQueue(nextFork, taskGraphState)
 
       let messages = flushed.messages
+      const flushProducedInbox = messages.length > preFlushMessageCount
       const lastMessage = messages[messages.length - 1]
-      if (!hadQueuedEntries && lastMessage?.source === 'agent') {
+      if (!flushProducedInbox && lastMessage?.source === 'agent') {
         messages = [...messages, { type: 'inbox', source: 'system', results: [toResultNoop()], timeline: [] }]
       }
 
       return {
-        ...flushed,
+        ...resetPendingTurnState(flushed),
         messages,
         currentTurnId: event.turnId,
         currentChainId: event.chainId,
@@ -349,42 +459,156 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     },
 
-    tool_event: ({ fork }) => fork,
+    tool_event: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
 
-    observations_captured: ({ event, fork }) => {
+      switch (event.event._tag) {
+        case 'ToolExecutionEnded': {
+          const result = event.event.result
+          switch (result._tag) {
+            case 'Success':
+              return fork
+            case 'Error':
+              return {
+                ...fork,
+                pendingResultItems: [
+                  ...fork.pendingResultItems,
+                  {
+                    kind: 'tool_error',
+                    toolKey: event.toolKey,
+                    status: 'error',
+                    message: result.error,
+                  },
+                ],
+              }
+            case 'Rejected':
+              return {
+                ...fork,
+                pendingResultItems: [
+                  ...fork.pendingResultItems,
+                  {
+                    kind: 'tool_error',
+                    toolKey: event.toolKey,
+                    status: 'rejected',
+                    message: typeof result.rejection === 'string' ? result.rejection : undefined,
+                  },
+                ],
+              }
+            case 'Interrupted':
+              return {
+                ...fork,
+                pendingResultItems: [
+                  ...fork.pendingResultItems,
+                  {
+                    kind: 'tool_error',
+                    toolKey: event.toolKey,
+                    status: 'interrupted',
+                  },
+                ],
+              }
+          }
+        }
+
+        case 'ToolObservation':
+          return {
+            ...fork,
+            pendingResultItems: [
+              ...fork.pendingResultItems,
+              {
+                kind: 'tool_observation',
+                tagName: event.event.tagName,
+                query: event.event.query,
+                content: event.event.content,
+              },
+            ],
+          }
+
+        default:
+          return fork
+      }
+    },
+
+    message_start: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+      if (event.forkId === null || event.destination.kind !== 'parent') return fork
+      return {
+        ...fork,
+        pendingParentMessages: new Map(fork.pendingParentMessages).set(event.id, {
+          body: '',
+          destination: 'parent',
+        }),
+      }
+    },
+
+    message_chunk: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+      const pending = fork.pendingParentMessages.get(event.id)
+      if (!pending) return fork
+
+      return {
+        ...fork,
+        pendingParentMessages: new Map(fork.pendingParentMessages).set(event.id, {
+          ...pending,
+          body: pending.body + event.text,
+        }),
+      }
+    },
+
+    message_end: ({ event, fork }) => {
+      if (fork.currentTurnId !== event.turnId) return fork
+      const pending = fork.pendingParentMessages.get(event.id)
+      if (!pending) return fork
+
+      const pendingParentMessages = new Map(fork.pendingParentMessages)
+      pendingParentMessages.delete(event.id)
+
+      return {
+        ...fork,
+        pendingParentMessages,
+        pendingResultItems: [
+          ...fork.pendingResultItems,
+          {
+            kind: 'message_ack',
+            destination: pending.destination,
+            chars: pending.body.length,
+          },
+        ],
+      }
+    },
+
+    observations_captured: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
       const nextFork = enqueueTimeline(
         fork,
         toTimelineObservation({ timestamp: event.timestamp, parts: event.parts.map(toContentPartFromObservation) }),
         event.timestamp,
       )
-      return flushQueue(nextFork)
+      return flushQueue(nextFork, read(TaskGraphProjection))
     },
 
     turn_completed: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
 
       const newMessages: Message[] = [...fork.messages]
-      const isCancelled = !event.result.success && event.result.cancelled
+      const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
+      const canonical = read(CanonicalTurnProjection)
+      const canonicalText = canonical.lastCompleted?.turnId === event.turnId
+        ? canonical.lastCompleted.canonicalXml
+        : ''
+      const hasAssistantContent = canonicalText.trim().length > 0
 
-      if (event.responseParts.length > 0) {
-        const canonical = read(CanonicalTurnProjection)
-        const canonicalText = canonical.lastCompleted?.turnId === event.turnId && canonical.lastCompleted.clean
-          ? canonical.lastCompleted.canonicalXml
-          : flattenResponseText(event.responseParts)
-
+      if (hasAssistantContent) {
         newMessages.push({
           type: 'assistant_turn',
           source: 'agent',
           content: textParts(canonicalText),
           strategyId: event.strategyId,
-          responseParts: event.responseParts,
         })
       }
 
       let nextFork: ForkMemoryState = { ...fork, messages: newMessages, currentTurnId: null }
 
-      if (event.responseParts.length === 0 && !isCancelled && event.result.success) {
+      if (!hasAssistantContent && !isCancelled && event.result.success) {
         nextFork = {
           ...nextFork,
           messages: [
@@ -394,7 +618,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
               source: 'agent',
               content: textParts('(empty response)'),
               strategyId: event.strategyId,
-              responseParts: [],
             },
           ],
         }
@@ -402,12 +625,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
 
       const hasError = !event.result.success
-      const errorMessage = hasError ? event.result.error : undefined
-      const observedResults = isCancelled ? [] : event.observedResults
-      if (event.toolCalls.length > 0 || observedResults.length > 0) {
+      const errorMessage = hasError && 'error' in event.result ? event.result.error : undefined
+      if (fork.pendingResultItems.length > 0) {
         nextFork = enqueueResult(
           nextFork,
-          toResultToolResults({ toolCalls: event.toolCalls, observedResults }),
+          toResultTurnResults({ items: fork.pendingResultItems }),
           event.timestamp,
         )
       }
@@ -426,13 +648,16 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
       }
 
-      return nextFork
+      return resetPendingTurnState(nextFork)
     },
 
-    turn_unexpected_error: ({ event, fork }) => {
+    turn_unexpected_error: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
-      const nextFork = flushQueue(enqueueResult(fork, toResultError({ message: event.message }), event.timestamp))
-      return { ...nextFork, currentTurnId: null }
+      const nextFork = flushQueue(
+        enqueueResult(fork, toResultError({ message: event.message }), event.timestamp),
+        read(TaskGraphProjection),
+      )
+      return resetPendingTurnState({ ...nextFork, currentTurnId: null })
     },
 
     skill_started: ({ event, fork }) => {
@@ -530,6 +755,34 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
   },
 
   globalEventHandlers: {
+    task_assigned: ({ event, state, read }) => {
+      if (!event.workerInfo) return state
+
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const task = read(TaskGraphProjection).tasks.get(event.taskId)
+      if (!task) return state
+
+      let nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineLifecycleHook({
+          timestamp: event.timestamp,
+          agentId: event.workerInfo.agentId,
+          role: event.workerInfo.role,
+          hookType: 'spawn',
+          taskId: event.taskId,
+          taskTitle: task.title,
+        }),
+        event.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    },
+
     agent_created: ({ event, state }) => {
       const { forkId, parentForkId } = event
       const parentState = state.forks.get(parentForkId)
@@ -540,14 +793,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         ? [{ type: 'fork_context', source: 'system', content: textParts(normalizedContext) }]
         : []
 
-      const newForkState: ForkMemoryState = {
+      let newForkState: ForkMemoryState = {
         messages: [...contextMessage],
         queuedEntries: [],
         currentTurnId: null,
         currentChainId: null,
         pendingPresenceText: null,
         nextQueueSeq: 0,
+        pendingResultItems: [],
+        pendingParentMessages: new Map(),
       }
+
+      newForkState = enqueueTimeline(
+        newForkState,
+        toTimelineParentMessage({ timestamp: event.timestamp, text: event.message }),
+        event.timestamp,
+      )
 
       const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
       const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
@@ -566,7 +827,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
   signalHandlers: on => [
     on(OutboundMessagesProjection.signals.messageCompleted, ({ value, state, read }) => {
-      if (value.dest === 'user') return state
+      if (value.userFacing) return state
 
       const targetForkId = value.targetForkId
       if (targetForkId === undefined) return state
@@ -576,6 +837,20 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const agentState = read(AgentStatusProjection)
       const sender = value.forkId === null ? null : getAgentByForkId(agentState, value.forkId)
       const senderAgentId = sender?.agentId ?? 'lead'
+
+      if (value.destination.kind === 'worker') {
+        return {
+          ...state,
+          forks: new Map(state.forks).set(
+            targetForkId,
+            enqueueTimeline(
+              targetState,
+              toTimelineParentMessage({ timestamp: value.timestamp, text: value.text }),
+              value.timestamp,
+            ),
+          ),
+        }
+      }
 
       const atom: AgentAtom = {
         kind: 'message',
@@ -631,7 +906,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state }) => {
+    on(AgentStatusProjection.signals.agentBecameIdle, ({ value, state, read }) => {
       const parentState = state.forks.get(value.parentForkId)
       if (!parentState) return state
 
@@ -654,6 +929,28 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         nextParent = enqueueTimeline(
           nextParent,
           toTimelineLifecycleHook({ timestamp: value.timestamp, agentId: value.agentId, role: value.role, hookType: 'idle' }),
+          value.timestamp,
+        )
+      }
+
+      const taskGraphState = read(TaskGraphProjection)
+      const linkedTask = findTaskForAgent(taskGraphState, { agentId: value.agentId, forkId: value.forkId })
+      if (linkedTask) {
+        nextParent = enqueueTimeline(
+          nextParent,
+          toTimelineTaskIdleHook({
+            timestamp: value.timestamp,
+            taskId: linkedTask.id,
+            taskType: linkedTask.taskType,
+            title: linkedTask.title,
+            agentId: value.agentId,
+          }),
+          value.timestamp,
+        )
+
+        nextParent = enqueueTimeline(
+          nextParent,
+          toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: linkedTask.id }),
           value.timestamp,
         )
       }
@@ -723,6 +1020,134 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       return {
         ...state,
         forks: new Map(state.forks).set(value.forkId, nextFork),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCreated, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const taskGraphState = read(TaskGraphProjection)
+      const task = taskGraphState.tasks.get(value.taskId)
+      if (!task) return state
+
+      let nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskTypeHook({
+          timestamp: value.timestamp,
+          taskId: task.id,
+          taskType: task.taskType,
+          title: task.title,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action: 'created',
+          taskId: task.id,
+          title: task.title,
+          taskType: task.taskType,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: task.id }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      const task = read(TaskGraphProjection).tasks.get(value.taskId)
+
+      let nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action: 'completed',
+          taskId: value.taskId,
+          title: task?.title,
+          taskType: task?.taskType,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskCancelled, ({ value, state }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+
+      let nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action: 'cancelled',
+          taskId: value.taskId,
+          cancelledCount: value.cancelledSubtree.length,
+        }),
+        value.timestamp,
+      )
+
+      nextLead = enqueueTimeline(
+        nextLead,
+        toTimelineTaskTreeDirty({ timestamp: value.timestamp, taskId: value.taskId }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
+      }
+    }),
+
+    on(TaskGraphProjection.signals.taskStatusChanged, ({ value, state, read }) => {
+      const leadFork = state.forks.get(null)
+      if (!leadFork) return state
+      if (value.next === 'completed') return state
+
+      const task = read(TaskGraphProjection).tasks.get(value.taskId)
+      const action = 'status_changed'
+
+      const nextLead = enqueueTimeline(
+        leadFork,
+        toTimelineTaskUpdate({
+          timestamp: value.timestamp,
+          action,
+          taskId: value.taskId,
+          title: task?.title,
+          taskType: task?.taskType,
+          previousStatus: value.previous,
+          nextStatus: value.next,
+        }),
+        value.timestamp,
+      )
+
+      return {
+        ...state,
+        forks: new Map(state.forks).set(null, nextLead),
       }
     }),
   ],

@@ -10,6 +10,7 @@ import { isMarkdownFile, renderCodeLines } from '../../utils/file-lang';
 import { BOX_CHARS } from '../../utils/ui-constants';
 import { useTheme } from '../../hooks/use-theme';
 import { useStreamingReveal } from '../../hooks/use-streaming-reveal';
+import { useSelectedFile } from '../../hooks/use-file-viewer';
 
 const SHIMMER_INTERVAL_MS = 160;
 
@@ -22,6 +23,8 @@ export const contentDisplay = createToolDisplay<ContentState>({
     const isDone = state.phase === 'completed';
     const isError = state.phase === 'error' || state.phase === 'interrupted' || state.phase === 'rejected';
     const [isHovered, setIsHovered] = useState(false);
+    const selectedFile = useSelectedFile();
+    const isViewerShowingSameFile = !!path && selectedFile?.path === path;
 
     const { displayedContent, showCursor } = useStreamingReveal(content, isStreaming);
     const codeLines = useMemo(
@@ -64,7 +67,7 @@ export const contentDisplay = createToolDisplay<ContentState>({
                 {`${state.charCount} chars · ${state.lineCount} lines`}
               </text>
             )}
-            {isStreaming && content.length > 0 && (
+            {isStreaming && content.length > 0 && !isViewerShowingSameFile && (
               <box style={{
                 borderStyle: 'single',
                 borderColor: isHovered ? (theme.link) : (theme.border || theme.muted),
@@ -72,6 +75,7 @@ export const contentDisplay = createToolDisplay<ContentState>({
                 height: 12,
               }}>
                 <scrollbox
+                  onMouseScroll={(e) => e.stopPropagation()}
                   stickyScroll
                   stickyStart="bottom"
                   scrollX={false}

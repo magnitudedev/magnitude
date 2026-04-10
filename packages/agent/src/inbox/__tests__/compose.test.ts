@@ -3,11 +3,12 @@ import {
   toResultError,
   toResultInterrupted,
   toResultNoop,
-  toResultToolResults,
+  toResultTurnResults,
   toTimelineAgentBlock,
   toTimelineObservation,
   toTimelinePhaseCriteria,
   toTimelinePhaseVerdict,
+  toTimelineTaskUpdate,
   toTimelineLifecycleHook,
   toTimelineSkillCompleted,
   toTimelineSkillStarted,
@@ -24,12 +25,12 @@ const TS = 1711641600000
 
 describe('inbox compose', () => {
   test('toResult* constructors set correct kinds', () => {
-    const toolResults = toResultToolResults({ toolCalls: [], observedResults: [] })
+    const turnResults = toResultTurnResults({ items: [] })
     const interrupted = toResultInterrupted()
     const error = toResultError({ message: 'bad' })
     const noop = toResultNoop()
 
-    expect(toolResults.kind).toBe('tool_results')
+    expect(turnResults.kind).toBe('turn_results')
     expect(interrupted.kind).toBe('interrupted')
     expect(error.kind).toBe('error')
     expect(noop.kind).toBe('noop')
@@ -73,6 +74,15 @@ describe('inbox compose', () => {
         hookType: 'spawn',
       }).kind,
     ).toBe('lifecycle_hook')
+    expect(
+      toTimelineTaskUpdate({
+        timestamp: TS,
+        action: 'status_changed',
+        taskId: 't1',
+        previousStatus: 'pending',
+        nextStatus: 'working',
+      }).kind,
+    ).toBe('task_update')
     expect(toTimelineObservation({ timestamp: TS, parts }).kind).toBe('observation')
   })
 
@@ -124,16 +134,27 @@ describe('inbox compose', () => {
       verdictText: 'fail',
       workflowCompleted: false,
     })
+    const update = toTimelineTaskUpdate({
+      timestamp: TS,
+      action: 'created',
+      taskId: 't1',
+    })
 
     if (block.kind !== 'agent_block') throw new Error('expected agent_block')
     if (workflow.kind !== 'workflow_phase') throw new Error('expected workflow_phase')
     if (skillStarted.kind !== 'skill_started') throw new Error('expected skill_started')
     if (verdict.kind !== 'phase_verdict') throw new Error('expected phase_verdict')
+    if (update.kind !== 'task_update') throw new Error('expected task_update')
 
     expect(block.atoms).toEqual([])
     expect(workflow.name).toBeUndefined()
     expect(workflow.phase).toBeUndefined()
     expect(skillStarted.firstPhase).toBeUndefined()
     expect(verdict.workflowCompleted).toBe(false)
+    expect(update.title).toBeUndefined()
+    expect(update.taskType).toBeUndefined()
+    expect(update.previousStatus).toBeUndefined()
+    expect(update.nextStatus).toBeUndefined()
+    expect(update.cancelledCount).toBeUndefined()
   })
 })

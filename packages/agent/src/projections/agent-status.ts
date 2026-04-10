@@ -6,9 +6,8 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { TurnProjection } from './turn'
 
-export type AgentStatus = 'starting' | 'working' | 'idle' | 'killed'
+export type AgentStatus = 'working' | 'idle' | 'killed'
 
 export interface AgentInfo {
   readonly agentId: string
@@ -145,9 +144,10 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     agent_created: ({ event, state, emit }) => {
       const normalizedMode: 'clone' | 'spawn' = event.mode === 'clone' ? 'clone' : 'spawn'
       const normalizedContext = typeof event.context === 'string' ? event.context : ''
-      const normalizedTaskId = typeof event.taskId === 'string' && event.taskId.trim().length > 0
-        ? event.taskId
-        : `legacy-${event.agentId}-${event.forkId}`
+      if (typeof event.taskId !== 'string' || event.taskId.trim().length === 0) {
+        return state
+      }
+      const normalizedTaskId = event.taskId
 
       const existingAgent = state.agents.get(event.agentId)
       if (existingAgent) {
@@ -181,7 +181,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         mode: normalizedMode,
         taskId: normalizedTaskId,
         message: event.message ?? null,
-        status: 'starting',
+        status: 'idle',
       }
 
       return {
@@ -215,6 +215,29 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     },
 
 
+    turn_completed: ({ event, state, emit }) => {
+      if (event.forkId === null) return state
+      if (event.result.success && event.result.turnDecision === 'continue') return state
+
+      const agent = getAgentByForkId(state, event.forkId)
+      if (!agent) return state
+
+      if (agent.status !== 'idle') {
+        emit.agentBecameIdle({
+          agentId: agent.agentId,
+          forkId: agent.forkId,
+          role: agent.role,
+          parentForkId: agent.parentForkId,
+          reason: 'stable',
+          timestamp: event.timestamp,
+        })
+      }
+
+      return {
+        ...state,
+        agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
+      }
+    },
 
     turn_unexpected_error: ({ event, state, emit }) => {
       if (event.forkId === null) return state
@@ -328,31 +351,5 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
       return removed.state
     },
   },
-
-  signalHandlers: (on) => [
-    on(TurnProjection.signals.turnTerminated, ({ value, state, emit }) => {
-      if (value.forkId === null) return state
-      if (value.triggersQueued) return state
-
-      const agent = getAgentByForkId(state, value.forkId)
-      if (!agent) return state
-
-      if (agent.status !== 'idle') {
-        emit.agentBecameIdle({
-          agentId: agent.agentId,
-          forkId: agent.forkId,
-          role: agent.role,
-          parentForkId: agent.parentForkId,
-          reason: 'stable',
-          timestamp: value.timestamp,
-        })
-      }
-
-      return {
-        ...state,
-        agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
-      }
-    }),
-  ],
 
 }))

@@ -7,7 +7,7 @@
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
-import { Effect, Stream, Queue, Context, Layer, Ref } from 'effect'
+import { Effect, Stream, Context, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
@@ -19,7 +19,7 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResult, TurnDecision, TurnToolCall, ToolResult, ObservedResult, TurnResultError } from '../events'
+import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools } from '../tools'
@@ -33,30 +33,32 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, UNCLOSED_ACTIONS_REMINDER, formatNonexistentAgentError } from '../prompts'
+import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
 import { WorkflowStateReaderTag, type WorkflowStateReader } from '../tools/workflow-reader'
+import { TaskGraphStateReaderTag, canCompleteRecord, getChildRecords, canAssignRecord, collectSubtreeRecords } from '../tools/task-reader'
 import { ConversationProjection, type ConversationState } from '../projections/conversation'
 import { createId } from '../util/id'
 import { logger } from '@magnitudedev/logger'
 
-import { AgentRoutingProjection, type AgentRoutingState, isActiveRoute, getRoutingEntryByForkId } from '../projections/agent-routing'
+import { AgentRoutingProjection, type AgentRoutingState, getRoutingEntryByForkId } from '../projections/agent-routing'
 import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentByForkId } from '../projections/agent-status'
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
 import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
+import { TaskGraphProjection, type TaskGraphState, type TaskStatus } from '../projections/task-graph'
 
 import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
 import { bindObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
-import type { TurnEvent } from './types'
+import type { TurnEvent, TurnEventSink } from './types'
 import { WorkingDirectoryTag } from './working-directory'
-import type { StreamingLeaf, StreamingPartial } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -65,11 +67,22 @@ const { ForkContext } = Fork
 
 type AgentDef = RoleDefinition
 
+type AnyStreamHook = StreamHook<Record<string, unknown>, unknown, unknown, unknown, unknown>
+type StreamableTool = ToolDefinition & { stream: AnyStreamHook }
+
+function hasStreamHook<T extends ToolDefinition>(tool: T): tool is T & StreamableTool {
+  return 'stream' in tool && !!tool.stream
+}
+
 import { mapXmlToolResult } from '../util/tool-result'
+import { handleTaskDirective } from '../tasks/operations'
+
 
 // =============================================================================
 // Types
 // =============================================================================
+
+export const IDENTICAL_RESPONSE_BREAKER_THRESHOLD = 5
 
 export interface ExecuteOptions {
   readonly forkId: string | null
@@ -81,8 +94,6 @@ export interface ExecuteOptions {
 
 export interface ExecuteResult {
   readonly result: TurnResult
-  readonly toolCalls: readonly TurnToolCall[]
-  readonly observedResults: readonly ObservedResult[]
 }
 
 // =============================================================================
@@ -98,11 +109,18 @@ export interface ExecutionManagerService {
   readonly execute: (
     xmlStream: Stream.Stream<string, ModelError>,
     options: ExecuteOptions,
-    sink: Queue.Queue<TurnEvent>,
+    sink: TurnEventSink,
   ) => Effect.Effect<
     ExecuteResult,
     XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ReactorState> | Projection.ForkedProjectionInstance<ForkTurnState>
+    Projection.ProjectionInstance<AgentRoutingState>
+    | Projection.ProjectionInstance<AgentStatusState>
+    | Projection.ProjectionInstance<TaskGraphState>
+    | Projection.ForkedProjectionInstance<ReactorState>
+    | Projection.ForkedProjectionInstance<ForkTurnState>
+    | WorkerBusService<AppEvent>
+    | TaskGraphStateReaderTag
+    | ConversationStateReaderTag
   >
 
   /**
@@ -135,7 +153,7 @@ export interface ExecutionManagerService {
     name: string
     agentId: string
     prompt: string
-    message?: string
+    message: string
     outputSchema?: JsonSchema | undefined
     mode: 'clone' | 'spawn'
     role: AgentVariant
@@ -182,6 +200,7 @@ function makeForkLayers(
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkTurnState>,
   workflowProjection: Projection.ForkedProjectionInstance<WorkflowCriteriaState>,
+  taskGraphProjection: Projection.ProjectionInstance<TaskGraphState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
   approvalState: ApprovalStateService,
@@ -216,6 +235,15 @@ function makeForkLayers(
     getAgent: (agentId: string) => Effect.map(agentStatusProjection.get, (state) => state.agents.get(agentId)),
   } satisfies AgentStateReader)
 
+  const taskGraphReaderLayer = Layer.succeed(TaskGraphStateReaderTag, {
+    getTask: (id) => Effect.map(taskGraphProjection.get, (s) => s.tasks.get(id)),
+    getState: () => taskGraphProjection.get,
+    getChildren: (id) => Effect.map(taskGraphProjection.get, (s) => getChildRecords(s, id)),
+    canComplete: (id) => Effect.map(taskGraphProjection.get, (s) => canCompleteRecord(s, id)),
+    canAssign: (id, assignee) => Effect.map(taskGraphProjection.get, (s) => canAssignRecord(s, id, assignee)),
+    getSubtree: (id) => Effect.map(taskGraphProjection.get, (s) => collectSubtreeRecords(s, id)),
+  })
+
   const policyCtxProvider = createPolicyContextProvider(
     forkId,
     cwd,
@@ -240,6 +268,7 @@ function makeForkLayers(
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
     workflowStateReaderLayer,
+    taskGraphReaderLayer,
     skillStateReaderLayer,
     agentStateReaderLayer,
 
@@ -283,6 +312,9 @@ const makeExecutionManager = Effect.gen(function* () {
 
   // Pre-built idle release effects (repeatable; run each time fork goes idle)
   const forkIdleReleases = new Map<string, Effect.Effect<void>>()
+
+  // Per-fork consecutive identical continue-response tracker
+  const identicalContinueTracker = new Map<string | null, { lastResponseText: string; consecutiveCount: number }>()
 
 
 
@@ -376,10 +408,24 @@ const makeExecutionManager = Effect.gen(function* () {
       // Track tools called (by definition key) for turn policy
       const toolsCalledKeys: ToolKey[] = []
       let lastToolKey: ToolKey | null = null
-      const toolCalls: TurnToolCall[] = []
-      const messagesSent: Array<{ id: string, dest: string }> = []
+      let hasToolErrors = false
+      const messagesSent: Array<{ id: string, taskId: string | null }> = []
       let hasAnyMessage = false
+      let hasAnyResponseContent = false
       let directUserRepliesSent = 0
+
+      const isTaskInAssignedSubtree = (
+        taskState: TaskGraphState,
+        candidateParentId: string,
+        assignedTaskId: string,
+      ): boolean => {
+        let current: string | null = candidateParentId
+        while (current !== null) {
+          if (current === assignedTaskId) return true
+          current = taskState.tasks.get(current)?.parentId ?? null
+        }
+        return false
+      }
 
       // Track tool input (ToolInputReady provides the parsed input)
       const toolInputs = new Map<string, unknown>()
@@ -392,27 +438,17 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Streaming hook state per tool call
       const streamHookStates = new Map<string, unknown>()
-      const streamHookConfigs = new Map<string, {
-        onInput: (
-          input: StreamingPartial<Record<string, unknown>>,
-          state: unknown,
-          ctx: { emit: (value: unknown) => Effect.Effect<void> }
-        ) => Effect.Effect<unknown, unknown, unknown>
-        initial: unknown
-      }>()
+      const streamHookConfigs = new Map<string, AnyStreamHook>()
       // Simple field accumulator for streaming partial input
       const streamingFields = new Map<string, Record<string, StreamingLeaf<unknown>>>()
 
       // Track tag names for ToolStarted events
       const toolCallTagNames = new Map<string, string>()
 
-      // Accumulate observed tool output results
-      const observedResults: ObservedResult[] = []
-
       const turnErrors: TurnResultError[] = []
 
       // Store execution result
-      let executionResult: TurnResult = { success: true, turnDecision: 'yield' }
+      let executionResult: TurnResult = { success: true, turnDecision: 'idle' }
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
@@ -428,8 +464,16 @@ const makeExecutionManager = Effect.gen(function* () {
       )
 
 
+      // Capture raw model response text for identical-response circuit breaker.
+      let rawResponseText = ''
+      const trackedXmlStream = xmlStream.pipe(
+        Stream.tap((chunk) => Effect.sync(() => {
+          rawResponseText += chunk
+        })),
+      )
+
       // Run xml-act runtime
-      const eventStream = runtime.streamWith(xmlStream, { initialState: replayState })
+      const eventStream = runtime.streamWith(trackedXmlStream, { initialState: replayState })
 
       // Track toolCallId → toolKey mapping for event forwarding
       const toolCallKeys = new Map<string, ToolKey>()
@@ -441,6 +485,7 @@ const makeExecutionManager = Effect.gen(function* () {
             switch (event._tag) {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
+                hasAnyResponseContent = true
                 const toolKey = resolveKey(event.tagName)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Failed to resolve tool key for tag ${event.tagName} (toolCallId: ${event.toolCallId}).`)
@@ -452,21 +497,14 @@ const makeExecutionManager = Effect.gen(function* () {
                 // Check for stream hook
                 const toolEntry = catalog.entries[toolKey]
                 const tool = toolEntry?.tool
-                if (tool && 'stream' in tool && (tool as any).stream) {
-                  const streamConfig = (tool as any).stream as {
-                    onInput: (
-                      input: StreamingPartial<Record<string, unknown>>,
-                      state: unknown,
-                      ctx: { emit: (value: unknown) => Effect.Effect<void> }
-                    ) => Effect.Effect<unknown, unknown, unknown>
-                    initial: unknown
-                  }
+                if (tool && hasStreamHook(tool)) {
+                  const streamConfig = tool.stream
                   streamHookStates.set(event.toolCallId, streamConfig.initial)
                   streamHookConfigs.set(event.toolCallId, streamConfig)
                   streamingFields.set(event.toolCallId, {})
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -497,7 +535,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   const currentState = streamHookStates.get(event.toolCallId)
                   const partialInput = streamingFields.get(event.toolCallId) ?? {}
                   const streamCtx = {
-                    emit: (value: unknown) => Queue.offer(sink, {
+                    emit: (value: unknown) => sink.emit( {
                       _tag: 'ToolEvent' as const,
                       toolCallId: event.toolCallId,
                       toolKey,
@@ -512,7 +550,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   streamHookStates.set(event.toolCallId, newState)
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -523,6 +561,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Tool Input Parse Error ---
               case 'ToolInputParseError': {
+                hasAnyResponseContent = true
                 const toolKey = resolveKey(event.tagName)
                 if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
@@ -532,9 +571,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 lastToolKey = toolKey
 
                 const errorResult: ToolResult = { status: 'error', message: event.error.detail }
-                toolCalls.push({ toolKey, group: event.group, toolName: event.toolName, result: errorResult })
+                if (errorResult.status === 'error') {
+                  hasToolErrors = true
+                }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -554,7 +595,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -569,7 +610,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -601,16 +642,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 streamHookConfigs.delete(event.toolCallId)
                 streamingFields.delete(event.toolCallId)
 
-                // Map XmlToolResult → ToolResult for TurnToolCall accumulation
                 const toolResult: ToolResult = mapXmlToolResult(event.result)
-
-                toolCalls.push({
-                  toolKey,
-                  group: event.group,
-                  toolName: event.toolName,
-                  result: toolResult,
-                })
-                yield* Queue.offer(sink, {
+                if (toolResult.status === 'error') {
+                  hasToolErrors = true
+                }
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -667,7 +703,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   const currentState = streamHookStates.get(event.toolCallId)
                   const partialInput = streamingFields.get(event.toolCallId) ?? {}
                   const streamCtx = {
-                    emit: (value: unknown) => Queue.offer(sink, {
+                    emit: (value: unknown) => sink.emit( {
                       _tag: 'ToolEvent' as const,
                       toolCallId: event.toolCallId,
                       toolKey,
@@ -682,7 +718,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   streamHookStates.set(event.toolCallId, newState)
                 }
 
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -693,88 +729,154 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Messages / Think prose ---
               case 'MessageStart': {
-                let resolvedDest = event.dest
-                if (forkId !== null && event.dest === 'user') {
-                  if (!allowSingleUserReplyThisTurn || directUserRepliesSent >= 1) {
-                    resolvedDest = 'parent'
+                hasAnyResponseContent = true
+                const taskProjection = yield* TaskGraphProjection.Tag
+                const taskState = yield* taskProjection.get
+
+                const explicitTo = typeof event.to === 'string' ? event.to : null
+
+                // Resolve destination
+                let destination: MessageDestination
+
+                if (explicitTo !== null) {
+                  if (explicitTo === 'user') {
+                    if (forkId !== null) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": only root fork can send to user`,
+                      })
+                      break
+                    }
+                    destination = { kind: 'user' }
+                  } else if (explicitTo === 'parent') {
+                    if (forkId === null) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": root fork has no parent`,
+                      })
+                      break
+                    }
+                    destination = { kind: 'parent' }
                   } else {
-                    directUserRepliesSent += 1
+                    const targetTask = taskState.tasks.get(explicitTo)
+                    if (!targetTask) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": task not found`,
+                      })
+                      break
+                    }
+                    if (!targetTask.worker) {
+                      turnErrors.push({
+                        code: 'nonexistent_agent_destination',
+                        message: `Invalid message destination "${explicitTo}": task has no active worker`,
+                      })
+                      break
+                    }
+                    destination = { kind: 'worker', taskId: explicitTo }
+                  }
+                } else {
+                  // No explicit `to` — resolve from context
+                  if (forkId === null) {
+                    destination = { kind: 'user' }
+                  } else {
+                    destination = defaultProseDest === 'user' ? { kind: 'user' } : { kind: 'parent' }
                   }
                 }
 
-                messagesSent.push({ id: event.id, dest: resolvedDest })
+                // Skip message directive for worker-targeted messages —
+                // they don't affect user reply counting
+                if (destination.kind !== 'worker') {
+                  const messageResult = yield* handleTaskDirective({
+                    kind: 'message',
+                    defaultTopLevelDestination: defaultProseDest,
+                    allowSingleUserReplyThisTurn,
+                    directUserRepliesSent,
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
+                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provide(executionLayer),
+                  )
+
+                  if (!messageResult.success) {
+                    turnErrors.push({
+                      code: 'task_operation_error',
+                      message: messageResult.error,
+                    })
+                    break
+                  }
+
+                  if (
+                    'directUserRepliesSent' in messageResult
+                    && typeof messageResult.directUserRepliesSent === 'number'
+                  ) {
+                    directUserRepliesSent = messageResult.directUserRepliesSent
+                  }
+                }
+
+                messagesSent.push({ id: event.id, taskId: destination.kind === 'worker' ? destination.taskId : null })
                 hasAnyMessage = true
 
-                // Validate agent message destinations inline during execution
-                if (resolvedDest !== 'user' && resolvedDest !== 'parent') {
-                  const currentAgentState = yield* agentRoutingProjectionInst.get
-                  const targetAgent = isActiveRoute(currentAgentState, resolvedDest)
-                  if (!targetAgent) {
-                    const destStr = `"${resolvedDest}"`
-                    turnErrors.push({
-                      code: 'nonexistent_agent_destination',
-                      message: formatNonexistentAgentError(destStr),
-                    })
-                  }
-                }
-
-                yield* Queue.offer(sink, { _tag: 'MessageStart', id: event.id, dest: resolvedDest })
+                yield* sink.emit( {
+                  _tag: 'MessageStart',
+                  id: event.id,
+                  destination,
+                })
                 break
               }
 
               case 'MessageChunk': {
-                yield* Queue.offer(sink, { _tag: 'MessageChunk', id: event.id, text: event.text })
+                yield* sink.emit( { _tag: 'MessageChunk', id: event.id, text: event.text })
                 break
               }
 
               case 'MessageEnd': {
-                yield* Queue.offer(sink, { _tag: 'MessageEnd', id: event.id })
+                yield* sink.emit( { _tag: 'MessageEnd', id: event.id })
                 break
               }
 
               case 'ProseChunk': {
+                hasAnyResponseContent = true
                 if (event.patternId === 'think') {
-                  yield* Queue.offer(sink, { _tag: 'ThinkingDelta', text: event.text })
+                  yield* sink.emit( { _tag: 'ThinkingDelta', text: event.text })
                 }
                 break
               }
 
               case 'ProseEnd': {
+                hasAnyResponseContent = true
                 if (event.patternId === 'think') {
-                  yield* Queue.offer(sink, { _tag: 'ThinkingEnd', about: event.about })
+                  yield* sink.emit( { _tag: 'ThinkingEnd', about: event.about })
                 }
                 break
               }
 
               case 'LensStart': {
-                yield* Queue.offer(sink, { _tag: 'LensStarted', name: event.name })
+                hasAnyResponseContent = true
+                yield* sink.emit( { _tag: 'LensStarted', name: event.name })
                 break
               }
 
               case 'LensChunk': {
-                yield* Queue.offer(sink, { _tag: 'LensDelta', text: event.text })
+                hasAnyResponseContent = true
+                yield* sink.emit( { _tag: 'LensDelta', text: event.text })
                 break
               }
 
               case 'LensEnd': {
-                yield* Queue.offer(sink, { _tag: 'LensEnded', name: event.name })
+                hasAnyResponseContent = true
+                yield* sink.emit( { _tag: 'LensEnded', name: event.name })
                 break
               }
 
 
               case 'ToolObservation': {
+                hasAnyResponseContent = true
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
-                observedResults.push({
-                  toolCallId: event.toolCallId,
-                  tagName: event.tagName,
-                  query: event.query,
-                  content: event.content,
-                })
-                yield* Queue.offer(sink, {
+                yield* sink.emit( {
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
@@ -783,11 +885,11 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
+
+
               case 'StructuralParseError': {
                 if (event.error._tag === 'UnclosedThink') {
                   turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
-                } else if (event.error._tag === 'UnclosedContainer') {
-                  turnErrors.push({ code: 'unclosed_actions', message: UNCLOSED_ACTIONS_REMINDER })
                 }
                 break
               }
@@ -802,19 +904,25 @@ const makeExecutionManager = Effect.gen(function* () {
                   //
                   // Errors within the turn always force continuation so the agent sees
                   // the error feedback and can retry. The turn policy only decides for clean turns.
-                  const hasToolErrors = toolCalls.some(tc => tc.result.status === 'error')
-
                   if (hasToolErrors || turnErrors.length > 0) {
                     executionResult = {
                       success: true,
                       turnDecision: 'continue',
                       ...(turnErrors.length > 0 ? { errors: turnErrors } : {}),
                     }
+                  } else if (endResult.turnControl === null && !hasAnyResponseContent) {
+                    // Empty LLM response (no messages/tools/think/lens output).
+                    // Always retrigger so memory-injected corrective feedback is visible next turn.
+                    executionResult = { success: true, turnDecision: 'continue' }
                   } else if (endResult.turnControl === 'finish') {
                     executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
-                  } else if (endResult.turnControl) {
-                    executionResult = { success: true, turnDecision: endResult.turnControl }
                   } else {
+                    const resolvedTurnControl = endResult.turnControl ?? 'continue'
+                    if (resolvedTurnControl === 'idle') {
+                      executionResult = { success: true, turnDecision: 'idle' }
+                    } else {
+                      executionResult = { success: true, turnDecision: 'continue' }
+                    }
                     const policyCtx = yield* policyCtxProvider.get
                     const turnResult = agentDef.getTurn({
                       toolsCalled: toolsCalledKeys,
@@ -822,10 +930,14 @@ const makeExecutionManager = Effect.gen(function* () {
                       messagesSent,
                       state: policyCtx,
                     })
-                    if (turnResult.action === 'finish') {
-                      executionResult = { success: true, turnDecision: 'finish', evidence: '' }
-                    } else {
-                      executionResult = { success: true, turnDecision: turnResult.action }
+                    if (endResult.turnControl === null) {
+                      if (turnResult.action === 'finish') {
+                        executionResult = { success: true, turnDecision: 'finish', evidence: '' }
+                      } else if (turnResult.action === 'continue') {
+                        executionResult = { success: true, turnDecision: 'continue' }
+                      } else {
+                        executionResult = { success: true, turnDecision: 'idle' }
+                      }
                     }
                   }
                 } else if (endResult._tag === 'Interrupted') {
@@ -845,8 +957,32 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
                 }
 
+                // Circuit breaker: stop tight loops of identical consecutive continue responses.
+                if (executionResult.success && executionResult.turnDecision === 'continue') {
+                  const previous = identicalContinueTracker.get(forkId)
+                  const nextCount = previous && previous.lastResponseText === rawResponseText
+                    ? previous.consecutiveCount + 1
+                    : 1
+
+                  identicalContinueTracker.set(forkId, {
+                    lastResponseText: rawResponseText,
+                    consecutiveCount: nextCount,
+                  })
+
+                  if (nextCount >= IDENTICAL_RESPONSE_BREAKER_THRESHOLD) {
+                    executionResult = {
+                      success: false,
+                      error: `Circuit breaker tripped after ${nextCount} identical consecutive responses.`,
+                      cancelled: false,
+                    }
+                    identicalContinueTracker.delete(forkId)
+                  }
+                } else {
+                  identicalContinueTracker.delete(forkId)
+                }
+
                 // Oneshot liveness guard: prevent stalling when nothing is active
-                if (executionResult.success && executionResult.turnDecision === 'yield' && oneshotEnabled) {
+                if (executionResult.success && executionResult.turnDecision === 'idle' && oneshotEnabled) {
                   const pCtx = yield* policyCtxProvider.get
                   if (pCtx.activeAgentCount === 0) {
                     executionResult = {
@@ -865,8 +1001,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       return {
         result: executionResult,
-        toolCalls,
-        observedResults,
       }
     }),
 
@@ -878,6 +1012,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* TurnProjection.Tag
       const workflowProjection = yield* WorkflowProjection.Tag
+      const taskGraphProjection = yield* TaskGraphProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
       const persistence = yield* ChatPersistence
@@ -898,7 +1033,7 @@ const makeExecutionManager = Effect.gen(function* () {
       let layers = makeForkLayers(
         forkId,
         sessionContextProjection, agentProjection, agentStatusProjection,
-        workingStateProjection, workflowProjection,
+        workingStateProjection, workflowProjection, taskGraphProjection,
         conversationProjection,
         approvalState,
         persistenceLayer, policyInterceptor, cwd, workspacePath, ephemeralSessionContext,
@@ -966,6 +1101,7 @@ const makeExecutionManager = Effect.gen(function* () {
       boundObservables.delete(forkId)
       forkAgentVariants.delete(forkId)
       forkIdleReleases.delete(forkId)
+      identicalContinueTracker.delete(forkId)
     }),
 
     fork: (params: {
@@ -973,7 +1109,7 @@ const makeExecutionManager = Effect.gen(function* () {
       name: string
       agentId: string
       prompt: string
-      message?: string
+      message: string
       outputSchema?: JsonSchema | undefined
       mode: 'clone' | 'spawn'
       role: AgentVariant
@@ -986,6 +1122,11 @@ const makeExecutionManager = Effect.gen(function* () {
 
       yield* service.initFork(forkId, params.role)
 
+      const taskId = params.taskId.trim()
+      if (taskId.length === 0) {
+        return yield* Effect.die(new Error('ExecutionManager.fork requires a non-empty taskId'))
+      }
+
       yield* workerBus.publish({
         type: 'agent_created',
         forkId,
@@ -995,8 +1136,8 @@ const makeExecutionManager = Effect.gen(function* () {
         role: params.role,
         context,
         mode: params.mode,
-        taskId: params.taskId ?? '',
-        message: params.message ?? params.prompt,
+        taskId,
+        message: params.message,
         outputSchema: params.outputSchema,
       })
 

@@ -52,14 +52,13 @@ export type TagMap = ReadonlyMap<string, TagHandler<XmlActFrame, XmlActEvent>>
 
 export type XmlActFrame =
   | { readonly type: 'prose'; readonly body: string; readonly pendingNewlines: number; readonly tags: TagMap }
-  | { readonly type: 'container'; readonly tag: string; readonly depth: number; readonly tags: TagMap }
+
   | {
       readonly type: 'think'
       readonly tag: string
       readonly body: string
       readonly depth: number
       readonly about: string | null
-      readonly isLenses: boolean
       readonly activeLens: ActiveLens | null
       readonly lenses: readonly CompletedLens[]
       readonly tags: TagMap
@@ -67,13 +66,12 @@ export type XmlActFrame =
   | {
       readonly type: 'message'
       readonly id: string
-      readonly dest: string
-      readonly artifactsRaw: string | null
       readonly body: string
       readonly depth: number
       readonly pendingNewlines: number
       readonly tags: TagMap
     }
+
   | {
       readonly type: 'tool-body'
       readonly tag: string
@@ -97,18 +95,18 @@ export type XmlActFrame =
       readonly tags: TagMap
     }
   | { readonly type: 'body-capture'; readonly tag: string; readonly body: string; readonly tags: TagMap }
+  | { readonly type: 'end-turn'; readonly decision: 'continue' | 'idle' | null; readonly tags: TagMap }
 
 export type StructuralParseErrorDetail =
   | { readonly _tag: 'UnclosedThink' }
-  | { readonly _tag: 'UnclosedContainer'; readonly tag: string }
+
   | { readonly _tag: 'TurnControlConflict' }
   | { readonly _tag: 'FinishWithoutEvidence' }
 
 export type UnclosedThinkDetail = Extract<StructuralParseErrorDetail, { _tag: 'UnclosedThink' }>
-export type UnclosedContainerDetail = Extract<StructuralParseErrorDetail, { _tag: 'UnclosedContainer' }>
+
 export type FinishWithoutEvidenceDetail = Extract<StructuralParseErrorDetail, { _tag: 'FinishWithoutEvidence' }>
 export type TurnControlConflictDetail = Extract<StructuralParseErrorDetail, { _tag: 'TurnControlConflict' }>
-export type UnclosedActionsDetail = UnclosedContainerDetail
 
 export type ParseErrorDetail = TagParseErrorDetail | StructuralParseErrorDetail
 
@@ -153,13 +151,20 @@ export type XmlActEvent =
   | { readonly _tag: 'LensStart'; readonly name: string }
   | { readonly _tag: 'LensChunk'; readonly text: string }
   | { readonly _tag: 'LensEnd'; readonly name: string; readonly content: string }
-  | { readonly _tag: 'ContainerOpen'; readonly tag: string }
-  | { readonly _tag: 'ContainerClose'; readonly tag: string }
-  | { readonly _tag: 'MessageStart'; readonly id: string; readonly dest: string; readonly artifactsRaw: string | null }
+
+  | {
+      readonly _tag: 'MessageStart'
+      readonly id: string
+      readonly to: string | null
+    }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'continue' | 'yield' }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string }
+  | {
+      readonly _tag: 'TurnControl'
+      readonly decision: 'continue' | 'idle'
+      readonly termination: 'natural' | 'runaway'
+    }
+  | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string; readonly termination: 'natural' | 'runaway' }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
 export type ParseEvent = XmlActEvent

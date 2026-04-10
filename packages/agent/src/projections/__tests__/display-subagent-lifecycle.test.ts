@@ -66,7 +66,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
 
       {
@@ -90,7 +90,7 @@ describe('display subagent lifecycle think steps', () => {
         timestamp: ts(10),
         forkId: 'fork-sub',
         turnId: 't-sub-1',
-        result: { success: true, turnDecision: 'yield', output: '' },
+        result: { success: true, turnDecision: 'idle', output: '' },
         toolCalls: [{ id: 'call-1', toolName: 'shell', input: {}, result: { _tag: 'Success', output: {} } }],
         providerId: null,
           modelId: null,
@@ -117,7 +117,7 @@ describe('display subagent lifecycle think steps', () => {
         timestamp: ts(20),
         forkId: 'fork-sub',
         turnId: 't-sub-2',
-        result: { success: true, turnDecision: 'yield', output: '' },
+        result: { success: true, turnDecision: 'idle', output: '' },
         toolCalls: [{ id: 'call-2', toolName: 'fileRead', input: {}, result: { _tag: 'Success', output: {} } }],
         providerId: null,
           modelId: null,
@@ -125,6 +125,32 @@ describe('display subagent lifecycle think steps', () => {
     ])
 
     const allSteps = rootDisplay.messages.flatMap(m => m.type === 'think_block' ? m.steps : [])
+
+    const forkActivity = rootDisplay.messages.filter(
+      (m): m is Extract<DisplayMessage, { type: 'fork_activity' }> =>
+        m.type === 'fork_activity' && m.forkId === 'fork-sub'
+    )
+
+    expect(forkActivity.length).toBe(2)
+    expect(forkActivity[0]).toMatchObject({
+      status: 'completed',
+      createdAt: ts(2),
+      activeSince: ts(5),
+      completedAt: ts(10),
+      accumulatedActiveMs: 5,
+      resumeCount: 0,
+      toolCounts: { commands: 1 },
+    })
+    expect(forkActivity[1]).toMatchObject({
+      status: 'completed',
+      createdAt: ts(15),
+      activeSince: ts(15),
+      completedAt: ts(20),
+      accumulatedActiveMs: 10,
+      resumeCount: 1,
+      toolCounts: { commands: 1, reads: 1 },
+    })
+    expect(forkActivity[0].id).not.toBe(forkActivity[1].id)
 
     const started = allSteps.filter((s: any) => s.type === 'subagent_started')
     const finished = allSteps.filter((s: any) => s.type === 'subagent_finished')
@@ -171,7 +197,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'agent_killed',
@@ -212,7 +238,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_user_killed',
@@ -250,7 +276,7 @@ describe('display subagent lifecycle think steps', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_idle_closed',

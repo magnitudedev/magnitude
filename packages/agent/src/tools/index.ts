@@ -59,5 +59,15 @@ export { globalTools } from './globals'
 export { shellTool } from './shell'
 export { fsTools } from './fs'
 
-export { agentTools } from './agent-tools'
+
 export { webFetchTool } from './web-fetch-tool'
+export {
+  createTaskTool,
+  updateTaskTool,
+  spawnWorkerTool,
+  killWorkerTool,
+  createTaskXmlBinding,
+  updateTaskXmlBinding,
+  spawnWorkerXmlBinding,
+  killWorkerXmlBinding,
+} from './task-tools'

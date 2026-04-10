@@ -33,12 +33,14 @@ export const webSearchDisplay = createToolDisplay<WebSearchState>({
     }
 
     if (isError) {
+      const errorMsg = state.errorDetail ?? '';
       return (
         <text style={{ wrapMode: 'word' }}>
           <span style={{ fg: theme.error }}>{'✗  '}</span>
           <span style={{ fg: theme.foreground }}>{'Searched web for '}</span>
           <span style={{ fg: theme.muted }}>{`"${state.query ? truncate(state.query, 50) : ''}"`}</span>
           <span style={{ fg: theme.error }}>{' · Error'}</span>
+          {errorMsg ? <span style={{ fg: theme.muted }}>{` (${truncate(errorMsg, 80)})`}</span> : null}
         </text>
       );
     }

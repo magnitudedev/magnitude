@@ -1,7 +1,14 @@
 import { ContentPartBuilder, type ContentPart } from '../content'
+import {
+  USER_MESSAGE_RESPONSE_REMINDER,
+  WORKER_PROGRESS_USER_MESSAGE_REMINDER,
+} from '../prompts'
+import { formatTaskTypeReminder } from '../tasks/guidance'
+import type { TaskTypeId } from '../tasks'
 import type { AgentAtom, LifecycleReminderFormatterMap, PhaseCriteriaPayload, ResultEntry, TimelineEntry } from './types'
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults } from './render-results'
 import { renderCompactToolCall } from './render-tool-call'
+import { TURN_CONTROL_IDLE, TURN_CONTROL_IDLE_TAG, END_TURN_TAG } from '@magnitudedev/xml-act'
 
 export interface FormatInboxInput {
   results: readonly ResultEntry[]
@@ -71,7 +78,9 @@ function renderAgentAtom(atom: AgentAtom): string {
     case 'error':
       return `<error>${atom.message}</error>`
     case 'idle':
-      return atom.reason && atom.reason !== 'stable' ? `<idle reason="${atom.reason}"/>` : '<idle/>'
+      return atom.reason && atom.reason !== 'stable'
+        ? `<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="${atom.reason}"/>\n</${END_TURN_TAG}>`
+        : TURN_CONTROL_IDLE
   }
 }
 
@@ -114,10 +123,16 @@ function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_mess
   return builder.build()
 }
 
-function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' }>): string[] {
+function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observation' | 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }>): string[] {
   switch (entry.kind) {
     case 'user_message':
       return [`<message from="user">${entry.text}</message>`]
+    case 'parent_message':
+      return [`<message from="parent">${entry.text}</message>`]
+    case 'user_bash_command':
+      return [
+        `<user_bash_command cwd="${entry.cwd}" exit_code="${entry.exitCode}">\n<command>${entry.command}</command>\n<stdout>${entry.stdout}</stdout>\n<stderr>${entry.stderr}</stderr>\n</user_bash_command>`,
+      ]
     case 'user_to_agent':
       return [`<user-to-agent agent="${entry.agentId}">${entry.text}</user-to-agent>`]
     case 'agent_block': {
@@ -149,6 +164,7 @@ function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observat
 
 function maybeAttentionBullet(entry: TimelineEntry, timezone: string | null): string | null {
   if (entry.kind === 'user_message') return `- user message at ${formatTime(entry.timestamp, timezone)}`
+  if (entry.kind === 'user_bash_command') return `- user ran bash command at ${formatTime(entry.timestamp, timezone)}`
   if (entry.kind === 'agent_block') {
     if (entry.atoms.some((a) => a.kind === 'error')) return `- ${entry.agentId} errored at ${formatTime(entry.timestamp, timezone)}`
     if (entry.atoms[entry.atoms.length - 1]?.kind === 'idle') return `- ${entry.agentId} went idle at ${formatTime(entry.timestamp, timezone)}`
@@ -171,11 +187,20 @@ function buildLifecycleReminderLines(
     }
     if (current.hookType === 'spawn' && hook.hookType === 'idle') {
       byAgent.set(hook.agentId, hook)
+      continue
+    }
+    if (
+      current.hookType === 'spawn'
+      && hook.hookType === 'spawn'
+      && !current.taskId
+      && Boolean(hook.taskId)
+    ) {
+      byAgent.set(hook.agentId, hook)
     }
   }
 
   const groups = new Map<string, { role: string, hookType: 'spawn' | 'idle', agentIds: string[] }>()
-  for (const hook of byAgent.values()) {
+  for (const hook of Array.from(byAgent.values())) {
     const key = `${hook.role}:${hook.hookType}`
     const group = groups.get(key)
     if (!group) {
@@ -187,15 +212,21 @@ function buildLifecycleReminderLines(
 
   const dedup = new Set<string>()
   const lines: string[] = []
-  for (const group of groups.values()) {
+  for (const group of Array.from(groups.values())) {
+    const spawnHookWithTask = group.hookType === 'spawn'
+      ? hooks.find(h => h.hookType === 'spawn' && h.role === group.role && group.agentIds.includes(h.agentId) && h.taskId && h.taskTitle)
+      : undefined
+
     const formatter = group.hookType === 'spawn'
       ? formatters[group.role]?.spawn
       : formatters[group.role]?.idle
-    const text = formatter
-      ? formatter(group.agentIds)
-      : group.hookType === 'spawn'
-        ? `Subagent(s) ${group.agentIds.join(', ')} spawned.`
-        : `Subagent(s) ${group.agentIds.join(', ')} went idle.`
+    const text = spawnHookWithTask
+      ? `Worker \`${spawnHookWithTask.role}\` spawned and working on task ${spawnHookWithTask.taskId} ("${spawnHookWithTask.taskTitle}").`
+      : formatter
+        ? formatter(group.agentIds)
+        : group.hookType === 'spawn'
+          ? `Worker(s) ${group.agentIds.join(', ')} spawned.`
+          : `Worker(s) ${group.agentIds.join(', ')} went idle.`
     if (!dedup.has(text)) {
       dedup.add(text)
       lines.push(text)
@@ -205,13 +236,74 @@ function buildLifecycleReminderLines(
   return lines
 }
 
+function buildTaskTypeReminderLines(
+  hooks: readonly Extract<TimelineEntry, { kind: 'task_type_hook' }>[],
+): string[] {
+  if (hooks.length === 0) return []
+
+  const byType = new Map<string, Set<string>>()
+  for (const hook of hooks) {
+    const ids = byType.get(hook.taskType) ?? new Set<string>()
+    ids.add(hook.taskId)
+    byType.set(hook.taskType, ids)
+  }
+
+  const lines: string[] = []
+  for (const [taskType, taskIdSet] of Array.from(byType.entries())) {
+    const line = formatTaskTypeReminder(Array.from(taskIdSet), taskType as TaskTypeId)
+    if (line) lines.push(line)
+  }
+
+  return lines
+}
+
+function buildTaskIdleReminderLines(
+  hooks: readonly Extract<TimelineEntry, { kind: 'task_idle_hook' }>[],
+): string[] {
+  if (hooks.length === 0) return []
+
+  const byTask = new Map<string, Extract<TimelineEntry, { kind: 'task_idle_hook' }>>()
+  for (const hook of hooks) {
+    byTask.set(hook.taskId, hook)
+  }
+
+  return Array.from(byTask.values()).map(
+    hook => `Worker ${hook.agentId} for task ${hook.taskId} ("${hook.title}") has finished. Review output and either send feedback or mark complete.`,
+  )
+}
+
+function hasWorkerToLeadMessage(entry: Extract<TimelineEntry, { kind: 'agent_block' }>): boolean {
+  return entry.atoms.some(atom => atom.kind === 'message' && atom.direction === 'to_lead')
+}
+
+function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update' }>): string {
+  if (entry.action === 'created') {
+    const title = entry.title ? `: "${entry.title}"` : ''
+    const taskType = entry.taskType ? ` (${entry.taskType})` : ''
+    return `- Task ${entry.taskId} created${title}${taskType}`
+  }
+
+  if (entry.action === 'cancelled') {
+    const cancelledSuffix = entry.cancelledCount != null ? ` (${entry.cancelledCount} tasks removed)` : ''
+    return `- Task ${entry.taskId} cancelled${cancelledSuffix}`
+  }
+
+  if (entry.action === 'completed') {
+    return `- Task ${entry.taskId} completed`
+  }
+
+  const previousStatus = entry.previousStatus ?? 'unknown'
+  const nextStatus = entry.nextStatus ?? 'unknown'
+  return `- Task ${entry.taskId} status changed: ${previousStatus} -> ${nextStatus}`
+}
+
 export function formatInbox(input: FormatInboxInput): ContentPart[] {
   const builder = new ContentPartBuilder()
 
   if (input.results.length > 0) {
     builder.pushText('<turn_result>')
     for (const result of input.results) {
-      if (result.kind === 'tool_results') builder.pushParts(formatResults(result.toolCalls, result.observedResults))
+      if (result.kind === 'turn_results') builder.pushParts(formatResults(result.items))
       else if (result.kind === 'interrupted') builder.pushText(formatInterrupted())
       else if (result.kind === 'error') builder.pushText(formatError(result.message))
       else if (result.kind === 'oneshot_liveness') builder.pushText(formatOneshotLiveness())
@@ -225,8 +317,26 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   const lifecycleHooks = input.timeline.filter(
     (entry): entry is Extract<TimelineEntry, { kind: 'lifecycle_hook' }> => entry.kind === 'lifecycle_hook',
   )
+  const taskTypeHooks = input.timeline.filter(
+    (entry): entry is Extract<TimelineEntry, { kind: 'task_type_hook' }> => entry.kind === 'task_type_hook',
+  )
+  const taskIdleHooks = input.timeline.filter(
+    (entry): entry is Extract<TimelineEntry, { kind: 'task_idle_hook' }> => entry.kind === 'task_idle_hook',
+  )
+  const treeViews = input.timeline.filter(
+    (entry): entry is Extract<TimelineEntry, { kind: 'task_tree_view' }> => entry.kind === 'task_tree_view',
+  )
+  const taskUpdates = input.timeline.filter(
+    (entry): entry is Extract<TimelineEntry, { kind: 'task_update' }> => entry.kind === 'task_update',
+  )
   const chronological = input.timeline.filter(
-    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' }> => entry.kind !== 'lifecycle_hook',
+    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_type_hook' | 'task_idle_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }> =>
+      entry.kind !== 'lifecycle_hook'
+      && entry.kind !== 'task_type_hook'
+      && entry.kind !== 'task_idle_hook'
+      && entry.kind !== 'task_tree_dirty'
+      && entry.kind !== 'task_tree_view'
+      && entry.kind !== 'task_update',
   )
 
   const attentionItems: { bullet: string, kind: TimelineEntry['kind'] }[] = []
@@ -265,9 +375,32 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     }
   }
 
-  const reminderLines = buildLifecycleReminderLines(lifecycleHooks, input.lifecycleReminderFormatters)
+  const hasUserMessage = chronological.some((entry) => entry.kind === 'user_message')
+  const hasWorkerMessage = chronological.some(
+    (entry) => entry.kind === 'agent_block' && hasWorkerToLeadMessage(entry),
+  )
+
+  const reminderLines = [
+    //...(hasUserMessage ? [USER_MESSAGE_RESPONSE_REMINDER] : []),
+    ...(hasWorkerMessage ? [WORKER_PROGRESS_USER_MESSAGE_REMINDER] : []),
+    ...buildLifecycleReminderLines(lifecycleHooks, input.lifecycleReminderFormatters),
+    ...buildTaskTypeReminderLines(taskTypeHooks),
+    ...buildTaskIdleReminderLines(taskIdleHooks),
+  ]
   if (reminderLines.length > 0) {
     builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<reminders>\n${reminderLines.map(line => `- ${line}`).join('\n')}\n</reminders>`)
+  }
+
+  if (taskUpdates.length > 0) {
+    const lines = taskUpdates.map(renderTaskUpdateLine)
+    builder.pushText(`${builder.hasContent() ? '\n\n' : ''}<task_updates>\n${lines.join('\n')}\n</task_updates>`)
+  }
+
+  if (treeViews.length > 0) {
+    const latestTree = treeViews[treeViews.length - 1]?.renderedTree
+    if (latestTree) {
+      builder.pushText(`\n\n<task_tree>\n${latestTree}\n</task_tree>`)
+    }
   }
 
   const trivialAttention = attentionItems.length === 1 && attentionItems[0]?.kind === 'user_message'

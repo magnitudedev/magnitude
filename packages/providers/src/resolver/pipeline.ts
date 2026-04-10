@@ -1,4 +1,4 @@
-import { Effect, Stream, Schedule, Duration, Scope, Exit, Option, Sink } from 'effect'
+import { Effect, Stream, Schedule, Duration, Scope, Exit, Option, Sink, Cause } from 'effect'
 import type { Model } from '../model/model'
 import type { ModelConnection } from '../model/model-connection'
 import type { InferenceConfig } from '../model/inference-config'
@@ -31,7 +31,7 @@ function extractTraceRequest(
   if (!raw) return fallback
   // BAML driver: raw request has `messages` array
   if (Array.isArray(raw.messages)) return { messages: raw.messages }
-  // Responses driver: BAML request body uses `input` instead of `messages`
+  // Some providers may use `input` instead of `messages` in request payloads
   if (Array.isArray(raw.input)) return { messages: raw.input }
   return fallback
 }
@@ -41,12 +41,9 @@ function extractTraceResponse(
   rawOutput: string | null,
 ): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string } {
   const rawBody = collectorData.rawResponseBody ?? null
-  const sseEvents = ('sseEvents' in collectorData && Array.isArray(collectorData.sseEvents))
-    ? collectorData.sseEvents
-    : null
   return {
     rawBody,
-    sseEvents,
+    sseEvents: null,
     ...(rawOutput != null ? { rawOutput } : {}),
   }
 }
@@ -98,7 +95,10 @@ function createBoundModelImpl<TSlot extends string>(
         connection,
         model,
         inference: requestInference,
-        providerOptions,
+        providerOptions: {
+          ...(providerOptions ?? {}),
+          ...(options?.providerOptions ?? {}),
+        },
         signal: abortController.signal,
       }
 
@@ -168,7 +168,6 @@ function createBoundModelImpl<TSlot extends string>(
             Stream.ensuring(
               Effect.catchAllCause(
                 Effect.all([
-                  Effect.sync(() => abortController.abort()),
                   Scope.close(peelScope, Exit.void) as Effect.Effect<void, never, never>,
                   Effect.suspend(() => {
                     const usage = result.getUsage()
@@ -179,6 +178,7 @@ function createBoundModelImpl<TSlot extends string>(
                     return Effect.void
                   }),
                   Effect.sync(() => maybeTrace()),
+                  Effect.sync(() => abortController.abort()),
                 ]).pipe(Effect.asVoid),
                 (cause) =>
                   Effect.sync(() => {
@@ -199,7 +199,9 @@ function createBoundModelImpl<TSlot extends string>(
             getCollectorData: result.getCollectorData,
           } satisfies ChatStream
         }).pipe(
-          Effect.onInterrupt(() => Effect.sync(() => abortController.abort())),
+          Effect.onInterrupt(() => Effect.sync(() => {
+            abortController.abort()
+          })),
         ),
         {
           schedule: connectionRetrySchedule,
@@ -225,7 +227,10 @@ function createBoundModelImpl<TSlot extends string>(
           connection,
           model,
           inference,
-          providerOptions,
+          providerOptions: {
+            ...(providerOptions ?? {}),
+            ...(_options?.providerOptions ?? {}),
+          },
         })
 
         // Extract raw output text for tracing

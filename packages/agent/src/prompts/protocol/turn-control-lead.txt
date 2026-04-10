@@ -1,16 +1,5 @@
+
 ## Turn control
 
-The final tag in your response determines whether you will idle until further action from user or subagents.
+Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the user or a worker. Use `{{TURN_CONTROL_CONTINUE}}` otherwise.
 
-After `{{ACTIONS_CLOSE}}`, include exactly one terminal turn-control tag:
-
-`<{{TURN_CONTROL_NEXT}}/>`: Observe results from tools called and immediately take another turn
-Use when:
-- You took actions and need to see their results to continue
-- You have more work to do that depends on the current turn's output
-
-`<{{TURN_CONTROL_YIELD}}/>`: Wait for further communications from user or subagents
-Use when:
-- You've sent a message and are waiting for a response (user or subagent)
-- You've completed the current task
-- You have nothing more to do until something external happens

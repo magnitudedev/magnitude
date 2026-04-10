@@ -14,7 +14,6 @@ import { MemoryProjection } from './memory'
 import { CompactionProjection } from './compaction'
 
 import { SessionContextProjection } from './session-context'
-import { ChatTitleProjection } from './chat-title'
 import { ReplayProjection } from './replay'
 import { getContextLimits } from '../constants'
 
@@ -53,7 +52,6 @@ interface ResolvedProjections {
   compactionProj: Effect.Effect.Success<typeof CompactionProjection.Tag>
 
   sessionProj: Effect.Effect.Success<typeof SessionContextProjection.Tag>
-  chatTitleProj: Effect.Effect.Success<typeof ChatTitleProjection.Tag>
   replayProj: Effect.Effect.Success<typeof ReplayProjection.Tag>
 }
 
@@ -68,7 +66,6 @@ function resolveProjections() {
       compactionProj: yield* CompactionProjection.Tag,
 
       sessionProj: yield* SessionContextProjection.Tag,
-      chatTitleProj: yield* ChatTitleProjection.Tag,
       replayProj: yield* ReplayProjection.Tag,
     } satisfies ResolvedProjections
   })
@@ -89,7 +86,6 @@ function buildSnapshot(
     const compactionRaw = yield* SubscriptionRef.get(projs.compactionProj.state)
 
     const sessionState = yield* SubscriptionRef.get(projs.sessionProj.state)
-    const chatTitleState = yield* SubscriptionRef.get(projs.chatTitleProj.state)
     const replayRaw = yield* SubscriptionRef.get(projs.replayProj.state)
 
     const displayForkState = displayRaw.forks.get(forkId)
@@ -108,7 +104,6 @@ function buildSnapshot(
       { name: 'CompactionProjection', state: compactionForkState, timestamp },
       { name: 'DisplayProjection', state: displayForkState, timestamp },
       { name: 'SessionContextProjection', state: sessionState, timestamp },
-      { name: 'ChatTitleProjection', state: chatTitleState, timestamp },
       { name: 'ReplayProjection', state: replayForkState, timestamp },
     ]
 
@@ -144,7 +139,6 @@ export function createDebugStream(forkId: string | null) {
       toTrigger(projs.compactionProj.state.changes),
 
       toTrigger(projs.sessionProj.state.changes),
-      toTrigger(projs.chatTitleProj.state.changes),
       toTrigger(projs.replayProj.state.changes),
     ], { concurrency: 'unbounded' })
 

@@ -65,16 +65,14 @@ export const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'tu
   turnId: 'turn-1',
   chainId: 'chain-1',
   strategyId: 'xml-act',
-  responseParts: [],
-  toolCalls: [],
-  observedResults: [],
   inputTokens: null,
   outputTokens: null,
   cacheReadTokens: null,
   cacheWriteTokens: null,
   providerId: null,
   modelId: null,
-  result: { success: true, turnDecision: 'yield' },
+  result: { success: true, turnDecision: 'idle' },
+
   ...overrides,
 })
 

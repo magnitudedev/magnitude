@@ -106,34 +106,35 @@ export function makeProviderRuntimeLive<TSlot extends string>(
               }),
             detectProviders: () =>
               Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
-                Effect.flatMap(config.getLocalProviderConfig(), (localProviderConfig) =>
-                  Effect.succeed(
-                    detectProviders(storedAuth, localProviderConfig).map((entry) => ({
+                Effect.flatMap(config.load(), (cfg) => {
+                  const providerOptionsById = cfg.providers ?? {}
+                  return Effect.succeed(
+                    detectProviders(storedAuth, providerOptionsById).map((entry) => ({
                       provider: entry.provider,
-                      authMethods: detectProviderAuthMethods(entry.provider.id, storedAuth, localProviderConfig)?.methods ?? [],
+                      authMethods: detectProviderAuthMethods(entry.provider.id, storedAuth, providerOptionsById)?.methods ?? [],
                     })),
-                  ),
-                ),
+                  )
+                }),
               ),
             detectDefaultProvider: () =>
               Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
                 Effect.map(
-                  config.getLocalProviderConfig(),
-                  (localProviderConfig) => detectDefaultProvider(storedAuth, localProviderConfig)?.provider.id ?? null,
+                  config.load(),
+                  (cfg) => detectDefaultProvider(storedAuth, cfg.providers ?? {})?.provider.id ?? null,
                 ),
               ),
             detectProviderAuthMethods: (providerId) =>
               Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
                 Effect.map(
-                  config.getLocalProviderConfig(),
-                  (localProviderConfig) => detectProviderAuthMethods(providerId, storedAuth, localProviderConfig),
+                  config.load(),
+                  (cfg) => detectProviderAuthMethods(providerId, storedAuth, cfg.providers ?? {}),
                 ),
               ),
             connectedProviderIds: () =>
               Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
                 Effect.map(
-                  config.getLocalProviderConfig(),
-                  (localProviderConfig) => new Set(detectProviders(storedAuth, localProviderConfig).map((d) => d.provider.id)),
+                  config.load(),
+                  (cfg) => new Set(detectProviders(storedAuth, cfg.providers ?? {}).map((d) => d.provider.id)),
                 ),
               ),
           }

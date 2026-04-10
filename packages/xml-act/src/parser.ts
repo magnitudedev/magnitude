@@ -1,4 +1,4 @@
-import { createStackMachine } from './machine'
+import { createStackMachine, type Op } from './machine'
 import { createTokenizer } from './tokenizer'
 import type { Format, XmlActFrame, XmlActEvent, ToolDef } from './format/types'
 import { createCurrentFormat } from './format/index'
@@ -8,6 +8,61 @@ import { classifyXmlActEvent, createCoalescingLayer, mergeXmlActEvent } from './
 
 export type IdGenerator = () => string
 export const defaultIdGenerator: IdGenerator = createId
+
+type ObserveOutcome = 'pending' | 'runaway'
+
+class PostTurnEndObserver {
+  private buffer = ''
+  private consumedOptionalClosing = false
+  private static readonly EXTRA_CLOSE = '</end-turn>'
+
+  feed(chunk: string): ObserveOutcome {
+    this.buffer += chunk
+    return this.process(false)
+  }
+
+  finish(): 'natural' | 'runaway' {
+    const outcome = this.process(true)
+    return outcome === 'runaway' ? 'runaway' : 'natural'
+  }
+
+  private process(isEof: boolean): ObserveOutcome {
+    while (true) {
+      const trimmedLeading = this.buffer.replace(/^\s+/u, '')
+      if (trimmedLeading !== this.buffer) {
+        this.buffer = trimmedLeading
+      }
+
+      if (this.buffer.length === 0) return 'pending'
+
+      if (!this.consumedOptionalClosing) {
+        const close = PostTurnEndObserver.EXTRA_CLOSE
+        if (this.buffer.startsWith(close)) {
+          this.buffer = this.buffer.slice(close.length)
+          this.consumedOptionalClosing = true
+          continue
+        }
+
+        if (close.startsWith(this.buffer)) {
+          return isEof ? 'runaway' : 'pending'
+        }
+      }
+
+      return 'runaway'
+    }
+  }
+}
+
+function isTurnControlEvent(event: unknown): event is {
+  _tag: 'TurnControl'
+  decision: 'continue' | 'idle'
+  termination: 'natural' | 'runaway'
+} {
+  if (!event || typeof event !== 'object') return false
+  const candidate = event as { _tag?: unknown; decision?: unknown }
+  return candidate._tag === 'TurnControl'
+    && (candidate.decision === 'continue' || candidate.decision === 'idle')
+}
 
 export interface StreamingParser {
   push(chunk: string): void
@@ -20,6 +75,7 @@ export interface StreamingParser {
 export function createParser<F extends { readonly type: string }, E>(config: {
   format: Format<F, E>
   initialFrame: F
+  knownToolTags?: ReadonlySet<string>
   generateId?: () => string
   emit?: (event: E) => void
   filter?: (event: E) => boolean
@@ -51,7 +107,7 @@ export function createParser<F extends { readonly type: string }, E>(config: {
       })
     : null
 
-  const onEvent = (event: E) => {
+  const routeEvent = (event: E) => {
     if (config.filter && !config.filter(event)) return
     if (coalescingLayer) {
       coalescingLayer.accept(event)
@@ -60,16 +116,57 @@ export function createParser<F extends { readonly type: string }, E>(config: {
     rawEmit(event)
   }
 
+  let activeBatch: E[] | null = null
+  const onEvent = (event: E) => {
+    if (activeBatch) {
+      activeBatch.push(event)
+      return
+    }
+    routeEvent(event)
+  }
+
   const machine = createStackMachine<F, E>(config.initialFrame, onEvent)
+  let deferredTurnControl: E | null = null
+  let observer: PostTurnEndObserver | null = null
+
+  const emitDeferredTurnControl = (termination: 'natural' | 'runaway') => {
+    if (!deferredTurnControl || !isTurnControlEvent(deferredTurnControl)) return
+    routeEvent({
+      ...deferredTurnControl,
+      termination,
+    } as E)
+    deferredTurnControl = null
+  }
+
+  const applyOps = (ops: ReadonlyArray<Op<F, E>>) => {
+    activeBatch = []
+    machine.apply(ops)
+    const batch = activeBatch
+    activeBatch = null
+
+    if (machine.mode === 'observing' && !observer) observer = new PostTurnEndObserver()
+
+    if (machine.mode === 'observing' && !deferredTurnControl) {
+      for (let i = batch.length - 1; i >= 0; i--) {
+        if (isTurnControlEvent(batch[i])) {
+          deferredTurnControl = batch[i]
+          batch.splice(i, 1)
+          break
+        }
+      }
+    }
+
+    for (const event of batch) routeEvent(event)
+  }
 
   const tokenizer = createTokenizer((signal) => {
-    if (machine.done) return
+    if (machine.mode !== 'active') return
 
     switch (signal.type) {
       case 'open': {
         const result = config.format.resolve(signal.tagName, machine.stack)
         if (result._tag === 'handle') {
-          machine.apply(result.handler.open({
+          applyOps(result.handler.open({
             tagName: signal.tagName,
             attrs: signal.attrs,
             afterNewline: signal.afterNewline,
@@ -86,13 +183,13 @@ export function createParser<F extends { readonly type: string }, E>(config: {
       case 'close': {
         const result = config.format.resolve(signal.tagName, machine.stack)
         if (result._tag === 'handle') {
-          machine.apply(result.handler.close({
+          applyOps(result.handler.close({
             tagName: signal.tagName,
             afterNewline: signal.afterNewline,
             stack: machine.stack,
           }))
         } else {
-          machine.apply(config.format.onUnknownClose(
+          applyOps(config.format.onUnknownClose(
             signal.tagName,
             machine.stack,
             signal.raw ?? `</${signal.tagName}>`,
@@ -103,7 +200,7 @@ export function createParser<F extends { readonly type: string }, E>(config: {
       case 'selfClose': {
         const result = config.format.resolve(signal.tagName, machine.stack)
         if (result._tag === 'handle') {
-          machine.apply(result.handler.selfClose({
+          applyOps(result.handler.selfClose({
             tagName: signal.tagName,
             attrs: signal.attrs,
             afterNewline: signal.afterNewline,
@@ -120,34 +217,65 @@ export function createParser<F extends { readonly type: string }, E>(config: {
       case 'content': {
         const top = machine.peek()
         if (top) {
-          machine.apply(config.format.onContent(top, signal.text))
+          applyOps(config.format.onContent(top, signal.text))
         }
         break
       }
     }
-  })
+  }, config.knownToolTags)
 
   const processChunk = (chunk: string): readonly E[] => {
     const start = events.length
-    if (!machine.done) tokenizer.push(chunk)
+
+    if (machine.mode === 'observing') {
+      if (observer?.feed(chunk) === 'runaway') {
+        emitDeferredTurnControl('runaway')
+        machine.finalize()
+      }
+    } else if (machine.mode === 'active') {
+      tokenizer.push(chunk)
+    }
+
     if (coalescingLayer) coalescingLayer.flush()
     return events.slice(start)
   }
 
   const flush = (): readonly E[] => {
     const start = events.length
-    tokenizer.end()
-    machine.apply(config.format.onFlush(machine.stack))
+
+    if (machine.mode === 'observing') {
+      const termination = observer?.finish() ?? 'natural'
+      emitDeferredTurnControl(termination)
+      machine.finalize()
+    } else {
+      tokenizer.end()
+      applyOps(config.format.onFlush(machine.stack))
+    }
+
     if (coalescingLayer) coalescingLayer.flush()
     return events.slice(start)
   }
 
   return {
     push(chunk) {
-      if (!machine.done) tokenizer.push(chunk)
+      if (machine.mode === 'observing') {
+        if (observer?.feed(chunk) === 'runaway') {
+          emitDeferredTurnControl('runaway')
+          machine.finalize()
+        }
+        if (coalescingLayer) coalescingLayer.flush()
+        return
+      }
+      if (machine.mode === 'active') tokenizer.push(chunk)
     },
     end() {
-      tokenizer.end()
+      if (machine.mode === 'observing') {
+        const termination = observer?.finish() ?? 'natural'
+        emitDeferredTurnControl(termination)
+        machine.finalize()
+      } else {
+        tokenizer.end()
+      }
       if (coalescingLayer) coalescingLayer.flush()
     },
     processChunk,
@@ -178,6 +306,7 @@ export function createStreamingXmlParser(
   return createParser<XmlActFrame, XmlActEvent>({
     format,
     initialFrame: { type: 'prose', body: '', pendingNewlines: 0, tags: structuralTags },
+    knownToolTags: knownTags,
     generateId,
     filter(event) {
       if (event._tag !== 'TurnControl') return true

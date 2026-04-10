@@ -73,16 +73,16 @@ describe('memory rendering', () => {
       })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'check this' }],
         },
         inputTokens: null,
@@ -229,16 +229,16 @@ describe('memory rendering', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'assistant' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'after turn' }],
         },
         inputTokens: null,

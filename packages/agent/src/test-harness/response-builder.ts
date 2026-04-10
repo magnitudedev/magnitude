@@ -22,32 +22,46 @@ function element(tag: string, attrs?: XmlAttrs, body?: string): string {
 }
 
 export class ResponseBuilder {
-  private readonly comms: string[] = []
-  private readonly actions: string[] = []
+  private readonly messages: string[] = []
+  private readonly tools: string[] = []
 
-  message(to: string, text: string): this {
-    this.comms.push(element('message', { to }, text))
+  message(text: string): this {
+    this.messages.push(element('message', undefined, text))
     return this
   }
 
-  messageUser(text: string): this {
-    return this.message('user', text)
+  spawnWorker(id: string, role: string, message: string): this {
+    this.tools.push(element('spawn-worker', { id, role }, message))
+    return this
   }
 
-  messageParent(text: string): this {
-    return this.message('parent', text)
+  createTask(id: string, type: string, title: string, parent?: string): this {
+    const attrs: XmlAttrs = { id, type, title }
+    if (parent) attrs.parent = parent
+    this.tools.push(element('create-task', attrs))
+    return this
+  }
+
+  updateTask(id: string, status: string): this {
+    this.tools.push(element('update-task', { id, status }))
+    return this
+  }
+
+  killWorker(id: string): this {
+    this.tools.push(element('kill-worker', { id }))
+    return this
   }
 
   tool(tag: string, attrs?: XmlAttrs, body?: string): this {
-    this.actions.push(element(tag, attrs, body))
+    this.tools.push(element(tag, attrs, body))
     return this
   }
 
   createAgent(agentId: string, type: string, title: string, message: string): this {
     return this.tool(
       'agent-create',
-      { agentId },
-      `${element('type', undefined, type)}${element('title', undefined, title)}${element('message', undefined, message)}`,
+      { id: agentId, type },
+      `${element('title', undefined, title)}${element('message', undefined, message)}`,
     )
   }
 
@@ -83,14 +97,16 @@ export class ResponseBuilder {
     )
   }
 
-  private build(control: 'yield' | 'next'): MockTurnResponse {
-    const comms = this.comms.length > 0 ? element('comms', undefined, this.comms.join('')) : ''
-    const actions = this.actions.length > 0 ? element('actions', undefined, this.actions.join('')) : ''
-    return { xml: `${actions}${comms}<${control}/>` }
+  private build(control: string): MockTurnResponse {
+    const parts: string[] = []
+    parts.push(...this.messages)
+    parts.push(...this.tools)
+    parts.push(`<${control}/>`)
+    return { xml: parts.join('') }
   }
 
   yield(): MockTurnResponse {
-    return this.build('yield')
+    return this.build('idle')
   }
 
   next(): MockTurnResponse {

@@ -42,21 +42,30 @@ describe('memory queue and flush', () => {
         skill: { name: 'ship', description: '', preamble: '', phases: [{ name: 'p1', prompt: 'phase one' }] },
       })
       yield* h.send({
+        type: 'tool_event',
+        forkId: null,
+        turnId: 't-1',
+        toolCallId: 'tc-1',
+        toolKey: 'shell',
+        event: {
+          _tag: 'ToolObservation',
+          toolCallId: 'tc-1',
+          tagName: 'shell',
+          query: '.',
+          content: [{ type: 'text', text: '<stdout>ok</stdout>' }],
+        },
+      })
+      yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [
-          { toolKey: 'shell', group: 'shell', toolName: 'shell', result: { status: 'success', output: { ok: true } } },
-        ],
-        observedResults: [
-          { toolCallId: 'tc-1', tagName: 'shell', query: '.', content: [{ type: 'text', text: '<stdout>ok</stdout>' }] },
-        ],
+
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'after turn' }],
         },
         inputTokens: null,
@@ -144,14 +153,13 @@ describe('memory queue and flush', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'assistant' }],
-        toolCalls: [],
-        observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -188,16 +196,15 @@ describe('memory queue and flush', () => {
       })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
+
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'remember me' }],
         },
         inputTokens: null,

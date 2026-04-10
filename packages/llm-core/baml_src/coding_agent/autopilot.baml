@@ -5,7 +5,8 @@
 function AutopilotContinuation(
   systemPrompt: string,
   messages: ChatMessage[],
-  includeClaudeSpoof: bool
+  includeClaudeSpoof: bool,
+  includeSystemPromptMessage: bool
 ) -> string {
   client ChatClientNoRetryAnthropicOnly
   prompt #"
@@ -13,8 +14,10 @@ function AutopilotContinuation(
     {{ _.role("system") }}
     You are Claude Code, Anthropic's official CLI for Claude.
     {%endif%}
+    {%if includeSystemPromptMessage%}
     {{ _.role("system") }}
     {{ systemPrompt }}
+    {%endif%}
 
     {% for message in messages %}
     {{ _.role(message.role) }}

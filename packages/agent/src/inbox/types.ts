@@ -1,5 +1,5 @@
 import type { ContentPart } from '../content'
-import type { ObservedResult, ResolvedMention, TurnToolCall } from '../events'
+import type { ResolvedMention, ToolResultStatus } from '../events'
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -78,11 +78,36 @@ export type PhaseCriteriaPayload =
   | PhaseCriteriaBase<'user'>
 
 // ---------------------------------------------------------------------------
-// ResultEntry
+// TurnResultItem / ResultEntry
 // ---------------------------------------------------------------------------
 
+export type ToolErrorResultItem = {
+  readonly kind: 'tool_error'
+  readonly toolKey: string
+  readonly status: Exclude<ToolResultStatus, 'success'>
+  readonly message?: string
+}
+
+export type ToolObservationResultItem = {
+  readonly kind: 'tool_observation'
+  readonly tagName: string
+  readonly query: string
+  readonly content: readonly ContentPart[]
+}
+
+export type MessageAckResultItem = {
+  readonly kind: 'message_ack'
+  readonly destination: 'parent'
+  readonly chars: number
+}
+
+export type TurnResultItem =
+  | ToolErrorResultItem
+  | ToolObservationResultItem
+  | MessageAckResultItem
+
 export type ResultEntry =
-  | { readonly kind: 'tool_results'; readonly toolCalls: readonly TurnToolCall[]; readonly observedResults: readonly ObservedResult[] }
+  | { readonly kind: 'turn_results'; readonly items: readonly TurnResultItem[] }
   | { readonly kind: 'interrupted' }
   | { readonly kind: 'error'; readonly message: string }
   | { readonly kind: 'noop' }
@@ -94,6 +119,14 @@ export type ResultEntry =
 
 export type TimelineEntry =
   | (TimestampedText<'user_message'> & { readonly attachments: readonly TimelineAttachment[] })
+  | (TimestampedText<'parent_message'>)
+  | (Timestamped<'user_bash_command'> & {
+      readonly command: string
+      readonly cwd: string
+      readonly exitCode: number
+      readonly stdout: string
+      readonly stderr: string
+    })
   | (TimestampedText<'user_to_agent'> & { readonly agentId: string })
   | (Timestamped<'agent_block'> & {
       readonly firstAtomTimestamp: number
@@ -109,7 +142,26 @@ export type TimelineEntry =
   | (Timestamped<'phase_verdict'> & { readonly passed: boolean; readonly verdictText: string; readonly workflowCompleted: boolean })
   | (Timestamped<'skill_started'> & { readonly skillName: string; readonly firstPhase?: string; readonly prompt: string })
   | (Timestamped<'skill_completed'> & { readonly skillName: string })
-  | (Timestamped<'lifecycle_hook'> & { readonly agentId: string; readonly role: string; readonly hookType: LifecycleHookType })
+  | (Timestamped<'lifecycle_hook'> & {
+      readonly agentId: string
+      readonly role: string
+      readonly hookType: LifecycleHookType
+      readonly taskId?: string
+      readonly taskTitle?: string
+    })
+  | (Timestamped<'task_type_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string })
+  | (Timestamped<'task_idle_hook'> & { readonly taskId: string; readonly taskType: string; readonly title: string; readonly agentId: string })
+  | (Timestamped<'task_tree_dirty'> & { readonly taskId: string })
+  | (Timestamped<'task_tree_view'> & { readonly renderedTree: string })
+  | (Timestamped<'task_update'> & {
+      readonly action: 'created' | 'cancelled' | 'completed' | 'status_changed'
+      readonly taskId: string
+      readonly title?: string
+      readonly taskType?: string
+      readonly previousStatus?: string
+      readonly nextStatus?: string
+      readonly cancelledCount?: number
+    })
   | (Timestamped<'observation'> & { readonly parts: readonly ContentPart[] })
 
 // ---------------------------------------------------------------------------

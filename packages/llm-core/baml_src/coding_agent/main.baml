@@ -8,7 +8,8 @@ function CodingAgentChat(
   systemPrompt: string,
   messages: ChatMessage[],
   ackTurn: string,
-  includeClaudeSpoof: bool
+  includeClaudeSpoof: bool,
+  includeSystemPromptMessage: bool
 ) -> string {
   client ChatClientNoRetryAnthropicOnly
   prompt #"
@@ -16,16 +17,24 @@ function CodingAgentChat(
     {{ _.role("system") }}
     You are Claude Code, Anthropic's official CLI for Claude.
     {%endif%}
+    {%if includeSystemPromptMessage%}
     {{ _.role("system") }}
     {{ systemPrompt }}
+    {%endif%}
 
+    {%if ackTurn %}
     {{ _.role("user") }}
-    <system-tutorial>
-    Acknowledge to demonstrate understanding of response syntax
-    </system-tutorial>
+    --- FEW-SHOT EXAMPLE START ---
+    <system>
+    Respond using the required turn format. Send a brief readiness message to your default recipient and continue.
+    </system>
 
     {{ _.role("assistant") }}
     {{ ackTurn }}
+
+    {{ _.role("user") }}
+    --- FEW-SHOT EXAMPLE END ---
+    {%endif%}
     {% for message in messages %}
     {% if message.role == "user" %}
     {% if loop.last %}

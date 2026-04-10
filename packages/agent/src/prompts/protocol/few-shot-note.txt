@@ -1,0 +1,4 @@
+## Few-shot example
+
+The conversation begins with a clearly designated few-shot example.
+This example is not a real part of the conversation and exists purely to demonstrate the required response format.

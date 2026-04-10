@@ -14,6 +14,7 @@ import { CanonicalTurnProjection } from '../canonical-turn'
 import { UserPresenceProjection } from '../user-presence'
 import { OutboundMessagesProjection } from '../outbound-messages'
 import { UserMessageResolutionProjection } from '../user-message-resolution'
+import { TaskGraphProjection } from '../task-graph'
 
 const ts = (n: number) => 1_700_100_000_000 + n
 
@@ -33,6 +34,7 @@ const makeRuntimeLayer = () => {
     Layer.provide(UserPresenceProjection.Layer, projectionBusLayer),
     Layer.provide(OutboundMessagesProjection.Layer, projectionBusLayer),
     Layer.provide(UserMessageResolutionProjection.Layer, projectionBusLayer),
+    Layer.provide(TaskGraphProjection.Layer, projectionBusLayer),
     Layer.provide(MemoryProjection.Layer, projectionBusLayer),
   )
 }
@@ -83,7 +85,7 @@ describe('MemoryProjection queue ordering regressions', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_user_killed',
@@ -119,6 +121,45 @@ describe('MemoryProjection queue ordering regressions', () => {
     expect((user as any).text).toBe('/debug issue')
   })
 
+  it('user_bash_command on root idle queues only and flushes on turn_started', async () => {
+    const rootFork = await runEvents([
+      {
+        type: 'session_initialized',
+        timestamp: ts(0),
+        sessionId: 's1',
+        cwd: '/tmp',
+        model: 'test',
+        mode: 'interactive',
+        approvalMode: 'on-request',
+      } as any,
+      {
+        type: 'user_bash_command',
+        timestamp: ts(3),
+        forkId: null,
+        command: 'pwd',
+        cwd: '/tmp',
+        exitCode: 0,
+        stdout: '/tmp',
+        stderr: '',
+      } as any,
+      {
+        type: 'turn_started',
+        timestamp: ts(4),
+        turnId: 'turn-1',
+        forkId: null,
+        strategyId: 'lead',
+        chainId: null,
+      } as any,
+    ])
+
+    expect(rootFork.queuedEntries).toEqual([])
+    const inbox = getLastInbox(rootFork)
+    expect(inbox.timeline.map(e => e.kind)).toEqual(['user_bash_command'])
+    const cmd = inbox.timeline[0] as any
+    expect(cmd.command).toBe('pwd')
+    expect(cmd.stdout).toBe('/tmp')
+  })
+
   it('userMessageResolved on root idle queues only and flushes in order on turn_started', async () => {
     const rootFork = await runEvents([
       {
@@ -141,7 +182,7 @@ describe('MemoryProjection queue ordering regressions', () => {
         context: 'ctx',
         mode: 'spawn',
         taskId: 'task-1',
-        message: '',
+        message: null,
       } as any,
       {
         type: 'subagent_user_killed',
@@ -307,9 +348,6 @@ describe('MemoryProjection queue ordering regressions', () => {
         forkId: null,
         turnId: 'turn-1',
         strategyId: 'lead',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
         result: { success: false, error: 'turn failed', cancelled: false },
       } as any,
       {

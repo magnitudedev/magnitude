@@ -74,7 +74,10 @@ List directory structure.
 Search file contents with regex.
 
 ```xml
-<grep pattern="TODO|FIXME" path="src/" glob="*.ts" limit="50" />
+<grep path="src/" limit="50">
+  <pattern>TODO|FIXME</pattern>
+  <glob>*.ts</glob>
+</grep>
 ```
 
 - **pattern** — regex pattern to search for

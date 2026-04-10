@@ -36,13 +36,11 @@ describe('turn-control/concurrent-signal-race', () => {
       const firstTurn = h.events().find((e): e is Extract<typeof e, { type: 'turn_started' }> => e.type === 'turn_started' && e.forkId === null)!
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: firstTurn.turnId,
         chainId: 'race-chain',
         strategyId: 'xml-act',
-        responseParts: [],
-        toolCalls: [],
-        observedResults: [],
         result: {
           success: true,
           turnDecision: 'continue',

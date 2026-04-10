@@ -1,20 +1,9 @@
-/**
- * Reactor State — pure state fold for the xml-act reactor.
- *
- * initialReactorState() creates a fresh state for first run.
- * foldReactorState() is the same function the reactor uses internally
- * and consumers use to reconstruct state from a persisted event log.
- */
-
-import type {
-  ReactorState,
-  ToolOutcome,
-  XmlRuntimeEvent,
-} from '../types'
+import type { ReactorState, ToolOutcome, XmlRuntimeEvent } from '../types'
 
 export function initialReactorState(): ReactorState {
   return {
     toolCallMap: new Map(),
+
     deadToolCalls: new Set(),
     outputTrees: new Map(),
     stopped: false,
@@ -47,9 +36,6 @@ export function foldReactorState(state: ReactorState, event: XmlRuntimeEvent): R
 
     case 'TurnEnd':
       return { ...state, stopped: true }
-
-    case 'StructuralParseError':
-      return state
 
     default:
       return state

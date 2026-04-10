@@ -199,6 +199,9 @@ async function build(target: string) {
 
   console.log('Building ' + target + '...')
 
+  console.log('Generating CLI version...')
+  await $`bun run ${resolve(PROJECT_ROOT, 'cli/scripts/generate-version.ts')}`
+
   // Build WASM dependencies
   console.log('Building @magnitudedev/image WASM...')
   await $`cd ${resolve(PROJECT_ROOT, 'packages/image')} && wasm-pack build --target nodejs --out-dir pkg --release`.quiet()

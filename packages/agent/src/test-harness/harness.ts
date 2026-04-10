@@ -1,6 +1,7 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
 import { defineCatalog } from '@magnitudedev/tools'
 import { Context, Effect, Layer } from 'effect'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import type { RoleDefinition } from '@magnitudedev/roles'
 import type { AgentCatalogEntry } from '../catalog'
 import type { AppEvent, SessionContext } from '../events'
@@ -11,6 +12,7 @@ import { createId } from '../util/id'
 // Projections
 import { SessionContextProjection } from '../projections/session-context'
 import { WorkflowProjection } from '../projections/workflow'
+import { TaskGraphProjection } from '../projections/task-graph'
 import { TurnProjection } from '../projections/turn'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { MemoryProjection, getView } from '../projections/memory'
@@ -21,7 +23,6 @@ import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
 
 import { ReplayProjection } from '../projections/replay'
-import { ChatTitleProjection } from '../projections/chat-title'
 import { ConversationProjection } from '../projections/conversation'
 import { UserPresenceProjection } from '../projections/user-presence'
 import { OutboundMessagesProjection } from '../projections/outbound-messages'
@@ -35,9 +36,9 @@ import { LifecycleCoordinator } from '../workers/lifecycle-coordinator'
 import { ApprovalWorker } from '../workers/approval-worker'
 import { Autopilot } from '../workers/autopilot'
 import { CompactionWorker } from '../workers/compaction-worker'
-import { ChatTitleWorker } from '../workers/chat-title-worker'
 import { UserPresenceWorker } from '../workers/user-presence-worker'
 import { FileMentionResolver } from '../workers/file-mention-resolver'
+import { SessionTitleWorker } from '../workers/session-title-worker'
 
 // Runtime/services
 import { ExecutionManagerLive } from '../execution/execution-manager'
@@ -87,6 +88,11 @@ export interface HarnessOptions {
   sessionContext?: Partial<SessionContext>
   persistence?: {
     seedEvents?: AppEvent[]
+    metadata?: {
+      chatName?: string
+      workingDirectory?: string
+      gitBranch?: string | null
+    }
   }
   defaults?: {
     waitTimeoutMs?: number
@@ -95,7 +101,6 @@ export interface HarnessOptions {
     turnController?: boolean
     autopilot?: boolean
     compaction?: boolean
-    chatTitle?: boolean
     userPresence?: boolean
   }
   files?: Record<string, string>
@@ -208,10 +213,10 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       ApprovalWorker,
       ...(options.workers?.autopilot ? [Autopilot] : []),
       ...(options.workers?.compaction ? [CompactionWorker] : []),
-      ...(options.workers?.chatTitle ? [ChatTitleWorker] : []),
       ...(options.workers?.userPresence ? [UserPresenceWorker] : []),
 
       FileMentionResolver,
+      SessionTitleWorker,
     ] as const
 
     const TestCodingAgent = Agent.define<AppEvent>()({
@@ -222,6 +227,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         AgentStatusProjection,
         CompactionProjection,
         WorkflowProjection,
+        TaskGraphProjection,
         TurnProjection,
         CanonicalTurnProjection,
 
@@ -231,7 +237,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         UserMessageResolutionProjection,
         MemoryProjection,
         DisplayProjection,
-        ChatTitleProjection,
         ConversationProjection,
         UserPresenceProjection,
       ],
@@ -239,7 +244,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       expose: {
         signals: {
           restoreQueuedMessages: DisplayProjection.signals.restoreQueuedMessages,
-          chatTitleGenerated: ChatTitleProjection.signals.chatTitleGenerated,
         },
         state: {
           display: DisplayProjection,
@@ -255,6 +259,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
     const basePersistenceLayer = makeInMemoryChatPersistenceLayer({
       events: options.persistence?.seedEvents ?? [],
+      metadata: options.persistence?.metadata,
     })
 
     const faultWrappedPersistenceLayer = Layer.effect(
@@ -462,7 +467,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           const resolver: MockTurnScriptResolver = ({ forkId }) => {
             if (forkId === null) return mapping.root
             const entry = Array.from(forksByAgent.entries()).find(([, id]) => id === forkId)
-            if (!entry || !mapping.subagents) return { xml: '<yield/>' }
+            if (!entry || !mapping.subagents) return { xml: TURN_CONTROL_IDLE }
 
             if ('xml' in mapping.subagents || 'xmlChunks' in mapping.subagents) {
               return mapping.subagents
@@ -470,7 +475,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
             const [agentId] = entry
             const perAgent = mapping.subagents as Record<string, MockTurnResponse>
-            return perAgent[agentId] ?? { xml: '<yield/>' }
+            return perAgent[agentId] ?? { xml: TURN_CONTROL_IDLE }
           }
 
           await client.runEffect(
@@ -638,7 +643,10 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           )
 
           if (turnState._tag !== 'idle' || turnState.triggers.length > 0) {
-            await send({ type: 'interrupt', forkId: null } as AppEvent)
+            await Promise.race([
+              send({ type: 'interrupt', forkId: null } as AppEvent),
+              new Promise<void>((resolve) => setTimeout(resolve, 250)),
+            ])
           }
         } catch {
           // ignore best-effort teardown interrupt failures

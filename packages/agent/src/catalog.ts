@@ -37,12 +37,7 @@ import {
 } from './tools/fs'
 import { webSearchTool, webSearchXmlBinding } from './tools/web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './tools/web-fetch-tool'
-import {
-  agentCreateTool,
-  agentCreateXmlBinding,
-  agentKillTool,
-  agentKillXmlBinding,
-} from './tools/agent-tools'
+
 import { skillTool, skillXmlBinding } from './tools/skill'
 import { phaseSubmitTool, phaseSubmitXmlBinding } from './tools/phase-submit'
 import { phaseVerdictTool, phaseVerdictXmlBinding } from './tools/phase-verdict'
@@ -72,6 +67,22 @@ import {
   evaluateTool,
   evaluateXmlBinding,
 } from './tools/browser-tools'
+import {
+  createTaskTool,
+  createTaskXmlBinding,
+  updateTaskTool,
+  updateTaskXmlBinding,
+  spawnWorkerTool,
+  spawnWorkerXmlBinding,
+  killWorkerTool,
+  killWorkerXmlBinding,
+} from './tools/task-tools'
+import {
+  agentCreateTool,
+  agentCreateXmlBinding,
+  agentKillTool,
+  agentKillXmlBinding,
+} from './tools/agent-tools'
 
 // State models
 import { shellModel } from './models/shell'
@@ -83,8 +94,7 @@ import { fileSearchModel } from './models/file-search'
 import { fileViewModel } from './models/file-view'
 import { webSearchModel } from './models/web-search'
 import { webFetchModel } from './models/web-fetch'
-import { agentCreateModel } from './models/agent-create'
-import { agentKillModel } from './models/agent-kill'
+
 import { skillModel } from './models/skill'
 import { phaseSubmitModel } from './models/phase-submit'
 import { phaseVerdictModel } from './models/phase-verdict'
@@ -102,6 +112,12 @@ import {
   screenshotModel,
   evaluateModel,
 } from './models/browser-action'
+import { createTaskModel } from './models/create-task'
+import { updateTaskModel } from './models/update-task'
+import { spawnWorkerModel } from './models/spawn-worker'
+import { killWorkerModel } from './models/kill-worker'
+import { agentCreateModel } from './models/agent-create'
+import { agentKillModel } from './models/agent-kill'
 
 export const catalog = defineCatalog({
   shell: { tool: shellTool, binding: shellXmlBinding, state: shellModel },
@@ -113,8 +129,7 @@ export const catalog = defineCatalog({
   fileView: { tool: viewTool, binding: viewXmlBinding, state: fileViewModel },
   webSearch: { tool: webSearchTool, binding: webSearchXmlBinding, state: webSearchModel },
   webFetch: { tool: webFetchTool, binding: webFetchXmlBinding, state: webFetchModel },
-  agentCreate: { tool: agentCreateTool, binding: agentCreateXmlBinding, state: agentCreateModel, display: false },
-  agentKill: { tool: agentKillTool, binding: agentKillXmlBinding, state: agentKillModel, display: false },
+
   skill: { tool: skillTool, binding: skillXmlBinding, state: skillModel },
   phaseSubmit: { tool: phaseSubmitTool, binding: phaseSubmitXmlBinding, state: phaseSubmitModel },
   workflowSubmit: { tool: phaseSubmitTool, binding: phaseSubmitXmlBinding, state: phaseSubmitModel },
@@ -131,6 +146,14 @@ export const catalog = defineCatalog({
   newTab: { tool: newTabTool, binding: newTabXmlBinding, state: newTabModel, group: 'browser' },
   screenshot: { tool: screenshotTool, binding: screenshotXmlBinding, state: screenshotModel, group: 'browser' },
   evaluate: { tool: evaluateTool, binding: evaluateXmlBinding, state: evaluateModel, group: 'browser' },
+
+  agentCreate: { tool: agentCreateTool, binding: agentCreateXmlBinding, state: agentCreateModel },
+  agentKill: { tool: agentKillTool, binding: agentKillXmlBinding, state: agentKillModel },
+
+  createTask: { tool: createTaskTool, binding: createTaskXmlBinding, state: createTaskModel, display: false },
+  updateTask: { tool: updateTaskTool, binding: updateTaskXmlBinding, state: updateTaskModel, display: false },
+  spawnWorker: { tool: spawnWorkerTool, binding: spawnWorkerXmlBinding, state: spawnWorkerModel, display: false },
+  killWorker: { tool: killWorkerTool, binding: killWorkerXmlBinding, state: killWorkerModel, display: false },
 } as const)
 
 export type ToolKey = keyof typeof catalog.entries

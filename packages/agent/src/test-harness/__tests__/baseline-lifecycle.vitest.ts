@@ -16,7 +16,7 @@ describe('baseline harness lifecycle', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next({
-        xml: '<comms><message to="user">done</message></comms><yield/>',
+        xml: '<message to="user">done</message><idle/>',
       })
 
       yield* harness.user('hello')
@@ -24,7 +24,7 @@ describe('baseline harness lifecycle', () => {
 
       expect(completed.result.success).toBe(true)
       if (completed.result.success) {
-        expect(completed.result.turnDecision).toBe('yield')
+        expect(completed.result.turnDecision).toBe('idle')
       }
 
       const root = yield* harness.projectionFork(TurnProjection.Tag, null)
@@ -36,8 +36,8 @@ describe('baseline harness lifecycle', () => {
   it.live('3) multi-turn chain (next then yield)', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<next/>' })
-      yield* harness.script.next({ xml: '<yield/>' })
+      yield* harness.script.next({ xml: '<shell>echo chain</shell>' })
+      yield* harness.script.next({ xml: '<idle/>' })
 
       yield* harness.user('run chain')
 
@@ -54,7 +54,7 @@ describe('baseline harness lifecycle', () => {
 
       expect(second.result.success).toBe(true)
       if (second.result.success) {
-        expect(second.result.turnDecision).toBe('yield')
+        expect(second.result.turnDecision).toBe('idle')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -63,14 +63,21 @@ describe('baseline harness lifecycle', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next({
-        xml: '<actions><write path="output.txt">content</write></actions><yield/>',
+        xml: '<write path="output.txt">content</write><idle/>',
       })
 
       yield* harness.user('write a file')
       const completed = yield* harness.wait.turnCompleted(null)
+      const toolEnded = yield* harness.wait.event(
+        'tool_event',
+        (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
+      )
 
       expect(completed.result.success).toBe(true)
-      expect(completed.toolCalls.length).toBeGreaterThan(0)
+      if (toolEnded.event._tag !== 'ToolExecutionEnded') {
+        throw new Error('Expected ToolExecutionEnded')
+      }
+      expect(toolEnded.event.result._tag).toBe('Success')
       expect(harness.files.get('output.txt')).toBe('content')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -87,13 +94,13 @@ describe('baseline harness lifecycle', () => {
               rootTurns += 1
               if (rootTurns === 1) {
                 return {
-                  xml: '<actions><agent-create agentId="baseline-sub"><type>explorer</type><title>baseline</title><message>do work</message></agent-create></actions><yield/>',
+                  xml: '<agent-create id="baseline-sub" type="explorer"><title>baseline</title><message>do work</message></agent-create><idle/>',
                 }
               }
-              return { xml: '<yield/>' }
+              return { xml: '<idle/>' }
             }
 
-            return { xml: '<comms><message to="parent">subagent done</message></comms><yield/>' }
+            return { xml: '<message to="parent">subagent done</message><idle/>' }
           }),
         ),
       )
@@ -131,13 +138,13 @@ describe('baseline harness lifecycle', () => {
               rootTurns += 1
               if (rootTurns === 1) {
                 return {
-                  xml: '<actions><agent-create agentId="baseline-sub-silent"><type>explorer</type><title>baseline</title><message>do work</message></agent-create></actions><yield/>',
+                  xml: '<agent-create id="baseline-sub-silent" type="explorer"><title>baseline</title><message>do work</message></agent-create><idle/>',
                 }
               }
-              return { xml: '<yield/>' }
+              return { xml: '<idle/>' }
             }
 
-            return { xml: '<actions><shell>echo hello</shell></actions><yield/>' }
+            return { xml: '<shell>echo hello</shell><idle/>' }
           }),
         ),
       )

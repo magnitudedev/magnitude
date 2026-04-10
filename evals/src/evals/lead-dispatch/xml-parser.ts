@@ -66,7 +66,7 @@ export interface ParsedArtifactWrite {
   content: string
 }
 
-type TurnControl = 'next' | 'yield' | null
+type TurnControl = 'idle' | null
 
 export interface ParsedInspectRef {
   toolRef: string
@@ -117,18 +117,7 @@ function extractAllAttributes(xml: string, tag: string, attr: string): string[] 
 }
 
 function detectTurnControl(raw: string): TurnControl {
-  const nextMatch = /<next\s*\/>/gi
-  const yieldMatch = /<yield\s*\/>/gi
-
-  let lastNext = -1
-  let lastYield = -1
-  let m: RegExpExecArray | null
-
-  while ((m = nextMatch.exec(raw)) !== null) lastNext = m.index
-  while ((m = yieldMatch.exec(raw)) !== null) lastYield = m.index
-
-  if (lastNext === -1 && lastYield === -1) return null
-  return lastNext > lastYield ? 'next' : 'yield'
+  return /<idle\s*\/>/i.test(raw) ? 'idle' : null
 }
 
 function detectFirstActionKind(raw: string): string | null {

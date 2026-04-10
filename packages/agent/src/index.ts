@@ -28,7 +28,6 @@ export type {
   TurnResult,
   TurnDecision,
   TurnToolCall,
-  ResponsePart,
   StrategyId,
   MessageStart,
   ThinkingChunk,
@@ -40,7 +39,6 @@ export type {
   AutopilotToggled,
   ToolApproved,
   ToolRejected,
-  ChatTitleGenerated,
   PhaseCriteriaVerdict,
   PhaseVerdict,
   PhaseVerdictEntry,
@@ -128,13 +126,12 @@ export type {
 export { OutboundMessagesProjection } from './projections/outbound-messages'
 export type { OutboundMessagesState, OutboundMessageCompletedSignal } from './projections/outbound-messages'
 
-export { ChatTitleProjection } from './projections/chat-title'
-export type { ChatTitleState, ChatTitleGeneratedSignal } from './projections/chat-title'
-
 export { SessionContextProjection } from './projections/session-context'
 export type { SessionContextState } from './projections/session-context'
 
 export { ReplayProjection } from './projections/replay'
+export { TaskGraphProjection, getPrimaryRootTask, getSessionTitleFromTaskGraph } from './projections/task-graph'
+export type { TaskGraphState, TaskRecord, TaskStatus, TaskWorkerInfo } from './projections/task-graph'
 export { WorkflowProjection } from './projections/workflow'
 export type { WorkflowCriteriaState } from './projections/workflow'
 
@@ -165,7 +162,6 @@ export { readTool, writeTool, editTool, treeTool, grepTool, fsTools } from './to
 export { webSearchTool } from './tools/web-search-tool'
 export { webFetchTool } from './tools/web-fetch-tool'
 
-export { agentCreateTool, agentKillTool } from './tools/agent-tools'
 export {
   clickTool, doubleClickTool, rightClickTool, typeTool, scrollTool, dragTool,
   navigateTool, goBackTool, switchTabTool, newTabTool, screenshotTool, evaluateTool,
@@ -190,6 +186,7 @@ export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'
 export { WorkflowWorker } from './workers/workflow-worker'
+export { SessionTitleWorker } from './workers/session-title-worker'
 
 // Persistence
 export { ChatPersistence, PersistenceError } from './persistence/chat-persistence-service'

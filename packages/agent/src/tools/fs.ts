@@ -366,10 +366,12 @@ export const grepTool = defineTool({
 export const grepXmlBinding = defineXmlBinding(grepTool, {
   input: {
     attributes: [
-      { field: 'pattern', attr: 'pattern' },
       { field: 'path', attr: 'path' },
-      { field: 'glob', attr: 'glob' },
       { field: 'limit', attr: 'limit' },
+    ],
+    childTags: [
+      { field: 'pattern', tag: 'pattern' },
+      { field: 'glob', tag: 'glob' },
     ],
   },
   output: {

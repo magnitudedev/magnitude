@@ -31,10 +31,9 @@ export interface ToolCall {
 }
 
 export type TurnTrigger =
-  | { readonly _tag: 'user_message'; readonly messageId: string }
+  | { readonly _tag: 'communication' }
   | { readonly _tag: 'chain_continue'; readonly chainId: string }
   | { readonly _tag: 'subagent_completed'; readonly agentId: string; readonly turnId: string }
-  | { readonly _tag: 'subagent_message'; readonly agentId: string; readonly messageId: string }
   | { readonly _tag: 'wake' }
   | { readonly _tag: 'skill_started'; readonly skillName: string }
   | { readonly _tag: 'phase_verdict' }
@@ -112,15 +111,9 @@ function isStable(fork: TurnLifecycleState): boolean {
   return fork._tag === 'idle' && fork.triggers.length === 0 && !fork.softInterrupted
 }
 
-function clearNonDurableTriggers(fork: TurnLifecycleState): TurnLifecycleState {
+function clearTriggers(fork: TurnLifecycleState): TurnLifecycleState {
   return TurnLifecycle.hold(fork, {
-    triggers: fork.triggers.filter(
-      (trigger) =>
-        trigger._tag === 'user_message' ||
-        trigger._tag === 'subagent_message' ||
-        trigger._tag === 'subagent_completed' ||
-        trigger._tag === 'phase_verdict'
-    ),
+    triggers: [],
   })
 }
 
@@ -172,7 +165,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       }),
 
     interrupt: ({ event, fork, emit }) => {
-      const afterClear = clearNonDurableTriggers(fork)
+      const afterClear = clearTriggers(fork)
 
       if (afterClear._tag === 'active') {
         emit.turnInterrupting({
@@ -214,6 +207,9 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
 
     agent_created: ({ event, fork }) => {
       const withParent = TurnLifecycle.hold(fork, { parentForkId: event.parentForkId })
+      if (event.message === null) {
+        return withParent
+      }
       const next = enqueueTrigger(withParent, { _tag: 'agent_created', agentId: event.agentId })
       return next
     },
@@ -403,7 +399,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
 
       const contentText = extractTextFromParts(value.content)
       const next = TurnLifecycle.hold(fork, {
-        triggers: [...fork.triggers, { _tag: 'user_message', messageId: value.messageId }],
+        triggers: [...fork.triggers, { _tag: 'communication' }],
         pendingInboundCommunications: [
           ...fork.pendingInboundCommunications,
           {
@@ -435,7 +431,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       const next = TurnLifecycle.hold(fork, {
         triggers: [
           ...fork.triggers,
-          { _tag: 'subagent_message', agentId: value.agentId, messageId: createId() },
+          { _tag: 'communication' },
         ],
         pendingInboundCommunications: [
           ...fork.pendingInboundCommunications,
@@ -468,7 +464,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       const next = TurnLifecycle.hold(fork, {
         triggers: [
           ...fork.triggers,
-          { _tag: 'subagent_message', agentId: value.agentId, messageId: createId() },
+          { _tag: 'communication' },
         ],
         pendingInboundCommunications: [
           ...fork.pendingInboundCommunications,

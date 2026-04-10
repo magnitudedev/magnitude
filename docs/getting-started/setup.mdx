@@ -1,0 +1,75 @@
+---
+title: Setup
+description: "Install Magnitude and configure your model provider"
+icon: rocket
+---
+
+## Install
+
+### Prerequisites
+
+Before installing Magnitude, make sure you have:
+
+- A modern terminal emulator, such as **Ghostty** or **Kitty**
+- Provider credentials or API keys
+
+<p className="docs-muted-note">Note: The default macOS Terminal.app has limited color support and may look strange.</p>
+
+### macOS / Linux
+
+<Tabs>
+  <Tab title="npm">
+    ```sh
+    npm install -g @magnitudedev/cli
+    ```
+  </Tab>
+  <Tab title="bun">
+    ```sh
+    bun install -g @magnitudedev/cli
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```sh
+    pnpm install -g @magnitudedev/cli
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```sh
+    yarn global add @magnitudedev/cli
+    ```
+  </Tab>
+</Tabs>
+
+### Windows
+
+<Warning>
+Magnitude requires **WSL** on Windows. We do not currently support native Windows environments.
+</Warning>
+
+To get started, run:
+
+```powershell
+wsl --install
+```
+
+Then restart your computer. After restarting, run `wsl` in your shell. Once you're inside WSL, you can use the normal Linux install commands above to install and run Magnitude.
+
+## Configure
+
+After installing, run:
+
+```sh
+magnitude
+```
+
+When you first run `magnitude`, Magnitude walks you through a setup wizard that helps you:
+
+- Connect a provider
+- Choose recommended models
+- Set up the browser agent
+
+If you already have one, we recommend using a **ChatGPT** subscription or **GitHub Copilot** subscription for the easiest setup.
+
+You can also configure providers and models anytime with `/provider` and `/model`.
+
+For the full list of supported providers and configuration options, see [Providers](/configuration/providers) and [Models](/configuration/models).

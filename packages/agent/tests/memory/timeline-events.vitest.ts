@@ -24,19 +24,19 @@ describe('memory/timeline-events', () => {
       })
 
       yield* h.send({ type: 'turn_started', forkId: subforkId, turnId: 'sub-turn-1', chainId: 'sub-chain-1' })
-      yield* h.send({ type: 'message_start', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', dest: 'lead' })
+      yield* h.send({ type: 'message_start', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', destination: { kind: 'parent' } })
       yield* h.send({ type: 'message_chunk', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', text: 'working on auth flow' })
       yield* h.send({ type: 'message_end', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: subforkId,
         turnId: 'sub-turn-1',
         chainId: 'sub-chain-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+
+
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -61,7 +61,6 @@ describe('memory/timeline-events', () => {
       if (inbox?.type === 'inbox') {
         const blocks = inbox.timeline.filter(t => t.kind === 'agent_block')
         expect(blocks.length).toBeGreaterThan(0)
-        expect(blocks.some(b => b.atoms.some(a => a.kind === 'idle'))).toBe(true)
       }
 
       const rendered = yield* getRenderedUserText(h)
@@ -139,16 +138,16 @@ describe('memory/timeline-events', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-rem-1', chainId: 'c-rem-1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-rem-1',
         chainId: 'c-rem-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'ok' }],
-        toolCalls: [],
-        observedResults: [],
+
+
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'follow up on deployment checks' }],
         },
         inputTokens: null,

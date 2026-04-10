@@ -3,11 +3,10 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 describe('AgentLifecycle lifecycle wiring', () => {
-  test('subagent_user_killed disposes fork and wakes parent fork', () => {
+  test('subagent_user_killed disposes fork', () => {
     const source = readFileSync(join(import.meta.dir, '..', 'agent-lifecycle.ts'), 'utf8')
-    expect(source.includes('subagent_user_killed: (event, publish)')).toBe(true)
+    expect(source.includes('subagent_user_killed: (event')).toBe(true)
     expect(source.includes('yield* execManager.disposeFork(event.forkId)')).toBe(true)
-    expect(source.includes("yield* publish({ type: 'wake', forkId: event.parentForkId })")).toBe(true)
   })
 
   test('subagent_idle_closed disposes fork without waking parent fork', () => {

@@ -13,6 +13,8 @@ import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { WorkflowSkill } from '@magnitudedev/skills'
+import type { TaskTypeId, TaskAssignee } from './tasks'
+
 
 export type Attachment = ImageAttachment | MentionAttachment
 
@@ -107,6 +109,17 @@ export interface ObservationsCaptured {
   readonly parts: readonly ObservationPart[]
 }
 
+export interface UserBashCommand {
+  readonly type: 'user_bash_command'
+  readonly forkId: null
+  readonly timestamp: number
+  readonly command: string
+  readonly cwd: string
+  readonly exitCode: number
+  readonly stdout: string
+  readonly stderr: string
+}
+
 export interface UserMessageReady {
   readonly type: 'user_message_ready'
   readonly messageId: string
@@ -137,14 +150,6 @@ export interface TurnToolCall {
 // Response Representation
 // =============================================================================
 
-/**
- * Durable record of what the model produced in a turn.
- * Used for memory reconstruction. Single text part containing the raw XML.
- */
-export type ResponsePart =
-  | { readonly type: 'text'; readonly content: string }
-  | { readonly type: 'thinking'; readonly content: string }
-
 export interface ObservedResult {
   readonly toolCallId: string
   readonly tagName: string
@@ -158,9 +163,6 @@ export interface TurnCompleted {
   readonly turnId: string
   readonly chainId: string
   readonly strategyId: StrategyId
-  readonly responseParts: readonly ResponsePart[]
-  readonly toolCalls: readonly TurnToolCall[]
-  readonly observedResults: readonly ObservedResult[]
   readonly result: TurnResult
   /** Actual input token count from LLM provider (via BAML Collector). Null when unavailable (e.g. Codex path, interrupted turns). */
   readonly inputTokens: number | null
@@ -176,12 +178,13 @@ export interface TurnCompleted {
   readonly modelId: string | null
 }
 
-export type TurnDecision = 'continue' | 'yield' | 'finish'
+export type TurnDecision = 'continue' | 'idle' | 'finish'
 
 export type TurnResultErrorCode =
   | 'unclosed_think'
-  | 'unclosed_actions'
   | 'nonexistent_agent_destination'
+  | 'task_outside_assigned_subtree'
+  | 'task_operation_error'
 
 export interface TurnResultError {
   readonly code: TurnResultErrorCode
@@ -191,7 +194,7 @@ export interface TurnResultError {
 export type TurnResult =
   | {
       readonly success: true
-      readonly turnDecision: 'continue' | 'yield'
+      readonly turnDecision: 'continue' | 'idle'
       readonly errors?: readonly TurnResultError[]
       readonly oneshotLivenessTriggered?: boolean
     }
@@ -216,12 +219,17 @@ export interface TurnUnexpectedError {
 // Streaming Events
 // =============================================================================
 
+export type MessageDestination =
+  | { readonly kind: 'user' }
+  | { readonly kind: 'parent' }
+  | { readonly kind: 'worker'; readonly taskId: string }
+
 export interface MessageStart {
   readonly type: 'message_start'
   readonly forkId: string | null
   readonly turnId: string
   readonly id: string
-  readonly dest: string
+  readonly destination: MessageDestination
 }
 
 export interface ThinkingChunk {
@@ -275,6 +283,28 @@ export interface MessageEnd {
   readonly id: string
 }
 
+/**
+ * Raw provider output streamed during a turn. Intentionally redundant with parsed
+ * streaming events (message_chunk, thinking_chunk, etc.) — the parsed events carry
+ * the same content in structured form. This event exists because:
+ *
+ * 1. Dirty turns (parse failures, truncation) need the original raw text to show
+ *    the model what it actually produced so it can correct mistakes.
+ * 2. Raw chunks are persisted as they stream, so they survive process crashes.
+ *    Without this, crash recovery would lose the raw response entirely since
+ *    turn_completed (which arrives after streaming) may never be persisted.
+ *
+ * If the redundancy cost becomes unacceptable, these events can be filtered out
+ * of persistence or stopped — but raw text from past sessions cannot be added
+ * retroactively.
+ */
+export interface RawResponseChunk {
+  readonly type: 'raw_response_chunk'
+  readonly forkId: string | null
+  readonly turnId: string
+  readonly text: string
+}
+
 // =============================================================================
 // Tool Events
 // =============================================================================
@@ -298,6 +328,8 @@ export type ToolResult =
   | { readonly status: 'error'; readonly message: string }
   | { readonly status: 'rejected'; readonly message: string; readonly reason?: string }
   | { readonly status: 'interrupted' }
+
+export type ToolResultStatus = ToolResult['status']
 
 
 
@@ -381,6 +413,65 @@ export interface SubagentIdleClosed {
 }
 
 // =============================================================================
+// Task Events
+// =============================================================================
+
+export interface TaskCreated {
+  readonly type: 'task_created'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly title: string
+  readonly taskType: TaskTypeId
+  readonly parentId: string | null
+  readonly after?: string
+  readonly timestamp: number
+}
+
+export interface TaskUpdated {
+  readonly type: 'task_updated'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly patch: {
+    readonly title?: string
+    readonly parentId?: string | null
+    readonly after?: string
+    readonly status?: string
+  }
+  readonly timestamp: number
+}
+
+export interface TaskAssigned {
+  readonly type: 'task_assigned'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly assignee: TaskAssignee
+  readonly workerRole?: string
+  readonly message: string
+  readonly workerInfo?: {
+    readonly agentId: string
+    readonly forkId: string
+    readonly role: string
+  }
+  readonly replacedWorker?: {
+    readonly agentId: string
+    readonly forkId: string
+  }
+  readonly timestamp: number
+}
+
+export interface TaskCancelled {
+  readonly type: 'task_cancelled'
+  readonly forkId: string | null
+  readonly taskId: string
+  readonly cancelledSubtree: readonly string[]
+  readonly killedWorkers: readonly {
+    readonly agentId: string
+    readonly forkId: string
+  }[]
+  readonly timestamp: number
+}
+
+// =============================================================================
 // Compaction Events
 // =============================================================================
 
@@ -443,17 +534,6 @@ export interface ToolRejected {
   readonly forkId: string | null
   readonly toolCallId: string
   readonly reason?: string
-}
-
-// =============================================================================
-// Chat Title Events
-// =============================================================================
-
-/** Chat title auto-generated from conversation */
-export interface ChatTitleGenerated {
-  readonly type: 'chat_title_generated'
-  readonly forkId: null  // Always root
-  readonly title: string
 }
 
 // =============================================================================
@@ -599,6 +679,7 @@ export type AppEvent =
   | OneshotTask
   | UserMessage
   | ObservationsCaptured
+  | UserBashCommand
   | UserMessageReady
   | TurnStarted
   | TurnCompleted
@@ -611,6 +692,7 @@ export type AppEvent =
   | LensChunk
   | LensEnd
   | MessageEnd
+  | RawResponseChunk
   | ToolEvent
   | AutopilotMessageGenerated
   | AutopilotToggled
@@ -625,9 +707,13 @@ export type AppEvent =
   | ContextLimitHit
   | ToolApproved
   | ToolRejected
-  | ChatTitleGenerated
   | PhaseCriteriaVerdict
   | PhaseVerdict
+  // Task events
+  | TaskCreated
+  | TaskUpdated
+  | TaskAssigned
+  | TaskCancelled
   // Agent events
   | AgentCreated
   | AgentKilled
@@ -639,3 +725,4 @@ export type AppEvent =
   | SkillActivated
   | SkillStarted
   | SkillCompleted
+

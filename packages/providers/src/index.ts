@@ -32,7 +32,6 @@ export {
   CodingAgentChat,
   SimpleChat,
   CodingAgentCompact,
-  GenerateChatTitle,
   ExtractMemoryDiff,
   GatherSplit,
   PatchFile,
@@ -107,7 +106,6 @@ export { normalizeModelOutput, normalizeQuotesInString } from './util/output-nor
 
 // Drivers
 export { BamlDriver } from './drivers/baml-driver'
-export { ResponsesDriver } from './drivers/responses-driver'
 
 // Browser-compatible models
 export {

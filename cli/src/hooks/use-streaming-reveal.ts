@@ -6,7 +6,10 @@ export function useStreamingReveal(
   isInterrupted?: boolean,
   initialDisplayedLength?: number,
 ): { displayedContent: string; isCatchingUp: boolean; showCursor: boolean } {
-  const [displayedLength, setDisplayedLength] = useState(isStreaming ? 0 : content.length)
+  const [displayedLength, setDisplayedLength] = useState(() => {
+    if (!isStreaming) return content.length
+    return Math.max(0, Math.min(initialDisplayedLength ?? 0, content.length))
+  })
   const isLinearDrainRef = useRef(!isStreaming)
   const previousContentRef = useRef(content)
   const previousIsStreamingRef = useRef(isStreaming)

@@ -60,7 +60,7 @@ export interface AssistantMessageDisplay {
 export interface ThinkingStep {
   readonly id: string
   readonly type: 'thinking'
-  readonly content?: string
+  readonly content: string
   readonly label?: string
 }
 
@@ -462,8 +462,6 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'newTab': return { ...counts, navigations: counts.navigations + 1 }
     case 'type': return { ...counts, inputs: counts.inputs + 1 }
     case 'evaluate': return { ...counts, evaluations: counts.evaluations + 1 }
-    case 'agentCreate':
-    case 'agentKill':
     case 'skill':
     case 'fileView':
     case 'phaseSubmit':
@@ -684,7 +682,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         return fork
       }
 
-      if (event.dest !== 'user') {
+      // Skip messages not targeting user
+      if (event.destination.kind !== 'user') {
         return fork
       }
 
@@ -775,7 +774,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             thinkBlockId,
             lastStep.id,
             (s) => s.type === 'thinking'
-              ? { ...s, content: (s.content ?? '') + event.text }
+              ? { ...s, content: s.content + event.text }
               : s
           )
         }
@@ -808,7 +807,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               thinkBlockId,
               lastStep.id,
               (s) => s.type === 'thinking'
-                ? { ...s, content: (s.content ?? '') + ' ' }
+                ? { ...s, content: s.content + ' ' }
                 : s
             )
           }
@@ -839,7 +838,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           thinkBlockId,
           lastStep.id,
           (s) => s.type === 'thinking'
-            ? { ...s, content: (s.content ?? '') + event.text }
+            ? { ...s, content: s.content + event.text }
             : s
         )
       }
@@ -1085,6 +1084,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     },
 
     agent_created: ({ event, fork }) => {
+      if (event.message === null) return fork
       const content = event.message.trim()
       if (!content) return fork
       if (event.forkId === null) return fork
@@ -1305,16 +1305,25 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
 
       const nextResumeCount = (message.resumeCount ?? 0) + 1
-      const moved = moveMessageToEndBeforeQueue<ForkActivityMessage>(parentState.messages, message.id, (msg) => ({
-        ...msg,
+      const resumedBlock: ForkActivityMessage = {
+        id: generateId(),
+        type: 'fork_activity',
+        forkId,
+        name: message.name,
+        role: message.role,
         status: 'running',
+        createdAt: value.timestamp,
         activeSince: value.timestamp,
-        completedAt: undefined,
+        accumulatedActiveMs: message.accumulatedActiveMs,
         resumeCount: nextResumeCount,
-        timestamp: value.timestamp,
-      }))
+        toolCounts: message.toolCounts,
+        timestamp: value.timestamp
+      }
 
-      let nextParentState: DisplayState = { ...parentState, messages: moved }
+      let nextParentState: DisplayState = {
+        ...parentState,
+        messages: insertBeforeQueuedMessages(parentState.messages, resumedBlock)
+      }
 
       if (parentForkId === null) {
         const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
@@ -1324,7 +1333,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           subagentType: value.role,
           subagentId: value.agentId,
           title: message.name,
-          resumed: nextResumeCount > 0,
+          resumed: true,
         }
         nextParentState = {
           ...withBlock.fork,

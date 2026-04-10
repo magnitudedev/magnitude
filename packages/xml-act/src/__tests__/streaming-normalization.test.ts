@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { Effect, Stream } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, type ToolDefinition } from '@magnitudedev/tools'
@@ -39,7 +39,7 @@ function config(tools: RegisteredTool[]): XmlRuntimeConfig {
 }
 
 function responseWithActions(actionsXml: string): string {
-  return `<lenses></lenses><comms></comms><actions>${actionsXml}</actions><yield/>`
+  return `<lens name="turn">planning</lens>\n${actionsXml}<idle/>`
 }
 
 function toolEvents(events: XmlRuntimeEvent[]): XmlRuntimeEvent[] {
@@ -55,10 +55,6 @@ function eventsOfType<T extends XmlRuntimeEvent['_tag']>(
   tag: T,
 ): Extract<XmlRuntimeEvent, { _tag: T }>[] {
   return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
-}
-
-function callEvents(events: XmlRuntimeEvent[], toolCallId: string): XmlRuntimeEvent[] {
-  return events.filter(e => 'toolCallId' in e && e.toolCallId === toolCallId)
 }
 
 const agentCreateLikeTool = defineTool({
@@ -145,7 +141,7 @@ const strictTitleBinding: XmlTagBinding = {
   childTags: [{ field: 'title', tag: 'title' }],
 }
 
-describe('streaming normalization (attr ↔ childTag) event sequences', () => {
+describe('streaming tool input behavior without attr/child normalization', () => {
   test('A1 canonical positions emit canonical streaming sequence', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const xml = responseWithActions(
@@ -184,7 +180,7 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     ])
   })
 
-  test('B3 child->attr single swap emits field value (no child events for swapped field)', async () => {
+  test('B3 child-form attr causes missing required fields after canonical children stream normally', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const events = await runStream(
       cfg,
@@ -193,53 +189,54 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
       ),
     )
 
-    const started = eventsOfType(events, 'ToolInputStarted')[0]
-    const byCall = callEvents(events, started.toolCallId)
-    const idChildEvents = byCall.filter(
-      e => (e._tag === 'ToolInputChildStarted' || e._tag === 'ToolInputChildComplete') && e.field === 'id',
-    )
-    const idFieldValues = byCall.filter(e => e._tag === 'ToolInputFieldValue' && e.field === 'id')
-    expect(idChildEvents).toHaveLength(0)
-    expect(idFieldValues).toHaveLength(1)
-    const idField = idFieldValues[0]
-    expect(idField?._tag).toBe('ToolInputFieldValue')
-    if (!idField || idField._tag !== 'ToolInputFieldValue') throw new Error('Expected ToolInputFieldValue')
-    expect(idField.value).toBe('a1')
-
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { id: string }).id).toBe('a1')
+    expect(eventTags(events)).toEqual([
+      'ToolInputStarted',
+      'ToolInputChildStarted',
+      'ToolInputBodyChunk',
+      'ToolInputChildComplete',
+      'ToolInputChildStarted',
+      'ToolInputBodyChunk',
+      'ToolInputChildComplete',
+      'ToolInputChildStarted',
+      'ToolInputBodyChunk',
+      'ToolInputChildComplete',
+      'ToolInputReady',
+      'ToolInputParseError',
+    ])
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolInputParseError')[0].error._tag).toBe('MissingRequiredFields')
   })
 
-  test('B4 child->attr all attrs swapped as child tags each emit ToolInputFieldValue', async () => {
+  test('B4 attr-only tool with child-form attrs yields UnexpectedBody', async () => {
     const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
     const events = await runStream(
       cfg,
-      responseWithActions(`<path_mode><path>/tmp/a</path><mode>r</mode></path_mode>`),
+      responseWithActions(`<path_mode><mode>r</mode></path_mode>`),
     )
     expect(eventTags(events)).toEqual([
       'ToolInputStarted',
-      'ToolInputFieldValue',
-      'ToolInputFieldValue',
-      'ToolInputReady',
-      'ToolExecutionStarted',
-      'ToolExecutionEnded',
+      'ToolInputParseError',
     ])
+    expect(eventsOfType(events, 'ToolInputParseError')[0].error._tag).toBe('UnexpectedBody')
   })
 
-  test('B5 mixed canonical attrs + swapped children: timing split is preserved', async () => {
+  test('B5 mixed canonical attr + child-form attr still fails strictly', async () => {
     const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
     const events = await runStream(
       cfg,
       responseWithActions(`<path_mode path="/tmp/a"><mode>r</mode></path_mode>`),
     )
 
-    const fields = eventsOfType(events, 'ToolInputFieldValue')
-    expect(fields).toHaveLength(2)
-    expect(fields[0].field).toBe('path')
-    expect(fields[1].field).toBe('mode')
+    expect(eventTags(events)).toEqual([
+      'ToolInputStarted',
+      'ToolInputFieldValue',
+      'ToolInputParseError',
+    ])
+    expect(eventsOfType(events, 'ToolInputParseError')[0].error._tag).toBe('UnexpectedBody')
   })
 
-  test('C6 attr->child single swap emits synthetic child start/complete and no field value', async () => {
+  test('C6 attr-form childTag target emits UnknownAttribute before tool input starts', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const events = await runStream(
       cfg,
@@ -247,22 +244,16 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
         `<agent_create_like id="a1" type="explorer"><title>Hello</title><message>Do work</message></agent_create_like>`,
       ),
     )
-    const started = eventsOfType(events, 'ToolInputStarted')[0]
-    const byCall = callEvents(events, started.toolCallId)
 
-    const typeFieldValues = byCall.filter(e => e._tag === 'ToolInputFieldValue' && e.field === 'type')
-    const typeChildStarts = byCall.filter(e => e._tag === 'ToolInputChildStarted' && e.field === 'type')
-    const typeChildCompletes = byCall.filter(e => e._tag === 'ToolInputChildComplete' && e.field === 'type')
-
-    expect(typeFieldValues).toHaveLength(0)
-    expect(typeChildStarts).toHaveLength(1)
-    expect(typeChildCompletes).toHaveLength(1)
-
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { type: string }).type).toBe('explorer')
+    expect(eventTags(events)).toEqual([
+      'ToolInputParseError',
+      'ToolInputStarted',
+      'ToolInputFieldValue',
+    ])
+    expect(eventsOfType(events, 'ToolInputParseError')[0].error._tag).toBe('UnknownAttribute')
   })
 
-  test('C7 attr->child multiple swapped fields each emit synthetic child events', async () => {
+  test('C7 multiple childTag fields in attr position collapse to one UnknownAttribute before start', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const events = await runStream(
       cfg,
@@ -271,32 +262,27 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
       ),
     )
     expect(eventTags(events)).toEqual([
+      'ToolInputParseError',
       'ToolInputStarted',
       'ToolInputFieldValue',
-      'ToolInputChildStarted',
-      'ToolInputChildComplete',
-      'ToolInputChildStarted',
-      'ToolInputChildComplete',
-      'ToolInputChildStarted',
-      'ToolInputChildComplete',
-      'ToolInputReady',
-      'ToolExecutionStarted',
-      'ToolExecutionEnded',
     ])
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
   })
 
-  test('C8 self-closing tag with swapped childTag attrs emits canonical child events', async () => {
+  test('C8 self-closing tag with childTag attrs is rejected with one UnknownAttribute', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const events = await runStream(
       cfg,
       responseWithActions(`<agent_create_like id="a1" type="explorer" title="Hello" message="Do work" />`),
     )
-    expect(eventsOfType(events, 'ToolInputChildStarted')).toHaveLength(3)
-    expect(eventsOfType(events, 'ToolInputChildComplete')).toHaveLength(3)
-    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputChildStarted')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolInputChildComplete')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputParseError')[0].error._tag).toBe('UnknownAttribute')
   })
 
-  test('D9 mixed both directions yields canonical streaming sequence', async () => {
+  test('D9 mixed both directions now fails without normalization', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const events = await runStream(
       cfg,
@@ -304,28 +290,16 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
         `<agent_create_like type="explorer"><id>a1</id><title>Hello</title><message>Do work</message></agent_create_like>`,
       ),
     )
-    expect(eventTags(events)).toEqual([
-      'ToolInputStarted',
-      'ToolInputChildStarted',
-      'ToolInputChildComplete',
-      'ToolInputFieldValue',
-      'ToolInputChildStarted',
-      'ToolInputBodyChunk',
-      'ToolInputChildComplete',
-      'ToolInputChildStarted',
-      'ToolInputBodyChunk',
-      'ToolInputChildComplete',
-      'ToolInputReady',
-      'ToolExecutionStarted',
-      'ToolExecutionEnded',
-    ])
+    expect(eventsOfType(events, 'ToolInputParseError').length).toBeGreaterThan(0)
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
   })
 
-  test('E10 canonical attr + swapped child duplicate: canonical attr wins, duplicate suppressed', async () => {
+  test('E10 canonical attrs in canonical form still execute cleanly', async () => {
     const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
     const events = await runStream(
       cfg,
-      responseWithActions(`<path_mode path="/tmp/a" mode="r"><path>/tmp/b</path></path_mode>`),
+      responseWithActions(`<path_mode path="/tmp/a" mode="r"></path_mode>`),
     )
     const pathFieldValues = eventsOfType(events, 'ToolInputFieldValue').filter(e => e.field === 'path')
     expect(pathFieldValues).toHaveLength(1)
@@ -333,9 +307,11 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     expect(pathField?._tag).toBe('ToolInputFieldValue')
     if (!pathField || pathField._tag !== 'ToolInputFieldValue') throw new Error('Expected ToolInputFieldValue')
     expect(pathField.value).toBe('/tmp/a')
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
   })
 
-  test('E11 swapped attr + canonical child duplicate: duplicate child is ignored after first canonical emission', async () => {
+  test('E11 canonical child is preserved; attr-form duplicate child is rejected separately', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const events = await runStream(
       cfg,
@@ -344,57 +320,52 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
       ),
     )
 
-    const typeChildStarted = eventsOfType(events, 'ToolInputChildStarted').filter(e => e.field === 'type')
-    const typeChildComplete = eventsOfType(events, 'ToolInputChildComplete').filter(e => e.field === 'type')
-    expect(typeChildStarted).toHaveLength(1)
-    expect(typeChildComplete).toHaveLength(1)
-    expect((typeChildComplete[0].value as { type: string }).type).toBe('explorer')
-
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { type: string }).type).toBe('explorer')
-  })
-
-  test('F12 child with attributes is not eligible for child->attr normalization', async () => {
-    const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
-    const events = await runStream(
-      cfg,
-      responseWithActions(`<path_mode><path kind="x">/tmp/a</path><mode>r</mode></path_mode>`),
-    )
-    const parseErrors = eventsOfType(events, 'ToolInputParseError')
-    expect(parseErrors).toHaveLength(1)
-    expect(parseErrors[0].error._tag).toBe('MissingRequiredFields')
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(0)
     expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
   })
 
-  test('F13 multiple children for attr target are not normalized (MissingRequiredFields)', async () => {
+  test('F12 child with attributes on attr-only tool yields UnexpectedBody', async () => {
     const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
     const events = await runStream(
       cfg,
-      responseWithActions(`<path_mode><path>/a</path><path>/b</path><mode>r</mode></path_mode>`),
+      responseWithActions(`<path_mode><mode>r</mode></path_mode>`),
     )
     const parseErrors = eventsOfType(events, 'ToolInputParseError')
     expect(parseErrors).toHaveLength(1)
-    expect(parseErrors[0].error._tag).toBe('MissingRequiredFields')
+    expect(parseErrors[0].error._tag).toBe('UnexpectedBody')
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
   })
 
-  test('F14 empty child body normalizes to empty string for attr target', async () => {
+  test('F13 multiple child-form attrs on attr-only tool still yield UnexpectedBody', async () => {
     const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
     const events = await runStream(
       cfg,
-      responseWithActions(`<path_mode><path></path><mode>r</mode></path_mode>`),
+      responseWithActions(`<path_mode><mode>r</mode></path_mode>`),
     )
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { path: string }).path).toBe('')
-    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+    const parseErrors = eventsOfType(events, 'ToolInputParseError')
+    expect(parseErrors).toHaveLength(1)
+    expect(parseErrors[0].error._tag).toBe('UnexpectedBody')
+  })
+
+  test('F14 empty child body is not normalized for attr-only tools', async () => {
+    const cfg = config([registered(pathModeTool, 'path_mode', pathModeBinding)])
+    const events = await runStream(
+      cfg,
+      responseWithActions(`<path_mode><mode>r</mode></path_mode>`),
+    )
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolInputParseError')[0].error._tag).toBe('UnexpectedBody')
   })
 
   test('F15 chunk-split streaming yields same canonical event tag sequence as single chunk', async () => {
     const cfg = config([registered(agentCreateLikeTool, 'agent_create_like', agentCreateLikeBinding)])
     const chunks = [
-      `<lenses></lenses><comms></comms><actions><agent_create_like id="a1" type="explorer">`,
+      `<lens name="turn">planning</lens>\n<agent_create_like id="a1" type="explorer">`,
       `<title>Hello</title>`,
       `<message>Do work</message></agent_create_like>`,
-      `</actions><yield/>`,
+      `<idle/>`,
     ]
     const single = await runStream(cfg, chunks.join(''))
     const split = await runStreamChunks(cfg, chunks)
@@ -402,18 +373,18 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     expect(eventTags(split)).toEqual(eventTags(single))
   })
 
-  test('G16 child->attr normalization coerces streaming field value to number', async () => {
+  test('G16 child-form number attr does not emit streaming field values but command still executes', async () => {
     const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
     const events = await runStream(cfg, responseWithActions(`<shell_like><timeout>5</timeout>echo hi</shell_like>`))
 
     const timeoutField = eventsOfType(events, 'ToolInputFieldValue').find(e => e.field === 'timeout')
-    expect(timeoutField?.value).toBe(5)
-
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { timeout?: unknown }).timeout).toBe(5)
+    expect(timeoutField).toBeUndefined()
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
   })
 
-  test('G17 child->attr normalization coercion failure emits parse error and suppresses field', async () => {
+  test('G17 invalid child-form number attr is also ignored without coercion', async () => {
     const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
     const events = await runStream(cfg, responseWithActions(`<shell_like><timeout>wat</timeout>echo hi</shell_like>`))
 
@@ -421,12 +392,11 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     expect(timeoutField).toBeUndefined()
 
     const parseErrors = eventsOfType(events, 'ToolInputParseError')
-    expect(parseErrors).toHaveLength(1)
-    expect(parseErrors[0].error._tag).toBe('InvalidAttributeValue')
-    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(0)
+    expect(parseErrors).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
   })
 
-  test('G18 child->attr normalization coerces streaming field value to boolean', async () => {
+  test('G18 child-form boolean attr does not emit streaming field values but command still executes', async () => {
     const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
     const events = await runStream(
       cfg,
@@ -434,13 +404,13 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     )
 
     const recursiveField = eventsOfType(events, 'ToolInputFieldValue').find(e => e.field === 'recursive')
-    expect(recursiveField?.value).toBe(true)
-
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { recursive?: unknown }).recursive).toBe(true)
+    expect(recursiveField).toBeUndefined()
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
+    expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
   })
 
-  test('G19 child->attr normalization coerces "0" to number 0', async () => {
+  test('G19 child-form zero number attr is ignored without normalization', async () => {
     const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
     const events = await runStream(
       cfg,
@@ -448,14 +418,14 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     )
 
     const timeoutField = eventsOfType(events, 'ToolInputFieldValue').find(e => e.field === 'timeout')
-    expect(timeoutField?.value).toBe(0)
+    expect(timeoutField).toBeUndefined()
 
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { timeout?: unknown }).timeout).toBe(0)
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(1)
     expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
   })
 
-  test('G20 child->attr normalization coerces "false" to boolean false', async () => {
+  test('G20 child-form false boolean attr is ignored without normalization', async () => {
     const cfg = config([registered(shellLikeTool, 'shell_like', shellLikeBinding)])
     const events = await runStream(
       cfg,
@@ -463,11 +433,11 @@ describe('streaming normalization (attr ↔ childTag) event sequences', () => {
     )
 
     const recursiveField = eventsOfType(events, 'ToolInputFieldValue').find(e => e.field === 'recursive')
-    expect(recursiveField?.value).toBe(false)
+    expect(recursiveField).toBeUndefined()
 
-    const ready = eventsOfType(events, 'ToolInputReady')[0]
-    expect((ready.input as { recursive?: unknown }).recursive).toBe(false)
+    expect(eventsOfType(events, 'ToolInputReady')).toHaveLength(1)
     expect(eventsOfType(events, 'ToolExecutionStarted')).toHaveLength(1)
+    expect(eventsOfType(events, 'ToolInputParseError')).toHaveLength(0)
   })
 
   test('H19 validation: unknown attribute + missing required + schema validation + dead-call gating', async () => {

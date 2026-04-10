@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect } from 'vitest'
 import { Effect, Stream } from 'effect'
 import { guardStream, guardEffectStream } from './stream-guard'
 

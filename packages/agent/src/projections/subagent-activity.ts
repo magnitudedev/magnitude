@@ -14,9 +14,9 @@ export interface TurnEntry {
 export interface SubagentActivityState {
   readonly entriesByParent: ReadonlyMap<string | null, readonly TurnEntry[]>
   readonly seenCursorByParent: ReadonlyMap<string | null, number>
-  // Buffer prose chunks during a turn (message_chunk events for user-dest messages)
+  // Buffer prose chunks during a turn (message_chunk events for top-level messages)
   readonly pendingProse: ReadonlyMap<string, string>
-  // Track user-destination message ids by fork
+  // Track top-level message ids by fork
   readonly userMessageIdsByFork: ReadonlyMap<string, ReadonlySet<string>>
 
 }
@@ -41,7 +41,7 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
   eventHandlers: {
     message_start: ({ event, state }) => {
       if (event.forkId === null) return state
-      if (event.dest !== 'user') return state
+      if (event.destination.kind !== 'parent') return state
 
       const existing = state.userMessageIdsByFork.get(event.forkId) ?? new Set<string>()
       const next = new Set(existing)

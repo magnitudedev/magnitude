@@ -1,5 +1,17 @@
 # @magnitudedev/cli
 
+## 0.0.1-alpha.10
+
+### Patch Changes
+
+- [`fe9a864`](https://github.com/magnitudedev/magnitude/commit/fe9a864c8fe669b3f875f25478a4dd6964f7641e) Thanks [@anerli](https://github.com/anerli)! - fixes
+
+## 0.0.1-alpha.9
+
+### Patch Changes
+
+- [`ceaa3d3`](https://github.com/magnitudedev/magnitude/commit/ceaa3d38983061481c89a1e31c4bb402b3c3bfae) Thanks [@anerli](https://github.com/anerli)! - task system
+
 ## 0.0.1-alpha.8
 
 ### Patch Changes

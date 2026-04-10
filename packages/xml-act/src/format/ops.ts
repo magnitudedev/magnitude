@@ -18,3 +18,4 @@ export function replace(frame: XmlActFrame): Fx {
 }
 
 export const done: Fx = { type: 'done' }
+export const observe: Fx = { type: 'observe' }

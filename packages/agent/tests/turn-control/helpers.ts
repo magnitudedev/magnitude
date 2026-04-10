@@ -25,10 +25,8 @@ export const mkTurnCompletedSuccess = (
   turnId: 'turn-1',
   chainId: 'chain-1',
   strategyId: 'xml-act',
-  responseParts: [],
-  toolCalls: [],
-  observedResults: [],
-  result: { success: true, turnDecision: 'yield' },
+  result: { success: true, turnDecision: 'idle' },
+
   inputTokens: null,
   outputTokens: null,
   cacheReadTokens: null,

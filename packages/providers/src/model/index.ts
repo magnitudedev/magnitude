@@ -8,7 +8,6 @@ export type { BoundModel, ChatStream, ModelFunctionDef, StreamingFn, CompleteFn,
 export {
   CodingAgentChat,
   CodingAgentCompact,
-  GenerateChatTitle,
   ExtractMemoryDiff,
   GatherSplit,
   PatchFile,

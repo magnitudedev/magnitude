@@ -4,8 +4,7 @@
 
 import { PROVIDERS } from './registry'
 
-type LocalProviderConfig = { baseUrl?: string; modelId?: string } | null | undefined
-import type { AuthInfo, AuthMethodDef, ProviderDefinition } from './types'
+import type { AuthInfo, AuthMethodDef, ProviderDefinition, ProviderOptions } from './types'
 
 export interface DetectedProvider {
   provider: ProviderDefinition
@@ -19,7 +18,7 @@ export interface DetectedProvider {
  */
 export function detectProviders(
   storedAuth: Record<string, AuthInfo>,
-  localProviderConfig?: LocalProviderConfig,
+  providerOptionsById?: Record<string, ProviderOptions | undefined>,
 ): DetectedProvider[] {
   const detected: DetectedProvider[] = []
 
@@ -38,11 +37,14 @@ export function detectProviders(
       continue
     }
 
-    // 3. Check for auth-less providers (e.g., local)
+    // 3. Check for auth-less providers (e.g., local runtimes)
     if (provider.authMethods.some(m => m.type === 'none')) {
-      if (provider.id === 'local') {
-        // Local is only "connected" when actually configured with a URL and model
-        if (localProviderConfig?.baseUrl && localProviderConfig?.modelId) {
+      if (provider.providerFamily === 'local') {
+        const options = providerOptionsById?.[provider.id]
+        const connected = provider.defaultBaseUrl
+          ? options?.lastDiscoveryStatus === 'success_non_empty'
+          : !!options?.baseUrl?.trim()
+        if (connected) {
           detected.push({ provider, auth: null, source: 'none' })
         }
       } else {
@@ -78,9 +80,9 @@ export function detectProviders(
  */
 export function detectDefaultProvider(
   storedAuth: Record<string, AuthInfo>,
-  localProviderConfig?: LocalProviderConfig,
+  providerOptionsById?: Record<string, ProviderOptions | undefined>,
 ): DetectedProvider | null {
-  const all = detectProviders(storedAuth, localProviderConfig)
+  const all = detectProviders(storedAuth, providerOptionsById)
   // Prefer stored auth (user explicitly configured)
   const stored = all.find(d => d.source === 'stored')
   if (stored) return stored
@@ -163,7 +165,7 @@ export interface ProviderAuthMethodStatus {
 export function detectProviderAuthMethods(
   providerId: string,
   storedAuth: Record<string, AuthInfo>,
-  localProviderConfig?: LocalProviderConfig,
+  providerOptionsById?: Record<string, ProviderOptions | undefined>,
 ): ProviderAuthMethodStatus | null {
   const provider = PROVIDERS.find(p => p.id === providerId)
   if (!provider) return null
@@ -224,8 +226,12 @@ export function detectProviderAuthMethods(
         }
       }
     } else if (method.type === 'none') {
-      if (provider.id === 'local') {
-        if (localProviderConfig?.baseUrl && localProviderConfig?.modelId) {
+      if (provider.providerFamily === 'local') {
+        const options = providerOptionsById?.[provider.id]
+        const isConnected = provider.defaultBaseUrl
+          ? options?.lastDiscoveryStatus === 'success_non_empty'
+          : !!options?.baseUrl?.trim()
+        if (isConnected) {
           connected = true
           source = 'none'
         }

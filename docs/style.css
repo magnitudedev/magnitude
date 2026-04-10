@@ -3,6 +3,11 @@
     max-height: 48px !important;
 }
 
+.docs-muted-note {
+    font-size: 0.875rem;
+    opacity: 0.75;
+}
+
 html.dark h1,
 html.dark h2,
 html.dark h3,

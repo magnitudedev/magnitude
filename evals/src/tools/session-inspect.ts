@@ -10,7 +10,6 @@ import {
   DisplayProjection,
   CompactionProjection,
   SessionContextProjection,
-  ChatTitleProjection,
   ReplayProjection,
   AgentRoutingProjection,
   AgentStatusProjection,
@@ -146,7 +145,7 @@ function cmdList(args: string[]) {
       const id = path.basename(sessionPath)
       const meta = readMeta(sessionPath)
       const created = meta.created ?? meta.createdAt ?? meta.date ?? ''
-      const title = meta.chatName ?? ''
+      const title = meta.chatName
       const messages = meta.messageCount ?? ''
       return {
         id,
@@ -299,7 +298,6 @@ const InspectAgent = Agent.define<AppEvent>()({
   name: 'SessionInspect',
   projections: [
     SessionContextProjection,
-    ChatTitleProjection,
     CompactionProjection,
     TurnProjection,
     MemoryProjection,
@@ -313,7 +311,6 @@ const InspectAgent = Agent.define<AppEvent>()({
   expose: {
     state: {
       sessionContext: SessionContextProjection,
-      chatTitle: ChatTitleProjection,
       compaction: CompactionProjection,
       turn: TurnProjection,
       memory: MemoryProjection,
@@ -336,7 +333,7 @@ async function replayProjections(events: any[]): Promise<Record<string, any>> {
     const result: Record<string, any> = {}
 
     // Global projections expose .get() -> state directly
-    const globalKeys = ['sessionContext', 'chatTitle', 'agentRouting', 'agentStatus'] as const
+    const globalKeys = ['sessionContext', 'agentRouting', 'agentStatus'] as const
     for (const key of globalKeys) {
       result[key] = await (client.state[key] as any).get()
     }
@@ -391,7 +388,7 @@ async function cmdProjection(args: string[]) {
     display: 'display',
     compaction: 'compaction',
     sessioncontext: 'sessionContext',
-    chattitle: 'chatTitle',
+
     replay: 'replay',
     agentrouting: 'agentRouting',
     agentstatus: 'agentStatus',
@@ -401,7 +398,7 @@ async function cmdProjection(args: string[]) {
   const key = projectionKeyMap[projectionName.toLowerCase()]
   if (!key || !(key in allStates)) {
     console.error(`Unknown projection: ${projectionName}`)
-    console.error('Supported: Memory, Turn, Display, Compaction, SessionContext, ChatTitle, Replay, AgentRouting, AgentStatus, Workflow, all')
+    console.error('Supported: Memory, Turn, Display, Compaction, SessionContext, Replay, AgentRouting, AgentStatus, Workflow, all')
     process.exit(1)
   }
 

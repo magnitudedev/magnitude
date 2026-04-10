@@ -1,32 +1,7 @@
 import { readFile } from 'fs/promises'
-import type { AppEvent, ResponsePart } from '../events'
+import type { AppEvent } from '../events'
 
 const DEFAULT_TRANSCRIPT_CHAR_BUDGET = 35_000
-
-function extractUserMessagesFromXml(xml: string): string[] {
-  const matches: string[] = []
-  const regex = /<message\b[^>]*\bto\s*=\s*(['"])user\1[^>]*>([\s\S]*?)<\/message>/gi
-  let match: RegExpExecArray | null = regex.exec(xml)
-
-  while (match) {
-    const message = (match[2] ?? '').trim()
-    if (message) matches.push(message)
-    match = regex.exec(xml)
-  }
-
-  return matches
-}
-
-function extractUserMessages(parts: readonly ResponsePart[]): string {
-  const messages: string[] = []
-
-  for (const part of parts) {
-    if (part.type !== 'text') continue
-    messages.push(...extractUserMessagesFromXml(part.content))
-  }
-
-  return messages.join('\n')
-}
 
 function getEventTimestamp(event: AppEvent): string {
   const anyEvent = event as { timestamp?: string }
@@ -36,24 +11,17 @@ function getEventTimestamp(event: AppEvent): string {
 function toLine(index: number, event: AppEvent): string | null {
   const ts = getEventTimestamp(event)
   switch (event.type) {
-    case 'oneshot_task': {
+    case 'oneshot_task':
       return `[${index}] ${ts} oneshot_task\n${event.prompt}`
-    }
 
     case 'user_message': {
-      const text = event.content
-        .filter((c: any) => c.type === 'text')
-        .map((c: any) => c.text ?? '')
+      const contentText = event.content
+        .filter((c): c is Extract<(typeof event.content)[number], { type: 'text' }> => c.type === 'text')
+        .map(c => c.text)
         .join('\n')
         .trim()
-      if (!text) return null
-      return `[${index}] ${ts} user_message\n${text}`
-    }
-
-    case 'turn_completed': {
-      const text = extractUserMessages(event.responseParts)
-      if (!text) return null
-      return `[${index}] ${ts} assistant_turn_completed\n${text}`
+      if (!contentText) return null
+      return `[${index}] ${ts} user_message\n${contentText}`
     }
 
     case 'turn_unexpected_error':
@@ -65,6 +33,11 @@ function toLine(index: number, event: AppEvent): string | null {
     default:
       return null
   }
+}
+
+function assistantTurnLine(index: number, timestamp: string, text: string): string | null {
+  if (!text) return null
+  return `[${index}] ${timestamp} assistant_turn_completed\n${text}`
 }
 
 function truncateTranscript(lines: string[], maxChars: number): string {
@@ -93,9 +66,36 @@ export function buildExtractionTranscript(
   opts?: { maxChars?: number }
 ): string {
   const lines: string[] = []
+  const pendingUserMessages = new Map<string, { startIndex: number; parts: string[] }>()
+
   for (let i = 0; i < events.length; i++) {
-    const line = toLine(i, events[i]!)
+    const event = events[i]!
+
+    if (event.type === 'message_start' && event.destination.kind === 'user') {
+      pendingUserMessages.set(event.id, { startIndex: i, parts: [] })
+      continue
+    }
+
+    if (event.type === 'message_chunk') {
+      const pending = pendingUserMessages.get(event.id)
+      if (pending) pending.parts.push(event.text)
+      continue
+    }
+
+    if (event.type === 'message_end') {
+      const pending = pendingUserMessages.get(event.id)
+      if (pending) {
+        pendingUserMessages.delete(event.id)
+        const text = pending.parts.join('').trim()
+        const line = assistantTurnLine(i, getEventTimestamp(event), text)
+        if (line) lines.push(line)
+      }
+      continue
+    }
+
+    const line = toLine(i, event)
     if (line) lines.push(line)
   }
+
   return truncateTranscript(lines, opts?.maxChars ?? DEFAULT_TRANSCRIPT_CHAR_BUDGET)
 }

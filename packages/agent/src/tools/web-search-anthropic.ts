@@ -1,6 +1,49 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { SearchAuth, WebSearchResponse, WebSearchToolResult, SearchOptions } from "./web-search";
 
+type CreateArgs = Parameters<Anthropic["beta"]["messages"]["create"]>[0];
+type CreateResult = Awaited<ReturnType<Anthropic["beta"]["messages"]["create"]>>;
+type StreamArgs = Parameters<Anthropic["beta"]["messages"]["stream"]>[0];
+type StreamResult = Awaited<ReturnType<Anthropic["beta"]["messages"]["stream"]>>;
+type FinalMessageResult = Awaited<ReturnType<StreamResult["finalMessage"]>>;
+
+type AnthropicInterceptor = {
+  onCreate?: (
+    payload: { client: Record<string, unknown>; args: CreateArgs },
+    next: () => Promise<CreateResult>,
+  ) => Promise<CreateResult>;
+  onStream?: (
+    payload: { client: Record<string, unknown>; args: StreamArgs },
+    next: () => Promise<StreamResult>,
+  ) => Promise<StreamResult>;
+};
+
+let anthropicInterceptor: AnthropicInterceptor | null = null;
+
+function createAnthropicClient(auth: SearchAuth): Anthropic {
+  return auth.type === "oauth-token"
+    ? new Anthropic({ authToken: auth.value })
+    : new Anthropic({ apiKey: auth.value });
+}
+
+async function runCreate(client: Anthropic, args: CreateArgs): Promise<CreateResult> {
+  const next = () => (client.beta.messages.create as Function)(args) as Promise<CreateResult>;
+  if (!anthropicInterceptor?.onCreate) return next();
+  return anthropicInterceptor.onCreate({
+    client: { provider: "anthropic" },
+    args,
+  }, next);
+}
+
+async function runStream(client: Anthropic, args: StreamArgs): Promise<StreamResult> {
+  const next = () => (client.beta.messages.stream as Function)(args) as Promise<StreamResult>;
+  if (!anthropicInterceptor?.onStream) return next();
+  return anthropicInterceptor.onStream({
+    client: { provider: "anthropic" },
+    args,
+  }, next);
+}
+
 /**
  * Perform a web search using Anthropic's API with web_search tool.
  */
@@ -9,15 +52,12 @@ export async function anthropicWebSearch(
   auth: SearchAuth,
   options?: SearchOptions,
 ): Promise<WebSearchResponse> {
-  const client =
-    auth.type === "oauth-token"
-      ? new Anthropic({ authToken: auth.value })
-      : new Anthropic({ apiKey: auth.value });
+  const client = createAnthropicClient(auth);
 
   const model = options?.model ?? "claude-haiku-4-5";
   const max_tokens = options?.max_tokens ?? 4096;
 
-  const response = await (client.beta.messages.create as Function)({
+  const response = await runCreate(client, {
     model,
     max_tokens,
     betas: ["web-search-2025-03-05"],
@@ -93,7 +133,7 @@ export async function* anthropicWebSearchStream(
   const model = options?.model ?? "claude-haiku-4-5";
   const max_tokens = options?.max_tokens ?? 4096;
 
-  const stream = await (client.beta.messages.stream as Function)({
+  const stream = await runStream(client, {
     model,
     max_tokens,
     betas: ["web-search-2025-03-05"],
@@ -170,4 +210,37 @@ export async function* anthropicWebSearchStream(
   };
 }
 
+export const __captureOnly = {
+  async withInterceptor<T>(interceptor: AnthropicInterceptor, run: () => Promise<T>): Promise<T> {
+    const previous = anthropicInterceptor;
+    anthropicInterceptor = interceptor;
+    try {
+      return await run();
+    } finally {
+      anthropicInterceptor = previous;
+    }
+  },
+
+  wrapStream(
+    stream: StreamResult,
+    onEvent: (event: unknown) => void | Promise<void>,
+    onFinalMessage?: (message: FinalMessageResult) => void | Promise<void>,
+  ): StreamResult {
+    return {
+      [Symbol.asyncIterator]: async function* () {
+        for await (const event of stream as any as AsyncIterable<unknown>) {
+          await onEvent(event);
+          yield event;
+        }
+      },
+      finalMessage: async () => {
+        const finalMessage = await stream.finalMessage();
+        if (onFinalMessage) {
+          await onFinalMessage(finalMessage);
+        }
+        return finalMessage;
+      },
+    } as StreamResult;
+  },
+};
 

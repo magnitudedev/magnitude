@@ -184,6 +184,11 @@ export function needsTypeComment(ast: AST.AST): string | null {
   if (unwrapped._tag === 'Union') {
     // Filter out undefined from optional unions
     const nonUndef = unwrapped.types.filter(t => unwrapAst(t)._tag !== 'UndefinedKeyword')
+
+    if (nonUndef.length === 1 && unwrapAst(nonUndef[0])._tag === 'Union') {
+      return needsTypeComment(nonUndef[0])
+    }
+
     const literals = nonUndef.filter(t => unwrapAst(t)._tag === 'Literal')
     if (literals.length === nonUndef.length && literals.length > 0) {
       return literals.map(t => JSON.stringify((unwrapAst(t) as AST.Literal).literal)).join(' | ')

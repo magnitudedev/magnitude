@@ -7,6 +7,28 @@ function includesClaudeSpoof(model: BoundModel): boolean {
   return model.model.providerId === 'anthropic' && model.connection.auth?.type === 'oauth'
 }
 
+function isCodexPath(model: BoundModel): boolean {
+  const auth = model.connection.auth
+  return (
+    (model.model.providerId === 'openai' && auth?.type === 'oauth') ||
+    (model.model.providerId === 'github-copilot' && model.model.id.includes('codex'))
+  )
+}
+
+function codexCallOptions(model: BoundModel, systemPrompt: string) {
+  if (!isCodexPath(model)) return undefined
+  return {
+    providerOptions: {
+      instructions: systemPrompt,
+      ...(model.model.providerId === 'openai' ? { store: false } : {}),
+    },
+  }
+}
+
+function includeSystemPromptMessage(model: BoundModel): boolean {
+  return !isCodexPath(model)
+}
+
 export const CodingAgentChat: StreamingFn<
   { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] }; ackTurn: string },
   ChatStream
@@ -16,8 +38,11 @@ export const CodingAgentChat: StreamingFn<
   execute: (model, input) =>
     model.stream(
       'CodingAgentChat',
-      [input.systemPrompt, input.messages, input.ackTurn, includesClaudeSpoof(model)],
-      { stopSequences: input.options?.stopSequences },
+      [input.systemPrompt, input.messages, input.ackTurn, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
+      {
+        stopSequences: input.options?.stopSequences,
+        ...(codexCallOptions(model, input.systemPrompt) ?? {}),
+      },
     ),
 }
 
@@ -30,8 +55,11 @@ export const SimpleChat: StreamingFn<
   execute: (model, input) =>
     model.stream(
       'SimpleChat',
-      [input.systemPrompt, input.messages],
-      { stopSequences: input.options?.stopSequences },
+      [input.systemPrompt, input.messages, includeSystemPromptMessage(model)],
+      {
+        stopSequences: input.options?.stopSequences,
+        ...(codexCallOptions(model, input.systemPrompt) ?? {}),
+      },
     ),
 }
 
@@ -43,21 +71,12 @@ export const CodingAgentCompact: CompleteFn<
   mode: 'complete',
   execute: (model, input) =>
     Effect.map(
-      model.complete('CodingAgentCompact', [input.systemPrompt, input.messages, includesClaudeSpoof(model)]),
+      model.complete(
+        'CodingAgentCompact',
+        [input.systemPrompt, input.messages, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
+        codexCallOptions(model, input.systemPrompt),
+      ),
       ({ result, usage }) => ({ text: result, usage }),
-    ),
-}
-
-export const GenerateChatTitle: CompleteFn<
-  { conversation: string; defaultName: string },
-  { title: string } | null
-> = {
-  name: 'GenerateChatTitle',
-  mode: 'complete',
-  execute: (model, input) =>
-    Effect.map(
-      model.complete('GenerateChatTitle', [input.conversation, input.defaultName, includesClaudeSpoof(model)]),
-      ({ result }) => result,
     ),
 }
 
@@ -126,7 +145,11 @@ export const AutopilotContinuation: CompleteFn<
   mode: 'complete',
   execute: (model, input) =>
     Effect.map(
-      model.complete('AutopilotContinuation', [input.systemPrompt, input.messages, includesClaudeSpoof(model)]),
+      model.complete(
+        'AutopilotContinuation',
+        [input.systemPrompt, input.messages, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
+        codexCallOptions(model, input.systemPrompt),
+      ),
       ({ result, usage }) => ({ result, usage }),
     ),
 }

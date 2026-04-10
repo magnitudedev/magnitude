@@ -12,12 +12,13 @@ mock.module('@opentui/react', () => ({
 
 const { ChatSurfaceKeyboard } = await import('./chat-surface-keyboard')
 
-function renderKeyboard(overrides: Partial<Parameters<typeof ChatSurfaceKeyboard>[0]> = {}) {
+function renderKeyboard(overrides: Partial<Parameters<typeof ChatSurfaceKeyboard>[0]> = {}): (key: KeyEvent) => void {
   keyboardHandler = null
   renderToStaticMarkup(
     <ChatSurfaceKeyboard
       status="idle"
       hasRunningForks={false}
+      isBlockingOverlayActive={false}
       nextEscWillKillAll={false}
       setNextEscWillKillAll={() => {}}
       killAllTimeoutRef={{ current: null }}
@@ -34,7 +35,7 @@ function renderKeyboard(overrides: Partial<Parameters<typeof ChatSurfaceKeyboard
     />,
   )
   if (!keyboardHandler) throw new Error('keyboard handler not registered')
-  return keyboardHandler
+  return keyboardHandler as (key: KeyEvent) => void
 }
 
 function makeCtrlCKey() {
@@ -127,4 +128,27 @@ test('Ctrl-C interrupts when streaming and composer is empty', () => {
 
   expect(interrupted).toBe(1)
   expect(wasPrevented()).toBe(true)
+})
+
+test('keyboard handler no-ops when blocking overlay is active', () => {
+  let interrupted = 0
+  let interruptedAll = 0
+  let setKillAll = 0
+  const handler = renderKeyboard({
+    status: 'streaming',
+    hasRunningForks: true,
+    isBlockingOverlayActive: true,
+    nextEscWillKillAll: true,
+    onInterrupt: () => { interrupted += 1 },
+    onInterruptAll: () => { interruptedAll += 1 },
+    setNextEscWillKillAll: () => { setKillAll += 1 },
+  })
+
+  const { key, wasPrevented } = makeEscapeKey()
+  handler(key)
+
+  expect(interrupted).toBe(0)
+  expect(interruptedAll).toBe(0)
+  expect(setKillAll).toBe(0)
+  expect(wasPrevented()).toBe(false)
 })

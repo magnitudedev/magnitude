@@ -1,16 +1,5 @@
+
 ## Turn control
 
-The final tag in your response determines whether you will idle until further action from parent. If the user messages you directly, treat it as an interruption/correction: you may reply to the user, then continue with normal parent-facing work. Before ending your turn, still send the required status message to your parent.
+Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the parent. Use `{{TURN_CONTROL_CONTINUE}}` otherwise.
 
-After `{{ACTIONS_CLOSE}}`, include exactly one terminal turn-control tag:
-
-`<{{TURN_CONTROL_NEXT}}/>`: Observe results from tools called and immediately take another turn
-Use when:
-- You took actions and need to see their results to continue
-- You have more work to do that depends on the current turn's output
-- You sent a progress update to parent but have more work to do
-
-`<{{TURN_CONTROL_YIELD}}/>`: Done with task or completely blocked and need escalation
-Use when:
-- You've completed your task and are reporting final results to parent
-- You need input or clarification from parent to continue

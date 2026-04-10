@@ -1,0 +1,43 @@
+---
+title: Workers
+description: "Specialized agents the lead agent delegates to for research, planning, implementation, debugging, and verification"
+icon: users
+---
+
+Magnitude uses a lead agent + workers model. The lead agent delegates focused work to specialized workers, then coordinates their results into the next decision.
+
+## Agent types
+
+All agents — including read-only ones — can read and write to the session workspace (`$M`). "Read-only" refers to project file access only. The workspace is shared scratch space that all agents use freely.
+
+### Explorer
+- **Purpose:** Investigate the codebase and gather evidence quickly.
+- **Access:** Read-only filesystem and shell access, web search.
+
+### Planner
+- **Purpose:** Evaluate approaches and produce an implementation plan. The planner considers three dimensions: velocity (fastest path to done), alignment (fits existing patterns and conventions), and capacity (leaves the system well-positioned for future changes).
+- **Access:** Read-only filesystem and shell access, web search.
+
+### Builder
+- **Purpose:** Implement code changes.
+- **Access:** Read-write filesystem and shell access.
+
+### Debugger
+- **Purpose:** Root-cause bugs through hypothesis testing. The debugger focuses on diagnosis — finding and explaining the problem — not implementing the fix.
+- **Access:** Read-write filesystem and shell access.
+
+### Reviewer
+- **Purpose:** Independently verify quality and behavior after changes. The reviewer runs tests and checks actual behavior — reading code alone isn't considered sufficient evidence. It can spawn its own browser agents when visual verification is needed.
+- **Access:** Read-only verification access; can spawn browser agents when visual checks are needed.
+
+### Browser
+- **Purpose:** Visual browser interaction with web applications.
+- **Access:** Screenshot-based browser controls (click, type, scroll, navigate, tabs, evaluate JavaScript).
+
+## How workers are used
+
+- The lead agent chooses the right specialist for each part of a task.
+- Multiple workers can run in parallel.
+- Workers are reused when their context is still relevant — not always spawned fresh.
+- Each worker has tool access levels appropriate to its role.
+- Activity appears inline in the interface as agent cards, so delegation is visible as it happens.

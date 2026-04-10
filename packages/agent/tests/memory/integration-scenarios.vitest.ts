@@ -17,18 +17,19 @@ describe('memory integration scenarios', () => {
       })
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
+      yield* h.send({ type: 'message_start', forkId: null, turnId: 't-1', id: 'm-t1', destination: { kind: 'user' } })
+      yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-t1', text: 'first answer' })
+      yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-t1' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'first answer' }],
-        toolCalls: [],
-        observedResults: [],
         result: {
           success: true,
-          turnDecision: 'yield',
+          turnDecision: 'idle',
           errors: [{ code: 'nonexistent_agent_destination', message: 'follow-up reminder' }],
         },
         inputTokens: null,
@@ -81,7 +82,7 @@ describe('memory integration scenarios', () => {
         forkId: 'f-sub',
         turnId: 'sub-turn',
         id: 'm1',
-        dest: 'lead',
+        destination: { kind: 'parent' },
       })
       yield* h.send({
         type: 'message_chunk',
@@ -127,16 +128,17 @@ describe('memory integration scenarios', () => {
         turnId: 't-1',
         parts: [{ type: 'text', text: 'observation' }],
       })
+      yield* h.send({ type: 'message_start', forkId: null, turnId: 't-1', id: 'm-obs', destination: { kind: 'user' } })
+      yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-obs', text: 'done' })
+      yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-obs' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'done' }],
-        toolCalls: [],
-        observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -221,16 +223,17 @@ describe('memory integration scenarios', () => {
         timestamp: 1711641600000,
         text: 'while queued',
       })
+      yield* h.send({ type: 'message_start', forkId: null, turnId: 't-1', id: 'm-done', destination: { kind: 'user' } })
+      yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-done', text: 'assistant done' })
+      yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-done' })
       yield* h.send({
         type: 'turn_completed',
+
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        responseParts: [{ type: 'text', content: 'assistant done' }],
-        toolCalls: [],
-        observedResults: [],
-        result: { success: true, turnDecision: 'yield' },
+        result: { success: true, turnDecision: 'idle' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,

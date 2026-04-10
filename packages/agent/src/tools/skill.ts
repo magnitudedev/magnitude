@@ -39,10 +39,10 @@ const SkillErrorSchema = ToolErrorSchema('SkillError', {})
 export const skillTool = defineTool({
   name: 'skill',
   group: 'default',
-  description: 'Activate a skill by name to load its full methodology into context. Use when a task clearly matches a skill type (feature, bug, refactor) or a project-specific skill.',
+  description: 'Activate a user-defined skill by name to load its full methodology into context.',
   inputSchema: Schema.Struct({
     name: Schema.String.annotations({
-      description: 'Name of the skill to activate (e.g., "feature", "bug", "refactor")'
+      description: 'Name of the skill to activate'
     })
   }),
   outputSchema: Schema.String,

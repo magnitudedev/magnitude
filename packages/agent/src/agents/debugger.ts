@@ -5,7 +5,7 @@
  * Focuses on diagnosis — forming hypotheses, testing them, narrowing down causes.
  */
 
-import { defineRole, continue_, yield_, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import debuggerPromptRaw from './prompts/debugger.txt' with { type: 'text' }
@@ -77,9 +77,9 @@ export const debuggerRole = defineRole<typeof tools, 'debugger', PolicyContext>(
   turn: {
     decide(turnCtx) {
       if (turnCtx.cancelled) return finish()
-      if (turnCtx.error) return continue_()
-      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.dest === 'parent')) return yield_()
-      return continue_()
+      if (turnCtx.error) return observe()
+      if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
+      return observe()
     },
   },
 })

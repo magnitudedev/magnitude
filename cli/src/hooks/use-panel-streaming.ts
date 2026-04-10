@@ -51,7 +51,12 @@ export function usePanelStreaming(
   const isWriteActive = !!(isWriteStream && (streaming?.status === 'receiving' || streaming?.status === 'applying'))
   const isWriteStreaming = !!(isWriteStream && streaming?.status === 'receiving')
   const writeContent = isWriteActive ? (streaming?.body ?? '') : ''
-  const { displayedContent: revealedWrite, showCursor: writeCursor } = useStreamingReveal(writeContent, isWriteStreaming)
+  const { displayedContent: revealedWrite, showCursor: writeCursor } = useStreamingReveal(
+    writeContent,
+    isWriteStreaming,
+    undefined,
+    writeContent.length,
+  )
 
   // --- Edit stream: new text ---
   const newStrContent = isReplaceStream ? streaming.newText : ''

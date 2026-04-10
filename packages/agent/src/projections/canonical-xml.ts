@@ -1,4 +1,5 @@
-import { ACTIONS_CLOSE, ACTIONS_OPEN, COMMS_CLOSE, COMMS_OPEN, LENSES_CLOSE, LENSES_OPEN, TURN_CONTROL_NEXT, TURN_CONTROL_YIELD, type XmlTagBinding } from '@magnitudedev/xml-act'
+import { TURN_CONTROL_IDLE, TURN_CONTROL_CONTINUE, type XmlTagBinding } from '@magnitudedev/xml-act'
+import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
   about: string | null
@@ -8,9 +9,9 @@ export interface ThinkBlock {
 export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
   thinkBlocks: ThinkBlock[]
-  messages: Array<{ dest: string; text: string }>
+  messages: Array<{ text: string; destination: MessageDestination }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string }>
-  turnDecision: 'continue' | 'yield'
+  turnDecision: 'continue' | 'idle'
 }
 
 function attrsToString(attrs: Record<string, string>): string {
@@ -135,7 +136,7 @@ export function serializeCanonicalTurn(
       const lensLines = activeLenses.map((lens) =>
         `<lens name="${lens.name}">${lens.content}</lens>`
       )
-      parts.push(`${LENSES_OPEN}\n${lensLines.join('\n')}\n${LENSES_CLOSE}`)
+      parts.push(lensLines.join('\n'))
     }
   }
 
@@ -147,26 +148,26 @@ export function serializeCanonicalTurn(
   }
 
   if (trace.messages.length > 0) {
-    const messageLines = trace.messages.map(msg => {
-      const attrs: Record<string, string> = { to: msg.dest }
+    for (const msg of trace.messages) {
       const trimmedText = msg.text.trim()
-      return `\n${serializeTag('message', attrs, trimmedText, [])}`
-    }).join('')
-    parts.push(`${COMMS_OPEN}${messageLines}\n${COMMS_CLOSE}`)
-  }
-
-  const actionLines: string[] = []
-  if (trace.toolCalls.length > 0) {
-    for (const call of trace.toolCalls) {
-      actionLines.push(serializeToolCall(call.tagName, call.input, call.query, bindings.get(call.tagName)))
+      const attrs: Record<string, string> = {}
+      if (msg.destination.kind === 'worker') attrs.to = msg.destination.taskId
+      else if (msg.destination.kind === 'parent') attrs.to = 'parent'
+      else if (msg.destination.kind === 'user') attrs.to = 'user'
+      parts.push(serializeTag('message', attrs, trimmedText, []))
     }
   }
 
-  if (actionLines.length > 0) {
-    parts.push(`${ACTIONS_OPEN}\n${actionLines.join('\n')}\n${ACTIONS_CLOSE}`)
+  if (trace.toolCalls.length > 0) {
+    for (const call of trace.toolCalls) {
+      parts.push(serializeToolCall(call.tagName, call.input, call.query, bindings.get(call.tagName)))
+    }
   }
 
-  const control = trace.turnDecision === 'continue' ? TURN_CONTROL_NEXT : TURN_CONTROL_YIELD
-  parts.push(control)
+  if (trace.turnDecision === 'idle') {
+    parts.push(TURN_CONTROL_IDLE)
+  } else if (trace.turnDecision === 'continue') {
+    parts.push(TURN_CONTROL_CONTINUE)
+  }
   return parts.join('\n')
 }

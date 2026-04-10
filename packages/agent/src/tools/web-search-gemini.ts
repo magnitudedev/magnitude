@@ -1,6 +1,31 @@
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import type { SearchAuth, WebSearchResponse, WebSearchToolResult, SearchOptions } from "./web-search";
 
+type GenerateContentArgs = Parameters<GoogleGenAI["models"]["generateContent"]>[0];
+type GenerateContentResult = Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>;
+type GenerateContentInterceptor = (
+  payload: {
+    client: Record<string, unknown>;
+    args: GenerateContentArgs;
+  },
+  next: () => Promise<GenerateContentResult>,
+) => Promise<GenerateContentResult>;
+
+let generateContentInterceptor: GenerateContentInterceptor | null = null;
+
+function createGoogleGenAI(apiKey: string): GoogleGenAI {
+  return new GoogleGenAI({ apiKey });
+}
+
+async function runGenerateContent(
+  ai: GoogleGenAI,
+  args: GenerateContentArgs,
+): Promise<GenerateContentResult> {
+  const next = () => ai.models.generateContent(args);
+  if (!generateContentInterceptor) return next();
+  return generateContentInterceptor({ client: { provider: "google", apiKeyConfigured: true }, args }, next);
+}
+
 /**
  * Perform a web search using Google Gemini's grounding with Google Search.
  * Note: Domain filtering is not supported by Gemini and is silently ignored.
@@ -10,9 +35,9 @@ export async function geminiWebSearch(
   auth: SearchAuth,
   options?: SearchOptions,
 ): Promise<WebSearchResponse> {
-  const ai = new GoogleGenAI({ apiKey: auth.value });
+  const ai = createGoogleGenAI(auth.value);
 
-  const response = await ai.models.generateContent({
+  const response = await runGenerateContent(ai, {
     model: options?.model ?? "gemini-3-flash-preview",
     contents: query,
     config: {
@@ -50,6 +75,18 @@ export async function geminiWebSearch(
     },
   };
 }
+
+export const __captureOnly = {
+  async withGenerateContentInterceptor<T>(interceptor: GenerateContentInterceptor, run: () => Promise<T>): Promise<T> {
+    const previous = generateContentInterceptor;
+    generateContentInterceptor = interceptor;
+    try {
+      return await run();
+    } finally {
+      generateContentInterceptor = previous;
+    }
+  },
+};
 
 // Quick test
 if (import.meta.main) {

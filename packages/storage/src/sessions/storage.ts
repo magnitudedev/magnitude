@@ -16,7 +16,6 @@ import {
 import type { GlobalStoragePaths } from '../paths/global-paths'
 import {
   MemoryExtractionJobRecordSchema,
-  StoredSessionMetaSchema,
   type MemoryExtractionJobRecord,
   type SessionDiscoveryOptions,
   type StoredSessionMeta,
@@ -60,15 +59,11 @@ export async function findLatestSessionId(
   return sessionIds[0] ?? null
 }
 
-export async function readSessionMeta(
+export async function readRawSessionMeta(
   paths: GlobalStoragePaths,
   sessionId: string
-): Promise<StoredSessionMeta | null> {
-  try {
-    return await readJsonFileWithSchema(paths.sessionMetaFile(sessionId), StoredSessionMetaSchema) as StoredSessionMeta
-  } catch {
-    return null
-  }
+): Promise<unknown | null> {
+  return readJsonFile<unknown | null>(paths.sessionMetaFile(sessionId), { fallback: null })
 }
 
 export async function writeSessionMeta(
@@ -83,9 +78,10 @@ export async function writeSessionMeta(
 export async function updateSessionMeta(
   paths: GlobalStoragePaths,
   sessionId: string,
+  current: StoredSessionMeta | null,
   updater: (current: StoredSessionMeta | null) => StoredSessionMeta
 ): Promise<StoredSessionMeta> {
-  const next = updater(await readSessionMeta(paths, sessionId))
+  const next = updater(current)
   await writeSessionMeta(paths, sessionId, next)
   return next
 }

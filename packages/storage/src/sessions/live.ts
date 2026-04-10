@@ -1,9 +1,10 @@
-import { Effect, Layer } from 'effect'
+import { Effect, Layer, Schema } from 'effect'
 
 import { SessionStorage } from './contracts'
 import {
   appendSessionEvents,
   createMemoryExtractionJobRecord,
+  createSessionWorkspace,
   createTimestampSessionId,
   findLatestSessionId,
   listPendingMemoryJobFiles,
@@ -12,104 +13,129 @@ import {
   markPendingMemoryJobPending,
   markPendingMemoryJobRunning,
   readPendingMemoryJob,
+  readRawSessionMeta,
   readSessionEvents,
   readSessionEventsFromPath,
-  readSessionMeta,
   removePendingMemoryJob,
   resolvePendingMemoryJobPath,
+  updateSessionMeta,
   writePendingMemoryJob,
   writeSessionMeta,
-  createSessionWorkspace,
-  updateSessionMeta,
 } from './storage'
 import { appendSessionLogs, clearSessionLog } from '../logs/storage'
-import type { StoredLogEntry } from '../types/log'
 import { GlobalStorage } from '../services'
+import { Version, VersionLive } from '../services/version'
+import type { StoredLogEntry } from '../types/log'
+import { StoredSessionMetaSchema, type StoredSessionMeta } from '../types/session'
 
-export const SessionStorageLive = Layer.effect(
-  SessionStorage,
-  Effect.gen(function* () {
-    const globalStorage = yield* GlobalStorage
+export function SessionStorageLive() {
+  return Layer.effect(
+    SessionStorage,
+    Effect.gen(function* () {
+      const globalStorage = yield* GlobalStorage
+      const version = yield* Version
+      const versionLayer = VersionLive(version.getVersion())
 
-    return SessionStorage.of({
-      paths: {
-        root: globalStorage.paths.root,
-        sessionsRoot: globalStorage.paths.sessionsRoot,
-        pendingMemoryExtractionRoot: globalStorage.paths.pendingMemoryExtractionRoot,
-        sessionDir: globalStorage.paths.sessionDir,
-        sessionMetaFile: globalStorage.paths.sessionMetaFile,
-        sessionEventsFile: globalStorage.paths.sessionEventsFile,
-        sessionLogFile: globalStorage.paths.sessionLogFile,
-        sessionWorkspace: globalStorage.paths.sessionWorkspace,
-        pendingMemoryJobFile: globalStorage.paths.pendingMemoryJobFile,
-      },
+      const decodeStoredSessionMeta = (
+        raw: unknown
+      ): Effect.Effect<StoredSessionMeta> =>
+        Schema.decodeUnknown(StoredSessionMetaSchema)(raw).pipe(
+          Effect.provide(versionLayer),
+          Effect.orDie,
+        )
 
-      createTimestampSessionId,
+      return SessionStorage.of({
+        paths: {
+          root: globalStorage.paths.root,
+          sessionsRoot: globalStorage.paths.sessionsRoot,
+          pendingMemoryExtractionRoot: globalStorage.paths.pendingMemoryExtractionRoot,
+          sessionDir: globalStorage.paths.sessionDir,
+          sessionMetaFile: globalStorage.paths.sessionMetaFile,
+          sessionEventsFile: globalStorage.paths.sessionEventsFile,
+          sessionLogFile: globalStorage.paths.sessionLogFile,
+          sessionWorkspace: globalStorage.paths.sessionWorkspace,
+          pendingMemoryJobFile: globalStorage.paths.pendingMemoryJobFile,
+        },
 
-      listSessionIds: (options) =>
-        Effect.promise(() => listSessionIds(globalStorage.paths, options)),
+        createTimestampSessionId,
 
-      findLatestSessionId: (options) =>
-        Effect.promise(() => findLatestSessionId(globalStorage.paths, options)),
+        listSessionIds: (options) =>
+          Effect.promise(() => listSessionIds(globalStorage.paths, options)),
 
-      readMeta: (sessionId) =>
-        Effect.promise(() => readSessionMeta(globalStorage.paths, sessionId)),
+        findLatestSessionId: (options) =>
+          Effect.promise(() => findLatestSessionId(globalStorage.paths, options)),
 
-      writeMeta: (sessionId, meta) =>
-        Effect.promise(() => writeSessionMeta(globalStorage.paths, sessionId, meta)),
+        readMeta: (sessionId) =>
+          Effect.gen(function* () {
+            const raw = yield* Effect.promise(() => readRawSessionMeta(globalStorage.paths, sessionId))
+            if (raw === null) {
+              return null
+            }
+            return yield* decodeStoredSessionMeta(raw)
+          }),
 
-      updateMeta: (sessionId, updater) =>
-        Effect.promise(() => updateSessionMeta(globalStorage.paths, sessionId, updater)),
+        writeMeta: (sessionId, meta) =>
+          Effect.promise(() => writeSessionMeta(globalStorage.paths, sessionId, meta)),
 
-      readEvents: <T>(sessionId: string) =>
-        Effect.promise(() => readSessionEvents<T>(globalStorage.paths, sessionId)),
+        updateMeta: (sessionId, updater) =>
+          Effect.gen(function* () {
+            const raw = yield* Effect.promise(() => readRawSessionMeta(globalStorage.paths, sessionId))
+            const current = raw === null ? null : yield* decodeStoredSessionMeta(raw)
+            return yield* Effect.promise(() =>
+              updateSessionMeta(globalStorage.paths, sessionId, current, updater)
+            )
+          }),
 
-      appendEvents: <T>(sessionId: string, events: readonly T[]) =>
-        Effect.promise(() => appendSessionEvents(globalStorage.paths, sessionId, events)),
+        readEvents: <T>(sessionId: string) =>
+          Effect.promise(() => readSessionEvents<T>(globalStorage.paths, sessionId)),
 
-      readEventsFromPath: <T>(eventsPath: string) =>
-        Effect.promise(() => readSessionEventsFromPath<T>(eventsPath)),
+        appendEvents: <T>(sessionId: string, events: readonly T[]) =>
+          Effect.promise(() => appendSessionEvents(globalStorage.paths, sessionId, events)),
 
-      appendLogs: <T>(sessionId: string, entries: readonly T[]) =>
-        Effect.promise(() =>
-          appendSessionLogs(globalStorage.paths, sessionId, entries as readonly StoredLogEntry[])
-        ),
+        readEventsFromPath: <T>(eventsPath: string) =>
+          Effect.promise(() => readSessionEventsFromPath<T>(eventsPath)),
 
-      clearLog: (sessionId) =>
-        Effect.promise(() =>
-          clearSessionLog(globalStorage.paths, sessionId)
-        ),
+        appendLogs: <T>(sessionId: string, entries: readonly T[]) =>
+          Effect.promise(() =>
+            appendSessionLogs(globalStorage.paths, sessionId, entries as readonly StoredLogEntry[])
+          ),
 
-      createSessionWorkspace: (sessionId, cwd) =>
-        Effect.promise(() =>
-          createSessionWorkspace(globalStorage.paths, sessionId, cwd)
-        ),
+        clearLog: (sessionId) =>
+          Effect.promise(() =>
+            clearSessionLog(globalStorage.paths, sessionId)
+          ),
 
-      createMemoryExtractionJobRecord,
+        createSessionWorkspace: (sessionId, cwd) =>
+          Effect.promise(() =>
+            createSessionWorkspace(globalStorage.paths, sessionId, cwd)
+          ),
 
-      writePendingMemoryJob: (job) =>
-        Effect.promise(() => writePendingMemoryJob(globalStorage.paths, job)),
+        createMemoryExtractionJobRecord,
 
-      listPendingMemoryJobFiles: () =>
-        Effect.promise(() => listPendingMemoryJobFiles(globalStorage.paths)),
+        writePendingMemoryJob: (job) =>
+          Effect.promise(() => writePendingMemoryJob(globalStorage.paths, job)),
 
-      listPendingMemoryJobIds: () =>
-        Effect.promise(() => listPendingMemoryJobIds(globalStorage.paths)),
+        listPendingMemoryJobFiles: () =>
+          Effect.promise(() => listPendingMemoryJobFiles(globalStorage.paths)),
 
-      readPendingMemoryJob: (input) =>
-        Effect.promise(() => readPendingMemoryJob(globalStorage.paths, input)),
+        listPendingMemoryJobIds: () =>
+          Effect.promise(() => listPendingMemoryJobIds(globalStorage.paths)),
 
-      markPendingMemoryJobRunning: (input, job) =>
-        Effect.promise(() => markPendingMemoryJobRunning(globalStorage.paths, input, job)),
+        readPendingMemoryJob: (input) =>
+          Effect.promise(() => readPendingMemoryJob(globalStorage.paths, input)),
 
-      markPendingMemoryJobPending: (input, job) =>
-        Effect.promise(() => markPendingMemoryJobPending(globalStorage.paths, input, job)),
+        markPendingMemoryJobRunning: (input, job) =>
+          Effect.promise(() => markPendingMemoryJobRunning(globalStorage.paths, input, job)),
 
-      removePendingMemoryJob: (input) =>
-        Effect.promise(() => removePendingMemoryJob(globalStorage.paths, input)),
+        markPendingMemoryJobPending: (input, job) =>
+          Effect.promise(() => markPendingMemoryJobPending(globalStorage.paths, input, job)),
 
-      resolvePendingMemoryJobPath: (jobId) =>
-        resolvePendingMemoryJobPath(globalStorage.paths, jobId),
-    })
+        removePendingMemoryJob: (input) =>
+          Effect.promise(() => removePendingMemoryJob(globalStorage.paths, input)),
+
+        resolvePendingMemoryJobPath: (jobId) =>
+          resolvePendingMemoryJobPath(globalStorage.paths, jobId),
+      })
   })
-)
+  )
+}

@@ -13,11 +13,12 @@ import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
+import { ExecutionManager } from '../execution/execution-manager'
 import { ConversationStateReaderTag } from './memory-reader'
 import { AgentStateReaderTag } from './fork'
 import { buildAgentContext, buildConversationSummary } from '../prompts'
 import type { AppEvent } from '../events'
-import { getSpawnableVariants, type AgentVariant } from '../agents'
+import { getSpawnableVariants, isValidVariant } from '../agents'
 
 const { ForkContext } = Fork
 
@@ -37,7 +38,7 @@ function executeAgentCreate({ agentId, options }: {
 
     const normalizedType = agentType.toLowerCase()
     const spawnable = getSpawnableVariants()
-    if (!spawnable.includes(normalizedType as any)) {
+    if (!isValidVariant(normalizedType) || !spawnable.includes(normalizedType)) {
       return yield* Effect.fail({
         _tag: 'AgentError' as const,
         message: `Invalid agent type "${agentType}". Valid types: ${spawnable.join(', ')}`,
@@ -53,20 +54,13 @@ function executeAgentCreate({ agentId, options }: {
       conversationContext = summary
     }
 
-    // Build context from title + message + conversation
-    const context = buildAgentContext(title, message, conversationContext)
-
-    const { ExecutionManager } = yield* Effect.tryPromise({
-      try: () => import('../execution/execution-manager'),
-      catch: (e) => ({
-        _tag: 'AgentError' as const,
-        message: e instanceof Error ? e.message : String(e),
-      }),
-    })
     const execManager = yield* ExecutionManager
     const { forkId: parentForkId } = yield* ForkContext
     // Use a synthetic task ID for the fork (agents no longer require pre-existing tasks)
     const taskId = `agent-${agentId}`
+
+    // Build context from title + conversation
+    const context = buildAgentContext(title, conversationContext, taskId)
 
     const forkId = yield* execManager.fork({
       parentForkId,
@@ -75,7 +69,7 @@ function executeAgentCreate({ agentId, options }: {
       prompt: context,
       message,
       mode: 'spawn',
-      role: normalizedType as AgentVariant,
+      role: normalizedType,
       taskId,
     })
 
@@ -131,10 +125,10 @@ export const agentKillTool = defineTool({
       })
     }
 
-    if (target.status !== 'starting' && target.status !== 'working') {
+    if (target.status !== 'working' && target.status !== 'idle') {
       return yield* Effect.fail({
         _tag: 'AgentError' as const,
-        message: `Cannot kill "${agentId}": only starting or working subagents can be killed (current status: ${target.status}).`,
+        message: `Cannot kill "${agentId}": only working or idle subagents can be killed (current status: ${target.status}).`,
       })
     }
 
@@ -177,7 +171,4 @@ export const agentKillXmlBinding = defineXmlBinding(agentKillTool, {
 // Tool Group Export
 // =============================================================================
 
-export const agentTools = [
-  agentCreateTool,
-  agentKillTool,
-]
+export const agentTools = []

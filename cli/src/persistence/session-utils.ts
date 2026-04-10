@@ -1,4 +1,4 @@
-import type { StorageClient } from '@magnitudedev/storage'
+import type { StorageClient, StoredSessionMeta } from '@magnitudedev/storage'
 
 const DEFAULT_CHAT_NAME = 'New Chat'
 
@@ -10,18 +10,6 @@ export interface SessionSummary {
   messageCount: number
 }
 
-interface MetadataFile {
-  sessionId: string
-  created: string
-  updated: string
-  chatName: string
-  workingDirectory: string
-  gitBranch: string | null
-  firstUserMessage: string | null
-  lastMessage: string | null
-  messageCount: number
-}
-
 export async function listAllSessions(storage: StorageClient, limit?: number): Promise<SessionSummary[]> {
   const ids = await storage.sessions.list()
   const summaries: SessionSummary[] = []
@@ -30,7 +18,7 @@ export async function listAllSessions(storage: StorageClient, limit?: number): P
     try {
       const meta = await storage.sessions.readMeta(id)
       if (meta) {
-        summaries.push(buildSessionSummary(meta as MetadataFile))
+        summaries.push(buildSessionSummary(meta))
       }
     } catch (error) {
       console.error(`Failed to load session ${id}:`, error)
@@ -44,28 +32,17 @@ export async function listAllSessions(storage: StorageClient, limit?: number): P
 export async function loadSessionSummary(storage: StorageClient, sessionId: string): Promise<SessionSummary | null> {
   const meta = await storage.sessions.readMeta(sessionId)
   if (!meta) return null
-  return buildSessionSummary(meta as MetadataFile)
+  return buildSessionSummary(meta)
 }
 
-function buildSessionSummary(meta: MetadataFile): SessionSummary {
-  const title = deriveTitle(meta.chatName, meta.firstUserMessage)
+function buildSessionSummary(meta: StoredSessionMeta): SessionSummary {
   const timestamp = Date.parse(meta.updated)
 
   return {
     sessionId: meta.sessionId,
-    title,
+    title: meta.chatName,
     lastMessage: meta.lastMessage ?? 'No messages yet',
     timestamp: Number.isNaN(timestamp) ? Date.parse(meta.created) : timestamp,
     messageCount: meta.messageCount,
   }
-}
-
-/**
- * Derive title from chat name or first user message
- */
-function deriveTitle(chatName: string, _firstUserMessage: string | null): string {
-  if (chatName.trim().length > 0 && chatName !== DEFAULT_CHAT_NAME) {
-    return chatName
-  }
-  return DEFAULT_CHAT_NAME
 }

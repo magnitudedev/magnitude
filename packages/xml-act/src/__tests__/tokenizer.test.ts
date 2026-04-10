@@ -1,9 +1,9 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { createTokenizer, type Token } from '../tokenizer'
 
-function collect(input: string | string[]): Token[] {
+function collect(input: string | string[], knownToolTags?: ReadonlySet<string>): Token[] {
   const out: Token[] = []
-  const tokenizer = createTokenizer((signal) => out.push(signal))
+  const tokenizer = createTokenizer((signal) => out.push(signal), knownToolTags)
   if (Array.isArray(input)) {
     for (const chunk of input) tokenizer.push(chunk)
   } else {
@@ -162,6 +162,30 @@ describe('tokenizer', () => {
           ['bar', 'baz'],
           ['x', 'y'],
         ]),
+        afterNewline: true,
+      },
+    ])
+  })
+
+  it('known tool malformed attr quoting consumes full tag and emits committed self-close tag', () => {
+    const xml = '<' + `grep pattern="from ['"]foo['"]" path="src"/>`
+    expect(collect(xml, new Set(['grep']))).toEqual([
+      {
+        type: 'selfClose',
+        tagName: 'grep',
+        attrs: new Map([['pattern', `from ['`]]),
+        afterNewline: true,
+      },
+    ])
+  })
+
+  it('known tool incomplete quoted attribute at EOF emits committed open tag', () => {
+    const xml = '<' + 'grep pattern="foo'
+    expect(collect(xml, new Set(['grep']))).toEqual([
+      {
+        type: 'open',
+        tagName: 'grep',
+        attrs: new Map(),
         afterNewline: true,
       },
     ])

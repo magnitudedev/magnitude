@@ -1,13 +1,13 @@
-export const ACTIONS_OPEN = '<actions>'
-export const ACTIONS_CLOSE = '</actions>'
-export const COMMS_OPEN = '<comms>'
-export const COMMS_CLOSE = '</comms>'
-export const LENSES_OPEN = '<lenses>'
-export const LENSES_CLOSE = '</lenses>'
+export const TURN_CONTROL_CONTINUE_TAG = 'continue'
+export const TURN_CONTROL_IDLE_TAG = 'idle'
+export const TURN_CONTROL_FINISH_TAG = 'finish'
+export const END_TURN_TAG = 'end-turn'
 
-export const TURN_CONTROL_NEXT = '<next/>'
-export const TURN_CONTROL_YIELD = '<yield/>'
-export const TURN_CONTROL_FINISH = '<finish/>'
+export const TURN_CONTROL_CONTINUE = `<${END_TURN_TAG}>\n<${TURN_CONTROL_CONTINUE_TAG}/>\n</${END_TURN_TAG}>`
+export const TURN_CONTROL_IDLE = `<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG}/>\n</${END_TURN_TAG}>`
+export const TURN_CONTROL_FINISH = `<${TURN_CONTROL_FINISH_TAG}/>`
+
+export const END_TURN_STOP_SEQUENCE = `\n</${END_TURN_TAG}>`
 
 export const AGENT_CREATE_TAG = 'agent-create'
 export const TITLE_TAG = 'title'
@@ -29,7 +29,7 @@ export const xmlClose = (tag: string) => `</${tag}>`
 export const lensOpen = (name: string) => xmlOpen(LENS_TAG, { name })
 export const lensClose = () => xmlClose(LENS_TAG)
 
-export const messageOpen = (to: string) => xmlOpen(MESSAGE_TAG, { to })
+export const messageOpen = () => xmlOpen(MESSAGE_TAG)
 export const messageClose = () => MESSAGE_CLOSE
 
 export const agentCreateOpen = (

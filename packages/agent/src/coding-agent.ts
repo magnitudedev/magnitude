@@ -23,11 +23,11 @@ import { SubagentActivityProjection } from './projections/subagent-activity'
 import { DisplayProjection } from './projections/display'
 import { AgentRoutingProjection } from './projections/agent-routing'
 import { AgentStatusProjection } from './projections/agent-status'
+import { TaskGraphProjection } from './projections/task-graph'
 import { CompactionProjection } from './projections/compaction'
 import { WorkflowProjection } from './projections/workflow'
 
 import { ReplayProjection } from './projections/replay'
-import { ChatTitleProjection } from './projections/chat-title'
 import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
 import { OutboundMessagesProjection } from './projections/outbound-messages'
@@ -44,10 +44,10 @@ import { Autopilot } from './workers/autopilot'
 import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
 import { WorkflowWorker } from './workers/workflow-worker'
-import type { AgentVariant } from './agents'
-import { ChatTitleWorker } from './workers/chat-title-worker'
+import { isValidVariant, type AgentVariant } from './agents'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
+import { SessionTitleWorker } from './workers/session-title-worker'
 import { FsLive } from './services/fs'
 
 // Execution
@@ -81,6 +81,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     SessionContextProjection,
     AgentRoutingProjection,
     AgentStatusProjection,
+    TaskGraphProjection,
     CompactionProjection,
     WorkflowProjection,
     TurnProjection,
@@ -92,7 +93,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     UserMessageResolutionProjection,
     MemoryProjection,
     DisplayProjection,
-    ChatTitleProjection,
     ConversationProjection,
     UserPresenceProjection,
   ],
@@ -109,15 +109,18 @@ export const CodingAgent = Agent.define<AppEvent>()({
 
     FileMentionResolver,
 
-    ChatTitleWorker,
     UserPresenceWorker,
+    SessionTitleWorker,
   ],
 
   expose: {
     signals: {
       restoreQueuedMessages: DisplayProjection.signals.restoreQueuedMessages,
 
-      chatTitleGenerated: ChatTitleProjection.signals.chatTitleGenerated
+      taskCreated: TaskGraphProjection.signals.taskCreated,
+      taskCompleted: TaskGraphProjection.signals.taskCompleted,
+      taskCancelled: TaskGraphProjection.signals.taskCancelled,
+      taskStatusChanged: TaskGraphProjection.signals.taskStatusChanged
     },
     state: {
       display: DisplayProjection,
@@ -127,6 +130,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
       workflow: WorkflowProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
+      taskGraph: TaskGraphProjection,
     }
   }
 })
@@ -317,7 +321,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       // Create execution resources for all known agents.
       const agentState = yield* agentStatusProjection.get
       for (const [, agent] of agentState.agents) {
-        yield* executionManager.initFork(agent.forkId, agent.role as AgentVariant)
+        if (!isValidVariant(agent.role)) {
+          continue
+        }
+        yield* executionManager.initFork(agent.forkId, agent.role)
       }
 
       // Hydration recovery: detect forks that were in-flight when the process
@@ -332,9 +339,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
             turnId: forkTurnState.turnId,
             chainId: forkTurnState.chainId,
             strategyId: 'xml-act',
-            responseParts: [],
-            toolCalls: [],
-            observedResults: [],
+
             result: {
               success: false,
               error: 'Hydration recovery: cancelled in-flight turn',
@@ -359,9 +364,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
           turnId: rootTurnState.turnId,
           chainId: rootTurnState.chainId,
           strategyId: 'xml-act',
-          responseParts: [],
-          toolCalls: [],
-          observedResults: [],
           result: {
             success: false,
             error: 'Hydration recovery: cancelled in-flight turn',

@@ -1,16 +1,17 @@
-import { Cause, Duration, Effect, Queue, Stream } from 'effect'
+import { Cause, Duration, Effect, Stream } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
-import type { AppEvent, ResponsePart } from '../events'
+import type { AppEvent } from '../events'
 import { TransportError } from '@magnitudedev/providers'
 import { ExecutionManager } from '../execution/execution-manager'
-import { createTurnStream } from '../execution/types'
+import { createTurnStream } from '../execution/turn-stream'
 import { drainTurnEventStream } from '../workers/turn-event-drain'
 import { MockTurnScriptTag, type MockTurnResponse } from './turn-script'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 
 function frameToChunks(frame: MockTurnResponse): readonly string[] {
   if (frame.xmlChunks && frame.xmlChunks.length > 0) return frame.xmlChunks
   if (frame.xml !== undefined) return [frame.xml]
-  return ['<comms><message to="user">ok</message></comms><yield/>']
+  return [`<message>ok</message>${TURN_CONTROL_IDLE}`]
 }
 
 function buildStream(frame: MockTurnResponse): Stream.Stream<string, import('@magnitudedev/providers').ModelError> {
@@ -43,18 +44,17 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
   eventHandlers: {
     turn_started: (event, publish) => {
       const { forkId, turnId, chainId } = event
-      const rawCodeChunks: string[] = []
 
       return Effect.gen(function* () {
         const script = yield* MockTurnScriptTag
         const execManager = yield* ExecutionManager
         const frame = yield* script.dequeue({ forkId, turnId })
 
-        const xmlStream = buildStream(frame).pipe(
-          Stream.tap((chunk) => Effect.sync(() => { rawCodeChunks.push(chunk) }))
-        )
+        const turnStream = createTurnStream((sink) => Effect.gen(function* () {
+          const xmlStream = buildStream(frame).pipe(
+            Stream.tap((chunk) => sink.emit({ _tag: 'RawResponseChunk', text: chunk }))
+          )
 
-        const turnStream = createTurnStream((queue) => Effect.gen(function* () {
           const executeResult = yield* execManager.execute(
             xmlStream,
             {
@@ -64,7 +64,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
               defaultProseDest: forkId === null ? 'user' : 'parent',
               allowSingleUserReplyThisTurn: false,
             },
-            queue,
+            sink,
           )
 
           const usage = {
@@ -77,17 +77,11 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             totalCost: null,
           }
 
-          const rawCode = rawCodeChunks.join('')
-
-          const responseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-
-          yield* Queue.offer(queue, { _tag: 'TurnResult', value: { executeResult, usage, responseParts, rawCodeChunks } })
+          yield* sink.emit({ _tag: 'TurnResult', value: { executeResult, usage } })
         }))
 
         const drained = yield* drainTurnEventStream(turnStream, forkId, turnId, publish)
-        const { executeResult, usage, responseParts } = drained.finalResult
+        const { executeResult, usage } = drained.finalResult
 
         yield* publish({
           type: 'turn_completed',
@@ -95,9 +89,6 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
           turnId,
           chainId,
           strategyId: 'xml-act',
-          responseParts,
-          toolCalls: executeResult.toolCalls,
-          observedResults: executeResult.observedResults,
           result: executeResult.result,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
@@ -108,20 +99,12 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
         })
       }).pipe(
         Effect.onInterrupt(() => {
-          const rawCode = rawCodeChunks.join('')
-          const responseParts: readonly ResponsePart[] = rawCode.trim()
-            ? [{ type: 'text', content: rawCode }]
-            : []
-
           return publish({
             type: 'turn_completed',
             forkId,
             turnId,
             chainId,
             strategyId: 'xml-act',
-            responseParts,
-            toolCalls: [],
-            observedResults: [],
             result: { success: false, error: 'Interrupted', cancelled: true },
             inputTokens: null,
             outputTokens: null,

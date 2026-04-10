@@ -27,7 +27,7 @@ import { applyPasteIntent } from './paste/apply'
 import { derivePasteEffects } from './paste/effects'
 import type { InputValue } from '../../types/store'
 import type { ChatControllerProps } from './types'
-import { SubagentTabBar } from './subagent-tab-bar'
+import { TaskList } from './task-list'
 import { buildSubmitDispatchEvents, shouldHandleSlashCommandInTab } from './submit-routing'
 
 const EMPTY_INPUT: InputValue = {
@@ -81,41 +81,16 @@ export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): 
   }
 }
 
-export function shouldCycleSubagentTabs(args: {
-  keyName: string
-  ctrl: boolean
-  meta: boolean
-  option: boolean
-  fileMentionOpen: boolean
-  slashMenuOpen: boolean
-}): boolean {
-  if (args.keyName !== 'tab') return false
-  if (args.ctrl || args.meta || args.option) return false
-  if (args.fileMentionOpen || args.slashMenuOpen) return false
-  return true
-}
-
-export function getCycledTabSelection(args: {
-  selectedForkId: string | null
-  subagentTabs: Array<{ forkId: string }>
-  shift: boolean
-}): string | null {
-  const tabIds: Array<string | null> = [null, ...args.subagentTabs.map((tab) => tab.forkId)]
-  if (tabIds.length === 0) return null
-  const currentIndex = Math.max(0, tabIds.indexOf(args.selectedForkId))
-  const delta = args.shift ? -1 : 1
-  const nextIndex = (currentIndex + delta + tabIds.length) % tabIds.length
-  return tabIds[nextIndex] ?? null
-}
 
 export function ChatController(props: ChatControllerProps) {
   const {
     env,
     services,
     displayMessages,
-    subagentTabs,
+    tasks,
     selectedForkId,
-    onSubagentTabSelect,
+    pushForkOverlay,
+    isBlockingOverlayActive,
     selectedFileOpen,
     onCloseFilePanel,
     onApprove,
@@ -306,23 +281,6 @@ export function ChatController(props: ChatControllerProps) {
     const hasContent = inputValue.text.trim().length > 0 || attachments.length > 0
     if (env.widgetNavActive && !hasContent && services.handleWidgetKeyEvent(key)) return true
 
-    if (shouldCycleSubagentTabs({
-      keyName: key.name,
-      ctrl: key.ctrl,
-      meta: key.meta,
-      option: key.option,
-      fileMentionOpen: fileMentions.isOpen,
-      slashMenuOpen: slashCommands.isSlashMenuOpen,
-    })) {
-      const nextTabId = getCycledTabSelection({
-        selectedForkId,
-        subagentTabs,
-        shift: key.shift,
-      })
-      onSubagentTabSelect(nextTabId)
-      return true
-    }
-
     const isPlainArrow = !key.ctrl && !key.meta && !key.option && !key.shift
     if (!isPlainArrow) return false
 
@@ -372,7 +330,7 @@ export function ChatController(props: ChatControllerProps) {
     }
 
     return false
-  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId, subagentTabs, onSubagentTabSelect])
+  }, [env.pendingApproval, env.bashMode, env.widgetNavActive, fileMentions, slashCommands, services, history, historyIndex, inputValue.text, savedDraft, setComposerText, selectedForkId])
 
   const handleInputChange = useCallback((value: InputValue) => {
     if (!env.bashMode && value.text === '!') {
@@ -421,6 +379,7 @@ export function ChatController(props: ChatControllerProps) {
       if (!trimmed) return
       const result = await Promise.resolve(services.executeBash(trimmed))
       services.appendBashOutput(result)
+      services.recordBashCommand(result)
       services.exitBashMode()
       setInputValue(EMPTY_INPUT)
       setHistoryIndex(null)
@@ -465,19 +424,30 @@ export function ChatController(props: ChatControllerProps) {
     }
   }, [inputValue, attachments.length, handleSubmit])
 
-  const selectedSubagentAgentId = selectedForkId == null
+  const selectedTaskForFork = selectedForkId == null
     ? null
-    : (subagentTabs.find((tab) => tab.forkId === selectedForkId)?.agentId ?? selectedForkId)
+    : tasks.find((task) => task.workerForkId === selectedForkId)
 
-  const pendingKillTab = pendingKillForkId == null
+  const selectedWorkerAgentId = selectedForkId == null
     ? null
-    : (subagentTabs.find((tab) => tab.forkId === pendingKillForkId) ?? null)
+    : selectedTaskForFork?.assignee.kind === 'worker'
+      ? selectedTaskForFork.assignee.agentId
+      : selectedForkId
+
+  const pendingKillTask = pendingKillForkId == null
+    ? null
+    : tasks.find((task) => task.workerForkId === pendingKillForkId)
+
+  const pendingKillTab = pendingKillTask?.assignee.kind === 'worker' && pendingKillTask.workerForkId
+    ? { forkId: pendingKillTask.workerForkId, agentId: pendingKillTask.assignee.agentId }
+    : null
 
   return (
     <>
       <ChatSurfaceKeyboard
         status={env.status}
         hasRunningForks={env.hasRunningForks}
+        isBlockingOverlayActive={isBlockingOverlayActive}
         nextEscWillKillAll={nextEscWillKillAll}
         setNextEscWillKillAll={setNextEscWillKillAll}
         killAllTimeoutRef={killAllTimeoutRef}
@@ -496,24 +466,13 @@ export function ChatController(props: ChatControllerProps) {
       />
 
       <box style={{ paddingLeft: 1, paddingRight: 1, flexShrink: 0 }}>
+        <TaskList
+          tasks={tasks}
+          pushForkOverlay={pushForkOverlay}
+          fileViewerOpen={selectedFileOpen}
+        />
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
-          <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 0, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
-            <SubagentTabBar
-              tabs={subagentTabs}
-              selectedForkId={selectedForkId}
-              onSelect={onSubagentTabSelect}
-              onCloseTab={(forkId, phase) => {
-                if (phase === 'idle') {
-                  const idleTab = subagentTabs.find((tab) => tab.forkId === forkId)
-                  services.requestIdleSubagentClose({
-                    forkId,
-                    agentId: idleTab?.agentId ?? forkId,
-                  })
-                  return
-                }
-                setPendingKillForkId(forkId)
-              }}
-            />
+          <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>
             {!env.bashMode && fileMentions.isOpen && (
               <FileMentionMenu
                 isOpen={fileMentions.isOpen}
@@ -534,7 +493,6 @@ export function ChatController(props: ChatControllerProps) {
                 onHoverIndex={slashCommands.setSelectedIndex}
               />
             )}
-            <box style={{ height: 1, backgroundColor: env.theme.inputBg }} />
             <box style={{ flexDirection: 'column' }}>
               <box style={{ flexDirection: 'row', alignItems: 'center', width: '100%' }}>
                 <box style={{ flexGrow: 1, minWidth: 0 }}>
@@ -552,7 +510,7 @@ export function ChatController(props: ChatControllerProps) {
                     onKeyIntercept={handleKeyIntercept}
                     focused={env.composerCanFocus && !env.pendingApproval}
                     highlightColor={env.bashMode ? orange[400] : undefined}
-                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with subagent ${selectedSubagentAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the team lead...'}
+                    placeholder={env.pendingApproval ? 'Approve or reject the pending action...' : env.bashMode ? 'Enter a command...' : env.isSubagentView ? `Chat directly with worker ${selectedWorkerAgentId}...` : env.status === 'streaming' ? 'Type to queue a message...' : 'Chat with the agent...'}
                     maxHeight={10}
                     minHeight={1}
                     bulkInsertEpoch={bulkInsertEpoch}
@@ -593,24 +551,22 @@ export function ChatController(props: ChatControllerProps) {
           {attachments.length > 0 ? (
             <AttachmentsBar attachments={attachments} onRemove={removeAttachment} maxWidth={env.attachmentsMaxWidth} />
           ) : nextEscWillKillAll ? (
-            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all subagents</text>
+            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all workers</text>
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null}
         </box>
         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
           {attachments.length > 0 && (nextEscWillKillAll ? (
-            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all subagents</text>
+            <text style={{ fg: env.theme.secondary }}>Press Esc again to interrupt all workers</text>
           ) : env.bashMode ? (
             <text style={{ fg: env.theme.muted }}><span attributes={TextAttributes.BOLD}>Esc</span> to exit Bash mode</text>
           ) : null)}
-          {env.tokenEstimate > 0 && (
-            <ContextUsageBar
-              tokenEstimate={env.tokenEstimate}
-              hardCap={env.contextHardCap ?? env.tokenEstimate}
-              isCompacting={env.isCompacting}
-            />
-          )}
+          <ContextUsageBar
+            tokenUsage={env.tokenUsage}
+            hardCap={env.contextHardCap}
+            isCompacting={env.isCompacting}
+          />
         </box>
       </box>
 
@@ -618,8 +574,8 @@ export function ChatController(props: ChatControllerProps) {
         <box style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: RGBA.fromInts(0, 0, 0, 153) }}>
           <box style={{ borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: env.theme.border, backgroundColor: env.theme.surface, customBorderChars: BOX_CHARS, minWidth: 52, maxWidth: 72, paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0 }}>
             <box style={{ paddingLeft: 2, paddingRight: 2, paddingTop: 1, paddingBottom: 1, flexDirection: 'column' }}>
-              <text style={{ fg: env.theme.foreground }}>Kill active subagent {pendingKillTab.agentId}?</text>
-              <text style={{ fg: env.theme.muted }}>This removes all subagent progress.</text>
+              <text style={{ fg: env.theme.foreground }}>Kill active worker {pendingKillTab.agentId}?</text>
+              <text style={{ fg: env.theme.muted }}>This removes all worker progress.</text>
               <box style={{ height: 1 }} />
               <box style={{ flexDirection: 'row', justifyContent: 'flex-end', gap: 1 }}>
                 <Button onClick={() => setPendingKillForkId(null)} onMouseOver={() => setIsKillCancelHovered(true)} onMouseOut={() => setIsKillCancelHovered(false)}>
@@ -636,7 +592,7 @@ export function ChatController(props: ChatControllerProps) {
                   onMouseOut={() => setIsKillConfirmHovered(false)}
                 >
                   <box style={{ borderStyle: 'single', borderColor: isKillConfirmHovered ? env.theme.error : env.theme.border, customBorderChars: BOX_CHARS, paddingLeft: 1, paddingRight: 1 }}>
-                    <text style={{ fg: isKillConfirmHovered ? env.theme.error : env.theme.foreground }}>Kill subagent</text>
+                    <text style={{ fg: isKillConfirmHovered ? env.theme.error : env.theme.foreground }}>Kill worker</text>
                   </box>
                 </Button>
               </box>

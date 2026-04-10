@@ -1,0 +1,108 @@
+---
+title: Models
+description: "Configure model slots and browser-compatible models"
+icon: cpu
+---
+
+## Model slots
+
+Magnitude uses seven model slots — one for each agent role:
+
+- **Lead** — the lead agent you interact with directly. Use your strongest model here.
+- **Explorer** — codebase investigation. Fast and capable.
+- **Planner** — converts findings into implementation plans. Fast and capable.
+- **Builder** — performs code changes. Fast and capable.
+- **Reviewer** — validates quality and completion. Fast and capable.
+- **Debugger** — diagnoses failures. Fast and capable.
+- **Browser** — visual browser tasks. Must be a visually grounded model. To see the full list of supported browser agent models, [click here](#visually-grounded-models).
+
+Configure each slot independently via `/settings`. The setup wizard sets sensible defaults based on your provider: a strong model for the lead, a fast capable model for workers (explorer, planner, builder, reviewer, debugger), and a visually capable model for the browser agent.
+
+## Default models by provider
+
+| Provider | Lead | Workers | Browser |
+|----------|------|-----------|---------|
+| OpenAI (OAuth) | GPT-5.4 | GPT-5.3 Codex | GPT-5.3 Codex |
+| OpenAI (API key) | GPT-5.4 | GPT-5.3 Codex | GPT-5.3 Codex |
+| Anthropic | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
+| GitHub Copilot | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
+| Google (Gemini) | Gemini 3.1 Pro | Gemini 3 Flash | Gemini 3 Flash |
+| OpenRouter | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
+| Vercel | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
+| Vertex AI (Gemini) | Gemini 3.1 Pro | Gemini 3 Flash | Gemini 3 Flash |
+| Vertex AI (Anthropic) | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
+| Amazon Bedrock | Claude Opus 4.6 | Claude Sonnet 4.6 | Claude Haiku 4.5 |
+| Cerebras | ZAI GLM-4.7 | ZAI GLM-4.7 | ZAI GLM-4.7 |
+| MiniMax | MiniMax M2.7 | MiniMax M2.7 | MiniMax M2.7 |
+| Z.AI | GLM-5 | GLM-5 | GLM-5 |
+
+## Switching models
+
+Use `/settings` to connect providers and change models. You can also use `/provider` or `/model` directly.
+
+## Visually grounded models
+
+Most modern frontier models support [visual grounding](https://arxiv.org/abs/2509.10345), so there are plenty of options to choose from. Below is the full list of models compatible with the browser agent, organized by provider.
+
+| Provider | Model |
+|----------|-------|
+| **OpenAI** | GPT-5.3 Codex |
+| | GPT-5.2 Codex |
+| **Anthropic** | Claude Opus 4.5, 4.6 |
+| | Claude Sonnet 4.5, 4.6 |
+| | Claude Haiku 4.5 |
+| **GitHub Copilot** | Claude Opus 4.5, 4.6 |
+| | Claude Sonnet 4.5, 4.6 |
+| | Claude Haiku 4.5 |
+| | GPT-5.2 Codex |
+| | Grok Code Fast 1 |
+| **Google (Gemini)** | Gemini 3.1 Pro Preview |
+| | Gemini 3 Pro Preview |
+| | Gemini 3 Flash Preview |
+| **OpenRouter** | Claude Opus 4.5, 4.6 |
+| | Claude Sonnet 4.5, 4.6 |
+| | Claude Haiku 4.5 |
+| | Qwen 3.5 (397B, 122B, 35B, 27B) |
+| | Qwen 3 Max Thinking, Coder Next |
+| | Qwen 3.5 Plus, Flash |
+| | Kimi K2.5, K2 Thinking |
+| | DeepSeek V3.2, V3.2 Speciale |
+| | MiniMax M2.5, M2.1 |
+| | GLM-5, GLM-4.7, GLM-4.6V, GLM-4.7 Flash |
+| | Grok 4, Grok 4.1 Fast |
+| | GPT-OSS 120B, 20B |
+| | Mistral Large 2512, Devstral 2512 |
+| | Arcee Trinity Large Preview |
+| **Vercel** | Claude Opus 4.5, 4.6 |
+| | Claude Sonnet 4.5, 4.6 |
+| | Claude Haiku 4.5 |
+| | GPT-5.3 Codex, 5.2 Codex |
+| | GPT-OSS 120B, 20B |
+| | Qwen 3.5 Flash, Plus |
+| | Qwen 3 Max Thinking, Coder Next |
+| | Kimi K2.5, K2 Thinking |
+| | DeepSeek V3.2 Exp, Thinking |
+| | MiniMax M2.5, M2.1 |
+| | GLM-5, GLM-4.7, GLM-4.6V |
+| | Grok 4, Grok 4.1 Fast Non-Reasoning |
+| | Mistral Large 3, Devstral 2 |
+| | Arcee Trinity Large Preview |
+| **Vertex AI (Gemini)** | Gemini 3.1 Pro Preview |
+| | Gemini 3 Pro Preview |
+| | Gemini 3 Flash Preview |
+| **Vertex AI (Anthropic)** | Claude Opus 4.5, 4.6 |
+| | Claude Sonnet 4.5, 4.6 |
+| | Claude Haiku 4.5 |
+| **Amazon Bedrock** | Claude Opus 4.5, 4.6 |
+| | Claude Sonnet 4.5, 4.6 |
+| | Claude Haiku 4.5 |
+| **Cerebras** | GPT-OSS 120B |
+| | Qwen 3 235B A22B Instruct |
+| | ZAI GLM-4.7 |
+| **MiniMax** | MiniMax M2.7 |
+| | MiniMax M2.5 |
+| | MiniMax M2.1 |
+| **Z.AI** | GLM-5 |
+| | GLM-4.7 |
+| | GLM-4.6V |
+| | GLM-4.7 Flash |

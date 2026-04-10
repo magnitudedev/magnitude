@@ -2,9 +2,9 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
-import { JsonChatPersistence } from './persistence'
+import { JsonChatPersistence, loadSessionSummary } from './persistence'
 
 import { MessageView } from './components/message-view'
 import { ErrorBoundary } from './components/error-boundary'
@@ -21,6 +21,13 @@ import { useTheme } from './hooks/use-theme'
 import { SelectedFileProvider } from './hooks/use-file-viewer'
 
 import { BOX_CHARS } from './utils/ui-constants'
+import { hasConversationActivity } from './utils/start-state'
+import {
+  localProviderAddedModelToast,
+  localProviderSavedApiKeyToast,
+  localProviderSavedEmptyApiKeyToast,
+  localProviderSavedEndpointToast,
+} from './utils/local-provider-toast-messages'
 import { AnimatedLogo } from './components/animated-logo'
 import { RecentChatsWidget } from './components/recent-chats-widget'
 import { SessionLoadingView } from './components/session-loading-view'
@@ -36,7 +43,9 @@ import { useAuthFlow } from './hooks/use-auth-flow'
 import { type WizardStep } from './components/setup-wizard-overlay'
 import { AppOverlays } from './components/app-overlays'
 
+
 import { buildModelPickerItems, filterModelPickerItems, resolveSlotDefaultSelection } from './utils/model-picker'
+import { resolveLocalWizardSlotDefaults } from './utils/wizard-flow'
 import { getRecentChats, type RecentChat } from './data/recent-chats'
 import { logger, initLogger, subscribeToLogs, clearSessionLog, getSessionLogPath, type LogEntry } from '@magnitudedev/logger'
 
@@ -52,7 +61,7 @@ import { FileViewerPanel } from './components/file-viewer-panel'
 import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
-import { useSubagentTabs } from './hooks/use-subagent-tabs'
+import { useTasks } from './hooks/use-tasks'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -68,17 +77,9 @@ import { useFilePanel } from './hooks/use-file-panel'
 import { useLazyClient } from './hooks/use-lazy-client'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '@magnitudedev/agent'
 
-import type { Preset } from '@magnitudedev/storage'
+import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 
 const SYSTEM_DEFAULTS_PRESET = '__system_defaults__'
-
-export const getEffectiveSelectedForkId = (
-  selectedTabForkId: string | null,
-  subagentTabs: ReadonlyArray<{ forkId: string }>
-): string | null => {
-  if (!selectedTabForkId) return null
-  return subagentTabs.some((tab) => tab.forkId === selectedTabForkId) ? selectedTabForkId : null
-}
 
 export const getSelectedForkContentVersion = (
   selectedForkId: string | null,
@@ -159,14 +160,14 @@ function AppInner({
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
   const pushForkOverlay = (forkId: string) => setExpandedForkStack(s => [...s, forkId])
-  const [selectedTabForkId, setSelectedTabForkId] = useState<string | null>(null)
   const popForkOverlay = () => {
     setExpandedForkStack(s => s.slice(0, -1))
-    setSelectedTabForkId(null)
   }
 
   const [forkDisplay, setForkDisplay] = useState<DisplayState | null>(null)
   const [forkTokenEstimate, setForkTokenEstimate] = useState(0)
+  const [forkLastActualInputTokens, setForkLastActualInputTokens] = useState<number | null>(null)
+  const [forkHasCompletedTurn, setForkHasCompletedTurn] = useState(false)
   const [forkIsCompacting, setForkIsCompacting] = useState(false)
 
   const [systemMessages, setSystemMessages] = useState<Array<{ id: string; text: string; timestamp: number }>>([])
@@ -188,6 +189,7 @@ function AppInner({
   const [providerDetailSelectedIndex, setProviderDetailSelectedIndex] = useState(0)
   const [providerRefreshKey, setProviderRefreshKey] = useState(0)
   const [providerDetailStatus, setProviderDetailStatus] = useState<ProviderAuthMethodStatus | null>(null)
+  const [providerDetailOptions, setProviderDetailOptions] = useState<ProviderOptions | undefined>(undefined)
   const [contextHardCap, setContextHardCap] = useState<number | null>(null)
   const [agentProjectionMode, setAgentProjectionMode] = useState<string>('default')
   const [bashMode, setBashMode] = useState(false)
@@ -199,6 +201,8 @@ function AppInner({
   const [composerHasContent, setComposerHasContent] = useState(false)
   const [restoredQueuedInputText, setRestoredQueuedInputText] = useState<string | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
+  const [lastActualInputTokens, setLastActualInputTokens] = useState<number | null>(null)
+  const [hasCompletedTurn, setHasCompletedTurn] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
   const [workflowState, setWorkflowState] = useState<WorkflowCriteriaState | null>(null)
   const returnToProviderDetailRef = useRef<string | null>(null)
@@ -220,17 +224,18 @@ function AppInner({
     }
     return `${n}`
   }
-  const contextPercent = contextHardCap ? Math.round((tokenEstimate / contextHardCap) * 100) : 0
-  const contextDisplayText = contextHardCap
-    ? `${contextPercent}% ${formatFooterTokens(tokenEstimate)}/${formatFooterTokens(contextHardCap)}`
-    : ''
-  const contextRenderedText = tokenEstimate > 0 && contextHardCap
-    ? (isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText)
-    : ''
+  const tokenUsage = lastActualInputTokens ?? (hasCompletedTurn ? tokenEstimate : null)
+  const contextPercent = (tokenUsage != null && contextHardCap) ? Math.round((tokenUsage / contextHardCap) * 100) : null
+  const contextDisplayText = tokenUsage == null
+    ? '-'
+    : (contextHardCap
+      ? `${contextPercent}% ${formatFooterTokens(tokenUsage)}/${formatFooterTokens(contextHardCap)}`
+      : `${formatFooterTokens(tokenUsage)}/Unknown`)
+  const contextRenderedText = isCompacting ? `>>> ${contextDisplayText} <<<` : contextDisplayText
 
   // Always reserve width for the longest possible escape hint so that
   // attachments don't reflow when hints appear/disappear.
-  const maxEscHintWidth = 'Press Esc again to interrupt all subagents'.length
+  const maxEscHintWidth = 'Press Esc again to interrupt all workers'.length
 
   const terminalWidth = process.stdout.columns ?? 80
   const footerRightGap = contextRenderedText ? 1 : 0
@@ -265,10 +270,17 @@ function AppInner({
   const [wizardConnectedProvider, setWizardConnectedProvider] = useState<string | null>(null)
   const [wizardNeedsChromium, setWizardNeedsChromium] = useState<boolean | null>(null)
 
+  const [wizardSelectedProviderId, setWizardSelectedProviderId] = useState<string | null>(null)
+  const [wizardSelectedProviderDiscoveredModels, setWizardSelectedProviderDiscoveredModels] = useState<Array<{ id: string, name: string }>>([])
+  const [wizardSelectedProviderRememberedModelIds, setWizardSelectedProviderRememberedModelIds] = useState<string[]>([])
+  const localProviderSet = useMemo(() => new Set(['lmstudio', 'ollama', 'llama.cpp', 'openai-compatible-local']), [])
+  const wizardHasProviderEndpointStep = !!wizardSelectedProviderId && localProviderSet.has(wizardSelectedProviderId)
+
   const wizardTotalSteps = useMemo(() => {
-    if (wizardNeedsChromium === false) return 2
-    return 3
-  }, [wizardNeedsChromium])
+    const baseSteps = wizardHasProviderEndpointStep ? 3 : 2 // provider (+endpoint when local) + models
+    if (wizardNeedsChromium === false) return baseSteps
+    return baseSteps + 1
+  }, [wizardNeedsChromium, wizardHasProviderEndpointStep])
 
   const [recentChats, setRecentChats] = useState<RecentChat[] | null>(null)
 
@@ -300,12 +312,13 @@ function AppInner({
   }, [providerUiState, storage])
 
   useEffect(() => {
+    if (!providerUiState) return
     providerRuntime.state.contextLimits('lead').then((limits) => {
       setContextHardCap(limits.hardCap)
     }).catch((error) => {
       logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Failed to load provider context limits')
     })
-  }, [providerRuntime, slotModels.lead])
+  }, [providerRuntime, slotModels.lead, providerUiState])
 
   // Check Chromium installation when wizard opens
   useEffect(() => {
@@ -358,6 +371,7 @@ function AppInner({
     })
 
     let resolvedWorkspacePath: string | null = null
+    let resolvedSessionId: string | null = null
 
     const createClient = async () => {
       let sessionId: string | undefined
@@ -375,6 +389,7 @@ function AppInner({
         sessionId,
       })
       const activeSessionId = persistence.getSessionId()
+      resolvedSessionId = activeSessionId
       onSessionId?.(activeSessionId)
       resolvedWorkspacePath = storage.sessions.getWorkspacePath(activeSessionId) ?? null
       initLogger(persistence.getSessionId())
@@ -403,6 +418,9 @@ function AppInner({
       const sessionTracker = new SessionTracker()
       setSessionTracker(sessionTracker)
       const forkRoles = new Map<string, { role: string; startTime: number }>()
+      const turnToolCounts = new Map<string, number>()
+
+      const turnKey = (forkId: string | null, turnId: string) => `${forkId ?? 'root'}:${turnId}`
 
 
       // Log all events to event log file + collect for debug panel
@@ -439,10 +457,33 @@ function AppInner({
           sessionTracker.recordAgentSpawned()
         }
 
+        if (event.type === 'tool_event') {
+          const key = turnKey(event.forkId, event.turnId)
+
+          if (event.event._tag === 'ToolInputStarted') {
+            turnToolCounts.set(key, (turnToolCounts.get(key) ?? 0) + 1)
+          }
+
+          if (event.event._tag === 'ToolExecutionEnded') {
+            const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
+            const agentRole = forkInfo?.role ?? 'lead'
+
+            trackToolUsage({
+              toolName: event.event.toolName,
+              group: event.event.group,
+              status: event.event.result._tag === 'Success' ? 'success' : 'error',
+              forkId: event.forkId,
+              agentRole,
+            })
+          }
+        }
+
         if (event.type === 'turn_completed') {
           const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
           const agentRole = forkInfo?.role ?? 'lead'
           const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agentRole) ? agentRole as MagnitudeSlot : 'lead' as MagnitudeSlot
+          const key = turnKey(event.forkId, event.turnId)
+          const toolCount = turnToolCounts.get(key) ?? 0
 
           trackTurnCompleted({
             providerId: event.providerId ?? null,
@@ -453,32 +494,14 @@ function AppInner({
             outputTokens: event.outputTokens,
             cacheReadTokens: event.cacheReadTokens,
             cacheWriteTokens: event.cacheWriteTokens,
-            toolCount: event.toolCalls.length,
+            toolCount,
             success: event.result.success,
             forkId: event.forkId,
             agentRole,
           })
 
-          // Track individual tool calls
-          for (const tc of event.toolCalls) {
-            let linesWritten: number | undefined
-
-            if (tc.result.status === 'success' && tc.result.display?.type === 'write_stats') {
-              linesWritten = tc.result.display.linesWritten
-              sessionTracker.recordLinesWritten(linesWritten)
-            }
-
-            trackToolUsage({
-              toolName: tc.toolName,
-              group: tc.group,
-              status: tc.result.status,
-              linesWritten,
-              forkId: event.forkId,
-              agentRole,
-            })
-          }
-
-          sessionTracker.recordTurn(event.inputTokens, event.outputTokens, event.toolCalls.length)
+          sessionTracker.recordTurn(event.inputTokens, event.outputTokens, toolCount)
+          turnToolCounts.delete(key)
         }
 
         if (event.type === 'compaction_completed') {
@@ -520,11 +543,12 @@ function AppInner({
       })
 
 
-      client.on.chatTitleGenerated(({ title }) => {
-        if (mounted) {
-          logger.info({ title }, 'Chat title generated')
-          renderer.setTerminalTitle(title)
-        }
+      client.state.taskGraph.subscribe((state) => {
+        if (!mounted) return
+        const title = getSessionTitleFromTaskGraph(state)
+        if (!title) return
+        logger.info({ title }, 'Session title derived from task graph')
+        renderer.setTerminalTitle(title)
       })
     }
 
@@ -551,9 +575,16 @@ function AppInner({
       createClient().catch((err) => {
         logger.error({ error: err.message, stack: err.stack }, 'Failed to create agent client');
         throw err;
-      }).then((client) => {
+      }).then(async (client) => {
         logger.info('Agent client created successfully');
         setupClient(client)
+
+        if (!resolvedSessionId) return
+
+        const summary = await loadSessionSummary(storage, resolvedSessionId)
+        if (summary?.title) {
+          renderer.setTerminalTitle(summary.title)
+        }
       })
     }
 
@@ -613,6 +644,8 @@ function AppInner({
 
     const unsubscribe = client.state.compaction.subscribeFork(null, (state: CompactionState) => {
       setTokenEstimate(state.tokenEstimate)
+      setLastActualInputTokens(state.lastActualInputTokens)
+      setHasCompletedTurn(state.hasCompletedTurn)
       setIsCompacting(state._tag !== 'idle')
     })
 
@@ -626,16 +659,11 @@ function AppInner({
     })
   }, [client])
 
-  const subagentTabs = useSubagentTabs({
+  const tasks = useTasks({
     client,
-    rootDisplayMessages: display?.messages ?? [],
-    agentStatusState,
   })
 
-  const selectedForkId = useMemo(
-    () => getEffectiveSelectedForkId(selectedTabForkId, subagentTabs),
-    [selectedTabForkId, subagentTabs]
-  )
+  const selectedForkId: string | null = null
 
   // Subscribe to selected fork's display
   useEffect(() => {
@@ -653,11 +681,15 @@ function AppInner({
   useEffect(() => {
     if (!client || !selectedForkId) {
       setForkTokenEstimate(0)
+      setForkLastActualInputTokens(null)
+      setForkHasCompletedTurn(false)
       setForkIsCompacting(false)
       return
     }
     const unsubscribe = client.state.compaction.subscribeFork(selectedForkId, (state: CompactionState) => {
       setForkTokenEstimate(state.tokenEstimate)
+      setForkLastActualInputTokens(state.lastActualInputTokens)
+      setForkHasCompletedTurn(state.hasCompletedTurn)
       setForkIsCompacting(state._tag !== 'idle')
     })
     return unsubscribe
@@ -674,12 +706,7 @@ function AppInner({
     return unsubscribe
   }, [client, debugMode, debugPanelVisible])
 
-  // Auto-deselect fork tab when fork is gone
-  useEffect(() => {
-    if (selectedTabForkId !== null && selectedForkId === null) {
-      setSelectedTabForkId(null)
-    }
-  }, [selectedTabForkId, selectedForkId])
+
 
 
 
@@ -706,6 +733,53 @@ function AppInner({
       model: getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)?.name ?? selection.modelId,
     }
   }, [selectedForkId, agentStatusState, slotModels])
+
+  const forkSlot = useMemo(() => {
+    if (!expandedForkId || !agentStatusState) return null
+    const agentId = agentStatusState.agentByForkId.get(expandedForkId)
+    const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
+    if (!agent) return null
+    return (MAGNITUDE_SLOTS as readonly string[]).includes(agent.role)
+      ? agent.role as MagnitudeSlot
+      : 'lead' as MagnitudeSlot
+  }, [expandedForkId, agentStatusState])
+
+  const forkModelSummary = useMemo(() => {
+    if (!forkSlot) return null
+    const selection = slotModels[forkSlot]
+    if (!selection) return null
+    return {
+      provider: getProvider(selection.providerId)?.name ?? selection.providerId,
+      model: getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)?.name ?? selection.modelId,
+    }
+  }, [forkSlot, slotModels])
+
+  const [forkContextHardCap, setForkContextHardCap] = useState<number | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    if (!forkSlot) {
+      setForkContextHardCap(contextHardCap)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    providerRuntime.state.contextLimits(forkSlot).then((limits) => {
+      if (!cancelled) {
+        setForkContextHardCap(limits.hardCap)
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setForkContextHardCap(contextHardCap)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [providerRuntime, forkSlot, contextHardCap])
 
   const mainTimelineMessages = useMemo(
     () => (activeDisplay?.messages ?? []).filter(m => {
@@ -854,7 +928,17 @@ function AppInner({
   }, [clientSend, showEphemeral, theme.error])
 
   const initProject = useCallback(() => {
-    clientSend({ type: 'user_message', forkId: null, content: textParts(INIT_PROMPT), attachments: [], mode: 'text', synthetic: false, taskMode: false })
+    clientSend({
+      type: 'user_message',
+      messageId: createId(),
+      timestamp: Date.now(),
+      forkId: null,
+      content: textParts(INIT_PROMPT),
+      attachments: [],
+      mode: 'text',
+      synthetic: false,
+      taskMode: false,
+    })
     logger.info('Init project activated')
   }, [clientSend])
 
@@ -876,8 +960,13 @@ function AppInner({
     onResumeSession(chat.id)
   }, [onResumeSession])
 
-  // Navigation for startup widget (active when no messages, overlay closed, and input empty)
-  const widgetNavActive = !showRecentChatsOverlay && (display?.messages ?? []).length === 0 && !composerHasContent
+  const hasActivity = hasConversationActivity({
+    displayMessageCount: (display?.messages ?? []).length,
+    bashOutputCount: bashOutputs.length,
+  })
+
+  // Navigation for startup widget (active when no activity, overlay closed, and input empty)
+  const widgetNavActive = !showRecentChatsOverlay && !hasActivity && !composerHasContent
   const widgetNavigation = useRecentChatsNavigation(
     recentChats ? recentChats.slice(0, 5) : [],
     handleResumeChat,
@@ -898,6 +987,22 @@ function AppInner({
     const auth = await providerRuntime.auth.getAuth(providerId)
     await providerRuntime.state.setSelection(selectingModelFor, providerId, modelId, auth ?? null)
     await storage.config.setModelSelection(selectingModelFor, selection)
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            modelId,
+            rememberedModelIds: Array.from(new Set([...remembered, modelId])),
+          },
+        },
+      }
+    })
     setSlotModels(prev => ({ ...prev, [selectingModelFor]: selection }))
 
     await reloadProviderState()
@@ -954,14 +1059,24 @@ function AppInner({
         reviewer: null, debugger: null, browser: null,
       }
 
-      for (const slot of MAGNITUDE_SLOTS) {
-        defaultModels[slot] = resolveSlotDefaultSelection({
-          allProviders: PROVIDERS,
-          connectedProviderIds,
-          slot,
-          preferredProviderId,
-          detectedAuthTypeByProviderId,
-        })
+      const preferredProvider = PROVIDERS.find((provider) => provider.id === preferredProviderId)
+      const isLocalPreferredProvider = preferredProvider?.providerFamily === 'local'
+      const firstLocalModelId = isLocalPreferredProvider ? preferredProvider?.models[0]?.id ?? null : null
+
+      if (isLocalPreferredProvider && firstLocalModelId) {
+        for (const slot of MAGNITUDE_SLOTS) {
+          defaultModels[slot] = { providerId: preferredProviderId, modelId: firstLocalModelId }
+        }
+      } else {
+        for (const slot of MAGNITUDE_SLOTS) {
+          defaultModels[slot] = resolveSlotDefaultSelection({
+            allProviders: PROVIDERS,
+            connectedProviderIds,
+            slot,
+            preferredProviderId,
+            detectedAuthTypeByProviderId,
+          })
+        }
       }
 
       await applySlotModelMap(defaultModels)
@@ -978,9 +1093,11 @@ function AppInner({
   useEffect(() => {
     if (!providerDetailId) {
       setProviderDetailStatus(null)
+      setProviderDetailOptions(undefined)
       return
     }
     setProviderDetailStatus(null)
+    setProviderDetailOptions(undefined)
     let stale = false
 
     providerRuntime.auth.detectProviderAuthMethods(providerDetailId).then((status) => {
@@ -992,27 +1109,40 @@ function AppInner({
       }, 'Failed to load provider auth methods')
       if (!stale) setProviderDetailStatus(null)
     })
+
+    storage.config.getProviderOptions(providerDetailId).then((options) => {
+      if (!stale) setProviderDetailOptions(options)
+    }).catch((error) => {
+      logger.warn({
+        providerId: providerDetailId,
+        error: error instanceof Error ? error.message : String(error),
+      }, 'Failed to load provider options')
+      if (!stale) setProviderDetailOptions(undefined)
+    })
+
     return () => { stale = true }
-  }, [providerDetailId, providerRefreshKey, providerRuntime])
+  }, [providerDetailId, providerRefreshKey, providerRuntime, storage])
 
   const providerDetailActions = useMemo(() => {
     if (!providerDetailStatus) return []
-    const actions: Array<{ type: 'connect' | 'disconnect' | 'update-key'; methodIndex: number; label: string }> = []
+    const actions: Array<{ type: 'connect' | 'disconnect' | 'update-key' | 'retry-discovery' | 'configure-endpoint'; methodIndex: number; label: string }> = []
+    const providerId = providerDetailStatus.provider.id
+    const isLocal = localProviderSet.has(providerId)
+
     for (const m of providerDetailStatus.methods) {
       if (m.connected) {
         if (m.method.type === 'api-key' && m.source === 'stored') {
           actions.push({ type: 'update-key', methodIndex: m.methodIndex, label: 'Update Key' })
           actions.push({ type: 'disconnect', methodIndex: m.methodIndex, label: 'Disconnect' })
-        } else if (m.source === 'stored' || m.source === 'none') {
+        } else if (!isLocal && (m.source === 'stored' || m.source === 'none')) {
           actions.push({ type: 'disconnect', methodIndex: m.methodIndex, label: 'Disconnect' })
         }
-        // env-sourced auth: no actions (can't disconnect env vars)
-      } else {
+      } else if (!isLocal) {
         actions.push({ type: 'connect', methodIndex: m.methodIndex, label: 'Connect' })
       }
     }
     return actions
-  }, [providerDetailStatus])
+  }, [providerDetailStatus, localProviderSet])
 
   const connectedProviderIds = useMemo(
     () => new Set(detectedProviders.map(d => d.provider.id)),
@@ -1046,7 +1176,7 @@ function AppInner({
       allProviders: PROVIDERS,
       connectedProviderIds,
       selectingModelFor,
-      localProviderConfig: providerUiState?.localProviderConfig,
+
       authStatusesByProviderId,
       detectedAuthTypeByProviderId,
     })
@@ -1081,6 +1211,7 @@ function AppInner({
       if (showSetupWizardRef.current) {
         // Wizard mode: advance to models step with defaults for this provider
         const provider = getProvider(providerId)
+        setWizardSelectedProviderId(providerId)
 
         const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
           lead: null, explorer: null, planner: null, builder: null,
@@ -1132,15 +1263,72 @@ function AppInner({
 
   // --- Setup wizard handlers ---
 
-  const handleWizardProviderSelected = useCallback((providerId: string) => {
+  const handleWizardProviderSelected = useCallback(async (providerId: string) => {
     const provider = getProvider(providerId)
     if (!provider) return
+    setWizardSelectedProviderId(providerId)
+
+    const isLocalProvider = localProviderSet.has(providerId)
+    if (isLocalProvider) {
+      // Local wizard path is models-first. Seed default endpoint in background if missing.
+      const existing = await storage.config.getProviderOptions(providerId)
+      const hasBaseUrl = typeof existing?.baseUrl === 'string' && existing.baseUrl.trim().length > 0
+      if (!hasBaseUrl && provider.defaultBaseUrl) {
+        await storage.config.updateFull((current) => {
+          const providerOptions = current.providers?.[providerId] ?? {}
+          return {
+            ...current,
+            providers: {
+              ...(current.providers ?? {}),
+              [providerId]: {
+                ...providerOptions,
+                baseUrl: provider.defaultBaseUrl,
+              },
+            },
+          }
+        })
+      }
+
+      await providerRuntime.catalog.refresh().catch(() => undefined)
+      await reloadProviderState().catch(() => undefined)
+
+      const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+
+      const refreshedConnectedProviderIds = new Set([
+        ...connectedProviderIds,
+        providerId,
+      ])
+
+      const newWizardSlotModels = resolveLocalWizardSlotDefaults({
+        slots: MAGNITUDE_SLOTS,
+        providerId,
+        existingSlotModels: slotModels,
+        discoveredModelIds: discoveredModels.map((m: { id: string }) => m.id),
+        rememberedModelIds,
+        applyWizardDefaults: true,
+      }) as Record<MagnitudeSlot, ModelSelection | null>
+
+      setWizardSlotModels(newWizardSlotModels)
+      setWizardConnectedProvider(provider.name)
+      setWizardStep('local-provider')
+      return
+    }
 
     const detected = detectedProviders
     const match = detected.find(d => d.provider.id === providerId)
 
     if (match) {
-      // Already authenticated — compute model defaults and go to models step
+      // Already authenticated and ready — compute model defaults and go to models step
       const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
         lead: null, explorer: null, planner: null, builder: null,
         reviewer: null, debugger: null, browser: null,
@@ -1156,6 +1344,8 @@ function AppInner({
       }
       setWizardSlotModels(newWizardSlotModels)
       setWizardConnectedProvider(provider.name)
+      setWizardSelectedProviderDiscoveredModels([])
+      setWizardSelectedProviderRememberedModelIds([])
       setWizardStep('models')
     } else if (provider.authMethods.length === 1) {
       // Single auth method — start it directly
@@ -1164,13 +1354,16 @@ function AppInner({
       // Multiple auth methods — show picker
       authFlow.openAuthMethodPicker(provider)
     }
-  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds])
+  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds, localProviderSet, storage, providerRuntime, reloadProviderState, slotModels])
 
   const finishWizard = useCallback(() => {
     setShowSetupWizard(false)
     setWizardStep('provider')
     setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardConnectedProvider(null)
+    setWizardSelectedProviderId(null)
+    setWizardSelectedProviderDiscoveredModels([])
+    setWizardSelectedProviderRememberedModelIds([])
     setProviderRefreshKey(prev => prev + 1)
   }, [])
 
@@ -1211,15 +1404,27 @@ function AppInner({
     finishWizard()
   }, [authFlow.cancelAll, finishWizard, providerUiState, reloadProviderState, storage])
 
+  const handleWizardContinueFromLocalProvider = useCallback(() => {
+    setWizardStep('models')
+  }, [])
+
   const handleWizardBack = useCallback(() => {
     if (wizardStep === 'browser') {
       setWizardStep('models')
       return
     }
+    if (wizardStep === 'models' && wizardHasProviderEndpointStep) {
+      setWizardStep('local-provider')
+      return
+    }
+    if (wizardStep === 'local-provider') {
+      setWizardStep('provider')
+      return
+    }
     setWizardStep('provider')
     setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
     setWizardConnectedProvider(null)
-  }, [wizardStep])
+  }, [wizardStep, wizardHasProviderEndpointStep])
 
   // Providers shown in the wizard (exclude cloud providers that require manual credential setup)
   const WIZARD_PROVIDERS = useMemo(() =>
@@ -1257,9 +1462,13 @@ function AppInner({
         return next
       })
     }
-    if (providerId === 'local') {
-      await storage.config.setLocalProviderConfig(null)
-    }
+
+
+    await storage.config.updateFull((current) => {
+      const providers = { ...(current.providers ?? {}) }
+      delete providers[providerId]
+      return { ...current, providers }
+    })
 
     await reloadProviderState()
     setProviderDetailSelectedIndex(0)
@@ -1291,6 +1500,16 @@ function AppInner({
       handleProviderUpdateKey(providerDetailId)
     } else if (action.type === 'disconnect') {
       handleProviderDisconnect(providerDetailId)
+    } else if (action.type === 'retry-discovery') {
+      void providerRuntime.catalog.refresh()
+        .then(() => reloadProviderState())
+        .then(() => {
+          setProviderRefreshKey(prev => prev + 1)
+          showEphemeral(`Discovery refreshed for ${getProvider(providerDetailId)?.name ?? providerDetailId}`, theme.success)
+        })
+        .catch(() => {
+          showEphemeral(`Couldn't refresh models right now`, theme.warning, 5000)
+        })
     } else if (action.type === 'connect') {
       const provider = getProvider(providerDetailId)
       if (provider) {
@@ -1300,8 +1519,147 @@ function AppInner({
         authFlow.startAuthForProvider(provider, action.methodIndex)
       }
     }
-  }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider])
+  }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider, providerRuntime, reloadProviderState, showEphemeral, theme.success, theme.warning])
 
+
+  const handleLocalProviderSaveEndpoint = useCallback(async (providerId: string, url: string) => {
+    const trimmed = url.trim()
+    if (!trimmed) return
+    const normalized = /^https?:\/\//.test(trimmed) ? trimmed : `http://${trimmed}`
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            baseUrl: normalized,
+          },
+        },
+      }
+    })
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
+    setProviderRefreshKey(prev => prev + 1)
+    showEphemeral(localProviderSavedEndpointToast(getProvider(providerId)?.name ?? providerId), theme.success)
+  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success, wizardSelectedProviderId])
+
+  const handleLocalProviderRefreshModels = useCallback(async (providerId: string) => {
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
+    setProviderRefreshKey(prev => prev + 1)
+  }, [providerRuntime, reloadProviderState, storage, wizardSelectedProviderId])
+
+  const handleLocalProviderAddManualModel = useCallback(async (providerId: string, modelId: string) => {
+    const trimmed = modelId.trim()
+    if (!trimmed) return
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            rememberedModelIds: Array.from(new Set([...remembered, trimmed])),
+          },
+        },
+      }
+    })
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
+    setProviderRefreshKey(prev => prev + 1)
+    showEphemeral(localProviderAddedModelToast(trimmed), theme.success)
+  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success, wizardSelectedProviderId])
+
+  const handleLocalProviderRemoveManualModel = useCallback(async (providerId: string, modelId: string) => {
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [providerId]: {
+            ...existing,
+            rememberedModelIds: remembered.filter((id) => id !== modelId),
+          },
+        },
+      }
+    })
+    await providerRuntime.catalog.refresh().catch(() => undefined)
+    await reloadProviderState().catch(() => undefined)
+    const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
+    if (wizardSelectedProviderId === providerId) {
+      const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
+        ? (latestOptions as any).discoveredModels
+          .filter((m: { id?: unknown }) => typeof m?.id === 'string')
+          .map((m: { id: string; name?: unknown }) => ({ id: String(m.id), name: typeof m.name === 'string' ? m.name : String(m.id) }))
+        : []
+      const rememberedModelIds = Array.isArray((latestOptions as any)?.rememberedModelIds)
+        ? (latestOptions as any).rememberedModelIds.filter((id: any) => typeof id === 'string')
+        : []
+      setWizardSelectedProviderDiscoveredModels(discoveredModels)
+      setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
+    }
+    setProviderRefreshKey(prev => prev + 1)
+  }, [storage, providerRuntime, reloadProviderState, wizardSelectedProviderId])
+
+  const handleLocalProviderSaveOptionalApiKey = useCallback(async (providerId: string, apiKey: string) => {
+    const trimmed = apiKey.trim()
+    if (trimmed.length === 0) {
+      await storage.auth.remove(providerId)
+      showEphemeral(localProviderSavedEmptyApiKeyToast(getProvider(providerId)?.name ?? providerId), theme.success)
+    } else {
+      await storage.auth.set(providerId, { type: 'api', key: trimmed })
+      showEphemeral(localProviderSavedApiKeyToast(getProvider(providerId)?.name ?? providerId), theme.success)
+    }
+    await reloadProviderState().catch(() => undefined)
+    setProviderRefreshKey(prev => prev + 1)
+  }, [storage, reloadProviderState, showEphemeral, theme.success])
 
   const handleChangeSlot = useCallback((slot: MagnitudeSlot) => {
     resetModelPickerState()
@@ -1425,7 +1783,7 @@ function AppInner({
 
   const handleInterruptAll = useCallback(() => {
     if (!client) return
-    logger.info('Interrupt all: interrupting all subagents')
+    logger.info('Interrupt all: interrupting all workers')
     // Interrupt root with allKilled flag
     client.send({ type: 'interrupt', forkId: null, allKilled: true })
     // Interrupt every running fork
@@ -1437,6 +1795,23 @@ function AppInner({
       }
     }
   }, [client, agentStatusState])
+
+  const activeOverlayKind =
+    (showSetupWizard && wizardStep === 'browser') ? 'setup-browser'
+    : (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.endpointSetup && !authFlow.showAuthMethodOverlay) ? 'setup-wizard'
+    : showRecentChatsOverlay ? 'recent-chats'
+    : (expandedForkId && client) ? 'fork-detail'
+    : showBrowserSetup ? 'browser-setup'
+    : settingsTab !== null ? 'settings'
+    : (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider) ? 'auth-method'
+    : authFlow.endpointSetup ? 'provider-endpoint'
+    : authFlow.apiKeySetup ? 'api-key'
+    : authFlow.oauthState ? 'oauth'
+    : 'none'
+
+  const isOverlayActive = activeOverlayKind !== 'none'
+  const isBlockingOverlayActive = isOverlayActive
+  const canToggleRecentChatsWithCtrlR = activeOverlayKind === 'none' || activeOverlayKind === 'recent-chats'
 
   useKeyboard(
     useCallback(
@@ -1462,12 +1837,13 @@ function AppInner({
         }
 
         if (isCtrlR) {
+          if (!canToggleRecentChatsWithCtrlR) return
           key.preventDefault()
           hasAnimatedRef.current = true
           setShowRecentChatsOverlay(prev => !prev)
         }
       },
-      [composerHasContent, debugMode, activeDisplay, display],
+      [composerHasContent, debugMode, activeDisplay, display, canToggleRecentChatsWithCtrlR],
     ),
   )
 
@@ -1608,7 +1984,17 @@ function AppInner({
     message: string
     attachments: Attachment[]
   }) => {
-    clientSend({ type: 'user_message', forkId: payload.forkId, content: textParts(payload.message), attachments: payload.attachments, mode: 'text', synthetic: false, taskMode: false })
+    clientSend({
+      type: 'user_message',
+      messageId: createId(),
+      timestamp: Date.now(),
+      forkId: payload.forkId,
+      content: textParts(payload.message),
+      attachments: payload.attachments,
+      mode: 'text',
+      synthetic: false,
+      taskMode: false,
+    })
   }, [clientSend])
 
   if (!display) {
@@ -1625,8 +2011,12 @@ function AppInner({
       showSetupWizard={showSetupWizard}
       wizardStep={wizardStep}
       wizardTotalSteps={wizardTotalSteps}
+      wizardHasProviderEndpointStep={wizardHasProviderEndpointStep}
       wizardSlotModels={wizardSlotModels}
       wizardConnectedProvider={wizardConnectedProvider}
+      wizardSelectedProviderId={wizardSelectedProviderId}
+      wizardSelectedProviderDiscoveredModels={wizardSelectedProviderDiscoveredModels}
+      wizardSelectedProviderRememberedModelIds={wizardSelectedProviderRememberedModelIds}
       wizardProviderSelectedIndex={wizardProviderSelectedIndex}
       wizardModelSelectedIndex={wizardModelSelectedIndex}
       showBrowserSetup={showBrowserSetup}
@@ -1635,7 +2025,13 @@ function AppInner({
       handleWizardProviderSelected={handleWizardProviderSelected}
       handleWizardComplete={handleWizardComplete}
       handleWizardBack={handleWizardBack}
+      handleWizardContinueFromLocalProvider={handleWizardContinueFromLocalProvider}
       handleWizardSkip={handleWizardSkip}
+      onLocalProviderSaveEndpoint={handleLocalProviderSaveEndpoint}
+      onLocalProviderRefreshModels={handleLocalProviderRefreshModels}
+      onLocalProviderAddManualModel={handleLocalProviderAddManualModel}
+      onLocalProviderRemoveManualModel={handleLocalProviderRemoveManualModel}
+      onLocalProviderSaveOptionalApiKey={handleLocalProviderSaveOptionalApiKey}
       setWizardProviderSelectedIndex={setWizardProviderSelectedIndex}
       setWizardModelSelectedIndex={setWizardModelSelectedIndex}
       wizardProviders={WIZARD_PROVIDERS}
@@ -1651,6 +2047,7 @@ function AppInner({
       preferencesSelectedIndex={preferencesSelectedIndex}
       setPreferencesSelectedIndex={setPreferencesSelectedIndex}
       providerDetailStatus={providerDetailStatus}
+      providerDetailOptions={providerDetailOptions}
       providerDetailActions={providerDetailActions}
       providerDetailSelectedIndex={providerDetailSelectedIndex}
       setProviderDetailSelectedIndex={setProviderDetailSelectedIndex}
@@ -1687,28 +2084,15 @@ function AppInner({
       expandedForkId={expandedForkId}
       client={client}
       agentStatusState={agentStatusState}
+      forkModelSummary={forkModelSummary}
+      forkContextHardCap={forkContextHardCap}
       popForkOverlay={popForkOverlay}
       pushForkOverlay={pushForkOverlay}
-      onFileClick={openFile}
-      localProviderConfig={providerUiState?.localProviderConfig
-        ? {
-            baseUrl: providerUiState.localProviderConfig.baseUrl ?? undefined,
-            modelId: providerUiState.localProviderConfig.modelId ?? undefined,
-          }
-        : null}
+      workspacePath={workspacePath}
+      projectRoot={process.cwd()}
+      showCopiedToast={clipboardToast}
     />
   )
-
-  const isOverlayActive = (showSetupWizard && wizardStep === 'browser')
-    || (showSetupWizard && wizardNeedsChromium !== null && !authFlow.oauthState && !authFlow.apiKeySetup && !authFlow.showLocalSetup && !authFlow.showAuthMethodOverlay)
-    || showRecentChatsOverlay
-    || (expandedForkId && client)
-    || showBrowserSetup
-    || settingsTab !== null
-    || (authFlow.showAuthMethodOverlay && authFlow.authMethodProvider)
-    || authFlow.showLocalSetup
-    || authFlow.apiKeySetup
-    || authFlow.oauthState
 
   const chatScrollbox = (
     <scrollbox
@@ -1749,14 +2133,14 @@ function AppInner({
         <text style={{ fg: theme.muted }} attributes={TextAttributes.BOLD}>{process.cwd().replace(process.env.HOME || '', '~')}</text>
       </box>
 
-      <box style={{ paddingLeft: 1, paddingBottom: ((display?.messages ?? []).length > 0 || (recentChats !== null && recentChats.length === 0)) ? 1 : 0, flexDirection: 'row' }}>
+      <box style={{ paddingLeft: 1, paddingBottom: (hasActivity || (recentChats !== null && recentChats.length === 0)) ? 1 : 0, flexDirection: 'row' }}>
         <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Tip: </text>
         <text style={{ fg: theme.muted }}>Use </text>
         <text style={{ fg: theme.foreground }}>/settings</text>
         <text style={{ fg: theme.muted }}> to configure providers and models!</text>
       </box>
 
-      {(display?.messages ?? []).length === 0 && (
+      {!hasActivity && (
         <box style={{ paddingLeft: 1 }}>
           <RecentChatsWidget
             chats={recentChats ? recentChats.slice(0, 5) : []}
@@ -1848,7 +2232,7 @@ function AppInner({
     && settingsTab === null
     && !authFlow.showAuthMethodOverlay
     && !authFlow.oauthState
-    && !authFlow.showLocalSetup
+    && !authFlow.endpointSetup
     && !authFlow.apiKeySetup
     && expandedForkId === null
 
@@ -1891,6 +2275,7 @@ function AppInner({
             }} />
           ) : null}
           <ChatController
+            isBlockingOverlayActive={isBlockingOverlayActive}
             env={{
               status: (activeDisplay ?? display)?.status ?? 'idle',
               pendingApproval: pendingApproval != null,
@@ -1898,7 +2283,9 @@ function AppInner({
               bashMode,
               modelsConfigured: !!slotModels.lead,
               modelSummary: activeModelSummary,
-              tokenEstimate: selectedForkId ? forkTokenEstimate : tokenEstimate,
+              tokenUsage: selectedForkId
+                ? (forkLastActualInputTokens ?? (forkHasCompletedTurn ? forkTokenEstimate : null))
+                : (lastActualInputTokens ?? (hasCompletedTurn ? tokenEstimate : null)),
               contextHardCap,
               isCompacting: selectedForkId ? forkIsCompacting : isCompacting,
               theme,
@@ -1919,6 +2306,18 @@ function AppInner({
                 })
               },
               appendBashOutput: (result) => setBashOutputs(prev => [...prev, result]),
+              recordBashCommand: (result) => {
+                clientSend({
+                  type: 'user_bash_command',
+                  forkId: null,
+                  timestamp: result.timestamp,
+                  command: result.command,
+                  cwd: result.cwd,
+                  exitCode: result.exitCode,
+                  stdout: result.stdout,
+                  stderr: result.stderr,
+                })
+              },
               clearSystemBanners: () => {
                 setSystemMessages([])
                 for (const timeoutId of systemMessageTimeoutsRef.current.values()) {
@@ -1963,9 +2362,9 @@ function AppInner({
               },
             }}
             displayMessages={(activeDisplay ?? display).messages}
-            subagentTabs={subagentTabs}
+            tasks={tasks}
             selectedForkId={selectedForkId}
-            onSubagentTabSelect={setSelectedTabForkId}
+            pushForkOverlay={pushForkOverlay}
             selectedFileOpen={isFilePanelOpen}
             onCloseFilePanel={closeFilePanel}
             onApprove={handleApprove}
@@ -1984,7 +2383,6 @@ function AppInner({
               border: ['left'],
               borderColor: theme.success,
               customBorderChars: { ...BOX_CHARS, vertical: '┃' },
-              backgroundColor: theme.surface,
             }}>
               <box style={{
                 backgroundColor: theme.surface,

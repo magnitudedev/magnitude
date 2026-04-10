@@ -52,41 +52,31 @@ describe('Event Serialization', () => {
       expect(deserialized).toEqual(event)
     })
 
-    test('serializes and deserializes turn_completed with tool calls', () => {
+    test('serializes and deserializes turn_completed', () => {
       const event: AppEvent = {
         type: 'turn_completed',
         forkId: null,
         turnId: 'turn-123',
         chainId: 'chain-456',
-        code: 'const x = 1 + 2;',
-        toolCalls: [
-          {
-            toolSlug: 'shell',
-            result: {
-              status: 'success',
-              output: { stdout: 'output', stderr: '', exitCode: 0 }
-            }
-          },
-          {
-            toolSlug: 'message',
-            result: {
-              status: 'success',
-              output: null
-            }
-          }
-        ],
+        strategyId: 'xml-act',
+
         result: {
           success: true,
-          calledActionTools: true, calledDone: false,
-          lastToolSlug: 'message'
-        }
+          turnDecision: 'idle'
+        },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       }
 
       const serialized = JSON.stringify(event)
       const deserialized = JSON.parse(serialized) as AppEvent
       
       expect(deserialized).toEqual(event)
-      expect(deserialized.toolCalls).toHaveLength(2)
+      expect(deserialized.result.success).toBe(true)
     })
 
     test('serializes and deserializes fork events', () => {
@@ -134,6 +124,22 @@ describe('Event Serialization', () => {
       }
 
       expect(JSON.parse(JSON.stringify(toolEvent))).toEqual(toolEvent)
+    })
+
+    test('serializes and deserializes user_bash_command', () => {
+      const event: AppEvent = {
+        type: 'user_bash_command',
+        forkId: null,
+        timestamp: Date.now(),
+        command: 'ls -la',
+        cwd: '/tmp',
+        exitCode: 0,
+        stdout: 'a\nb',
+        stderr: '',
+      }
+
+      const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent
+      expect(deserialized).toEqual(event)
     })
 
     test('serializes and deserializes streaming events', () => {
@@ -244,28 +250,21 @@ describe('Event Serialization', () => {
 
     test('handles arrays in events', () => {
       const event: AppEvent = {
-        type: 'turn_completed',
+        type: 'phase_verdict',
         forkId: null,
-        turnId: 'turn-1',
-        chainId: 'chain-1',
-        code: 'code',
-        toolCalls: Array.from({ length: 100 }, (_, i) => ({
-          toolSlug: `tool-${i}`,
-          result: {
-            status: 'success' as const,
-            output: i
-          }
+        passed: true,
+        verdicts: Array.from({ length: 100 }, (_, i) => ({
+          criteriaIndex: i,
+          criteriaName: `criterion-${i}`,
+          passed: i % 2 === 0,
+          reason: `reason-${i}`,
         })),
-        result: {
-          success: true,
-          calledActionTools: true, calledDone: false,
-          lastToolSlug: 'tool-99'
-        }
+        nextPhasePrompt: null,
+        workflowCompleted: false,
       }
 
       const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent
-      expect(deserialized.toolCalls).toHaveLength(100)
-      expect(deserialized.toolCalls[50].toolSlug).toBe('tool-50')
+      expect(deserialized).toEqual(event)
     })
   })
 
@@ -338,13 +337,19 @@ describe('Event Serialization', () => {
         forkId: null,
         turnId: 'turn-1',
         chainId: 'chain-1',
-        code: 'bad code',
-        toolCalls: [],
+        strategyId: 'xml-act',
+
         result: {
           success: false,
           error: 'Syntax error',
           cancelled: false
-        }
+        },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       }
 
       const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent

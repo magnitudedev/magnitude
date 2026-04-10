@@ -28,6 +28,8 @@ export interface SessionMetadata {
   readonly gitBranch: string | null
   readonly created: string
   readonly updated: string
+  readonly initialVersion: string
+  readonly lastActiveVersion: string
 }
 
 export interface ChatPersistenceService {
@@ -50,7 +52,7 @@ export interface ChatPersistenceService {
    * Save mutable session metadata fields
    */
   readonly saveSessionMetadata: (
-    update: Partial<Omit<SessionMetadata, 'sessionId' | 'created'>>
+    update: Partial<Omit<SessionMetadata, 'sessionId' | 'created' | 'initialVersion' | 'lastActiveVersion'>>
   ) => Effect.Effect<void, PersistenceError>
 }
 

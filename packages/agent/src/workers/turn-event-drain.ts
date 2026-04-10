@@ -23,7 +23,13 @@ export function drainTurnEventStream<R>(
       Stream.runForEach((event) => Effect.gen(function* () {
         switch (event._tag) {
           case 'MessageStart':
-            yield* publish({ type: 'message_start', forkId, turnId, id: event.id, dest: event.dest })
+            yield* publish({
+              type: 'message_start',
+              forkId,
+              turnId,
+              id: event.id,
+              destination: event.destination,
+            })
             break
           case 'MessageChunk':
             yield* publish({ type: 'message_chunk', forkId, turnId, id: event.id, text: event.text })
@@ -36,6 +42,9 @@ export function drainTurnEventStream<R>(
             break
           case 'ThinkingEnd':
             yield* publish({ type: 'thinking_end', forkId, turnId, about: event.about })
+            break
+          case 'RawResponseChunk':
+            yield* publish({ type: 'raw_response_chunk', forkId, turnId, text: event.text })
             break
           case 'LensStarted':
             yield* publish({ type: 'lens_start', forkId, turnId, name: event.name })

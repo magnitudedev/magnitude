@@ -5,6 +5,7 @@ import {
   startOpenAIBrowserOAuth,
   startOpenAIDeviceOAuth,
   startCopilotAuth,
+  getProvider,
   type ProviderDefinition,
 } from '@magnitudedev/agent'
 import { writeTextToClipboard } from '../utils/clipboard'
@@ -43,10 +44,15 @@ export interface UseAuthFlowOptions {
   reloadProviderState?: () => Promise<void>
 }
 
+export interface EndpointSetupState {
+  provider: ProviderDefinition
+  initialOptions?: { baseUrl?: string; modelId?: string } | null
+}
+
 export interface UseAuthFlowReturn {
   oauthState: OAuthState | null
   apiKeySetup: ApiKeySetupState | null
-  showLocalSetup: boolean
+  endpointSetup: EndpointSetupState | null
   showAuthMethodOverlay: boolean
   authMethodProvider: ProviderDefinition | null
   startAuthForProvider: (provider: ProviderDefinition, methodIndex: number) => Promise<void>
@@ -59,8 +65,8 @@ export interface UseAuthFlowReturn {
   handleOAuthCopyUrl: () => void
   handleApiKeySubmit: (key: string) => Promise<void>
   handleApiKeyCancel: () => void
-  handleLocalSetupSubmit: (config: { url: string; modelId: string; apiKey?: string }) => Promise<void>
-  handleLocalSetupCancel: () => void
+  handleEndpointSetupSubmit: (config: { providerId: string; url: string; modelId?: string; apiKey?: string }) => Promise<void>
+  handleEndpointSetupCancel: () => void
   cancelAll: () => void
 }
 
@@ -76,7 +82,7 @@ export function useAuthFlow({
   const storage = useStorage()
   const [oauthState, setOauthState] = useState<OAuthState | null>(null)
   const [apiKeySetup, setApiKeySetup] = useState<ApiKeySetupState | null>(null)
-  const [showLocalSetup, setShowLocalSetup] = useState(false)
+  const [endpointSetup, setEndpointSetup] = useState<EndpointSetupState | null>(null)
   const [showAuthMethodOverlay, setShowAuthMethodOverlay] = useState(false)
   const [authMethodProvider, setAuthMethodProvider] = useState<ProviderDefinition | null>(null)
 
@@ -199,13 +205,14 @@ export function useAuthFlow({
         onMessage('Run gcloud auth application-default login, or set GOOGLE_APPLICATION_CREDENTIALS to your service account key file path, then restart Magnitude.')
       }
     } else if (method.type === 'none') {
-      if (provider.id === 'local') {
-        setShowLocalSetup(true)
-      } else {
-        await reload()
-        showEphemeral(`Connected ${provider.name}`, theme.success)
-        onAuthSuccess(provider.id, provider.name)
-      }
+      const existing = await storage.config.getProviderOptions(provider.id)
+      setEndpointSetup({
+        provider,
+        initialOptions: {
+          baseUrl: existing?.baseUrl,
+          modelId: typeof existing?.modelId === 'string' ? existing.modelId : undefined,
+        },
+      })
     }
   }, [showEphemeral, theme.success, theme.error, onAuthSuccess, onMessage, storage, reload])
 
@@ -243,22 +250,44 @@ export function useAuthFlow({
     writeTextToClipboard(oauthState.url)
   }, [oauthState])
 
-  const handleLocalSetupSubmit = useCallback(async (config: { url: string; modelId: string; apiKey?: string }) => {
-    setShowLocalSetup(false)
-    if (config.apiKey) {
-      await storage.auth.set('local', { type: 'api' as const, key: config.apiKey })
-      trackProviderConnected({ providerId: 'local', authType: 'api' })
-    } else {
-      trackProviderConnected({ providerId: 'local', authType: 'none' })
-    }
-    await storage.config.setLocalProviderConfig({ baseUrl: config.url, modelId: config.modelId })
-    await reload()
-    showEphemeral(`Connected to local model: ${config.modelId}`, theme.success)
-    onAuthSuccess('local', 'Local')
-  }, [showEphemeral, theme.success, onAuthSuccess, storage, reload])
+  const handleEndpointSetupSubmit = useCallback(async (config: { providerId: string; url: string; modelId?: string; apiKey?: string }) => {
+    const provider = getProvider(config.providerId)
+    setEndpointSetup(null)
 
-  const handleLocalSetupCancel = useCallback(() => {
-    setShowLocalSetup(false)
+    if (config.apiKey) {
+      await storage.auth.set(config.providerId, { type: 'api' as const, key: config.apiKey })
+      trackProviderConnected({ providerId: config.providerId, authType: 'api' })
+    } else {
+      trackProviderConnected({ providerId: config.providerId, authType: 'none' })
+    }
+
+    await storage.config.updateFull((current) => {
+      const existing = current.providers?.[config.providerId] ?? {}
+      const rememberedRaw = (existing as any).rememberedModelIds
+      const remembered = Array.isArray(rememberedRaw) ? rememberedRaw.filter((id): id is string => typeof id === 'string') : []
+      return {
+        ...current,
+        providers: {
+          ...(current.providers ?? {}),
+          [config.providerId]: {
+            ...existing,
+            baseUrl: config.url,
+            ...(config.modelId ? { modelId: config.modelId } : {}),
+            ...(config.modelId ? { rememberedModelIds: Array.from(new Set([...remembered, config.modelId])) } : {}),
+          },
+        },
+      }
+    })
+
+    await runtime.catalog.refresh()
+    await reload()
+    const providerName = provider?.name ?? config.providerId
+    showEphemeral(`Connected ${providerName}`, theme.success)
+    onAuthSuccess(config.providerId, providerName)
+  }, [showEphemeral, theme.success, onAuthSuccess, storage, runtime, reload])
+
+  const handleEndpointSetupCancel = useCallback(() => {
+    setEndpointSetup(null)
     onAuthCancel()
   }, [onAuthCancel])
 
@@ -284,7 +313,7 @@ export function useAuthFlow({
     oauthState?.cleanup?.()
     setOauthState(null)
     setApiKeySetup(null)
-    setShowLocalSetup(false)
+    setEndpointSetup(null)
     setShowAuthMethodOverlay(false)
     setAuthMethodProvider(null)
   }, [oauthState])
@@ -292,7 +321,7 @@ export function useAuthFlow({
   return {
     oauthState,
     apiKeySetup,
-    showLocalSetup,
+    endpointSetup,
     showAuthMethodOverlay,
     authMethodProvider,
     startAuthForProvider,
@@ -305,8 +334,8 @@ export function useAuthFlow({
     handleOAuthCopyUrl,
     handleApiKeySubmit,
     handleApiKeyCancel,
-    handleLocalSetupSubmit,
-    handleLocalSetupCancel,
+    handleEndpointSetupSubmit,
+    handleEndpointSetupCancel,
     cancelAll,
   }
 }

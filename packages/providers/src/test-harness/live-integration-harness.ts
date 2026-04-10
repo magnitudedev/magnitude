@@ -1,11 +1,10 @@
 import { Effect, Layer, ManagedRuntime, Stream } from 'effect'
 import type { ChatMessage } from '@magnitudedev/llm-core'
-import type { StreamResult, CompleteResult, ExecutableDriver } from '../drivers/types'
-import { BamlDriver, ResponsesDriver } from '../drivers'
+import type { StreamResult, ExecutableDriver } from '../drivers/types'
+import { BamlDriver } from '../drivers'
 import {
   bootstrapProviderRuntime,
   CodingAgentChat,
-  GenerateChatTitle,
   makeModelResolver,
   makeProviderRuntimeLive,
   ModelResolver,
@@ -19,7 +18,7 @@ import type { Model } from '../model/model'
 import type { BoundModel } from '../model/bound-model'
 import type { TraceInput } from '../resolver/tracing'
 
-export type ExpectedDriver = 'baml' | 'openai-responses'
+export type ExpectedDriver = 'baml'
 
 export interface LiveTraceStore {
   readonly traces: TraceInput[]
@@ -43,10 +42,8 @@ export interface LiveHarness {
   getLiveTargets(): Promise<LiveTestTarget[]>
   resolveSlot(slot: string): Promise<ResolvedLiveTarget>
   resolveTarget(target: LiveTestTarget): Promise<ResolvedLiveTarget>
-  runBoundGenerateChatTitle(bound: BoundModel): Promise<{ title: string } | null>
   runBoundCodingAgentChat(bound: BoundModel): Promise<{ text: string; usage: CallUsage | null }>
   connectExpectedDriver(target: LiveTestTarget): Promise<{ driver: ExecutableDriver; connection: ResolvedLiveTarget['bound']['connection'] }>
-  runDriverGenerateChatTitle(target: LiveTestTarget): Promise<CompleteResult<{ title: string } | null>>
   runDriverCodingAgentChat(target: LiveTestTarget): Promise<{ text: string; usage: CallUsage | null; collectorData: StreamResult['getCollectorData'] extends () => infer T ? T : never }>
 }
 
@@ -62,17 +59,8 @@ export function getLiveProviderTestSkipReason(): string | null {
     : 'Set MAGNITUDE_RUN_LIVE_PROVIDER_TESTS=1 to run live provider integration tests'
 }
 
-export function expectedDriverForSelection(model: Model, auth: AuthInfo | null): ExpectedDriver {
-  const isCodex = model.providerId === 'openai' && auth?.type === 'oauth'
-  const isCopilotCodex = model.providerId === 'github-copilot' && model.id.includes('codex')
-  return (isCodex || isCopilotCodex) ? 'openai-responses' : 'baml'
-}
-
-export function makeGenerateChatTitleInput() {
-  return {
-    conversation: 'User: hello\nAssistant: hi\nUser: summarize tracing bug',
-    defaultName: 'New Chat',
-  }
+export function expectedDriverForSelection(_model: Model, _auth: AuthInfo | null): ExpectedDriver {
+  return 'baml'
 }
 
 export function makeCodingAgentChatInput(): {
@@ -87,8 +75,8 @@ export function makeCodingAgentChatInput(): {
   }
 }
 
-function driverForExpected(expectedDriver: ExpectedDriver): ExecutableDriver {
-  return expectedDriver === 'openai-responses' ? ResponsesDriver : BamlDriver
+function driverForExpected(_expectedDriver: ExpectedDriver): ExecutableDriver {
+  return BamlDriver
 }
 
 function makeTraceStore(): LiveTraceStore {
@@ -165,10 +153,6 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
     return resolveSlot(target.slot)
   }
 
-  async function runBoundGenerateChatTitle(bound: BoundModel) {
-    return runtime.runPromise(bound.invoke(GenerateChatTitle, makeGenerateChatTitleInput()))
-  }
-
   async function runBoundCodingAgentChat(bound: BoundModel): Promise<{ text: string; usage: CallUsage | null }> {
     const chatStream = await runtime.runPromise(bound.invoke(CodingAgentChat, makeCodingAgentChatInput()))
     const text = await runtime.runPromise(Stream.runFold(chatStream.stream, '', (acc, chunk) => acc + chunk))
@@ -181,22 +165,6 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
     return { driver, connection }
   }
 
-  async function runDriverGenerateChatTitle(target: LiveTestTarget) {
-    const { driver, connection } = await connectExpectedDriver(target)
-    const input = makeGenerateChatTitleInput()
-    return runtime.runPromise(
-      driver.complete<{ title: string } | null>({
-        slot: target.slot,
-        functionName: 'GenerateChatTitle',
-        args: [input.conversation, input.defaultName, false],
-        connection,
-        model: target.model,
-        inference: {},
-        providerOptions: undefined,
-      }),
-    )
-  }
-
   async function runDriverCodingAgentChat(target: LiveTestTarget): Promise<{ text: string; usage: CallUsage | null; collectorData: ReturnType<StreamResult['getCollectorData']> }> {
     const { driver, connection } = await connectExpectedDriver(target)
     const input = makeCodingAgentChatInput()
@@ -204,7 +172,7 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
       driver.stream({
         slot: target.slot,
         functionName: 'CodingAgentChat',
-        args: [input.systemPrompt, input.messages, input.ackTurn, false],
+        args: [input.systemPrompt, input.messages, input.ackTurn, false, true],
         connection,
         model: target.model,
         inference: {},
@@ -221,10 +189,8 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
     getLiveTargets,
     resolveSlot,
     resolveTarget,
-    runBoundGenerateChatTitle,
     runBoundCodingAgentChat,
     connectExpectedDriver,
-    runDriverGenerateChatTitle,
     runDriverCodingAgentChat,
   }
 }

@@ -57,10 +57,9 @@ export type {
   ParseErrorDetail,
   StructuralParseErrorDetail,
   UnclosedThinkDetail,
-  UnclosedContainerDetail,
+
   FinishWithoutEvidenceDetail,
   TurnControlConflictDetail,
-  UnclosedActionsDetail,
 } from './format/types'
 
 // Core types — results
@@ -118,7 +117,8 @@ export { buildOutputTree, outputToText, outputToDOM, outputFromDOM } from './out
 export type { OutputNode } from './output-tree'
 
 // Stream guard
-export { guardStream, guardEffectStream } from './stream-guard'
+
+export { END_TURN_STOP_SEQUENCE } from './constants'
 
 // Parser
 export { createStreamingXmlParser, createParser, defaultIdGenerator } from './parser'

@@ -34,7 +34,8 @@ export const webFetchDisplay = createToolDisplay<WebFetchState>({
           <span style={{ fg: theme.error }}>{'✗  '}</span>
           <span style={{ fg: theme.foreground }}>{'Fetch '}</span>
           <span style={{ fg: theme.muted }}>{truncate(state.url ?? '', 60)}</span>
-          <span style={{ fg: theme.error }}>{` · Error${errorMsg ? ` (${truncate(errorMsg, 80)})` : ''}`}</span>
+          <span style={{ fg: theme.error }}>{' · Error'}</span>
+          {errorMsg ? <span style={{ fg: theme.muted }}>{` (${truncate(errorMsg, 80)})`}</span> : null}
         </text>
       );
     }

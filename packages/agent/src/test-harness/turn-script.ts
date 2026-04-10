@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Ref } from 'effect'
+import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 
 export interface ScriptGate {
   wait(): Promise<void>
@@ -75,7 +76,7 @@ interface MockTurnScriptState {
 }
 
 const defaultFrame: MockTurnResponse = {
-  xml: '<comms><message to="user">ok</message></comms><yield/>',
+  xml: `<message>ok</message>${TURN_CONTROL_IDLE}`,
 }
 
 const initialState: MockTurnScriptState = {

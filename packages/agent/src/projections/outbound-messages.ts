@@ -7,10 +7,12 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentRoutingProjection, getRoutingEntryByForkId } from './agent-routing'
+import { TaskGraphProjection } from './task-graph'
+import type { MessageDestination } from '../events'
 
 export interface PendingOutboundMessage {
   readonly forkId: string | null
-  readonly dest: string
+  readonly destination: MessageDestination
   readonly text: string
 }
 
@@ -21,14 +23,16 @@ export interface OutboundMessagesState {
 export interface OutboundMessageCompletedSignal {
   readonly id: string
   readonly forkId: string | null
-  readonly dest: string
+  readonly destination: MessageDestination
   readonly text: string
   readonly targetForkId: string | null | undefined
+  readonly userFacing: boolean
+  readonly timestamp: number
 }
 
 export const OutboundMessagesProjection = Projection.define<AppEvent, OutboundMessagesState>()({
   name: 'OutboundMessages',
-  reads: [AgentRoutingProjection] as const,
+  reads: [AgentRoutingProjection, TaskGraphProjection] as const,
 
   initial: {
     pendingMessages: new Map(),
@@ -41,7 +45,11 @@ export const OutboundMessagesProjection = Projection.define<AppEvent, OutboundMe
   eventHandlers: {
     message_start: ({ event, state }) => {
       const pendingMessages = new Map(state.pendingMessages)
-      pendingMessages.set(event.id, { forkId: event.forkId, dest: event.dest, text: '' })
+      pendingMessages.set(event.id, {
+        forkId: event.forkId,
+        destination: event.destination,
+        text: '',
+      })
       return { ...state, pendingMessages }
     },
 
@@ -62,20 +70,38 @@ export const OutboundMessagesProjection = Projection.define<AppEvent, OutboundMe
       pendingMessages.delete(event.id)
 
       const agentState = read(AgentRoutingProjection)
-      const targetForkId = entry.dest === 'user'
-        ? null
-        : entry.dest === 'parent'
-          ? entry.forkId === null
-            ? null
-            : getRoutingEntryByForkId(agentState, entry.forkId)?.parentForkId
-          : agentState.agents.get(entry.dest)?.forkId
+      const taskGraph = read(TaskGraphProjection)
+
+      let targetForkId: string | null | undefined
+      let userFacing: boolean
+
+      switch (entry.destination.kind) {
+        case 'user':
+          targetForkId = null
+          userFacing = true
+          break
+        case 'parent':
+          targetForkId = entry.forkId !== null
+            ? getRoutingEntryByForkId(agentState, entry.forkId)?.parentForkId ?? null
+            : null
+          userFacing = false
+          break
+        case 'worker': {
+          const workerAgentId = taskGraph.tasks.get(entry.destination.taskId)?.worker?.agentId
+          targetForkId = workerAgentId ? agentState.agents.get(workerAgentId)?.forkId : undefined
+          userFacing = false
+          break
+        }
+      }
 
       emit.messageCompleted({
         id: event.id,
         forkId: entry.forkId,
-        dest: entry.dest,
+        destination: entry.destination,
         text: entry.text,
         targetForkId,
+        userFacing,
+        timestamp: event.timestamp,
       })
 
       return { ...state, pendingMessages }

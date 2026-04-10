@@ -103,7 +103,7 @@ export function selectLatestLiveActivityFromMessages(
   return null
 }
 
-export function selectLatestLiveActivityForSubagentTab(
+export function selectLatestLiveActivityForTask(
   messages: readonly DisplayMessage[],
 ): string | null {
   return selectLatestLiveActivityFromMessages(messages)
