@@ -14,10 +14,10 @@
  * to interrupt and remove a fork fiber when a terminal event occurs.
  */
 
-import { Effect, Context, Layer, Stream, PubSub, Queue, Ref, Fiber, Scope, Cause } from 'effect'
+import { Effect, Context, Layer, Stream, PubSub, Queue, Ref, Fiber, Cause } from 'effect'
 import { WorkerBusTag, type WorkerBusService } from '../core/worker-bus'
 import { HydrationContext } from '../core/hydration-context'
-import { InterruptPubSub } from '../core/interrupt-pubsub'
+import { InterruptCoordinator } from '../core/interrupt-coordinator'
 import { extractForkIdFromEvent, extractForkIdFromSignal } from './util'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import { Signal, type SignalValue } from '../signal/define'
@@ -108,7 +108,7 @@ export interface ForkedWorkerResult<
     void,
     never,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ExtractHandlerRequirements<THandlers> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
+    ExtractHandlerRequirements<THandlers> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<any> | FrameworkErrorReporterService
   >
 }
 
@@ -119,7 +119,6 @@ export interface ForkedWorkerResult<
 interface ForkFiber<TEvent> {
   readonly fiber: Fiber.RuntimeFiber<void, never>
   readonly queue: Queue.Queue<TEvent>
-  readonly interruptPubSub: PubSub.PubSub<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +173,7 @@ export function defineForked<TEvent extends ForkableEvent>() {
     const Live = Layer.scoped(Tag, Effect.gen(function* () {
       const bus = yield* BusTag
       const hydration = yield* HydrationContext
-      const globalInterruptPubSub = yield* InterruptPubSub
+      const interruptCoordinator = yield* InterruptCoordinator
       const reporter = yield* FrameworkErrorReporter
 
       if (yield* hydration.isHydrating()) {
@@ -183,43 +182,17 @@ export function defineForked<TEvent extends ForkableEvent>() {
 
       const publish: PublishFn<TEvent> = (event) => bus.publish(event)
 
-      // Helper for signal handlers: race against per-fork interrupt + global interrupt
-      const withInterrupt = <A, RH>(handler: Effect.Effect<A, never, RH>, targetForkId: string | null) =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const fibers = yield* Ref.get(forkFibers)
-            const forkFiber = targetForkId !== null ? fibers.get(targetForkId) : null
-            const globalQueue = yield* PubSub.subscribe(globalInterruptPubSub)
-
-            const globalInterrupt = Stream.fromQueue(globalQueue).pipe(
-              Stream.filter((interruptForkId) => interruptForkId === targetForkId),
-              Stream.take(1),
-              Stream.runDrain,
-              Effect.flatMap(() => Effect.interrupt)
-            )
-
-            if (forkFiber) {
-              const forkQueue = yield* PubSub.subscribe(forkFiber.interruptPubSub)
-              return yield* Effect.raceFirst(
-                handler,
-                Effect.raceFirst(
-                  Stream.fromQueue(forkQueue).pipe(
-                    Stream.take(1),
-                    Stream.runDrain,
-                    Effect.flatMap(() => Effect.interrupt)
-                  ),
-                  globalInterrupt
-                )
-              )
-            }
-
-            return yield* Effect.raceFirst(handler, globalInterrupt)
-          })
-        )
-
-      // Capture the layer scope so fork fibers can be attached to it
-      // even when spawned from inside stream callbacks
-      const layerScope = yield* Effect.scope
+      const withInterrupt = <A, RH>(
+        handler: Effect.Effect<A, never, RH>,
+        targetForkId: string | null
+      ) =>
+        Effect.gen(function* () {
+          const baseline = yield* interruptCoordinator.current(targetForkId)
+          return yield* Effect.raceFirst(
+            handler,
+            interruptCoordinator.waitForInterrupt(targetForkId, baseline)
+          )
+        })
 
       // Track active fork fibers: forkId → ForkFiber
       const forkFibers = yield* Ref.make<Map<string | null, ForkFiber<TEvent>>>(new Map())
@@ -254,43 +227,14 @@ export function defineForked<TEvent extends ForkableEvent>() {
 
       const spawnForkFiber = (forkId: string | null) =>
         Effect.gen(function* () {
-          // Create per-fork event queue and interrupt PubSub
           const forkQueue = yield* Queue.unbounded<TEvent>()
-          const forkInterruptPubSub = yield* PubSub.unbounded<void>()
-
-          // Helper: wrap handler with per-fork interrupt + global interrupt racing
-          const withInterrupt = <A, RH>(handler: Effect.Effect<A, never, RH>) =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const forkInterruptQueue = yield* PubSub.subscribe(forkInterruptPubSub)
-                const globalQueue = yield* PubSub.subscribe(globalInterruptPubSub)
-                return yield* Effect.raceFirst(
-                  handler,
-                  Effect.raceFirst(
-                    // Per-fork interrupt (from fork_completed lifecycle)
-                    Stream.fromQueue(forkInterruptQueue).pipe(
-                      Stream.take(1),
-                      Stream.runDrain,
-                      Effect.flatMap(() => Effect.interrupt)
-                    ),
-                    // Global interrupt — only if targeting THIS fork
-                    Stream.fromQueue(globalQueue).pipe(
-                      Stream.filter((interruptForkId) => interruptForkId === forkId),
-                      Stream.take(1),
-                      Stream.runDrain,
-                      Effect.flatMap(() => Effect.interrupt)
-                    )
-                  )
-                )
-              })
-            )
+          if (forkId !== null) {
+            yield* interruptCoordinator.beginExecution(forkId)
+          }
 
           const read = makeWorkerReadFn<TEvent>(forkId)
 
-          // Spawn fiber that consumes from the per-fork queue.
-          // Use Scope.extend to attach to the layer scope so the fiber
-          // survives even when spawned from inside a stream callback.
-          const fiber = yield* Effect.forkIn(
+          const fiber = yield* Effect.forkScoped(
             Stream.runForEach(
               Stream.fromQueue(forkQueue),
               (event) => {
@@ -319,13 +263,15 @@ export function defineForked<TEvent extends ForkableEvent>() {
                   return withErrorBoundary(handlerEffect)
                 }
 
-                return withErrorBoundary(withInterrupt(handlerEffect))
+                return withErrorBoundary(withInterrupt(handlerEffect, forkId))
               }
-            ),
-            layerScope
+            )
           )
 
-          const forkFiberEntry: ForkFiber<TEvent> = { fiber, queue: forkQueue, interruptPubSub: forkInterruptPubSub }
+          // beginExecution is fork-lifecycle-scoped, but interrupt baselines are
+          // invocation-scoped. The root fork is long-lived, so each handler run must
+          // read the current baseline immediately before racing against interrupts.
+          const forkFiberEntry: ForkFiber<TEvent> = { fiber, queue: forkQueue }
           yield* Ref.update(forkFibers, (m) => new Map(m).set(forkId, forkFiberEntry))
           return forkFiberEntry
         })
@@ -408,7 +354,6 @@ export function defineForked<TEvent extends ForkableEvent>() {
                 const fibers = yield* Ref.get(forkFibers)
                 const forkFiber = fibers.get(forkId)
                 if (forkFiber) {
-                  yield* PubSub.publish(forkFiber.interruptPubSub, undefined)
                   yield* Fiber.interrupt(forkFiber.fiber)
                   yield* Ref.update(forkFibers, (m) => {
                     const newMap = new Map(m)
@@ -442,7 +387,7 @@ export function defineForked<TEvent extends ForkableEvent>() {
     }))
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    type LayerInput = ExtractHandlerRequirements<THandlers> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
+    type LayerInput = ExtractHandlerRequirements<THandlers> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<any> | FrameworkErrorReporterService
 
     return {
       Tag,

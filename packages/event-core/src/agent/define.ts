@@ -2,7 +2,7 @@ import { Effect, Layer, ManagedRuntime, Stream, SubscriptionRef, PubSub, Context
 import { makeEventBusCoreLayer, type BaseEvent, type EventBusCoreService } from '../core/event-bus-core'
 import { EventSinkTag, makeEventSinkLayer, type EventSinkService } from '../core/event-sink'
 import { HydrationContext } from '../core/hydration-context'
-import { InterruptPubSub, InterruptPubSubLive } from '../core/interrupt-pubsub'
+import { InterruptCoordinatorLive } from '../core/interrupt-coordinator'
 import { makeProjectionBusLayer, ProjectionBusTag, type ProjectionBusService } from '../core/projection-bus'
 import { makeWorkerBusLayer, WorkerBusTag, type WorkerBusService } from '../core/worker-bus'
 import { type Signal } from '../signal/define'
@@ -326,7 +326,7 @@ export function define<TEvent extends BaseEvent>() {
     // FrameworkErrorReporterLive depends on FrameworkErrorPubSubLive — must be explicitly wired
     // (Layer.mergeAll only merges outputs, it does NOT provide one layer's output as another's input at runtime)
     const FrameworkErrorReporterProvided = Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive)
-    const CoreDeps = Layer.mergeAll(HydrationContext.Default, makeEventSinkLayer<TEvent>(), InterruptPubSubLive, FrameworkErrorPubSubLive, FrameworkErrorReporterProvided)
+    const CoreDeps = Layer.mergeAll(HydrationContext.Default, makeEventSinkLayer<TEvent>(), InterruptCoordinatorLive, FrameworkErrorPubSubLive, FrameworkErrorReporterProvided)
     const WithProjectionBus = Layer.provideMerge(ProjectionBusLayer, CoreDeps)
     const WithEventBusCore = Layer.provideMerge(EventBusCoreLayer, WithProjectionBus)
     const WithWorkerBus = Layer.provideMerge(WorkerBusLayer, WithEventBusCore)

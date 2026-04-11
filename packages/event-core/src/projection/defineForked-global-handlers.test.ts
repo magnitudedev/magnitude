@@ -152,8 +152,8 @@ describe('defineForked global handlers + cross-fork read', () => {
       await client.send({ type: 'seed', forkId: 'a', value: 9 })
       await client.send({ type: 'hit', forkId: null, value: 0 })
 
-      expect(observed?.forks.get(null)).toEqual({ value: 7 })
-      expect(observed?.forks.get('a')).toEqual({ value: 9 })
+      expect((observed as ForkedState<{ value: number }> | null)?.forks.get(null)).toEqual({ value: 7 })
+      expect((observed as ForkedState<{ value: number }> | null)?.forks.get('a')).toEqual({ value: 9 })
     } finally {
       await client.dispose()
     }
@@ -219,7 +219,7 @@ describe('defineForked global handlers + cross-fork read', () => {
       initial: { count: 0 },
       signalHandlers: (on) => [
         on(Signaller.signals.pong, ({ value, state }) => {
-          seen.push(value.msg)
+          seen.push((value as { msg: string; timestamp: number }).msg)
           return { count: state.count + 1 }
         }),
       ],

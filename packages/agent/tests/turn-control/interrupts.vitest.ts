@@ -14,6 +14,18 @@ import {
   mkTurnStarted,
 } from './helpers'
 
+const mkUserMessage = (id: string, text: string): Extract<AppEvent, { type: 'user_message' }> => ({
+  type: 'user_message',
+  messageId: id,
+  forkId: null,
+  timestamp: Date.now(),
+  content: [{ type: 'text', text }],
+  attachments: [],
+  mode: 'text',
+  synthetic: false,
+  taskMode: false,
+})
+
 describe('turn control interrupts', () => {
   it.live('interrupt clears current turn state', () =>
     Effect.gen(function* () {
@@ -69,50 +81,129 @@ describe('turn control interrupts', () => {
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('root interrupt clears communication trigger, preserves buffered message, and later wake consumes it', () =>
+  it.live('fresh user message after interrupted completion starts a new root turn without manual wake', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      yield* h.send(mkTurnStarted({ turnId: 't-int-msg-1', chainId: 'c-int-msg' }))
-      yield* h.user('buffered after interrupt')
-
-      const beforeInterrupt = yield* h.projectionFork(TurnProjection.Tag, null)
-      expect(beforeInterrupt.pendingInboundCommunications).toHaveLength(1)
-      expect(beforeInterrupt.pendingInboundCommunications[0]?.content).toBe('buffered after interrupt')
-      expect(beforeInterrupt.triggers).toEqual([{ _tag: 'communication' }])
-
+      yield* h.send(mkTurnStarted({ turnId: 't-fresh-1', chainId: 'c-fresh-1' }))
       yield* h.send({ type: 'interrupt', forkId: null })
-
-      const interrupting = yield* h.projectionFork(TurnProjection.Tag, null)
-      expect(interrupting._tag).toBe('interrupting')
-      expect(interrupting.triggers).toEqual([])
-      expect(interrupting.pendingInboundCommunications).toHaveLength(1)
-
       yield* h.send(mkTurnCompletedFailure({
-        turnId: 't-int-msg-1',
-        chainId: 'c-int-msg',
+        turnId: 't-fresh-1',
+        chainId: 'c-fresh-1',
         result: { success: false, error: 'interrupted', cancelled: true },
       }))
 
-      const afterCancel = yield* h.projectionFork(TurnProjection.Tag, null)
-      expect(afterCancel._tag).toBe('idle')
-      expect(afterCancel.triggers).toEqual([])
-      expect(afterCancel.pendingInboundCommunications).toHaveLength(1)
-      expect(afterCancel.pendingInboundCommunications[0]?.content).toBe('buffered after interrupt')
+      yield* h.send(mkUserMessage('msg-fresh-after-cancel', 'new instruction after cancel'))
 
-      const turnStartedEventsAfterCancel = eventsForFork(h, null).filter((event) => event.type === 'turn_started')
-      expect(turnStartedEventsAfterCancel.map((event) => event.turnId)).toEqual(['t-int-msg-1'])
-
-      yield* h.send({ type: 'wake', forkId: null })
-      const resumed = yield* h.wait.event('turn_started', (event) => event.forkId === null && event.turnId !== 't-int-msg-1')
+      const resumed = yield* h.wait.event(
+        'turn_started',
+        (event) => event.forkId === null && event.turnId !== 't-fresh-1',
+      )
 
       const activeAgain = yield* h.projectionFork(TurnProjection.Tag, null)
       if (activeAgain._tag !== 'active') {
-        expect.fail(`expected resumed root fork to be active, got ${activeAgain._tag}`)
+        expect.fail(`expected fresh root turn to be active, got ${activeAgain._tag}`)
       }
+
       expect(activeAgain.turnId).toBe(resumed.turnId)
       expect(activeAgain.currentTurnAllowsDirectUserReply).toBe(true)
-      expect(activeAgain.pendingInboundCommunications).toHaveLength(0)
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('user message received during interrupt is accepted and does not wedge later root progress', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+
+      yield* h.send(mkTurnStarted({ turnId: 't-buffer-1', chainId: 'c-buffer-1' }))
+      yield* h.send({ type: 'interrupt', forkId: null })
+      yield* h.send(mkUserMessage('msg-buffered', 'resume with this'))
+
+      const stillInterrupting = yield* h.projectionFork(TurnProjection.Tag, null)
+      expect(stillInterrupting._tag).toBe('interrupting')
+      expect(stillInterrupting.pendingInboundCommunications).toHaveLength(1)
+      expect(stillInterrupting.pendingInboundCommunications[0]?.content).toBe('resume with this')
+
+      yield* h.send(mkTurnCompletedFailure({
+        turnId: 't-buffer-1',
+        chainId: 'c-buffer-1',
+        result: { success: false, error: 'interrupted', cancelled: true },
+      }))
+
+      const nextTurn = yield* h.wait.event(
+        'turn_started',
+        (event) => event.forkId === null && event.turnId !== 't-buffer-1',
+      )
+
+      const root = yield* h.projectionFork(TurnProjection.Tag, null)
+      if (root._tag !== 'active') {
+        expect.fail(`expected root turn to be active after interrupted completion, got ${root._tag}`)
+      }
+
+      expect(root.turnId).toBe(nextTurn.turnId)
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('stale completion from interrupted root turn does not block a later fresh user turn', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+
+      yield* h.send(mkTurnStarted({ turnId: 't-stale-1', chainId: 'c-stale-1' }))
+      yield* h.send({ type: 'interrupt', forkId: null })
+      yield* h.send(mkTurnCompletedFailure({
+        turnId: 't-stale-1',
+        chainId: 'c-stale-1',
+        result: { success: false, error: 'interrupted', cancelled: true },
+      }))
+
+      yield* h.send(mkTurnCompletedSuccess({
+        turnId: 't-stale-1',
+        chainId: 'c-stale-1',
+      }))
+
+      yield* h.send(mkUserMessage('msg-stale-followup', 'follow-up instruction'))
+
+      const followUp = yield* h.wait.event(
+        'turn_started',
+        (event) => event.forkId === null && event.turnId !== 't-stale-1',
+      )
+
+      const root = yield* h.projectionFork(TurnProjection.Tag, null)
+      if (root._tag !== 'active') {
+        expect.fail(`expected fresh follow-up root turn to remain active, got ${root._tag}`)
+      }
+
+      expect(root.turnId).toBe(followUp.turnId)
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('subfork completion still wakes the parent after a root interrupt', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+
+      yield* h.send({
+        type: 'agent_created',
+        forkId: 'sub-1',
+        parentForkId: null,
+        agentId: 'test-subagent',
+        message: null,
+      })
+
+      yield* h.send({ type: 'turn_started', forkId: 'sub-1', turnId: 'sub-turn-1', chainId: 'sub-chain-1' })
+      yield* h.send(mkUserMessage('msg-parent', 'parent follow-up'))
+      yield* h.send({ type: 'interrupt', forkId: null })
+
+      yield* h.send(mkTurnCompletedSuccess({
+        forkId: 'sub-1',
+        turnId: 'sub-turn-1',
+        chainId: 'sub-chain-1',
+      }))
+
+      const parentWake = yield* h.wait.event(
+        'turn_started',
+        (event) => event.forkId === null,
+      )
+
+      expect(parentWake.forkId).toBeNull()
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

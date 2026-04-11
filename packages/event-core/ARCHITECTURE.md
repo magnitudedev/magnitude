@@ -55,7 +55,7 @@ graph TB
         WB[WorkerBus]
         ES[EventSink]
         HC[HydrationContext]
-        IPS[InterruptPubSub]
+        IPS[InterruptCoordinator]
     end
 
     subgraph "Application Layer"
@@ -100,7 +100,7 @@ graph LR
     subgraph "Service Dependencies"
         HC[HydrationContext]
         ES[EventSink]
-        IPS[InterruptPubSub]
+        IPS[InterruptCoordinator]
 
         HC --> EBCL
         ES --> EBCL
@@ -145,7 +145,7 @@ publish: (event: E) => Effect.gen(function* () {
 
   // Broadcast interrupt before persistence
   if (event.type === 'interrupt') {
-    yield* PubSub.publish(interruptPubSub, undefined)
+    yield* PubSub.publish(interruptCoordinator, undefined)
   }
 
   // Persist and broadcast
@@ -259,14 +259,14 @@ When `isHydrating = true`:
 - Workers are NOT started
 - Projections still process events (to rebuild state)
 
-### InterruptPubSub
+### InterruptCoordinator
 
-**Location:** `src/core/interrupt-pubsub.ts`
+**Location:** `src/core/interrupt-coordinator.ts`
 
 Broadcast channel for interrupt signals:
 
 ```typescript
-const InterruptPubSub = Context.GenericTag<PubSub.PubSub<void>>('InterruptPubSub')
+const InterruptCoordinator = Context.GenericTag<PubSub.PubSub<void>>('InterruptCoordinator')
 ```
 
 Workers race their handlers against this signal for automatic interruption.
@@ -823,7 +823,7 @@ graph TB
         subgraph "Core Deps"
             HC[HydrationContext]
             ES[EventSink]
-            IPS[InterruptPubSub]
+            IPS[InterruptCoordinator]
         end
 
         subgraph "Bus Stack"
@@ -870,7 +870,7 @@ const AppLayer = Layer.provideMerge(
 ```
 
 **Build order:**
-1. CoreDeps (HydrationContext, EventSink, InterruptPubSub)
+1. CoreDeps (HydrationContext, EventSink, InterruptCoordinator)
 2. ProjectionBus
 3. EventBusCore (depends on ProjectionBus + CoreDeps)
 4. WorkerBus (depends on EventBusCore)
@@ -1058,13 +1058,13 @@ const MyDisplay = Display.define({
 
 ### Interrupt System
 
-**Location:** `src/core/interrupt-pubsub.ts`, `src/worker/define.ts`
+**Location:** `src/core/interrupt-coordinator.ts`, `src/worker/define.ts`
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant EBC as EventBusCore
-    participant IPS as InterruptPubSub
+    participant IPS as InterruptCoordinator
     participant W1 as Worker1 Handler
     participant W2 as Worker2 Handler
 
@@ -1088,7 +1088,7 @@ sequenceDiagram
 const withInterrupt = <A, RH>(handler: Effect.Effect<A, never, RH>) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const queue = yield* PubSub.subscribe(interruptPubSub)
+      const queue = yield* PubSub.subscribe(interruptCoordinator)
       return yield* Effect.raceFirst(
         handler,
         Stream.fromQueue(queue).pipe(
