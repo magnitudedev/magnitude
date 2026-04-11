@@ -252,7 +252,7 @@ describe('memory tool results', () => {
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('noop result emitted after assistant turn and empty flush', () =>
+  it.live('successful no-action turn emits no-tools notice instead of noop', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -262,10 +262,12 @@ describe('memory tool results', () => {
 
       const memory = yield* getRootMemory(h)
       const inbox = lastInboxMessage(memory)
+      const text = renderedUserTextFromMemory(memory.messages)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'noop')).toBe(true)
+        expect(inbox.results.some(r => r.kind === 'noop')).toBe(false)
       }
+      expect(text).toContain('(no tools or messages were used this turn)')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -523,6 +525,39 @@ describe('memory tool results', () => {
       expect(text).toContain('Invalid tool input: missing required attribute "path".')
       expect(text).toContain('Invalid tool input: unknown attribute "foo".')
       expect(text.match(/Correct tool shape:/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('text-only turns emit no-tools-or-messages notice', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-text-only', chainId: 'c-1' })
+      yield* h.send(turnCompletedEvent('t-text-only'))
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-after-text-only', chainId: 'c-1' })
+
+      const memory = yield* getRootMemory(h)
+      const text = renderedUserTextFromMemory(memory.messages)
+
+      expect(text).toContain('(no tools or messages were used this turn)')
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('no-content turn result includes no-tools-or-messages notice', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-empty', chainId: 'c-1' })
+      yield* h.send(turnCompletedEvent('t-empty'))
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-after-empty', chainId: 'c-1' })
+
+      const memory = yield* getRootMemory(h)
+      const inbox = lastInboxMessage(memory)
+      const text = renderedUserTextFromMemory(memory.messages)
+
+      expect(text).toContain('(no tools or messages were used this turn)')
+      expect(text).not.toContain('<noop>')
+      expect(inbox?.type).toBe('inbox')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 

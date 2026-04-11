@@ -64,4 +64,19 @@ describe('formatResults', () => {
       },
     ] satisfies ContentPart[])
   })
+
+  test('formats no-tools-or-messages notice as plain text result content', () => {
+    const output = formatResults([
+      {
+        kind: 'no_tools_or_messages',
+      },
+    ])
+
+    expect(output).toEqual([
+      {
+        type: 'text',
+        text: '\n(no tools or messages were used this turn)',
+      },
+    ] satisfies ContentPart[])
+  })
 })

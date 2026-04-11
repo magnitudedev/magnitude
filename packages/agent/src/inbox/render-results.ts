@@ -60,6 +60,11 @@ export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
       continue
     }
 
+    if (item.kind === 'no_tools_or_messages') {
+      builder.pushText('\n(no tools or messages were used this turn)')
+      continue
+    }
+
     builder.pushText(formatMessageAck(item))
   }
 

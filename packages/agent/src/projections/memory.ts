@@ -676,7 +676,19 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       let nextFork: ForkMemoryState = { ...fork, messages: newMessages, currentTurnId: null }
 
-      if (!hasAssistantContent && !isCancelled && event.result.success && fork.pendingResultItems.length === 0) {
+      if (fork.pendingResultItems.length === 0 && !isCancelled && event.result.success) {
+        nextFork = {
+          ...nextFork,
+          pendingResultItems: [
+            ...nextFork.pendingResultItems,
+            { kind: 'no_tools_or_messages' },
+          ],
+        }
+      }
+
+      const hasSubstantivePendingResults = nextFork.pendingResultItems.some(item => item.kind !== 'no_tools_or_messages')
+
+      if (!hasAssistantContent && !isCancelled && event.result.success && !hasSubstantivePendingResults) {
         nextFork = {
           ...nextFork,
           messages: [
@@ -694,10 +706,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       const hasError = !event.result.success
       const errorMessage = hasError && 'error' in event.result ? event.result.error : undefined
-      if (fork.pendingResultItems.length > 0) {
+      if (nextFork.pendingResultItems.length > 0) {
         nextFork = enqueueResult(
           nextFork,
-          toResultTurnResults({ items: fork.pendingResultItems }),
+          toResultTurnResults({ items: nextFork.pendingResultItems }),
           event.timestamp,
         )
       }

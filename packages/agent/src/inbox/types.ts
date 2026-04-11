@@ -102,10 +102,15 @@ export type MessageAckResultItem = {
   readonly chars: number
 }
 
+export type NoToolsOrMessagesResultItem = {
+  readonly kind: 'no_tools_or_messages'
+}
+
 export type TurnResultItem =
   | ToolErrorResultItem
   | ToolObservationResultItem
   | MessageAckResultItem
+  | NoToolsOrMessagesResultItem
 
 export type ResultEntry =
   | { readonly kind: 'turn_results'; readonly items: readonly TurnResultItem[] }
