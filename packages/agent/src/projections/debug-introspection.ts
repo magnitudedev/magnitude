@@ -6,6 +6,7 @@
  */
 
 import { Effect, Stream, SubscriptionRef } from 'effect'
+import { AmbientServiceTag } from '@magnitudedev/event-core'
 import { DisplayProjection } from './display'
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection } from './agent-status'
@@ -15,7 +16,8 @@ import { CompactionProjection } from './compaction'
 
 import { SessionContextProjection } from './session-context'
 import { ReplayProjection } from './replay'
-import { getContextLimits } from '../constants'
+import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
+import { getSlotForFork } from '../agents'
 
 // =============================================================================
 // Types
@@ -74,7 +76,7 @@ function resolveProjections() {
 function buildSnapshot(
   forkId: string | null,
   projs: ResolvedProjections
-): Effect.Effect<DebugSnapshot> {
+) {
   return Effect.gen(function* () {
     const timestamp = Date.now()
 
@@ -109,7 +111,9 @@ function buildSnapshot(
 
     let contextUsage: ContextUsage | undefined
     if (memoryForkState && compactionForkState) {
-      const limits = getContextLimits()
+      const ambientService = yield* AmbientServiceTag
+      const configState = ambientService.getValue(ConfigAmbient)
+      const limits = getSlotConfig(configState, getSlotForFork(statusState, forkId))
       contextUsage = {
         currentTokens: compactionForkState.tokenEstimate,
         hardCap: limits.hardCap,

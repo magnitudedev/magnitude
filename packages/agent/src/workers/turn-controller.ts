@@ -13,8 +13,8 @@ import {
   type TurnTrigger,
   type ForkTurnState,
 } from '../projections/turn'
-import { CompactionProjection, type CompactionState } from '../projections/compaction'
-import { WorkflowProjection, type WorkflowCriteriaState, type WorkflowCriterion } from '../projections/workflow'
+import { CompactionProjection } from '../projections/compaction'
+import { WorkflowProjection, type WorkflowCriterion } from '../projections/workflow'
 import { createId } from '../util/id'
 
 function resolveChainId(triggers: readonly TurnTrigger[]): string | null {
@@ -58,8 +58,8 @@ export const TurnController = Worker.define<AppEvent>()({
       const workflowForks = yield* read.allForks(WorkflowProjection)
 
       for (const [forkId, turnFork] of turnForks) {
-        const compactionFork: CompactionState | undefined = compactionForks.get(forkId)
-        const workflowFork: WorkflowCriteriaState | undefined = workflowForks.get(forkId)
+        const compactionFork: import('../projections/compaction').CompactionState | undefined = compactionForks.get(forkId)
+        const workflowFork = workflowForks.get(forkId)
 
         const hasTrigger = turnFork.triggers.length > 0
         const isTurnIdle = turnFork._tag === 'idle'

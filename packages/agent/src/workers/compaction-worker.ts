@@ -18,7 +18,7 @@
  */
 
 import { Effect } from 'effect'
-import { Worker, type PublishFn, type WorkerReadFn } from '@magnitudedev/event-core'
+import { Worker, type PublishFn, type WorkerReadFn, AmbientServiceTag } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 import { type ChatMessage } from '@magnitudedev/llm-core'
 import { Image as BamlImage } from '@boundaryml/baml'
@@ -33,12 +33,14 @@ import { TurnProjection } from '../projections/turn'
 
 // ExecutionManager no longer needed — xml-act is stateless, no sandbox reset
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
-import { getAgentDefinition, type AgentVariant } from '../agents'
-import { ModelResolver, CodingAgentCompact, ProviderState } from '@magnitudedev/providers'
+import { getAgentDefinition, getSlotForFork, type AgentVariant } from '../agents'
+import { ModelResolver, CodingAgentCompact } from '@magnitudedev/providers'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
 import type { SessionContext } from '../events'
 import { withTraceScope } from '../tracing'
+import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
+
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
   return parts.map(part => {
@@ -65,7 +67,7 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
   eventHandlers: {
     turn_completed: (event, publish, read) =>
       Effect.gen(function* () {
-        const compactionState = yield* read(CompactionProjection)
+        const compactionState = (yield* read(CompactionProjection, event.forkId)) as CompactionState
         if (compactionState._tag !== 'pendingFinalization') return
         yield* finalizeCompaction(event.forkId, publish, read)
       }),
@@ -95,8 +97,8 @@ function startCompaction(
   read: WorkerReadFn<AppEvent>,
 ) {
   return Effect.gen(function* () {
-    const forkMemory: ForkMemoryState = yield* read(MemoryProjection)
-    const compactionState: CompactionState = yield* read(CompactionProjection)
+    const forkMemory: ForkMemoryState = yield* read(MemoryProjection, forkId)
+    const compactionState = (yield* read(CompactionProjection, forkId)) as CompactionState
     const sessionCtx = yield* read(SessionContextProjection)
     const timezone = sessionCtx.context?.timezone ?? null
 
@@ -108,12 +110,13 @@ function startCompaction(
       ? getAgentByForkId(agentState, forkId)!.role
       : 'lead'
     const agentDef = getAgentDefinition(variant)
-    const modelSlot = agentDef.slot
+    const modelSlot = getSlotForFork(agentState, forkId)
 
     // Calculate how many messages to compact
-    const providerState = yield* ProviderState
-    const { softCap } = yield* providerState.contextLimits(modelSlot)
-    const keepTokenBudget = softCap * KEEP_MESSAGE_RATIO
+    const ambientService = yield* AmbientServiceTag
+    const configState = ambientService.getValue(ConfigAmbient)
+    const limits = getSlotConfig(configState, modelSlot)
+    const keepTokenBudget = limits.softCap * KEEP_MESSAGE_RATIO
     let keepTokens = 0
     let keepCount = 0
 
@@ -211,7 +214,7 @@ function startCompaction(
           refreshedContext,
         })
 
-        const turnState = yield* read(TurnProjection)
+        const turnState = yield* read(TurnProjection, forkId)
         if (turnState._tag === 'idle') {
           yield* finalizeCompaction(forkId, publish, read)
         }
@@ -235,7 +238,7 @@ function finalizeCompaction(
   read: WorkerReadFn<AppEvent>
 ) {
   return Effect.gen(function* () {
-    const compactionState: CompactionState = yield* read(CompactionProjection)
+    const compactionState = (yield* read(CompactionProjection, forkId)) as CompactionState
     if (compactionState._tag !== 'pendingFinalization') return
 
     const summaryTokens = Math.ceil(compactionState.summary.length / CHARS_PER_TOKEN)

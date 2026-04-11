@@ -7,6 +7,7 @@
 import type { RoleDefinition } from '@magnitudedev/roles'
 
 import type { MagnitudeSlot } from '../model-slots'
+import type { AgentStatusState } from '../projections/agent-status'
 
 import { leadRole } from './lead'
 import { leadOneshotRole } from './lead-oneshot'
@@ -60,4 +61,14 @@ export function getAgentDefinition(variant: AgentVariant): MagnitudeRoleDef {
 
 export function getAgentSlot(variant: AgentVariant): MagnitudeSlot {
   return getAgentDefinition(variant).slot as MagnitudeSlot
+}
+
+export function getSlotForFork(agentStatus: AgentStatusState, forkId: string | null): MagnitudeSlot {
+  if (forkId === null) {
+    return getAgentSlot('lead')
+  }
+
+  const agentId = agentStatus.agentByForkId.get(forkId)!
+  const agent = agentStatus.agents.get(agentId)!
+  return getAgentSlot(agent.role)
 }

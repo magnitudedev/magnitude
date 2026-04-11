@@ -132,7 +132,12 @@ function enqueueTrigger(fork: TurnLifecycleState, trigger: TurnTrigger): TurnLif
 export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleState>()({
   name: 'Turn',
 
-  reads: [AgentRoutingProjection, UserMessageResolutionProjection, CompactionProjection, WorkflowProjection] as const,
+  reads: [
+    AgentRoutingProjection,
+    UserMessageResolutionProjection,
+    CompactionProjection,
+    WorkflowProjection,
+  ] as const,
 
   signals: {
     turnActivated: Signal.create<{ forkId: string | null; turnId: string; chainId: string }>('Turn/turnActivated'),

@@ -35,9 +35,9 @@ export type PublishFn<E extends BaseEvent> = (event: E) => Effect.Effect<void>
  */
 export type WorkerReadFn<TEvent extends BaseEvent> = {
   <TState>(projection: ProjectionResult<any, TState, any, any>): Effect.Effect<TState>
-  <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>): Effect.Effect<TForkState>
-  <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>, forkId: string | null): Effect.Effect<TForkState>
-  allForks: <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) => Effect.Effect<Map<string | null, TForkState>>
+  <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any, any>): Effect.Effect<TForkState>
+  <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any, any>, forkId: string | null): Effect.Effect<TForkState>
+  allForks: <TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any, any>) => Effect.Effect<Map<string | null, TForkState>>
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +150,7 @@ export interface WorkerResult<
  */
 function makeWorkerReadFn<TEvent extends BaseEvent>(forkId: string | null): WorkerReadFn<TEvent> {
   const impl = ((
-    projection: ProjectionResult<any, unknown, any, any> | ForkedProjectionResult<any, unknown, any, any>,
+    projection: ProjectionResult<any, unknown, any, any, any> | ForkedProjectionResult<any, unknown, any, any, any>,
     overrideForkId?: string | null
   ) => {
     const targetForkId = overrideForkId !== undefined ? overrideForkId : forkId
@@ -167,7 +167,7 @@ function makeWorkerReadFn<TEvent extends BaseEvent>(forkId: string | null): Work
     }
   }) as WorkerReadFn<TEvent>
 
-  impl.allForks = ((<TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any>) =>
+  impl.allForks = ((<TForkState>(projection: ForkedProjectionResult<any, TForkState, any, any, any>) =>
     Effect.flatMap(
       projection.Tag,
       (instance: ForkedProjectionInstance<TForkState>) => instance.getAllForks()

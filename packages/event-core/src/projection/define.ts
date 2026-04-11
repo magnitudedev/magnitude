@@ -9,7 +9,9 @@
 
 import { Effect, SubscriptionRef, Context, Layer, PubSub } from 'effect'
 import { ProjectionBusTag, type ProjectionBusService } from '../core/projection-bus'
+import { AmbientServiceTag } from '../core/ambient-service'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
+import { type AmbientDef, type AmbientValueOf } from '../ambient/define'
 import {
   Signal,
   fromDef,
@@ -66,13 +68,17 @@ export type StateOfProjection<P> =
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AnyProjectionResult =
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  | ProjectionResult<string, any, any, any>
+  | ProjectionResult<string, any, any, any, any>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  | ForkedProjectionResult<string, any, any, any>
+  | ForkedProjectionResult<string, any, any, any, any>
 
 /** The read function type - constrained to declared dependencies */
 export type ReadFn<TReads extends readonly AnyProjectionResult[]> =
   <P extends TReads[number]>(projection: P) => StateOfProjection<P>
+
+export type AmbientReader<TAmbients extends readonly AmbientDef<any, any>[]> = {
+  get<C extends TAmbients[number]>(def: C): AmbientValueOf<C>
+}
 
 // ---------------------------------------------------------------------------
 // Signal Handler Builder Types
@@ -86,7 +92,8 @@ export type ProjectionSignalHandlerBuilder<
   TState,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   TSignalDefs extends Record<string, SignalDef<any>>,
-  TReads extends readonly AnyProjectionResult[] = readonly []
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > =
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   <TSignal extends Signal<any, any>>(
@@ -97,8 +104,24 @@ export type ProjectionSignalHandlerBuilder<
       state: TState
       emit: SignalEmitters<TSignalDefs>
       read: ReadFn<TReads>
+      ambient: AmbientReader<TAmbients>
     }) => TState
   ) => { signal: TSignal; handler: typeof handler }
+
+export type ProjectionAmbientHandlerBuilder<
+  TState,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  TSignalDefs extends Record<string, SignalDef<any>>,
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
+> =
+  <C extends TAmbients[number]>(ambientDef: C, handler: (ctx: {
+    value: AmbientValueOf<C>
+    state: TState
+    emit: SignalEmitters<TSignalDefs>
+    read: ReadFn<TReads>
+    ambient: AmbientReader<TAmbients>
+  }) => TState) => { ambient: C; handler: typeof handler }
 
 /**
  * Return type of signal handler builder - the { signal, handler } pair
@@ -107,9 +130,19 @@ export type ProjectionSignalHandlerPair<
   TState,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   TSignalDefs extends Record<string, SignalDef<any>>,
-  TReads extends readonly AnyProjectionResult[] = readonly []
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > =
-  ReturnType<ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads>>
+  ReturnType<ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads, TAmbients>>
+
+export type ProjectionAmbientHandlerPair<
+  TState,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  TSignalDefs extends Record<string, SignalDef<any>>,
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
+> =
+  ReturnType<ProjectionAmbientHandlerBuilder<TState, TSignalDefs, TReads, TAmbients>>
 
 // ---------------------------------------------------------------------------
 // Config and Result Types
@@ -121,7 +154,8 @@ export interface ProjectionConfig<
   TEvent extends BaseEvent,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>,
-  TReads extends readonly AnyProjectionResult[] = readonly []
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > {
   readonly name: TName
   readonly initial: TState
@@ -135,6 +169,9 @@ export interface ProjectionConfig<
    */
   readonly reads?: TReads
 
+  /** Ambient dependencies that this projection can read from synchronously. */
+  readonly ambients?: TAmbients
+
   /** Event handlers - pure reducers that return new state */
   readonly eventHandlers?: {
     [E in TEvent['type']]?: (ctx: {
@@ -142,6 +179,7 @@ export interface ProjectionConfig<
       state: TState
       emit: SignalEmitters<TSignalDefs>
       read: ReadFn<TReads>
+      ambient: AmbientReader<TAmbients>
     }) => TState
   }
 
@@ -150,8 +188,16 @@ export interface ProjectionConfig<
    * Use the builder pattern: `signalHandlers: (on) => [on(signal, handler)]`
    */
   readonly signalHandlers?: (
-    on: ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads>
-  ) => readonly ProjectionSignalHandlerPair<TState, TSignalDefs, TReads>[]
+    on: ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads, TAmbients>
+  ) => readonly ProjectionSignalHandlerPair<TState, TSignalDefs, TReads, TAmbients>[]
+
+  /**
+   * Ambient handlers - react to runtime ambient changes.
+   * Use the builder pattern: `ambientHandlers: (on) => [on(ambientDef, handler)]`
+   */
+  readonly ambientHandlers?: (
+    on: ProjectionAmbientHandlerBuilder<TState, TSignalDefs, TReads, TAmbients>
+  ) => readonly ProjectionAmbientHandlerPair<TState, TSignalDefs, TReads, TAmbients>[]
 }
 
 /** Signal subscription info for tooling/visualization */
@@ -167,7 +213,8 @@ export interface ProjectionResult<
   TState,
   TEvent extends BaseEvent,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>
+  TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>,
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > {
   /** Projection name - used for dependency graph */
   readonly name: TName
@@ -177,6 +224,9 @@ export interface ProjectionResult<
 
   /** Names of projections this one reads from (for tooling/visualization) */
   readonly reads: readonly string[]
+
+  /** Ambients this projection reads from (for tooling/visualization and typing) */
+  readonly ambients: TAmbients
 
   /** Signals this projection subscribes to (for tooling/visualization) */
   readonly signalSubscriptions: readonly SignalSubscription[]
@@ -240,10 +290,11 @@ export function define<TEvent extends BaseEvent, TState>() {
     TName extends string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>,
-    TReads extends readonly AnyProjectionResult[] = readonly []
+    TReads extends readonly AnyProjectionResult[] = readonly [],
+    TAmbients extends readonly AmbientDef<any, any>[] = readonly []
   >(
-    config: ProjectionConfig<TName, TState, TEvent, TSignalDefs, TReads>
-  ): ProjectionResult<TName, TState, TEvent, TSignalDefs> => {
+    config: ProjectionConfig<TName, TState, TEvent, TSignalDefs, TReads, TAmbients>
+  ): ProjectionResult<TName, TState, TEvent, TSignalDefs, TAmbients> => {
     const serviceName = `${config.name}Projection`
     const Tag = Context.GenericTag<ProjectionInstance<TState>>(serviceName)
     const BusTag = ProjectionBusTag<TEvent>()
@@ -270,12 +321,13 @@ export function define<TEvent extends BaseEvent, TState>() {
 
     // Extract read dependency names
     const readDeps = (config.reads ?? []) as readonly AnyProjectionResult[]
+    const ambients = (config.ambients ?? []) as TAmbients
     const allowedReadNames = new Set(readDeps.map(p => p.name))
 
     // Extract signal subscription metadata for tooling (signal names only, no handlers)
     const signalSubscriptions: SignalSubscription[] = []
     if (config.signalHandlers) {
-      const extractSignalName: ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads> = (signal) => {
+      const extractSignalName: ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads, TAmbients> = (signal) => {
         signalSubscriptions.push({
           signal: signal.name,
           source: signal.name.split('/')[0]
@@ -289,7 +341,12 @@ export function define<TEvent extends BaseEvent, TState>() {
       Tag,
       Effect.gen(function* () {
         const bus = yield* BusTag
+        const ambientService = yield* AmbientServiceTag
         const stateRef = yield* SubscriptionRef.make(config.initial)
+
+        for (const ambientDef of ambients) {
+          yield* ambientService.register(ambientDef)
+        }
 
         // Register read dependencies with the bus
         for (const dep of readDeps) {
@@ -316,6 +373,9 @@ export function define<TEvent extends BaseEvent, TState>() {
         }
 
         const readFn = makeReadFn()
+        const ambientReader: AmbientReader<TAmbients> = {
+          get: <C extends TAmbients[number]>(def: C): AmbientValueOf<C> => ambientService.getValue(def)
+        }
 
         // Get PubSubs for async worker subscriptions
         const pubsubs: Record<string, PubSub.PubSub<unknown>> = {}
@@ -357,7 +417,7 @@ export function define<TEvent extends BaseEvent, TState>() {
 
         // Register signal handlers with the bus (SYNC dispatch during flush phase)
         if (config.signalHandlers) {
-          const on: ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads> = (signal, handler) => ({
+          const on: ProjectionSignalHandlerBuilder<TState, TSignalDefs, TReads, TAmbients> = (signal, handler) => ({
             signal,
             handler
           })
@@ -373,10 +433,38 @@ export function define<TEvent extends BaseEvent, TState>() {
                     source: sourceState,
                     state: currentState,
                     emit: typedEmitters,
-                    read: readFn
+                    read: readFn,
+                    ambient: ambientReader
                   })
                 )
                 // Queue any signals emitted by this handler
+                yield* flushPendingSignals
+              }),
+              serviceName
+            )
+          }
+        }
+
+        if (config.ambientHandlers) {
+          const on: ProjectionAmbientHandlerBuilder<TState, TSignalDefs, TReads, TAmbients> = (ambientDef, handler) => ({
+            ambient: ambientDef,
+            handler
+          })
+          const handlerPairs = config.ambientHandlers(on)
+
+          for (const { ambient, handler } of handlerPairs) {
+            yield* bus.registerAmbientHandler(
+              ambient.name,
+              (value) => Effect.gen(function* () {
+                yield* SubscriptionRef.update(stateRef, (currentState) =>
+                  handler({
+                    value: value as never,
+                    state: currentState,
+                    emit: typedEmitters,
+                    read: readFn,
+                    ambient: ambientReader
+                  })
+                )
                 yield* flushPendingSignals
               }),
               serviceName
@@ -397,7 +485,8 @@ export function define<TEvent extends BaseEvent, TState>() {
                 event: event as Timestamped<Extract<TEvent, { type: typeof event.type }>>,
                 state: currentState,
                 emit: typedEmitters,
-                read: readFn
+                read: readFn,
+                ambient: ambientReader
               })
             )
             // Queue any signals emitted by this handler
@@ -435,6 +524,7 @@ export function define<TEvent extends BaseEvent, TState>() {
       name: config.name,
       isForked: false as const,
       reads: readDeps.map(p => p.name),
+      ambients,
       signalSubscriptions,
       Tag,
       Layer: FullLayer,

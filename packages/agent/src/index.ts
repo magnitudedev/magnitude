@@ -55,7 +55,7 @@ export type { PolicyContext } from './agents/types'
 export { getAgentDefinition, registerAgentDefinition, clearAgentOverrides } from './agents'
 
 // Constants
-export { DEFAULT_CONTEXT_WINDOW, COMPACT_TRIGGER_RATIO, PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, DEFAULT_CHAT_NAME, USER_BLUR_DEBOUNCE_MS } from './constants'
+export { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, DEFAULT_CHAT_NAME, USER_BLUR_DEBOUNCE_MS } from './constants'
 
 // Session Context Collection
 export { collectSessionContext } from './util/collect-session-context'
@@ -210,6 +210,9 @@ export type { SerializedEvent } from './serialization'
 // Debug Introspection
 export { createDebugStream, getDebugSnapshot } from './projections/debug-introspection'
 export type { DebugSnapshot, ProjectionSnapshot, ContextUsage } from './projections/debug-introspection'
+
+// Ambient config
+export * from './ambient'
 
 // Providers (re-exported from @magnitudedev/providers)
 export {

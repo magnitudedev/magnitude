@@ -15,6 +15,7 @@
 
 import { Effect, SubscriptionRef, Context, Layer, PubSub } from 'effect'
 import { ProjectionBusTag, type ProjectionBusService } from '../core/projection-bus'
+import { AmbientServiceTag } from '../core/ambient-service'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import {
   Signal,
@@ -28,8 +29,10 @@ import {
 import {
   type AnyProjectionResult,
   type StateOfProjection,
-  type SignalSubscription
+  type SignalSubscription,
+  type AmbientReader
 } from './define'
+import { type AmbientDef, type AmbientValueOf } from '../ambient/define'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -79,7 +82,7 @@ export type ForkedReadFn<TReads extends readonly AnyProjectionResult[]> = {
   <P extends TReads[number]>(
     projection: P,
     forkId: string | null
-  ): P extends ForkedProjectionResult<any, infer TForkState, any, any>
+  ): P extends ForkedProjectionResult<any, infer TForkState, any, any, any>
     ? TForkState
     : StateOfProjection<P>
 }
@@ -90,7 +93,7 @@ export type ForkedReadFn<TReads extends readonly AnyProjectionResult[]> = {
  */
 export type ForkedSignalReadFn<TReads extends readonly AnyProjectionResult[]> =
   <P extends TReads[number]>(projection: P) =>
-    P extends ForkedProjectionResult<any, infer TForkState, any, any>
+    P extends ForkedProjectionResult<any, infer TForkState, any, any, any>
       ? ForkedState<TForkState>
       : StateOfProjection<P>
 
@@ -106,7 +109,8 @@ export type ForkedSignalHandlerBuilder<
   TForkState,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   TSignalDefs extends Record<string, SignalDef<any>>,
-  TReads extends readonly AnyProjectionResult[] = readonly []
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > =
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   <TSignal extends Signal<any, any>>(
@@ -117,8 +121,24 @@ export type ForkedSignalHandlerBuilder<
       state: ForkedState<TForkState>
       emit: SignalEmitters<TSignalDefs>
       read: ForkedSignalReadFn<TReads>
+      ambient: AmbientReader<TAmbients>
     }) => ForkedState<TForkState>
   ) => { signal: TSignal; handler: typeof handler }
+
+export type ForkedAmbientHandlerBuilder<
+  TForkState,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  TSignalDefs extends Record<string, SignalDef<any>>,
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
+> =
+  <C extends TAmbients[number]>(ambientDef: C, handler: (ctx: {
+    value: AmbientValueOf<C>
+    state: ForkedState<TForkState>
+    emit: SignalEmitters<TSignalDefs>
+    read: ForkedSignalReadFn<TReads>
+    ambient: AmbientReader<TAmbients>
+  }) => ForkedState<TForkState>) => { ambient: C; handler: typeof handler }
 
 /**
  * Return type of signal handler builder - the { signal, handler } pair
@@ -127,9 +147,19 @@ export type ForkedSignalHandlerPair<
   TForkState,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   TSignalDefs extends Record<string, SignalDef<any>>,
-  TReads extends readonly AnyProjectionResult[] = readonly []
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > =
-  ReturnType<ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads>>
+  ReturnType<ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients>>
+
+export type ForkedAmbientHandlerPair<
+  TForkState,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  TSignalDefs extends Record<string, SignalDef<any>>,
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
+> =
+  ReturnType<ForkedAmbientHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients>>
 
 // ---------------------------------------------------------------------------
 // Config and Result Types
@@ -141,7 +171,8 @@ export interface ForkedProjectionConfig<
   TEvent extends ForkableEvent,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>,
-  TReads extends readonly AnyProjectionResult[] = readonly []
+  TReads extends readonly AnyProjectionResult[] = readonly [],
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > {
   readonly name: TName
 
@@ -157,6 +188,9 @@ export interface ForkedProjectionConfig<
    */
   readonly reads?: TReads
 
+  /** Ambient dependencies that this projection can read from synchronously. */
+  readonly ambients?: TAmbients
+
   /**
    * Event handlers - receive fork state, return new fork state.
    * Framework extracts forkId from event, manages the Map.
@@ -169,6 +203,7 @@ export interface ForkedProjectionConfig<
       fork: TForkState
       emit: SignalEmitters<TSignalDefs>
       read: ForkedReadFn<TReads>
+      ambient: AmbientReader<TAmbients>
     }) => TForkState | null
   }
 
@@ -182,6 +217,7 @@ export interface ForkedProjectionConfig<
       state: ForkedState<TForkState>
       emit: SignalEmitters<TSignalDefs>
       read: ForkedSignalReadFn<TReads>
+      ambient: AmbientReader<TAmbients>
     }) => ForkedState<TForkState>
   }
 
@@ -190,8 +226,16 @@ export interface ForkedProjectionConfig<
    * Use the builder pattern: `signalHandlers: (on) => [on(signal, handler)]`
    */
   readonly signalHandlers?: (
-    on: ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads>
-  ) => readonly ForkedSignalHandlerPair<TForkState, TSignalDefs, TReads>[]
+    on: ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients>
+  ) => readonly ForkedSignalHandlerPair<TForkState, TSignalDefs, TReads, TAmbients>[]
+
+  /**
+   * Ambient handlers - react to runtime ambient changes.
+   * Use the builder pattern: `ambientHandlers: (on) => [on(ambientDef, handler)]`
+   */
+  readonly ambientHandlers?: (
+    on: ForkedAmbientHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients>
+  ) => readonly ForkedAmbientHandlerPair<TForkState, TSignalDefs, TReads, TAmbients>[]
 }
 
 export interface ForkedProjectionResult<
@@ -199,7 +243,8 @@ export interface ForkedProjectionResult<
   TForkState,
   TEvent extends ForkableEvent,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>
+  TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>,
+  TAmbients extends readonly AmbientDef<any, any>[] = readonly []
 > {
   readonly name: TName
 
@@ -208,6 +253,9 @@ export interface ForkedProjectionResult<
 
   /** Names of projections this one reads from (for tooling/visualization) */
   readonly reads: readonly string[]
+
+  /** Ambients this projection reads from (for tooling/visualization and typing) */
+  readonly ambients: TAmbients
 
   /** Signals this projection subscribes to (for tooling/visualization) */
   readonly signalSubscriptions: readonly SignalSubscription[]
@@ -272,10 +320,11 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
     TName extends string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     TSignalDefs extends Record<string, SignalDef<any>> = Record<string, never>,
-    TReads extends readonly AnyProjectionResult[] = readonly []
+    TReads extends readonly AnyProjectionResult[] = readonly [],
+    TAmbients extends readonly AmbientDef<any, any>[] = readonly []
   >(
-    config: ForkedProjectionConfig<TName, TForkState, TEvent, TSignalDefs, TReads>
-  ): ForkedProjectionResult<TName, TForkState, TEvent, TSignalDefs> => {
+    config: ForkedProjectionConfig<TName, TForkState, TEvent, TSignalDefs, TReads, TAmbients>
+  ): ForkedProjectionResult<TName, TForkState, TEvent, TSignalDefs, TAmbients> => {
     const serviceName = `${config.name}Projection`
     const Tag = Context.GenericTag<ForkedProjectionInstance<TForkState>>(serviceName)
     const BusTag = ProjectionBusTag<TEvent>()
@@ -303,13 +352,14 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
 
     // Extract read dependency names and track which are forked
     const readDeps = (config.reads ?? []) as readonly AnyProjectionResult[]
+    const ambients = (config.ambients ?? []) as TAmbients
     const allowedReadNames = new Set(readDeps.map(p => p.name))
     const forkedReadNames = new Set(readDeps.filter(p => p.isForked).map(p => p.name))
 
     // Extract signal subscription metadata for tooling
     const signalSubscriptions: SignalSubscription[] = []
     if (config.signalHandlers) {
-      const extractSignalName: ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads> = (signal) => {
+      const extractSignalName: ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients> = (signal) => {
         signalSubscriptions.push({
           signal: signal.name,
           source: signal.name.split('/')[0]
@@ -323,6 +373,11 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
       Tag,
       Effect.gen(function* () {
         const bus = yield* BusTag
+        const ambientService = yield* AmbientServiceTag
+
+        for (const ambientDef of ambients) {
+          yield* ambientService.register(ambientDef)
+        }
 
         // Initialize with root fork (null = root)
         const initialState: TFullState = {
@@ -360,15 +415,18 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
         }
 
         // Build read function for signal handlers (returns full state for forked deps)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const signalReadFn: ForkedSignalReadFn<TReads> = <P extends TReads[number]>(projection: P): any => {
+        const signalReadFn: ForkedSignalReadFn<TReads> = <P extends TReads[number]>(projection: P) => {
           if (!allowedReadNames.has(projection.name)) {
             throw new Error(
               `Projection "${config.name}" cannot read "${projection.name}" - not declared in reads`
             )
           }
           // Always return full state in signal handlers
-          return bus.getProjectionState(projection.name)
+          return bus.getProjectionState(projection.name) as ReturnType<ForkedSignalReadFn<TReads>>
+        }
+
+        const ambientReader: AmbientReader<TAmbients> = {
+          get: <C extends TAmbients[number]>(def: C): AmbientValueOf<C> => ambientService.getValue(def)
         }
 
         // Get PubSubs for async worker subscriptions
@@ -408,7 +466,7 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
         // Register signal handlers (operate on full state)
         if (config.signalHandlers) {
           // Create the `on` builder function
-          const on: ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads> = (signal, handler) => ({
+          const on: ForkedSignalHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients> = (signal, handler) => ({
             signal,
             handler
           })
@@ -426,7 +484,35 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
                     source: sourceState,
                     state: currentState,
                     emit: typedEmitters,
-                    read: signalReadFn
+                    read: signalReadFn,
+                    ambient: ambientReader
+                  })
+                )
+                yield* flushPendingSignals
+              }),
+              serviceName
+            )
+          }
+        }
+
+        if (config.ambientHandlers) {
+          const on: ForkedAmbientHandlerBuilder<TForkState, TSignalDefs, TReads, TAmbients> = (ambientDef, handler) => ({
+            ambient: ambientDef,
+            handler
+          })
+          const handlerPairs = config.ambientHandlers(on)
+
+          for (const { ambient, handler } of handlerPairs) {
+            yield* bus.registerAmbientHandler(
+              ambient.name,
+              (value) => Effect.gen(function* () {
+                yield* SubscriptionRef.update(stateRef, (currentState) =>
+                  handler({
+                    value: value as never,
+                    state: currentState,
+                    emit: typedEmitters,
+                    read: signalReadFn,
+                    ambient: ambientReader
                   })
                 )
                 yield* flushPendingSignals
@@ -454,7 +540,8 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
                   event: event as Timestamped<Extract<TEvent, { type: typeof event.type }>>,
                   fork: currentFork,
                   emit: typedEmitters,
-                  read: readFn
+                  read: readFn,
+                  ambient: ambientReader
                 })
 
                 const newForks = new Map(currentState.forks)
@@ -476,7 +563,8 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
                   event: event as Timestamped<Extract<TEvent, { type: typeof event.type }>>,
                   state: currentState,
                   emit: typedEmitters,
-                  read: signalReadFn
+                  read: signalReadFn,
+                  ambient: ambientReader
                 })
               })
             }
@@ -525,6 +613,7 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
       name: config.name,
       isForked: true as const,
       reads: readDeps.map(p => p.name),
+      ambients,
       signalSubscriptions,
       Tag,
       Layer: FullLayer,

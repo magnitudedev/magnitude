@@ -1,5 +1,3 @@
-import type { MagnitudeSlot } from './model-slots'
-
 /**
  * Agent Configuration Constants
  */
@@ -32,12 +30,6 @@ export const PROSE_DELIM_CLOSE = '</raw>'
 // Compaction
 // =============================================================================
 
-/** Default context window size when model doesn't specify one */
-export const DEFAULT_CONTEXT_WINDOW = 200_000
-
-/** Ratio of context window at which to trigger compaction proactively (soft cap) */
-export const COMPACT_TRIGGER_RATIO = 0.9
-
 /** Fraction of soft cap to keep as recent messages during compaction */
 export const KEEP_MESSAGE_RATIO = 0.1
 
@@ -54,10 +46,3 @@ export const USER_PRESENCE_CONFIRM_DELAY_MS = 3_000
 export const USER_BLUR_DEBOUNCE_MS = 5_000
 
 // =============================================================================
-
-/** Get context limits for a model slot */
-export function getContextLimits(_slot: MagnitudeSlot = 'lead'): { hardCap: number; softCap: number } {
-  const hardCap = DEFAULT_CONTEXT_WINDOW
-  const softCap = Math.floor(hardCap * COMPACT_TRIGGER_RATIO)
-  return { hardCap, softCap }
-}

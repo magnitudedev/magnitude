@@ -23,6 +23,8 @@ import { Effect, Context, Layer, Ref, Cause } from 'effect'
 import { type BaseEvent, type Timestamped } from './event-bus-core'
 import { FrameworkErrorReporter, FrameworkError, type FrameworkErrorReporterService } from './framework-error'
 
+const MAX_SIGNAL_FLUSH_ITERATIONS = 100
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -49,6 +51,16 @@ export interface ProjectionBusService<E extends BaseEvent> {
   ) => Effect.Effect<void>
 
   /**
+   * Register an ambient handler for this projection.
+   * Handlers run in dependency order using the same dependency graph as events/signals.
+   */
+  registerAmbientHandler: (
+    ambientName: string,
+    handler: (value: unknown) => Effect.Effect<void>,
+    projectionName: string
+  ) => Effect.Effect<void>
+
+  /**
    * Queue a signal for emission (called by projections).
    * Signals are not dispatched immediately - they're buffered until flush phase.
    */
@@ -60,6 +72,12 @@ export interface ProjectionBusService<E extends BaseEvent> {
    * Phase 2: Flush all queued signals iteratively (handlers sorted per-signal)
    */
   processEvent: (event: Timestamped<E>) => Effect.Effect<void>
+
+  /**
+   * Process an ambient change through all registered ambient handlers.
+   * Ambient handlers run in dependency order and can emit signals, which are flushed iteratively.
+   */
+  processAmbientChange: (ambientName: string, value: unknown) => Effect.Effect<void>
 
   /**
    * Register a dependency edge: `from` depends on `to`.
@@ -190,6 +208,13 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
     }
     const signalHandlersRef = yield* Ref.make<Map<string, SignalHandlerItem[]>>(new Map())
 
+    // Ambient handlers: Map<ambientName, Array<{name, handler}>>
+    type AmbientHandlerItem = {
+      name: string
+      handler: (value: unknown) => Effect.Effect<void>
+    }
+    const ambientHandlersRef = yield* Ref.make<Map<string, AmbientHandlerItem[]>>(new Map())
+
     // Global signal queue for two-phase processing
     type QueuedSignal = {
       signalName: string
@@ -215,6 +240,53 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
 
     // Helper to get dependency graph synchronously
     const getDependencyGraph = () => Effect.runSync(Ref.get(dependencyGraphRef))
+
+    const flushSignalQueue = Effect.gen(function* () {
+      let iterations = 0
+      const graph = getDependencyGraph()
+
+      while (true) {
+        const queue = yield* Ref.getAndSet(signalQueueRef, [])
+        if (queue.length === 0) break
+
+        if (iterations++ >= MAX_SIGNAL_FLUSH_ITERATIONS) {
+          yield* Effect.logWarning(`Signal flush exceeded ${MAX_SIGNAL_FLUSH_ITERATIONS} iterations, possible infinite loop`)
+          break
+        }
+
+        const signalHandlers = yield* Ref.get(signalHandlersRef)
+
+        for (const { signalName, value, sourceState, eventTimestamp } of queue) {
+          const timestampedValue = Object.assign({}, value, { timestamp: eventTimestamp })
+          const handlers = signalHandlers.get(signalName) ?? []
+          if (handlers.length === 0) continue
+
+          let sortedNames = signalHandlerOrderCache.get(signalName)
+          if (!sortedNames) {
+            const handlerNames = handlers.map(h => h.name)
+            sortedNames = topologicalSort(handlerNames, graph)
+            signalHandlerOrderCache.set(signalName, sortedNames)
+          }
+
+          const nameToSignalHandler = new Map(handlers.map(h => [h.name, h]))
+
+          for (const name of sortedNames) {
+            const handlerItem = nameToSignalHandler.get(name)
+            if (handlerItem) {
+              yield* handlerItem.handler(timestampedValue, sourceState).pipe(
+                Effect.catchAllCause((cause) =>
+                  reporter.report(FrameworkError.ProjectionSignalHandlerError({
+                    projectionName: name,
+                    signalName,
+                    cause
+                  }))
+                )
+              )
+            }
+          }
+        }
+      }
+    })
 
     let currentEventTimestamp: number = Date.now()
 
@@ -257,6 +329,19 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
 
         // Invalidate signal handler cache for this signal
         signalHandlerOrderCache.delete(signalName)
+      }),
+
+      registerAmbientHandler: (
+        ambientName: string,
+        handler: (value: unknown) => Effect.Effect<void>,
+        projectionName: string
+      ) => Effect.gen(function* () {
+        yield* Ref.update(ambientHandlersRef, (map) => {
+          const existing = map.get(ambientName) ?? []
+          const newMap = new Map(map)
+          newMap.set(ambientName, [...existing, { name: projectionName, handler }])
+          return newMap
+        })
       }),
 
       queueSignal: (signalName: string, value: unknown, sourceState: unknown) =>
@@ -362,53 +447,35 @@ export function makeProjectionBusLayer<E extends BaseEvent>(): Layer.Layer<
         }
 
         // Phase 2: Flush signals iteratively
-        let iterations = 0
-        const maxIterations = 100 // Safety limit for infinite loops
+        yield* flushSignalQueue
+      }),
 
-        while (true) {
-          const queue = yield* Ref.getAndSet(signalQueueRef, [])
-          if (queue.length === 0) break
+      processAmbientChange: (ambientName: string, value: unknown) => Effect.gen(function* () {
+        const graph = getDependencyGraph()
+        const ambientHandlers = yield* Ref.get(ambientHandlersRef)
+        const handlers = ambientHandlers.get(ambientName) ?? []
+        if (handlers.length === 0) return
 
-          if (iterations++ >= maxIterations) {
-            yield* Effect.logWarning(`Signal flush exceeded ${maxIterations} iterations, possible infinite loop`)
-            break
-          }
+        const handlerNames = handlers.map(h => h.name)
+        const sortedNames = topologicalSort(handlerNames, graph)
+        const nameToHandler = new Map(handlers.map(h => [h.name, h]))
 
-          const signalHandlers = yield* Ref.get(signalHandlersRef)
-
-          for (const { signalName, value, sourceState, eventTimestamp } of queue) {
-            const timestampedValue = Object.assign({}, value, { timestamp: eventTimestamp })
-            const handlers = signalHandlers.get(signalName) ?? []
-            if (handlers.length === 0) continue
-
-            // Get or compute sorted order for this signal's handlers
-            let sortedNames = signalHandlerOrderCache.get(signalName)
-            if (!sortedNames) {
-              const handlerNames = handlers.map(h => h.name)
-              sortedNames = topologicalSort(handlerNames, graph)
-              signalHandlerOrderCache.set(signalName, sortedNames)
-            }
-
-            // Build name -> handler map for this signal
-            const nameToSignalHandler = new Map(handlers.map(h => [h.name, h]))
-
-            // Run handlers in sorted order
-            for (const name of sortedNames) {
-              const handlerItem = nameToSignalHandler.get(name)
-              if (handlerItem) {
-                yield* handlerItem.handler(timestampedValue, sourceState).pipe(
-                  Effect.catchAllCause((cause) =>
-                    reporter.report(FrameworkError.ProjectionSignalHandlerError({
-                      projectionName: name,
-                      signalName,
-                      cause
-                    }))
-                  )
-                )
-              }
-            }
+        for (const name of sortedNames) {
+          const handlerItem = nameToHandler.get(name)
+          if (handlerItem) {
+            yield* handlerItem.handler(value).pipe(
+              Effect.catchAllCause((cause) =>
+                reporter.report(FrameworkError.ProjectionSignalHandlerError({
+                  projectionName: name,
+                  signalName: `ambient:${ambientName}`,
+                  cause
+                }))
+              )
+            )
           }
         }
+
+        yield* flushSignalQueue
       })
     }
   }))

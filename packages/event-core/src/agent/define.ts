@@ -4,8 +4,10 @@ import { EventSinkTag, makeEventSinkLayer, type EventSinkService } from '../core
 import { HydrationContext } from '../core/hydration-context'
 import { InterruptCoordinatorLive } from '../core/interrupt-coordinator'
 import { makeProjectionBusLayer, ProjectionBusTag, type ProjectionBusService } from '../core/projection-bus'
+import { makeAmbientServiceLayer, AmbientServiceTag, type AmbientService } from '../core/ambient-service'
 import { makeWorkerBusLayer, WorkerBusTag, type WorkerBusService } from '../core/worker-bus'
 import { type Signal } from '../signal/define'
+import type { AmbientDef, AmbientRequirementsOf } from '../ambient/define'
 import {
   FrameworkErrorPubSub,
   FrameworkErrorPubSubLive,
@@ -24,6 +26,7 @@ export type CoreServices<TEvent extends BaseEvent> =
   | EventSinkService<TEvent>
   | EventBusCoreService<TEvent>
   | ProjectionBusService<TEvent>
+  | AmbientService
   | WorkerBusService<TEvent>
   | FrameworkErrorReporterService
   | PubSub.PubSub<FrameworkError>
@@ -40,6 +43,7 @@ export type CoreServices<TEvent extends BaseEvent> =
 interface ProjectionComponent {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly Layer: Layer.Layer<any, never, any>
+  readonly ambients?: readonly AmbientDef<any, any>[]
 }
 
 /**
@@ -51,6 +55,18 @@ interface WorkerComponent {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly Layer: Layer.Layer<void, never, any>
 }
+
+/** Extract ambient requirements from a projection's declared ambients */
+type ExtractProjectionAmbientRequirements<P> =
+  P extends { readonly ambients?: infer TAmbients }
+    ? TAmbients extends readonly unknown[]
+      ? AmbientRequirementsOf<TAmbients[number]>
+      : never
+    : never
+
+/** Extract all ambient requirements as a union */
+type ExtractAllProjectionAmbientRequirements<T extends readonly ProjectionComponent[]> =
+  ExtractProjectionAmbientRequirements<T[number]>
 
 /** Extract requirements from a worker's Layer */
 type ExtractWorkerRequirements<W> =
@@ -80,10 +96,12 @@ type ExtractExternalRequirements<
   TEvent extends BaseEvent,
   TProjections extends readonly ProjectionComponent[],
   TWorkers extends readonly WorkerComponent[]
-> = Exclude<
-  ExtractAllWorkerRequirements<TWorkers>,
-  InternalRequirements<TEvent, TProjections>
->
+> =
+  | Exclude<
+    ExtractAllWorkerRequirements<TWorkers>,
+    InternalRequirements<TEvent, TProjections>
+  >
+  | ExtractAllProjectionAmbientRequirements<TProjections>
 
 type ExtractLayerOutput<L> = L extends Layer.Layer<infer Out, infer _E, infer _R> ? Out : never
 type ExtractProjectionOutputs<T extends readonly ProjectionComponent[]> =
@@ -322,13 +340,15 @@ export function define<TEvent extends BaseEvent>() {
     const ProjectionBusLayer = makeProjectionBusLayer<TEvent>()
     const EventBusCoreLayer = makeEventBusCoreLayer<TEvent>()
     const WorkerBusLayer = makeWorkerBusLayer<TEvent>()
+    const AmbientServiceLayer = makeAmbientServiceLayer<TEvent>()
 
     // FrameworkErrorReporterLive depends on FrameworkErrorPubSubLive — must be explicitly wired
     // (Layer.mergeAll only merges outputs, it does NOT provide one layer's output as another's input at runtime)
     const FrameworkErrorReporterProvided = Layer.provide(FrameworkErrorReporterLive, FrameworkErrorPubSubLive)
     const CoreDeps = Layer.mergeAll(HydrationContext.Default, makeEventSinkLayer<TEvent>(), InterruptCoordinatorLive, FrameworkErrorPubSubLive, FrameworkErrorReporterProvided)
     const WithProjectionBus = Layer.provideMerge(ProjectionBusLayer, CoreDeps)
-    const WithEventBusCore = Layer.provideMerge(EventBusCoreLayer, WithProjectionBus)
+    const WithAmbientService = Layer.provideMerge(AmbientServiceLayer, WithProjectionBus)
+    const WithEventBusCore = Layer.provideMerge(EventBusCoreLayer, WithAmbientService)
     const WithWorkerBus = Layer.provideMerge(WorkerBusLayer, WithEventBusCore)
 
     const BaseLayer = WithWorkerBus
@@ -365,6 +385,7 @@ export function define<TEvent extends BaseEvent>() {
       const runtime = ManagedRuntime.make(FinalLayer)
       const BusTag = WorkerBusTag<TEvent>()
       const ProjBusTag = ProjectionBusTag<TEvent>()
+      const _AmbientTag = AmbientServiceTag
 
       // Validate no cycles in dependency graph after all projections are registered
       await runtime.runPromise(

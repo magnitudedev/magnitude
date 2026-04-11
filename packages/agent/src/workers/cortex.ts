@@ -16,7 +16,7 @@
  */
 
 import { Effect, Stream, Either } from 'effect'
-import { Worker } from '@magnitudedev/event-core'
+import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
 import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
@@ -44,14 +44,22 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
+import { getAgentDefinition, getSlotForFork, isValidVariant, type AgentVariant } from '../agents'
 
-import { getContextLimits } from '../constants'
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
+import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
 
 
+type TaggedCause = {
+  readonly _tag: string
+  readonly message?: string
+}
+
+function isTaggedCause(cause: unknown): cause is TaggedCause {
+  return typeof cause === 'object' && cause !== null && '_tag' in cause
+}
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
   return parts.map(part => {
@@ -128,7 +136,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
         const agentState = yield* read(AgentStatusProjection)
-        const turnState = yield* read(TurnProjection)
+        const turnState = yield* read(TurnProjection, forkId)
         const allowSingleUserReplyThisTurn =
           forkId !== null && (turnState._tag === 'active' || turnState._tag === 'interrupting')
             ? turnState.currentTurnAllowsDirectUserReply
@@ -137,7 +145,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const variant: AgentVariant = agentInstance?.role ?? 'lead'
 
         const agentDef = getAgentDefinition(variant)
-        const modelSlot = agentDef.slot
+        const modelSlot = getSlotForFork(agentState, forkId)
         const timezone = sessionCtx.context?.timezone ?? null
 
         const runtime = yield* ModelResolver
@@ -282,9 +290,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           if (error._tag === 'XmlRuntimeCrash') {
             // Improvement C: if crash was caused by a typed ModelError, surface it as a turn error
             const cause = error.cause
-            if (cause && typeof cause === 'object' && '_tag' in cause) {
-              const errorType = (cause as any)._tag as string
-              const errorMessage = (cause as any).message as string ?? error.message
+            if (isTaggedCause(cause)) {
+              const errorType = cause._tag
+              const errorMessage = cause.message ?? error.message
               logger.error({ context: 'Cortex', forkId, turnId, errorType }, `Cortex: Mid-stream ModelError (${errorType}): ${errorMessage}`)
               yield* publish({
                 type: 'turn_unexpected_error',
@@ -306,8 +314,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           // Tier 2: Heuristic — if over soft cap and compacting, any error is likely context-related
           let probableContextLimit = false
           if (!definiteContextLimit) {
-            const compactionState = yield* read(CompactionProjection)
-            const { softCap } = getContextLimits()
+            const compactionState = yield* read(CompactionProjection, forkId)
+            const ambientService = yield* AmbientServiceTag
+            const configState = ambientService.getValue(ConfigAmbient)
+            const heuristicAgentStatus = yield* read(AgentStatusProjection)
+            const { softCap } = getSlotConfig(configState, getSlotForFork(heuristicAgentStatus, forkId))
             probableContextLimit = compactionState.tokenEstimate >= softCap && compactionState._tag !== 'idle'
           }
 

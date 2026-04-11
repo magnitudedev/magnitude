@@ -69,6 +69,8 @@ import { initLogger, logger } from '@magnitudedev/logger'
 import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 
 import { EphemeralSessionContextTag } from './agents/types'
+import { publishConfigFromProviders } from './ambient/config-ambient'
+
 
 // =============================================================================
 // Agent
@@ -292,6 +294,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       if (pending.length > 0) {
         yield* persistence.persistNewEvents(pending)
       }
+
     } else {
       // Existing session — hydrate
       // Ensure workspace exists and symlink is up-to-date
@@ -429,10 +432,13 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     await originalDispose()
   }
 
+  const refreshConfig = () => client.runEffect(publishConfigFromProviders)
+
   return {
     ...client,
     dispose,
-    subscribeDebug
+    subscribeDebug,
+    refreshConfig,
   }
 }
 

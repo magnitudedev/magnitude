@@ -16,6 +16,7 @@ export { HydrationContext } from './core/hydration-context'
 export { EventSinkTag, makeEventSinkLayer, type EventSinkService } from './core/event-sink'
 export { InterruptCoordinator, InterruptCoordinatorLive, type InterruptBaseline, type InterruptCoordinator as InterruptCoordinatorService } from './core/interrupt-coordinator'
 export { ProjectionBusTag, makeProjectionBusLayer, type ProjectionBusService } from './core/projection-bus'
+export { AmbientServiceTag, makeAmbientServiceLayer, type AmbientService } from './core/ambient-service'
 export { WorkerBusTag, makeWorkerBusLayer, type WorkerBusService } from './core/worker-bus'
 export { EventBusCoreTag, makeEventBusCoreLayer, type EventBusCoreService, type BaseEvent, type Timestamped } from './core/event-bus-core'
 export {
@@ -28,6 +29,7 @@ export {
 } from './core/framework-error'
 
 // Main API modules
+export * as Ambient from './ambient/index'
 export * as Signal from './signal/index'
 export * as FSM from './fsm/index'
 export * as Projection from './projection/index'
