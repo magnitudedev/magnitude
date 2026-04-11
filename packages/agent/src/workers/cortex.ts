@@ -133,12 +133,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           forkId !== null && (turnState._tag === 'active' || turnState._tag === 'interrupting')
             ? turnState.currentTurnAllowsDirectUserReply
             : false
-        const agentInstance = forkId ? getAgentByForkId(agentState, forkId) : null
-
-        // Determine agent: child forks use their role, root fork is always lead.
-        const variant: AgentVariant = agentInstance
-          ? (isValidVariant(agentInstance.role) ? agentInstance.role : 'builder')
-          : 'lead'
+        const agentInstance = forkId ? getAgentByForkId(agentState, forkId)! : null
+        const variant: AgentVariant = agentInstance?.role ?? 'lead'
 
         const agentDef = getAgentDefinition(variant)
         const modelSlot = agentDef.slot

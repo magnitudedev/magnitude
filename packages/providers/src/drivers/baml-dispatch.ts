@@ -24,13 +24,18 @@ export interface BamlStreamOpts {
   readonly signal?: AbortSignal
 }
 
+export interface BamlRawStream {
+  getFinalResponse(): Promise<unknown>
+  [Symbol.asyncIterator](): AsyncIterator<string>
+}
+
 export function bamlStream(
   name: string,
   args: readonly unknown[],
   opts: BamlStreamOpts,
-): AsyncIterable<string> {
+): BamlRawStream {
   if (!(name in b.stream)) throw new Error(`Unknown BAML stream function: ${name}`)
-  const fn = b.stream[name as keyof StreamClient] as (...args: unknown[]) => AsyncIterable<string>
+  const fn = b.stream[name as keyof StreamClient] as (...args: unknown[]) => BamlRawStream
   return fn.call(b.stream, ...args, opts)
 }
 

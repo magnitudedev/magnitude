@@ -27,12 +27,13 @@ import { textOf, ContentPart } from '../content'
 import { MemoryProjection, getView, LLMMessage, type ForkMemoryState } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import type { CompactionState } from '../projections/compaction'
+import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 import { SessionContextProjection } from '../projections/session-context'
 import { TurnProjection } from '../projections/turn'
 
 // ExecutionManager no longer needed — xml-act is stateless, no sandbox reset
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
-import { getAgentDefinition } from '../agents'
+import { getAgentDefinition, type AgentVariant } from '../agents'
 import { ModelResolver, CodingAgentCompact, ProviderState } from '@magnitudedev/providers'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
@@ -101,9 +102,17 @@ function startCompaction(
 
     if (compactionState._tag !== 'idle') return
 
+    // Resolve agent variant from fork (same pattern as Cortex)
+    const agentState = yield* read(AgentStatusProjection)
+    const variant: AgentVariant = forkId
+      ? getAgentByForkId(agentState, forkId)!.role
+      : 'lead'
+    const agentDef = getAgentDefinition(variant)
+    const modelSlot = agentDef.slot
+
     // Calculate how many messages to compact
     const providerState = yield* ProviderState
-    const { softCap } = yield* providerState.contextLimits('lead')
+    const { softCap } = yield* providerState.contextLimits(modelSlot)
     const keepTokenBudget = softCap * KEEP_MESSAGE_RATIO
     let keepTokens = 0
     let keepCount = 0
@@ -144,14 +153,14 @@ function startCompaction(
 
     const bamlEffect = Effect.gen(function* () {
       const runtime = yield* ModelResolver
-      const usable = yield* runtime.resolve('lead')
+      const usable = yield* runtime.resolve(modelSlot)
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const result = yield* withTraceScope(
           { metadata: { callType: 'compact', forkId } },
           usable.invoke(
             CodingAgentCompact,
             {
-              systemPrompt: getAgentDefinition('lead').systemPrompt,
+              systemPrompt: agentDef.systemPrompt,
               messages: trimmedMessages,
             },
           ),

@@ -10,10 +10,24 @@ import { ClientRegistry } from '@magnitudedev/llm-core'
 import { logger } from '@magnitudedev/logger'
 import { getProvider } from './registry'
 import { getLowestEffortOptions } from './reasoning-effort'
-import type { AuthInfo, ProviderDefinition, ProviderOptions } from './types'
+import type { AuthInfo, BamlProviderType, ProviderDefinition, ProviderOptions } from './types'
 
 /** The BAML client name used by CodingAgentChat */
 const CHAT_CLIENT_NAME = 'ChatClientNoRetryAnthropicOnly'
+
+function resolveBamlProvider(providerId: string, modelId: string, auth: AuthInfo | null): BamlProviderType {
+  const def = getProvider(providerId)
+  if (!def) {
+    logger.warn(`[Provider] Unknown provider: ${providerId}`)
+    return 'anthropic'
+  }
+
+  return (providerId === 'openai' && (auth?.type === 'oauth' || auth?.type === 'api'))
+    ? 'openai-responses'
+    : (providerId === 'github-copilot' && modelId.includes('codex'))
+      ? 'openai-responses'
+      : def.bamlProvider
+}
 
 /**
  * Build a ClientRegistry targeting the given provider + model.
@@ -34,14 +48,7 @@ export function buildClientRegistry(
   }
 
   const providerOpts = providerOptions
-
-  // For OpenAI with OAuth (ChatGPT subscription) or Copilot with Codex models,
-  // use openai-responses provider which hits the /responses endpoint
-  const bamlProvider = (providerId === 'openai' && (auth?.type === 'oauth' || auth?.type === 'api'))
-    ? 'openai-responses' as const
-    : (providerId === 'github-copilot' && modelId.includes('codex'))
-      ? 'openai-responses' as const
-      : def.bamlProvider
+  const bamlProvider = resolveBamlProvider(providerId, modelId, auth)
 
   const modelDef = def.models.find(m => m.id === modelId)
   const maxOutputTokens = modelDef?.maxOutputTokens
@@ -469,11 +476,7 @@ export function __testOnly_buildProviderOptions(
   const def = getProvider(providerId)
   if (!def) return undefined
 
-  const bamlProvider = (providerId === 'openai' && (auth?.type === 'oauth' || auth?.type === 'api'))
-    ? 'openai-responses' as const
-    : (providerId === 'github-copilot' && modelId.includes('codex'))
-      ? 'openai-responses' as const
-      : def.bamlProvider
+  const bamlProvider = resolveBamlProvider(providerId, modelId, auth)
 
   const modelDef = def.models.find(m => m.id === modelId)
   return buildOptions(

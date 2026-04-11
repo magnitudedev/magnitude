@@ -6,6 +6,7 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
+import type { AgentVariant } from '../agents'
 
 export type AgentStatus = 'working' | 'idle' | 'killed'
 
@@ -14,7 +15,7 @@ export interface AgentInfo {
   readonly forkId: string
   readonly parentForkId: string | null
   readonly name: string
-  readonly role: string
+  readonly role: AgentVariant
   readonly context: string
   readonly mode: 'clone' | 'spawn'
   readonly taskId: string
@@ -32,7 +33,7 @@ export interface AgentCreatedSignal {
   readonly parentForkId: string | null
   readonly agentId: string
   readonly name: string
-  readonly role: string
+  readonly role: AgentVariant
   readonly taskId: string
   readonly mode: 'clone' | 'spawn'
   readonly context: string
@@ -42,7 +43,7 @@ export interface AgentCreatedSignal {
 export interface AgentBecameIdleSignal {
   readonly agentId: string
   readonly forkId: string
-  readonly role: string
+  readonly role: AgentVariant
   readonly parentForkId: string | null
   readonly reason: 'stable' | 'interrupt' | 'error'
   readonly timestamp: number
@@ -164,7 +165,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         parentForkId: event.parentForkId,
         agentId: event.agentId,
         name: event.name,
-        role: event.role,
+        role: event.role as AgentVariant,
         taskId: normalizedTaskId,
         mode: normalizedMode,
         context: normalizedContext,
@@ -176,7 +177,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
         forkId: event.forkId,
         parentForkId: event.parentForkId,
         name: event.name,
-        role: event.role,
+        role: event.role as AgentVariant,
         context: normalizedContext,
         mode: normalizedMode,
         taskId: normalizedTaskId,

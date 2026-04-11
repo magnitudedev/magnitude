@@ -17,7 +17,7 @@ import { CollectorData } from './types'
 import { classifyHttpError, classifyUnknownError } from '../errors/classify-error'
 import { TransportError } from '../errors/model-error'
 
-import { bamlCall, bamlStream } from './baml-dispatch'
+import { bamlStream } from './baml-dispatch'
 
 import { extractUsageFromCollectorData } from './usage-extraction'
 
@@ -37,7 +37,7 @@ function extractUsageFromCollector(
   model: Model | null,
   authType: string | null,
 ): CallUsage {
-  const extracted = extractUsageFromCollectorData(collector)
+  const extracted = extractUsageFromCollectorData(collector as Parameters<typeof extractUsageFromCollectorData>[0])
   return buildUsage(
     model,
     authType,
@@ -76,7 +76,7 @@ function toNormalizedAsyncStream(stream: AsyncIterable<string>): AsyncIterable<s
 
 export const BamlDriver: ExecutableDriver = {
   id: 'baml',
-  connect(model: Model, auth: AuthInfo | null, _inference: InferenceConfig): Effect.Effect<ReturnType<typeof ModelConnectionCtor.Baml>, ModelError> {
+  connect(_model: Model, auth: AuthInfo | null, _inference: InferenceConfig): Effect.Effect<ReturnType<typeof ModelConnectionCtor.Baml>, ModelError> {
     return Effect.succeed(ModelConnectionCtor.Baml({ auth }))
   },
   stream(req: DriverRequest) {
@@ -136,9 +136,10 @@ export const BamlDriver: ExecutableDriver = {
         }
         const clientRegistry = buildRegistry(req)
         const collector = new Collector(`${req.functionName}-complete`)
-        const opts = { clientRegistry, collector }
-        const result = await bamlCall(req.functionName, req.args, opts)
         const authType = req.connection._tag === 'Baml' ? (req.connection.auth?.type ?? null) : null
+        const opts = { clientRegistry, collector, signal: req.signal }
+        const stream = bamlStream(req.functionName, req.args, opts)
+        const result = await stream.getFinalResponse()
         return {
           result: normalizeModelOutput(result) as T,
           usage: extractUsageFromCollector(collector, req.model, authType),

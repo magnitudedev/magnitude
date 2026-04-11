@@ -22,9 +22,9 @@ type UsageCarrier = {
 
 type CollectorLike = {
   last?: {
-    calls: Array<{
+    calls: ReadonlyArray<{
       httpResponse?: { body?: { json?(): unknown } }
-      sseResponses?(): Array<{ json?(): unknown }>
+      sseResponses?(): ReadonlyArray<{ json?(): unknown }>
     }>
   }
   usage?: UsageCarrier
