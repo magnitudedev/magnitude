@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { __testOnly_buildProviderOptions } from '../client-registry-builder'
 
 describe('client-registry codex openai-responses options', () => {
@@ -34,5 +34,51 @@ describe('client-registry codex openai-responses options', () => {
     expect(options?.base_url).toBe('https://api.githubcopilot.com')
     expect(options?.instructions).toBe('SYSTEM')
     expect(options?.store).toBeUndefined()
+  })
+})
+
+describe('client-registry openai-generic Fireworks options', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('builds Fireworks options from explicit api auth', () => {
+    const options = __testOnly_buildProviderOptions(
+      'fireworks',
+      'accounts/fireworks/routers/kimi-k2p5-turbo',
+      { type: 'api', key: 'test-key' },
+      undefined,
+      ['STOP'],
+    )
+
+    expect(options).toBeDefined()
+    expect(options).toEqual(expect.objectContaining({
+      model: 'accounts/fireworks/routers/kimi-k2p5-turbo',
+      api_key: 'test-key',
+      base_url: 'https://api.fireworks.ai/inference/v1',
+      max_tokens: 131072,
+      stop: ['STOP'],
+      stream_options: { include_usage: true },
+    }))
+  })
+
+  it('uses FIREWORKS_API_KEY and honors baseUrl override through generic path', () => {
+    vi.stubEnv('FIREWORKS_API_KEY', 'env-fireworks-key')
+
+    const options = __testOnly_buildProviderOptions(
+      'fireworks',
+      'accounts/fireworks/models/glm-5p1',
+      null,
+      { baseUrl: 'https://example.fireworks.test/v1' },
+    )
+
+    expect(options).toBeDefined()
+    expect(options).toEqual(expect.objectContaining({
+      model: 'accounts/fireworks/models/glm-5p1',
+      api_key: 'env-fireworks-key',
+      base_url: 'https://example.fireworks.test/v1',
+      max_tokens: 131072,
+      stream_options: { include_usage: true },
+    }))
   })
 })

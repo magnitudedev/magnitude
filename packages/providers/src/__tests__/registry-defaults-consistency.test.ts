@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import type { MagnitudeSlot } from '@magnitudedev/agent'
-import { getStaticProviderModels } from '../registry'
+import { getProvider, getStaticProviderModels } from '../registry'
 
 const rest = (model: string): Record<MagnitudeSlot, string> => ({
   lead: model,
@@ -39,6 +39,7 @@ const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'zai-coding-plan': rest('glm-4.7'),
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
+  'fireworks': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
 }
 
 /** Duplicated from cli/src/utils/model-preferences.ts for validation */
@@ -47,6 +48,23 @@ const MODEL_OAUTH_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
 }
 
 describe('MODEL_DEFAULTS consistency with static registry', () => {
+  it('registers Fireworks AI with curated OpenAI-compatible static config', () => {
+    const provider = getProvider('fireworks')
+    expect(provider).toBeDefined()
+    expect(provider?.name).toBe('Fireworks AI')
+    expect(provider?.bamlProvider).toBe('openai-generic')
+    expect(provider?.defaultBaseUrl).toBe('https://api.fireworks.ai/inference/v1')
+    expect(provider?.authMethods).toEqual([
+      { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },
+    ])
+
+    const staticModels = getStaticProviderModels('fireworks')
+    expect(staticModels.map((model) => model.id)).toEqual([
+      'accounts/fireworks/routers/kimi-k2p5-turbo',
+      'accounts/fireworks/models/glm-5p1',
+    ])
+  })
+
   for (const [providerId, slotMap] of Object.entries(MODEL_DEFAULTS)) {
     for (const [slot, modelId] of Object.entries(slotMap)) {
       it(`${providerId}/${slot}: "${modelId}" exists in static registry`, () => {

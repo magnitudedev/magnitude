@@ -1,8 +1,14 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { detectProviderAuthMethods, detectProviders } from '../detect'
 import type { AuthInfo, ProviderOptions } from '../types'
 
 describe('detect local-family providers', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    delete process.env.FIREWORKS_API_KEY
+    delete process.env.OPENAI_API_KEY
+  })
+
   // First-class locals (lmstudio, ollama, llama.cpp) use discovery status
   it('marks first-class local connected when lastDiscoveryStatus is success_non_empty', () => {
     const storedAuth: Record<string, AuthInfo> = {}
@@ -65,6 +71,46 @@ describe('detect local-family providers', () => {
       { 'llama.cpp': { lastDiscoveryStatus: 'success_empty' } },
     )
 
+    expect(status).not.toBeNull()
+    expect(status!.anyConnected).toBe(false)
+  })
+
+  it('detects Fireworks from FIREWORKS_API_KEY env auth', () => {
+    process.env.FIREWORKS_API_KEY = 'fireworks-env-key'
+
+    const detected = detectProviders({}, {})
+    const fireworks = detected.find((d) => d.provider.id === 'fireworks')
+
+    expect(fireworks).toBeDefined()
+    expect(fireworks?.source).toBe('env')
+    expect(fireworks?.auth).toEqual({ type: 'api', key: 'fireworks-env-key' })
+  })
+
+  it('reports Fireworks api-key auth method as connected from env', () => {
+    process.env.FIREWORKS_API_KEY = 'fireworks-env-key'
+
+    const status = detectProviderAuthMethods('fireworks', {}, {})
+
+    expect(status).not.toBeNull()
+    expect(status!.anyConnected).toBe(true)
+    expect(status!.methods).toEqual([
+      {
+        method: { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },
+        methodIndex: 0,
+        connected: true,
+        source: 'env',
+        auth: { type: 'api', key: 'fireworks-env-key' },
+      },
+    ])
+  })
+
+  it('does not detect Fireworks from OPENAI_API_KEY alone', () => {
+    process.env.OPENAI_API_KEY = 'openai-only-key'
+
+    const detected = detectProviders({}, {})
+    expect(detected.some((d) => d.provider.id === 'fireworks')).toBe(false)
+
+    const status = detectProviderAuthMethods('fireworks', {}, {})
     expect(status).not.toBeNull()
     expect(status!.anyConnected).toBe(false)
   })
