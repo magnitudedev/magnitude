@@ -403,7 +403,7 @@ export const MultilineInput = forwardRef<
   const valueRef = useRef(value)
   const cursorPositionRef = useRef(cursorPosition)
 
-  // Kill-ring for readline-style kill/yank (Ctrl+U, Ctrl+K, Ctrl+W, Option+D → Ctrl+Y)
+  // Kill-ring for readline-style kill/yank (Ctrl+U, Ctrl+K, Ctrl+W, Ctrl+D → Ctrl+Y)
   const killRingRef = useRef<string>('')
 
   // Keep refs current on every render (synchronous assignment avoids useEffect timing issues)
@@ -1195,8 +1195,8 @@ export const MultilineInput = forwardRef<
         return true
       }
 
-      // Option+D: Kill word after cursor (readline kill-word)
-      if (hasAltLikeModifier && lowerKeyName === 'd' && !key.ctrl) {
+      // Ctrl+D: Kill word after cursor (readline kill-word)
+      if (key.ctrl && lowerKeyName === 'd' && !key.meta && !key.option) {
         suppressKeyDefault(key)
         if (removeSelectionIfPresent()) return true
         if (cursorPosition < wordEnd) {
