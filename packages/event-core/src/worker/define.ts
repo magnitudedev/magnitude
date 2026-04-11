@@ -8,7 +8,7 @@
 import { Effect, Context, Layer, Stream, PubSub, Cause } from 'effect'
 import { WorkerBusTag, type WorkerBusService } from '../core/worker-bus'
 import { HydrationContext } from '../core/hydration-context'
-import { InterruptPubSub } from '../core/interrupt-pubsub'
+import { InterruptCoordinator } from '../core/interrupt-coordinator'
 import { extractForkIdFromEvent, extractForkIdFromSignal } from './util'
 import { type BaseEvent, type Timestamped } from '../core/event-bus-core'
 import { Signal, type SignalValue } from '../signal/define'
@@ -136,7 +136,7 @@ export interface WorkerResult<
     void,
     never,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ExtractHandlerRequirements<THandlers> | ExtractSettledRequirements<TSettledHandler> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
+    ExtractHandlerRequirements<THandlers> | ExtractSettledRequirements<TSettledHandler> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<any> | FrameworkErrorReporterService
   >
 }
 
@@ -192,7 +192,7 @@ export function define<TEvent extends BaseEvent>() {
     const Live = Layer.scoped(Tag, Effect.gen(function* () {
       const bus = yield* BusTag
       const hydration = yield* HydrationContext
-      const interruptPubSub = yield* InterruptPubSub
+      const interruptCoordinator = yield* InterruptCoordinator
       const reporter = yield* FrameworkErrorReporter
 
       if (yield* hydration.isHydrating()) {
@@ -201,24 +201,14 @@ export function define<TEvent extends BaseEvent>() {
 
       const publish: PublishFn<TEvent> = (event) => bus.publish(event)
 
-      // Helper to wrap handler with interrupt racing
-      // Each handler gets a fresh subscription so it only sees interrupts fired after it starts
-      // Only interrupts matching the target forkId will trigger interruption
       const withInterrupt = <A, RH>(handler: Effect.Effect<A, never, RH>, targetForkId: string | null) =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const queue = yield* PubSub.subscribe(interruptPubSub)
-            return yield* Effect.raceFirst(
-              handler,
-              Stream.fromQueue(queue).pipe(
-                Stream.filter((interruptForkId) => interruptForkId === targetForkId),
-                Stream.take(1),
-                Stream.runDrain,
-                Effect.flatMap(() => Effect.interrupt)
-              )
-            )
-          })
-        )
+        Effect.gen(function* () {
+          const baseline = yield* interruptCoordinator.current(targetForkId)
+          return yield* Effect.raceFirst(
+            handler,
+            interruptCoordinator.waitForInterrupt(targetForkId, baseline)
+          )
+        })
 
       // Set up event handlers
       if (config.eventHandlers) {
@@ -330,7 +320,7 @@ export function define<TEvent extends BaseEvent>() {
 
     // TypeScript can't track Signal<T> types through loops, so cast the Layer
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    type LayerInput = ExtractHandlerRequirements<THandlers> | ExtractSettledRequirements<TSettledHandler> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<void> | PubSub.PubSub<any> | FrameworkErrorReporterService
+    type LayerInput = ExtractHandlerRequirements<THandlers> | ExtractSettledRequirements<TSettledHandler> | WorkerBusService<TEvent> | HydrationContext | PubSub.PubSub<any> | FrameworkErrorReporterService
 
     return {
       Tag,

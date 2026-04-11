@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test'
+import { Effect } from 'effect'
 import { define as defineAgent } from '../agent'
 import { defineForked } from './defineForked'
 import type { ForkableEvent } from '../projection/defineForked'
@@ -22,7 +23,7 @@ describe('Worker.defineForked completeOn lifecycle', () => {
       eventHandlers: {
         turn_started: (event) => {
           seen.push({ type: event.type, forkId: event.forkId })
-          return undefined as any
+          return Effect.void
         },
       },
     })
@@ -62,7 +63,7 @@ describe('Worker.defineForked completeOn lifecycle', () => {
       eventHandlers: {
         turn_started: (event) => {
           seen.push({ type: event.type, forkId: event.forkId })
-          return undefined as any
+          return Effect.void
         },
       },
     })

@@ -13,7 +13,7 @@ import {
 import { EventSinkTag, makeEventSinkLayer } from './event-sink'
 import { makeProjectionBusLayer, ProjectionBusTag } from './projection-bus'
 import { HydrationContext } from './hydration-context'
-import { InterruptPubSubLive } from './interrupt-pubsub'
+import { InterruptCoordinatorLive } from './interrupt-coordinator'
 import {
   FrameworkErrorPubSubLive,
   FrameworkErrorReporterLive,
@@ -44,7 +44,7 @@ function makeTestLayers() {
   const coreDeps = Layer.mergeAll(
     HydrationContext.Default,
     makeEventSinkLayer<TestEvent>(),
-    InterruptPubSubLive,
+    InterruptCoordinatorLive,
     FrameworkErrorPubSubLive,
     frameworkErrorLayer,
   )

@@ -12,7 +12,7 @@
 import { Effect, PubSub, Queue, Deferred, Stream, Context, Layer, Scope, Cause } from 'effect'
 import { HydrationContext } from './hydration-context'
 import { EventSinkTag, type EventSinkService } from './event-sink'
-import { InterruptPubSub } from './interrupt-pubsub'
+import { InterruptCoordinator } from './interrupt-coordinator'
 import { ProjectionBusTag, type ProjectionBusService } from './projection-bus'
 import { extractForkIdFromEvent } from '../worker/util'
 import { FrameworkErrorReporter, FrameworkError, type FrameworkErrorReporterService } from './framework-error'
@@ -67,7 +67,7 @@ export type EventBusCoreTagType<E extends BaseEvent> = ReturnType<typeof EventBu
 export function makeEventBusCoreLayer<E extends BaseEvent>(): Layer.Layer<
   EventBusCoreService<E>,
   never,
-  HydrationContext | EventSinkService<E> | PubSub.PubSub<string | null> | ProjectionBusService<E> | FrameworkErrorReporterService
+  HydrationContext | EventSinkService<E> | InterruptCoordinator | ProjectionBusService<E> | FrameworkErrorReporterService
 > {
   const Tag = EventBusCoreTag<E>()
   const SinkTag = EventSinkTag<E>()
@@ -76,10 +76,11 @@ export function makeEventBusCoreLayer<E extends BaseEvent>(): Layer.Layer<
   return Layer.scoped(Tag, Effect.gen(function* () {
     const hydration = yield* HydrationContext
     const sink = yield* SinkTag
-    const interruptPubSub = yield* InterruptPubSub
+    const interruptCoordinator = yield* InterruptCoordinator
     const projectionBus = yield* ProjBusTag
     const reporter = yield* FrameworkErrorReporter
     const pubsub = yield* PubSub.unbounded<Timestamped<E>>()
+    yield* interruptCoordinator.beginExecution(null)
 
     // Sequential event processing queue.
     // Events are enqueued by publish() and processed one at a time by a
@@ -100,7 +101,7 @@ export function makeEventBusCoreLayer<E extends BaseEvent>(): Layer.Layer<
             }
 
             if (event.type === 'interrupt') {
-              yield* PubSub.publish(interruptPubSub, extractForkIdFromEvent(event))
+              yield* interruptCoordinator.interrupt(extractForkIdFromEvent(event))
             }
 
             if (!event.ephemeral) {

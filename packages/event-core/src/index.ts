@@ -14,7 +14,7 @@
 export * from './types'
 export { HydrationContext } from './core/hydration-context'
 export { EventSinkTag, makeEventSinkLayer, type EventSinkService } from './core/event-sink'
-export { InterruptPubSub, InterruptPubSubLive } from './core/interrupt-pubsub'
+export { InterruptCoordinator, InterruptCoordinatorLive, type InterruptBaseline, type InterruptCoordinator as InterruptCoordinatorService } from './core/interrupt-coordinator'
 export { ProjectionBusTag, makeProjectionBusLayer, type ProjectionBusService } from './core/projection-bus'
 export { WorkerBusTag, makeWorkerBusLayer, type WorkerBusService } from './core/worker-bus'
 export { EventBusCoreTag, makeEventBusCoreLayer, type EventBusCoreService, type BaseEvent, type Timestamped } from './core/event-bus-core'
