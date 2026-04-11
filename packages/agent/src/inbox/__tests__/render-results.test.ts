@@ -27,4 +27,41 @@ describe('formatResults', () => {
       { type: 'text', text: '</view>' },
     ] satisfies ContentPart[])
   })
+
+  test('formats invalid tool input with inline correct tool shape inside error block', () => {
+    const output = formatResults([
+      {
+        kind: 'tool_error',
+        tagName: 'read',
+        status: 'error',
+        message: 'Invalid tool input: missing required attribute "path".',
+        correctToolShape: '<read\npath="..."\noffset="..."\nlimit="..."\n/>',
+      },
+    ])
+
+    expect(output).toEqual([
+      {
+        type: 'text',
+        text: '\n<tool name="read"><error>\nInvalid tool input: missing required attribute "path".\n\nCorrect tool shape:\n<read\npath="..."\noffset="..."\nlimit="..."\n/>\n</error></tool>',
+      },
+    ] satisfies ContentPart[])
+  })
+
+  test('keeps runtime execution errors unchanged when no correct tool shape is present', () => {
+    const output = formatResults([
+      {
+        kind: 'tool_error',
+        tagName: 'read',
+        status: 'error',
+        message: 'Failed to read does-not-exist.txt',
+      },
+    ])
+
+    expect(output).toEqual([
+      {
+        type: 'text',
+        text: '\n<tool name="read"><error>Failed to read does-not-exist.txt</error></tool>',
+      },
+    ] satisfies ContentPart[])
+  })
 })

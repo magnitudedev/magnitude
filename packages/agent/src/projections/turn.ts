@@ -25,6 +25,8 @@ import { createId } from '../util/id'
 
 export interface ToolCall {
   readonly toolCallId: string
+  // Internal turn bookkeeping stays on catalog keys. Model-facing rendering resolves
+  // the XML tag separately at the inbox/memory boundary.
   readonly toolKey: ToolKey
   readonly input: unknown
   readonly result?: XmlToolResult

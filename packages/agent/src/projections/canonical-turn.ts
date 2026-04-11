@@ -171,6 +171,8 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           const idx = fork.toolCalls.length
           const nextToolCalls = [...fork.toolCalls, {
             toolCallId: event.toolCallId,
+            // Canonical XML is model-facing, so preserve the parsed XML tag here
+            // instead of the internal catalog key carried alongside the app event.
             tagName: event.event.tagName,
             input: {},
             query: '.',
