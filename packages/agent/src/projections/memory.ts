@@ -63,6 +63,7 @@ import { builderRole } from '../agents/builder'
 import { explorerRole } from '../agents/explorer'
 import { plannerRole } from '../agents/planner'
 import { reviewerRole } from '../agents/reviewer'
+import { generateXmlActToolShape, resolveXmlTagName } from '../tools/xml-tool-docs'
 
 const lifecycleReminderFormatters: LifecycleReminderFormatterMap = {
   builder: {
@@ -339,6 +340,61 @@ function findTaskForAgent(state: TaskGraphState, args: { agentId: string, forkId
   return null
 }
 
+function getAgentDefinitionForFork(read: <T>(projection: T) => any, forkId: string | null) {
+  if (forkId === null) return getAgentDefinition('lead')
+  const role = getAgentByForkId(read(AgentStatusProjection), forkId)?.role
+  return role && isValidVariant(role) ? getAgentDefinition(role) : undefined
+}
+
+function toToolErrorResult(args: {
+  tagName: string
+  status: Extract<TurnResultItem, { kind: 'tool_error' }>['status']
+  message?: string
+  correctToolShape?: string
+}): TurnResultItem {
+  return {
+    kind: 'tool_error',
+    tagName: args.tagName,
+    status: args.status,
+    message: args.message,
+    correctToolShape: args.correctToolShape,
+  }
+}
+
+function toRuntimeToolErrorResult(
+  read: <T>(projection: T) => any,
+  forkId: string | null,
+  toolKey: string,
+  status: Extract<TurnResultItem, { kind: 'tool_error' }>['status'],
+  message?: string,
+): TurnResultItem {
+  const agentDef = getAgentDefinitionForFork(read, forkId)!
+  const tagName = resolveXmlTagName(agentDef, toolKey)!
+
+  return toToolErrorResult({
+    tagName,
+    status,
+    message,
+    correctToolShape: generateXmlActToolShape(agentDef, tagName),
+  })
+}
+
+function toInvalidToolInputResult(
+  read: <T>(projection: T) => any,
+  forkId: string | null,
+  tagName: string,
+  detail: string,
+): TurnResultItem {
+  const agentDef = getAgentDefinitionForFork(read, forkId)
+
+  return toToolErrorResult({
+    tagName,
+    status: 'error',
+    message: `Invalid tool input: ${detail}`,
+    correctToolShape: agentDef ? generateXmlActToolShape(agentDef, tagName) : undefined,
+  })
+}
+
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
   const content = message.type === 'inbox'
     ? formatInbox({ results: message.results, timeline: message.timeline, timezone, lifecycleReminderFormatters })
@@ -459,7 +515,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     },
 
-    tool_event: ({ event, fork }) => {
+    tool_event: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
 
       switch (event.event._tag) {
@@ -473,12 +529,13 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  {
-                    kind: 'tool_error',
-                    toolKey: event.toolKey,
-                    status: 'error',
-                    message: result.error,
-                  },
+                  toRuntimeToolErrorResult(
+                    read,
+                    event.forkId,
+                    event.toolKey,
+                    'error',
+                    result.error,
+                  ),
                 ],
               }
             case 'Rejected':
@@ -486,12 +543,13 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  {
-                    kind: 'tool_error',
-                    toolKey: event.toolKey,
-                    status: 'rejected',
-                    message: typeof result.rejection === 'string' ? result.rejection : undefined,
-                  },
+                  toRuntimeToolErrorResult(
+                    read,
+                    event.forkId,
+                    event.toolKey,
+                    'rejected',
+                    typeof result.rejection === 'string' ? result.rejection : undefined,
+                  ),
                 ],
               }
             case 'Interrupted':
@@ -499,11 +557,12 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  {
-                    kind: 'tool_error',
-                    toolKey: event.toolKey,
-                    status: 'interrupted',
-                  },
+                  toRuntimeToolErrorResult(
+                    read,
+                    event.forkId,
+                    event.toolKey,
+                    'interrupted',
+                  ),
                 ],
               }
           }
@@ -520,6 +579,15 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 query: event.event.query,
                 content: event.event.content,
               },
+            ],
+          }
+
+        case 'ToolInputParseError':
+          return {
+            ...fork,
+            pendingResultItems: [
+              ...fork.pendingResultItems,
+              toInvalidToolInputResult(read, event.forkId, event.event.tagName, event.event.error.detail),
             ],
           }
 
@@ -608,7 +676,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       let nextFork: ForkMemoryState = { ...fork, messages: newMessages, currentTurnId: null }
 
-      if (!hasAssistantContent && !isCancelled && event.result.success) {
+      if (!hasAssistantContent && !isCancelled && event.result.success && fork.pendingResultItems.length === 0) {
         nextFork = {
           ...nextFork,
           messages: [

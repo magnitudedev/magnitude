@@ -11,10 +11,23 @@ import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
 import { ONESHOT_LIVENESS_REMINDER } from '../prompts/error-states'
 import { ContentPartBuilder, type ContentPart } from '../content'
-import type { MessageAckResultItem, TurnResultItem } from './types'
+import type { MessageAckResultItem, ToolErrorResultItem, TurnResultItem } from './types'
 
 function formatMessageAck(item: MessageAckResultItem): string {
   return `\n<message-sent to="${item.destination}" chars="${item.chars}"/>`
+}
+
+function formatToolError(item: ToolErrorResultItem): string {
+  if (item.status === 'interrupted') {
+    return `\n<tool name="${item.tagName}"><error>Interrupted</error></tool>`
+  }
+
+  const message = item.message ?? 'Unknown error'
+  if (item.correctToolShape) {
+    return `\n<tool name="${item.tagName}"><error>\n${message}\n\nCorrect tool shape:\n${item.correctToolShape}\n</error></tool>`
+  }
+
+  return `\n<tool name="${item.tagName}"><error>${message}</error></tool>`
 }
 
 /** Format ordered turn results for LLM context */
@@ -23,11 +36,7 @@ export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
 
   for (const item of items) {
     if (item.kind === 'tool_error') {
-      if (item.status === 'interrupted') {
-        builder.pushText(`\n<tool name="${item.toolKey}"><error>Interrupted</error></tool>`)
-      } else {
-        builder.pushText(`\n<tool name="${item.toolKey}"><error>${item.message ?? 'Unknown error'}</error></tool>`)
-      }
+      builder.pushText(formatToolError(item))
       continue
     }
 

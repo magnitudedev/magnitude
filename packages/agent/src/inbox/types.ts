@@ -83,9 +83,10 @@ export type PhaseCriteriaPayload =
 
 export type ToolErrorResultItem = {
   readonly kind: 'tool_error'
-  readonly toolKey: string
+  readonly tagName: string
   readonly status: Exclude<ToolResultStatus, 'success'>
   readonly message?: string
+  readonly correctToolShape?: string
 }
 
 export type ToolObservationResultItem = {

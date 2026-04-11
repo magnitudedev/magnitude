@@ -300,12 +300,22 @@ function classifyOutputDoc(schemaAst: AST.AST): OutputDocShape {
 // =============================================================================
 
 /**
- * Generate unified annotated XML documentation for a single tool.
+ * Generate the canonical XML input shape for a single tool.
  */
-export function generateXmlToolDoc(tool: XmlToolDocEntry): string {
+export function generateXmlToolInputShape(tool: XmlToolDocEntry): string {
   const tagName = tool.xmlInput.tag
   const fields = getFieldInfos(tool.inputSchema.ast)
   const lines: string[] = []
+  buildAnnotatedInput(lines, tagName, tool.xmlInput, fields, tool.inputSchema.ast)
+  return lines.join('\n')
+}
+
+/**
+ * Generate unified annotated XML documentation for a single tool.
+ */
+export function generateXmlToolDoc(tool: XmlToolDocEntry): string {
+  const lines: string[] = []
+  const tagName = tool.xmlInput.tag
 
   // 1. Description
   if (tool.description) {
@@ -314,7 +324,7 @@ export function generateXmlToolDoc(tool: XmlToolDocEntry): string {
   }
 
   // 2. Annotated input example
-  buildAnnotatedInput(lines, tagName, tool.xmlInput, fields, tool.inputSchema.ast)
+  lines.push(generateXmlToolInputShape(tool))
 
   // 3. Output documentation
   buildAnnotatedOutput(lines, tagName, tool.outputSchema.ast, tool.xmlOutput)

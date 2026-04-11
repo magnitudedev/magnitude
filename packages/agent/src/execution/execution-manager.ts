@@ -475,7 +475,9 @@ const makeExecutionManager = Effect.gen(function* () {
       // Run xml-act runtime
       const eventStream = runtime.streamWith(trackedXmlStream, { initialState: replayState })
 
-      // Track toolCallId → toolKey mapping for event forwarding
+      // Track toolCallId → internal catalog key for app events / projections.
+      // xml-act events still carry the model-facing XML tagName; downstream
+      // renderers should use that tagName when presenting tool errors back to the model.
       const toolCallKeys = new Map<string, ToolKey>()
 
       yield* Effect.scoped(
