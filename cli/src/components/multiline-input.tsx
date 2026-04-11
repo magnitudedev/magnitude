@@ -403,6 +403,9 @@ export const MultilineInput = forwardRef<
   const valueRef = useRef(value)
   const cursorPositionRef = useRef(cursorPosition)
 
+  // Kill-ring for readline-style kill/yank (Ctrl+U, Ctrl+K, Ctrl+W, Ctrl+D → Ctrl+Y)
+  const killRingRef = useRef<string>('')
+
   // Keep refs current on every render (synchronous assignment avoids useEffect timing issues)
   valueRef.current = value
   cursorPositionRef.current = cursorPosition
@@ -1108,6 +1111,143 @@ export const MultilineInput = forwardRef<
       const lineStart = locateLineStart(value, cursorPosition)
       const wordStart = findWordStartBefore(value, cursorPosition)
       const wordEnd = findWordEndAfter(value, cursorPosition)
+      const lowerKeyName = (key.name ?? '').toLowerCase()
+      const lineEnd = locateLineEnd(value, cursorPosition)
+
+      // Ctrl+U: Kill from cursor to beginning of line (readline unix-line-discard)
+      if (key.ctrl && lowerKeyName === 'u' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        if (removeSelectionIfPresent()) return true
+        if (cursorPosition > lineStart) {
+          killRingRef.current = value.substring(lineStart, cursorPosition)
+          const next = applyTextEditWithPastesAndMentions(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
+            },
+            lineStart,
+            cursorPosition,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
+        }
+        return true
+      }
+
+      // Ctrl+K: Kill from cursor to end of line (readline kill-line)
+      if (key.ctrl && lowerKeyName === 'k' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        if (removeSelectionIfPresent()) return true
+        if (cursorPosition < lineEnd) {
+          killRingRef.current = value.substring(cursorPosition, lineEnd)
+          const next = applyTextEditWithPastesAndMentions(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
+            },
+            cursorPosition,
+            lineEnd,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
+        }
+        return true
+      }
+
+      // Ctrl+W: Kill word before cursor (readline unix-word-rubout)
+      if (key.ctrl && lowerKeyName === 'w' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        if (removeSelectionIfPresent()) return true
+        if (cursorPosition > wordStart) {
+          killRingRef.current = value.substring(wordStart, cursorPosition)
+          const next = applyTextEditWithPastesAndMentions(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
+            },
+            wordStart,
+            cursorPosition,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
+        }
+        return true
+      }
+
+      // Ctrl+D: Kill word after cursor (readline kill-word)
+      if (key.ctrl && lowerKeyName === 'd' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        if (removeSelectionIfPresent()) return true
+        if (cursorPosition < wordEnd) {
+          killRingRef.current = value.substring(cursorPosition, wordEnd)
+          const next = applyTextEditWithPastesAndMentions(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
+            },
+            cursorPosition,
+            wordEnd,
+            '',
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
+        }
+        return true
+      }
+
+      // Ctrl+Y: Yank (paste) previously killed text
+      if (key.ctrl && lowerKeyName === 'y' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        if (removeSelectionIfPresent()) return true
+        const killedText = killRingRef.current
+        if (killedText) {
+          const next = applyTextEditWithPastesAndMentions(
+            {
+              text: value,
+              cursorPosition,
+              lastEditDueToNav: false,
+              pasteSegments: sortedPasteSegments,
+              selectedPasteSegmentId,
+              mentionSegments: sortedMentionSegments,
+              selectedMentionSegmentId: null,
+            },
+            cursorPosition,
+            cursorPosition,
+            killedText,
+          )
+          valueRef.current = next.text
+          cursorPositionRef.current = next.cursorPosition
+          commitInput(next)
+        }
+        return true
+      }
 
       // Alt+Backspace: Delete word backward
       if (key.name === 'backspace' && hasAltLikeModifier) {
@@ -1393,6 +1533,28 @@ export const MultilineInput = forwardRef<
       const visualLineEnd = lineStarts[visualLineIndex + 1] !== undefined
         ? lineStarts[visualLineIndex + 1] - 1
         : logicalLineEnd
+
+      // Ctrl+A: Move to beginning of logical line (readline-style)
+      if (key.ctrl && key.name === 'a' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        commitInput({
+          text: value,
+          cursorPosition: logicalLineStart,
+          lastEditDueToNav: false,
+        })
+        return true
+      }
+
+      // Ctrl+E: Move to end of logical line (readline-style)
+      if (key.ctrl && key.name === 'e' && !key.meta && !key.option) {
+        suppressKeyDefault(key)
+        commitInput({
+          text: value,
+          cursorPosition: logicalLineEnd,
+          lastEditDueToNav: false,
+        })
+        return true
+      }
 
       // Alt+Left/B: Word left
       if (

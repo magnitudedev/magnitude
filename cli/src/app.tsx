@@ -290,7 +290,7 @@ function AppInner({
 
   useEffect(() => {
     logger.info('App started')
-    if (debugMode) logger.info('Debug mode enabled - press Ctrl+D to toggle debug panel')
+    if (debugMode) logger.info('Debug mode enabled - press Ctrl+X to toggle debug panel')
     refreshRecentChats()
   }, [debugMode, refreshRecentChats])
 
@@ -1819,7 +1819,7 @@ function AppInner({
         if (key.defaultPrevented) return
 
         const isCtrlC = key.ctrl && key.name === 'c' && !key.meta && !key.option
-        const isCtrlD = key.ctrl && key.name === 'd' && !key.meta && !key.option
+        const isCtrlX = key.ctrl && key.name === 'x' && !key.meta && !key.option
         const isCtrlR = key.ctrl && key.name === 'r' && !key.meta && !key.option
 
         if (isCtrlC) {
@@ -1830,7 +1830,7 @@ function AppInner({
           return
         }
 
-        if (isCtrlD && debugMode) {
+        if (isCtrlX && debugMode) {
           key.preventDefault()
           setDebugPanelVisible(prev => !prev)
           return
