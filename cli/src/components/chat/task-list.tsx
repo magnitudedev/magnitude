@@ -54,9 +54,8 @@ type TaskRowProps = {
   onHoverEnd: () => void
   now: number
   taskNameWidth: number
+  columnGap: number
   agentIdWidth: number
-  showAssigneeColumn: boolean
-
 }
 
 function truncate(s: string, maxWidth: number) {
@@ -143,8 +142,8 @@ function TaskRow({
   onHoverEnd,
   now,
   taskNameWidth,
+  columnGap,
   agentIdWidth,
-  showAssigneeColumn,
 }: TaskRowProps) {
   const theme = useTheme()
   const assigneeLabel = getAssigneeLabel(task)
@@ -158,7 +157,7 @@ function TaskRow({
       <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
         <TaskNameContent task={task} effectiveStatus={effectiveStatus} taskNameWidth={taskNameWidth} />
       </box>
-
+      <box style={{ width: columnGap, minWidth: columnGap, maxWidth: columnGap, flexShrink: 0 }} />
       {(
         <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row' }}>
           {task.assignee.kind === 'worker' && task.workerForkId ? (
@@ -196,8 +195,10 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
 
   const box = useLocalWidth()
   const usableWidth = Math.max(1, (box.width ?? 60) - 4)
-  const agentIdWidth = Math.max(12, Math.floor(usableWidth * 0.43))
-  const taskNameWidth = Math.max(1, usableWidth - agentIdWidth)
+  const columnGap = 2
+  const contentWidth = Math.max(14, usableWidth - columnGap)
+  const agentIdWidth = Math.max(12, Math.floor(contentWidth * 0.43))
+  const taskNameWidth = Math.max(1, contentWidth - agentIdWidth)
 
   const visibleAllTasks = tasks
 
@@ -261,34 +262,37 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
       {stickyRootSummary ? (
         <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
           <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
-            <TaskNameContent task={stickyRootSummary.task} effectiveStatus={effectiveVisualStates.get(stickyRootSummary.task.taskId) ?? 'pending'} taskNameWidth={taskNameWidth} />
-            <HeaderCountsText completed={stickyRootSummary.completed} active={stickyRootSummary.active} theme={theme} />
+            {(() => {
+              const countsStr = ` (${stickyRootSummary.completed} completed, ${stickyRootSummary.active} active)`
+              return <>
+                <TaskNameContent task={stickyRootSummary.task} effectiveStatus={effectiveVisualStates.get(stickyRootSummary.task.taskId) ?? 'pending'} taskNameWidth={taskNameWidth - countsStr.length} />
+                <text style={{ fg: theme.muted }}>{countsStr}</text>
+              </>
+            })()}
           </box>
-          {(
-            <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-              <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
-                {truncate(getAssigneeLabel(stickyRootSummary.task), agentIdWidth)}
-              </text>
-              <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
-                <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
-              </Button>
-            </box>
-          )}
+          <box style={{ width: columnGap, minWidth: columnGap, maxWidth: columnGap, flexShrink: 0 }} />
+          <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+            <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
+              {truncate(getAssigneeLabel(stickyRootSummary.task), agentIdWidth)}
+            </text>
+            <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
+              <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
+            </Button>
+          </box>
         </box>
       ) : (
         <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
           <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
             <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Task</text>
-            <HeaderCountsText completed={completedCount} active={activeCount} theme={theme} />
+            <text style={{ fg: theme.muted }}>{` (${completedCount} completed, ${activeCount} active)`}</text>
           </box>
-          {(
-            <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-              <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
-              <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
-                <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
-              </Button>
-            </box>
-          )}
+          <box style={{ width: columnGap, minWidth: columnGap, maxWidth: columnGap, flexShrink: 0 }} />
+          <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+            <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
+            <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
+              <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
+            </Button>
+          </box>
         </box>
       )}
 
@@ -327,8 +331,8 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
               onHoverEnd={handleHoverEnd}
               now={now}
               taskNameWidth={taskNameWidth}
+              columnGap={columnGap}
               agentIdWidth={agentIdWidth}
-              showAssigneeColumn
             />
           ))}
         </scrollbox>
@@ -345,8 +349,8 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
               onHoverEnd={handleHoverEnd}
               now={now}
               taskNameWidth={taskNameWidth}
+              columnGap={columnGap}
               agentIdWidth={agentIdWidth}
-              showAssigneeColumn
             />
           ))}
         </box>
