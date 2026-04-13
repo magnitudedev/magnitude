@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   resolveFileRef,
   type DisplayState,
+  type ToolStateProjectionState,
 } from '@magnitudedev/agent'
 import { logger } from '@magnitudedev/logger'
 import { readFileSync, watchFile, unwatchFile } from 'node:fs'
@@ -34,6 +35,7 @@ export type FilePanelStream =
 
 export interface UseFilePanelParams {
   display: DisplayState | null
+  toolState: ToolStateProjectionState | null
   workspacePath: string | null
   projectRoot: string
 }
@@ -51,6 +53,7 @@ export interface UseFilePanelResult {
 
 export function useFilePanel({
   display,
+  toolState,
   workspacePath,
   projectRoot,
 }: UseFilePanelParams): UseFilePanelResult {
@@ -91,13 +94,15 @@ export function useFilePanel({
 
   const activeStream = useMemo(() => {
     if (!selectedFile || !display) return null
-    const byRaw = findActiveFileStream(display, selectedFile.path)
+
+    const toolHandles = toolState?.toolHandles
+    const byRaw = findActiveFileStream(toolHandles, selectedFile.path)
     if (byRaw) return byRaw
     if (selectedFileResolvedPath && selectedFileResolvedPath !== selectedFile.path) {
-      return findActiveFileStream(display, selectedFileResolvedPath)
+      return findActiveFileStream(toolHandles, selectedFileResolvedPath)
     }
     return null
-  }, [selectedFile, selectedFileResolvedPath, display])
+  }, [selectedFile, selectedFileResolvedPath, display, toolState])
 
   const hasActiveSelectedFileStreamRef = useRef(false)
   useEffect(() => {

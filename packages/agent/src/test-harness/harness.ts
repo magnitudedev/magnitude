@@ -1,6 +1,6 @@
 import { Agent, type Projection } from '@magnitudedev/event-core'
 import { defineCatalog } from '@magnitudedev/tools'
-import { Context, Effect, Layer } from 'effect'
+import { Context, Effect, Layer, SubscriptionRef } from 'effect'
 import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
 import type { RoleDefinition } from '@magnitudedev/roles'
 import type { AgentCatalogEntry } from '../catalog'
@@ -18,6 +18,8 @@ import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { MemoryProjection, getView } from '../projections/memory'
 import { SubagentActivityProjection } from '../projections/subagent-activity'
 import { DisplayProjection } from '../projections/display'
+import { ToolStateProjection } from '../projections/tool-state'
+import { TaskWorkerProjection } from '../projections/task-worker'
 import { AgentRoutingProjection } from '../projections/agent-routing'
 import { AgentStatusProjection } from '../projections/agent-status'
 import { CompactionProjection } from '../projections/compaction'
@@ -141,6 +143,9 @@ export interface TestHarnessService {
     tag: Context.Tag<Projection.ForkedProjectionInstance<S>, Projection.ForkedProjectionInstance<S>>,
     forkId: string | null,
   ) => Effect.Effect<S>
+  readonly projection: <S>(
+    tag: Context.Tag<Projection.ProjectionInstance<S>, Projection.ProjectionInstance<S>>,
+  ) => Effect.Effect<S>
   readonly runEffect: <A, E>(effect: Effect.Effect<A, E, any>) => Effect.Effect<A, E>
 }
 
@@ -171,6 +176,7 @@ export function TestHarnessLive(options: HarnessOptions = {}): Layer.Layer<TestH
           route: (mapping) => Effect.promise(() => harness.script.route(mapping)),
         },
         projectionFork: (tag, forkId) => Effect.promise(() => harness.projectionFork(tag, forkId)),
+        projection: (tag) => Effect.promise(() => harness.projection(tag)),
         runEffect: (effect) => Effect.promise(() => harness.runEffect(effect)),
       })),
     ),
@@ -235,6 +241,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         SubagentActivityProjection,
         OutboundMessagesProjection,
         UserMessageResolutionProjection,
+        ToolStateProjection,
+        TaskWorkerProjection,
         MemoryProjection,
         DisplayProjection,
         ConversationProjection,
@@ -247,6 +255,8 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         },
         state: {
           display: DisplayProjection,
+          toolState: ToolStateProjection,
+          taskWorker: TaskWorkerProjection,
           turn: TurnProjection,
           memory: MemoryProjection,
           compaction: CompactionProjection,

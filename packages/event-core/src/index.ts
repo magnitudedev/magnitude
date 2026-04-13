@@ -42,3 +42,5 @@ export * as Fork from './fork/index'
 
 // Convenience exports
 export { type PublishFn, type WorkerReadFn } from './worker/index'
+export { type ReadFn } from './projection/index'
+export { type ForkedState } from './projection/defineForked'

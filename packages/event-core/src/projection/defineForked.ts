@@ -29,6 +29,7 @@ import {
 import {
   type AnyProjectionResult,
   type StateOfProjection,
+  type StateOfProjectionForForkedReader,
   type SignalSubscription,
   type AmbientReader
 } from './define'
@@ -78,13 +79,13 @@ type SignalPubSubs<TSignals extends Record<string, Signal<unknown, unknown>>> = 
  * Automatically resolves forked dependencies to the same forkId.
  */
 export type ForkedReadFn<TReads extends readonly AnyProjectionResult[]> = {
-  <P extends TReads[number]>(projection: P): StateOfProjection<P>
+  <P extends TReads[number]>(projection: P): StateOfProjectionForForkedReader<P>
   <P extends TReads[number]>(
     projection: P,
     forkId: string | null
   ): P extends ForkedProjectionResult<any, infer TForkState, any, any, any>
     ? TForkState
-    : StateOfProjection<P>
+    : StateOfProjectionForForkedReader<P>
 }
 
 /**
@@ -95,7 +96,7 @@ export type ForkedSignalReadFn<TReads extends readonly AnyProjectionResult[]> =
   <P extends TReads[number]>(projection: P) =>
     P extends ForkedProjectionResult<any, infer TForkState, any, any, any>
       ? ForkedState<TForkState>
-      : StateOfProjection<P>
+      : StateOfProjectionForForkedReader<P>
 
 // ---------------------------------------------------------------------------
 // Signal Handler Builder Types
@@ -399,7 +400,7 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
 
         // Build read function for event handlers (fork-aware)
         const makeEventReadFn = (eventForkId: string | null): ForkedReadFn<TReads> => {
-          return <P extends TReads[number]>(projection: P, forkId?: string | null): StateOfProjection<P> => {
+          return <P extends TReads[number]>(projection: P, forkId?: string | null): StateOfProjectionForForkedReader<P> => {
             if (!allowedReadNames.has(projection.name)) {
               throw new Error(
                 `Projection "${config.name}" cannot read "${projection.name}" - not declared in reads`
@@ -408,9 +409,9 @@ export function defineForked<TEvent extends ForkableEvent, TForkState>() {
             // For forked projections, resolve to specified forkId or default to event forkId
             if (forkedReadNames.has(projection.name)) {
               const targetForkId = forkId !== undefined ? forkId : eventForkId
-              return bus.getForkState(projection.name, targetForkId) as StateOfProjection<P>
+              return bus.getForkState(projection.name, targetForkId) as StateOfProjectionForForkedReader<P>
             }
-            return bus.getProjectionState(projection.name) as StateOfProjection<P>
+            return bus.getProjectionState(projection.name) as StateOfProjectionForForkedReader<P>
           }
         }
 

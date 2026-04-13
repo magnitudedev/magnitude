@@ -2,7 +2,7 @@ import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolStateEvent, StreamingAccumulatorLike } from '@magnitudedev/tools'
 import { normalizeToolEvent } from '../normalizer'
 import type { ToolState } from '../models'
-import { catalog, type ToolKey, type AgentCatalogEntry } from '../catalog'
+import type { ToolKey, AgentCatalogEntry } from '../catalog'
 
 export type { ToolState } from '../models'
 type AnyToolEvent = ToolStateEvent<unknown, unknown, unknown>
@@ -17,8 +17,7 @@ export interface ToolHandle {
 
 type ToolStateFor<K extends ToolKey> = AgentCatalogEntry['state']['initial']
 
-export function createToolHandle(toolKey: ToolKey): ToolHandle {
-  const entry = catalog.entries[toolKey] as AgentCatalogEntry
+export function createToolHandle(toolKey: ToolKey, entry: AgentCatalogEntry): ToolHandle {
   const acc = entry.state.binding.createAccumulator()
   return buildHandle(toolKey, entry.state.initial, acc, entry.state.reduce as ToolReducer<ToolStateFor<typeof toolKey>>)
 }

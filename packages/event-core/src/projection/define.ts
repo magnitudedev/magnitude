@@ -41,26 +41,50 @@ type SignalPubSubs<TSignals extends Record<string, Signal<unknown, unknown>>> = 
 // ---------------------------------------------------------------------------
 
 // Import forked types for state extraction
-import type { ForkedProjectionInstance, ForkedProjectionResult } from './defineForked'
+import type { ForkedProjectionInstance, ForkedProjectionResult, ForkedState } from './defineForked'
 
-/** Helper to extract state from an instance type */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ExtractState<I> =
+/**
+ * Extract fork state type from a forked projection instance.
+ * Returns S (the per-fork state), not ForkedState<S>.
+ */
+type ExtractForkState<I> =
+  I extends ForkedProjectionInstance<infer S>
+    ? S
+    : never
+
+/**
+ * Extract state type for non-forked ReadFn.
+ * Non-forked projections reading forked projections get ForkedState<S>.
+ * Non-forked projections reading non-forked projections get S.
+ */
+type ExtractStateForNonForkedReader<I> =
   I extends ProjectionInstance<infer S>
     ? S
     : I extends ForkedProjectionInstance<infer S>
-      ? S
+      ? ForkedState<S>
       : never
 
 /**
- * Extract state type from any projection result.
- * Uses Context.Tag.Service to get the instance type, then extracts state from that.
+ * Extract state type from any projection result for non-forked readers.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type StateOfProjection<P> =
   P extends { Tag: infer T }
     ? T extends Context.Tag<infer I, any>
-      ? ExtractState<I>
+      ? ExtractStateForNonForkedReader<I>
+      : never
+    : never
+
+/**
+ * Extract state type from any projection result for forked readers (same-fork access).
+ */
+export type StateOfProjectionForForkedReader<P> =
+  P extends { Tag: infer T }
+    ? T extends Context.Tag<infer I, any>
+      ? I extends ProjectionInstance<infer S>
+        ? S
+        : I extends ForkedProjectionInstance<infer S>
+          ? S
+          : never
       : never
     : never
 

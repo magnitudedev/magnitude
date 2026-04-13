@@ -1,5 +1,5 @@
 export type WorkerTimerSnapshot = {
-  state: 'working' | 'idle' | 'killed'
+  state: 'spawning' | 'working' | 'idle' | 'killing' | 'killed-ghost'
   activeSince: number | null
   accumulatedActiveMs: number
   resumeCount: number

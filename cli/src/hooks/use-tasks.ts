@@ -1,18 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { AgentStatusState, DisplayMessage, DisplayState } from '@magnitudedev/agent'
-import type { TaskListItem, WorkerExecutionSnapshot } from '../components/chat/types'
-import { flattenTaskTree, type TaskGraphState } from '../utils/task-tree'
+import { useEffect, useRef, useState } from 'react'
+import type { TaskWorkerSnapshot, TaskWorkerState } from '@magnitudedev/agent'
+import type {
+  GhostOverlay,
+  TaskDisplayRow,
+  TaskListItem,
+  VisibleWorkerContinuity,
+} from '../components/chat/task-list/index'
+import { deriveTaskDisplayRow } from '../components/chat/task-list/index'
 
 type AgentClientLike = {
   state: {
-    taskGraph: {
-      subscribe: (cb: (state: TaskGraphState) => void) => () => void
-    }
-    display: {
-      subscribeFork: (forkId: string | null, cb: (state: DisplayState) => void) => () => void
-    }
-    agentStatus: {
-      subscribe: (cb: (state: AgentStatusState) => void) => () => void
+    taskWorker: {
+      subscribe: (cb: (state: TaskWorkerState) => void) => () => void
     }
   }
 }
@@ -21,145 +20,211 @@ type UseTasksArgs = {
   client: AgentClientLike | null
 }
 
-function getLatestForkActivityMessage(messages: readonly DisplayMessage[], workerForkId: string) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]
-    if (message?.type === 'fork_activity' && message.forkId === workerForkId) return message
-  }
-  return null
+type TaskListDisplayState = {
+  rowsByTaskId: ReadonlyMap<string, TaskDisplayRow>
+  orderedTaskIds: readonly string[]
+  ghostsByTaskId: ReadonlyMap<string, GhostOverlay>
+  previousContinuityByTaskId: ReadonlyMap<string, VisibleWorkerContinuity>
+  nextGhostExpiryAt: number | null
+  items: TaskListItem[]
 }
 
-export function deriveWorkerExecutionSnapshot(args: {
-  task: TaskListItem
-  fromDisplay: WorkerExecutionSnapshot | null
-  agentStatusState: AgentStatusState | null
-}): WorkerExecutionSnapshot | null {
-  const { task, fromDisplay, agentStatusState } = args
-  if (task.assignee.kind !== 'worker' || !task.workerForkId) return null
+const EMPTY_TASK_WORKER_STATE: TaskWorkerState = {
+  orderedTaskIds: [],
+  snapshots: new Map(),
+  workerActivityByForkId: new Map(),
+}
 
-  const linkedAgentId = agentStatusState?.agentByForkId.get(task.workerForkId)
-  const linkedAgent = linkedAgentId ? agentStatusState?.agents.get(linkedAgentId) : undefined
-  const canResolveAgent = agentStatusState !== null
-  const isKilled = canResolveAgent && (linkedAgentId === undefined || linkedAgent === undefined)
+const EMPTY_DISPLAY_STATE: TaskListDisplayState = {
+  rowsByTaskId: new Map(),
+  orderedTaskIds: [],
+  ghostsByTaskId: new Map(),
+  previousContinuityByTaskId: new Map(),
+  nextGhostExpiryAt: null,
+  items: [],
+}
 
-  if (isKilled) {
-    return {
-      state: 'killed',
-      activeSince: fromDisplay?.activeSince ?? null,
-      accumulatedActiveMs: fromDisplay?.accumulatedActiveMs ?? 0,
-      completedAt: fromDisplay?.completedAt ?? null,
-      resumeCount: fromDisplay?.resumeCount ?? 0,
+const KILLED_GHOST_HOLD_MS = 1000
+
+function pruneExpiredGhosts(
+  ghostsByTaskId: ReadonlyMap<string, GhostOverlay>,
+  now: number,
+): {
+  ghostsByTaskId: ReadonlyMap<string, GhostOverlay>
+  nextGhostExpiryAt: number | null
+} {
+  let nextGhostExpiryAt: number | null = null
+  let changed = false
+  const nextGhostsByTaskId = new Map<string, GhostOverlay>()
+
+  for (const [taskId, ghost] of ghostsByTaskId) {
+    if (ghost.expiresAt <= now) {
+      changed = true
+      continue
+    }
+
+    nextGhostsByTaskId.set(taskId, ghost)
+    nextGhostExpiryAt = nextGhostExpiryAt === null
+      ? ghost.expiresAt
+      : Math.min(nextGhostExpiryAt, ghost.expiresAt)
+  }
+
+  return {
+    ghostsByTaskId: changed ? nextGhostsByTaskId : ghostsByTaskId,
+    nextGhostExpiryAt,
+  }
+}
+
+function getVisibleWorkerContinuity(
+  row: TaskDisplayRow,
+  index: number,
+): VisibleWorkerContinuity {
+  const assignee = row.assignee
+  if (assignee.kind !== 'worker' || !assignee.ghostEligible || !assignee.continuityKey) {
+    return null
+  }
+
+  return {
+    continuityKey: assignee.continuityKey,
+    taskId: row.taskId,
+    label: assignee.label,
+    lastKnownIndex: index,
+  }
+}
+
+function mergeDisplayRows(
+  orderedTaskIds: readonly string[],
+  rowsByTaskId: ReadonlyMap<string, TaskDisplayRow>,
+  ghostsByTaskId: ReadonlyMap<string, GhostOverlay>,
+): TaskListItem[] {
+  return orderedTaskIds
+    .map((taskId) => {
+      const row = rowsByTaskId.get(taskId)
+      if (!row) return null
+
+      const ghost = ghostsByTaskId.get(taskId) ?? null
+      return ghost
+        ? {
+            ...row,
+            assignee: {
+              kind: 'ghost',
+              icon: '✕',
+              label: ghost.label,
+              tone: 'ghost',
+              expiresAt: ghost.expiresAt,
+            },
+          }
+        : row
+    })
+    .filter((row): row is TaskDisplayRow => Boolean(row))
+}
+
+function reconcileDisplayState(
+  taskWorkerState: TaskWorkerState,
+  previousDisplayState: TaskListDisplayState,
+  now: number,
+): TaskListDisplayState {
+  const derivedRows = taskWorkerState.orderedTaskIds
+    .map((taskId) => taskWorkerState.snapshots.get(taskId))
+    .filter((snapshot): snapshot is TaskWorkerSnapshot => Boolean(snapshot))
+    .map((snapshot) => deriveTaskDisplayRow(snapshot))
+
+  const rowsByTaskId = new Map<string, TaskDisplayRow>(
+    derivedRows.map(row => [row.taskId, row]),
+  )
+  const orderedTaskIds = derivedRows.map(row => row.taskId)
+
+  const prunedGhosts = pruneExpiredGhosts(previousDisplayState.ghostsByTaskId, now)
+  const nextGhostsByTaskId = new Map(prunedGhosts.ghostsByTaskId)
+  const nextContinuityByTaskId = new Map<string, VisibleWorkerContinuity>()
+
+  for (const [index, row] of derivedRows.entries()) {
+    const continuity = getVisibleWorkerContinuity(row, index)
+    nextContinuityByTaskId.set(row.taskId, continuity)
+
+    const assignee = row.assignee
+    const hasLiveWorker =
+      assignee.kind === 'worker'
+      && assignee.ghostEligible
+      && assignee.continuityKey !== null
+
+    if (hasLiveWorker) {
+      nextGhostsByTaskId.delete(row.taskId)
     }
   }
 
-  const state = linkedAgent
-    ? (linkedAgent.status === 'working' ? 'working' : 'idle')
-    : (fromDisplay?.state ?? 'idle')
+  for (const [taskId, previousContinuity] of previousDisplayState.previousContinuityByTaskId) {
+    if (!previousContinuity) continue
+
+    const nextContinuity = nextContinuityByTaskId.get(taskId) ?? null
+    const workerRemoved =
+      nextContinuity === null
+      || nextContinuity.continuityKey !== previousContinuity.continuityKey
+
+    if (!workerRemoved) continue
+
+    if (!rowsByTaskId.has(taskId)) continue
+
+    nextGhostsByTaskId.set(taskId, {
+      taskId,
+      expiresAt: now + KILLED_GHOST_HOLD_MS,
+      label: previousContinuity.label,
+    })
+  }
+
+  const { nextGhostExpiryAt } = pruneExpiredGhosts(nextGhostsByTaskId, now)
 
   return {
-    state,
-    activeSince: fromDisplay?.activeSince ?? null,
-    accumulatedActiveMs: fromDisplay?.accumulatedActiveMs ?? 0,
-    completedAt: fromDisplay?.completedAt ?? null,
-    resumeCount: fromDisplay?.resumeCount ?? 0,
+    rowsByTaskId,
+    orderedTaskIds,
+    ghostsByTaskId: nextGhostsByTaskId,
+    previousContinuityByTaskId: nextContinuityByTaskId,
+    nextGhostExpiryAt,
+    items: mergeDisplayRows(orderedTaskIds, rowsByTaskId, nextGhostsByTaskId),
   }
 }
 
 export function useTasks({ client }: UseTasksArgs): TaskListItem[] {
-  const [tasks, setTasks] = useState<TaskListItem[]>([])
-  const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
-  const [forkActivityByForkId, setForkActivityByForkId] = useState<Record<string, WorkerExecutionSnapshot>>({})
-  const unsubscribesRef = useRef<Map<string, () => void>>(new Map())
+  const [displayState, setDisplayState] = useState<TaskListDisplayState>(EMPTY_DISPLAY_STATE)
+  const latestTaskWorkerStateRef = useRef<TaskWorkerState>(EMPTY_TASK_WORKER_STATE)
+  const latestDisplayStateRef = useRef<TaskListDisplayState>(EMPTY_DISPLAY_STATE)
 
   useEffect(() => {
     if (!client) {
-      setTasks([])
+      latestTaskWorkerStateRef.current = EMPTY_TASK_WORKER_STATE
+      latestDisplayStateRef.current = EMPTY_DISPLAY_STATE
+      setDisplayState(EMPTY_DISPLAY_STATE)
       return
     }
 
-    return client.state.taskGraph.subscribe((state) => {
-      setTasks(flattenTaskTree(state))
-    })
-  }, [client])
-
-  useEffect(() => {
-    if (!client) {
-      setAgentStatusState(null)
-      return
-    }
-
-    return client.state.agentStatus.subscribe((state) => {
-      setAgentStatusState(state)
-    })
-  }, [client])
-
-  useEffect(() => {
-    const workerForkIds = tasks.map(task => task.workerForkId).filter((id): id is string => Boolean(id))
-    const activeSubscriptionKeys = new Set<string>()
-
-    for (const workerForkId of workerForkIds) {
-      const linkedAgentId = agentStatusState?.agentByForkId.get(workerForkId)
-      const linkedAgent = linkedAgentId ? agentStatusState?.agents.get(linkedAgentId) : undefined
-      const sourceForkId = linkedAgent?.parentForkId ?? null
-      const sourceKey = sourceForkId ?? '__root__'
-      const subscriptionKey = `${workerForkId}::${sourceKey}`
-      activeSubscriptionKeys.add(subscriptionKey)
-
-      if (!client || unsubscribesRef.current.has(subscriptionKey)) continue
-
-      const unsubscribe = client.state.display.subscribeFork(sourceForkId, (state) => {
-        const latest = getLatestForkActivityMessage(state.messages, workerForkId)
-        if (!latest) return
-        setForkActivityByForkId(prev => ({
-          ...prev,
-          [workerForkId]: {
-            state: latest.status === 'running' ? 'working' : 'idle',
-            activeSince: latest.activeSince ?? null,
-            accumulatedActiveMs: latest.accumulatedActiveMs ?? 0,
-            completedAt: latest.completedAt ?? null,
-            resumeCount: latest.resumeCount ?? 0,
-          },
-        }))
+    return client.state.taskWorker.subscribe((state) => {
+      latestTaskWorkerStateRef.current = state
+      setDisplayState((previousDisplayState) => {
+        const nextDisplayState = reconcileDisplayState(state, previousDisplayState, Date.now())
+        latestDisplayStateRef.current = nextDisplayState
+        return nextDisplayState
       })
-      unsubscribesRef.current.set(subscriptionKey, unsubscribe)
-    }
-
-    for (const [key, unsubscribe] of unsubscribesRef.current.entries()) {
-      if (activeSubscriptionKeys.has(key)) continue
-      unsubscribe()
-      unsubscribesRef.current.delete(key)
-    }
-
-    const activeWorkerForkIdSet = new Set(workerForkIds)
-    setForkActivityByForkId(prev => {
-      let changed = false
-      const next: Record<string, WorkerExecutionSnapshot> = {}
-      for (const [forkId, snapshot] of Object.entries(prev)) {
-        if (!activeWorkerForkIdSet.has(forkId)) {
-          changed = true
-          continue
-        }
-        next[forkId] = snapshot
-      }
-      return changed ? next : prev
     })
-  }, [tasks, client, agentStatusState])
+  }, [client])
 
   useEffect(() => {
-    return () => {
-      for (const unsubscribe of unsubscribesRef.current.values()) unsubscribe()
-      unsubscribesRef.current.clear()
-    }
-  }, [])
+    if (displayState.nextGhostExpiryAt === null) return
 
-  return useMemo(() => {
-    return tasks.map((task) => ({
-      ...task,
-      workerExecution: deriveWorkerExecutionSnapshot({
-        task,
-        fromDisplay: task.workerForkId ? (forkActivityByForkId[task.workerForkId] ?? null) : null,
-        agentStatusState,
-      }),
-    }))
-  }, [tasks, forkActivityByForkId, agentStatusState])
+    const timeoutMs = Math.max(0, displayState.nextGhostExpiryAt - Date.now())
+    const timeout = globalThis.setTimeout(() => {
+      setDisplayState((previousDisplayState) => {
+        const nextDisplayState = reconcileDisplayState(
+          latestTaskWorkerStateRef.current,
+          previousDisplayState,
+          Date.now(),
+        )
+        latestDisplayStateRef.current = nextDisplayState
+        return nextDisplayState
+      })
+    }, timeoutMs)
+
+    return () => globalThis.clearTimeout(timeout)
+  }, [displayState.nextGhostExpiryAt])
+
+  return displayState.items
 }

@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useCallback, useRef } from 'react'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
-import type { CompactionState, DisplayState, DisplayMessage } from '@magnitudedev/agent'
+import type { CompactionState, DisplayState, DisplayMessage, ToolStateProjectionState } from '@magnitudedev/agent'
 import { useTheme } from '../hooks/use-theme'
 import { useFilePanel } from '../hooks/use-file-panel'
 import { Button } from './button'
@@ -23,6 +23,7 @@ interface ForkDetailOverlayProps {
   projectRoot: string
   subscribeForkDisplay: (forkId: string, cb: (state: DisplayState) => void) => () => void
   subscribeForkCompaction: (forkId: string, cb: (state: CompactionState) => void) => () => void
+  subscribeForkToolState: (forkId: string, cb: (state: ToolStateProjectionState) => void) => () => void
 }
 
 function capitalize(s: string): string {
@@ -54,10 +55,12 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
   projectRoot,
   subscribeForkDisplay,
   subscribeForkCompaction,
+  subscribeForkToolState,
 }: ForkDetailOverlayProps) {
   const theme = useTheme()
   const [closeHover, setCloseHover] = useState(false)
   const [display, setDisplay] = useState<DisplayState | null>(null)
+  const [toolState, setToolState] = useState<ToolStateProjectionState | null>(null)
   const [tokenEstimate, setTokenEstimate] = useState(0)
   const [lastActualInputTokens, setLastActualInputTokens] = useState<number | null>(null)
   const [hasCompletedTurn, setHasCompletedTurn] = useState(false)
@@ -92,6 +95,13 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
     return unsubscribe
   }, [forkId, subscribeForkCompaction])
 
+  useEffect(() => {
+    const unsubscribe = subscribeForkToolState(forkId, (state) => {
+      setToolState(state)
+    })
+    return unsubscribe
+  }, [forkId, subscribeForkToolState])
+
   const messages = display?.messages ?? EMPTY_MESSAGES
   const isStreaming = display?.status === 'streaming'
 
@@ -104,6 +114,7 @@ export const ForkDetailOverlay = memo(function ForkDetailOverlay({
     closeFilePanel,
   } = useFilePanel({
     display,
+    toolState,
     workspacePath,
     projectRoot,
   })

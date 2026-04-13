@@ -1,19 +1,20 @@
-import { describe, expect, test } from 'bun:test'
-import type { TaskListItem } from '../components/chat/types'
+import { describe, expect, test } from 'vitest'
+import type { TaskDisplayRow } from '../components/chat/task-list/index'
 import { buildRootSummaries, findOwningRootIndex } from './task-tree'
 
-const makeTask = (overrides: Partial<TaskListItem> = {}): TaskListItem => ({
+type TaskRow = TaskDisplayRow
+
+const makeTask = (overrides: Partial<TaskRow> = {}): TaskRow => ({
+  rowId: 'task:t-1',
+  kind: 'task',
   taskId: 't-1',
   title: 'Task',
-  type: 'implement',
+  taskType: 'implement',
   status: 'pending',
   depth: 0,
   parentId: null,
-  createdAt: 1_000,
   updatedAt: 2_000,
-  completedAt: null,
-  assignee: { kind: 'lead' },
-  workerForkId: null,
+  workerSlot: null,
   ...overrides,
 })
 
@@ -21,7 +22,7 @@ describe('buildRootSummaries', () => {
   test('single root with children has correct range and progress', () => {
     const tasks = [
       makeTask({ taskId: 'root', status: 'pending' }),
-      makeTask({ taskId: 'child-1', depth: 1, parentId: 'root', status: 'completed', completedAt: 10_000 }),
+      makeTask({ taskId: 'child-1', depth: 1, parentId: 'root', status: 'completed',  }),
       makeTask({ taskId: 'child-2', depth: 1, parentId: 'root', status: 'pending' }),
     ]
 

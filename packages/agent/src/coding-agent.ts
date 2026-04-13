@@ -21,9 +21,11 @@ import { CanonicalTurnProjection } from './projections/canonical-turn'
 import { MemoryProjection } from './projections/memory'
 import { SubagentActivityProjection } from './projections/subagent-activity'
 import { DisplayProjection } from './projections/display'
+import { ToolStateProjection } from './projections/tool-state'
 import { AgentRoutingProjection } from './projections/agent-routing'
 import { AgentStatusProjection } from './projections/agent-status'
 import { TaskGraphProjection } from './projections/task-graph'
+import { TaskWorkerProjection } from './projections/task-worker'
 import { CompactionProjection } from './projections/compaction'
 import { WorkflowProjection } from './projections/workflow'
 
@@ -93,7 +95,9 @@ export const CodingAgent = Agent.define<AppEvent>()({
     SubagentActivityProjection,
     OutboundMessagesProjection,
     UserMessageResolutionProjection,
+    ToolStateProjection,
     MemoryProjection,
+    TaskWorkerProjection,
     DisplayProjection,
     ConversationProjection,
     UserPresenceProjection,
@@ -126,6 +130,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
     },
     state: {
       display: DisplayProjection,
+      toolState: ToolStateProjection,
       turn: TurnProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
@@ -133,6 +138,7 @@ export const CodingAgent = Agent.define<AppEvent>()({
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
       taskGraph: TaskGraphProjection,
+      taskWorker: TaskWorkerProjection,
     }
   }
 })
