@@ -1,60 +1,59 @@
-import { describe, expect, test } from 'bun:test'
-import type { TaskListItem } from '../components/chat/types'
+import { describe, expect, test } from 'vitest'
+import type { TaskListItem } from '../components/chat/task-list/index'
 import {
   computeInheritedVisualStatusMap,
   getOwnVisualStatus,
 } from './task-visual-status'
 
-const makeTask = (overrides: Partial<TaskListItem> = {}): TaskListItem => ({
+type TaskRow = Extract<TaskListItem, { kind: 'task' }>
+
+const makeTask = (overrides: Partial<TaskRow> = {}): TaskRow => ({
+  rowId: 'task:t-1',
+  kind: 'task',
   taskId: 't-1',
   title: 'Task',
-  type: 'implement',
+  taskType: 'implement',
   status: 'pending',
   depth: 0,
   parentId: null,
-  createdAt: 1_000,
   updatedAt: 2_000,
-  completedAt: null,
-  assignee: { kind: 'lead' },
-  workerForkId: null,
+  workerSlot: null,
   ...overrides,
 })
 
 describe('getOwnVisualStatus', () => {
   test('returns completed for completed tasks', () => {
-    expect(getOwnVisualStatus(makeTask({ status: 'completed', completedAt: 10_000 }))).toBe('completed')
+    expect(getOwnVisualStatus(makeTask({ status: 'completed' }))).toBe('completed')
   })
 
   test('returns pending for working tasks', () => {
     expect(getOwnVisualStatus(makeTask({ status: 'working' }))).toBe('pending')
   })
 
-  test('returns pending for worker with fork id', () => {
+  test('returns pending for task with worker slot', () => {
     expect(
       getOwnVisualStatus(
         makeTask({
           status: 'pending',
-          assignee: { kind: 'worker', agentId: 'builder-1', workerType: 'builder' },
-          workerForkId: 'fork-1',
+          workerSlot: {
+            kind: 'worker',
+            variant: 'idle',
+            label: '[builder] builder-1',
+            icon: '●',
+            tone: 'muted',
+            interactiveForkId: 'fork-1',
+            timer: { startedAt: 0, resumedAt: null },
+            resumed: false,
+            continuityKey: 'fork-1',
+            ghostEligible: true,
+          },
         }),
       ),
     ).toBe('pending')
   })
 
-  test('returns pending when worker is present but fork id is missing', () => {
-    expect(
-      getOwnVisualStatus(
-        makeTask({
-          status: 'pending',
-          assignee: { kind: 'worker', agentId: 'builder-1', workerType: 'builder' },
-          workerForkId: null,
-        }),
-      ),
-    ).toBe('pending')
-  })
-
-  test('returns pending for unassigned lead task', () => {
-    expect(getOwnVisualStatus(makeTask({ status: 'pending', assignee: { kind: 'lead' } }))).toBe('pending')
+  test('returns pending for unassigned task', () => {
+    expect(getOwnVisualStatus(makeTask({ status: 'pending', workerSlot: null }))).toBe('pending')
   })
 })
 
@@ -82,8 +81,18 @@ describe('computeInheritedVisualStatusMap', () => {
         depth: 1,
         parentId: 'parent',
         status: 'pending',
-        assignee: { kind: 'worker', agentId: 'builder-1', workerType: 'builder' },
-        workerForkId: 'fork-1',
+        workerSlot: {
+          kind: 'worker',
+          variant: 'idle',
+          label: '[builder] builder-1',
+          icon: '●',
+          tone: 'muted',
+          interactiveForkId: 'fork-1',
+          timer: { startedAt: 0, resumedAt: null },
+          resumed: false,
+          continuityKey: 'fork-1',
+          ghostEligible: true,
+        },
       }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
@@ -98,8 +107,18 @@ describe('computeInheritedVisualStatusMap', () => {
         depth: 1,
         parentId: 'parent',
         status: 'pending',
-        assignee: { kind: 'worker', agentId: 'builder-1', workerType: 'builder' },
-        workerForkId: 'fork-1',
+        workerSlot: {
+          kind: 'worker',
+          variant: 'idle',
+          label: '[builder] builder-1',
+          icon: '●',
+          tone: 'muted',
+          interactiveForkId: 'fork-1',
+          timer: { startedAt: 0, resumedAt: null },
+          resumed: false,
+          continuityKey: 'fork-1',
+          ghostEligible: true,
+        },
       }),
       makeTask({ taskId: 'working-child', depth: 1, parentId: 'parent', status: 'working' }),
     ]
@@ -109,7 +128,7 @@ describe('computeInheritedVisualStatusMap', () => {
 
   test('completed parent with working child stays completed', () => {
     const tasks = [
-      makeTask({ taskId: 'parent', status: 'completed', completedAt: 10_000 }),
+      makeTask({ taskId: 'parent', status: 'completed' }),
       makeTask({ taskId: 'child', depth: 1, parentId: 'parent', status: 'working' }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
@@ -119,7 +138,7 @@ describe('computeInheritedVisualStatusMap', () => {
   test('completed child does not propagate upward', () => {
     const tasks = [
       makeTask({ taskId: 'parent', status: 'pending' }),
-      makeTask({ taskId: 'child', depth: 1, parentId: 'parent', status: 'completed', completedAt: 10_000 }),
+      makeTask({ taskId: 'child', depth: 1, parentId: 'parent', status: 'completed' }),
     ]
     const result = computeInheritedVisualStatusMap(tasks)
     expect(result.get('parent')).toBe('pending')

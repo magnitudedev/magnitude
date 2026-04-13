@@ -1,4 +1,4 @@
-import type { TaskListItem } from '../components/chat/types'
+import type { TaskDisplayRow } from '../components/chat/task-list/index'
 
 export type VisualStatus = 'completed' | 'pending'
 
@@ -7,13 +7,13 @@ const STATUS_PRIORITY: Record<VisualStatus, number> = {
   completed: -1, // completed never propagates
 }
 
-export function getOwnVisualStatus(task: TaskListItem): VisualStatus {
+export function getOwnVisualStatus(task: TaskDisplayRow): VisualStatus {
   if (task.status === 'completed') return 'completed'
   return 'pending'
 }
 
 export function computeInheritedVisualStatusMap(
-  tasks: readonly TaskListItem[]
+  tasks: readonly TaskDisplayRow[]
 ): Map<string, VisualStatus> {
   const result = new Map<string, VisualStatus>()
 

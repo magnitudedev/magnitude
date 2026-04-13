@@ -1,4 +1,4 @@
-import type { DisplayState, FileEditState, FileWriteState } from '@magnitudedev/agent'
+import type { FileEditState, FileWriteState, ToolState } from '@magnitudedev/agent'
 import type { Span } from '../markdown/blocks'
 
 export interface ChangedRange {
@@ -127,11 +127,13 @@ export function highlightCodeLines(
 }
 
 export function findActiveFileStream(
-  display: DisplayState,
+  toolHandles: Record<string, { state: ToolState }> | undefined,
   targetPath: string,
 ): { toolCallId: string; state: FileEditState | FileWriteState } | null {
+  if (!toolHandles) return null
+
   let result: { toolCallId: string; state: FileEditState | FileWriteState } | null = null
-  for (const [callId, handle] of Object.entries(display.toolHandles)) {
+  for (const [callId, handle] of Object.entries(toolHandles)) {
     if (!handle.state) continue
     const s = handle.state
     if (s.toolKey !== 'fileEdit' && s.toolKey !== 'fileWrite') continue

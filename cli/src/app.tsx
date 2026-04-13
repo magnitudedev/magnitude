@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type WorkflowCriteriaState, type ToolStateProjectionState } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence, loadSessionSummary } from './persistence'
 
@@ -157,6 +157,7 @@ function AppInner({
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const { client, workspacePath, send: clientSend, ensureReady: ensureClientReady, setFactory: setClientFactory, setClient: setLazyClient } = useLazyClient()
   const [display, setDisplay] = useState<DisplayState | null>(null)
+  const [toolState, setToolState] = useState<ToolStateProjectionState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
   const [expandedForkStack, setExpandedForkStack] = useState<string[]>([])
   const expandedForkId = expandedForkStack.length > 0 ? expandedForkStack[expandedForkStack.length - 1] : null
@@ -564,7 +565,6 @@ function AppInner({
         streamingMessageId: null,
         activeThinkBlockId: null,
         showButton: 'send',
-        toolHandles: {},
       })
       setClientFactory(async () => {
         const client = await createClient()
@@ -1861,6 +1861,7 @@ function AppInner({
     closeFilePanel,
   } = useFilePanel({
     display: activeDisplay ?? display,
+    toolState,
     workspacePath,
     projectRoot: process.cwd(),
   })

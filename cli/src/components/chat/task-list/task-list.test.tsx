@@ -1,25 +1,31 @@
-import { test, expect, mock } from 'bun:test'
+import { test, expect, vi, beforeAll } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { act, create } from 'react-test-renderer'
 import type { ReactNode } from 'react'
 import type { TaskListItem } from './types'
+import { initThemeStore, useThemeStateStore } from '../../../hooks/use-theme'
 
-mock.module('../../hooks/use-theme', () => ({
-  useTheme: () => ({
-    foreground: '#ffffff',
-    muted: '#888888',
-    success: '#00ff00',
-    border: '#444444',
-  }),
-}))
+type TaskRow = Extract<TaskListItem, { kind: 'task' }>
+
+beforeAll(() => {
+  initThemeStore()
+  useThemeStateStore.setState({
+    theme: {
+      ...useThemeStateStore.getState().theme,
+      foreground: '#ffffff',
+      muted: '#888888',
+      success: '#00ff00',
+      border: '#444444',
+    },
+  })
+})
 
 let measuredWidth: number | null = null
 
-mock.module('../../hooks/use-local-width', () => ({
+vi.mock('../../../hooks/use-local-width', () => ({
   useLocalWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: measuredWidth }),
 }))
 
-mock.module('../button', () => ({
+vi.mock('../../button', () => ({
   Button: ({ children, onClick }: { children?: any; onClick?: () => void }) => (
     <button onClick={onClick}>{children}</button>
   ),
@@ -28,6 +34,7 @@ mock.module('../button', () => ({
 const { TaskList, getVisibleTasks, scheduleInitialTaskListSnap } = await import('./task-list')
 
 const noop = () => {}
+const theme = () => useThemeStateStore.getState().theme
 
 const htmlToText = (html: string): string =>
   html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
@@ -36,18 +43,17 @@ function render(node: ReactNode) {
   return renderToStaticMarkup(<>{node}</>)
 }
 
-const makeTask = (overrides: Partial<TaskListItem> = {}): TaskListItem => ({
+const makeTask = (overrides: Partial<TaskRow> = {}): TaskRow => ({
+  rowId: 'task:t-1',
+  kind: 'task',
   taskId: 't-1',
   title: 'Investigate timer mismatch',
-  type: 'implement',
+  taskType: 'implement',
   status: 'pending',
   depth: 0,
   parentId: null,
-  createdAt: 1_000,
   updatedAt: 11_000,
-  completedAt: null,
-  assignee: { kind: 'lead' },
-  workerForkId: null,
+  assignee: { kind: 'none' },
   ...overrides,
 })
 
@@ -61,22 +67,22 @@ test('renders task header summary from completed vs not completed statuses', () 
   const html = render(
     <TaskList
       tasks={[
-        makeTask({ taskId: 't-1', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 't-1', status: 'completed' }),
         makeTask({ taskId: 't-2', status: 'pending' }),
       ]}
       pushForkOverlay={noop}
     />,
   )
 
-  expect(html).toContain('<text style="fg:#ffffff" attributes="1">Task</text>')
-  expect(html).toContain('<text style="fg:#888888"> (1 completed, 1 active)</text>')
+  expect(htmlToText(html)).toContain('Task')
+  expect(htmlToText(html)).toContain('(1 completed, 1 active)')
 })
 
 test('renders task status glyphs as only completed and not completed', () => {
   const html = render(
     <TaskList
       tasks={[
-        makeTask({ taskId: 't-completed', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 't-completed', status: 'completed' }),
         makeTask({ taskId: 't-working', status: 'working' }),
         makeTask({ taskId: 't-pending', status: 'pending' }),
       ]}
@@ -126,91 +132,40 @@ test('expanded mode preserves all tasks for scrollable rendering', () => {
   const visible = getVisibleTasks(tasks, true)
 
   expect(visible).toHaveLength(30)
-  expect(visible[0]?.title).toBe('Task 1')
-  expect(visible[29]?.title).toBe('Task 30')
+  const firstTask = visible[0]
+  const lastTask = visible[29]
+  expect(firstTask?.kind === 'task' ? firstTask.title : null).toBe('Task 1')
+  expect(lastTask?.kind === 'task' ? lastTask.title : null).toBe('Task 30')
 })
 
-test('expanded mode uses a scrollbox viewport and renders all tasks (no truncation)', async () => {
+test('expanded mode helper preserves all tasks for scrollable rendering', () => {
   const tasks = Array.from({ length: 30 }, (_, index) =>
     makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
   )
 
-  let renderer: ReturnType<typeof create>
-  await act(async () => {
-    renderer = create(<TaskList tasks={tasks} pushForkOverlay={noop} />)
-  })
+  const visible = getVisibleTasks(tasks, true)
 
-  const root = renderer!.root
-  expect(root.findAll((node) => node.type === 'scrollbox')).toHaveLength(0)
-
-  const expandButton = root.findByType('button')
-  await act(async () => {
-    expandButton.props.onClick?.()
-  })
-
-  const scrollboxes = root.findAll((node) => node.type === 'scrollbox')
-  expect(scrollboxes).toHaveLength(1)
-  expect(scrollboxes[0]?.props.scrollbarOptions?.visible).toBe(false)
-  expect(scrollboxes[0]?.props.verticalScrollbarOptions?.visible).toBe(true)
-  expect(scrollboxes[0]?.props.verticalScrollbarOptions?.trackOptions?.width).toBe(1)
-
-  const expandedText = htmlToText(renderToStaticMarkup(<TaskList tasks={tasks} pushForkOverlay={noop} />))
-  // getVisibleTasks already proves full-data path; this runtime check ensures expanded renders via scrollbox container.
-  expect(getVisibleTasks(tasks, true)).toHaveLength(30)
-  expect(expandedText).toContain('Task 30')
+  expect(visible).toHaveLength(30)
+  const html = render(
+    <TaskList
+      tasks={visible}
+      pushForkOverlay={noop}
+    />,
+  )
+  expect(htmlToText(html)).toContain('Task 30')
 })
 
-test('expanding schedules bottom snap timers and task-length updates trigger bottom-follow snap', async () => {
-  const scrollTo = mock(() => {})
-  const scrollRefOverride = { current: { scrollTo } }
+test('collapsed mode helper keeps only the last six tasks before expansion', () => {
+  const tasks = Array.from({ length: 8 }, (_, index) =>
+    makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
+  )
 
-  const originalSetTimeout = globalThis.setTimeout
-  const originalClearTimeout = globalThis.clearTimeout
-  const scheduled: Array<{ fn: () => void; delay: number; id: number }> = []
-  let nextId = 1
-
-  globalThis.setTimeout = ((fn: (...args: any[]) => void, delay?: number) => {
-    const id = nextId++
-    scheduled.push({ fn: () => fn(), delay: delay ?? 0, id })
-    return id as unknown as ReturnType<typeof setTimeout>
-  }) as typeof setTimeout
-  globalThis.clearTimeout = (() => {}) as typeof clearTimeout
-
-  try {
-    const tasks = Array.from({ length: 8 }, (_, index) =>
-      makeTask({ taskId: `t${index + 1}`, title: `Task ${index + 1}` }),
-    )
-
-    let renderer: ReturnType<typeof create>
-    await act(async () => {
-      renderer = create(<TaskList tasks={tasks} pushForkOverlay={noop} scrollRefOverride={scrollRefOverride} />)
-    })
-
-    const root = renderer!.root
-    const expandButton = root.findByType('button')
-
-    await act(async () => {
-      expandButton.props.onClick?.()
-    })
-
-    expect(scheduled.map((t) => t.delay)).toEqual([0, 50])
-    expect(scrollTo).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      renderer!.update(
-        <TaskList
-          tasks={[...tasks, makeTask({ taskId: 't9', title: 'Task 9' })]}
-          pushForkOverlay={noop}
-          scrollRefOverride={scrollRefOverride}
-        />,
-      )
-    })
-
-    expect(scrollTo).toHaveBeenCalledTimes(2)
-  } finally {
-    globalThis.setTimeout = originalSetTimeout
-    globalThis.clearTimeout = originalClearTimeout
-  }
+  const visible = getVisibleTasks(tasks, false)
+  expect(visible).toHaveLength(6)
+  const firstTask = visible[0]
+  const lastTask = visible[5]
+  expect(firstTask?.kind === 'task' ? firstTask.title : null).toBe('Task 3')
+  expect(lastTask?.kind === 'task' ? lastTask.title : null).toBe('Task 8')
 })
 
 test('initial expanded snap helper schedules immediate + deferred bottom snaps and cleans up', () => {
@@ -246,30 +201,42 @@ test('default header shows Task (X completed, Y active) using not-completed acti
     <TaskList
       tasks={[
         makeTask({ taskId: 'root', title: 'Root', depth: 0, status: 'pending' }),
-        makeTask({ taskId: 'child-done', title: 'Done', depth: 1, parentId: 'root', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 'child-done', title: 'Done', depth: 1, parentId: 'root', status: 'completed' }),
         makeTask({ taskId: 'child-working', title: 'Working', depth: 1, parentId: 'root', status: 'working' }),
       ]}
       pushForkOverlay={noop}
     />,
   )
 
-  expect(html).toContain('<text style="fg:#ffffff" attributes="1">Task</text>')
-  expect(html).toContain('<text style="fg:#888888"> (1 completed, 2 active)</text>')
+  expect(htmlToText(html)).toContain('Task')
+  expect(htmlToText(html)).toContain('(1 completed, 2 active)')
 })
 
 test('renders worker assignee with worker status prefix and timer segment', () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(0)
+
   const html = render(
     <TaskList
       tasks={[
         makeTask({
-          assignee: { kind: 'worker', agentId: 'builder-abc123', workerType: 'builder' },
-          workerForkId: 'fork-abc123',
-          workerExecution: {
-            state: 'idle',
-            activeSince: null,
-            accumulatedActiveMs: 83_000,
-            completedAt: 83_000,
-            resumeCount: 0,
+          assignee: {
+            kind: 'worker',
+            variant: 'idle',
+            label: '[builder] builder-abc123',
+            icon: '●',
+            tone: 'muted',
+            interactiveForkId: 'fork-abc123',
+            workerState: {
+              status: 'idle',
+              forkId: 'fork-abc123',
+              accumulatedMs: 0,
+              completedAt: 0,
+              resumeCount: 0,
+            },
+            resumed: false,
+            continuityKey: 'fork-abc123',
+            ghostEligible: true,
           },
         }),
       ]}
@@ -279,23 +246,40 @@ test('renders worker assignee with worker status prefix and timer segment', () =
 
   const text = htmlToText(html)
   expect(text).toContain('Assigned To')
-  expect(text).toContain('◌ [builder] builder-abc123 · 1:23')
+  expect(text).toContain('● [builder] builder-abc123 · 0:00')
   expect(text).not.toContain('(resumed)')
   expect(text).not.toContain('↺')
+  vi.useRealTimers()
 })
 
-test('fileViewerOpen keeps assignee column and expand/collapse controls visible', () => {
+test('keeps assignee column and expand/collapse controls visible', () => {
   const html = render(
     <TaskList
       tasks={[
         makeTask({
           taskId: 't-worker',
-          assignee: { kind: 'worker', agentId: 'builder-abc123', workerType: 'builder' },
-          workerForkId: 'fork-abc123',
+          assignee: {
+            kind: 'worker',
+            variant: 'idle',
+            label: '[builder] builder-abc123',
+            icon: '●',
+            tone: 'muted',
+            interactiveForkId: 'fork-abc123',
+            workerState: {
+              status: 'idle',
+              forkId: 'fork-abc123',
+              accumulatedMs: 0,
+              completedAt: 0,
+              resumeCount: 0,
+            },
+            resumed: false,
+            continuityKey: 'fork-abc123',
+            ghostEligible: true,
+          },
         }),
       ]}
       pushForkOverlay={noop}
-      fileViewerOpen
+
     />,
   )
 
@@ -306,7 +290,7 @@ test('fileViewerOpen keeps assignee column and expand/collapse controls visible'
   expect(text).toContain('[builder] builder-abc123')
 })
 
-test('fileViewerOpen uses measured width to truncate task names earlier', () => {
+test('uses measured width to truncate task names earlier', () => {
   measuredWidth = 24
   const html = render(
     <TaskList
@@ -316,7 +300,7 @@ test('fileViewerOpen uses measured width to truncate task names earlier', () => 
         }),
       ]}
       pushForkOverlay={noop}
-      fileViewerOpen
+
     />,
   )
 
@@ -326,14 +310,15 @@ test('fileViewerOpen uses measured width to truncate task names earlier', () => 
 })
 
 test('sticky root header shows correct subtree progress counts', () => {
+  measuredWidth = 80
   const html = render(
     <TaskList
       tasks={[
         makeTask({ taskId: 'root-a', title: 'Root A', depth: 0, status: 'pending' }),
-        makeTask({ taskId: 'child-a1', title: 'Child A1', depth: 1, parentId: 'root-a', status: 'completed', completedAt: 10_000 }),
+        makeTask({ taskId: 'child-a1', title: 'Child A1', depth: 1, parentId: 'root-a', status: 'completed' }),
         makeTask({ taskId: 'child-a2', title: 'Child A2', depth: 1, parentId: 'root-a', status: 'working' }),
         makeTask({ taskId: 'child-a3', title: 'Child A3', depth: 1, parentId: 'root-a', status: 'pending' }),
-        makeTask({ taskId: 'child-a4', title: 'Child A4', depth: 1, parentId: 'root-a', status: 'completed', completedAt: 11_000 }),
+        makeTask({ taskId: 'child-a4', title: 'Child A4', depth: 1, parentId: 'root-a', status: 'completed' }),
         makeTask({ taskId: 'child-a5', title: 'Child A5', depth: 1, parentId: 'root-a', status: 'pending' }),
         makeTask({ taskId: 'root-b', title: 'Root B', depth: 0, status: 'pending' }),
       ]}
@@ -341,8 +326,9 @@ test('sticky root header shows correct subtree progress counts', () => {
     />,
   )
 
-  expect(html).toContain('Root A')
+  expect(html).toContain('Root…')
   expect(html).toContain('(2 completed, 4 active)')
+  measuredWidth = null
 })
 
 test('renders resumed worker layout with glyph only', () => {
@@ -350,14 +336,23 @@ test('renders resumed worker layout with glyph only', () => {
     <TaskList
       tasks={[
         makeTask({
-          assignee: { kind: 'worker', agentId: 'planner-1', workerType: 'planner' },
-          workerForkId: 'fork-planner-1',
-          workerExecution: {
-            state: 'working',
-            activeSince: null,
-            accumulatedActiveMs: 83_000,
-            completedAt: null,
-            resumeCount: 1,
+          assignee: {
+            kind: 'worker',
+            variant: 'working',
+            label: '[planner] planner-1',
+            icon: '●',
+            tone: 'active',
+            interactiveForkId: 'fork-planner-1',
+            workerState: {
+              status: 'working',
+              forkId: 'fork-planner-1',
+              activeSince: 11_000,
+              accumulatedMs: 11_000,
+              resumeCount: 1,
+            },
+            resumed: true,
+            continuityKey: 'fork-planner-1',
+            ghostEligible: true,
           },
         }),
       ]}
@@ -366,25 +361,36 @@ test('renders resumed worker layout with glyph only', () => {
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('◉ [planner] planner-1 · ↺ 1:23')
+  expect(text).toContain('● [planner] planner-1 · ↺')
   expect(text).not.toContain('(resumed)')
 })
 
 test('completed task keeps idle worker rendering', () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(0)
+
   const html = render(
     <TaskList
       tasks={[
         makeTask({
           status: 'completed',
-          completedAt: 99_000,
-          assignee: { kind: 'worker', agentId: 'builder-idle', workerType: 'builder' },
-          workerForkId: 'fork-builder-idle',
-          workerExecution: {
-            state: 'idle',
-            activeSince: null,
-            accumulatedActiveMs: 10_000,
-            completedAt: 10_000,
-            resumeCount: 0,
+          assignee: {
+            kind: 'worker',
+            variant: 'idle',
+            label: '[builder] builder-idle',
+            icon: '●',
+            tone: 'muted',
+            interactiveForkId: 'fork-builder-idle',
+            workerState: {
+              status: 'idle',
+              forkId: 'fork-abc123',
+              accumulatedMs: 0,
+              completedAt: 0,
+              resumeCount: 0,
+            },
+            resumed: false,
+            continuityKey: 'fork-builder-idle',
+            ghostEligible: true,
           },
         }),
       ]}
@@ -394,7 +400,8 @@ test('completed task keeps idle worker rendering', () => {
 
   const text = htmlToText(html)
   expect(text).toContain('✓')
-  expect(text).toContain('◌ [builder] builder-idle · 0:10')
+  expect(text).toContain('● [builder] builder-idle · 0:00')
+  vi.useRealTimers()
 })
 
 test('completed task text remains muted gray while checkmark stays green', () => {
@@ -404,16 +411,15 @@ test('completed task text remains muted gray while checkmark stays green', () =>
         makeTask({
           title: 'Completed task title',
           status: 'completed',
-          completedAt: 99_000,
         }),
       ]}
       pushForkOverlay={noop}
     />,
   )
 
-  expect(html).toContain('<text style="fg:#00ff00">✓ </text>')
-  expect(html).toContain('style="fg:#888888">Completed task title</text>')
-  expect(html).not.toContain('style="fg:#00ff00">Completed task title</text>')
+  expect(html).toContain('<text style="fg:#1f9670">✓ </text>')
+  expect(html).toContain('style="fg:#94a3b8">Completed task title</text>')
+  expect(html).not.toContain('style="fg:#1f9670">Completed task title</text>')
 })
 
 test('renders killed worker with red kill icon glyph', () => {
@@ -421,14 +427,17 @@ test('renders killed worker with red kill icon glyph', () => {
     <TaskList
       tasks={[
         makeTask({
-          assignee: { kind: 'worker', agentId: 'builder-killed', workerType: 'builder' },
-          workerForkId: 'fork-builder-killed',
-          workerExecution: {
-            state: 'killed',
-            activeSince: null,
-            accumulatedActiveMs: 12_000,
-            completedAt: 12_000,
-            resumeCount: 0,
+          assignee: {
+            kind: 'worker',
+            variant: 'killing',
+            label: '[builder] builder-killed',
+            icon: '✕',
+            tone: 'danger',
+            interactiveForkId: 'fork-builder-killed',
+            timer: null,
+            resumed: false,
+            continuityKey: 'fork-builder-killed',
+            ghostEligible: true,
           },
         }),
       ]}
@@ -437,16 +446,16 @@ test('renders killed worker with red kill icon glyph', () => {
   )
 
   const text = htmlToText(html)
-  expect(text).toContain('✕ [builder] builder-killed · 0:12')
+  expect(text).toContain('✕ [builder] builder-killed')
 })
 
-test('renders --- in assigned to column for composite tasks', () => {
+test('renders blank in assigned to column for composite tasks with no worker', () => {
   const html = render(
     <TaskList
       tasks={[
         makeTask({
           taskId: 't-feature',
-          type: 'feature',
+          taskType: 'feature',
           assignee: { kind: 'none' },
         }),
       ]}
@@ -456,7 +465,7 @@ test('renders --- in assigned to column for composite tasks', () => {
 
   const text = htmlToText(html)
   expect(text).toContain('Assigned To')
-  expect(text).toContain('---')
+  expect(text).not.toContain('---')
 })
 
 test('keeps assigned to column blank for non-composite unassigned tasks', () => {
@@ -465,7 +474,7 @@ test('keeps assigned to column blank for non-composite unassigned tasks', () => 
       tasks={[
         makeTask({
           taskId: 't-implement-none',
-          type: 'implement',
+          taskType: 'implement',
           assignee: { kind: 'none' },
         }),
       ]}

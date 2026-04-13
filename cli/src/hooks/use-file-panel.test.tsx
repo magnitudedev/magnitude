@@ -12,8 +12,8 @@ beforeAll(async () => {
 type PanelResult = ReturnType<typeof useFilePanel>
 
 function Harness({ onState }: { onState: (left: PanelResult, right: PanelResult) => void }) {
-  const left = useFilePanel({ display: null, workspacePath: null, projectRoot: '/tmp/project' })
-  const right = useFilePanel({ display: null, workspacePath: null, projectRoot: '/tmp/project' })
+  const left = useFilePanel({ display: null, toolState: null, workspacePath: null, projectRoot: '/tmp/project' })
+  const right = useFilePanel({ display: null, toolState: null, workspacePath: null, projectRoot: '/tmp/project' })
   onState(left, right)
   return null
 }

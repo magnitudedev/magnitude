@@ -80,6 +80,17 @@ export type { QueuedEntry } from './inbox/types'
 export { CompactionProjection } from './projections/compaction'
 export type { CompactionState } from './projections/compaction'
 
+export { ToolStateProjection } from './projections/tool-state'
+export type { ToolStateProjectionState } from './projections/tool-state'
+
+export { TaskWorkerProjection } from './projections/task-worker'
+export type {
+  WorkerState,
+  WorkerActivity,
+  TaskWorkerSnapshot,
+  TaskWorkerState,
+} from './projections/task-worker'
+
 export {
   DisplayProjection,
 } from './projections/display'

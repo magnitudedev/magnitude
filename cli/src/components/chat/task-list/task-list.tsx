@@ -1,20 +1,25 @@
 import { TextAttributes } from '@opentui/core'
-import { blue, orange, red, slate } from '../../utils/palette'
+import { blue, red, slate } from '../../../utils/palette'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useTheme } from '../../hooks/use-theme'
-import { useLocalWidth } from '../../hooks/use-local-width'
-import { Button } from '../button'
-import { computeWorkerElapsedMs, formatWorkerTimer, isWorkerResumed } from '../../utils/task-list-worker-timer'
-import { BOX_CHARS } from '../../utils/ui-constants'
+import { useTheme } from '../../../hooks/use-theme'
+import { useLocalWidth } from '../../../hooks/use-local-width'
+import { Button } from '../../button'
+import { computeWorkerElapsedMs, formatWorkerTimer, isWorkerResumed } from '../../../utils/task-list-worker-timer'
+import { BOX_CHARS } from '../../../utils/ui-constants'
 import {
   computeInheritedVisualStatusMap,
   type VisualStatus,
-} from '../../utils/task-visual-status'
+} from '../../../utils/task-visual-status'
 import {
   buildRootSummaries,
   findOwningRootIndex,
-} from '../../utils/task-tree'
-import type { TaskListItem } from './types'
+} from '../../../utils/task-tree'
+import type {
+  TaskDisplayRow,
+  TaskListItem,
+  TaskAssigneeSlot,
+  WorkerSlotDisplay,
+} from './types'
 
 const COLLAPSED_ROWS = 6
 const EXPANDED_ROWS = 25
@@ -41,7 +46,6 @@ const PULSE_BLUE_SHADES = [
 type Props = {
   tasks: readonly TaskListItem[]
   pushForkOverlay: (forkId: string) => void
-  fileViewerOpen?: boolean
   scrollRefOverride?: { current: { scrollTo: (offset: number) => void } | null }
 }
 
@@ -58,6 +62,16 @@ type TaskRowProps = {
   agentIdWidth: number
 }
 
+type WorkerPresentation = {
+  icon: string
+  iconColor: string
+  labelColor: string
+  timerColor: string
+  showTimer: boolean
+  showResumed: boolean
+  interactiveForkId: string | null
+}
+
 function truncate(s: string, maxWidth: number) {
   return s.length > maxWidth ? s.slice(0, maxWidth - 1) + '…' : s
 }
@@ -70,9 +84,9 @@ function getStatusColor(status: VisualStatus, theme: ReturnType<typeof useTheme>
   return status === 'completed' ? theme.success : theme.muted
 }
 
-function buildTaskTitleText(task: TaskListItem) {
+function buildTaskTitleText(task: TaskDisplayRow) {
   const SHOWN_TYPES = new Set(['feature', 'bug', 'refactor'])
-  const typeLabel = SHOWN_TYPES.has(task.type) ? `[${task.type}] ` : ''
+  const typeLabel = SHOWN_TYPES.has(task.taskType) ? `[${task.taskType}] ` : ''
   return `${typeLabel}${task.title}`
 }
 
@@ -80,41 +94,106 @@ function getTaskIndent(depth: number): string {
   return depth > 0 ? '  '.repeat(depth) : ''
 }
 
-function HeaderCountsText({ completed, active, theme }: { completed: number; active: number; theme: ReturnType<typeof useTheme> }) {
-  return <text style={{ fg: theme.muted }}>{` (${completed} completed, ${active} active)`}</text>
+function getAssigneeLabel(assignee: TaskAssigneeSlot): string {
+  if (assignee.kind === 'none') return ''
+  return assignee.label
 }
 
-function getWorkerStatusIcon(task: TaskListItem, now: number): { text: string; color: string } | null {
-  if (task.assignee.kind !== 'worker') return null
-  const state = task.workerExecution?.state
-  if (state === 'working') return { text: '◉', color: PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length] }
-  if (state === 'idle') return { text: '◌', color: orange[500] }
-  if (state === 'killed') return { text: '✕', color: red[500] }
-  return null
-}
+function getWorkerPresentation(
+  assignee: TaskAssigneeSlot,
+  now: number,
+  theme: ReturnType<typeof useTheme>,
+  hovered: boolean,
+): WorkerPresentation | null {
+  switch (assignee.kind) {
+    case 'none':
+      return null
+    case 'ghost':
+      return {
+        icon: assignee.icon,
+        iconColor: red[500],
+        labelColor: slate[500],
+        timerColor: slate[500],
+        showTimer: false,
+        showResumed: false,
+        interactiveForkId: null,
+      }
+    case 'user':
+      return {
+        icon: '',
+        iconColor: theme.warning ?? theme.foreground,
+        labelColor: theme.warning ?? theme.foreground,
+        timerColor: theme.warning ?? theme.foreground,
+        showTimer: false,
+        showResumed: false,
+        interactiveForkId: null,
+      }
+    case 'worker': {
+      const labelBaseColor = assignee.tone === 'muted' ? theme.muted : theme.foreground
+      const labelHoverColor = assignee.tone === 'active'
+        ? theme.primary
+        : assignee.tone === 'muted'
+          ? slate[300]
+          : labelBaseColor
+      const labelColor = hovered && assignee.interactiveForkId ? labelHoverColor : labelBaseColor
 
-function isCompositeTask(task: TaskListItem): boolean {
-  return task.type === 'bug' || task.type === 'feature' || task.type === 'refactor' || task.type === 'group'
-}
-
-function getAssigneeLabel(task: TaskListItem): string {
-  if (isCompositeTask(task)) return '---'
-  if (task.assignee.kind === 'lead') return 'lead'
-  if (task.assignee.kind === 'none') return ''
-  if (task.assignee.kind === 'user') return 'user'
-  return task.assignee.workerType ? `[${task.assignee.workerType}] ${task.assignee.agentId}` : task.assignee.agentId
+      switch (assignee.variant) {
+        case 'spawning':
+          return {
+            icon: assignee.icon,
+            iconColor: PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length],
+            labelColor,
+            timerColor: theme.muted,
+            showTimer: false,
+            showResumed: false,
+            interactiveForkId: null,
+          }
+        case 'working':
+          return {
+            icon: assignee.icon,
+            iconColor: PULSE_BLUE_SHADES[Math.floor(now / 200) % PULSE_BLUE_SHADES.length],
+            labelColor,
+            timerColor: theme.muted,
+            showTimer: true,
+            showResumed: true,
+            interactiveForkId: assignee.interactiveForkId,
+          }
+        case 'idle':
+          return {
+            icon: assignee.icon,
+            iconColor: slate[600],
+            labelColor,
+            timerColor: labelColor,
+            showTimer: true,
+            showResumed: true,
+            interactiveForkId: assignee.interactiveForkId,
+          }
+        case 'killing':
+          return {
+            icon: assignee.icon,
+            iconColor: red[500],
+            labelColor,
+            timerColor: labelColor,
+            showTimer: false,
+            showResumed: false,
+            interactiveForkId: assignee.interactiveForkId,
+          }
+      }
+    }
+  }
 }
 
 function TaskNameContent({
   task,
   effectiveStatus,
   taskNameWidth,
+  theme,
 }: {
-  task: TaskListItem
+  task: TaskDisplayRow
   effectiveStatus: VisualStatus
   taskNameWidth: number
+  theme: ReturnType<typeof useTheme>
 }) {
-  const theme = useTheme()
   const isCompleted = task.status === 'completed'
   const indent = getTaskIndent(task.depth)
   const glyphText = `${getStatusGlyph(effectiveStatus)} `
@@ -146,46 +225,63 @@ function TaskRow({
   agentIdWidth,
 }: TaskRowProps) {
   const theme = useTheme()
-  const assigneeLabel = getAssigneeLabel(task)
-  const workerStatusIcon = getWorkerStatusIcon(task, now)
-  const workerResumed = task.assignee.kind === 'worker' && task.workerExecution ? isWorkerResumed(task.workerExecution) : false
-  const workerTimer = task.assignee.kind === 'worker' && task.workerExecution
-    ? formatWorkerTimer(computeWorkerElapsedMs(task.workerExecution, now))
+  const workerPresentation = getWorkerPresentation(task.assignee, now, theme, hovered)
+  const workerLabel = getAssigneeLabel(task.assignee)
+  const workerTimerSnapshot = task.assignee.kind === 'worker' && 'workerState' in task.assignee
+    ? {
+        state: task.assignee.workerState.status,
+        activeSince: task.assignee.workerState.status === 'working' ? task.assignee.workerState.activeSince : null,
+        accumulatedActiveMs: task.assignee.workerState.accumulatedMs,
+        resumeCount: task.assignee.workerState.resumeCount ?? 0,
+      }
     : null
+  const workerTimer = workerTimerSnapshot && workerPresentation?.showTimer
+    ? formatWorkerTimer(computeWorkerElapsedMs(workerTimerSnapshot, now))
+    : null
+  const workerResumed = workerTimerSnapshot && workerPresentation?.showResumed
+    ? isWorkerResumed(workerTimerSnapshot)
+    : false
+  const canOpenWorkerFork = Boolean(workerPresentation?.interactiveForkId)
+
   return (
     <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
       <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
-        <TaskNameContent task={task} effectiveStatus={effectiveStatus} taskNameWidth={taskNameWidth} />
+        <TaskNameContent task={task} effectiveStatus={effectiveStatus} taskNameWidth={taskNameWidth} theme={theme} />
       </box>
       <box style={{ width: columnGap, minWidth: columnGap, maxWidth: columnGap, flexShrink: 0 }} />
-      {(
+      {workerPresentation && workerLabel ? (
         <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row' }}>
-          {task.assignee.kind === 'worker' && task.workerForkId ? (
-            <Button onClick={() => pushForkOverlay(task.workerForkId!)} onMouseOver={() => onHover(task.taskId)} onMouseOut={() => onHoverEnd()}>
-              <text style={{ fg: hovered ? slate[300] : theme.muted }}>
-                <span fg={workerStatusIcon?.color ?? (hovered ? slate[300] : theme.muted)}>{workerStatusIcon ? `${workerStatusIcon.text} ` : ''}</span>
-                <span fg={hovered ? slate[300] : theme.muted}>{assigneeLabel}</span>
+          {canOpenWorkerFork ? (
+            <Button
+              onClick={() => pushForkOverlay(workerPresentation.interactiveForkId!)}
+              onMouseOver={() => onHover(task.taskId)}
+              onMouseOut={() => onHoverEnd()}
+            >
+              <text style={{ fg: workerPresentation.labelColor }}>
+                <span fg={workerPresentation.iconColor}>{workerPresentation.icon ? `${workerPresentation.icon} ` : ''}</span>
+                <span fg={workerPresentation.labelColor}>{workerLabel}</span>
                 {workerTimer ? (
                   <>
-                    <span fg={theme.muted}> · </span>
-                    {workerResumed ? <span fg={theme.muted}>↺ </span> : null}
-                    <span fg={theme.muted}>{workerTimer}</span>
+                    <span fg={workerPresentation.timerColor}> · </span>
+                    {workerResumed ? <span fg={workerPresentation.timerColor}>↺ </span> : null}
+                    <span fg={workerPresentation.timerColor}>{workerTimer}</span>
                   </>
                 ) : null}
               </text>
             </Button>
           ) : (
-            <text style={{ fg: task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
-              {truncate(assigneeLabel, agentIdWidth)}
+            <text style={{ fg: workerPresentation.labelColor }}>
+              <span fg={workerPresentation.iconColor}>{workerPresentation.icon ? `${workerPresentation.icon} ` : ''}</span>
+              {truncate(workerLabel, agentIdWidth)}
             </text>
           )}
         </box>
-      )}
+      ) : null}
     </box>
   )
 }
 
-export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrollRefOverride }: Props) {
+export function TaskList({ tasks, pushForkOverlay, scrollRefOverride }: Props) {
   const theme = useTheme()
   const [expanded, setExpanded] = useState(false)
   const [expandHovered, setExpandHovered] = useState(false)
@@ -201,22 +297,32 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
   const taskNameWidth = Math.max(1, contentWidth - agentIdWidth)
 
   const visibleAllTasks = tasks
+  const realTasksOnly = useMemo(
+    () => visibleAllTasks,
+    [visibleAllTasks]
+  )
 
-  const effectiveVisualStates = useMemo(() => computeInheritedVisualStatusMap(visibleAllTasks), [visibleAllTasks])
-  const rootSummaries = useMemo(() => buildRootSummaries(visibleAllTasks), [visibleAllTasks])
+  const effectiveVisualStates = useMemo(() => computeInheritedVisualStatusMap(realTasksOnly), [realTasksOnly])
+  const rootSummaries = useMemo(() => buildRootSummaries(realTasksOnly), [realTasksOnly])
 
-  const hasWorkingTasks = useMemo(
-    () => visibleAllTasks.some(task => task.workerExecution?.state === 'working'),
+  const needsFastTick = useMemo(
+    () => visibleAllTasks.some(task => (
+      task.assignee.kind === 'ghost'
+      || (
+        task.assignee.kind === 'worker'
+        && (task.assignee.variant === 'working' || task.assignee.variant === 'spawning')
+      )
+    )),
     [visibleAllTasks]
   )
 
   useEffect(() => {
     if (tasks.length === 0) return
-    const tickMs = hasWorkingTasks ? 200 : 1000
+    const tickMs = needsFastTick ? 200 : 1000
     setNow(Date.now())
     const interval = setInterval(() => setNow(Date.now()), tickMs)
     return () => clearInterval(interval)
-  }, [hasWorkingTasks, tasks.length])
+  }, [needsFastTick, tasks.length])
 
   const handleHoverEnd = useCallback(() => setHoveredTaskId(null), [])
   const snapExpandedToBottom = useCallback(() => {
@@ -224,22 +330,24 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
     scrollTarget?.scrollTo(Number.MAX_SAFE_INTEGER)
   }, [scrollRefOverride])
   const visibleTasks = getVisibleTasks(visibleAllTasks, expanded)
-  const completedCount = visibleAllTasks.filter(task => task.status === 'completed').length
-  const activeCount = visibleAllTasks.filter(task => task.status !== 'completed').length
+  const completedCount = realTasksOnly.filter(task => task.status === 'completed').length
+  const activeCount = realTasksOnly.filter(task => task.status !== 'completed').length
 
   const stickyRootSummary = useMemo(() => {
     if (expanded) return null
 
-    const collapsedTasks = visibleAllTasks.slice(-COLLAPSED_ROWS)
+    const collapsedTasks = visibleTasks
     if (collapsedTasks.length === 0) return null
-    const firstIdx = visibleAllTasks.findIndex(t => t.taskId === collapsedTasks[0]?.taskId)
+    const firstRealCollapsedTask = collapsedTasks[0]
+    if (!firstRealCollapsedTask) return null
+    const firstIdx = realTasksOnly.findIndex(t => t.taskId === firstRealCollapsedTask.taskId)
     if (firstIdx < 0) return null
-    const rootIdx = findOwningRootIndex(visibleAllTasks, firstIdx)
+    const rootIdx = findOwningRootIndex(realTasksOnly, firstIdx)
     if (rootIdx === null) return null
-    const rootTask = visibleAllTasks[rootIdx]
+    const rootTask = realTasksOnly[rootIdx]
     if (!rootTask || collapsedTasks.some(t => t.taskId === rootTask.taskId)) return null
-    return rootSummaries.find(root => root.task.taskId === rootTask.taskId) ?? null
-  }, [expanded, rootSummaries, visibleAllTasks])
+    return rootSummaries.find((root) => root.task.taskId === rootTask.taskId) ?? null
+  }, [expanded, rootSummaries, realTasksOnly, visibleTasks])
 
   useEffect(() => {
     if (!expanded) return
@@ -259,21 +367,22 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
       onSizeChange={box.onSizeChange}
       style={{ flexDirection: 'column', flexShrink: 0, borderStyle: 'single', border: ['left', 'right', 'top', 'bottom'], borderColor: slate[500], customBorderChars: BOX_CHARS, backgroundColor: 'transparent', paddingLeft: 1, paddingRight: 1 }}
     >
-      {stickyRootSummary ? (
+      {stickyRootSummary && stickyRootSummary.task.kind === 'task' ? (
         <box style={{ flexDirection: 'row', height: 1, minHeight: 1, maxHeight: 1 }}>
           <box style={{ width: taskNameWidth, minWidth: taskNameWidth, maxWidth: taskNameWidth, flexShrink: 0, flexDirection: 'row' }}>
             {(() => {
+              const stickyTask = stickyRootSummary.task
               const countsStr = ` (${stickyRootSummary.completed} completed, ${stickyRootSummary.active} active)`
               return <>
-                <TaskNameContent task={stickyRootSummary.task} effectiveStatus={effectiveVisualStates.get(stickyRootSummary.task.taskId) ?? 'pending'} taskNameWidth={taskNameWidth - countsStr.length} />
+                <TaskNameContent task={stickyTask} effectiveStatus={effectiveVisualStates.get(stickyTask.taskId) ?? 'pending'} taskNameWidth={taskNameWidth - countsStr.length} theme={theme} />
                 <text style={{ fg: theme.muted }}>{countsStr}</text>
               </>
             })()}
           </box>
           <box style={{ width: columnGap, minWidth: columnGap, maxWidth: columnGap, flexShrink: 0 }} />
           <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
-            <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
-              {truncate(getAssigneeLabel(stickyRootSummary.task), agentIdWidth)}
+            <text style={{ fg: theme.muted }}>
+              {truncate(getAssigneeLabel(stickyRootSummary.task.assignee), agentIdWidth)}
             </text>
             <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
               <text style={{ fg: expandHovered ? theme.foreground : theme.muted }}>{expanded ? 'Collapse all ▼  ' : 'Expand all ▲  '}</text>
@@ -322,7 +431,7 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
         >
           {visibleTasks.map(task => (
             <TaskRow
-              key={task.taskId}
+              key={task.rowId}
               task={task}
               effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
               pushForkOverlay={pushForkOverlay}
@@ -340,7 +449,7 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
         <box style={{ flexDirection: 'column' }}>
           {visibleTasks.map(task => (
             <TaskRow
-              key={task.taskId}
+              key={task.rowId}
               task={task}
               effectiveStatus={effectiveVisualStates.get(task.taskId) ?? 'pending'}
               pushForkOverlay={pushForkOverlay}

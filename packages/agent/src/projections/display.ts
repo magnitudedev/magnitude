@@ -25,7 +25,8 @@ import { createId } from '../util/id'
 
 import { finalizeOpenToolStepsAsInterruptedInSteps } from './display-interrupt'
 import { catalog, type ToolKey } from '../catalog'
-import { createToolHandle, type ToolHandle, type ToolState } from '../tools/tool-handle'
+import type { ToolState } from '../tools/tool-handle'
+import { ToolStateProjection } from './tool-state'
 
 
 // =============================================================================
@@ -239,8 +240,6 @@ export type DisplayMessage =
 /** Per-fork display state */
 export interface PendingInboundCommunicationDisplay extends PendingInboundCommunication {}
 
-
-
 export interface DisplayState {
   readonly status: 'idle' | 'streaming'
   readonly messages: readonly DisplayMessage[]
@@ -249,7 +248,6 @@ export interface DisplayState {
   readonly streamingMessageId: string | null  // Tracks streaming assistant message
   readonly activeThinkBlockId: string | null
   readonly showButton: 'send' | 'stop'
-  readonly toolHandles: { readonly [callId: string]: ToolHandle }
 }
 
 // =============================================================================
@@ -258,10 +256,11 @@ export interface DisplayState {
 
 const generateId = () => createId()
 
-
-
-const getVisualState = (fork: DisplayState, callId: string): ToolState | undefined =>
-  fork.toolHandles[callId]?.state
+const getVisualState = (
+  toolStateFork: { readonly toolHandles: { readonly [callId: string]: { readonly state: ToolState } } },
+  callId: string
+): ToolState | undefined =>
+  toolStateFork.toolHandles[callId]?.state
 
 /**
  * Find the index where new content should be inserted (before queued messages).
@@ -382,28 +381,17 @@ function closeThinkBlock(state: DisplayState, timestamp: number): DisplayState {
   }
 }
 
-export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): DisplayState {
+export function finalizeOpenToolStepsAsInterrupted(
+  state: DisplayState,
+  toolStateFork: { readonly toolHandles: { readonly [callId: string]: { readonly state: ToolState } } }
+): DisplayState {
   if (!state.activeThinkBlockId) return state
   const block = findThinkBlock(state.messages, state.activeThinkBlockId)
   if (!block) return state
 
-  let updatedHandles = state.toolHandles
-
-  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (_toolKey, state, stepId) => {
-    if (!stepId) return state
-
-    const handle = updatedHandles[stepId]
-    if (!handle) {
-      throw new Error(`Display invariant violated: missing tool handle for stepId ${stepId}`)
-    }
-
-    const nextHandle = handle.interrupt()
-    updatedHandles = {
-      ...updatedHandles,
-      [stepId]: nextHandle,
-    }
-
-    return nextHandle.state
+  const nextSteps = finalizeOpenToolStepsAsInterruptedInSteps(block.steps, (_toolKey, currentState, stepId) => {
+    if (!stepId) return currentState
+    return toolStateFork.toolHandles[stepId]?.state ?? currentState
   })
 
   if (nextSteps === block.steps || nextSteps.every((step, i) => step === block.steps[i])) {
@@ -412,7 +400,6 @@ export function finalizeOpenToolStepsAsInterrupted(state: DisplayState): Display
 
   return {
     ...state,
-    toolHandles: updatedHandles,
     messages: updateMessageById<ThinkBlockMessage>(
       state.messages, state.activeThinkBlockId,
       (b) => ({ ...b, steps: nextSteps })
@@ -569,7 +556,7 @@ export function upsertStreamingCommunicationStep(
 export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>()({
   name: 'Display',
 
-  reads: [AgentRoutingProjection, AgentStatusProjection, UserMessageResolutionProjection, TurnProjection] as const,
+  reads: [AgentRoutingProjection, AgentStatusProjection, UserMessageResolutionProjection, TurnProjection, ToolStateProjection] as const,
 
   initialFork: {
     status: 'idle',
@@ -579,7 +566,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
     streamingMessageId: null,
     activeThinkBlockId: null,
     showButton: 'send',
-    toolHandles: {},
   },
 
   signals: {
@@ -850,30 +836,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
     tool_event: ({ event, fork, read, emit }) => {
       const inner = event.event
-
-      let currentFork = fork
-      if (inner._tag === 'ToolInputStarted') {
-        const handle = createToolHandle(event.toolKey).process(inner)
-        currentFork = {
-          ...currentFork,
-          toolHandles: {
-            ...currentFork.toolHandles,
-            [event.toolCallId]: handle,
-          },
-        }
-      } else {
-        const handle = currentFork.toolHandles[event.toolCallId]
-        if (handle) {
-          const nextHandle = handle.process(inner)
-          currentFork = {
-            ...currentFork,
-            toolHandles: {
-              ...currentFork.toolHandles,
-              [event.toolCallId]: nextHandle,
-            },
-          }
-        }
-      }
+      const toolStateFork = read(ToolStateProjection) ?? { toolHandles: {} }
 
       switch (inner._tag) {
         case 'ToolInputStarted': {
@@ -881,43 +844,43 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
           emit.forkToolStep({ forkId: event.forkId, toolKey: event.toolKey })
 
           // Ignore if not for current turn
-          if (currentFork.currentTurnId !== event.turnId) {
-            return currentFork
+          if (fork.currentTurnId !== event.turnId) {
+            return fork
           }
 
           // Consult agent definition's display policy
           void read(AgentStatusProjection)
           const entry = catalog.entries[event.toolKey]
           if ('display' in entry && entry.display === false) {
-            return currentFork
+            return fork
           }
 
-          const { fork: newState, thinkBlockId } = ensureThinkBlock(currentFork, event.timestamp)
+          const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
           return {
             ...newState,
             messages: addStepToThinkBlock(newState.messages, thinkBlockId, {
               id: event.toolCallId,
               type: 'tool',
               toolKey: event.toolKey,
-              state: getVisualState(newState, event.toolCallId),
+              state: getVisualState(toolStateFork, event.toolCallId),
             })
           }
         }
 
         case 'ToolInputReady': {
-          if (currentFork.currentTurnId !== event.turnId) return currentFork
-          if (!currentFork.activeThinkBlockId) return currentFork
+          if (fork.currentTurnId !== event.turnId) return fork
+          if (!fork.activeThinkBlockId) return fork
 
           return {
-            ...currentFork,
+            ...fork,
             messages: updateStepInThinkBlock(
-              currentFork.messages,
-              currentFork.activeThinkBlockId,
+              fork.messages,
+              fork.activeThinkBlockId,
               event.toolCallId,
               (s) => s.type === 'tool'
                 ? {
                     ...s,
-                    state: getVisualState(currentFork, event.toolCallId) ?? s.state,
+                    state: getVisualState(toolStateFork, event.toolCallId) ?? s.state,
                   }
                 : s
             )
@@ -926,29 +889,29 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
         case 'ToolExecutionEnded': {
           // Ignore if not for current turn
-          if (currentFork.currentTurnId !== event.turnId) {
-            return currentFork
+          if (fork.currentTurnId !== event.turnId) {
+            return fork
           }
 
           // Consult agent definition's display policy
           void read(AgentStatusProjection)
           const entry = catalog.entries[event.toolKey]
           if ('display' in entry && entry.display === false) {
-            return currentFork
+            return fork
           }
 
-          if (!currentFork.activeThinkBlockId) return currentFork
+          if (!fork.activeThinkBlockId) return fork
 
           return {
-            ...currentFork,
+            ...fork,
             messages: updateStepInThinkBlock(
-              currentFork.messages,
-              currentFork.activeThinkBlockId,
+              fork.messages,
+              fork.activeThinkBlockId,
               event.toolCallId,
               (s) => s.type === 'tool'
                 ? {
                     ...s,
-                    state: getVisualState(currentFork, event.toolCallId) ?? s.state,
+                    state: getVisualState(toolStateFork, event.toolCallId) ?? s.state,
                   }
                 : s
             )
@@ -956,20 +919,20 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
 
         case 'ToolObservation':
-          return currentFork
+          return fork
 
         default: {
-          if (currentFork.currentTurnId !== event.turnId) return currentFork
-          if (!currentFork.activeThinkBlockId) return currentFork
+          if (fork.currentTurnId !== event.turnId) return fork
+          if (!fork.activeThinkBlockId) return fork
 
-          const vs = getVisualState(currentFork, event.toolCallId)
-          if (!vs) return currentFork
+          const vs = getVisualState(toolStateFork, event.toolCallId)
+          if (!vs) return fork
 
           return {
-            ...currentFork,
+            ...fork,
             messages: updateStepInThinkBlock(
-              currentFork.messages,
-              currentFork.activeThinkBlockId,
+              fork.messages,
+              fork.activeThinkBlockId,
               event.toolCallId,
               (s) => s.type === 'tool'
                 ? { ...s, state: vs }
@@ -1041,7 +1004,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    interrupt: ({ event, fork, emit }) => {
+    interrupt: ({ event, fork, emit, read }) => {
       // Find queued messages before removing them
       const queuedMessages = fork.messages.filter(
         (m): m is QueuedUserMessageDisplay => m.type === 'queued_user_message'
@@ -1056,7 +1019,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
 
       // Finalize any still-open tool steps as interrupted before closing think block
-      const interruptedState = finalizeOpenToolStepsAsInterrupted(fork)
+      const toolStateFork = read(ToolStateProjection) ?? { toolHandles: {} }
+      const interruptedState = finalizeOpenToolStepsAsInterrupted(fork, toolStateFork)
 
       // Close think block and remove queued messages
       const closedState = closeThinkBlock(interruptedState, event.timestamp)

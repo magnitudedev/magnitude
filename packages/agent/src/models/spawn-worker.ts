@@ -24,13 +24,20 @@ export const spawnWorkerModel = defineStateModel('spawnWorker', {
       case 'started':
         return { ...state, phase: 'streaming' }
       case 'inputUpdated':
-      case 'inputReady':
         return {
           ...state,
           phase: 'streaming',
           id: event.streaming.id?.value ?? state.id,
           role: event.streaming.role?.value ?? state.role,
           message: event.streaming.message?.value ?? state.message,
+        }
+      case 'inputReady':
+        return {
+          ...state,
+          phase: 'streaming',
+          id: event.input.id ?? state.id,
+          role: event.input.role ?? state.role,
+          message: event.input.message ?? state.message,
         }
       case 'executionStarted':
       case 'emission':

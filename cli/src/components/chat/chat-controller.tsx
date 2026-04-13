@@ -474,20 +474,35 @@ export function ChatController(props: ChatControllerProps) {
 
   const selectedTaskForFork = selectedForkId == null
     ? null
-    : tasks.find((task) => task.workerForkId === selectedForkId)
+    : tasks.find((task) => (
+        task.kind === 'task'
+        && task.assignee.kind === 'worker'
+        && task.assignee.interactiveForkId === selectedForkId
+      ))
 
   const selectedWorkerAgentId = selectedForkId == null
     ? null
-    : selectedTaskForFork?.assignee.kind === 'worker'
-      ? selectedTaskForFork.assignee.agentId
+    : selectedTaskForFork?.kind === 'task'
+      && selectedTaskForFork.assignee.kind === 'worker'
+      && selectedTaskForFork.assignee.interactiveForkId
+      ? selectedTaskForFork.assignee.label
       : selectedForkId
 
   const pendingKillTask = pendingKillForkId == null
     ? null
-    : tasks.find((task) => task.workerForkId === pendingKillForkId)
+    : tasks.find((task) => (
+        task.kind === 'task'
+        && task.assignee.kind === 'worker'
+        && task.assignee.interactiveForkId === pendingKillForkId
+      ))
 
-  const pendingKillTab = pendingKillTask?.assignee.kind === 'worker' && pendingKillTask.workerForkId
-    ? { forkId: pendingKillTask.workerForkId, agentId: pendingKillTask.assignee.agentId }
+  const pendingKillTab = pendingKillTask?.kind === 'task'
+    && pendingKillTask.assignee.kind === 'worker'
+    && pendingKillTask.assignee.interactiveForkId
+    ? {
+        forkId: pendingKillTask.assignee.interactiveForkId,
+        agentId: pendingKillTask.assignee.label,
+      }
     : null
 
   return (
@@ -517,7 +532,6 @@ export function ChatController(props: ChatControllerProps) {
         <TaskList
           tasks={tasks}
           pushForkOverlay={pushForkOverlay}
-          fileViewerOpen={selectedFileOpen}
         />
         <box style={{ borderStyle: 'single', border: ['left'], borderColor: env.bashMode ? orange[400] : env.modeColor, customBorderChars: { ...BOX_CHARS, vertical: '┃' } }}>
           <box style={{ backgroundColor: env.theme.inputBg, paddingTop: 1, paddingLeft: 1, paddingRight: 2, flexDirection: 'column', flexGrow: 1 }}>

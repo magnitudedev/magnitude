@@ -112,6 +112,10 @@ function propsWithDisplay(display: DisplayState) {
       cb(idleCompaction)
       return noop
     },
+    subscribeForkToolState: (_forkId: string, cb: (state: any) => void) => {
+      cb({ toolHandles: {} })
+      return noop
+    },
   }
 }
 
