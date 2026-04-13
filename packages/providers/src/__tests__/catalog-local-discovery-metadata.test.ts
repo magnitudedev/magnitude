@@ -1,10 +1,55 @@
-import { describe, expect, it, mock, afterEach } from 'bun:test'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Effect } from 'effect'
 import { createStorageClient } from '@magnitudedev/storage'
-import { ModelCatalogLive, ModelCatalog } from '../catalog'
+import { ModelCatalogLive, ModelCatalog, CatalogSourceRegistry } from '../catalog'
+import { localCatalogSource } from '../catalog/local-catalog-source'
+import { staticCatalogSource } from '../catalog/static-catalog-source'
 import { getProvider } from '../registry'
+import { ProviderAuth, type ProviderAuthShape } from '../runtime/contracts'
 
 const originalFetch = globalThis.fetch
+
+const providerAuthStub: ProviderAuthShape = {
+  loadAuth: () => Effect.succeed({}),
+  getAuth: () => Effect.succeed(undefined),
+  setAuth: () => Effect.void,
+  removeAuth: () => Effect.void,
+  refresh: () => Effect.succeed(null),
+  detectProviders: () => Effect.succeed([]),
+  detectDefaultProvider: () => Effect.succeed(null),
+  detectProviderAuthMethods: () => Effect.succeed(null),
+  connectedProviderIds: () => Effect.succeed(new Set()),
+}
+
+function stubFetch(
+  impl: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>,
+): void {
+  const mock = vi.fn(impl)
+  const fetchStub: typeof fetch = Object.assign(
+    (...args: Parameters<typeof fetch>) => mock(...args),
+    originalFetch,
+  )
+  globalThis.fetch = fetchStub
+}
+
+async function runRefresh(storage: Awaited<ReturnType<typeof createStorageClient>>) {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const catalog = yield* ModelCatalog
+      yield* catalog.refresh()
+    }).pipe(
+      Effect.provide(ModelCatalogLive),
+      Effect.provideService(CatalogSourceRegistry, {
+        list: () => [
+          staticCatalogSource,
+          localCatalogSource,
+        ],
+      }),
+      Effect.provideService(ProviderAuth, providerAuthStub),
+      Effect.provide(storage.layer),
+    ),
+  )
+}
 
 afterEach(() => {
   globalThis.fetch = originalFetch
@@ -18,7 +63,7 @@ describe('local catalog discovery metadata persistence', () => {
       lastDiscoveryError: 'old error',
     })
 
-    globalThis.fetch = mock(async (url: string | URL | Request) => {
+    stubFetch(async (url) => {
       const raw = typeof url === 'string' ? url : (url instanceof URL ? url.toString() : url.url)
       if (raw.includes('localhost:1234') && raw.endsWith('/api/v1/models')) {
         return new Response(JSON.stringify({ data: [{ id: 'qwen2.5-coder:14b', max_context_length: 32768 }] }), { status: 200 })
@@ -30,17 +75,9 @@ describe('local catalog discovery metadata persistence', () => {
         return new Response(JSON.stringify({ data: [{ id: 'qwen2.5-coder:14b', name: 'Qwen' }] }), { status: 200 })
       }
       return new Response('unavailable', { status: 503 })
-    }) as any
+    })
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const options = await storage.config.getProviderOptions('lmstudio')
     expect(options?.inventoryUpdatedAt).toBeDefined()
@@ -61,23 +98,15 @@ describe('local catalog discovery metadata persistence', () => {
       baseUrl: 'http://localhost:1234/v1',
     })
 
-    globalThis.fetch = mock(async (url: string | URL | Request) => {
+    stubFetch(async (url) => {
       const raw = typeof url === 'string' ? url : (url instanceof URL ? url.toString() : url.url)
       if (raw.includes('localhost:1234') && raw.endsWith('/models')) {
         return new Response('nope', { status: 500 })
       }
       return new Response('unavailable', { status: 503 })
-    }) as any
+    })
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const options = await storage.config.getProviderOptions('lmstudio')
     expect(options?.inventoryUpdatedAt).toBeDefined()
@@ -97,7 +126,7 @@ describe('local catalog discovery metadata persistence', () => {
 
     let nativeContext = 32768
 
-    globalThis.fetch = mock(async (url: string | URL | Request) => {
+    stubFetch(async (url) => {
       const raw = typeof url === 'string' ? url : (url instanceof URL ? url.toString() : url.url)
       if (raw.includes('localhost:1234') && raw.endsWith('/api/v1/models')) {
         return new Response(JSON.stringify({ data: [{ id: 'qwen2.5-coder:14b', max_context_length: nativeContext }] }), { status: 200 })
@@ -109,17 +138,9 @@ describe('local catalog discovery metadata persistence', () => {
         return new Response(JSON.stringify({ data: [{ id: 'qwen2.5-coder:14b', name: 'Qwen' }] }), { status: 200 })
       }
       return new Response('unavailable', { status: 503 })
-    }) as any
+    })
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const first = await storage.config.getProviderOptions('lmstudio')
     expect(first?.discoveredModels?.[0]?.id).toBe('qwen2.5-coder:14b')
@@ -127,15 +148,7 @@ describe('local catalog discovery metadata persistence', () => {
 
     nativeContext = 8192
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const second = await storage.config.getProviderOptions('lmstudio')
     expect(second?.discoveredModels?.[0]?.id).toBe('qwen2.5-coder:14b')
@@ -150,7 +163,7 @@ describe('local catalog discovery metadata persistence', () => {
 
     let loadedContext = 73728
 
-    globalThis.fetch = mock(async (url: string | URL | Request) => {
+    stubFetch(async (url) => {
       const raw = typeof url === 'string' ? url : (url instanceof URL ? url.toString() : url.url)
       if (raw.includes('localhost:1234') && raw.endsWith('/api/v1/models')) {
         return new Response(JSON.stringify({
@@ -170,17 +183,9 @@ describe('local catalog discovery metadata persistence', () => {
         return new Response(JSON.stringify({ models: [] }), { status: 200 })
       }
       return new Response('unavailable', { status: 503 })
-    }) as any
+    })
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const first = await storage.config.getProviderOptions('lmstudio')
     expect(first?.discoveredModels?.[0]?.id).toBe('gemma-3-12b-it')
@@ -188,15 +193,7 @@ describe('local catalog discovery metadata persistence', () => {
 
     loadedContext = 65536
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const second = await storage.config.getProviderOptions('lmstudio')
     expect(second?.discoveredModels?.[0]?.id).toBe('gemma-3-12b-it')
@@ -211,7 +208,7 @@ describe('local catalog discovery metadata persistence', () => {
 
     let loadedContext = 73195
 
-    globalThis.fetch = mock(async (url: string | URL | Request) => {
+    stubFetch(async (url) => {
       const raw = typeof url === 'string' ? url : (url instanceof URL ? url.toString() : url.url)
       if (raw.includes('localhost:1234') && raw.endsWith('/v1/models')) {
         return new Response(JSON.stringify({ data: [{ id: 'gemma-3-12b-it' }] }), { status: 200 })
@@ -227,32 +224,16 @@ describe('local catalog discovery metadata persistence', () => {
         }), { status: 200 })
       }
       return new Response('unavailable', { status: 503 })
-    }) as any
+    })
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const first = await storage.config.getProviderOptions('lmstudio')
     expect(first?.discoveredModels?.[0]?.maxContextTokens).toBe(73195)
 
     loadedContext = 65536
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const second = await storage.config.getProviderOptions('lmstudio')
     expect(second?.discoveredModels?.[0]?.maxContextTokens).toBe(65536)
@@ -264,7 +245,7 @@ describe('local catalog discovery metadata persistence', () => {
       baseUrl: 'http://localhost:1234/v1',
     })
 
-    globalThis.fetch = mock(async (url: string | URL | Request) => {
+    stubFetch(async (url) => {
       const raw = typeof url === 'string' ? url : (url instanceof URL ? url.toString() : url.url)
       if (raw.includes('localhost:1234') && raw.endsWith('/api/v1/models')) {
         return new Response(JSON.stringify({ data: [{ id: 'qwen2.5-coder:14b' }] }), { status: 200 })
@@ -276,17 +257,9 @@ describe('local catalog discovery metadata persistence', () => {
         return new Response(JSON.stringify({ data: [{ id: 'qwen2.5-coder:14b', name: 'Qwen' }] }), { status: 200 })
       }
       return new Response('unavailable', { status: 503 })
-    }) as any
+    })
 
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const catalog = yield* ModelCatalog
-        yield* catalog.refresh()
-      }).pipe(
-        Effect.provide(ModelCatalogLive),
-        Effect.provide(storage.layer),
-      ),
-    )
+    await runRefresh(storage)
 
     const options = await storage.config.getProviderOptions('lmstudio')
     expect(options?.discoveredModels?.[0]?.id).toBe('qwen2.5-coder:14b')

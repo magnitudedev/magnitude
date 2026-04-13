@@ -22,7 +22,6 @@ const tiered = (lead: string, sub: string, browser: string): Record<MagnitudeSlo
   browser,
 })
 
-/** Duplicated from cli/src/utils/model-preferences.ts for validation */
 const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'anthropic': tiered('claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'),
   'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
@@ -39,17 +38,16 @@ const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'zai-coding-plan': rest('glm-4.7'),
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
-  'fireworks': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
+  'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
 }
 
-/** Duplicated from cli/src/utils/model-preferences.ts for validation */
 const MODEL_OAUTH_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
 }
 
 describe('MODEL_DEFAULTS consistency with static registry', () => {
   it('registers Fireworks AI with curated OpenAI-compatible static config', () => {
-    const provider = getProvider('fireworks')
+    const provider = getProvider('fireworks-ai')
     expect(provider).toBeDefined()
     expect(provider?.name).toBe('Fireworks AI')
     expect(provider?.bamlProvider).toBe('openai-generic')
@@ -57,12 +55,15 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
     expect(provider?.authMethods).toEqual([
       { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },
     ])
+    expect(provider?.providerFamily).toBe('cloud')
+    expect(provider?.inventoryMode).toBe('dynamic')
 
-    const staticModels = getStaticProviderModels('fireworks')
+    const staticModels = getStaticProviderModels('fireworks-ai')
     expect(staticModels.map((model) => model.id)).toEqual([
       'accounts/fireworks/routers/kimi-k2p5-turbo',
       'accounts/fireworks/models/glm-5p1',
     ])
+    expect(staticModels.some((model) => model.id === 'accounts/fireworks/routers/kimi-k2p5-turbo')).toBe(true)
   })
 
   for (const [providerId, slotMap] of Object.entries(MODEL_DEFAULTS)) {

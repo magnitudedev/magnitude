@@ -61,8 +61,8 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   rule(/^k2p5$/, [...ALL_SLOTS], 'kimi-for-coding'),
 
   // Fireworks
-  rule(/^accounts\/fireworks\/models\/glm-5p1$/, [...ALL_SLOTS], 'fireworks'),
-  rule(/^accounts\/fireworks\/routers\/kimi-k2p5-turbo$/, [...ALL_SLOTS], 'fireworks'),
+  rule(/^accounts\/fireworks\/models\/glm-5p1$/, [...ALL_SLOTS], 'fireworks-ai'),
+  rule(/^accounts\/fireworks\/routers\/kimi-k2p5-turbo$/, [...ALL_SLOTS], 'fireworks-ai'),
 
   // Local intentionally omitted: recommendations depend on user-local inventory
 ]

@@ -44,7 +44,7 @@ describe('client-registry openai-generic Fireworks options', () => {
 
   it('builds Fireworks options from explicit api auth', () => {
     const options = __testOnly_buildProviderOptions(
-      'fireworks',
+      'fireworks-ai',
       'accounts/fireworks/routers/kimi-k2p5-turbo',
       { type: 'api', key: 'test-key' },
       undefined,
@@ -66,7 +66,7 @@ describe('client-registry openai-generic Fireworks options', () => {
     vi.stubEnv('FIREWORKS_API_KEY', 'env-fireworks-key')
 
     const options = __testOnly_buildProviderOptions(
-      'fireworks',
+      'fireworks-ai',
       'accounts/fireworks/models/glm-5p1',
       null,
       { baseUrl: 'https://example.fireworks.test/v1' },

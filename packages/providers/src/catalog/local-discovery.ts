@@ -9,6 +9,105 @@ type OllamaTagsResponse = {
   models?: Array<{ name?: string; model?: string }>
 }
 
+interface LmStudioLoadedInstance {
+  config?: {
+    context_length?: number | string
+  }
+}
+
+interface LmStudioModelV1 {
+  id?: string
+  model?: string
+  modelKey?: string
+  model_key?: string
+  name?: string
+  title?: string
+  modelName?: string
+  model_name?: string
+  max_context_length?: number | string
+  loaded_instances?: LmStudioLoadedInstance[]
+}
+
+interface LmStudioModelV0 {
+  id?: string
+  model?: string
+  modelKey?: string
+  model_key?: string
+  name?: string
+  title?: string
+  modelName?: string
+  model_name?: string
+  max_context_length?: number | string
+  loaded_context_length?: number | string
+  loadedContextLength?: number | string
+  context_length?: number | string
+}
+
+type LmStudioModel = LmStudioModelV1 | LmStudioModelV0
+
+interface LmStudioResponse {
+  data?: LmStudioModel[]
+  models?: LmStudioModel[]
+  items?: LmStudioModel[]
+}
+
+interface OllamaShowResponse {
+  num_ctx?: number | string
+  parameters?: string
+  model_info?: {
+    context_length?: number | string
+    [key: string]: unknown
+  }
+}
+
+interface OllamaPsModel {
+  name?: string
+  model?: string
+  context?: number | string
+  CONTEXT?: number | string
+  context_length?: number | string
+  CONTEXT_LENGTH?: number | string
+  contextLength?: number | string
+  num_ctx?: number | string
+  n_ctx?: number | string
+}
+
+interface OllamaPsResponse {
+  models?: OllamaPsModel[]
+}
+
+interface LlamaCppPropsResponse {
+  default_generation_settings?: {
+    n_ctx?: number | string
+  }
+}
+
+interface LlamaSlotsEntry {
+  n_ctx?: number | string
+}
+
+interface LlamaSlotsResponse {
+  slots?: LlamaSlotsEntry[] | LlamaSlotsEntry
+}
+
+interface LlamaShowResponse {
+  model_info?: {
+    'llama.context_length'?: number | string
+  }
+}
+
+interface LlamaV1MetaEntry {
+  id?: string
+  n_ctx_train?: number | string
+  meta?: {
+    n_ctx_train?: number | string
+  }
+}
+
+interface LlamaV1MetaResponse {
+  data?: LlamaV1MetaEntry[]
+}
+
 export type LocalDiscoveryStatus = 'success_non_empty' | 'success_empty' | 'failure'
 
 export type LocalDiscoveryResult = {
@@ -124,38 +223,22 @@ function readNumber(value: unknown): number | null {
   return null
 }
 
-function readLmStudioLoadedContext(item: Record<string, unknown>): number | null {
-  const loaded = item.loaded_instances
-  if (!Array.isArray(loaded)) return null
-  for (const instance of loaded) {
-    if (!instance || typeof instance !== 'object') continue
-    const config = (instance as Record<string, unknown>).config
-    if (!config || typeof config !== 'object') continue
-    const parsed = readNumber((config as Record<string, unknown>).context_length)
-    if (parsed != null) return parsed
-  }
-  return null
+function isLmStudioModel(value: unknown): value is LmStudioModel {
+  return !!value && typeof value === 'object'
 }
 
-function readLmStudioLoadedContextV0(item: Record<string, unknown>): number | null {
-  return (
-    readNumber(item.loaded_context_length) ??
-    readNumber(item.loadedContextLength) ??
-    readNumber(item.context_length)
-  )
-}
-
-function readModelLikeRecords(payload: unknown): Array<Record<string, unknown>> {
+function parseLmStudioModels(payload: unknown): LmStudioModel[] {
   const list = Array.isArray(payload)
     ? payload
-    : (payload && typeof payload === 'object'
-      ? ((payload as any).data ?? (payload as any).models ?? (payload as any).items ?? [])
-      : [])
+    : payload && typeof payload === 'object'
+      ? ((payload as LmStudioResponse).data ?? (payload as LmStudioResponse).models ?? (payload as LmStudioResponse).items ?? [])
+      : []
+
   if (!Array.isArray(list)) return []
-  return list.filter((raw): raw is Record<string, unknown> => !!raw && typeof raw === 'object')
+  return list.filter(isLmStudioModel)
 }
 
-function readModelRecordId(item: Record<string, unknown>): string | null {
+function readModelRecordId(item: LmStudioModel): string | null {
   return [
     item.id,
     item.model,
@@ -164,7 +247,7 @@ function readModelRecordId(item: Record<string, unknown>): string | null {
   ].find((v): v is string => typeof v === 'string' && v.trim().length > 0)?.trim() ?? null
 }
 
-function readModelRecordName(item: Record<string, unknown>): string | null {
+function readModelRecordName(item: LmStudioModel): string | null {
   return [
     item.name,
     item.title,
@@ -173,9 +256,25 @@ function readModelRecordName(item: Record<string, unknown>): string | null {
   ].find((v): v is string => typeof v === 'string' && v.trim().length > 0)?.trim() ?? null
 }
 
+function readLmStudioLoadedContext(item: LmStudioModelV1): number | null {
+  for (const instance of item.loaded_instances ?? []) {
+    const parsed = readNumber(instance.config?.context_length)
+    if (parsed != null) return parsed
+  }
+  return null
+}
+
+function readLmStudioLoadedContextV0(item: LmStudioModelV0): number | null {
+  return (
+    readNumber(item.loaded_context_length) ??
+    readNumber(item.loadedContextLength) ??
+    readNumber(item.context_length)
+  )
+}
+
 function fromLmStudioNativeModels(payload: unknown): ModelDefinition[] {
   const out: ModelDefinition[] = []
-  for (const item of readModelLikeRecords(payload)) {
+  for (const item of parseLmStudioModels(payload)) {
     const id = readModelRecordId(item)
     if (!id) continue
     const name = readModelRecordName(item)
@@ -227,8 +326,8 @@ function normalizeLmStudioMatchKey(value: string): string {
 
 function findSingleLmStudioRecord(
   modelId: string,
-  records: readonly Record<string, unknown>[],
-): Record<string, unknown> | null {
+  records: readonly LmStudioModel[],
+): LmStudioModel | null {
   const exact = records.filter((item) => readModelRecordId(item) === modelId)
   if (exact.length === 1) return exact[0]!
   if (exact.length > 1) return null
@@ -276,13 +375,16 @@ function llamaCppSlotsUrl(baseUrl: string): string {
   return `${normalizeBaseUrl(baseUrl)}/slots`
 }
 
+function isOllamaShowResponse(payload: unknown): payload is OllamaShowResponse {
+  return !!payload && typeof payload === 'object'
+}
+
 function parseOllamaShowNumCtx(payload: unknown): number | null {
-  if (!payload || typeof payload !== 'object') return null
-  const obj = payload as Record<string, unknown>
-  const direct = readNumber(obj.num_ctx)
+  if (!isOllamaShowResponse(payload)) return null
+  const direct = readNumber(payload.num_ctx)
   if (direct != null) return direct
 
-  const parameters = obj.parameters
+  const parameters = payload.parameters
   if (typeof parameters === 'string') {
     const match = parameters.match(/(?:^|\s)num_ctx(?:\s+|=)(\d+)(?:\s|$)/)
     if (match?.[1]) {
@@ -295,12 +397,8 @@ function parseOllamaShowNumCtx(payload: unknown): number | null {
 }
 
 function parseOllamaShowModelInfoContextLength(payload: unknown): number | null {
-  if (!payload || typeof payload !== 'object') return null
-  const obj = payload as Record<string, unknown>
-  const modelInfo = obj.model_info
-  if (!modelInfo || typeof modelInfo !== 'object') return null
-  const info = modelInfo as Record<string, unknown>
-  for (const [key, value] of Object.entries(info)) {
+  if (!isOllamaShowResponse(payload) || !payload.model_info) return null
+  for (const [key, value] of Object.entries(payload.model_info)) {
     if (key === 'context_length' || key.endsWith('.context_length')) {
       const parsed = readNumber(value)
       if (parsed != null) return parsed
@@ -309,42 +407,50 @@ function parseOllamaShowModelInfoContextLength(payload: unknown): number | null 
   return null
 }
 
+function isLlamaCppPropsResponse(payload: unknown): payload is LlamaCppPropsResponse {
+  return !!payload && typeof payload === 'object'
+}
 
 function parseLlamaCppContextLength(payload: unknown): number | null {
-  if (!payload || typeof payload !== 'object') return null
-  const obj = payload as Record<string, unknown>
-  const defaults = obj.default_generation_settings
-  if (!defaults || typeof defaults !== 'object') return null
-  return readNumber((defaults as Record<string, unknown>).n_ctx)
+  if (!isLlamaCppPropsResponse(payload)) return null
+  return readNumber(payload.default_generation_settings?.n_ctx)
+}
+
+function isLlamaShowResponse(payload: unknown): payload is LlamaShowResponse {
+  return !!payload && typeof payload === 'object'
 }
 
 function parseLlamaShowContextLength(payload: unknown): number | null {
-  if (!payload || typeof payload !== 'object') return null
-  const obj = payload as Record<string, unknown>
-  const modelInfo = obj.model_info
-  if (!modelInfo || typeof modelInfo !== 'object') return null
-  const info = modelInfo as Record<string, unknown>
-  return readNumber(info['llama.context_length'])
+  if (!isLlamaShowResponse(payload)) return null
+  return readNumber(payload.model_info?.['llama.context_length'])
+}
+
+function isLlamaSlotsEntry(payload: unknown): payload is LlamaSlotsEntry {
+  return !!payload && typeof payload === 'object'
+}
+
+function isLlamaSlotsResponse(payload: unknown): payload is LlamaSlotsResponse {
+  return !!payload && typeof payload === 'object'
 }
 
 function parseLlamaSlotsContextLength(payload: unknown): number | null {
   const slots = Array.isArray(payload)
     ? payload
-    : (payload && typeof payload === 'object'
-      ? ((payload as Record<string, unknown>).slots ?? payload)
-      : null)
+    : isLlamaSlotsResponse(payload)
+      ? (payload.slots ?? payload)
+      : null
 
   if (Array.isArray(slots)) {
     for (const slot of slots) {
-      if (!slot || typeof slot !== 'object') continue
-      const parsed = readNumber((slot as Record<string, unknown>).n_ctx)
+      if (!isLlamaSlotsEntry(slot)) continue
+      const parsed = readNumber(slot.n_ctx)
       if (parsed != null) return parsed
     }
     return null
   }
 
-  if (slots && typeof slots === 'object') {
-    return readNumber((slots as Record<string, unknown>).n_ctx)
+  if (isLlamaSlotsEntry(slots)) {
+    return readNumber(slots.n_ctx)
   }
 
   return null
@@ -382,20 +488,20 @@ async function enrichLmStudioContext(
   baseUrl: string,
   models: readonly ModelDefinition[],
 ): Promise<ModelDefinition[]> {
-  let v1Records: Array<Record<string, unknown>> | null = null
-  let v0Records: Array<Record<string, unknown>> | null = null
+  let v1Records: LmStudioModel[] | null = null
+  let v0Records: LmStudioModel[] | null = null
 
-  const getV1Records = async (): Promise<Array<Record<string, unknown>>> => {
+  const getV1Records = async (): Promise<LmStudioModel[]> => {
     if (v1Records != null) return v1Records
     const payload = await fetchJson<unknown>(lmStudioNativeV1Url(baseUrl))
-    v1Records = readModelLikeRecords(payload)
+    v1Records = parseLmStudioModels(payload)
     return v1Records
   }
 
-  const getV0Records = async (): Promise<Array<Record<string, unknown>>> => {
+  const getV0Records = async (): Promise<LmStudioModel[]> => {
     if (v0Records != null) return v0Records
     const payload = await fetchJson<unknown>(lmStudioNativeV0Url(baseUrl))
-    v0Records = readModelLikeRecords(payload)
+    v0Records = parseLmStudioModels(payload)
     return v0Records
   }
 
@@ -444,14 +550,14 @@ async function enrichLmStudioContext(
 
 type OllamaPsEntry = { ids: string[]; context: number }
 
+function isOllamaPsResponse(payload: unknown): payload is OllamaPsResponse {
+  return !!payload && typeof payload === 'object'
+}
+
 function parseOllamaPsEntries(payload: unknown): OllamaPsEntry[] {
   const out: OllamaPsEntry[] = []
-  if (!payload || typeof payload !== 'object') return out
-  const obj = payload as Record<string, unknown>
-  const list = Array.isArray(obj.models) ? obj.models : []
-  for (const raw of list) {
-    if (!raw || typeof raw !== 'object') continue
-    const item = raw as Record<string, unknown>
+  if (!isOllamaPsResponse(payload)) return out
+  for (const item of payload.models ?? []) {
     const ids = [item.name, item.model]
       .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
       .map((v) => v.trim())
@@ -533,23 +639,17 @@ async function enrichOllamaContext(
   return mergeContextMetadata(models, maxById)
 }
 
+function isLlamaV1MetaResponse(payload: unknown): payload is LlamaV1MetaResponse {
+  return !!payload && typeof payload === 'object'
+}
+
 function parseLlamaV1MetaContextMap(payload: unknown): Map<string, number> {
   const out = new Map<string, number>()
-  if (!payload || typeof payload !== 'object') return out
-  const list = Array.isArray((payload as Record<string, unknown>).data)
-    ? (payload as Record<string, unknown>).data as unknown[]
-    : []
-  for (const raw of list) {
-    if (!raw || typeof raw !== 'object') continue
-    const item = raw as Record<string, unknown>
+  if (!isLlamaV1MetaResponse(payload)) return out
+  for (const item of payload.data ?? []) {
     const id = typeof item.id === 'string' && item.id.trim().length > 0 ? item.id.trim() : null
     if (!id) continue
-    const meta = item.meta
-    let value: number | null = null
-    if (meta && typeof meta === 'object') {
-      value = readNumber((meta as Record<string, unknown>).n_ctx_train)
-    }
-    value = value ?? readNumber(item.n_ctx_train)
+    const value = readNumber(item.meta?.n_ctx_train) ?? readNumber(item.n_ctx_train)
     if (value != null) out.set(id, value)
   }
   return out

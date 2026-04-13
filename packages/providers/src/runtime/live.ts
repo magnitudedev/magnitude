@@ -11,9 +11,10 @@ import {
 import { ProviderCatalog, ProviderState, ProviderAuth } from './contracts'
 import { PROVIDERS, getProvider } from '../registry'
 import { detectDefaultProvider, detectProviderAuthMethods, detectProviders } from '../detect'
-import { ModelCatalog, ModelCatalogLive } from '../catalog'
+import { CatalogSourceRegistryLive, ModelCatalog, ModelCatalogLive } from '../catalog'
 
 import { makeProviderStateStore } from '../state/provider-state'
+import { resolveNonStoredAuth } from '../auth/resolve'
 import { refreshAnthropicToken } from '../auth/anthropic-oauth'
 import { refreshOpenAIToken } from '../auth/openai-oauth'
 import { exchangeCopilotToken } from '../auth/copilot-oauth'
@@ -29,7 +30,80 @@ export function makeProviderRuntimeLive<TSlot extends string>(
     Layer.provide(CatalogCacheLive, GlobalStorageLive),
   )
 
-  const catalogLayer = modelCatalogLayer ?? Layer.provide(ModelCatalogLive, storageLayer)
+  const providerAuthLayer = Layer.effect(
+    ProviderAuth,
+    Effect.gen(function* () {
+      const authStorage = yield* AuthStorage
+      const config = yield* AppConfig
+      return {
+        loadAuth: () => authStorage.loadAll(),
+        getAuth: (providerId) =>
+          Effect.map(authStorage.get(providerId), (stored) => {
+            if (stored) return stored
+            const provider = getProvider(providerId)
+            return provider ? resolveNonStoredAuth(provider) ?? undefined : undefined
+          }),
+        setAuth: (providerId, auth) => authStorage.set(providerId, auth),
+        removeAuth: (providerId) => authStorage.remove(providerId),
+        refresh: (providerId, refreshToken) =>
+          Effect.tryPromise({
+            try: async () => {
+              if (providerId === 'anthropic') return refreshAnthropicToken(refreshToken)
+              if (providerId === 'openai') return refreshOpenAIToken(refreshToken)
+              if (providerId === 'github-copilot') return exchangeCopilotToken(refreshToken)
+              return null
+            },
+            catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+          }),
+        detectProviders: () =>
+          Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
+            Effect.flatMap(config.load(), (cfg) => {
+              const providerOptionsById = cfg.providers ?? {}
+              return Effect.succeed(
+                detectProviders(storedAuth, providerOptionsById).map((entry) => ({
+                  provider: entry.provider,
+                  authMethods: detectProviderAuthMethods(entry.provider.id, storedAuth, providerOptionsById)?.methods ?? [],
+                })),
+              )
+            }),
+          ),
+        detectDefaultProvider: () =>
+          Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
+            Effect.map(
+              config.load(),
+              (cfg) => detectDefaultProvider(storedAuth, cfg.providers ?? {})?.provider.id ?? null,
+            ),
+          ),
+        detectProviderAuthMethods: (providerId) =>
+          Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
+            Effect.map(
+              config.load(),
+              (cfg) => detectProviderAuthMethods(providerId, storedAuth, cfg.providers ?? {}),
+            ),
+          ),
+        connectedProviderIds: () =>
+          Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
+            Effect.map(
+              config.load(),
+              (cfg) => new Set(detectProviders(storedAuth, cfg.providers ?? {}).map((d) => d.provider.id)),
+            ),
+          ),
+      }
+    }),
+  )
+
+  const catalogRuntimeLayer = Layer.mergeAll(
+    storageLayer,
+    Layer.provide(providerAuthLayer, storageLayer),
+  )
+
+  const catalogLayer = modelCatalogLayer ?? Layer.provide(
+    ModelCatalogLive,
+    Layer.mergeAll(
+      CatalogSourceRegistryLive,
+      catalogRuntimeLayer,
+    ),
+  )
 
   const providerCatalogLayer = Layer.effect(
     ProviderCatalog,
@@ -84,62 +158,7 @@ export function makeProviderRuntimeLive<TSlot extends string>(
           }
         }),
       ),
-      Layer.effect(
-        ProviderAuth,
-        Effect.gen(function* () {
-          const authStorage = yield* AuthStorage
-          const config = yield* AppConfig
-          return {
-            loadAuth: () => authStorage.loadAll(),
-            getAuth: (providerId) => authStorage.get(providerId),
-            setAuth: (providerId, auth) => authStorage.set(providerId, auth),
-            removeAuth: (providerId) => authStorage.remove(providerId),
-            refresh: (providerId, refreshToken) =>
-              Effect.tryPromise({
-                try: async () => {
-                  if (providerId === 'anthropic') return refreshAnthropicToken(refreshToken)
-                  if (providerId === 'openai') return refreshOpenAIToken(refreshToken)
-                  if (providerId === 'github-copilot') return exchangeCopilotToken(refreshToken)
-                  return null
-                },
-                catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-              }),
-            detectProviders: () =>
-              Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
-                Effect.flatMap(config.load(), (cfg) => {
-                  const providerOptionsById = cfg.providers ?? {}
-                  return Effect.succeed(
-                    detectProviders(storedAuth, providerOptionsById).map((entry) => ({
-                      provider: entry.provider,
-                      authMethods: detectProviderAuthMethods(entry.provider.id, storedAuth, providerOptionsById)?.methods ?? [],
-                    })),
-                  )
-                }),
-              ),
-            detectDefaultProvider: () =>
-              Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
-                Effect.map(
-                  config.load(),
-                  (cfg) => detectDefaultProvider(storedAuth, cfg.providers ?? {})?.provider.id ?? null,
-                ),
-              ),
-            detectProviderAuthMethods: (providerId) =>
-              Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
-                Effect.map(
-                  config.load(),
-                  (cfg) => detectProviderAuthMethods(providerId, storedAuth, cfg.providers ?? {}),
-                ),
-              ),
-            connectedProviderIds: () =>
-              Effect.flatMap(authStorage.loadAll(), (storedAuth) =>
-                Effect.map(
-                  config.load(),
-                  (cfg) => new Set(detectProviders(storedAuth, cfg.providers ?? {}).map((d) => d.provider.id)),
-                ),
-              ),
-          }
-        }),
-      ),
+      providerAuthLayer,
     ),
     Layer.mergeAll(storageLayer, catalogLayer),
   )

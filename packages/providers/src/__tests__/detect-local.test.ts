@@ -79,7 +79,7 @@ describe('detect local-family providers', () => {
     process.env.FIREWORKS_API_KEY = 'fireworks-env-key'
 
     const detected = detectProviders({}, {})
-    const fireworks = detected.find((d) => d.provider.id === 'fireworks')
+    const fireworks = detected.find((d) => d.provider.id === 'fireworks-ai')
 
     expect(fireworks).toBeDefined()
     expect(fireworks?.source).toBe('env')
@@ -89,7 +89,7 @@ describe('detect local-family providers', () => {
   it('reports Fireworks api-key auth method as connected from env', () => {
     process.env.FIREWORKS_API_KEY = 'fireworks-env-key'
 
-    const status = detectProviderAuthMethods('fireworks', {}, {})
+    const status = detectProviderAuthMethods('fireworks-ai', {}, {})
 
     expect(status).not.toBeNull()
     expect(status!.anyConnected).toBe(true)
@@ -108,9 +108,9 @@ describe('detect local-family providers', () => {
     process.env.OPENAI_API_KEY = 'openai-only-key'
 
     const detected = detectProviders({}, {})
-    expect(detected.some((d) => d.provider.id === 'fireworks')).toBe(false)
+    expect(detected.some((d) => d.provider.id === 'fireworks-ai')).toBe(false)
 
-    const status = detectProviderAuthMethods('fireworks', {}, {})
+    const status = detectProviderAuthMethods('fireworks-ai', {}, {})
     expect(status).not.toBeNull()
     expect(status!.anyConnected).toBe(false)
   })
