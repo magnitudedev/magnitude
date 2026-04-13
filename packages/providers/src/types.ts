@@ -61,7 +61,7 @@ export interface ModelDefinition {
 }
 
 export interface ProviderDefinition {
-  id: string                    // e.g. "anthropic", "openrouter", "lmstudio"
+  id: string                    // e.g. "anthropic", "openrouter", "lmstudio". Should match models.dev key.
   name: string                  // Display name: "Anthropic", "OpenRouter", etc.
   bamlProvider: BamlProviderType
   defaultBaseUrl?: string       // For openai-generic providers

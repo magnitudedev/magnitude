@@ -136,3 +136,10 @@ export {
   COPILOT_HEADERS,
 } from './auth/copilot-oauth'
 export type { CopilotOAuthStart } from './auth/copilot-oauth'
+
+export {
+  resolveEnvAuth,
+  resolveAwsAuth,
+  resolveGcpAuth,
+  resolveNonStoredAuth,
+} from './auth/resolve'

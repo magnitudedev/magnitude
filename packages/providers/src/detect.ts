@@ -2,6 +2,7 @@
  * Auto-detect available providers from environment variables and stored auth.
  */
 
+import { resolveAwsAuth, resolveGcpAuth, resolveNonStoredAuth } from './auth/resolve'
 import { PROVIDERS } from './registry'
 
 import type { AuthInfo, AuthMethodDef, ProviderDefinition, ProviderOptions } from './types'
@@ -30,10 +31,10 @@ export function detectProviders(
       continue
     }
 
-    // 2. Check env vars for API key auth methods
-    const envAuth = checkEnvAuth(provider)
-    if (envAuth) {
-      detected.push({ provider, auth: envAuth, source: 'env' })
+    // 2. Check non-stored auth sources
+    const nonStoredAuth = resolveNonStoredAuth(provider)
+    if (nonStoredAuth) {
+      detected.push({ provider, auth: nonStoredAuth, source: 'env' })
       continue
     }
 
@@ -53,23 +54,7 @@ export function detectProviders(
       continue
     }
 
-    // 4. Check AWS credential chain (profile-based, no explicit key needed)
-    if (provider.authMethods.some(m => m.type === 'aws-chain')) {
-      const awsAuth = checkAwsEnv(provider)
-      if (awsAuth) {
-        detected.push({ provider, auth: awsAuth, source: 'env' })
-        continue
-      }
-    }
 
-    // 5. Check GCP credentials
-    if (provider.authMethods.some(m => m.type === 'gcp-credentials')) {
-      const gcpAuth = checkGcpEnv(provider)
-      if (gcpAuth) {
-        detected.push({ provider, auth: gcpAuth, source: 'env' })
-        continue
-      }
-    }
   }
 
   return detected
@@ -91,52 +76,6 @@ export function detectDefaultProvider(
   if (env) return env
   // Then auth-less
   return all[0] ?? null
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function checkEnvAuth(provider: ProviderDefinition): AuthInfo | null {
-  for (const method of provider.authMethods) {
-    if (method.type !== 'api-key' || !method.envKeys) continue
-    for (const envKey of method.envKeys) {
-      const value = process.env[envKey]
-      if (value) {
-        return { type: 'api', key: value }
-      }
-    }
-  }
-  return null
-}
-
-function checkAwsEnv(provider: ProviderDefinition): AuthInfo | null {
-  // AWS credential chain: explicit keys, profile, or instance metadata
-  const hasAccessKey = !!process.env.AWS_ACCESS_KEY_ID
-  const hasProfile = !!process.env.AWS_PROFILE
-  const hasRegion = !!(process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION)
-
-  if (hasAccessKey || hasProfile) {
-    return {
-      type: 'aws',
-      profile: process.env.AWS_PROFILE,
-      region: process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION,
-    }
-  }
-  return null
-}
-
-function checkGcpEnv(provider: ProviderDefinition): AuthInfo | null {
-  const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS
-  if (credPath) {
-    return {
-      type: 'gcp',
-      credentialsPath: credPath,
-      project: process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
-      location: process.env.GOOGLE_CLOUD_LOCATION,
-    }
-  }
-  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +144,7 @@ export function detectProviderAuthMethods(
         source = 'stored'
         auth = stored
       } else {
-        const awsAuth = checkAwsEnv(provider)
+        const awsAuth = resolveAwsAuth(provider)
         if (awsAuth) {
           connected = true
           source = 'env'
@@ -218,7 +157,7 @@ export function detectProviderAuthMethods(
         source = 'stored'
         auth = stored
       } else {
-        const gcpAuth = checkGcpEnv(provider)
+        const gcpAuth = resolveGcpAuth(provider)
         if (gcpAuth) {
           connected = true
           source = 'env'

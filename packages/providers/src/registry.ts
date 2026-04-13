@@ -228,7 +228,7 @@ export const PROVIDERS: ProviderDefinition[] = [
     ],
   },
   {
-    id: 'fireworks',
+    id: 'fireworks-ai',
     name: 'Fireworks AI',
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'https://api.fireworks.ai/inference/v1',
@@ -239,6 +239,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },
     ],
+    providerFamily: 'cloud',
+    inventoryMode: 'dynamic',
   },
   {
     id: 'lmstudio',

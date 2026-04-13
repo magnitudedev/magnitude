@@ -1,18 +1,3 @@
-import type { ModelDefinition } from '../types'
-
-export interface SourceSnapshot {
-  providerId: string
-  sourceId: string
-  fetchedAt: string
-  models: ModelDefinition[]
-}
-
-export interface CachedSourceData<T> {
-  _cachedAt: number
-  ttlMs: number
-  data: T
-}
-
 export interface ModelsDevModel {
   id: string
   name: string
@@ -80,3 +65,4 @@ export interface OpenRouterModel {
 export interface OpenRouterResponse {
   data: OpenRouterModel[]
 }
+
