@@ -14,13 +14,61 @@ export interface PastedImageFileResult {
 
 const SUPPORTED_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
 
+function splitLines(value: string): string[] {
+  return value.split(/\r\n|\n|\r/)
+}
+
+function tokenizeShellWords(value: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let inSingle = false
+  let inDouble = false
+  let escaping = false
+
+  for (const char of value) {
+    if (escaping) {
+      current += char
+      escaping = false
+      continue
+    }
+
+    if (char === '\\') {
+      escaping = true
+      continue
+    }
+
+    if (!inDouble && char === "'") {
+      inSingle = !inSingle
+      continue
+    }
+
+    if (!inSingle && char === '"') {
+      inDouble = !inDouble
+      continue
+    }
+
+    if (!inSingle && !inDouble && /\s/.test(char)) {
+      if (current.trim().length > 0) {
+        tokens.push(current)
+      }
+      current = ''
+      continue
+    }
+
+    current += char
+  }
+
+  if (escaping) current += '\\'
+  if (current.trim().length > 0) tokens.push(current)
+
+  return tokens
+}
+
 function normalizePastedPath(raw: string): string | null {
   if (!raw) return null
 
   const trimmed = raw.trim()
   if (!trimmed) return null
-
-  if (trimmed.includes('\n') || trimmed.includes('\t')) return null
 
   let value = trimmed
 
@@ -56,6 +104,54 @@ function normalizePastedPath(raw: string): string | null {
   return path.resolve(value)
 }
 
+function dedupeOrdered(values: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    if (seen.has(value)) continue
+    seen.add(value)
+    out.push(value)
+  }
+  return out
+}
+
+export function extractPastedPathCandidates(rawPasteText: string): string[] {
+  const raw = rawPasteText.trim()
+  if (!raw) return []
+
+  const uriLines = splitLines(raw)
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !line.startsWith('#'))
+  if (uriLines.length > 0 && uriLines.every(line => line.startsWith('file://'))) {
+    return dedupeOrdered(
+      uriLines
+        .map(normalizePastedPath)
+        .filter((value): value is string => value != null),
+    )
+  }
+
+  if (/[\r\n]/.test(raw)) {
+    return dedupeOrdered(
+      raw
+        .split(/\r\n|\n|\r|\t|\0/g)
+        .map(token => normalizePastedPath(token))
+        .filter((value): value is string => value != null),
+    )
+  }
+
+  const shellWordTokens = tokenizeShellWords(raw)
+  if (shellWordTokens.length > 1) {
+    return dedupeOrdered(
+      shellWordTokens
+        .map(token => normalizePastedPath(token))
+        .filter((value): value is string => value != null),
+    )
+  }
+
+  const normalizedSingle = normalizePastedPath(raw)
+  return normalizedSingle ? [normalizedSingle] : []
+}
+
 function isSupportedImageExtension(filePath: string): boolean {
   return SUPPORTED_EXTENSIONS.has(path.extname(filePath).toLowerCase())
 }
@@ -69,10 +165,10 @@ function mimeFromExtension(filePath: string): ImageMediaType | null {
   return null
 }
 
-export async function tryReadPastedImageFile(
-  rawPasteText: string,
+export async function tryReadPastedImageFileCandidate(
+  candidatePath: string,
 ): Promise<PastedImageFileResult | null> {
-  const normalizedPath = normalizePastedPath(rawPasteText)
+  const normalizedPath = normalizePastedPath(candidatePath)
   if (!normalizedPath) return null
 
   if (!isSupportedImageExtension(normalizedPath)) return null
@@ -98,4 +194,10 @@ export async function tryReadPastedImageFile(
     width: dimensions.width,
     height: dimensions.height,
   }
+}
+
+export async function tryReadPastedImageFile(
+  rawPasteText: string,
+): Promise<PastedImageFileResult | null> {
+  return tryReadPastedImageFileCandidate(rawPasteText)
 }

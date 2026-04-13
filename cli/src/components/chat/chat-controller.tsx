@@ -15,7 +15,7 @@ import { ContextUsageBar } from '../context-usage-bar'
 import { useFileMentions } from '../../hooks/use-file-mentions'
 import { useSlashCommands } from '../../hooks/use-slash-commands'
 import { readClipboardBitmap, readClipboardText } from '../../utils/clipboard'
-import { tryReadPastedImageFile } from '../../utils/pasted-image-path'
+import { extractPastedPathCandidates, tryReadPastedImageFileCandidate } from '../../utils/pasted-image-path'
 import { autoScaleImageAttachmentIfNeeded } from '../../utils/image-scaling'
 import {
   applyTextEditWithPastesAndMentions,
@@ -81,6 +81,76 @@ export function buildRestoredQueuedInputValue(restoredQueuedInputText: string): 
   }
 }
 
+
+type ReadPastedImageCandidate = (
+  candidate: string,
+) => Promise<{
+  filename: string
+  base64: string
+  mediaType: ImageMediaType
+  width: number
+  height: number
+} | null>
+
+type ScaleImageAttachment = (args: {
+  base64: string
+  mime: ImageMediaType
+  width: number
+  height: number
+  filename: string
+}) => Promise<{
+  base64: string
+  mime: ImageMediaType
+  width: number
+  height: number
+}>
+
+export async function addImageAttachmentsFromPastedText(args: {
+  rawPasteText: string
+  appendAttachments: (attachments: ImageAttachment[]) => void
+  extractCandidates?: (rawPasteText: string) => string[]
+  readCandidate?: ReadPastedImageCandidate
+  scaleAttachment?: ScaleImageAttachment
+}): Promise<boolean> {
+  const extractCandidates = args.extractCandidates ?? extractPastedPathCandidates
+  const readCandidate = args.readCandidate ?? tryReadPastedImageFileCandidate
+  const scaleAttachment = args.scaleAttachment ?? autoScaleImageAttachmentIfNeeded
+
+  const candidates = extractCandidates(args.rawPasteText)
+  if (candidates.length === 0) return false
+
+  const newAttachments: ImageAttachment[] = []
+
+  for (const candidate of candidates) {
+    const result = await readCandidate(candidate)
+    if (!result) continue
+
+    const scaled = await scaleAttachment({
+      base64: result.base64,
+      mime: result.mediaType,
+      width: result.width,
+      height: result.height,
+      filename: result.filename,
+    })
+    const parsed = result.filename.includes('.') ? result.filename.split('.') : [result.filename]
+    const stem = parsed.slice(0, -1).join('.') || result.filename
+    const filename = scaled.mime === 'image/jpeg' ? `${stem}.jpg` : result.filename
+
+    newAttachments.push({
+      type: 'image',
+      base64: scaled.base64,
+      mediaType: scaled.mime as ImageMediaType,
+      width: scaled.width,
+      height: scaled.height,
+      filename,
+    })
+  }
+
+  if (newAttachments.length === 0) return false
+
+  args.appendAttachments(newAttachments)
+  return true
+}
 
 export function ChatController(props: ChatControllerProps) {
   const {
@@ -206,27 +276,10 @@ export function ChatController(props: ChatControllerProps) {
   }, [])
 
   const addImageAttachmentFromFilePath = useCallback(async (rawPasteText: string) => {
-    const result = await tryReadPastedImageFile(rawPasteText)
-    if (!result) return false
-    const scaled = await autoScaleImageAttachmentIfNeeded({
-      base64: result.base64,
-      mime: result.mediaType,
-      width: result.width,
-      height: result.height,
-      filename: result.filename,
+    return addImageAttachmentsFromPastedText({
+      rawPasteText,
+      appendAttachments: (newAttachments) => setAttachments(prev => [...prev, ...newAttachments]),
     })
-    const parsed = result.filename.includes('.') ? result.filename.split('.') : [result.filename]
-    const stem = parsed.slice(0, -1).join('.') || result.filename
-    const filename = scaled.mime === 'image/jpeg' ? `${stem}.jpg` : result.filename
-    setAttachments(prev => [...prev, {
-      type: 'image',
-      base64: scaled.base64,
-      mediaType: scaled.mime as ImageMediaType,
-      width: scaled.width,
-      height: scaled.height,
-      filename,
-    }])
-    return true
   }, [])
 
   const removeAttachment = useCallback((index: number) => {
@@ -369,11 +422,6 @@ export function ChatController(props: ChatControllerProps) {
 
   const handleSubmit = useCallback(async (message: string, visibleMessage?: string, mentionAttachments: Attachment[] = []) => {
     const targetForkId = selectedForkId
-    const slashText = visibleMessage ?? message
-    if (!env.bashMode && shouldHandleSlashCommandInTab(targetForkId) && services.runSlashCommand(slashText)) {
-      clearComposer()
-      return
-    }
     if (env.bashMode) {
       const trimmed = message.trim()
       if (!trimmed) return

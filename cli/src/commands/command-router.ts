@@ -100,13 +100,7 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
   if (!trimmed.startsWith('/')) return false
 
   const parsed = parseSlashCommand(trimmed)
-
-  if (!parsed) {
-    // Starts with '/' but doesn't match any known command
-    const attemptedCmd = trimmed.slice(1).split(/\s+/)[0] || ''
-    ctx.showSystemMessage(`Unknown command: /${attemptedCmd}`)
-    return true
-  }
+  if (!parsed) return false
 
   logger.info({ command: parsed.commandId, args: parsed.args }, 'Slash command executed')
 
