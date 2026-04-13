@@ -138,6 +138,26 @@ test('enter submits active field action: endpoint saves, manual adds (independen
   expect(addCalls).toEqual(['qwen2.5-coder'])
 })
 
+test('escape clears active local input focus', () => {
+  const renderer = renderPage()
+
+  const focusBoxes = renderer.root.findAll(
+    (n) => n.type === 'box' && typeof n.props.onMouseDown === 'function' && n.props.style?.borderStyle === 'single',
+  )
+
+  act(() => {
+    focusBoxes[0]!.props.onMouseDown()
+  })
+  let output = textContent(renderer)
+  expect(output).toContain('input:http://localhost:1234/v1:focused:http://localhost:1234/v1')
+
+  act(() => {
+    keyboardHandler?.({ name: 'escape', preventDefault: () => {} } as KeyEvent)
+  })
+  output = textContent(renderer)
+  expect(output).toContain('input:http://localhost:1234/v1:unfocused:http://localhost:1234/v1')
+})
+
 test('refresh and remove render as inline bracket actions (not bordered button boxes)', () => {
   const renderer = renderPage({
     manualModelIds: ['manual-model-1'],

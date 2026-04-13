@@ -1,7 +1,22 @@
 import { test, expect, mock } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { act, create } from 'react-test-renderer'
+import type { KeyEvent } from '@opentui/core'
 import type { ProviderDefinition, ProviderAuthMethodStatus } from '@magnitudedev/agent'
 import type { MagnitudeSlot, ModelSelection } from '@magnitudedev/agent'
+
+const keyboardHandlers: Array<(key: KeyEvent) => void> = []
+const dispatchKey = (key: Partial<KeyEvent> & { name: string }) => {
+  for (const handler of keyboardHandlers) {
+    handler({ preventDefault: () => {}, ...key } as KeyEvent)
+  }
+}
+
+mock.module('@opentui/react', () => ({
+  useKeyboard: (handler: (key: KeyEvent) => void) => {
+    keyboardHandlers.push(handler)
+  },
+}))
 
 mock.module('../hooks/use-theme', () => ({
   useTheme: () => ({
@@ -271,4 +286,74 @@ test('local provider detail excludes discovered model IDs from manual models sec
   expect(text).toContain('qwen2.5-coder')
   expect(text).toContain('Manual models')
   expect(text).toContain('manual-only-model')
+})
+
+test('provider-detail keyboard path ignores plain b and Esc still goes back', () => {
+  keyboardHandlers.length = 0
+  let providerKeyCalls = 0
+  let escBackCalls = 0
+
+  act(() => {
+    create(
+      <SettingsOverlay
+        activeTab="provider"
+        onTabChange={noop}
+        onClose={noop}
+        modelItems={[]}
+        modelSelectedIndex={0}
+        onModelSelect={noop}
+        onModelHoverIndex={noop}
+        modelSearch=""
+        onModelSearchChange={noop}
+        showAllProviders={false}
+        onToggleShowAllProviders={noop}
+        showRecommendedOnly={false}
+        onToggleShowRecommendedOnly={noop}
+        allProviders={[buildLocalProviderStatus([]).provider]}
+        detectedProviders={[]}
+        providerSelectedIndex={0}
+        onProviderSelect={noop}
+        onProviderHoverIndex={noop}
+        providerDetailStatus={buildLocalProviderStatus([])}
+        providerDetailOptions={{ baseUrl: 'http://localhost:1234/v1' } as any}
+        providerDetailActions={[]}
+        providerDetailSelectedIndex={0}
+        onProviderDetailAction={noop}
+        onProviderDetailHoverIndex={noop}
+        onLocalProviderSaveEndpoint={noop}
+        onLocalProviderRefreshModels={noop}
+        onLocalProviderAddManualModel={noop}
+        onLocalProviderRemoveManualModel={noop}
+        onLocalProviderSaveOptionalApiKey={noop}
+        slotModels={emptySlots}
+        selectingModelFor={null}
+        onChangeSlot={noop}
+        modelPrefsSelectedIndex={0}
+        onModelPrefsHoverIndex={noop}
+        onModelHandleKeyEvent={() => false}
+        onProviderHandleKeyEvent={() => {
+          providerKeyCalls += 1
+          return false
+        }}
+        onBackFromModelPicker={noop}
+        onBackFromProviderDetail={() => { escBackCalls += 1 }}
+        presets={[]}
+        systemDefaultsPresetToken="__system_defaults__"
+        onSavePreset={noopAsync}
+        onLoadPreset={noopAsync}
+        onDeletePreset={noopAsync}
+      />,
+    )
+  })
+
+  act(() => {
+    dispatchKey({ name: 'b' })
+  })
+  expect(providerKeyCalls).toBeGreaterThan(0)
+  expect(escBackCalls).toBe(0)
+
+  act(() => {
+    dispatchKey({ name: 'escape' })
+  })
+  expect(escBackCalls).toBeGreaterThan(0)
 })

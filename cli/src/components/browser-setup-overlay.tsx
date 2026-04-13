@@ -129,15 +129,25 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
     const plain = !key.ctrl && !key.meta && !key.option
     const isEnter = (key.name === 'return' || key.name === 'enter') && plain && !key.shift
 
-    if (key.name === 'escape') {
+    if (wizardMode && key.name === 'escape') {
       key.preventDefault()
-      onClose()
+      if (state !== 'installing') {
+        wizardMode.onBack?.()
+      }
       return
     }
 
-    if (wizardMode && key.name === 'b' && plain && !key.shift && state !== 'installing') {
+    if (wizardMode && key.ctrl && key.name === 's' && !key.meta && !key.option && !key.shift) {
       key.preventDefault()
-      wizardMode.onBack?.()
+      if (state !== 'installing') {
+        wizardMode.onSkip?.()
+      }
+      return
+    }
+
+    if (!wizardMode && key.name === 'escape') {
+      key.preventDefault()
+      onClose()
       return
     }
 
@@ -160,6 +170,7 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
           stepLabel={wizardMode.stepLabel}
           subtitle={wizardMode.subtitle}
           onSkip={wizardMode.onSkip}
+          skipDisabled={state === 'installing'}
           theme={theme}
         />
       ) : (
@@ -366,13 +377,15 @@ export function BrowserSetupOverlay({ onClose, onResult, wizardMode }: BrowserSe
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: theme.muted }}>← Back (B)</text>
+              <text style={{ fg: theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         )}
         <text style={{ fg: theme.muted }}>
           <span attributes={TextAttributes.DIM}>
-            {state === 'required' ? 'Press Enter to install, Esc to close' : 'Press Esc to close'}
+            {wizardMode
+              ? (state === 'required' ? 'Press Enter to install, Esc to go back, Ctrl+S to skip' : 'Press Esc to go back, Ctrl+S to skip')
+              : (state === 'required' ? 'Press Enter to install, Esc to close' : 'Press Esc to close')}
           </span>
         </text>
       </box>

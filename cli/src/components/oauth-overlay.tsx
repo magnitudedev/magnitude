@@ -95,18 +95,18 @@ function PasteMode({
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
         key.preventDefault()
-        wizardMode?.onSkip?.() ?? onCancel()
+        wizardMode?.onBack?.() ?? onCancel()
+        return
+      }
+
+      if (key.ctrl && key.name === 's' && !key.meta && !key.option && !key.shift && wizardMode?.onSkip) {
+        key.preventDefault()
+        wizardMode.onSkip()
         return
       }
       if ((key.name === 'return' || key.name === 'enter') && !key.shift) {
         key.preventDefault()
         handleSubmit()
-        return
-      }
-
-      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
-        key.preventDefault()
-        wizardMode.onBack()
         return
       }
 
@@ -245,7 +245,7 @@ function PasteMode({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         </box>
@@ -279,12 +279,13 @@ function AutoMode({
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
         key.preventDefault()
-        wizardMode?.onSkip?.() ?? onCancel()
+        wizardMode?.onBack?.() ?? onCancel()
         return
       }
-      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
+
+      if (key.ctrl && key.name === 's' && !key.meta && !key.option && !key.shift && wizardMode?.onSkip) {
         key.preventDefault()
-        wizardMode.onBack()
+        wizardMode.onSkip()
         return
       }
       if (!key.defaultPrevented) {
@@ -398,7 +399,7 @@ function AutoMode({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         </box>

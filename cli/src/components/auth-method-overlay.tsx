@@ -37,7 +37,13 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
 
     if (key.name === 'escape') {
       key.preventDefault()
-      wizardMode?.onSkip?.() ?? onBack()
+      wizardMode?.onBack?.() ?? onBack()
+      return
+    }
+
+    if (key.ctrl && key.name === 's' && !key.meta && !key.option && !key.shift && wizardMode?.onSkip) {
+      key.preventDefault()
+      wizardMode.onSkip()
       return
     }
 
@@ -58,12 +64,6 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
     if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
       key.preventDefault()
       onSelect(selectedIndex)
-      return
-    }
-
-    if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
-      key.preventDefault()
-      wizardMode.onBack()
       return
     }
 
@@ -160,7 +160,7 @@ export const AuthMethodOverlay = memo(function AuthMethodOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         </box>

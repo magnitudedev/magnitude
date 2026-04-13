@@ -2,9 +2,31 @@ import { test, expect, mock } from 'bun:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { act, create } from 'react-test-renderer'
+import type { KeyEvent } from '@opentui/core'
 import { SingleLineInput } from './single-line-input'
+
+const keyboardHandlers: Array<(key: KeyEvent) => void> = []
+const dispatchAnyKey = (key: Partial<KeyEvent> & { name: string }) => {
+  for (const handler of keyboardHandlers) {
+    handler({ preventDefault: () => {}, ...key } as KeyEvent)
+  }
+}
+const dispatchOverlayKey = (key: Partial<KeyEvent> & { name: string }) => {
+  const overlayHandler =
+    keyboardHandlers.length >= 2
+      ? keyboardHandlers[keyboardHandlers.length - 2]
+      : keyboardHandlers[keyboardHandlers.length - 1]
+
+  overlayHandler?.({ preventDefault: () => {}, ...key } as KeyEvent)
+}
 import type { ProviderDefinition, DetectedProvider } from '@magnitudedev/agent'
 import type { MagnitudeSlot, ModelSelection } from '@magnitudedev/agent'
+
+mock.module('@opentui/react', () => ({
+  useKeyboard: (handler: (key: KeyEvent) => void) => {
+    keyboardHandlers.push(handler)
+  },
+}))
 
 mock.module('../hooks/use-theme', () => ({
   useTheme: () => ({
@@ -224,6 +246,102 @@ test('models step shows empty discovered inventory fallback guidance for selecte
 
   const text = htmlToText(html)
   expect(text).toContain('LM Studio')
+})
+
+test('local-provider step remaps wizard keys: Esc => back, Ctrl+S => skip, and plain b does not go back', () => {
+  keyboardHandlers.length = 0
+  let backCalls = 0
+  let skipCalls = 0
+
+  let renderer!: ReturnType<typeof create>
+  act(() => {
+    renderer = create(
+      <SetupWizardOverlay
+        step="local-provider"
+        allProviders={localProviders}
+        detectedProviders={[]}
+        slotModels={emptySlots}
+        connectedProviderName="LM Studio"
+        selectedProviderId="lmstudio"
+        selectedProviderDiscoveredModels={[{ id: 'qwen2.5-coder', name: 'Qwen 2.5 Coder' }]}
+        selectedProviderRememberedModelIds={[]}
+        totalSteps={4}
+        onProviderSelected={noop}
+        onComplete={noop}
+        onBack={() => { backCalls += 1 }}
+        onContinueFromLocalProvider={noop}
+        onSkip={() => { skipCalls += 1 }}
+        onWizardCtrlCExit={noop}
+        onLocalProviderSaveOptionalApiKey={noop}
+        providerSelectedIndex={0}
+        onProviderSelectedIndexChange={noop}
+        onProviderHoverIndex={noop}
+        modelNavSelectedIndex={0}
+        onModelNavSelectedIndexChange={noop}
+        onModelNavHoverIndex={noop}
+        hasProviderEndpointStep
+      />,
+    )
+  })
+
+  act(() => {
+    dispatchAnyKey({ name: 'escape' })
+  })
+  expect(backCalls).toBe(1)
+  expect(skipCalls).toBe(0)
+
+  act(() => {
+    dispatchAnyKey({ name: 's', ctrl: true })
+  })
+  expect(skipCalls).toBe(1)
+
+  act(() => {
+    dispatchAnyKey({ name: 'b' })
+  })
+  expect(backCalls).toBe(1)
+
+  const text = htmlToText(JSON.stringify(renderer.toJSON()))
+  expect(text).toContain('Skip (Ctrl+S)')
+  expect(text).toContain('← Back (Esc)')
+})
+
+test('provider step Esc is a no-op in wizard root step', () => {
+  keyboardHandlers.length = 0
+  let backCalls = 0
+  let skipCalls = 0
+
+  act(() => {
+    create(
+      <SetupWizardOverlay
+        step="provider"
+        allProviders={localProviders}
+        detectedProviders={[]}
+        slotModels={emptySlots}
+        connectedProviderName={null}
+        selectedProviderId={null}
+        totalSteps={4}
+        onProviderSelected={noop}
+        onComplete={noop}
+        onBack={() => { backCalls += 1 }}
+        onSkip={() => { skipCalls += 1 }}
+        onWizardCtrlCExit={noop}
+        providerSelectedIndex={0}
+        onProviderSelectedIndexChange={noop}
+        onProviderHoverIndex={noop}
+        modelNavSelectedIndex={0}
+        onModelNavSelectedIndexChange={noop}
+        onModelNavHoverIndex={noop}
+        hasProviderEndpointStep
+      />,
+    )
+  })
+
+  act(() => {
+    dispatchAnyKey({ name: 'escape' })
+  })
+
+  expect(backCalls).toBe(0)
+  expect(skipCalls).toBe(0)
 })
 
 test('local-provider step add flow updates manual models on same wizard page', () => {

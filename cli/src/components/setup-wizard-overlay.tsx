@@ -140,6 +140,14 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
 
     if (key.name === 'escape') {
       key.preventDefault()
+      if (step !== 'provider') {
+        onBack()
+      }
+      return
+    }
+
+    if (key.ctrl && key.name === 's' && !key.meta && !key.option && !key.shift) {
+      key.preventDefault()
       onSkip()
       return
     }
@@ -170,11 +178,6 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
     }
 
     if (step === 'local-provider') {
-      if (key.name === 'b' && plain && !key.shift) {
-        key.preventDefault()
-        onBack()
-        return
-      }
       if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
         key.preventDefault()
         onContinueFromLocalProvider?.()
@@ -184,11 +187,6 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
     }
 
     if (step === 'models') {
-      if (key.name === 'b' && plain && !key.shift) {
-        key.preventDefault()
-        onBack()
-        return
-      }
       if ((key.name === 'return' || key.name === 'enter') && plain && !key.shift) {
         key.preventDefault()
         handleConfirm()
@@ -288,7 +286,7 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         </box>
@@ -381,7 +379,7 @@ export const SetupWizardOverlay = memo(function SetupWizardOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         </box>

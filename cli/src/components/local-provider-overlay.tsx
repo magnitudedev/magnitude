@@ -75,7 +75,13 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
     useCallback((key: KeyEvent) => {
       if (key.name === 'escape') {
         key.preventDefault()
-        wizardMode?.onSkip?.() ?? onCancel()
+        wizardMode?.onBack?.() ?? onCancel()
+        return
+      }
+
+      if (key.ctrl && key.name === 's' && !key.meta && !key.option && !key.shift && wizardMode?.onSkip) {
+        key.preventDefault()
+        wizardMode.onSkip()
         return
       }
 
@@ -98,12 +104,6 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
       if ((key.name === 'return' || key.name === 'enter') && !key.shift) {
         key.preventDefault()
         handleSubmit()
-        return
-      }
-
-      if (key.name === 'b' && !key.ctrl && !key.meta && !key.option && !key.shift && wizardMode?.onBack) {
-        key.preventDefault()
-        wizardMode.onBack()
         return
       }
 
@@ -227,7 +227,7 @@ export const LocalProviderOverlay = memo(function LocalProviderOverlay({
               paddingLeft: 1,
               paddingRight: 1,
             }}>
-              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (B)</text>
+              <text style={{ fg: backHovered ? theme.primary : theme.muted }}>← Back (Esc)</text>
             </box>
           </Button>
         </box>

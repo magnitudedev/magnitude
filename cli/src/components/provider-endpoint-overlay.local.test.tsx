@@ -52,7 +52,8 @@ test('provider endpoint wizard for local provider renders discovery/manual guida
   const text = htmlToText(html)
   expect(text).toContain('Endpoint is optional here. Save to refresh available models;')
   expect(text).toContain('Manual model ID (optional):')
-  expect(text).toContain('← Back (B)')
+  expect(text).toContain('← Back (Esc)')
+  expect(text).toContain('Skip (Ctrl+S)')
 })
 
 test('provider endpoint for non-local provider keeps seed-model labeling', () => {

@@ -14,6 +14,7 @@ interface WizardHeaderProps {
   stepLabel: string
   subtitle: string
   onSkip: () => void
+  skipDisabled?: boolean
   theme: Record<string, any>
 }
 
@@ -21,6 +22,7 @@ export const WizardHeader = memo(function WizardHeader({
   stepLabel,
   subtitle,
   onSkip,
+  skipDisabled = false,
   theme,
 }: WizardHeaderProps) {
   const [skipHovered, setSkipHovered] = useState(false)
@@ -42,16 +44,21 @@ export const WizardHeader = memo(function WizardHeader({
         <text style={{ fg: theme.muted }}>
           <span attributes={TextAttributes.DIM}>{stepLabel}</span>
         </text>
-        <Button onClick={onSkip} onMouseOver={() => setSkipHovered(true)} onMouseOut={() => setSkipHovered(false)}>
+        <Button
+          onClick={skipDisabled ? undefined : onSkip}
+          onMouseOver={() => !skipDisabled && setSkipHovered(true)}
+          onMouseOut={() => setSkipHovered(false)}
+        >
           <box style={{
             borderStyle: 'single',
-            borderColor: skipHovered ? theme.primary : theme.border,
+            borderColor: skipDisabled ? theme.border : (skipHovered ? theme.primary : theme.border),
             customBorderChars: BOX_CHARS,
             paddingLeft: 1,
             paddingRight: 1,
             marginLeft: 1,
+            ...(skipDisabled ? { opacity: 0.6 } : {}),
           }}>
-            <text style={{ fg: skipHovered ? theme.primary : theme.muted }}>Skip (Esc)</text>
+            <text style={{ fg: skipDisabled ? theme.border : (skipHovered ? theme.primary : theme.muted) }}>Skip (Ctrl+S)</text>
           </box>
         </Button>
       </box>

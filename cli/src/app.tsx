@@ -1716,7 +1716,7 @@ function AppInner({
   const providerTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
     if (providerDetailId) {
       const plain = !key.ctrl && !key.meta && !key.option
-      if ((key.name === 'escape' || (key.name === 'b' && plain)) && !key.shift) {
+      if (key.name === 'escape' && !key.shift) {
         setProviderDetailId(null)
         return true
       }
