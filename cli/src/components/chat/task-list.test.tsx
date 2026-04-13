@@ -13,14 +13,10 @@ mock.module('../../hooks/use-theme', () => ({
   }),
 }))
 
-mock.module('../../hooks/use-terminal-width', () => ({
-  useTerminalWidth: () => 120,
-}))
-
 let measuredWidth: number | null = null
 
-mock.module('../../hooks/use-chat-width', () => ({
-  useBoxWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: measuredWidth }),
+mock.module('../../hooks/use-local-width', () => ({
+  useLocalWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: measuredWidth }),
 }))
 
 mock.module('../button', () => ({
@@ -288,7 +284,7 @@ test('renders worker assignee with worker status prefix and timer segment', () =
   expect(text).not.toContain('↺')
 })
 
-test('fileViewerOpen hides assignee column and expand/collapse controls', () => {
+test('fileViewerOpen keeps assignee column and expand/collapse controls visible', () => {
   const html = render(
     <TaskList
       tasks={[
@@ -304,10 +300,10 @@ test('fileViewerOpen hides assignee column and expand/collapse controls', () => 
   )
 
   const text = htmlToText(html)
-  expect(text).not.toContain('Assigned To')
-  expect(text).not.toContain('Expand all')
+  expect(text).toContain('Assigned To')
+  expect(text).toContain('Expand all')
   expect(text).not.toContain('Collapse all')
-  expect(text).not.toContain('⚒ [builder] builder-abc123')
+  expect(text).toContain('[builder] builder-abc123')
 })
 
 test('fileViewerOpen uses measured width to truncate task names earlier', () => {

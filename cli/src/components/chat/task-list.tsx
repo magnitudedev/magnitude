@@ -2,8 +2,7 @@ import { TextAttributes } from '@opentui/core'
 import { blue, orange, red, slate } from '../../utils/palette'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTheme } from '../../hooks/use-theme'
-import { useTerminalWidth } from '../../hooks/use-terminal-width'
-import { useBoxWidth } from '../../hooks/use-chat-width'
+import { useLocalWidth } from '../../hooks/use-local-width'
 import { Button } from '../button'
 import { computeWorkerElapsedMs, formatWorkerTimer, isWorkerResumed } from '../../utils/task-list-worker-timer'
 import { BOX_CHARS } from '../../utils/ui-constants'
@@ -160,7 +159,7 @@ function TaskRow({
         <TaskNameContent task={task} effectiveStatus={effectiveStatus} taskNameWidth={taskNameWidth} />
       </box>
 
-      {showAssigneeColumn && (
+      {(
         <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row' }}>
           {task.assignee.kind === 'worker' && task.workerForkId ? (
             <Button onClick={() => pushForkOverlay(task.workerForkId!)} onMouseOver={() => onHover(task.taskId)} onMouseOut={() => onHoverEnd()}>
@@ -195,12 +194,10 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
   const [now, setNow] = useState(() => Date.now())
   const taskScrollRef = useRef<any>(null)
 
-  const terminalWidth = useTerminalWidth()
-  const box = useBoxWidth()
-  const showAssigneeColumn = !fileViewerOpen
-  const usableWidth = Math.max(1, (box.width ?? terminalWidth) - 4)
-  const taskNameWidth = showAssigneeColumn ? Math.floor(usableWidth * 0.57) : usableWidth
-  const agentIdWidth = showAssigneeColumn ? (usableWidth - taskNameWidth) : 0
+  const box = useLocalWidth()
+  const usableWidth = Math.max(1, (box.width ?? 60) - 4)
+  const agentIdWidth = Math.max(12, Math.floor(usableWidth * 0.43))
+  const taskNameWidth = Math.max(1, usableWidth - agentIdWidth)
 
   const visibleAllTasks = tasks
 
@@ -267,7 +264,7 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
             <TaskNameContent task={stickyRootSummary.task} effectiveStatus={effectiveVisualStates.get(stickyRootSummary.task.taskId) ?? 'pending'} taskNameWidth={taskNameWidth} />
             <HeaderCountsText completed={stickyRootSummary.completed} active={stickyRootSummary.active} theme={theme} />
           </box>
-          {showAssigneeColumn && (
+          {(
             <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
               <text style={{ fg: stickyRootSummary.task.assignee.kind === 'user' ? theme.warning ?? theme.foreground : theme.muted }}>
                 {truncate(getAssigneeLabel(stickyRootSummary.task), agentIdWidth)}
@@ -284,7 +281,7 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
             <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Task</text>
             <HeaderCountsText completed={completedCount} active={activeCount} theme={theme} />
           </box>
-          {showAssigneeColumn && (
+          {(
             <box style={{ width: agentIdWidth, minWidth: agentIdWidth, maxWidth: agentIdWidth, flexShrink: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
               <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>Assigned To</text>
               <Button onClick={() => setExpanded(prev => !prev)} onMouseOver={() => setExpandHovered(true)} onMouseOut={() => setExpandHovered(false)}>
@@ -331,7 +328,7 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
               now={now}
               taskNameWidth={taskNameWidth}
               agentIdWidth={agentIdWidth}
-              showAssigneeColumn={showAssigneeColumn}
+              showAssigneeColumn
             />
           ))}
         </scrollbox>
@@ -349,7 +346,7 @@ export function TaskList({ tasks, pushForkOverlay, fileViewerOpen = false, scrol
               now={now}
               taskNameWidth={taskNameWidth}
               agentIdWidth={agentIdWidth}
-              showAssigneeColumn={showAssigneeColumn}
+              showAssigneeColumn
             />
           ))}
         </box>

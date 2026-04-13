@@ -4,7 +4,7 @@ import { useTheme } from '../hooks/use-theme'
 import { buildMarkdownColorPalette } from '../utils/theme'
 import { useStreamingMarkdownCache } from '../markdown/streaming'
 import { BlockRenderer } from '../markdown/block-renderer'
-import { useBoxWidth } from '../hooks/use-chat-width'
+import { useLocalWidth } from '../hooks/use-local-width'
 
 interface AssistantMessageProps {
   content: string
@@ -22,7 +22,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   const theme = useTheme()
   const markdownPalette = buildMarkdownColorPalette(theme)
   const { displayedContent, showCursor } = useStreamingReveal(content, isStreaming, isInterrupted)
-  const box = useBoxWidth()
+  const box = useLocalWidth()
   const contentWidth = box.width ?? 79
   const codeBlockWidth = Math.max(20, contentWidth - 2)
   const { blocks, pendingText } = useStreamingMarkdownCache(displayedContent, {

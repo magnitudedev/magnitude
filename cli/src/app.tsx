@@ -62,6 +62,7 @@ import type { Attachment } from '@magnitudedev/agent'
 import { DebugPanel } from './components/debug-panel'
 import { ChatController } from './components/chat/chat-controller'
 import { useTasks } from './hooks/use-tasks'
+import { useLocalWidth } from './hooks/use-local-width'
 
 import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
 
@@ -237,13 +238,14 @@ function AppInner({
   // attachments don't reflow when hints appear/disappear.
   const maxEscHintWidth = 'Press Esc again to interrupt all workers'.length
 
-  const terminalWidth = process.stdout.columns ?? 80
+  const chatColumn = useLocalWidth()
+  const chatColumnWidth = chatColumn.width ?? 80
   const footerRightGap = contextRenderedText ? 1 : 0
   const footerHorizontalPadding = 4
   const footerSafetyBuffer = 4
   const attachmentsMaxWidth = Math.max(
     0,
-    terminalWidth
+    chatColumnWidth
       - footerHorizontalPadding
       - maxEscHintWidth
       - contextRenderedText.length
@@ -2249,7 +2251,11 @@ function AppInner({
       )}
 
       {/* Center column — chat, status bar, input, footer */}
-      <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, position: 'relative', height: '100%', paddingBottom: 0, marginBottom: 0 }}>
+      <box
+        ref={chatColumn.ref}
+        onSizeChange={chatColumn.onSizeChange}
+        style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, position: 'relative', height: '100%', paddingBottom: 0, marginBottom: 0 }}
+      >
         <box style={{ flexGrow: 1, minHeight: 0, flexDirection: 'column' }}>
           {showStickyHeader && activeThinkBlock && (
             <box style={{ flexShrink: 0, paddingLeft: 2 }}>

@@ -1,6 +1,6 @@
 import { memo, useMemo, useRef } from 'react'
 import { TextAttributes } from '@opentui/core'
-import { useTerminalDimensions } from '@opentui/react'
+import { useLocalWidth } from '../hooks/use-local-width'
 import { useTheme } from '../hooks/use-theme'
 import { usePanelStreaming } from '../hooks/use-panel-streaming'
 import { useScrollToElement } from '../hooks/use-scroll-to-element'
@@ -26,7 +26,7 @@ export const FileViewerPanel = memo(function FileViewerPanel({
   filePath, content, scrollToSection, onClose, onOpenFile, streaming,
 }: FileViewerPanelProps) {
   const theme = useTheme()
-  const { width: terminalWidth } = useTerminalDimensions()
+  const panel = useLocalWidth()
   const scrollboxRef = useRef<any>(null)
   const markdown = isMarkdownFile(filePath)
 
@@ -39,7 +39,7 @@ export const FileViewerPanel = memo(function FileViewerPanel({
     isActivelyStreaming,
   } = usePanelStreaming(streaming, content)
 
-  const codeBlockWidth = Math.max(20, terminalWidth - 10)
+  const codeBlockWidth = Math.max(20, (panel.width ?? 30) - 10)
 
   const targetSectionId = useMemo(
     () => markdown && scrollToSection ? `section-${slugify(scrollToSection)}` : null,
@@ -63,15 +63,19 @@ export const FileViewerPanel = memo(function FileViewerPanel({
   )
 
   return (
-    <box style={{
-      flexDirection: 'column',
-      height: '100%',
-      borderStyle: 'single',
-      borderColor: theme.border || theme.muted,
-      customBorderChars: BOX_CHARS,
-      paddingLeft: 1,
-      paddingRight: 1,
-    }}>
+    <box
+      ref={panel.ref}
+      onSizeChange={panel.onSizeChange}
+      style={{
+        flexDirection: 'column',
+        height: '100%',
+        borderStyle: 'single',
+        borderColor: theme.border || theme.muted,
+        customBorderChars: BOX_CHARS,
+        paddingLeft: 1,
+        paddingRight: 1,
+      }}
+    >
       <box style={{ flexDirection: 'row', justifyContent: 'space-between', flexShrink: 0 }}>
         <box style={{ flexDirection: 'row', gap: 1 }}>
           <text style={{ fg: theme.foreground }} attributes={TextAttributes.BOLD}>

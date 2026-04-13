@@ -43,8 +43,8 @@ mock.module('@opentui/react', () => ({
   }),
 }))
 
-mock.module('../hooks/use-chat-width', () => ({
-  useBoxWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: rendererWidth - 4 }),
+mock.module('../hooks/use-local-width', () => ({
+  useLocalWidth: () => ({ ref: { current: null }, onSizeChange: () => {}, width: rendererWidth - 4 }),
 }))
 
 mock.module('../markdown/blocks', () => ({

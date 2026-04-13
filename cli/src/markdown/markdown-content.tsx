@@ -5,7 +5,7 @@ import { renderDocumentToBlocks, type HighlightRange } from './blocks'
 import { useStreamingMarkdownCache } from './streaming'
 import { useTheme } from '../hooks/use-theme'
 import { BlockRenderer } from './block-renderer'
-import { useBoxWidth } from '../hooks/use-chat-width'
+import { useLocalWidth } from '../hooks/use-local-width'
 
 export const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -28,7 +28,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 }) {
   const theme = useTheme()
   const palette = buildMarkdownColorPalette(theme)
-  const box = useBoxWidth()
+  const box = useLocalWidth()
   const contentWidth = explicitContentWidth ?? box.width ?? 79
   const effectiveCodeBlockWidth = codeBlockWidth ?? Math.max(20, contentWidth - 2)
   const blocks = renderDocumentToBlocks(parseMarkdownToMdast(content), {
@@ -79,7 +79,7 @@ export const StreamingMarkdownContent = memo(function StreamingMarkdownContent({
 }) {
   const theme = useTheme()
   const palette = buildMarkdownColorPalette(theme)
-  const box = useBoxWidth()
+  const box = useLocalWidth()
   const contentWidth = explicitContentWidth ?? box.width ?? 79
   const effectiveCodeBlockWidth = codeBlockWidth ?? Math.max(20, contentWidth - 2)
   const { blocks, pendingText } = useStreamingMarkdownCache(content, {
