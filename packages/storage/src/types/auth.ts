@@ -8,6 +8,7 @@ export type ApiKeyAuth = Schema.Schema.Type<typeof ApiKeyAuthSchema>
 
 export const OAuthAuthSchema = Schema.Struct({
   type: Schema.Literal('oauth'),
+  oauthMethod: Schema.Literal('oauth-pkce', 'oauth-device', 'oauth-browser'),
   accessToken: Schema.String,
   refreshToken: Schema.String,
   expiresAt: Schema.Number,

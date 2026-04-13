@@ -119,6 +119,7 @@ export async function exchangeAnthropicCode(
 
   return {
     type: 'oauth',
+    oauthMethod: 'oauth-pkce',
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
     expiresAt: Date.now() + data.expires_in * 1000,
@@ -148,6 +149,7 @@ export async function refreshAnthropicToken(refreshToken: string): Promise<OAuth
 
   return {
     type: 'oauth',
+    oauthMethod: 'oauth-pkce',
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
     expiresAt: Date.now() + data.expires_in * 1000,

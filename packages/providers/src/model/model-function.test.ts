@@ -28,7 +28,13 @@ function makeModel(providerId: string, id: string, authType: 'oauth' | 'api' | n
       auth: authType === null
         ? null
         : authType === 'oauth'
-          ? { type: 'oauth', accessToken: 'token', refreshToken: 'refresh', expiresAt: Date.now() + 60_000 }
+          ? {
+            type: 'oauth',
+            oauthMethod: providerId === 'github-copilot' ? 'oauth-device' : 'oauth-browser',
+            accessToken: 'token',
+            refreshToken: 'refresh',
+            expiresAt: Date.now() + 60_000,
+          }
           : { type: 'api', key: 'key' },
     }),
     invoke(fn: any, input: any) {

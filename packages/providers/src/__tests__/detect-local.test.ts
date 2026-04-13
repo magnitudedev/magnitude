@@ -114,4 +114,60 @@ describe('detect local-family providers', () => {
     expect(status).not.toBeNull()
     expect(status!.anyConnected).toBe(false)
   })
+
+  it('marks only OpenAI oauth-device method as connected when stored oauthMethod is oauth-device', () => {
+    const status = detectProviderAuthMethods('openai', {
+      openai: {
+        type: 'oauth',
+        oauthMethod: 'oauth-device',
+        accessToken: 'token',
+        refreshToken: 'refresh',
+        expiresAt: Date.now() + 60_000,
+      },
+    }, {})
+
+    expect(status).not.toBeNull()
+    const browser = status!.methods.find((m) => m.method.type === 'oauth-browser')
+    const device = status!.methods.find((m) => m.method.type === 'oauth-device')
+
+    expect(device?.connected).toBe(true)
+    expect(browser?.connected).toBe(false)
+  })
+
+  it('marks only OpenAI oauth-browser method as connected when stored oauthMethod is oauth-browser', () => {
+    const status = detectProviderAuthMethods('openai', {
+      openai: {
+        type: 'oauth',
+        oauthMethod: 'oauth-browser',
+        accessToken: 'token',
+        refreshToken: 'refresh',
+        expiresAt: Date.now() + 60_000,
+      },
+    }, {})
+
+    expect(status).not.toBeNull()
+    const browser = status!.methods.find((m) => m.method.type === 'oauth-browser')
+    const device = status!.methods.find((m) => m.method.type === 'oauth-device')
+
+    expect(browser?.connected).toBe(true)
+    expect(device?.connected).toBe(false)
+  })
+
+  it('does not connect OpenAI OAuth methods when stored oauthMethod is missing', () => {
+    const status = detectProviderAuthMethods('openai', {
+      openai: {
+        type: 'oauth',
+        accessToken: 'token',
+        refreshToken: 'refresh',
+        expiresAt: Date.now() + 60_000,
+      } as AuthInfo,
+    }, {})
+
+    expect(status).not.toBeNull()
+    const oauthMethods = status!.methods.filter(
+      (m) => m.method.type === 'oauth-browser' || m.method.type === 'oauth-device' || m.method.type === 'oauth-pkce',
+    )
+
+    expect(oauthMethods.every((m) => !m.connected)).toBe(true)
+  })
 })

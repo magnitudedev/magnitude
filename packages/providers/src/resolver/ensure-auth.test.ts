@@ -7,12 +7,14 @@ import type { OAuthAuth } from '../types'
 const now = Date.now()
 const expired: OAuthAuth = {
   type: 'oauth',
+  oauthMethod: 'oauth-browser',
   accessToken: 'expired',
   refreshToken: 'refresh-old',
   expiresAt: now - 60_000,
 }
 const fresh: OAuthAuth = {
   type: 'oauth',
+  oauthMethod: 'oauth-browser',
   accessToken: 'fresh',
   refreshToken: 'refresh-fresh',
   expiresAt: now + 60 * 60_000,

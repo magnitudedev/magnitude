@@ -133,7 +133,7 @@ export function detectProviderAuthMethods(
         auth = stored
       }
     } else if (method.type === 'oauth-pkce' || method.type === 'oauth-device' || method.type === 'oauth-browser') {
-      if (stored?.type === 'oauth') {
+      if (stored?.type === 'oauth' && stored.oauthMethod === method.type) {
         connected = true
         source = 'stored'
         auth = stored

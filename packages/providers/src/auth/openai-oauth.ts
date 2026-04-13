@@ -222,6 +222,7 @@ async function exchangeOpenAICode(code: string, redirectUri: string, verifier: s
 
   return {
     type: 'oauth',
+    oauthMethod: 'oauth-browser',
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
@@ -304,6 +305,7 @@ export async function startOpenAIDeviceOAuth(): Promise<OpenAIDeviceOAuthStart> 
 
           return {
             type: 'oauth' as const,
+            oauthMethod: 'oauth-device' as const,
             accessToken: tokens.access_token,
             refreshToken: tokens.refresh_token,
             expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
@@ -325,7 +327,10 @@ export async function startOpenAIDeviceOAuth(): Promise<OpenAIDeviceOAuthStart> 
 /**
  * Refresh an expired OpenAI OAuth token.
  */
-export async function refreshOpenAIToken(refreshToken: string): Promise<OAuthAuth> {
+export async function refreshOpenAIToken(
+  refreshToken: string,
+  oauthMethod: 'oauth-browser' | 'oauth-device' = 'oauth-browser',
+): Promise<OAuthAuth> {
   const response = await fetch(`${ISSUER}/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -345,6 +350,7 @@ export async function refreshOpenAIToken(refreshToken: string): Promise<OAuthAut
 
   return {
     type: 'oauth',
+    oauthMethod,
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,

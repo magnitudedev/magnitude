@@ -6,7 +6,7 @@ describe('client-registry codex openai-responses options', () => {
     const options = __testOnly_buildProviderOptions(
       'openai',
       'gpt-5.3-codex',
-      { type: 'oauth', accessToken: 'token', refreshToken: 'refresh', expiresAt: Date.now() + 60_000, accountId: 'acct' },
+      { type: 'oauth', oauthMethod: 'oauth-browser', accessToken: 'token', refreshToken: 'refresh', expiresAt: Date.now() + 60_000, accountId: 'acct' },
       {
         instructions: 'SYSTEM',
         store: false,
@@ -26,7 +26,7 @@ describe('client-registry codex openai-responses options', () => {
     const options = __testOnly_buildProviderOptions(
       'github-copilot',
       'gpt-5-codex',
-      { type: 'oauth', accessToken: 'token', refreshToken: 'refresh', expiresAt: Date.now() + 60_000 },
+      { type: 'oauth', oauthMethod: 'oauth-device', accessToken: 'token', refreshToken: 'refresh', expiresAt: Date.now() + 60_000 },
       { instructions: 'SYSTEM' },
     )
 

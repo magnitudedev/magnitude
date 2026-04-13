@@ -136,7 +136,7 @@ export function useAuthFlow({
           url: result.verificationUrl, userCode: result.userCode,
         })
         result.poll().then(async auth => {
-          await storage.auth.set(provider.id, auth)
+          await storage.auth.set(provider.id, { ...auth, oauthMethod: 'oauth-device' })
           trackProviderConnected({ providerId: provider.id, authType: auth.type })
           await reload()
           setOauthState(null)
@@ -157,7 +157,7 @@ export function useAuthFlow({
           url: result.authUrl, cleanup: result.stop,
         })
         result.waitForCallback().then(async auth => {
-          await storage.auth.set(provider.id, auth)
+          await storage.auth.set(provider.id, { ...auth, oauthMethod: 'oauth-browser' })
           trackProviderConnected({ providerId: provider.id, authType: auth.type })
           await reload()
           setOauthState(null)
@@ -221,7 +221,7 @@ export function useAuthFlow({
     setOauthState(prev => prev ? { ...prev, isSubmitting: true, codeError: null } : null)
     try {
       const auth = await exchangeAnthropicCode(code, oauthState.codeVerifier)
-      await storage.auth.set(oauthState.provider.id, auth)
+      await storage.auth.set(oauthState.provider.id, { ...auth, oauthMethod: 'oauth-pkce' })
       trackProviderConnected({ providerId: oauthState.provider.id, authType: auth.type })
       await reload()
       const providerName = oauthState.provider.name

@@ -24,6 +24,7 @@ describe('openai-responses complete path', () => {
       connection: ModelConnection.Baml({
         auth: {
           type: 'oauth',
+          oauthMethod: 'oauth-browser',
           accessToken: 'token',
           refreshToken: 'refresh',
           expiresAt: Date.now() + 60_000,

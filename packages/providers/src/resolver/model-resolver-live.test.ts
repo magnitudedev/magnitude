@@ -9,6 +9,7 @@ import type { OAuthAuth } from '../types'
 
 const expired: OAuthAuth = {
   type: 'oauth',
+  oauthMethod: 'oauth-browser',
   accessToken: 'expired',
   refreshToken: 'refresh-old',
   expiresAt: Date.now() - 60_000,

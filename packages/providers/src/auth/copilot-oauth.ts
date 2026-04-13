@@ -78,6 +78,7 @@ export async function exchangeCopilotToken(githubOAuthToken: string): Promise<OA
 
   return {
     type: 'oauth',
+    oauthMethod: 'oauth-device',
     accessToken: data.token,                          // Short-lived Copilot API token
     refreshToken: githubOAuthToken,                   // Long-lived GitHub OAuth token
     expiresAt: data.expires_at * 1000 - 5 * 60 * 1000, // 5-minute buffer before actual expiry
