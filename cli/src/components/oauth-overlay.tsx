@@ -12,24 +12,27 @@ interface OAuthOverlayProps {
   mode: 'paste' | 'auto'
   url: string
   onCancel: () => void
-  onCopyUrl: () => void
+  onCopyUrl: () => void | Promise<void>
   // Paste mode
   onSubmitCode?: (code: string) => void
   codeError?: string | null
   isSubmitting?: boolean
   // Auto mode
   userCode?: string
-  onCopyCode?: () => void
+  onCopyCode?: () => void | Promise<void>
   wizardMode?: WizardMode
+  autoOpenBrowser?: boolean
 }
 
 export const OAuthOverlay = memo(function OAuthOverlay(props: OAuthOverlayProps) {
   const [cancelHover, setCancelHover] = useState(false)
 
+  const autoOpenBrowser = props.autoOpenBrowser ?? process.env.NODE_ENV !== 'test'
+
   if (props.mode === 'paste') {
-    return <PasteMode {...props} cancelHover={cancelHover} setCancelHover={setCancelHover} />
+    return <PasteMode {...props} autoOpenBrowser={autoOpenBrowser} cancelHover={cancelHover} setCancelHover={setCancelHover} />
   }
-  return <AutoMode {...props} cancelHover={cancelHover} setCancelHover={setCancelHover} />
+  return <AutoMode {...props} autoOpenBrowser={autoOpenBrowser} cancelHover={cancelHover} setCancelHover={setCancelHover} />
 })
 
 function useCopyFeedback() {
@@ -73,16 +76,17 @@ function PasteMode({
   onCancel,
   onCopyUrl,
   wizardMode,
+  autoOpenBrowser,
   cancelHover,
   setCancelHover,
-}: OAuthOverlayProps & { cancelHover: boolean; setCancelHover: (hovered: boolean) => void }) {
+}: OAuthOverlayProps & { autoOpenBrowser: boolean; cancelHover: boolean; setCancelHover: (hovered: boolean) => void }) {
   const theme = useTheme()
   const [code, setCode] = useState('')
   const urlCopy = useCopyFeedback()
   const [copyHovered, setCopyHovered] = useState(false)
   const [backHovered, setBackHovered] = useState(false)
 
-  useOpenBrowser(url)
+  useOpenBrowser(autoOpenBrowser ? url : undefined)
 
   const handleSubmit = useCallback(() => {
     const trimmed = code.trim()
@@ -175,7 +179,12 @@ function PasteMode({
         </box>
         <box style={{ paddingBottom: 1 }}>
           <Button
-            onClick={() => { onCopyUrl(); urlCopy.showCopied() }}
+            onClick={async () => {
+              try {
+                await onCopyUrl()
+                urlCopy.showCopied()
+              } catch {}
+            }}
             onMouseOver={() => setCopyHovered(true)}
             onMouseOut={() => setCopyHovered(false)}
           >
@@ -262,9 +271,10 @@ function AutoMode({
   onCopyUrl,
   onCopyCode,
   wizardMode,
+  autoOpenBrowser,
   cancelHover,
   setCancelHover,
-}: OAuthOverlayProps & { cancelHover: boolean; setCancelHover: (hovered: boolean) => void }) {
+}: OAuthOverlayProps & { autoOpenBrowser: boolean; cancelHover: boolean; setCancelHover: (hovered: boolean) => void }) {
   const theme = useTheme()
   const urlCopy = useCopyFeedback()
   const codeCopy = useCopyFeedback()
@@ -273,7 +283,7 @@ function AutoMode({
   const [backHovered, setBackHovered] = useState(false)
 
   // Only auto-open browser when there's no device code to copy first
-  useOpenBrowser(userCode ? undefined : url)
+  useOpenBrowser(autoOpenBrowser && !userCode ? url : undefined)
 
   useKeyboard(
     useCallback((key: KeyEvent) => {
@@ -349,7 +359,12 @@ function AutoMode({
         </box>
         <box style={{ paddingBottom: 1 }}>
           <Button
-            onClick={() => { onCopyUrl(); urlCopy.showCopied() }}
+            onClick={async () => {
+              try {
+                await onCopyUrl()
+                urlCopy.showCopied()
+              } catch {}
+            }}
             onMouseOver={() => setCopyHovered(true)}
             onMouseOut={() => setCopyHovered(false)}
           >
@@ -371,7 +386,12 @@ function AutoMode({
               </text>
               <text> </text>
               <Button
-                onClick={() => { onCopyCode?.(); codeCopy.showCopied() }}
+                onClick={async () => {
+                  try {
+                    await onCopyCode?.()
+                    codeCopy.showCopied()
+                  } catch {}
+                }}
                 onMouseOver={() => setCodeCopyHovered(true)}
                 onMouseOut={() => setCodeCopyHovered(false)}
               >

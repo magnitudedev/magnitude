@@ -255,15 +255,17 @@ function CodeBlockView({
   const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const safeTimeout = useSafeTimeout()
 
-  const handleCopy = (e: { stopPropagation?: () => void }) => {
+  const handleCopy = async (e: { stopPropagation?: () => void }) => {
     e.stopPropagation?.()
-    void writeTextToClipboard(block.rawCode)
-    setCopied(true)
-    safeTimeout.clear(copiedTimeoutRef.current)
-    copiedTimeoutRef.current = safeTimeout.set(() => {
-      setCopied(false)
-      copiedTimeoutRef.current = null
-    }, COPY_FEEDBACK_RESET_MS)
+    try {
+      await writeTextToClipboard(block.rawCode)
+      setCopied(true)
+      safeTimeout.clear(copiedTimeoutRef.current)
+      copiedTimeoutRef.current = safeTimeout.set(() => {
+        setCopied(false)
+        copiedTimeoutRef.current = null
+      }, COPY_FEEDBACK_RESET_MS)
+    } catch {}
   }
 
   return (

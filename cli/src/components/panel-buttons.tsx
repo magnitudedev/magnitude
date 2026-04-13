@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import { useSafeTimeout } from '../hooks/use-safe-timeout'
+import { writeTextToClipboard } from '../utils/clipboard'
 import { Button } from './button'
 
 export function CopyButton({ content, theme }: { content: string; theme: any }) {
@@ -8,14 +9,13 @@ export function CopyButton({ content, theme }: { content: string; theme: any }) 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const safeTimeout = useSafeTimeout()
 
-  const handleCopy = useCallback(() => {
-    const proc = require('child_process').spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
-    proc.stdin.write(content)
-    proc.stdin.end()
-
-    setCopied(true)
-    safeTimeout.clear(timerRef.current)
-    timerRef.current = safeTimeout.set(() => setCopied(false), 2000)
+  const handleCopy = useCallback(async () => {
+    try {
+      await writeTextToClipboard(content)
+      setCopied(true)
+      safeTimeout.clear(timerRef.current)
+      timerRef.current = safeTimeout.set(() => setCopied(false), 2000)
+    } catch {}
   }, [content, safeTimeout])
 
   const color = copied ? theme.success : hovered ? theme.foreground : theme.muted

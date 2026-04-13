@@ -128,6 +128,7 @@ test('oauth overlay wizard shortcuts remap (paste mode)', () => {
           onCancel={() => {}}
           onCopyUrl={() => {}}
           onSubmitCode={() => {}}
+          autoOpenBrowser={true}
           wizardMode={wizardMode(() => { back += 1 }, () => { skip += 1 })}
         />,
       )

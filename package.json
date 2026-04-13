@@ -13,10 +13,12 @@
     "dash": "bun run --cwd packages/tracing dashboard",
     "events": "cat ~/.magnitude/logs/events.jsonl",
     "events:tail": "tail -f ~/.magnitude/logs/events.jsonl",
-    "events:copy": "cat ~/.magnitude/logs/events.jsonl | pbcopy && echo 'Events copied to clipboard'",
+    "events:copy": "bun run scripts/copy-file-to-clipboard.ts ~/.magnitude/logs/events.jsonl \"Events copied to clipboard\"",
+
     "logs": "cat ~/.magnitude/logs/cli.jsonl",
     "logs:tail": "tail -f ~/.magnitude/logs/cli.jsonl",
-    "logs:copy": "cat ~/.magnitude/logs/cli.jsonl | pbcopy && echo 'Logs copied to clipboard'",
+    "logs:copy": "bun run scripts/copy-file-to-clipboard.ts ~/.magnitude/logs/cli.jsonl \"Logs copied to clipboard\"",
+
     "cs": "changeset",
     "changeset": "changeset",
     "version": "changeset version",

@@ -24,8 +24,10 @@ mock.module('../hooks/use-artifacts', () => ({
   useArtifacts: () => ({ artifacts: new Map() }),
 }))
 
+
 mock.module('../utils/clipboard', () => ({
   writeTextToClipboard: async () => {},
+  readClipboardText: () => null,
 }))
 
 mock.module('@opentui/react', () => ({
@@ -45,7 +47,7 @@ mock.module('../hooks/use-local-width', () => ({
 
 const { extractTextFromStaticMarkup } = await import('./test-render-helpers')
 const { MarkdownContent, StreamingMarkdownContent } = await import('../markdown/markdown-content')
-const { ArtifactReaderPanel } = await import('./artifact-reader-panel')
+const { FileViewerPanel } = await import('./file-viewer-panel')
 
 function renderText(node: React.ReactNode): string {
   return extractTextFromStaticMarkup(renderToStaticMarkup(<div>{node}</div>))
@@ -132,8 +134,8 @@ describe('Markdown rendering Layer 6 - Suite B Tables in multiple width contexts
 
     const normalText = renderText(<MarkdownContent content={markdown} />)
     const panelText = renderText(
-      <ArtifactReaderPanel
-        artifactName="table.md"
+      <FileViewerPanel
+        filePath="table.md"
         content={markdown}
         onClose={() => {}}
       />,

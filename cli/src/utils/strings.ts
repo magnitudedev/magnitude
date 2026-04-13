@@ -1,6 +1,5 @@
 import stringWidth from 'string-width'
 import type { InputMentionSegment, InputPasteSegment, InputValue } from '../types/store'
-import { readClipboardText } from './clipboard'
 
 // Re-export InputValue type for backwards compatibility
 export type { InputValue } from '../types/store'
@@ -452,21 +451,6 @@ export function clipTextLines(
   return text
 }
 
-/**
- * Insert text at cursor position and return the new text and cursor position.
- */
-function spliceTextAtCursor(
-  currentText: string,
-  caretIndex: number,
-  insertion: string,
-): { newText: string; newCursor: number } {
-  const beforeCursor = currentText.slice(0, caretIndex)
-  const afterCursor = currentText.slice(caretIndex)
-  return {
-    newText: beforeCursor + insertion + afterCursor,
-    newCursor: beforeCursor.length + insertion.length,
-  }
-}
 
 /**
  * Format a timestamp as HH:MM (no seconds)
@@ -489,32 +473,4 @@ export function formatFullTimestamp(ts: number): string {
   return `${hours}:${minutes}:${seconds}`
 }
 
-/**
- * Creates a paste handler for text-only inputs (feedback, ask-user, etc.).
- * Reads from clipboard with event text fallback, then inserts at cursor.
- */
-export function createTextInputPasteHandler(
-  text: string,
-  cursorPosition: number,
-  onChange: (value: InputValue) => void,
-): (eventText?: string) => void {
-  return (eventText) => {
-    const pasteText = eventText || readClipboardText()
-    if (!pasteText) return
-    const { newText, newCursor } = spliceTextAtCursor(
-      text,
-      cursorPosition,
-      pasteText,
-    )
-    onChange({
-      text: newText,
-      cursorPosition: newCursor,
-      lastEditDueToNav: false,
-      pasteSegments: [],
-      mentionSegments: [],
-      selectedPasteSegmentId: null,
-      selectedMentionSegmentId: null,
-    })
-  }
-}
 

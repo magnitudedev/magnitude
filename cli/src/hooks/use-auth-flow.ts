@@ -61,8 +61,8 @@ export interface UseAuthFlowReturn {
   closeAuthMethodPicker: () => void
   handleOAuthCodeSubmit: (code: string) => Promise<void>
   handleOAuthCancel: () => void
-  handleOAuthCopyCode: () => void
-  handleOAuthCopyUrl: () => void
+  handleOAuthCopyCode: () => Promise<void>
+  handleOAuthCopyUrl: () => Promise<void>
   handleApiKeySubmit: (key: string) => Promise<void>
   handleApiKeyCancel: () => void
   handleEndpointSetupSubmit: (config: { providerId: string; url: string; modelId?: string; apiKey?: string }) => Promise<void>
@@ -240,14 +240,14 @@ export function useAuthFlow({
     onAuthCancel()
   }, [oauthState, onAuthCancel])
 
-  const handleOAuthCopyCode = useCallback(() => {
+  const handleOAuthCopyCode = useCallback(async () => {
     if (!oauthState?.userCode) return
-    writeTextToClipboard(oauthState.userCode)
+    await writeTextToClipboard(oauthState.userCode)
   }, [oauthState])
 
-  const handleOAuthCopyUrl = useCallback(() => {
+  const handleOAuthCopyUrl = useCallback(async () => {
     if (!oauthState?.url) return
-    writeTextToClipboard(oauthState.url)
+    await writeTextToClipboard(oauthState.url)
   }, [oauthState])
 
   const handleEndpointSetupSubmit = useCallback(async (config: { providerId: string; url: string; modelId?: string; apiKey?: string }) => {

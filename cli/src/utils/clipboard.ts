@@ -1,5 +1,6 @@
 import { closeSync, openSync, writeSync } from 'fs'
-import { spawnSync } from 'child_process'
+import * as childProcess from 'child_process'
+import type { SpawnSyncReturns } from 'child_process'
 import { $ } from 'bun'
 import { tmpdir } from 'os'
 import path from 'path'
@@ -12,72 +13,147 @@ import { useSafeTimeout } from '../hooks/use-safe-timeout'
 import { safeRenderableAccess, safeRenderableCall } from './safe-renderable-access'
 
 // =============================================================================
-// Read from Clipboard (cross-platform)
+// Clipboard strategy
 // =============================================================================
+//
+// Clipboard behavior is centralized in this module for both copy and read paths.
+// Input/paste ingestion is already centralized elsewhere (SingleLineInput /
+// MultilineInput + paste coordinator), so reliability improvements are localized
+// here and automatically propagate across those paths.
+//
 
-/**
- * Read text from clipboard. Returns null if reading fails.
- */
-export function readClipboardText(): string | null {
-  try {
-    const platform = process.platform
-    const opts = { encoding: 'utf-8' as const, timeout: 1000 }
+type ClipboardPlatform = NodeJS.Platform
+type ClipboardWriteBackend = 'osc52' | 'pbcopy' | 'clip' | 'powershell' | 'wl-copy' | 'xclip' | 'xsel'
+type ClipboardReadTextBackend = 'pbpaste' | 'powershell-get' | 'wl-paste' | 'xclip-read' | 'xsel-read'
+type ClipboardReadImageBackend = 'wl-paste-image' | 'xclip-image' | 'powershell-image' | 'osascript-image'
 
-    let result
-    switch (platform) {
-      case 'darwin':
-        result = spawnSync('pbpaste', [], opts)
-        break
-      case 'win32':
-        result = spawnSync('powershell', ['-Command', 'Get-Clipboard'], opts)
-        break
-      case 'linux':
-        result = spawnSync('xclip', ['-selection', 'clipboard', '-o'], opts)
-        break
-      default:
-        return null
-    }
+export interface ClipboardEnv {
+  platform: ClipboardPlatform
+  remoteShell: boolean
+  isWsl: boolean
+  hasWayland: boolean
+  hasX11: boolean
+  inTmux: boolean
+  inScreen: boolean
+  term: string | undefined
+}
 
-    if (result.status === 0 && result.stdout) {
-      return result.stdout.replace(/\n+$/, '')
-    }
-    return null
-  } catch {
-    return null
+interface CommandResult {
+  success: boolean
+  stdout: string
+}
+
+interface CommandRunnerOptions {
+  input?: string
+  timeout?: number
+  encoding?: BufferEncoding
+}
+
+function detectClipboardEnv(
+  platform: ClipboardPlatform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): ClipboardEnv {
+  return {
+    platform,
+    remoteShell: Boolean(env.SSH_CLIENT || env.SSH_TTY || env.SSH_CONNECTION),
+    isWsl: platform === 'linux' && Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP),
+    hasWayland: Boolean(env.WAYLAND_DISPLAY),
+    hasX11: Boolean(env.DISPLAY),
+    inTmux: Boolean(env.TMUX),
+    inScreen: Boolean(env.STY),
+    term: env.TERM,
+  }
+}
+
+function commandSucceeded(result: Pick<SpawnSyncReturns<string>, 'status' | 'error'>): boolean {
+  return result.status === 0 && !result.error
+}
+
+function runClipboardCommand(
+  command: string,
+  args: string[],
+  options: CommandRunnerOptions = {},
+): CommandResult {
+  const result = childProcess.spawnSync(command, args, {
+    input: options.input,
+    timeout: options.timeout ?? 1000,
+    encoding: options.encoding ?? 'utf-8',
+    stdio: options.input === undefined ? ['ignore', 'pipe', 'ignore'] : ['pipe', 'pipe', 'ignore'],
+  }) as SpawnSyncReturns<string>
+
+  const success = commandSucceeded(result)
+  return { success, stdout: result.stdout ?? '' }
+}
+
+function selectWriteBackends(env: ClipboardEnv): ClipboardWriteBackend[] {
+  const backends: ClipboardWriteBackend[] = ['osc52']
+
+  switch (env.platform) {
+    case 'darwin':
+      backends.push('pbcopy')
+      break
+    case 'win32':
+      backends.push('clip', 'powershell')
+      break
+    case 'linux':
+      if (env.hasWayland) backends.push('wl-copy')
+      backends.push('xclip', 'xsel')
+      break
+  }
+
+  return backends
+}
+
+function selectReadTextBackends(env: ClipboardEnv): ClipboardReadTextBackend[] {
+  switch (env.platform) {
+    case 'darwin':
+      return ['pbpaste']
+    case 'win32':
+      return ['powershell-get']
+    case 'linux':
+      if (env.isWsl) return ['powershell-get', 'wl-paste', 'xclip-read', 'xsel-read']
+      if (env.hasWayland) return ['wl-paste', 'xclip-read', 'xsel-read']
+      return ['xclip-read', 'xsel-read', 'wl-paste']
+    default:
+      return []
+  }
+}
+
+function selectReadImageBackends(env: ClipboardEnv): ClipboardReadImageBackend[] {
+  switch (env.platform) {
+    case 'darwin':
+      return ['osascript-image']
+    case 'win32':
+      return ['powershell-image']
+    case 'linux':
+      if (env.isWsl) return ['powershell-image', 'wl-paste-image', 'xclip-image']
+      return env.hasWayland ? ['wl-paste-image', 'xclip-image'] : ['xclip-image', 'wl-paste-image']
+    default:
+      return []
   }
 }
 
 // 32KB is safe for all environments (tmux is the strictest)
 const OSC52_MAX_BASE64_PAYLOAD = 32_000
 
-function inRemoteShell(): boolean {
-  return !!(process.env.SSH_CLIENT || process.env.SSH_TTY || process.env.SSH_CONNECTION)
-}
-
-function createOsc52Payload(text: string): string | null {
-  if (process.env.TERM === 'dumb') return null
+function createOsc52Payload(text: string, env: ClipboardEnv): string | null {
+  if (env.term === 'dumb') return null
 
   const base64 = Buffer.from(text, 'utf8').toString('base64')
   if (base64.length > OSC52_MAX_BASE64_PAYLOAD) return null
 
   const rawOsc52 = `\x1b]52;c;${base64}\x07`
 
-  if (!process.env.TMUX && !process.env.STY) {
-    return rawOsc52
-  }
-
-  if (process.env.TMUX) {
-    return `\x1bPtmux;${rawOsc52.replace(/\x1b/g, '\x1b\x1b')}\x1b\\`
-  }
-
+  if (!env.inTmux && !env.inScreen) return rawOsc52
+  if (env.inTmux) return `\x1bPtmux;${rawOsc52.replace(/\x1b/g, '\x1b\x1b')}\x1b\\`
   return `\x1bP${rawOsc52}\x1b\\`
 }
 
-function sendOsc52Copy(text: string): boolean {
-  const sequence = createOsc52Payload(text)
+function tryOsc52Write(text: string, env: ClipboardEnv): boolean {
+  const sequence = createOsc52Payload(text, env)
   if (!sequence) return false
 
-  const ttyPath = process.platform === 'win32' ? 'CON' : '/dev/tty'
+  const ttyPath = env.platform === 'win32' ? 'CON' : '/dev/tty'
   let fd: number | null = null
   try {
     fd = openSync(ttyPath, 'w')
@@ -90,60 +166,81 @@ function sendOsc52Copy(text: string): boolean {
   }
 }
 
-function copyUsingSystemClipboard(text: string): boolean {
-  const opts = { input: text, stdio: ['pipe', 'ignore', 'ignore'] as ('pipe' | 'ignore')[] }
-
-  try {
-    if (process.platform === 'linux') {
-      try {
-        spawnSync('xclip', ['-selection', 'clipboard'], opts)
-      } catch {
-        spawnSync('xsel', ['--clipboard', '--input'], opts)
-      }
-    } else if (process.platform === 'win32') {
-      spawnSync('clip', [], opts)
-    } else if (process.platform === 'darwin') {
-      spawnSync('pbcopy', [], opts)
-    } else {
-      return false
-    }
-    return true
-  } catch {
-    return false
+function tryWriteBackend(backend: ClipboardWriteBackend, text: string, env: ClipboardEnv): boolean {
+  switch (backend) {
+    case 'osc52':
+      return tryOsc52Write(text, env)
+    case 'pbcopy':
+      return runClipboardCommand('pbcopy', [], { input: text }).success
+    case 'clip':
+      return runClipboardCommand('clip', [], { input: text }).success
+    case 'powershell':
+      return runClipboardCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Set-Clipboard'], { input: text }).success
+    case 'wl-copy':
+      return runClipboardCommand('wl-copy', [], { input: text }).success
+    case 'xclip':
+      return runClipboardCommand('xclip', ['-selection', 'clipboard'], { input: text }).success
+    case 'xsel':
+      return runClipboardCommand('xsel', ['--clipboard', '--input'], { input: text }).success
   }
 }
 
-// =============================================================================
-// Copy to Clipboard (cross-platform)
-// =============================================================================
+function tryReadTextBackend(backend: ClipboardReadTextBackend): string | null {
+  let result: CommandResult | null = null
+  switch (backend) {
+    case 'pbpaste':
+      result = runClipboardCommand('pbpaste', [])
+      break
+    case 'powershell-get':
+      result = runClipboardCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard'])
+      break
+    case 'wl-paste':
+      result = runClipboardCommand('wl-paste', ['-n'])
+      break
+    case 'xclip-read':
+      result = runClipboardCommand('xclip', ['-selection', 'clipboard', '-o'])
+      break
+    case 'xsel-read':
+      result = runClipboardCommand('xsel', ['--clipboard', '--output'])
+      break
+  }
+
+  if (!result?.success) return null
+  const value = result.stdout.replace(/\n+$/, '')
+  return value.length > 0 ? value : null
+}
 
 /**
- * Copy text to clipboard using platform-native tools or OSC52 escape sequence.
- * In remote sessions (SSH), prefers OSC52 which writes to the client terminal's clipboard.
- * In local sessions, prefers platform tools (pbcopy/xclip/clip).
+ * Read text from clipboard. Returns null if reading fails.
+ */
+export function readClipboardText(): string | null {
+  try {
+    const env = detectClipboardEnv()
+    for (const backend of selectReadTextBackends(env)) {
+      const value = tryReadTextBackend(backend)
+      if (value) return value
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Copy text to clipboard using platform backends and OSC52 fallback.
+ * Throws when all eligible backends fail.
  */
 export async function writeTextToClipboard(text: string) {
-  if (!text || text.trim().length === 0) {
-    return
+  if (!text || text.trim().length === 0) return
+
+  const env = detectClipboardEnv()
+  for (const backend of selectWriteBackends(env)) {
+    if (tryWriteBackend(backend, text, env)) return
   }
 
-  try {
-    let copied: boolean
-    if (inRemoteShell()) {
-      // Remote/SSH: prefer OSC 52 (copies to client terminal's clipboard)
-      copied = sendOsc52Copy(text) || copyUsingSystemClipboard(text)
-    } else {
-      // Local: prefer platform tools (reliable with tmux), OSC 52 as fallback
-      copied = copyUsingSystemClipboard(text) || sendOsc52Copy(text)
-    }
-
-    if (!copied) {
-      throw new Error('No clipboard method available')
-    }
-  } catch (error) {
-    console.error('Failed to copy to clipboard', error)
-    throw error
-  }
+  const error = new Error('No clipboard backend succeeded')
+  console.error('Failed to copy to clipboard', error)
+  throw error
 }
 
 export interface ClipboardBitmapResult {
@@ -155,13 +252,11 @@ export interface ClipboardBitmapResult {
 
 /** Parse PNG/JPEG headers to extract dimensions without external dependencies */
 export function extractImageDimensions(buffer: Buffer): { width: number; height: number } | null {
-  // PNG: signature 89 50 4E 47, width at bytes 16-19, height at 20-23 (big-endian)
   if (buffer.length >= 24 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
     const width = buffer.readUInt32BE(16)
     const height = buffer.readUInt32BE(20)
     return { width, height }
   }
-  // JPEG: signature FF D8, scan for SOF0 (FFC0) or SOF2 (FFC2) marker
   if (buffer.length >= 4 && buffer[0] === 0xFF && buffer[1] === 0xD8) {
     let offset = 2
     while (offset < buffer.length - 9) {
@@ -179,59 +274,62 @@ export function extractImageDimensions(buffer: Buffer): { width: number; height:
   return null
 }
 
-export async function readClipboardBitmap(): Promise<ClipboardBitmapResult | null> {
-  const platform = process.platform
-
-  let base64: string | null = null
-  let mime = 'image/png'
-
-  if (platform === 'linux') {
-    try {
-      const wayland = await $`wl-paste -t image/png`.nothrow().arrayBuffer()
-      if (wayland && wayland.byteLength > 0) {
-        base64 = Buffer.from(wayland).toString('base64')
-      }
-    } catch {}
-    if (!base64) {
+async function tryReadImageBackend(backend: ClipboardReadImageBackend): Promise<string | null> {
+  switch (backend) {
+    case 'wl-paste-image': {
+      try {
+        const wayland = await $`wl-paste -t image/png`.nothrow().arrayBuffer()
+        if (wayland && wayland.byteLength > 0) return Buffer.from(wayland).toString('base64')
+      } catch {}
+      return null
+    }
+    case 'xclip-image': {
       try {
         const x11 = await $`xclip -selection clipboard -t image/png -o`.nothrow().arrayBuffer()
-        if (x11 && x11.byteLength > 0) {
-          base64 = Buffer.from(x11).toString('base64')
-        }
+        if (x11 && x11.byteLength > 0) return Buffer.from(x11).toString('base64')
       } catch {}
+      return null
     }
-  } else if (platform === 'win32') {
-    const script = "Add-Type -AssemblyName System.Windows.Forms; $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [System.Convert]::ToBase64String($ms.ToArray()) }"
-    try {
-      const result = await $`powershell.exe -NonInteractive -NoProfile -command "${script}"`.nothrow().text()
-      if (result) {
-        const trimmed = result.trim()
-        if (trimmed) base64 = trimmed
+    case 'powershell-image': {
+      const script = "Add-Type -AssemblyName System.Windows.Forms; $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [System.Convert]::ToBase64String($ms.ToArray()) }"
+      try {
+        const result = await $`powershell.exe -NonInteractive -NoProfile -command "${script}"`.nothrow().text()
+        const trimmed = result?.trim()
+        return trimmed ? trimmed : null
+      } catch {
+        return null
       }
-    } catch {}
-  } else if (platform === 'darwin') {
-    const tmpfile = path.join(tmpdir(), 'magnitude-clipboard.png')
-    try {
-      await $`osascript -e 'set imageData to the clipboard as "PNGf"' -e 'set fileRef to open for access POSIX file "${tmpfile}" with write permission' -e 'set eof fileRef to 0' -e 'write imageData to fileRef' -e 'close access fileRef'`
-        .nothrow()
-        .quiet()
-      const file = Bun.file(tmpfile)
-      const buffer = await file.arrayBuffer()
-      if (buffer.byteLength > 0) {
-        base64 = Buffer.from(buffer).toString('base64')
+    }
+    case 'osascript-image': {
+      const tmpfile = path.join(tmpdir(), 'magnitude-clipboard.png')
+      try {
+        await $`osascript -e 'set imageData to the clipboard as "PNGf"' -e 'set fileRef to open for access POSIX file "${tmpfile}" with write permission' -e 'set eof fileRef to 0' -e 'write imageData to fileRef' -e 'close access fileRef'`
+          .nothrow()
+          .quiet()
+        const buffer = await Bun.file(tmpfile).arrayBuffer()
+        if (buffer.byteLength > 0) return Buffer.from(buffer).toString('base64')
+      } catch {
+      } finally {
+        await $`rm -f "${tmpfile}"`.nothrow().quiet()
       }
-    } catch {}
-    finally {
-      await $`rm -f "${tmpfile}"`.nothrow().quiet()
+      return null
     }
   }
+}
 
-  if (!base64) return null
+export async function readClipboardBitmap(): Promise<ClipboardBitmapResult | null> {
+  const env = detectClipboardEnv()
+  const mime = 'image/png'
 
-  const dims = extractImageDimensions(Buffer.from(base64, 'base64'))
-  if (!dims) return null
+  for (const backend of selectReadImageBackends(env)) {
+    const base64 = await tryReadImageBackend(backend)
+    if (!base64) continue
+    const dims = extractImageDimensions(Buffer.from(base64, 'base64'))
+    if (!dims) continue
+    return { base64, mime, width: dims.width, height: dims.height }
+  }
 
-  return { base64, mime, width: dims.width, height: dims.height }
+  return null
 }
 
 const COPY_DEBOUNCE_MS = 250
@@ -311,4 +409,14 @@ export function useSelectionAutoCopy() {
   }, [mountedRef, renderer, safeAsync, safeTimeout])
 
   return { showCopiedToast }
+}
+
+export const __clipboardInternals = {
+  detectClipboardEnv,
+  selectWriteBackends,
+  selectReadTextBackends,
+  selectReadImageBackends,
+  createOsc52Payload,
+  runClipboardCommand,
+  commandSucceeded,
 }
