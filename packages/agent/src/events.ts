@@ -563,86 +563,6 @@ export interface OneshotTask {
   readonly prompt: string
 }
 
-interface PhaseCriteriaVerdictBase {
-  readonly type: 'phase_criteria_verdict'
-  readonly forkId: string | null
-  readonly parentForkId: string | null
-  readonly criteriaIndex: number
-  readonly criteriaName: string
-}
-
-export type PhaseCriteriaVerdict =
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'shell'
-      readonly status: 'running'
-      readonly command: string
-      readonly pid: number
-    }
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'shell'
-      readonly status: 'passed'
-      readonly command: string
-    }
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'shell'
-      readonly status: 'failed'
-      readonly command: string
-      readonly reason: string
-    }
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'agent'
-      readonly status: 'running'
-      readonly agentId: string
-    }
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'agent'
-      readonly status: 'passed'
-      readonly agentId: string
-      readonly reason: string
-    }
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'agent'
-      readonly status: 'failed'
-      readonly agentId: string
-      readonly reason: string
-    }
-  | PhaseCriteriaVerdictBase & {
-      readonly criteriaType: 'user'
-      readonly status: 'passed'
-      readonly reason: string
-    }
-
-export interface PhaseVerdictEntry {
-  readonly criteriaIndex: number
-  readonly criteriaName: string
-  readonly passed: boolean
-  readonly reason: string
-}
-
-export interface PhaseVerdict {
-  readonly type: 'phase_verdict'
-  readonly forkId: string | null
-  readonly passed: boolean
-  readonly verdicts: readonly PhaseVerdictEntry[]
-  readonly nextPhasePrompt: string | null
-  readonly workflowCompleted: boolean
-}
-
-export interface PhaseSubmitted {
-  readonly type: 'phase_submitted'
-  readonly forkId: string | null
-  readonly fields: ReadonlyMap<string, string>
-}
-
-export interface PhaseCriteriaStarted {
-  readonly type: 'phase_criteria_started'
-  readonly forkId: string | null
-  readonly criteria: readonly {
-    readonly index: number
-    readonly name: string
-    readonly type: 'shell' | 'agent' | 'user'
-  }[]
-}
 
 export type SkillActivated =
   | {
@@ -707,8 +627,6 @@ export type AppEvent =
   | ContextLimitHit
   | ToolApproved
   | ToolRejected
-  | PhaseCriteriaVerdict
-  | PhaseVerdict
   // Task events
   | TaskCreated
   | TaskUpdated
@@ -720,8 +638,6 @@ export type AppEvent =
   | SubagentUserKilled
   | SubagentIdleClosed
   | UserReturnConfirmed
-  | PhaseSubmitted
-  | PhaseCriteriaStarted
   | SkillActivated
   | SkillStarted
   | SkillCompleted

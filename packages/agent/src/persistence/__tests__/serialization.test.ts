@@ -250,17 +250,15 @@ describe('Event Serialization', () => {
 
     test('handles arrays in events', () => {
       const event: AppEvent = {
-        type: 'phase_verdict',
+        type: 'task_cancelled',
         forkId: null,
-        passed: true,
-        verdicts: Array.from({ length: 100 }, (_, i) => ({
-          criteriaIndex: i,
-          criteriaName: `criterion-${i}`,
-          passed: i % 2 === 0,
-          reason: `reason-${i}`,
+        taskId: 'task-1',
+        cancelledSubtree: Array.from({ length: 100 }, (_, i) => `task-${i}`),
+        killedWorkers: Array.from({ length: 100 }, (_, i) => ({
+          agentId: `agent-${i}`,
+          forkId: `fork-${i}`,
         })),
-        nextPhasePrompt: null,
-        workflowCompleted: false,
+        timestamp: Date.now(),
       }
 
       const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent

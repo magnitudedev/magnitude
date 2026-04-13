@@ -39,8 +39,6 @@ import { webSearchTool, webSearchXmlBinding } from './tools/web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './tools/web-fetch-tool'
 
 import { skillTool, skillXmlBinding } from './tools/skill'
-import { phaseSubmitTool, phaseSubmitXmlBinding } from './tools/phase-submit'
-import { phaseVerdictTool, phaseVerdictXmlBinding } from './tools/phase-verdict'
 import {
   clickTool,
   clickXmlBinding,
@@ -96,8 +94,6 @@ import { webSearchModel } from './models/web-search'
 import { webFetchModel } from './models/web-fetch'
 
 import { skillModel } from './models/skill'
-import { phaseSubmitModel } from './models/phase-submit'
-import { phaseVerdictModel } from './models/phase-verdict'
 import {
   clickModel,
   doubleClickModel,
@@ -131,9 +127,6 @@ export const catalog = defineCatalog({
   webFetch: { tool: webFetchTool, binding: webFetchXmlBinding, state: webFetchModel },
 
   skill: { tool: skillTool, binding: skillXmlBinding, state: skillModel },
-  phaseSubmit: { tool: phaseSubmitTool, binding: phaseSubmitXmlBinding, state: phaseSubmitModel },
-  workflowSubmit: { tool: phaseSubmitTool, binding: phaseSubmitXmlBinding, state: phaseSubmitModel },
-  phaseVerdict: { tool: phaseVerdictTool, binding: phaseVerdictXmlBinding, state: phaseVerdictModel },
   click: { tool: clickTool, binding: clickXmlBinding, state: clickModel, group: 'browser' },
   doubleClick: { tool: doubleClickTool, binding: doubleClickXmlBinding, state: doubleClickModel, group: 'browser' },
   rightClick: { tool: rightClickTool, binding: rightClickXmlBinding, state: rightClickModel, group: 'browser' },

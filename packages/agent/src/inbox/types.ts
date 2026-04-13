@@ -72,11 +72,6 @@ type PhaseCriteriaBase<S extends string> = {
   readonly reason?: string
 }
 
-export type PhaseCriteriaPayload =
-  | (PhaseCriteriaBase<'agent'> & { readonly agentId: string })
-  | (PhaseCriteriaBase<'shell'> & { readonly command: string })
-  | PhaseCriteriaBase<'user'>
-
 // ---------------------------------------------------------------------------
 // TurnResultItem / ResultEntry
 // ---------------------------------------------------------------------------
@@ -144,8 +139,6 @@ export type TimelineEntry =
   | (Timestamped<'subagent_user_killed'> & { readonly agentId: string; readonly agentType: string })
   | (TimestampedText<'user_presence'> & { readonly confirmed: boolean })
   | (TimestampedText<'workflow_phase'> & { readonly name?: string; readonly phase?: string })
-  | (Timestamped<'phase_criteria'> & { readonly payload: PhaseCriteriaPayload })
-  | (Timestamped<'phase_verdict'> & { readonly passed: boolean; readonly verdictText: string; readonly workflowCompleted: boolean })
   | (Timestamped<'skill_started'> & { readonly skillName: string; readonly firstPhase?: string; readonly prompt: string })
   | (Timestamped<'skill_completed'> & { readonly skillName: string })
   | (Timestamped<'lifecycle_hook'> & {

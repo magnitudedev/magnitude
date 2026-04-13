@@ -112,15 +112,11 @@ describe('memory/append-only-invariant', () => {
       snap = snapshotMessageRefs(state)
 
       yield* h.send({
-        type: 'phase_verdict',
+        type: 'interrupt',
         forkId: null,
-        passed: true,
-        verdicts: [{ criteriaIndex: 0, criteriaName: 'c1', passed: true, reason: 'ok' }],
-        nextPhasePrompt: null,
-        workflowCompleted: true,
       })
       state = yield* getRootMemory(h)
-      expect(state.messages.length).toBe(snap.refs.length)
+      expect(state.messages.length).toBeGreaterThanOrEqual(snap.refs.length)
       assertPrefixUnchanged(snap, state)
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )

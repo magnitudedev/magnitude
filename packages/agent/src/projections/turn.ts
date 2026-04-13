@@ -38,7 +38,6 @@ export type TurnTrigger =
   | { readonly _tag: 'subagent_completed'; readonly agentId: string; readonly turnId: string }
   | { readonly _tag: 'wake' }
   | { readonly _tag: 'skill_started'; readonly skillName: string }
-  | { readonly _tag: 'phase_verdict' }
   | { readonly _tag: 'oneshot' }
   | { readonly _tag: 'agent_created'; readonly agentId: string }
 
@@ -199,11 +198,6 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
     skill_started: ({ event, fork }) => {
       if (event.source !== 'user') return fork
       const next = enqueueTrigger(fork, { _tag: 'skill_started', skillName: event.skill.name })
-      return next
-    },
-
-    phase_verdict: ({ fork }) => {
-      const next = enqueueTrigger(fork, { _tag: 'phase_verdict' })
       return next
     },
 

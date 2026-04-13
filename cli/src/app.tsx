@@ -2272,13 +2272,6 @@ function AppInner({
             <WorkflowPhaseBar state={{
               skillName: workflowState.skillName,
               phases: workflowState.phases,
-              criteria: workflowState.criteria.length > 0 ? workflowState.criteria.map(c => ({
-                index: c.index,
-                name: c.name,
-                type: c.type,
-                status: c.lifecycle._tag,
-                reason: c.lifecycle._tag === 'failed' ? c.lifecycle.reason : undefined,
-              })) : null,
             }} />
           ) : null}
           <ChatController

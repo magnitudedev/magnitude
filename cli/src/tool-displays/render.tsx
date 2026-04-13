@@ -10,18 +10,9 @@ import { webSearchDisplay } from './displays/web-search'
 import { webFetchDisplay } from './displays/web-fetch'
 import { skillDisplay } from './displays/skill'
 import { browserActionDisplay } from './displays/browser-action'
-import { phaseSubmitDisplay } from './displays/phase-submit'
-import { phaseVerdictDisplay } from './displays/phase-verdict'
 import { defaultDisplay } from './displays/default'
 
-type WorkflowSubmitState = {
-  toolKey: 'workflowSubmit'
-  phase?: string
-  output?: string
-  errorMessage?: string
-}
-
-type RenderableToolState = ToolState | WorkflowSubmitState
+type RenderableToolState = ToolState
 
 export function renderToolStep(state: RenderableToolState, common: CommonToolProps) {
   switch (state.toolKey) {
@@ -47,11 +38,6 @@ export function renderToolStep(state: RenderableToolState, common: CommonToolPro
     case 'screenshot':
     case 'evaluate':
       return browserActionDisplay.render({ state, ...common })
-    case 'phaseSubmit':
-    case 'workflowSubmit':
-      return phaseSubmitDisplay.render({ state, ...common })
-    case 'phaseVerdict':
-      return phaseVerdictDisplay.render({ state, ...common })
     default:
       return defaultDisplay.render({ state, ...common })
   }
@@ -81,11 +67,6 @@ export function summarizeToolStep(state: RenderableToolState): string {
     case 'screenshot':
     case 'evaluate':
       return browserActionDisplay.summary(state)
-    case 'phaseSubmit':
-    case 'workflowSubmit':
-      return phaseSubmitDisplay.summary(state)
-    case 'phaseVerdict':
-      return phaseVerdictDisplay.summary(state)
     default:
       return defaultDisplay.summary(state)
   }

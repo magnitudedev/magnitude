@@ -37,7 +37,7 @@ export function formatSkillInitialPrompt(skill: WorkflowSkill): string {
   if (skill.phases.length > 0) {
     // Phase overview
     const phaseList = skill.phases.map((p, i) => `${i + 1}. **${p.name}**`).join('\n')
-    sections.push(`## Workflow Phases\n\nThis skill has ${skill.phases.length} phase${skill.phases.length > 1 ? 's' : ''}:\n\n${phaseList}\n\nComplete each phase by submitting deliverables with \`phase-submit\`. Phases may have criteria that must pass before advancing.`)
+    sections.push(`## Workflow Phases\n\nThis skill has ${skill.phases.length} phase${skill.phases.length > 1 ? 's' : ''}:\n\n${phaseList}`)
 
     // First phase instructions with submission fields
     sections.push(formatPhasePrompt(skill.phases[0], 0))

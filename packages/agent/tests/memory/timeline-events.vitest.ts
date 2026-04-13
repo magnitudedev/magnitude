@@ -86,7 +86,7 @@ describe('memory/timeline-events', () => {
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('workflow and skill events map to timeline entries', () =>
+  it.live('skill events map to timeline entries', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -96,37 +96,16 @@ describe('memory/timeline-events', () => {
         source: 'assistant',
         skill: { name: 'deploy', description: 'deploy workflow', preamble: '', phases: [{ name: 'phase1', prompt: 'do phase 1' }] },
       })
-      yield* h.send({
-        type: 'phase_criteria_verdict',
-        forkId: null,
-        parentForkId: null,
-        criteriaIndex: 0,
-        criteriaName: 'tests',
-        criteriaType: 'shell',
-        status: 'passed',
-        command: 'npm test',
-      })
-      yield* h.send({
-        type: 'phase_verdict',
-        forkId: null,
-        passed: true,
-        verdicts: [{ criteriaIndex: 0, criteriaName: 'tests', passed: true, reason: 'ok' }],
-        nextPhasePrompt: 'ship it',
-        workflowCompleted: false,
-      })
       yield* h.send({ type: 'skill_completed', forkId: null, skillName: 'deploy' })
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-workflow-1', chainId: 'c-workflow-1' })
 
       const memory = yield* getRootMemory(h)
       const timeline = inboxMessages(memory).flatMap(m => m.type === 'inbox' ? m.timeline : [])
-      expect(timeline.some(t => t.kind === 'phase_criteria')).toBe(true)
-      expect(timeline.some(t => t.kind === 'phase_verdict')).toBe(true)
+      expect(timeline.some(t => t.kind === 'skill_started')).toBe(true)
       expect(timeline.some(t => t.kind === 'skill_completed')).toBe(true)
 
       const rendered = yield* getRenderedUserText(h)
-      expect(rendered).toContain('<phase_criteria')
-      expect(rendered).toContain('<phase_verdict')
-      expect(rendered).toContain('<workflow_phase')
+      expect(rendered).toContain('<skill ')
       expect(rendered).toContain('<skill_completed')
     }).pipe(Effect.provide(TestHarnessLive()))
   )

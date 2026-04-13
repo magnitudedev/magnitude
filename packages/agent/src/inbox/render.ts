@@ -5,7 +5,7 @@ import {
 } from '../prompts'
 import { formatTaskTypeReminder } from '../tasks/guidance'
 import type { TaskTypeId } from '../tasks'
-import type { AgentAtom, LifecycleReminderFormatterMap, PhaseCriteriaPayload, ResultEntry, TimelineEntry } from './types'
+import type { AgentAtom, LifecycleReminderFormatterMap, ResultEntry, TimelineEntry } from './types'
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults } from './render-results'
 import { renderCompactToolCall } from './render-tool-call'
 import { TURN_CONTROL_IDLE, TURN_CONTROL_IDLE_TAG, END_TURN_TAG } from '@magnitudedev/xml-act'
@@ -84,24 +84,6 @@ function renderAgentAtom(atom: AgentAtom): string {
   }
 }
 
-function renderPhaseCriteriaPayload(payload: PhaseCriteriaPayload): string {
-  if (payload.source === 'agent') {
-    return `<phase_criteria name="${payload.name}" status="${payload.status}" type="agent" agent="${payload.agentId}"${payload.reason ? ` reason="${payload.reason}"` : ''}/>`
-  }
-  if (payload.source === 'shell') {
-    return `<phase_criteria name="${payload.name}" status="${payload.status}" type="shell" command="${payload.command}"${payload.reason ? ` reason="${payload.reason}"` : ''}/>`
-  }
-  return `<phase_criteria name="${payload.name}" status="${payload.status}" type="user"${payload.reason ? ` reason="${payload.reason}"` : ''}/>`
-}
-
-function renderPhaseVerdict(entry: Extract<TimelineEntry, { kind: 'phase_verdict' }>): string {
-  let body = entry.verdictText
-  if (entry.workflowCompleted) {
-    body += '\n<workflow_completed/>'
-  }
-  return `<phase_verdict passed="${entry.passed ? 'true' : 'false'}">${body}</phase_verdict>`
-}
-
 function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_message' }>): ContentPart[] {
   const builder = new ContentPartBuilder()
   builder.pushText(`<message from="user">${entry.text}</message>`)
@@ -149,10 +131,6 @@ function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observat
       const attrs = `${entry.name ? ` name="${entry.name}"` : ''}${entry.phase ? ` phase="${entry.phase}"` : ''}`
       return [`<workflow_phase${attrs}>${entry.text}</workflow_phase>`]
     }
-    case 'phase_criteria':
-      return [renderPhaseCriteriaPayload(entry.payload)]
-    case 'phase_verdict':
-      return [renderPhaseVerdict(entry)]
     case 'skill_started': {
       const attrs = `${entry.skillName ? ` name="${entry.skillName}"` : ''}${entry.firstPhase ? ` phase="${entry.firstPhase}"` : ''}`
       return [`<skill${attrs}>${entry.prompt}</skill>`]

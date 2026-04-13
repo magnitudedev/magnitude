@@ -104,7 +104,7 @@ describe('workflow runtime', () => {
     expect(state.submissions.get('explore.findings')).toBe('/tmp/findings.md')
   })
 
-  test('criteria phase submit moves phase to awaiting-criteria', () => {
+  test('submitting a criteria-gated phase moves phase to awaiting-criteria', () => {
     let state: WorkflowState = createWorkflowState(loadFeatureSkill())
     state = reduce(state, { type: 'submit', fields: mapOf([['findings', '/tmp/findings.md']]) })
     state = reduce(state, { type: 'advance' })

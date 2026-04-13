@@ -14,7 +14,7 @@ import {
   type ForkTurnState,
 } from '../projections/turn'
 import { CompactionProjection } from '../projections/compaction'
-import { WorkflowProjection, type WorkflowCriterion } from '../projections/workflow'
+import { WorkflowProjection } from '../projections/workflow'
 import { createId } from '../util/id'
 
 function resolveChainId(triggers: readonly TurnTrigger[]): string | null {
@@ -55,27 +55,20 @@ export const TurnController = Worker.define<AppEvent>()({
     Effect.gen(function* () {
       const turnForks = yield* read.allForks(TurnProjection)
       const compactionForks = yield* read.allForks(CompactionProjection)
-      const workflowForks = yield* read.allForks(WorkflowProjection)
+      yield* read.allForks(WorkflowProjection)
 
       for (const [forkId, turnFork] of turnForks) {
         const compactionFork: import('../projections/compaction').CompactionState | undefined = compactionForks.get(forkId)
-        const workflowFork = workflowForks.get(forkId)
-
         const hasTrigger = turnFork.triggers.length > 0
         const isTurnIdle = turnFork._tag === 'idle'
         const isCompactionIdle = compactionFork === undefined || compactionFork._tag === 'idle'
         const contextLimitBlocked = compactionFork?.contextLimitBlocked === true
-        const hasPendingVerdict = (workflowFork?.criteria ?? []).some(
-          (criterion: WorkflowCriterion) =>
-            criterion.lifecycle._tag === 'pending' || criterion.lifecycle._tag === 'running'
-        )
 
         const canStart =
           hasTrigger &&
           isTurnIdle &&
           isCompactionIdle &&
-          !contextLimitBlocked &&
-          !hasPendingVerdict
+          !contextLimitBlocked
 
         if (canStart) {
           yield* startTurnForFork(forkId, turnFork, publish)

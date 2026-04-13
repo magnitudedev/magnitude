@@ -7,14 +7,12 @@ interface WorkflowPhaseBarProps {
   state: {
     skillName: string
     phases: Array<{ name: string; status: 'pending' | 'active' | 'verifying' | 'completed' }>
-    criteria: Array<{ index: number; name: string; type: string; status: string; reason?: string }> | null
   }
 }
 
 export function WorkflowPhaseBar({ state }: WorkflowPhaseBarProps) {
   const theme = useTheme()
   const isVerifying = state.phases.some((p) => p.status === 'verifying')
-  const showCriteria = Boolean(state.criteria?.length) && isVerifying
 
   const [spinnerIndex, setSpinnerIndex] = useState(0)
   useEffect(() => {
@@ -54,25 +52,6 @@ export function WorkflowPhaseBar({ state }: WorkflowPhaseBarProps) {
           </box>
         ))}
       </box>
-      {showCriteria ? (
-        <box style={{ flexDirection: 'row', paddingLeft: 3, paddingRight: 1 }}>
-          {(state.criteria ?? []).map((c, i) => (
-            <box key={c.index} style={{ flexDirection: 'row' }}>
-              {i > 0 ? <text style={{ fg: theme.muted }}>{' · '}</text> : null}
-              <text style={{ fg: theme.foreground }}>{c.name}</text>
-              {c.status === 'running' ? (
-                <text style={{ fg: theme.info }}>{' ● running'}</text>
-              ) : c.status === 'passed' ? (
-                <text style={{ fg: theme.success }}>{' ✓'}</text>
-              ) : c.status === 'failed' ? (
-                <text style={{ fg: theme.error }}>{' ✗'}</text>
-              ) : (
-                <text style={{ fg: theme.muted }}>{' ◌ pending'}</text>
-              )}
-            </box>
-          ))}
-        </box>
-      ) : null}
     </box>
   )
 }

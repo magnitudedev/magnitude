@@ -39,9 +39,7 @@ export type {
   AutopilotToggled,
   ToolApproved,
   ToolRejected,
-  PhaseCriteriaVerdict,
-  PhaseVerdict,
-  PhaseVerdictEntry,
+
   SkillActivated,
   SkillStarted,
 
@@ -181,9 +179,6 @@ export {
 export type { AgentStateReader } from './tools/fork'
 export { skillTool } from './tools/skill'
 export type { SkillStateReader } from './tools/skill'
-export { phaseSubmitTool } from './tools/phase-submit'
-export { phaseVerdictTool, PhaseVerdictContextTag } from './tools/phase-verdict'
-
 
 // Skills
 export { resolveSkill, getUserSkills } from './skills'

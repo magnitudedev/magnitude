@@ -26,8 +26,6 @@ export { killWorkerModel, type KillWorkerState } from './kill-worker'
 export { skillModel, type SkillState } from './skill'
 export { shellModel, type ShellState } from './shell'
 export { fileViewModel, type FileViewState } from './file-view'
-export { phaseSubmitModel, type PhaseSubmitState } from './phase-submit'
-export { phaseVerdictModel, type PhaseVerdictState } from './phase-verdict'
 export {
   createBrowserActionModel,
   type BrowserActionState,

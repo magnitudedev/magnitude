@@ -1,7 +1,6 @@
 import type { ContentPart } from '../content'
 import type {
   AgentAtom,
-  PhaseCriteriaPayload,
   ResultEntry,
   TimelineAttachment,
   TimelineEntry,
@@ -133,28 +132,6 @@ export function toTimelineWorkflowPhase(args: {
 }): TimelineEntry {
   return {
     kind: 'workflow_phase',
-    ...args,
-  }
-}
-
-export function toTimelinePhaseCriteria(args: {
-  timestamp: number
-  payload: PhaseCriteriaPayload
-}): TimelineEntry {
-  return {
-    kind: 'phase_criteria',
-    ...args,
-  }
-}
-
-export function toTimelinePhaseVerdict(args: {
-  timestamp: number
-  passed: boolean
-  verdictText: string
-  workflowCompleted: boolean
-}): TimelineEntry {
-  return {
-    kind: 'phase_verdict',
     ...args,
   }
 }

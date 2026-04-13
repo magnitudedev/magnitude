@@ -30,7 +30,6 @@ import type {
   TimelineAttachment,
   QueuedEntry,
   AgentAtom,
-  PhaseCriteriaPayload,
   LifecycleReminderFormatterMap,
   TurnResultItem,
 } from '../inbox/types'
@@ -49,8 +48,6 @@ import {
   toTimelineSubagentUserKilled,
   toTimelineSkillStarted,
   toTimelineSkillCompleted,
-  toTimelinePhaseCriteria,
-  toTimelinePhaseVerdict,
   toTimelineWorkflowPhase,
   toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
@@ -752,66 +749,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         }),
         event.timestamp,
       )
-    },
-
-    phase_criteria_verdict: ({ event, fork }) => {
-      let payload: PhaseCriteriaPayload
-      if (event.criteriaType === 'agent') {
-        payload = {
-          source: 'agent',
-          name: event.criteriaName,
-          status: event.status === 'running' ? 'pending' : event.status,
-          agentId: event.agentId,
-          reason: 'reason' in event ? event.reason : undefined,
-        }
-      } else if (event.criteriaType === 'shell') {
-        payload = {
-          source: 'shell',
-          name: event.criteriaName,
-          status: event.status === 'running' ? 'pending' : event.status,
-          command: event.command,
-          reason: 'reason' in event ? event.reason : undefined,
-        }
-      } else {
-        payload = {
-          source: 'user',
-          name: event.criteriaName,
-          status: event.status,
-          reason: event.reason,
-        }
-      }
-
-      return enqueueTimeline(fork, toTimelinePhaseCriteria({ timestamp: event.timestamp, payload }), event.timestamp)
-    },
-
-    phase_verdict: ({ event, fork }) => {
-      const verdictText = event.verdicts
-        .map(v => `  <verdict name="${v.criteriaName}" passed="${v.passed}" reason="${v.reason}"/>`)
-        .join('\n')
-
-      let nextFork = enqueueTimeline(
-        fork,
-        toTimelinePhaseVerdict({
-          timestamp: event.timestamp,
-          passed: event.passed,
-          verdictText,
-          workflowCompleted: event.workflowCompleted,
-        }),
-        event.timestamp,
-      )
-
-      if (event.passed && !event.workflowCompleted && event.nextPhasePrompt) {
-        nextFork = enqueueTimeline(
-          nextFork,
-          toTimelineWorkflowPhase({
-            timestamp: event.timestamp,
-            text: event.nextPhasePrompt,
-          }),
-          event.timestamp,
-        )
-      }
-
-      return nextFork
     },
 
     skill_completed: ({ event, fork }) =>

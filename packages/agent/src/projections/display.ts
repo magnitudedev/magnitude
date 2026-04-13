@@ -451,9 +451,6 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'evaluate': return { ...counts, evaluations: counts.evaluations + 1 }
     case 'skill':
     case 'fileView':
-    case 'phaseSubmit':
-    case 'workflowSubmit':
-    case 'phaseVerdict':
     case 'scroll':
     case 'screenshot':
       return { ...counts, other: counts.other + 1 }
