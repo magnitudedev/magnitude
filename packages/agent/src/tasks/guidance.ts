@@ -53,7 +53,7 @@ export function formatTaskTypeGuidanceForTool(taskType: TaskTypeId): string {
 }
 
 /**
- * task_type_hook reminder formatter — preserves task ID context and returns
+ * task_start_hook reminder formatter — preserves task ID context and returns
  * full per-type lead guidance + criteria.
  */
 export function formatTaskTypeReminder(taskIds: readonly string[], taskType: TaskTypeId): string {

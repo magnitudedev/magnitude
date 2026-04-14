@@ -145,7 +145,7 @@ export function toTimelineTaskTypeHook(args: {
   title: string
 }): TimelineEntry {
   return {
-    kind: 'task_type_hook',
+    kind: 'task_start_hook',
     ...args,
   }
 }
@@ -159,6 +159,19 @@ export function toTimelineTaskIdleHook(args: {
 }): TimelineEntry {
   return {
     kind: 'task_idle_hook',
+    ...args,
+  }
+}
+
+export function toTimelineTaskCompleteHook(args: {
+  timestamp: number
+  taskId: string
+  taskType: string
+  title: string
+  skillPath: string
+}): TimelineEntry {
+  return {
+    kind: 'task_complete_hook',
     ...args,
   }
 }

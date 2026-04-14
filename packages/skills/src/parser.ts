@@ -3,7 +3,7 @@ import { remark } from 'remark'
 import remarkParse from 'remark-parse'
 import remarkFrontmatter from 'remark-frontmatter'
 import type { Root, Html } from 'mdast'
-import { SkillSchema, ThinkingLensSchema, type Skill, type SkillSections, type ThinkingLens } from './types'
+import { ParsedSkillSchema, ThinkingLensSchema, type ParsedSkill, type SkillSections, type ThinkingLens } from './types'
 
 export class SkillParseError extends Data.TaggedError('SkillParseError')<{
   readonly cause: ParseResult.ParseError
@@ -71,7 +71,7 @@ function splitSections(body: string, tree: Root): SkillSections {
   }
 }
 
-export function parseSkill(content: string): Effect.Effect<Skill, SkillParseError> {
+export function parseSkill(content: string): Effect.Effect<ParsedSkill, SkillParseError> {
   return Effect.gen(function* () {
     const tree = processor.parse(content) as Root
     const { name, description, thinking } = yield* parseFrontmatter(tree)
@@ -82,7 +82,7 @@ export function parseSkill(content: string): Effect.Effect<Skill, SkillParseErro
 
     const sections = splitSections(body, processor.parse(body) as Root)
 
-    return yield* Schema.decodeUnknown(SkillSchema)({
+    return yield* Schema.decodeUnknown(ParsedSkillSchema)({
       name,
       description,
       thinking,

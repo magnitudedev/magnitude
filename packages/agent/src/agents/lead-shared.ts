@@ -30,6 +30,12 @@ export const diligenceLens = defineThinkingLens({
   description: 'Is the work my workers produced actually meeting the bar? Am I confident enough to own this output? What would I push back on?',
 })
 
+export const skillLens = defineThinkingLens({
+  name: 'skill',
+  trigger: 'When creating a skill-governed task, receiving worker output for a skill-governed task, or completing a skill-governed task',
+  description: 'What does the skill say about how to approach this? What context and files should I share with workers? Is the work meeting the skill\'s quality bar? Does anything from this session warrant updating the skill?',
+})
+
 export const pivotLens = defineThinkingLens({
   name: 'pivot',
   trigger: 'When progress has stalled or results are unexpected',

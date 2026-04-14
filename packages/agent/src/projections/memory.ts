@@ -14,6 +14,7 @@ import { CanonicalTurnProjection } from './canonical-turn'
 
 import { OutboundMessagesProjection } from './outbound-messages'
 import { compactionSummaryTag, buildSessionContextContent, TASK_TREE_COMPLETION_REMINDER } from '../prompts'
+import { SkillsetAmbient } from '../ambient'
 import { UserPresenceProjection } from './user-presence'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
@@ -48,6 +49,7 @@ import {
   toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
   toTimelineTaskIdleHook,
+  toTimelineTaskCompleteHook,
   toTimelineTaskTreeDirty,
   toTimelineTaskTreeView,
   toTimelineTaskUpdate,
@@ -418,6 +420,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
   reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection, TaskGraphProjection] as const,
+  ambients: [SkillsetAmbient] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -1058,7 +1061,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read }) => {
+    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read, ambient }) => {
       const leadFork = state.forks.get(null)
       if (!leadFork) return state
 
@@ -1075,6 +1078,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         }),
         value.timestamp,
       )
+
+      if (task) {
+        const skillset = ambient.get(SkillsetAmbient)
+        const skillPath = skillset.skills[task.taskType]?.path ?? ''
+        nextLead = enqueueTimeline(
+          nextLead,
+          toTimelineTaskCompleteHook({
+            timestamp: value.timestamp,
+            taskId: task.id,
+            taskType: task.taskType,
+            title: task.title,
+            skillPath,
+          }),
+          value.timestamp,
+        )
+      }
 
       nextLead = enqueueTimeline(
         nextLead,
