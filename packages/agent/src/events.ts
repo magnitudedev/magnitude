@@ -13,7 +13,7 @@ import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { Skill } from '@magnitudedev/skills'
-import type { TaskTypeId, TaskAssignee } from './tasks'
+import type { TaskAssignee } from './tasks'
 
 
 export type Attachment = ImageAttachment | MentionAttachment
@@ -421,7 +421,7 @@ export interface TaskCreated {
   readonly forkId: string | null
   readonly taskId: string
   readonly title: string
-  readonly taskType: TaskTypeId
+  readonly taskType: string
   readonly parentId: string | null
   readonly after?: string
   readonly timestamp: number

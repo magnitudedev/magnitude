@@ -11,26 +11,16 @@ import type { AgentStatusState } from '../projections/agent-status'
 
 import { leadRole } from './lead'
 import { leadOneshotRole } from './lead-oneshot'
-import { builderRole } from './builder'
-import { explorerRole } from './explorer'
-import { plannerRole } from './planner'
-import { debuggerRole } from './debugger'
-import { reviewerRole } from './reviewer'
-import { browserRole } from './browser'
+import { workerRole } from './worker'
 
-export type AgentVariant = 'lead' | 'lead-oneshot' | 'builder' | 'explorer' | 'planner' | 'debugger' | 'reviewer' | 'browser'
+export type AgentVariant = 'lead' | 'lead-oneshot' | 'worker'
 
 type MagnitudeRoleDef = RoleDefinition
 
 const AGENTS: Record<AgentVariant, MagnitudeRoleDef> = {
   lead: leadRole,
   'lead-oneshot': leadOneshotRole,
-  builder: builderRole,
-  explorer: explorerRole,
-  planner: plannerRole,
-  debugger: debuggerRole,
-  reviewer: reviewerRole,
-  browser: browserRole,
+  worker: workerRole,
 }
 
 export function isValidVariant(v: string): v is AgentVariant {

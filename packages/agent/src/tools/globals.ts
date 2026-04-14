@@ -7,14 +7,11 @@
 
 import { webSearchTool, webSearchXmlBinding } from './web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './web-fetch-tool'
-import { skillTool, skillXmlBinding } from './skill'
 
 // =============================================================================
 // Global Tools
 // =============================================================================
 
-export { skillTool }
+export const globalTools = [webSearchTool, webFetchTool]
 
-export const globalTools = [webSearchTool, webFetchTool, skillTool]
-
-export const globalXmlBindings = [webSearchXmlBinding, webFetchXmlBinding, skillXmlBinding]
+export const globalXmlBindings = [webSearchXmlBinding, webFetchXmlBinding]

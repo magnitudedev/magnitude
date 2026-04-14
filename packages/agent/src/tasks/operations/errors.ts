@@ -8,8 +8,6 @@ import {
   formatTaskNotFoundError,
   formatTaskParentNotFoundError,
 } from '../../prompts/error-states'
-import type { TaskTypeId } from '../registry'
-
 export type TaskOperationErrorCode =
   | 'task_not_found'
   | 'parent_not_found'
@@ -40,7 +38,7 @@ export function duplicateTaskId(taskId: string): TaskOperationErrorDetails {
   return { code: 'duplicate_task_id', message: formatDuplicateTaskIdError(taskId) }
 }
 
-export function invalidTaskType(taskId: string, taskType: TaskTypeId | string): TaskOperationErrorDetails {
+export function invalidTaskType(taskId: string, taskType: string): TaskOperationErrorDetails {
   return { code: 'invalid_task_type', message: formatInvalidTaskTypeError(taskId, taskType) }
 }
 

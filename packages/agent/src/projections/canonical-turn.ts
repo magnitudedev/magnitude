@@ -224,7 +224,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         const variant: AgentVariant = event.forkId
           ? (() => {
               const role = getAgentByForkId(agentState, event.forkId)?.role
-              return role && isValidVariant(role) ? role : 'builder'
+              return role && isValidVariant(role) ? role : 'worker'
             })()
           : 'lead'
         const agentDef = getAgentDefinition(variant)

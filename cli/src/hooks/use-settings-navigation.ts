@@ -1,9 +1,9 @@
 import { useCallback } from 'react'
 import type { KeyEvent } from '@opentui/core'
 
-export type SettingsTab = 'provider' | 'model'
+export type SettingsTab = 'provider' | 'model' | 'skillset'
 
-const TAB_ORDER: SettingsTab[] = ['provider', 'model']
+const TAB_ORDER: SettingsTab[] = ['provider', 'model', 'skillset']
 
 /**
  * Combines tab switching (left/right) with delegation to the active tab's
@@ -14,6 +14,7 @@ export function useSettingsNavigation(
   onTabChange: (tab: SettingsTab) => void,
   modelHandleKeyEvent: (key: KeyEvent) => boolean,
   providerHandleKeyEvent: (key: KeyEvent) => boolean,
+  skillsetHandleKeyEvent: (key: KeyEvent) => boolean,
   isActive: boolean,
 ): { handleKeyEvent: (key: KeyEvent) => boolean } {
 
@@ -41,10 +42,12 @@ export function useSettingsNavigation(
     // Delegate to active tab's list navigation
     if (activeTab === 'model') {
       return modelHandleKeyEvent(key)
+    } else if (activeTab === 'skillset') {
+      return skillsetHandleKeyEvent(key)
     } else {
       return providerHandleKeyEvent(key)
     }
-  }, [isActive, activeTab, onTabChange, modelHandleKeyEvent, providerHandleKeyEvent])
+  }, [isActive, activeTab, onTabChange, modelHandleKeyEvent, providerHandleKeyEvent, skillsetHandleKeyEvent])
 
   return { handleKeyEvent }
 }

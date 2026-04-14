@@ -17,7 +17,7 @@ function makeAgentState(status: 'working' | 'idle', parentForkId: string | null)
         forkId: 'fork-sub',
         parentForkId,
         name: 'Subagent',
-        role: 'builder',
+        role: 'worker',
         context: '',
         mode: 'spawn',
         taskId: 'task-1',

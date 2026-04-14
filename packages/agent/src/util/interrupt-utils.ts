@@ -20,7 +20,7 @@ export const buildInterruptedTurnCompleted = (params: {
   const variant: AgentVariant = forkId
     ? (() => {
         const role = getAgentByForkId(agentState, forkId)?.role
-        return role && isValidVariant(role) ? role : 'builder'
+        return role && isValidVariant(role) ? role : 'worker'
       })()
     : 'lead'
 

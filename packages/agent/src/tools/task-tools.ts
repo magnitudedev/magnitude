@@ -10,6 +10,8 @@ import { handleTaskDirective } from '../tasks/operations'
 import type { TaskOperationGraphSnapshot } from '../tasks/operations/types'
 import { formatTaskOutsideSubtreeError } from '../prompts'
 import type { TaskRecord } from '../projections/task-graph'
+import { AmbientServiceTag } from '@magnitudedev/event-core'
+import { SkillsetAmbient } from '../ambient'
 
 const TaskToolErrorSchema = ToolErrorSchema('TaskToolError', {})
 
@@ -70,10 +72,13 @@ const runDirective = (directive: Parameters<typeof handleTaskDirective>[0]) =>
       }
     }
 
+    const ambientService = yield* AmbientServiceTag
+    const skillset = ambientService.getValue(SkillsetAmbient)
     const result = yield* handleTaskDirective(directive, {
       forkId,
       timestamp: Date.now(),
       graph: toGraphSnapshot(state.tasks),
+      skillset,
     })
 
     if (result.success === false) {
@@ -145,12 +150,10 @@ export const spawnWorkerTool = defineTool({
   description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <message to="task-id"> for follow-up communications. Only use spawn-worker to create a new worker or replace the current one.',
   inputSchema: Schema.Struct({
     id: Schema.String,
-    role: Schema.String,
     message: Schema.String,
   }),
   outputSchema: Schema.Struct({
     id: Schema.String,
-    role: Schema.String,
   }),
   errorSchema: TaskToolErrorSchema,
   execute: (input, _ctx) =>
@@ -159,7 +162,6 @@ export const spawnWorkerTool = defineTool({
       yield* runDirective({
         kind: 'spawn-worker',
         id: input.id,
-        role: input.role,
         message: input.message,
         spawnWorker: (params): ReturnType<typeof execManager.fork> =>
           execManager.fork({
@@ -169,11 +171,11 @@ export const spawnWorkerTool = defineTool({
             prompt: params.prompt,
             message: params.message,
             mode: 'spawn',
-            role: params.role,
+            role: 'worker',
             taskId: params.taskId,
           }),
       })
-      return { id: input.id, role: input.role }
+      return { id: input.id }
     }),
   label: (input) => input.id ? `Spawning worker for ${input.id}` : 'Spawning worker…',
 })
@@ -233,14 +235,12 @@ export const spawnWorkerXmlBinding = defineXmlBinding(spawnWorkerTool, {
   input: {
     attributes: [
       { field: 'id', attr: 'id' },
-      { field: 'role', attr: 'role' },
     ],
     body: 'message',
   },
   output: {
     childTags: [
       { field: 'id', tag: 'id' },
-      { field: 'role', tag: 'role' },
     ],
   },
 } as const)

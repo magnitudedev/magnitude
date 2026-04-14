@@ -14,6 +14,7 @@ import { CanonicalTurnProjection } from './canonical-turn'
 
 import { OutboundMessagesProjection } from './outbound-messages'
 import { compactionSummaryTag, buildSessionContextContent, TASK_TREE_COMPLETION_REMINDER } from '../prompts'
+import { SkillsetAmbient } from '../ambient'
 import { UserPresenceProjection } from './user-presence'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
@@ -29,7 +30,6 @@ import type {
   TimelineAttachment,
   QueuedEntry,
   AgentAtom,
-  LifecycleReminderFormatterMap,
   TurnResultItem,
 } from '../inbox/types'
 import {
@@ -45,37 +45,14 @@ import {
   toTimelineObservation,
   toTimelineAgentBlock,
   toTimelineSubagentUserKilled,
-  toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
   toTimelineTaskIdleHook,
+  toTimelineTaskCompleteHook,
   toTimelineTaskTreeDirty,
   toTimelineTaskTreeView,
   toTimelineTaskUpdate,
 } from '../inbox/compose'
-import { builderRole } from '../agents/builder'
-import { explorerRole } from '../agents/explorer'
-import { plannerRole } from '../agents/planner'
-import { reviewerRole } from '../agents/reviewer'
 import { generateXmlActToolShape, resolveXmlTagName } from '../tools/xml-tool-docs'
-
-const lifecycleReminderFormatters: LifecycleReminderFormatterMap = {
-  builder: {
-    spawn: builderRole.lifecyclePrompts?.parentOnSpawn,
-    idle: builderRole.lifecyclePrompts?.parentOnIdle,
-  },
-  explorer: {
-    spawn: explorerRole.lifecyclePrompts?.parentOnSpawn,
-    idle: explorerRole.lifecyclePrompts?.parentOnIdle,
-  },
-  planner: {
-    spawn: plannerRole.lifecyclePrompts?.parentOnSpawn,
-    idle: plannerRole.lifecyclePrompts?.parentOnIdle,
-  },
-  reviewer: {
-    spawn: reviewerRole.lifecyclePrompts?.parentOnSpawn,
-    idle: reviewerRole.lifecyclePrompts?.parentOnIdle,
-  },
-}
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -390,7 +367,7 @@ function toInvalidToolInputResult(
 
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
   const content = message.type === 'inbox'
-    ? formatInbox({ results: message.results, timeline: message.timeline, timezone, lifecycleReminderFormatters })
+    ? formatInbox({ results: message.results, timeline: message.timeline, timezone })
     : message.content
 
   if (message.type === 'compacted') {
@@ -418,6 +395,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
   reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection, TaskGraphProjection] as const,
+  ambients: [SkillsetAmbient] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -747,32 +725,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
   },
 
   globalEventHandlers: {
-    task_assigned: ({ event, state, read }) => {
+    task_assigned: ({ event, state }) => {
       if (!event.workerInfo) return state
-
-      const leadFork = state.forks.get(null)
-      if (!leadFork) return state
-
-      const task = read(TaskGraphProjection).tasks.get(event.taskId)
-      if (!task) return state
-
-      let nextLead = enqueueTimeline(
-        leadFork,
-        toTimelineLifecycleHook({
-          timestamp: event.timestamp,
-          agentId: event.workerInfo.agentId,
-          role: event.workerInfo.role,
-          hookType: 'spawn',
-          taskId: event.taskId,
-          taskTitle: task.title,
-        }),
-        event.timestamp,
-      )
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(null, nextLead),
-      }
+      return state
     },
 
     agent_created: ({ event, state }) => {
@@ -801,17 +756,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         toTimelineParentMessage({ timestamp: event.timestamp, text: event.message }),
         event.timestamp,
       )
-
-      const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
-      const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
-      if (spawnReminder) {
-        const updatedParent = enqueueTimeline(
-          parentState,
-          toTimelineLifecycleHook({ timestamp: event.timestamp, agentId: event.agentId, role: event.role, hookType: 'spawn' }),
-          event.timestamp,
-        )
-        return { ...state, forks: new Map(state.forks).set(parentForkId, updatedParent).set(forkId, newForkState) }
-      }
 
       return { ...state, forks: new Map(state.forks).set(forkId, newForkState) }
     },
@@ -914,16 +858,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         role: value.role,
         atoms: [idleAtom],
       })
-
-      const roleDef = isValidVariant(value.role) ? getAgentDefinition(value.role) : undefined
-      const idleReminder = roleDef?.lifecyclePrompts?.parentOnIdle
-      if (idleReminder) {
-        nextParent = enqueueTimeline(
-          nextParent,
-          toTimelineLifecycleHook({ timestamp: value.timestamp, agentId: value.agentId, role: value.role, hookType: 'idle' }),
-          value.timestamp,
-        )
-      }
 
       const taskGraphState = read(TaskGraphProjection)
       const linkedTask = findTaskForAgent(taskGraphState, { agentId: value.agentId, forkId: value.forkId })
@@ -1058,7 +992,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       }
     }),
 
-    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read }) => {
+    on(TaskGraphProjection.signals.taskCompleted, ({ value, state, read, ambient }) => {
       const leadFork = state.forks.get(null)
       if (!leadFork) return state
 
@@ -1075,6 +1009,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         }),
         value.timestamp,
       )
+
+      if (task) {
+        const skillset = ambient.get(SkillsetAmbient)
+        const skillPath = skillset.skills[task.taskType]?.path ?? ''
+        nextLead = enqueueTimeline(
+          nextLead,
+          toTimelineTaskCompleteHook({
+            timestamp: value.timestamp,
+            taskId: task.id,
+            taskType: task.taskType,
+            title: task.title,
+            skillPath,
+          }),
+          value.timestamp,
+        )
+      }
 
       nextLead = enqueueTimeline(
         nextLead,

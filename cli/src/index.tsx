@@ -16,8 +16,11 @@ import { isLightBackground } from './utils/theme'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
 
 import { runOneshot } from './oneshot'
+import { provisionMagnitudeSkillset } from '@magnitudedev/skills'
 
 async function main() {
+  // Auto-provision magnitude skillset on first run
+  await provisionMagnitudeSkillset()
   // Initialize theme store before rendering (defaults to dark)
   initThemeStore()
 

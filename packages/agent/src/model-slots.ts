@@ -1,4 +1,4 @@
-export const MAGNITUDE_SLOTS = ['lead', 'explorer', 'planner', 'builder', 'debugger', 'reviewer', 'browser'] as const
+export const MAGNITUDE_SLOTS = ['lead', 'worker'] as const
 
 export type MagnitudeSlot = typeof MAGNITUDE_SLOTS[number]
 
