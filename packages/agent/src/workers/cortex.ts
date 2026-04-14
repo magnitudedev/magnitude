@@ -42,9 +42,10 @@ import { LLMMessage } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
+
 import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, getSlotForFork, isValidVariant, type AgentVariant } from '../agents'
+import { getAgentDefinition, getForkInfo } from '../agents'
 
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
@@ -116,11 +117,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           forkId !== null && (turnState._tag === 'active' || turnState._tag === 'interrupting')
             ? turnState.currentTurnAllowsDirectUserReply
             : false
-        const agentInstance = forkId ? getAgentByForkId(agentState, forkId)! : null
-        const variant: AgentVariant = agentInstance?.role ?? 'lead'
-
+        const forkInfo = getForkInfo(agentState, forkId)
+        if (!forkInfo) return
+        const { variant, slot: modelSlot } = forkInfo
         const agentDef = getAgentDefinition(variant)
-        const modelSlot = getSlotForFork(agentState, forkId)
+        const agentInstance = forkId ? getAgentByForkId(agentState, forkId) : null
         const timezone = sessionCtx.context?.timezone ?? null
 
         const runtime = yield* ModelResolver
@@ -297,8 +298,11 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             const ambientService = yield* AmbientServiceTag
             const configState = ambientService.getValue(ConfigAmbient)
             const heuristicAgentStatus = yield* read(AgentStatusProjection)
-            const { softCap } = getSlotConfig(configState, getSlotForFork(heuristicAgentStatus, forkId))
-            probableContextLimit = compactionState.tokenEstimate >= softCap && compactionState._tag !== 'idle'
+            const heuristicForkInfo = getForkInfo(heuristicAgentStatus, forkId)
+            if (heuristicForkInfo) {
+              const { softCap } = getSlotConfig(configState, heuristicForkInfo.slot)
+              probableContextLimit = compactionState.tokenEstimate >= softCap && compactionState._tag !== 'idle'
+            }
           }
 
           if (definiteContextLimit || probableContextLimit) {

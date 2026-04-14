@@ -27,13 +27,13 @@ import { textOf, ContentPart } from '../content'
 import { MemoryProjection, getView, LLMMessage, type ForkMemoryState } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import type { CompactionState } from '../projections/compaction'
-import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
+import { AgentStatusProjection } from '../projections/agent-status'
 import { SessionContextProjection } from '../projections/session-context'
 import { TurnProjection } from '../projections/turn'
 
 // ExecutionManager no longer needed — xml-act is stateless, no sandbox reset
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
-import { getAgentDefinition, getSlotForFork, type AgentVariant } from '../agents'
+import { getAgentDefinition, getForkInfo } from '../agents'
 import { ModelResolver, CodingAgentCompact } from '@magnitudedev/providers'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
@@ -106,11 +106,10 @@ function startCompaction(
 
     // Resolve agent variant from fork (same pattern as Cortex)
     const agentState = yield* read(AgentStatusProjection)
-    const variant: AgentVariant = forkId
-      ? getAgentByForkId(agentState, forkId)!.role
-      : 'lead'
+    const forkInfo = getForkInfo(agentState, forkId)
+    if (!forkInfo) return
+    const { variant, slot: modelSlot } = forkInfo
     const agentDef = getAgentDefinition(variant)
-    const modelSlot = getSlotForFork(agentState, forkId)
 
     // Calculate how many messages to compact
     const ambientService = yield* AmbientServiceTag

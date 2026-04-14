@@ -63,12 +63,22 @@ export function getAgentSlot(variant: AgentVariant): MagnitudeSlot {
   return getAgentDefinition(variant).slot as MagnitudeSlot
 }
 
-export function getSlotForFork(agentStatus: AgentStatusState, forkId: string | null): MagnitudeSlot {
+/**
+ * Resolve variant and slot for a fork.
+ * Returns null when the agent is missing (e.g. already killed).
+ * Callers must bail out when null is returned.
+ */
+export function getForkInfo(
+  agentStatus: AgentStatusState,
+  forkId: string | null
+): { variant: AgentVariant; slot: MagnitudeSlot } | null {
   if (forkId === null) {
-    return getAgentSlot('lead')
+    return { variant: 'lead', slot: getAgentSlot('lead') }
   }
-
-  const agentId = agentStatus.agentByForkId.get(forkId)!
-  const agent = agentStatus.agents.get(agentId)!
-  return getAgentSlot(agent.role)
+  const agentId = agentStatus.agentByForkId.get(forkId)
+  const agent = agentId ? agentStatus.agents.get(agentId) : undefined
+  if (!agent) return null
+  return { variant: agent.role, slot: getAgentSlot(agent.role) }
 }
+
+

@@ -10,14 +10,14 @@ const { defineFSM } = FSM
 
 import type { AppEvent, SessionContext } from '../events'
 import { AgentRoutingProjection } from './agent-routing'
-import { AgentStatusProjection, getAgentByForkId, type AgentStatusState } from './agent-status'
+import { AgentStatusProjection, type AgentStatusState } from './agent-status'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { CanonicalTurnProjection } from './canonical-turn'
-import { ConfigAmbient, getSlotConfig, type SlotConfig } from '../ambient/config-ambient'
+import { ConfigAmbient, getSlotConfig, type SlotConfig, type ConfigState } from '../ambient/config-ambient'
 
 import { CHARS_PER_TOKEN } from '../constants'
 
-import { getAgentDefinition, getSlotForFork, type AgentVariant } from '../agents'
+import { getAgentDefinition, getForkInfo, type AgentVariant } from '../agents'
 import { buildSessionContextContent } from '../prompts/session-context'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
@@ -214,21 +214,16 @@ function withAmbient(
   return CompactionLifecycle.hold(state, updates)
 }
 
-function getForkVariant(
-  forkId: string | null,
-  agentStatus: AgentStatusState
-): AgentVariant {
-  if (forkId === null) return 'lead'
-  const role = getAgentByForkId(agentStatus, forkId)?.role
-  return asAgentVariant(role ?? '') ?? 'lead'
-}
-
 function getForkConfig(
-  configState: import('../ambient/config-ambient').ConfigState,
+  configState: ConfigState,
   agentStatus: AgentStatusState,
   forkId: string | null,
-): SlotConfig {
-  return getSlotConfig(configState, getSlotForFork(agentStatus, forkId))
+): SlotConfig | null {
+  const info = getForkInfo(agentStatus, forkId)
+  if (!info) return null
+  const slot = info.slot
+  if (!slot) return null
+  return getSlotConfig(configState, slot)
 }
 
 function recomputeOperationalFields(
@@ -279,6 +274,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
       const nextState = recomputeOperationalFields(fork, limits, {
         tokenEstimate,
       })
@@ -288,7 +284,6 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
     },
 
     turn_completed: ({ event, fork, emit, read, ambient }) => {
-      const { modelId, providerId } = event
       const canonical = read(CanonicalTurnProjection)
       const completedText = canonical.lastCompleted?.turnId === event.turnId
         ? canonical.lastCompleted.canonicalXml
@@ -301,6 +296,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
       const nextState = recomputeOperationalFields(fork, limits, {
         tokenEstimate,
         lastActualInputTokens: event.inputTokens ?? fork.lastActualInputTokens,
@@ -318,6 +314,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
       const nextState = recomputeOperationalFields(fork, limits, {
         tokenEstimate,
       })
@@ -332,6 +329,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
       const nextState = CompactionLifecycle.transition(fork, 'compacting', {
         compactedMessageCount: event.compactedMessageCount,
         shouldCompact: false,
@@ -348,6 +346,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
       const nextState = CompactionLifecycle.transition(fork, 'pendingFinalization', {
         summary: event.summary,
         compactedMessageCount: event.compactedMessageCount,
@@ -368,6 +367,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
       const nextState = CompactionLifecycle.transition(fork, 'idle', {
         tokenEstimate,
         shouldCompact: deriveShouldCompact('idle', tokenEstimate, limits),
@@ -452,7 +452,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
         hasCompletedTurn: false,
         modelId: parentState.modelId,
         providerId: parentState.providerId,
-        shouldCompact: deriveShouldCompact('idle', tokenEstimate, limits),
+        shouldCompact: limits ? deriveShouldCompact('idle', tokenEstimate, limits) : false,
         contextLimitBlocked: false,
       })
 
@@ -471,6 +471,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, value.forkId)
+      if (!limits) return state
       const nextState = recomputeOperationalFields(fork, limits, {
         tokenEstimate,
       })
@@ -491,6 +492,10 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
 
       for (const [forkId, fork] of state.forks) {
         const limits = getForkConfig(value, agentStatus, forkId)
+        if (!limits) {
+          nextForks.set(forkId, fork)
+          continue
+        }
         const nextFork = recomputeOperationalFields(fork, limits)
         emitLifecycleSignals(fork, nextFork, forkId, emit)
         nextForks.set(forkId, nextFork)
