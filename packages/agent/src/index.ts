@@ -141,8 +141,6 @@ export type { SessionContextState } from './projections/session-context'
 export { ReplayProjection } from './projections/replay'
 export { TaskGraphProjection, getPrimaryRootTask, getSessionTitleFromTaskGraph } from './projections/task-graph'
 export type { TaskGraphState, TaskRecord, TaskStatus, TaskWorkerInfo } from './projections/task-graph'
-export { WorkflowProjection } from './projections/workflow'
-export type { WorkflowCriteriaState } from './projections/workflow'
 
 // Line-edit types
 export type { EditDiff } from './util/line-edit'
@@ -191,7 +189,7 @@ export { AgentLifecycle } from './workers/agent-lifecycle'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'
-export { WorkflowWorker } from './workers/workflow-worker'
+
 export { SessionTitleWorker } from './workers/session-title-worker'
 
 // Persistence

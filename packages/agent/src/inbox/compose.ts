@@ -124,40 +124,6 @@ export function toTimelineUserPresence(args: {
 }
 
 
-export function toTimelineWorkflowPhase(args: {
-  timestamp: number
-  name?: string
-  phase?: string
-  text: string
-}): TimelineEntry {
-  return {
-    kind: 'workflow_phase',
-    ...args,
-  }
-}
-
-export function toTimelineSkillStarted(args: {
-  timestamp: number
-  skillName: string
-  firstPhase?: string
-  prompt: string
-}): TimelineEntry {
-  return {
-    kind: 'skill_started',
-    ...args,
-  }
-}
-
-export function toTimelineSkillCompleted(args: {
-  timestamp: number
-  skillName: string
-}): TimelineEntry {
-  return {
-    kind: 'skill_completed',
-    ...args,
-  }
-}
-
 export function toTimelineLifecycleHook(args: {
   timestamp: number
   agentId: string

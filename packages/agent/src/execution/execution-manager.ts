@@ -37,7 +37,6 @@ import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, formatTa
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
-import { WorkflowStateReaderTag, type WorkflowStateReader } from '../tools/workflow-reader'
 import { TaskGraphStateReaderTag, canCompleteRecord, getChildRecords, canAssignRecord, collectSubtreeRecords } from '../tools/task-reader'
 import { ConversationProjection, type ConversationState } from '../projections/conversation'
 import { createId } from '../util/id'
@@ -48,7 +47,6 @@ import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentB
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
-import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
 import { TaskGraphProjection, type TaskGraphState, type TaskStatus } from '../projections/task-graph'
 
 import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
@@ -134,7 +132,7 @@ export interface ExecutionManagerService {
   ) => Effect.Effect<
     void,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -161,7 +159,7 @@ export interface ExecutionManagerService {
   }) => Effect.Effect<
     string,
     never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
+    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
   >
 
   /**
@@ -199,7 +197,6 @@ function makeForkLayers(
   agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkTurnState>,
-  workflowProjection: Projection.ForkedProjectionInstance<WorkflowCriteriaState>,
   taskGraphProjection: Projection.ProjectionInstance<TaskGraphState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
@@ -225,10 +222,6 @@ function makeForkLayers(
   const conversationStateReaderLayer = Layer.succeed(ConversationStateReaderTag, {
     getState: () => conversationProjection.get
   } satisfies ConversationStateReader)
-
-  const workflowStateReaderLayer = Layer.succeed(WorkflowStateReaderTag, {
-    getState: (forkId: string | null) => workflowProjection.getFork(forkId),
-  } satisfies WorkflowStateReader)
 
   const agentStateReaderLayer = Layer.succeed(AgentStateReaderTag, {
     getAgentState: () => agentStatusProjection.get,
@@ -267,7 +260,6 @@ function makeForkLayers(
 
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
-    workflowStateReaderLayer,
     taskGraphReaderLayer,
     skillStateReaderLayer,
     agentStateReaderLayer,
@@ -1013,7 +1005,6 @@ const makeExecutionManager = Effect.gen(function* () {
       const agentProjection = yield* AgentRoutingProjection.Tag
       const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* TurnProjection.Tag
-      const workflowProjection = yield* WorkflowProjection.Tag
       const taskGraphProjection = yield* TaskGraphProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
@@ -1035,7 +1026,7 @@ const makeExecutionManager = Effect.gen(function* () {
       let layers = makeForkLayers(
         forkId,
         sessionContextProjection, agentProjection, agentStatusProjection,
-        workingStateProjection, workflowProjection, taskGraphProjection,
+        workingStateProjection, taskGraphProjection,
         conversationProjection,
         approvalState,
         persistenceLayer, policyInterceptor, cwd, workspacePath, ephemeralSessionContext,
@@ -1086,7 +1077,7 @@ const makeExecutionManager = Effect.gen(function* () {
         bindObservable(obs, () => Effect.succeed(layers as Layer.Layer<unknown>))
       )
       boundObservables.set(forkId, agentObservables)
-    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
+    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
 
     disposeFork: (forkId) => Effect.gen(function* () {
       // Run role teardown if defined (e.g. browser cleanup)

@@ -147,13 +147,6 @@ describe('prompt caching consistency', () => {
       const h = yield* TestHarness
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
-      yield* h.send({
-        type: 'skill_started',
-        forkId: null,
-        source: 'user',
-        skill: { name: 's', description: '', preamble: '', phases: [{ name: 'p', prompt: 'x' }] },
-      })
-
       const beforeRendered = yield* getRenderedUserText(h)
       const beforeMemory = yield* getRootMemory(h)
       const before = snapshotMessageRefs(beforeMemory)

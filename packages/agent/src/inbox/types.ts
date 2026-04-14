@@ -138,9 +138,6 @@ export type TimelineEntry =
     })
   | (Timestamped<'subagent_user_killed'> & { readonly agentId: string; readonly agentType: string })
   | (TimestampedText<'user_presence'> & { readonly confirmed: boolean })
-  | (TimestampedText<'workflow_phase'> & { readonly name?: string; readonly phase?: string })
-  | (Timestamped<'skill_started'> & { readonly skillName: string; readonly firstPhase?: string; readonly prompt: string })
-  | (Timestamped<'skill_completed'> & { readonly skillName: string })
   | (Timestamped<'lifecycle_hook'> & {
       readonly agentId: string
       readonly role: string

@@ -207,17 +207,6 @@ describe('memory integration scenarios', () => {
       const h = yield* TestHarness
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
-      yield* h.send({
-        type: 'skill_started',
-        forkId: null,
-        source: 'user',
-        skill: { name: 'one', description: '', preamble: '', phases: [{ name: 'phase', prompt: 'p' }] },
-      })
-      yield* h.send({
-        type: 'skill_completed',
-        forkId: null,
-        skillName: 'one',
-      })
       yield* sendUserMessage(h, {
         forkId: null,
         timestamp: 1711641600000,
@@ -245,8 +234,6 @@ describe('memory integration scenarios', () => {
 
       const text = yield* getRenderedUserText(h)
       expect(text).toContain('while queued')
-      expect(text).toContain('<skill')
-      expect(text).toContain('<skill_completed')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

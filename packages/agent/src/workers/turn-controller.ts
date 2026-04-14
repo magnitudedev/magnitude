@@ -14,7 +14,6 @@ import {
   type ForkTurnState,
 } from '../projections/turn'
 import { CompactionProjection } from '../projections/compaction'
-import { WorkflowProjection } from '../projections/workflow'
 import { createId } from '../util/id'
 
 function resolveChainId(triggers: readonly TurnTrigger[]): string | null {
@@ -55,7 +54,6 @@ export const TurnController = Worker.define<AppEvent>()({
     Effect.gen(function* () {
       const turnForks = yield* read.allForks(TurnProjection)
       const compactionForks = yield* read.allForks(CompactionProjection)
-      yield* read.allForks(WorkflowProjection)
 
       for (const [forkId, turnFork] of turnForks) {
         const compactionFork: import('../projections/compaction').CompactionState | undefined = compactionForks.get(forkId)

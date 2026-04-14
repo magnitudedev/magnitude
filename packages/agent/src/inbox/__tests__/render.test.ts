@@ -363,9 +363,6 @@ describe('formatInbox', () => {
       },
       { kind: 'user_presence', timestamp: TS1, text: 'back', confirmed: true },
 
-      { kind: 'workflow_phase', timestamp: TS1, name: 'wf', phase: '2/3', text: 'phase text' },
-      { kind: 'skill_started', timestamp: TS1, skillName: 'skill', firstPhase: 'p1', prompt: 'start' },
-      { kind: 'skill_completed', timestamp: TS1, skillName: 'skill' },
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
@@ -374,7 +371,7 @@ describe('formatInbox', () => {
     expect(text).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n<workflow_phase name="wf" phase="2/3">phase text</workflow_phase>\n<skill name="skill" phase="p1">start</skill>\n<skill_completed name="skill"/>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>`,
+        `--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>`,
     })
   })
 

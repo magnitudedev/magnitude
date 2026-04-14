@@ -27,8 +27,6 @@ import { AgentStatusProjection } from './projections/agent-status'
 import { TaskGraphProjection } from './projections/task-graph'
 import { TaskWorkerProjection } from './projections/task-worker'
 import { CompactionProjection } from './projections/compaction'
-import { WorkflowProjection } from './projections/workflow'
-
 import { ReplayProjection } from './projections/replay'
 import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
@@ -45,7 +43,6 @@ import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 import { Autopilot } from './workers/autopilot'
 import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
-import { WorkflowWorker } from './workers/workflow-worker'
 import { isValidVariant, type AgentVariant } from './agents'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
@@ -87,7 +84,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     AgentStatusProjection,
     TaskGraphProjection,
     CompactionProjection,
-    WorkflowProjection,
     TurnProjection,
     CanonicalTurnProjection,
 
@@ -111,7 +107,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     Autopilot,
     CompactionWorker,
     ApprovalWorker,
-    WorkflowWorker,
 
     FileMentionResolver,
 
@@ -134,7 +129,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
       turn: TurnProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
-      workflow: WorkflowProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
       taskGraph: TaskGraphProjection,

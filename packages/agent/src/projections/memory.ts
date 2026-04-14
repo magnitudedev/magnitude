@@ -19,7 +19,6 @@ import { UserMessageResolutionProjection } from './user-message-resolution'
 import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
 import { getAgentDefinition, isValidVariant } from '../agents'
 import { formatUserPresence, formatUserReturnedAfterAbsence } from '../prompts/presence'
-import { formatSkillInitialPrompt } from '../prompts/skills'
 import { ContentPart, ImageMediaType, textParts, wrapTextParts } from '../content'
 
 import { EMPTY_RESPONSE_ERROR } from '../prompts/error-states'
@@ -46,9 +45,6 @@ import {
   toTimelineObservation,
   toTimelineAgentBlock,
   toTimelineSubagentUserKilled,
-  toTimelineSkillStarted,
-  toTimelineSkillCompleted,
-  toTimelineWorkflowPhase,
   toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
   toTimelineTaskIdleHook,
@@ -736,27 +732,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       )
       return resetPendingTurnState({ ...nextFork, currentTurnId: null })
     },
-
-    skill_started: ({ event, fork }) => {
-      const firstPhase = event.skill.phases[0]
-      return enqueueTimeline(
-        fork,
-        toTimelineSkillStarted({
-          timestamp: event.timestamp,
-          skillName: event.skill.name,
-          firstPhase: firstPhase?.name,
-          prompt: formatSkillInitialPrompt(event.skill),
-        }),
-        event.timestamp,
-      )
-    },
-
-    skill_completed: ({ event, fork }) =>
-      enqueueTimeline(
-        fork,
-        toTimelineSkillCompleted({ timestamp: event.timestamp, skillName: event.skillName }),
-        event.timestamp,
-      ),
 
     interrupt: ({ fork }) => fork,
 

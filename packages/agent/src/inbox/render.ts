@@ -127,16 +127,6 @@ function renderTimelineTextLines(entry: Exclude<TimelineEntry, { kind: 'observat
     case 'user_presence':
       return [`<user-presence${entry.confirmed ? ' confirmed="true"' : ''}>${entry.text}</user-presence>`]
 
-    case 'workflow_phase': {
-      const attrs = `${entry.name ? ` name="${entry.name}"` : ''}${entry.phase ? ` phase="${entry.phase}"` : ''}`
-      return [`<workflow_phase${attrs}>${entry.text}</workflow_phase>`]
-    }
-    case 'skill_started': {
-      const attrs = `${entry.skillName ? ` name="${entry.skillName}"` : ''}${entry.firstPhase ? ` phase="${entry.firstPhase}"` : ''}`
-      return [`<skill${attrs}>${entry.prompt}</skill>`]
-    }
-    case 'skill_completed':
-      return [`<skill_completed name="${entry.skillName}"/>`]
   }
 }
 

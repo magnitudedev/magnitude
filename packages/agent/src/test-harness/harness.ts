@@ -11,7 +11,6 @@ import { createId } from '../util/id'
 
 // Projections
 import { SessionContextProjection } from '../projections/session-context'
-import { WorkflowProjection } from '../projections/workflow'
 import { TaskGraphProjection } from '../projections/task-graph'
 import { TurnProjection } from '../projections/turn'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
@@ -232,7 +231,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         AgentRoutingProjection,
         AgentStatusProjection,
         CompactionProjection,
-        WorkflowProjection,
         TaskGraphProjection,
         TurnProjection,
         CanonicalTurnProjection,

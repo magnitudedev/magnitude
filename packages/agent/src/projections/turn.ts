@@ -16,7 +16,7 @@ import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { AgentRoutingProjection } from './agent-routing'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { CompactionProjection } from './compaction'
-import { WorkflowProjection } from './workflow'
+
 import { createId } from '../util/id'
 
 // =============================================================================
@@ -135,7 +135,6 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
     AgentRoutingProjection,
     UserMessageResolutionProjection,
     CompactionProjection,
-    WorkflowProjection,
   ] as const,
 
   signals: {

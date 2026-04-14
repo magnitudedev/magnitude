@@ -12,7 +12,7 @@ import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
-import type { WorkflowSkill } from '@magnitudedev/skills'
+import type { Skill } from '@magnitudedev/skills'
 import type { TaskTypeId, TaskAssignee } from './tasks'
 
 
@@ -585,7 +585,7 @@ export interface SkillStarted {
   readonly type: 'skill_started'
   readonly forkId: string | null
   readonly source: 'user' | 'assistant'
-  readonly skill: WorkflowSkill
+  readonly skill: Skill
 }
 
 export interface SkillCompleted {

@@ -13,7 +13,6 @@ import {
   ReplayProjection,
   AgentRoutingProjection,
   AgentStatusProjection,
-  WorkflowProjection
 } from '@magnitudedev/agent'
 
 import { Agent } from '@magnitudedev/event-core'
@@ -305,7 +304,6 @@ const InspectAgent = Agent.define<AppEvent>()({
     ReplayProjection,
     AgentRoutingProjection,
     AgentStatusProjection,
-    WorkflowProjection
   ],
   workers: [],
   expose: {
@@ -318,7 +316,6 @@ const InspectAgent = Agent.define<AppEvent>()({
       replay: ReplayProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
-      workflow: WorkflowProjection
     }
   }
 })
@@ -341,7 +338,7 @@ async function replayProjections(events: any[]): Promise<Record<string, any>> {
     // Forked projections expose .getFork(forkId) -> per-fork state
     const forkIds: (string | null)[] = [null]
 
-    const forkedKeys = ['compaction', 'turn', 'memory', 'display', 'replay', 'workflow'] as const
+    const forkedKeys = ['compaction', 'turn', 'memory', 'display', 'replay'] as const
     for (const key of forkedKeys) {
       const inst = client.state[key] as any
       const forks: Record<string, any> = {}
@@ -392,13 +389,12 @@ async function cmdProjection(args: string[]) {
     replay: 'replay',
     agentrouting: 'agentRouting',
     agentstatus: 'agentStatus',
-    workflow: 'workflow'
   }
 
   const key = projectionKeyMap[projectionName.toLowerCase()]
   if (!key || !(key in allStates)) {
     console.error(`Unknown projection: ${projectionName}`)
-    console.error('Supported: Memory, Turn, Display, Compaction, SessionContext, Replay, AgentRouting, AgentStatus, Workflow, all')
+    console.error('Supported: Memory, Turn, Display, Compaction, SessionContext, Replay, AgentRouting, AgentStatus, all')
     process.exit(1)
   }
 
