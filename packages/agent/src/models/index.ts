@@ -23,7 +23,6 @@ export { updateTaskModel, type UpdateTaskState } from './update-task'
 export { spawnWorkerModel, type SpawnWorkerState } from './spawn-worker'
 export { killWorkerModel, type KillWorkerState } from './kill-worker'
 
-export { skillModel, type SkillState } from './skill'
 export { shellModel, type ShellState } from './shell'
 export { fileViewModel, type FileViewState } from './file-view'
 export {

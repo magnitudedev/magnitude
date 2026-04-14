@@ -175,9 +175,6 @@ export {
   browserTools,
 } from './tools/browser-tools'
 export type { AgentStateReader } from './tools/fork'
-export { skillTool } from './tools/skill'
-export type { SkillStateReader } from './tools/skill'
-
 // Skills
 export { resolveSkill, getUserSkills } from './skills'
 export type { ResolvedSkill } from './skills'

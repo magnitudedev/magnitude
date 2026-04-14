@@ -1,7 +1,20 @@
+import type { Skillset } from '@magnitudedev/skills'
+
 /**
  * Prompt text for task lifecycle hook reminders.
  * These are injected into the lead's context at specific moments.
  */
+
+/**
+ * Lightweight reference table for system prompt, driven by the active skillset.
+ */
+export function renderTaskTypeReferenceTable(skillset: Skillset): string {
+  const lines: string[] = []
+  for (const [name, skill] of Object.entries(skillset.skills)) {
+    lines.push(`- **${skill.name}** (\`${name}\`) — ${skill.description}`)
+  }
+  return lines.join('\n')
+}
 
 /** Shown when a worker finishes and goes idle on a task */
 export const taskIdleReminder = (agentId: string, taskId: string, title: string) =>

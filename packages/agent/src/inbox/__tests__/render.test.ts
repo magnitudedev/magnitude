@@ -8,13 +8,6 @@ import {
   WORKER_PROGRESS_USER_MESSAGE_REMINDER,
 } from '../../prompts/lead-communication-reminders'
 
-const lifecycleReminderFormatters = {
-  builder: {
-    spawn: (ids: readonly string[]) => `Builder spawned: ${ids.join(', ')}`,
-    idle: (ids: readonly string[]) => `Builder idle: ${ids.join(', ')}`,
-  },
-} as const
-
 const TS0 = 1711641600000 // 2024-03-28 16:00:00 UTC
 const TS1 = TS0 + 30_000
 const TS2 = TS0 + 60_000
@@ -22,7 +15,7 @@ const TS3 = TS0 + 120_000
 
 describe('formatInbox', () => {
   test('returns empty array for empty input', () => {
-    expect(formatInbox({ results: [], timeline: [], timezone: 'UTC', lifecycleReminderFormatters })).toEqual([])
+    expect(formatInbox({ results: [], timeline: [], timezone: 'UTC', skillset: null })).toEqual([])
   })
 
   test('renders results-only entries (turn_results, interrupted, error, noop)', () => {
@@ -33,7 +26,7 @@ describe('formatInbox', () => {
       { kind: 'noop' },
     ]
 
-    const out = formatInbox({ results, timeline: [], timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results, timeline: [], timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       { type: 'text', text: '<turn_result>' + formatInterrupted() + '<error>boom</error>' + formatNoop() + '\n</turn_result>\n' },
     ])
@@ -43,7 +36,7 @@ describe('formatInbox', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'hello', attachments: [] },
     ]
-    expect(formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })).toEqual([
+    expect(formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })).toEqual([
       {
         type: 'text',
         text:
@@ -72,7 +65,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    expect(formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })).toEqual([
+    expect(formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })).toEqual([
       {
         type: 'text',
         text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
@@ -86,7 +79,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS0, text: 'a', attachments: [] },
       { kind: 'user_message', timestamp: TS2, text: 'b', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
@@ -101,7 +94,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS2, text: 'second', attachments: [] },
       { kind: 'user_message', timestamp: TS0, text: 'first', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -129,7 +122,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
@@ -137,11 +130,6 @@ describe('formatInbox', () => {
           '--- 2024-03-28 16:00 ---\n<message from="user">see this</message>\n<mention path="b.ts" type="text" truncated="true" original_bytes="123">const x = 1</mention>\n<mention path="c.ts" type="text" error="not found"/>',
       },
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
-      {
-        type: 'text',
-        text:
-          `\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>`,
-      },
     ])
   })
 
@@ -157,13 +145,8 @@ describe('formatInbox', () => {
         taskTitle: 'Investigate the crash',
       },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
-    expect(out).toEqual([
-      {
-        type: 'text',
-        text: '<reminders>\n- Worker `debugger` spawned and working on task diag-1 ("Investigate the crash").\n</reminders>',
-      },
-    ])
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    expect(out).toEqual([])
   })
 
   test('equal timestamp entries preserve input order', () => {
@@ -171,7 +154,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS0, text: 'first-input', attachments: [] },
       { kind: 'user_message', timestamp: TS0, text: 'second-input', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -194,11 +177,11 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n${TURN_CONTROL_IDLE}\n</agent>\n\n<reminders>\n- Builder idle: builder-a\n</reminders>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n${TURN_CONTROL_IDLE}\n</agent>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
     })
   })
 
@@ -213,17 +196,13 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
         text: '--- 2024-03-28 16:00 ---\nseen',
       },
       img,
-      {
-        type: 'text',
-        text: '\n\n<reminders>\n- Builder spawned: builder-a\n</reminders>',
-      },
     ])
   })
 
@@ -232,13 +211,14 @@ describe('formatInbox', () => {
       results: [{ kind: 'error', message: 'failed' }],
       timeline: [{ kind: 'lifecycle_hook', timestamp: TS0, agentId: 'builder-a', role: 'builder', hookType: 'idle' }],
       timezone: 'UTC',
-      lifecycleReminderFormatters,
+      skillset: null,
+      
     })
 
     expect(out).toEqual([
       {
         type: 'text',
-        text: '<turn_result><error>failed</error>\n</turn_result>\n\n\n<reminders>\n- Builder idle: builder-a\n</reminders>',
+        text: '<turn_result><error>failed</error>\n</turn_result>\n',
       },
     ])
   })
@@ -251,7 +231,7 @@ describe('formatInbox', () => {
       { kind: 'task_update', timestamp: TS3 + 1, action: 'cancelled', taskId: 't2', cancelledCount: 3 },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
@@ -267,7 +247,7 @@ describe('formatInbox', () => {
       { kind: 'task_tree_view', timestamp: TS1, renderedTree: '- [ ] t3 next' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
@@ -283,7 +263,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS1, text: 'hello', attachments: [] },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
@@ -320,11 +300,11 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS3 + 1, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="error"/>\n</${END_TURN_TAG}>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="error"/>\n</${END_TURN_TAG}>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
     })
   })
 
@@ -341,7 +321,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
@@ -366,12 +346,12 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     const text = out[0]
     expect(text).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>`,
+        `--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>`,
     })
   })
 
@@ -381,12 +361,12 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<message from="parent">from parent</message>\n\n<reminders>\n- Builder spawned: builder-z\n</reminders>',
+          '--- 2024-03-28 16:00 ---\n<message from="parent">from parent</message>',
       },
     ])
   })
@@ -416,12 +396,12 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS3, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="working">\nthinking\n<read path="src/a.ts"/>\n<error>oops</error>\n</agent>\n\n<reminders>\n- Builder idle: builder-x\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>',
+          '--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="working">\nthinking\n<read path="src/a.ts"/>\n<error>oops</error>\n</agent>\n\n<attention>\n- builder-x errored at 16:00\n</attention>',
       },
     ])
   })
@@ -432,12 +412,12 @@ describe('formatInbox', () => {
       { kind: 'task_idle_hook', timestamp: TS1, taskId: 't1', taskType: 'implement', title: 'Build thing', agentId: 'builder-z' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',
         text:
-          '<reminders>\n- Builder spawned: builder-z\n- Worker builder-z for task t1 ("Build thing") has finished. Review output and either send feedback or mark complete.\n</reminders>',
+          '<reminders>\n- Worker builder-z for task t1 ("Build thing") has finished. Review output and either send feedback or mark complete. Re-consult the skill governing this task and evaluate the output against its quality bar before proceeding.\n</reminders>',
       },
     ])
   })
@@ -456,7 +436,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', lifecycleReminderFormatters })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
     expect(out).toEqual([
       {
         type: 'text',

@@ -51,6 +51,7 @@ import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
+import { SkillsetAmbient } from '../ambient/skillset-ambient'
 import {
   authReconnectMessage,
   classifyRetryability,
@@ -147,12 +148,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           })
         }
 
+        // 2. Build system prompt with runtime protocol/tool-doc substitution
+        const ambientService = yield* AmbientServiceTag
+        const skillset = ambientService.getValue(SkillsetAmbient)
+
         // Build messages array (now includes observations in system inbox)
         const forkMemory = yield* read(MemoryProjection)
         const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
-
-        // 2. Build system prompt with runtime protocol/tool-doc substitution
-        const systemPrompt = renderSystemPrompt(agentDef)
+        const systemPrompt = renderSystemPrompt(agentDef, skillset)
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 

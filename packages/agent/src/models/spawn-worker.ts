@@ -4,13 +4,11 @@ import { spawnWorkerTool, spawnWorkerXmlBinding } from '../tools/task-tools'
 export interface SpawnWorkerState extends BaseState {
   toolKey: 'spawnWorker'
   id?: string
-  role?: string
   message?: string
 }
 
 const initial: Omit<SpawnWorkerState, 'phase' | 'toolKey'> = {
   id: undefined,
-  role: undefined,
   message: undefined,
 }
 
@@ -28,7 +26,6 @@ export const spawnWorkerModel = defineStateModel('spawnWorker', {
           ...state,
           phase: 'streaming',
           id: event.streaming.id?.value ?? state.id,
-          role: event.streaming.role?.value ?? state.role,
           message: event.streaming.message?.value ?? state.message,
         }
       case 'inputReady':
@@ -36,7 +33,6 @@ export const spawnWorkerModel = defineStateModel('spawnWorker', {
           ...state,
           phase: 'streaming',
           id: event.input.id ?? state.id,
-          role: event.input.role ?? state.role,
           message: event.input.message ?? state.message,
         }
       case 'executionStarted':
@@ -48,7 +44,7 @@ export const spawnWorkerModel = defineStateModel('spawnWorker', {
       case 'parseError':
         return { ...state, phase: 'error' }
       case 'completed':
-        return { ...state, phase: 'completed', id: event.output.id, role: event.output.role }
+        return { ...state, phase: 'completed', id: event.output.id }
       case 'error':
         return { ...state, phase: 'error' }
       case 'rejected':

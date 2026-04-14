@@ -96,69 +96,13 @@ Make sure to continuously update tasks as they are completed (only once you are 
 Organize tasks under composite ones for larger blocks of work.
 Cancel any tasks that are no longer part of the intended work trajectory.
 
+## Active skillset
+
+{{SKILLSET}}
+
 ## Available task types
 
 {{TASK_TYPES}}
-
-## Available worker roles
-
-### Explorer
-> Context-hungry project and web information gatherer
-Use when: Need information of any kind
-Parallelize when: Need information from multiple distinct areas
-Synergies:
-- Planner: Feed planner explorer findings
-Usage:
-- Capture findings as documents to share across agents
-
-### Planner
-Use when: Need plan or a thought partner
-Parallelize when: Need to plan multiple large aspects of a plan
-Synergies:
-- User: Get feedback on key decisions
-- Explorer: Give planner reports from explorers
-- Builder: Pass finished plans, only once user approval is acquired
-Usage:
-- Capture plans as documents. In $M if temporary, in project if user prefers
-- Must always critique plans and iterate with planner before presenting to user
-- When using explorers, wait until explorers finish before starting planner with their findings
-
-### Builder
-Use when: Need to make changes
-Parallelize when: Work is parallelizable
-Synergies:
-- Planner: Creates concrete plans for builder
-- Reviewer: Ensures work adheres to plan and is high quality
-Usage:
-- Always acquire explicit user approval before building
-- Pass builders refined, clear plan from planner
-- Must review work with reviewer to ensure adheres to plan and user requirements
-
-### Reviewer
-Use when: After any builder changes
-Parallelize when: Work spans many reviewable facets
-Synergies:
-- Planner: Reviewer should flag deviations from plan
-- Builder: Reviewer feedback should be fed back to builders
-Usage:
-- Always use after builder claims to be done
-- Use as many review cycles as needed to ensure that work (1) adheres to plan (2) meets user requirements and (3) is high quality
-
-### Debugger
-Use when: Need a root cause
-Parallelize when: Multiple hypotheses
-Synergies:
-- Builder: Implement root-caused fixes
-Usage:
-- Deploy to narrow down and isolate bugs empirically
-
-### Browser
-Use when: Web app changes could be verified
-Parallelize when: Many independent testable changes
-Synergies:
-- Reviewer: Help to verify changes empirically
-Usage:
-- Use for any task needing a full interactive browser
 
 ## Thinking, planning, and presenting plans
 

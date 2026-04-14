@@ -9,7 +9,7 @@
  */
 
 import { Effect, Layer, Stream } from 'effect'
-import { Agent } from '@magnitudedev/event-core'
+import { Agent, makeAmbientServiceLayer } from '@magnitudedev/event-core'
 import { HydrationContext, EventSinkTag } from '@magnitudedev/event-core'
 import type { AppEvent, SessionContext } from './events'
 import type { DebugSnapshot } from './projections/debug-introspection'
@@ -69,6 +69,7 @@ import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 
 import { EphemeralSessionContextTag } from './agents/types'
 import { publishConfigFromProviders } from './ambient/config-ambient'
+import { SkillsetResolverLive } from '@magnitudedev/skills'
 
 
 // =============================================================================
@@ -217,6 +218,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     FsLive,
     tracerLayer,
     options.persistence,
+    SkillsetResolverLive,
   )
   const client = await CodingAgent.createClient(layer)
 

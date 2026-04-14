@@ -10,6 +10,18 @@ import { handleMessageDirective } from '../message'
 import { handleUpdateDirective } from '../update'
 import { handleSpawnWorkerDirective } from '../spawn-worker'
 import { handleKillWorkerDirective } from '../kill-worker'
+import type { Skillset } from '@magnitudedev/skills'
+
+const mkSkillset = (): Skillset => ({
+  path: '',
+  content: '',
+  skills: {
+    feature: { name: 'feature', description: 'Feature task', thinking: [], sections: { lead: '', shared: '', worker: '', handoff: '' }, path: '' },
+    bug: { name: 'bug', description: 'Bug fix', thinking: [], sections: { lead: '', shared: '', worker: '', handoff: '' }, path: '' },
+  },
+})
+
+const mkCtx = () => ({ forkId: null as null, timestamp: Date.now(), graph: { tasks: new Map() }, skillset: mkSkillset() })
 
 const mkTaskState = (overrides?: Partial<TaskGraphState>): TaskGraphState => ({
   tasks: new Map(),
@@ -83,7 +95,7 @@ describe('task operation handlers validation', () => {
       defaultTopLevelDestination: 'parent',
       allowSingleUserReplyThisTurn: false,
       directUserRepliesSent: 0,
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), mkTaskState())
+    }, mkCtx()), mkTaskState())
 
     expect(result.success).toBe(true)
     if (result.success) {
@@ -98,7 +110,7 @@ describe('task operation handlers validation', () => {
       defaultTopLevelDestination: 'user',
       allowSingleUserReplyThisTurn: true,
       directUserRepliesSent: 1,
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), mkTaskState())
+    }, mkCtx()), mkTaskState())
 
     expect(result.success).toBe(true)
     if (result.success) {
@@ -123,10 +135,9 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleSpawnWorkerDirective({
       kind: 'spawn-worker',
       id: 't2',
-      role: 'builder',
       message: 'Test instruction',
       spawnWorker: () => Effect.succeed('fork-2'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
+    }, mkCtx()), state, published)
 
     expect(result.success).toBe(true)
     expect(published.some((e) => e.type === 'task_assigned')).toBe(true)
@@ -139,8 +150,8 @@ describe('task operation handlers validation', () => {
       tasks: new Map<string, TaskRecord>([
         ['t3', {
           id: 't3', title: 'Task', taskType: 'implement', status: 'pending',
-          parentId: null, childIds: [], assignee: 'builder',
-          worker: { agentId: 'worker-3', forkId: 'fork-3', role: 'builder' as const, message: 'Existing' },
+          parentId: null, childIds: [], assignee: 'worker',
+          worker: { agentId: 'worker-3', forkId: 'fork-3', role: 'worker' as const, message: 'Existing' },
           createdAt: 0, updatedAt: 0, completedAt: null,
         }],
       ]),
@@ -150,10 +161,9 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleSpawnWorkerDirective({
       kind: 'spawn-worker',
       id: 't3',
-      role: 'builder',
       message: 'Test instruction',
       spawnWorker: () => Effect.succeed('fork-3-new'),
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
+    }, mkCtx()), state, published)
 
     expect(result.success).toBe(true)
     expect(published.some((e) => e.type === 'agent_killed')).toBe(true)
@@ -175,7 +185,7 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleKillWorkerDirective({
       kind: 'kill-worker',
       id: 't4',
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
+    }, mkCtx()), state)
 
     expect(result.success).toBe(false)
     if (!result.success) {
@@ -189,8 +199,8 @@ describe('task operation handlers validation', () => {
       tasks: new Map<string, TaskRecord>([
         ['t5', {
           id: 't5', title: 'Task', taskType: 'implement', status: 'pending',
-          parentId: null, childIds: [], assignee: 'builder',
-          worker: { agentId: 'worker-5', forkId: 'fork-5', role: 'builder' as const, message: 'Existing' },
+          parentId: null, childIds: [], assignee: 'worker',
+          worker: { agentId: 'worker-5', forkId: 'fork-5', role: 'worker' as const, message: 'Existing' },
           createdAt: 0, updatedAt: 0, completedAt: null,
         }],
       ]),
@@ -200,7 +210,7 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleKillWorkerDirective({
       kind: 'kill-worker',
       id: 't5',
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state, published)
+    }, mkCtx()), state, published)
 
     expect(result.success).toBe(true)
     expect(published.some((e) => e.type === 'agent_killed')).toBe(true)
@@ -218,7 +228,7 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleUpdateDirective({
       kind: 'update',
       taskId: 't1',
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
+    }, mkCtx()), state)
 
     expect(result.success).toBe(false)
     if (!result.success) {
@@ -238,7 +248,7 @@ describe('task operation handlers validation', () => {
       kind: 'update',
       taskId: 't1',
       status: 'pending',
-    }, { forkId: null, timestamp: Date.now(), graph: { tasks: new Map() } }), state)
+    }, mkCtx()), state)
 
     expect(result.success).toBe(false)
     if (!result.success) {

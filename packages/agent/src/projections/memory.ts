@@ -30,7 +30,6 @@ import type {
   TimelineAttachment,
   QueuedEntry,
   AgentAtom,
-  LifecycleReminderFormatterMap,
   TurnResultItem,
 } from '../inbox/types'
 import {
@@ -46,7 +45,6 @@ import {
   toTimelineObservation,
   toTimelineAgentBlock,
   toTimelineSubagentUserKilled,
-  toTimelineLifecycleHook,
   toTimelineTaskTypeHook,
   toTimelineTaskIdleHook,
   toTimelineTaskCompleteHook,
@@ -54,30 +52,7 @@ import {
   toTimelineTaskTreeView,
   toTimelineTaskUpdate,
 } from '../inbox/compose'
-import { builderRole } from '../agents/builder'
-import { explorerRole } from '../agents/explorer'
-import { plannerRole } from '../agents/planner'
-import { reviewerRole } from '../agents/reviewer'
 import { generateXmlActToolShape, resolveXmlTagName } from '../tools/xml-tool-docs'
-
-const lifecycleReminderFormatters: LifecycleReminderFormatterMap = {
-  builder: {
-    spawn: builderRole.lifecyclePrompts?.parentOnSpawn,
-    idle: builderRole.lifecyclePrompts?.parentOnIdle,
-  },
-  explorer: {
-    spawn: explorerRole.lifecyclePrompts?.parentOnSpawn,
-    idle: explorerRole.lifecyclePrompts?.parentOnIdle,
-  },
-  planner: {
-    spawn: plannerRole.lifecyclePrompts?.parentOnSpawn,
-    idle: plannerRole.lifecyclePrompts?.parentOnIdle,
-  },
-  reviewer: {
-    spawn: reviewerRole.lifecyclePrompts?.parentOnSpawn,
-    idle: reviewerRole.lifecyclePrompts?.parentOnIdle,
-  },
-}
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -392,7 +367,7 @@ function toInvalidToolInputResult(
 
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
   const content = message.type === 'inbox'
-    ? formatInbox({ results: message.results, timeline: message.timeline, timezone, lifecycleReminderFormatters })
+    ? formatInbox({ results: message.results, timeline: message.timeline, timezone })
     : message.content
 
   if (message.type === 'compacted') {
@@ -750,32 +725,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
   },
 
   globalEventHandlers: {
-    task_assigned: ({ event, state, read }) => {
+    task_assigned: ({ event, state }) => {
       if (!event.workerInfo) return state
-
-      const leadFork = state.forks.get(null)
-      if (!leadFork) return state
-
-      const task = read(TaskGraphProjection).tasks.get(event.taskId)
-      if (!task) return state
-
-      let nextLead = enqueueTimeline(
-        leadFork,
-        toTimelineLifecycleHook({
-          timestamp: event.timestamp,
-          agentId: event.workerInfo.agentId,
-          role: event.workerInfo.role,
-          hookType: 'spawn',
-          taskId: event.taskId,
-          taskTitle: task.title,
-        }),
-        event.timestamp,
-      )
-
-      return {
-        ...state,
-        forks: new Map(state.forks).set(null, nextLead),
-      }
+      return state
     },
 
     agent_created: ({ event, state }) => {
@@ -804,17 +756,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         toTimelineParentMessage({ timestamp: event.timestamp, text: event.message }),
         event.timestamp,
       )
-
-      const roleDef = isValidVariant(event.role) ? getAgentDefinition(event.role) : undefined
-      const spawnReminder = roleDef?.lifecyclePrompts?.parentOnSpawn
-      if (spawnReminder) {
-        const updatedParent = enqueueTimeline(
-          parentState,
-          toTimelineLifecycleHook({ timestamp: event.timestamp, agentId: event.agentId, role: event.role, hookType: 'spawn' }),
-          event.timestamp,
-        )
-        return { ...state, forks: new Map(state.forks).set(parentForkId, updatedParent).set(forkId, newForkState) }
-      }
 
       return { ...state, forks: new Map(state.forks).set(forkId, newForkState) }
     },
@@ -917,16 +858,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         role: value.role,
         atoms: [idleAtom],
       })
-
-      const roleDef = isValidVariant(value.role) ? getAgentDefinition(value.role) : undefined
-      const idleReminder = roleDef?.lifecyclePrompts?.parentOnIdle
-      if (idleReminder) {
-        nextParent = enqueueTimeline(
-          nextParent,
-          toTimelineLifecycleHook({ timestamp: value.timestamp, agentId: value.agentId, role: value.role, hookType: 'idle' }),
-          value.timestamp,
-        )
-      }
 
       const taskGraphState = read(TaskGraphProjection)
       const linkedTask = findTaskForAgent(taskGraphState, { agentId: value.agentId, forkId: value.forkId })

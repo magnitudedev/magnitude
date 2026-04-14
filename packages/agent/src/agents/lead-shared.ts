@@ -48,30 +48,6 @@ export const turnLens = defineThinkingLens({
   description: 'What to communicate, what actions to take, which turn control to use.',
 })
 
-// export const intentLens = defineThinkingLens({
-//   name: 'intent',
-//   trigger: 'When you receive a message from the user',
-//   description: 'Carefully consider what the user means and what they actually want. Look past the literal request to understand the underlying goal.',
-// })
-
-// export const ideateLens = defineThinkingLens({
-//   name: 'ideate',
-//   trigger: 'When the problem requires creative thinking or there are multiple possible approaches',
-//   description: 'Think freely about the problem space. Generate and consider different approaches, ideas, or solutions before committing to one. Explore tradeoffs and implications.',
-// })
-
-// export const traitsLens = defineThinkingLens({
-//   name: 'traits',
-//   trigger: 'Whenever one or more traits are applicable to the current situation',
-//   description: 'Assess how one or traits might apply in the current situation',
-// })
-
-// export const workflowLens = defineThinkingLens({
-//   name: 'workflow',
-//   trigger: 'When deciding how to tackle work',
-//   description: 'How should I execute this? Which subagents, what parallelism, what sequencing, what workspace usage?',
-// })
-
 export const constraintsLens = defineThinkingLens({
   name: 'constraints',
   trigger: 'When planning work, delegating to subagents, or evaluating progress',
@@ -85,13 +61,6 @@ export const validationLens = defineThinkingLens({
   description:
     'Have I empirically tested my complete solution, not just individual pieces? Are there edge cases or details I haven\'t checked? Am I accepting results that look wrong or suspicious?',
 })
-
-// export const taskLens = defineThinkingLens({
-//   name: 'task',
-//   trigger: 'When receiving user request or performing work of any kind',
-//   description:
-//     "Is all work captured as tasks? Am I about to do something that should be a task but isn't? Are there implicit subtasks I haven't created yet? Every piece of work — no matter how small — must be represented as a task.",
-// })
 
 export const leadTools = catalog.pick(
   'fileRead',
@@ -109,7 +78,6 @@ export const leadTools = catalog.pick(
   'updateTask',
   'spawnWorker',
   'killWorker',
-  'skill',
 )
 
 export const leadObservables: readonly [] = []

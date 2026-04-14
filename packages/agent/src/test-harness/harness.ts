@@ -1,4 +1,4 @@
-import { Agent, type Projection } from '@magnitudedev/event-core'
+import { Agent, type Projection, makeAmbientServiceLayer } from '@magnitudedev/event-core'
 import { defineCatalog } from '@magnitudedev/tools'
 import { Context, Effect, Layer, SubscriptionRef } from 'effect'
 import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
@@ -57,6 +57,7 @@ import { createTurnsBuilder } from './scenario-builder'
 import { clearAgentOverrides } from '../agents'
 import { createVirtualFs, createVirtualFsLayer } from './virtual-fs'
 import { EphemeralSessionContextTag, type PolicyContext } from '../agents/types'
+import { SkillsetResolverLive } from '@magnitudedev/skills'
 import { ChatPersistence, PersistenceError, type ChatPersistenceService } from '../persistence/chat-persistence-service'
 import { createFaultRegistry, type FaultPlan, type FaultRegistry, type FaultScope } from './faults'
 import { createFakeClock } from './fake-clock'
@@ -324,6 +325,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       MockTurnScriptLive,
       basePersistenceLayer,
       faultWrappedPersistenceLayer,
+      SkillsetResolverLive,
       ...(fakeClock ? [fakeClock.layer] : []),
       ...(options.extraLayers ?? []),
     )
