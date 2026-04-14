@@ -1,5 +1,11 @@
 import { Schema } from 'effect'
 
+export interface SkillsetInfo {
+  name: string
+  path: string
+  scope: 'project' | 'global'
+}
+
 
 
 export const ThinkingLensSchema = Schema.Struct({
@@ -36,3 +42,9 @@ export const SkillsetSchema = Schema.Struct({
   skills: Schema.Record({ key: Schema.String, value: SkillSchema }),
 })
 export type Skillset = typeof SkillsetSchema.Type
+
+export const EmptySkillset: Skillset = {
+  path: '',
+  content: '',
+  skills: {},
+}

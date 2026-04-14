@@ -81,9 +81,15 @@ function renderForkOverlay(showCopiedToast: boolean) {
       handleChangeSlot={() => {}}
       modelTabHandleKeyEvent={() => false}
       providerTabHandleKeyEvent={() => false}
+      skillsetTabHandleKeyEvent={() => false}
       modelNavigation={{ items: [], selectedIndex: 0, setSelectedIndex: () => {} }}
       providerNavigation={{ selectedIndex: 0, setSelectedIndex: () => {} }}
       onSettingsClose={() => {}}
+      availableSkillsets={[]}
+      selectedSkillsetName={null}
+      skillsetSelectedIndex={0}
+      onSkillsetSelect={async () => {}}
+      onSkillsetHoverIndex={() => {}}
       showRecentChatsOverlay={false}
       recentChats={[]}
       recentChatsSelectedIndex={0}

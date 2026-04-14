@@ -70,6 +70,7 @@ import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 import { EphemeralSessionContextTag } from './agents/types'
 import { publishConfigFromProviders } from './ambient/config-ambient'
 import { SkillsetResolverLive } from '@magnitudedev/skills'
+import { SelectedSkillsetName } from './ambient/skillset-ambient'
 
 
 // =============================================================================
@@ -210,6 +211,9 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     disableShellSafeguards: options.disableShellSafeguards ?? false,
     disableCwdSafeguards: options.disableCwdSafeguards ?? false,
   })
+  const magnitudeConfig = await options.storage.config.loadFull()
+  const selectedSkillsetLayer = Layer.succeed(SelectedSkillsetName, magnitudeConfig.selectedSkillset ?? null)
+
   const layer = Layer.mergeAll(
     Layer.provide(ExecutionManagerLive, ephemeralSessionContextLayer),
     Layer.provide(BrowserServiceLive, providerRuntime),
@@ -219,6 +223,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     tracerLayer,
     options.persistence,
     SkillsetResolverLive,
+    selectedSkillsetLayer,
   )
   const client = await CodingAgent.createClient(layer)
 

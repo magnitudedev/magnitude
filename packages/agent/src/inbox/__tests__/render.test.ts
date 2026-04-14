@@ -15,7 +15,7 @@ const TS3 = TS0 + 120_000
 
 describe('formatInbox', () => {
   test('returns empty array for empty input', () => {
-    expect(formatInbox({ results: [], timeline: [], timezone: 'UTC', skillset: null })).toEqual([])
+    expect(formatInbox({ results: [], timeline: [], timezone: 'UTC' })).toEqual([])
   })
 
   test('renders results-only entries (turn_results, interrupted, error, noop)', () => {
@@ -26,7 +26,7 @@ describe('formatInbox', () => {
       { kind: 'noop' },
     ]
 
-    const out = formatInbox({ results, timeline: [], timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results, timeline: [], timezone: 'UTC' })
     expect(out).toEqual([
       { type: 'text', text: '<turn_result>' + formatInterrupted() + '<error>boom</error>' + formatNoop() + '\n</turn_result>\n' },
     ])
@@ -36,7 +36,7 @@ describe('formatInbox', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'hello', attachments: [] },
     ]
-    expect(formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })).toEqual([
+    expect(formatInbox({ results: [], timeline, timezone: 'UTC' })).toEqual([
       {
         type: 'text',
         text:
@@ -65,7 +65,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    expect(formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })).toEqual([
+    expect(formatInbox({ results: [], timeline, timezone: 'UTC' })).toEqual([
       {
         type: 'text',
         text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
@@ -79,7 +79,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS0, text: 'a', attachments: [] },
       { kind: 'user_message', timestamp: TS2, text: 'b', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -94,7 +94,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS2, text: 'second', attachments: [] },
       { kind: 'user_message', timestamp: TS0, text: 'first', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -122,7 +122,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -145,7 +145,7 @@ describe('formatInbox', () => {
         taskTitle: 'Investigate the crash',
       },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([])
   })
 
@@ -154,7 +154,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS0, text: 'first-input', attachments: [] },
       { kind: 'user_message', timestamp: TS0, text: 'second-input', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -177,7 +177,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -196,7 +196,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -211,8 +211,6 @@ describe('formatInbox', () => {
       results: [{ kind: 'error', message: 'failed' }],
       timeline: [{ kind: 'lifecycle_hook', timestamp: TS0, agentId: 'builder-a', role: 'builder', hookType: 'idle' }],
       timezone: 'UTC',
-      skillset: null,
-      
     })
 
     expect(out).toEqual([
@@ -231,7 +229,7 @@ describe('formatInbox', () => {
       { kind: 'task_update', timestamp: TS3 + 1, action: 'cancelled', taskId: 't2', cancelledCount: 3 },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -247,7 +245,7 @@ describe('formatInbox', () => {
       { kind: 'task_tree_view', timestamp: TS1, renderedTree: '- [ ] t3 next' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -263,7 +261,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS1, text: 'hello', attachments: [] },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -300,7 +298,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS3 + 1, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -321,7 +319,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -346,7 +344,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     const text = out[0]
     expect(text).toEqual({
       type: 'text',
@@ -361,7 +359,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -396,7 +394,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS3, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -412,7 +410,7 @@ describe('formatInbox', () => {
       { kind: 'task_idle_hook', timestamp: TS1, taskId: 't1', taskType: 'implement', title: 'Build thing', agentId: 'builder-z' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',
@@ -436,7 +434,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC', skillset: null })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
     expect(out).toEqual([
       {
         type: 'text',

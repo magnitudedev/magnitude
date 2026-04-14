@@ -17,8 +17,8 @@ export interface CommandContext {
   activateSkill: (skillName: string, skillPath: string | undefined, args: string) => void
   /** Run the /init flow: explore codebase and generate AGENTS.md */
   initProject: () => void
-  /** Handle /settings, /model, /provider commands — open settings overlay */
-  openSettings: (tab?: 'provider' | 'model') => void
+  /** Handle /settings, /model, /provider, /skillset commands — open settings overlay */
+  openSettings: (tab?: 'provider' | 'model' | 'skillset') => void
   /** Open the setup wizard */
   openSetup: () => void
   /** Open the browser setup overlay */
@@ -146,6 +146,10 @@ export function routeSlashCommand(input: string, ctx: CommandContext): boolean {
 
     case 'provider':
       ctx.openSettings('provider')
+      return true
+
+    case 'skillset':
+      ctx.openSettings('skillset')
       return true
 
     case 'browser-setup':
