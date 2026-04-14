@@ -225,10 +225,11 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     (entry): entry is Extract<TimelineEntry, { kind: 'task_update' }> => entry.kind === 'task_update',
   )
   const chronological = input.timeline.filter(
-    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_idle_hook' | 'task_complete_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }> =>
+    (entry): entry is Exclude<TimelineEntry, { kind: 'lifecycle_hook' | 'task_idle_hook' | 'task_complete_hook' | 'task_start_hook' | 'task_tree_dirty' | 'task_tree_view' | 'task_update' }> =>
       entry.kind !== 'lifecycle_hook'
       && entry.kind !== 'task_idle_hook'
       && entry.kind !== 'task_complete_hook'
+      && entry.kind !== 'task_start_hook'
       && entry.kind !== 'task_tree_dirty'
       && entry.kind !== 'task_tree_view'
       && entry.kind !== 'task_update',

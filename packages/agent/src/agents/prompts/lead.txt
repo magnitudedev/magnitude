@@ -96,13 +96,9 @@ Make sure to continuously update tasks as they are completed (only once you are 
 Organize tasks under composite ones for larger blocks of work.
 Cancel any tasks that are no longer part of the intended work trajectory.
 
-## Active skillset
+{{SKILLSET_SECTION}}
 
-{{SKILLSET}}
-
-## Available task types
-
-{{TASK_TYPES}}
+{{TASK_TYPES_SECTION}}
 
 ## Thinking, planning, and presenting plans
 

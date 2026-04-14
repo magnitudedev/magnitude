@@ -36,8 +36,18 @@ export function renderSystemPrompt(
     )
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)
-    .replaceAll('{{SKILLSET}}', skillset.content)
-    .replaceAll('{{TASK_TYPES}}', renderTaskTypeReferenceTable(skillset))
+    .replaceAll(
+      '{{SKILLSET_SECTION}}',
+      skillset.content
+        ? `## Active skillset\n\n${skillset.content}`
+        : '',
+    )
+    .replaceAll(
+      '{{TASK_TYPES_SECTION}}',
+      skillset.content
+        ? `## Available task types\n\n${renderTaskTypeReferenceTable(skillset)}`
+        : '',
+    )
     //.replaceAll('{{WORKSPACE_SECTION}}', workspaceRaw)
     + '\n\n' + fewShotNoteRaw
 }

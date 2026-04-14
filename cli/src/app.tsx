@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type ToolStateProjectionState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type ToolStateProjectionState, publishSkillset } from '@magnitudedev/agent'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence, loadSessionSummary } from './persistence'
 
@@ -38,6 +38,7 @@ import { useRecentChatsNavigation } from './hooks/use-recent-chats-navigation'
 import { useModelSelectNavigation } from './hooks/use-model-select-navigation'
 import { useProviderSelectNavigation } from './hooks/use-provider-select-navigation'
 import type { SettingsTab } from './hooks/use-settings-navigation'
+import { useSkillsetSettings } from './hooks/use-skillset-settings'
 import { useAuthFlow } from './hooks/use-auth-flow'
 import { type WizardStep } from './components/setup-wizard-overlay'
 import { AppOverlays } from './components/app-overlays'
@@ -1704,6 +1705,12 @@ function AppInner({
     }
   }, [authFlow.showAuthMethodOverlay, authFlow.authMethodProvider?.id])
 
+  const skillsetSettings = useSkillsetSettings({
+    onPublishSkillset: (skillset) => {
+      client?.runEffect(publishSkillset(skillset))
+    },
+  })
+
   const providerTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
     if (providerDetailId) {
       const plain = !key.ctrl && !key.meta && !key.option
@@ -2060,9 +2067,15 @@ function AppInner({
       handleChangeSlot={handleChangeSlot}
       modelTabHandleKeyEvent={modelTabHandleKeyEvent}
       providerTabHandleKeyEvent={providerTabHandleKeyEvent}
+      skillsetTabHandleKeyEvent={skillsetSettings.handleKeyEvent}
       modelNavigation={modelNavigation}
       providerNavigation={providerNavigation}
       onSettingsClose={onSettingsClose}
+      availableSkillsets={skillsetSettings.availableSkillsets}
+      selectedSkillsetName={skillsetSettings.selectedName}
+      skillsetSelectedIndex={skillsetSettings.selectedIndex}
+      onSkillsetSelect={skillsetSettings.onSelect}
+      onSkillsetHoverIndex={skillsetSettings.onHoverIndex}
       onBackFromModelPicker={handleBackFromModelPicker}
       presets={presets}
       systemDefaultsPresetToken={SYSTEM_DEFAULTS_PRESET}

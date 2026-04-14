@@ -112,8 +112,14 @@ test('load preset modal includes local provider defaults rows', () => {
         onModelPrefsHoverIndex={noop}
         onModelHandleKeyEvent={() => false}
         onProviderHandleKeyEvent={() => false}
+        onSkillsetHandleKeyEvent={() => false}
         onBackFromModelPicker={noop}
         onBackFromProviderDetail={noop}
+        availableSkillsets={[]}
+        selectedSkillsetName={null}
+        skillsetSelectedIndex={0}
+        onSkillsetSelect={noopAsync}
+        onSkillsetHoverIndex={noop}
         presets={[]}
         systemDefaultsPresetToken="__system_defaults__"
         onSavePreset={noopAsync}
@@ -191,8 +197,14 @@ test('load preset modal keeps non-local provider defaults behavior', () => {
         onModelPrefsHoverIndex={noop}
         onModelHandleKeyEvent={() => false}
         onProviderHandleKeyEvent={() => false}
+        onSkillsetHandleKeyEvent={() => false}
         onBackFromModelPicker={noop}
         onBackFromProviderDetail={noop}
+        availableSkillsets={[]}
+        selectedSkillsetName={null}
+        skillsetSelectedIndex={0}
+        onSkillsetSelect={noopAsync}
+        onSkillsetHoverIndex={noop}
         presets={[]}
         systemDefaultsPresetToken="__system_defaults__"
         onSavePreset={noopAsync}
