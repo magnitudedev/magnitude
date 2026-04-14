@@ -1,159 +1,143 @@
-import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { describe, it, expect } from 'vitest'
+import { Effect } from 'effect'
 import { parseSkill } from '../parser'
-import { resolveTemplates } from '../template'
 
-const featureContent = readFileSync(resolve(import.meta.dir, '../../../../.magnitude/skills/feature/SKILL.md'), 'utf8')
-const bugContent = readFileSync(resolve(import.meta.dir, '../../../../.magnitude/skills/bug/SKILL.md'), 'utf8')
-const refactorContent = readFileSync(resolve(import.meta.dir, '../../../../.magnitude/skills/refactor/SKILL.md'), 'utf8')
+const runParseSkill = (content: string) => Effect.runSync(parseSkill(content))
 
 describe('parseSkill', () => {
-  test('parses feature skill', () => {
-    const skill = parseSkill(featureContent)
-
-    expect(skill.name).toBe('feature')
-    expect(skill.description).toBe('Plan, approve, build, and review a feature')
-    expect(skill.preamble).toBe('')
-    expect(skill.phases.map((p) => p.name)).toEqual(['explore', 'plan', 'build', 'review'])
-
-    expect(skill.phases[0].submit?.fields).toEqual([
-      {
-        type: 'file',
-        name: 'findings',
-        fileType: 'md',
-        description: 'Exploration findings covering architecture, patterns, and integration points',
-      },
-    ])
-
-    expect(skill.phases[1].criteria).toEqual([
-      {
-        type: 'user-approval',
-        name: '',
-        message: 'Review the implementation plan. Ready to begin implementation?',
-      },
-    ])
-
-    expect(skill.phases[3].criteria).toEqual([
-      { type: 'shell-succeed', name: 'tests', command: 'bash {{build.test_script}}' },
-      {
-        type: 'agent-approval',
-        name: 'review',
-        subagent: 'reviewer',
-        prompt:
-          'Review the implementation for correctness, code quality, test coverage, and adherence to the plan at {{plan.plan}}.',
-      },
-    ])
-
-    expect(skill.phases[1].prompt).toContain('Based on `{{explore.findings}}`, create a detailed implementation plan.')
-  })
-
-  test('parses bug skill', () => {
-    const skill = parseSkill(bugContent)
-
-    expect(skill.name).toBe('bug')
-    expect(skill.description).toBe('Systematically diagnose, reproduce, and fix a bug')
-    expect(skill.preamble).toBe('')
-    expect(skill.phases.map((p) => p.name)).toEqual(['investigate', 'reproduce', 'fix', 'verify'])
-
-    expect(skill.phases[0].submit?.fields).toEqual([
-      {
-        type: 'file',
-        name: 'analysis',
-        fileType: 'md',
-        description: 'Analysis of involved systems, potential causes, and debugging strategy',
-      },
-    ])
-
-    expect(skill.phases[1].criteria).toEqual([
-      { type: 'shell-succeed', name: 'repro', command: '! bash {{reproduce.repro_test}}' },
-    ])
-    expect(skill.phases[3].criteria?.[1]).toEqual({
-      type: 'agent-approval',
-      name: 'review',
-      subagent: 'reviewer',
-      prompt:
-        'Review the fix for correctness and ensure it addresses the root cause identified in {{investigate.analysis}} without introducing regressions.',
-    })
-
-    expect(skill.phases[1].prompt).toContain('The reproduction script must fail (exit non-zero)')
-  })
-
-  test('parses refactor skill', () => {
-    const skill = parseSkill(refactorContent)
-
-    expect(skill.name).toBe('refactor')
-    expect(skill.description).toBe('Safely refactor code with test-verified behavior parity')
-    expect(skill.preamble).toBe('')
-    expect(skill.phases.map((p) => p.name)).toEqual(['scope', 'baseline', 'refactor', 'verify'])
-
-    expect(skill.phases[0].submit?.fields).toEqual([
-      {
-        type: 'file',
-        name: 'scope_doc',
-        fileType: 'md',
-        description: 'Document describing refactor scope and approach',
-      },
-      {
-        type: 'file',
-        name: 'test_script',
-        fileType: 'sh',
-        description: 'Script that runs the relevant tests and captures results',
-      },
-    ])
-
-    expect(skill.phases[1].submit?.fields).toEqual([
-      {
-        type: 'file',
-        name: 'baseline_results',
-        fileType: undefined,
-        description: 'Baseline test results',
-      },
-    ])
-
-    expect(skill.phases[2].criteria).toEqual([
-      { type: 'shell-succeed', name: 'parity', command: 'bash {{refactor.verify_script}}' },
-    ])
-    expect(skill.phases[3].criteria?.[1]).toEqual({
-      type: 'agent-approval',
-      name: 'review',
-      subagent: 'reviewer',
-      prompt:
-        'Review the refactored code for quality, readability, and adherence to the scope defined in {{scope.scope_doc}}.',
-    })
-
-    expect(skill.phases[0].prompt).toContain('Identify the scope of this refactor.')
-  })
-
-  test('supports skills with no phases', () => {
+  it('plain skill (no markers) — body goes to shared', () => {
     const content = `---
-name: docs
-description: no phase doc
+name: foo
+description: does foo
 ---
 
-# Hello
-
-This is preamble content only.
+Just instructions here.
 `
-    const skill = parseSkill(content)
-
-    expect(skill.name).toBe('docs')
-    expect(skill.description).toBe('no phase doc')
-    expect(skill.phases).toEqual([])
-    expect(skill.preamble).toContain('# Hello')
+    const skill = runParseSkill(content)
+    expect(skill.name).toBe('foo')
+    expect(skill.description).toBe('does foo')
+    expect(skill.sections.shared).toBe('Just instructions here.')
+    expect(skill.sections.lead).toBe('')
+    expect(skill.sections.worker).toBe('')
+    expect(skill.sections.handoff).toBe('')
   })
-})
 
-describe('resolveTemplates', () => {
-  test('replaces {{phase.field}} values', () => {
-    const resolved = resolveTemplates(
-      'Use {{plan.file}} and {{build.script}} (keep {{missing.value}})',
-      new Map([
-        ['plan.file', 'plan.md'],
-        ['build.script', 'test.sh'],
-      ]),
-    )
+  it('full skill (all markers) — each section populated', () => {
+    const content = `---
+name: implement
+description: Build a code change
+---
 
-    expect(resolved).toBe('Use plan.md and test.sh (keep {{missing.value}})')
+<!-- @lead -->
+Lead orchestration guidance.
+
+<!-- @worker -->
+Worker instructions.
+
+<!-- @handoff -->
+What to check on return.
+`
+    const skill = runParseSkill(content)
+    expect(skill.sections.shared).toBe('')
+    expect(skill.sections.lead).toBe('Lead orchestration guidance.')
+    expect(skill.sections.worker).toBe('Worker instructions.')
+    expect(skill.sections.handoff).toBe('What to check on return.')
+  })
+
+  it('accumulation — two @worker blocks join with double newline', () => {
+    const content = `---
+name: multi
+description: test
+---
+
+<!-- @worker -->
+First worker block.
+
+<!-- @worker -->
+Second worker block.
+`
+    const skill = runParseSkill(content)
+    expect(skill.sections.worker).toBe('First worker block.\n\nSecond worker block.')
+  })
+
+  it('mixed preamble + markers — preamble goes to shared', () => {
+    const content = `---
+name: mixed
+description: test
+---
+
+Shared preamble content.
+
+<!-- @lead -->
+Lead-only content.
+`
+    const skill = runParseSkill(content)
+    expect(skill.sections.shared).toBe('Shared preamble content.')
+    expect(skill.sections.lead).toBe('Lead-only content.')
+  })
+
+  it('explicit @shared after other markers — shared accumulates', () => {
+    const content = `---
+name: explicit-shared
+description: test
+---
+
+<!-- @worker -->
+Worker content.
+
+<!-- @shared -->
+Explicit shared content.
+`
+    const skill = runParseSkill(content)
+    expect(skill.sections.worker).toBe('Worker content.')
+    expect(skill.sections.shared).toBe('Explicit shared content.')
+  })
+
+  it('thinking parsing — produces ThinkingLens array', () => {
+    const content = `---
+name: think
+description: test
+thinking:
+  - lens: quality
+    trigger: When editing files
+    description: Does this hold up to project standards?
+  - lens: turn
+    trigger: When deciding next action
+    description: What is the most focused next action?
+---
+
+Body content.
+`
+    const skill = runParseSkill(content)
+    expect(skill.thinking).toHaveLength(2)
+    expect(skill.thinking[0]).toEqual({
+      lens: 'quality',
+      trigger: 'When editing files',
+      description: 'Does this hold up to project standards?',
+    })
+    expect(skill.thinking[1]).toEqual({
+      lens: 'turn',
+      trigger: 'When deciding next action',
+      description: 'What is the most focused next action?',
+    })
+  })
+
+  it('missing frontmatter — name/description empty, body goes to shared', () => {
+    const content = `Just some content without frontmatter.`
+    const skill = runParseSkill(content)
+    expect(skill.name).toBe('')
+    expect(skill.description).toBe('')
+    expect(skill.sections.shared).toBe('Just some content without frontmatter.')
+  })
+
+  it('empty skill — all fields empty', () => {
+    const skill = runParseSkill('')
+    expect(skill.name).toBe('')
+    expect(skill.description).toBe('')
+    expect(skill.thinking).toHaveLength(0)
+    expect(skill.sections.shared).toBe('')
+    expect(skill.sections.lead).toBe('')
+    expect(skill.sections.worker).toBe('')
+    expect(skill.sections.handoff).toBe('')
   })
 })
