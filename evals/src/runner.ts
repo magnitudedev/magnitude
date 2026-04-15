@@ -103,7 +103,13 @@ export async function callModel(
             {
               systemPrompt,
               messages,
-              ackTurn: '<lenses>task: no</lenses>\n<comms>\n<message>Ready.</message>\n</comms>',
+              ackTurns: [
+                { role: 'user', content: '--- FEW-SHOT EXAMPLE START ---\n<system>\nRespond using the required turn format. The user reports a bug in the login redirect.\n</system>' },
+                { role: 'assistant', content: '<lens name="skills">Bug report → activate the bug skill to load methodology.</lens>\n<lens name="tasks">Bug fix isn\'t one-turnable. Need to understand and delegate.</lens>\n<skill name="bug" />\n<read path="src/auth/redirect.ts" />\n<end-turn>\n<continue/>\n</end-turn>' },
+                { role: 'user', content: '<turn_result>\n<tool name="skill"><content># Skill: Bug\n\nProvides methodology for diagnosing and fixing bugs.</content></tool>\n<tool name="read">export function redirectAfterLogout(req, res) {\n  res.redirect(\'/home\') // Bug: should redirect to \'/login\'\n}</tool>\n</turn_result>' },
+                { role: 'assistant', content: '<lens name="skills">Skill loaded. Bug skill says: diagnose root cause first, then fix.</lens>\n<lens name="tasks">Create a bug task and spawn a debugger worker.</lens>\n<create-task id="fix-redirect" type="bug" title="Fix login redirect bug" />\n<spawn-worker id="fix-redirect">The redirect function is using \'/home\' instead of \'/login\'. Diagnose and fix.</spawn-worker>\n<message to="user">Found the bug — redirectAfterLogout sends to `/home` instead of `/login`. Worker is fixing it now.</message>\n<end-turn>\n<idle/>\n</end-turn>' },
+                { role: 'user', content: '--- FEW-SHOT EXAMPLE END ---' },
+              ],
             },
           )
         }).pipe(Effect.provide(Layer.merge(makeModelResolver().pipe(Layer.provide(client.layer), Layer.provide(makeNoopTracer())), makeNoopTracer()))),

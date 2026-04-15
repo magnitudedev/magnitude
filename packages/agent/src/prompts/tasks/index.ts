@@ -1,4 +1,4 @@
-import type { Skillset } from '@magnitudedev/skills'
+import type { Skill } from '@magnitudedev/skills'
 
 /**
  * Prompt text for task lifecycle hook reminders.
@@ -6,11 +6,11 @@ import type { Skillset } from '@magnitudedev/skills'
  */
 
 /**
- * Lightweight reference table for system prompt, driven by the active skillset.
+ * Lightweight reference table for system prompt, driven by the active skills.
  */
-export function renderTaskTypeReferenceTable(skillset: Skillset): string {
+export function renderTaskTypeReferenceTable(skills: Map<string, Skill>): string {
   const lines: string[] = []
-  for (const [name, skill] of Object.entries(skillset.skills)) {
+  for (const [name, skill] of skills.entries()) {
     lines.push(`- **${skill.name}** (\`${name}\`) — ${skill.description}`)
   }
   return lines.join('\n')

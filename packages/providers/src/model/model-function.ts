@@ -30,7 +30,7 @@ function includeSystemPromptMessage(model: BoundModel): boolean {
 }
 
 export const CodingAgentChat: StreamingFn<
-  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] }; ackTurn: string },
+  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] }; ackTurns: { role: string; content: string[] }[] },
   ChatStream
 > = {
   name: 'CodingAgentChat',
@@ -38,7 +38,7 @@ export const CodingAgentChat: StreamingFn<
   execute: (model, input) =>
     model.stream(
       'CodingAgentChat',
-      [input.systemPrompt, input.messages, input.ackTurn, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
+      [input.systemPrompt, input.messages, input.ackTurns, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
       {
         stopSequences: input.options?.stopSequences,
         ...(codexCallOptions(model, input.systemPrompt) ?? {}),

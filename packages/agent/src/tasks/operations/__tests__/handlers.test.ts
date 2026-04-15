@@ -10,18 +10,14 @@ import { handleMessageDirective } from '../message'
 import { handleUpdateDirective } from '../update'
 import { handleSpawnWorkerDirective } from '../spawn-worker'
 import { handleKillWorkerDirective } from '../kill-worker'
-import type { Skillset } from '@magnitudedev/skills'
+import type { Skill } from '@magnitudedev/skills'
 
-const mkSkillset = (): Skillset => ({
-  path: '',
-  content: '',
-  skills: {
-    feature: { name: 'feature', description: 'Feature task', thinking: [], sections: { lead: '', shared: '', worker: '', handoff: '' }, path: '' },
-    bug: { name: 'bug', description: 'Bug fix', thinking: [], sections: { lead: '', shared: '', worker: '', handoff: '' }, path: '' },
-  },
-})
+const mkSkills = (): Map<string, Skill> => new Map([
+  ['feature', { name: 'feature', description: 'Feature task', thinking: [], sections: { lead: '', shared: '', worker: '', handoff: '' }, path: '' }],
+  ['bug', { name: 'bug', description: 'Bug fix', thinking: [], sections: { lead: '', shared: '', worker: '', handoff: '' }, path: '' }],
+])
 
-const mkCtx = () => ({ forkId: null as null, timestamp: Date.now(), graph: { tasks: new Map() }, skillset: mkSkillset() })
+const mkCtx = () => ({ forkId: null as null, timestamp: Date.now(), graph: { tasks: new Map() }, skills: mkSkills() })
 
 const mkTaskState = (overrides?: Partial<TaskGraphState>): TaskGraphState => ({
   tasks: new Map(),

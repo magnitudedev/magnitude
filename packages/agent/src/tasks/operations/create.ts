@@ -3,7 +3,7 @@ import { WorkerBusTag } from '@magnitudedev/event-core'
 import type { AppEvent } from '../../events'
 import { TaskGraphStateReaderTag } from '../../tools/task-reader'
 import { buildTaskCreatedValidated, buildTaskStatusChangedValidated } from './builders'
-import { duplicateTaskId, parentNotFound, invalidTaskType } from './errors'
+import { duplicateTaskId, parentNotFound } from './errors'
 import type { TaskDirectiveContext, TaskDirectiveResult } from './handler'
 
 export interface CreateDirective {
@@ -17,11 +17,7 @@ export interface CreateDirective {
 
 export const handleCreateDirective = (directive: CreateDirective, context: TaskDirectiveContext) =>
   Effect.gen(function* () {
-    const normalizedType = directive.taskType.trim().toLowerCase()
-    if (!context.skillset.skills[normalizedType]) {
-      const err = invalidTaskType(directive.taskId, directive.taskType)
-      return { success: false, code: err.code, error: err.message } as const
-    }
+    const normalizedType = directive.taskType ? directive.taskType.trim().toLowerCase() : ''
     const taskReader = yield* TaskGraphStateReaderTag
     const existingTask = yield* taskReader.getTask(directive.taskId)
     if (existingTask) {

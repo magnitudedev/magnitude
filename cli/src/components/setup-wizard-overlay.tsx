@@ -20,12 +20,7 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
 
 export const SLOT_UI_ORDER: { slot: MagnitudeSlot; label: string; description: string }[] = [
   { slot: 'lead', label: 'Lead', description: '(Coordinates all worker usage)' },
-  { slot: 'explorer', label: 'Explorer', description: '(Reads lots of files and does web searches)' },
-  { slot: 'planner', label: 'Planner', description: '(Plans out implementation approaches)' },
-  { slot: 'builder', label: 'Builder', description: '(Implements changes in files)' },
-  { slot: 'reviewer', label: 'Reviewer', description: '(Reviews code for correctness)' },
-  { slot: 'debugger', label: 'Debugger', description: '(Root causes and fixes issues)' },
-  { slot: 'browser', label: 'Browser', description: '(Visually navigates a browser)' },
+  { slot: 'worker', label: 'Worker', description: '(Implements tasks with skill activation)' },
 ]
 
 export type WizardStep = 'provider' | 'local-provider' | 'models' | 'browser'

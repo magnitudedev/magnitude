@@ -7,7 +7,7 @@ template_string ProseClose #"</raw>"#
 function CodingAgentChat(
   systemPrompt: string,
   messages: ChatMessage[],
-  ackTurn: string,
+  ackTurns: ChatMessage[],
   includeClaudeSpoof: bool,
   includeSystemPromptMessage: bool
 ) -> string {
@@ -22,18 +22,14 @@ function CodingAgentChat(
     {{ systemPrompt }}
     {%endif%}
 
-    {%if ackTurn %}
-    {{ _.role("user") }}
-    --- FEW-SHOT EXAMPLE START ---
-    <system>
-    Respond using the required turn format. Send a brief readiness message to your default recipient and continue.
-    </system>
-
-    {{ _.role("assistant") }}
-    {{ ackTurn }}
-
-    {{ _.role("user") }}
-    --- FEW-SHOT EXAMPLE END ---
+    {%if ackTurns %}
+    {% for msg in ackTurns %}
+    {% if msg.role == "user" %}
+      {{ RenderUserContent(msg.content, false) }}
+    {% else %}
+      {{ RenderAssistantContent(msg.content, false) }}
+    {% endif %}
+    {% endfor %}
     {%endif%}
     {% for message in messages %}
     {% if message.role == "user" %}

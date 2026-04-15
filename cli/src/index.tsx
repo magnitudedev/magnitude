@@ -16,11 +16,8 @@ import { isLightBackground } from './utils/theme'
 import { installGracefulShutdownHandlers } from './utils/graceful-shutdown'
 
 import { runOneshot } from './oneshot'
-import { provisionMagnitudeSkillset } from '@magnitudedev/skills'
 
 async function main() {
-  // Auto-provision magnitude skillset on first run
-  await provisionMagnitudeSkillset()
   // Initialize theme store before rendering (defaults to dark)
   initThemeStore()
 
@@ -126,6 +123,18 @@ async function main() {
         debug: options.debug ?? false
       })
     })
+
+  program
+    .command('skills')
+    .description('Manage skills')
+    .addCommand(
+      new Command('init')
+        .description('Initialize project skills from built-in defaults')
+        .action(async () => {
+          const { initProjectSkills } = await import('@magnitudedev/skills')
+          await initProjectSkills(process.cwd())
+        })
+    )
 
   program.parse()
 }

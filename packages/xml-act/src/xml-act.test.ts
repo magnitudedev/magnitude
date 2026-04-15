@@ -623,20 +623,6 @@ describe('xml-act end-to-end', () => {
   })
 
   // =========================================================================
-  // Actions wrapper
-  // =========================================================================
-
-  test('tools inside <task id="t1"> block execute normally', async () => {
-    const cfg = config([registered(readTool, 'read', readBinding)])
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><read id="r2" path="b.ts"/>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const ended = eventsOfType(events, 'ToolExecutionEnded')
-    expect(ended).toHaveLength(1)
-    expect(ended[0].result._tag).toBe('Success')
-  })
-
-  // =========================================================================
   // Prose before/between/after tools
   // =========================================================================
 
@@ -1114,15 +1100,6 @@ describe('unknown tag prose emission', () => {
     const prose = eventsOfType(events, 'MessageEnd')
     expect(prose.length).toBeGreaterThanOrEqual(1)
     expect(messageText(events)).toContain('<unknown  attr="val" />')
-  })
-
-  test('unknown tag between known tool calls does not interfere', async () => {
-    const xml = `${ACTIONS_TAG_OPEN}<read id="r1" path="a.ts"/><read id="r2" path="b.ts"/>${ACTIONS_TAG_CLOSE}`
-    const events = await runStream(cfg, xml)
-
-    const execEnded = eventsOfType(events, 'ToolExecutionEnded')
-    expect(execEnded).toHaveLength(1)
-    expect(execEnded[0].result._tag).toBe('Success')
   })
 
   test('unknown tag body streams as message char-by-char', async () => {
@@ -1759,19 +1736,6 @@ describe('prose streaming (parser-level)', () => {
     // The prose read tag should appear as literal text in prose events
     const proseChunks = parseEvents(events, 'ProseChunk').filter(c => c.patternId === 'prose')
     const allText = proseChunks.map(c => c.text).join('')
-    expect(allText).toContain('<read')
-  })
-})
-
-// =============================================================================
-// Prose streaming tests (runtime-level, full pipeline)
-// =============================================================================
-
-describe('prose streaming (runtime-level)', () => {
-
-  const cfg = config([registered(readTool, 'read', readBinding)])
-
-  test('prose emits MessageChunk', async () => {
     const events = await runStreamChunked(cfg, [`Hello world\n${ACTIONS_TAG_OPEN}<read id="r1" path="x"/>${ACTIONS_TAG_CLOSE}`])
     const chunks = eventsOfType(events, 'MessageChunk')
     expect(chunks.length).toBeGreaterThan(0)

@@ -68,3 +68,60 @@ export function buildAckTurn(
 ${TURN_CONTROL_CONTINUE}
 `
 }
+
+export interface AckTurnMessage {
+  role: 'user' | 'assistant'
+  content: string[]
+}
+
+export function buildAckTurns(
+  _lenses: ThinkingLens[],
+  defaultRecipient: 'user' | 'parent' = 'user',
+): AckTurnMessage[] {
+  return [
+    {
+      role: 'user',
+      content: [`--- FEW-SHOT EXAMPLE START ---
+<system>
+Respond using the required turn format. The user reports a bug in the login redirect.
+</system>`]
+    },
+    {
+      role: 'assistant',
+      content: [`<${LENS_TAG} name="skills">Bug report → activate the bug skill to load methodology.</${LENS_TAG}>
+<${LENS_TAG} name="tasks">Bug fix isn't one-turnable. Need to understand and delegate.</${LENS_TAG}>
+<skill name="bug" />
+<read path="src/auth/redirect.ts" />
+${TURN_CONTROL_CONTINUE}`]
+    },
+    {
+      role: 'user',
+      content: [`<turn_result>
+<tool name="skill"><content># Skill: Bug
+
+Provides methodology for diagnosing and fixing bugs.
+
+## Steps
+1. Identify root cause
+2. Write minimal fix
+3. Test the fix</content></tool>
+<tool name="read">export function redirectAfterLogout(req, res) {
+  res.redirect('/home') // Bug: should redirect to '/login'
+}</tool>
+</turn_result>`]
+    },
+    {
+      role: 'assistant',
+      content: [`<${LENS_TAG} name="skills">Skill loaded. Bug skill says: diagnose root cause first, then fix.</${LENS_TAG}>
+<${LENS_TAG} name="tasks">Create a bug task and spawn a debugger worker.</${LENS_TAG}>
+<create-task id="fix-redirect" type="bug" title="Fix login redirect bug" />
+<spawn-worker id="fix-redirect">The redirect function is using '/home' instead of '/login'. Diagnose and fix.</spawn-worker>
+<${MESSAGE_TAG} to="${defaultRecipient}">Found the bug — redirectAfterLogout sends to \`/home\` instead of \`/login\`. Worker is fixing it now.</${MESSAGE_TAG}>
+${TURN_CONTROL_IDLE}`]
+    },
+    {
+      role: 'user',
+      content: ['--- FEW-SHOT EXAMPLE END ---\n\n--- CONVERSATION START ---']
+    }
+  ]
+}

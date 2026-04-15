@@ -41,6 +41,9 @@ export function createXmlActFormat(
   handlers.set(END_TURN_TAG, endTurnHandler())
 
   for (const tool of tools) {
+    // Skip tags that already have dedicated structural handlers
+    if (handlers.has(tool.tag)) continue
+    
     const toolTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>> = new Map()
     for (const childTag of tool.childTags) {
       toolTags.set(childTag, childHandler())

@@ -11,7 +11,7 @@ import type { TaskOperationGraphSnapshot } from '../tasks/operations/types'
 import { formatTaskOutsideSubtreeError } from '../prompts'
 import type { TaskRecord } from '../projections/task-graph'
 import { AmbientServiceTag } from '@magnitudedev/event-core'
-import { SkillsetAmbient } from '../ambient'
+import { SkillsAmbient } from '../ambient'
 
 const TaskToolErrorSchema = ToolErrorSchema('TaskToolError', {})
 
@@ -73,12 +73,12 @@ const runDirective = (directive: Parameters<typeof handleTaskDirective>[0]) =>
     }
 
     const ambientService = yield* AmbientServiceTag
-    const skillset = ambientService.getValue(SkillsetAmbient)
+    const skills = ambientService.getValue(SkillsAmbient)
     const result = yield* handleTaskDirective(directive, {
       forkId,
       timestamp: Date.now(),
       graph: toGraphSnapshot(state.tasks),
-      skillset,
+      skills,
     })
 
     if (result.success === false) {
@@ -99,7 +99,7 @@ export const createTaskTool = defineTool({
   description: 'Create a task.',
   inputSchema: Schema.Struct({
     id: Schema.String,
-    type: Schema.String,
+    type: Schema.optional(Schema.String),
     title: Schema.String,
     parent: Schema.optional(Schema.String),
   }),
@@ -110,7 +110,7 @@ export const createTaskTool = defineTool({
       yield* runDirective({
         kind: 'create',
         taskId: input.id,
-        taskType: input.type,
+        taskType: input.type ?? '',
         parentId: input.parent ?? null,
         title: input.title,
       })

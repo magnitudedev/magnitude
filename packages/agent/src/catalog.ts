@@ -112,6 +112,8 @@ import { spawnWorkerModel } from './models/spawn-worker'
 import { killWorkerModel } from './models/kill-worker'
 import { agentCreateModel } from './models/agent-create'
 import { agentKillModel } from './models/agent-kill'
+import { skillTool, skillXmlBinding } from './tools/skill-tool'
+import { skillActivationModel } from './models/skill-activation'
 
 export const catalog = defineCatalog({
   shell: { tool: shellTool, binding: shellXmlBinding, state: shellModel },
@@ -144,6 +146,7 @@ export const catalog = defineCatalog({
   updateTask: { tool: updateTaskTool, binding: updateTaskXmlBinding, state: updateTaskModel, display: false },
   spawnWorker: { tool: spawnWorkerTool, binding: spawnWorkerXmlBinding, state: spawnWorkerModel, display: false },
   killWorker: { tool: killWorkerTool, binding: killWorkerXmlBinding, state: killWorkerModel, display: false },
+  skill: { tool: skillTool, binding: skillXmlBinding, state: skillActivationModel },
 } as const)
 
 export type ToolKey = keyof typeof catalog.entries

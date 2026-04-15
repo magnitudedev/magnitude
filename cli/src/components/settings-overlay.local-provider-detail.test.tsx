@@ -127,14 +127,8 @@ function renderDetail(params: {
       onModelPrefsHoverIndex={noop}
       onModelHandleKeyEvent={() => false}
       onProviderHandleKeyEvent={() => false}
-      onSkillsetHandleKeyEvent={() => false}
       onBackFromModelPicker={noop}
       onBackFromProviderDetail={noop}
-      availableSkillsets={[]}
-      selectedSkillsetName={null}
-      skillsetSelectedIndex={0}
-      onSkillsetSelect={noopAsync}
-      onSkillsetHoverIndex={noop}
       presets={[]}
       systemDefaultsPresetToken="__system_defaults__"
       onSavePreset={noopAsync}
@@ -341,15 +335,9 @@ test('provider-detail keyboard path ignores plain b and Esc still goes back', ()
           providerKeyCalls += 1
           return false
         }}
-        onSkillsetHandleKeyEvent={() => false}
         onBackFromModelPicker={noop}
         onBackFromProviderDetail={() => { escBackCalls += 1 }}
-        availableSkillsets={[]}
-        selectedSkillsetName={null}
-        skillsetSelectedIndex={0}
-        onSkillsetSelect={noopAsync}
-        onSkillsetHoverIndex={noop}
-          presets={[]}
+        presets={[]}
         systemDefaultsPresetToken="__system_defaults__"
         onSavePreset={noopAsync}
         onLoadPreset={noopAsync}

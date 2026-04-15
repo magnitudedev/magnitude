@@ -14,8 +14,8 @@ import { AgentStatusProjection, type AgentStatusState } from './agent-status'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { CanonicalTurnProjection } from './canonical-turn'
 import { ConfigAmbient, getSlotConfig, type SlotConfig, type ConfigState } from '../ambient/config-ambient'
-import { SkillsetAmbient } from '../ambient/skillset-ambient'
-import type { Skillset } from '@magnitudedev/skills'
+import { SkillsAmbient } from '../ambient/skills-ambient'
+import type { Skill } from '@magnitudedev/skills'
 
 import { CHARS_PER_TOKEN } from '../constants'
 
@@ -72,11 +72,11 @@ function estimateContentTokens(content: string | ContentPart[], modelId?: string
 
 const systemPromptTokenCache = new Map<string, number>()
 
-function estimateSystemPromptTokens(variant: AgentVariant, skillset: Skillset): number {
-  const cacheKey = `${variant}:${skillset.path}`
+function estimateSystemPromptTokens(variant: AgentVariant, skills: Map<string, Skill>): number {
+  const cacheKey = variant
   const cached = systemPromptTokenCache.get(cacheKey)
   if (cached !== undefined) return cached
-  const prompt = renderSystemPrompt(getAgentDefinition(variant), skillset)
+  const prompt = renderSystemPrompt(getAgentDefinition(variant), skills)
   const tokens = Math.ceil(prompt.length / CHARS_PER_TOKEN)
   systemPromptTokenCache.set(cacheKey, tokens)
   return tokens
@@ -245,7 +245,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
   name: 'Compaction',
 
   reads: [AgentRoutingProjection, AgentStatusProjection, UserMessageResolutionProjection, CanonicalTurnProjection] as const,
-  ambients: [ConfigAmbient, SkillsetAmbient] as const,
+  ambients: [ConfigAmbient, SkillsAmbient] as const,
 
   signals: {
     shouldCompactChanged: Signal.create<{ forkId: string | null; shouldCompact: boolean }>('Compaction/shouldCompactChanged'),
@@ -267,8 +267,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
     session_initialized: ({ event, fork, emit, ambient, read }) => {
       const content = buildSessionContextContent(event.context)
       const contentTokens = estimateContentTokens(content)
-      const skillset = ambient.get(SkillsetAmbient)
-      const tokenEstimate = estimateSystemPromptTokens('lead', skillset) + contentTokens
+      const skills = ambient.get(SkillsAmbient)
+      const tokenEstimate = estimateSystemPromptTokens('lead', skills) + contentTokens
 
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
@@ -441,8 +441,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
         throw new Error(`Unknown agent variant: ${role}`)
       }
 
-      const skillset = ambient.get(SkillsetAmbient)
-      const tokenEstimate = estimateSystemPromptTokens(variant, skillset)
+      const skills = ambient.get(SkillsAmbient)
+      const tokenEstimate = estimateSystemPromptTokens(variant, skills)
       const configState = ambient.get(ConfigAmbient)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, forkId)
@@ -486,7 +486,7 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
   ],
 
   ambientHandlers: (on) => ([
-    on(SkillsetAmbient, ({ state }) => state),
+    on(SkillsAmbient, ({ state }) => state),
     on(ConfigAmbient, ({ value, state, emit, read }) => {
       const nextForks = new Map<string | null, CompactionState>()
       const agentStatus = read(AgentStatusProjection)

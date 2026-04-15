@@ -16,7 +16,7 @@ import type { RecentChat } from '../data/recent-chats'
 import type { useAuthFlow } from '../hooks/use-auth-flow'
 
 import type { Preset, ProviderOptions } from '@magnitudedev/storage'
-import type { SkillsetInfo } from '@magnitudedev/skills'
+
 import { useTheme } from '../hooks/use-theme'
 import { BOX_CHARS } from '../utils/ui-constants'
 
@@ -89,16 +89,10 @@ export type AppOverlaysProps = {
   handleChangeSlot: (slot: MagnitudeSlot) => void
   modelTabHandleKeyEvent: (key: KeyEvent) => boolean
   providerTabHandleKeyEvent: (key: KeyEvent) => boolean
-  skillsetTabHandleKeyEvent: (key: KeyEvent) => boolean
+
   modelNavigation: { items: any[]; selectedIndex: number; setSelectedIndex: (n: number) => void }
   providerNavigation: { selectedIndex: number; setSelectedIndex: (n: number) => void }
   onSettingsClose: () => void
-  // Skillset tab
-  availableSkillsets: SkillsetInfo[]
-  selectedSkillsetName: string | null
-  skillsetSelectedIndex: number
-  onSkillsetSelect: (name: string | null) => Promise<void>
-  onSkillsetHoverIndex: (index: number) => void
   showRecentChatsOverlay: boolean
   recentChats: RecentChat[] | null
   recentChatsSelectedIndex: number
@@ -183,15 +177,9 @@ export function AppOverlays({
   handleChangeSlot,
   modelTabHandleKeyEvent,
   providerTabHandleKeyEvent,
-  skillsetTabHandleKeyEvent,
   modelNavigation,
   providerNavigation,
   onSettingsClose,
-  availableSkillsets,
-  selectedSkillsetName,
-  skillsetSelectedIndex,
-  onSkillsetSelect,
-  onSkillsetHoverIndex,
   showRecentChatsOverlay,
   recentChats,
   recentChatsSelectedIndex,
@@ -373,14 +361,8 @@ export function AppOverlays({
           onModelPrefsHoverIndex={setPreferencesSelectedIndex}
           onModelHandleKeyEvent={modelTabHandleKeyEvent}
           onProviderHandleKeyEvent={providerTabHandleKeyEvent}
-          onSkillsetHandleKeyEvent={skillsetTabHandleKeyEvent}
           onBackFromModelPicker={onBackFromModelPicker}
           onBackFromProviderDetail={handleProviderDetailBack}
-          availableSkillsets={availableSkillsets}
-          selectedSkillsetName={selectedSkillsetName}
-          skillsetSelectedIndex={skillsetSelectedIndex}
-          onSkillsetSelect={onSkillsetSelect}
-          onSkillsetHoverIndex={onSkillsetHoverIndex}
           presets={presets}
           systemDefaultsPresetToken={systemDefaultsPresetToken}
           onSavePreset={onSavePreset}

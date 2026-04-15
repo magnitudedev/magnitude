@@ -18,7 +18,6 @@ export const SLASH_COMMANDS: SlashCommandDefinition[] = [
   { id: 'model',         label: 'model',         description: 'Select or switch model', aliases: ['m'] },
   { id: 'provider',      label: 'provider',      description: 'Manage providers' },
   { id: 'browser-setup', label: 'browser-setup', description: 'Set up the browser agent' },
-  { id: 'skillset',      label: 'skillset',      description: 'Select or switch skillset' },
 ]
 
 let skillCommands: SlashCommandDefinition[] = []

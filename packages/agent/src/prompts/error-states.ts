@@ -18,9 +18,7 @@ export function formatTaskOutsideSubtreeError(taskId: string, attemptedParent: s
   return `Task creation rejected: workers can only create subtasks under assigned task "${assignedTaskId}". Task "${taskId}" with parent "${attemptedParent}" is outside your subtree.`
 }
 
-export function formatInvalidTaskTypeError(taskId: string, taskType: string): string {
-  return `Task creation rejected: task "${taskId}" has invalid type "${taskType}". Use a valid task type.`
-}
+// Task type validation removed - types are now optional and not validated against skills
 
 export function formatTaskNotFoundError(taskId: string): string {
   return `Task operation rejected: task "${taskId}" does not exist.`

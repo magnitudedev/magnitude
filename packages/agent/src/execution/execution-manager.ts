@@ -19,7 +19,7 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
-import { SkillsetAmbient } from '../ambient'
+import { SkillsAmbient } from '../ambient'
 import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
@@ -193,7 +193,6 @@ export class ExecutionManager extends Context.Tag('ExecutionManager')<
  */
 function makeForkLayers(
   forkId: string | null,
-  ambientService: AmbientService,
 
   sessionContextProjection: Projection.ProjectionInstance<SessionContextState>,
   agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
@@ -265,7 +264,6 @@ function makeForkLayers(
     Layer.succeed(PolicyContextProviderTag, policyCtxProvider),
     Layer.succeed(ToolInterceptorTag, providedInterceptor),
     persistenceLayer,
-    Layer.succeed(AmbientServiceTag, ambientService),
   )
 }
 
@@ -275,27 +273,6 @@ function makeForkLayers(
  */
 const makeExecutionManager = Effect.gen(function* () {
   const ephemeralSessionContext = yield* EphemeralSessionContextTag
-  const ambientService: AmbientService = yield* Effect.sync(() => {
-    const snapshots = new Map<{ name: string }, { value: unknown; version: number }>()
-    return {
-      register(def: { name: string; initial: unknown }) {
-        if (snapshots.has(def)) return Effect.void
-        return Effect.gen(function* () {
-          const initial = Effect.isEffect(def.initial) ? yield* (def.initial as Effect.Effect<unknown>) : def.initial
-          snapshots.set(def, { value: initial, version: 0 })
-        })
-      },
-      getValue(def: { name: string }) {
-        return snapshots.get(def)!.value
-      },
-      update(def: { name: string }, value: unknown) {
-        const current = snapshots.get(def)
-        if (!current) return Effect.die(new Error(`Unregistered ambient: ${def.name}`))
-        snapshots.set(def, { value, version: current.version + 1 })
-        return Effect.void
-      },
-    } as unknown as AmbientService
-  })
   // Per-fork cached layers (built during initFork, reused across turns)
   const forkLayers = new Map<string | null, Layer.Layer<never>>()
   const forkCwds = new Map<string | null, string>()
@@ -357,7 +334,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const { forkId, turnId, defaultProseDest, allowSingleUserReplyThisTurn } = options
 
       const ambientService = yield* AmbientServiceTag
-      const skillset = ambientService.getValue(SkillsetAmbient)
+      const skills = ambientService.getValue(SkillsAmbient)
 
       // Resolve agent definition for this fork
       const agentRoutingProjectionInst = yield* AgentRoutingProjection.Tag
@@ -805,7 +782,7 @@ const makeExecutionManager = Effect.gen(function* () {
                     defaultTopLevelDestination: defaultProseDest,
                     allowSingleUserReplyThisTurn,
                     directUserRepliesSent,
-                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() }, skillset }).pipe(
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() }, skills }).pipe(
                     Effect.provideService(ForkContext, { forkId }),
                     Effect.provide(executionLayer),
                   )
@@ -1044,7 +1021,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       let layers = makeForkLayers(
         forkId,
-        ambientService,
         sessionContextProjection, agentProjection, agentStatusProjection,
         workingStateProjection, taskGraphProjection,
         conversationProjection,

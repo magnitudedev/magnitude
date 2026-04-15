@@ -14,7 +14,7 @@ import { CanonicalTurnProjection } from './canonical-turn'
 
 import { OutboundMessagesProjection } from './outbound-messages'
 import { compactionSummaryTag, buildSessionContextContent, TASK_TREE_COMPLETION_REMINDER } from '../prompts'
-import { SkillsetAmbient } from '../ambient'
+import { SkillsAmbient } from '../ambient'
 import { UserPresenceProjection } from './user-presence'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { TaskGraphProjection, type TaskGraphState, type TaskRecord } from './task-graph'
@@ -395,7 +395,7 @@ export function getView(messages: readonly Message[], timezone: string | null, p
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
   name: 'Memory',
   reads: [AgentStatusProjection, SubagentActivityProjection, CanonicalTurnProjection, UserPresenceProjection, OutboundMessagesProjection, UserMessageResolutionProjection, TaskGraphProjection] as const,
-  ambients: [SkillsetAmbient] as const,
+  ambients: [SkillsAmbient] as const,
   signals: {},
   initialFork: {
     messages: [],
@@ -1011,8 +1011,8 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       )
 
       if (task) {
-        const skillset = ambient.get(SkillsetAmbient)
-        const skillPath = skillset.skills[task.taskType]?.path ?? ''
+        const skills = ambient.get(SkillsAmbient)
+        const skillPath = skills.get(task.taskType)?.path ?? ''
         nextLead = enqueueTimeline(
           nextLead,
           toTimelineTaskCompleteHook({

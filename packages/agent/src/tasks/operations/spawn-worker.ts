@@ -68,7 +68,7 @@ export const handleSpawnWorkerDirective = <R>(
     const conversationState = yield* conversationReader.getState()
     const summary = buildConversationSummary(conversationState.entries)
 
-    const skill = context.skillset.skills[task.taskType]
+    const skill = context.skills.get(task.taskType)
     const taskContract: string | undefined = skill
       ? (skill.sections.worker || skill.sections.shared || undefined)
       : undefined

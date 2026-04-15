@@ -9,7 +9,7 @@ import { LocalProviderPage } from './local-provider-page'
 import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus, MagnitudeSlot } from '@magnitudedev/agent'
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
-import type { SkillsetInfo } from '@magnitudedev/skills'
+
 import { SLOT_UI_ORDER } from './setup-wizard-overlay'
 import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 
@@ -78,15 +78,8 @@ interface SettingsOverlayProps {
 
   onModelHandleKeyEvent: (key: KeyEvent) => boolean
   onProviderHandleKeyEvent: (key: KeyEvent) => boolean
-  onSkillsetHandleKeyEvent: (key: KeyEvent) => boolean
   onBackFromModelPicker: () => void
   onBackFromProviderDetail: () => void
-  // Skillset tab
-  availableSkillsets: SkillsetInfo[]
-  selectedSkillsetName: string | null
-  skillsetSelectedIndex: number
-  onSkillsetSelect: (name: string | null) => Promise<void>
-  onSkillsetHoverIndex: (index: number) => void
   presets: Preset[]
   systemDefaultsPresetToken: string
   onSavePreset: (name: string) => void | Promise<void>
@@ -161,14 +154,8 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
   onModelHandleKeyEvent,
   onProviderHandleKeyEvent,
-  onSkillsetHandleKeyEvent,
   onBackFromModelPicker,
   onBackFromProviderDetail,
-  availableSkillsets,
-  selectedSkillsetName,
-  skillsetSelectedIndex,
-  onSkillsetSelect,
-  onSkillsetHoverIndex,
   presets,
   systemDefaultsPresetToken,
   onSavePreset,
@@ -255,7 +242,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
   const TABS: { id: SettingsTab; label: string }[] = [
     { id: 'provider', label: 'Provider' },
     { id: 'model', label: 'Model' },
-    { id: 'skillset', label: 'Skillset' },
   ]
 
   const readPointerCoords = useCallback((event: unknown): { x: number; y: number } | null => {
@@ -436,7 +422,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
     if (key.name === 'left' && plain) {
       key.preventDefault()
-      const tabOrder: SettingsTab[] = ['provider', 'model', 'skillset']
+      const tabOrder: SettingsTab[] = ['provider', 'model']
       const idx = tabOrder.indexOf(activeTab)
       if (idx > 0) onTabChange(tabOrder[idx - 1])
       return
@@ -444,7 +430,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
     if (key.name === 'right' && plain) {
       key.preventDefault()
-      const tabOrder: SettingsTab[] = ['provider', 'model', 'skillset']
+      const tabOrder: SettingsTab[] = ['provider', 'model']
       const idx = tabOrder.indexOf(activeTab)
       if (idx < tabOrder.length - 1) onTabChange(tabOrder[idx + 1])
       return
@@ -456,9 +442,7 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
     const handled = activeTab === 'model'
       ? onModelHandleKeyEvent(key)
-      : activeTab === 'skillset'
-        ? onSkillsetHandleKeyEvent(key)
-        : onProviderHandleKeyEvent(key)
+      : onProviderHandleKeyEvent(key)
     if (handled) {
       key.preventDefault()
     }
@@ -472,7 +456,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
     onBackFromProviderDetail,
     onModelHandleKeyEvent,
     onProviderHandleKeyEvent,
-    onSkillsetHandleKeyEvent,
     showLoadPresetModal,
     loadPresetSelectedIndex,
     loadPresetRows,
@@ -796,82 +779,6 @@ export const SettingsOverlay = memo(function SettingsOverlay({
             </box>
           </>
         )
-      ) : activeTab === 'skillset' ? (
-        <>
-          {/* Skillset list */}
-          <scrollbox
-            scrollX={false}
-            scrollbarOptions={{ visible: false }}
-            verticalScrollbarOptions={{
-              visible: true,
-              trackOptions: { width: 1 },
-            }}
-            style={{
-              flexGrow: 1,
-              rootOptions: {
-                flexGrow: 1,
-                backgroundColor: 'transparent',
-              },
-              wrapperOptions: {
-                border: false,
-                backgroundColor: 'transparent',
-              },
-              contentOptions: {
-                paddingLeft: 1,
-                paddingRight: 1,
-                paddingTop: 1,
-              },
-            }}
-          >
-            {availableSkillsets.length === 0 ? (
-              <box style={{ paddingLeft: 2 }}>
-                <text style={{ fg: theme.muted }}>
-                  <span attributes={TextAttributes.DIM}>No skillsets found. Place a skillset in </span>
-                  {'~/.magnitude/skillsets/<name>/'}
-                </text>
-              </box>
-            ) : (
-              availableSkillsets.map((skillset, index) => {
-                const isActive = index === skillsetSelectedIndex
-                const isSelected = skillset.name === selectedSkillsetName
-                return (
-                  <Button
-                    key={skillset.name}
-                    onClick={() => onSkillsetSelect(skillset.name)}
-                    onMouseOver={() => onSkillsetHoverIndex(index)}
-                    style={{
-                      flexDirection: 'row',
-                      paddingLeft: 1,
-                      paddingRight: 1,
-                      backgroundColor: isActive ? theme.surface : undefined,
-                    }}
-                  >
-                    <text style={{ fg: isActive ? theme.primary : theme.foreground }}>
-                      {isActive ? '> ' : '  '}
-                      {isSelected ? (
-                        <span style={{ fg: theme.success }}>{'✓ '}</span>
-                      ) : (
-                        <span style={{ fg: theme.muted }}>{'· '}</span>
-                      )}
-                      {skillset.name}
-                      <span attributes={TextAttributes.DIM}>{' — '}{skillset.scope}</span>
-                    </text>
-                  </Button>
-                )
-              })
-            )}
-          </scrollbox>
-
-          {/* Skillset footer */}
-          <box style={{ paddingLeft: 2, paddingTop: 1, paddingBottom: 1, flexShrink: 0 }}>
-            <text style={{ fg: theme.muted }}>
-              <span attributes={TextAttributes.DIM}>
-                {availableSkillsets.length} skillset{availableSkillsets.length === 1 ? '' : 's'} available
-                {selectedSkillsetName ? ` · active: ${selectedSkillsetName}` : ' · none active'}
-              </span>
-            </text>
-          </box>
-        </>
       ) : providerDetailStatus ? (() => {
         // Build map of methodIndex -> actions with their global indices
         const methodActionMap = new Map<number, Array<{ globalIdx: number; action: typeof providerDetailActions[0] }>>()

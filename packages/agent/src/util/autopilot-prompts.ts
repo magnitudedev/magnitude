@@ -54,4 +54,3 @@ export function buildAutopilotSystemPrompt(activeSkillName: string | null): stri
   }
   return BASE_AUTOPILOT_PROMPT
 }
-

@@ -581,18 +581,8 @@ export type SkillActivated =
       readonly source: 'assistant'
     }
 
-export interface SkillStarted {
-  readonly type: 'skill_started'
-  readonly forkId: string | null
-  readonly source: 'user' | 'assistant'
-  readonly skill: Skill
-}
-
-export interface SkillCompleted {
-  readonly type: 'skill_completed'
-  readonly forkId: string | null
-  readonly skillName: string
-}
+// Note: SkillStarted and SkillCompleted event types removed.
+// Skills are now activated via the `skill` tool which returns content directly.
 
 export type AppEvent =
   | SessionInitialized
@@ -639,6 +629,4 @@ export type AppEvent =
   | SubagentIdleClosed
   | UserReturnConfirmed
   | SkillActivated
-  | SkillStarted
-  | SkillCompleted
 

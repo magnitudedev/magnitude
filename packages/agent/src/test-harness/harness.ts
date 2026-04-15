@@ -57,7 +57,7 @@ import { createTurnsBuilder } from './scenario-builder'
 import { clearAgentOverrides } from '../agents'
 import { createVirtualFs, createVirtualFsLayer } from './virtual-fs'
 import { EphemeralSessionContextTag, type PolicyContext } from '../agents/types'
-import { SkillsetResolverLive } from '@magnitudedev/skills'
+import { SkillsAmbient, publishSkills } from '../ambient/skills-ambient'
 import { ChatPersistence, PersistenceError, type ChatPersistenceService } from '../persistence/chat-persistence-service'
 import { createFaultRegistry, type FaultPlan, type FaultRegistry, type FaultScope } from './faults'
 import { createFakeClock } from './fake-clock'
@@ -325,7 +325,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       MockTurnScriptLive,
       basePersistenceLayer,
       faultWrappedPersistenceLayer,
-      SkillsetResolverLive,
+      makeAmbientServiceLayer(),
       ...(fakeClock ? [fakeClock.layer] : []),
       ...(options.extraLayers ?? []),
     )

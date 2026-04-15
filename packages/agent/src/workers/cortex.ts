@@ -28,7 +28,7 @@ import type { ChatMessage } from '@magnitudedev/llm-core'
 import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { Image as BamlImage } from '@boundaryml/baml'
 import type { ObservationPart } from '@magnitudedev/roles'
-import { buildAckTurn } from '../prompts/protocol'
+import { buildAckTurns } from '../prompts/protocol'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
 import type { AppEvent } from '../events'
@@ -51,7 +51,7 @@ import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
-import { SkillsetAmbient } from '../ambient/skillset-ambient'
+import { SkillsAmbient } from '../ambient/skills-ambient'
 import {
   authReconnectMessage,
   classifyRetryability,
@@ -150,12 +150,12 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // 2. Build system prompt with runtime protocol/tool-doc substitution
         const ambientService = yield* AmbientServiceTag
-        const skillset = ambientService.getValue(SkillsetAmbient)
+        const skills = ambientService.getValue(SkillsAmbient)
 
         // Build messages array (now includes observations in system inbox)
         const forkMemory = yield* read(MemoryProjection)
         const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
-        const systemPrompt = renderSystemPrompt(agentDef, skillset)
+        const systemPrompt = renderSystemPrompt(agentDef, skills)
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 
@@ -173,7 +173,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // 3. Build and consume the turn event stream
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
-          const ackTurn = buildAckTurn(agentDef.lenses, agentDef.defaultRecipient)
+          const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
             {
               metadata: { callType: 'chat', forkId, forkName: agentInstance?.name ?? 'root', turnId, chainId },
@@ -186,7 +186,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
                 systemPrompt,
                 messages: chatMessages,
                 options: { stopSequences: [END_TURN_STOP_SEQUENCE] },
-                ackTurn,
+                ackTurns,
               },
             ),
           ).pipe(

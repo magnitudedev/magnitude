@@ -42,6 +42,7 @@ const tools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
+  'skill',
 )
 
 export const explorerRole = defineRole<typeof tools, 'explorer', PolicyContext>({

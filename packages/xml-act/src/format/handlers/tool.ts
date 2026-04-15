@@ -1,5 +1,5 @@
 import { emit, pop, push, replace } from '../ops'
-import { appendTopProse, endTopProse } from '../prose'
+import { endTopProse } from '../prose'
 import { rawOpenTag, rawSelfCloseTag } from '../raw'
 import type { Fx } from '../ops'
 import type { TagSchema } from '../../execution/binding-validator'
@@ -57,10 +57,6 @@ export function toolHandler(
 ): TagHandler<XmlActFrame, XmlActEvent> {
   return {
     open(ctx) {
-      const top = ctx.stack[ctx.stack.length - 1]
-      if (!ctx.afterNewline && top?.type === 'prose') {
-        return appendTopProse(ctx.stack, rawOpenTag(tag, ctx.attrs))
-      }
       const id = ctx.generateId()
       const { valid, errors } = validateAttrs(tag, id, ctx.attrs, schema)
       return [
@@ -127,10 +123,6 @@ export function toolHandler(
       return [emit({ _tag: 'TagClosed', toolCallId: frame.id, tagName: frame.tag, element }), pop]
     },
     selfClose(ctx) {
-      const top = ctx.stack[ctx.stack.length - 1]
-      if (!ctx.afterNewline && top?.type === 'prose') {
-        return appendTopProse(ctx.stack, rawSelfCloseTag(tag, ctx.attrs))
-      }
       const id = ctx.generateId()
       const { valid, errors } = validateAttrs(tag, id, ctx.attrs, schema)
       const element: ParsedElement = {

@@ -222,12 +222,12 @@ async function build(target: string) {
   try {
     const entrypoint = resolve(import.meta.dir, '..', 'src', 'index.tsx')
 
-    // Glob skillset files for embedding
+    // Glob builtin skill files for embedding
     const skillsetFiles: string[] = []
-    for await (const f of new Bun.Glob('skillsets/**/*.md').scan({ cwd: PROJECT_ROOT })) {
+    for await (const f of new Bun.Glob('packages/skills/builtin/**/*.md').scan({ cwd: PROJECT_ROOT })) {
       skillsetFiles.push(resolve(PROJECT_ROOT, f))
     }
-    console.log(`  [embed] ${skillsetFiles.length} skillset files`)
+    console.log(`  [embed] ${skillsetFiles.length} builtin skill files`)
 
     await $`bun build ${entrypoint} ${rgBinPath} ${skillsetFiles} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
   } finally {

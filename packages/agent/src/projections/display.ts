@@ -610,22 +610,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    skill_completed: ({ event, fork }) => {
-      const messageId = generateId()
-      return {
-        ...fork,
-        messages: [
-          ...fork.messages,
-          {
-            id: messageId,
-            type: 'assistant_message' as const,
-            content: `✓ Skill "${event.skillName}" completed`,
-            timestamp: event.timestamp,
-          }
-        ]
-      }
-    },
-
     turn_started: ({ event, fork }) => {
       // Check if there are queued messages to promote
       const hasQueuedMessages = fork.messages.some(m => m.type === 'queued_user_message')

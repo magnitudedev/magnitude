@@ -82,12 +82,9 @@ Spawning a worker for a task which already has a worker will completely replace 
 You should balance creating tasks ahead of time (to give user visibility) with restraint (to prevent committing to work that might change).
 When spawning workers, you must consider ordering and timing. Spawn workers for independent tasks in parallel, but do not spawn workers for a task until its upstream tasks are completed.
 
-## Task types
+## Skills & task types
 
-Some tasks serve as "composite" tasks and shouldn't be directly assigned a worker.
-Other tasks are "leaf" tasks which are designed to be delegated to a worker directly.
-
-You have access to a variety of specific types of both composite and leaf tasks. Create tasks of the appropriate type to recieve detailed guidance on effectively handling that type of task.
+Skills provide detailed methodologies for specific types of work. **Before creating tasks or delegating work, consider whether a skill governs this type of work.** Activate relevant skills with the `skill` tool early — before planning or spawning workers — so their methodologies shape your approach. Task types are optional — use them for organization when helpful, but skills can be applied to any task regardless of its declared type.
 
 ## Task Organization
 
@@ -95,8 +92,6 @@ Tasks are organized as a tree with arbitrary structure.
 Make sure to continuously update tasks as they are completed (only once you are satisfied with them).
 Organize tasks under composite ones for larger blocks of work.
 Cancel any tasks that are no longer part of the intended work trajectory.
-
-{{SKILLSET_SECTION}}
 
 {{TASK_TYPES_SECTION}}
 

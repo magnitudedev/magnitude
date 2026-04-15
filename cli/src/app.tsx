@@ -2,7 +2,8 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, scanSkills, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type ToolStateProjectionState, publishSkillset } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type ToolStateProjectionState } from '@magnitudedev/agent'
+import { loadSkills } from '@magnitudedev/skills'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence, loadSessionSummary } from './persistence'
 
@@ -38,7 +39,7 @@ import { useRecentChatsNavigation } from './hooks/use-recent-chats-navigation'
 import { useModelSelectNavigation } from './hooks/use-model-select-navigation'
 import { useProviderSelectNavigation } from './hooks/use-provider-select-navigation'
 import type { SettingsTab } from './hooks/use-settings-navigation'
-import { useSkillsetSettings } from './hooks/use-skillset-settings'
+
 import { useAuthFlow } from './hooks/use-auth-flow'
 import { type WizardStep } from './components/setup-wizard-overlay'
 import { AppOverlays } from './components/app-overlays'
@@ -351,10 +352,10 @@ function AppInner({
     let c: AgentClient | null = null
 
     // Register skills as slash commands (fire-and-forget, non-blocking)
-    scanSkills(process.cwd()).then((skills) => {
+    loadSkills(process.cwd()).then((skillsMap) => {
       const commands: SlashCommandDefinition[] = []
 
-      for (const s of skills) {
+      for (const s of skillsMap.values()) {
         commands.push({
           id: s.name,
           label: s.name,
@@ -369,7 +370,7 @@ function AppInner({
         logger.info({ count: commands.length, names: commands.map(c => c.id) }, 'Registered skill commands')
       }
     }).catch((err) => {
-      logger.warn({ error: err.message }, 'Failed to scan skills')
+      logger.warn({ error: err.message }, 'Failed to load skills')
     })
 
     let resolvedWorkspacePath: string | null = null
@@ -1705,11 +1706,7 @@ function AppInner({
     }
   }, [authFlow.showAuthMethodOverlay, authFlow.authMethodProvider?.id])
 
-  const skillsetSettings = useSkillsetSettings({
-    onPublishSkillset: (skillset) => {
-      client?.runEffect(publishSkillset(skillset))
-    },
-  })
+
 
   const providerTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
     if (providerDetailId) {
@@ -2067,15 +2064,9 @@ function AppInner({
       handleChangeSlot={handleChangeSlot}
       modelTabHandleKeyEvent={modelTabHandleKeyEvent}
       providerTabHandleKeyEvent={providerTabHandleKeyEvent}
-      skillsetTabHandleKeyEvent={skillsetSettings.handleKeyEvent}
       modelNavigation={modelNavigation}
       providerNavigation={providerNavigation}
       onSettingsClose={onSettingsClose}
-      availableSkillsets={skillsetSettings.availableSkillsets}
-      selectedSkillsetName={skillsetSettings.selectedName}
-      skillsetSelectedIndex={skillsetSettings.selectedIndex}
-      onSkillsetSelect={skillsetSettings.onSelect}
-      onSkillsetHoverIndex={skillsetSettings.onHoverIndex}
       onBackFromModelPicker={handleBackFromModelPicker}
       presets={presets}
       systemDefaultsPresetToken={SYSTEM_DEFAULTS_PRESET}

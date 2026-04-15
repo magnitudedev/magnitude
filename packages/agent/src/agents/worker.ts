@@ -20,6 +20,12 @@ const turnLens = defineThinkingLens({
   description: "Plan what to read and edit this turn. What files do you need to understand before making changes? What's the right order of edits?",
 })
 
+const skillsLens = defineThinkingLens({
+  name: 'skills',
+  trigger: 'When receiving task instructions or starting new work',
+  description: 'Does this task have a governing skill? Should I activate the skill to understand the methodology before starting work?',
+})
+
 const systemPrompt = compilePromptTemplate(subagentBaseRaw)
 
 const tools = catalog.pick(
@@ -32,6 +38,7 @@ const tools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
+  'skill',
 )
 
 export const workerRole = defineRole<typeof tools, 'worker', PolicyContext>({
@@ -39,7 +46,7 @@ export const workerRole = defineRole<typeof tools, 'worker', PolicyContext>({
   id: 'worker',
   slot: 'worker',
   systemPrompt,
-  lenses: [turnLens],
+  lenses: [turnLens, skillsLens],
   defaultRecipient: 'parent',
   protocolRole: 'subagent',
   initialContext: { parentConversation: true },

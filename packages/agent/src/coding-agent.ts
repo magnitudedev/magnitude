@@ -9,7 +9,7 @@
  */
 
 import { Effect, Layer, Stream } from 'effect'
-import { Agent, makeAmbientServiceLayer } from '@magnitudedev/event-core'
+import { Agent } from '@magnitudedev/event-core'
 import { HydrationContext, EventSinkTag } from '@magnitudedev/event-core'
 import type { AppEvent, SessionContext } from './events'
 import type { DebugSnapshot } from './projections/debug-introspection'
@@ -69,8 +69,8 @@ import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 
 import { EphemeralSessionContextTag } from './agents/types'
 import { publishConfigFromProviders } from './ambient/config-ambient'
-import { SkillsetResolverLive } from '@magnitudedev/skills'
-import { SelectedSkillsetName } from './ambient/skillset-ambient'
+import { loadSkills } from '@magnitudedev/skills'
+import { SkillsAmbient, publishSkills } from './ambient/skills-ambient'
 
 
 // =============================================================================
@@ -211,9 +211,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     disableShellSafeguards: options.disableShellSafeguards ?? false,
     disableCwdSafeguards: options.disableCwdSafeguards ?? false,
   })
-  const magnitudeConfig = await options.storage.config.loadFull()
-  const selectedSkillsetLayer = Layer.succeed(SelectedSkillsetName, magnitudeConfig.selectedSkillset ?? null)
-
   const layer = Layer.mergeAll(
     Layer.provide(ExecutionManagerLive, ephemeralSessionContextLayer),
     Layer.provide(BrowserServiceLive, providerRuntime),
@@ -222,8 +219,6 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
     FsLive,
     tracerLayer,
     options.persistence,
-    SkillsetResolverLive,
-    selectedSkillsetLayer,
   )
   const client = await CodingAgent.createClient(layer)
 
@@ -295,6 +290,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         forkId: null,
         context
       }))
+
+      // Load skills from standard directories
+      const skills = yield* Effect.tryPromise(() => loadSkills(process.cwd()))
+      yield* publishSkills(skills)
 
       // Persist the initial event immediately
       const pending = yield* eventSink.drainPending()
@@ -390,6 +389,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
       // NOTE: AgentStatusProjection is the source of truth for agent identity, metadata, and execution state.
       // AgentRoutingProjection handles message routing only. forkId remains the execution handle used by forked projections/workers.
+
+      // Load skills from standard directories
+      const skills = yield* Effect.tryPromise(() => loadSkills(process.cwd()))
+      yield* publishSkills(skills)
 
       // Persist all recovery events immediately so reopening the same session
       // again won't re-run recovery for already-terminated forks.

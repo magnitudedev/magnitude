@@ -6,7 +6,6 @@
  */
 
 import type { SessionContext } from '../events'
-import { getUserSkills } from '../skills'
 
 /** Build the session context message content from a SessionContext object */
 export function buildSessionContextContent(ctx: SessionContext): string {

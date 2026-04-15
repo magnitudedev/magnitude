@@ -1,13 +1,5 @@
 import { Schema } from 'effect'
 
-export interface SkillsetInfo {
-  name: string
-  path: string
-  scope: 'project' | 'global'
-}
-
-
-
 export const ThinkingLensSchema = Schema.Struct({
   lens: Schema.String,
   trigger: Schema.String,
@@ -36,15 +28,5 @@ export const SkillSchema = Schema.extend(ParsedSkillSchema, Schema.Struct({
 }))
 export type Skill = typeof SkillSchema.Type
 
-export const SkillsetSchema = Schema.Struct({
-  path: Schema.String,
-  content: Schema.String,
-  skills: Schema.Record({ key: Schema.String, value: SkillSchema }),
-})
-export type Skillset = typeof SkillsetSchema.Type
-
-export const EmptySkillset: Skillset = {
-  path: '',
-  content: '',
-  skills: {},
-}
+/** Convenience type for a map of skills keyed by skill name */
+export type SkillsMap = ReadonlyMap<string, Skill>

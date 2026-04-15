@@ -18,22 +18,16 @@ export const tasksLens = defineThinkingLens({
   description: 'Consider task one-turnability, whether all non one-turnable work is being represented as tasks, and whether existing tasks are organized and up to date',
 })
 
-export const strategyLens = defineThinkingLens({
-  name: 'strategy',
-  trigger: 'When planning or progressing composite tasks with prescribed workflows',
-  description: 'How does the task strategy guidance apply to my current situation? What does it suggest given where I am and what I know?',
-})
-
 export const diligenceLens = defineThinkingLens({
   name: 'diligence',
   trigger: 'When receiving worker output or evaluating whether work is ready to present',
   description: 'Is the work my workers produced actually meeting the bar? Am I confident enough to own this output? What would I push back on?',
 })
 
-export const skillLens = defineThinkingLens({
-  name: 'skill',
-  trigger: 'When creating a skill-governed task, receiving worker output for a skill-governed task, or completing a skill-governed task',
-  description: 'What does the skill say about how to approach this? What context and files should I share with workers? Is the work meeting the skill\'s quality bar? Does anything from this session warrant updating the skill?',
+export const skillsLens = defineThinkingLens({
+  name: 'skills',
+  trigger: 'When planning work, creating tasks, receiving worker output, or completing work',
+  description: 'Is there a skill that applies to this work? If so, have I activated it and read its guidance? What does the skill say about how to approach this, what context to share with workers, and what quality bar to meet? If work is in progress, is it meeting the skill\'s standard?',
 })
 
 export const pivotLens = defineThinkingLens({
@@ -78,6 +72,7 @@ export const leadTools = catalog.pick(
   'updateTask',
   'spawnWorker',
   'killWorker',
+  'skill',
 )
 
 export const leadObservables: readonly [] = []
