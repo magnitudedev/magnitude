@@ -59,6 +59,24 @@ export function getLowestEffortOptions(
     return null
   }
 
+  // --- Fireworks AI (disable reasoning where supported) ---
+  // GLM models support reasoning_effort: "none"
+  // Kimi models on Fireworks also support disabling via reasoning_effort: "none"
+  // MiniMax requires reasoning enabled (minimum "low") — cannot disable
+  if (providerId === 'fireworks-ai') {
+    if (id.includes('minimax')) {
+      return {
+        optionsMerge: { reasoning_effort: 'low' },
+        label: 'Fireworks reasoning_effort=low',
+      }
+    }
+    // GLM, Kimi, and other models: disable reasoning entirely
+    return {
+      optionsMerge: { reasoning_effort: 'none' },
+      label: 'Fireworks reasoning_effort=none',
+    }
+  }
+
   // --- Z.AI (disable thinking entirely — we provide our own reasoning) ---
   if (providerId === 'zai' || providerId === 'zai-coding-plan') {
     return {
@@ -182,6 +200,32 @@ export function getCodexReasoningEffort(modelId: string): string | null {
     return 'low'
   }
   return null
+}
+
+/**
+ * Check whether grammar-constrained generation is safe to use with streaming
+ * for a given provider + model combination.
+ *
+ * Grammar + streaming is broken when model reasoning/thinking cannot be fully
+ * disabled (the reasoning phase completes but content generation never starts).
+ * This returns false for models where reasoning cannot be set to "none".
+ */
+export function canUseGrammarWithStreaming(
+  providerId: string,
+  modelId: string,
+  bamlProvider: string,
+): boolean {
+  const id = modelId.toLowerCase()
+
+  // Fireworks: MiniMax and GPT-OSS cannot disable reasoning (min "low")
+  // Grammar + streaming is broken for these models
+  if (providerId === 'fireworks-ai') {
+    if (id.includes('minimax') || id.includes('gpt-oss')) {
+      return false
+    }
+  }
+
+  return true
 }
 
 // ---------------------------------------------------------------------------

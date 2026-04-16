@@ -1,0 +1,73 @@
+tool ::= readtool | writetool | edittool | treetool | greptool | viewtool | shelltool | websearchtool | webfetchtool | agentcreatetool | agentkilltool | createtasktool | updatetasktool | spawnworkertool | killworkertool | skilltool
+ws ::= [ \t\n]*
+root ::= lens* (msg | tool)* endturn
+lens ::= "<lens name=\"" lensname "\">" [^<]+ "</lens>" ws
+lensname ::= "alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"
+msg ::= "<message to=\"" [^"]* "\">" [^<]+ "</message>" ws
+endturn ::= "<end-turn>" ws ("<idle/>" | "<continue/>") ws "</end-turn>"
+readtool-attrs-alt ::= "observe=\"" [^"]* "\"" | "path=\"" [^"]* "\"" | "offset=\"" [0-9]+ "\"" | "limit=\"" [0-9]+ "\"" | "id=\"" [^"]* "\""
+readtool-attrs ::= (ws readtool-attrs-alt)* ws
+readtool ::= "<read" ws readtool-attrs "/>" ws
+writetool-attrs-alt ::= "observe=\"" [^"]* "\"" | "path=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+writetool-attrs ::= (ws writetool-attrs-alt)* ws
+writetool ::= "<write" ws writetool-attrs ">" [^<]+ "</write>" ws
+edittool-attrs-alt ::= "observe=\"" [^"]* "\"" | "path=\"" [^"]* "\"" | "replaceAll=\"" ("true" | "false") "\"" | "id=\"" [^"]* "\""
+edittool-attrs ::= (ws edittool-attrs-alt)* ws
+edittool-oldtool-attrs ::= ws
+edittool-oldtool ::= "<old" ws edittool-oldtool-attrs ">" [^<]+ "</old>" ws
+edittool-newtool-attrs ::= ws
+edittool-newtool ::= "<new" ws edittool-newtool-attrs ">" [^<]+ "</new>" ws
+edittool-children ::= (edittool-oldtool | edittool-newtool)*
+edittool ::= "<edit" ws edittool-attrs ">" ws edittool-children ws "</edit>" ws
+treetool-attrs-alt ::= "observe=\"" [^"]* "\"" | "path=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+treetool-attrs ::= (ws treetool-attrs-alt)* ws
+treetool ::= "<tree" ws treetool-attrs "/>" ws
+greptool-attrs-alt ::= "observe=\"" [^"]* "\"" | "path=\"" [^"]* "\"" | "limit=\"" [0-9]+ "\"" | "id=\"" [^"]* "\""
+greptool-attrs ::= (ws greptool-attrs-alt)* ws
+greptool-patterntool-attrs ::= ws
+greptool-patterntool ::= "<pattern" ws greptool-patterntool-attrs ">" [^<]+ "</pattern>" ws
+greptool-globtool-attrs ::= ws
+greptool-globtool ::= "<glob" ws greptool-globtool-attrs ">" [^<]+ "</glob>" ws
+greptool-children ::= (greptool-patterntool | greptool-globtool)*
+greptool ::= "<grep" ws greptool-attrs ">" ws greptool-children ws "</grep>" ws
+viewtool-attrs-alt ::= "observe=\"" [^"]* "\"" | "path=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+viewtool-attrs ::= (ws viewtool-attrs-alt)* ws
+viewtool ::= "<view" ws viewtool-attrs "/>" ws
+shelltool-attrs-alt ::= "observe=\"" [^"]* "\"" | "timeout=\"" [0-9]+ "\"" | "id=\"" [^"]* "\""
+shelltool-attrs ::= (ws shelltool-attrs-alt)* ws
+shelltool ::= "<shell" ws shelltool-attrs ">" [^<]+ "</shell>" ws
+websearchtool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+websearchtool-attrs ::= (ws websearchtool-attrs-alt)* ws
+websearchtool ::= "<web-search" ws websearchtool-attrs ">" [^<]+ "</web-search>" ws
+webfetchtool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+webfetchtool-attrs ::= (ws webfetchtool-attrs-alt)* ws
+webfetchtool ::= "<web-fetch" ws webfetchtool-attrs ">" [^<]+ "</web-fetch>" ws
+agentcreatetool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\"" | "type=\"" [^"]* "\""
+agentcreatetool-attrs ::= (ws agentcreatetool-attrs-alt)* ws
+agentcreatetool-titletool-attrs ::= ws
+agentcreatetool-titletool ::= "<title" ws agentcreatetool-titletool-attrs ">" [^<]+ "</title>" ws
+agentcreatetool-messagetool-attrs ::= ws
+agentcreatetool-messagetool ::= "<message" ws agentcreatetool-messagetool-attrs ">" [^<]+ "</message>" ws
+agentcreatetool-children ::= (agentcreatetool-titletool | agentcreatetool-messagetool)*
+agentcreatetool ::= "<agent-create" ws agentcreatetool-attrs ">" ws agentcreatetool-children ws "</agent-create>" ws
+agentkilltool-attrs-alt ::= "observe=\"" [^"]* "\"" | "agentId=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+agentkilltool-attrs ::= (ws agentkilltool-attrs-alt)* ws
+agentkilltool-reasontool-attrs ::= ws
+agentkilltool-reasontool ::= "<reason" ws agentkilltool-reasontool-attrs ">" [^<]+ "</reason>" ws
+agentkilltool-children ::= (agentkilltool-reasontool)*
+agentkilltool ::= "<agent-kill" ws agentkilltool-attrs ">" ws agentkilltool-children ws "</agent-kill>" ws
+createtasktool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\"" | "type=\"" [^"]* "\"" | "title=\"" [^"]* "\"" | "parent=\"" [^"]* "\""
+createtasktool-attrs ::= (ws createtasktool-attrs-alt)* ws
+createtasktool ::= "<create-task" ws createtasktool-attrs "/>" ws
+updatetasktool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\"" | "status=\"" [^"]* "\""
+updatetasktool-attrs ::= (ws updatetasktool-attrs-alt)* ws
+updatetasktool ::= "<update-task" ws updatetasktool-attrs "/>" ws
+spawnworkertool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+spawnworkertool-attrs ::= (ws spawnworkertool-attrs-alt)* ws
+spawnworkertool ::= "<spawn-worker" ws spawnworkertool-attrs ">" [^<]+ "</spawn-worker>" ws
+killworkertool-attrs-alt ::= "observe=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+killworkertool-attrs ::= (ws killworkertool-attrs-alt)* ws
+killworkertool ::= "<kill-worker" ws killworkertool-attrs "/>" ws
+skilltool-attrs-alt ::= "observe=\"" [^"]* "\"" | "name=\"" [^"]* "\"" | "id=\"" [^"]* "\""
+skilltool-attrs ::= (ws skilltool-attrs-alt)* ws
+skilltool ::= "<skill" ws skilltool-attrs "/>" ws

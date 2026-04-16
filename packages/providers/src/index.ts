@@ -96,7 +96,7 @@ export {
 export type { ModelRecommendationRule, RecommendationMatch } from './model-recommendations'
 
 // Reasoning effort
-export { getLowestEffortOptions } from './reasoning-effort'
+export { getLowestEffortOptions, canUseGrammarWithStreaming } from './reasoning-effort'
 
 // Usage calculation
 export { buildUsage, calculateCosts } from './usage'
