@@ -6,7 +6,7 @@
 
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import type { AgentVariant } from '../agents'
+import type { AgentVariant } from '../agents/variants'
 
 export type AgentStatus = 'working' | 'idle' | 'killed'
 

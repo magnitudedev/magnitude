@@ -1,6 +1,7 @@
 import { Effect } from 'effect'
 import type { TurnCompleted } from '../events'
-import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
+import { isValidVariant, type AgentVariant } from '../agents/variants'
+import { getAgentDefinition } from '../agents/registry'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 

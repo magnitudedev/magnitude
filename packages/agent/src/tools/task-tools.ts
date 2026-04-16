@@ -3,15 +3,15 @@ import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork } from '@magnitudedev/event-core'
-import { ExecutionManager } from '../execution/execution-manager'
+import { ExecutionManager } from '../execution/types'
 import { TaskGraphStateReaderTag } from './task-reader'
 import { AgentStateReaderTag } from './fork'
 import { handleTaskDirective } from '../tasks/operations'
 import type { TaskOperationGraphSnapshot } from '../tasks/operations/types'
-import { formatTaskOutsideSubtreeError } from '../prompts'
+import { formatTaskOutsideSubtreeError } from '../prompts/error-states'
 import type { TaskRecord } from '../projections/task-graph'
 import { AmbientServiceTag } from '@magnitudedev/event-core'
-import { SkillsAmbient } from '../ambient'
+import { SkillsAmbient } from '../ambient/skills-ambient'
 
 const TaskToolErrorSchema = ToolErrorSchema('TaskToolError', {})
 

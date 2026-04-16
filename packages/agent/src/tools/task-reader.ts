@@ -1,5 +1,5 @@
 import { Context, Effect } from 'effect'
-import { type TaskAssignee } from '../tasks'
+import { type TaskAssignee } from '../tasks/types'
 import {
   canCompleteTask,
   collectSubtreeTaskIds,

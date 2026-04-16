@@ -4,7 +4,7 @@ import { createStorageClient } from '@magnitudedev/storage'
 import { bootstrapProviderRuntime, ModelResolver, makeModelResolver, makeNoopTracer, makeProviderRuntimeLive, ExtractMemoryDiff } from '@magnitudedev/providers'
 import { MAGNITUDE_SLOTS, type MagnitudeSlot } from '../model-slots'
 import { applyMemoryDiff, enforceLineBudget, ensureMemoryFile, readMemory, writeMemory, type MemoryDiff } from './memory-file'
-import { withTraceScope } from '../tracing'
+import { withTraceScope } from '../tracing/scoped-tracer'
 import { buildExtractionTranscript, readEventsJsonl } from './transcript'
 
 function parseJsonDiff(raw: unknown): MemoryDiff | null {

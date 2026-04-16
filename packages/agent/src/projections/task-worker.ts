@@ -14,7 +14,7 @@ import {
 } from './task-graph'
 import { ToolStateProjection, type ToolStateProjectionState } from './tool-state'
 import type { ToolHandle } from '../tools/tool-handle'
-import type { ToolState } from '../models'
+import type { ToolState } from '../models/tool-state'
 
 export type WorkerState =
   | { readonly status: 'unassigned' }

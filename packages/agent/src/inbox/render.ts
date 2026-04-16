@@ -2,7 +2,7 @@ import { ContentPartBuilder, type ContentPart } from '../content'
 import {
   USER_MESSAGE_RESPONSE_REMINDER,
   WORKER_PROGRESS_USER_MESSAGE_REMINDER,
-} from '../prompts'
+} from '../prompts/lead-communication-reminders'
 import type { AgentAtom, ResultEntry, TimelineEntry } from './types'
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults } from './render-results'
 import { renderCompactToolCall } from './render-tool-call'

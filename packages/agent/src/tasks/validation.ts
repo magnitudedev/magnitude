@@ -1,4 +1,4 @@
-import { isValidVariant } from '../agents'
+import { isValidVariant } from '../agents/variants'
 import type { TaskAssignee, WorkerAssignee } from './types'
 
 function isWorkerAssignee(value: string): value is WorkerAssignee {

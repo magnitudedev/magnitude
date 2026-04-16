@@ -3,7 +3,8 @@ import type { AppEvent, TurnResultError, MessageDestination } from '../events'
 
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
-import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
+import { isValidVariant, type AgentVariant } from '../agents/variants'
+import { getAgentDefinition } from '../agents/registry'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 

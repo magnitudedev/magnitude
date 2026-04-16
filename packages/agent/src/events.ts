@@ -13,7 +13,7 @@ import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { Skill } from '@magnitudedev/skills'
-import type { TaskAssignee } from './tasks'
+import type { TaskAssignee } from './tasks/types'
 
 
 export type Attachment = ImageAttachment | MentionAttachment

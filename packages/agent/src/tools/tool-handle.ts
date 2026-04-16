@@ -1,10 +1,10 @@
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolStateEvent, StreamingAccumulatorLike } from '@magnitudedev/tools'
 import { normalizeToolEvent } from '../normalizer'
-import type { ToolState } from '../models'
+import type { ToolState } from '../models/tool-state'
 import type { ToolKey, AgentCatalogEntry } from '../catalog'
 
-export type { ToolState } from '../models'
+export type { ToolState } from '../models/tool-state'
 type AnyToolEvent = ToolStateEvent<unknown, unknown, unknown>
 type ToolReducer<S> = { bivarianceHack(state: S, event: AnyToolEvent): S }['bivarianceHack']
 

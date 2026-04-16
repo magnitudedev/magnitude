@@ -43,14 +43,15 @@ import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 import { Autopilot } from './workers/autopilot'
 import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
-import { isValidVariant, type AgentVariant } from './agents'
+import { isValidVariant, type AgentVariant } from './agents/variants'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
 import { SessionTitleWorker } from './workers/session-title-worker'
 import { FsLive } from './services/fs'
 
 // Execution
-import { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
+import { ExecutionManager } from './execution/types'
+import { ExecutionManagerLive } from './execution/execution-manager'
 import { BrowserServiceLive } from './services/browser-service'
 import { registerApprovalBridge } from './execution/approval-bridge'
 

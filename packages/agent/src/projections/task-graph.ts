@@ -1,7 +1,7 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentStatusProjection, type AgentStatusState } from './agent-status'
-import { type TaskAssignee } from '../tasks'
+import { type TaskAssignee } from '../tasks/types'
 
 export type TaskStatus = 'pending' | 'working' | 'completed'
 

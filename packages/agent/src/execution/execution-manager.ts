@@ -7,7 +7,7 @@
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
-import { Effect, Stream, Context, Layer, Ref } from 'effect'
+import { Effect, Stream, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
@@ -19,14 +19,16 @@ import {
   type OutputNode,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
-import { SkillsAmbient } from '../ambient'
+import { SkillsAmbient } from '../ambient/skills-ambient'
 import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
-import { buildRegisteredTools } from '../tools'
+import { buildRegisteredTools } from '../tools/tool-registry'
 
-import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
+import { isValidVariant, type AgentVariant } from '../agents/variants'
+import { getAgentDefinition } from '../agents/registry'
 import { buildPolicyInterceptor, type AgentResolver } from './permission-gate'
+export { IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
 import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from './approval-state'
 
 import { BrowserService } from '../services/browser-service'
@@ -34,7 +36,8 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts'
+import { buildCloneContext, buildSpawnContext } from '../prompts/fork-context'
+import { UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts/error-states'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
 import { TaskGraphStateReaderTag, canCompleteRecord, getChildRecords, canAssignRecord, collectSubtreeRecords } from '../tools/task-reader'
@@ -54,7 +57,8 @@ import { bindObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
-import type { TurnEvent, TurnEventSink } from './types'
+import { ExecutionManager, IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
+import type { TurnEvent, TurnEventSink, ExecuteOptions, ExecuteResult, ExecutionManagerService } from './types'
 import { WorkingDirectoryTag } from './working-directory'
 import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
@@ -80,108 +84,7 @@ import { handleTaskDirective } from '../tasks/operations'
 // Types
 // =============================================================================
 
-export const IDENTICAL_RESPONSE_BREAKER_THRESHOLD = 5
 
-export interface ExecuteOptions {
-  readonly forkId: string | null
-  readonly turnId: string
-  readonly chainId: string
-  readonly defaultProseDest: 'user' | 'parent'
-  readonly allowSingleUserReplyThisTurn: boolean
-}
-
-export interface ExecuteResult {
-  readonly result: TurnResult
-}
-
-// =============================================================================
-// Service Interface
-// =============================================================================
-
-export interface ExecutionManagerService {
-  /**
-   * Execute an XML stream from the LLM.
-   * XmlRuntimeEvents are mapped to TurnEvents and offered to the sink queue.
-   * Returns the accumulated execution result.
-   */
-  readonly execute: (
-    xmlStream: Stream.Stream<string, ModelError>,
-    options: ExecuteOptions,
-    sink: TurnEventSink,
-  ) => Effect.Effect<
-    ExecuteResult,
-    XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentRoutingState>
-    | Projection.ProjectionInstance<AgentStatusState>
-    | Projection.ProjectionInstance<TaskGraphState>
-    | Projection.ForkedProjectionInstance<ReactorState>
-    | Projection.ForkedProjectionInstance<ForkTurnState>
-    | WorkerBusService<AppEvent>
-    | TaskGraphStateReaderTag
-    | ConversationStateReaderTag
-    | AmbientService
-  >
-
-  /**
-   * Initialize a fork with the given agent variant.
-   * Builds and caches the fork's Effect layers and bound observables.
-   * No runtime object is created — xml-act runtime is built fresh per execute() call.
-   */
-  readonly initFork: (
-    forkId: string | null,
-    variant: AgentVariant
-  ) => Effect.Effect<
-    void,
-    never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
-  >
-
-  /**
-   * Dispose a fork's cached state.
-   */
-  readonly disposeFork: (forkId: string) => Effect.Effect<void>
-
-  /** Get bound observables for a fork */
-  readonly getObservables: (forkId: string | null) => BoundObservable[]
-
-  /**
-   * Spawn a non-blocking background fork. Returns the forkId.
-   */
-  readonly fork: (params: {
-    parentForkId: string | null
-    name: string
-    agentId: string
-    prompt: string
-    message: string
-    outputSchema?: JsonSchema | undefined
-    mode: 'clone' | 'spawn'
-    role: AgentVariant
-    taskId: string
-  }) => Effect.Effect<
-    string,
-    never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
-  >
-
-  /**
-   * Release the browser for a fork (called when fork goes idle).
-   * No-op if the fork has no browser.
-   */
-  readonly releaseBrowserFork: (forkId: string) => Effect.Effect<void>
-
-  /**
-   * The approval state service instance.
-   * Exposed so workers (ApprovalWorker) and projections can register handlers and resolve approvals.
-   */
-  readonly approvalState: ApprovalStateService
-
-
-}
-
-export class ExecutionManager extends Context.Tag('ExecutionManager')<
-  ExecutionManager,
-  ExecutionManagerService
->() {}
 
 // =============================================================================
 // Implementation

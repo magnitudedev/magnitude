@@ -19,7 +19,8 @@ import type { Skill } from '@magnitudedev/skills'
 
 import { CHARS_PER_TOKEN } from '../constants'
 
-import { getAgentDefinition, getForkInfo, type AgentVariant } from '../agents'
+import type { AgentVariant } from '../agents/variants'
+import { getAgentDefinition, getForkInfo } from '../agents/registry'
 import { buildSessionContextContent } from '../prompts/session-context'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'

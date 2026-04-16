@@ -47,9 +47,10 @@ export type {
 } from './events'
 
 // Agents
-export type { AgentVariant } from './agents'
+export type { AgentVariant } from './agents/variants'
+export { isValidVariant, getSpawnableVariants } from './agents/variants'
 export type { PolicyContext } from './agents/types'
-export { getAgentDefinition, registerAgentDefinition, clearAgentOverrides } from './agents'
+export { getAgentDefinition, registerAgentDefinition, clearAgentOverrides } from './agents/registry'
 
 // Constants
 export { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, DEFAULT_CHAT_NAME, USER_BLUR_DEBOUNCE_MS } from './constants'
@@ -142,8 +143,9 @@ export type { TaskGraphState, TaskRecord, TaskStatus, TaskWorkerInfo } from './p
 export type { EditDiff } from './util/line-edit'
 
 // Execution
-export { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
-export type { ExecutionManagerService, ExecuteOptions, ExecuteResult } from './execution/execution-manager'
+export { ExecutionManager } from './execution/types'
+export type { ExecutionManagerService, ExecuteOptions, ExecuteResult } from './execution/types'
+export { ExecutionManagerLive } from './execution/execution-manager'
 export { PermissionRejection } from './execution/permission-rejection'
 
 // Prompt Utilities

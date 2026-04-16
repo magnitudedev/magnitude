@@ -13,12 +13,12 @@ import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
-import { ExecutionManager } from '../execution/execution-manager'
+import { ExecutionManager } from '../execution/types'
 import { ConversationStateReaderTag } from './memory-reader'
 import { AgentStateReaderTag } from './fork'
-import { buildAgentContext, buildConversationSummary } from '../prompts'
+import { buildAgentContext, buildConversationSummary } from '../prompts/agents'
 import type { AppEvent } from '../events'
-import { getSpawnableVariants, isValidVariant } from '../agents'
+import { getSpawnableVariants, isValidVariant } from '../agents/variants'
 
 const { ForkContext } = Fork
 
