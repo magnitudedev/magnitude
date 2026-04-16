@@ -173,7 +173,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         resolvedModelId = boundModel.model.id
 
         // 3. Build and consume the turn event stream
-        const toolGrammar = boundModel.model.supportsGrammar ? generateToolGrammar(agentDef) : undefined
+        // Check if grammar is disabled via env var (MAGNITUDE_ENABLE_GRAMMAR)
+        const grammarEnabled = ((): boolean => {
+          const envValue = process.env.MAGNITUDE_ENABLE_GRAMMAR
+          if (envValue === undefined) return true // Default: enabled
+          const normalized = envValue.toLowerCase().trim()
+          return normalized !== '0' && normalized !== 'false' && normalized !== ''
+        })()
+        const toolGrammar = grammarEnabled && boundModel.model.supportsGrammar ? generateToolGrammar(agentDef) : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
