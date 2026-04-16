@@ -40,12 +40,14 @@ export function generateGrammar(tools: ReadonlyArray<GrammarToolDef>): string {
   // Root
   rules.push('root ::= lens* (msg | tool)* endturn')
 
-  // Lens
-  rules.push('lens ::= "<lens name=\\"" lensname "\\">" [^<]+ "</lens>" ws')
+  // Lens - uses DFA body to allow any content including angle brackets
+  rules.push('lens ::= "<lens name=\\"" lensname "\\">" lens-body "</lens>" ws')
   rules.push('lensname ::= "alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"')
+  rules.push(...generateBodyRules('lens', 'lens'))
 
-  // Message
-  rules.push('msg ::= "<message to=\\"" [^"]* "\\">" [^<]+ "</message>" ws')
+  // Message - uses DFA body to allow any content including angle brackets
+  rules.push('msg ::= "<message to=\\"" [^"]* "\\">" msg-body "</message>" ws')
+  rules.push(...generateBodyRules('msg', 'message'))
 
   // End-turn
   rules.push('endturn ::= "<end-turn>" ws ("<idle/>" | "<continue/>") ws "</end-turn>"')
@@ -67,6 +69,106 @@ export function generateGrammar(tools: ReadonlyArray<GrammarToolDef>): string {
   }
 
   return rules.join('\n')
+}
+
+// =============================================================================
+// DFA body rule generation
+// =============================================================================
+
+/**
+ * Generate GBNF rules for a body that can contain any content EXCEPT
+ * the exact closing tag string `</tagName>`.
+ *
+ * Uses a DFA (deterministic finite automaton) encoded as recursive GBNF rules.
+ * Each state tracks how many characters of `</tagName>` have been matched so far.
+ *
+ * State 0: no partial match in progress
+ * State 1: seen `<`
+ * State 2: seen `</`
+ * State 3: seen `</t` (first char of tagName)
+ * ...
+ * State N+2: seen `</tagName` (all chars of tagName matched)
+ *   - if next char is `>`, the closing tag is complete → body ends (no alternative)
+ *   - otherwise, reset
+ *
+ * @param prefix  Rule name prefix (e.g. "writetool")
+ * @param tagName The XML tag name (e.g. "write") used to form the closing tag
+ * @returns Array of GBNF rule strings
+ */
+export function generateBodyRules(prefix: string, tagName: string): string[] {
+  const rules: string[] = []
+  const closing = `</${tagName}>`
+  // closing sequence characters: '<', '/', ...tagName chars..., '>'
+  // States: s0 = normal, s1 = seen '<', s2 = seen '</', s(2+i) = seen closing[0..1+i]
+  // Total states: 2 + tagName.length + 1 = tagName.length + 3
+  // But we only need states for partial matches of the closing sequence.
+  // closing = ['<', '/', t, a, g, N, a, m, e, '>']
+  // State k means we've matched closing[0..k-1] (k chars of closing)
+  const n = closing.length // total chars in closing tag string
+
+  // Entry rule: just references s0
+  rules.push(`${prefix}-body ::= ${prefix}-body-s0`)
+
+  for (let k = 0; k < n; k++) {
+    const stateName = `${prefix}-body-s${k}`
+    const nextStateName = `${prefix}-body-s${k + 1}`
+    const ch = closing[k]
+
+    if (k === 0) {
+      // State 0: normal. 
+      // - any char that isn't `<` → stay in s0
+      // - `<` → go to s1 (we've matched `<`)
+      // - empty → body ends
+      rules.push(`${stateName} ::= [^<] ${stateName} | "<" ${nextStateName} | ""`)
+    } else if (k < n - 1) {
+      // Intermediate state: we've matched closing[0..k-1], next expected is closing[k]
+      // - if next char == closing[k] → advance to s(k+1)
+      // - if next char == '<' → go to s1 (restart partial match from '<')
+      // - if next char is anything else → go back to s0
+      // Special case: closing[k] might itself be '<' (it's not for normal tag names, but handle it)
+      const escapedCh = escapeGbnfChar(ch)
+      if (ch === '<') {
+        // Expected char is '<': matching it advances state; no separate '<' branch needed
+        rules.push(`${stateName} ::= "<" ${nextStateName} | [^<] ${prefix}-body-s0 | ""`)
+      } else {
+        const ccExcludes = ch === '-' ? `[^<-]` : `[^${escapeGbnfCharClass(ch)}<]`
+        rules.push(`${stateName} ::= ${escapedCh} ${nextStateName} | "<" ${prefix}-body-s1 | ${ccExcludes} ${prefix}-body-s0 | ""`)
+      }
+    } else {
+      // Final state: we've matched closing[0..n-2] = all of `</tagName`
+      // Next char would be `>` which completes the closing tag → body MUST end here
+      // Any other char: go back to appropriate state
+      // closing[n-1] is '>'
+      // - if next char == '>' → DO NOT consume, body ends (empty alternative)
+      // - if next char == '<' → go to s1
+      // - otherwise → go back to s0
+      rules.push(`${stateName} ::= "<" ${prefix}-body-s1 | [^<>] ${prefix}-body-s0 | ""`)
+    }
+  }
+
+  return rules
+}
+
+function escapeGbnfChar(ch: string): string {
+  // Returns a GBNF literal for a single character
+  switch (ch) {
+    case '"': return '\\"'
+    case '\\': return '"\\\\"'
+    case '\n': return '"\\n"'
+    case '\t': return '"\\t"'
+    default: return `"${ch}"`
+  }
+}
+
+function escapeGbnfCharClass(ch: string): string {
+  // Returns a character suitable for use inside [...] character class
+  // Note: '-' is handled specially at the call site by placing it at the end
+  switch (ch) {
+    case ']': return '\\]'
+    case '\\': return '\\\\'
+    case '^': return '\\^'
+    default: return ch
+  }
 }
 
 // =============================================================================
@@ -106,8 +208,9 @@ function generateToolRules(
 
     rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} ">" ws ${childAltName} ws "</${tagName}>" ws`)
   } else if (hasBody) {
-    // Tool with body content
-    rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} ">" [^<]+ "</${tagName}>" ws`)
+    // Tool with body content — use DFA body rules
+    rules.push(...generateBodyRules(ruleName, tagName))
+    rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} ">" ${ruleName}-body "</${tagName}>" ws`)
   } else {
     // Self-closing tool
     rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} "/>" ws`)
@@ -160,7 +263,8 @@ function generateChildRules(
   rules.push(...generateAttrRules(attrRuleName, schema.attributes))
 
   if (schema.acceptsBody) {
-    rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} ">" [^<]+ "</${tagName}>" ws`)
+    rules.push(...generateBodyRules(ruleName, tagName))
+    rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} ">" ${ruleName}-body "</${tagName}>" ws`)
   } else {
     rules.push(`${ruleName} ::= "<${tagName}" ws ${attrRuleName} "/>" ws`)
   }
