@@ -165,6 +165,7 @@ function startCompaction(
               systemPrompt: agentDef.systemPrompt,
               messages: trimmedMessages,
             },
+            { inputTokenEstimate: compactionState.tokenEstimate },
           ),
         ).pipe(
           Effect.map(({ text }) => ({ success: true as const, text })),

@@ -172,6 +172,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         resolvedProviderId = boundModel.model.providerId
         resolvedModelId = boundModel.model.id
 
+        // 2b. Provide input token estimate so provider can clamp max_tokens
+        const compactionState = yield* read(CompactionProjection, forkId)
+
         // 3. Build and consume the turn event stream
         // Check if grammar is disabled via env var (MAGNITUDE_ENABLE_GRAMMAR)
         const grammarEnabled = ((): boolean => {
@@ -198,6 +201,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
                 options: { stopSequences: [END_TURN_STOP_SEQUENCE], grammar: toolGrammar },
                 ackTurns,
               },
+              { inputTokenEstimate: compactionState.tokenEstimate },
             ),
           ).pipe(
             Effect.mapError((e) => TurnErrorCtor.LLMFailed({ message: e.message, cause: e })),

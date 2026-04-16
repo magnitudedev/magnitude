@@ -41,6 +41,7 @@ export function buildClientRegistry(
   providerOptions?: ProviderOptions,
   stopSequences?: string[],
   grammar?: string,
+  maxTokensOverride?: number,
 ): ClientRegistry | undefined {
   const def = getProvider(providerId)
   if (!def) {
@@ -52,7 +53,7 @@ export function buildClientRegistry(
   const bamlProvider = resolveBamlProvider(providerId, modelId, auth)
 
   const modelDef = def.models.find(m => m.id === modelId)
-  const maxOutputTokens = modelDef?.maxOutputTokens
+  const maxOutputTokens = maxTokensOverride ?? modelDef?.maxOutputTokens
 
   let options = buildOptions({ ...def, bamlProvider }, modelId, auth, providerOpts, stopSequences, maxOutputTokens, grammar)
   if (!options) return undefined

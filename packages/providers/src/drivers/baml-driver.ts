@@ -30,6 +30,7 @@ function buildRegistry(req: DriverRequest): ClientRegistry | undefined {
     req.providerOptions,
     req.inference.stopSequences ? [...req.inference.stopSequences] : undefined,
     req.grammar,
+    req.inference.maxTokens,
   )
 }
 
