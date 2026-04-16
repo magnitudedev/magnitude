@@ -99,6 +99,7 @@ function createBoundModelImpl<TSlot extends string>(
           ...(providerOptions ?? {}),
           ...(options?.providerOptions ?? {}),
         },
+        grammar: options?.grammar,
         signal: abortController.signal,
       }
 

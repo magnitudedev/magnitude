@@ -233,8 +233,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     bamlProvider: 'openai-generic',
     defaultBaseUrl: 'https://api.fireworks.ai/inference/v1',
     models: [
-      staticModel({ id: 'accounts/fireworks/routers/kimi-k2p5-turbo', name: 'Kimi K2.5 Turbo (Fire Pass)', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-      staticModel({ id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+      staticModel({ id: 'accounts/fireworks/routers/kimi-k2p5-turbo', name: 'Kimi K2.5 Turbo (Fire Pass)', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
+      staticModel({ id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },

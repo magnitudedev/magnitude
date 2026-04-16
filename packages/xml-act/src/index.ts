@@ -138,3 +138,6 @@ export { StreamingAccumulator, type StreamingAccumulatorConfig } from './streami
 export { defineXmlBinding, type XmlBindingResult, type XmlMappingConfig, type XmlInputMappingConfig, type XmlOutputBinding } from './xml-binding'
 export type { DeriveStreamingShape, DeriveFields, DeriveChildren, AttrNames, ChildTagNames, ChildrenTagNames } from './type-chain'
 export * from './constants'
+
+// GBNF grammar for constrained generation (e.g. Fireworks AI)
+export { generateGrammar, type GrammarToolDef } from './grammar-generator'

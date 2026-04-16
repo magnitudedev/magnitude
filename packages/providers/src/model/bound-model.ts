@@ -15,6 +15,7 @@ export interface CallOptions {
 
 export interface StreamOptions extends CallOptions {
   readonly stopSequences?: string[]
+  readonly grammar?: string
 }
 
 export interface CompleteOptions extends CallOptions {}

@@ -18,7 +18,7 @@
 import { Effect, Stream, Either } from 'effect'
 import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
-import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash, generateGrammar } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -46,6 +46,7 @@ import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-st
 import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/execution-manager'
 import { getAgentDefinition, getForkInfo } from '../agents'
+import { generateToolGrammar } from '../tools'
 
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing'
@@ -172,6 +173,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         resolvedModelId = boundModel.model.id
 
         // 3. Build and consume the turn event stream
+        const toolGrammar = boundModel.model.supportsGrammar ? generateToolGrammar(agentDef) : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
@@ -185,7 +187,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               {
                 systemPrompt,
                 messages: chatMessages,
-                options: { stopSequences: [END_TURN_STOP_SEQUENCE] },
+                options: { stopSequences: [END_TURN_STOP_SEQUENCE], grammar: toolGrammar },
                 ackTurns,
               },
             ),

@@ -1,0 +1,12 @@
+ws ::= [ \t\n]*
+
+root ::= ws lens* ws (msg | tool)* ws endturn ws
+lens ::= "<lens name=\"" lensname "\">" [^<]+ "</lens>" ws
+lensname ::= "alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"
+msg ::= "<message to=\"user\">" [^<]+ "</message>" ws
+tool ::= readtool | shelltool | greptool | edittool
+readtool ::= "<read observe=\".\" path=\"" [^\"]+ "\"/>" ws
+shelltool ::= "<shell observe=\"//stdout\">" [^<]+ "</shell>" ws
+greptool ::= "<grep observe=\".\"><pattern>" [^<]+ "</pattern></grep>" ws
+edittool ::= "<edit observe=\".\" path=\"" [^\"]+ "\">" ws "<old>" [^<]+ "</old>" ws "<new>" [^<]+ "</new>" ws "</edit>" ws
+endturn ::= "<end-turn>" ws ("<idle/>" | "<continue/>") ws "</end-turn>"

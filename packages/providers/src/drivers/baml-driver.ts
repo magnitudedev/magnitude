@@ -29,6 +29,7 @@ function buildRegistry(req: DriverRequest): ClientRegistry | undefined {
     req.connection.auth,
     req.providerOptions,
     req.inference.stopSequences ? [...req.inference.stopSequences] : undefined,
+    req.grammar,
   )
 }
 

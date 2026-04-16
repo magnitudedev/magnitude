@@ -14,4 +14,5 @@ export class Model extends Data.Class<{
   readonly contextWindow: number
   readonly maxOutputTokens: number | null
   readonly costs: ModelCosts | null
+  readonly supportsGrammar?: boolean
 }> {}
