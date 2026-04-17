@@ -61,10 +61,17 @@ export interface ModelDefinition {
   }
 }
 
+import type { AuthInfo } from '@magnitudedev/storage'
+import type { ProviderProtocol } from './protocol/types'
+
+export interface ResolvedProtocol {
+  bamlProvider: BamlProviderType
+  protocol: ProviderProtocol
+}
+
 export interface ProviderDefinition {
   id: string                    // e.g. "anthropic", "openrouter", "lmstudio". Should match models.dev key.
   name: string                  // Display name: "Anthropic", "OpenRouter", etc.
-  bamlProvider: BamlProviderType
   defaultBaseUrl?: string       // For openai-generic providers
   models: ModelDefinition[]     // Known models for this provider
   authMethods: AuthMethodDef[]  // All supported auth methods, in display order
@@ -72,4 +79,5 @@ export interface ProviderDefinition {
   providerFamily?: 'local' | 'cloud'
   inventoryMode?: 'static' | 'dynamic'
   localDiscoveryStrategy?: 'openai-models' | 'ollama-hybrid' | 'openai-models-best-effort'
+  resolveProtocol: (auth: AuthInfo | null) => ResolvedProtocol
 }

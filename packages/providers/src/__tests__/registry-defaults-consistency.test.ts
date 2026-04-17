@@ -40,7 +40,7 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
     const provider = getProvider('fireworks-ai')
     expect(provider).toBeDefined()
     expect(provider?.name).toBe('Fireworks AI')
-    expect(provider?.bamlProvider).toBe('openai-generic')
+    expect(provider?.resolveProtocol(null).bamlProvider).toBe('openai-generic')
     expect(provider?.defaultBaseUrl).toBe('https://api.fireworks.ai/inference/v1')
     expect(provider?.authMethods).toEqual([
       { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },
@@ -60,7 +60,7 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
     const provider = getProvider('magnitude')
     expect(provider).toBeDefined()
     expect(provider?.name).toBe('Magnitude')
-    expect(provider?.bamlProvider).toBe('openai-generic')
+    expect(provider?.resolveProtocol(null).bamlProvider).toBe('openai-generic')
     expect(provider?.defaultBaseUrl).toBe('https://app.magnitude.dev/api/v1')
     expect(provider?.authMethods).toEqual([
       { type: 'api-key', label: 'API key', envKeys: ['MAGNITUDE_API_KEY'] },

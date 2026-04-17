@@ -48,7 +48,7 @@ import { ExecutionManager } from '../execution/types'
 import { getAgentDefinition, getForkInfo } from '../agents/registry'
 import { generateToolGrammar } from '../tools/tool-registry'
 
-import { ModelResolver, CodingAgentChat, canUseGrammarWithStreaming } from '@magnitudedev/providers'
+import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing/scoped-tracer'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
@@ -183,8 +183,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const normalized = envValue.toLowerCase().trim()
           return normalized !== '0' && normalized !== 'false' && normalized !== ''
         })()
-        const grammarSafe = canUseGrammarWithStreaming(boundModel.model.providerId, boundModel.model.id, '')
-        const toolGrammar = grammarEnabled && grammarSafe && boundModel.model.supportsGrammar ? generateToolGrammar(agentDef) : undefined
+        const grammarSafe = boundModel.model.supportsGrammar !== false
+        const toolGrammar = grammarEnabled && grammarSafe ? generateToolGrammar(agentDef) : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(

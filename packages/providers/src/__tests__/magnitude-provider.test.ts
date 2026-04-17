@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { __testOnly_buildProviderOptions } from '../client-registry-builder'
-import { getLowestEffortOptions } from '../reasoning-effort'
 import { modelsDevCatalogSource } from '../catalog/models-dev-catalog-source'
 import { openRouterCatalogSource } from '../catalog/openrouter-catalog-source'
 import { staticCatalogSource } from '../catalog/static-catalog-source'
@@ -54,16 +53,32 @@ describe('Magnitude provider', () => {
     }))
   })
 
-  it('uses Magnitude reasoning policy for minimax and non-minimax models', () => {
-    expect(getLowestEffortOptions('magnitude', 'minimax-m2.7', 'openai-generic')).toEqual({
-      optionsMerge: { reasoning_effort: 'low' },
-      label: 'Magnitude reasoning_effort=low',
-    })
+  it('applies reasoning_effort=low for minimax models', () => {
+    vi.stubEnv('MAGNITUDE_API_KEY', 'test-key')
 
-    expect(getLowestEffortOptions('magnitude', 'glm-5.1', 'openai-generic')).toEqual({
-      optionsMerge: { reasoning_effort: 'none' },
-      label: 'Magnitude reasoning_effort=none',
-    })
+    const options = __testOnly_buildProviderOptions(
+      'magnitude',
+      'minimax-m2.7',
+      null,
+    )
+
+    expect(options).toEqual(expect.objectContaining({
+      reasoning_effort: 'low',
+    }))
+  })
+
+  it('applies reasoning_effort=none for non-minimax models', () => {
+    vi.stubEnv('MAGNITUDE_API_KEY', 'test-key')
+
+    const options = __testOnly_buildProviderOptions(
+      'magnitude',
+      'glm-5.1',
+      null,
+    )
+
+    expect(options).toEqual(expect.objectContaining({
+      reasoning_effort: 'none',
+    }))
   })
 
   it('is static-only for catalog refresh behavior', () => {

@@ -93,6 +93,11 @@ export function makeProviderStateStore<TSlot extends string>(): ProviderStateSto
       if (!s.providerId || !s.modelId) return null
       const provider = getProvider(s.providerId)
       const def = provider?.models.find(m => m.id === s.modelId)
+      const providerHasGrammar = (() => {
+        if (!provider) return false
+        const { protocol } = provider.resolveProtocol(s.auth)
+        return protocol.type === 'openai-generic' && protocol.capabilities.grammar !== undefined
+      })()
       return {
         model: new Model({
           id: s.modelId,
@@ -106,7 +111,7 @@ export function makeProviderStateStore<TSlot extends string>(): ProviderStateSto
             cacheReadPerM: def.cost.cache_read ?? null,
             cacheWritePerM: def.cost.cache_write ?? null,
           } : null,
-          supportsGrammar: def?.supportsGrammar ?? false,
+          supportsGrammar: def?.supportsGrammar ?? providerHasGrammar,
         }),
         auth: s.auth,
       }
