@@ -29,6 +29,7 @@
     "@magnitudedev/xml-act": "workspace:*",
     "ai": "^6.0.154",
     "effect": "^3.19.6",
+    "exa-js": "^2.11.0",
     "ignore": "^7.0.5",
     "luxon": "^3.7.2",
     "openai": "^6.22.0",

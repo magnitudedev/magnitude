@@ -23,7 +23,7 @@ import { SkillsAmbient } from '../ambient/skills-ambient'
 import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
-import { buildRegisteredTools } from '../tools/tool-registry'
+import { buildRegisteredTools, generateToolGrammar } from '../tools/tool-registry'
 
 import { isValidVariant, type AgentVariant } from '../agents/variants'
 import { getAgentDefinition } from '../agents/registry'
@@ -265,7 +265,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const executionLayer = layers
 
       // Build registered tools for xml-act runtime
-      const registeredTools = buildRegisteredTools(agentDef, executionLayer)
+      const registeredTools = buildRegisteredTools(agentDef, executionLayer, options.excludeTools)
 
       // Create fresh xml-act runtime for this execution
       // Surface binding validation errors as XmlRuntimeCrash so they appear as turn errors

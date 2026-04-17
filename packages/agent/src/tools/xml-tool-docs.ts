@@ -33,11 +33,13 @@ export interface ToolPresentation {
  */
 export function buildToolPresentation(
   agentDef: RoleDefinition,
-  implicitTools: readonly string[] = []
+  implicitTools: readonly string[] = [],
+  excludeTools?: Set<string>,
 ): ToolPresentation[] {
   const presentations: ToolPresentation[] = []
 
   for (const defKey of agentDef.tools.keys) {
+    if (excludeTools?.has(defKey)) continue
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const tool = entry.tool
     if (implicitTools.includes(defKey)) continue
@@ -139,7 +141,8 @@ export function generateXmlActToolShape(
  */
 export function generateXmlActToolDocs(
   agentDef: RoleDefinition,
-  implicitTools: readonly string[] = []
+  implicitTools: readonly string[] = [],
+  excludeTools?: Set<string>,
 ): string {
 
   // Build defKey lookup: entry instance → defKey (for implicit filtering)
@@ -149,6 +152,7 @@ export function generateXmlActToolDocs(
   const groups = new Map<string, { tools: XmlToolDocEntry[]; global: boolean }>()
 
   for (const defKey of agentDef.tools.keys) {
+    if (excludeTools?.has(defKey)) continue
     const catalogEntry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const entry = toXmlToolDocEntry(catalogEntry)
 

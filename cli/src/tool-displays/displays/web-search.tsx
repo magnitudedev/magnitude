@@ -17,7 +17,7 @@ export const webSearchDisplay = createToolDisplay<WebSearchState>({
     const theme = useTheme();
     const isRunning = state.phase === 'streaming' || state.phase === 'executing';
     const isError = state.phase === 'error';
-    const sources = state.sources;
+    const sources = state.sources ?? [];
 
     if (isRunning) {
       return (

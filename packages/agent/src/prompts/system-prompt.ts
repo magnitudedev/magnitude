@@ -26,9 +26,9 @@ function mapProtocolMode(roleDef: RoleDefinition): 'lead' | 'subagent' | 'onesho
 export function renderSystemPrompt(
   roleDef: RoleDefinition,
   skills: Map<string, Skill>,
-  options?: { implicitTools?: readonly string[] },
+  options?: { implicitTools?: readonly string[]; excludeTools?: Set<string> },
 ): string {
-  const toolDocs = generateXmlActToolDocs(roleDef, options?.implicitTools ?? [])
+  const toolDocs = generateXmlActToolDocs(roleDef, options?.implicitTools ?? [], options?.excludeTools)
   return roleDef.systemPrompt
     .replaceAll(
       '{{RESPONSE_PROTOCOL}}',

@@ -104,6 +104,7 @@ export interface ExecuteOptions {
   readonly chainId: string
   readonly defaultProseDest: 'user' | 'parent'
   readonly allowSingleUserReplyThisTurn: boolean
+  readonly excludeTools?: Set<string>
 }
 
 export interface ExecuteResult {

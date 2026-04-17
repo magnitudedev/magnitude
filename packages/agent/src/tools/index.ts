@@ -1,73 +1,11 @@
 /**
  * Tools Index
  *
- * Builds RegisteredTool map from agent definitions for xml-act runtime.
- * The agent definition's tool set is the single source of truth
- * for what tools each agent gets.
+ * Re-exports for the tools package barrel.
+ * buildRegisteredTools and generateToolGrammar live in ./tool-registry.
  */
-
-import type { RegisteredTool } from '@magnitudedev/xml-act'
-import { generateGrammar, type GrammarToolDef } from '@magnitudedev/xml-act'
-import { Effect, type Layer } from 'effect'
-import type { RoleDefinition } from '@magnitudedev/roles'
-import type { AgentCatalogEntry } from '../catalog'
-import type { XmlBinding } from '@magnitudedev/tools'
-
-// =============================================================================
-// Build registered tools from agent definition
-// =============================================================================
-
-/**
- * Derive a Map<tagName, RegisteredTool> from an RoleDefinition.
- */
-export function buildRegisteredTools(
-  agentDef: RoleDefinition,
-  layers: Layer.Layer<never>,
-): Map<string, RegisteredTool> {
-  const tools = new Map<string, RegisteredTool>()
-
-  for (const defKey of agentDef.tools.keys) {
-    const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
-    const tool = entry.tool
-
-    const binding = entry.binding.toXmlTagBinding()
-    const tagName = binding.tag
-    const rawOutputBinding = entry.binding.toXmlOutputBinding()
-    const outputBinding: XmlBinding<unknown> = { type: 'tag' as const, ...rawOutputBinding }
-
-    tools.set(tagName, {
-      tool,
-      tagName,
-      groupName: tool.group ?? 'default',
-      binding,
-      outputBinding,
-      meta: { defKey },
-      layerProvider: () => Effect.succeed(layers),
-    })
-  }
-
-  return tools
-}
 
 export { getBindingRegistry } from './binding-registry'
-
-/**
- * Generate GBNF grammar from agent definition's tool catalog.
- * Used JIT before model invocation for constrained generation.
- */
-export function generateToolGrammar(agentDef: RoleDefinition): string {
-  const defs: GrammarToolDef[] = []
-  for (const defKey of agentDef.tools.keys) {
-    const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
-    const binding = entry.binding.toXmlTagBinding()
-    defs.push({
-      tagName: binding.tag,
-      binding,
-      inputSchema: entry.tool.inputSchema,
-    })
-  }
-  return generateGrammar(defs)
-}
 
 // =============================================================================
 // Re-exports
@@ -80,6 +18,7 @@ export { fsTools } from './fs'
 
 
 export { webFetchTool } from './web-fetch-tool'
+export { webSearchTool, webSearchXmlBinding } from './web-search'
 export {
   createTaskTool,
   updateTaskTool,

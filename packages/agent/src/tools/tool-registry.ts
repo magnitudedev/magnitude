@@ -17,10 +17,12 @@ import type { XmlBinding } from '@magnitudedev/tools'
 export function buildRegisteredTools(
   agentDef: RoleDefinition,
   layers: Layer.Layer<never>,
+  excludeTools?: Set<string>,
 ): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>()
 
   for (const defKey of agentDef.tools.keys) {
+    if (excludeTools?.has(defKey)) continue
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const tool = entry.tool
 
@@ -47,9 +49,10 @@ export function buildRegisteredTools(
  * Generate GBNF grammar from agent definition's tool catalog.
  * Used JIT before model invocation for constrained generation.
  */
-export function generateToolGrammar(agentDef: RoleDefinition): string {
+export function generateToolGrammar(agentDef: RoleDefinition, excludeTools?: Set<string>): string {
   const defs: GrammarToolDef[] = []
   for (const defKey of agentDef.tools.keys) {
+    if (excludeTools?.has(defKey)) continue
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const binding = entry.binding.toXmlTagBinding()
     defs.push({

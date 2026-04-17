@@ -153,10 +153,18 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const ambientService = yield* AmbientServiceTag
         const skills = ambientService.getValue(SkillsAmbient)
 
+        // Determine if web search should be available (same logic as execution manager)
+        const configState = ambientService.getValue(ConfigAmbient)
+        const isMagnitudeProvider = configState?.bySlot.lead.providerId === 'magnitude'
+        const hasExaKey = !!process.env.EXA_API_KEY
+        const excludeTools = (!isMagnitudeProvider && !hasExaKey)
+          ? new Set(['webSearch'])
+          : undefined
+
         // Build messages array (now includes observations in system inbox)
         const forkMemory = yield* read(MemoryProjection)
         const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
-        const systemPrompt = renderSystemPrompt(agentDef, skills)
+        const systemPrompt = renderSystemPrompt(agentDef, skills, { excludeTools })
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 
@@ -184,7 +192,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           return normalized !== '0' && normalized !== 'false' && normalized !== ''
         })()
         const grammarSafe = boundModel.model.supportsGrammar !== false
-        const toolGrammar = grammarEnabled && grammarSafe ? generateToolGrammar(agentDef) : undefined
+
+        const toolGrammar = grammarEnabled && grammarSafe ? generateToolGrammar(agentDef, excludeTools) : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
@@ -220,6 +229,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               chainId,
               defaultProseDest: agentDef.defaultRecipient,
               allowSingleUserReplyThisTurn,
+              excludeTools,
             },
             sink,
           )

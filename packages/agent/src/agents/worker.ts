@@ -37,6 +37,7 @@ const tools = catalog.pick(
   'fileView',
   'shell',
   'webFetch',
+  'webSearch',
   'skill',
 )
 
