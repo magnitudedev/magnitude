@@ -178,10 +178,10 @@ function AppInner({
   const [showRecentChatsOverlay, setShowRecentChatsOverlay] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null)
   const [selectingModelFor, setSelectingModelFor] = useState<MagnitudeSlot | null>(null)
-  const [slotModels, setSlotModels] = useState<Record<MagnitudeSlot, ModelSelection | null>>({
-    lead: null, explorer: null, planner: null, builder: null,
-    reviewer: null, debugger: null, browser: null,
-  })
+  const emptySlotModels = (): Record<MagnitudeSlot, ModelSelection | null> => (
+    Object.fromEntries(MAGNITUDE_SLOTS.map((slot) => [slot, null])) as Record<MagnitudeSlot, ModelSelection | null>
+  )
+  const [slotModels, setSlotModels] = useState<Record<MagnitudeSlot, ModelSelection | null>>(emptySlotModels)
   const [presets, setPresets] = useState<Preset[]>([])
 
   const [preferencesSelectedIndex, setPreferencesSelectedIndex] = useState(0)
@@ -266,10 +266,7 @@ function AppInner({
   const [wizardModelSelectedIndex, setWizardModelSelectedIndex] = useState(0)
   const [recentChatsSelectedIndex, setRecentChatsSelectedIndex] = useState(0)
   const [authMethodSelectedIndex, setAuthMethodSelectedIndex] = useState(0)
-  const [wizardSlotModels, setWizardSlotModels] = useState<Record<MagnitudeSlot, ModelSelection | null>>({
-    lead: null, explorer: null, planner: null, builder: null,
-    reviewer: null, debugger: null, browser: null,
-  })
+  const [wizardSlotModels, setWizardSlotModels] = useState<Record<MagnitudeSlot, ModelSelection | null>>(emptySlotModels)
   const [wizardConnectedProvider, setWizardConnectedProvider] = useState<string | null>(null)
   const [wizardNeedsChromium, setWizardNeedsChromium] = useState<boolean | null>(null)
 
@@ -717,7 +714,7 @@ function AppInner({
     const agentId = agentStatusState.agentByForkId.get(selectedForkId)
     const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
     if (!agent) return rootModelSummary
-    // agent.role is the slot name (lead, explorer, planner, etc.)
+    // agent.role is the slot name (lead or worker)
     const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agent.role)
       ? agent.role as MagnitudeSlot
       : 'lead' as MagnitudeSlot
@@ -1049,10 +1046,7 @@ function AppInner({
         detectedAuthTypeByProviderId.set(detected.provider.id, detected.auth?.type ?? null)
       }
 
-      const defaultModels: Record<MagnitudeSlot, ModelSelection | null> = {
-        lead: null, explorer: null, planner: null, builder: null,
-        reviewer: null, debugger: null, browser: null,
-      }
+      const defaultModels: Record<MagnitudeSlot, ModelSelection | null> = emptySlotModels()
 
       const preferredProvider = PROVIDERS.find((provider) => provider.id === preferredProviderId)
       const isLocalPreferredProvider = preferredProvider?.providerFamily === 'local'
@@ -1208,10 +1202,7 @@ function AppInner({
         const provider = getProvider(providerId)
         setWizardSelectedProviderId(providerId)
 
-        const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
-          lead: null, explorer: null, planner: null, builder: null,
-          reviewer: null, debugger: null, browser: null,
-        }
+        const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = emptySlotModels()
         const freshConnectedProviderIds = new Set([...connectedProviderIds, providerId])
         for (const slot of MAGNITUDE_SLOTS) {
           const selection = resolveSlotDefaultSelection({
@@ -1324,10 +1315,7 @@ function AppInner({
 
     if (match) {
       // Already authenticated and ready — compute model defaults and go to models step
-      const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = {
-        lead: null, explorer: null, planner: null, builder: null,
-        reviewer: null, debugger: null, browser: null,
-      }
+      const newWizardSlotModels: Record<MagnitudeSlot, ModelSelection | null> = emptySlotModels()
       for (const slot of MAGNITUDE_SLOTS) {
         const selection = resolveSlotDefaultSelection({
           allProviders: PROVIDERS,
@@ -1354,7 +1342,7 @@ function AppInner({
   const finishWizard = useCallback(() => {
     setShowSetupWizard(false)
     setWizardStep('provider')
-    setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
+    setWizardSlotModels(emptySlotModels())
     setWizardConnectedProvider(null)
     setWizardSelectedProviderId(null)
     setWizardSelectedProviderDiscoveredModels([])
@@ -1417,7 +1405,7 @@ function AppInner({
       return
     }
     setWizardStep('provider')
-    setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
+    setWizardSlotModels(emptySlotModels())
     setWizardConnectedProvider(null)
   }, [wizardStep, wizardHasProviderEndpointStep])
 
@@ -1661,7 +1649,7 @@ function AppInner({
     setSelectingModelFor(slot)
   }, [resetModelPickerState])
 
-  const SLOT_UI_ORDER_KEYS: MagnitudeSlot[] = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser']
+  const SLOT_UI_ORDER_KEYS: MagnitudeSlot[] = [...MAGNITUDE_SLOTS]
 
   // Combined model tab keyboard handler — switches between slot view and model picker
   const modelTabHandleKeyEvent = useCallback((key: KeyEvent): boolean => {
@@ -1748,7 +1736,7 @@ function AppInner({
     setWizardStep('provider')
     setWizardProviderSelectedIndex(0)
     setWizardModelSelectedIndex(0)
-    setWizardSlotModels({ lead: null, explorer: null, planner: null, builder: null, reviewer: null, debugger: null, browser: null })
+    setWizardSlotModels(emptySlotModels())
     setWizardNeedsChromium(null)
     setShowSetupWizard(true)
   }, [])

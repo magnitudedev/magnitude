@@ -2,34 +2,24 @@ import type { MagnitudeSlot } from '@magnitudedev/agent'
 
 const rest = (model: string): Record<MagnitudeSlot, string> => ({
   lead: model,
-  explorer: model,
-  planner: model,
-  builder: model,
-  reviewer: model,
-  debugger: model,
-  browser: model,
+  worker: model,
 })
 
-const tiered = (lead: string, sub: string, browser: string): Record<MagnitudeSlot, string> => ({
+const tiered = (lead: string, worker: string): Record<MagnitudeSlot, string> => ({
   lead,
-  explorer: sub,
-  planner: sub,
-  builder: sub,
-  reviewer: sub,
-  debugger: sub,
-  browser,
+  worker,
 })
 
 export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
-  'anthropic': tiered('claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'),
-  'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
-  'github-copilot': tiered('claude-opus-4.6', 'claude-sonnet-4.6', 'claude-haiku-4.5'),
-  'openrouter': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'),
-  'vercel': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'),
-  'amazon-bedrock': tiered('us.anthropic.claude-opus-4-6-v1', 'us.anthropic.claude-sonnet-4-6-v1', 'us.anthropic.claude-haiku-4-5-v1'),
-  'google-vertex-anthropic': tiered('claude-opus-4-6@default', 'claude-sonnet-4-6@default', 'claude-haiku-4-5@default'),
-  'google': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3-flash-preview'),
-  'google-vertex': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3-flash-preview'),
+  'anthropic': tiered('claude-opus-4-6', 'claude-sonnet-4-6'),
+  'openai': tiered('gpt-5.4', 'gpt-5.3-codex'),
+  'github-copilot': tiered('claude-opus-4.6', 'claude-sonnet-4.6'),
+  'openrouter': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6'),
+  'vercel': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6'),
+  'amazon-bedrock': tiered('us.anthropic.claude-opus-4-6-v1', 'us.anthropic.claude-sonnet-4-6-v1'),
+  'google-vertex-anthropic': tiered('claude-opus-4-6@default', 'claude-sonnet-4-6@default'),
+  'google': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview'),
+  'google-vertex': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview'),
   'cerebras': rest('gpt-oss-120b'),
   'minimax': rest('MiniMax-M2.7'),
   'zai': rest('glm-4.7'),
@@ -37,12 +27,12 @@ export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
   'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
-  'magnitude': tiered('glm-5.1', 'kimi-k2.5', 'kimi-k2.5'),
+  'magnitude': tiered('glm-5.1', 'kimi-k2.5'),
 }
 
 /** OAuth-specific overrides */
 export const MODEL_OAUTH_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
-  'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
+  'openai': tiered('gpt-5.4', 'gpt-5.3-codex'),
 }
 
 /** Get the default model IDs for all slots for a provider */

@@ -8,11 +8,11 @@ interface SetupWizardNavState {
   handleKeyEvent: (key: KeyEvent) => boolean
 }
 
-const SLOT_ORDER: MagnitudeSlot[] = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser']
+const SLOT_ORDER: MagnitudeSlot[] = ['lead', 'worker']
 
 /**
  * Manages keyboard navigation for the setup wizard model confirmation step.
- * Items: 0 = "Start chatting/Continue", 1-7 = individual slots (lead, explorer, planner, builder, reviewer, debugger, browser)
+ * Items: 0 = "Start chatting/Continue", 1-2 = individual slots (lead, worker)
  */
 export function useSetupWizardNavigation(
   onConfirm: () => void,
@@ -35,13 +35,13 @@ export function useSetupWizardNavigation(
     }
 
     if (isDown) {
-      setSelectedIndex(prev => Math.min(7, prev + 1))
+      setSelectedIndex(prev => Math.min(2, prev + 1))
       return true
     }
 
     if (isEnter) {
       if (selectedIndex === 0) onConfirm()
-      else if (selectedIndex >= 1 && selectedIndex <= 7) onChangeSlot(SLOT_ORDER[selectedIndex - 1])
+      else if (selectedIndex >= 1 && selectedIndex <= 2) onChangeSlot(SLOT_ORDER[selectedIndex - 1])
       return true
     }
 
