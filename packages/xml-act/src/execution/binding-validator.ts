@@ -21,7 +21,7 @@ function unwrapAst(ast: AST.AST): AST.AST {
   return ast
 }
 
-type ScalarType = 'string' | 'number' | 'boolean'
+type ScalarType = 'string' | 'number' | 'boolean' | { readonly _tag: 'enum'; readonly values: readonly string[] }
 
 function getScalarType(ast: AST.AST): ScalarType | undefined {
   const unwrapped = unwrapAst(ast)
@@ -37,13 +37,22 @@ function getScalarType(ast: AST.AST): ScalarType | undefined {
       return undefined
     }
     case 'Union': {
-      // Union of literals (e.g., Schema.Literal('a', 'b', 'c')) — resolve if all members share one scalar type
+      // Check if all members are string literals → enum
+      const allStringLiterals = unwrapped.types.every(t => {
+        const u = unwrapAst(t)
+        return u._tag === 'Literal' && typeof u.literal === 'string'
+      })
+      if (allStringLiterals && unwrapped.types.length > 0) {
+        const values = unwrapped.types.map(t => (unwrapAst(t) as AST.Literal).literal as string)
+        return { _tag: 'enum', values }
+      }
+      // Union of literals sharing one scalar type
       const memberTypes = unwrapped.types
         .map(t => getScalarType(t))
         .filter((t): t is ScalarType => t !== undefined)
       if (memberTypes.length === 0) return undefined
       const first = memberTypes[0]
-      if (memberTypes.every(t => t === first)) return first
+      if (typeof first === 'string' && memberTypes.every(t => t === first)) return first
       return undefined
     }
     default: return undefined

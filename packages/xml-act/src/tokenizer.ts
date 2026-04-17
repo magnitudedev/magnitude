@@ -47,6 +47,7 @@ type ActiveTag = {
   attrKey: string
   attrValue: string
   attrQuote: '"' | "'" | null
+  attrEscaping: boolean
 }
 
 type FenceState = {
@@ -188,6 +189,7 @@ export function createTokenizer(
       attrKey: '',
       attrValue: '',
       attrQuote: null,
+      attrEscaping: false,
     }
   }
 
@@ -477,6 +479,15 @@ export function createTokenizer(
     }
 
     if (tag.phase === 'attrValueQuoted') {
+      if (tag.attrEscaping) {
+        tag.attrEscaping = false
+        tag.attrValue += ch === '"' ? '"' : '\\' + ch
+        return
+      }
+      if (ch === '\\' && tag.attrQuote === '"') {
+        tag.attrEscaping = true
+        return
+      }
       if (ch === tag.attrQuote) {
         finalizeAttrValue(tag)
         tag.phase = 'attrs'

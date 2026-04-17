@@ -190,4 +190,52 @@ describe('tokenizer', () => {
       },
     ])
   })
+
+  it('handles escaped quote in attribute value', () => {
+    const tokens = collect('<foo bar="hello \\"world\\"">')
+    expect(tokens).toEqual([
+      {
+        type: 'open',
+        tagName: 'foo',
+        attrs: new Map([['bar', 'hello "world"']]),
+        afterNewline: true,
+      },
+    ])
+  })
+
+  it('handles backslash without quote as literal backslash', () => {
+    const tokens = collect('<foo bar="C:\\path\\to\\file">')
+    expect(tokens).toEqual([
+      {
+        type: 'open',
+        tagName: 'foo',
+        attrs: new Map([['bar', 'C:\\path\\to\\file']]),
+        afterNewline: true,
+      },
+    ])
+  })
+
+  it('handles escaped quote at end of attribute value', () => {
+    const tokens = collect('<foo bar="test\\"">')
+    expect(tokens).toEqual([
+      {
+        type: 'open',
+        tagName: 'foo',
+        attrs: new Map([['bar', 'test"']]),
+        afterNewline: true,
+      },
+    ])
+  })
+
+  it('handles multiple escaped quotes in attribute value', () => {
+    const tokens = collect('<foo bar="a\\"b\\"c">')
+    expect(tokens).toEqual([
+      {
+        type: 'open',
+        tagName: 'foo',
+        attrs: new Map([['bar', 'a"b"c']]),
+        afterNewline: true,
+      },
+    ])
+  })
 })

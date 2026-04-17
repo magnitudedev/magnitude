@@ -36,6 +36,7 @@ export function generateGrammar(tools: ReadonlyArray<GrammarToolDef>): string {
 
   // Whitespace
   rules.push('ws ::= [ \\t\\n]*')
+  rules.push('ws1 ::= [ \\t\\n]+')
 
   // Root
   rules.push('root ::= lens* (msg | tool)* endturn')
@@ -46,7 +47,7 @@ export function generateGrammar(tools: ReadonlyArray<GrammarToolDef>): string {
   rules.push(...generateBodyRules('lens', 'lens'))
 
   // Message - uses DFA body to allow any content including angle brackets
-  rules.push('msg ::= "<message to=\\"" [^"]* "\\">" msg-body "</message>" ws')
+  rules.push('msg ::= "<message to=\\"" ([^"] | "\\\\\\"")*  "\\">" msg-body "</message>" ws')
   rules.push(...generateBodyRules('msg', 'message'))
 
   // End-turn
@@ -232,7 +233,7 @@ function generateAttrRules(
 
   // Add observe attribute if requested (framework metadata, not part of tool bindings)
   if (options?.includeObserve) {
-    alts.push(`"observe=\\"" [^"]* "\\""`)
+    alts.push(`"observe=\\"" ([^"] | "\\\\\\"")*  "\\""`)
   }
 
   for (const [attrName, attrSchema] of attributes) {
@@ -248,7 +249,7 @@ function generateAttrRules(
   // Order-independent: (ws (alt1 | alt2 | ...))* ws
   // Trailing ws allows whitespace before closing > or />
   rules.push(`${attrAltName} ::= ${alts.join(' | ')}`)
-  rules.push(`${attrRuleName} ::= (ws ${attrAltName})* ws`)
+  rules.push(`${attrRuleName} ::= (ws1 ${attrAltName})* ws`)
   return rules
 }
 
@@ -272,10 +273,14 @@ function generateChildRules(
   return rules
 }
 
-function valuePatternForType(type: 'string' | 'number' | 'boolean'): string {
+function valuePatternForType(type: AttributeSchema['type']): string {
+  if (typeof type === 'object' && type._tag === 'enum') {
+    return `(${type.values.map(v => `"${v}"`).join(' | ')})`
+  }
   switch (type) {
-    case 'string': return '[^"]*'
+    case 'string': return '([^"] | "\\\\\\"")*'
     case 'number': return '[0-9]+'
     case 'boolean': return '("true" | "false")'
+    default: return '[^"]*'
   }
 }

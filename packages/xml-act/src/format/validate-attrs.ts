@@ -6,7 +6,7 @@
  */
 
 import type { AttributeValue } from './types'
-import type { TagSchema, ChildTagSchema } from '../execution/binding-validator'
+import type { TagSchema, ChildTagSchema, AttributeSchema } from '../execution/binding-validator'
 import { coerceAttributeValue } from './coerce'
 
 export type AttrValidationError =
@@ -39,11 +39,16 @@ export function validateToolAttr(
   if (!result.ok) {
     return {
       ok: false,
-      error: { _tag: 'InvalidAttributeValue', expected: attrSchema.type, received: raw },
+      error: { _tag: 'InvalidAttributeValue', expected: describeAttrType(attrSchema.type), received: raw },
     }
   }
 
   return result
+}
+
+function describeAttrType(type: AttributeSchema['type']): string {
+  if (typeof type === 'object' && type._tag === 'enum') return `enum(${type.values.join(',')})`
+  return type as string
 }
 
 export function validateChildAttr(
@@ -60,7 +65,7 @@ export function validateChildAttr(
   if (!result.ok) {
     return {
       ok: false,
-      error: { _tag: 'InvalidAttributeValue', expected: attrSchema.type, received: raw },
+      error: { _tag: 'InvalidAttributeValue', expected: describeAttrType(attrSchema.type), received: raw },
     }
   }
 

@@ -204,4 +204,68 @@ describe('generateGrammar', () => {
     // tool rule should handle empty case
     expect(grammar).toContain('tool ::=')
   })
+
+  it('includes ws1 rule for mandatory whitespace', () => {
+    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    expect(grammar).toContain('ws1 ::= [ \\t\\n]+')
+  })
+
+  it('uses ws1 before attributes to prevent tag-attribute fusion', () => {
+    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    // Attr rules must use ws1 (one-or-more) not ws (zero-or-more) before each attribute
+    expect(grammar).toContain('readtool-attrs ::= (ws1 readtool-attrs-alt)* ws')
+  })
+
+  it('uses ws1 for parent tool attr rules with children', () => {
+    const grammar = generateGrammar([makeDef(editBinding, editTool)])
+    // Parent edit tool attrs use ws1
+    expect(grammar).toContain('edittool-attrs ::= (ws1 edittool-attrs-alt)* ws')
+    // Child elements (old, new) have no attrs, so their attr rule is just ws
+    expect(grammar).toContain('edittool-oldtool-attrs ::= ws')
+  })
+
+  it('generates escape pattern for string attribute values', () => {
+    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    // String attrs should allow escaped quotes: ([^"] | "\\\"")* not [^"]*
+    expect(grammar).toContain('([^"] | "\\\\\\"")*')
+    expect(grammar).not.toMatch(/readtool-attrs-alt.*\[^\"\]\*/)
+  })
+
+  it('generates escape pattern for observe attribute', () => {
+    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    // observe attr should also use escape pattern
+    expect(grammar).toContain('"observe=\\"" ([^"] | "\\\\\\"")*')
+  })
+
+  it('generates escape pattern for message to attribute', () => {
+    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    // msg rule should use escape pattern for to value
+    expect(grammar).toContain('msg ::= "<message to=\\"" ([^"] | "\\\\\\"")*')
+  })
+
+  it('generates enum pattern for literal union attributes', () => {
+    const enumTool = defineTool({
+      name: 'update-task',
+      group: 'task',
+      description: 'Update task',
+      inputSchema: Schema.Struct({
+        id: Schema.String,
+        status: Schema.Literal('pending', 'completed', 'cancelled'),
+      }),
+      outputSchema: Schema.Struct({ id: Schema.String }),
+      execute: () => Effect.succeed({ id: '' }),
+    })
+    const enumBinding = defineXmlBinding(enumTool, {
+      input: {
+        attributes: [
+          { field: 'id', attr: 'id' },
+          { field: 'status', attr: 'status' },
+        ],
+      },
+      output: {},
+    } as const)
+    const grammar = generateGrammar([makeDef(enumBinding, enumTool)])
+    // status should be enum, not string
+    expect(grammar).toContain('"status=\\"" ("pending" | "completed" | "cancelled") "\\""')
+  })
 })
