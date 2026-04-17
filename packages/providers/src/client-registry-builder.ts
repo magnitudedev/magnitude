@@ -217,10 +217,6 @@ function buildOpenAIGenericOptions(
 
   if (def.id === 'magnitude') {
     base.stream = true
-    // Temporarily disable Magnitude-specific response_format override.
-    // base.response_format = grammar
-    //   ? { type: 'grammar', grammar }
-    //   : { type: 'text' }
   }
 
   if (auth?.type === 'api') {
