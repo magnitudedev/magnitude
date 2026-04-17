@@ -11,23 +11,18 @@ describe('model recommendations', () => {
     ]))
   })
 
-  it('recommends kimi-k2.5 for Magnitude subagents and browser', () => {
+  it('recommends kimi-k2.5 for Magnitude worker', () => {
     const recommendation = getModelRecommendation('magnitude', 'kimi-k2.5')
     expect(recommendation).not.toBeNull()
     expect(recommendation?.classes).toEqual(new Set([
-      'explorer',
-      'planner',
-      'builder',
-      'reviewer',
-      'debugger',
-      'browser',
+      'worker',
     ]))
   })
 
-  it('still recommends kimi-k2.5 for Moonshot AI', () => {
+  it('still recommends kimi-k2.5 for Moonshot AI lead and worker', () => {
     const recommendation = getModelRecommendation('moonshotai', 'kimi-k2.5')
     expect(recommendation).not.toBeNull()
     expect(recommendation?.classes.has('lead')).toBe(true)
-    expect(recommendation?.classes.has('browser')).toBe(true)
+    expect(recommendation?.classes.has('worker')).toBe(true)
   })
 })

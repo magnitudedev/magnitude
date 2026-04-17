@@ -19,10 +19,10 @@ function rule(
   return { provider, model, classes }
 }
 
-const ALL_SLOTS = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser'] as const
-const SUBAGENT_SLOTS = ['explorer', 'planner', 'builder', 'reviewer', 'debugger'] as const
-const NON_BROWSER_SLOTS = ['lead', 'explorer', 'planner', 'builder', 'reviewer', 'debugger'] as const
-const SUBAGENT_AND_BROWSER = ['explorer', 'planner', 'builder', 'reviewer', 'debugger', 'browser'] as const
+const ALL_SLOTS = ['lead', 'worker'] as const
+const SUBAGENT_SLOTS = ['worker'] as const
+const NON_BROWSER_SLOTS = ['lead', 'worker'] as const
+const SUBAGENT_AND_BROWSER = ['worker'] as const
 
 export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   // Anthropic
