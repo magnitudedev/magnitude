@@ -39,6 +39,7 @@ const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
   'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
+  'magnitude': rest('glm-5.1'),
 }
 
 const MODEL_OAUTH_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
@@ -64,6 +65,30 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
       'accounts/fireworks/models/glm-5p1',
     ])
     expect(staticModels.some((model) => model.id === 'accounts/fireworks/routers/kimi-k2p5-turbo')).toBe(true)
+  })
+
+  it('registers Magnitude with static OpenAI-compatible API-key config', () => {
+    const provider = getProvider('magnitude')
+    expect(provider).toBeDefined()
+    expect(provider?.name).toBe('Magnitude')
+    expect(provider?.bamlProvider).toBe('openai-generic')
+    expect(provider?.defaultBaseUrl).toBe('https://app.magnitude.dev/api/v1')
+    expect(provider?.authMethods).toEqual([
+      { type: 'api-key', label: 'API key', envKeys: ['MAGNITUDE_API_KEY'] },
+    ])
+    expect(provider?.providerFamily).toBe('cloud')
+    expect(provider?.inventoryMode).toBe('static')
+
+    const staticModels = getStaticProviderModels('magnitude')
+    expect(staticModels.map((model) => model.id)).toEqual([
+      'qwen3.6-plus',
+      'glm-4.7',
+      'glm-5',
+      'glm-5.1',
+      'kimi-k2.5',
+      'minimax-m2.5',
+      'minimax-m2.7',
+    ])
   })
 
   for (const [providerId, slotMap] of Object.entries(MODEL_DEFAULTS)) {

@@ -243,6 +243,26 @@ export const PROVIDERS: ProviderDefinition[] = [
     inventoryMode: 'dynamic',
   },
   {
+    id: 'magnitude',
+    name: 'Magnitude',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'https://app.magnitude.dev/api/v1',
+    models: [
+      staticModel({ id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus', family: 'qwen', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 200000, contextWindow: 200000 }),
+      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
+      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
+      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
+      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000 }),
+      staticModel({ id: 'minimax-m2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000 }),
+      staticModel({ id: 'minimax-m2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000 }),
+    ],
+    authMethods: [
+      { type: 'api-key', label: 'API key', envKeys: ['MAGNITUDE_API_KEY'] },
+    ],
+    providerFamily: 'cloud',
+    inventoryMode: 'static',
+  },
+  {
     id: 'lmstudio',
     name: 'LM Studio',
     bamlProvider: 'openai-generic',

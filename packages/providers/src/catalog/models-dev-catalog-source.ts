@@ -8,7 +8,7 @@ import { resolveCachedSource } from './source-cache'
 export const modelsDevCatalogSource: CatalogSource = {
   id: 'models.dev',
   priority: 100,
-  supports: (provider) => provider.providerFamily !== 'local',
+  supports: (provider) => provider.providerFamily !== 'local' && provider.id !== 'magnitude',
   refresh: (provider) =>
     resolveCachedSource(
       'models-dev',

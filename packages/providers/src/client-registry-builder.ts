@@ -229,6 +229,14 @@ function buildOpenAIGenericOptions(
     stream_options: { include_usage: true },
   }
 
+  if (def.id === 'magnitude') {
+    base.stream = true
+    // Temporarily disable Magnitude-specific response_format override.
+    // base.response_format = grammar
+    //   ? { type: 'grammar', grammar }
+    //   : { type: 'text' }
+  }
+
   // Provider-specific headers
   if (def.id === 'github-copilot') {
     base.headers = {
@@ -477,6 +485,7 @@ export function __testOnly_buildProviderOptions(
   auth: AuthInfo | null,
   providerOptions?: ProviderOptions,
   stopSequences?: string[],
+  grammar?: string,
 ): Record<string, any> | undefined {
   const def = getProvider(providerId)
   if (!def) return undefined
@@ -491,6 +500,7 @@ export function __testOnly_buildProviderOptions(
     providerOptions,
     stopSequences,
     modelDef?.maxOutputTokens,
+    grammar,
   )
 }
 

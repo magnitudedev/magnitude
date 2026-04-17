@@ -59,6 +59,20 @@ export function getLowestEffortOptions(
     return null
   }
 
+  // --- Magnitude (provider-specific reasoning policy) ---
+  if (providerId === 'magnitude') {
+    if (id.includes('minimax')) {
+      return {
+        optionsMerge: { reasoning_effort: 'low' },
+        label: 'Magnitude reasoning_effort=low',
+      }
+    }
+    return {
+      optionsMerge: { reasoning_effort: 'none' },
+      label: 'Magnitude reasoning_effort=none',
+    }
+  }
+
   // --- Fireworks AI (disable reasoning where supported) ---
   // GLM models support reasoning_effort: "none"
   // Kimi models on Fireworks also support disabling via reasoning_effort: "none"

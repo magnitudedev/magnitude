@@ -36,7 +36,8 @@ export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'zai-coding-plan': rest('glm-4.7'),
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
-  'fireworks': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
+  'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
+  'magnitude': tiered('glm-5.1', 'kimi-k2.5', 'kimi-k2.5'),
 }
 
 /** OAuth-specific overrides */

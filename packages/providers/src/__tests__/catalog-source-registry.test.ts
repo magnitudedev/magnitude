@@ -23,6 +23,7 @@ describe('catalog source registry contracts', () => {
     ])
 
     const fireworks = getProvider('fireworks-ai')!
+    const magnitude = getProvider('magnitude')!
     const openrouter = getProvider('openrouter')!
     const lmstudio = getProvider('lmstudio')!
     const anthropic = getProvider('anthropic')!
@@ -31,6 +32,7 @@ describe('catalog source registry contracts', () => {
     expect(sources.find((s) => s.id === 'models.dev')!.supports(lmstudio)).toBe(false)
     expect(sources.find((s) => s.id === 'models.dev')!.supports(anthropic)).toBe(true)
     expect(sources.find((s) => s.id === 'models.dev')!.supports(fireworks)).toBe(true)
+    expect(sources.find((s) => s.id === 'models.dev')!.supports(magnitude)).toBe(false)
     expect(sources.find((s) => s.id === 'local-discovery')!.supports(lmstudio)).toBe(true)
     expect(sources.find((s) => s.id === 'openrouter-api')!.supports(openrouter)).toBe(true)
     expect(sources.find((s) => s.id === 'openrouter-api')!.supports(fireworks)).toBe(false)

@@ -57,8 +57,12 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   rule(/^MiniMax-M2\.7$/, [...ALL_SLOTS]),
 
   // Moonshot
-  rule(/^kimi-k2\.5$/, [...ALL_SLOTS]),
+  rule(/^kimi-k2\.5$/, [...ALL_SLOTS], 'moonshotai'),
   rule(/^k2p5$/, [...ALL_SLOTS], 'kimi-for-coding'),
+
+  // Magnitude
+  rule(/^glm-5\.1$/, ['lead'], 'magnitude'),
+  rule(/^kimi-k2\.5$/, [...SUBAGENT_AND_BROWSER], 'magnitude'),
 
   // Fireworks
   rule(/^accounts\/fireworks\/models\/glm-5p1$/, [...ALL_SLOTS], 'fireworks-ai'),

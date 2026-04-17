@@ -216,6 +216,8 @@ export function resolveSlotDefaultSelection({
   for (const provider of preferredFirst) {
     const isOAuth = detectedAuthTypeByProviderId?.get(provider.id) === 'oauth'
     const defaults = getDefaultModels(provider.id, isOAuth)
+    if (!defaults) continue
+
     const defaultModelId = defaults[slot as keyof typeof defaults]
     if (defaultModelId && provider.models.some(model => model.id === defaultModelId)) {
       return { providerId: provider.id, modelId: defaultModelId }
