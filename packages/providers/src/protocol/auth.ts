@@ -56,6 +56,8 @@ export function resolveAnthropicAuth(
     case 'none':
       return {}
     case 'local-optional': {
+      if (auth?.type === 'api') return { api_key: auth.key }
+      if (auth?.type === 'oauth') return { api_key: auth.accessToken }
       for (const envKey of strategy.envKeys) {
         const value = process.env[envKey]
         if (value) return { api_key: value }
@@ -112,6 +114,8 @@ export function resolveOpenAIAuth(
     case 'none':
       return {}
     case 'local-optional': {
+      if (auth?.type === 'api') return { api_key: auth.key }
+      if (auth?.type === 'oauth') return { api_key: auth.accessToken }
       for (const envKey of strategy.envKeys) {
         const value = process.env[envKey]
         if (value) return { api_key: value }
@@ -169,6 +173,8 @@ export function resolveOpenAIGenericAuth(
     case 'none':
       return {}
     case 'local-optional': {
+      if (auth?.type === 'api') return { api_key: auth.key }
+      if (auth?.type === 'oauth') return { api_key: auth.accessToken }
       for (const envKey of strategy.envKeys) {
         const value = process.env[envKey]
         if (value) return { api_key: value }
