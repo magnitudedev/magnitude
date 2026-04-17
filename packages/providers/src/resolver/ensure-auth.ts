@@ -16,7 +16,6 @@ import { AuthFailed } from '../errors/model-error'
 import { ProviderAuth, ProviderState } from '../runtime/contracts'
 import { refreshAnthropicToken } from '../auth/anthropic-oauth'
 import { refreshOpenAIToken } from '../auth/openai-oauth'
-import { exchangeCopilotToken } from '../auth/copilot-oauth'
 import type { AuthInfo } from '../types'
 
 /** Refresh OAuth tokens 5 minutes before actual expiry */
@@ -37,7 +36,6 @@ function getOAuthRefreshToken(auth: AuthInfo | null | undefined): string | null 
 async function refreshForProvider(providerId: string, refreshToken: string) {
   if (providerId === 'anthropic') return refreshAnthropicToken(refreshToken)
   if (providerId === 'openai') return refreshOpenAIToken(refreshToken)
-  if (providerId === 'github-copilot') return exchangeCopilotToken(refreshToken)
   return null
 }
 

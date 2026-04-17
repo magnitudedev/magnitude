@@ -53,9 +53,9 @@ export interface SearchOptions {
 // Provider Detection
 // =============================================================================
 
-type SearchProvider = "anthropic" | "openai" | "gemini" | "openrouter" | "vercel" | "github-copilot";
+type SearchProvider = "anthropic" | "openai" | "openrouter" | "vercel";
 
-const SEARCH_PROVIDER_OVERRIDES = ["anthropic", "openai", "gemini", "openrouter", "vercel", "github-copilot"] as const;
+const SEARCH_PROVIDER_OVERRIDES = ["anthropic", "openai", "openrouter", "vercel"] as const;
 const SEARCHABLE_PROVIDER_SLOTS = ['lead', ...MAGNITUDE_SLOTS.filter((slot) => slot !== 'lead')] as const;
 
 function resolveAnthropicAuth(auth?: AuthInfo): SearchAuth {
@@ -74,13 +74,6 @@ function resolveOpenAIAuth(auth?: AuthInfo): SearchAuth {
   throw new Error("No OpenAI auth available for web search. Set OPENAI_API_KEY or authenticate via the app.");
 }
 
-function resolveGeminiAuth(auth?: AuthInfo): SearchAuth {
-  if (auth?.type === "api") return { type: "api-key", value: auth.key };
-  const envKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
-  if (envKey) return { type: "api-key", value: envKey };
-  throw new Error("No Google API key available for web search. Set GOOGLE_API_KEY or GEMINI_API_KEY.");
-}
-
 function resolveOpenRouterAuth(auth?: AuthInfo): SearchAuth {
   if (auth?.type === "api") return { type: "api-key", value: auth.key };
   const envKey = process.env.OPENROUTER_API_KEY;
@@ -93,11 +86,6 @@ export function resolveVercelAuth(auth?: AuthInfo): SearchAuth {
   const envKey = process.env.AI_GATEWAY_API_KEY ?? process.env.VERCEL_API_KEY;
   if (envKey) return { type: "api-key", value: envKey };
   throw new Error("No Vercel AI Gateway API key available for web search. Set AI_GATEWAY_API_KEY or authenticate Vercel in the app.");
-}
-
-export function resolveCopilotAuth(auth?: AuthInfo): SearchAuth {
-  if (auth?.type === "oauth") return { type: "oauth-token", value: auth.accessToken };
-  throw new Error("No GitHub Copilot OAuth session available for web search. Authenticate GitHub Copilot in the app.");
 }
 
 export function detectSearchProvider(providerId: string | null): SearchProvider {
@@ -118,12 +106,8 @@ export function detectSearchProvider(providerId: string | null): SearchProvider 
       return "openai";
     case "openrouter":
       return "openrouter";
-    case "google":
-      return "gemini";
     case "vercel":
       return "vercel";
-    case "github-copilot":
-      return "github-copilot";
     default:
       throw new Error(
         `Web search is not supported with the "${providerId}" provider. ` +
@@ -141,14 +125,10 @@ function resolveSearchAuth(provider: SearchProvider): Effect.Effect<SearchAuth, 
         return resolveAnthropicAuth(yield* auth.getAuth("anthropic"));
       case "openai":
         return resolveOpenAIAuth(yield* auth.getAuth("openai"));
-      case "gemini":
-        return resolveGeminiAuth(yield* auth.getAuth("google"));
       case "openrouter":
         return resolveOpenRouterAuth(yield* auth.getAuth("openrouter"));
       case "vercel":
         return resolveVercelAuth(yield* auth.getAuth("vercel"));
-      case "github-copilot":
-        return resolveCopilotAuth(yield* auth.getAuth("github-copilot"));
     }
   });
 }
@@ -217,10 +197,6 @@ export function webSearch(
         const { openaiWebSearch } = yield* Effect.promise(() => import("./web-search-openai"));
         return yield* Effect.promise(() => openaiWebSearch(query, auth, options));
       }
-      case "gemini": {
-        const { geminiWebSearch } = yield* Effect.promise(() => import("./web-search-gemini"));
-        return yield* Effect.promise(() => geminiWebSearch(query, auth, options));
-      }
       case "openrouter": {
         const { openrouterWebSearch } = yield* Effect.promise(() => import("./web-search-openrouter"));
         return yield* Effect.promise(() => openrouterWebSearch(query, auth, options));
@@ -228,10 +204,6 @@ export function webSearch(
       case "vercel": {
         const { vercelWebSearch } = yield* Effect.promise(() => import("./web-search-vercel"));
         return yield* Effect.promise(() => vercelWebSearch(query, auth, options));
-      }
-      case "github-copilot": {
-        const { copilotWebSearch } = yield* Effect.promise(() => import("./web-search-copilot"));
-        return yield* Effect.promise(() => copilotWebSearch(query, auth, options));
       }
     }
   });

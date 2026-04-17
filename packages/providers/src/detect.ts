@@ -2,7 +2,7 @@
  * Auto-detect available providers from environment variables and stored auth.
  */
 
-import { resolveAwsAuth, resolveGcpAuth, resolveNonStoredAuth } from './auth/resolve'
+import { resolveNonStoredAuth } from './auth/resolve'
 import { PROVIDERS } from './registry'
 
 import type { AuthInfo, AuthMethodDef, ProviderDefinition, ProviderOptions } from './types'
@@ -137,32 +137,6 @@ export function detectProviderAuthMethods(
         connected = true
         source = 'stored'
         auth = stored
-      }
-    } else if (method.type === 'aws-chain') {
-      if (stored?.type === 'aws') {
-        connected = true
-        source = 'stored'
-        auth = stored
-      } else {
-        const awsAuth = resolveAwsAuth(provider)
-        if (awsAuth) {
-          connected = true
-          source = 'env'
-          auth = awsAuth
-        }
-      }
-    } else if (method.type === 'gcp-credentials') {
-      if (stored?.type === 'gcp') {
-        connected = true
-        source = 'stored'
-        auth = stored
-      } else {
-        const gcpAuth = resolveGcpAuth(provider)
-        if (gcpAuth) {
-          connected = true
-          source = 'env'
-          auth = gcpAuth
-        }
       }
     } else if (method.type === 'none') {
       if (provider.providerFamily === 'local') {

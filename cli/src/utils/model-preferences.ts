@@ -13,13 +13,8 @@ const tiered = (lead: string, worker: string): Record<MagnitudeSlot, string> => 
 export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'anthropic': tiered('claude-opus-4-6', 'claude-sonnet-4-6'),
   'openai': tiered('gpt-5.4', 'gpt-5.3-codex'),
-  'github-copilot': tiered('claude-opus-4.6', 'claude-sonnet-4.6'),
   'openrouter': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6'),
   'vercel': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6'),
-  'amazon-bedrock': tiered('us.anthropic.claude-opus-4-6-v1', 'us.anthropic.claude-sonnet-4-6-v1'),
-  'google-vertex-anthropic': tiered('claude-opus-4-6@default', 'claude-sonnet-4-6@default'),
-  'google': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview'),
-  'google-vertex': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview'),
   'cerebras': rest('gpt-oss-120b'),
   'minimax': rest('MiniMax-M2.7'),
   'zai': rest('glm-4.7'),

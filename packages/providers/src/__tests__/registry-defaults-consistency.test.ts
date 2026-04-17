@@ -1,37 +1,26 @@
 import { describe, it, expect } from 'vitest'
 import type { MagnitudeSlot } from '@magnitudedev/agent'
+
+type TestSlot = 'lead' | 'worker' | 'browser'
 import { getProvider, getStaticProviderModels } from '../registry'
 
-const rest = (model: string): Record<MagnitudeSlot, string> => ({
+const rest = (model: string): Record<TestSlot, string> => ({
   lead: model,
-  explorer: model,
-  planner: model,
-  builder: model,
-  reviewer: model,
-  debugger: model,
+  worker: model,
   browser: model,
 })
 
-const tiered = (lead: string, sub: string, browser: string): Record<MagnitudeSlot, string> => ({
+const tiered = (lead: string, sub: string, browser: string): Record<TestSlot, string> => ({
   lead,
-  explorer: sub,
-  planner: sub,
-  builder: sub,
-  reviewer: sub,
-  debugger: sub,
+  worker: sub,
   browser,
 })
 
-const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
+const MODEL_DEFAULTS: Record<string, Record<TestSlot, string>> = {
   'anthropic': tiered('claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'),
   'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
-  'github-copilot': tiered('claude-opus-4.6', 'claude-sonnet-4.6', 'claude-haiku-4.5'),
   'openrouter': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'),
   'vercel': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'),
-  'amazon-bedrock': tiered('us.anthropic.claude-opus-4-6-v1', 'us.anthropic.claude-sonnet-4-6-v1', 'us.anthropic.claude-haiku-4-5-v1'),
-  'google-vertex-anthropic': tiered('claude-opus-4-6@default', 'claude-sonnet-4-6@default', 'claude-haiku-4-5@default'),
-  'google': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3-flash-preview'),
-  'google-vertex': tiered('gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3-flash-preview'),
   'cerebras': rest('gpt-oss-120b'),
   'minimax': rest('MiniMax-M2.7'),
   'zai': rest('glm-4.7'),
@@ -42,7 +31,7 @@ const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'magnitude': rest('glm-5.1'),
 }
 
-const MODEL_OAUTH_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
+const MODEL_OAUTH_DEFAULTS: Record<string, Record<TestSlot, string>> = {
   'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
 }
 

@@ -112,13 +112,6 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
     'arcee-ai/trinity-large-preview:free',
   ],
 
-  // ─── GitHub Copilot ───────────────────────────────────────────
-  'github-copilot': [
-    'claude-opus-4.6', 'claude-opus-4.5', 'claude-sonnet-4.6', 'claude-sonnet-4.5', 'claude-haiku-4.5',
-    'gpt-5.2-codex',
-    'grok-code-fast-1',
-  ],
-
   // ─── Vercel ───────────────────────────────────────────────────
   'vercel': [
     // Anthropic
@@ -158,23 +151,6 @@ export const BROWSER_COMPATIBLE_MODELS: Record<string, string[]> = {
     'gpt-oss-120b', 'qwen-3-235b-a22b-instruct-2507', 'zai-glm-4.7',
   ],
 
-  // ─── Google (Gemini API) ─────────────────────────────────────
-  'google': [
-    'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-3-flash-preview',
-  ],
-
-  // ─── Google Vertex AI (Gemini) ─────────────────────────────────
-  'google-vertex': [
-    'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-3-flash-preview',
-  ],
-
-  // ─── Proxy providers (Anthropic models only) ──────────────────
-  'google-vertex-anthropic': [
-    'claude-opus-4-6', 'claude-opus-4-5', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
-  ],
-  'amazon-bedrock': [
-    'us.anthropic.claude-opus-4-6', 'us.anthropic.claude-opus-4-5', 'us.anthropic.claude-sonnet-4-6', 'us.anthropic.claude-sonnet-4-5', 'us.anthropic.claude-haiku-4-5',
-  ],
 }
 
 /** Check if a provider+model combination is browser-compatible */

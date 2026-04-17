@@ -4,7 +4,6 @@ import {
   exchangeAnthropicCode,
   startOpenAIBrowserOAuth,
   startOpenAIDeviceOAuth,
-  startCopilotAuth,
   getProvider,
   type ProviderDefinition,
 } from '@magnitudedev/agent'
@@ -128,9 +127,8 @@ export function useAuthFlow({
         url: authUrl, codeVerifier, codeError: null, isSubmitting: false,
       })
     } else if (method.type === 'oauth-device') {
-      const startFn = provider.id === 'github-copilot' ? startCopilotAuth : startOpenAIDeviceOAuth
       try {
-        const result = await startFn()
+        const result = await startOpenAIDeviceOAuth()
         setOauthState({
           provider, mode: 'auto', methodLabel: method.label,
           url: result.verificationUrl, userCode: result.userCode,
@@ -169,40 +167,6 @@ export function useAuthFlow({
         })
       } catch (err: any) {
         showEphemeral(`Failed to start auth: ${err.message}`, theme.error, 8000)
-      }
-    } else if (method.type === 'aws-chain') {
-      const hasAccessKey = !!process.env.AWS_ACCESS_KEY_ID
-      const hasProfile = !!process.env.AWS_PROFILE
-      if (hasAccessKey || hasProfile) {
-        const auth = {
-          type: 'aws' as const,
-          profile: process.env.AWS_PROFILE,
-          region: process.env.AWS_DEFAULT_REGION || process.env.AWS_REGION,
-        }
-        await storage.auth.set(provider.id, auth)
-        trackProviderConnected({ providerId: provider.id, authType: 'aws' })
-        await reload()
-        showEphemeral(`Connected ${provider.name}`, theme.success)
-        onAuthSuccess(provider.id, provider.name)
-      } else {
-        onMessage('Configure AWS credentials using aws configure, or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables, then restart Magnitude.')
-      }
-    } else if (method.type === 'gcp-credentials') {
-      const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS
-      if (credPath) {
-        const auth = {
-          type: 'gcp' as const,
-          credentialsPath: credPath,
-          project: process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
-          location: process.env.GOOGLE_CLOUD_LOCATION,
-        }
-        await storage.auth.set(provider.id, auth)
-        trackProviderConnected({ providerId: provider.id, authType: 'gcp' })
-        await reload()
-        showEphemeral(`Connected ${provider.name}`, theme.success)
-        onAuthSuccess(provider.id, provider.name)
-      } else {
-        onMessage('Run gcloud auth application-default login, or set GOOGLE_APPLICATION_CREDENTIALS to your service account key file path, then restart Magnitude.')
       }
     } else if (method.type === 'none') {
       const existing = await storage.config.getProviderOptions(provider.id)

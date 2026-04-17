@@ -47,11 +47,7 @@ export const BrowserServiceLive = Layer.scoped(
 
           // Gemini models use a 1000x1000 coordinate grid; set virtualScreenDimensions
           // so the harness transforms coordinates to the actual viewport
-          const browserModel = await Effect.runPromise(providerState.peek('browser'))
-          const isGemini = browserModel?.model.providerId === 'google' || browserModel?.model.providerId === 'google-vertex'
-          const harnessOptions: WebHarnessOptions = isGemini
-            ? { virtualScreenDimensions: { width: 1000, height: 1000 } }
-            : {}
+          const harnessOptions: WebHarnessOptions = {}
 
           const harness = new WebHarness(context, harnessOptions)
           await harness.start()

@@ -34,10 +34,6 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   rule(/^gpt-5\.4$/, ['lead']),
   rule(/^gpt-5\.3-codex$/, [...SUBAGENT_AND_BROWSER]),
 
-  // Google
-  rule(/^gemini-3\.1-pro-preview$/, ['lead']),
-  rule(/^gemini-3-flash-preview$/, [...SUBAGENT_AND_BROWSER]),
-
   // Qwen
   rule(/^qwen3\.5-(397b-a17b|max-thinking|coder-next)$/, [...NON_BROWSER_SLOTS]),
   rule(/^qwen3\.5-27b$/, [...SUBAGENT_AND_BROWSER]),
@@ -83,14 +79,6 @@ function matchesProvider(providerId: string, provider?: string | RegExp): boolea
 export function normalizeModelId(providerId: string, modelId: string): string {
   if (providerId === 'openrouter' || providerId === 'vercel') {
     return modelId.replace(/^[^/]+\//, '')
-  }
-
-  if (providerId === 'amazon-bedrock') {
-    return modelId.replace(/^(?:(?:[a-z]{2}|global)\.)?anthropic\./i, '')
-  }
-
-  if (providerId === 'google-vertex-anthropic') {
-    return modelId.replace(/@.+$/, '')
   }
 
   return modelId

@@ -3,7 +3,6 @@ import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Effect, Layer } from "effect";
 import { ProviderAuth, ProviderState, type AuthInfo } from "@magnitudedev/providers";
-import { exchangeCopilotToken } from "../../providers/src/auth/copilot-oauth";
 import { webSearch, webSearchStream, type SearchAuth, type SearchOptions } from "../src/tools/web-search";
 import { runDirectAdapter } from "./web-search-capture/runners";
 import {
@@ -18,10 +17,9 @@ import {
 } from "./web-search-capture/capture-harness";
 import { withFetchInterceptor, type FetchCaptureState } from "./web-search-capture/interceptors/fetch-interceptor";
 import { withOpenAISdkInterceptor, type OpenAISdkCaptureState } from "./web-search-capture/interceptors/openai-sdk-interceptor";
-import { withGoogleSdkInterceptor, type GoogleSdkCaptureState } from "./web-search-capture/interceptors/google-sdk-interceptor";
 import { withAnthropicSdkInterceptor, type AnthropicSdkCaptureState } from "./web-search-capture/interceptors/anthropic-sdk-interceptor";
 
-type ProviderCli = "openai" | "openrouter" | "vercel" | "github-copilot" | "gemini" | "anthropic" | "all";
+type ProviderCli = "openai" | "openrouter" | "vercel" | "anthropic" | "all";
 type OpenAIAuthMode = "api" | "oauth" | "both";
 
 interface CliConfig {
@@ -38,7 +36,7 @@ interface CliConfig {
 
 interface RunSpec {
   runId: string;
-  providerSlot: "openai" | "openrouter" | "vercel" | "github-copilot" | "google" | "anthropic";
+  providerSlot: "openai" | "openrouter" | "vercel" | "anthropic";
   providerLabel: string;
   authMode: "api" | "oauth";
   authInfo?: AuthInfo;
@@ -120,7 +118,7 @@ Usage:
   bun run scripts/web-search-capture.ts [options]
 
 Options:
-  --provider <openai|openrouter|vercel|github-copilot|gemini|anthropic|all>
+  --provider <openai|openrouter|vercel|anthropic|all>
   --query "<text>"
   --out <dir>
   --openai-auth <api|oauth|both>
@@ -318,9 +316,6 @@ function createProviderAuthLayer(spec: RunSpec) {
     refresh: (providerId: string, refreshToken: string) =>
       Effect.tryPromise({
         try: async () => {
-          if (providerId === "github-copilot") {
-            return await exchangeCopilotToken(refreshToken);
-          }
           return null;
         },
         catch: (error) => (error instanceof Error ? error : new Error(String(error))),
@@ -703,8 +698,6 @@ async function runOne(
         throw error;
       }
 
-      const refreshedAuth = await exchangeCopilotToken(spec.authInfo.refreshToken);
-      spec.authInfo = refreshedAuth;
       captured = await withInterceptorsForSpec(spec, executeWithMode);
     }
 

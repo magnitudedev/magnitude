@@ -11,7 +11,7 @@ describe('Magnitude provider', () => {
     vi.unstubAllEnvs()
   })
 
-  it('builds Magnitude options from explicit API auth with text response format and stream enabled', () => {
+  it('builds Magnitude options from explicit API auth with stream enabled', () => {
     const options = __testOnly_buildProviderOptions(
       'magnitude',
       'glm-5.1',
@@ -28,7 +28,6 @@ describe('Magnitude provider', () => {
       stop: ['STOP'],
       stream: true,
       stream_options: { include_usage: true },
-      response_format: { type: 'text' },
     }))
   })
 

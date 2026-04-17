@@ -24,41 +24,6 @@ export function getLowestEffortOptions(
 ): EffortOptions | null {
   const id = modelId.toLowerCase()
 
-  // --- GitHub Copilot (must check before generic openai/anthropic) ---
-  if (providerId === 'github-copilot') {
-    // Claude models on Copilot use thinking_budget as a top-level param
-    if (id.includes('claude')) {
-      return {
-        optionsMerge: { thinking_budget: 1 },
-        label: 'Copilot Claude thinking_budget=1',
-      }
-    }
-    // o-series on Copilot — lowest is "low"
-    if (id.includes('o3') || id.includes('o4')) {
-      return {
-        optionsMerge: { reasoning_effort: 'low' },
-        label: 'Copilot reasoning_effort=low',
-      }
-    }
-    // Codex models on Copilot — lowest supported is "low"
-    if (id.includes('codex')) {
-      return {
-        optionsMerge: { reasoning_effort: 'low' },
-        label: 'Copilot reasoning_effort=low',
-      }
-    }
-    // GPT-5 base on Copilot — lowest supported is "low"
-    if (id.includes('gpt-5') && !id.includes('5.')) {
-      return {
-        optionsMerge: { reasoning_effort: 'low' },
-        label: 'Copilot reasoning_effort=low',
-      }
-    }
-    // GPT-5.1+, GPT-5.2+ non-Codex already default to "none" — skip
-    // Gemini on Copilot: no reasoning params supported
-    return null
-  }
-
   // --- Magnitude (provider-specific reasoning policy) ---
   if (providerId === 'magnitude') {
     if (id.includes('minimax')) {
@@ -107,7 +72,7 @@ export function getLowestEffortOptions(
     }
   }
 
-  // --- Anthropic Claude (direct API, Vertex Anthropic) ---
+  // --- Anthropic Claude (direct API) ---
   // Opus 4.6, Sonnet 4.6, Opus 4.5 support effort (Sonnet 4.5 does NOT)
   if (
     (bamlProvider === 'anthropic' && !providerId.startsWith('minimax')) &&
@@ -116,26 +81,6 @@ export function getLowestEffortOptions(
     return {
       optionsMerge: { output_config: { effort: 'low' } },
       label: 'Anthropic effort=low',
-    }
-  }
-
-  // --- Vertex AI Anthropic ---
-  if (providerId === 'google-vertex-anthropic' && isClaudeWithEffort(id)) {
-    return {
-      optionsMerge: { output_config: { effort: 'low' } },
-      label: 'Vertex Anthropic effort=low',
-    }
-  }
-
-  // --- Amazon Bedrock (Anthropic models) ---
-  if (bamlProvider === 'aws-bedrock' && isClaudeWithEffort(id)) {
-    return {
-      optionsMerge: {
-        additional_model_request_fields: {
-          output_config: { effort: 'low' },
-        },
-      },
-      label: 'Bedrock Anthropic effort=low',
     }
   }
 
@@ -167,38 +112,6 @@ export function getLowestEffortOptions(
     // GPT-5.1, GPT-5.2, etc. already default to "none" — don't touch
   }
 
-  // --- Google Gemini 3 (thinkingLevel) ---
-  if (
-    (bamlProvider === 'vertex-ai' || bamlProvider === 'google-ai') &&
-    id.includes('gemini-3')
-  ) {
-    // Flash supports MINIMAL, Pro only supports LOW as lowest
-    const level = id.includes('flash') ? 'MINIMAL' : 'LOW'
-    return {
-      optionsMerge: {
-        generationConfig: {
-          thinkingConfig: { thinkingLevel: level },
-        },
-      },
-      label: `Gemini 3 thinkingLevel=${level}`,
-    }
-  }
-
-  // --- Google Gemini 2.5 (thinkingBudget) ---
-  if (
-    (bamlProvider === 'vertex-ai' || bamlProvider === 'google-ai') &&
-    id.includes('gemini-2.5')
-  ) {
-    return {
-      optionsMerge: {
-        generationConfig: {
-          thinkingConfig: { thinkingBudget: 0 },
-        },
-      },
-      label: 'Gemini 2.5 thinkingBudget=0',
-    }
-  }
-
   return null
 }
 
@@ -216,14 +129,6 @@ export function getCodexReasoningEffort(modelId: string): string | null {
   return null
 }
 
-/**
- * Check whether grammar-constrained generation is safe to use with streaming
- * for a given provider + model combination.
- *
- * Grammar + streaming is broken when model reasoning/thinking cannot be fully
- * disabled (the reasoning phase completes but content generation never starts).
- * This returns false for models where reasoning cannot be set to "none".
- */
 export function canUseGrammarWithStreaming(
   providerId: string,
   modelId: string,

@@ -24,9 +24,7 @@ function resolveBamlProvider(providerId: string, modelId: string, auth: AuthInfo
 
   return (providerId === 'openai' && (auth?.type === 'oauth' || auth?.type === 'api'))
     ? 'openai-responses'
-    : (providerId === 'github-copilot' && modelId.includes('codex'))
-      ? 'openai-responses'
-      : def.bamlProvider
+    : def.bamlProvider
 }
 
 /**
@@ -94,21 +92,9 @@ function buildOptions(
     case 'openai':
       return buildOpenAIOptions(modelId, auth, stopSequences, maxOutputTokens)
     case 'openai-responses':
-      if (def.id === 'github-copilot') {
-        return buildCopilotCodexOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
-      }
       return buildOpenAIResponsesOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
     case 'openai-generic':
       return buildOpenAIGenericOptions(def, modelId, auth, providerOpts, stopSequences, maxOutputTokens, grammar)
-    case 'aws-bedrock':
-      return buildBedrockOptions(modelId, auth, stopSequences, maxOutputTokens)
-    case 'vertex-ai':
-      if (def.id === 'google-vertex-anthropic') {
-        return buildVertexAnthropicOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
-      }
-      return buildVertexGeminiOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
-    case 'google-ai':
-      return buildGoogleAIOptions(modelId, auth, stopSequences, maxOutputTokens)
     default:
       logger.warn(`[Provider] Unsupported BAML provider type: ${def.bamlProvider}`)
       return undefined
@@ -209,7 +195,7 @@ function buildOpenAIResponsesOptions(
   return mergeOpenAIResponsesOverrides(base, providerOpts)
 }
 
-/** OpenAI-generic (OpenRouter, Local, Cerebras, Vercel, GitHub Copilot) */
+/** OpenAI-generic (OpenRouter, Local, Cerebras, Vercel, etc.) */
 function buildOpenAIGenericOptions(
   def: ProviderDefinition,
   modelId: string,
@@ -237,22 +223,9 @@ function buildOpenAIGenericOptions(
     //   : { type: 'text' }
   }
 
-  // Provider-specific headers
-  if (def.id === 'github-copilot') {
-    base.headers = {
-      'Openai-Intent': 'conversation-edits',
-      'x-initiator': 'user',
-      'User-Agent': 'GitHubCopilotChat/0.35.0',
-      'Editor-Version': 'vscode/1.107.0',
-      'Editor-Plugin-Version': 'copilot-chat/0.35.0',
-      'Copilot-Integration-Id': 'vscode-chat',
-    }
-  }
-
   if (auth?.type === 'api') {
     base.api_key = auth.key
   } else if (auth?.type === 'oauth') {
-    // Copilot: accessToken is the exchanged Copilot API token
     base.api_key = auth.accessToken
   } else {
     // Try env vars from auth methods
@@ -276,90 +249,6 @@ function buildOpenAIGenericOptions(
 
   return base
 }
-
-/** AWS Bedrock — uses AWS credential chain, no explicit api_key */
-function buildBedrockOptions(modelId: string, auth: AuthInfo | null, stopSequences?: string[], maxOutputTokens?: number): Record<string, any> | undefined {
-  const base: Record<string, any> = {
-    model: modelId,
-    inference_configuration: {
-      max_tokens: maxOutputTokens ?? 8192,
-      temperature: 0.7,
-    },
-    ...(stopSequences && stopSequences.length > 0
-      ? { additional_model_request_fields: { stop_sequences: stopSequences } }
-      : {}),
-    allowed_role_metadata: ['cache_control'],
-  }
-
-  if (auth?.type === 'aws') {
-    if (auth.region) base.region = auth.region
-    if (auth.profile) base.profile = auth.profile
-  }
-
-  return base
-}
-
-/** Vertex AI — Gemini models on GCP */
-function buildVertexGeminiOptions(
-  modelId: string,
-  auth: AuthInfo | null,
-  providerOpts?: ProviderOptions,
-  stopSequences?: string[],
-  maxOutputTokens?: number,
-): Record<string, any> | undefined {
-  const location = providerOpts?.location ?? process.env.GOOGLE_CLOUD_LOCATION ?? 'us-east5'
-  const base: Record<string, any> = {
-    model: modelId,
-    location,
-    generationConfig: {
-      temperature: 0.7,
-      ...(maxOutputTokens ? { maxOutputTokens } : {}),
-      ...(stopSequences && stopSequences.length > 0 ? { stopSequences } : {}),
-    },
-  }
-
-  if (auth?.type === 'gcp') {
-    base.credentials = auth.credentialsPath
-  } else {
-    const envCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS
-    if (!envCreds) return undefined
-    base.credentials = envCreds
-  }
-
-  return base
-}
-
-/** Vertex AI — Anthropic Claude models on GCP */
-function buildVertexAnthropicOptions(
-  modelId: string,
-  auth: AuthInfo | null,
-  providerOpts?: ProviderOptions,
-  stopSequences?: string[],
-  maxOutputTokens?: number,
-): Record<string, any> | undefined {
-  const project = providerOpts?.project ?? process.env.GCLOUD_PROJECT ?? process.env.GOOGLE_CLOUD_PROJECT ?? 'magnitudeai'
-  const location = providerOpts?.location ?? process.env.GOOGLE_CLOUD_LOCATION ?? 'us-east5'
-  const base: Record<string, any> = {
-    model: modelId,
-    location,
-    anthropic_version: 'vertex-2023-10-16',
-    max_tokens: maxOutputTokens ?? 8192,
-    base_url: `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/anthropic/models`,
-    ...(stopSequences && stopSequences.length > 0 ? { stop_sequences: stopSequences } : {}),
-    allowed_role_metadata: ['cache_control'],
-  }
-
-  if (auth?.type === 'gcp') {
-    base.credentials = auth.credentialsPath
-  } else {
-    const envCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS
-    if (!envCreds) return undefined
-    base.credentials = envCreds
-  }
-
-  return base
-}
-
 
 /** Anthropic-compatible providers (e.g. MiniMax) — api-key with custom base_url */
 function buildAnthropicCompatibleOptions(
@@ -399,59 +288,6 @@ function buildAnthropicCompatibleOptions(
 
   return base
 }
-/** GitHub Copilot with Codex model — uses openai-responses BAML provider */
-// NOTE: Also uses the Responses API, which does not support stop sequences (see buildOpenAIResponsesOptions).
-function buildCopilotCodexOptions(
-  modelId: string,
-  auth: AuthInfo | null,
-  providerOpts?: ProviderOptions,
-  stopSequences?: string[],
-  _maxOutputTokens?: number,
-): Record<string, any> | undefined {
-  // NOTE: max_output_tokens not supported — Codex/Copilot Responses API endpoints reject it with 400.
-  if (auth?.type !== 'oauth') return undefined
-
-  const base = {
-    model: modelId,
-    // stop sequences intentionally omitted — not supported by Responses API
-    api_key: auth.accessToken,
-    base_url: 'https://api.githubcopilot.com',
-    headers: {
-      'Openai-Intent': 'conversation-edits',
-      'x-initiator': 'user',
-      'User-Agent': 'GitHubCopilotChat/0.35.0',
-      'Editor-Version': 'vscode/1.107.0',
-      'Editor-Plugin-Version': 'copilot-chat/0.35.0',
-      'Copilot-Integration-Id': 'vscode-chat',
-      ...extractOpenAIResponsesHeaders(providerOpts),
-    },
-  }
-
-  return mergeOpenAIResponsesOverrides(base, providerOpts)
-}
-
-/** Google AI (Gemini API) — direct API key */
-function buildGoogleAIOptions(modelId: string, auth: AuthInfo | null, stopSequences?: string[], maxOutputTokens?: number): Record<string, any> | undefined {
-  const base: Record<string, any> = {
-    model: modelId,
-    generationConfig: {
-      temperature: 0.7,
-      ...(maxOutputTokens ? { maxOutputTokens } : {}),
-      ...(stopSequences && stopSequences.length > 0 ? { stopSequences } : {}),
-    },
-  }
-
-  if (auth?.type === 'api') {
-    base.api_key = auth.key
-  } else {
-    const envKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY
-    if (!envKey) return undefined
-    base.api_key = envKey
-  }
-
-  return base
-}
-
 function extractOpenAIResponsesHeaders(providerOpts?: ProviderOptions): Record<string, string> {
   const value = providerOpts?.headers
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {}

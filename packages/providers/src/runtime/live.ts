@@ -17,7 +17,6 @@ import { makeProviderStateStore } from '../state/provider-state'
 import { resolveNonStoredAuth } from '../auth/resolve'
 import { refreshAnthropicToken } from '../auth/anthropic-oauth'
 import { refreshOpenAIToken } from '../auth/openai-oauth'
-import { exchangeCopilotToken } from '../auth/copilot-oauth'
 
 export function makeProviderRuntimeLive<TSlot extends string>(
   modelCatalogLayer?: Layer.Layer<ModelCatalog, never, never>
@@ -50,7 +49,6 @@ export function makeProviderRuntimeLive<TSlot extends string>(
             try: async () => {
               if (providerId === 'anthropic') return refreshAnthropicToken(refreshToken)
               if (providerId === 'openai') return refreshOpenAIToken(refreshToken)
-              if (providerId === 'github-copilot') return exchangeCopilotToken(refreshToken)
               return null
             },
             catch: (error) => (error instanceof Error ? error : new Error(String(error))),

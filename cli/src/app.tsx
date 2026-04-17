@@ -1411,7 +1411,7 @@ function AppInner({
 
   // Providers shown in the wizard (exclude cloud providers that require manual credential setup)
   const WIZARD_PROVIDERS = useMemo(() =>
-    PROVIDERS.filter(p => !['google-vertex', 'google-vertex-anthropic', 'amazon-bedrock'].includes(p.id)),
+    PROVIDERS,
   [])
 
   useEffect(() => {

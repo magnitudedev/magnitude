@@ -225,9 +225,6 @@ export {
   startOpenAIBrowserOAuth,
   startOpenAIDeviceOAuth,
   refreshOpenAIToken,
-  startCopilotAuth,
-  exchangeCopilotToken,
-  COPILOT_HEADERS,
 
   isBrowserCompatible,
   getBrowserCompatibleModels,
@@ -254,8 +251,7 @@ export type {
   AnthropicOAuthStart,
   OpenAIBrowserOAuthStart,
   OpenAIDeviceOAuthStart,
-  CopilotOAuthStart,
-  
+
   ChatStream,
   CallUsage,
   SlotUsage,

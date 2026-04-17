@@ -27,6 +27,26 @@ function staticModel(model: Omit<ModelDefinition, 'contextWindow' | 'supportsRea
 
 export const PROVIDERS: ProviderDefinition[] = [
   {
+    id: 'magnitude',
+    name: 'Magnitude',
+    bamlProvider: 'openai-generic',
+    defaultBaseUrl: 'https://app.magnitude.dev/api/v1',
+    models: [
+      staticModel({ id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus', family: 'qwen', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 200000, contextWindow: 200000 }),
+      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
+      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
+      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
+      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000 }),
+      staticModel({ id: 'minimax-m2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000 }),
+      staticModel({ id: 'minimax-m2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000 }),
+    ],
+    authMethods: [
+      { type: 'api-key', label: 'API key', envKeys: ['MAGNITUDE_API_KEY'] },
+    ],
+    providerFamily: 'cloud',
+    inventoryMode: 'static',
+  },
+  {
     id: 'anthropic',
     name: 'Anthropic',
     bamlProvider: 'anthropic',
@@ -57,33 +77,8 @@ export const PROVIDERS: ProviderDefinition[] = [
       { type: 'api-key', label: 'API key', envKeys: ['OPENAI_API_KEY'] },
     ],
   },
-  {
-    id: 'github-copilot',
-    name: 'GitHub Copilot',
-    bamlProvider: 'openai-generic',
-    defaultBaseUrl: 'https://api.githubcopilot.com',
-    models: [
-      staticModel({ id: 'claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
-    ],
-    authMethods: [
-      { type: 'oauth-device', label: 'GitHub Copilot' },
-    ],
-  },
-  {
-    id: 'google',
-    name: 'Google (Gemini)',
-    bamlProvider: 'google-ai',
-    models: [
-      staticModel({ id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', family: 'gemini', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
-      staticModel({ id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', family: 'gemini', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 1048576 }),
-      staticModel({ id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', family: 'gemini', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
-    ],
-    authMethods: [
-      { type: 'api-key', label: 'API key', envKeys: ['GOOGLE_API_KEY', 'GEMINI_API_KEY'] },
-    ],
-  },
+
+
   {
     id: 'openrouter',
     name: 'OpenRouter',
@@ -112,45 +107,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       { type: 'api-key', label: 'API key', envKeys: ['AI_GATEWAY_API_KEY'] },
     ],
   },
-  {
-    id: 'google-vertex',
-    name: 'Google Vertex AI',
-    bamlProvider: 'vertex-ai',
-    models: [
-      staticModel({ id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', family: 'gemini', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
-      staticModel({ id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', family: 'gemini', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
-      staticModel({ id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', family: 'gemini', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 65536, contextWindow: 1048576 }),
-    ],
-    authMethods: [
-      { type: 'gcp-credentials', label: 'Service account', envKeys: ['GOOGLE_APPLICATION_CREDENTIALS'] },
-    ],
-  },
-  {
-    id: 'google-vertex-anthropic',
-    name: 'Vertex AI (Anthropic)',
-    bamlProvider: 'vertex-ai',
-    models: [
-      staticModel({ id: 'claude-opus-4-6@default', name: 'Claude Opus 4.6 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-sonnet-4-6@default', name: 'Claude Sonnet 4.6 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-haiku-4-5@default', name: 'Claude Haiku 4.5 (Vertex)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
-    ],
-    authMethods: [
-      { type: 'gcp-credentials', label: 'Service account', envKeys: ['GOOGLE_APPLICATION_CREDENTIALS'] },
-    ],
-  },
-  {
-    id: 'amazon-bedrock',
-    name: 'Amazon Bedrock',
-    bamlProvider: 'aws-bedrock',
-    models: [
-      staticModel({ id: 'us.anthropic.claude-opus-4-6-v1', name: 'Claude Opus 4.6 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'us.anthropic.claude-sonnet-4-6-v1', name: 'Claude Sonnet 4.6 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'us.anthropic.claude-haiku-4-5-v1', name: 'Claude Haiku 4.5 (Bedrock)', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
-    ],
-    authMethods: [
-      { type: 'aws-chain', label: 'AWS credentials', envKeys: ['AWS_ACCESS_KEY_ID', 'AWS_PROFILE', 'AWS_DEFAULT_REGION'] },
-    ],
-  },
+
   {
     id: 'minimax',
     name: 'MiniMax',
@@ -241,26 +198,6 @@ export const PROVIDERS: ProviderDefinition[] = [
     ],
     providerFamily: 'cloud',
     inventoryMode: 'dynamic',
-  },
-  {
-    id: 'magnitude',
-    name: 'Magnitude',
-    bamlProvider: 'openai-generic',
-    defaultBaseUrl: 'https://app.magnitude.dev/api/v1',
-    models: [
-      staticModel({ id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus', family: 'qwen', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 200000, contextWindow: 200000 }),
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000 }),
-      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000 }),
-      staticModel({ id: 'minimax-m2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000 }),
-      staticModel({ id: 'minimax-m2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000 }),
-    ],
-    authMethods: [
-      { type: 'api-key', label: 'API key', envKeys: ['MAGNITUDE_API_KEY'] },
-    ],
-    providerFamily: 'cloud',
-    inventoryMode: 'static',
   },
   {
     id: 'lmstudio',

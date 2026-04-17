@@ -105,7 +105,7 @@ describe('web search integration', () => {
         }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }) as any,
       () => runWebSearch('latest news', {
-        lead: { providerId: 'amazon-bedrock' },
+        lead: { providerId: 'minimax' },
         builder: { providerId: 'openrouter' },
       }, {
         openrouter: { type: 'api', key: 'worker-openrouter-key' },
@@ -300,11 +300,11 @@ describe('web search integration', () => {
 
   test('no search-capable lead/workers errors clearly with full provider guidance', async () => {
     await expect(runWebSearch('latest news', {
-      lead: { providerId: 'amazon-bedrock' },
-      explorer: { providerId: 'google-vertex-anthropic' },
+      lead: { providerId: 'minimax' },
+      explorer: { providerId: 'cerebras' },
       builder: { providerId: null },
     })).rejects.toThrow(
-      'Current provider does not support web search. To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: anthropic, openai, gemini, openrouter, vercel, github-copilot.',
+      'Current provider does not support web search. To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: anthropic, openai, openrouter, vercel.',
     )
   })
 
@@ -325,14 +325,14 @@ describe('web search integration', () => {
     })
   })
 
-  test('invalid override value lists openrouter and github-copilot', async () => {
+  test('invalid override value lists openrouter and vercel', async () => {
     await withEnv({ MAGNITUDE_SEARCH_PROVIDER: 'bad-provider' }, async () => {
       await expect(runWebSearch('latest news', 'openrouter', {
         openrouter: { type: 'api', key: 'stored-openrouter-key' },
       })).rejects.toThrow('openrouter')
       await expect(runWebSearch('latest news', 'openrouter', {
         openrouter: { type: 'api', key: 'stored-openrouter-key' },
-      })).rejects.toThrow('github-copilot')
+      })).rejects.toThrow('vercel')
     })
   })
 

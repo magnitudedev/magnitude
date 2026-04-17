@@ -16,7 +16,6 @@ import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   anthropic: '(Claude Max or API key)',
   openai: '(ChatGPT Plus/Pro or API key)',
-  'github-copilot': '(GitHub.com or Enterprise)',
   'openai-compatible-local': '(DIY OpenAI-compatible local)',
 }
 
@@ -1002,6 +1001,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
                       <span style={{ fg: theme.muted }}>{'· '}</span>
                     )}
                     {provider.name}
+                    {provider.id === 'magnitude' && (
+                      <span style={{ fg: theme.primary }}>{' '}(recommended)</span>
+                    )}
                     {description && (
                       <span attributes={TextAttributes.DIM}>{' '}{description}</span>
                     )}

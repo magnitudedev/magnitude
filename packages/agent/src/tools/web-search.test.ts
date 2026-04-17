@@ -82,7 +82,7 @@ describe("web-search vercel router reconciliation", () => {
 
   test("vercel override wins over slot provider identity", () => {
     process.env.MAGNITUDE_SEARCH_PROVIDER = "vercel";
-    expect(detectSearchProvider("github-copilot")).toBe("vercel");
+    expect(detectSearchProvider("openrouter")).toBe("vercel");
   });
 });
 

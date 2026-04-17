@@ -131,15 +131,6 @@ export {
 export type { OpenAIBrowserOAuthStart, OpenAIDeviceOAuthStart } from './auth/openai-oauth'
 
 export {
-  startCopilotAuth,
-  exchangeCopilotToken,
-  COPILOT_HEADERS,
-} from './auth/copilot-oauth'
-export type { CopilotOAuthStart } from './auth/copilot-oauth'
-
-export {
   resolveEnvAuth,
-  resolveAwsAuth,
-  resolveGcpAuth,
   resolveNonStoredAuth,
 } from './auth/resolve'
