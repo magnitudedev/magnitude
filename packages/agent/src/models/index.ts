@@ -15,7 +15,7 @@ export { fileEditModel, type FileEditState } from './file-edit'
 export { fileTreeModel, type FileTreeState } from './file-tree'
 export { fileSearchModel, type FileSearchState } from './file-search'
 export { webFetchModel, type WebFetchState } from './web-fetch'
-export { webSearchModel, type WebSearchState } from './web-search'
+// webSearchModel disabled — awaiting Exa reimplementation
 export { agentCreateModel, type AgentCreateState } from './agent-create'
 export { agentKillModel, type AgentKillState } from './agent-kill'
 export { createTaskModel, type CreateTaskState } from './create-task'

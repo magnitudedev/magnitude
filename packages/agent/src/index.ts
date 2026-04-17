@@ -164,7 +164,7 @@ export type { FileEditState, FileWriteState } from './models'
 export { globalTools } from './tools/globals'
 export { shellTool, SHELL_TOOLS } from './tools/shell'
 export { readTool, writeTool, editTool, treeTool, grepTool, fsTools } from './tools/fs'
-export { webSearchTool } from './tools/web-search-tool'
+// webSearchTool disabled — awaiting Exa reimplementation
 export { webFetchTool } from './tools/web-fetch-tool'
 
 export {

@@ -2,16 +2,17 @@
  * Global Tools
  *
  * Built-in tools available in the sandbox:
- * - webSearch(query, schema?) - Search the web with optional structured output
+ * - webFetch(url) - Fetch and extract web page content
  */
 
-import { webSearchTool, webSearchXmlBinding } from './web-search-tool'
+// Web search tool temporarily disabled — awaiting Exa-based reimplementation
+// import { webSearchTool, webSearchXmlBinding } from './web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './web-fetch-tool'
 
 // =============================================================================
 // Global Tools
 // =============================================================================
 
-export const globalTools = [webSearchTool, webFetchTool]
+export const globalTools = [webFetchTool]
 
-export const globalXmlBindings = [webSearchXmlBinding, webFetchXmlBinding]
+export const globalXmlBindings = [webFetchXmlBinding]

@@ -437,7 +437,6 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'fileWrite': return { ...counts, writes: counts.writes + 1 }
     case 'fileEdit': return { ...counts, edits: counts.edits + 1 }
     case 'fileSearch': return { ...counts, searches: counts.searches + 1 }
-    case 'webSearch': return { ...counts, webSearches: counts.webSearches + 1 }
     case 'webFetch': return { ...counts, webFetches: counts.webFetches + 1 }
     case 'click':
     case 'doubleClick':

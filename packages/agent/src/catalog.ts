@@ -35,7 +35,6 @@ import {
   viewTool,
   viewXmlBinding,
 } from './tools/fs'
-import { webSearchTool, webSearchXmlBinding } from './tools/web-search-tool'
 import { webFetchTool, webFetchXmlBinding } from './tools/web-fetch-tool'
 
 import {
@@ -89,7 +88,7 @@ import { fileEditModel } from './models/file-edit'
 import { fileTreeModel } from './models/file-tree'
 import { fileSearchModel } from './models/file-search'
 import { fileViewModel } from './models/file-view'
-import { webSearchModel } from './models/web-search'
+/* webSearch disabled — awaiting Exa reimplementation */
 import { webFetchModel } from './models/web-fetch'
 
 import {
@@ -123,7 +122,7 @@ export const catalog = defineCatalog({
   fileTree: { tool: treeTool, binding: treeXmlBinding, state: fileTreeModel },
   fileSearch: { tool: grepTool, binding: grepXmlBinding, state: fileSearchModel },
   fileView: { tool: viewTool, binding: viewXmlBinding, state: fileViewModel },
-  webSearch: { tool: webSearchTool, binding: webSearchXmlBinding, state: webSearchModel },
+  // webSearch: disabled — awaiting Exa reimplementation
   webFetch: { tool: webFetchTool, binding: webFetchXmlBinding, state: webFetchModel },
 
   click: { tool: clickTool, binding: clickXmlBinding, state: clickModel, group: 'browser' },

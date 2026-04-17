@@ -1,14 +1,17 @@
 /**
- * Web Search Router
+ * Web Search
  *
- * Routes web search requests to the appropriate backend based on the user's
- * current provider selection. Exports shared types used by all provider implementations.
+ * Provider-specific web search shims have been removed.
+ * Web search will be reimplemented using Exa (via Magnitude provider or user-provided API key).
+ *
+ * This module is kept as a skeleton for the future implementation,
+ * preserving useful type definitions and the tool definition.
  */
 
 import { Effect } from 'effect'
-import { ProviderAuth, ProviderState } from '@magnitudedev/providers'
-import type { AuthInfo } from '@magnitudedev/providers'
-import { MAGNITUDE_SLOTS } from '../model-slots'
+import { Schema } from '@effect/schema'
+import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
+import { defineXmlBinding } from '@magnitudedev/xml-act'
 
 // =============================================================================
 // Shared Types
@@ -36,9 +39,8 @@ export interface WebSearchResponse {
 }
 
 export interface SearchAuth {
-  type: "oauth-token" | "api-key";
+  type: "api-key";
   value: string;
-  accountId?: string;  // ChatGPT account ID for Codex endpoint
 }
 
 export interface SearchOptions {
@@ -50,179 +52,42 @@ export interface SearchOptions {
 }
 
 // =============================================================================
-// Provider Detection
+// Tool Definition
 // =============================================================================
 
-type SearchProvider = "anthropic" | "openai" | "openrouter" | "vercel";
+const WebSearchErrorSchema = ToolErrorSchema('WebSearchError', {})
 
-const SEARCH_PROVIDER_OVERRIDES = ["anthropic", "openai", "openrouter", "vercel"] as const;
-const SEARCHABLE_PROVIDER_SLOTS = ['lead', ...MAGNITUDE_SLOTS.filter((slot) => slot !== 'lead')] as const;
+export const webSearchTool = defineTool({
+  name: 'web-search',
+  group: 'default',
+  description: 'Search the web and optionally extract structured data',
 
-function resolveAnthropicAuth(auth?: AuthInfo): SearchAuth {
-  if (auth?.type === "oauth") return { type: "oauth-token", value: auth.accessToken };
-  if (auth?.type === "api") return { type: "api-key", value: auth.key };
-  const envKey = process.env.ANTHROPIC_API_KEY;
-  if (envKey) return { type: "api-key", value: envKey };
-  throw new Error("No Anthropic auth available for web search. Set ANTHROPIC_API_KEY or authenticate via the app.");
-}
+  inputSchema: Schema.Struct({
+    query: Schema.String,
+    schema: Schema.optional(Schema.Record({ key: Schema.String, value: Schema.Unknown }))
+  }),
 
-function resolveOpenAIAuth(auth?: AuthInfo): SearchAuth {
-  if (auth?.type === "oauth") return { type: "oauth-token", value: auth.accessToken, accountId: auth.accountId };
-  if (auth?.type === "api") return { type: "api-key", value: auth.key };
-  const envKey = process.env.OPENAI_API_KEY;
-  if (envKey) return { type: "api-key", value: envKey };
-  throw new Error("No OpenAI auth available for web search. Set OPENAI_API_KEY or authenticate via the app.");
-}
+  outputSchema: Schema.Struct({
+    text: Schema.String,
+    sources: Schema.Array(Schema.Struct({ title: Schema.String, url: Schema.String })),
+    data: Schema.optional(Schema.Unknown),
+  }),
+  errorSchema: WebSearchErrorSchema,
 
-function resolveOpenRouterAuth(auth?: AuthInfo): SearchAuth {
-  if (auth?.type === "api") return { type: "api-key", value: auth.key };
-  const envKey = process.env.OPENROUTER_API_KEY;
-  if (envKey) return { type: "api-key", value: envKey };
-  throw new Error("No OpenRouter auth available for web search. Set OPENROUTER_API_KEY or authenticate via the app.");
-}
+  execute: ({ query }, _ctx) =>
+    Effect.fail({ _tag: 'WebSearchError' as const, message: 'Web search is not yet reimplemented with Exa. Coming soon.' }),
 
-export function resolveVercelAuth(auth?: AuthInfo): SearchAuth {
-  if (auth?.type === "api") return { type: "api-key", value: auth.key };
-  const envKey = process.env.AI_GATEWAY_API_KEY ?? process.env.VERCEL_API_KEY;
-  if (envKey) return { type: "api-key", value: envKey };
-  throw new Error("No Vercel AI Gateway API key available for web search. Set AI_GATEWAY_API_KEY or authenticate Vercel in the app.");
-}
+  label: (input) => input.query ? `Searching: ${input.query.slice(0, 50)}` : 'Searching…',
+})
 
-export function detectSearchProvider(providerId: string | null): SearchProvider {
-  const override = process.env.MAGNITUDE_SEARCH_PROVIDER as SearchProvider | undefined;
-  if (override) {
-    if (!SEARCH_PROVIDER_OVERRIDES.includes(override)) {
-      throw new Error(
-        `Invalid MAGNITUDE_SEARCH_PROVIDER value "${override}". Must be one of: ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
-      );
-    }
-    return override;
-  }
-
-  switch (providerId) {
-    case "anthropic":
-      return "anthropic";
-    case "openai":
-      return "openai";
-    case "openrouter":
-      return "openrouter";
-    case "vercel":
-      return "vercel";
-    default:
-      throw new Error(
-        `Web search is not supported with the "${providerId}" provider. ` +
-        `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
-      );
-  }
-}
-
-function resolveSearchAuth(provider: SearchProvider): Effect.Effect<SearchAuth, Error, ProviderAuth> {
-  return Effect.gen(function* () {
-    const auth = yield* ProviderAuth;
-
-    switch (provider) {
-      case "anthropic":
-        return resolveAnthropicAuth(yield* auth.getAuth("anthropic"));
-      case "openai":
-        return resolveOpenAIAuth(yield* auth.getAuth("openai"));
-      case "openrouter":
-        return resolveOpenRouterAuth(yield* auth.getAuth("openrouter"));
-      case "vercel":
-        return resolveVercelAuth(yield* auth.getAuth("vercel"));
-    }
-  });
-}
-
-function tryDetectSearchProvider(providerId: string | null): SearchProvider | null {
-  try {
-    return detectSearchProvider(providerId);
-  } catch {
-    return null;
-  }
-}
-
-function getUnsupportedSearchError(): Error {
-  return new Error(
-    `Current provider does not support web search. ` +
-    `To enable web search, set MAGNITUDE_SEARCH_PROVIDER to one of: ${SEARCH_PROVIDER_OVERRIDES.join(', ')}.`
-  );
-}
-
-function selectSearchBackend(): Effect.Effect<
-  { provider: SearchProvider; modelId?: string },
-  Error,
-  ProviderState
-> {
-  return Effect.gen(function* () {
-    const providerState = yield* ProviderState;
-
-    for (const slot of SEARCHABLE_PROVIDER_SLOTS) {
-      const current = yield* providerState.peek(slot);
-      const provider = tryDetectSearchProvider(current?.model.providerId ?? null);
-      if (provider) {
-        return {
-          provider,
-          modelId: current?.model.id,
-        };
-      }
-    }
-
-    return yield* Effect.fail(getUnsupportedSearchError());
-  });
-}
-
-// =============================================================================
-// Router
-// =============================================================================
-
-/**
- * Perform a web search using the lead provider first, then worker providers.
- * Arbitrary connected providers are intentionally ignored.
- */
-export function webSearch(
-  query: string,
-  options?: SearchOptions,
-): Effect.Effect<WebSearchResponse, Error, ProviderState | ProviderAuth> {
-  return Effect.gen(function* () {
-    const selection = yield* selectSearchBackend();
-    const auth = yield* resolveSearchAuth(selection.provider);
-    const authService = yield* ProviderAuth;
-
-    switch (selection.provider) {
-      case "anthropic": {
-        const { anthropicWebSearch } = yield* Effect.promise(() => import("./web-search-anthropic"));
-        return yield* Effect.promise(() => anthropicWebSearch(query, auth, options));
-      }
-      case "openai": {
-        const { openaiWebSearch } = yield* Effect.promise(() => import("./web-search-openai"));
-        return yield* Effect.promise(() => openaiWebSearch(query, auth, options));
-      }
-      case "openrouter": {
-        const { openrouterWebSearch } = yield* Effect.promise(() => import("./web-search-openrouter"));
-        return yield* Effect.promise(() => openrouterWebSearch(query, auth, options));
-      }
-      case "vercel": {
-        const { vercelWebSearch } = yield* Effect.promise(() => import("./web-search-vercel"));
-        return yield* Effect.promise(() => vercelWebSearch(query, auth, options));
-      }
-    }
-  });
-}
-
-/**
- * Streaming web search (Anthropic-only).
- * Caller must provide already-resolved auth.
- */
-export async function* webSearchStream(
-  query: string,
-  auth: SearchAuth,
-  options?: SearchOptions,
-): AsyncGenerator<
-  | { type: "search_started"; query: string }
-  | { type: "search_result"; result: WebSearchToolResult }
-  | { type: "text_delta"; text: string }
-  | { type: "done"; response: WebSearchResponse }
-> {
-  const { anthropicWebSearchStream } = await import("./web-search-anthropic");
-  yield* anthropicWebSearchStream(query, auth, options);
-}
+export const webSearchXmlBinding = defineXmlBinding(webSearchTool, {
+  input: { body: 'query' },
+  output: {
+    body: 'text',
+    children: [{
+      field: 'sources',
+      tag: 'source',
+      attributes: [{ field: 'title', attr: 'title' }, { field: 'url', attr: 'url' }],
+    }],
+  },
+} as const)

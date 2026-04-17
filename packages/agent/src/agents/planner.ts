@@ -59,7 +59,6 @@ const tools = catalog.pick(
   'fileTree',
   'fileSearch',
   'shell',
-  'webSearch',
   'webFetch',
   'skill',
   // 'gather',
