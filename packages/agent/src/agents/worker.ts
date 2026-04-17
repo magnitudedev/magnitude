@@ -8,7 +8,7 @@
 import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import subagentBaseRaw from './prompts/subagent-base.txt' with { type: 'text' }
+import workerPromptRaw from './prompts/worker.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
 import { allowAll } from './policy'
@@ -26,7 +26,7 @@ const skillsLens = defineThinkingLens({
   description: 'Does this task have a governing skill? Should I activate the skill to understand the methodology before starting work?',
 })
 
-const systemPrompt = compilePromptTemplate(subagentBaseRaw)
+const systemPrompt = compilePromptTemplate(workerPromptRaw)
 
 const tools = catalog.pick(
   'fileRead',
