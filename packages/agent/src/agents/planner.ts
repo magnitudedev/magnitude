@@ -61,6 +61,7 @@ const tools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
+  'skill',
   // 'gather',
 )
 

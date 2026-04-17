@@ -10,7 +10,7 @@
 import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
-import { ExecutionManager } from '../execution/execution-manager'
+import { ExecutionManager } from '../execution/types'
 import { TurnProjection } from '../projections/turn'
 
 

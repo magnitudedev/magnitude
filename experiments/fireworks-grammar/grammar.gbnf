@@ -1,0 +1,12 @@
+ws ::= [ \t\n]*
+root ::= lens* (msg | tool)* "<end-turn>" ws ("<idle/>" | "<continue/>") ws "</end-turn>"
+lens ::= "<lens name=\"" lensname "\">" [^<]+ "</lens>" ws
+lensname ::= "alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"
+msg ::= "<message to=\"" [^"]* "\">" [^<]+ "</message>" ws
+tool ::= readtool | shelltool | greptool | edittool | writetool | treetool
+readtool ::= "<read observe=\"" [^"]* "\" path=\"" [^"]* "\"" (" offset=\"" [^"]* "\"")? (" limit=\"" [^"]* "\"")? "/>" ws
+shelltool ::= "<shell observe=\"" [^"]* "\">" [^<]+ "</shell>" ws
+greptool ::= "<grep observe=\"" [^"]* "\"><pattern>" [^<]+ "</pattern>" ("<glob>" [^<]+ "</glob>")? "</grep>" ws
+edittool ::= "<edit observe=\"" [^"]* "\" path=\"" [^"]* "\"><old>" [^<]+ "</old><new>" [^<]+ "</new></edit>" ws
+writetool ::= "<write path=\"" [^"]* "\">" [^<]+ "</write>" ws
+treetool ::= "<tree observe=\"" [^"]* "\"" (" path=\"" [^"]* "\"")? "/>" ws

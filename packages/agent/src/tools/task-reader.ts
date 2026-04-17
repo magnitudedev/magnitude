@@ -1,5 +1,5 @@
 import { Context, Effect } from 'effect'
-import { isTaskAssigneeAllowed, type TaskAssignee } from '../tasks'
+import { type TaskAssignee } from '../tasks/types'
 import {
   canCompleteTask,
   collectSubtreeTaskIds,
@@ -30,10 +30,8 @@ export function canCompleteRecord(state: TaskGraphState, id: string): boolean {
   return canCompleteTask(state, id)
 }
 
-export function canAssignRecord(state: TaskGraphState, id: string, assignee: TaskAssignee): boolean {
-  const task = state.tasks.get(id)
-  if (!task) return false
-  return isTaskAssigneeAllowed(task.taskType, assignee)
+export function canAssignRecord(state: TaskGraphState, id: string, _assignee: TaskAssignee): boolean {
+  return state.tasks.has(id)
 }
 
 export function collectSubtreeRecords(state: TaskGraphState, id: string): readonly TaskRecord[] {

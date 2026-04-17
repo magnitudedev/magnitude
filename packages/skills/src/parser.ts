@@ -1,220 +1,92 @@
+import { Data, Effect, ParseResult, Schema } from 'effect'
 import { remark } from 'remark'
 import remarkParse from 'remark-parse'
-import type { Root, Content, Html } from 'mdast'
-import type { Criteria, Hooks, Phase, SubmitBlock, SubmitField, WorkflowSkill } from './types'
+import remarkFrontmatter from 'remark-frontmatter'
+import type { Root, Html } from 'mdast'
+import { ParsedSkillSchema, ThinkingLensSchema, type ParsedSkill, type SkillSections, type ThinkingLens } from './types'
 
-interface FrontmatterResult {
-  readonly name: string
-  readonly description: string
-  readonly body: string
-}
+export class SkillParseError extends Data.TaggedError('SkillParseError')<{
+  readonly cause: ParseResult.ParseError
+}> {}
 
-interface NodeSlice {
-  readonly start: number
-  readonly end: number
-}
+type SectionKey = 'shared' | 'lead' | 'worker' | 'handoff'
 
-function extractFrontmatter(content: string): FrontmatterResult {
-  const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/)
-  if (!match) {
-    return { name: '', description: '', body: content }
+const MARKER_RE = /^<!--\s*@(shared|lead|worker|handoff)\s*-->$/
+
+const processor = remark().use(remarkParse).use(remarkFrontmatter, ['yaml'])
+
+const ThinkingArraySchema = Schema.Array(ThinkingLensSchema)
+
+function parseFrontmatter(tree: Root) {
+  const yamlNode = tree.children.find((n) => n.type === 'yaml')
+  if (!yamlNode || !('value' in yamlNode)) {
+    return Effect.succeed({ name: '', description: '', thinking: [] as readonly ThinkingLens[] })
   }
 
-  const yaml = match[1]
-  const body = match[2]
-  const data: Record<string, string> = {}
+  const data = (Bun.YAML.parse(yamlNode.value as string) ?? {}) as Record<string, unknown>
 
-  for (const line of yaml.split('\n')) {
-    const idx = line.indexOf(':')
-    if (idx === -1) continue
-    const key = line.slice(0, idx).trim()
-    const rawValue = line.slice(idx + 1).trim()
-    const value = rawValue.replace(/^['"]|['"]$/g, '')
-    data[key] = value
+  return Effect.gen(function* () {
+    const name = yield* Schema.decodeUnknown(Schema.String)(data.name ?? '')
+    const description = yield* Schema.decodeUnknown(Schema.String)(data.description ?? '')
+    const thinking = Array.isArray(data.thinking)
+      ? yield* Schema.decodeUnknown(ThinkingArraySchema)(data.thinking)
+      : []
+
+    return { name, description, thinking }
+  })
+}
+
+function splitSections(body: string, tree: Root): SkillSections {
+  const acc: Record<SectionKey, string[]> = { shared: [], lead: [], worker: [], handoff: [] }
+  const markers: Array<{ key: SectionKey; start: number; end: number }> = []
+
+  for (const node of tree.children) {
+    if (node.type !== 'html') continue
+    const m = (node as Html).value.trim().match(MARKER_RE)
+    if (!m) continue
+    const start = node.position?.start.offset
+    const end = node.position?.end.offset
+    if (typeof start !== 'number' || typeof end !== 'number') continue
+    markers.push({ key: m[1] as SectionKey, start, end })
+  }
+
+  if (markers.length === 0) {
+    const trimmed = body.trim()
+    if (trimmed) acc.shared.push(trimmed)
+  } else {
+    const preamble = body.slice(0, markers[0].start).trim()
+    if (preamble) acc.shared.push(preamble)
+
+    for (let i = 0; i < markers.length; i++) {
+      const chunk = body.slice(markers[i].end, markers[i + 1]?.start ?? body.length).trim()
+      if (chunk) acc[markers[i].key].push(chunk)
+    }
   }
 
   return {
-    name: data.name ?? '',
-    description: data.description ?? '',
-    body,
+    shared: acc.shared.join('\n\n'),
+    lead: acc.lead.join('\n\n'),
+    worker: acc.worker.join('\n\n'),
+    handoff: acc.handoff.join('\n\n'),
   }
 }
 
-function getSlice(node: Content): NodeSlice | undefined {
-  const start = node.position?.start.offset
-  const end = node.position?.end.offset
-  if (typeof start !== 'number' || typeof end !== 'number') return undefined
-  return { start, end }
-}
+export function parseSkill(content: string): Effect.Effect<ParsedSkill, SkillParseError> {
+  return Effect.gen(function* () {
+    const tree = processor.parse(content) as Root
+    const { name, description, thinking } = yield* parseFrontmatter(tree)
 
-function parseAttributes(input: string): Record<string, string> {
-  const attrs: Record<string, string> = {}
-  const re = /([a-zA-Z0-9_-]+)\s*=\s*"([^"]*)"/g
-  let match: RegExpExecArray | null
-  while ((match = re.exec(input)) !== null) {
-    attrs[match[1]] = match[2]
-  }
-  return attrs
-}
+    const yamlNode = tree.children.find((n) => n.type === 'yaml')
+    const bodyStart = yamlNode?.position?.end.offset ?? 0
+    const body = content.slice(bodyStart)
 
-function getTagContent(input: string, tag: string): string | undefined {
-  const re = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`)
-  const match = input.match(re)
-  return match?.[1]
-}
+    const sections = splitSections(body, processor.parse(body) as Root)
 
-function parseSubmit(block: string): SubmitBlock | undefined {
-  const submitContent = getTagContent(block, 'submit')
-  if (!submitContent) return undefined
-
-  const fields: SubmitField[] = []
-  const fieldRe = /<(text|file)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g
-  let match: RegExpExecArray | null
-
-  while ((match = fieldRe.exec(submitContent)) !== null) {
-    const kind = match[1] as 'text' | 'file'
-    const attrs = parseAttributes(match[2] ?? '')
-    const innerDescription = (match[3] ?? '').trim()
-    const description = attrs.description ?? innerDescription
-
-    if (kind === 'text') {
-      fields.push({
-        type: 'text',
-        name: attrs.name ?? '',
-        description,
-      })
-    } else {
-      fields.push({
-        type: 'file',
-        name: attrs.name ?? '',
-        fileType: attrs.type,
-        description,
-      })
-    }
-  }
-
-  return fields.length > 0 ? { fields } : undefined
-}
-
-function parseCriteria(block: string): readonly Criteria[] | undefined {
-  const criteriaContent = getTagContent(block, 'criteria')
-  if (!criteriaContent) return undefined
-
-  const criteria: Criteria[] = []
-
-  {
-    const shellRe = /<shell-succeed\b([^>]*)>([\s\S]*?)<\/shell-succeed>/g
-    let match: RegExpExecArray | null
-    while ((match = shellRe.exec(criteriaContent)) !== null) {
-      const attrs = parseAttributes(match[1] ?? '')
-      criteria.push({ type: 'shell-succeed', name: attrs.name ?? '', command: (match[2] ?? '').trim() })
-    }
-  }
-
-  {
-    const userRe = /<user-approval\b([^>]*)>([\s\S]*?)<\/user-approval>/g
-    let match: RegExpExecArray | null
-    while ((match = userRe.exec(criteriaContent)) !== null) {
-      const attrs = parseAttributes(match[1] ?? '')
-      criteria.push({ type: 'user-approval', name: attrs.name ?? '', message: (match[2] ?? '').trim() })
-    }
-  }
-
-  {
-    const agentRe = /<agent-approval\b([^>]*)>([\s\S]*?)<\/agent-approval>/g
-    let match: RegExpExecArray | null
-    while ((match = agentRe.exec(criteriaContent)) !== null) {
-      const attrs = parseAttributes(match[1] ?? '')
-      criteria.push({
-        type: 'agent-approval',
-        name: attrs.name ?? '',
-        subagent: attrs.subagent ?? '',
-        prompt: (match[2] ?? '').trim(),
-      })
-    }
-  }
-
-  return criteria.length > 0 ? criteria : undefined
-}
-
-function parseHooks(block: string): Hooks | undefined {
-  const hooksContent = getTagContent(block, 'hooks')
-  if (!hooksContent) return undefined
-
-  const onStart = getTagContent(hooksContent, 'on-start')?.trim()
-  const onSubmit = getTagContent(hooksContent, 'on-submit')?.trim()
-  const onAccept = getTagContent(hooksContent, 'on-accept')?.trim()
-  const onReject = getTagContent(hooksContent, 'on-reject')?.trim()
-
-  const hooks: Hooks = { onStart, onSubmit, onAccept, onReject }
-  return hooks.onStart || hooks.onSubmit || hooks.onAccept || hooks.onReject ? hooks : undefined
-}
-
-function parsePhaseBlock(html: string): Omit<Phase, 'prompt'> {
-  const trimmed = html.trim()
-  const nameMatch = trimmed.match(/<phase\b[^>]*\bname="([^"]+)"/)
-  const name = nameMatch?.[1] ?? ''
-
-  const selfClosing = /<phase\b[^>]*\/>\s*$/.test(trimmed)
-  if (selfClosing) {
-    return { name }
-  }
-
-  const innerMatch = trimmed.match(/<phase\b[^>]*>([\s\S]*?)<\/phase>/)
-  const inner = innerMatch?.[1] ?? ''
-
-  const submit = parseSubmit(inner)
-  const criteria = parseCriteria(inner)
-  const hooks = parseHooks(inner)
-
-  return {
-    name,
-    ...(submit ? { submit } : {}),
-    ...(criteria ? { criteria } : {}),
-    ...(hooks ? { hooks } : {}),
-  }
-}
-
-function isPhaseHtml(node: Content): node is Html {
-  return node.type === 'html' && /^\s*<phase\b/.test(node.value)
-}
-
-export function parseSkill(content: string): WorkflowSkill {
-  const { name, description, body } = extractFrontmatter(content)
-  const tree = remark().use(remarkParse).parse(body) as Root
-
-  const phaseNodes = tree.children
-    .map((node, index) => ({ node, index, slice: getSlice(node) }))
-    .filter((entry): entry is { node: Html; index: number; slice: NodeSlice } => isPhaseHtml(entry.node) && !!entry.slice)
-
-  if (phaseNodes.length === 0) {
-    return {
+    return yield* Schema.decodeUnknown(ParsedSkillSchema)({
       name,
       description,
-      preamble: body.trim(),
-      phases: [],
-    }
-  }
-
-  const firstPhaseStart = phaseNodes[0].slice.start
-  const preamble = body.slice(0, firstPhaseStart).trim()
-
-  const phases: Phase[] = phaseNodes.map((current, idx) => {
-    const next = phaseNodes[idx + 1]
-    const promptStart = current.slice.end
-    const promptEnd = next ? next.slice.start : body.length
-    const prompt = body.slice(promptStart, promptEnd).trim()
-
-    return {
-      ...parsePhaseBlock(current.node.value),
-      prompt,
-    }
-  })
-
-  return {
-    name,
-    description,
-    preamble,
-    phases,
-  }
+      thinking,
+      sections,
+    })
+  }).pipe(Effect.mapError((cause) => new SkillParseError({ cause })))
 }

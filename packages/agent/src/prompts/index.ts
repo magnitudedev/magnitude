@@ -18,7 +18,6 @@ export {
   ONESHOT_LIVENESS_REMINDER,
   formatNonexistentAgentError,
   formatTaskOutsideSubtreeError,
-  formatInvalidTaskTypeError,
   formatTaskNotFoundError,
   formatTaskParentNotFoundError,
   formatDuplicateTaskIdError,

@@ -13,8 +13,8 @@ import { compilePromptTemplate } from '../prompts/system-prompt'
 import {
   alignmentLens,
   tasksLens,
-  strategyLens,
   diligenceLens,
+  skillsLens,
   pivotLens,
   turnLens,
   leadObservables,
@@ -30,7 +30,7 @@ export const leadRole = defineRole<typeof leadTools, 'lead', PolicyContext>({
   id: 'lead',
   slot: 'lead',
   systemPrompt,
-  lenses: [alignmentLens, tasksLens, strategyLens, diligenceLens, pivotLens, turnLens],
+  lenses: [alignmentLens, tasksLens, diligenceLens, skillsLens, pivotLens, turnLens],
   defaultRecipient: 'user',
   protocolRole: 'lead',
   initialContext: { parentConversation: false },

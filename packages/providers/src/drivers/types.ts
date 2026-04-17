@@ -14,6 +14,7 @@ export interface DriverRequest<TSlot extends string = string> {
   readonly model: Model
   readonly inference: InferenceConfig
   readonly providerOptions?: ProviderOptions
+  readonly grammar?: string
   readonly signal?: AbortSignal
 }
 

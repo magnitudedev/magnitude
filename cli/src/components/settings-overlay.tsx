@@ -9,6 +9,7 @@ import { LocalProviderPage } from './local-provider-page'
 import type { ProviderDefinition, DetectedProvider, ModelSelection, ProviderAuthMethodStatus, MagnitudeSlot } from '@magnitudedev/agent'
 import type { ModelSelectItem } from '../hooks/use-model-select-navigation'
 import type { SettingsTab } from '../hooks/use-settings-navigation'
+
 import { SLOT_UI_ORDER } from './setup-wizard-overlay'
 import type { Preset, ProviderOptions } from '@magnitudedev/storage'
 
@@ -421,13 +422,17 @@ export const SettingsOverlay = memo(function SettingsOverlay({
 
     if (key.name === 'left' && plain) {
       key.preventDefault()
-      onTabChange('provider')
+      const tabOrder: SettingsTab[] = ['provider', 'model']
+      const idx = tabOrder.indexOf(activeTab)
+      if (idx > 0) onTabChange(tabOrder[idx - 1])
       return
     }
 
     if (key.name === 'right' && plain) {
       key.preventDefault()
-      onTabChange('model')
+      const tabOrder: SettingsTab[] = ['provider', 'model']
+      const idx = tabOrder.indexOf(activeTab)
+      if (idx < tabOrder.length - 1) onTabChange(tabOrder[idx + 1])
       return
     }
 
@@ -435,7 +440,9 @@ export const SettingsOverlay = memo(function SettingsOverlay({
       setModelPickerInputMode('keyboard')
     }
 
-    const handled = activeTab === 'model' ? onModelHandleKeyEvent(key) : onProviderHandleKeyEvent(key)
+    const handled = activeTab === 'model'
+      ? onModelHandleKeyEvent(key)
+      : onProviderHandleKeyEvent(key)
     if (handled) {
       key.preventDefault()
     }

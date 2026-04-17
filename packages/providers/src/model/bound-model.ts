@@ -15,9 +15,13 @@ export interface CallOptions {
 
 export interface StreamOptions extends CallOptions {
   readonly stopSequences?: string[]
+  readonly grammar?: string
+  readonly maxTokens?: number
 }
 
-export interface CompleteOptions extends CallOptions {}
+export interface CompleteOptions extends CallOptions {
+  readonly maxTokens?: number
+}
 
 export interface ChatStream {
   readonly stream: Stream.Stream<string, ModelError>
@@ -44,14 +48,18 @@ export interface CompleteFn<I, O> {
 
 export type ModelFunctionDef<I, O> = StreamingFn<I, O> | CompleteFn<I, O>
 
+export interface CallLevelOptions {
+  readonly inputTokenEstimate: number
+}
+
 export interface BoundModel {
   readonly model: Model
   readonly connection: ModelConnection
 
   /** Typed invoke for streaming functions */
-  invoke<I, O>(fn: StreamingFn<I, O>, input: I): Effect.Effect<O, ModelError, TraceEmitter>
+  invoke<I, O>(fn: StreamingFn<I, O>, input: I, callOptions?: CallLevelOptions): Effect.Effect<O, ModelError, TraceEmitter>
   /** Typed invoke for complete functions */
-  invoke<I, O>(fn: CompleteFn<I, O>, input: I): Effect.Effect<O, ModelError, TraceEmitter>
+  invoke<I, O>(fn: CompleteFn<I, O>, input: I, callOptions?: CallLevelOptions): Effect.Effect<O, ModelError, TraceEmitter>
 
   /** @internal Raw stream — prefer invoke() */
   stream<K extends BamlStreamFunctionName>(

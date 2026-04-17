@@ -7,7 +7,7 @@
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
-import { Effect, Stream, Context, Layer, Ref } from 'effect'
+import { Effect, Stream, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
   createXmlRuntime,
@@ -18,14 +18,17 @@ import {
   type ToolInterceptor,
   type OutputNode,
 } from '@magnitudedev/xml-act'
-import { Fork, Projection, WorkerBusTag, type WorkerBusService } from '@magnitudedev/event-core'
+import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
+import { SkillsAmbient } from '../ambient/skills-ambient'
 import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 import type { XmlToolResult } from '@magnitudedev/xml-act'
-import { buildRegisteredTools } from '../tools'
+import { buildRegisteredTools } from '../tools/tool-registry'
 
-import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
+import { isValidVariant, type AgentVariant } from '../agents/variants'
+import { getAgentDefinition } from '../agents/registry'
 import { buildPolicyInterceptor, type AgentResolver } from './permission-gate'
+export { IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
 import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from './approval-state'
 
 import { BrowserService } from '../services/browser-service'
@@ -33,11 +36,10 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
-import { buildCloneContext, buildSpawnContext, UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts'
+import { buildCloneContext, buildSpawnContext } from '../prompts/fork-context'
+import { UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts/error-states'
 import type { JsonSchema } from '@magnitudedev/llm-core'
-import { SkillStateReaderTag, type SkillStateReader } from '../tools/skill'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
-import { WorkflowStateReaderTag, type WorkflowStateReader } from '../tools/workflow-reader'
 import { TaskGraphStateReaderTag, canCompleteRecord, getChildRecords, canAssignRecord, collectSubtreeRecords } from '../tools/task-reader'
 import { ConversationProjection, type ConversationState } from '../projections/conversation'
 import { createId } from '../util/id'
@@ -48,7 +50,6 @@ import { AgentStatusProjection, type AgentStatusState, getActiveAgent, getAgentB
 import { TurnProjection, type ForkTurnState } from '../projections/turn'
 import { SessionContextProjection, type SessionContextState } from '../projections/session-context'
 import { ReplayProjection } from '../projections/replay'
-import { WorkflowProjection, type WorkflowCriteriaState } from '../projections/workflow'
 import { TaskGraphProjection, type TaskGraphState, type TaskStatus } from '../projections/task-graph'
 
 import type { RoleDefinition, BoundObservable } from '@magnitudedev/roles'
@@ -56,7 +57,8 @@ import { bindObservable } from '@magnitudedev/roles'
 import { ProjectionReaderTag, type ProjectionReader } from '../observables/projection-reader'
 import { EphemeralSessionContextTag, PolicyContextProviderTag, type EphemeralSessionContext, type PolicyContext } from '../agents/types'
 import { createPolicyContextProvider } from '../agents/policy-context'
-import type { TurnEvent, TurnEventSink } from './types'
+import { ExecutionManager, IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
+import type { TurnEvent, TurnEventSink, ExecuteOptions, ExecuteResult, ExecutionManagerService } from './types'
 import { WorkingDirectoryTag } from './working-directory'
 import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
@@ -82,107 +84,7 @@ import { handleTaskDirective } from '../tasks/operations'
 // Types
 // =============================================================================
 
-export const IDENTICAL_RESPONSE_BREAKER_THRESHOLD = 5
 
-export interface ExecuteOptions {
-  readonly forkId: string | null
-  readonly turnId: string
-  readonly chainId: string
-  readonly defaultProseDest: 'user' | 'parent'
-  readonly allowSingleUserReplyThisTurn: boolean
-}
-
-export interface ExecuteResult {
-  readonly result: TurnResult
-}
-
-// =============================================================================
-// Service Interface
-// =============================================================================
-
-export interface ExecutionManagerService {
-  /**
-   * Execute an XML stream from the LLM.
-   * XmlRuntimeEvents are mapped to TurnEvents and offered to the sink queue.
-   * Returns the accumulated execution result.
-   */
-  readonly execute: (
-    xmlStream: Stream.Stream<string, ModelError>,
-    options: ExecuteOptions,
-    sink: TurnEventSink,
-  ) => Effect.Effect<
-    ExecuteResult,
-    XmlRuntimeCrash,
-    Projection.ProjectionInstance<AgentRoutingState>
-    | Projection.ProjectionInstance<AgentStatusState>
-    | Projection.ProjectionInstance<TaskGraphState>
-    | Projection.ForkedProjectionInstance<ReactorState>
-    | Projection.ForkedProjectionInstance<ForkTurnState>
-    | WorkerBusService<AppEvent>
-    | TaskGraphStateReaderTag
-    | ConversationStateReaderTag
-  >
-
-  /**
-   * Initialize a fork with the given agent variant.
-   * Builds and caches the fork's Effect layers and bound observables.
-   * No runtime object is created — xml-act runtime is built fresh per execute() call.
-   */
-  readonly initFork: (
-    forkId: string | null,
-    variant: AgentVariant
-  ) => Effect.Effect<
-    void,
-    never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
-  >
-
-  /**
-   * Dispose a fork's cached state.
-   */
-  readonly disposeFork: (forkId: string) => Effect.Effect<void>
-
-  /** Get bound observables for a fork */
-  readonly getObservables: (forkId: string | null) => BoundObservable[]
-
-  /**
-   * Spawn a non-blocking background fork. Returns the forkId.
-   */
-  readonly fork: (params: {
-    parentForkId: string | null
-    name: string
-    agentId: string
-    prompt: string
-    message: string
-    outputSchema?: JsonSchema | undefined
-    mode: 'clone' | 'spawn'
-    role: AgentVariant
-    taskId: string
-  }) => Effect.Effect<
-    string,
-    never,
-    Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>
-  >
-
-  /**
-   * Release the browser for a fork (called when fork goes idle).
-   * No-op if the fork has no browser.
-   */
-  readonly releaseBrowserFork: (forkId: string) => Effect.Effect<void>
-
-  /**
-   * The approval state service instance.
-   * Exposed so workers (ApprovalWorker) and projections can register handlers and resolve approvals.
-   */
-  readonly approvalState: ApprovalStateService
-
-
-}
-
-export class ExecutionManager extends Context.Tag('ExecutionManager')<
-  ExecutionManager,
-  ExecutionManagerService
->() {}
 
 // =============================================================================
 // Implementation
@@ -199,7 +101,6 @@ function makeForkLayers(
   agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
   agentStatusProjection: Projection.ProjectionInstance<AgentStatusState>,
   workingStateProjection: Projection.ForkedProjectionInstance<ForkTurnState>,
-  workflowProjection: Projection.ForkedProjectionInstance<WorkflowCriteriaState>,
   taskGraphProjection: Projection.ProjectionInstance<TaskGraphState>,
 
   conversationProjection: Projection.ProjectionInstance<ConversationState>,
@@ -215,20 +116,9 @@ function makeForkLayers(
     getState: () => agentStatusProjection.get
   } satisfies AgentRegistryStateReader)
 
-  const skillStateReaderLayer = Layer.succeed(SkillStateReaderTag, {
-    getUserSkills: () => Effect.map(
-      sessionContextProjection.get,
-      (state) => state.context?.skills ?? []
-    )
-  } satisfies SkillStateReader)
-
   const conversationStateReaderLayer = Layer.succeed(ConversationStateReaderTag, {
     getState: () => conversationProjection.get
   } satisfies ConversationStateReader)
-
-  const workflowStateReaderLayer = Layer.succeed(WorkflowStateReaderTag, {
-    getState: (forkId: string | null) => workflowProjection.getFork(forkId),
-  } satisfies WorkflowStateReader)
 
   const agentStateReaderLayer = Layer.succeed(AgentStateReaderTag, {
     getAgentState: () => agentStatusProjection.get,
@@ -267,9 +157,7 @@ function makeForkLayers(
 
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
-    workflowStateReaderLayer,
     taskGraphReaderLayer,
-    skillStateReaderLayer,
     agentStateReaderLayer,
 
 
@@ -324,7 +212,7 @@ const makeExecutionManager = Effect.gen(function* () {
    */
   const resolveAgent: AgentResolver = (forkId) => {
     if (forkId !== null) {
-      const variant = forkAgentVariants.get(forkId) ?? 'builder'
+      const variant = forkAgentVariants.get(forkId) ?? 'worker'
       return getAgentDefinition(variant)
     }
     return getAgentDefinition('lead')
@@ -348,6 +236,9 @@ const makeExecutionManager = Effect.gen(function* () {
     execute: (xmlStream: Stream.Stream<string, ModelError>, options, sink) => Effect.gen(function* () {
       const { forkId, turnId, defaultProseDest, allowSingleUserReplyThisTurn } = options
 
+      const ambientService = yield* AmbientServiceTag
+      const skills = ambientService.getValue(SkillsAmbient)
+
       // Resolve agent definition for this fork
       const agentRoutingProjectionInst = yield* AgentRoutingProjection.Tag
       const agentStatusProjectionInst = yield* AgentStatusProjection.Tag
@@ -357,7 +248,7 @@ const makeExecutionManager = Effect.gen(function* () {
       if (forkId) {
         const agentInstance = getAgentByForkId(agentState, forkId)
         const role = agentInstance?.role
-        variant = role && isValidVariant(role) ? role : 'builder'
+        variant = role && isValidVariant(role) ? role : 'worker'
       } else {
         variant = 'lead'
       }
@@ -794,7 +685,7 @@ const makeExecutionManager = Effect.gen(function* () {
                     defaultTopLevelDestination: defaultProseDest,
                     allowSingleUserReplyThisTurn,
                     directUserRepliesSent,
-                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() } }).pipe(
+                  }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() }, skills }).pipe(
                     Effect.provideService(ForkContext, { forkId }),
                     Effect.provide(executionLayer),
                   )
@@ -1013,7 +904,6 @@ const makeExecutionManager = Effect.gen(function* () {
       const agentProjection = yield* AgentRoutingProjection.Tag
       const agentStatusProjection = yield* AgentStatusProjection.Tag
       const workingStateProjection = yield* TurnProjection.Tag
-      const workflowProjection = yield* WorkflowProjection.Tag
       const taskGraphProjection = yield* TaskGraphProjection.Tag
 
       const conversationProjection = yield* ConversationProjection.Tag
@@ -1035,7 +925,7 @@ const makeExecutionManager = Effect.gen(function* () {
       let layers = makeForkLayers(
         forkId,
         sessionContextProjection, agentProjection, agentStatusProjection,
-        workingStateProjection, workflowProjection, taskGraphProjection,
+        workingStateProjection, taskGraphProjection,
         conversationProjection,
         approvalState,
         persistenceLayer, policyInterceptor, cwd, workspacePath, ephemeralSessionContext,
@@ -1086,7 +976,7 @@ const makeExecutionManager = Effect.gen(function* () {
         bindObservable(obs, () => Effect.succeed(layers as Layer.Layer<unknown>))
       )
       boundObservables.set(forkId, agentObservables)
-    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ForkedProjectionInstance<WorkflowCriteriaState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
+    }) as Effect.Effect<void, never, Projection.ProjectionInstance<SessionContextState> | Projection.ProjectionInstance<AgentRoutingState> | Projection.ProjectionInstance<AgentStatusState> | Projection.ForkedProjectionInstance<ForkTurnState> | Projection.ProjectionInstance<ConversationState> | ChatPersistence | BrowserService | WorkerBusService<AppEvent>>),
 
     disposeFork: (forkId) => Effect.gen(function* () {
       // Run role teardown if defined (e.g. browser cleanup)

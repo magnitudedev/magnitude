@@ -22,7 +22,7 @@ import {
 } from './services'
 import { makeProjectStoragePaths } from './paths'
 import { SessionStorage, SessionStorageLive } from './sessions'
-import { SkillStorage, SkillStorageLive } from './skills'
+
 import { TraceStorage, TraceStorageLive } from './traces'
 import type {
   AuthInfo,
@@ -44,7 +44,6 @@ export type AllStorageServices =
   | LogStorage
   | MemoryStorage
   | SessionStorage
-  | SkillStorage
   | TraceStorage
 
 export interface StorageClient<TSlot extends string = string> {
@@ -130,14 +129,6 @@ export interface StorageClient<TSlot extends string = string> {
     getPath(): string
   }
 
-  skills: {
-    ensureDir(): Promise<void>
-    list(): Promise<Array<{ name: string; path: string }>>
-    read(skillName: string): Promise<string>
-    write(skillName: string, content: string): Promise<void>
-    remove(skillName: string): Promise<void>
-  }
-
   logs: {
     append(sessionId: string, entries: StoredLogEntry[]): Promise<void>
     clear(sessionId: string): Promise<void>
@@ -181,8 +172,7 @@ export async function createStorageClient<TSlot extends string = string>(options
   )
 
   const projectLayer = Layer.mergeAll(
-    MemoryStorageLive,
-    SkillStorageLive
+    MemoryStorageLive
   ).pipe(Layer.provide(ProjectStorageLiveFromCwd(cwd)))
 
   const layer = Layer.mergeAll(globalLayer, projectLayer)
@@ -367,24 +357,6 @@ export async function createStorageClient<TSlot extends string = string>(options
       read: () => run(Effect.flatMap(MemoryStorage, (s) => s.read())),
       write: (content) => run(Effect.flatMap(MemoryStorage, (s) => s.write(content))),
       getPath: () => projectPaths.memoryFile,
-    },
-
-    skills: {
-      ensureDir: async () => {
-        await run(Effect.flatMap(SkillStorage, (s) => s.ensureDir()))
-      },
-      list: async () => {
-        const names = await run(Effect.flatMap(SkillStorage, (s) => s.list()))
-        return names.map((name) => ({
-          name,
-          path: projectPaths.projectSkillFile(name),
-        }))
-      },
-      read: (skillName) => run(Effect.flatMap(SkillStorage, (s) => s.read(skillName))),
-      write: (skillName, content) =>
-        run(Effect.flatMap(SkillStorage, (s) => s.write(skillName, content))),
-      remove: (skillName) =>
-        run(Effect.flatMap(SkillStorage, (s) => s.remove(skillName))),
     },
 
     logs: {

@@ -449,7 +449,6 @@ function incrementToolCount(counts: ForkActivityToolCounts, toolKey: ToolKey): F
     case 'newTab': return { ...counts, navigations: counts.navigations + 1 }
     case 'type': return { ...counts, inputs: counts.inputs + 1 }
     case 'evaluate': return { ...counts, evaluations: counts.evaluations + 1 }
-    case 'skill':
     case 'fileView':
     case 'scroll':
     case 'screenshot':
@@ -606,22 +605,6 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
             timestamp: event.timestamp,
             taskMode: false,
             attachments: [],
-          }
-        ]
-      }
-    },
-
-    skill_completed: ({ event, fork }) => {
-      const messageId = generateId()
-      return {
-        ...fork,
-        messages: [
-          ...fork.messages,
-          {
-            id: messageId,
-            type: 'assistant_message' as const,
-            content: `✓ Skill "${event.skillName}" completed`,
-            timestamp: event.timestamp,
           }
         ]
       }

@@ -16,6 +16,7 @@ import type { RecentChat } from '../data/recent-chats'
 import type { useAuthFlow } from '../hooks/use-auth-flow'
 
 import type { Preset, ProviderOptions } from '@magnitudedev/storage'
+
 import { useTheme } from '../hooks/use-theme'
 import { BOX_CHARS } from '../utils/ui-constants'
 
@@ -88,10 +89,10 @@ export type AppOverlaysProps = {
   handleChangeSlot: (slot: MagnitudeSlot) => void
   modelTabHandleKeyEvent: (key: KeyEvent) => boolean
   providerTabHandleKeyEvent: (key: KeyEvent) => boolean
+
   modelNavigation: { items: any[]; selectedIndex: number; setSelectedIndex: (n: number) => void }
   providerNavigation: { selectedIndex: number; setSelectedIndex: (n: number) => void }
   onSettingsClose: () => void
-
   showRecentChatsOverlay: boolean
   recentChats: RecentChat[] | null
   recentChatsSelectedIndex: number

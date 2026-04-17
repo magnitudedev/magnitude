@@ -52,6 +52,7 @@ export interface ModelDefinition {
   releaseDate: string
   maxOutputTokens?: number
   supportsVision?: boolean
+  supportsGrammar?: boolean
   description?: string
   status?: 'alpha' | 'beta' | 'deprecated'
   discovery?: {

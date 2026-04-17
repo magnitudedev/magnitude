@@ -3,7 +3,8 @@ import type { AppEvent, TurnResultError, MessageDestination } from '../events'
 
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
-import { getAgentDefinition, isValidVariant, type AgentVariant } from '../agents'
+import { isValidVariant, type AgentVariant } from '../agents/variants'
+import { getAgentDefinition } from '../agents/registry'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 
@@ -224,7 +225,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         const variant: AgentVariant = event.forkId
           ? (() => {
               const role = getAgentByForkId(agentState, event.forkId)?.role
-              return role && isValidVariant(role) ? role : 'builder'
+              return role && isValidVariant(role) ? role : 'worker'
             })()
           : 'lead'
         const agentDef = getAgentDefinition(variant)

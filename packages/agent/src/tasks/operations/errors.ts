@@ -1,14 +1,12 @@
 import {
   formatDuplicateTaskIdError,
   formatInvalidAssigneeError,
-  formatInvalidTaskTypeError,
   formatMissingAssignmentMessageError,
   formatMissingAssignmentRoleError,
   formatTaskCompletionBlockedError,
   formatTaskNotFoundError,
   formatTaskParentNotFoundError,
 } from '../../prompts/error-states'
-import type { TaskTypeId } from '../registry'
 
 export type TaskOperationErrorCode =
   | 'task_not_found'
@@ -38,10 +36,6 @@ export function parentNotFound(taskId: string, parentId: string): TaskOperationE
 
 export function duplicateTaskId(taskId: string): TaskOperationErrorDetails {
   return { code: 'duplicate_task_id', message: formatDuplicateTaskIdError(taskId) }
-}
-
-export function invalidTaskType(taskId: string, taskType: TaskTypeId | string): TaskOperationErrorDetails {
-  return { code: 'invalid_task_type', message: formatInvalidTaskTypeError(taskId, taskType) }
 }
 
 export function invalidAssignee(taskId: string, assignee: string): TaskOperationErrorDetails {

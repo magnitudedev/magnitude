@@ -14,11 +14,9 @@
     "events": "cat ~/.magnitude/logs/events.jsonl",
     "events:tail": "tail -f ~/.magnitude/logs/events.jsonl",
     "events:copy": "bun run scripts/copy-file-to-clipboard.ts ~/.magnitude/logs/events.jsonl \"Events copied to clipboard\"",
-
     "logs": "cat ~/.magnitude/logs/cli.jsonl",
     "logs:tail": "tail -f ~/.magnitude/logs/cli.jsonl",
     "logs:copy": "bun run scripts/copy-file-to-clipboard.ts ~/.magnitude/logs/cli.jsonl \"Logs copied to clipboard\"",
-
     "cs": "changeset",
     "changeset": "changeset",
     "version": "changeset version",
@@ -32,7 +30,7 @@
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.30.0",
-    "@types/bun": "^1.3.8",
+    "@types/bun": "^1.3.12",
     "@types/mdast": "^4.0.4",
     "turbo": "^2.5.4",
     "typescript": "^5.8.3",

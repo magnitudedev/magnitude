@@ -33,12 +33,12 @@ import { TurnProjection } from '../projections/turn'
 
 // ExecutionManager no longer needed — xml-act is stateless, no sandbox reset
 import { KEEP_MESSAGE_RATIO, CHARS_PER_TOKEN, EMERGENCY_COMPACT_CONTEXT_TRIM_RATIO } from '../constants'
-import { getAgentDefinition, getForkInfo } from '../agents'
+import { getAgentDefinition, getForkInfo } from '../agents/registry'
 import { ModelResolver, CodingAgentCompact } from '@magnitudedev/providers'
 // compactionVariableNote removed — xml-act has no cross-turn variables
 import { collectSessionContext } from '../util/collect-session-context'
 import type { SessionContext } from '../events'
-import { withTraceScope } from '../tracing'
+import { withTraceScope } from '../tracing/scoped-tracer'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
 
 
@@ -165,6 +165,7 @@ function startCompaction(
               systemPrompt: agentDef.systemPrompt,
               messages: trimmedMessages,
             },
+            { inputTokenEstimate: compactionState.tokenEstimate },
           ),
         ).pipe(
           Effect.map(({ text }) => ({ success: true as const, text })),

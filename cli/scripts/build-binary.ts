@@ -221,7 +221,15 @@ async function build(target: string) {
 
   try {
     const entrypoint = resolve(import.meta.dir, '..', 'src', 'index.tsx')
-    await $`bun build ${entrypoint} ${rgBinPath} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
+
+    // Glob builtin skill files for embedding
+    const skillsetFiles: string[] = []
+    for await (const f of new Bun.Glob('packages/skills/builtin/**/*.md').scan({ cwd: PROJECT_ROOT })) {
+      skillsetFiles.push(resolve(PROJECT_ROOT, f))
+    }
+    console.log(`  [embed] ${skillsetFiles.length} builtin skill files`)
+
+    await $`bun build ${entrypoint} ${rgBinPath} ${skillsetFiles} --compile --target=${target} --outfile=${binaryFile} --external electron --external chromium-bidi`
   } finally {
     // Always restore original files
     await restoreBuildPatches()

@@ -3,7 +3,6 @@ import type { AppEvent } from '../../events'
 import type { ConversationStateReaderTag } from '../../tools/memory-reader'
 import type { TaskGraphStateReaderTag } from '../../tools/task-reader'
 import type { TaskAssignee } from '../types'
-import type { TaskTypeId } from '../registry'
 import type { TaskStatus } from '../../projections/task-graph'
 
 export interface TaskOperationTaskSnapshot {
@@ -37,7 +36,7 @@ export type TaskOperationEnv =
 export interface CreateTaskDirectiveInput {
   readonly taskId: string
   readonly title: string
-  readonly taskType: TaskTypeId
+  readonly taskType: string
   readonly parentId: string | null
   readonly after?: string
 }

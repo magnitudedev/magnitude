@@ -1,0 +1,17 @@
+ws ::= [ \t\n]*
+
+root ::= ws lens* ws (msg | tool)* ws endturn ws
+lens ::= "<lens name=\"" lensname "\">" [^<]+ "</lens>" ws
+lensname ::= "alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"
+msg ::= "<message to=\"user\">" [^<]+ "</message>" ws
+tool ::= readtool | shelltool | greptool | edittool | writetool | treetool
+readtool ::= "<read observe=\"" [^\"]* "\"" readattr* "/>" ws
+readattr ::= " path=\"" [^\"]* "\"" | " offset=\"" [^\"]* "\"" | " limit=\"" [^\"]* "\""
+shelltool ::= "<shell observe=\"" [^\"]* "\">" [^<]+ "</shell>" ws
+greptool ::= "<grep observe=\"" [^\"]* "\">" greppattern "</grep>" ws
+greppattern ::= "<pattern>" [^<]+ "</pattern>" ws ("<glob>" [^<]+ "</glob>" ws)?
+edittool ::= "<edit observe=\"" [^\"]* "\" path=\"" [^\"]* "\">" ws "<old>" [^<]+ "</old>" ws "<new>" [^<]+ "</new>" ws "</edit>" ws
+writetool ::= "<write path=\"" [^\"]* "\">" [^<]+ "</write>" ws
+treetool ::= "<tree observe=\"" [^\"]* "\"" treeattr* "/>" ws
+treeattr ::= " path=\"" [^\"]* "\""
+endturn ::= "<end-turn>" ws ("<idle/>" | "<continue/>") ws "</end-turn>"

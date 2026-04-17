@@ -14,7 +14,7 @@ import {
 } from './task-graph'
 import { ToolStateProjection, type ToolStateProjectionState } from './tool-state'
 import type { ToolHandle } from '../tools/tool-handle'
-import type { ToolState } from '../models'
+import type { ToolState } from '../models/tool-state'
 
 export type WorkerState =
   | { readonly status: 'unassigned' }
@@ -140,11 +140,7 @@ function deriveWorkerState(args: {
   const activeSpawnToolCallId = findActiveToolCallId(toolHandles, 'spawnWorker', task.id)
   if (activeSpawnToolCallId) {
     const handle = toolHandles[activeSpawnToolCallId]
-    const role =
-      handle?.state?.toolKey === 'spawnWorker' && typeof handle.state.role === 'string'
-        ? handle.state.role
-        : null
-    return { status: 'spawning', toolCallId: activeSpawnToolCallId, role }
+    return { status: 'spawning', toolCallId: activeSpawnToolCallId, role: 'worker' as const }
   }
 
   if (task.worker) {

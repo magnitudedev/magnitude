@@ -1,4 +1,4 @@
-import { Agent, type Projection } from '@magnitudedev/event-core'
+import { Agent, type Projection, makeAmbientServiceLayer } from '@magnitudedev/event-core'
 import { defineCatalog } from '@magnitudedev/tools'
 import { Context, Effect, Layer, SubscriptionRef } from 'effect'
 import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
@@ -11,7 +11,6 @@ import { createId } from '../util/id'
 
 // Projections
 import { SessionContextProjection } from '../projections/session-context'
-import { WorkflowProjection } from '../projections/workflow'
 import { TaskGraphProjection } from '../projections/task-graph'
 import { TurnProjection } from '../projections/turn'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
@@ -55,9 +54,10 @@ import { MockCortex } from './mock-cortex'
 import { MockTurnScriptTag, MockTurnScriptLive, createScriptGate, type MockTurnResponse, type MockTurnScriptResolver, type ScriptGate } from './turn-script'
 import { response as standaloneResponse } from './response-builder'
 import { createTurnsBuilder } from './scenario-builder'
-import { clearAgentOverrides } from '../agents'
+import { clearAgentOverrides } from '../agents/registry'
 import { createVirtualFs, createVirtualFsLayer } from './virtual-fs'
 import { EphemeralSessionContextTag, type PolicyContext } from '../agents/types'
+import { SkillsAmbient, publishSkills } from '../ambient/skills-ambient'
 import { ChatPersistence, PersistenceError, type ChatPersistenceService } from '../persistence/chat-persistence-service'
 import { createFaultRegistry, type FaultPlan, type FaultRegistry, type FaultScope } from './faults'
 import { createFakeClock } from './fake-clock'
@@ -232,7 +232,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
         AgentRoutingProjection,
         AgentStatusProjection,
         CompactionProjection,
-        WorkflowProjection,
         TaskGraphProjection,
         TurnProjection,
         CanonicalTurnProjection,
@@ -326,6 +325,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       MockTurnScriptLive,
       basePersistenceLayer,
       faultWrappedPersistenceLayer,
+      makeAmbientServiceLayer(),
       ...(fakeClock ? [fakeClock.layer] : []),
       ...(options.extraLayers ?? []),
     )

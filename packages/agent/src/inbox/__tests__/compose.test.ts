@@ -8,13 +8,10 @@ import {
   toTimelineObservation,
   toTimelineTaskUpdate,
   toTimelineLifecycleHook,
-  toTimelineSkillCompleted,
-  toTimelineSkillStarted,
   toTimelineSubagentUserKilled,
   toTimelineUserMessage,
   toTimelineUserPresence,
   toTimelineUserToAgent,
-  toTimelineWorkflowPhase,
 } from '../compose'
 import type { ContentPart } from '../../content'
 import type { AgentAtom, TimelineAttachment } from '../types'
@@ -51,9 +48,6 @@ describe('inbox compose', () => {
     }).kind).toBe('agent_block')
     expect(toTimelineSubagentUserKilled({ timestamp: TS, agentId: 'a1', agentType: 'builder' }).kind).toBe('subagent_user_killed')
     expect(toTimelineUserPresence({ timestamp: TS, text: 'present', confirmed: true }).kind).toBe('user_presence')
-    expect(toTimelineWorkflowPhase({ timestamp: TS, text: 'phase' }).kind).toBe('workflow_phase')
-    expect(toTimelineSkillStarted({ timestamp: TS, skillName: 's', prompt: 'go' }).kind).toBe('skill_started')
-    expect(toTimelineSkillCompleted({ timestamp: TS, skillName: 's' }).kind).toBe('skill_completed')
     expect(
       toTimelineLifecycleHook({
         timestamp: TS,
@@ -114,8 +108,6 @@ describe('inbox compose', () => {
       role: 'builder',
       atoms: [],
     })
-    const workflow = toTimelineWorkflowPhase({ timestamp: TS, text: 'phase' })
-    const skillStarted = toTimelineSkillStarted({ timestamp: TS, skillName: 'skill', prompt: 'prompt' })
     const update = toTimelineTaskUpdate({
       timestamp: TS,
       action: 'created',
@@ -123,14 +115,9 @@ describe('inbox compose', () => {
     })
 
     if (block.kind !== 'agent_block') throw new Error('expected agent_block')
-    if (workflow.kind !== 'workflow_phase') throw new Error('expected workflow_phase')
-    if (skillStarted.kind !== 'skill_started') throw new Error('expected skill_started')
     if (update.kind !== 'task_update') throw new Error('expected task_update')
 
     expect(block.atoms).toEqual([])
-    expect(workflow.name).toBeUndefined()
-    expect(workflow.phase).toBeUndefined()
-    expect(skillStarted.firstPhase).toBeUndefined()
     expect(update.title).toBeUndefined()
     expect(update.taskType).toBeUndefined()
     expect(update.previousStatus).toBeUndefined()

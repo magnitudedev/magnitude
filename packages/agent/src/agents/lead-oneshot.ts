@@ -9,7 +9,6 @@ import {
   leadTools,
   leadTurnPolicy,
   pivotLens,
-  strategyLens,
   turnLens,
   validationLens,
 } from './lead-shared'
@@ -21,7 +20,7 @@ export const leadOneshotRole = defineRole<typeof leadTools, 'lead', PolicyContex
   id: 'lead-oneshot',
   slot: 'lead',
   systemPrompt,
-  lenses: [constraintsLens, pivotLens, strategyLens, validationLens, turnLens],
+  lenses: [constraintsLens, pivotLens, validationLens, turnLens],
   defaultRecipient: 'user',
   protocolRole: 'oneshot-lead',
   initialContext: { parentConversation: false },

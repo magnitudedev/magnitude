@@ -51,6 +51,7 @@ const tools = catalog.pick(
   'fileSearch',
   'fileView',
   'shell',
+  'skill',
 )
 
 export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>({

@@ -7,7 +7,7 @@ import { join } from 'path'
 import type { StorageClient } from '@magnitudedev/storage'
 import type { MagnitudeSlot } from '../model-slots'
 import type { SessionContext, GitContext } from '../events'
-import { scanSkills } from './skill-scanner'
+import { loadSkills } from '@magnitudedev/skills'
 import { runGitCommand } from './git-command'
 import { knapsackFolderTree } from './folder-tree-knapsack'
 import { truncateFolderTree } from './folder-tree-truncation'
@@ -178,13 +178,17 @@ export async function collectSessionContext(opts?: CollectSessionContextOptions)
   const cwd = opts?.cwd ?? process.cwd()
   const platform = normalizePlatform(process.platform)
 
-  const [git, folderStructure, userInfo, agentsFile, skills] = await Promise.all([
+  const [git, folderStructure, userInfo, agentsFile, skillsMap] = await Promise.all([
     collectGitContext(cwd),
     collectFolderStructure(cwd),
     collectUserInfo(platform),
     readAgentsFile(cwd),
-    scanSkills(cwd),
+    loadSkills(cwd),
   ])
+
+  const skills = skillsMap.size > 0
+    ? Array.from(skillsMap.values()).map(s => ({ name: s.name, description: s.description, path: s.path }))
+    : null
 
   return {
     cwd,
@@ -196,7 +200,7 @@ export async function collectSessionContext(opts?: CollectSessionContextOptions)
     git,
     folderStructure,
     agentsFile,
-    skills: skills.length > 0 ? skills : null,
+    skills,
     oneshot: opts?.oneshot,
   }
 }

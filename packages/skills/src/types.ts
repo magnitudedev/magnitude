@@ -1,51 +1,32 @@
-export interface WorkflowSkill {
-  readonly name: string
-  readonly description: string
-  readonly preamble: string
-  readonly phases: readonly Phase[]
-}
+import { Schema } from 'effect'
 
-export interface Phase {
-  readonly name: string
-  readonly prompt: string
-  readonly submit?: SubmitBlock
-  readonly criteria?: readonly Criteria[]
-  readonly hooks?: Hooks
-}
+export const ThinkingLensSchema = Schema.Struct({
+  lens: Schema.String,
+  trigger: Schema.String,
+  description: Schema.String,
+})
+export type ThinkingLens = typeof ThinkingLensSchema.Type
 
-export interface SubmitBlock {
-  readonly fields: readonly SubmitField[]
-}
+export const SkillSectionsSchema = Schema.Struct({
+  shared: Schema.String,
+  lead: Schema.String,
+  worker: Schema.String,
+  handoff: Schema.String,
+})
+export type SkillSections = typeof SkillSectionsSchema.Type
 
-export type SubmitField =
-  | { readonly type: 'text'; readonly name: string; readonly description: string }
-  | { readonly type: 'file'; readonly name: string; readonly fileType?: string; readonly description: string }
+export const ParsedSkillSchema = Schema.Struct({
+  name: Schema.String,
+  description: Schema.String,
+  thinking: Schema.Array(ThinkingLensSchema),
+  sections: SkillSectionsSchema,
+})
+export type ParsedSkill = typeof ParsedSkillSchema.Type
 
-export type Criteria =
-  | { readonly type: 'shell-succeed'; readonly name: string; readonly command: string }
-  | { readonly type: 'user-approval'; readonly name: string; readonly message: string }
-  | { readonly type: 'agent-approval'; readonly name: string; readonly subagent: string; readonly prompt: string }
+export const SkillSchema = Schema.extend(ParsedSkillSchema, Schema.Struct({
+  path: Schema.String,
+}))
+export type Skill = typeof SkillSchema.Type
 
-export type CriteriaResult =
-  | { readonly type: 'passed' }
-  | { readonly type: 'failed'; readonly reason: string }
-
-export type FieldError =
-  | { readonly type: 'missing'; readonly name: string }
-  | { readonly type: 'file-not-found'; readonly name: string; readonly path: string }
-
-export type ValidationResult =
-  | { readonly valid: true }
-  | { readonly valid: false; readonly errors: readonly FieldError[] }
-
-export type WorkflowAction =
-  | { readonly type: 'submit'; readonly fields: ReadonlyMap<string, string> }
-  | { readonly type: 'advance' }
-  | { readonly type: 'criteria-failed'; readonly results: readonly CriteriaResult[] }
-
-export interface Hooks {
-  readonly onStart?: string
-  readonly onSubmit?: string
-  readonly onAccept?: string
-  readonly onReject?: string
-}
+/** Convenience type for a map of skills keyed by skill name */
+export type SkillsMap = ReadonlyMap<string, Skill>

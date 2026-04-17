@@ -1,4 +1,5 @@
 import { Effect } from 'effect'
+import type { Skill } from '@magnitudedev/skills'
 import type { TaskOperationGraphSnapshot } from './types'
 import { handleCreateDirective, type CreateDirective } from './create'
 import { handleUpdateDirective, type UpdateDirective } from './update'
@@ -11,6 +12,7 @@ export interface TaskDirectiveContext {
   readonly forkId: string | null
   readonly timestamp: number
   readonly graph: TaskOperationGraphSnapshot
+  readonly skills: Map<string, Skill>
 }
 
 export type TaskDirectiveResult =

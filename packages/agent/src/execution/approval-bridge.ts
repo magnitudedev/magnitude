@@ -13,7 +13,7 @@
  */
 
 import { Effect, SubscriptionRef } from 'effect'
-import { ExecutionManager } from './execution-manager'
+import { ExecutionManager } from './types'
 import { DisplayProjection, type ApprovalRequestMessage } from '../projections/display'
 import { isToolKey } from '../catalog'
 

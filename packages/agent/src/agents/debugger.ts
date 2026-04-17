@@ -52,6 +52,7 @@ const tools = catalog.pick(
   'shell',
   'webSearch',
   'webFetch',
+  'skill',
 )
 
 export const debuggerRole = defineRole<typeof tools, 'debugger', PolicyContext>({

@@ -1,5 +1,5 @@
-import type { AgentVariant } from '../agents'
-import { clearAgentOverrides, registerAgentDefinition, getAgentDefinition } from '../agents'
+import type { AgentVariant } from '../agents/variants'
+import { clearAgentOverrides, registerAgentDefinition, getAgentDefinition } from '../agents/registry'
 import { runWithGlobalAgentTestGuard } from './global-test-guard'
 
 type AgentDefinitionForVariant = ReturnType<typeof getAgentDefinition>

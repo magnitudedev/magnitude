@@ -7,7 +7,6 @@ import { AgentStatusProjection } from '../../projections/agent-status'
 import { AgentRoutingProjection } from '../../projections/agent-routing'
 import { UserMessageResolutionProjection } from '../../projections/user-message-resolution'
 import { CompactionProjection } from '../../projections/compaction'
-import { WorkflowProjection } from '../../projections/workflow'
 import { TurnController } from '../turn-controller'
 
 const TestAgent = Agent.define<AppEvent>()({
@@ -18,7 +17,6 @@ const TestAgent = Agent.define<AppEvent>()({
     AgentRoutingProjection,
     UserMessageResolutionProjection,
     CompactionProjection,
-    WorkflowProjection,
   ],
   workers: [TurnController],
 })

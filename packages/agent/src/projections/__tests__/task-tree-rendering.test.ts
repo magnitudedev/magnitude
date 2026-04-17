@@ -69,7 +69,6 @@ const inboxText = (inbox: Extract<ForkMemoryState['messages'][number], { type: '
     results: inbox.results,
     timeline: inbox.timeline,
     timezone: null,
-    lifecycleReminderFormatters: {},
   })
     .filter((p): p is { type: 'text', text: string } => p.type === 'text')
     .map(p => p.text)

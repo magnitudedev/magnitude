@@ -18,7 +18,7 @@ import { MemoryProjection, getView } from '../projections/memory'
 import type { LLMMessage } from '../projections/memory'
 import { SessionContextProjection } from '../projections/session-context'
 
-import { buildAutopilotSystemPrompt } from '../skills/autopilot-prompts'
+import { buildAutopilotSystemPrompt } from '../util/autopilot-prompts'
 /** Max recent messages to send to the autopilot LLM */
 const CONTEXT_MESSAGE_LIMIT = 10
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {

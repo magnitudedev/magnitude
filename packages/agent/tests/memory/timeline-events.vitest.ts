@@ -86,30 +86,6 @@ describe('memory/timeline-events', () => {
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('skill events map to timeline entries', () =>
-    Effect.gen(function* () {
-      const h = yield* TestHarness
-
-      yield* h.send({
-        type: 'skill_started',
-        forkId: null,
-        source: 'assistant',
-        skill: { name: 'deploy', description: 'deploy workflow', preamble: '', phases: [{ name: 'phase1', prompt: 'do phase 1' }] },
-      })
-      yield* h.send({ type: 'skill_completed', forkId: null, skillName: 'deploy' })
-      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-workflow-1', chainId: 'c-workflow-1' })
-
-      const memory = yield* getRootMemory(h)
-      const timeline = inboxMessages(memory).flatMap(m => m.type === 'inbox' ? m.timeline : [])
-      expect(timeline.some(t => t.kind === 'skill_started')).toBe(true)
-      expect(timeline.some(t => t.kind === 'skill_completed')).toBe(true)
-
-      const rendered = yield* getRenderedUserText(h)
-      expect(rendered).toContain('<skill ')
-      expect(rendered).toContain('<skill_completed')
-    }).pipe(Effect.provide(TestHarnessLive()))
-  )
-
   it.live('turn error entries are injected and rendered in results', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness

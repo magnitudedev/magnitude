@@ -40,6 +40,8 @@ export function buildClientRegistry(
   auth: AuthInfo | null,
   providerOptions?: ProviderOptions,
   stopSequences?: string[],
+  grammar?: string,
+  maxTokensOverride?: number,
 ): ClientRegistry | undefined {
   const def = getProvider(providerId)
   if (!def) {
@@ -51,9 +53,9 @@ export function buildClientRegistry(
   const bamlProvider = resolveBamlProvider(providerId, modelId, auth)
 
   const modelDef = def.models.find(m => m.id === modelId)
-  const maxOutputTokens = modelDef?.maxOutputTokens
+  const maxOutputTokens = maxTokensOverride ?? modelDef?.maxOutputTokens
 
-  let options = buildOptions({ ...def, bamlProvider }, modelId, auth, providerOpts, stopSequences, maxOutputTokens)
+  let options = buildOptions({ ...def, bamlProvider }, modelId, auth, providerOpts, stopSequences, maxOutputTokens, grammar)
   if (!options) return undefined
 
   // Apply lowest reasoning effort for models that support it.
@@ -81,6 +83,7 @@ function buildOptions(
   providerOpts?: ProviderOptions,
   stopSequences?: string[],
   maxOutputTokens?: number,
+  grammar?: string,
 ): Record<string, any> | undefined {
   switch (def.bamlProvider) {
     case 'anthropic':
@@ -96,7 +99,7 @@ function buildOptions(
       }
       return buildOpenAIResponsesOptions(modelId, auth, providerOpts, stopSequences, maxOutputTokens)
     case 'openai-generic':
-      return buildOpenAIGenericOptions(def, modelId, auth, providerOpts, stopSequences, maxOutputTokens)
+      return buildOpenAIGenericOptions(def, modelId, auth, providerOpts, stopSequences, maxOutputTokens, grammar)
     case 'aws-bedrock':
       return buildBedrockOptions(modelId, auth, stopSequences, maxOutputTokens)
     case 'vertex-ai':
@@ -214,6 +217,7 @@ function buildOpenAIGenericOptions(
   providerOpts?: ProviderOptions,
   stopSequences?: string[],
   maxOutputTokens?: number,
+  grammar?: string,
 ): Record<string, any> | undefined {
   const baseUrl = providerOpts?.baseUrl ?? def.defaultBaseUrl
   const base: Record<string, any> = {
@@ -221,6 +225,7 @@ function buildOpenAIGenericOptions(
     ...(maxOutputTokens ? { max_tokens: maxOutputTokens } : {}),
     ...(baseUrl ? { base_url: baseUrl } : {}),
     ...(stopSequences && stopSequences.length > 0 ? { stop: stopSequences } : {}),
+    ...(grammar ? { response_format: { type: 'grammar', grammar } } : {}),
     stream_options: { include_usage: true },
   }
 

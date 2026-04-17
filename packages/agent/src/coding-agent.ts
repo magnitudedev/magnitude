@@ -27,8 +27,6 @@ import { AgentStatusProjection } from './projections/agent-status'
 import { TaskGraphProjection } from './projections/task-graph'
 import { TaskWorkerProjection } from './projections/task-worker'
 import { CompactionProjection } from './projections/compaction'
-import { WorkflowProjection } from './projections/workflow'
-
 import { ReplayProjection } from './projections/replay'
 import { ConversationProjection } from './projections/conversation'
 import { UserPresenceProjection } from './projections/user-presence'
@@ -45,15 +43,15 @@ import { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 import { Autopilot } from './workers/autopilot'
 import { CompactionWorker } from './workers/compaction-worker'
 import { ApprovalWorker } from './workers/approval-worker'
-import { WorkflowWorker } from './workers/workflow-worker'
-import { isValidVariant, type AgentVariant } from './agents'
+import { isValidVariant, type AgentVariant } from './agents/variants'
 import { UserPresenceWorker } from './workers/user-presence-worker'
 import { FileMentionResolver } from './workers/file-mention-resolver'
 import { SessionTitleWorker } from './workers/session-title-worker'
 import { FsLive } from './services/fs'
 
 // Execution
-import { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
+import { ExecutionManager } from './execution/types'
+import { ExecutionManagerLive } from './execution/execution-manager'
 import { BrowserServiceLive } from './services/browser-service'
 import { registerApprovalBridge } from './execution/approval-bridge'
 
@@ -72,6 +70,8 @@ import { writeTrace, initTraceSession } from '@magnitudedev/tracing'
 
 import { EphemeralSessionContextTag } from './agents/types'
 import { publishConfigFromProviders } from './ambient/config-ambient'
+import { loadSkills } from '@magnitudedev/skills'
+import { SkillsAmbient, publishSkills } from './ambient/skills-ambient'
 
 
 // =============================================================================
@@ -87,7 +87,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     AgentStatusProjection,
     TaskGraphProjection,
     CompactionProjection,
-    WorkflowProjection,
     TurnProjection,
     CanonicalTurnProjection,
 
@@ -111,7 +110,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
     Autopilot,
     CompactionWorker,
     ApprovalWorker,
-    WorkflowWorker,
 
     FileMentionResolver,
 
@@ -134,7 +132,6 @@ export const CodingAgent = Agent.define<AppEvent>()({
       turn: TurnProjection,
       memory: MemoryProjection,
       compaction: CompactionProjection,
-      workflow: WorkflowProjection,
       agentRouting: AgentRoutingProjection,
       agentStatus: AgentStatusProjection,
       taskGraph: TaskGraphProjection,
@@ -295,6 +292,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         context
       }))
 
+      // Load skills from standard directories
+      const skills = yield* Effect.tryPromise(() => loadSkills(process.cwd()))
+      yield* publishSkills(skills)
+
       // Persist the initial event immediately
       const pending = yield* eventSink.drainPending()
       if (pending.length > 0) {
@@ -389,6 +390,10 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
       // NOTE: AgentStatusProjection is the source of truth for agent identity, metadata, and execution state.
       // AgentRoutingProjection handles message routing only. forkId remains the execution handle used by forked projections/workers.
+
+      // Load skills from standard directories
+      const skills = yield* Effect.tryPromise(() => loadSkills(process.cwd()))
+      yield* publishSkills(skills)
 
       // Persist all recovery events immediately so reopening the same session
       // again won't re-run recovery for already-terminated forks.

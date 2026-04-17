@@ -41,16 +41,16 @@ export type {
   ToolRejected,
 
   SkillActivated,
-  SkillStarted,
 
   Attachment,
   ImageAttachment,
 } from './events'
 
 // Agents
-export type { AgentVariant } from './agents'
+export type { AgentVariant } from './agents/variants'
+export { isValidVariant, getSpawnableVariants } from './agents/variants'
 export type { PolicyContext } from './agents/types'
-export { getAgentDefinition, registerAgentDefinition, clearAgentOverrides } from './agents'
+export { getAgentDefinition, registerAgentDefinition, clearAgentOverrides } from './agents/registry'
 
 // Constants
 export { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, DEFAULT_CHAT_NAME, USER_BLUR_DEBOUNCE_MS } from './constants'
@@ -59,12 +59,9 @@ export { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE, DEFAULT_CHAT_NAME, USER_BLUR_DEBOU
 export { collectSessionContext } from './util/collect-session-context'
 export type { CollectSessionContextOptions } from './util/collect-session-context'
 
-// Skill Scanner
-export { scanSkills } from './util/skill-scanner'
-export type { SkillMetadata } from './util/skill-scanner'
-// Frontmatter Utility
-export { parseFrontmatter, serializeFrontmatter } from './util/frontmatter'
-export type { FrontmatterResult } from './util/frontmatter'
+// Skills (loaded from @magnitudedev/skills)
+export { loadSkills } from '@magnitudedev/skills'
+export type { Skill } from '@magnitudedev/skills'
 
 // Workspace
 export * from './workspace'
@@ -141,20 +138,19 @@ export type { SessionContextState } from './projections/session-context'
 export { ReplayProjection } from './projections/replay'
 export { TaskGraphProjection, getPrimaryRootTask, getSessionTitleFromTaskGraph } from './projections/task-graph'
 export type { TaskGraphState, TaskRecord, TaskStatus, TaskWorkerInfo } from './projections/task-graph'
-export { WorkflowProjection } from './projections/workflow'
-export type { WorkflowCriteriaState } from './projections/workflow'
 
 // Line-edit types
 export type { EditDiff } from './util/line-edit'
 
 // Execution
-export { ExecutionManager, ExecutionManagerLive } from './execution/execution-manager'
-export type { ExecutionManagerService, ExecuteOptions, ExecuteResult } from './execution/execution-manager'
+export { ExecutionManager } from './execution/types'
+export type { ExecutionManagerService, ExecuteOptions, ExecuteResult } from './execution/types'
+export { ExecutionManagerLive } from './execution/execution-manager'
 export { PermissionRejection } from './execution/permission-rejection'
 
 // Prompt Utilities
 export { generateXmlActToolDocs } from './tools/xml-tool-docs'
-export { getXmlActProtocol, buildAckTurn } from './prompts/protocol'
+export { getXmlActProtocol, buildAckTurn, buildAckTurns } from './prompts/protocol'
 
 // Tool types (re-exported from xml-act and tools packages)
 export type { ToolCallEvent } from '@magnitudedev/xml-act'
@@ -177,12 +173,6 @@ export {
   browserTools,
 } from './tools/browser-tools'
 export type { AgentStateReader } from './tools/fork'
-export { skillTool } from './tools/skill'
-export type { SkillStateReader } from './tools/skill'
-
-// Skills
-export { resolveSkill, getUserSkills } from './skills'
-export type { ResolvedSkill } from './skills'
 
 // Workers
 export { TurnController } from './workers/turn-controller'
@@ -191,7 +181,7 @@ export { AgentLifecycle } from './workers/agent-lifecycle'
 export { LifecycleCoordinator } from './workers/lifecycle-coordinator'
 export { Autopilot } from './workers/autopilot'
 export { ApprovalWorker } from './workers/approval-worker'
-export { WorkflowWorker } from './workers/workflow-worker'
+
 export { SessionTitleWorker } from './workers/session-title-worker'
 
 // Persistence

@@ -124,6 +124,18 @@ async function main() {
       })
     })
 
+  program
+    .command('skills')
+    .description('Manage skills')
+    .addCommand(
+      new Command('init')
+        .description('Initialize project skills from built-in defaults')
+        .action(async () => {
+          const { initProjectSkills } = await import('@magnitudedev/skills')
+          await initProjectSkills(process.cwd())
+        })
+    )
+
   program.parse()
 }
 

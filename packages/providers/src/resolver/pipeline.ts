@@ -4,7 +4,7 @@ import type { ModelConnection } from '../model/model-connection'
 import type { InferenceConfig } from '../model/inference-config'
 import type { ExecutableDriver } from '../drivers/types'
 import type { BamlFunctionName, BamlResult, BamlStreamFunctionName } from '../drivers/baml-types'
-import type { BoundModel, ChatStream, CompleteOptions, CompleteResult, ModelFunctionDef, StreamOptions } from '../model/bound-model'
+import type { BoundModel, CallLevelOptions, ChatStream, CompleteOptions, CompleteResult, ModelFunctionDef, StreamOptions } from '../model/bound-model'
 import type { CallUsage } from '../state/provider-state'
 import { CollectorData } from '../drivers/types'
 import type { ProviderOptions } from '../types'
@@ -14,6 +14,25 @@ import { isRetryableError } from '../errors/classify-error'
 
 import { ProviderState } from '../runtime/contracts'
 import { TraceEmitter } from './tracing'
+
+const MIN_OUTPUT_TOKENS = 1024
+/** Hard cap on max_tokens when no calibrated input token estimate is available */
+const MAX_OUTPUT_TOKENS_FALLBACK = 32_768
+
+/** Compute clamped max_tokens given model limits and estimated input size */
+function computeMaxTokens(model: Model, inputTokenEstimate?: number): number | undefined {
+  const maxOut = model.maxOutputTokens
+  if (!maxOut) return undefined
+  if (inputTokenEstimate != null) {
+    const margin = Math.max(512, Math.ceil(inputTokenEstimate * 0.1))
+    const available = model.contextWindow - inputTokenEstimate - margin
+    if (available >= maxOut) return undefined  // no clamping needed
+    return Math.max(MIN_OUTPUT_TOKENS, available)
+  }
+  // Fallback: hard cap when no estimate is available
+  if (maxOut > MAX_OUTPUT_TOKENS_FALLBACK) return MAX_OUTPUT_TOKENS_FALLBACK
+  return undefined
+}
 
 /** Retry schedule for transient connection failures before first chunk */
 const connectionRetrySchedule = Schedule.exponential(Duration.seconds(1), 1.5).pipe(
@@ -74,8 +93,20 @@ function createBoundModelImpl<TSlot extends string>(
   const boundModel: BoundModel = {
     model,
     connection,
-    invoke<I, O>(fn: ModelFunctionDef<I, O>, input: I) {
-      return fn.execute(boundModel, input)
+    invoke<I, O>(fn: ModelFunctionDef<I, O>, input: I, callOptions?: CallLevelOptions) {
+      const maxTokens = computeMaxTokens(model, callOptions?.inputTokenEstimate)
+      if (maxTokens == null) return fn.execute(boundModel, input)
+      const wrapped: BoundModel = {
+        ...boundModel,
+        invoke: boundModel.invoke,
+        stream(functionName, args, options) {
+          return boundModel.stream(functionName, args, { ...options, maxTokens })
+        },
+        complete(functionName, args, options) {
+          return boundModel.complete(functionName, args, { ...options, maxTokens })
+        },
+      }
+      return fn.execute(wrapped, input)
     },
     stream<K extends BamlStreamFunctionName>(functionName: K, args: readonly unknown[], options?: StreamOptions) {
       const abortController = new AbortController()
@@ -83,6 +114,7 @@ function createBoundModelImpl<TSlot extends string>(
       const requestInference: InferenceConfig = {
         ...inference,
         ...(options?.stopSequences ? { stopSequences: options.stopSequences } : {}),
+        ...(options?.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
       }
 
       const startMs = Date.now()
@@ -99,6 +131,7 @@ function createBoundModelImpl<TSlot extends string>(
           ...(providerOptions ?? {}),
           ...(options?.providerOptions ?? {}),
         },
+        grammar: options?.grammar,
         signal: abortController.signal,
       }
 
@@ -220,13 +253,17 @@ function createBoundModelImpl<TSlot extends string>(
       return Effect.gen(function* () {
         const tracer = yield* TraceEmitter
 
+        const completeInference: InferenceConfig = {
+          ...inference,
+          ...(_options?.maxTokens !== undefined ? { maxTokens: _options.maxTokens } : {}),
+        }
         const { result, usage, collectorData } = yield* driver.complete({
           slot,
           functionName,
           args,
           connection,
           model,
-          inference,
+          inference: completeInference,
           providerOptions: {
             ...(providerOptions ?? {}),
             ...(_options?.providerOptions ?? {}),

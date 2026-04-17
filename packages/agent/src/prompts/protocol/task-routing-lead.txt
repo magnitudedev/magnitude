@@ -24,15 +24,15 @@ Tasks and workers are managed with flat tool calls — no block syntax, no nesti
 
 <create-task id="impl-parser" type="implement" title="Implement parser updates" />
 
-A task requires `id`, `type`, and `title`. Use `parent` to nest under an existing task:
+A task requires `id` and `title`. The `type` is optional — use it for organization when helpful. Use `parent` to nest under an existing task:
 
-<create-task id="impl-parser" type="implement" title="Implement parser updates" parent="parser-feature" />
+<create-task id="impl-parser" title="Implement parser updates" parent="parser-feature" />
 
 ### Spawning workers
 
-<spawn-worker id="impl-parser" role="builder">Implement Unit A from the [plan]($M/plans/the-plan.md).</spawn-worker>
+<spawn-worker id="impl-parser">Implement Unit A from the [plan]($M/plans/the-plan.md).</spawn-worker>
 
-`spawn-worker` creates a worker for a task. The `id` must match an existing task. The `role` must be allowed for that task type. `spawn-worker` requires a body, and the body is the worker's initial instruction message with the same semantics as a normal `<message to="task-id">...</message>`.
+`spawn-worker` creates a worker for a task. The `id` must match an existing task. `spawn-worker` requires a body, and the body is the worker's initial instruction message with the same semantics as a normal `<message to="task-id">...</message>`.
 
 If a worker already exists on that task, `spawn-worker` kills the old worker and spawns a new one.
 
@@ -58,9 +58,3 @@ The `working` status is derived — it reflects that a task has a live worker. Y
 To send instructions or follow-ups to a worker, use `<message>`:
 
 <message to="impl-parser">Focus on test coverage before refactors.</message>
-
-### Complete example turn
-
-<create-task id="auth-research" type="research" title="Map auth flow" parent="auth-feature" />
-<spawn-worker id="auth-research" role="explorer">Trace the auth middleware chain and document entry points.</spawn-worker>
-<update-task id="old-task" status="completed" />

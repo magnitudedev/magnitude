@@ -76,4 +76,5 @@ export const MagnitudeConfigSchema = Schema.Struct({
   telemetry: Schema.optional(Schema.Boolean),
   contextLimits: Schema.optional(ContextLimitPolicySchema),
 })
+
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

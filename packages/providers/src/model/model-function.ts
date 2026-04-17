@@ -3,6 +3,7 @@ import type { ChatMessage, ExtractMemoryDiffResult } from '@magnitudedev/llm-cor
 import type { CallUsage } from '../state/provider-state'
 import { type StreamingFn, type CompleteFn, type BoundModel, type ChatStream } from './bound-model'
 
+
 function includesClaudeSpoof(model: BoundModel): boolean {
   return model.model.providerId === 'anthropic' && model.connection.auth?.type === 'oauth'
 }
@@ -30,7 +31,7 @@ function includeSystemPromptMessage(model: BoundModel): boolean {
 }
 
 export const CodingAgentChat: StreamingFn<
-  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] }; ackTurn: string },
+  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[]; grammar?: string }; ackTurns: { role: string; content: string[] }[] },
   ChatStream
 > = {
   name: 'CodingAgentChat',
@@ -38,16 +39,17 @@ export const CodingAgentChat: StreamingFn<
   execute: (model, input) =>
     model.stream(
       'CodingAgentChat',
-      [input.systemPrompt, input.messages, input.ackTurn, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
+      [input.systemPrompt, input.messages, input.ackTurns, includesClaudeSpoof(model), includeSystemPromptMessage(model)],
       {
         stopSequences: input.options?.stopSequences,
+        grammar: input.options?.grammar,
         ...(codexCallOptions(model, input.systemPrompt) ?? {}),
       },
     ),
 }
 
 export const SimpleChat: StreamingFn<
-  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[] } },
+  { systemPrompt: string; messages: ChatMessage[]; options?: { stopSequences?: string[]; grammar?: string } },
   ChatStream
 > = {
   name: 'SimpleChat',
@@ -58,6 +60,7 @@ export const SimpleChat: StreamingFn<
       [input.systemPrompt, input.messages, includeSystemPromptMessage(model)],
       {
         stopSequences: input.options?.stopSequences,
+        grammar: input.options?.grammar,
         ...(codexCallOptions(model, input.systemPrompt) ?? {}),
       },
     ),

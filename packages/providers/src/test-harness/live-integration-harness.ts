@@ -66,12 +66,16 @@ export function expectedDriverForSelection(_model: Model, _auth: AuthInfo | null
 export function makeCodingAgentChatInput(): {
   systemPrompt: string
   messages: ChatMessage[]
-  ackTurn: string
+  ackTurns: Array<{ role: string; content: string }>
 } {
   return {
     systemPrompt: 'You are concise. Reply with 3-5 words.',
     messages: [{ role: 'user', content: ['Say hello.'] }],
-    ackTurn: 'ack-test',
+    ackTurns: [
+      { role: 'user', content: '--- FEW-SHOT EXAMPLE START ---\n<system>\nRespond using the required turn format. The user reports a bug in the login redirect.\n</system>' },
+      { role: 'assistant', content: '<lens name="skills">Bug report → activate the bug skill to load methodology.</lens>\n<skill name="bug" />\n<end-turn>\n<continue/>\n</end-turn>' },
+      { role: 'user', content: '--- FEW-SHOT EXAMPLE END ---' },
+    ],
   }
 }
 
@@ -172,7 +176,7 @@ export async function createLiveIntegrationHarness(): Promise<LiveHarness> {
       driver.stream({
         slot: target.slot,
         functionName: 'CodingAgentChat',
-        args: [input.systemPrompt, input.messages, input.ackTurn, false, true],
+        args: [input.systemPrompt, input.messages, input.ackTurns, false, true],
         connection,
         model: target.model,
         inference: {},

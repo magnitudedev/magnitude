@@ -18,7 +18,7 @@
 import { Effect, Stream, Either } from 'effect'
 import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
-import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash, generateGrammar } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -28,7 +28,7 @@ import type { ChatMessage } from '@magnitudedev/llm-core'
 import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { Image as BamlImage } from '@boundaryml/baml'
 import type { ObservationPart } from '@magnitudedev/roles'
-import { buildAckTurn } from '../prompts/protocol'
+import { buildAckTurns } from '../prompts/protocol'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
 import type { AppEvent } from '../events'
@@ -44,13 +44,15 @@ import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 
 import { TurnProjection } from '../projections/turn'
-import { ExecutionManager } from '../execution/execution-manager'
-import { getAgentDefinition, getForkInfo } from '../agents'
+import { ExecutionManager } from '../execution/types'
+import { getAgentDefinition, getForkInfo } from '../agents/registry'
+import { generateToolGrammar } from '../tools/tool-registry'
 
-import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
-import { withTraceScope } from '../tracing'
+import { ModelResolver, CodingAgentChat, canUseGrammarWithStreaming } from '@magnitudedev/providers'
+import { withTraceScope } from '../tracing/scoped-tracer'
 import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
+import { SkillsAmbient } from '../ambient/skills-ambient'
 import {
   authReconnectMessage,
   classifyRetryability,
@@ -147,12 +149,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           })
         }
 
+        // 2. Build system prompt with runtime protocol/tool-doc substitution
+        const ambientService = yield* AmbientServiceTag
+        const skills = ambientService.getValue(SkillsAmbient)
+
         // Build messages array (now includes observations in system inbox)
         const forkMemory = yield* read(MemoryProjection)
         const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
-
-        // 2. Build system prompt with runtime protocol/tool-doc substitution
-        const systemPrompt = renderSystemPrompt(agentDef)
+        const systemPrompt = renderSystemPrompt(agentDef, skills)
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 
@@ -168,9 +172,21 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         resolvedProviderId = boundModel.model.providerId
         resolvedModelId = boundModel.model.id
 
+        // 2b. Provide input token estimate so provider can clamp max_tokens
+        const compactionState = yield* read(CompactionProjection, forkId)
+
         // 3. Build and consume the turn event stream
+        // Check if grammar is disabled via env var (MAGNITUDE_ENABLE_GRAMMAR)
+        const grammarEnabled = ((): boolean => {
+          const envValue = process.env.MAGNITUDE_ENABLE_GRAMMAR
+          if (envValue === undefined) return true // Default: enabled
+          const normalized = envValue.toLowerCase().trim()
+          return normalized !== '0' && normalized !== 'false' && normalized !== ''
+        })()
+        const grammarSafe = canUseGrammarWithStreaming(boundModel.model.providerId, boundModel.model.id, '')
+        const toolGrammar = grammarEnabled && grammarSafe && boundModel.model.supportsGrammar ? generateToolGrammar(agentDef) : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
-          const ackTurn = buildAckTurn(agentDef.lenses, agentDef.defaultRecipient)
+          const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
             {
               metadata: { callType: 'chat', forkId, forkName: agentInstance?.name ?? 'root', turnId, chainId },
@@ -182,9 +198,10 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               {
                 systemPrompt,
                 messages: chatMessages,
-                options: { stopSequences: [END_TURN_STOP_SEQUENCE] },
-                ackTurn,
+                options: { stopSequences: [END_TURN_STOP_SEQUENCE], grammar: toolGrammar },
+                ackTurns,
               },
+              { inputTokenEstimate: compactionState.tokenEstimate },
             ),
           ).pipe(
             Effect.mapError((e) => TurnErrorCtor.LLMFailed({ message: e.message, cause: e })),

@@ -12,8 +12,8 @@ import type { ImageMediaType } from './content'
 import type { ToolCallEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
-import type { WorkflowSkill } from '@magnitudedev/skills'
-import type { TaskTypeId, TaskAssignee } from './tasks'
+import type { Skill } from '@magnitudedev/skills'
+import type { TaskAssignee } from './tasks/types'
 
 
 export type Attachment = ImageAttachment | MentionAttachment
@@ -421,7 +421,7 @@ export interface TaskCreated {
   readonly forkId: string | null
   readonly taskId: string
   readonly title: string
-  readonly taskType: TaskTypeId
+  readonly taskType: string
   readonly parentId: string | null
   readonly after?: string
   readonly timestamp: number
@@ -581,18 +581,8 @@ export type SkillActivated =
       readonly source: 'assistant'
     }
 
-export interface SkillStarted {
-  readonly type: 'skill_started'
-  readonly forkId: string | null
-  readonly source: 'user' | 'assistant'
-  readonly skill: WorkflowSkill
-}
-
-export interface SkillCompleted {
-  readonly type: 'skill_completed'
-  readonly forkId: string | null
-  readonly skillName: string
-}
+// Note: SkillStarted and SkillCompleted event types removed.
+// Skills are now activated via the `skill` tool which returns content directly.
 
 export type AppEvent =
   | SessionInitialized
@@ -639,6 +629,4 @@ export type AppEvent =
   | SubagentIdleClosed
   | UserReturnConfirmed
   | SkillActivated
-  | SkillStarted
-  | SkillCompleted
 

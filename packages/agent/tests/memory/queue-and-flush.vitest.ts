@@ -36,12 +36,6 @@ describe('memory queue and flush', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'skill_started',
-        forkId: null,
-        source: 'assistant',
-        skill: { name: 'ship', description: '', preamble: '', phases: [{ name: 'p1', prompt: 'phase one' }] },
-      })
-      yield* h.send({
         type: 'tool_event',
         forkId: null,
         turnId: 't-1',
@@ -187,12 +181,6 @@ describe('memory queue and flush', () => {
         forkId: null,
         timestamp: 1711641600000,
         text: 'from user',
-      })
-      yield* h.send({
-        type: 'skill_started',
-        forkId: null,
-        source: 'assistant',
-        skill: { name: 'skill-x', description: '', preamble: '', phases: [{ name: 'p1', prompt: 'phase one' }] },
       })
       yield* h.send({
         type: 'turn_completed',

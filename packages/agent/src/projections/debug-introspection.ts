@@ -17,7 +17,7 @@ import { CompactionProjection } from './compaction'
 import { SessionContextProjection } from './session-context'
 import { ReplayProjection } from './replay'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
-import { getForkInfo } from '../agents'
+import { getForkInfo } from '../agents/registry'
 
 // =============================================================================
 // Types

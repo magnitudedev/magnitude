@@ -1,7 +1,7 @@
 import { Projection, Signal } from '@magnitudedev/event-core'
 import type { AppEvent } from '../events'
 import { AgentStatusProjection, type AgentStatusState } from './agent-status'
-import { type TaskAssignee, type TaskTypeId } from '../tasks'
+import { type TaskAssignee } from '../tasks/types'
 
 export type TaskStatus = 'pending' | 'working' | 'completed'
 
@@ -15,7 +15,7 @@ export interface TaskWorkerInfo {
 export interface TaskRecord {
   readonly id: string
   readonly title: string
-  readonly taskType: TaskTypeId
+  readonly taskType: string
   readonly parentId: string | null
   readonly childIds: readonly string[]
   readonly assignee: TaskAssignee | null
@@ -233,13 +233,6 @@ function canTransition(current: TaskStatus, requested: TaskStatus): boolean {
   }
 }
 
-function isTaskAssigneeAllowed(taskType: TaskTypeId, assignee: TaskAssignee): boolean {
-  if (assignee === 'user') {
-    return taskType === 'review'
-  }
-  return true
-}
-
 export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()(({
   name: 'TaskGraph',
 
@@ -431,10 +424,6 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
 
     task_assigned: ({ event, state, read, emit }) => {
       const current = getTask(state, event.taskId)
-
-      if (!isTaskAssigneeAllowed(current.taskType, event.assignee)) {
-        return state
-      }
 
       const agentState = read(AgentStatusProjection)
       const worker: TaskWorkerInfo | null = event.workerInfo

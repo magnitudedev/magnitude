@@ -2,9 +2,8 @@ import { Effect } from 'effect'
 import { WorkerBusTag } from '@magnitudedev/event-core'
 import type { AppEvent } from '../../events'
 import { TaskGraphStateReaderTag } from '../../tools/task-reader'
-import { parseTaskTypeId } from '../validation'
 import { buildTaskCreatedValidated, buildTaskStatusChangedValidated } from './builders'
-import { duplicateTaskId, parentNotFound, invalidTaskType } from './errors'
+import { duplicateTaskId, parentNotFound } from './errors'
 import type { TaskDirectiveContext, TaskDirectiveResult } from './handler'
 
 export interface CreateDirective {
@@ -18,13 +17,7 @@ export interface CreateDirective {
 
 export const handleCreateDirective = (directive: CreateDirective, context: TaskDirectiveContext) =>
   Effect.gen(function* () {
-    const normalizedType = directive.taskType.trim().toLowerCase()
-    const parsedTaskType = parseTaskTypeId(normalizedType)
-    if (!parsedTaskType) {
-      const err = invalidTaskType(directive.taskId, directive.taskType)
-      return { success: false, code: err.code, error: err.message } as const
-    }
-
+    const normalizedType = directive.taskType ? directive.taskType.trim().toLowerCase() : ''
     const taskReader = yield* TaskGraphStateReaderTag
     const existingTask = yield* taskReader.getTask(directive.taskId)
     if (existingTask) {
@@ -63,7 +56,7 @@ export const handleCreateDirective = (directive: CreateDirective, context: TaskD
       buildTaskCreatedValidated({
         taskId: directive.taskId,
         title: directive.title.trim(),
-        taskType: parsedTaskType,
+        taskType: normalizedType,
         parentId: directive.parentId,
         after: directive.after ?? undefined,
       }, { forkId: context.forkId, timestamp: context.timestamp, graph: context.graph }),
