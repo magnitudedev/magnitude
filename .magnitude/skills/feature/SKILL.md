@@ -11,40 +11,29 @@ Build new functionality, behavior, or capabilities that don't exist yet.
 
 Feature work goes through four phases: context, design, implementation, and verification. Skipping phases creates compounding problems — skipping context leads to wrong assumptions, skipping design leads to expensive in-flight decisions, skipping verification leads to gaps between what was built and what was asked for.
 
-**Context** — Builders who don't understand the existing code make wrong assumptions. Explore the relevant parts of the codebase first: entry points, related modules, types, conventions, and how similar things are already done. If the feature involves external APIs or libraries you haven't worked with, research those separately — guessing at API surfaces causes integration bugs.
-
-**Design** — Without a plan, builders make design decisions while coding, which is expensive to undo. A good plan names the files that will change, the interfaces involved, what the new behavior should be, and how to verify it works. Plans get better with critique — first drafts miss edge cases that show up under scrutiny. Scope and direction decisions belong to the user. Surface these during planning, before anyone starts building.
-
-**Implementation** — Builders do their best work when they have a solid plan and codebase context to work from. Workers on independent scopes can run in parallel. Workers whose scopes touch the same interfaces or state need agreed contracts before they start, or their work will conflict at merge time.
-
-**Verification** — The builder and the bugs in their code share the same blind spots. A reviewer working from the plan and requirements sees from a different angle — this catches things the builder structurally cannot, regardless of how careful they were. Route review findings back to implementation until they're resolved.
+The lead should orchestrate each phase, ensuring it completes before the next begins. Context must map the relevant codebase before design starts. Design must produce a concrete, implementation-ready plan before building begins. Implementation must follow the approved plan. Verification must confirm the integrated result meets the original requirements.
 
 ## Delegation
 
-Typical worker breakdown for a feature:
+Feature work is the most involved delegation pattern — it has the most phases, the most handoffs, and the most room for parallelism. The lead's job is to keep the phases flowing and ensure the final result actually matches what the user asked for.
 
-- **scan/explore-codebase** — Map relevant code before design begins. Share specific questions about entry points, related modules, and existing patterns.
-- **explore-docs** — Research external APIs or libraries if the feature depends on them.
-- **plan** — Produce an implementation-ready design. Share the user's requirements, constraints, and any exploration findings. The plan names files, interfaces, and verification strategy.
-- **implement** — Execute the plan. Share the approved plan and relevant codebase context. Independent scopes can run in parallel.
-- **review** — Verify the integrated result. Share the original requirements and plan as the baseline.
+**Phase 1: Context** — Map relevant code before design begins. Use **scan** or **explore-codebase**. This is fast, focused work — give the worker specific questions about entry points, related modules, existing patterns, and how similar features are already built. The output feeds directly into planning, so emphasize what matters for design decisions.
 
-For simple features, collapse phases — a combined scan+plan, or a single implement+review pass, may be sufficient. Match depth to complexity.
+**Phase 2: Design** — Produce an implementation-ready plan. Use **plan** (or **web-research** if external APIs are involved). Share the user's requirements, constraints, and the context findings. This is where the lead is most involved — review the plan for gaps, push back on unclear parts, and shape it into something the user can evaluate. The plan names files, interfaces, ordered steps, and verification strategy.
 
-## Quality Bar
+**Phase 3: Implementation** — Execute the plan. This is where parallelism can help. If the plan identifies independent scopes (e.g., backend API + frontend component that don't share state), different workers can implement them in parallel. Workers touching shared interfaces or state need agreed contracts before they start, or their work will conflict at merge time. Share the approved plan and relevant context with each worker.
 
-The feature is done when the user's requirements are actually met, not when all subtasks are checked off. Verify the integrated behavior against what was originally requested — gaps are common when work is split across multiple workers.
+**Phase 4: Verification** — Use **review**. The reviewer should be a different worker than the implementer — they bring fresh eyes. Share the original requirements and the plan as the baseline. The reviewer verifies the integrated result, not just individual pieces — gaps between "each piece works" and "the whole thing does what was asked" are common.
 
-- The integrated result satisfies the user's stated requirements and scope boundaries.
-- Correctness, edge cases, and regression checks are verified.
-- Code changes align with codebase conventions and maintain code quality.
-- Review findings are resolved or explicitly accepted.
-- User confirms the feature works as intended.
+**For simple features**, collapse phases — a combined scan+plan, or a single implement+review pass, may be sufficient. Match depth to complexity.
 
-## Skill Evolution
+The biggest risk in feature work is building something that technically checks all the subtask boxes but doesn't actually satisfy the user's original request. The lead should verify the integrated behavior against what was originally asked for, not just mark subtasks complete.
 
-Update this skill when:
-- A phase is repeatedly skipped and causes problems — make it explicit.
-- A delegation pattern works particularly well for this project — capture it.
-- The user expresses preferences about how features should be built or verified.
-- Project-specific conventions emerge that should always be followed.
+## Completion
+
+The feature is done when:
+- The integrated result satisfies the user's stated requirements and scope boundaries
+- Correctness, edge cases, and regression checks are verified
+- Code changes align with codebase conventions and maintain code quality
+- Review findings are resolved or explicitly accepted
+- User confirms the feature works as intended

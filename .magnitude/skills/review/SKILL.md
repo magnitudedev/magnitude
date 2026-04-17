@@ -11,52 +11,25 @@ Verify completed work for correctness, quality, and requirement coverage.
 
 Review is independent verification. The reviewer's job is to find problems, not confirm success. Assume nothing works until there is proof. When in doubt, report the issue.
 
-The requirement baseline defines what "correct" means — read the plan, scope, and constraints before evaluating code. Check each expected behavior for full, partial, or missing implementation. Inspect logic paths, state transitions, failure handling, and edge cases. Run or inspect relevant tests and confirm adjacent behavior remains intact.
-
-Evidence-backed findings are actionable; vague concerns are not. Severity reflects impact, not emphasis. Pass means no unresolved blocking issues remain.
+The lead should ensure the reviewer reads the requirement baseline (plan, scope, constraints) before evaluating code. The reviewer should check each expected behavior for full, partial, or missing implementation; inspect logic paths, state transitions, failure handling, and edge cases; run or inspect relevant tests; and confirm adjacent behavior remains intact. Evidence-backed findings are actionable; vague concerns are not. Severity reflects impact, not emphasis. Pass means no unresolved blocking issues remain.
 
 ## Delegation
 
-When assigning a worker to review, share in your spawn message:
+Review is delegated, and the reviewer should be someone other than the person who built the thing being reviewed. The builder and their bugs share the same blind spots — a fresh pair of eyes catches what the builder structurally cannot.
 
-- Canonical requirements source: approved plan, user request, or acceptance criteria
-- Scope: task IDs, changed files, diff range, and areas explicitly out of scope
-- Risk focus areas: correctness edge cases, regressions, security, performance, integration boundaries
-- Required validation: tests to run, environments to use
-- Decision context for known tradeoffs so the reviewer can distinguish intentional deviations from defects
+**Why independence matters:** If the reviewer is the same worker who built the thing, the review is theater. They'll see what they intended, not what's actually there. Use a different worker.
 
-Expect back: explicit verdict (pass or fail), findings with severity and evidence (file + line refs, test output), coverage summary, validation summary, and residual risks called out separately.
+**What to give the reviewer:** The canonical requirements source — approved plan, user request, or acceptance criteria. Without this, the reviewer can only judge code quality, not whether the right thing was built. Also share: scope (changed files, diff range, areas out of scope), risk focus areas (correctness edge cases, regressions, security, performance, integration boundaries), required validation (tests to run, what to check), and decision context for any known tradeoffs so the reviewer can distinguish intentional decisions from defects.
 
-Vague or unsupported findings need evidence before acceptance. Route accepted findings to implementation with remediation scope. Re-run review after fixes until issues are resolved or explicitly accepted with rationale. A pass verdict is only meaningful when requirement coverage and validation were actually demonstrated.
+**What to expect back:** An explicit verdict (pass or fail) — not hedging. Findings with severity and evidence (file + line refs, test output, specific commands run). Coverage summary (what was reviewed, what was not). Residual risks called out separately.
 
-## Worker Guidance
+**Handling findings:** Vague or unsupported findings need evidence before you accept them. Concrete findings get routed back to implementation for fixes. After fixes, re-review until issues are resolved or explicitly accepted with rationale. A pass verdict is only meaningful when the reviewer actually demonstrated requirement coverage and validation — a pass without evidence is just an opinion.
 
-Read the plan, scope, and constraints before evaluating any code. Your job is to find problems, not confirm success.
+## Completion
 
-What counts as evidence:
-- Test suite output, build/typecheck output, shell commands that exercise the feature
-- Specific code patterns verified by targeted reading with file and line references
-
-What does not count as evidence:
-- "X is implemented in file Y" (code existence)
-- "The implementation handles edge cases" (vague correctness)
-- Any conclusion from reading code without running it for behavioral claims
-
-Cite what you ran or read — specific file paths, line references, command output. If you cannot verify something, report it as unverified and explain why.
-
-Write findings to `$M/reports/` and link in your message to the lead.
-
-## Quality Bar
-
-- Verdict is explicit (pass or fail) and consistent with reported findings.
-- Every reported finding is concrete and includes verifiable evidence.
-- Requirement coverage is assessed, including callouts for anything not reviewed.
-- Correctness, regression, and quality checks were performed and summarized.
-- Unresolved issues are either fixed or explicitly accepted with rationale.
-
-## Skill Evolution
-
-Update this skill when:
-- The user expresses specific quality standards (e.g., "never use `as any`") — add them here.
-- A class of defect keeps slipping through — add it to the focus areas.
-- The user has preferences about what counts as sufficient evidence.
+The review is complete when:
+- Verdict is explicit (pass or fail) and consistent with reported findings
+- Every reported finding is concrete and includes verifiable evidence
+- Requirement coverage is assessed, including callouts for anything not reviewed
+- Correctness, regression, and quality checks were performed and summarized
+- Unresolved issues are either fixed or explicitly accepted with rationale
