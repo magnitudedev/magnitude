@@ -18,7 +18,6 @@ describe('TaskWorkerProjection', () => {
         forkId: null,
         taskId: 'task-1',
         title: 'Build it',
-        taskType: 'implement',
         parentId: null,
       } as any)
       yield* h.send({
@@ -91,7 +90,7 @@ describe('TaskWorkerProjection', () => {
       expect(state.snapshots.get('task-1')).toEqual({
         taskId: 'task-1',
         title: 'Build it',
-        taskType: 'implement',
+
         status: 'pending',
         parentId: null,
         depth: 0,
@@ -121,7 +120,7 @@ describe('TaskWorkerProjection', () => {
         forkId: null,
         taskId: 'task-1',
         title: 'Build it',
-        taskType: 'implement',
+
         parentId: null,
       } as any)
       yield* h.send({
@@ -198,7 +197,7 @@ describe('TaskWorkerProjection', () => {
         forkId: null,
         taskId: 'task-1',
         title: 'Build it',
-        taskType: 'implement',
+
         parentId: null,
       } as any)
       yield* h.send({
@@ -307,7 +306,7 @@ describe('TaskWorkerProjection', () => {
         forkId: null,
         taskId: 'task-1',
         title: 'Build it',
-        taskType: 'implement',
+
         parentId: null,
       } as any)
       yield* h.send({
@@ -386,7 +385,7 @@ describe('TaskWorkerProjection', () => {
         forkId: null,
         taskId: 'task-1',
         title: 'Build it',
-        taskType: 'implement',
+
         parentId: null,
       } as any)
       yield* h.send({

@@ -9,7 +9,7 @@ describe('spawn-worker lifecycle integration', () => {
 
       // Turn 1 (root): create task
       yield* h.script.next({
-        xml: '<create-task id="flow-task" type="implement" title="Flow task"/><idle/>',
+        xml: '<create-task id="flow-task" title="Flow task"/><idle/>',
       }, null)
 
       // Turn 2 (root): spawn worker with initial instructions

@@ -29,7 +29,6 @@ export function buildTaskCreatedValidated(
     ...baseEvent(context),
     taskId: input.taskId,
     title: input.title,
-    taskType: input.taskType,
     parentId: input.parentId,
     after: input.after,
   } as Validated<TaskCreated>

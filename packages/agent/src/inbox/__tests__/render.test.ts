@@ -223,7 +223,7 @@ describe('formatInbox', () => {
 
   test('renders task updates block with expected lines', () => {
     const timeline: readonly TimelineEntry[] = [
-      { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title', taskType: 'implement' },
+      { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title' },
       { kind: 'task_update', timestamp: TS1, action: 'status_changed', taskId: 't1', previousStatus: 'pending', nextStatus: 'working' },
       { kind: 'task_update', timestamp: TS2, action: 'completed', taskId: 't1' },
       { kind: 'task_update', timestamp: TS3 + 1, action: 'cancelled', taskId: 't2', cancelledCount: 3 },
@@ -234,7 +234,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '<task_updates>\n- Task t1 created: "Title" (implement)\n- Task t1 status changed: pending -> working\n- Task t1 completed\n- Task t2 cancelled (3 tasks removed)\n</task_updates>',
+          '<task_updates>\n- Task t1 created: "Title"\n- Task t1 status changed: pending -> working\n- Task t1 completed\n- Task t2 cancelled (3 tasks removed)\n</task_updates>',
       },
     ])
   })
@@ -257,7 +257,7 @@ describe('formatInbox', () => {
 
   test('does not include task_update entries in chronological stream', () => {
     const timeline: readonly TimelineEntry[] = [
-      { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title', taskType: 'implement' },
+      { kind: 'task_update', timestamp: TS0, action: 'created', taskId: 't1', title: 'Title' },
       { kind: 'user_message', timestamp: TS1, text: 'hello', attachments: [] },
     ]
 
@@ -266,7 +266,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<task_updates>\n- Task t1 created: "Title" (implement)\n</task_updates>`,
+          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<task_updates>\n- Task t1 created: "Title"\n</task_updates>`,
       },
     ])
   })
@@ -407,7 +407,7 @@ describe('formatInbox', () => {
   test('does not render worker progress reminder for lifecycle_hook/task_idle_hook alone', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'lifecycle_hook', timestamp: TS0, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
-      { kind: 'task_idle_hook', timestamp: TS1, taskId: 't1', taskType: 'implement', title: 'Build thing', agentId: 'builder-z' },
+      { kind: 'task_idle_hook', timestamp: TS1, taskId: 't1', title: 'Build thing', agentId: 'builder-z' },
     ]
 
     const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
@@ -415,7 +415,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '<reminders>\n- Worker builder-z for task t1 ("Build thing") has finished. Review output and either send feedback or mark complete. Re-consult the skill governing this task and evaluate the output against its quality bar before proceeding.\n</reminders>',
+          '<reminders>\n- Worker builder-z for task t1 ("Build thing") has finished. Review output and either send feedback or mark complete.\n</reminders>',
       },
     ])
   })

@@ -421,7 +421,6 @@ export interface TaskCreated {
   readonly forkId: string | null
   readonly taskId: string
   readonly title: string
-  readonly taskType: string
   readonly parentId: string | null
   readonly after?: string
   readonly timestamp: number

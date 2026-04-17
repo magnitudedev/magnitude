@@ -54,7 +54,7 @@ describe('SessionTitleWorker', () => {
         taskId: 'root-task',
         parentId: null,
         title: 'Initial task title',
-        taskType: 'implement',
+
         timestamp: 1,
       })
 

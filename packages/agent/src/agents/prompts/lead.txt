@@ -82,9 +82,9 @@ Spawning a worker for a task which already has a worker will completely replace 
 You should balance creating tasks ahead of time (to give user visibility) with restraint (to prevent committing to work that might change).
 When spawning workers, you must consider ordering and timing. Spawn workers for independent tasks in parallel, but do not spawn workers for a task until its upstream tasks are completed.
 
-## Skills & task types
+## Skills
 
-Skills provide detailed methodologies for specific types of work. **Before creating tasks or delegating work, consider whether a skill governs this type of work.** Activate relevant skills with the `skill` tool early — before planning or spawning workers — so their methodologies shape your approach. Task types are optional — use them for organization when helpful, but skills can be applied to any task regardless of its declared type.
+Skills provide detailed methodologies for specific types of work. **Before creating tasks or delegating work, consider whether a skill would provide useful guidance.** Activate relevant skills with the `skill` tool early — before planning or spawning workers — so their methodologies shape your approach. Skills can be applied to any work regardless of task structure.
 
 ## Task Organization
 
@@ -93,7 +93,7 @@ Make sure to continuously update tasks as they are completed (only once you are 
 Organize tasks under composite ones for larger blocks of work.
 Cancel any tasks that are no longer part of the intended work trajectory.
 
-{{TASK_TYPES_SECTION}}
+{{SKILLS_SECTION}}
 
 ## Thinking, planning, and presenting plans
 

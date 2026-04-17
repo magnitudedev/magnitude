@@ -75,7 +75,6 @@ export type TaskDisplayRow = {
   kind: 'task'
   taskId: string
   title: string
-  taskType: string
   status: TaskStatus
   parentId: string | null
   depth: number

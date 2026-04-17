@@ -282,7 +282,7 @@ function renderTaskSubtree(state: TaskGraphState, taskId: string, depth: number)
     ? `, assigned: ${task.worker.role}`
     : ''
   const assigneeStr = task.assignee === 'user' ? ', user' : ''
-  const line = `${indent}[${status}] ${task.taskType}: ${task.title} (${task.id}${assignedRoleStr}${assigneeStr})`
+  const line = `${indent}[${status}] ${task.title} (${task.id}${assignedRoleStr}${assigneeStr})`
 
   const childLines = task.childIds.flatMap(childId => renderTaskSubtree(state, childId, depth + 1))
 
@@ -870,7 +870,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           toTimelineTaskIdleHook({
             timestamp: value.timestamp,
             taskId: linkedTask.id,
-            taskType: linkedTask.taskType,
             title: linkedTask.title,
             agentId: value.agentId,
           }),
@@ -965,7 +964,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         toTimelineTaskTypeHook({
           timestamp: value.timestamp,
           taskId: task.id,
-          taskType: task.taskType,
           title: task.title,
         }),
         value.timestamp,
@@ -978,7 +976,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           action: 'created',
           taskId: task.id,
           title: task.title,
-          taskType: task.taskType,
         }),
         value.timestamp,
       )
@@ -1008,22 +1005,17 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           action: 'completed',
           taskId: value.taskId,
           title: task?.title,
-          taskType: task?.taskType,
         }),
         value.timestamp,
       )
 
       if (task) {
-        const skills = ambient.get(SkillsAmbient)
-        const skillPath = skills.get(task.taskType)?.path ?? ''
         nextLead = enqueueTimeline(
           nextLead,
           toTimelineTaskCompleteHook({
             timestamp: value.timestamp,
             taskId: task.id,
-            taskType: task.taskType,
             title: task.title,
-            skillPath,
           }),
           value.timestamp,
         )
@@ -1083,7 +1075,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
           action,
           taskId: value.taskId,
           title: task?.title,
-          taskType: task?.taskType,
           previousStatus: value.previous,
           nextStatus: value.next,
         }),

@@ -6,7 +6,7 @@ function makeSnapshot(overrides: Partial<TaskWorkerSnapshot> = {}): TaskWorkerSn
   return {
     taskId: 'task-1',
     title: 'Task',
-    taskType: 'implement',
+  
     parentId: null,
     depth: 0,
     status: 'pending',

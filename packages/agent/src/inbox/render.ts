@@ -163,7 +163,7 @@ function buildTaskCompleteReminderLines(
   }
 
   return Array.from(byTask.values()).map(
-    hook => taskCompleteReminder(hook.taskId, hook.title, hook.skillPath),
+    hook => taskCompleteReminder(hook.taskId, hook.title),
   )
 }
 
@@ -174,8 +174,7 @@ function hasWorkerToLeadMessage(entry: Extract<TimelineEntry, { kind: 'agent_blo
 function renderTaskUpdateLine(entry: Extract<TimelineEntry, { kind: 'task_update' }>): string {
   if (entry.action === 'created') {
     const title = entry.title ? `: "${entry.title}"` : ''
-    const taskType = entry.taskType ? ` (${entry.taskType})` : ''
-    return `- Task ${entry.taskId} created${title}${taskType}`
+    return `- Task ${entry.taskId} created${title}`
   }
 
   if (entry.action === 'cancelled') {

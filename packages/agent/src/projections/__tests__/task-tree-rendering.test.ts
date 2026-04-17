@@ -92,7 +92,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'root-1',
         title: 'Root 1',
-        taskType: 'implement',
+
         parentId: null,
       } as any,
       {
@@ -131,7 +131,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'root-1',
         title: 'Root 1',
-        taskType: 'feature',
+
         parentId: null,
       } as any,
       {
@@ -140,7 +140,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'child-a',
         title: 'Child A',
-        taskType: 'implement',
+
         parentId: 'root-1',
       } as any,
       {
@@ -149,7 +149,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'child-b',
         title: 'Child B',
-        taskType: 'review',
+
         parentId: 'root-1',
       } as any,
       {
@@ -188,7 +188,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'root-a',
         title: 'Root A',
-        taskType: 'feature',
+
         parentId: null,
       } as any,
       {
@@ -197,7 +197,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'root-b',
         title: 'Root B',
-        taskType: 'bug',
+
         parentId: null,
       } as any,
       {
@@ -206,7 +206,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'a-child',
         title: 'A Child',
-        taskType: 'implement',
+
         parentId: 'root-a',
       } as any,
       {
@@ -215,7 +215,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'b-child',
         title: 'B Child',
-        taskType: 'review',
+
         parentId: 'root-b',
       } as any,
       {
@@ -284,7 +284,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'task-dup',
         title: 'Task Dup',
-        taskType: 'implement',
+
         parentId: null,
       } as any,
       {
@@ -328,7 +328,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'task-final',
         title: 'Task Final',
-        taskType: 'implement',
+
         parentId: null,
       } as any,
       {
@@ -371,7 +371,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'diag-1',
         title: 'Root cause analysis',
-        taskType: 'diagnose',
+
         parentId: null,
       } as any,
       {
@@ -417,7 +417,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'task-hidden',
         title: 'Task Hidden',
-        taskType: 'implement',
+
         parentId: null,
       } as any,
       {
@@ -454,7 +454,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'task-cancel',
         title: 'Task Cancel',
-        taskType: 'implement',
+
         parentId: null,
       } as any,
       {
@@ -504,7 +504,7 @@ describe('task tree rendering mechanics', () => {
         forkId: null,
         taskId: 'task-regression',
         title: 'Task Regression',
-        taskType: 'implement',
+
         parentId: null,
       } as any,
       {

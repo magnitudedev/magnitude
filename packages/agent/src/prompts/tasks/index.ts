@@ -8,7 +8,7 @@ import type { Skill } from '@magnitudedev/skills'
 /**
  * Lightweight reference table for system prompt, driven by the active skills.
  */
-export function renderTaskTypeReferenceTable(skills: Map<string, Skill>): string {
+export function renderSkillReferenceTable(skills: Map<string, Skill>): string {
   const lines: string[] = []
   for (const [name, skill] of skills.entries()) {
     lines.push(`- **${skill.name}** (\`${name}\`) — ${skill.description}`)
@@ -18,8 +18,8 @@ export function renderTaskTypeReferenceTable(skills: Map<string, Skill>): string
 
 /** Shown when a worker finishes and goes idle on a task */
 export const taskIdleReminder = (agentId: string, taskId: string, title: string) =>
-  `Worker ${agentId} for task ${taskId} ("${title}") has finished. Review output and either send feedback or mark complete. Re-consult the skill governing this task and evaluate the output against its quality bar before proceeding.`
+  `Worker ${agentId} for task ${taskId} ("${title}") has finished. Review output and either send feedback or mark complete.`
 
 /** Shown when a task is marked completed */
-export const taskCompleteReminder = (taskId: string, title: string, skillPath: string) =>
-  `Task ${taskId} ("${title}") completed. Consider whether the skill for this task should be updated based on what you learned. Skill file: ${skillPath}/SKILL.md`
+export const taskCompleteReminder = (taskId: string, title: string) =>
+  `Task ${taskId} ("${title}") completed.`

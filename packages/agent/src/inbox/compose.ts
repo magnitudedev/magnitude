@@ -141,7 +141,6 @@ export function toTimelineLifecycleHook(args: {
 export function toTimelineTaskTypeHook(args: {
   timestamp: number
   taskId: string
-  taskType: string
   title: string
 }): TimelineEntry {
   return {
@@ -153,7 +152,6 @@ export function toTimelineTaskTypeHook(args: {
 export function toTimelineTaskIdleHook(args: {
   timestamp: number
   taskId: string
-  taskType: string
   title: string
   agentId: string
 }): TimelineEntry {
@@ -166,9 +164,7 @@ export function toTimelineTaskIdleHook(args: {
 export function toTimelineTaskCompleteHook(args: {
   timestamp: number
   taskId: string
-  taskType: string
   title: string
-  skillPath: string
 }): TimelineEntry {
   return {
     kind: 'task_complete_hook',
@@ -201,7 +197,6 @@ export function toTimelineTaskUpdate(args: {
   action: 'created' | 'cancelled' | 'completed' | 'status_changed'
   taskId: string
   title?: string
-  taskType?: string
   previousStatus?: string
   nextStatus?: string
   cancelledCount?: number

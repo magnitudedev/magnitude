@@ -48,7 +48,7 @@ const makeTask = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   kind: 'task',
   taskId: 't-1',
   title: 'Investigate timer mismatch',
-  taskType: 'implement',
+
   status: 'pending',
   depth: 0,
   parentId: null,
@@ -455,7 +455,7 @@ test('renders blank in assigned to column for composite tasks with no worker', (
       tasks={[
         makeTask({
           taskId: 't-feature',
-          taskType: 'feature',
+
           assignee: { kind: 'none' },
         }),
       ]}
@@ -474,7 +474,7 @@ test('keeps assigned to column blank for non-composite unassigned tasks', () => 
       tasks={[
         makeTask({
           taskId: 't-implement-none',
-          taskType: 'implement',
+        
           assignee: { kind: 'none' },
         }),
       ]}

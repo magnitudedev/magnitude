@@ -36,7 +36,6 @@ export type TaskOperationEnv =
 export interface CreateTaskDirectiveInput {
   readonly taskId: string
   readonly title: string
-  readonly taskType: string
   readonly parentId: string | null
   readonly after?: string
 }

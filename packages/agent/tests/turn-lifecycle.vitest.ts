@@ -108,7 +108,6 @@ describe('turn lifecycle', () => {
         forkId: null,
         taskId,
         title: 'Task without worker',
-        taskType: 'implement',
         parentId: null,
         timestamp: Date.now(),
       })

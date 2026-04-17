@@ -53,7 +53,7 @@ describe('TaskGraphProjection defensive guards', () => {
         forkId: null,
         taskId: 't1',
         title: 'Task 1',
-        taskType: 'implement',
+
         parentId: null,
       } satisfies TaskCreated,
       {
@@ -76,7 +76,7 @@ describe('TaskGraphProjection defensive guards', () => {
         forkId: null,
         taskId: 't2',
         title: 'Task 2',
-        taskType: 'implement',
+
         parentId: null,
       } satisfies TaskCreated,
       {
@@ -106,7 +106,7 @@ describe('TaskGraphProjection defensive guards', () => {
         forkId: null,
         taskId: 't3',
         title: 'Task 3',
-        taskType: 'implement',
+
         parentId: null,
       } satisfies TaskCreated,
       {

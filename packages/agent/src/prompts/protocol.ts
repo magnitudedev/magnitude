@@ -114,7 +114,7 @@ Provides methodology for diagnosing and fixing bugs.
       role: 'assistant',
       content: [`<${LENS_TAG} name="skills">Skill loaded. Bug skill says: diagnose root cause first, then fix.</${LENS_TAG}>
 <${LENS_TAG} name="tasks">Create a bug task and spawn a debugger worker.</${LENS_TAG}>
-<create-task id="fix-redirect" type="bug" title="Fix login redirect bug" />
+<create-task id="fix-redirect" title="Fix login redirect bug" />
 <spawn-worker id="fix-redirect">The redirect function is using '/home' instead of '/login'. Diagnose and fix.</spawn-worker>
 <${MESSAGE_TAG} to="${defaultRecipient}">Found the bug — redirectAfterLogout sends to \`/home\` instead of \`/login\`. Worker is fixing it now.</${MESSAGE_TAG}>
 ${TURN_CONTROL_IDLE}`]

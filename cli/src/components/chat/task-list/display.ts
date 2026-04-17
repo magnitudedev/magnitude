@@ -94,7 +94,6 @@ export function deriveTaskDisplayRow(snapshot: TaskWorkerSnapshot): TaskDisplayR
     kind: 'task',
     taskId: snapshot.taskId,
     title: snapshot.title,
-    taskType: snapshot.taskType,
     status: snapshot.status,
     parentId: snapshot.parentId,
     depth: snapshot.depth,

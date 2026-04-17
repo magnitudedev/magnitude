@@ -85,9 +85,7 @@ function getStatusColor(status: VisualStatus, theme: ReturnType<typeof useTheme>
 }
 
 function buildTaskTitleText(task: TaskDisplayRow) {
-  const SHOWN_TYPES = new Set(['feature', 'bug', 'refactor'])
-  const typeLabel = SHOWN_TYPES.has(task.taskType) ? `[${task.taskType}] ` : ''
-  return `${typeLabel}${task.title}`
+  return task.title
 }
 
 function getTaskIndent(depth: number): string {

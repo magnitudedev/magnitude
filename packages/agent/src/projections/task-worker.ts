@@ -60,7 +60,6 @@ export type TaskWorkerAssignee =
 export interface TaskWorkerSnapshot {
   readonly taskId: string
   readonly title: string
-  readonly taskType: string
   readonly status: TaskStatus
   readonly parentId: string | null
   readonly depth: number
@@ -211,7 +210,6 @@ function recomputeState(args: {
     snapshots.set(taskId, {
       taskId: task.id,
       title: task.title,
-      taskType: task.taskType,
       status: task.status,
       parentId: task.parentId,
       depth: depthByTaskId.get(taskId) ?? 0,

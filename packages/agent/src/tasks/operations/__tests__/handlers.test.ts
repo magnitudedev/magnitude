@@ -120,7 +120,7 @@ describe('task operation handlers validation', () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t2', {
-          id: 't2', title: 'New Task', taskType: 'implement', status: 'pending',
+          id: 't2', title: 'New Task', status: 'pending',
           parentId: null, childIds: [], assignee: null, worker: null,
           createdAt: 0, updatedAt: 0, completedAt: null,
         }],
@@ -145,7 +145,7 @@ describe('task operation handlers validation', () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t3', {
-          id: 't3', title: 'Task', taskType: 'implement', status: 'pending',
+          id: 't3', title: 'Task', status: 'pending',
           parentId: null, childIds: [], assignee: 'worker',
           worker: { agentId: 'worker-3', forkId: 'fork-3', role: 'worker' as const, message: 'Existing' },
           createdAt: 0, updatedAt: 0, completedAt: null,
@@ -170,7 +170,7 @@ describe('task operation handlers validation', () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t4', {
-          id: 't4', title: 'Task', taskType: 'implement', status: 'pending',
+          id: 't4', title: 'Task', status: 'pending',
           parentId: null, childIds: [], assignee: null, worker: null,
           createdAt: 0, updatedAt: 0, completedAt: null,
         }],
@@ -194,7 +194,7 @@ describe('task operation handlers validation', () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t5', {
-          id: 't5', title: 'Task', taskType: 'implement', status: 'pending',
+          id: 't5', title: 'Task', status: 'pending',
           parentId: null, childIds: [], assignee: 'worker',
           worker: { agentId: 'worker-5', forkId: 'fork-5', role: 'worker' as const, message: 'Existing' },
           createdAt: 0, updatedAt: 0, completedAt: null,
@@ -216,7 +216,7 @@ describe('task operation handlers validation', () => {
   test('empty update patch returns error', async () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
-        ['t1', { id: 't1', title: 'Task', taskType: 'implement', status: 'pending', parentId: null, childIds: [], assignee: null, worker: null, createdAt: 0, updatedAt: 0, completedAt: null }],
+        ['t1', { id: 't1', title: 'Task', status: 'pending', parentId: null, childIds: [], assignee: null, worker: null, createdAt: 0, updatedAt: 0, completedAt: null }],
       ]),
       rootTaskIds: ['t1'],
     })
@@ -235,7 +235,7 @@ describe('task operation handlers validation', () => {
   test('invalid status transition returns error', async () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
-        ['t1', { id: 't1', title: 'Task', taskType: 'implement', status: 'pending', parentId: null, childIds: [], assignee: null, worker: null, createdAt: 0, updatedAt: 0, completedAt: null }],
+        ['t1', { id: 't1', title: 'Task', status: 'pending', parentId: null, childIds: [], assignee: null, worker: null, createdAt: 0, updatedAt: 0, completedAt: null }],
       ]),
       rootTaskIds: ['t1'],
     })

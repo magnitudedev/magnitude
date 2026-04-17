@@ -119,7 +119,6 @@ describe('inbox compose', () => {
 
     expect(block.atoms).toEqual([])
     expect(update.title).toBeUndefined()
-    expect(update.taskType).toBeUndefined()
     expect(update.previousStatus).toBeUndefined()
     expect(update.nextStatus).toBeUndefined()
     expect(update.cancelledCount).toBeUndefined()

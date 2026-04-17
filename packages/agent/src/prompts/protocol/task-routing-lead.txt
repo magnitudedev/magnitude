@@ -22,9 +22,9 @@ Tasks and workers are managed with flat tool calls — no block syntax, no nesti
 
 ### Creating tasks
 
-<create-task id="impl-parser" type="implement" title="Implement parser updates" />
+<create-task id="impl-parser" title="Implement parser updates" />
 
-A task requires `id` and `title`. The `type` is optional — use it for organization when helpful. Use `parent` to nest under an existing task:
+A task requires `id` and `title`. Use `parent` to nest under an existing task:
 
 <create-task id="impl-parser" title="Implement parser updates" parent="parser-feature" />
 

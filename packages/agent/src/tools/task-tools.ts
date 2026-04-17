@@ -99,7 +99,6 @@ export const createTaskTool = defineTool({
   description: 'Create a task.',
   inputSchema: Schema.Struct({
     id: Schema.String,
-    type: Schema.optional(Schema.String),
     title: Schema.String,
     parent: Schema.optional(Schema.String),
   }),
@@ -110,7 +109,6 @@ export const createTaskTool = defineTool({
       yield* runDirective({
         kind: 'create',
         taskId: input.id,
-        taskType: input.type ?? '',
         parentId: input.parent ?? null,
         title: input.title,
       })
@@ -206,7 +204,6 @@ export const createTaskXmlBinding = defineXmlBinding(createTaskTool, {
   input: {
     attributes: [
       { field: 'id', attr: 'id' },
-      { field: 'type', attr: 'type' },
       { field: 'title', attr: 'title' },
       { field: 'parent', attr: 'parent' },
     ],

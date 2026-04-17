@@ -3,7 +3,6 @@ import type { TaskDisplayRow, TaskListItem } from '../components/chat/task-list/
 type TaskRecord = {
   id: string
   title: string
-  taskType: string
   parentId: string | null
   childIds: readonly string[]
   assignee: unknown
@@ -45,7 +44,7 @@ function toTaskListItem(task: TaskRecord, depth: number): TaskListItem {
     kind: 'task',
     taskId: task.id,
     title: task.title,
-    taskType: task.taskType,
+
     status: task.status,
     depth,
     parentId: task.parentId,

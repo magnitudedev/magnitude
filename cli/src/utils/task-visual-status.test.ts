@@ -12,7 +12,7 @@ const makeTask = (overrides: Partial<TaskRow> = {}): TaskRow => ({
   kind: 'task',
   taskId: 't-1',
   title: 'Task',
-  taskType: 'implement',
+
   status: 'pending',
   depth: 0,
   parentId: null,

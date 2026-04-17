@@ -21,7 +21,7 @@ describe('display pending communications promotion', () => {
         forkId: null,
         taskId: 'task-1',
         title: 'Task 1',
-        taskType: 'implement',
+
         parentId: null,
         timestamp: ts(1),
       } as any)
@@ -173,7 +173,7 @@ describe('display pending communications promotion', () => {
         forkId: null,
         taskId: 'task-2',
         title: 'Task 2',
-        taskType: 'implement',
+
         parentId: null,
         timestamp: ts(11),
       } as any)
@@ -281,7 +281,7 @@ describe('display pending communications promotion', () => {
         forkId: null,
         taskId: 'task-explicit',
         title: 'Task explicit',
-        taskType: 'implement',
+
         parentId: null,
         timestamp: ts(20),
       } as any)

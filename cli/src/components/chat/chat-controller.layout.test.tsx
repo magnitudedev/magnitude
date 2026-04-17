@@ -138,7 +138,7 @@ function makeTask(): TaskListItem {
     rowId: 't-1',
     taskId: 't-1',
     title: 'Task 1',
-    taskType: 'implement',
+
     status: 'pending',
     parentId: null,
     depth: 0,

@@ -15,7 +15,6 @@ export interface TaskWorkerInfo {
 export interface TaskRecord {
   readonly id: string
   readonly title: string
-  readonly taskType: string
   readonly parentId: string | null
   readonly childIds: readonly string[]
   readonly assignee: TaskAssignee | null
@@ -263,7 +262,6 @@ export const TaskGraphProjection = Projection.define<AppEvent, TaskGraphState>()
       const task: TaskRecord = {
         id: event.taskId,
         title: event.title,
-        taskType: event.taskType,
         parentId: event.parentId,
         childIds: [],
         assignee: null,

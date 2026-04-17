@@ -1,8 +1,8 @@
 /**
  * Generic Worker Agent Definition
  *
- * A single generic worker that handles all task types. Full read/write access.
- * Task-specific context is provided by the lead via the skill system.
+ * A single generic worker that handles all work types. Full read/write access.
+ * Workers can activate skills via the `<skill>` tool when they need methodology guidance.
  */
 
 import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
@@ -22,8 +22,8 @@ const turnLens = defineThinkingLens({
 
 const skillsLens = defineThinkingLens({
   name: 'skills',
-  trigger: 'When receiving task instructions or starting new work',
-  description: 'Does this task have a governing skill? Should I activate the skill to understand the methodology before starting work?',
+  trigger: 'When starting new work or uncertain about approach',
+  description: 'Should I activate a skill for methodology guidance? The `<skill>` tool loads detailed approaches for specific work types (research, plan, implement, debug, etc.). Activate early when the work type is clear.',
 })
 
 const systemPrompt = compilePromptTemplate(workerPromptRaw)
