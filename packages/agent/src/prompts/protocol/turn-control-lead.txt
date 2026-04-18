@@ -3,3 +3,6 @@
 
 Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the user or a worker. Use `{{TURN_CONTROL_CONTINUE}}` otherwise.
 
+## User responsiveness
+
+When the user sends you a message, the first element in your response after lenses must be a `<{{MESSAGE_TAG}} to="user">`. Acknowledge what they said and indicate your next step before taking any actions.

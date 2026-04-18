@@ -10,12 +10,14 @@ import { skillTool, skillXmlBinding } from '../tools/skill-tool'
 export interface SkillActivationState extends BaseState {
   toolKey: 'skill'
   skillName?: string
+  skillPath?: string      // resolved skill file path
   contentPreview?: string
   errorDetail?: string
 }
 
 const initial: Omit<SkillActivationState, 'phase' | 'toolKey'> = {
   skillName: undefined,
+  skillPath: undefined,
   contentPreview: undefined,
   errorDetail: undefined,
 }
@@ -46,6 +48,7 @@ export const skillActivationModel = defineStateModel('skill', {
         return {
           ...state,
           phase: 'completed',
+          skillPath: event.output.skillPath ?? state.skillPath,
           contentPreview: content.length > 200 ? content.slice(0, 200) + '…' : content,
         }
       case 'error':

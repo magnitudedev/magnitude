@@ -24,6 +24,7 @@ export { spawnWorkerModel, type SpawnWorkerState } from './spawn-worker'
 export { killWorkerModel, type KillWorkerState } from './kill-worker'
 
 export { shellModel, type ShellState } from './shell'
+export { skillActivationModel, type SkillActivationState } from './skill-activation'
 export { fileViewModel, type FileViewState } from './file-view'
 export {
   createBrowserActionModel,

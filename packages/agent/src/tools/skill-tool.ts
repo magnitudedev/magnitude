@@ -55,7 +55,7 @@ function executeSkill({ name }: { name: string }) {
 
     const content = parts.join('\n')
 
-    return { content }
+    return { content, skillPath: skill.path }
   })
 }
 
@@ -67,6 +67,7 @@ export const skillTool = defineTool({
   }),
   outputSchema: Schema.Struct({
     content: Schema.String.annotations({ description: 'Full skill content with all sections (shared, lead, worker, handoff)' }),
+    skillPath: Schema.String.annotations({ description: 'Resolved file path of the skill' }),
   }),
   errorSchema: SkillErrorSchema,
   execute: (input, _ctx) => executeSkill(input),
@@ -78,6 +79,6 @@ export const skillXmlBinding = defineXmlBinding(skillTool, {
     attributes: [{ field: 'name', attr: 'name' }],
   },
   output: {
-    childTags: [{ field: 'content', tag: 'content' }],
+    childTags: [{ field: 'content', tag: 'content' }, { field: 'skillPath', tag: 'skillPath' }],
   },
 } as const)

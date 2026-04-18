@@ -71,9 +71,8 @@ export function normalizeReferencedPath(refPath: string): string | null {
     return null
   }
 
-  if (normalizedBody.startsWith('/')) {
-    return null
-  }
+  // Absolute paths are allowed — they resolve to themselves
+  // when processed by resolveFileRefPath
 
   if (explicitWorkspacePrefix) {
     return `${prefix}${normalizedBody}`

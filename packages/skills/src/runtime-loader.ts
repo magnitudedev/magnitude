@@ -54,7 +54,7 @@ export async function loadSkills(cwd: string): Promise<Map<string, Skill>> {
 
       const skill: Skill = {
         ...parsed,
-        path: skillName,
+        path: fullPath,
       }
 
       skills.set(skillName, skill)
