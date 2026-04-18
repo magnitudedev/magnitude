@@ -20,9 +20,10 @@ import type { Skill } from '@magnitudedev/skills'
 import { CHARS_PER_TOKEN } from '../constants'
 
 import type { AgentVariant } from '../agents/variants'
-import { getAgentDefinition, getForkInfo } from '../agents/registry'
+import { getAgentDefinition, getAgentSlot, getForkInfo } from '../agents/registry'
 import { buildSessionContextContent } from '../prompts/session-context'
 import { renderSystemPrompt } from '../prompts/system-prompt'
+import { buildResolvedToolSet } from '../tools/resolved-toolset'
 import { ContentPart } from '../content'
 
 // =============================================================================
@@ -73,11 +74,16 @@ function estimateContentTokens(content: string | ContentPart[], modelId?: string
 
 const systemPromptTokenCache = new Map<string, number>()
 
-function estimateSystemPromptTokens(variant: AgentVariant, skills: Map<string, Skill>): number {
+function estimateSystemPromptTokens(variant: AgentVariant, skills: Map<string, Skill>, configState: ConfigState): number {
   const cacheKey = variant
   const cached = systemPromptTokenCache.get(cacheKey)
   if (cached !== undefined) return cached
-  const prompt = renderSystemPrompt(getAgentDefinition(variant), skills)
+  
+  const agentDef = getAgentDefinition(variant)
+  const slot = getAgentSlot(variant)
+  const toolSet = buildResolvedToolSet(agentDef, configState, slot)
+  const prompt = renderSystemPrompt(agentDef, skills, toolSet)
+  
   const tokens = Math.ceil(prompt.length / CHARS_PER_TOKEN)
   systemPromptTokenCache.set(cacheKey, tokens)
   return tokens
@@ -269,9 +275,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       const content = buildSessionContextContent(event.context)
       const contentTokens = estimateContentTokens(content)
       const skills = ambient.get(SkillsAmbient)
-      const tokenEstimate = estimateSystemPromptTokens('lead', skills) + contentTokens
-
       const configState = ambient.get(ConfigAmbient)
+      const tokenEstimate = estimateSystemPromptTokens('lead', skills, configState) + contentTokens
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, event.forkId)
       if (!limits) return fork
@@ -443,8 +448,8 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       }
 
       const skills = ambient.get(SkillsAmbient)
-      const tokenEstimate = estimateSystemPromptTokens(variant, skills)
       const configState = ambient.get(ConfigAmbient)
+      const tokenEstimate = estimateSystemPromptTokens(variant, skills, configState)
       const agentStatus = read(AgentStatusProjection)
       const limits = getForkConfig(configState, agentStatus, forkId)
       const newForkState = new CompactionIdle({

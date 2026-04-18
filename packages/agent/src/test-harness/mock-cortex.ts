@@ -7,6 +7,23 @@ import { createTurnStream } from '../execution/turn-stream'
 import { drainTurnEventStream } from '../workers/turn-event-drain'
 import { MockTurnScriptTag, type MockTurnResponse } from './turn-script'
 import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { buildResolvedToolSet, type ResolvedToolSet } from '../tools/resolved-toolset'
+import { getAgentDefinition, getAgentSlot } from '../agents/registry'
+import type { ConfigState } from '../ambient/config-ambient'
+
+// Mock config state for testing
+const mockConfigState: ConfigState = {
+  bySlot: {
+    lead: { providerId: 'openai', modelId: 'gpt-4', hardCap: 100000, softCap: 80000 },
+    worker: { providerId: 'openai', modelId: 'gpt-4', hardCap: 100000, softCap: 80000 },
+  },
+}
+
+function createMockToolSet(variant: 'lead' | 'worker'): ResolvedToolSet {
+  const agentDef = getAgentDefinition(variant)
+  const slot = getAgentSlot(variant)
+  return buildResolvedToolSet(agentDef, mockConfigState, slot)
+}
 
 function frameToChunks(frame: MockTurnResponse): readonly string[] {
   if (frame.xmlChunks && frame.xmlChunks.length > 0) return frame.xmlChunks
@@ -55,6 +72,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             Stream.tap((chunk) => sink.emit({ _tag: 'RawResponseChunk', text: chunk }))
           )
 
+          const variant = forkId === null ? 'lead' : 'worker'
           const executeResult = yield* execManager.execute(
             xmlStream,
             {
@@ -63,6 +81,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
               chainId,
               defaultProseDest: forkId === null ? 'user' : 'parent',
               allowSingleUserReplyThisTurn: false,
+              toolSet: createMockToolSet(variant),
             },
             sink,
           )

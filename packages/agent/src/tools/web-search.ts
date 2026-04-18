@@ -12,9 +12,11 @@ import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
 import { defineXmlBinding } from '@magnitudedev/xml-act'
-import { AmbientServiceTag } from '@magnitudedev/event-core'
+import { AmbientServiceTag, Fork } from '@magnitudedev/event-core'
 import { ProviderState } from '@magnitudedev/providers'
 import { ConfigAmbient } from '../ambient/config-ambient'
+
+const { ForkContext } = Fork
 
 const WebSearchErrorSchema = ToolErrorSchema('WebSearchError', {})
 
@@ -133,13 +135,16 @@ export const webSearchTool = defineTool({
       const providerState = yield* ProviderState
       const configState = ambientService.getValue(ConfigAmbient)
 
-      // Check if Magnitude provider is active for the lead slot
-      const leadConfig = configState.bySlot.lead
-      const isMagnitudeProvider = leadConfig.providerId === 'magnitude'
+      // Get current slot from fork context
+      const forkCtx = yield* ForkContext
+      const slot = forkCtx.slot as 'lead' | 'worker'
+      
+      const slotConfig = configState.bySlot[slot]
+      const isMagnitudeProvider = slotConfig.providerId === 'magnitude'
 
       if (isMagnitudeProvider) {
-        // Get Magnitude API key from ProviderState
-        const peekResult = yield* providerState.peek('lead')
+        // Get Magnitude API key from ProviderState for THIS slot
+        const peekResult = yield* providerState.peek(slot)
         if (!peekResult || !peekResult.auth) {
           return yield* Effect.fail({
             _tag: 'WebSearchError' as const,

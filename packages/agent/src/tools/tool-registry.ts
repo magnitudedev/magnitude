@@ -7,22 +7,21 @@
 import type { RegisteredTool } from '@magnitudedev/xml-act'
 import { generateGrammar, type GrammarToolDef } from '@magnitudedev/xml-act'
 import { Effect, type Layer } from 'effect'
-import type { RoleDefinition } from '@magnitudedev/roles'
 import type { AgentCatalogEntry } from '../catalog'
 import type { XmlBinding } from '@magnitudedev/tools'
+import type { ResolvedToolSet } from './resolved-toolset'
 
 /**
- * Derive a Map<tagName, RegisteredTool> from an RoleDefinition.
+ * Derive a Map<tagName, RegisteredTool> from a ResolvedToolSet.
  */
 export function buildRegisteredTools(
-  agentDef: RoleDefinition,
+  toolSet: ResolvedToolSet,
   layers: Layer.Layer<never>,
-  excludeTools?: Set<string>,
 ): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>()
+  const agentDef = toolSet.agentDef
 
-  for (const defKey of agentDef.tools.keys) {
-    if (excludeTools?.has(defKey)) continue
+  for (const defKey of toolSet.availableKeys) {
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const tool = entry.tool
 
@@ -46,13 +45,14 @@ export function buildRegisteredTools(
 }
 
 /**
- * Generate GBNF grammar from agent definition's tool catalog.
+ * Generate GBNF grammar from a ResolvedToolSet.
  * Used JIT before model invocation for constrained generation.
  */
-export function generateToolGrammar(agentDef: RoleDefinition, excludeTools?: Set<string>): string {
+export function generateToolGrammar(toolSet: ResolvedToolSet): string {
   const defs: GrammarToolDef[] = []
-  for (const defKey of agentDef.tools.keys) {
-    if (excludeTools?.has(defKey)) continue
+  const agentDef = toolSet.agentDef
+
+  for (const defKey of toolSet.availableKeys) {
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const binding = entry.binding.toXmlTagBinding()
     defs.push({

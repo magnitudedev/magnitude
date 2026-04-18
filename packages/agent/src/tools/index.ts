@@ -6,6 +6,7 @@
  */
 
 export { getBindingRegistry } from './binding-registry'
+export { buildResolvedToolSet, type ResolvedToolSet } from './resolved-toolset'
 
 // =============================================================================
 // Re-exports

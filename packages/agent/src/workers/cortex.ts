@@ -47,6 +47,7 @@ import { TurnProjection } from '../projections/turn'
 import { ExecutionManager } from '../execution/types'
 import { getAgentDefinition, getForkInfo } from '../agents/registry'
 import { generateToolGrammar } from '../tools/tool-registry'
+import { buildResolvedToolSet } from '../tools/resolved-toolset'
 
 import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing/scoped-tracer'
@@ -153,18 +154,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const ambientService = yield* AmbientServiceTag
         const skills = ambientService.getValue(SkillsAmbient)
 
-        // Determine if web search should be available (same logic as execution manager)
+        // Build ResolvedToolSet for this slot — single decision site for tool availability
         const configState = ambientService.getValue(ConfigAmbient)
-        const isMagnitudeProvider = configState?.bySlot.lead.providerId === 'magnitude'
-        const hasExaKey = !!process.env.EXA_API_KEY
-        const excludeTools = (!isMagnitudeProvider && !hasExaKey)
-          ? new Set(['webSearch'])
-          : undefined
+        const toolSet = buildResolvedToolSet(agentDef, configState, modelSlot)
 
         // Build messages array (now includes observations in system inbox)
         const forkMemory = yield* read(MemoryProjection)
         const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
-        const systemPrompt = renderSystemPrompt(agentDef, skills, { excludeTools })
+        const systemPrompt = renderSystemPrompt(agentDef, skills, toolSet)
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
 
@@ -193,7 +190,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         })()
         const grammarSafe = boundModel.model.supportsGrammar !== false
 
-        const toolGrammar = grammarEnabled && grammarSafe ? generateToolGrammar(agentDef, excludeTools) : undefined
+        const toolGrammar = grammarEnabled && grammarSafe ? generateToolGrammar(toolSet) : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
@@ -229,7 +226,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               chainId,
               defaultProseDest: agentDef.defaultRecipient,
               allowSingleUserReplyThisTurn,
-              excludeTools,
+              toolSet,
             },
             sink,
           )

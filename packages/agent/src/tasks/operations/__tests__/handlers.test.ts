@@ -70,7 +70,7 @@ function runOp<A>(
 
   return Effect.runPromise(
     effect.pipe(
-      Effect.provideService(Fork.ForkContext, { forkId: null }),
+      Effect.provideService(Fork.ForkContext, { forkId: null, slot: 'lead' }),
       Effect.provideService(TaskGraphStateReaderTag, mkTaskReader(state)),
       Effect.provideService(ConversationStateReaderTag, {
         getState: () => Effect.succeed({

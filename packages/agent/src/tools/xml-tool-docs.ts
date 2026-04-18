@@ -10,6 +10,7 @@
 import type { RoleDefinition } from '@magnitudedev/roles'
 import { generateXmlToolGroupDoc, generateXmlToolInputShape, type XmlToolDocEntry } from '@magnitudedev/xml-act'
 import type { AgentCatalogEntry } from '../catalog'
+import type { ResolvedToolSet } from './resolved-toolset'
 
 // =============================================================================
 // Tool Presentation (strategy-agnostic tool metadata)
@@ -29,17 +30,16 @@ export interface ToolPresentation {
 }
 
 /**
- * Build ToolPresentation[] from an agent definition.
+ * Build ToolPresentation[] from a ResolvedToolSet.
  */
 export function buildToolPresentation(
-  agentDef: RoleDefinition,
+  toolSet: ResolvedToolSet,
   implicitTools: readonly string[] = [],
-  excludeTools?: Set<string>,
 ): ToolPresentation[] {
   const presentations: ToolPresentation[] = []
+  const agentDef = toolSet.agentDef
 
-  for (const defKey of agentDef.tools.keys) {
-    if (excludeTools?.has(defKey)) continue
+  for (const defKey of toolSet.availableKeys) {
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const tool = entry.tool
     if (implicitTools.includes(defKey)) continue
@@ -136,14 +136,14 @@ export function generateXmlActToolShape(
 }
 
 /**
- * Generate XML-ACT tool documentation from an agent definition.
+ * Generate XML-ACT tool documentation from a ResolvedToolSet.
  * Uses XML bindings on tools to produce XML tag documentation grouped by namespace.
  */
 export function generateXmlActToolDocs(
-  agentDef: RoleDefinition,
+  toolSet: ResolvedToolSet,
   implicitTools: readonly string[] = [],
-  excludeTools?: Set<string>,
 ): string {
+  const agentDef = toolSet.agentDef
 
   // Build defKey lookup: entry instance → defKey (for implicit filtering)
   const defKeyLookup = new Map<XmlToolDocEntry, string>()
@@ -151,8 +151,7 @@ export function generateXmlActToolDocs(
   // Group tools by group name for documentation
   const groups = new Map<string, { tools: XmlToolDocEntry[]; global: boolean }>()
 
-  for (const defKey of agentDef.tools.keys) {
-    if (excludeTools?.has(defKey)) continue
+  for (const defKey of toolSet.availableKeys) {
     const catalogEntry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const entry = toXmlToolDocEntry(catalogEntry)
 

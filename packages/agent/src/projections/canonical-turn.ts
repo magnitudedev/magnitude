@@ -3,8 +3,10 @@ import type { AppEvent, TurnResultError, MessageDestination } from '../events'
 
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { getBindingRegistry } from '../tools/binding-registry'
+import { buildResolvedToolSet, type ResolvedToolSet } from '../tools/resolved-toolset'
+import { ConfigAmbient } from '../ambient/config-ambient'
 import { isValidVariant, type AgentVariant } from '../agents/variants'
-import { getAgentDefinition } from '../agents/registry'
+import { getAgentDefinition, getAgentSlot } from '../agents/registry'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 
@@ -71,6 +73,7 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
 export const CanonicalTurnProjection = Projection.defineForked<AppEvent, CanonicalTurnState>()({
   name: 'CanonicalTurn',
   reads: [AgentStatusProjection] as const,
+  ambients: [ConfigAmbient] as const,
   initialFork: createInitialCanonicalTurnState(),
   eventHandlers: {
     turn_started: ({ event, fork }) => ({
@@ -213,7 +216,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       }
     },
 
-    turn_completed: ({ event, fork, read }) => {
+    turn_completed: ({ event, fork, read, ambient }) => {
       if (fork.turnId !== event.turnId) return fork
 
       const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
@@ -229,7 +232,13 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
             })()
           : 'lead'
         const agentDef = getAgentDefinition(variant)
-        const bindings = getBindingRegistry(agentDef)
+        const slot = getAgentSlot(variant)
+        
+        // Build toolSet for getBindingRegistry using ConfigAmbient
+        const configState = ambient.get(ConfigAmbient)
+        const toolSet = buildResolvedToolSet(agentDef, configState, slot)
+        const bindings = getBindingRegistry(toolSet)
+        
         const trace: CanonicalTrace = {
           lenses: fork.lenses,
           thinkBlocks: fork.thinkBlocks,

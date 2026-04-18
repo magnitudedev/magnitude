@@ -2,8 +2,10 @@ import { describe, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { expect } from 'vitest'
 import { CHARS_PER_TOKEN } from '../../src/constants'
-import { getAgentDefinition } from '../../src/agents'
+import { getAgentDefinition, getAgentSlot } from '../../src/agents'
 import { renderSystemPrompt } from '../../src/prompts/system-prompt'
+import { buildResolvedToolSet } from '../../src/tools/resolved-toolset'
+import type { ConfigState } from '../../src/ambient/config-ambient'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import {
   ROOT_FORK_ID,
@@ -19,7 +21,17 @@ import {
   mkUserMessage,
 } from './helpers'
 
-const leadSystemPromptTokens = Math.ceil(renderSystemPrompt(getAgentDefinition('lead')).length / CHARS_PER_TOKEN)
+// Create a mock config state for testing
+const mockConfigState: ConfigState = {
+  bySlot: {
+    lead: { providerId: 'openai', modelId: 'gpt-4', hardCap: 100000, softCap: 80000 },
+    worker: { providerId: 'openai', modelId: 'gpt-4', hardCap: 100000, softCap: 80000 },
+  },
+}
+
+const leadDef = getAgentDefinition('lead')
+const leadToolSet = buildResolvedToolSet(leadDef, mockConfigState, getAgentSlot('lead'))
+const leadSystemPromptTokens = Math.ceil(renderSystemPrompt(leadDef, new Map(), leadToolSet).length / CHARS_PER_TOKEN)
 
 describe('compaction/projection-transitions', () => {
   it.effect('initial token estimate includes system prompt tokens', () =>

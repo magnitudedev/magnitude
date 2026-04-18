@@ -31,7 +31,7 @@ function makeAgentState(status: 'working' | 'idle', parentForkId: string | null)
 
 function makeLayer(state: AgentStatusState, eventsRef: Ref.Ref<AppEvent[]>) {
   return Layer.mergeAll(
-    Layer.succeed(ForkContext, { forkId: 'parent-1' }),
+    Layer.succeed(ForkContext, { forkId: 'parent-1', slot: 'lead' }),
     Layer.succeed(AgentStateReaderTag, {
       getAgentState: () => Effect.succeed(state),
       getAgent: (agentId: string) => Effect.succeed(state.agents.get(agentId)),

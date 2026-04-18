@@ -8,6 +8,7 @@ import toolingSectionRaw from '../agents/prompts/lead-tooling.txt' with { type: 
 import subagentBaseRaw from '../agents/prompts/subagent-base.txt' with { type: 'text' }
 import { renderSkillReferenceTable } from './tasks/index'
 import fewShotNoteRaw from './protocol/few-shot-note.txt' with { type: 'text' }
+import type { ResolvedToolSet } from '../tools/resolved-toolset'
 //import workspaceRaw from '../agents/prompts/workspace.txt' with { type: 'text' }
 
 export function compilePromptTemplate(raw: string): string {
@@ -26,9 +27,10 @@ function mapProtocolMode(roleDef: RoleDefinition): 'lead' | 'subagent' | 'onesho
 export function renderSystemPrompt(
   roleDef: RoleDefinition,
   skills: Map<string, Skill>,
-  options?: { implicitTools?: readonly string[]; excludeTools?: Set<string> },
+  toolSet: ResolvedToolSet,
+  options?: { implicitTools?: readonly string[] },
 ): string {
-  const toolDocs = generateXmlActToolDocs(roleDef, options?.implicitTools ?? [], options?.excludeTools)
+  const toolDocs = generateXmlActToolDocs(toolSet, options?.implicitTools ?? [])
   return roleDef.systemPrompt
     .replaceAll(
       '{{RESPONSE_PROTOCOL}}',

@@ -26,7 +26,7 @@ import type { XmlToolResult } from '@magnitudedev/xml-act'
 import { buildRegisteredTools, generateToolGrammar } from '../tools/tool-registry'
 
 import { isValidVariant, type AgentVariant } from '../agents/variants'
-import { getAgentDefinition } from '../agents/registry'
+import { getAgentDefinition, getAgentSlot } from '../agents/registry'
 import { buildPolicyInterceptor, type AgentResolver } from './permission-gate'
 export { IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
 import { createApprovalState, ApprovalStateTag, type ApprovalStateService } from './approval-state'
@@ -96,6 +96,7 @@ import { handleTaskDirective } from '../tasks/operations'
  */
 function makeForkLayers(
   forkId: string | null,
+  slot: string,
 
   sessionContextProjection: Projection.ProjectionInstance<SessionContextState>,
   agentProjection: Projection.ProjectionInstance<AgentRoutingState>,
@@ -146,14 +147,14 @@ function makeForkLayers(
   const providedInterceptor: ToolInterceptor = {
     beforeExecute: (ctx) =>
       policyInterceptor(ctx).pipe(
-        Effect.provideService(ForkContext, { forkId }),
+        Effect.provideService(ForkContext, { forkId, slot }),
         Effect.provideService(PolicyContextProviderTag, policyCtxProvider),
         Effect.provideService(ApprovalStateTag, approvalState),
       ),
   }
 
   return Layer.mergeAll(
-    Layer.succeed(ForkContext, { forkId }),
+    Layer.succeed(ForkContext, { forkId, slot }),
 
     agentRegistryStateReaderLayer,
     conversationStateReaderLayer,
@@ -265,7 +266,7 @@ const makeExecutionManager = Effect.gen(function* () {
       const executionLayer = layers
 
       // Build registered tools for xml-act runtime
-      const registeredTools = buildRegisteredTools(agentDef, executionLayer, options.excludeTools)
+      const registeredTools = buildRegisteredTools(options.toolSet, executionLayer)
 
       // Create fresh xml-act runtime for this execution
       // Surface binding validation errors as XmlRuntimeCrash so they appear as turn errors
@@ -686,7 +687,7 @@ const makeExecutionManager = Effect.gen(function* () {
                     allowSingleUserReplyThisTurn,
                     directUserRepliesSent,
                   }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() }, skills }).pipe(
-                    Effect.provideService(ForkContext, { forkId }),
+                    Effect.provideService(ForkContext, { forkId, slot: options.toolSet.slot }),
                     Effect.provide(executionLayer),
                   )
 
@@ -922,8 +923,11 @@ const makeExecutionManager = Effect.gen(function* () {
         oneshotEnabled = !!sessionState.context?.oneshot
       }
 
+      const slot = getAgentSlot(variant)
+      
       let layers = makeForkLayers(
         forkId,
+        slot,
         sessionContextProjection, agentProjection, agentStatusProjection,
         workingStateProjection, taskGraphProjection,
         conversationProjection,

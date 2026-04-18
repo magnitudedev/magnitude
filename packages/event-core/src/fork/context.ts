@@ -1,5 +1,5 @@
 /**
- * ForkContext - Service providing current forkId during execution
+ * ForkContext - Service providing current forkId and slot during execution
  *
  * The agent layer is responsible for providing this context.
  * Tools and workers can access it to know which fork they're running in.
@@ -13,6 +13,8 @@ import { Context } from 'effect'
 export interface ForkContextService {
   /** Current forkId - null means root agent */
   readonly forkId: string | null
+  /** Current slot - 'lead' or 'worker' */
+  readonly slot: string
 }
 
 /**

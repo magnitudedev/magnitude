@@ -29,6 +29,7 @@ import type { ChatPersistence } from '../persistence/chat-persistence-service'
 import type { BoundObservable } from '@magnitudedev/roles'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import type { AppEvent } from '../events'
+import type { ResolvedToolSet } from '../tools/resolved-toolset'
 
 
 // =============================================================================
@@ -104,7 +105,7 @@ export interface ExecuteOptions {
   readonly chainId: string
   readonly defaultProseDest: 'user' | 'parent'
   readonly allowSingleUserReplyThisTurn: boolean
-  readonly excludeTools?: Set<string>
+  readonly toolSet: ResolvedToolSet
 }
 
 export interface ExecuteResult {
