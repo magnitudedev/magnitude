@@ -136,7 +136,6 @@ export interface TurnStarted {
   readonly forkId: string | null
   readonly turnId: string
   readonly chainId: string  // Groups turns within user→stable cycle
-  readonly currentTurnAllowsDirectUserReply?: boolean
 }
 
 export interface TurnToolCall {

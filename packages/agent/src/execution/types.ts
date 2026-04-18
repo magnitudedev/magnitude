@@ -104,7 +104,7 @@ export interface ExecuteOptions {
   readonly turnId: string
   readonly chainId: string
   readonly defaultProseDest: 'user' | 'parent'
-  readonly allowSingleUserReplyThisTurn: boolean
+  readonly triggeredByUser: boolean
   readonly toolSet: ResolvedToolSet
 }
 

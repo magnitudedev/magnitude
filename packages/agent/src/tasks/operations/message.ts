@@ -4,7 +4,7 @@ import type { TaskDirectiveContext } from './handler'
 export interface MessageDirective {
   readonly kind: 'message'
   readonly defaultTopLevelDestination: 'user' | 'parent'
-  readonly allowSingleUserReplyThisTurn: boolean
+  readonly triggeredByUser: boolean
   readonly directUserRepliesSent: number
 }
 
@@ -22,7 +22,7 @@ export const handleMessageDirective = (
     let destination = directive.defaultTopLevelDestination
     let sent = directive.directUserRepliesSent
     if (destination === 'user') {
-      if (!directive.allowSingleUserReplyThisTurn || sent >= 1) {
+      if (!directive.triggeredByUser || sent >= 1) {
         destination = 'parent'
       } else {
         sent += 1

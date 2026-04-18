@@ -43,7 +43,6 @@ export type TurnTrigger =
 export interface PendingInboundCommunication {
   readonly id: string
   readonly source: 'agent' | 'user'
-  readonly replyPolicy: 'parent_default' | 'user_reply_once'
   readonly direction: 'from_agent' | 'to_agent'
   readonly agentId: string
   readonly agentName?: string
@@ -71,7 +70,7 @@ export class TurnActive extends Data.TaggedClass('active')<
     readonly turnId: string
     readonly chainId: string
     readonly toolCalls: readonly ToolCall[]
-    readonly currentTurnAllowsDirectUserReply: boolean
+    readonly triggeredByUser: boolean
   }
 > {}
 
@@ -80,7 +79,7 @@ export class TurnInterrupting extends Data.TaggedClass('interrupting')<
     readonly turnId: string
     readonly chainId: string
     readonly toolCalls: readonly ToolCall[]
-    readonly currentTurnAllowsDirectUserReply: boolean
+    readonly triggeredByUser: boolean
   }
 > {}
 
@@ -179,7 +178,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
 
         return TurnLifecycle.transition(afterClear, 'interrupting', {
           softInterrupted: false,
-          currentTurnAllowsDirectUserReply: afterClear.currentTurnAllowsDirectUserReply,
+          triggeredByUser: afterClear.triggeredByUser,
         })
       }
 
@@ -235,8 +234,8 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
         triggers: [],
         pendingInboundCommunications: [],
         softInterrupted: false,
-        currentTurnAllowsDirectUserReply: fork.pendingInboundCommunications.some(
-          (message) => message.source === 'user' && message.replyPolicy === 'user_reply_once'
+        triggeredByUser: fork.pendingInboundCommunications.some(
+          (message) => message.source === 'user'
         ),
       })
     },
@@ -398,7 +397,6 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
           {
             id: createId(),
             source: 'user',
-            replyPolicy: 'user_reply_once',
             direction: 'from_agent',
             agentId: 'user',
             forkId,
@@ -431,7 +429,6 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
           {
             id: createId(),
             source: 'agent',
-            replyPolicy: 'parent_default',
             direction: 'from_agent',
             agentId: value.agentId,
             forkId,
@@ -464,7 +461,6 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
           {
             id: createId(),
             source: 'agent',
-            replyPolicy: 'parent_default',
             direction: 'from_agent',
             agentId: value.agentId,
             forkId,

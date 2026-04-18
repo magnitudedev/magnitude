@@ -11,7 +11,7 @@
 import { describe, it, expect } from 'vitest'
 import { Schema } from '@effect/schema'
 import { Effect } from 'effect'
-import { generateBodyRules, generateGrammar, type GrammarToolDef } from '../grammar-generator'
+import { generateBodyRules, GrammarBuilder, type GrammarToolDef } from '../grammar-builder'
 import { defineXmlBinding } from '../xml-binding'
 import { defineTool } from '@magnitudedev/tools'
 
@@ -394,6 +394,7 @@ describe('DFA body matcher - edge cases', () => {
 const writeTool = defineTool({
   name: 'write',
   group: 'fs',
+  label: (input) => input.path ?? 'write',
   description: 'Write file',
   inputSchema: Schema.Struct({ path: Schema.String, content: Schema.String }),
   outputSchema: Schema.Void,
@@ -411,6 +412,7 @@ const writeBinding = defineXmlBinding(writeTool, {
 const editTool = defineTool({
   name: 'edit',
   group: 'fs',
+  label: (input) => input.path ?? 'edit',
   description: 'Edit file',
   inputSchema: Schema.Struct({
     path: Schema.String,
@@ -435,6 +437,7 @@ const editBinding = defineXmlBinding(editTool, {
 const readTool = defineTool({
   name: 'read',
   group: 'fs',
+  label: (input) => input.path ?? 'read',
   description: 'Read file',
   inputSchema: Schema.Struct({ path: Schema.String }),
   outputSchema: Schema.String,
@@ -453,37 +456,37 @@ function makeDef(binding: any, tool: any): GrammarToolDef {
 
 describe('generateGrammar integration - DFA body rules', () => {
   it('lens rule uses DFA body', () => {
-    const grammar = generateGrammar([])
+    const grammar = GrammarBuilder.create([]).build()
     expect(grammar).toContain('lens-body')
     expect(grammar).toContain('lens-body-s0')
   })
 
   it('message rule uses DFA body', () => {
-    const grammar = generateGrammar([])
+    const grammar = GrammarBuilder.create([]).build()
     expect(grammar).toContain('msg-body')
     expect(grammar).toContain('msg-body-s0')
   })
 
   it('tool with body uses DFA body rules', () => {
-    const grammar = generateGrammar([makeDef(writeBinding, writeTool)])
+    const grammar = GrammarBuilder.create([makeDef(writeBinding, writeTool)]).build()
     expect(grammar).toContain('writetool-body')
     expect(grammar).toContain('writetool-body-s0')
     expect(grammar).toMatch(/writetool ::=.*writetool-body/)
   })
 
   it('child tags with body use DFA body rules', () => {
-    const grammar = generateGrammar([makeDef(editBinding, editTool)])
+    const grammar = GrammarBuilder.create([makeDef(editBinding, editTool)]).build()
     expect(grammar).toContain('edittool-oldtool-body')
     expect(grammar).toContain('edittool-newtool-body')
   })
 
   it('self-closing tool does not generate body rules', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
     expect(grammar).not.toContain('readtool-body')
   })
 
   it('grammar contains no [^<]+ patterns', () => {
-    const grammar = generateGrammar([
+    const grammar = GrammarBuilder.create([
       makeDef(writeBinding, writeTool),
       makeDef(editBinding, editTool),
       makeDef(readBinding, readTool),
@@ -492,7 +495,7 @@ describe('generateGrammar integration - DFA body rules', () => {
   })
 
   it('body entry rule references s0', () => {
-    const grammar = generateGrammar([makeDef(writeBinding, writeTool)])
+    const grammar = GrammarBuilder.create([makeDef(writeBinding, writeTool)]).build()
     expect(grammar).toContain('writetool-body ::= writetool-body-s0')
   })
 })

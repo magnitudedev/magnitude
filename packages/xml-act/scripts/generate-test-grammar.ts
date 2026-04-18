@@ -8,7 +8,7 @@ import { Schema } from '@effect/schema'
 import { Effect } from 'effect'
 import { defineTool } from '@magnitudedev/tools'
 import { defineXmlBinding } from '../src/xml-binding'
-import { generateGrammar, type GrammarToolDef } from '../src/grammar-generator'
+import { GrammarBuilder, type GrammarToolDef } from '../src/grammar-builder'
 
 // =============================================================================
 // Tool definitions (matching real agent tools)
@@ -115,13 +115,13 @@ function makeDef(binding: any, tool: any): GrammarToolDef {
   return { tagName: tagBinding.tag, binding: tagBinding, inputSchema: tool.inputSchema }
 }
 
-const grammar = generateGrammar([
+const grammar = GrammarBuilder.create([
   makeDef(readBinding, readTool),
   makeDef(writeBinding, writeTool),
   makeDef(editBinding, editTool),
   makeDef(shellBinding, shellTool),
   makeDef(grepBinding, grepTool),
   makeDef(treeBinding, treeTool),
-])
+]).build()
 
 console.log(grammar)

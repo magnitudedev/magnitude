@@ -5,7 +5,7 @@
  */
 
 import type { RegisteredTool } from '@magnitudedev/xml-act'
-import { generateGrammar, type GrammarToolDef } from '@magnitudedev/xml-act'
+import { GrammarBuilder, type GrammarBuildOptions, type GrammarToolDef } from '@magnitudedev/xml-act'
 import { Effect, type Layer } from 'effect'
 import type { AgentCatalogEntry } from '../catalog'
 import type { XmlBinding } from '@magnitudedev/tools'
@@ -48,7 +48,10 @@ export function buildRegisteredTools(
  * Generate GBNF grammar from a ResolvedToolSet.
  * Used JIT before model invocation for constrained generation.
  */
-export function generateToolGrammar(toolSet: ResolvedToolSet): string {
+export function generateToolGrammar(
+  toolSet: ResolvedToolSet,
+  options: GrammarBuildOptions,
+): string {
   const defs: GrammarToolDef[] = []
   const agentDef = toolSet.agentDef
 
@@ -61,5 +64,5 @@ export function generateToolGrammar(toolSet: ResolvedToolSet): string {
       inputSchema: entry.tool.inputSchema,
     })
   }
-  return generateGrammar(defs)
+  return GrammarBuilder.create(defs).withOptions(options ?? {}).build()
 }

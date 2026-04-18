@@ -80,7 +80,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
               turnId,
               chainId,
               defaultProseDest: forkId === null ? 'user' : 'parent',
-              allowSingleUserReplyThisTurn: false,
+              triggeredByUser: false,
               toolSet: createMockToolSet(variant),
             },
             sink,

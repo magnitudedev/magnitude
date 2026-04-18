@@ -1736,20 +1736,18 @@ describe('prose streaming (parser-level)', () => {
     // The prose read tag should appear as literal text in prose events
     const proseChunks = parseEvents(events, 'ProseChunk').filter(c => c.patternId === 'prose')
     const allText = proseChunks.map(c => c.text).join('')
-    const events = await runStreamChunked(cfg, [`Hello world\n${ACTIONS_TAG_OPEN}<read id="r1" path="x"/>${ACTIONS_TAG_CLOSE}`])
-    const chunks = eventsOfType(events, 'MessageChunk')
-    expect(chunks.length).toBeGreaterThan(0)
-    const allText = chunks.map(c => c.text).join('')
-    expect(allText).toContain('Hello world')
+    expect(allText).toContain('Use <read path="x.ts"/> to read files.')
   })
 
   test('prose emits MessageEnd', async () => {
+    const cfg = config([registered(readTool, 'read', readBinding)])
     const events = await runStreamChunked(cfg, [`Hello\n${ACTIONS_TAG_OPEN}\n<read id="r1" path="x"/>\n${ACTIONS_TAG_CLOSE}`])
     const ends = eventsOfType(events, 'MessageEnd')
     expect(ends).toHaveLength(1)
   })
 
   test('think emits ProseChunk with patternId think', async () => {
+    const cfg = config([registered(readTool, 'read', readBinding)])
     const events = await runStreamChunked(cfg, [`<think>reasoning\n</think>\n${ACTIONS_TAG_OPEN}\n<read id="r1" path="x"/>\n${ACTIONS_TAG_CLOSE}`])
     const thinkChunks = eventsOfType(events, 'ProseChunk').filter(c => c.patternId === 'think')
     expect(thinkChunks.length).toBeGreaterThan(0)
@@ -1758,6 +1756,7 @@ describe('prose streaming (parser-level)', () => {
   })
 
   test('prose streams incrementally across chunks', async () => {
+    const cfg = config([registered(readTool, 'read', readBinding)])
     const events = await runStreamChunked(cfg, [
       'Hel', 'lo ', 'wor', 'ld\n',
       `${ACTIONS_TAG_OPEN}<read id="r1" path="x"/>${ACTIONS_TAG_CLOSE}`,
@@ -1769,6 +1768,7 @@ describe('prose streaming (parser-level)', () => {
   })
 
   test('code fences stripped in runtime pipeline', async () => {
+    const cfg = config([registered(readTool, 'read', readBinding)])
     const events = await runStreamChunked(cfg, [
       `\`\`\`xml\n${ACTIONS_TAG_OPEN}<read id="r1" path="x"/>${ACTIONS_TAG_CLOSE}\n\`\`\``,
     ])
@@ -1790,6 +1790,7 @@ describe('prose streaming (parser-level)', () => {
   })
 
   test('no prose events when only actions', async () => {
+    const cfg = config([registered(readTool, 'read', readBinding)])
     const events = await runStreamChunked(cfg, [`${ACTIONS_TAG_OPEN}\n<read id="r1" path="x"/>\n${ACTIONS_TAG_CLOSE}`])
     const chunks = eventsOfType(events, 'MessageChunk')
     expect(chunks).toHaveLength(0)

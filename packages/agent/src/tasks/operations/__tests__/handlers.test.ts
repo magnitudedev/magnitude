@@ -89,7 +89,7 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleMessageDirective({
       kind: 'message',
       defaultTopLevelDestination: 'parent',
-      allowSingleUserReplyThisTurn: false,
+      triggeredByUser: false,
       directUserRepliesSent: 0,
     }, mkCtx()), mkTaskState())
 
@@ -104,7 +104,7 @@ describe('task operation handlers validation', () => {
     const result = await runOp(handleMessageDirective({
       kind: 'message',
       defaultTopLevelDestination: 'user',
-      allowSingleUserReplyThisTurn: true,
+      triggeredByUser: true,
       directUserRepliesSent: 1,
     }, mkCtx()), mkTaskState())
 

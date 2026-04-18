@@ -235,7 +235,7 @@ const makeExecutionManager = Effect.gen(function* () {
 
   const service: ExecutionManagerService = {
     execute: (xmlStream: Stream.Stream<string, ModelError>, options, sink) => Effect.gen(function* () {
-      const { forkId, turnId, defaultProseDest, allowSingleUserReplyThisTurn } = options
+      const { forkId, turnId, defaultProseDest, triggeredByUser } = options
 
       const ambientService = yield* AmbientServiceTag
       const skills = ambientService.getValue(SkillsAmbient)
@@ -684,7 +684,7 @@ const makeExecutionManager = Effect.gen(function* () {
                   const messageResult = yield* handleTaskDirective({
                     kind: 'message',
                     defaultTopLevelDestination: defaultProseDest,
-                    allowSingleUserReplyThisTurn,
+                    triggeredByUser,
                     directUserRepliesSent,
                   }, { forkId, timestamp: Date.now(), graph: { tasks: new Map() }, skills }).pipe(
                     Effect.provideService(ForkContext, { forkId, slot: options.toolSet.slot }),

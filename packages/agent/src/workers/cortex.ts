@@ -18,7 +18,7 @@
 import { Effect, Stream, Either } from 'effect'
 import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
-import { END_TURN_STOP_SEQUENCE, type XmlRuntimeCrash, generateGrammar } from '@magnitudedev/xml-act'
+import { END_TURN_STOP_SEQUENCE, type GrammarBuildOptions, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -116,9 +116,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const sessionCtx = yield* read(SessionContextProjection)
         const agentState = yield* read(AgentStatusProjection)
         const turnState = yield* read(TurnProjection, forkId)
-        const allowSingleUserReplyThisTurn =
-          forkId !== null && (turnState._tag === 'active' || turnState._tag === 'interrupting')
-            ? turnState.currentTurnAllowsDirectUserReply
+        const triggeredByUser =
+          (turnState._tag === 'active' || turnState._tag === 'interrupting')
+            ? turnState.triggeredByUser
             : false
         const forkInfo = getForkInfo(agentState, forkId)
         if (!forkInfo) return
@@ -189,8 +189,13 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           return normalized !== '0' && normalized !== 'false' && normalized !== ''
         })()
         const grammarSafe = boundModel.model.supportsGrammar !== false
+        const grammarOptions: GrammarBuildOptions = triggeredByUser
+          ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length }
+          : {}
 
-        const toolGrammar = grammarEnabled && grammarSafe ? generateToolGrammar(toolSet) : undefined
+        const toolGrammar = grammarEnabled && grammarSafe
+          ? generateToolGrammar(toolSet, grammarOptions)
+          : undefined
         const turnStream = createTurnStream((sink) => Effect.gen(function* () {
           const ackTurns = buildAckTurns(agentDef.lenses, agentDef.defaultRecipient)
           const cs = yield* withTraceScope(
@@ -225,7 +230,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               turnId,
               chainId,
               defaultProseDest: agentDef.defaultRecipient,
-              allowSingleUserReplyThisTurn,
+              triggeredByUser,
               toolSet,
             },
             sink,

@@ -29,11 +29,6 @@ function startTurnForFork(
   publish: PublishFn<AppEvent>,
 ) {
   return Effect.gen(function* () {
-    const currentTurnAllowsDirectUserReply = turnFork.pendingInboundCommunications.some(
-      (message: PendingInboundCommunication) =>
-        message.source === 'user' && message.replyPolicy === 'user_reply_once'
-    )
-
     const turnId = createId()
     const chainId = resolveChainId(turnFork.triggers) ?? createId()
 
@@ -42,7 +37,6 @@ function startTurnForFork(
       forkId,
       turnId,
       chainId,
-      currentTurnAllowsDirectUserReply,
     })
   })
 }

@@ -140,4 +140,10 @@ export type { DeriveStreamingShape, DeriveFields, DeriveChildren, AttrNames, Chi
 export * from './constants'
 
 // GBNF grammar for constrained generation (e.g. Fireworks AI)
-export { generateGrammar, type GrammarToolDef } from './grammar-generator'
+export { type GrammarToolDef } from './grammar-builder'
+export {
+  GrammarBuilder,
+  type ProtocolConfig,
+  type GrammarConfig,
+  type GrammarBuildOptions,
+} from './grammar-builder'

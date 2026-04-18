@@ -12,8 +12,8 @@ import { describe, it, expect } from 'vitest'
 import { Schema } from '@effect/schema'
 import { AST } from '@effect/schema'
 import { Effect } from 'effect'
-import { generateGrammar, type GrammarToolDef } from '../grammar-generator'
-import { defineXmlBinding } from '../xml-binding'
+import { GrammarBuilder, type GrammarToolDef } from '../grammar-builder'
+import { defineXmlBinding, type XmlBindingResult } from '../xml-binding'
 import { defineTool } from '@magnitudedev/tools'
 
 // --- Test tool definitions ---
@@ -21,6 +21,7 @@ import { defineTool } from '@magnitudedev/tools'
 const readTool = defineTool({
   name: 'read',
   group: 'fs',
+  label: (input) => input.path ?? 'read',
   description: 'Read file',
   inputSchema: Schema.Struct({
     path: Schema.String,
@@ -46,6 +47,7 @@ const readBinding = defineXmlBinding(readTool, {
 const writeTool = defineTool({
   name: 'write',
   group: 'fs',
+  label: (input) => input.path ?? 'write',
   description: 'Write file',
   inputSchema: Schema.Struct({
     path: Schema.String,
@@ -67,6 +69,7 @@ const writeBinding = defineXmlBinding(writeTool, {
 const editTool = defineTool({
   name: 'edit',
   group: 'fs',
+  label: (input) => input.path ?? 'edit',
   description: 'Edit file',
   inputSchema: Schema.Struct({
     path: Schema.String,
@@ -96,6 +99,7 @@ const editBinding = defineXmlBinding(editTool, {
 const shellTool = defineTool({
   name: 'shell',
   group: 'exec',
+  label: (input) => input.command ?? 'shell',
   description: 'Run shell command',
   inputSchema: Schema.Struct({
     command: Schema.String,
@@ -124,7 +128,7 @@ function makeDef(binding: XmlBindingResult<any, any, any>, tool: { inputSchema: 
 
 describe('generateGrammar', () => {
   it('produces valid GBNF with correct root structure', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
 
     // Must have standard protocol elements
     expect(grammar).toContain('root ::= lens* (msg | tool)*')
@@ -135,17 +139,17 @@ describe('generateGrammar', () => {
   })
 
   it('generates tool alternation from multiple tools', () => {
-    const grammar = generateGrammar([
+    const grammar = GrammarBuilder.create([
       makeDef(readBinding, readTool),
       makeDef(writeBinding, writeTool),
       makeDef(editBinding, editTool),
-    ])
+    ]).build()
 
     expect(grammar).toContain('tool ::= readtool | writetool | edittool')
   })
 
   it('generates self-closing tool with required and optional attributes', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
 
     // read is self-closing (no body, no children)
     expect(grammar).toContain('readtool ::= "<read" ws readtool-attrs "/>"')
@@ -157,7 +161,7 @@ describe('generateGrammar', () => {
   })
 
   it('generates tool with body content', () => {
-    const grammar = generateGrammar([makeDef(writeBinding, writeTool)])
+    const grammar = GrammarBuilder.create([makeDef(writeBinding, writeTool)]).build()
 
     // write has body
     expect(grammar).toContain('writetool ::= "<write" ws writetool-attrs ">"')
@@ -165,7 +169,7 @@ describe('generateGrammar', () => {
   })
 
   it('generates tool with child tags', () => {
-    const grammar = generateGrammar([makeDef(editBinding, editTool)])
+    const grammar = GrammarBuilder.create([makeDef(editBinding, editTool)]).build()
 
     // edit has child tags (old, new)
     expect(grammar).toContain('edittool ::= "<edit" ws edittool-attrs ">"')
@@ -175,7 +179,7 @@ describe('generateGrammar', () => {
   })
 
   it('uses correct value patterns for attribute types', () => {
-    const grammar = generateGrammar([makeDef(editBinding, editTool)])
+    const grammar = GrammarBuilder.create([makeDef(editBinding, editTool)]).build()
 
     // replaceAll is boolean
     expect(grammar).toContain('"true" | "false"')
@@ -184,21 +188,21 @@ describe('generateGrammar', () => {
   it('produces consistent grammar for the same inputs', () => {
     const tools = [makeDef(readBinding, readTool), makeDef(writeBinding, writeTool)]
 
-    const grammar1 = generateGrammar(tools)
-    const grammar2 = generateGrammar(tools)
+    const grammar1 = GrammarBuilder.create(tools).build()
+    const grammar2 = GrammarBuilder.create(tools).build()
 
     expect(grammar1).toBe(grammar2)
   })
 
   it('includes whitespace rule', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
 
     expect(grammar).toContain('ws ::= [ \\t\\n]*')
   })
 
   it('handles empty tool list', () => {
-    const grammar = generateGrammar([])
-    const grammar2 = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([]).build()
+    const grammar2 = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
 
     expect(grammar).toContain('root ::= lens* (msg | tool)*')
     // tool rule should handle empty case
@@ -206,18 +210,18 @@ describe('generateGrammar', () => {
   })
 
   it('includes ws1 rule for mandatory whitespace', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
     expect(grammar).toContain('ws1 ::= [ \\t\\n]+')
   })
 
   it('uses ws1 before attributes to prevent tag-attribute fusion', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
     // Attr rules must use ws1 (one-or-more) not ws (zero-or-more) before each attribute
     expect(grammar).toContain('readtool-attrs ::= (ws1 readtool-attrs-alt)* ws')
   })
 
   it('uses ws1 for parent tool attr rules with children', () => {
-    const grammar = generateGrammar([makeDef(editBinding, editTool)])
+    const grammar = GrammarBuilder.create([makeDef(editBinding, editTool)]).build()
     // Parent edit tool attrs use ws1
     expect(grammar).toContain('edittool-attrs ::= (ws1 edittool-attrs-alt)* ws')
     // Child elements (old, new) have no attrs, so their attr rule is just ws
@@ -225,20 +229,20 @@ describe('generateGrammar', () => {
   })
 
   it('generates escape pattern for string attribute values', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
     // String attrs should allow escaped quotes: ([^"] | "\\\"")* not [^"]*
     expect(grammar).toContain('([^"] | "\\\\\\"")*')
     expect(grammar).not.toMatch(/readtool-attrs-alt.*\[^\"\]\*/)
   })
 
   it('generates escape pattern for observe attribute', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
     // observe attr should also use escape pattern
     expect(grammar).toContain('"observe=\\"" ([^"] | "\\\\\\"")*')
   })
 
   it('generates escape pattern for message to attribute', () => {
-    const grammar = generateGrammar([makeDef(readBinding, readTool)])
+    const grammar = GrammarBuilder.create([makeDef(readBinding, readTool)]).build()
     // msg rule should use escape pattern for to value
     expect(grammar).toContain('msg ::= "<message to=\\"" ([^"] | "\\\\\\"")*')
   })
@@ -247,6 +251,7 @@ describe('generateGrammar', () => {
     const enumTool = defineTool({
       name: 'update-task',
       group: 'task',
+      label: (input) => input.id ?? 'update-task',
       description: 'Update task',
       inputSchema: Schema.Struct({
         id: Schema.String,
@@ -264,7 +269,7 @@ describe('generateGrammar', () => {
       },
       output: {},
     } as const)
-    const grammar = generateGrammar([makeDef(enumBinding, enumTool)])
+    const grammar = GrammarBuilder.create([makeDef(enumBinding, enumTool)]).build()
     // status should be enum, not string
     expect(grammar).toContain('"status=\\"" ("pending" | "completed" | "cancelled") "\\""')
   })

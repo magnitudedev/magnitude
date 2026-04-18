@@ -106,7 +106,7 @@ describe('turn control interrupts', () => {
       }
 
       expect(activeAgain.turnId).toBe(resumed.turnId)
-      expect(activeAgain.currentTurnAllowsDirectUserReply).toBe(true)
+      expect(activeAgain.triggeredByUser).toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
