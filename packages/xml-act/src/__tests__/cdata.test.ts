@@ -55,9 +55,8 @@ describe('CDATA support', () => {
 
   it('4) CDATA split across multiple chunks is assembled correctly', () => {
     const events = parseChunks([
-      '<shell><!',
-      '[CDATA[some <content>',
-      ' here]]></shell>',
+      '<shell><!' + '[CDATA[some <content>',
+      ' here' + ']]></shell>',
     ])
     const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
     expect(body).toBe('some <content> here')
@@ -90,5 +89,88 @@ describe('CDATA support', () => {
     const events = parse(`before ${CDATA_OPEN}unterminated <x>`)
     const prose = byTag(events, 'ProseChunk').map(e => e.text).join('')
     expect(prose).toBe(`before ${CDATA_OPEN}unterminated <x>`)
+  })
+
+  it('9) CDATA close split as ]] + > across chunks', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[hello world]' + ']',
+      '></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('hello world')
+  })
+
+  it('10) CDATA close split as ] + ]> across chunks', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[hello world]',
+      ']></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('hello world')
+  })
+
+  it('11) CDATA close split across three chunks as ] + ] + >', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[hello world]',
+      ']',
+      '></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('hello world')
+  })
+
+  it('12) content containing ] before the real close is preserved', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[data]more',
+      ']]></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('data]more')
+  })
+
+  it('13) content containing ]] that is not a close is preserved', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[arr[0]]stuff',
+      ' more]]></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('arr[0]]stuff more')
+  })
+
+  it('14) multiple CDATA sections still work when one close is split across chunks', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[first]]><!' + '[CDATA[ second]',
+      ']',
+      '></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('first second')
+  })
+
+  it('15) CDATA close where ]] ends a chunk and > starts the next chunk is assembled correctly', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[mid chunk close]]',
+      '></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('mid chunk close')
+  })
+
+  it('16) single ] at chunk boundary that is not part of a close remains content', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[edge]',
+      'case]]></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('edge]case')
+  })
+
+  it('17) content ending with ]] before the real close is preserved', () => {
+    const events = parseChunks([
+      '<shell><!' + '[CDATA[tricky]]',
+      'tail]]></shell>',
+    ])
+    const body = byTag(events, 'BodyChunk').map(e => e.text).join('')
+    expect(body).toBe('tricky]]tail')
   })
 })

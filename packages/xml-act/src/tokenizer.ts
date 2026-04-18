@@ -103,6 +103,7 @@ export function createTokenizer(
   let pendingTag: { signal: Token; allowEofAsNewline: boolean } | null = null
 
   let cdataBuffer: string | null = null
+  let cdataCloseProgress = 0
 
   function updateContentFlags(text: string): void {
     for (const ch of text) {
@@ -299,6 +300,7 @@ export function createTokenizer(
           if (tag.raw === CDATA_OPEN) {
             activeTag = null
             cdataBuffer = ''
+            cdataCloseProgress = 0
           }
           return
         }
@@ -533,16 +535,30 @@ export function createTokenizer(
       let i = 0
       while (i < input.length) {
         if (cdataBuffer !== null) {
-          const closeIdx = input.indexOf(CDATA_CLOSE, i)
-          if (closeIdx === -1) {
-            cdataBuffer += input.slice(i)
-            i = input.length
+          const ch = input[i]
+          if (ch === ']') {
+            if (cdataCloseProgress === 0) cdataCloseProgress = 1
+            else if (cdataCloseProgress === 1) cdataCloseProgress = 2
+            else cdataBuffer += ']'
+            i++
             continue
           }
-          cdataBuffer += input.slice(i, closeIdx)
-          contentBuffer += cdataBuffer
-          cdataBuffer = null
-          i = closeIdx + CDATA_CLOSE.length
+
+          if (ch === '>' && cdataCloseProgress === 2) {
+            contentBuffer += cdataBuffer
+            cdataBuffer = null
+            cdataCloseProgress = 0
+            i++
+            continue
+          }
+
+          if (cdataCloseProgress > 0) {
+            cdataBuffer += ']'.repeat(cdataCloseProgress)
+            cdataCloseProgress = 0
+          }
+
+          cdataBuffer += ch
+          i++
           continue
         }
 
@@ -612,8 +628,9 @@ export function createTokenizer(
         pendingTag = null
       }
       if (cdataBuffer !== null) {
-        contentBuffer += CDATA_OPEN + cdataBuffer
+        contentBuffer += CDATA_OPEN + cdataBuffer + ']'.repeat(cdataCloseProgress)
         cdataBuffer = null
+        cdataCloseProgress = 0
       }
       flushContent()
     },
