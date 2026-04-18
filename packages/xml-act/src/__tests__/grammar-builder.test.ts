@@ -81,8 +81,8 @@ describe('GrammarBuilder', () => {
       .requireMessageTo('parent')
       .build()
 
-    // Should have 6 optional lens slots followed by forced message
-    expect(grammar).toContain('root ::= lens? lens? lens? lens? lens? lens? forced-msg (msg | tool)* endturn')
+    // Should have 6 optional lens-tight slots followed by forced message
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* endturn')
     expect(grammar).toContain('forced-msg ::= "<message to=\\"parent\\">" msg-body "</message>" ws')
   })
 
@@ -92,9 +92,9 @@ describe('GrammarBuilder', () => {
       .withMaxLenses(3)
       .build()
 
-    // Should have exactly 3 optional lens slots
-    expect(grammar).toContain('root ::= lens? lens? lens? forced-msg (msg | tool)* endturn')
-    expect(grammar).not.toContain('lens? lens? lens? lens?')
+    // Should have exactly 3 optional lens-tight slots
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* endturn')
+    expect(grammar).not.toContain('lens-tight? lens-tight? lens-tight? lens-tight?')
   })
 
   it('withMaxLenses is ignored when no requiredMessageTo is set', () => {
@@ -135,17 +135,19 @@ describe('GrammarBuilder', () => {
       .build()
 
     // Lenses should flow directly into forced-msg with no intermediate rules
-    expect(grammar).toContain('root ::= lens? lens? lens? lens? lens? lens? forced-msg (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* endturn')
   })
 
-  it('lens rule uses unbounded ws (not tight/bounded)', () => {
-    const grammar = GrammarBuilder.create(tools).build()
+  it('default grammar uses unbounded ws lens; forced-msg grammar uses lens-tight with ws-bounded', () => {
+    const defaultGrammar = GrammarBuilder.create(tools).build()
+    const forcedGrammar = GrammarBuilder.create(tools).requireMessageTo('user').build()
 
-    // Standard lens uses unbounded whitespace after closing tag
-    expect(grammar).toContain('lens ::= "<lens name=\\"" lensname "\\">" lens-body "</lens>" ws')
-    // Should NOT contain the old tight/bounded variants
-    expect(grammar).not.toContain('lens-tight')
-    expect(grammar).not.toContain('ws-bounded')
+    // Default: unbounded whitespace, no tight variants needed
+    expect(defaultGrammar).toContain('lens ::= "<lens name=\\"" lensname "\\">" lens-body "</lens>" ws')
+
+    // Forced: uses lens-tight with bounded whitespace to prevent ws loops
+    expect(forcedGrammar).toContain('lens-tight ::= "<lens name=\\"" lensname "\\">" lens-body "</lens>" ws-bounded')
+    expect(forcedGrammar).toContain('ws-bounded ::= [ \\t\\n] [ \\t\\n]? [ \\t\\n]? [ \\t\\n]?')
   })
 
   it('does not contain old recursive lens prefix rules', () => {
@@ -189,6 +191,6 @@ describe('GrammarBuilder', () => {
     // After 2 lens slots, the model MUST proceed to forced-msg or tools
     // The grammar allows: lens? lens? forced-msg (msg | tool)* endturn
     // Each lens? can be either a lens or empty, but after both slots, forced-msg is required
-    expect(grammar).toContain('root ::= lens? lens? forced-msg')
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? forced-msg')
   })
 })

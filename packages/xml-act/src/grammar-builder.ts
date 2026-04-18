@@ -118,14 +118,19 @@ export class GrammarBuilder {
   private addWhitespaceRules(rules: RuleMap): void {
     // ws: unbounded whitespace between elements (normal case)
     // ws1: required whitespace (for separating attributes)
+    // ws-bounded: limited whitespace (1-4 chars) used between lenses when a forced
+    //   element follows, to prevent the model from looping on whitespace tokens
     rules.set('ws', '[ \\t\\n]*')
     rules.set('ws1', '[ \\t\\n]+')
+    rules.set('ws-bounded', '[ \\t\\n] [ \\t\\n]? [ \\t\\n]? [ \\t\\n]?')
   }
 
   private addLensRules(rules: RuleMap): void {
-    // lens: a thinking lens for structured reasoning
-    // Uses unbounded whitespace after the closing tag (normal case)
+    // lens: a thinking lens with unbounded trailing whitespace (used when no forced element follows)
+    // lens-tight: same but with bounded whitespace, used in capped lens slots before a forced
+    //   message to prevent infinite whitespace loops
     rules.set('lens', '"<lens name=\\"" lensname "\\">" lens-body "</lens>" ws')
+    rules.set('lens-tight', '"<lens name=\\"" lensname "\\">" lens-body "</lens>" ws-bounded')
     rules.set('lensname', '"alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"')
 
     for (const rule of generateBodyRules('lens', 'lens')) {
@@ -180,13 +185,13 @@ export class GrammarBuilder {
 
     // Lens section
     if (recipient !== null) {
-      // Forced message case: cap lenses at maxLenses to prevent infinite loops
-      // Generate lens? lens? ... (maxLenses times) - each optional individually
-      // This allows 0 to maxLenses lenses, then forces the message
+      // Forced message case: cap lenses at maxLenses to prevent infinite loops.
+      // Uses lens-tight (bounded whitespace) to prevent the model from looping
+      // on whitespace tokens between lenses or before the forced message.
       const lensCount = maxLenses ?? 6
       const lensSlots: string[] = []
       for (let i = 0; i < lensCount; i++) {
-        lensSlots.push('lens?')
+        lensSlots.push('lens-tight?')
       }
       parts.push(...lensSlots)
     } else if (this.config.protocol.minLenses === 1) {
