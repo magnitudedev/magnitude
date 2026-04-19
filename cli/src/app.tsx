@@ -1340,7 +1340,7 @@ function AppInner({
     }
   }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds, localProviderSet, storage, providerRuntime, reloadProviderState, slotModels])
 
-  const finishWizard = useCallback(() => {
+  const finishWizard = useCallback(async () => {
     setShowSetupWizard(false)
     setWizardStep('provider')
     setWizardSlotModels(emptySlotModels())
@@ -1349,6 +1349,12 @@ function AppInner({
     setWizardSelectedProviderDiscoveredModels([])
     setWizardSelectedProviderRememberedModelIds([])
     setProviderRefreshKey(prev => prev + 1)
+
+    // Initialize global skills on first run
+    const { initGlobalSkills } = await import('@magnitudedev/skills')
+    await initGlobalSkills().catch((err) => {
+      logger.warn({ error: err.message }, 'Failed to initialize global skills')
+    })
   }, [])
 
   const handleWizardComplete = useCallback(async (result: Record<MagnitudeSlot, ModelSelection | null>) => {

@@ -4,7 +4,7 @@ description: "Add reusable agent behaviors with the Agent Skills standard"
 icon: biceps-flexed
 ---
 
-Magnitude supports the open source [Agent Skills](https://agentskills.io) standard — a cross-agent convention for defining reusable agent behaviors. Skills you create work in any agent that supports the standard.
+Magnitude uses the [Agent Skills](https://agentskills.io) format for defining reusable agent behaviors. Skills are stored in `.magnitude/skills/` directories.
 
 ## What are skills?
 
@@ -15,7 +15,7 @@ A skill is a markdown file (`SKILL.md`) that defines a reusable behavior the age
 Create a `SKILL.md` file in one of the scan directories:
 
 ```
-.agents/skills/my-skill/SKILL.md
+.magnitude/skills/my-skill/SKILL.md
 ```
 
 ### SKILL.md format
@@ -51,12 +51,28 @@ Magnitude scans these directories for skills, in order of priority (later overri
 
 | Location | Scope |
 |----------|-------|
-| `~/.agents/skills/` | Global (cross-agent standard) |
-| `~/.magnitude/skills/` | Global (Magnitude-specific) |
-| `<project>/.agents/skills/` | Project-local (cross-agent standard) |
-| `<project>/.magnitude/skills/` | Project-local (Magnitude-specific) |
+| `~/.magnitude/skills/` | Global (available to all projects) |
+| `<project>/.magnitude/skills/` | Project-local (overrides global) |
 
-Project-local skills override global skills with the same name. Magnitude-specific directories override cross-agent directories.
+Project-local skills override global skills with the same name.
+
+## First-run initialization
+
+When you first run Magnitude and complete the setup wizard, built-in skills are automatically copied to `~/.magnitude/skills/`. These skills are available across all your projects.
+
+You can create custom skills in either location:
+- `~/.magnitude/skills/` — Global skills available to all projects
+- `<project>/.magnitude/skills/` — Project-specific skills that override global ones
+
+## Resetting skills
+
+To reset global skills to their built-in defaults, run:
+
+```bash
+magnitude skills reset
+```
+
+Warning: This will overwrite all skills in `~/.magnitude/skills/`. You must type "yes" to confirm.
 
 ## Example: Debug skill
 

@@ -1,20 +1,21 @@
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 
 /**
- * Initialize project skills by copying built-in skills to the project directory.
+ * Initialize global skills by copying built-in skills to the global directory.
  * 
  * Built-in skills are located at:
  * - Compiled mode: Bun.embeddedFiles filtered by 'builtin/' prefix
  * - Dev mode: packages/skills/builtin/ directory (relative to this file)
  * 
- * Target: <cwd>/.magnitude/skills/
+ * Target: ~/.magnitude/skills/
  * 
  * If the target directory exists and contains SKILL.md files, initialization
  * is skipped (user owns these skills).
  */
-export async function initProjectSkills(cwd: string): Promise<void> {
-  const targetDir = path.join(cwd, '.magnitude', 'skills')
+export async function initGlobalSkills(): Promise<void> {
+  const targetDir = path.join(os.homedir(), '.magnitude', 'skills')
   
   // Check if target exists and has SKILL.md files (user owns these)
   if (fs.existsSync(targetDir)) {
@@ -23,7 +24,7 @@ export async function initProjectSkills(cwd: string): Promise<void> {
       .some(d => fs.existsSync(path.join(targetDir, d.name, 'SKILL.md')))
     
     if (hasExistingSkills) {
-      console.log(`Skipping skill initialization: .magnitude/skills/ already exists with skills`)
+      console.log(`Skipping skill initialization: ~/.magnitude/skills/ already exists with skills`)
       return
     }
   }
@@ -50,7 +51,7 @@ export async function initProjectSkills(cwd: string): Promise<void> {
     copied++
   }
   
-  console.log(`Initialized ${copied} skills in .magnitude/skills/`)
+  console.log(`Initialized ${copied} skills in ~/.magnitude/skills/`)
 }
 
 interface BuiltinSkill {

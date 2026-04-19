@@ -6,19 +6,15 @@ import type { Skill } from './types'
 
 /**
  * Load skills from standard directories.
- * Scans 4 directories in priority order (later overrides earlier on name conflicts):
- * 1. ~/.agents/skills/ (global, cross-agent)
- * 2. ~/.magnitude/skills/ (global, Magnitude-native)
- * 3. <cwd>/.agents/skills/ (project-local, cross-agent)
- * 4. <cwd>/.magnitude/skills/ (project-local, highest priority)
+ * Scans 2 directories in priority order (later overrides earlier on name conflicts):
+ * 1. ~/.magnitude/skills/ (global, Magnitude-native)
+ * 2. <cwd>/.magnitude/skills/ (project-local, highest priority)
  */
 export async function loadSkills(cwd: string): Promise<Map<string, Skill>> {
   const home = os.homedir()
 
   const dirs = [
-    path.join(home, '.agents', 'skills'),
     path.join(home, '.magnitude', 'skills'),
-    path.join(cwd, '.agents', 'skills'),
     path.join(cwd, '.magnitude', 'skills'),
   ]
 
