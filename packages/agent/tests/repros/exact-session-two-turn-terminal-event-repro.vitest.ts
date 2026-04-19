@@ -49,7 +49,6 @@ describe('exact session-shaped two-turn repro', () => {
     const firstResponse = `
 
 <update-task id="explore-web-search" status="completed" />
-<end-turn>
 <message to="user">Great question — here's how it works:
 
 ### How Web Search Works
@@ -60,9 +59,7 @@ Magnitude has per-provider implementations in [\`packages/agent/src/tools/web-se
 - **Google Gemini** — synchronous (but silently ignores domain filters)
 
 The router at [\`packages/agent/src/tools/web-search.ts\`](packages/agent/src/tools/web-search.ts) determines which one to call based on your active provider.</message>
-<end-turn>
-<continue/>
-</end-turn>`
+<yield-tool/>`
 
     const secondResponse = `
 

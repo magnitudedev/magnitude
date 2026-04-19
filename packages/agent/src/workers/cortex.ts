@@ -18,7 +18,7 @@
 import { Effect, Stream, Either } from 'effect'
 import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
-import { END_TURN_STOP_SEQUENCE, type GrammarBuildOptions, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import { LEAD_YIELD_STOP_SEQUENCES, SUBAGENT_YIELD_STOP_SEQUENCES, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, type GrammarBuildOptions, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -189,9 +189,19 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           return normalized !== '0' && normalized !== 'false' && normalized !== ''
         })()
         const grammarSafe = boundModel.model.supportsGrammar !== false
-        const grammarOptions: GrammarBuildOptions = triggeredByUser
-          ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length }
-          : {}
+        // Select stop sequences and yield tags based on protocol role
+        const isSubagent = agentDef.protocolRole === 'subagent'
+        // Stop sequences not passed for now — yield tags are self-closing and would be
+        // cut from the stream if used as stop sequences, losing the decision info.
+        // Grammar-constrained models end naturally after yield. Non-grammar models
+        // are handled by PostYieldObserver runaway detection.
+        // const stopSequences = isSubagent ? [...SUBAGENT_YIELD_STOP_SEQUENCES] : [...LEAD_YIELD_STOP_SEQUENCES]
+        const yieldTags = isSubagent ? [...SUBAGENT_YIELD_TAGS] : [...LEAD_YIELD_TAGS]
+
+        const grammarOptions: GrammarBuildOptions = {
+          ...(triggeredByUser ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length } : {}),
+          yieldTags,
+        }
 
         const toolGrammar = grammarEnabled && grammarSafe
           ? generateToolGrammar(toolSet, grammarOptions)
@@ -209,7 +219,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               {
                 systemPrompt,
                 messages: chatMessages,
-                options: { stopSequences: [END_TURN_STOP_SEQUENCE], grammar: toolGrammar },
+                options: { grammar: toolGrammar },
                 ackTurns,
               },
               { inputTokenEstimate: compactionState.tokenEstimate },

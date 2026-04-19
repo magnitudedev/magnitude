@@ -8,13 +8,13 @@ import { buildClientRegistry } from '../client-registry-builder'
 import { bamlStream } from '../drivers/baml-dispatch'
 import { toIncrementalStream } from '../util/incremental-stream'
 
-const STOP_SEQUENCES = ['\n</end-turn>']
+const STOP_SEQUENCES = ['<yield-user/>', '<yield-tool/>', '<yield-worker/>']
 
 async function runWithCollector(provider: string, modelId: string, auth: any) {
   const collector = new Collector('test')
   const registry = buildClientRegistry(provider, modelId, auth, undefined, [...STOP_SEQUENCES])
 
-  const messages = [{ role: 'user', content: ['Respond with exactly this text:\n\n<end-turn>\n<idle/>\n</end-turn>\n\nDo not add any other text.'] }]
+  const messages = [{ role: 'user', content: ['Respond with exactly this text:\n\n<yield-user/>\n\nDo not add any other text.'] }]
 
   const rawStream = bamlStream('CodingAgentChat', [
     'You are a helpful assistant.',
@@ -77,9 +77,9 @@ describe('stop reason extraction from collector', () => {
     })
     console.log('Anthropic result:', JSON.stringify(result, null, 2))
 
-    expect(result.content).not.toContain('</end-turn>')
+    expect(result.content).not.toContain('<yield-user/>')
     const stopSeq = result.httpStopSequence ?? result.sseStopSequence
-    expect(stopSeq).toBe('\n</end-turn>')
+    expect(stopSeq).toBe('<yield-user/>')
   }, 30000)
 
   it('openai: extracts finish_reason from collector', async () => {
@@ -91,7 +91,7 @@ describe('stop reason extraction from collector', () => {
     })
     console.log('OpenAI result:', JSON.stringify(result, null, 2))
 
-    expect(result.content).not.toContain('</end-turn>')
+    expect(result.content).not.toContain('<yield-user/>')
     const fr = result.httpFinishReason ?? result.sseFinishReason
     expect(fr).toBe('stop')
   }, 30000)

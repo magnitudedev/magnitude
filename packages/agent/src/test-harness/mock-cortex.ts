@@ -6,7 +6,7 @@ import { ExecutionManager } from '../execution/types'
 import { createTurnStream } from '../execution/turn-stream'
 import { drainTurnEventStream } from '../workers/turn-event-drain'
 import { MockTurnScriptTag, type MockTurnResponse } from './turn-script'
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { YIELD_USER } from '@magnitudedev/xml-act'
 import { buildResolvedToolSet, type ResolvedToolSet } from '../tools/resolved-toolset'
 import { getAgentDefinition, getAgentSlot } from '../agents/registry'
 import type { ConfigState } from '../ambient/config-ambient'
@@ -28,7 +28,7 @@ function createMockToolSet(variant: 'lead' | 'worker'): ResolvedToolSet {
 function frameToChunks(frame: MockTurnResponse): readonly string[] {
   if (frame.xmlChunks && frame.xmlChunks.length > 0) return frame.xmlChunks
   if (frame.xml !== undefined) return [frame.xml]
-  return [`<message>ok</message>${TURN_CONTROL_IDLE}`]
+  return [`<message>ok</message>${YIELD_USER}`]
 }
 
 function buildStream(frame: MockTurnResponse): Stream.Stream<string, import('@magnitudedev/providers').ModelError> {

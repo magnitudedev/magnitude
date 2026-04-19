@@ -1,7 +1,9 @@
 
 ## Turn control
 
-Use `{{TURN_CONTROL_IDLE}}` when you are waiting on a response from the user or a worker. Use `{{TURN_CONTROL_CONTINUE}}` otherwise.
+Use `{{YIELD_USER}}` when you are waiting on a response from the user.
+Use `{{YIELD_WORKER}}` when you are waiting on a response from a worker.
+Use `{{YIELD_TOOL}}` when you have made tool calls and are ready to wait for results.
 
 ## User responsiveness
 

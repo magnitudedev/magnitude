@@ -698,6 +698,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       if (event.result.success && event.result.oneshotLivenessTriggered) {
         nextFork = enqueueResult(nextFork, { kind: 'oneshot_liveness' }, event.timestamp)
       }
+      if (event.result.success && event.result.yieldWorkerRetriggered) {
+        nextFork = enqueueResult(nextFork, { kind: 'yield_worker_retrigger' }, event.timestamp)
+      }
       if (isCancelled) {
         nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
       }

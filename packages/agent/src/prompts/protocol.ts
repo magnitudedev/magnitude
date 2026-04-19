@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { TURN_CONTROL_IDLE, TURN_CONTROL_CONTINUE, TURN_CONTROL_IDLE_TAG, TURN_CONTROL_CONTINUE_TAG, TURN_CONTROL_FINISH_TAG, END_TURN_TAG, MESSAGE_TAG, LENS_TAG } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_TOOL, YIELD_WORKER, YIELD_PARENT, YIELD_USER_TAG, YIELD_TOOL_TAG, YIELD_WORKER_TAG, YIELD_PARENT_TAG, MESSAGE_TAG, LENS_TAG } from '@magnitudedev/xml-act'
 import xmlActProtocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -48,12 +48,14 @@ export function getXmlActProtocol(
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{LENS_TAG}}', LENS_TAG)
     .replaceAll('{{MESSAGE_TAG}}', MESSAGE_TAG)
-    .replaceAll('{{END_TURN_TAG}}', END_TURN_TAG)
-    .replaceAll('{{IDLE_TAG}}', TURN_CONTROL_IDLE_TAG)
-    .replaceAll('{{CONTINUE_TAG}}', TURN_CONTROL_CONTINUE_TAG)
-    .replaceAll('{{TURN_CONTROL_FINISH}}', TURN_CONTROL_FINISH_TAG)
-    .replaceAll('{{TURN_CONTROL_IDLE}}', TURN_CONTROL_IDLE)
-    .replaceAll('{{TURN_CONTROL_CONTINUE}}', TURN_CONTROL_CONTINUE)
+    .replaceAll('{{YIELD_USER_TAG}}', YIELD_USER_TAG)
+    .replaceAll('{{YIELD_TOOL_TAG}}', YIELD_TOOL_TAG)
+    .replaceAll('{{YIELD_WORKER_TAG}}', YIELD_WORKER_TAG)
+    .replaceAll('{{YIELD_PARENT_TAG}}', YIELD_PARENT_TAG)
+    .replaceAll('{{YIELD_USER}}', YIELD_USER)
+    .replaceAll('{{YIELD_TOOL}}', YIELD_TOOL)
+    .replaceAll('{{YIELD_WORKER}}', YIELD_WORKER)
+    .replaceAll('{{YIELD_PARENT}}', YIELD_PARENT)
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
 }
 
@@ -65,7 +67,7 @@ export function buildAckTurn(
 
   return `<${LENS_TAG} name="${lensName}">Acknowledge readiness and continue.</${LENS_TAG}>
 <${MESSAGE_TAG} to="${defaultRecipient}">Ready.</${MESSAGE_TAG}>
-${TURN_CONTROL_CONTINUE}
+${YIELD_TOOL}
 `
 }
 
@@ -92,7 +94,7 @@ Respond using the required turn format. The user reports a bug in the login redi
 <${LENS_TAG} name="tasks">Bug fix isn't one-turnable. Need to understand and delegate.</${LENS_TAG}>
 <skill name="bug" />
 <read path="src/auth/redirect.ts" />
-${TURN_CONTROL_CONTINUE}`]
+${YIELD_TOOL}`]
     },
     {
       role: 'user',
@@ -117,7 +119,7 @@ Provides methodology for diagnosing and fixing bugs.
 <create-task id="fix-redirect" title="Fix login redirect bug" />
 <spawn-worker id="fix-redirect">The redirect function is using '/home' instead of '/login'. Diagnose and fix.</spawn-worker>
 <${MESSAGE_TAG} to="${defaultRecipient}">Found the bug — redirectAfterLogout sends to \`/home\` instead of \`/login\`. Worker is fixing it now.</${MESSAGE_TAG}>
-${TURN_CONTROL_IDLE}`]
+${YIELD_USER}`]
     },
     {
       role: 'user',

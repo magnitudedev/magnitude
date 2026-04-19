@@ -1,3 +1,4 @@
+
 /**
  * @magnitudedev/xml-act — Standalone XML Tool Execution Runtime
  *
@@ -57,9 +58,6 @@ export type {
   ParseErrorDetail,
   StructuralParseErrorDetail,
   UnclosedThinkDetail,
-
-  FinishWithoutEvidenceDetail,
-  TurnControlConflictDetail,
 } from './format/types'
 
 // Core types — results
@@ -117,8 +115,24 @@ export { buildOutputTree, outputToText, outputToDOM, outputFromDOM } from './out
 export type { OutputNode } from './output-tree'
 
 // Stream guard
-
-export { END_TURN_STOP_SEQUENCE } from './constants'
+export {
+  YIELD_USER_TAG,
+  YIELD_TOOL_TAG,
+  YIELD_WORKER_TAG,
+  YIELD_PARENT_TAG,
+  YIELD_USER,
+  YIELD_TOOL,
+  YIELD_WORKER,
+  YIELD_PARENT,
+  YIELD_USER_STOP,
+  YIELD_TOOL_STOP,
+  YIELD_WORKER_STOP,
+  YIELD_PARENT_STOP,
+  LEAD_YIELD_STOP_SEQUENCES,
+  SUBAGENT_YIELD_STOP_SEQUENCES,
+  LEAD_YIELD_TAGS,
+  SUBAGENT_YIELD_TAGS,
+} from './constants'
 
 // Parser
 export { createStreamingXmlParser, createParser, defaultIdGenerator } from './parser'

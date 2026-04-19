@@ -9,9 +9,7 @@ turn     := {{LENS_TAG}}* ({{MESSAGE_TAG}} | tool)* turnctl
 {{LENS_TAG}}     := <{{LENS_TAG}} name="...">reasoning</{{LENS_TAG}}>
 {{MESSAGE_TAG}}  := <{{MESSAGE_TAG}} to="recipient">text</{{MESSAGE_TAG}}>
 tool     := <TAG observe="query" .../>  |  <TAG observe="query" ...>body</TAG>
-turnctl  := <{{END_TURN_TAG}}>
-<{{IDLE_TAG}}/> | <{{CONTINUE_TAG}}/>
-</{{END_TURN_TAG}}>
+turnctl  := {{YIELD_USER}} | {{YIELD_TOOL}} | {{YIELD_WORKER}} | {{YIELD_PARENT}}
 ```
 
 ## Agentic operation
@@ -27,10 +25,6 @@ Agents operate using a finite context window. There is an inherent cost tradeoff
 Based on these principles, any reasonable agent should:
 (1) Always separate **observation-dependent** tools/messages with a turn end
 (2) Batch independent tools, but keeping per-turn tool volume bounded to only the highest-signal tools to allow for incremental observation
-
-## Stop sequence
-
-The sequence "\n</{{END_TURN_TAG}}>" is configured as a stop sequence. Use this sequence exclusively at the end of your response.
 
 {{TURN_CONTROL_SECTION}}
 

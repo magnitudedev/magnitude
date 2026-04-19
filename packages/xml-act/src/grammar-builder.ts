@@ -1,4 +1,6 @@
+
 import { buildToolRules, generateBodyRules, type GrammarToolDef } from './grammar-shared'
+import { LEAD_YIELD_TAGS } from './constants'
 
 export { generateBodyRules, type GrammarToolDef } from './grammar-shared'
 
@@ -14,6 +16,8 @@ export interface ProtocolConfig {
   /** Maximum number of lenses allowed when a forced message is required.
    *  Prevents infinite lens loops by capping the model's thinking space. */
   readonly maxLenses: number | undefined
+  /** Yield tags to use at turn end. Defaults to lead yield tags. */
+  readonly yieldTags: ReadonlyArray<string>
 }
 
 export interface GrammarConfig {
@@ -27,6 +31,8 @@ export interface GrammarBuildOptions {
   /** Maximum number of lenses allowed when a forced message is required.
    *  Prevents infinite lens loops by capping the model's thinking space. */
   readonly maxLenses?: number
+  /** Yield tags to use at turn end. Defaults to lead yield tags. */
+  readonly yieldTags?: ReadonlyArray<string>
 }
 
 // =============================================================================
@@ -53,6 +59,7 @@ const defaultProtocol: ProtocolConfig = {
   allowTools: true,
   requiredMessageTo: null,
   maxLenses: undefined,
+  yieldTags: LEAD_YIELD_TAGS,
 }
 
 // =============================================================================
@@ -88,6 +95,7 @@ export class GrammarBuilder {
     if (options.minLenses !== undefined) next = next.withMinLenses(options.minLenses)
     if (options.requiredMessageTo !== undefined) next = next.requireMessageTo(options.requiredMessageTo)
     if (options.maxLenses !== undefined) next = next.withMaxLenses(options.maxLenses)
+    if (options.yieldTags !== undefined) next = next.withYieldTags(options.yieldTags)
     return next
   }
 
@@ -98,13 +106,20 @@ export class GrammarBuilder {
     })
   }
 
+  withYieldTags(yieldTags: ReadonlyArray<string>): GrammarBuilder {
+    return new GrammarBuilder({
+      ...this.config,
+      protocol: { ...this.config.protocol, yieldTags },
+    })
+  }
+
   build(): string {
     const rules: RuleMap = new Map()
 
     this.addWhitespaceRules(rules)
     this.addLensRules(rules)
     this.addMessageRules(rules)
-    this.addEndTurnRules(rules)
+    this.addYieldRules(rules)
     this.addToolRules(rules)
     this.addRootRule(rules)
 
@@ -153,8 +168,11 @@ export class GrammarBuilder {
     }
   }
 
-  private addEndTurnRules(rules: RuleMap): void {
-    rules.set('endturn', '"<end-turn>" ws ("<idle/>" | "<continue/>") ws "</end-turn>"')
+  private addYieldRules(rules: RuleMap): void {
+    const alternatives = this.config.protocol.yieldTags
+      .map(tag => `"<${tag}/>"`)
+      .join(' | ')
+    rules.set('yield', alternatives)
   }
 
   private addToolRules(rules: RuleMap): void {
@@ -177,7 +195,7 @@ export class GrammarBuilder {
     // Root rule structure:
     // - Lenses come first (optional, for thinking/reasoning)
     // - Then either a forced message (if required) or free-form messages/tools
-    // - Finally endturn to close the turn
+    // - Finally yield to close the turn
     //
     // When a forced message is required (e.g., user reply), we cap the number
     // of lenses to prevent infinite loops. The model can use up to maxLenses
@@ -210,8 +228,8 @@ export class GrammarBuilder {
     // Middle section: messages and tools
     parts.push(this.buildMiddleAlternative())
 
-    // End turn
-    parts.push('endturn')
+    // Yield (turn end)
+    parts.push('yield')
 
     rules.set('root', parts.join(' '))
   }

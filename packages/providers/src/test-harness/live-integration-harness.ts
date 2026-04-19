@@ -73,7 +73,7 @@ export function makeCodingAgentChatInput(): {
     messages: [{ role: 'user', content: ['Say hello.'] }],
     ackTurns: [
       { role: 'user', content: '--- FEW-SHOT EXAMPLE START ---\n<system>\nRespond using the required turn format. The user reports a bug in the login redirect.\n</system>' },
-      { role: 'assistant', content: '<lens name="skills">Bug report → activate the bug skill to load methodology.</lens>\n<skill name="bug" />\n<end-turn>\n<continue/>\n</end-turn>' },
+      { role: 'assistant', content: '<lens name="skills">Bug report → activate the bug skill to load methodology.</lens>\n<skill name="bug" />\n<yield-tool/>' },
       { role: 'user', content: '--- FEW-SHOT EXAMPLE END ---' },
     ],
   }

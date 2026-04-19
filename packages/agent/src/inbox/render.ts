@@ -4,9 +4,9 @@ import {
   WORKER_PROGRESS_USER_MESSAGE_REMINDER,
 } from '../prompts/lead-communication-reminders'
 import type { AgentAtom, ResultEntry, TimelineEntry } from './types'
-import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults } from './render-results'
+import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults, formatYieldWorkerRetrigger } from './render-results'
 import { renderCompactToolCall } from './render-tool-call'
-import { TURN_CONTROL_IDLE, TURN_CONTROL_IDLE_TAG, END_TURN_TAG } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_USER_TAG } from '@magnitudedev/xml-act'
 import { taskIdleReminder, taskCompleteReminder } from '../prompts/tasks/index'
 
 export interface FormatInboxInput {
@@ -77,8 +77,8 @@ function renderAgentAtom(atom: AgentAtom): string {
       return `<error>${atom.message}</error>`
     case 'idle':
       return atom.reason && atom.reason !== 'stable'
-        ? `<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG} reason="${atom.reason}"/>\n</${END_TURN_TAG}>`
-        : TURN_CONTROL_IDLE
+        ? `<${YIELD_USER_TAG} reason="${atom.reason}"/>`
+        : YIELD_USER
   }
 }
 
@@ -201,6 +201,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
       else if (result.kind === 'interrupted') builder.pushText(formatInterrupted())
       else if (result.kind === 'error') builder.pushText(formatError(result.message))
       else if (result.kind === 'oneshot_liveness') builder.pushText(formatOneshotLiveness())
+      else if (result.kind === 'yield_worker_retrigger') builder.pushText(formatYieldWorkerRetrigger())
       else builder.pushText(formatNoop())
     }
     builder.pushText('\n</turn_result>\n')

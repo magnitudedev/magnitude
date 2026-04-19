@@ -1,12 +1,17 @@
+
 import { xmlActContent } from './content'
 import { xmlActFlush } from './flush'
-import { finishHandler } from './handlers/finish'
 import { messageHandler } from './handlers/message'
 import { lensHandler, thinkHandler } from './handlers/think'
 import { childHandler, toolHandler } from './handlers/tool'
+import { yieldHandler } from './handlers/yield'
 
-import { endTurnHandler } from './handlers/end-turn'
-import { TURN_CONTROL_FINISH_TAG, END_TURN_TAG } from '../constants'
+import {
+  YIELD_USER_TAG,
+  YIELD_TOOL_TAG,
+  YIELD_WORKER_TAG,
+  YIELD_PARENT_TAG,
+} from '../constants'
 import type { Format, TagHandler, TagMap, ToolDef, XmlActEvent, XmlActFrame } from './types'
 import { xmlActUnknownClose, xmlActUnknownOpen } from './unknown'
 
@@ -14,6 +19,7 @@ export function createXmlActFormat(
   tools: readonly ToolDef[],
   _defaultMessageDest: string,
   aliases?: ReadonlyMap<string, string>,
+  yieldTags?: ReadonlyArray<string>,
 ): {
   readonly format: Format<XmlActFrame, XmlActEvent>
   readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
@@ -36,9 +42,12 @@ export function createXmlActFormat(
   handlers.set('think', think)
   handlers.set('thinking', thinking)
   handlers.set('message', message)
-  handlers.set(TURN_CONTROL_FINISH_TAG, finishHandler())
 
-  handlers.set(END_TURN_TAG, endTurnHandler())
+  // Register yield handlers
+  handlers.set(YIELD_USER_TAG, yieldHandler('user'))
+  handlers.set(YIELD_TOOL_TAG, yieldHandler('tool'))
+  handlers.set(YIELD_WORKER_TAG, yieldHandler('worker'))
+  handlers.set(YIELD_PARENT_TAG, yieldHandler('parent'))
 
   for (const tool of tools) {
     // Skip tags that already have dedicated structural handlers
@@ -61,7 +70,9 @@ export function createXmlActFormat(
     messageTags.set('message', messageEntry)
   }
 
-  for (const tag of ['message', TURN_CONTROL_FINISH_TAG, END_TURN_TAG, 'think', 'thinking', 'lens']) {
+  // Build topLevelTags with yield tags instead of old end-turn/finish
+  const effectiveYieldTags = yieldTags ?? [YIELD_USER_TAG, YIELD_TOOL_TAG, YIELD_WORKER_TAG]
+  for (const tag of ['message', ...effectiveYieldTags, 'think', 'thinking', 'lens']) {
     const handler = handlers.get(tag)
     if (handler) topLevelTags.set(tag, handler)
   }
@@ -116,27 +127,30 @@ export function createXmlActFormat(
 export function createCurrentFormat(
   tools: readonly ToolDef[],
   defaultMessageDest = 'user',
+  yieldTags?: ReadonlyArray<string>,
 ): {
   readonly format: Format<XmlActFrame, XmlActEvent>
   readonly structuralTags: Map<string, TagHandler<XmlActFrame, XmlActEvent>>
   readonly tags: {
     readonly think: 'think'
     readonly message: 'message'
-    readonly continue: 'continue'
-    readonly idle: 'idle'
-    readonly finish: 'finish'
+    readonly yieldUser: 'yield-user'
+    readonly yieldTool: 'yield-tool'
+    readonly yieldWorker: 'yield-worker'
+    readonly yieldParent: 'yield-parent'
   }
 } {
-  const { format, structuralTags } = createXmlActFormat(tools, defaultMessageDest)
+  const { format, structuralTags } = createXmlActFormat(tools, defaultMessageDest, undefined, yieldTags)
   return {
     format,
     structuralTags,
     tags: {
       think: 'think',
       message: 'message',
-      continue: 'continue',
-      idle: 'idle',
-      finish: 'finish',
+      yieldUser: 'yield-user',
+      yieldTool: 'yield-tool',
+      yieldWorker: 'yield-worker',
+      yieldParent: 'yield-parent',
     },
   }
 }
@@ -162,6 +176,5 @@ export { xmlActUnknownOpen, xmlActUnknownClose } from './unknown'
 export { thinkHandler, lensHandler } from './handlers/think'
 export { messageHandler } from './handlers/message'
 export { toolHandler, childHandler } from './handlers/tool'
-
-export { finishHandler } from './handlers/finish'
+export { yieldHandler } from './handlers/yield'
 export { HANDLE, PASS } from './types'

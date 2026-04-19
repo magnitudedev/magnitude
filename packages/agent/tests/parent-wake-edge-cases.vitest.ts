@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect, Exit } from 'effect'
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { YIELD_USER } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../src/test-harness/harness'
 import { MockTurnScriptTag } from '../src/test-harness/turn-script'
 
@@ -15,10 +15,10 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: `<agent-create id="error-sub" type="explorer"><title>err</title><message>go</message></agent-create>\n${TURN_CONTROL_IDLE}`,
+              xml: `<agent-create id="error-sub" type="explorer"><title>err</title><message>go</message></agent-create>\n${YIELD_USER}`,
             }
           }
-          return { xml: TURN_CONTROL_IDLE }
+          return { xml: YIELD_USER }
         }
         // Subagent resolver throws -> triggers turn_unexpected_error
         throw new Error('simulated subagent crash')
@@ -61,13 +61,13 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: `<agent-create id="kill-sub" type="explorer"><title>will be killed</title><message>do work</message></agent-create>\n${TURN_CONTROL_IDLE}`,
+              xml: `<agent-create id="kill-sub" type="explorer"><title>will be killed</title><message>do work</message></agent-create>\n${YIELD_USER}`,
             }
           }
-          return { xml: TURN_CONTROL_IDLE }
+          return { xml: YIELD_USER }
         }
 
-        return { xml: `<message to="parent">subagent done</message>\n${TURN_CONTROL_IDLE}` }
+        return { xml: `<message to="parent">subagent done</message>\n${YIELD_USER}` }
       })
 
       yield* h.user('start killable subagent')

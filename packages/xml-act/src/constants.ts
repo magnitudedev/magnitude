@@ -1,14 +1,29 @@
-export const TURN_CONTROL_CONTINUE_TAG = 'continue'
-export const TURN_CONTROL_IDLE_TAG = 'idle'
-export const TURN_CONTROL_FINISH_TAG = 'finish'
-export const END_TURN_TAG = 'end-turn'
 
-export const TURN_CONTROL_CONTINUE = `<${END_TURN_TAG}>\n<${TURN_CONTROL_CONTINUE_TAG}/>\n</${END_TURN_TAG}>`
-export const TURN_CONTROL_IDLE = `<${END_TURN_TAG}>\n<${TURN_CONTROL_IDLE_TAG}/>\n</${END_TURN_TAG}>`
-export const TURN_CONTROL_FINISH = `<${TURN_CONTROL_FINISH_TAG}/>`
+// Yield tag constants (bare tag names)
+export const YIELD_USER_TAG = 'yield-user'
+export const YIELD_TOOL_TAG = 'yield-tool'
+export const YIELD_WORKER_TAG = 'yield-worker'
+export const YIELD_PARENT_TAG = 'yield-parent'
 
-export const END_TURN_STOP_SEQUENCE = `\n</${END_TURN_TAG}>`
+// Full XML strings (self-closing)
+export const YIELD_USER = `<${YIELD_USER_TAG}/>`
+export const YIELD_TOOL = `<${YIELD_TOOL_TAG}/>`
+export const YIELD_WORKER = `<${YIELD_WORKER_TAG}/>`
+export const YIELD_PARENT = `<${YIELD_PARENT_TAG}/>`
 
+// Stop sequences (one per yield tag)
+export const YIELD_USER_STOP = `<${YIELD_USER_TAG}/>`
+export const YIELD_TOOL_STOP = `<${YIELD_TOOL_TAG}/>`
+export const YIELD_WORKER_STOP = `<${YIELD_WORKER_TAG}/>`
+export const YIELD_PARENT_STOP = `<${YIELD_PARENT_TAG}/>`
+
+// Role-specific groupings
+export const LEAD_YIELD_STOP_SEQUENCES = [YIELD_USER_STOP, YIELD_TOOL_STOP, YIELD_WORKER_STOP] as const
+export const SUBAGENT_YIELD_STOP_SEQUENCES = [YIELD_PARENT_STOP, YIELD_TOOL_STOP] as const
+export const LEAD_YIELD_TAGS = [YIELD_USER_TAG, YIELD_TOOL_TAG, YIELD_WORKER_TAG] as const
+export const SUBAGENT_YIELD_TAGS = [YIELD_PARENT_TAG, YIELD_TOOL_TAG] as const
+
+// Other constants
 export const AGENT_CREATE_TAG = 'agent-create'
 export const TITLE_TAG = 'title'
 export const MESSAGE_TAG = 'message'

@@ -67,13 +67,13 @@ describe('GrammarBuilder', () => {
   it('GrammarBuilder.create(tools).build() produces default root rule', () => {
     const grammar = GrammarBuilder.create(tools).build()
 
-    expect(grammar).toContain('root ::= lens* (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens* (msg | tool)* yield')
   })
 
   it('withMinLenses(1) produces lens+ root (at least one lens required)', () => {
     const grammar = GrammarBuilder.create(tools).withMinLenses(1).build()
 
-    expect(grammar).toContain('root ::= lens+ (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens+ (msg | tool)* yield')
   })
 
   it('requireMessageTo("parent") produces forced-msg with capped lenses (default 6)', () => {
@@ -82,7 +82,7 @@ describe('GrammarBuilder', () => {
       .build()
 
     // Should have 6 optional lens-tight slots followed by forced message
-    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* yield')
     expect(grammar).toContain('forced-msg ::= "<message to=\\"parent\\">" msg-body "</message>" ws')
   })
 
@@ -93,7 +93,7 @@ describe('GrammarBuilder', () => {
       .build()
 
     // Should have exactly 3 optional lens-tight slots
-    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* yield')
     expect(grammar).not.toContain('lens-tight? lens-tight? lens-tight? lens-tight?')
   })
 
@@ -103,7 +103,7 @@ describe('GrammarBuilder', () => {
       .build()
 
     // Without forced message, should use unconstrained lens*
-    expect(grammar).toContain('root ::= lens* (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens* (msg | tool)* yield')
   })
 
   it('is immutable: modifying builder returns a new instance and leaves original unchanged', () => {
@@ -111,8 +111,8 @@ describe('GrammarBuilder', () => {
     const modified = original.withMinLenses(1)
 
     expect(original).not.toBe(modified)
-    expect(original.build()).toContain('root ::= lens* (msg | tool)* endturn')
-    expect(modified.build()).toContain('root ::= lens+ (msg | tool)* endturn')
+    expect(original.build()).toContain('root ::= lens* (msg | tool)* yield')
+    expect(modified.build()).toContain('root ::= lens+ (msg | tool)* yield')
   })
 
   it('is deterministic for the same config', () => {
@@ -135,7 +135,7 @@ describe('GrammarBuilder', () => {
       .build()
 
     // Lenses should flow directly into forced-msg with no intermediate rules
-    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* endturn')
+    expect(grammar).toContain('root ::= lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? lens-tight? forced-msg (msg | tool)* yield')
   })
 
   it('default grammar uses unbounded ws lens; forced-msg grammar uses lens-tight with ws-bounded', () => {
@@ -189,7 +189,7 @@ describe('GrammarBuilder', () => {
       .build()
 
     // After 2 lens slots, the model MUST proceed to forced-msg or tools
-    // The grammar allows: lens? lens? forced-msg (msg | tool)* endturn
+    // The grammar allows: lens? lens? forced-msg (msg | tool)* yield
     // Each lens? can be either a lens or empty, but after both slots, forced-msg is required
     expect(grammar).toContain('root ::= lens-tight? lens-tight? forced-msg')
   })

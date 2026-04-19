@@ -1935,7 +1935,7 @@ describe.skip('structural tag auto-close', () => {
     ])
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
     expect(parseEvents(events, 'ParseError')).toHaveLength(0)
   })
 
@@ -1946,7 +1946,7 @@ describe.skip('structural tag auto-close', () => {
     ])
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
     expect(parseEvents(events, 'ParseError')).toHaveLength(0)
   })
 
@@ -2063,7 +2063,7 @@ describe.skip('turn-control scoping across parser contexts', () => {
     const events = parseChunked(['<task id="t1"></task><idle/>'], ['read'])
     const tc = parseEvents(events, 'TurnControl')
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 
   test('turn control inside unclosed task with prior content remains passthrough', () => {
@@ -2120,10 +2120,10 @@ describe.skip('turn-control scoping across parser contexts', () => {
 
     const nextTc = parseEvents(nextEvents, 'TurnControl')
     expect(nextTc).toHaveLength(1)
-    expect(nextTc[0].decision).toBe('idle')
+    expect(nextTc[0].target).toBe('user')
 
     const yieldTc = parseEvents(yieldEvents, 'TurnControl')
     expect(yieldTc).toHaveLength(1)
-    expect(yieldTc[0].decision).toBe('idle')
+    expect(yieldTc[0].target).toBe('user')
   })
 })

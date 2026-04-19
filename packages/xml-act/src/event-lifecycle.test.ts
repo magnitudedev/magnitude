@@ -957,7 +957,7 @@ describe('pairing guarantee', () => {
 describe('TurnEnd', () => {
   test('aborts upstream on runaway content after TurnEnd', async () => {
     const runtime = createXmlRuntime(cfg([reg(readTool, 'read', readBinding)]))
-    const chunks = ['<end-turn>\n<idle/>\n</end-turn>', '<read path="late.ts"/>', 'trailing prose']
+    const chunks = ['<yield-user/>', '<read path="late.ts"/>', 'trailing prose']
     let nextCalls = 0
     const xmlStream = Stream.fromAsyncIterable(
       {
@@ -981,7 +981,7 @@ describe('TurnEnd', () => {
     expect(ends).toHaveLength(1)
     expect(events).toHaveLength(1)
     expect(events[0]._tag).toBe('TurnEnd')
-    // Runaway content after end-turn should abort — not drain all chunks
+    // Runaway content after yield should abort — not drain all chunks
     expect(nextCalls).toBeLessThan(chunks.length + 1)
     expect((ends[0].result as any).termination).toBe('runaway')
   })

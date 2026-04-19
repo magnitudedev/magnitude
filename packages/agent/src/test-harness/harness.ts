@@ -1,7 +1,7 @@
 import { Agent, type Projection, makeAmbientServiceLayer } from '@magnitudedev/event-core'
 import { defineCatalog } from '@magnitudedev/tools'
 import { Context, Effect, Layer, SubscriptionRef } from 'effect'
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { YIELD_USER } from '@magnitudedev/xml-act'
 import type { RoleDefinition } from '@magnitudedev/roles'
 import type { AgentCatalogEntry } from '../catalog'
 import type { AppEvent, SessionContext } from '../events'
@@ -477,7 +477,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           const resolver: MockTurnScriptResolver = ({ forkId }) => {
             if (forkId === null) return mapping.root
             const entry = Array.from(forksByAgent.entries()).find(([, id]) => id === forkId)
-            if (!entry || !mapping.subagents) return { xml: TURN_CONTROL_IDLE }
+            if (!entry || !mapping.subagents) return { xml: YIELD_USER }
 
             if ('xml' in mapping.subagents || 'xmlChunks' in mapping.subagents) {
               return mapping.subagents
@@ -485,7 +485,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
 
             const [agentId] = entry
             const perAgent = mapping.subagents as Record<string, MockTurnResponse>
-            return perAgent[agentId] ?? { xml: TURN_CONTROL_IDLE }
+            return perAgent[agentId] ?? { xml: YIELD_USER }
           }
 
           await client.runEffect(

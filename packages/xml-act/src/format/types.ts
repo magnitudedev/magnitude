@@ -94,19 +94,12 @@ export type XmlActFrame =
       readonly childIndex: number
       readonly tags: TagMap
     }
-  | { readonly type: 'body-capture'; readonly tag: string; readonly body: string; readonly tags: TagMap }
-  | { readonly type: 'end-turn'; readonly decision: 'continue' | 'idle' | null; readonly tags: TagMap }
+  | { readonly type: 'yield'; readonly target: 'user' | 'tool' | 'worker' | 'parent'; readonly tags: TagMap }
 
 export type StructuralParseErrorDetail =
   | { readonly _tag: 'UnclosedThink' }
 
-  | { readonly _tag: 'TurnControlConflict' }
-  | { readonly _tag: 'FinishWithoutEvidence' }
-
 export type UnclosedThinkDetail = Extract<StructuralParseErrorDetail, { _tag: 'UnclosedThink' }>
-
-export type FinishWithoutEvidenceDetail = Extract<StructuralParseErrorDetail, { _tag: 'FinishWithoutEvidence' }>
-export type TurnControlConflictDetail = Extract<StructuralParseErrorDetail, { _tag: 'TurnControlConflict' }>
 
 export type ParseErrorDetail = TagParseErrorDetail | StructuralParseErrorDetail
 
@@ -159,12 +152,7 @@ export type XmlActEvent =
     }
   | { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
   | { readonly _tag: 'MessageEnd'; readonly id: string }
-  | {
-      readonly _tag: 'TurnControl'
-      readonly decision: 'continue' | 'idle'
-      readonly termination: 'natural' | 'runaway'
-    }
-  | { readonly _tag: 'TurnControl'; readonly decision: 'finish'; readonly evidence: string; readonly termination: 'natural' | 'runaway' }
+  | { readonly _tag: 'TurnControl'; readonly target: 'user' | 'tool' | 'worker' | 'parent'; readonly termination: 'natural' | 'runaway' }
   | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
 export type ParseEvent = XmlActEvent

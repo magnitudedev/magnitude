@@ -168,28 +168,8 @@ describe('BUG 1: child-body fallthrough — structural tags inside tool child bo
   })
 })
 
-describe('BUG 2: body-capture fallthrough — structural tags inside finish body', () => {
-  it('structural tags inside finish body should be captured as text', () => {
-    const xml = `<finish>The task is done. Used <task id="t1"> and <shell> to complete it.</finish>`
-
-    const events = parse(xml)
-
-    const turnControl = events.find(
-      (e): e is Extract<ParseEvent, { _tag: 'TurnControl'; decision: 'finish' }> =>
-        e._tag === 'TurnControl' && e.decision === 'finish',
-    )
-    expect(turnControl).toBeDefined()
-    if (!turnControl) return
-    expect(turnControl.evidence).toContain('Used')
-    expect(turnControl.evidence).toContain('complete it')
-
-    const containerOpens = events.filter(e => e._tag === 'TagOpened')
-    expect(containerOpens).toHaveLength(0)
-
-    const toolOpens = events.filter(e => e._tag === 'TagOpened')
-    expect(toolOpens).toHaveLength(0)
-  })
-})
+// BUG 2: body-capture fallthrough tests removed — finish tag no longer supported
+// Yield tags are self-closing and don't have body capture
 
 describe('BUG 3: lenses with no active lens — structural tags after last lens', () => {
   it.skip('auto-closes lenses and handles structural tags normally', () => {

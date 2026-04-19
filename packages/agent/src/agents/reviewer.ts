@@ -6,7 +6,7 @@
  * Can write within workspace for notes/reports; cannot write project files.
  */
 
-import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, observe, idle, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import reviewerPromptRaw from './prompts/reviewer.txt' with { type: 'text' }
@@ -80,7 +80,7 @@ export const reviewerRole = defineRole<typeof tools, 'reviewer', PolicyContext>(
 
   turn: {
     decide(turnCtx) {
-      if (turnCtx.cancelled) return finish()
+      if (turnCtx.cancelled) return idle()
       if (turnCtx.error) return observe()
       if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
 

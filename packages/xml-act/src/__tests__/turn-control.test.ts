@@ -1,13 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
+import { YIELD_USER, YIELD_TOOL, YIELD_WORKER, YIELD_PARENT, SUBAGENT_YIELD_TAGS } from '../constants'
 
-const TURN_CONTROL_FINISH = 'finish'
-const END_TURN_IDLE = '<end-turn>\n<idle/>\n</end-turn>'
-const END_TURN_CONTINUE = '<end-turn>\n<continue/>\n</end-turn>'
 const actionsTagOpen = () => ''
 const actionsTagClose = () => ''
-const thinkTagOpen = () => '<think>'
+const thinkTagOpen = () => '<think name="test">'
 const thinkTagClose = () => '</think>'
 const commsTagOpen = () => ''
 const commsTagClose = () => ''
@@ -37,99 +35,106 @@ function parseErrors(events: ParseEvent[]) {
 }
 
 // =============================================================================
-// Basic turn control parsing
+// Basic yield tag parsing
 // =============================================================================
 
-describe('basic turn control', () => {
-  it('end-turn with idle emits idle decision', () => {
-    const events = parse(END_TURN_IDLE)
+describe('basic yield control', () => {
+  it('yield-user emits target user', () => {
+    const events = parse(YIELD_USER)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 
-  it('end-turn with continue emits continue decision', () => {
-    const events = parse(END_TURN_CONTINUE)
+  it('yield-tool emits target tool', () => {
+    const events = parse(YIELD_TOOL)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('continue')
+    expect(tc[0].target).toBe('tool')
   })
 
-  it('<finish/> without evidence emits ParseError', () => {
-    const events = parse(`<${TURN_CONTROL_FINISH}/>`)
-    const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
-    const errors = parseErrors(events)
-    expect(errors).toHaveLength(1)
-    expect(errors[0].error._tag).toBe('FinishWithoutEvidence')
-  })
-
-  it('<finish>evidence</finish> emits finish with evidence', () => {
-    const events = parse(`<${TURN_CONTROL_FINISH}>task verified</${TURN_CONTROL_FINISH}>`)
+  it('yield-worker emits target worker', () => {
+    const events = parse(YIELD_WORKER)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
-    expect((tc[0] as any).evidence).toBe('task verified')
+    expect(tc[0].target).toBe('worker')
   })
 
-  it('end-turn with idle char-by-char', () => {
-    const events = parseCharByChar(END_TURN_IDLE)
+  it('yield-parent emits target parent (with subagent yield tags)', () => {
+    const parser = createStreamingXmlParser(knownTags, childTagMap, undefined, undefined, undefined, SUBAGENT_YIELD_TAGS)
+    const events = [...parser.processChunk(YIELD_PARENT), ...parser.flush()]
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('parent')
   })
 
-  it('end-turn with continue char-by-char', () => {
-    const events = parseCharByChar(END_TURN_CONTINUE)
+  it('yield-user char-by-char', () => {
+    const events = parseCharByChar(YIELD_USER)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('continue')
+    expect(tc[0].target).toBe('user')
   })
 
-  it('<finish>evidence</finish> char-by-char', () => {
-    const events = parseCharByChar(`<${TURN_CONTROL_FINISH}>all tests pass</${TURN_CONTROL_FINISH}>`)
+  it('yield-tool char-by-char', () => {
+    const events = parseCharByChar(YIELD_TOOL)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
-    expect((tc[0] as any).evidence).toBe('all tests pass')
+    expect(tc[0].target).toBe('tool')
+  })
+
+  it('yield-worker char-by-char', () => {
+    const events = parseCharByChar(YIELD_WORKER)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].target).toBe('worker')
+  })
+
+  it('yield-parent char-by-char (with subagent yield tags)', () => {
+    const parser = createStreamingXmlParser(knownTags, childTagMap, undefined, undefined, undefined, SUBAGENT_YIELD_TAGS)
+    const events: ParseEvent[] = []
+    for (const ch of YIELD_PARENT) events.push(...parser.processChunk(ch))
+    events.push(...parser.flush())
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].target).toBe('parent')
   })
 })
 
 // =============================================================================
-// Turn control after other blocks
+// Yield control after other blocks
 // =============================================================================
 
-describe('turn control after content blocks', () => {
+describe('yield control after content blocks', () => {
   it('after think block', () => {
-    const xml = `${thinkTagOpen()}planning\n${thinkTagClose()}\n${END_TURN_IDLE}`
+    const xml = `${thinkTagOpen()}planning\n${thinkTagClose()}\n${YIELD_USER}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 
   it('after actions block', () => {
-    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${END_TURN_IDLE}`
+    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${YIELD_USER}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 
-  it('after actions block with <finish>evidence</finish>', () => {
-    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n<${TURN_CONTROL_FINISH}>verified</${TURN_CONTROL_FINISH}>`
+  it('after actions block with yield-tool', () => {
+    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${YIELD_TOOL}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
+    expect(tc[0].target).toBe('tool')
   })
 
   it('after comms block', () => {
-    const xml = `${commsTagOpen()}\n<message>hello</message>\n${commsTagClose()}\n${END_TURN_IDLE}`
+    const xml = `${commsTagOpen()}\n<message>hello</message>\n${commsTagClose()}\n${YIELD_USER}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 
   it('after think + comms + actions', () => {
@@ -137,12 +142,12 @@ describe('turn control after content blocks', () => {
       `${thinkTagOpen()}plan\n${thinkTagClose()}`,
       `${commsTagOpen()}\n<message>hi</message>\n${commsTagClose()}`,
       `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}`,
-      END_TURN_IDLE,
+      YIELD_USER,
     ].join('\n')
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 
   it('after think + comms + actions (char-by-char)', () => {
@@ -150,12 +155,12 @@ describe('turn control after content blocks', () => {
       `${thinkTagOpen()}plan\n${thinkTagClose()}`,
       `${commsTagOpen()}\n<message>hi</message>\n${commsTagClose()}`,
       `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}`,
-      END_TURN_IDLE,
+      YIELD_USER,
     ].join('\n')
     const events = parseCharByChar(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
   })
 })
 
@@ -163,95 +168,60 @@ describe('turn control after content blocks', () => {
 // Duplicate tags — first wins, rest silently ignored
 // =============================================================================
 
-describe('duplicate turn control tags', () => {
-  it('duplicate end-turn idle — only one TurnControl event', () => {
-    const xml = `${END_TURN_IDLE}\n${END_TURN_IDLE}`
+describe('duplicate yield control tags', () => {
+  it('duplicate yield-user — only one TurnControl event', () => {
+    const xml = `${YIELD_USER}\n${YIELD_USER}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
     expect(parseErrors(events)).toHaveLength(0)
   })
 
-  it('duplicate <finish/> — emits ParseError, no TurnControl', () => {
-    const xml = `<${TURN_CONTROL_FINISH}/>\n<${TURN_CONTROL_FINISH}/>`
-    const events = parse(xml)
-    const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
-    const errors = parseErrors(events)
-    expect(errors.some(e => e.error._tag === 'FinishWithoutEvidence')).toBe(true)
-  })
-
-  it('end-turn idle then end-turn idle — first wins', () => {
-    const xml = `${END_TURN_IDLE}\n${END_TURN_IDLE}`
+  it('duplicate yield-tool — only one TurnControl event', () => {
+    const xml = `${YIELD_TOOL}\n${YIELD_TOOL}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('tool')
     expect(parseErrors(events)).toHaveLength(0)
   })
 
-  it('<finish/> then end-turn idle — finish errors, idle wins', () => {
-    const xml = `<${TURN_CONTROL_FINISH}/>\n${END_TURN_IDLE}`
-    const events = parse(xml)
-    const errors = parseErrors(events)
-    expect(errors.some(e => e.error._tag === 'FinishWithoutEvidence')).toBe(true)
-  })
-
-  it('end-turn idle then <finish/> — first wins', () => {
-    const xml = `${END_TURN_IDLE}\n<${TURN_CONTROL_FINISH}/>`
+  it('yield-user then yield-tool — first wins', () => {
+    const xml = `${YIELD_USER}\n${YIELD_TOOL}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('user')
     expect(parseErrors(events)).toHaveLength(0)
   })
 
-  it('three end-turn idle tags — first wins', () => {
-    const xml = `${END_TURN_IDLE}\n${END_TURN_IDLE}\n${END_TURN_IDLE}`
+  it('yield-tool then yield-user — first wins', () => {
+    const xml = `${YIELD_TOOL}\n${YIELD_USER}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('idle')
+    expect(tc[0].target).toBe('tool')
+    expect(parseErrors(events)).toHaveLength(0)
+  })
+
+  it('three yield-user tags — first wins', () => {
+    const xml = `${YIELD_USER}\n${YIELD_USER}\n${YIELD_USER}`
+    const events = parse(xml)
+    const tc = turnControls(events)
+    expect(tc).toHaveLength(1)
+    expect(tc[0].target).toBe('user')
     expect(parseErrors(events)).toHaveLength(0)
   })
 })
 
 // =============================================================================
-// Turn control inside structural blocks auto-closes the block
+// Content after yield control is ignored
 // =============================================================================
 
-describe.skip('turn control inside blocks is passthrough and not recognized', () => {
-  it('inside actions block — no turn control is emitted', () => {
-    const xml = `${actionsTagOpen()}\n${END_TURN_IDLE}\n${actionsTagClose()}`
-    const events = parse(xml)
-    const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
-  })
-
-  it('inside comms block — no turn control is emitted', () => {
-    const xml = `${commsTagOpen()}\n${END_TURN_IDLE}\n${commsTagClose()}`
-    const events = parse(xml)
-    const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
-  })
-
-  it('inside actions block with <finish>evidence</finish> is ignored in task scope', () => {
-    const xml = `${actionsTagOpen()}\n<${TURN_CONTROL_FINISH}>verified</${TURN_CONTROL_FINISH}>\n${actionsTagClose()}`
-    const events = parse(xml)
-    const tc = turnControls(events)
-    expect(tc).toHaveLength(0)
-    expect(parseErrors(events)).toHaveLength(0)
-  })
-})
-
-// =============================================================================
-// Content after turn control is ignored
-// =============================================================================
-
-describe('content after turn control is dropped', () => {
-  it('tool calls after end-turn idle are not parsed', () => {
-    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${END_TURN_IDLE}\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
+describe('content after yield control is dropped', () => {
+  it('tool calls after yield-user are not parsed', () => {
+    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${YIELD_USER}\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -259,8 +229,8 @@ describe('content after turn control is dropped', () => {
     expect(tagCloseds).toHaveLength(1) // only the first shell
   })
 
-  it('tool calls after end-turn idle are not parsed (char-by-char)', () => {
-    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${END_TURN_IDLE}\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
+  it('tool calls after yield-user are not parsed (char-by-char)', () => {
+    const xml = `${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}\n${YIELD_USER}\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
     const events = parseCharByChar(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -268,8 +238,8 @@ describe('content after turn control is dropped', () => {
     expect(tagCloseds).toHaveLength(1)
   })
 
-  it('prose after end-turn idle is not emitted', () => {
-    const xml = `${END_TURN_IDLE}\nsome trailing text`
+  it('prose after yield-user is not emitted', () => {
+    const xml = `${YIELD_USER}\nsome trailing text`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -277,18 +247,18 @@ describe('content after turn control is dropped', () => {
     expect(prose).toHaveLength(0)
   })
 
-  it('content after <finish>evidence</finish> is dropped', () => {
-    const xml = `<${TURN_CONTROL_FINISH}>done</${TURN_CONTROL_FINISH}>\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
+  it('content after yield-tool is dropped', () => {
+    const xml = `${YIELD_TOOL}\n${actionsTagOpen()}\n<shell>rm -rf /</shell>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
-    expect(tc[0].decision).toBe('finish')
+    expect(tc[0].target).toBe('tool')
     const tagCloseds = events.filter(e => e._tag === 'TagClosed')
     expect(tagCloseds).toHaveLength(0)
   })
 
-  it('no unclosed errors from content after turn control', () => {
-    const xml = `${END_TURN_IDLE}\n${actionsTagOpen()}\n<shell>orphaned`
+  it('no unclosed errors from content after yield control', () => {
+    const xml = `${YIELD_USER}\n${actionsTagOpen()}\n<shell>orphaned`
     const events = parse(xml)
     const tc = turnControls(events)
     expect(tc).toHaveLength(1)
@@ -297,11 +267,11 @@ describe('content after turn control is dropped', () => {
 })
 
 // =============================================================================
-// No turn control tag
+// No yield control tag
 // =============================================================================
 
-describe('missing turn control', () => {
-  it('no turn control tag emits no TurnControl event', () => {
+describe('missing yield control', () => {
+  it('no yield control tag emits no TurnControl event', () => {
     const xml = `${thinkTagOpen()}plan\n${thinkTagClose()}\n${actionsTagOpen()}\n<shell>ls</shell>\n${actionsTagClose()}`
     const events = parse(xml)
     const tc = turnControls(events)

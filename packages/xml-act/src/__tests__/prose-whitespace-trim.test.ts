@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createStreamingXmlParser } from '../parser'
 import type { ParseEvent } from '../format/types'
-import { TURN_CONTROL_IDLE } from '../constants'
+import { YIELD_USER } from '../constants'
 
 const TASK_OPEN = '<task id="t2">'
 const TASK_CLOSE = '</task>'
@@ -28,7 +28,7 @@ describe('prose whitespace trimming', () => {
       '\n<message>Hey!</message>\n',
       TASK_CLOSE,
       '\n',
-      TURN_CONTROL_IDLE,
+      YIELD_USER,
     ].join('')
 
     const events = parse(xml)
@@ -49,7 +49,7 @@ describe('prose whitespace trimming', () => {
       '\n<message>Hey!</message>\n',
       TASK_CLOSE,
       '\n',
-      TURN_CONTROL_IDLE,
+      YIELD_USER,
     ].join('')
 
     const events = parse(xml)
@@ -77,7 +77,7 @@ describe('prose whitespace trimming', () => {
     const chunks = [
       '<lens name="turn">planning</lens>\n',
       '\n' + TASK_OPEN + '\n<message>Hey Anders! What can',
-      ' I help you with?</message>\n' + TASK_CLOSE + '\n' + TURN_CONTROL_IDLE,
+      ' I help you with?</message>\n' + TASK_CLOSE + '\n' + YIELD_USER,
     ]
 
     const events = parseChunks(chunks)

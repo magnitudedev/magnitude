@@ -177,7 +177,7 @@ export interface TurnCompleted {
   readonly modelId: string | null
 }
 
-export type TurnDecision = 'continue' | 'idle' | 'finish'
+export type TurnDecision = 'continue' | 'idle'
 
 export type TurnResultErrorCode =
   | 'unclosed_think'
@@ -196,13 +196,7 @@ export type TurnResult =
       readonly turnDecision: 'continue' | 'idle'
       readonly errors?: readonly TurnResultError[]
       readonly oneshotLivenessTriggered?: boolean
-    }
-  | {
-      readonly success: true
-      readonly turnDecision: 'finish'
-      readonly evidence: string
-      readonly errors?: readonly TurnResultError[]
-      readonly oneshotLivenessTriggered?: boolean
+      readonly yieldWorkerRetriggered?: boolean
     }
   | { readonly success: false; readonly error: string; readonly cancelled: boolean }
 

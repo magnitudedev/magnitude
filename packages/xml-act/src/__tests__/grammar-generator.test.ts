@@ -134,8 +134,8 @@ describe('generateGrammar', () => {
     expect(grammar).toContain('root ::= lens* (msg | tool)*')
     expect(grammar).toContain('lens ::= "<lens name=\\"" lensname "\\">"')
     expect(grammar).toContain('msg ::= "<message to=\\""')
-    expect(grammar).toContain('endturn ::=')
-    expect(grammar).toContain('"<idle/>" | "<continue/>"')
+    expect(grammar).toContain('yield ::=')
+    expect(grammar).toContain('"<yield-user/>" | "<yield-tool/>" | "<yield-worker/>"')
   })
 
   it('generates tool alternation from multiple tools', () => {

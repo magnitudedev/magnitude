@@ -12,6 +12,4 @@ export function idle(reminder: string | null = null): TurnResult {
   return reminder ? { action: 'idle', reminder } : { action: 'idle' }
 }
 
-export function finish(reminder: string | null = null): TurnResult {
-  return reminder ? { action: 'finish', reminder } : { action: 'finish' }
-}
+

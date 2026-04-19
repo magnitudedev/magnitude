@@ -69,15 +69,8 @@ export function xmlActFlush(stack: ReadonlyArray<XmlActFrame>): Fx[] {
         suppressToolBodyForId = frame.parentToolId
         ops.push(pop)
         break
-      case 'body-capture':
-        ops.push(emit({ _tag: 'TurnControl', decision: 'finish', evidence: frame.body.trim(), termination: 'natural' }))
-        ops.push(done)
-        break
-      case 'end-turn':
-        ops.push(emit({ _tag: 'TurnControl', decision: frame.decision ?? 'idle', termination: 'natural' }))
-        ops.push(done)
-        ops.push(pop)
-        break
+      // Note: yield tags are self-closing and emit TurnControl + done immediately
+      // No frame is pushed for yield, so no flush case needed
     }
   }
   return ops

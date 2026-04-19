@@ -5,7 +5,7 @@
  * Workers can activate skills via the `<skill>` tool when they need methodology guidance.
  */
 
-import { defineRole, observe, idle, finish, defineThinkingLens } from '@magnitudedev/roles'
+import { defineRole, observe, idle, defineThinkingLens } from '@magnitudedev/roles'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import workerPromptRaw from './prompts/worker.txt' with { type: 'text' }
@@ -59,7 +59,7 @@ export const workerRole = defineRole<typeof tools, 'worker', PolicyContext>({
 
   turn: {
     decide(turnCtx) {
-      if (turnCtx.cancelled) return finish()
+      if (turnCtx.cancelled) return idle()
       if (turnCtx.error) return observe()
       if (turnCtx.toolsCalled.length === 0 && turnCtx.messagesSent.some(m => m.taskId === null)) return idle()
       return observe()

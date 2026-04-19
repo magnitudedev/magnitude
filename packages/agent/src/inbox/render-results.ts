@@ -5,7 +5,7 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { YIELD_USER } from '@magnitudedev/xml-act'
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
@@ -83,10 +83,15 @@ export function formatError(message: string): string {
 
 /** Noop turn — agent continued without taking any task/tool operations */
 export function formatNoop(): string {
-  return `<noop>No actions were taken. Use ${TURN_CONTROL_IDLE} if you have nothing more to do.</noop>`
+  return `<noop>No actions were taken. Use ${YIELD_USER} if you have nothing more to do.</noop>`
 }
 
 /** Oneshot liveness reminder rendered as result feedback */
 export function formatOneshotLiveness(): string {
   return `<error>${ONESHOT_LIVENESS_REMINDER}</error>`
+}
+
+/** Yield worker retrigger reminder — lead yielded to workers but none are active */
+export function formatYieldWorkerRetrigger(): string {
+  return `<error>You yielded to workers with <yield-worker/> but no workers are currently active. Check your task assignments or continue working.</error>`
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
-import { TURN_CONTROL_IDLE } from '@magnitudedev/xml-act'
+import { YIELD_USER } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../src/test-harness/harness'
 import { IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from '../src/execution/execution-manager'
 
@@ -8,7 +8,7 @@ describe('turn lifecycle', () => {
   it.live('Single turn with yield', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: `<message to="user">hi</message>\n${TURN_CONTROL_IDLE}` })
+      yield* h.script.next({ xml: `<message to="user">hi</message>\n${YIELD_USER}` })
 
       yield* h.user('hello')
       const completed = yield* h.wait.turnCompleted(null)
@@ -24,7 +24,7 @@ describe('turn lifecycle', () => {
   it.live('Single turn with next', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: `<message to="user">first</message>\n${TURN_CONTROL_IDLE}` })
+      yield* h.script.next({ xml: `<message to="user">first</message>\n${YIELD_USER}` })
 
       yield* h.user('run')
       const completed = yield* h.wait.turnCompleted(null)
@@ -38,11 +38,11 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      yield* h.script.next({ xml: `<message to="user">response 1</message>\n${TURN_CONTROL_IDLE}` })
+      yield* h.script.next({ xml: `<message to="user">response 1</message>\n${YIELD_USER}` })
       yield* h.user('message 1')
       const first = yield* h.wait.turnCompleted(null)
 
-      yield* h.script.next({ xml: `<message to="user">response 2</message>\n${TURN_CONTROL_IDLE}` })
+      yield* h.script.next({ xml: `<message to="user">response 2</message>\n${YIELD_USER}` })
       yield* h.user('message 2')
       const second = yield* h.wait.event(
         'turn_completed',
@@ -77,7 +77,7 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.script.next({ xml: '' })
-      yield* h.script.next({ xml: TURN_CONTROL_IDLE })
+      yield* h.script.next({ xml: YIELD_USER })
 
       yield* h.user('trigger empty response')
       const first = yield* h.wait.turnCompleted(null)
@@ -112,7 +112,7 @@ describe('turn lifecycle', () => {
         timestamp: Date.now(),
       })
 
-      yield* h.script.next({ xml: `<message to="${taskId}">hello</message>\n${TURN_CONTROL_IDLE}` })
+      yield* h.script.next({ xml: `<message to="${taskId}">hello</message>\n${YIELD_USER}` })
 
       yield* h.user('trigger workerless task message')
       const completed = yield* h.wait.turnCompleted(null)
@@ -181,7 +181,7 @@ describe('turn lifecycle', () => {
       yield* h.script.next({ xml: a })
       yield* h.script.next({ xml: b })
       yield* h.script.next({ xml: a })
-      yield* h.script.next({ xml: TURN_CONTROL_IDLE })
+      yield* h.script.next({ xml: YIELD_USER })
 
       yield* h.user('trigger reset on different response sequence')
 
@@ -219,12 +219,12 @@ describe('turn lifecycle', () => {
       const h = yield* TestHarness
 
       const a = '<read>foo</read>'
-      const idleWithMessage = `<message to="user">boundary</message>\n${TURN_CONTROL_IDLE}`
+      const idleWithMessage = `<message to="user">boundary</message>\n${YIELD_USER}`
       yield* h.script.next({ xml: a })                 // continue
       yield* h.script.next({ xml: a })                 // continue
       yield* h.script.next({ xml: idleWithMessage })   // idle boundary (reset)
       yield* h.script.next({ xml: a })                 // continue after reset
-      yield* h.script.next({ xml: TURN_CONTROL_IDLE })              // stop
+      yield* h.script.next({ xml: YIELD_USER })              // stop
 
       yield* h.user('trigger reset on idle boundary sequence')
 

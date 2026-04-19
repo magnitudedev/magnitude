@@ -77,10 +77,8 @@ export function xmlActContent(frame: XmlActFrame, text: string): Fx[] {
           text,
         }),
       ]
-    case 'body-capture':
-      return [replace({ ...frame, body: frame.body + text })]
-    case 'end-turn':
-      // Whitespace/content inside <end-turn> is ignored (only <idle/> and <continue/> matter)
+    case 'yield':
+      // Yield is self-closing, no content expected
       return []
   }
 }

@@ -673,9 +673,7 @@ function reactImpl(
       case 'TurnControl': {
         currentState = yield* emitAndFold(currentState, {
           _tag: 'TurnEnd',
-          result: parseEvent.decision === 'finish'
-            ? { _tag: 'Success', turnControl: 'finish', evidence: parseEvent.evidence, termination: parseEvent.termination }
-            : { _tag: 'Success', turnControl: parseEvent.decision, termination: parseEvent.termination },
+          result: { _tag: 'Success', turnControl: { target: parseEvent.target }, termination: parseEvent.termination },
         })
         break
       }
@@ -691,13 +689,7 @@ function reactImpl(
           break
         }
 
-        if (error._tag === 'TurnControlConflict' || error._tag === 'FinishWithoutEvidence') {
-          currentState = yield* emitAndFold(currentState, {
-            _tag: 'StructuralParseError',
-            error,
-          })
-          break
-        }
+        // Other parse errors are handled by the default case below
 
         if (currentState.deadToolCalls.has(error.id)) break
         if (hasPriorOutcome(priorOutcomes, error.id)) break

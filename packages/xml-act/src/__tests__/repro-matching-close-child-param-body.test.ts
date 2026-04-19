@@ -4,9 +4,7 @@ import type { ParseEvent } from '../format/types'
 import {
   AGENT_CREATE_OPEN_PREFIX,
   AGENT_CREATE_TAG,
-
-  TURN_CONTROL_FINISH,
-  TURN_CONTROL_IDLE,
+  YIELD_USER,
   xmlClose,
   xmlOpen,
 } from '../constants'
@@ -83,7 +81,7 @@ function runActiveChildCase(tc: ToolCase, activeChild: string, interferingText: 
     xmlClose(activeChild),
     xmlClose(tc.toolTag),
     TASK_A_CLOSE,
-    TURN_CONTROL_IDLE,
+    YIELD_USER,
   ].join('\n')
 
   const events = parse(xml)
@@ -107,8 +105,7 @@ describe('repro matrix: active child-body passthrough (multi-tool, multi-child, 
         { name: 'TASK_B_CLOSE raw', text: TASK_B_CLOSE },
         { name: 'LENS_OPEN raw', text: '<lens name="x">' },
         { name: 'LENS_CLOSE raw', text: '</lens>' },
-        { name: 'TURN_CONTROL_IDLE raw', text: TURN_CONTROL_IDLE },
-        { name: 'TURN_CONTROL_FINISH raw', text: TURN_CONTROL_FINISH },
+        { name: 'YIELD_USER raw', text: YIELD_USER },
         { name: 'same-child open text raw', text: xmlOpen(activeChild, { nested: '1' }) },
         { name: 'sibling-child open text raw', text: xmlOpen(siblingChild, { s: '1' }) },
         { name: 'sibling-child close text raw', text: xmlClose(siblingChild) },
@@ -154,7 +151,7 @@ describe('RED matrix: multiline tool opens should parse structurally across tool
         `${xmlOpen(childB)}b${xmlClose(childB)}`,
         xmlClose(tc.toolTag),
         TASK_A_CLOSE,
-        TURN_CONTROL_IDLE,
+        YIELD_USER,
       ].join('\n')
 
       const events = parse(xml)
@@ -181,7 +178,7 @@ describe('RED matrix: missing matching child close emits only child-root-cause e
           TASK_A_CLOSE,
           TASK_B_OPEN,
           '<lens name="q">x</lens>',
-          TURN_CONTROL_IDLE,
+          YIELD_USER,
         ].join('\n')
 
         const errs = parseErrors(parse(xml)).map(e => e.error._tag)

@@ -11,10 +11,13 @@ export const defaultIdGenerator: IdGenerator = createId
 
 type ObserveOutcome = 'pending' | 'runaway'
 
-class PostTurnEndObserver {
+/**
+ * Observer for content after a yield tag.
+ * Since yield tags are self-closing and the stop sequence halts generation,
+ * any non-whitespace content after yield indicates a runaway.
+ */
+class PostYieldObserver {
   private buffer = ''
-  private consumedOptionalClosing = false
-  private static readonly EXTRA_CLOSE = '</end-turn>'
 
   feed(chunk: string): ObserveOutcome {
     this.buffer += chunk
@@ -27,41 +30,29 @@ class PostTurnEndObserver {
   }
 
   private process(isEof: boolean): ObserveOutcome {
-    while (true) {
-      const trimmedLeading = this.buffer.replace(/^\s+/u, '')
-      if (trimmedLeading !== this.buffer) {
-        this.buffer = trimmedLeading
-      }
-
-      if (this.buffer.length === 0) return 'pending'
-
-      if (!this.consumedOptionalClosing) {
-        const close = PostTurnEndObserver.EXTRA_CLOSE
-        if (this.buffer.startsWith(close)) {
-          this.buffer = this.buffer.slice(close.length)
-          this.consumedOptionalClosing = true
-          continue
-        }
-
-        if (close.startsWith(this.buffer)) {
-          return isEof ? 'runaway' : 'pending'
-        }
-      }
-
-      return 'runaway'
+    // Trim leading whitespace
+    const trimmedLeading = this.buffer.replace(/^\s+/u, '')
+    if (trimmedLeading !== this.buffer) {
+      this.buffer = trimmedLeading
     }
+
+    if (this.buffer.length === 0) return 'pending'
+
+    // Any non-whitespace content after yield is a runaway
+    return 'runaway'
   }
 }
 
 function isTurnControlEvent(event: unknown): event is {
   _tag: 'TurnControl'
-  decision: 'continue' | 'idle'
+  target: 'user' | 'tool' | 'worker' | 'parent'
   termination: 'natural' | 'runaway'
 } {
   if (!event || typeof event !== 'object') return false
-  const candidate = event as { _tag?: unknown; decision?: unknown }
+  const candidate = event as { _tag?: unknown; target?: unknown }
   return candidate._tag === 'TurnControl'
-    && (candidate.decision === 'continue' || candidate.decision === 'idle')
+    && typeof candidate.target === 'string'
+    && ['user', 'tool', 'worker', 'parent'].includes(candidate.target)
 }
 
 export interface StreamingParser {
@@ -127,7 +118,7 @@ export function createParser<F extends { readonly type: string }, E>(config: {
 
   const machine = createStackMachine<F, E>(config.initialFrame, onEvent)
   let deferredTurnControl: E | null = null
-  let observer: PostTurnEndObserver | null = null
+  let observer: PostYieldObserver | null = null
 
   const emitDeferredTurnControl = (termination: 'natural' | 'runaway') => {
     if (!deferredTurnControl || !isTurnControlEvent(deferredTurnControl)) return
@@ -144,7 +135,7 @@ export function createParser<F extends { readonly type: string }, E>(config: {
     const batch = activeBatch
     activeBatch = null
 
-    if (machine.mode === 'observing' && !observer) observer = new PostTurnEndObserver()
+    if (machine.mode === 'observing' && !observer) observer = new PostYieldObserver()
 
     if (machine.mode === 'observing' && !deferredTurnControl) {
       for (let i = batch.length - 1; i >= 0; i--) {
@@ -292,6 +283,7 @@ export function createStreamingXmlParser(
   tagSchemas?: ReadonlyMap<string, TagSchema>,
   generateId?: () => string,
   defaultMessageDest?: string,
+  yieldTags?: ReadonlyArray<string>,
 ): StreamingParser {
   const tools: ToolDef[] = [...(knownTags ?? [])].map((tag) => ({
     tag,
@@ -299,7 +291,7 @@ export function createStreamingXmlParser(
     schema: tagSchemas?.get(tag),
   }))
 
-  const { format, structuralTags } = createCurrentFormat(tools, defaultMessageDest)
+  const { format, structuralTags } = createCurrentFormat(tools, defaultMessageDest, yieldTags)
 
   let emittedTurnControl = false
 

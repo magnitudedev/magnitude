@@ -808,26 +808,28 @@ const makeExecutionManager = Effect.gen(function* () {
                     // Empty LLM response (no messages/tools/think/lens output).
                     // Always retrigger so memory-injected corrective feedback is visible next turn.
                     executionResult = { success: true, turnDecision: 'continue' }
-                  } else if (endResult.turnControl === 'finish') {
-                    executionResult = { success: true, turnDecision: 'finish', evidence: endResult.evidence }
                   } else {
-                    const resolvedTurnControl = endResult.turnControl ?? 'continue'
-                    if (resolvedTurnControl === 'idle') {
-                      executionResult = { success: true, turnDecision: 'idle' }
-                    } else {
+                    // Map yield target to turn decision
+                    // yield-tool → continue (wait for tool results)
+                    // yield-user, yield-worker, yield-parent → idle
+                    const target = endResult.turnControl?.target ?? null
+                    if (target === 'tool') {
                       executionResult = { success: true, turnDecision: 'continue' }
+                    } else {
+                      // user, worker, parent, or null → idle
+                      executionResult = { success: true, turnDecision: 'idle' }
                     }
-                    const policyCtx = yield* policyCtxProvider.get
-                    const turnResult = agentDef.getTurn({
-                      toolsCalled: toolsCalledKeys,
-                      lastTool: lastToolKey,
-                      messagesSent,
-                      state: policyCtx,
-                    })
-                    if (endResult.turnControl === null) {
-                      if (turnResult.action === 'finish') {
-                        executionResult = { success: true, turnDecision: 'finish', evidence: '' }
-                      } else if (turnResult.action === 'continue') {
+
+                    // Apply turn policy when no explicit yield (null case)
+                    if (target === null) {
+                      const policyCtx = yield* policyCtxProvider.get
+                      const turnResult = agentDef.getTurn({
+                        toolsCalled: toolsCalledKeys,
+                        lastTool: lastToolKey,
+                        messagesSent,
+                        state: policyCtx,
+                      })
+                      if (turnResult.action === 'continue') {
                         executionResult = { success: true, turnDecision: 'continue' }
                       } else {
                         executionResult = { success: true, turnDecision: 'idle' }
@@ -873,6 +875,18 @@ const makeExecutionManager = Effect.gen(function* () {
                   }
                 } else {
                   identicalContinueTracker.delete(forkId)
+                }
+
+                // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
+                if (executionResult.success && executionResult.turnDecision === 'idle' && endResult.turnControl?.target === 'worker') {
+                  const pCtx = yield* policyCtxProvider.get
+                  if (pCtx.activeAgentCount === 0) {
+                    executionResult = {
+                      success: true,
+                      turnDecision: 'continue',
+                      yieldWorkerRetriggered: true,
+                    }
+                  }
                 }
 
                 // Oneshot liveness guard: prevent stalling when nothing is active

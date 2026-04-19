@@ -4,7 +4,7 @@
  * Usage: bun run packages/agent/scripts/generate-lead-grammar.ts
  */
 
-import { GrammarBuilder, type GrammarToolDef } from '@magnitudedev/xml-act'
+import { GrammarBuilder, type GrammarToolDef, LEAD_YIELD_TAGS } from '@magnitudedev/xml-act'
 import type { AgentCatalogEntry } from '../src/catalog'
 import { leadTools } from '../src/agents/lead-shared'
 
@@ -19,5 +19,5 @@ for (const defKey of leadTools.keys) {
   })
 }
 
-const grammar = GrammarBuilder.create(defs).build()
+const grammar = GrammarBuilder.create(defs).withYieldTags([...LEAD_YIELD_TAGS]).build()
 console.log(grammar)
