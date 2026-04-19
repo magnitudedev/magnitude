@@ -126,6 +126,7 @@ export async function runOneshot(options: RunOneshotOptions): Promise<void> {
     providerRuntime,
     disableShellSafeguards,
     disableCwdSafeguards,
+    sessionId: persistence.getSessionId(),
   })
 
   line(`✓ ${dim('session initialized')}`)

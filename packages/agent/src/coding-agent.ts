@@ -184,6 +184,12 @@ export interface CreateClientOptions {
    * Disable working-directory boundary safeguards for this runtime only.
    */
   disableCwdSafeguards?: boolean
+
+  /**
+   * Session ID to use for trace recording. When provided with debug mode,
+   * the trace folder uses this ID instead of a date-based string.
+   */
+  sessionId?: string
 }
 
 /**
@@ -204,9 +210,8 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
 
   // Enable tracing in debug mode
   if (options.debug) {
-    const traceSessionId = new Date().toISOString().replace(/:/g, '-').replace(/\.\d{3}Z$/, 'Z')
+    const traceSessionId = options.sessionId ?? new Date().toISOString().replace(/:/g, '-').replace(/\.\d{3}Z$/, 'Z')
     initTraceSession(traceSessionId, { cwd: process.cwd(), platform: process.platform, gitBranch: null })
-
   }
 
   const tracerLayer = options.debug ? makeTracePersister((trace) => writeTrace(trace as any)) : makeNoopTracer()

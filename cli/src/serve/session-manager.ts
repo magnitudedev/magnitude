@@ -146,6 +146,7 @@ export class SessionManager {
       debug: this.debug,
       sessionContext,
       providerRuntime: this.providerRuntime,
+      sessionId: id,
     })
     const createdAt = new Date().toISOString()
 

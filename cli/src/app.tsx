@@ -401,6 +401,7 @@ function AppInner({
         storage,
         debug: debugMode,
         providerRuntime: providerRuntime.layer,
+        sessionId: activeSessionId,
       })
     }
 

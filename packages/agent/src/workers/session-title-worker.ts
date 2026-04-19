@@ -1,6 +1,7 @@
 import { Effect } from 'effect'
 import { Worker } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
+import { updateTraceMeta } from '@magnitudedev/tracing'
 import type { AppEvent } from '../events'
 import { ChatPersistence } from '../persistence/chat-persistence-service'
 import { TaskGraphProjection, getSessionTitleFromTaskGraph } from '../projections/task-graph'
@@ -19,6 +20,7 @@ export const SessionTitleWorker = Worker.define<AppEvent>()({
       if (metadata.chatName === title) return
 
       yield* persistence.saveSessionMetadata({ chatName: title })
+      updateTraceMeta({ chatName: title })
     }).pipe(
       Effect.catchAll((error) => Effect.sync(() => {
         logger.error({ error }, '[SessionTitleWorker] Failed to persist session title')

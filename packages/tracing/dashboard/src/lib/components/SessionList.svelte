@@ -62,8 +62,8 @@
         >
           <div class="flex items-center justify-between">
             <div>
-              {#if session.meta?.title}
-                <span class="text-sm text-[var(--text-primary)]">{session.meta.title}</span>
+              {#if session.meta?.chatName}
+                <span class="text-sm text-[var(--text-primary)]">{session.meta.chatName}</span>
               {:else}
                 <span class="text-sm text-[var(--text-muted)]">New Chat</span>
               {/if}
