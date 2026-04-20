@@ -30,7 +30,14 @@ const END = Symbol('END')
 type QueueItem = TurnEngineEvent | typeof END
 
 function describeDefect(defect: unknown): string {
-  if (defect instanceof Error) return defect.message
+  if (defect instanceof Error) {
+    const msg = defect.message
+    const stack = defect.stack
+    if (stack) {
+      return stack
+    }
+    return msg
+  }
   if (typeof defect === 'string') return defect
   if (typeof defect === 'object' && defect !== null) {
     const parts: string[] = []
