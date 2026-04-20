@@ -4,12 +4,7 @@ export { getOrCreateMachineId } from './machine-id'
 export {
   trackSessionStart,
   trackSessionEnd,
-  trackUserMessage,
-  trackTurnCompleted,
-  trackToolUsage,
-  trackAgentSpawned,
-  trackAgentCompleted,
   trackProviderConnected,
-  trackCompaction,
 } from './events'
 export { SessionTracker } from './session-tracker'
+export type { ModelUsage } from './session-tracker'

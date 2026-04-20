@@ -65,7 +65,7 @@ import { ChatController } from './components/chat/chat-controller'
 import { useTasks } from './hooks/use-tasks'
 import { useLocalWidth } from './hooks/use-local-width'
 
-import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, trackUserMessage, trackTurnCompleted, trackToolUsage, trackAgentSpawned, trackAgentCompleted, trackCompaction, SessionTracker } from '@magnitudedev/telemetry'
+import { initTelemetry, shutdownTelemetry, trackSessionStart, trackSessionEnd, SessionTracker } from '@magnitudedev/telemetry'
 
 import { setSessionTracker } from './utils/telemetry-state'
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -418,11 +418,6 @@ function AppInner({
       // Telemetry tracking state
       const sessionTracker = new SessionTracker()
       setSessionTracker(sessionTracker)
-      const forkRoles = new Map<string, { role: string; startTime: number }>()
-      const turnToolCounts = new Map<string, number>()
-
-      const turnKey = (forkId: string | null, turnId: string) => `${forkId ?? 'root'}:${turnId}`
-
 
       // Log all events to event log file + collect for debug panel
       client.onEvent((event) => {
@@ -440,76 +435,18 @@ function AppInner({
         }
 
         if (event.type === 'user_message') {
-          trackUserMessage({
-            mode: event.mode,
-            synthetic: event.synthetic,
-            taskMode: event.taskMode,
-            hasAttachments: event.attachments.length > 0,
-          })
           sessionTracker.recordUserMessage()
         }
 
-        if (event.type === 'agent_created') {
-          forkRoles.set(event.forkId, { role: event.role, startTime: Date.now() })
-          trackAgentSpawned({
-            agentType: event.role,
-            mode: event.mode,
-          })
-          sessionTracker.recordAgentSpawned()
-        }
-
-        if (event.type === 'tool_event') {
-          const key = turnKey(event.forkId, event.turnId)
-
-          if (event.event._tag === 'ToolInputStarted') {
-            turnToolCounts.set(key, (turnToolCounts.get(key) ?? 0) + 1)
-          }
-
-          if (event.event._tag === 'ToolExecutionEnded') {
-            const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
-            const agentRole = forkInfo?.role ?? 'lead'
-
-            trackToolUsage({
-              toolName: event.event.toolName,
-              group: event.event.group,
-              status: event.event.result._tag === 'Success' ? 'success' : 'error',
-              forkId: event.forkId,
-              agentRole,
-            })
-          }
-        }
-
         if (event.type === 'turn_completed') {
-          const forkInfo = event.forkId ? forkRoles.get(event.forkId) : null
-          const agentRole = forkInfo?.role ?? 'lead'
-          const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agentRole) ? agentRole as MagnitudeSlot : 'lead' as MagnitudeSlot
-          const key = turnKey(event.forkId, event.turnId)
-          const toolCount = turnToolCounts.get(key) ?? 0
-
-          trackTurnCompleted({
-            providerId: event.providerId ?? null,
-            modelId: event.modelId ?? null,
-            modelSlot: slot,
-            authType: null,
-            inputTokens: event.inputTokens,
-            outputTokens: event.outputTokens,
-            cacheReadTokens: event.cacheReadTokens,
-            cacheWriteTokens: event.cacheWriteTokens,
-            toolCount,
-            success: event.result.success,
-            forkId: event.forkId,
-            agentRole,
-          })
-
-          sessionTracker.recordTurn(event.inputTokens, event.outputTokens, toolCount)
-          turnToolCounts.delete(key)
+          sessionTracker.recordTurn(event.providerId ?? null, event.modelId ?? null, event.inputTokens, event.outputTokens)
         }
 
         if (event.type === 'compaction_completed') {
-          trackCompaction({ tokensSaved: event.tokensSaved, success: true })
+          sessionTracker.recordCompaction()
         }
         if (event.type === 'compaction_failed') {
-          trackCompaction({ tokensSaved: 0, success: false })
+          sessionTracker.recordCompaction()
         }
       })
 

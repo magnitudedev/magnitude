@@ -1,17 +1,27 @@
 # Magnitude Telemetry
 
-Magnitude collects anonymous usage telemetry to help us understand how the tool is being used and improve the experience. This data is **completely anonymous** and contains **no personal information**.
+Magnitude collects minimal anonymous usage telemetry to help us understand how the tool is being used and improve the experience. This data is **completely anonymous** and contains **no personal information**.
 
-## What We Collect
+## What We Collect (3 Events)
 
-We collect high-level, aggregate usage data:
+We collect only three high-level events per session:
 
-- **Session counts** — how many times Magnitude is started, session duration
-- **Message counts** — number of user messages sent (not the content)
-- **Tool usage** — which tools are used and how often (e.g. file edit, file write, shell, search), success/failure counts
-- **Lines of code** — number of lines written, added, and removed by tools (not the actual code)
-- **Model and provider usage** — which LLM providers and models are selected, token consumption (input/output counts)
-- **Agent usage** — number and types of sub-agents spawned (explorer, builder, browser, etc.)
+### `session_start`
+- Platform (macOS/Linux/Windows)
+- Shell type (bash/zsh/fish/etc.)
+- Whether this is a resumed session
+
+### `session_end` (summary of entire session)
+- Session duration
+- Total number of turns (LLM calls)
+- Total number of user messages
+- Total input/output tokens across all turns
+- **Models used** — per-model breakdown of provider, model ID, and token counts
+- Number of memory compaction events
+
+### `provider_connected`
+- Provider ID (e.g., anthropic, openai, google)
+- Authentication type (OAuth, API key, free tier)
 
 ## What We Do NOT Collect
 
@@ -21,6 +31,8 @@ We collect high-level, aggregate usage data:
 - No API keys, tokens, or credentials
 - No personally identifiable information (names, emails, IPs)
 - No code, diffs, or repository information
+- No per-tool-call or per-agent tracking
+- No lines of code metrics
 
 All telemetry data is anonymous aggregate counts and metadata. GeoIP tracking is disabled — we do not track your location.
 

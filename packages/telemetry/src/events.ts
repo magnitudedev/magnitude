@@ -6,6 +6,7 @@
  */
 
 import { capture } from './client'
+import type { ModelUsage } from './session-tracker'
 
 // ========== Session Lifecycle ==========
 
@@ -20,77 +21,13 @@ export function trackSessionStart(props: {
 export function trackSessionEnd(props: {
   durationSeconds: number
   totalTurns: number
-  totalTools: number
   totalUserMessages: number
   totalInputTokens: number
   totalOutputTokens: number
-  totalLinesWritten: number
-  totalLinesAdded: number
-  totalLinesRemoved: number
-  agentCount: number
+  modelsUsed: ModelUsage[]
+  compactionCount: number
 }): void {
   capture('session_end', props)
-}
-
-// ========== User Messages ==========
-
-export function trackUserMessage(props: {
-  mode: 'text' | 'audio'
-  synthetic: boolean
-  taskMode: boolean
-  hasAttachments: boolean
-}): void {
-  capture('user_message', props)
-}
-
-// ========== Turn Completed (LLM Call) ==========
-
-export function trackTurnCompleted(props: {
-  providerId: string | null
-  modelId: string | null
-  modelSlot: string
-  authType: string | null
-  inputTokens: number | null
-  outputTokens: number | null
-  cacheReadTokens: number | null
-  cacheWriteTokens: number | null
-  toolCount: number
-  success: boolean
-  forkId: string | null
-  agentRole: string
-}): void {
-  capture('turn_completed', props)
-}
-
-// ========== Tool Usage ==========
-
-export function trackToolUsage(props: {
-  toolName: string
-  group: string
-  status: 'success' | 'error' | 'rejected' | 'interrupted'
-  linesAdded?: number
-  linesRemoved?: number
-  linesWritten?: number
-  forkId: string | null
-  agentRole: string
-}): void {
-  capture('tool_usage', props)
-}
-
-// ========== Agent Lifecycle ==========
-
-export function trackAgentSpawned(props: {
-  agentType: string
-  mode: 'clone' | 'spawn'
-}): void {
-  capture('agent_spawned', props)
-}
-
-export function trackAgentCompleted(props: {
-  agentType: string
-  durationSeconds: number
-}): void {
-  capture('agent_completed', props)
 }
 
 // ========== Provider ==========
@@ -100,13 +37,4 @@ export function trackProviderConnected(props: {
   authType: string
 }): void {
   capture('provider_connected', props)
-}
-
-// ========== Compaction ==========
-
-export function trackCompaction(props: {
-  tokensSaved: number
-  success: boolean
-}): void {
-  capture('compaction', props)
 }
