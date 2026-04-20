@@ -173,7 +173,7 @@ export function dispatchTool(
           : String(e)
       result = { _tag: 'Error', error }
     } else {
-      result = { _tag: 'Success', output: executionResult.right, query: request.filterQuery }
+      result = { _tag: 'Success', output: executionResult.right ?? null, query: request.filterQuery }
     }
 
     // 5. Interceptor afterExecute
