@@ -25,7 +25,7 @@ import { createTokenizer } from '../tokenizer'
 import { createStackMachine, type Op } from '../machine'
 import { createStreamingJsonParser } from '../jsonish/parser'
 import { coerceToStreamingPartial } from '../jsonish/coercer'
-import { deriveParameters } from '../execution/parameter-schema'
+import { deriveParameters } from '../engine/parameter-schema'
 import { generateToolInterface, printAst } from '@magnitudedev/tools'
 import type {
   Token,

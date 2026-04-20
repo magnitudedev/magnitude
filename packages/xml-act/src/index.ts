@@ -9,7 +9,7 @@ export { createTurnEngine } from './engine/turn-engine'
 export type { TurnEngine, TurnEngineConfig } from './engine/turn-engine'
 
 // Engine state
-export { initialEngineState, foldEngineState } from './execution/reactor-state'
+export { initialEngineState, foldEngineState } from './engine/engine-state'
 
 // Core types — events
 export type {
@@ -106,12 +106,8 @@ export {
 } from './types'
 
 // Parameter schema derivation
-export { deriveParameters } from './execution/parameter-schema'
-export type { ParameterSchema, ToolSchema, ScalarType } from './execution/parameter-schema'
-
-// Input building
-export { buildInput, coerceParameterValue } from './execution/input-builder'
-export type { ParsedParameter, ParsedInvoke } from './execution/input-builder'
+export { deriveParameters } from './engine/parameter-schema'
+export type { ParameterSchema, ToolSchema, ScalarType } from './engine/parameter-schema'
 
 // Output (query, rendering, persistence)
 export {
