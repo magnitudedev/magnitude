@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Cause, Effect, Exit, Ref, Scope, Stream } from 'effect'
-import type { RuntimeEvent, TurnEngineCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineEvent, TurnEngineCrash } from '@magnitudedev/xml-act'
 import type { CallUsage } from '@magnitudedev/providers'
 import type { MessageDestination, TurnResult } from '../src/events'
 import { createTurnStream } from '../src/execution/turn-stream'
@@ -17,7 +17,7 @@ type PublishedEvent =
   | { readonly type: 'lens_start'; readonly name: string }
   | { readonly type: 'lens_chunk'; readonly text: string }
   | { readonly type: 'lens_end'; readonly name: string }
-  | { readonly type: 'tool_event'; readonly toolCallId: string; readonly toolKey: string; readonly event: RuntimeEvent }
+  | { readonly type: 'tool_event'; readonly toolCallId: string; readonly toolKey: string; readonly event: TurnEngineEvent }
 
 const successfulTurnResult: TurnResult = {
   success: true,

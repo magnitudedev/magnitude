@@ -2,20 +2,21 @@
  * ExecutionManager
  *
  * Owns per-fork lifecycle and xml-act runtime execution.
- * Maps RuntimeEvents to agent TurnEvents.
+ * Maps TurnEngineEvents to agent TurnEvents.
  *
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
+import * as path from 'path'
 import { Effect, Stream, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
-  createRuntime,
+  createTurnEngine,
   ToolInterceptorTag,
   TurnEngineCrash,
-  type RuntimeEvent,
-  type ReactorState,
+  type TurnEngineEvent,
   type ToolInterceptor,
+  type EngineState,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
 import { SkillsAmbient } from '../ambient/skills-ambient'
@@ -59,7 +60,7 @@ import { createPolicyContextProvider } from '../agents/policy-context'
 import { ExecutionManager, IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
 import type { TurnEvent, TurnEventSink, ExecuteOptions, ExecuteResult, ExecutionManagerService } from './types'
 import { WorkingDirectoryTag } from './working-directory'
-import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -264,22 +265,25 @@ const makeExecutionManager = Effect.gen(function* () {
 
       const executionLayer = layers
 
+      const workspacePath = forkWorkspacePaths.get(forkId)!
+
       // Build registered tools for xml-act runtime
       const registeredTools = buildRegisteredTools(options.toolSet, executionLayer)
 
       // Create fresh runtime for this execution
       // Surface validation errors as TurnEngineCrash so they appear as turn errors
       const runtime = yield* Effect.try({
-        try: () => createRuntime({
+        try: () => createTurnEngine({
           tools: registeredTools,
           defaultProseDest,
+          resultsDir: path.join(workspacePath, 'results'),
         }),
         catch: (e) => new TurnEngineCrash(`Runtime initialization failed: ${e instanceof Error ? e.message : String(e)}`, e),
       })
 
       // Get replay state from projection for crash recovery
       const replayProjection = yield* ReplayProjection.Tag
-      const replayState: ReactorState = yield* replayProjection.getFork(forkId)
+      const replayState: EngineState = yield* replayProjection.getFork(forkId)
 
       // Build tool tagName → defKey lookup from registered metadata.
       const tagToDefKey = new Map<string, string>()
@@ -343,7 +347,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
-      const workspacePath = forkWorkspacePaths.get(forkId)!
 
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
@@ -374,7 +377,7 @@ const makeExecutionManager = Effect.gen(function* () {
       yield* Effect.scoped(
         eventStream.pipe(
           Stream.provideLayer(executionLayer),
-          Stream.runForEach((event: RuntimeEvent) => Effect.gen(function* () {
+          Stream.runForEach((event: TurnEngineEvent) => Effect.gen(function* () {
             switch (event._tag) {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
@@ -548,18 +551,20 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              // --- Tool input field value events ---
-              case 'ToolInputFieldValue': {
+              // --- Tool input field chunk events ---
+              case 'ToolInputFieldChunk': {
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
 
-                // Update streaming fields for stream hook
+                // Update streaming fields (accumulate raw text per field)
                 const fields = streamingFields.get(event.toolCallId)
                 if (fields) {
-                  fields[event.field] = { value: event.value, isFinal: true }
+                  const existing = fields[event.field]
+                  const prev = existing && !existing.isFinal ? String(existing.value) : ''
+                  fields[event.field] = { value: prev + event.delta, isFinal: false }
                 }
 
                 // Invoke stream hook if present
@@ -591,6 +596,21 @@ const makeExecutionManager = Effect.gen(function* () {
                 })
                 break
               }
+
+              case 'ToolInputFieldComplete':
+                // Field complete — final value comes via ToolInputReady; emit for consumers
+                {
+                  const toolKey = toolCallKeys.get(event.toolCallId)
+                  if (toolKey) {
+                    yield* sink.emit( {
+                      _tag: 'ToolEvent',
+                      toolCallId: event.toolCallId,
+                      toolKey,
+                      event,
+                    })
+                  }
+                }
+                break
 
               // --- Messages / Think prose ---
               case 'MessageStart': {

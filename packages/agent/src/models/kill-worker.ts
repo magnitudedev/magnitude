@@ -13,28 +13,35 @@ const initial: Omit<KillWorkerState, 'phase' | 'toolKey'> = {
 export const killWorkerModel = defineStateModel('killWorker', killWorkerTool)({
   initial,
   reduce: (state, event): KillWorkerState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', id: event.streaming.id?.value ?? state.id }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolInputFieldChunk':
+        return event.field === 'id'
+          ? { ...state, phase: 'streaming', id: (state.id ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', id: event.input.id }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed', id: event.result.output.id }
+          case 'Error':
+            return { ...state, phase: 'error' }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolInputParseError':
         return { ...state, phase: 'error' }
-      case 'completed':
-        return { ...state, phase: 'completed', id: event.output.id }
-      case 'error':
-        return { ...state, phase: 'error' }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

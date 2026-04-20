@@ -7,7 +7,7 @@
 
 import { Effect, Layer, Stream } from 'effect'
 import { Schema } from '@effect/schema'
-import { createRuntime, type RuntimeEvent } from '..'
+import { createRuntime, type TurnEngineEvent } from '..'
 import { defineTool } from '@magnitudedev/tools'
 
 // Tool definitions matching the real agent tools
@@ -122,7 +122,7 @@ Effect.runPromise(
 
     yield* Effect.scoped(
       eventStream.pipe(
-        Stream.runForEach((event: RuntimeEvent) =>
+        Stream.runForEach((event: TurnEngineEvent) =>
           Effect.sync(() => {
             if (event._tag === 'ToolInputStarted') {
               console.log(`EVENT: ToolInputStarted tagName=${event.tagName} toolCallId=${event.toolCallId}`)

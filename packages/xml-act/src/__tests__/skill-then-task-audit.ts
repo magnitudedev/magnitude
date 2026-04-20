@@ -5,7 +5,7 @@
 
 import { Effect, Layer, Stream } from 'effect'
 import { Schema } from '@effect/schema'
-import { createRuntime, type RuntimeEvent } from '..'
+import { createRuntime, type TurnEngineEvent } from '..'
 import { defineTool } from '@magnitudedev/tools'
 
 const skillTool = defineTool({
@@ -80,11 +80,11 @@ Effect.runPromise(
     const textStream = Stream.succeed(modelOutput)
     const eventStream = runtime.streamWith(textStream)
 
-    const events: RuntimeEvent[] = []
+    const events: TurnEngineEvent[] = []
     
     yield* Effect.scoped(
       eventStream.pipe(
-        Stream.runForEach((event: RuntimeEvent) =>
+        Stream.runForEach((event: TurnEngineEvent) =>
           Effect.sync(() => {
             events.push(event)
             if (event._tag === 'ToolInputParseError') {

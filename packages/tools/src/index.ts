@@ -30,15 +30,15 @@ export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type Stream
 // Tool context
 export * from './tool-context'
 
-// Tool state events
-export * from './tool-state-event'
+// Tool lifecycle events
+export type { ToolStateEvent, ToolResult, ParseErrorDetail } from './tool-state-event'
 
 // Streaming partial
 export * from './streaming-partial'
 
 // State model
 export { defineStateModel } from './state-model'
-export type { StateModel, BaseState, Phase, StreamingAccumulatorLike } from './state-model'
+export type { StateModel, BaseState, Phase } from './state-model'
 
 // Tool call state
 export { ToolCallState, createToolCallState } from './tool-call-state'

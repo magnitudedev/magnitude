@@ -1,10 +1,10 @@
 /**
  * ParameterAccumulator — Streaming accumulator for tool input parameters.
  *
- * Implements StreamingAccumulatorLike<TInput, RuntimeEvent>.
- * Receives RuntimeEvent events and produces StreamingPartial via its `current` property.
+ * Implements StreamingAccumulatorLike<TInput, TurnEngineEvent>.
+ * Receives TurnEngineEvent events and produces StreamingPartial via its `current` property.
  *
- * Works with the existing RuntimeEvent flow:
+ * Works with the existing TurnEngineEvent flow:
  * - ToolInputStarted: initialize
  * - ToolInputFieldValue: scalar field streaming (text value accumulating)
  * - ToolInputReady: finalize all fields
@@ -15,8 +15,8 @@
  */
 
 import { AST } from '@effect/schema'
-import type { StreamingPartial, StreamingLeaf, StreamingAccumulatorLike } from '@magnitudedev/tools'
-import type { RuntimeEvent } from '../types'
+import type { StreamingPartial, StreamingLeaf } from '@magnitudedev/tools'
+import type { TurnEngineEvent } from '../types'
 import type { ToolSchema, ParameterSchema, ScalarType } from '../execution/parameter-schema'
 import { createStreamingJsonParser } from './parser'
 import type { StreamingJsonParser, ParsedValue } from './types'
@@ -210,10 +210,17 @@ function setNestedValue(obj: Record<string, unknown>, path: string, value: unkno
 // ParameterAccumulator Implementation
 // =============================================================================
 
+/** @deprecated StreamingAccumulatorLike removed — accumulation moved to parser layer. */
+export interface LegacyStreamingAccumulatorLike<TInput, TEvent = unknown> {
+  ingest(event: TEvent): void;
+  readonly current: StreamingPartial<TInput>;
+  reset(): void;
+}
+
 export function createParameterAccumulator(
   toolSchema: ToolSchema,
   schemaAst: AST.AST
-): StreamingAccumulatorLike<unknown, RuntimeEvent> {
+): { ingest(event: TurnEngineEvent): void; readonly current: StreamingPartial<unknown>; reset(): void; } {
   const state: AccumulatorState = {
     params: new Map(),
     active: false,
@@ -260,21 +267,21 @@ export function createParameterAccumulator(
     return result as StreamingPartial<unknown>
   }
 
-  function ingest(event: RuntimeEvent): void {
+  function ingest(event: TurnEngineEvent): void {
     switch (event._tag) {
       case 'ToolInputStarted': {
         state.toolCallId = event.toolCallId
         initialize()
         break
       }
-      case 'ToolInputFieldValue': {
+      case 'ToolInputFieldComplete': {
         if (!state.active) break
         const field = String(event.field)
         const paramState = state.params.get(field)
         if (paramState === undefined) break
 
         paramState.hasData = true
-        const textValue = String(event.value)
+        const textValue = String(event.value ?? '')
 
         switch (paramState._tag) {
           case 'scalar':
@@ -298,7 +305,7 @@ export function createParameterAccumulator(
         break
       }
       default:
-        // Ignore other RuntimeEvent types
+        // Ignore other TurnEngineEvent types
         break
     }
   }

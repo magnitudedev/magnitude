@@ -10,14 +10,14 @@
  */
 
 import { Projection } from '@magnitudedev/event-core'
-import { initialReactorState, foldReactorState } from '@magnitudedev/xml-act'
-import type { ReactorState } from '@magnitudedev/xml-act'
+import { initialEngineState, foldEngineState } from '@magnitudedev/xml-act'
+import type { EngineState } from '@magnitudedev/xml-act'
 import type { AppEvent } from '../events'
 
-export const ReplayProjection = Projection.defineForked<AppEvent, ReactorState>()({
+export const ReplayProjection = Projection.defineForked<AppEvent, EngineState>()({
   name: 'Replay',
 
-  initialFork: initialReactorState(),
+  initialFork: initialEngineState(),
 
   eventHandlers: {
     tool_event: ({ event, fork }) => {
@@ -26,7 +26,7 @@ export const ReplayProjection = Projection.defineForked<AppEvent, ReactorState>(
         case 'ToolInputStarted':
         case 'ToolInputParseError':
         case 'ToolExecutionEnded':
-          return foldReactorState(fork, event.event)
+          return foldEngineState(fork, event.event)
         default:
           return fork
       }
@@ -36,6 +36,6 @@ export const ReplayProjection = Projection.defineForked<AppEvent, ReactorState>(
     // Reset on turn_completed — completed turns don't need replay.
     // Only a crashed turn (no turn_completed) retains its state for recovery.
     turn_started: ({ fork }) => fork,
-    turn_completed: () => initialReactorState(),
+    turn_completed: () => initialEngineState(),
   },
 })

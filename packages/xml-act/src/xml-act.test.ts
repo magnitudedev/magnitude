@@ -17,7 +17,7 @@ import {
   buildOutputTree,
   type OutputNode,
   type XmlRuntimeConfig,
-  type XmlRuntimeEvent,
+  type XmlTurnEngineEvent,
   type RegisteredTool,
   type XmlTagBinding,
   type ToolInterceptor,
@@ -40,7 +40,7 @@ function runStream(
   config: XmlRuntimeConfig,
   xml: string,
   opts?: { layers?: Layer.Layer<never>; initialState?: ReactorState },
-): Promise<XmlRuntimeEvent[]> {
+): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   const stream = runtime.streamWith(Stream.make(xml), {
     initialState: opts?.initialState,
@@ -55,7 +55,7 @@ function runStreamCharByChar(
   config: XmlRuntimeConfig,
   xml: string,
   layers?: Layer.Layer<never>,
-): Promise<XmlRuntimeEvent[]> {
+): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   const stream = runtime.streamWith(Stream.fromIterable([...xml]))
   const collected = Stream.runCollect(stream)
@@ -67,7 +67,7 @@ function runStreamCharByChar(
 function runStreamChunked(
   config: XmlRuntimeConfig,
   chunks: string[],
-): Promise<XmlRuntimeEvent[]> {
+): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   const stream = runtime.streamWith(Stream.fromIterable(chunks))
   return Effect.runPromise(Stream.runCollect(stream)).then(c => Array.from(c))
@@ -119,11 +119,11 @@ function config(
 }
 
 /** Filter events to a specific tag */
-function eventsOfType<T extends XmlRuntimeEvent['_tag']>(
-  events: XmlRuntimeEvent[],
+function eventsOfType<T extends XmlTurnEngineEvent['_tag']>(
+  events: XmlTurnEngineEvent[],
   tag: T,
-): Extract<XmlRuntimeEvent, { _tag: T }>[] {
-  return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
+): Extract<XmlTurnEngineEvent, { _tag: T }>[] {
+  return events.filter(e => e._tag === tag) as Extract<XmlTurnEngineEvent, { _tag: T }>[]
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +736,7 @@ describe('xml-act end-to-end', () => {
 
     expect(events).toHaveLength(1)
     expect(events[0]._tag).toBe('TurnEnd')
-    expect((events[0] as Extract<XmlRuntimeEvent, { _tag: 'TurnEnd' }>).result._tag).toBe('Success')
+    expect((events[0] as Extract<XmlTurnEngineEvent, { _tag: 'TurnEnd' }>).result._tag).toBe('Success')
   })
 
   // =========================================================================
@@ -1201,7 +1201,7 @@ describe('foldReactorState', () => {
       tagName: 'read',
       toolName: 'read',
       group: 'default',
-      error: { _tag: 'MissingRequiredFields', id: 'tc_1', tagName: 'read', fields: ['path'], detail: 'missing' },
+      error: { _tag: 'MissingRequiredField', toolCallId: 'tc_1', tagName: 'read', parameterName: 'path', detail: 'missing' },
     })
     expect(next.deadToolCalls.has('tc_1')).toBe(true)
     expect(next.toolOutcomes.get('tc_1')).toEqual({ _tag: 'ParseError' })
@@ -1214,6 +1214,7 @@ describe('foldReactorState', () => {
     const next = foldReactorState(state, {
       _tag: 'ToolExecutionEnded',
       toolCallId: 'tc_1',
+      tagName: 'read',
       group: 'default',
       toolName: 'read',
       result,
@@ -1241,6 +1242,7 @@ describe('foldReactorState', () => {
     const next = foldReactorState(state, {
       _tag: 'ToolExecutionEnded',
       toolCallId: 'tc_1',
+      tagName: 'read',
       group: 'default',
       toolName: 'read',
       result: { _tag: 'Error', error: 'something went wrong' },

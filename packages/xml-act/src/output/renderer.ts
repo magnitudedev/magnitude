@@ -1,4 +1,3 @@
-
 /**
  * Output Renderer — Renders tool output using result/out syntax.
  * 
@@ -13,7 +12,7 @@
  * - Void outputs are empty result blocks
  */
 
-import type { ContentPart } from '@magnitudedev/tools'
+import type { ContentPart, ImageMediaType } from '@magnitudedev/tools'
 
 /**
  * Configuration for result rendering.
@@ -23,6 +22,31 @@ export interface RenderConfig {
   includeFullPath?: boolean
   /** Full result file path (for partial results) */
   fullPath?: string
+}
+
+/**
+ * Shape of an image output produced by a tool.
+ */
+interface ImageOutput {
+  base64: string
+  mediaType: ImageMediaType
+  width: number
+  height: number
+}
+
+/**
+ * Check if a tool output is an image output.
+ */
+function isImageOutput(output: unknown): output is ImageOutput {
+  if (typeof output !== 'object' || output === null) return false
+  const o = output as Record<string, unknown>
+  return (
+    typeof o.base64 === 'string' &&
+    typeof o.mediaType === 'string' &&
+    o.mediaType.startsWith('image/') &&
+    typeof o.width === 'number' &&
+    typeof o.height === 'number'
+  )
 }
 
 /**
@@ -154,12 +178,23 @@ export function renderOutField(name: string, value: unknown): string {
 
 /**
  * Render a result to ContentPart[] for LLM context injection.
+ * 
+ * If the output is an image, returns an image ContentPart instead of text.
  */
 export function renderResultToParts(
   toolName: string,
   output: unknown,
   config?: RenderConfig
 ): ContentPart[] {
+  if (isImageOutput(output)) {
+    return [{
+      type: 'image',
+      base64: output.base64,
+      mediaType: output.mediaType,
+      width: output.width,
+      height: output.height,
+    }]
+  }
   const text = renderResult(toolName, output, config)
   return [{ type: 'text', text }]
 }

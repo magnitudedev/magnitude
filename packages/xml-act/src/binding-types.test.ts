@@ -19,7 +19,7 @@ import {
   validateBinding,
   generateXmlToolDoc,
   type XmlRuntimeConfig,
-  type XmlRuntimeEvent,
+  type XmlTurnEngineEvent,
   type RegisteredTool,
   type XmlTagBinding,
 
@@ -37,7 +37,7 @@ const defineToolUnsafe: any = defineTool
 const buildInputUnsafe: any = buildInput
 const validateBindingUnsafe: any = validateBinding
 
-function runStream(cfg: XmlRuntimeConfig, xml: string): Promise<XmlRuntimeEvent[]> {
+function runStream(cfg: XmlRuntimeConfig, xml: string): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(cfg)
   const stream = runtime.streamWith(Stream.make(xml))
   return Effect.runPromise(Stream.runCollect(stream)).then(c => Array.from(c))
@@ -55,11 +55,11 @@ function cfg(tools: RegisteredTool[]): XmlRuntimeConfig {
   return { tools: new Map(tools.map(t => [t.tagName, t])) }
 }
 
-function ofType<T extends XmlRuntimeEvent['_tag']>(
-  events: XmlRuntimeEvent[],
+function ofType<T extends XmlTurnEngineEvent['_tag']>(
+  events: XmlTurnEngineEvent[],
   tag: T,
-): Extract<XmlRuntimeEvent, { _tag: T }>[] {
-  return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
+): Extract<XmlTurnEngineEvent, { _tag: T }>[] {
+  return events.filter(e => e._tag === tag) as Extract<XmlTurnEngineEvent, { _tag: T }>[]
 }
 
 function el(

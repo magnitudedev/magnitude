@@ -6,11 +6,11 @@ import {
   createXmlRuntime,
   type RegisteredTool,
   type XmlRuntimeConfig,
-  type XmlRuntimeEvent,
+  type XmlTurnEngineEvent,
   type XmlTagBinding,
 } from '../index'
 
-function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlRuntimeEvent[]> {
+function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   const stream = runtime.streamWith(Stream.make(xml))
   return Effect.runPromise(Stream.runCollect(stream)).then(c => Array.from(c))
@@ -36,11 +36,11 @@ function config(tools: RegisteredTool[]): XmlRuntimeConfig {
   }
 }
 
-function eventsOfType<T extends XmlRuntimeEvent['_tag']>(
-  events: XmlRuntimeEvent[],
+function eventsOfType<T extends XmlTurnEngineEvent['_tag']>(
+  events: XmlTurnEngineEvent[],
   tag: T,
-): Extract<XmlRuntimeEvent, { _tag: T }>[] {
-  return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
+): Extract<XmlTurnEngineEvent, { _tag: T }>[] {
+  return events.filter(e => e._tag === tag) as Extract<XmlTurnEngineEvent, { _tag: T }>[]
 }
 
 function responseWithActions(actionsXml: string): string {

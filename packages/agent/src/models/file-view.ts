@@ -13,28 +13,35 @@ const initial: Omit<FileViewState, 'phase' | 'toolKey'> = {
 export const fileViewModel = defineStateModel('fileView', viewTool)({
   initial,
   reduce: (state, event): FileViewState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', path: event.streaming.path?.value ?? state.path }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolInputFieldChunk':
+        return event.field === 'path'
+          ? { ...state, phase: 'streaming', path: (state.path ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', path: event.input.path }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed' }
+          case 'Error':
+            return { ...state, phase: 'error' }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolInputParseError':
         return { ...state, phase: 'error' }
-      case 'completed':
-        return { ...state, phase: 'completed' }
-      case 'error':
-        return { ...state, phase: 'error' }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

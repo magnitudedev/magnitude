@@ -148,4 +148,12 @@ export interface StreamingJsonParser {
    * Whether the parser has completed a top-level value.
    */
   readonly done: boolean;
+
+  /**
+   * Get the current nesting path within the JSON structure being parsed.
+   * Returns an array of keys/indices representing the current position.
+   * e.g. ["config", "tls", "cert"] when parsing inside config.tls.cert
+   * Used by the mact parser to compute ToolInputFieldChunk paths.
+   */
+  readonly currentPath: readonly string[];
 }

@@ -20,7 +20,7 @@ export interface CanonicalTurnState {
   thinkBlocks: ThinkBlock[]
   messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
-  toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string; order: number }>
+  toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string | null; order: number }>
   toolCallMap: Map<string, number>
   hasParseError: boolean
   hasStructuralError: boolean

@@ -3,7 +3,9 @@
  */
 
 import { Context, Effect, Layer } from "effect"
-import type { ToolDefinition, ContentPart } from "@magnitudedev/tools"
+import type { ToolDefinition, ContentPart, DeepPaths, StreamingPartial } from "@magnitudedev/tools"
+
+export type { DeepPaths, StreamingPartial }
 
 // =============================================================================
 // Token Types
@@ -170,11 +172,31 @@ export interface ToolInputStarted {
   readonly group: string
 }
 
-export interface ToolInputFieldValue {
-  readonly _tag: 'ToolInputFieldValue'
+
+
+/**
+ * Streaming chunk for a parameter field.
+ * path: type-safe path into TInput (e.g. ["config", "tls", "cert"] for nested JSON)
+ * delta: raw incremental text — consumer applies this to their own StreamingPartial via applyFieldChunk
+ */
+export interface ToolInputFieldChunk<TInput = unknown> {
+  readonly _tag: 'ToolInputFieldChunk'
   readonly toolCallId: string
-  readonly field: string
-  readonly value: string | number | boolean
+  readonly field: string & keyof TInput
+  readonly path: DeepPaths<TInput>
+  readonly delta: string
+}
+
+/**
+ * Final value for a completed parameter field.
+ * value: coerced typed value for this specific field
+ */
+export interface ToolInputFieldComplete<TInput = unknown> {
+  readonly _tag: 'ToolInputFieldComplete'
+  readonly toolCallId: string
+  readonly field: string & keyof TInput
+  readonly path: DeepPaths<TInput>
+  readonly value: unknown
 }
 
 export interface ToolInputReady<TInput = unknown> {
@@ -190,11 +212,13 @@ export interface ToolInputParseError {
   readonly toolName: string
   readonly group: string
   readonly error: ParseErrorDetail
+  readonly correctToolShape?: string
 }
 
 export interface ToolExecutionStarted<TInput = unknown> {
   readonly _tag: 'ToolExecutionStarted'
   readonly toolCallId: string
+  readonly tagName: string
   readonly group: string
   readonly toolName: string
   readonly input: TInput
@@ -204,6 +228,7 @@ export interface ToolExecutionStarted<TInput = unknown> {
 export interface ToolExecutionEnded<TOutput = unknown> {
   readonly _tag: 'ToolExecutionEnded'
   readonly toolCallId: string
+  readonly tagName: string
   readonly group: string
   readonly toolName: string
   readonly result: ToolResult<TOutput>
@@ -258,17 +283,69 @@ export class TurnEngineCrash {
   constructor(readonly message: string, readonly cause?: unknown) {}
 }
 
-export interface ParseErrorDetail {
-  readonly _tag: string
-  readonly id: string
+// =============================================================================
+// Parse Error Detail Variants
+// =============================================================================
+
+export interface UnknownToolError {
+  readonly _tag: 'UnknownTool'
   readonly tagName: string
   readonly detail: string
 }
 
-export interface StructuralParseErrorDetail {
-  readonly _tag: string
+export interface UnknownParameterError {
+  readonly _tag: 'UnknownParameter'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export interface IncompleteToolError {
+  readonly _tag: 'IncompleteTool'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface JsonStructuralError {
+  readonly _tag: 'JsonStructuralError'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export interface SchemaCoercionError {
+  readonly _tag: 'SchemaCoercionError'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export interface MissingRequiredFieldError {
+  readonly _tag: 'MissingRequiredField'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export type ParseErrorDetail =
+  | UnknownToolError
+  | UnknownParameterError
+  | IncompleteToolError
+  | JsonStructuralError
+  | SchemaCoercionError
+  | MissingRequiredFieldError
+
+export interface UnclosedThinkError {
+  readonly _tag: 'UnclosedThink'
   readonly message: string
 }
+
+export type StructuralParseErrorDetail = UnclosedThinkError
 
 // =============================================================================
 // Interceptor
@@ -297,27 +374,61 @@ export class ToolInterceptorTag extends Context.Tag('ToolInterceptor')<
 >() {}
 
 // =============================================================================
-// Reactor State
+// Reactor State / Engine State
 // =============================================================================
 
 export type ToolOutcome =
   | { readonly _tag: 'Completed'; readonly result: ToolResult }
   | { readonly _tag: 'ParseError' }
 
-export interface ReactorState {
+
+
+/** Replaces ReactorState. Owned by the turn engine. */
+export interface EngineState {
   readonly toolCallMap: ReadonlyMap<string, string>
+  readonly toolOutcomes: ReadonlyMap<string, ToolOutcome>
   readonly deadToolCalls: ReadonlySet<string>
   readonly stopped: boolean
-  readonly toolOutcomes: ReadonlyMap<string, ToolOutcome>
 }
+
+// =============================================================================
+// Tool Lifecycle Event (for state model consumers)
+// =============================================================================
+
+/**
+ * Subset of TurnEngineEvent relevant to tool state.
+ * Used by StateModel.reduce() — consumers get full type safety via TInput/TOutput/TEmission.
+ * No information loss — just type narrowing (structural events excluded).
+ */
+export type ToolLifecycleEvent<TInput = unknown, TOutput = unknown, TEmission = unknown> =
+  | ToolInputStarted
+  | ToolInputFieldChunk<TInput>
+  | ToolInputFieldComplete<TInput>
+  | ToolInputReady<TInput>
+  | ToolInputParseError
+  | ToolExecutionStarted<TInput>
+  | ToolExecutionEnded<TOutput>
+  | ToolEmission<TEmission>
+
+/**
+ * Apply a ToolInputFieldChunk to an existing StreamingPartial, returning the updated partial.
+ * Consumers (state models, projections) call this in their reduce() to build streaming input state.
+ * Implementation lives in engine/input-builder.ts — exported from index.ts.
+ */
+export type ApplyFieldChunk = <TInput>(
+  partial: StreamingPartial<TInput>,
+  path: DeepPaths<TInput>,
+  text: string
+) => StreamingPartial<TInput>
 
 // =============================================================================
 // Runtime Event Union
 // =============================================================================
 
-export type RuntimeEvent<TInput = unknown, TOutput = unknown, TEmission = unknown> =
+export type TurnEngineEvent<TInput = unknown, TOutput = unknown, TEmission = unknown> =
   | ToolInputStarted
-  | ToolInputFieldValue
+  | ToolInputFieldChunk<TInput>
+  | ToolInputFieldComplete<TInput>
   | ToolInputReady<TInput>
   | ToolInputParseError
   | ToolExecutionStarted<TInput>
@@ -330,6 +441,8 @@ export type RuntimeEvent<TInput = unknown, TOutput = unknown, TEmission = unknow
   | StructuralParseError
   | TurnEnd
 
+
+
 // =============================================================================
 // Runtime Config
 // =============================================================================
@@ -337,4 +450,5 @@ export type RuntimeEvent<TInput = unknown, TOutput = unknown, TEmission = unknow
 export interface RuntimeConfig {
   readonly tools: ReadonlyMap<string, RegisteredTool>
   readonly defaultProseDest?: string
+  readonly resultsDir: string
 }

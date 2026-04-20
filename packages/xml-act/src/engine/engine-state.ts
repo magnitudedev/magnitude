@@ -1,11 +1,18 @@
+/**
+ * EngineState — the fold-state of the turn engine.
+ *
+ * Tracks which tool calls exist, which have outcomes, and which are dead.
+ * Replaces ReactorState.
+ */
+
 import type { EngineState, ToolOutcome, TurnEngineEvent } from '../types'
 
 export function initialEngineState(): EngineState {
   return {
     toolCallMap: new Map(),
+    toolOutcomes: new Map(),
     deadToolCalls: new Set(),
     stopped: false,
-    toolOutcomes: new Map(),
   }
 }
 

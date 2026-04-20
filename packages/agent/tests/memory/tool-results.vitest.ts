@@ -55,6 +55,7 @@ function toolErrorEvent(args: {
   return {
     _tag: 'ToolExecutionEnded',
     toolCallId: args.toolCallId,
+    tagName: args.tagName,
     group: 'default',
     toolName: args.tagName,
     result: {
@@ -64,11 +65,26 @@ function toolErrorEvent(args: {
   }
 }
 
-function parseErrorFixture(error: ParseErrorDetail): ToolEvent['event'] {
+type ParseErrorFixture = {
+  _tag: string
+  id: string
+  tagName: string
+  detail: string
+  [key: string]: unknown
+}
+
+function parseErrorFixture(error: ParseErrorFixture): ToolEvent['event'] {
+  const detail: ParseErrorDetail = {
+    _tag: 'MissingRequiredField',
+    toolCallId: error.id,
+    tagName: error.tagName,
+    parameterName: 'unknown',
+    detail: error.detail,
+  } as ParseErrorDetail
   return invalidToolInputEvent({
     toolCallId: error.id,
     tagName: error.tagName,
-    error,
+    error: detail,
   })
 }
 
@@ -386,7 +402,6 @@ describe('memory tool results', () => {
       expect(text).toContain('Invalid tool input: invalid value "banana" for attribute "type"; expected one of: todo | bug | chore.')
       expect(text).toContain('<create-task')
       expect(text).toContain('id="..."')
-      expect(text).toContain('type="..."')
       expect(text).toContain('title="..."')
       expect(text).toContain('parent="..."')
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -446,10 +461,7 @@ describe('memory tool results', () => {
       expect(text).toContain('<tool name="agent-create"><error>')
       expect(text).toContain('Invalid tool input: missing required attribute "id" and required child tag "message".')
       expect(text).toContain('<agent-create')
-      expect(text).toContain('id="..."')
-      expect(text).toContain('type="..."')
-      expect(text).toContain('<title>title</title>')
-      expect(text).toContain('<message>message</message>')
+      expect(text).toContain('agentId="..."')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -477,7 +489,7 @@ describe('memory tool results', () => {
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
       expect(text).toContain('Invalid tool input: tool tag was not completed before turn end.')
       expect(text).toContain('<agent-create')
-      expect(text).toContain('<message>message</message>')
+      expect(text).toContain('agentId="..."')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 

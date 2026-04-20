@@ -10,16 +10,16 @@
  * - Reset behavior
  * - Multiple tool calls (accumulator reset between calls)
  *
- * Uses RuntimeEvent types (ToolInputFieldValue, ToolInputReady) instead of
+ * Uses TurnEngineEvent types (ToolInputFieldValue, ToolInputReady) instead of
  * ParseEvent types (ParameterChunk, ParameterComplete) since the accumulator
- * works with RuntimeEvent from the tool-handle layer.
+ * works with TurnEngineEvent from the tool-handle layer.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import { Schema } from '@effect/schema'
 import { createParameterAccumulator } from '../accumulator'
 import { deriveParameters, type ToolSchema } from '../../execution/parameter-schema'
-import type { RuntimeEvent } from '../../types'
+import type { TurnEngineEvent } from '../../types'
 
 // =============================================================================
 // Test Helpers
@@ -29,7 +29,7 @@ function makeToolSchema<T>(schema: Schema.Schema<T>): ToolSchema {
   return deriveParameters(schema.ast)
 }
 
-function toolInputStarted(toolCallId: string): RuntimeEvent {
+function toolInputStarted(toolCallId: string): TurnEngineEvent {
   return {
     _tag: 'ToolInputStarted',
     toolCallId,
@@ -39,7 +39,7 @@ function toolInputStarted(toolCallId: string): RuntimeEvent {
   }
 }
 
-function toolInputFieldValue(toolCallId: string, field: string, value: string | number | boolean): RuntimeEvent {
+function toolInputFieldValue(toolCallId: string, field: string, value: string | number | boolean): TurnEngineEvent {
   return {
     _tag: 'ToolInputFieldValue',
     toolCallId,
@@ -48,7 +48,7 @@ function toolInputFieldValue(toolCallId: string, field: string, value: string | 
   }
 }
 
-function toolInputReady(toolCallId: string, input: unknown): RuntimeEvent {
+function toolInputReady(toolCallId: string, input: unknown): TurnEngineEvent {
   return {
     _tag: 'ToolInputReady',
     toolCallId,
@@ -66,6 +66,8 @@ describe('scalar parameters', () => {
     count: Schema.Number,
   })
 
+  type SimplePartial = { name?: { isFinal: boolean; value: unknown }; count?: { isFinal: boolean; value: unknown } }
+
   let accumulator: ReturnType<typeof createParameterAccumulator>
 
   beforeEach(() => {
@@ -77,7 +79,7 @@ describe('scalar parameters', () => {
     accumulator.ingest(toolInputStarted('call-1'))
     accumulator.ingest(toolInputFieldValue('call-1', 'name', 'Hello'))
 
-    const current = accumulator.current
+    const current = accumulator.current as SimplePartial
     expect(current.name).toEqual({ isFinal: false, value: 'Hello' })
   })
 
@@ -86,7 +88,7 @@ describe('scalar parameters', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'name', 'World'))
     accumulator.ingest(toolInputReady('call-1', { name: 'World', count: 0 }))
 
-    const current = accumulator.current
+    const current = accumulator.current as SimplePartial
     expect(current.name).toEqual({ isFinal: true, value: 'World' })
   })
 
@@ -95,7 +97,7 @@ describe('scalar parameters', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'count', '42'))
     accumulator.ingest(toolInputReady('call-1', { name: '', count: 42 }))
 
-    const current = accumulator.current
+    const current = accumulator.current as SimplePartial
     expect(current.count).toEqual({ isFinal: true, value: 42 })
   })
 
@@ -105,7 +107,7 @@ describe('scalar parameters', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'count', '123'))
     accumulator.ingest(toolInputReady('call-1', { name: 'Test', count: 123 }))
 
-    const current = accumulator.current
+    const current = accumulator.current as SimplePartial
     expect(current.name).toEqual({ isFinal: true, value: 'Test' })
     expect(current.count).toEqual({ isFinal: true, value: 123 })
   })
@@ -134,7 +136,7 @@ describe('json parameters', () => {
     accumulator.ingest(toolInputStarted('call-1'))
     accumulator.ingest(toolInputFieldValue('call-1', 'items', '[{"name":'))
 
-    const current1 = accumulator.current
+    const current1 = accumulator.current as { items?: unknown }
     // JSON is incomplete, should have partial structure
     expect(current1.items).toBeDefined()
   })
@@ -144,7 +146,7 @@ describe('json parameters', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'items', '[{"name":"foo","value":42}]'))
     accumulator.ingest(toolInputReady('call-1', { items: [{ name: 'foo', value: 42 }] }))
 
-    const current = accumulator.current
+    const current = accumulator.current as { items?: unknown }
     expect(current.items).toBeDefined()
     const items = current.items as Array<Record<string, { isFinal: boolean; value: unknown }>>
     expect(items).toHaveLength(1)
@@ -156,7 +158,7 @@ describe('json parameters', () => {
     accumulator.ingest(toolInputStarted('call-1'))
     accumulator.ingest(toolInputFieldValue('call-1', 'items', '[{"name":"incomplete'))
 
-    const current = accumulator.current
+    const current = accumulator.current as { items?: unknown }
     expect(current.items).toBeDefined()
   })
 })
@@ -187,7 +189,7 @@ describe('mixed scalar and json parameters', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'items', '[{"id":1,"name":"first"}]'))
     accumulator.ingest(toolInputReady('call-1', { path: '/workspace', items: [{ id: 1, name: 'first' }] }))
 
-    const current = accumulator.current
+    const current = accumulator.current as { path?: unknown; items?: unknown }
     expect(current.path).toEqual({ isFinal: true, value: '/workspace' })
     expect(current.items).toBeDefined()
     const items = current.items as Array<Record<string, { isFinal: boolean; value: unknown }>>
@@ -222,7 +224,7 @@ describe('dotted parameter paths', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'options.depth', '5'))
     accumulator.ingest(toolInputReady('call-1', { options: { type: 'explorer', depth: 5 } }))
 
-    const current = accumulator.current
+    const current = accumulator.current as { options?: unknown }
     expect(current.options).toBeDefined()
     const options = current.options as Record<string, { isFinal: boolean; value: unknown }>
     expect(options.type).toEqual({ isFinal: true, value: 'explorer' })
@@ -260,7 +262,7 @@ describe('reset behavior', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'value', 'first'))
     accumulator.ingest(toolInputReady('call-1', { value: 'first' }))
 
-    let current = accumulator.current
+    let current = accumulator.current as { value?: unknown }
     expect(current.value).toEqual({ isFinal: true, value: 'first' })
 
     // Reset and second call
@@ -269,7 +271,7 @@ describe('reset behavior', () => {
     accumulator.ingest(toolInputFieldValue('call-2', 'value', 'second'))
     accumulator.ingest(toolInputReady('call-2', { value: 'second' }))
 
-    current = accumulator.current
+    current = accumulator.current as { value?: unknown }
     expect(current.value).toEqual({ isFinal: true, value: 'second' })
   })
 })
@@ -292,7 +294,7 @@ describe('incomplete parameters', () => {
     accumulator.ingest(toolInputFieldValue('call-1', 'name', 'Incom'))
     // Don't send ToolInputReady
 
-    const current = accumulator.current
+    const current = accumulator.current as { name?: unknown; count?: unknown }
     expect(current.name).toEqual({ isFinal: false, value: 'Incom' })
     expect(current.count).toBeUndefined()
   })

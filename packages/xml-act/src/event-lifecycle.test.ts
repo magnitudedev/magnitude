@@ -14,7 +14,7 @@ import {
   createXmlRuntime,
   ToolInterceptorTag,
   type XmlRuntimeConfig,
-  type XmlRuntimeEvent,
+  type XmlTurnEngineEvent,
   type RegisteredTool,
   type XmlTagBinding,
   type ToolInterceptor,
@@ -36,7 +36,7 @@ function runStream(
   cfg: XmlRuntimeConfig,
   xml: string,
   layers?: Layer.Layer<never>,
-): Promise<XmlRuntimeEvent[]> {
+): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(cfg)
   const stream = runtime.streamWith(Stream.make(xml))
   const collected = Stream.runCollect(stream)
@@ -48,7 +48,7 @@ function runStreamCharByChar(
   cfg: XmlRuntimeConfig,
   xml: string,
   layers?: Layer.Layer<never>,
-): Promise<XmlRuntimeEvent[]> {
+): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(cfg)
   const stream = runtime.streamWith(Stream.fromIterable([...xml]))
   const collected = Stream.runCollect(stream)
@@ -71,15 +71,15 @@ function cfg(
   return { tools: new Map(tools.map(t => [t.tagName, t])) }
 }
 
-function ofType<T extends XmlRuntimeEvent['_tag']>(
-  events: XmlRuntimeEvent[],
+function ofType<T extends XmlTurnEngineEvent['_tag']>(
+  events: XmlTurnEngineEvent[],
   tag: T,
-): Extract<XmlRuntimeEvent, { _tag: T }>[] {
-  return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
+): Extract<XmlTurnEngineEvent, { _tag: T }>[] {
+  return events.filter(e => e._tag === tag) as Extract<XmlTurnEngineEvent, { _tag: T }>[]
 }
 
 /** Assert the pairing guarantee: every ToolInputStarted has exactly one terminal event */
-function assertPairingGuarantee(events: XmlRuntimeEvent[]): void {
+function assertPairingGuarantee(events: XmlTurnEngineEvent[]): void {
   const starts = ofType(events, 'ToolInputStarted')
   for (const start of starts) {
     const execEnded = events.filter(
@@ -94,7 +94,7 @@ function assertPairingGuarantee(events: XmlRuntimeEvent[]): void {
 }
 
 /** Get the event sequence tags for a specific toolCallId */
-function toolCallEvents(events: XmlRuntimeEvent[], toolCallId: string): string[] {
+function toolCallEvents(events: XmlTurnEngineEvent[], toolCallId: string): string[] {
   return events
     .filter(e => 'toolCallId' in e && (e as { toolCallId: string }).toolCallId === toolCallId)
     .map(e => e._tag)
@@ -932,7 +932,7 @@ describe('pairing guarantee', () => {
     const c = cfg([reg(readTool, 'read', readBinding)])
     const events = await runStream(c, `${TASK_TAG_OPEN}<read id="r1" path="a.ts"/>${TASK_TAG_CLOSE}`)
 
-    const toolEvents = events.filter(e => 'toolCallId' in e) as (XmlRuntimeEvent & { toolCallId: string })[]
+    const toolEvents = events.filter(e => 'toolCallId' in e) as (XmlTurnEngineEvent & { toolCallId: string })[]
     const ids = new Set(toolEvents.map(e => e.toolCallId))
     expect(ids.size).toBe(1)  // all events reference the same tool call
   })

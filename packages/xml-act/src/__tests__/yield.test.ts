@@ -2,18 +2,18 @@ import { describe, test, expect } from 'vitest'
 import { Effect, Stream } from 'effect'
 import { createXmlRuntime } from '../execution/xml-runtime'
 import { createStreamingXmlParser } from '../parser'
-import type { XmlRuntimeConfig, XmlRuntimeEvent } from '../types'
+import type { XmlRuntimeConfig, XmlTurnEngineEvent } from '../types'
 import { YIELD_USER, YIELD_TOOL, YIELD_WORKER, YIELD_PARENT } from '../constants'
 
 function cfg(): XmlRuntimeConfig {
   return { tools: new Map() }
 }
 
-function ofType<T extends XmlRuntimeEvent['_tag']>(events: XmlRuntimeEvent[], tag: T) {
-  return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
+function ofType<T extends XmlTurnEngineEvent['_tag']>(events: XmlTurnEngineEvent[], tag: T) {
+  return events.filter(e => e._tag === tag) as Extract<XmlTurnEngineEvent, { _tag: T }>[]
 }
 
-async function run(chunks: string[]): Promise<XmlRuntimeEvent[]> {
+async function run(chunks: string[]): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(cfg())
   const stream = Stream.fromIterable(chunks)
   const events = await Effect.runPromise(Stream.runCollect(runtime.streamWith(stream)))

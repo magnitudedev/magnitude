@@ -155,7 +155,7 @@ export { PermissionRejection } from './execution/permission-rejection'
 // export { getProtocol } from './prompts/protocol'
 
 // Tool types (re-exported from xml-act and tools packages)
-export type { RuntimeEvent } from '@magnitudedev/xml-act'
+export type { TurnEngineEvent } from '@magnitudedev/xml-act'
 export type { ToolDefinition } from '@magnitudedev/tools'
 
 // Tools

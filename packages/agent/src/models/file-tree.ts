@@ -23,36 +23,43 @@ const initial: Omit<FileTreeState, 'phase' | 'toolKey'> = {
 export const fileTreeModel = defineStateModel('fileTree', treeTool)({
   initial,
   reduce: (state, event): FileTreeState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', path: event.streaming.path?.value ?? state.path }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolInputFieldChunk':
+        return event.field === 'path'
+          ? { ...state, phase: 'streaming', path: (state.path ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', path: event.input.path }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
-        return { ...state, phase: 'error', errorDetail: event.error }
-      case 'completed': {
-        const entries = event.output as TreeEntry[]
-        return {
-          ...state,
-          phase: 'completed',
-          entries: [...entries],
-          fileCount: entries.filter((entry) => entry.type === 'file').length,
-          dirCount: entries.filter((entry) => entry.type === 'dir').length,
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success': {
+            const entries = event.result.output as TreeEntry[]
+            return {
+              ...state,
+              phase: 'completed',
+              entries: [...entries],
+              fileCount: entries.filter((e) => e.type === 'file').length,
+              dirCount: entries.filter((e) => e.type === 'dir').length,
+            }
+          }
+          case 'Error':
+            return { ...state, phase: 'error', errorDetail: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
         }
       }
-      case 'error':
-        return { ...state, phase: 'error', errorDetail: event.error.message }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolInputParseError':
+        return { ...state, phase: 'error', errorDetail: event.error.detail }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

@@ -8,6 +8,8 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { AppEvent, StrategyId, ImageAttachment } from '../events'
+import { deriveParameters } from '@magnitudedev/xml-act'
+import { catalog } from '../catalog'
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
@@ -318,16 +320,38 @@ function getAgentDefinitionForFork(read: <T>(projection: T) => any, forkId: stri
   return role && isValidVariant(role) ? getAgentDefinition(role) : undefined
 }
 
+/** Lazy map from tagName to correctToolShape (XML format), built once from catalog */
+const toolShapeByTagName: Map<string, string> = (() => {
+  const map = new Map<string, string>()
+  for (const [, entry] of Object.entries(catalog.entries)) {
+    const e = entry as { tool: { name: string; inputSchema: { ast: unknown } } }
+    try {
+      const params = deriveParameters(e.tool.inputSchema.ast as import('@effect/schema/AST').AST)
+      let shape = '<' + e.tool.name
+      for (const [name] of params.parameters) {
+        shape += '\n' + name + '="..."'
+      }
+      shape += '\n/>'
+      map.set(e.tool.name, shape)
+    } catch {
+      // skip tools that fail to generate
+    }
+  }
+  return map
+})()
+
 function toToolErrorResult(args: {
   tagName: string
   status: Extract<TurnResultItem, { kind: 'tool_error' }>['status']
   message?: string
+  correctToolShape?: string
 }): TurnResultItem {
   return {
     kind: 'tool_error',
     tagName: args.tagName,
     status: args.status,
     message: args.message,
+    correctToolShape: args.correctToolShape ?? toolShapeByTagName.get(args.tagName),
   }
 }
 
@@ -458,6 +482,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       switch (event.event._tag) {
         case 'ToolExecutionEnded': {
           const result = event.event.result
+          const tagName = event.event.tagName ?? event.toolKey
           switch (result._tag) {
             case 'Success':
               return fork
@@ -467,7 +492,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 pendingResultItems: [
                   ...fork.pendingResultItems,
                   toToolErrorResult({
-                    tagName: event.toolKey,
+                    tagName,
                     status: 'error',
                     message: result.error,
                   }),
@@ -479,7 +504,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 pendingResultItems: [
                   ...fork.pendingResultItems,
                   toToolErrorResult({
-                    tagName: event.toolKey,
+                    tagName,
                     status: 'rejected',
                     message: typeof result.rejection === 'string' ? result.rejection : undefined,
                   }),
@@ -491,7 +516,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 pendingResultItems: [
                   ...fork.pendingResultItems,
                   toToolErrorResult({
-                    tagName: event.toolKey,
+                    tagName,
                     status: 'interrupted',
                   }),
                 ],
@@ -522,6 +547,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 tagName: event.event.tagName,
                 status: 'error',
                 message: `Invalid tool input: ${event.event.error.detail}`,
+                correctToolShape: event.event.correctToolShape,
               }),
             ],
           }

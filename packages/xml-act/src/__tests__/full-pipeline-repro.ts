@@ -4,7 +4,7 @@
 
 import { Effect, Layer, Stream } from 'effect'
 import { Schema } from '@effect/schema'
-import { createRuntime, type RuntimeEvent } from '..'
+import { createRuntime, type TurnEngineEvent } from '..'
 import { defineTool } from '@magnitudedev/tools'
 
 const createTaskTool = defineTool({
@@ -60,7 +60,7 @@ Effect.runPromise(
 
     yield* Effect.scoped(
       eventStream.pipe(
-        Stream.runForEach((event: RuntimeEvent) =>
+        Stream.runForEach((event: TurnEngineEvent) =>
           Effect.sync(() => console.log(`EVENT: ${JSON.stringify(event)}`))
         ),
       )

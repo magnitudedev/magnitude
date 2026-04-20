@@ -5,7 +5,7 @@
 
 import { Effect, Layer, Stream } from 'effect'
 import { Schema } from '@effect/schema'
-import { createRuntime, type RuntimeEvent } from '..'
+import { createRuntime, type TurnEngineEvent } from '..'
 import { defineTool } from '@magnitudedev/tools'
 
 const createTaskTool = defineTool({
@@ -76,7 +76,7 @@ for (const chunkSize of [1, 2, 5, 10]) {
       
       yield* Effect.scoped(
         eventStream.pipe(
-          Stream.runForEach((event: RuntimeEvent) =>
+          Stream.runForEach((event: TurnEngineEvent) =>
             Effect.sync(() => {
               if (event._tag === 'ToolExecutionEnded') {
                 if (event.result._tag === 'Success') toolSuccesses++

@@ -6,16 +6,16 @@ import {
   createXmlRuntime,
   type RegisteredTool,
   type XmlRuntimeConfig,
-  type XmlRuntimeEvent,
+  type XmlTurnEngineEvent,
   type XmlTagBinding,
 } from '../index'
 
-function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlRuntimeEvent[]> {
+function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   return Effect.runPromise(Stream.runCollect(runtime.streamWith(Stream.make(xml)))).then(c => Array.from(c))
 }
 
-function runStreamChunks(config: XmlRuntimeConfig, chunks: string[]): Promise<XmlRuntimeEvent[]> {
+function runStreamChunks(config: XmlRuntimeConfig, chunks: string[]): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   return Effect.runPromise(Stream.runCollect(runtime.streamWith(Stream.fromIterable(chunks)))).then(c => Array.from(c))
 }
@@ -42,19 +42,19 @@ function responseWithActions(actionsXml: string): string {
   return `<lens name="turn">planning</lens>\n${actionsXml}<idle/>`
 }
 
-function toolEvents(events: XmlRuntimeEvent[]): XmlRuntimeEvent[] {
+function toolEvents(events: XmlTurnEngineEvent[]): XmlTurnEngineEvent[] {
   return events.filter(e => e._tag.startsWith('ToolInput') || e._tag.startsWith('ToolExecution'))
 }
 
-function eventTags(events: XmlRuntimeEvent[]): string[] {
+function eventTags(events: XmlTurnEngineEvent[]): string[] {
   return toolEvents(events).map(e => e._tag)
 }
 
-function eventsOfType<T extends XmlRuntimeEvent['_tag']>(
-  events: XmlRuntimeEvent[],
+function eventsOfType<T extends XmlTurnEngineEvent['_tag']>(
+  events: XmlTurnEngineEvent[],
   tag: T,
-): Extract<XmlRuntimeEvent, { _tag: T }>[] {
-  return events.filter(e => e._tag === tag) as Extract<XmlRuntimeEvent, { _tag: T }>[]
+): Extract<XmlTurnEngineEvent, { _tag: T }>[] {
+  return events.filter(e => e._tag === tag) as Extract<XmlTurnEngineEvent, { _tag: T }>[]
 }
 
 const agentCreateLikeTool = defineTool({

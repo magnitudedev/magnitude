@@ -674,5 +674,20 @@ export function createStreamingJsonParser(): StreamingJsonParser {
     end,
     get partial() { return getPartial(); },
     get done() { return isDone(); },
+    get currentPath(): readonly string[] {
+      const path: string[] = []
+      for (const collection of collectionStack) {
+        if (collection._tag === 'object') {
+          // In object value position: keys.length > values.length → last key is current
+          if (collection.keys.length > collection.values.length) {
+            path.push(collection.keys[collection.keys.length - 1])
+          }
+        } else if (collection._tag === 'array') {
+          path.push(String(collection.items.length))
+        }
+        // quotedString/unquotedString don't add path segments
+      }
+      return path
+    },
   };
 }

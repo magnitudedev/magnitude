@@ -10,7 +10,7 @@
  */
 
 import { Effect, Data, Context, Stream } from 'effect'
-import type { RuntimeEvent, TurnEngineCrash, ReactorState } from '@magnitudedev/xml-act'
+import type { TurnEngineEvent, TurnEngineCrash, EngineState } from '@magnitudedev/xml-act'
 import type { MessageDestination, TurnResult } from '../events'
 import type { CallUsage, ModelError } from '@magnitudedev/providers'
 import type { Projection, WorkerBusService, AmbientService } from '@magnitudedev/event-core'
@@ -55,8 +55,8 @@ export type TurnEvent =
   | { readonly _tag: 'LensDelta'; readonly text: string }
   | { readonly _tag: 'LensEnded'; readonly name: string }
 
-  // --- Tool events (forwarded xml-act RuntimeEvent with agent metadata) ---
-  | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: string; readonly event: RuntimeEvent }
+  // --- Tool events (forwarded xml-act TurnEngineEvent with agent metadata) ---
+  | { readonly _tag: 'ToolEvent'; readonly toolCallId: string; readonly toolKey: string; readonly event: TurnEngineEvent }
 
   // --- Terminal (always last event in the stream) ---
   | { readonly _tag: 'TurnResult'; readonly value: TurnStrategyResult }
@@ -123,7 +123,7 @@ export interface ExecutionManagerService {
     Projection.ProjectionInstance<AgentRoutingState>
     | Projection.ProjectionInstance<AgentStatusState>
     | Projection.ProjectionInstance<TaskGraphState>
-    | Projection.ForkedProjectionInstance<ReactorState>
+    | Projection.ForkedProjectionInstance<EngineState>
     | Projection.ForkedProjectionInstance<ForkTurnState>
     | WorkerBusService<AppEvent>
     | TaskGraphStateReaderTag

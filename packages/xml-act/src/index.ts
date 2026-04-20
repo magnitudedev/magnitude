@@ -5,17 +5,19 @@
  */
 
 // Runtime
-export { createRuntime } from './runtime'
-export type { Runtime } from './runtime'
+export { createTurnEngine } from './engine/turn-engine'
+export type { TurnEngine, TurnEngineConfig } from './engine/turn-engine'
 
-// Reactor state
-export { initialReactorState, foldReactorState } from './execution/reactor-state'
+// Engine state
+export { initialEngineState, foldEngineState } from './execution/reactor-state'
 
 // Core types — events
 export type {
-  RuntimeEvent,
+  TurnEngineEvent,
+  ToolLifecycleEvent,
   ToolInputStarted,
-  ToolInputFieldValue,
+  ToolInputFieldChunk,
+  ToolInputFieldComplete,
   ToolInputReady,
   ToolInputParseError,
   ProseChunk,
@@ -51,7 +53,18 @@ export type {
 } from './types'
 
 // Core types — errors
-export type { ParseErrorDetail, StructuralParseErrorDetail } from './types'
+export type {
+  ParseErrorDetail,
+  StructuralParseErrorDetail,
+  UnknownToolError,
+  UnknownParameterError,
+  IncompleteToolError,
+  JsonStructuralError,
+  SchemaCoercionError,
+  MissingRequiredFieldError,
+  UnclosedThinkError,
+} from './types'
+
 export type { ToolCallContext } from './types'
 
 // Core types — results
@@ -73,10 +86,17 @@ export type {
   InterceptorDecision,
 } from './types'
 
-// Core types — reactor
+// Core types — engine state
 export type {
-  ReactorState,
+  EngineState,
   ToolOutcome,
+} from './types'
+
+// Generic path and streaming types
+export type {
+  DeepPaths,
+  StreamingPartial,
+  ApplyFieldChunk,
 } from './types'
 
 // Service tags
@@ -93,18 +113,10 @@ export type { ParameterSchema, ToolSchema, ScalarType } from './execution/parame
 export { buildInput, coerceParameterValue } from './execution/input-builder'
 export type { ParsedParameter, ParsedInvoke } from './execution/input-builder'
 
-// Output query (JSONPath-based)
+// Output (query, rendering, persistence)
 export {
   queryOutput,
   renderFilteredResult,
-  renderResultBlock,
-  observeOutput,
-  QueryPatterns,
-} from './output-query'
-export type { QueryResult } from './output-query'
-
-// Output renderer
-export {
   renderResult,
   renderResultBody,
   renderVoidResult,
@@ -124,13 +136,6 @@ export {
   parseResultBlock,
   isValidResultBlock,
   extractToolName,
-} from './output-renderer'
-export type { RenderConfig } from './output-renderer'
-
-// Result persistence
-export {
-  getResultsDir,
-  ensureResultsDir,
   getResultPath,
   persistResult,
   loadResult,
@@ -139,7 +144,8 @@ export {
   deleteResult,
   listResults,
   cleanupResults,
-} from './result-persistence'
+} from './output'
+export type { QueryResult, RenderConfig } from './output'
 
 // Constants
 export {
@@ -165,9 +171,13 @@ export {
 export { createTokenizer } from './tokenizer'
 export type { Tokenizer } from './tokenizer'
 
-// Parser
+// Parser (legacy — emits ParseEvent/StructuralEvent, used by runtime.ts)
 export { createParser } from './parser'
 export type { Parser, ParserEvent, Frame } from './parser'
+
+// New parser (emits TurnEngineEvent directly, integrates jsonish)
+export { createParser as createMactParser, createParserWithTokenizer } from './parser/index'
+export type { MactParser, ParserConfig } from './parser/index'
 
 // Machine
 export { createStackMachine } from './machine'

@@ -6,11 +6,11 @@ import {
   createXmlRuntime,
   type RegisteredTool,
   type XmlRuntimeConfig,
-  type XmlRuntimeEvent,
+  type XmlTurnEngineEvent,
   type XmlTagBinding,
 } from '../index'
 
-function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlRuntimeEvent[]> {
+function runStream(config: XmlRuntimeConfig, xml: string): Promise<XmlTurnEngineEvent[]> {
   const runtime = createXmlRuntime(config)
   const stream = runtime.streamWith(Stream.make(xml))
   return Effect.runPromise(Stream.runCollect(stream)).then(c => Array.from(c))
@@ -28,7 +28,7 @@ function responseWithActions(actionsXml: string): string {
   return `<lens name="turn">planning</lens>\n${actionsXml}<idle/>`
 }
 
-function turnFailure(events: XmlRuntimeEvent[]): string {
+function turnFailure(events: XmlTurnEngineEvent[]): string {
   const turnEnd = [...events].reverse().find((e) => e._tag === 'TurnEnd')
   if (!turnEnd || turnEnd.result._tag !== 'Failure') {
     throw new Error('Expected TurnEnd failure')
