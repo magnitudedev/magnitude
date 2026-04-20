@@ -180,6 +180,7 @@ export class GrammarBuilder {
     rules.set('ws', '[ \\t\\n]*')
     rules.set('ws1', '[ \\t\\n]+')
     rules.set('ws-bounded', '[ \\t\\n] [ \\t\\n]? [ \\t\\n]? [ \\t\\n]?')
+    rules.set('hws', '[ \\t]*')
   }
 
   private addLensRules(rules: RuleMap): void {
@@ -188,8 +189,8 @@ export class GrammarBuilder {
     const lensnameAlts = lensNames.map(n => `"${n}"`).join(' | ')
     
     rules.set('lensname', lensnameAlts)
-    rules.set('lens', '"\\n<|think:" lensname ">\\n" think-body "\\n<think|>\\n" ws')
-    rules.set('lens-tight', '"\\n<|think:" lensname ">\\n" think-body "\\n<think|>\\n" ws-bounded')
+    rules.set('lens', '"\\n" hws "<|think:" lensname ">" hws "\\n" think-body "\\n" hws "<think|>" hws "\\n" ws')
+    rules.set('lens-tight', '"\\n" hws "<|think:" lensname ">" hws "\\n" think-body "\\n" hws "<think|>" hws "\\n" ws-bounded')
 
     // Generate DFA body rules for think content (tracks "<think|>" close)
     for (const rule of generateBodyRules('think', 'think')) {
@@ -202,7 +203,7 @@ export class GrammarBuilder {
     // message format: <|message:RECIPIENT> content <message|>
     // Recipient is more open - can be user, parent, or task IDs
     rules.set('recipient', '[^ \\t\\n>]+')
-    rules.set('msg', '"\\n<|message:" recipient ">\\n" msg-body "\\n<message|>\\n" ws')
+    rules.set('msg', '"\\n" hws "<|message:" recipient ">" hws "\\n" msg-body "\\n" hws "<message|>" hws "\\n" ws')
 
     // Generate DFA body rules for message content (tracks "<message|>" close)
     for (const rule of generateBodyRules('msg', 'message')) {
@@ -212,14 +213,14 @@ export class GrammarBuilder {
 
     const requiredRecipient = this.config.protocol.requiredMessageTo
     if (requiredRecipient !== null) {
-      rules.set('forced-msg', `"\\n<|message:${requiredRecipient}>\\n" msg-body "\\n<message|>\\n" ws`)
+      rules.set('forced-msg', `"\\n" hws "<|message:${requiredRecipient}>" hws "\\n" msg-body "\\n" hws "<message|>" hws "\\n" ws`)
     }
   }
 
   private addYieldRules(rules: RuleMap): void {
     // yield format: <|yield:TARGET|>
     const alternatives = this.config.protocol.yieldTags
-      .map(target => `"\\n<|yield:${target}|>\\n"`)
+      .map(target => `"\\n" hws "<|yield:${target}|>" hws "\\n"`)
       .join(' | ')
     rules.set('yield', alternatives)
   }
@@ -386,7 +387,7 @@ export function generateToolRules(
     paramAlts.push(paramRuleName)
     
     // Parameter rule: <|parameter:name> body <parameter|>\n
-    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>\\n" ${paramRuleName}-body "<parameter|>\\n" ws`)
+    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>" hws "\\n" ${paramRuleName}-body "<parameter|>" hws "\\n" ws`)
     
     // DFA body rules for this parameter
     for (const bodyRule of generateBodyRules(`${paramRuleName}`, 'parameter')) {
@@ -399,10 +400,10 @@ export function generateToolRules(
   const paramSeq = paramAlts.length > 0 ? `(${paramAlts.join(' ')})*` : ''
   
   // Invoke close: either simple <invoke|> or piped <invoke|filter>...<filter|>
-  rules.push(`${ruleName} ::= "\\n<|${toolKeyword}:${tagName}>\\n" ws ${paramSeq} ${ruleName}-close ws`)
+  rules.push(`${ruleName} ::= "\\n" hws "<|${toolKeyword}:${tagName}>" hws "\\n" ws ${paramSeq} ${ruleName}-close ws`)
   
   // Close alternatives
-  rules.push(`${ruleName}-close ::= "\\n<invoke|>\\n" | "\\n<invoke|filter>\\n" ws ${ruleName}-filter-body "\\n<filter|>\\n"`)
+  rules.push(`${ruleName}-close ::= "\\n" hws "<invoke|>" hws "\\n" | "\\n" hws "<invoke|filter>" hws "\\n" ws ${ruleName}-filter-body "\\n" hws "<filter|>" hws "\\n"`)
   
   // Filter body DFA rules
   for (const bodyRule of generateBodyRules(`${ruleName}-filter`, 'filter')) {

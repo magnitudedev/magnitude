@@ -389,6 +389,74 @@ describe('Newline enforcement (tokenizer)', () => {
       expect(tokens.some(t => t._tag === 'Close' && t.name === 'think')).toBe(true)
     })
   })
+
+  describe('horizontal whitespace after newline (\\n + spaces/tabs + tag)', () => {
+    it('accepts open tag with spaces after newline', () => {
+      const tokens = collect('\n  <|message:user>')
+      expect(tokens.some(t => t._tag === 'Open' && t.name === 'message' && t.variant === 'user')).toBe(true)
+    })
+
+    it('accepts open tag with tab after newline', () => {
+      const tokens = collect('\n\t<|think:strategy>')
+      expect(tokens.some(t => t._tag === 'Open' && t.name === 'think')).toBe(true)
+    })
+
+    it('accepts open tag with mixed spaces and tabs after newline', () => {
+      const tokens = collect('\n \t <|invoke:shell>')
+      expect(tokens.some(t => t._tag === 'Open' && t.name === 'invoke')).toBe(true)
+    })
+
+    it('accepts close tag with spaces after newline', () => {
+      const tokens = collect('\n  <think|>')
+      expect(tokens.some(t => t._tag === 'Close' && t.name === 'think')).toBe(true)
+    })
+
+    it('accepts close tag with tab after newline', () => {
+      const tokens = collect('\n\t<message|>')
+      expect(tokens.some(t => t._tag === 'Close' && t.name === 'message')).toBe(true)
+    })
+
+    it('accepts self-close tag with spaces after newline', () => {
+      const tokens = collect('\n  <|yield:user|>')
+      expect(tokens.some(t => t._tag === 'SelfClose' && t.name === 'yield')).toBe(true)
+    })
+
+    it('accepts lenient close (Mode 1) with spaces after newline', () => {
+      const tokens = collect('\n  </think|>')
+      expect(tokens.some(t => t._tag === 'Close' && t.name === 'think')).toBe(true)
+    })
+
+    it('accepts lenient close (Mode 2) with spaces after newline', () => {
+      const tokens = collect('\n  </message>')
+      expect(tokens.some(t => t._tag === 'Close' && t.name === 'message')).toBe(true)
+    })
+
+    it('accepts lenient close (Mode 3) with tab after newline', () => {
+      const tokens = collect('\n\t<invoke>')
+      expect(tokens.some(t => t._tag === 'Close' && t.name === 'invoke')).toBe(true)
+    })
+
+    it('rejects tag with only spaces (no preceding newline)', () => {
+      const tokens = collect('text  <|think:strategy>')
+      expect(tokens.some(t => t._tag === 'Open' && t.name === 'think')).toBe(false)
+    })
+
+    it('accepts full turn with indented tags', () => {
+      const input = ' <|think:strategy>reasoning\n <think|>\n <|message:user>\nHey! How can I help?\n <message|>\n <|yield:user|>'
+      const tokens = collect(input)
+      expect(tokens.filter(t => t._tag === 'Open')).toHaveLength(2)
+      expect(tokens.filter(t => t._tag === 'Close')).toHaveLength(2)
+      expect(tokens.filter(t => t._tag === 'SelfClose')).toHaveLength(1)
+    })
+
+    it('accepts the exact LLM example from the user', () => {
+      const input = ' <|message:user>\nHey Anders! How can I help you today?\n<message|>\n\n<|yield:user|>'
+      const tokens = collect(input)
+      expect(tokens.some(t => t._tag === 'Open' && t.name === 'message' && t.variant === 'user')).toBe(true)
+      expect(tokens.some(t => t._tag === 'Close' && t.name === 'message')).toBe(true)
+      expect(tokens.some(t => t._tag === 'SelfClose' && t.name === 'yield')).toBe(true)
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -519,55 +587,53 @@ describe('Grammar newline enforcement', () => {
     ]).build()
   }
 
-  it('lens open tag includes \\n before and after', () => {
+  it('lens open tag includes \\n + hws before and hws + \\n after', () => {
     const grammar = buildGrammar()
-    // Should contain \n<|think:...\n
-    expect(grammar).toContain('"\\n<|think:')
-    expect(grammar).toContain('>\\n"')
+    expect(grammar).toContain('hws "<|think:')
+    expect(grammar).toContain('>" hws "\\n"')
   })
 
   it('lens close tag includes \\n before and after', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"\\n<think|>\\n"')
+    expect(grammar).toContain('hws "<think|>" hws "\\n"')
   })
 
-  it('message open tag includes \\n before and after', () => {
+  it('message open tag includes \\n before and hws + after', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"\\n<|message:')
+    expect(grammar).toContain('hws "<|message:')
   })
 
-  it('message close tag includes \\n before and after', () => {
+  it('message close tag includes \\n before and hws + after', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"\\n<message|>\\n"')
+    expect(grammar).toContain('hws "<message|>" hws "\\n"')
   })
 
-  it('invoke open tag includes \\n before and after', () => {
+  it('invoke open tag includes \\n + hws before and hws + \\n after', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"\\n<|invoke:shell>\\n"')
+    expect(grammar).toContain('hws "<|invoke:shell>" hws "\\n"')
   })
 
-  it('invoke close tag includes \\n before and after', () => {
+  it('invoke close tag includes \\n + hws before and hws + \\n after', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"\\n<invoke|>\\n"')
+    expect(grammar).toContain('hws "<invoke|>" hws "\\n"')
   })
 
-  it('yield tag includes \\n before and after', () => {
+  it('yield tag includes \\n + hws before and hws + \\n after', () => {
     const grammar = buildGrammar()
-    // yield is a self-close
-    expect(grammar).toMatch(/"\\n<\|yield:[^>]+\|>\\n"/)
+    expect(grammar).toMatch(/hws "<\|yield:[^>]+\|>" hws "\\n"/)
   })
 
-  it('parameter close tag includes \\n after (no preceding newline required)', () => {
+  it('parameter close tag includes hws + \\n after (no preceding newline required)', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"<parameter|>\\n"')
+    expect(grammar).toContain('"<parameter|>" hws "\\n"')
   })
 
   it('parameter open tag does NOT include \\n prefix', () => {
     const grammar = buildGrammar()
-    // Parameter open is "<|parameter:name>\n" — no preceding newline
-    expect(grammar).toContain('"<|parameter:cmd>\\n"')
-    // Should NOT have \n<|parameter
-    expect(grammar).not.toContain('"\\n<|parameter:')
+    // Parameter open has no preceding newline
+    expect(grammar).toContain('"<|parameter:cmd>" hws "\\n"')
+    // Should NOT have \n before parameter open
+    expect(grammar).not.toContain('"\\n" hws "<|parameter:')
   })
 
   describe('custom toolKeyword', () => {
@@ -577,7 +643,7 @@ describe('Grammar newline enforcement', () => {
       ])
         .withToolKeyword('tool')
         .build()
-      expect(grammar).toContain('"\\n<|tool:shell>\\n"')
+      expect(grammar).toContain('hws "<|tool:shell>" hws "\\n"')
     })
   })
 })

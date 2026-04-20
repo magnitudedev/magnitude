@@ -74,7 +74,8 @@ export function createTokenizer(
     onToken({ _tag: 'Content', text })
     // Update afterNewline based on content
     for (const ch of text) {
-      afterNewline = ch === '\n'
+      if (ch === '\n') afterNewline = true
+      else if (ch !== ' ' && ch !== '\t') afterNewline = false
     }
   }
 
@@ -315,7 +316,8 @@ export function createTokenizer(
           emitClose(tag.name, undefined)
           activeTag = null
           contentBuffer += ch
-          afterNewline = ch === '\n'
+          if (ch === '\n') afterNewline = true
+      else if (ch !== ' ' && ch !== '\t') afterNewline = false
           return
         }
 
@@ -343,7 +345,8 @@ export function createTokenizer(
             emitClose(tag.name, undefined)
             activeTag = null
             contentBuffer += ch
-            afterNewline = ch === '\n'
+            if (ch === '\n') afterNewline = true
+      else if (ch !== ' ' && ch !== '\t') afterNewline = false
             return
           }
           // Invalid after pipe
@@ -369,7 +372,8 @@ export function createTokenizer(
           emitClose(tag.name, tag.variant)
           activeTag = null
           contentBuffer += ch
-          afterNewline = ch === '\n'
+          if (ch === '\n') afterNewline = true
+      else if (ch !== ' ' && ch !== '\t') afterNewline = false
           return
         }
 
@@ -465,7 +469,8 @@ export function createTokenizer(
           }
         } else {
           contentBuffer += ch
-          afterNewline = ch === '\n'
+          if (ch === '\n') afterNewline = true
+      else if (ch !== ' ' && ch !== '\t') afterNewline = false
         }
       }
     },
