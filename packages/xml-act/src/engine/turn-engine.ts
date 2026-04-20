@@ -306,9 +306,11 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
               generateId,
             })
 
-            const tokenizer = createTokenizer((token) => {
-              parser.pushToken(token)
-            })
+            const tokenizer = createTokenizer(
+              (token) => { parser.pushToken(token) },
+              new Set(),
+              { strictNewlines: true, toolKeyword: 'invoke' },
+            )
 
             yield* textStream.pipe(
               Stream.mapError((e) => new TurnEngineCrash(e.message, e)),

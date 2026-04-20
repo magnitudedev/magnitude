@@ -52,10 +52,16 @@ function isWhitespace(ch: string): boolean {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
 }
 
+const TOP_LEVEL_TAGS = new Set(['think', 'message', 'invoke', 'yield'])
+
+const DEFAULT_TOKENIZER_OPTIONS = { strictNewlines: true, toolKeyword: 'invoke' } as const
+
 export function createTokenizer(
   onToken: (token: Token) => void,
-  knownToolTags?: ReadonlySet<string>,
+  knownToolTags: ReadonlySet<string> = new Set(),
+  options: { strictNewlines: boolean; toolKeyword: string } = DEFAULT_TOKENIZER_OPTIONS,
 ): Tokenizer {
+  const toolKeyword = options.toolKeyword
   let contentBuffer = ''
   let afterNewline = true
   let activeTag: ActiveTag | null = null
@@ -73,18 +79,40 @@ export function createTokenizer(
   }
 
   function emitOpen(name: string, variant: string | undefined): void {
+    // Unit B: invoke-without-keyword leniency
+    let emitName = name
+    let emitVariant = variant
+    if (variant === undefined && knownToolTags?.has(name)) {
+      emitName = toolKeyword
+      emitVariant = name
+    }
+    // Unit C: newline enforcement for top-level tags
+    if (TOP_LEVEL_TAGS.has(emitName) && !activeTag!.savedAfterNewline) {
+      failAsContent()
+      return
+    }
     flushContent()
-    onToken({ _tag: 'Open', name, variant })
+    onToken({ _tag: 'Open', name: emitName, variant: emitVariant })
     afterNewline = false
   }
 
   function emitClose(name: string, pipe: string | undefined): void {
+    // Unit C: newline enforcement for top-level tags
+    if (TOP_LEVEL_TAGS.has(name) && !activeTag!.savedAfterNewline) {
+      failAsContent()
+      return
+    }
     flushContent()
     onToken({ _tag: 'Close', name, pipe })
     afterNewline = false
   }
 
   function emitSelfClose(name: string, variant: string | undefined): void {
+    // Unit C: newline enforcement for top-level tags (yield is self-close)
+    if (TOP_LEVEL_TAGS.has(name) && !activeTag!.savedAfterNewline) {
+      failAsContent()
+      return
+    }
     flushContent()
     onToken({ _tag: 'SelfClose', name, variant })
     afterNewline = false
@@ -376,6 +404,12 @@ export function createTokenizer(
           startCloseTag()
           // Don't skip, process this char as part of close tag
           // i stays 0 to process this char
+        } else if (ch === '/') {
+          // Unit A: lenient close tag - skip the / and start close tag
+          flushContent()
+          startCloseTag()
+          activeTag!.raw += '/'
+          i = 1  // Skip /, main loop processes chunk[1] as first name char
         } else {
           // Not a tag, treat pending < as content
           contentBuffer += '<'
@@ -410,6 +444,13 @@ export function createTokenizer(
               flushContent()
               startCloseTag()
               // Don't skip, let processTagChar handle the name char
+              continue
+            } else if (next === '/') {
+              // Unit A: lenient close tag - skip < and /
+              flushContent()
+              startCloseTag()
+              activeTag!.raw += '/'
+              i += 1  // Point at /, loop increments to i+2 (first name char)
               continue
             } else {
               // < followed by non-tag char - treat as content

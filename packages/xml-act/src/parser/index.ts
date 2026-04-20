@@ -1193,7 +1193,11 @@ export function createParserWithTokenizer(config: ParserConfig): {
   end(): readonly TurnEngineEvent[]
 } {
   const parser = createParser(config)
-  const tokenizer = createTokenizer((token) => parser.pushToken(token))
+  const tokenizer = createTokenizer(
+    (token) => parser.pushToken(token),
+    new Set(),
+    { strictNewlines: true, toolKeyword: 'invoke' },
+  )
 
   return {
     push(chunk: string): readonly TurnEngineEvent[] {

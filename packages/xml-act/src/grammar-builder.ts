@@ -188,8 +188,8 @@ export class GrammarBuilder {
     const lensnameAlts = lensNames.map(n => `"${n}"`).join(' | ')
     
     rules.set('lensname', lensnameAlts)
-    rules.set('lens', '"<|think:" lensname ">" ws think-body "<think|>" ws')
-    rules.set('lens-tight', '"<|think:" lensname ">" ws think-body "<think|>" ws-bounded')
+    rules.set('lens', '"\\n<|think:" lensname ">\\n" think-body "\\n<think|>\\n" ws')
+    rules.set('lens-tight', '"\\n<|think:" lensname ">\\n" think-body "\\n<think|>\\n" ws-bounded')
 
     // Generate DFA body rules for think content (tracks "<think|>" close)
     for (const rule of generateBodyRules('think', 'think')) {
@@ -202,7 +202,7 @@ export class GrammarBuilder {
     // message format: <|message:RECIPIENT> content <message|>
     // Recipient is more open - can be user, parent, or task IDs
     rules.set('recipient', '[^ \\t\\n>]+')
-    rules.set('msg', '"<|message:" recipient ">" ws msg-body "<message|>" ws')
+    rules.set('msg', '"\\n<|message:" recipient ">\\n" msg-body "\\n<message|>\\n" ws')
 
     // Generate DFA body rules for message content (tracks "<message|>" close)
     for (const rule of generateBodyRules('msg', 'message')) {
@@ -212,14 +212,14 @@ export class GrammarBuilder {
 
     const requiredRecipient = this.config.protocol.requiredMessageTo
     if (requiredRecipient !== null) {
-      rules.set('forced-msg', `"<|message:${requiredRecipient}>" msg-body "<message|>" ws`)
+      rules.set('forced-msg', `"\\n<|message:${requiredRecipient}>\\n" msg-body "\\n<message|>\\n" ws`)
     }
   }
 
   private addYieldRules(rules: RuleMap): void {
     // yield format: <|yield:TARGET|>
     const alternatives = this.config.protocol.yieldTags
-      .map(target => `"<|yield:${target}|>"`)
+      .map(target => `"\\n<|yield:${target}|>\\n"`)
       .join(' | ')
     rules.set('yield', alternatives)
   }
@@ -295,49 +295,53 @@ export class GrammarBuilder {
 // =============================================================================
 
 /**
- * Generate DFA body rules format.
- * 
- * The close delimiter is `<tagname|>` (asymmetric delimiters).
- * We track this character-by-character, resetting on deviation.
- * 
+ * Generate DFA body rules that accept all 4 close tag variants:
+ *   - `<tagname|>`   (canonical)
+ *   - `</tagname|>`  (Mode 1: slash-prefix with pipe)
+ *   - `</tagname>`   (Mode 2: slash-prefix without pipe)
+ *   - `<tagname>`    (Mode 3: no slash, no pipe)
+ *
+ * States share tagname-tracking after the optional `/`, and accept
+ * both `|>` and `>` as terminators.
+ *
  * @param prefix - Rule name prefix (e.g., "think", "msg", "param")
  * @param tagName - The tag name for the close delimiter (e.g., "think", "message", "parameter")
  * @returns Array of GBNF rule strings
  */
 export function generateBodyRules(prefix: string, tagName: string): string[] {
   const rules: string[] = []
-  const closing = `<${tagName}|>`
-  const n = closing.length
+  const n = tagName.length
+  const s = (k: number) => `${prefix}-body-s${k}`
+  const slashState = `${prefix}-body-slash`
+  const pipeState = `${prefix}-body-pipe`
 
-  rules.push(`${prefix}-body ::= ${prefix}-body-s0`)
+  rules.push(`${prefix}-body ::= ${s(0)}`)
 
-  for (let k = 0; k < n; k++) {
-    const stateName = `${prefix}-body-s${k}`
-    const nextStateName = `${prefix}-body-s${k + 1}`
-    const ch = closing[k]
+  // s0: base state — accumulate non-'<' content, or start matching on '<'
+  rules.push(`${s(0)} ::= [^<] ${s(0)} | "<" ${s(1)} | ""`)
 
-    if (k === 0) {
-      // State 0: not matching close sequence yet
-      // Can stay in state 0 on non-'<', or move to state 1 on '<'
-      rules.push(`${stateName} ::= [^<] ${stateName} | "<" ${nextStateName} | ""`)
-    } else if (k < n - 1) {
-      // Intermediate states: building up the close sequence
-      const escapedCh = escapeGbnfChar(ch)
-      if (ch === '<') {
-        // Special case: '<' can start a new close sequence
-        rules.push(`${stateName} ::= "<" ${nextStateName} | [^<] ${prefix}-body-s0 | ""`)
-      } else {
-        // Match expected char -> advance, or mismatch -> reset to state 0
-        // Need to exclude '<' to avoid ambiguity
-        const ccExcludes = ch === '-' ? '[^<-]' : `[^${escapeGbnfCharClass(ch)}<]`
-        rules.push(`${stateName} ::= ${escapedCh} ${nextStateName} | "<" ${prefix}-body-s1 | ${ccExcludes} ${prefix}-body-s0 | ""`)
-      }
-    } else {
-      // Final state: last char of close sequence
-      // On mismatch, reset to state 0 (but '<' goes to state 1)
-      rules.push(`${stateName} ::= "<" ${prefix}-body-s1 | [^<>] ${prefix}-body-s0 | ""`)
-    }
+  // s1: after '<' — accept '/' (slash variant) or first tagname char (canonical)
+  const fc = escapeGbnfChar(tagName[0])
+  const fcClass = escapeGbnfCharClass(tagName[0])
+  rules.push(`${s(1)} ::= "/" ${slashState} | ${fc} ${s(2)} | [^</${fcClass}] ${s(0)} | ""`)
+
+  // slashState: after '</' — expect first tagname char (shared path with canonical from s2)
+  rules.push(`${slashState} ::= ${fc} ${s(2)} | [^<${fcClass}] ${s(0)} | ""`)
+
+  // s2..s{n}: match remaining tagname chars (shared between canonical and slash paths)
+  // s2 has matched tagName[0], s{k+1} has matched tagName[k]
+  for (let i = 1; i < n; i++) {
+    const ch = tagName[i]
+    const esc = escapeGbnfChar(ch)
+    const ccExclude = ch === '-' ? '[^<-]' : `[^${escapeGbnfCharClass(ch)}<]`
+    rules.push(`${s(i + 1)} ::= ${esc} ${s(i + 2)} | "<" ${s(1)} | ${ccExclude} ${s(0)} | ""`)
   }
+
+  // s{n+1}: after full tagname — accept '|' (pipe variants) or '>' (no-pipe variants)
+  rules.push(`${s(n + 1)} ::= "|" ${pipeState} | ">" | "<" ${s(1)} | [^<|>] ${s(0)} | ""`)
+
+  // pipeState: after '<[/]tagname|' — accept '>' to close
+  rules.push(`${pipeState} ::= ">" | "<" ${s(1)} | [^<>] ${s(0)} | ""`)
 
   return rules
 }
@@ -381,8 +385,8 @@ export function generateToolRules(
     const paramRuleName = `${ruleName}-param-${sanitizeRuleName(param.name)}`
     paramAlts.push(paramRuleName)
     
-    // Parameter rule: <|parameter:name> body <parameter|>
-    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>" ${paramRuleName}-body "<parameter|>" ws`)
+    // Parameter rule: <|parameter:name> body <parameter|>\n
+    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>\\n" ${paramRuleName}-body "<parameter|>\\n" ws`)
     
     // DFA body rules for this parameter
     for (const bodyRule of generateBodyRules(`${paramRuleName}`, 'parameter')) {
@@ -395,10 +399,10 @@ export function generateToolRules(
   const paramSeq = paramAlts.length > 0 ? `(${paramAlts.join(' ')})*` : ''
   
   // Invoke close: either simple <invoke|> or piped <invoke|filter>...<filter|>
-  rules.push(`${ruleName} ::= "<|${toolKeyword}:${tagName}>" ws ${paramSeq} ${ruleName}-close ws`)
+  rules.push(`${ruleName} ::= "\\n<|${toolKeyword}:${tagName}>\\n" ws ${paramSeq} ${ruleName}-close ws`)
   
   // Close alternatives
-  rules.push(`${ruleName}-close ::= "<invoke|>" | "<invoke|filter>" ws ${ruleName}-filter-body "<filter|>"`)
+  rules.push(`${ruleName}-close ::= "\\n<invoke|>\\n" | "\\n<invoke|filter>\\n" ws ${ruleName}-filter-body "\\n<filter|>\\n"`)
   
   // Filter body DFA rules
   for (const bodyRule of generateBodyRules(`${ruleName}-filter`, 'filter')) {

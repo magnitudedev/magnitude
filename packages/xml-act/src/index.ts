@@ -171,12 +171,8 @@ export {
 export { createTokenizer } from './tokenizer'
 export type { Tokenizer } from './tokenizer'
 
-// Parser (legacy — emits ParseEvent/StructuralEvent, used by runtime.ts)
-export { createParser } from './parser'
-export type { Parser, ParserEvent, Frame } from './parser'
-
-// New parser (emits TurnEngineEvent directly, integrates jsonish)
-export { createParser as createMactParser, createParserWithTokenizer } from './parser/index'
+// Parser (emits TurnEngineEvent directly, integrates jsonish)
+export { createParser, createParserWithTokenizer } from './parser/index'
 export type { MactParser, ParserConfig } from './parser/index'
 
 // Machine
