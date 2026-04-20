@@ -1,5 +1,5 @@
 
-import { YIELD_USER, YIELD_TOOL, deriveParameters } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, deriveParameters } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 import type { ResolvedToolSet } from '../tools/resolved-toolset'
 import { buildRegisteredTools } from '../tools/tool-registry'
@@ -127,7 +127,7 @@ export function serializeMactTurn(
   if (trace.turnDecision === 'idle') {
     parts.push(YIELD_USER)
   } else if (trace.turnDecision === 'continue') {
-    parts.push(YIELD_TOOL)
+    parts.push(YIELD_INVOKE)
   }
 
   return parts.join('\n\n')

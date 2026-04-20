@@ -261,7 +261,7 @@ export function createParser(config: ParserConfig): MactParser {
 
   const events: TurnEngineEvent[] = []
   let coalescingBuffer: CoalescingBuffer | null = null
-  let deferredYieldTarget: 'user' | 'tool' | 'worker' | 'parent' | null = null
+  let deferredYieldTarget: 'user' | 'invoke' | 'worker' | 'parent' | null = null
   let postYieldHasContent = false
 
   function flushCoalescing(): void {
@@ -564,7 +564,7 @@ export function createParser(config: ParserConfig): MactParser {
 
     switch (name) {
       case 'yield': {
-        const target = (variant as 'user' | 'tool' | 'worker' | 'parent') ?? 'user'
+        const target = (variant as 'user' | 'invoke' | 'worker' | 'parent') ?? 'user'
         endCurrentProse()
         deferredYieldTarget = target
         postYieldHasContent = false

@@ -1,5 +1,5 @@
 import type { MockTurnResponse } from './turn-script'
-import { YIELD_USER, YIELD_TOOL } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE } from '@magnitudedev/xml-act'
 
 type MactParams = Record<string, string>
 
@@ -111,8 +111,8 @@ export class ResponseBuilder {
     return this.build(YIELD_USER)
   }
 
-  yieldTool(): MockTurnResponse {
-    return this.build(YIELD_TOOL)
+  yieldInvoke(): MockTurnResponse {
+    return this.build(YIELD_INVOKE)
   }
 
   next(): MockTurnResponse {

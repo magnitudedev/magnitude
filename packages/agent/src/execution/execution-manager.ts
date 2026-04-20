@@ -797,10 +797,10 @@ const makeExecutionManager = Effect.gen(function* () {
                     executionResult = { success: true, turnDecision: 'continue' }
                   } else {
                     // Map yield target to turn decision
-                    // yield-tool → continue (wait for tool results)
+                    // yield-invoke → continue (wait for tool results)
                     // yield-user, yield-worker, yield-parent → idle
                     const target = endResult.turnControl?.target ?? null
-                    if (target === 'tool') {
+                    if (target === 'invoke') {
                       executionResult = { success: true, turnDecision: 'continue' }
                     } else {
                       // user, worker, parent, or null → idle

@@ -59,7 +59,7 @@ Magnitude has per-provider implementations in [\`packages/agent/src/tools/web-se
 - **Google Gemini** — synchronous (but silently ignores domain filters)
 
 The router at [\`packages/agent/src/tools/web-search.ts\`](packages/agent/src/tools/web-search.ts) determines which one to call based on your active provider.</message>
-<yield-tool/>`
+<yield-invoke/>`
 
     const secondResponse = `
 

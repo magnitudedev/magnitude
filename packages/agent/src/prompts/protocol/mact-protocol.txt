@@ -1,6 +1,6 @@
 # Response Protocol
 
-You respond using the Mact format. Each response must be exactly one turn.
+You respond using the MACT (Magnitude Act) format. Each response must be exactly one turn.
 
 ## Turn structure
 
@@ -11,8 +11,6 @@ message  := <|message:RECIPIENT>\n content \n<message|>
 invoke   := <|invoke:NAME>\n parameter+ \n<invoke|>
 yield    := <|yield:TARGET|>
 ```
-
-
 
 ## Agentic operation
 
@@ -32,11 +30,25 @@ Based on these principles, any reasonable agent should:
 
 ## Response parsing
 
-This is NOT standard XML. Tags use asymmetric delimiters: `<|tag>` to open, `<tag|>` to close.
-All content is raw text — no entity processing, no escaping.
-WRONG: `&lt;div&gt;`, `&amp;`, `&quot;`
-RIGHT: `<div>`, `&`, `"`
-This applies everywhere — thinking, message bodies, and parameter values. Escaping will corrupt your output (e.g., a file edit with `&lt;` instead of `<` will fail to match).
+### Mechanics
+
+MACT is parsed by matching opening and closing tags of the exact same name. Within a given MACT context, only subtags of that context and the closing tag are parsed as tags.
+
+### Escaping
+
+MACT tags should be used with extreme care.
+With the sole exception of parameters inside invoke, usage of MACT tags inside other MACT tags should be avoided, else the parser will fail.
+
+If for whatever reason you need to think about a MACT tag, message about a MACT tag, or use a MACT tag inside a tool parameter, substitute `|` for `$` to prevent the syntax from being parsed.
+Example:
+```
+<|message:{{DEFAULT_RECIPIENT}}>
+I respond using the MACT protcol, in which I send messages like `<$message:{{DEFAULT_RECIPIENT}}>Hello!<message$>`
+<message|>
+```
+If you are programming using MACT, use constants for keywords and combine in template literals.
+
+MACT is not XML. HTML entity escaping should not be used.
 
 ## Think
 

@@ -121,7 +121,7 @@ export interface MessageEnd { readonly _tag: 'MessageEnd'; readonly id: string }
 
 export interface TurnControl {
   readonly _tag: 'TurnControl'
-  readonly target: 'user' | 'tool' | 'worker' | 'parent'
+  readonly target: 'user' | 'invoke' | 'worker' | 'parent'
   readonly termination: 'natural' | 'runaway'
 }
 
@@ -269,7 +269,7 @@ export type ToolResult<TOutput = unknown> =
   | { readonly _tag: 'Interrupted' }
 
 export type ExecutionResult =
-  | { readonly _tag: 'Success'; readonly turnControl: { readonly target: 'user' | 'tool' | 'worker' | 'parent' } | null; readonly termination: 'natural' | 'runaway' }
+  | { readonly _tag: 'Success'; readonly turnControl: { readonly target: 'user' | 'invoke' | 'worker' | 'parent' } | null; readonly termination: 'natural' | 'runaway' }
   | { readonly _tag: 'Failure'; readonly error: string }
   | { readonly _tag: 'Interrupted' }
   | { readonly _tag: 'GateRejected'; readonly rejection: unknown }

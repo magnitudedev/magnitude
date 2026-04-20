@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { YIELD_USER, YIELD_TOOL, YIELD_WORKER, YIELD_PARENT } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT } from '@magnitudedev/xml-act'
 import mactProtocolRaw from './protocol/mact-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -50,6 +50,10 @@ export function getMactProtocol(
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))
     .replaceAll('{{THINKING_LENSES}}', renderThinkingLenses(lenses))
     .replaceAll('{{DEFAULT_RECIPIENT}}', defaultRecipient)
+    .replaceAll('{{YIELD_USER}}', YIELD_USER)
+    .replaceAll('{{YIELD_INVOKE}}', YIELD_INVOKE)
+    .replaceAll('{{YIELD_WORKER}}', YIELD_WORKER)
+    .replaceAll('{{YIELD_PARENT}}', YIELD_PARENT)
 }
 
 /**
@@ -69,7 +73,7 @@ Acknowledge readiness and continue.
 Ready.
 <message|>
 
-${YIELD_TOOL}
+${YIELD_INVOKE}
 `
 }
 
@@ -111,7 +115,7 @@ Bug fix isn't one-turnable. Need to understand and delegate.
 <|parameter:path>src/auth/redirect.ts<parameter|>
 <invoke|>
 
-${YIELD_TOOL}`]
+${YIELD_INVOKE}`]
     },
     {
       role: 'user',

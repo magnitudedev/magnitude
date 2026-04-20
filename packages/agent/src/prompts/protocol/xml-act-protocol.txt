@@ -9,7 +9,7 @@ turn     := {{LENS_TAG}}* ({{MESSAGE_TAG}} | tool)* turnctl
 {{LENS_TAG}}     := <{{LENS_TAG}} name="...">reasoning</{{LENS_TAG}}>
 {{MESSAGE_TAG}}  := <{{MESSAGE_TAG}} to="recipient">text</{{MESSAGE_TAG}}>
 tool     := <TAG observe="query" .../>  |  <TAG observe="query" ...>body</TAG>
-turnctl  := {{YIELD_USER}} | {{YIELD_TOOL}} | {{YIELD_WORKER}} | {{YIELD_PARENT}}
+turnctl  := {{YIELD_USER}} | {{YIELD_INVOKE}} | {{YIELD_WORKER}} | {{YIELD_PARENT}}
 ```
 
 ## Agentic operation

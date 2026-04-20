@@ -1,4 +1,4 @@
-import { YIELD_USER, YIELD_TOOL } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 
 export interface ThinkBlock {
@@ -102,7 +102,7 @@ export function serializeCanonicalTurn(
   if (trace.turnDecision === 'idle') {
     parts.push(YIELD_USER)
   } else if (trace.turnDecision === 'continue') {
-    parts.push(YIELD_TOOL)
+    parts.push(YIELD_INVOKE)
   }
   return parts.join('\n')
 }
