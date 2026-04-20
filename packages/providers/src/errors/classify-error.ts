@@ -2,7 +2,9 @@ import {
   AuthFailed,
   ContextLimitExceeded,
   RateLimited,
+  SubscriptionRequired,
   TransportError,
+  UsageLimitExceeded,
   type ModelError,
 } from './model-error'
 
@@ -42,6 +44,16 @@ function parseRetryAfterMs(message: string): number | null {
   return unit === 'ms' ? value : value * 1000
 }
 
+function tryParseErrorCode(text: string): string | null {
+  try {
+    const parsed = JSON.parse(text)
+    const code = parsed?.error?.code
+    return typeof code === 'string' ? code : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Classify an HTTP error by status code and message text.
  * This is the shared heuristic layer — driver-agnostic.
@@ -54,7 +66,15 @@ export function classifyHttpError(status: number, message: string): ModelError {
   if (status === 401 || status === 403 || hasAuthSignal(lower)) {
     return new AuthFailed({ message })
   }
+  if (status === 402) {
+    const code = tryParseErrorCode(message) ?? 'subscription_required'
+    return new SubscriptionRequired({ message, code })
+  }
   if (status === 429) {
+    const code = tryParseErrorCode(message)
+    if (code?.startsWith('usage_limit_exceeded')) {
+      return new UsageLimitExceeded({ message, code })
+    }
     return new RateLimited({ message, retryAfterMs: parseRetryAfterMs(message) })
   }
   return new TransportError({ message, status })
@@ -84,6 +104,8 @@ export function classifyUnknownError(error: unknown): ModelError {
  *   - NotConfigured
  *   - ProviderDisconnected
  *   - ParseError
+ *   - SubscriptionRequired
+ *   - UsageLimitExceeded
  */
 export function isRetryableError(error: ModelError): boolean {
   switch (error._tag) {

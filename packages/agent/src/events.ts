@@ -206,6 +206,7 @@ export interface TurnUnexpectedError {
   readonly forkId: string | null
   readonly turnId: string
   readonly message: string
+  readonly errorCode?: string
 }
 
 // =============================================================================

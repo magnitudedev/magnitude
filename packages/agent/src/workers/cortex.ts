@@ -21,7 +21,7 @@ import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 import { LEAD_YIELD_STOP_SEQUENCES, SUBAGENT_YIELD_STOP_SEQUENCES, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, type GrammarBuildOptions, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
-import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
+import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError, SubscriptionRequired, UsageLimitExceeded } from '@magnitudedev/providers'
 import type { ModelError } from '@magnitudedev/providers'
 import { drainTurnEventStream } from './turn-event-drain'
 import type { ChatMessage } from '@magnitudedev/llm-core'
@@ -306,18 +306,25 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               const errorMessage = cause.message ?? error.message
               logger.error({ context: 'Cortex', forkId, turnId, errorType }, `Cortex: Mid-stream ModelError (${errorType}): ${errorMessage}`)
 
-              const message =
-                errorType === 'AuthFailed'
-                  ? authReconnectMessage()
-                  : errorType === 'ProviderDisconnected' && isAuthReconnectMessage(errorMessage)
-                    ? errorMessage
-                    : `Stream error (${errorType}): ${errorMessage}`
+              let message: string
+              if (errorType === 'AuthFailed') {
+                message = authReconnectMessage()
+              } else if (errorType === 'ProviderDisconnected' && isAuthReconnectMessage(errorMessage)) {
+                message = errorMessage
+              } else if (errorType === 'SubscriptionRequired') {
+                message = errorMessage
+              } else if (errorType === 'UsageLimitExceeded') {
+                message = errorMessage
+              } else {
+                message = `Stream error (${errorType}): ${errorMessage}`
+              }
 
               yield* publish({
                 type: 'turn_unexpected_error',
                 forkId,
                 turnId,
                 message,
+                errorCode: 'code' in cause ? (cause as any).code : undefined,
               })
               return
             }

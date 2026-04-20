@@ -155,6 +155,7 @@ export interface UnexpectedErrorMessage {
   readonly tag: string | null
   readonly message: string
   readonly timestamp: number
+  readonly errorCode?: string
 }
 
 export interface ForkResultMessage {
@@ -970,7 +971,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         type: 'unexpected_error',
         tag: null,
         message: event.message,
-        timestamp: event.timestamp
+        timestamp: event.timestamp,
+        errorCode: event.errorCode,
       }
 
       return {

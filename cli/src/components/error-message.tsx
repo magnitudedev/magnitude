@@ -11,9 +11,10 @@ interface ErrorMessageProps {
   tag: string | null
   message: string
   timestamp: number
+  errorCode?: string
 }
 
-export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp }: ErrorMessageProps) {
+export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp, errorCode }: ErrorMessageProps) {
   const theme = useTheme()
   const [isHovered, setIsHovered] = useState(false)
   const [isCopied, setIsCopied] = useState(false)
@@ -28,6 +29,15 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
 
   const prefix = tag ? `[${tag}]` : '[Error]'
   const fullError = `${prefix} ${message}`
+
+  // Detect Magnitude-specific errors using error code
+  const isSubscriptionError = errorCode === 'subscription_required' || errorCode === 'trial_expired'
+  const isUsageLimitError = errorCode?.startsWith('usage_limit_exceeded') ?? false
+  const magnitudeCtaText = isSubscriptionError
+    ? { url: '→ app.magnitude.dev', suffix: ' — upgrade to Pro' }
+    : isUsageLimitError
+      ? { url: '→ app.magnitude.dev', suffix: ' — manage your subscription' }
+      : null
 
   const handleCopy = async () => {
     try {
@@ -75,10 +85,17 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
         customBorderChars: BOX_CHARS,
         paddingLeft: 1,
         paddingRight: 1,
+        flexDirection: 'column',
       }}>
         <text style={{ fg: theme.error }}>
           {fullError}
         </text>
+        {magnitudeCtaText && (
+          <text>
+            <span style={{ fg: 'cyan' }} attributes={TextAttributes.UNDERLINE}>{magnitudeCtaText.url}</span>
+            <span style={{ fg: theme.muted }}>{magnitudeCtaText.suffix}</span>
+          </text>
+        )}
       </box>
 
       {(isHovered || isCopied) && (

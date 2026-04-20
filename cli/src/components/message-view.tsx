@@ -99,7 +99,7 @@ export const MessageView = memo(function MessageView({
       }
 
       case 'unexpected_error':
-        return <ErrorMessage tag={message.tag} message={message.message} timestamp={message.timestamp} />
+        return <ErrorMessage tag={message.tag} message={message.message} timestamp={message.timestamp} errorCode={message.errorCode} />
 
       case 'fork_activity':
         return (

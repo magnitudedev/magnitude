@@ -33,6 +33,16 @@ export class ParseError extends Data.TaggedError('ParseError')<{
   readonly raw: unknown
 }> {}
 
+export class SubscriptionRequired extends Data.TaggedError('SubscriptionRequired')<{
+  readonly message: string
+  readonly code: string
+}> {}
+
+export class UsageLimitExceeded extends Data.TaggedError('UsageLimitExceeded')<{
+  readonly message: string
+  readonly code: string
+}> {}
+
 export type ModelError =
   | NotConfigured
   | ProviderDisconnected
@@ -41,3 +51,5 @@ export type ModelError =
   | RateLimited
   | TransportError
   | ParseError
+  | SubscriptionRequired
+  | UsageLimitExceeded

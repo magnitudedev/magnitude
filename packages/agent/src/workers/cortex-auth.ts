@@ -2,7 +2,9 @@ import {
   AuthFailed,
   ContextLimitExceeded,
   ParseError as ProviderParseError,
+  SubscriptionRequired,
   TransportError as ProviderTransportError,
+  UsageLimitExceeded,
 } from '@magnitudedev/providers'
 import type { ModelError } from '@magnitudedev/providers'
 import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
@@ -30,12 +32,20 @@ export function resolveFailureMessage(error: ModelError): string {
   if (error._tag === 'AuthFailed') {
     return authReconnectMessage()
   }
+  if (error._tag === 'SubscriptionRequired') {
+    return error.message
+  }
+  if (error._tag === 'UsageLimitExceeded') {
+    return error.message
+  }
   return `Authentication failed: ${error.message}`
 }
 
 export function classifyRetryability(error: unknown): NonRetryableReason {
   if (error instanceof ContextLimitExceeded) return 'context-limit'
   if (error instanceof AuthFailed) return 'auth'
+  if (error instanceof SubscriptionRequired) return 'client-error'
+  if (error instanceof UsageLimitExceeded) return 'client-error'
   if (error instanceof ProviderParseError) return 'parse'
   if (error instanceof ProviderTransportError) {
     const s = error.status

@@ -48,6 +48,8 @@ export {
   RateLimited,
   TransportError,
   ParseError,
+  SubscriptionRequired,
+  UsageLimitExceeded,
 } from './errors/model-error'
 export type { ModelError } from './errors/model-error'
 export { classifyHttpError, classifyUnknownError } from './errors/classify-error'

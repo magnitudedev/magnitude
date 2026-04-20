@@ -11,6 +11,7 @@ import { SettingsOverlay } from './settings-overlay'
 import { AuthMethodOverlay } from './auth-method-overlay'
 import { ProviderEndpointOverlay } from './provider-endpoint-overlay'
 import { ApiKeyOverlay } from './api-key-overlay'
+import { MagnitudeApiKeyOverlay } from './magnitude-api-key-overlay'
 import { OAuthOverlay } from './oauth-overlay'
 import type { RecentChat } from '../data/recent-chats'
 import type { useAuthFlow } from '../hooks/use-auth-flow'
@@ -405,7 +406,7 @@ export function AppOverlays({
           onSubmit={authFlow.handleEndpointSetupSubmit}
           onCancel={authFlow.handleEndpointSetupCancel}
           wizardMode={showSetupWizard ? {
-            stepLabel: `Provider setup (${wizardStep === 'provider-endpoint' ? 2 : 1} of ${wizardTotalSteps})`,
+            stepLabel: `Provider setup (1 of ${wizardTotalSteps})`,
             subtitle: `Configure ${authFlow.endpointSetup.provider.name} endpoint to continue.`,
             onSkip: handleWizardSkip,
             onBack: authFlow.handleEndpointSetupCancel,
@@ -416,21 +417,33 @@ export function AppOverlays({
   }
 
   if (authFlow.apiKeySetup) {
+    const wizardMode = showSetupWizard ? {
+      stepLabel: `Providers (1 of ${wizardTotalSteps})`,
+      subtitle: `Connect to ${authFlow.apiKeySetup.provider.name} to get started.`,
+      onSkip: handleWizardSkip,
+      onBack: authFlow.handleApiKeyCancel,
+    } : undefined
     return (
       <box style={{ flexDirection: 'column', height: '100%' }}>
-        <ApiKeyOverlay
-          providerName={authFlow.apiKeySetup.provider.name}
-          envKeyHint={authFlow.apiKeySetup.envKeyHint}
-          initialKey={authFlow.apiKeySetup.existingKey}
-          onSubmit={authFlow.handleApiKeySubmit}
-          onCancel={authFlow.handleApiKeyCancel}
-          wizardMode={showSetupWizard ? {
-            stepLabel: `Providers (1 of ${wizardTotalSteps})`,
-            subtitle: `Connect to ${authFlow.apiKeySetup.provider.name} to get started.`,
-            onSkip: handleWizardSkip,
-            onBack: authFlow.handleApiKeyCancel,
-          } : undefined}
-        />
+        {authFlow.apiKeySetup.provider.id === 'magnitude' ? (
+          <MagnitudeApiKeyOverlay
+            providerName={authFlow.apiKeySetup.provider.name}
+            envKeyHint={authFlow.apiKeySetup.envKeyHint}
+            initialKey={authFlow.apiKeySetup.existingKey}
+            onSubmit={authFlow.handleApiKeySubmit}
+            onCancel={authFlow.handleApiKeyCancel}
+            wizardMode={wizardMode}
+          />
+        ) : (
+          <ApiKeyOverlay
+            providerName={authFlow.apiKeySetup.provider.name}
+            envKeyHint={authFlow.apiKeySetup.envKeyHint}
+            initialKey={authFlow.apiKeySetup.existingKey}
+            onSubmit={authFlow.handleApiKeySubmit}
+            onCancel={authFlow.handleApiKeyCancel}
+            wizardMode={wizardMode}
+          />
+        )}
       </box>
     )
   }
