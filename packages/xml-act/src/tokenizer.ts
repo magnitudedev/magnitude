@@ -473,6 +473,12 @@ export function createTokenizer(
       else if (ch !== ' ' && ch !== '\t') afterNewline = false
         }
       }
+
+      // Flush content at end of each push() for incremental streaming,
+      // but only when not mid-tag-parse and no pending < at chunk boundary
+      if (!activeTag && !pendingLt) {
+        flushContent()
+      }
     },
 
     end(): void {
