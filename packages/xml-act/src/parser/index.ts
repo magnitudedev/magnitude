@@ -1188,26 +1188,4 @@ export function createParser(config: ParserConfig): MactParser {
  * Convenience: create a parser and wire it to a tokenizer.
  * Returns a function that accepts text chunks and an end() function.
  */
-export function createParserWithTokenizer(config: ParserConfig): {
-  push(chunk: string): readonly TurnEngineEvent[]
-  end(): readonly TurnEngineEvent[]
-} {
-  const parser = createParser(config)
-  const tokenizer = createTokenizer(
-    (token) => parser.pushToken(token),
-    new Set(),
-    { strictNewlines: true, toolKeyword: 'invoke' },
-  )
 
-  return {
-    push(chunk: string): readonly TurnEngineEvent[] {
-      tokenizer.push(chunk)
-      return parser.drain()
-    },
-    end(): readonly TurnEngineEvent[] {
-      tokenizer.end()
-      parser.end()
-      return parser.drain()
-    },
-  }
-}

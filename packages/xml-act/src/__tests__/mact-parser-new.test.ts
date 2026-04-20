@@ -7,8 +7,9 @@ import { describe, it, expect } from 'vitest'
 import { Schema } from '@effect/schema'
 import { defineTool } from '@magnitudedev/tools'
 import { Effect } from 'effect'
-import { createParser, createParserWithTokenizer } from '../parser/index'
-import type { RegisteredTool } from '../types'
+import { createParser } from '../parser/index'
+import { createTokenizer } from '../tokenizer'
+import type { RegisteredTool, TurnEngineEvent } from '../types'
 
 // ---------------------------------------------------------------------------
 // Test tool setup
@@ -37,9 +38,17 @@ const tools = new Map<string, RegisteredTool>([
 ])
 
 function parse(input: string, customTools = tools) {
-  const p = createParserWithTokenizer({ tools: customTools })
-  const fromPush = p.push(input)
-  const fromEnd = p.end()
+  const p = createParser({ tools: customTools })
+  const knownToolTags = new Set(customTools.keys())
+  const tokenizer = createTokenizer(
+    (token) => p.pushToken(token),
+    knownToolTags,
+  )
+  tokenizer.push(input)
+  const fromPush = p.drain()
+  tokenizer.end()
+  p.end()
+  const fromEnd = p.drain()
   return [...fromPush, ...fromEnd]
 }
 
