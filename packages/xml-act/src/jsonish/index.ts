@@ -27,4 +27,4 @@ export type {
 
 export { coerceToStreamingPartial, tryCastToStreamingPartial } from './coercer'
 
-export { createParameterAccumulator } from './accumulator';
+

@@ -201,5 +201,4 @@ export type { StreamingJsonParser, ParsedValue, CompletionState } from './jsonis
 export { coerceToStreamingPartial, tryCastToStreamingPartial } from './jsonish/coercer'
 export type { CoercionFlag, CoercedResult } from './jsonish/coercer'
 
-// JSONish parameter accumulator
-export { createParameterAccumulator } from './jsonish/accumulator'
+
