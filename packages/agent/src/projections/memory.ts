@@ -55,7 +55,6 @@ import {
   toTimelineTaskTreeView,
   toTimelineTaskUpdate,
 } from '../inbox/compose'
-import { generateXmlActToolShape, resolveXmlTagName } from '../tools/xml-tool-docs'
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -323,49 +322,13 @@ function toToolErrorResult(args: {
   tagName: string
   status: Extract<TurnResultItem, { kind: 'tool_error' }>['status']
   message?: string
-  correctToolShape?: string
 }): TurnResultItem {
   return {
     kind: 'tool_error',
     tagName: args.tagName,
     status: args.status,
     message: args.message,
-    correctToolShape: args.correctToolShape,
   }
-}
-
-function toRuntimeToolErrorResult(
-  read: <T>(projection: T) => any,
-  forkId: string | null,
-  toolKey: string,
-  status: Extract<TurnResultItem, { kind: 'tool_error' }>['status'],
-  message?: string,
-): TurnResultItem {
-  const agentDef = getAgentDefinitionForFork(read, forkId)!
-  const tagName = resolveXmlTagName(agentDef, toolKey)!
-
-  return toToolErrorResult({
-    tagName,
-    status,
-    message,
-    correctToolShape: generateXmlActToolShape(agentDef, tagName),
-  })
-}
-
-function toInvalidToolInputResult(
-  read: <T>(projection: T) => any,
-  forkId: string | null,
-  tagName: string,
-  detail: string,
-): TurnResultItem {
-  const agentDef = getAgentDefinitionForFork(read, forkId)
-
-  return toToolErrorResult({
-    tagName,
-    status: 'error',
-    message: `Invalid tool input: ${detail}`,
-    correctToolShape: agentDef ? generateXmlActToolShape(agentDef, tagName) : undefined,
-  })
 }
 
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
@@ -503,13 +466,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  toRuntimeToolErrorResult(
-                    read,
-                    event.forkId,
-                    event.toolKey,
-                    'error',
-                    result.error,
-                  ),
+                  toToolErrorResult({
+                    tagName: event.toolKey,
+                    status: 'error',
+                    message: result.error,
+                  }),
                 ],
               }
             case 'Rejected':
@@ -517,13 +478,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  toRuntimeToolErrorResult(
-                    read,
-                    event.forkId,
-                    event.toolKey,
-                    'rejected',
-                    typeof result.rejection === 'string' ? result.rejection : undefined,
-                  ),
+                  toToolErrorResult({
+                    tagName: event.toolKey,
+                    status: 'rejected',
+                    message: typeof result.rejection === 'string' ? result.rejection : undefined,
+                  }),
                 ],
               }
             case 'Interrupted':
@@ -531,12 +490,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  toRuntimeToolErrorResult(
-                    read,
-                    event.forkId,
-                    event.toolKey,
-                    'interrupted',
-                  ),
+                  toToolErrorResult({
+                    tagName: event.toolKey,
+                    status: 'interrupted',
+                  }),
                 ],
               }
           }
@@ -561,7 +518,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
             ...fork,
             pendingResultItems: [
               ...fork.pendingResultItems,
-              toInvalidToolInputResult(read, event.forkId, event.event.tagName, event.event.error.detail),
+              toToolErrorResult({
+                tagName: event.event.tagName,
+                status: 'error',
+                message: `Invalid tool input: ${event.event.error.detail}`,
+              }),
             ],
           }
 
@@ -635,7 +596,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
       const canonical = read(CanonicalTurnProjection)
       const canonicalText = canonical.lastCompleted?.turnId === event.turnId
-        ? canonical.lastCompleted.canonicalXml
+        ? canonical.lastCompleted.canonicalMact
         : ''
       const hasAssistantContent = canonicalText.trim().length > 0
 

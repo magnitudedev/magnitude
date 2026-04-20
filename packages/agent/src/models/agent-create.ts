@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { agentCreateTool, agentCreateXmlBinding } from '../tools/agent-tools'
+import { agentCreateTool } from '../tools/agent-tools'
 
 export interface AgentCreateState extends BaseState {
   toolKey: 'agentCreate'
@@ -10,10 +10,7 @@ const initial: Omit<AgentCreateState, 'phase' | 'toolKey'> = {
   agentId: undefined,
 }
 
-export const agentCreateModel = defineStateModel('agentCreate', {
-  tool: agentCreateTool,
-  binding: agentCreateXmlBinding,
-})({
+export const agentCreateModel = defineStateModel('agentCreate', agentCreateTool)({
   initial,
   reduce: (state, event): AgentCreateState => {
     switch (event.type) {

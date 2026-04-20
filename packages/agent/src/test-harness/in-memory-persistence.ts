@@ -42,6 +42,8 @@ const buildInitialMetadata = (seed?: Partial<SessionMetadata>): SessionMetadata 
     gitBranch: seed?.gitBranch ?? null,
     created: seed?.created ?? now,
     updated: seed?.updated ?? now,
+    initialVersion: seed?.initialVersion ?? '0.0.1',
+    lastActiveVersion: seed?.lastActiveVersion ?? '0.0.1',
   }
 }
 

@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { killWorkerTool, killWorkerXmlBinding } from '../tools/task-tools'
+import { killWorkerTool } from '../tools/task-tools'
 
 export interface KillWorkerState extends BaseState {
   toolKey: 'killWorker'
@@ -10,10 +10,7 @@ const initial: Omit<KillWorkerState, 'phase' | 'toolKey'> = {
   id: undefined,
 }
 
-export const killWorkerModel = defineStateModel('killWorker', {
-  tool: killWorkerTool,
-  binding: killWorkerXmlBinding,
-})({
+export const killWorkerModel = defineStateModel('killWorker', killWorkerTool)({
   initial,
   reduce: (state, event): KillWorkerState => {
     switch (event.type) {

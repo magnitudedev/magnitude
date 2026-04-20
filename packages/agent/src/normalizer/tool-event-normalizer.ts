@@ -1,22 +1,15 @@
-import type { ToolCallEvent, XmlToolResult } from '@magnitudedev/xml-act'
+import type { RuntimeEvent, ToolResult } from '@magnitudedev/xml-act'
 import type { StreamingPartial, ToolStateEvent } from '@magnitudedev/tools'
 
 export function normalizeToolEvent<TInput, TOutput, TEmission>(
-  raw: ToolCallEvent,
+  raw: RuntimeEvent,
   streaming: StreamingPartial<TInput>,
 ): ToolStateEvent<TInput, TOutput, TEmission> | undefined {
   switch (raw._tag) {
     case 'ToolInputStarted':
       return { type: 'started' }
     case 'ToolInputFieldValue':
-    case 'ToolInputBodyChunk':
-    case 'ToolInputChildStarted':
-    case 'ToolInputChildComplete': {
-      const changed = raw._tag === 'ToolInputFieldValue' ? 'field'
-        : raw._tag === 'ToolInputBodyChunk' ? 'body' : 'child'
-      const name = raw._tag === 'ToolInputFieldValue' ? String(raw.field) : undefined
-      return { type: 'inputUpdated', streaming, changed, name }
-    }
+      return { type: 'inputUpdated', streaming, changed: 'field', name: String(raw.field) }
     case 'ToolInputReady':
       return { type: 'inputReady', input: raw.input as TInput, streaming }
     case 'ToolInputParseError': {
@@ -39,11 +32,23 @@ export function normalizeToolEvent<TInput, TOutput, TEmission>(
       return normalizeToolResult<TInput, TOutput, TEmission>(raw.result)
     case 'ToolObservation':
       return undefined
+    // Structural events don't produce tool state events
+    case 'ProseChunk':
+    case 'ProseEnd':
+    case 'LensStart':
+    case 'LensChunk':
+    case 'LensEnd':
+    case 'MessageStart':
+    case 'MessageChunk':
+    case 'MessageEnd':
+    case 'StructuralParseError':
+    case 'TurnEnd':
+      return undefined
   }
 }
 
 function normalizeToolResult<TInput, TOutput, TEmission>(
-  result: XmlToolResult
+  result: ToolResult
 ): ToolStateEvent<TInput, TOutput, TEmission> {
   switch (result._tag) {
     case 'Success':

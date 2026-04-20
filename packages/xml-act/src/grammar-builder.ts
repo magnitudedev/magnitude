@@ -1,38 +1,63 @@
 
-import { buildToolRules, generateBodyRules, type GrammarToolDef } from './grammar-shared'
 import { LEAD_YIELD_TAGS } from './constants'
-
-export { generateBodyRules, type GrammarToolDef } from './grammar-shared'
 
 // =============================================================================
 // Types
 // =============================================================================
 
+/**
+ * Parameter binding for grammar generation.
+ */
+export interface GrammarParameterDef {
+  readonly name: string
+  readonly field: string
+  readonly type: 'scalar' | 'json'
+}
+
+/**
+ * Tool definition for grammar generation.
+ */
+export interface GrammarToolDef {
+  readonly tagName: string
+  readonly parameters: ReadonlyArray<GrammarParameterDef>
+}
+
+/**
+ * Protocol configuration for Grammar.
+ */
 export interface ProtocolConfig {
   readonly minLenses: 0 | 1
   readonly allowMessages: boolean
   readonly allowTools: boolean
   readonly requiredMessageTo: string | null
-  /** Maximum number of lenses allowed when a forced message is required.
-   *  Prevents infinite lens loops by capping the model's thinking space. */
+  /** Maximum number of lenses allowed when a forced message is required. */
   readonly maxLenses: number | undefined
-  /** Yield tags to use at turn end. Defaults to lead yield tags. */
+  /** Yield tags to use at turn end. */
   readonly yieldTags: ReadonlyArray<string>
+  /** Available lens names. */
+  readonly lensNames: ReadonlyArray<string>
+  /** Tool keyword (default: "invoke"). */
+  readonly toolKeyword: string
 }
 
+/**
+ * Grammar configuration.
+ */
 export interface GrammarConfig {
   readonly tools: ReadonlyArray<GrammarToolDef>
   readonly protocol: ProtocolConfig
 }
 
+/**
+ * Options for building Grammar.
+ */
 export interface GrammarBuildOptions {
   readonly minLenses?: 0 | 1
   readonly requiredMessageTo?: string
-  /** Maximum number of lenses allowed when a forced message is required.
-   *  Prevents infinite lens loops by capping the model's thinking space. */
   readonly maxLenses?: number
-  /** Yield tags to use at turn end. Defaults to lead yield tags. */
   readonly yieldTags?: ReadonlyArray<string>
+  readonly lensNames?: ReadonlyArray<string>
+  readonly toolKeyword?: string
 }
 
 // =============================================================================
@@ -60,6 +85,8 @@ const defaultProtocol: ProtocolConfig = {
   requiredMessageTo: null,
   maxLenses: undefined,
   yieldTags: LEAD_YIELD_TAGS,
+  lensNames: ['alignment', 'tasks', 'diligence', 'skills', 'turn', 'pivot'],
+  toolKeyword: 'invoke',
 }
 
 // =============================================================================
@@ -90,15 +117,6 @@ export class GrammarBuilder {
     })
   }
 
-  withOptions(options: GrammarBuildOptions): GrammarBuilder {
-    let next = this as GrammarBuilder
-    if (options.minLenses !== undefined) next = next.withMinLenses(options.minLenses)
-    if (options.requiredMessageTo !== undefined) next = next.requireMessageTo(options.requiredMessageTo)
-    if (options.maxLenses !== undefined) next = next.withMaxLenses(options.maxLenses)
-    if (options.yieldTags !== undefined) next = next.withYieldTags(options.yieldTags)
-    return next
-  }
-
   withMaxLenses(maxLenses: number): GrammarBuilder {
     return new GrammarBuilder({
       ...this.config,
@@ -111,6 +129,31 @@ export class GrammarBuilder {
       ...this.config,
       protocol: { ...this.config.protocol, yieldTags },
     })
+  }
+
+  withLensNames(lensNames: ReadonlyArray<string>): GrammarBuilder {
+    return new GrammarBuilder({
+      ...this.config,
+      protocol: { ...this.config.protocol, lensNames },
+    })
+  }
+
+  withToolKeyword(toolKeyword: string): GrammarBuilder {
+    return new GrammarBuilder({
+      ...this.config,
+      protocol: { ...this.config.protocol, toolKeyword },
+    })
+  }
+
+  withOptions(options: GrammarBuildOptions): GrammarBuilder {
+    let next = this as GrammarBuilder
+    if (options.minLenses !== undefined) next = next.withMinLenses(options.minLenses)
+    if (options.requiredMessageTo !== undefined) next = next.requireMessageTo(options.requiredMessageTo)
+    if (options.maxLenses !== undefined) next = next.withMaxLenses(options.maxLenses)
+    if (options.yieldTags !== undefined) next = next.withYieldTags(options.yieldTags)
+    if (options.lensNames !== undefined) next = next.withLensNames(options.lensNames)
+    if (options.toolKeyword !== undefined) next = next.withToolKeyword(options.toolKeyword)
+    return next
   }
 
   build(): string {
@@ -131,52 +174,59 @@ export class GrammarBuilder {
   // ---------------------------------------------------------------------------
 
   private addWhitespaceRules(rules: RuleMap): void {
-    // ws: unbounded whitespace between elements (normal case)
-    // ws1: required whitespace (for separating attributes)
-    // ws-bounded: limited whitespace (1-4 chars) used between lenses when a forced
-    //   element follows, to prevent the model from looping on whitespace tokens
+    // ws: unbounded whitespace between elements
+    // ws1: required whitespace
+    // ws-bounded: limited whitespace (1-4 chars) for capped lens slots
     rules.set('ws', '[ \\t\\n]*')
     rules.set('ws1', '[ \\t\\n]+')
     rules.set('ws-bounded', '[ \\t\\n] [ \\t\\n]? [ \\t\\n]? [ \\t\\n]?')
   }
 
   private addLensRules(rules: RuleMap): void {
-    // lens: a thinking lens with unbounded trailing whitespace (used when no forced element follows)
-    // lens-tight: same but with bounded whitespace, used in capped lens slots before a forced
-    //   message to prevent infinite whitespace loops
-    rules.set('lens', '"<lens name=\\"" lensname "\\">" lens-body "</lens>" ws')
-    rules.set('lens-tight', '"<lens name=\\"" lensname "\\">" lens-body "</lens>" ws-bounded')
-    rules.set('lensname', '"alignment" | "tasks" | "diligence" | "skills" | "turn" | "pivot"')
+    // think format: <|think:NAME> content <think|>
+    const lensNames = this.config.protocol.lensNames
+    const lensnameAlts = lensNames.map(n => `"${n}"`).join(' | ')
+    
+    rules.set('lensname', lensnameAlts)
+    rules.set('lens', '"<|think:" lensname ">" ws think-body "<think|>" ws')
+    rules.set('lens-tight', '"<|think:" lensname ">" ws think-body "<think|>" ws-bounded')
 
-    for (const rule of generateBodyRules('lens', 'lens')) {
+    // Generate DFA body rules for think content (tracks "<think|>" close)
+    for (const rule of generateBodyRules('think', 'think')) {
       const match = rule.match(/^(\S+) ::= (.+)$/)
       if (match) rules.set(match[1], match[2])
     }
   }
 
   private addMessageRules(rules: RuleMap): void {
-    rules.set('msg', '"<message to=\\"" ([^"] | "\\\\\\"")*  "\\">" msg-body "</message>" ws')
+    // message format: <|message:RECIPIENT> content <message|>
+    // Recipient is more open - can be user, parent, or task IDs
+    rules.set('recipient', '[^ \\t\\n>]+')
+    rules.set('msg', '"<|message:" recipient ">" ws msg-body "<message|>" ws')
 
+    // Generate DFA body rules for message content (tracks "<message|>" close)
     for (const rule of generateBodyRules('msg', 'message')) {
       const match = rule.match(/^(\S+) ::= (.+)$/)
       if (match) rules.set(match[1], match[2])
     }
 
-    const recipient = this.config.protocol.requiredMessageTo
-    if (recipient !== null) {
-      rules.set('forced-msg', `"<message to=\\"${recipient}\\">" msg-body "</message>" ws`)
+    const requiredRecipient = this.config.protocol.requiredMessageTo
+    if (requiredRecipient !== null) {
+      rules.set('forced-msg', `"<|message:${requiredRecipient}>" msg-body "<message|>" ws`)
     }
   }
 
   private addYieldRules(rules: RuleMap): void {
+    // yield format: <|yield:TARGET|>
     const alternatives = this.config.protocol.yieldTags
-      .map(tag => `"<${tag}/>"`)
+      .map(target => `"<|yield:${target}|>"`)
       .join(' | ')
     rules.set('yield', alternatives)
   }
 
   private addToolRules(rules: RuleMap): void {
-    const { toolRule, rules: toolRuleStrings } = buildToolRules(this.config.tools)
+    const toolKeyword = this.config.protocol.toolKeyword
+    const { toolRule, rules: toolRuleStrings } = buildToolRules(this.config.tools, toolKeyword)
 
     const toolMatch = toolRule.match(/^(\S+) ::= (.+)$/)
     if (toolMatch) rules.set(toolMatch[1], toolMatch[2])
@@ -196,16 +246,10 @@ export class GrammarBuilder {
     // - Lenses come first (optional, for thinking/reasoning)
     // - Then either a forced message (if required) or free-form messages/tools
     // - Finally yield to close the turn
-    //
-    // When a forced message is required (e.g., user reply), we cap the number
-    // of lenses to prevent infinite loops. The model can use up to maxLenses
-    // thinking lenses, but then MUST emit the forced message before continuing.
 
     // Lens section
     if (recipient !== null) {
       // Forced message case: cap lenses at maxLenses to prevent infinite loops.
-      // Uses lens-tight (bounded whitespace) to prevent the model from looping
-      // on whitespace tokens between lenses or before the forced message.
       const lensCount = maxLenses ?? 6
       const lensSlots: string[] = []
       for (let i = 0; i < lensCount; i++) {
@@ -241,7 +285,157 @@ export class GrammarBuilder {
   private buildMiddleAlternative(): string {
     const middle: string[] = []
     if (this.config.protocol.allowMessages) middle.push('msg')
-    if (this.config.protocol.allowTools) middle.push('tool')
+    if (this.config.protocol.allowTools) middle.push('invoke')
     return middle.length > 0 ? `(${middle.join(' | ')})*` : 'msg*'
+  }
+}
+
+// =============================================================================
+// DFA Body Rule Generation
+// =============================================================================
+
+/**
+ * Generate DFA body rules format.
+ * 
+ * The close delimiter is `<tagname|>` (asymmetric delimiters).
+ * We track this character-by-character, resetting on deviation.
+ * 
+ * @param prefix - Rule name prefix (e.g., "think", "msg", "param")
+ * @param tagName - The tag name for the close delimiter (e.g., "think", "message", "parameter")
+ * @returns Array of GBNF rule strings
+ */
+export function generateBodyRules(prefix: string, tagName: string): string[] {
+  const rules: string[] = []
+  const closing = `<${tagName}|>`
+  const n = closing.length
+
+  rules.push(`${prefix}-body ::= ${prefix}-body-s0`)
+
+  for (let k = 0; k < n; k++) {
+    const stateName = `${prefix}-body-s${k}`
+    const nextStateName = `${prefix}-body-s${k + 1}`
+    const ch = closing[k]
+
+    if (k === 0) {
+      // State 0: not matching close sequence yet
+      // Can stay in state 0 on non-'<', or move to state 1 on '<'
+      rules.push(`${stateName} ::= [^<] ${stateName} | "<" ${nextStateName} | ""`)
+    } else if (k < n - 1) {
+      // Intermediate states: building up the close sequence
+      const escapedCh = escapeGbnfChar(ch)
+      if (ch === '<') {
+        // Special case: '<' can start a new close sequence
+        rules.push(`${stateName} ::= "<" ${nextStateName} | [^<] ${prefix}-body-s0 | ""`)
+      } else {
+        // Match expected char -> advance, or mismatch -> reset to state 0
+        // Need to exclude '<' to avoid ambiguity
+        const ccExcludes = ch === '-' ? '[^<-]' : `[^${escapeGbnfCharClass(ch)}<]`
+        rules.push(`${stateName} ::= ${escapedCh} ${nextStateName} | "<" ${prefix}-body-s1 | ${ccExcludes} ${prefix}-body-s0 | ""`)
+      }
+    } else {
+      // Final state: last char of close sequence
+      // On mismatch, reset to state 0 (but '<' goes to state 1)
+      rules.push(`${stateName} ::= "<" ${prefix}-body-s1 | [^<>] ${prefix}-body-s0 | ""`)
+    }
+  }
+
+  return rules
+}
+
+// =============================================================================
+// Tool Rule Generation
+// =============================================================================
+
+export interface GrammarToolDefInternal extends GrammarToolDef {}
+
+export function buildToolRules(
+  tools: ReadonlyArray<GrammarToolDef>,
+  toolKeyword: string
+): { toolRule: string; rules: string[] } {
+  const rules: string[] = []
+  const toolNames: string[] = []
+
+  for (const tool of tools) {
+    const safeName = sanitizeRuleName(tool.tagName)
+    toolNames.push(safeName)
+    rules.push(...generateToolRules(safeName, tool.tagName, tool.parameters, toolKeyword))
+  }
+
+  return {
+    toolRule: toolNames.length > 0 ? `invoke ::= ${toolNames.join(' | ')}` : 'invoke ::= msg',
+    rules,
+  }
+}
+
+export function generateToolRules(
+  ruleName: string,
+  tagName: string,
+  parameters: ReadonlyArray<GrammarParameterDef>,
+  toolKeyword: string
+): string[] {
+  const rules: string[] = []
+
+  // Generate parameter rules
+  const paramAlts: string[] = []
+  for (const param of parameters) {
+    const paramRuleName = `${ruleName}-param-${sanitizeRuleName(param.name)}`
+    paramAlts.push(paramRuleName)
+    
+    // Parameter rule: <|parameter:name> body <parameter|>
+    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>" ${paramRuleName}-body "<parameter|>" ws`)
+    
+    // DFA body rules for this parameter
+    for (const bodyRule of generateBodyRules(`${paramRuleName}`, 'parameter')) {
+      rules.push(bodyRule)
+    }
+  }
+
+  // Tool invoke rule with optional filter
+  // <|invoke:NAME> ws parameter* invoke-close ws
+  const paramSeq = paramAlts.length > 0 ? `(${paramAlts.join(' ')})*` : ''
+  
+  // Invoke close: either simple <invoke|> or piped <invoke|filter>...<filter|>
+  rules.push(`${ruleName} ::= "<|${toolKeyword}:${tagName}>" ws ${paramSeq} ${ruleName}-close ws`)
+  
+  // Close alternatives
+  rules.push(`${ruleName}-close ::= "<invoke|>" | "<invoke|filter>" ws ${ruleName}-filter-body "<filter|>"`)
+  
+  // Filter body DFA rules
+  for (const bodyRule of generateBodyRules(`${ruleName}-filter`, 'filter')) {
+    rules.push(bodyRule)
+  }
+
+  return rules
+}
+
+// =============================================================================
+// Utilities
+// =============================================================================
+
+export function sanitizeRuleName(tagName: string): string {
+  // Remove non-alphanumeric characters and lowercase
+  return `${tagName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}tool`
+}
+
+export function escapeGbnfChar(ch: string): string {
+  switch (ch) {
+    case '"': return '\\"'
+    case '\\': return '"\\\\"'
+    case '\n': return '"\\n"'
+    case '\t': return '"\\t"'
+    case '<': return '"<"'
+    case '>': return '">"'
+    case '|': return '"|"'
+    default: return `"${ch}"`
+  }
+}
+
+export function escapeGbnfCharClass(ch: string): string {
+  switch (ch) {
+    case ']': return '\\]'
+    case '\\': return '\\\\'
+    case '^': return '\\^'
+    case '-': return '\\-'
+    default: return ch
   }
 }

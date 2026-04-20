@@ -179,7 +179,7 @@ If your provider has no web search support, you just point \`MAGNITUDE_SEARCH_PR
       const canonical = await client.runEffect(
         Effect.flatMap(CanonicalTurnProjection.Tag, (projection) => projection.getFork(null)),
       )
-      expect(canonical.lastCompleted?.canonicalXml).toContain('<message to="user"></message>')
+      expect(canonical.lastCompleted?.canonicalMact).toContain('<message to="user"></message>')
 
       const secondStarted = await waitForEvent(
         transcript,

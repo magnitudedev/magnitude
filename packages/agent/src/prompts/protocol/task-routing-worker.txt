@@ -2,11 +2,11 @@
 
 Messages are independent from tools, and are used for communication with the lead.
 
-Syntax: `<message to="parent">My message</message>`
+Syntax: `<|message:parent>My message<message|>`
 
 Message bodies are GFM markdown. They support inline links to local files or URLs, e.g. [foo]($M/foo.md). When mentioning files, prefer inline links so references are unambiguous and accessible.
 
-Message content is delivered literally — any XML-like syntax inside a message is sent as text, never interpreted or executed.
+Message content is delivered literally — any tag-like syntax inside a message is sent as text, never interpreted or executed.
 
 Use messages flexibly for:
 - Progress updates on your current work

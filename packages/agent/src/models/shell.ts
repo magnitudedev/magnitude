@@ -1,5 +1,5 @@
-import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { shellTool, shellXmlBinding } from '../tools/shell'
+import { defineStateModel, type BaseState, type StreamingPartial, type StreamingLeaf } from '@magnitudedev/tools'
+import { shellTool } from '../tools/shell'
 
 export interface ShellState extends BaseState {
   toolKey: 'shell'
@@ -22,10 +22,7 @@ const initial: Omit<ShellState, 'phase' | 'toolKey'> = {
   rejectionReason: undefined,
 }
 
-export const shellModel = defineStateModel('shell', {
-  tool: shellTool,
-  binding: shellXmlBinding,
-})({
+export const shellModel = defineStateModel('shell', shellTool)({
   initial,
   reduce: (state, event): ShellState => {
     switch (event.type) {

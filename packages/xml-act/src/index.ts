@@ -1,27 +1,21 @@
-
 /**
- * @magnitudedev/xml-act — Standalone XML Tool Execution Runtime
+ * @magnitudedev/xml-act — Format Runtime
  *
- * Parses streaming XML directly and dispatches tool calls via Effect.
- * No JS generation, no sandbox — just XML parsing → tool dispatch → events.
+ * Parses streaming format output and dispatches tool calls via Effect.
  */
 
 // Runtime
-export { createXmlRuntime } from './execution/xml-runtime'
-export type { XmlRuntime } from './execution/xml-runtime'
+export { createRuntime } from './runtime'
+export type { Runtime } from './runtime'
 
 // Reactor state
 export { initialReactorState, foldReactorState } from './execution/reactor-state'
 
 // Core types — events
 export type {
-  XmlRuntimeEvent,
-  ToolCallEvent,
+  RuntimeEvent,
   ToolInputStarted,
   ToolInputFieldValue,
-  ToolInputBodyChunk,
-  ToolInputChildStarted,
-  ToolInputChildComplete,
   ToolInputReady,
   ToolInputParseError,
   ProseChunk,
@@ -32,46 +26,44 @@ export type {
   ToolObservation,
   StructuralParseError,
   TurnEnd,
+  LensStart,
+  LensChunk,
+  LensEnd,
+  MessageStart,
+  MessageChunk,
+  MessageEnd,
+  TurnControl,
 } from './types'
 
-// Binding type-level helpers
+// Core types — tokens and parse events
 export type {
-  ResolvePath,
-  BindingAttrs,
-  BindingBody,
-  BindingChildren,
-  BindingChildTags,
-  BindingChildRecord,
-  ChildBindingField,
-  ChildBindingAttrs,
-  ChildBindingBody,
-  ChildRecordField,
-  ChildElem,
-  ChildAttrsPick,
-  AllBodyFields,
+  Token,
+  ParseEvent,
+  ParameterStarted,
+  ParameterChunk,
+  ParameterComplete,
+  FilterStarted,
+  FilterChunk,
+  FilterComplete,
+  InvokeStarted,
+  InvokeComplete,
+  StructuralEvent,
 } from './types'
 
 // Core types — errors
+export type { ParseErrorDetail, StructuralParseErrorDetail } from './types'
 export type { ToolCallContext } from './types'
-export type {
-  TagParseErrorDetail,
-  ParseErrorDetail,
-  StructuralParseErrorDetail,
-  UnclosedThinkDetail,
-} from './format/types'
 
 // Core types — results
 export type {
-  XmlToolResult,
-  XmlExecutionResult,
+  ToolResult,
+  ExecutionResult,
 } from './types'
 
 // Core types — configuration
 export type {
-  XmlRuntimeConfig,
+  RuntimeConfig,
   RegisteredTool,
-  XmlTagBinding,
-  XmlChildBinding,
 } from './types'
 
 // Core types — services
@@ -90,36 +82,71 @@ export type {
 // Service tags
 export {
   ToolInterceptorTag,
-  XmlRuntimeCrash,
+  TurnEngineCrash,
 } from './types'
 
-// Utilities
-export { buildInput } from './execution/input-builder'
+// Parameter schema derivation
+export { deriveParameters } from './execution/parameter-schema'
+export type { ParameterSchema, ToolSchema, ScalarType } from './execution/parameter-schema'
 
-// Binding validation
-export { validateBinding } from './execution/binding-validator'
-export type { TagSchema, ChildTagSchema, AttributeSchema } from './execution/binding-validator'
+// Input building
+export { buildInput, coerceParameterValue } from './execution/input-builder'
+export type { ParsedParameter, ParsedInvoke } from './execution/input-builder'
 
-// XML documentation generation
-export { generateXmlToolDoc, generateXmlToolGroupDoc, generateXmlToolInputShape } from './xml-docs'
-export type { XmlToolDocEntry } from './xml-docs'
-
-// Output serializer
-export { serializeOutput } from './output-serializer'
-
-// Output query
-export { observeOutput } from './output-query'
-
-// Output tree (structured tool output AST)
-export { buildOutputTree, outputToText, outputToDOM, outputFromDOM } from './output-tree'
-export type { OutputNode } from './output-tree'
-
-// Stream guard
+// Output query (JSONPath-based)
 export {
-  YIELD_USER_TAG,
-  YIELD_TOOL_TAG,
-  YIELD_WORKER_TAG,
-  YIELD_PARENT_TAG,
+  queryOutput,
+  renderFilteredResult,
+  renderResultBlock,
+  observeOutput,
+  QueryPatterns,
+} from './output-query'
+export type { QueryResult } from './output-query'
+
+// Output renderer
+export {
+  renderResult,
+  renderResultBody,
+  renderVoidResult,
+  renderStringResult,
+  renderScalarResult,
+  renderArrayResult,
+  renderObjectResult,
+  renderOutField,
+  renderResultToParts,
+  renderShellResult,
+  renderGrepResult,
+  renderReadResult,
+  renderWriteResult,
+  renderEditResult,
+  renderTreeResult,
+  renderSkillResult,
+  parseResultBlock,
+  isValidResultBlock,
+  extractToolName,
+} from './output-renderer'
+export type { RenderConfig } from './output-renderer'
+
+// Result persistence
+export {
+  getResultsDir,
+  ensureResultsDir,
+  getResultPath,
+  persistResult,
+  loadResult,
+  loadResultFromPath,
+  hasResult,
+  deleteResult,
+  listResults,
+  cleanupResults,
+} from './result-persistence'
+
+// Constants
+export {
+  YIELD_USER_TARGET,
+  YIELD_TOOL_TARGET,
+  YIELD_WORKER_TARGET,
+  YIELD_PARENT_TARGET,
   YIELD_USER,
   YIELD_TOOL,
   YIELD_WORKER,
@@ -134,30 +161,35 @@ export {
   SUBAGENT_YIELD_TAGS,
 } from './constants'
 
-// Parser
-export { createStreamingXmlParser, createParser, defaultIdGenerator } from './parser'
-export type { StreamingParser, IdGenerator } from './parser'
+// Tokenizer
+export { createTokenizer } from './tokenizer'
+export type { Tokenizer } from './tokenizer'
 
-// Machine + tokenizer
+// Parser
+export { createParser } from './parser'
+export type { Parser, ParserEvent, Frame } from './parser'
+
+// Machine
 export { createStackMachine } from './machine'
 export type { Op, StackMachine } from './machine'
-export { createTokenizer } from './tokenizer'
-export type { Tokenizer, Token } from './tokenizer'
 
-// Format
-export * from './format'
-export type { ParseEvent, ParsedElement, ParsedChild, AttributeValue, XmlActEvent } from './format/types'
-export { SchemaAccumulator } from './schema-accumulator'
-export { StreamingAccumulator, type StreamingAccumulatorConfig } from './streaming-accumulator'
-export { defineXmlBinding, type XmlBindingResult, type XmlMappingConfig, type XmlInputMappingConfig, type XmlOutputBinding } from './xml-binding'
-export type { DeriveStreamingShape, DeriveFields, DeriveChildren, AttrNames, ChildTagNames, ChildrenTagNames } from './type-chain'
-export * from './constants'
-
-// GBNF grammar for constrained generation (e.g. Fireworks AI)
-export { type GrammarToolDef } from './grammar-builder'
+// Grammar builder
 export {
   GrammarBuilder,
+  type GrammarToolDef,
+  type GrammarParameterDef,
   type ProtocolConfig,
   type GrammarConfig,
   type GrammarBuildOptions,
 } from './grammar-builder'
+
+// JSONish streaming parser
+export { createStreamingJsonParser } from './jsonish/parser'
+export type { StreamingJsonParser, ParsedValue, CompletionState } from './jsonish/types'
+
+// JSONish schema coercer
+export { coerceToStreamingPartial, tryCastToStreamingPartial } from './jsonish/coercer'
+export type { CoercionFlag, CoercedResult } from './jsonish/coercer'
+
+// JSONish parameter accumulator
+export { createParameterAccumulator } from './jsonish/accumulator'

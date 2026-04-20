@@ -1,82 +1,38 @@
 /**
- * ToolDispatcher — executes a parsed tool element.
+ * ToolDispatcher — executes a tool with validated input.
  *
- * Triggered when TagClosed fires (element is complete).
- * Handles: input building, validation, interceptor, execution, and output-tree serialization.
+ * The runtime has already built the input from parameters. The dispatcher
+ * handles: schema validation, interceptor, execution, and result construction.
  *
- * The dispatcher receives an `emit` callback from the reactor. It calls emit
+ * The dispatcher receives an `emit` callback from the runtime. It calls emit
  * at the right moments (ToolExecutionStarted before execution, ToolExecutionEnded
- * after). The reactor provides emitAndFold as the callback, so state stays in
- * sync automatically. The dispatcher never touches the queue or replay state directly.
+ * after).
  */
 
 import { Effect, Either } from "effect"
-import { AST } from "@effect/schema"
 import { Schema } from "@effect/schema"
 import type { ToolContext } from '@magnitudedev/tools'
-import type { ParsedElement, TagParseErrorDetail } from '../format/types'
 import type {
   RegisteredTool,
-  XmlRuntimeEvent,
-  XmlToolResult,
+  RuntimeEvent,
+  ToolResult,
   ToolInterceptor,
   InterceptorContext,
+  ParseErrorDetail,
 } from '../types'
-import { buildInput } from './input-builder'
-import { buildOutputTree } from '../output-tree'
 
 // =============================================================================
-// Schema AST helpers
-// =============================================================================
-
-function unwrapAst(ast: AST.AST): AST.AST {
-  if (ast._tag === 'Transformation') return unwrapAst(ast.from)
-  if (ast._tag === 'Refinement') return unwrapAst(ast.from)
-  return ast
-}
-
-function findMissingRequiredFields(
-  rawInput: Record<string, unknown>,
-  schemaAst: AST.AST,
-  bodyField?: string,
-): string[] {
-  const missing: string[] = []
-  const ast = unwrapAst(schemaAst)
-  if (ast._tag !== 'TypeLiteral') return missing
-
-  for (const prop of ast.propertySignatures) {
-    const name = String(prop.name)
-    if (prop.isOptional) continue
-
-    if (!(name in rawInput)) {
-      missing.push(name)
-      continue
-    }
-
-    if (bodyField === name) {
-      const value = rawInput[name]
-      const propType = unwrapAst(prop.type)
-      if (propType._tag === 'StringKeyword' && typeof value === 'string' && value.length === 0) {
-        missing.push(name)
-      }
-    }
-  }
-
-  return missing
-}
-
-// =============================================================================
-// Dispatch result (returned to reactor)
+// Dispatch result (returned to runtime)
 // =============================================================================
 
 export type DispatchResult =
   | { readonly _tag: 'Dispatched' }
-  | { readonly _tag: 'ParseError'; readonly error: TagParseErrorDetail }
+  | { readonly _tag: 'ParseError'; readonly error: ParseErrorDetail }
 
 export interface DispatchContext {
   readonly tools: ReadonlyMap<string, RegisteredTool>
   readonly interceptor: ToolInterceptor | undefined
-  readonly emit: (event: XmlRuntimeEvent) => Effect.Effect<void>
+  readonly emit: (event: RuntimeEvent) => Effect.Effect<void>
   readonly toolContext?: ToolContext<unknown>
 }
 
@@ -105,54 +61,38 @@ function executeToolEffect(
   })
 }
 
+// =============================================================================
+// Public API
+// =============================================================================
+
+export interface ToolDispatchRequest {
+  readonly tagName: string
+  readonly toolCallId: string
+  readonly input: Record<string, unknown>
+}
+
 /**
- * Dispatch a completed tool element for execution.
+ * Dispatch a tool for execution.
  *
- * Emits ToolExecutionStarted/ToolExecutionEnded via the emit callback
- * at the correct moments (started before execution, ended after).
- * Returns a DispatchResult so the reactor knows whether it was a parse error
- * (which the reactor handles itself) or a successful dispatch.
+ * Emits ToolExecutionStarted/ToolExecutionEnded via the emit callback.
+ * Returns a DispatchResult so the runtime knows whether it was a parse error
+ * or a successful dispatch.
  */
 export function dispatchTool(
-  element: ParsedElement,
+  request: ToolDispatchRequest,
   ctx: DispatchContext,
 ): Effect.Effect<DispatchResult, never, never> {
   return Effect.gen(function* () {
-    const registered = ctx.tools.get(element.tagName)
+    const registered = ctx.tools.get(request.tagName)
 
     if (!registered) {
       return { _tag: 'Dispatched' as const }
     }
 
-    const { tool, groupName, binding, meta } = registered
-    const observe = typeof element.attributes.get('observe') === 'string' ? String(element.attributes.get('observe')) : '.'
-    const sanitizedAttributes = new Map(element.attributes)
-    sanitizedAttributes.delete('observe')
-    const sanitizedElement: ParsedElement = {
-      ...element,
-      attributes: sanitizedAttributes,
-    }
+    const { tool, groupName, meta } = registered
+    const rawInput = request.input
 
-    // 1. Build input from element + binding
-    const rawInput = buildInput(sanitizedElement, binding)
-
-    // 2. Check for missing required fields
-    const missingFields = findMissingRequiredFields(rawInput, tool.inputSchema.ast, binding.body)
-    if (missingFields.length > 0) {
-      const fieldList = missingFields.map(f => `'${f}'`).join(', ')
-      return {
-        _tag: 'ParseError' as const,
-        error: {
-          _tag: 'MissingRequiredFields' as const,
-          id: element.toolCallId,
-          tagName: element.tagName,
-          fields: missingFields,
-          detail: `Required field${missingFields.length > 1 ? 's' : ''} ${fieldList} missing on <${element.tagName}>`,
-        },
-      }
-    }
-
-    // 3. Validate against schema
+    // 1. Validate against schema
     let input: unknown
     try {
       input = Schema.decodeUnknownSync(tool.inputSchema as Schema.Schema<unknown>)(rawInput)
@@ -162,30 +102,29 @@ export function dispatchTool(
         _tag: 'ParseError' as const,
         error: {
           _tag: 'ToolValidationFailed' as const,
-          id: element.toolCallId,
-          tagName: element.tagName,
-          detail: `Schema validation failed for <${element.tagName}>: ${msg}`,
-        },
+          id: request.toolCallId,
+          tagName: request.tagName,
+          detail: `Schema validation failed for <${request.tagName}>: ${msg}`,
+        } satisfies ParseErrorDetail,
       }
     }
 
-    // 4. Interceptor beforeExecute
+    // 2. Interceptor beforeExecute
     if (ctx.interceptor) {
       const interceptorCtx: InterceptorContext = {
-        toolCallId: element.toolCallId, tagName: element.tagName,
+        toolCallId: request.toolCallId, tagName: request.tagName,
         group: groupName, toolName: tool.name, input, meta,
       }
       const decision = yield* ctx.interceptor.beforeExecute(interceptorCtx)
       if (decision._tag === 'Reject') {
-        // Emit both events even for rejections — they happened
         yield* ctx.emit({
           _tag: 'ToolExecutionStarted',
-          toolCallId: element.toolCallId, group: groupName, toolName: tool.name,
+          toolCallId: request.toolCallId, group: groupName, toolName: tool.name,
           input, cached: false,
         })
         yield* ctx.emit({
           _tag: 'ToolExecutionEnded',
-          toolCallId: element.toolCallId, group: groupName, toolName: tool.name,
+          toolCallId: request.toolCallId, group: groupName, toolName: tool.name,
           result: { _tag: 'Rejected', rejection: decision.rejection },
         })
         return { _tag: 'Dispatched' as const }
@@ -195,17 +134,17 @@ export function dispatchTool(
       }
     }
 
-    // 5. Emit ToolExecutionStarted BEFORE execution
+    // 3. Emit ToolExecutionStarted BEFORE execution
     yield* ctx.emit({
       _tag: 'ToolExecutionStarted',
-      toolCallId: element.toolCallId, group: groupName, toolName: tool.name,
+      toolCallId: request.toolCallId, group: groupName, toolName: tool.name,
       input, cached: false,
     })
 
-    // 6. Execute tool
+    // 4. Execute tool
     const executionResult = yield* executeToolEffect(registered, input, ctx.toolContext)
 
-    let result: XmlToolResult
+    let result: ToolResult
 
     if (Either.isLeft(executionResult)) {
       const e = executionResult.left
@@ -217,16 +156,13 @@ export function dispatchTool(
       result = { _tag: 'Error', error }
     } else {
       const output = executionResult.right
-      
-      const outputBinding = registered.outputBinding ?? { type: 'tag' as const, ...registered.binding }
-      const outputTree = buildOutputTree(element.tagName, output, outputBinding, undefined, { outputSchema: tool.outputSchema as Schema.Schema<unknown> })
-      result = { _tag: 'Success', output, outputTree: { tag: element.tagName, tree: outputTree }, query: observe }
+      result = { _tag: 'Success', output, query: null }
     }
 
-    // 7. Interceptor afterExecute
+    // 5. Interceptor afterExecute
     if (ctx.interceptor?.afterExecute && result._tag === 'Success') {
       const interceptorCtx: InterceptorContext & { result: unknown } = {
-        toolCallId: element.toolCallId, tagName: element.tagName,
+        toolCallId: request.toolCallId, tagName: request.tagName,
         group: groupName, toolName: tool.name, input, meta,
         result: result.output,
       }
@@ -236,10 +172,10 @@ export function dispatchTool(
       }
     }
 
-    // 8. Emit ToolExecutionEnded AFTER execution
+    // 6. Emit ToolExecutionEnded AFTER execution
     yield* ctx.emit({
       _tag: 'ToolExecutionEnded',
-      toolCallId: element.toolCallId, group: groupName, toolName: tool.name,
+      toolCallId: request.toolCallId, group: groupName, toolName: tool.name,
       result,
     })
 

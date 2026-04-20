@@ -1,5 +1,4 @@
 import type { StreamingPartial } from './streaming-partial';
-import type { ToolBinding } from './tool-binding';
 import type { ToolStateEvent } from './tool-state-event';
 
 export type Phase = 'streaming' | 'executing' | 'completed' | 'error' | 'rejected' | 'interrupted';
@@ -19,18 +18,13 @@ export interface StateModel<TState, TInput, TOutput, TEmission, TEvent = unknown
     state: TState,
     event: ToolStateEvent<TInput, TOutput, TEmission>
   ) => TState;
-  readonly binding: { createAccumulator(): StreamingAccumulatorLike<TInput, TEvent> };
+  readonly createAccumulator: () => StreamingAccumulatorLike<TInput, TEvent>;
 }
 
-export function defineStateModel<TToolKey extends string, TInput, TOutput, TEmission, TEvent = unknown>(
+export function defineStateModel<TToolKey extends string, TInput, TOutput, TEmission>(
   toolKey: TToolKey,
-  chain: {
-    tool: { inputSchema: { Type: TInput }; outputSchema: { Type: TOutput }; emissionSchema?: { Type: TEmission } };
-    binding: ToolBinding<TInput, TEvent>;
-  }
+  tool: { inputSchema: { Type: TInput }; outputSchema: { Type: TOutput }; emissionSchema?: { Type: TEmission } },
 ) {
-  void chain;
-
   return <TExtra extends Record<string, unknown>>(
     config: {
       initial: TExtra;
@@ -39,8 +33,16 @@ export function defineStateModel<TToolKey extends string, TInput, TOutput, TEmis
         event: ToolStateEvent<TInput, TOutput, TEmission>
       ) => { toolKey: TToolKey } & BaseState & TExtra;
     }
-  ): StateModel<{ toolKey: TToolKey } & BaseState & TExtra, TInput, TOutput, TEmission, TEvent> => {
+  ): StateModel<{ toolKey: TToolKey } & BaseState & TExtra, TInput, TOutput, TEmission, unknown> => {
     const initial = { toolKey, ...({ phase: 'streaming' } satisfies BaseState), ...config.initial };
-    return { initial, reduce: config.reduce, binding: chain.binding };
+    // createAccumulator is no longer provided by the state model — it's created externally
+    // from the tool's schema in tool-handle.ts
+    return { 
+      initial, 
+      reduce: config.reduce, 
+      createAccumulator: () => {
+        throw new Error('createAccumulator should not be called directly — use createParameterAccumulator from tool schema')
+      } 
+    };
   };
 }

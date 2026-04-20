@@ -1,5 +1,4 @@
-
 ## Turn control
 
-Use `{{YIELD_PARENT}}` when you are waiting on a response from the parent.
-Use `{{YIELD_TOOL}}` when you have made tool calls and are ready to wait for results.
+Use `<|yield:parent|>` when you are waiting on a response from the parent.
+Use `<|yield:tool|>` when you have made tool calls and are ready to wait for results.

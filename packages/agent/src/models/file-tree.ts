@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { treeTool, treeXmlBinding } from '../tools/fs'
+import { treeTool } from '../tools/fs'
 
 type TreeEntry = { path: string; name: string; type: 'file' | 'dir'; depth: number }
 
@@ -20,10 +20,7 @@ const initial: Omit<FileTreeState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const fileTreeModel = defineStateModel('fileTree', {
-  tool: treeTool,
-  binding: treeXmlBinding,
-})({
+export const fileTreeModel = defineStateModel('fileTree', treeTool)({
   initial,
   reduce: (state, event): FileTreeState => {
     switch (event.type) {

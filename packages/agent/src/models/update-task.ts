@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { updateTaskTool, updateTaskXmlBinding } from '../tools/task-tools'
+import { updateTaskTool } from '../tools/task-tools'
 
 export interface UpdateTaskState extends BaseState {
   toolKey: 'updateTask'
@@ -16,10 +16,7 @@ function isValidUpdateTaskStatus(value: string | undefined): value is NonNullabl
   return value === 'pending' || value === 'completed' || value === 'cancelled'
 }
 
-export const updateTaskModel = defineStateModel('updateTask', {
-  tool: updateTaskTool,
-  binding: updateTaskXmlBinding,
-})({
+export const updateTaskModel = defineStateModel('updateTask', updateTaskTool)({
   initial,
   reduce: (state, event): UpdateTaskState => {
     switch (event.type) {

@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { createTaskTool, createTaskXmlBinding } from '../tools/task-tools'
+import { createTaskTool } from '../tools/task-tools'
 
 export interface CreateTaskState extends BaseState {
   toolKey: 'createTask'
@@ -10,10 +10,7 @@ const initial: Omit<CreateTaskState, 'phase' | 'toolKey'> = {
   id: undefined,
 }
 
-export const createTaskModel = defineStateModel('createTask', {
-  tool: createTaskTool,
-  binding: createTaskXmlBinding,
-})({
+export const createTaskModel = defineStateModel('createTask', createTaskTool)({
   initial,
   reduce: (state, event): CreateTaskState => {
     switch (event.type) {

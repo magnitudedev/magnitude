@@ -1,8 +1,7 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent, TurnResultError, MessageDestination } from '../events'
 
-import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
-import { getBindingRegistry } from '../tools/binding-registry'
+import { serializeMactTurn, type MactTrace } from './mact-canonical'
 import { buildResolvedToolSet, type ResolvedToolSet } from '../tools/resolved-toolset'
 import { ConfigAmbient } from '../ambient/config-ambient'
 import { isValidVariant, type AgentVariant } from '../agents/variants'
@@ -27,7 +26,7 @@ export interface CanonicalTurnState {
   hasStructuralError: boolean
   rawResponse: string
   orderCounter: number
-  lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
+  lastCompleted: { turnId: string; canonicalMact: string; clean: boolean } | null
   resolvedTurnDecision: 'continue' | 'idle' | null
 }
 
@@ -179,7 +178,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
             // instead of the internal catalog key carried alongside the app event.
             tagName: event.event.tagName,
             input: {},
-            query: '.',
+            query: null,
             order: fork.orderCounter,
           }]
           const nextMap = new Map(fork.toolCallMap)
@@ -222,7 +221,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
       const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
 
-      let canonicalXml: string
+      let canonicalMact: string
       if (clean) {
         const agentState = read(AgentStatusProjection)
         const variant: AgentVariant = event.forkId
@@ -234,12 +233,11 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         const agentDef = getAgentDefinition(variant)
         const slot = getAgentSlot(variant)
         
-        // Build toolSet for getBindingRegistry using ConfigAmbient
+        // Build toolSet for serialization using ConfigAmbient
         const configState = ambient.get(ConfigAmbient)
         const toolSet = buildResolvedToolSet(agentDef, configState, slot)
-        const bindings = getBindingRegistry(toolSet)
         
-        const trace: CanonicalTrace = {
+        const trace: MactTrace = {
           lenses: fork.lenses,
           thinkBlocks: fork.thinkBlocks,
           messages: [...fork.messages]
@@ -247,12 +245,12 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
             .map(({ text, destination }) => ({ text, destination })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
-            .map(({ tagName, input, query }) => ({ tagName, input, query })),
+            .map(({ tagName, input, query }) => ({ tagName, input, filter: query })),
           turnDecision: event.result.turnDecision === 'idle' ? 'idle' : 'continue',
         }
-        canonicalXml = serializeCanonicalTurn(trace, bindings)
+        canonicalMact = serializeMactTurn(trace, toolSet)
       } else {
-        canonicalXml = fork.rawResponse
+        canonicalMact = fork.rawResponse
       }
 
       const finalized: CanonicalTurnState = {
@@ -260,7 +258,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         hasStructuralError,
         lastCompleted: {
           turnId: event.turnId,
-          canonicalXml,
+          canonicalMact,
           clean,
         }
       }

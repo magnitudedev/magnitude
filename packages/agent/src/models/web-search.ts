@@ -1,6 +1,6 @@
 
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { webSearchTool, webSearchXmlBinding } from '../tools/web-search'
+import { webSearchTool } from '../tools/web-search'
 
 export interface WebSearchState extends BaseState {
   toolKey: 'webSearch'
@@ -15,10 +15,7 @@ const initial: Omit<WebSearchState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const webSearchModel = defineStateModel('webSearch', {
-  tool: webSearchTool,
-  binding: webSearchXmlBinding,
-})({
+export const webSearchModel = defineStateModel('webSearch', webSearchTool)({
   initial,
   reduce: (state, event): WebSearchState => {
     switch (event.type) {

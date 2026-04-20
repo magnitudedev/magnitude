@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { spawnWorkerTool, spawnWorkerXmlBinding } from '../tools/task-tools'
+import { spawnWorkerTool } from '../tools/task-tools'
 
 export interface SpawnWorkerState extends BaseState {
   toolKey: 'spawnWorker'
@@ -12,10 +12,7 @@ const initial: Omit<SpawnWorkerState, 'phase' | 'toolKey'> = {
   message: undefined,
 }
 
-export const spawnWorkerModel = defineStateModel('spawnWorker', {
-  tool: spawnWorkerTool,
-  binding: spawnWorkerXmlBinding,
-})({
+export const spawnWorkerModel = defineStateModel('spawnWorker', spawnWorkerTool)({
   initial,
   reduce: (state, event): SpawnWorkerState => {
     switch (event.type) {

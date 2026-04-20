@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Cause, Effect, Exit, Ref, Scope, Stream } from 'effect'
-import type { ToolCallEvent, XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import type { RuntimeEvent, TurnEngineCrash } from '@magnitudedev/xml-act'
 import type { CallUsage } from '@magnitudedev/providers'
 import type { MessageDestination, TurnResult } from '../src/events'
 import { createTurnStream } from '../src/execution/turn-stream'
@@ -17,7 +17,7 @@ type PublishedEvent =
   | { readonly type: 'lens_start'; readonly name: string }
   | { readonly type: 'lens_chunk'; readonly text: string }
   | { readonly type: 'lens_end'; readonly name: string }
-  | { readonly type: 'tool_event'; readonly toolCallId: string; readonly toolKey: string; readonly event: ToolCallEvent }
+  | { readonly type: 'tool_event'; readonly toolCallId: string; readonly toolKey: string; readonly event: RuntimeEvent }
 
 const successfulTurnResult: TurnResult = {
   success: true,
@@ -100,7 +100,7 @@ type ProducerPlan = {
 
 function makeProducer(
   plan: ProducerPlan,
-): (sink: TurnEventSink) => Effect.Effect<void, XmlRuntimeCrash | TurnErrorType, never> {
+): (sink: TurnEventSink) => Effect.Effect<void, TurnEngineCrash | TurnErrorType, never> {
   return (sink: TurnEventSink) => Effect.gen(function* () {
     for (let i = 0; i < plan.events.length; i++) {
       if (plan.failAtIndex === i) {
@@ -143,9 +143,9 @@ function makeProducer(
 }
 
 function drainTurnStream<R>(
-  turnStream: Stream.Stream<TurnEvent, XmlRuntimeCrash | TurnErrorType, R | Scope.Scope>,
+  turnStream: Stream.Stream<TurnEvent, TurnEngineCrash | TurnErrorType, R | Scope.Scope>,
   publish: (event: PublishedEvent) => Effect.Effect<void, never, never>,
-): Effect.Effect<{ finalResult: TurnStrategyResult }, XmlRuntimeCrash | TurnErrorType, R> {
+): Effect.Effect<{ finalResult: TurnStrategyResult }, TurnEngineCrash | TurnErrorType, R> {
   return Effect.gen(function* () {
     let finalResult: TurnStrategyResult | null = null
 

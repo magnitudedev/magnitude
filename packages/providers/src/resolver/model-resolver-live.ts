@@ -35,14 +35,15 @@ export function makeModelResolver<TSlot extends string>(): Layer.Layer<ModelReso
               }))
             }
 
+            const providerName = yield* catalog.getProviderName(initial.model.providerId)
             yield* ensureAuth(slot).pipe(
               Effect.provideService(ProviderState, state),
               Effect.provideService(ProviderAuth, auth),
               Effect.catchTag('AuthFailed', () =>
                 Effect.fail(new ProviderDisconnected({
                   providerId: initial.model.providerId,
-                  providerName: initial.model.providerName,
-                  message: `${initial.model.providerName} session expired or became invalid. Please reconnect in /settings.`,
+                  providerName,
+                  message: `${providerName} session expired or became invalid. Please reconnect in /settings.`,
                 })),
               ),
             )

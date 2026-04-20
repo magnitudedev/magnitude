@@ -1,11 +1,11 @@
 import { Cause, Chunk, Effect, Stream, Queue, Scope, Option } from 'effect'
-import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineCrash } from '@magnitudedev/xml-act'
 import type { TurnEvent, TurnEventSink, TurnError } from './types'
 
 type Envelope =
   | { readonly _tag: 'Event'; readonly event: TurnEvent }
   | { readonly _tag: 'Done' }
-  | { readonly _tag: 'Failure'; readonly error: XmlRuntimeCrash | TurnError }
+  | { readonly _tag: 'Failure'; readonly error: TurnEngineCrash | TurnError }
   | { readonly _tag: 'Defect'; readonly cause: Cause.Cause<never> }
 
 /**
@@ -19,8 +19,8 @@ type Envelope =
  * forkScoped still ensures the producer is interrupted when the stream scope closes.
  */
 export function createTurnStream<R>(
-  producer: (sink: TurnEventSink) => Effect.Effect<void, XmlRuntimeCrash | TurnError, R>
-): Stream.Stream<TurnEvent, XmlRuntimeCrash | TurnError, R | Scope.Scope> {
+  producer: (sink: TurnEventSink) => Effect.Effect<void, TurnEngineCrash | TurnError, R>
+): Stream.Stream<TurnEvent, TurnEngineCrash | TurnError, R | Scope.Scope> {
   return Stream.unwrapScoped(
     Effect.gen(function* () {
       const queue = yield* Queue.unbounded<Envelope>()
@@ -44,7 +44,7 @@ export function createTurnStream<R>(
       return Stream.fromPull(
         Effect.succeed(
           Queue.take(queue).pipe(
-            Effect.flatMap((item): Effect.Effect<Chunk.Chunk<TurnEvent>, Option.Option<XmlRuntimeCrash | TurnError>, never> => {
+            Effect.flatMap((item): Effect.Effect<Chunk.Chunk<TurnEvent>, Option.Option<TurnEngineCrash | TurnError>, never> => {
               switch (item._tag) {
                 case 'Event':
                   return Effect.succeed(Chunk.of(item.event))

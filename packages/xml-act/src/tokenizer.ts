@@ -1,636 +1,444 @@
-export type Token =
-  | {
-      readonly type: 'open'
-      readonly tagName: string
-      readonly attrs: ReadonlyMap<string, string>
-      readonly afterNewline: boolean
-      readonly raw?: string
-    }
-  | {
-      readonly type: 'close'
-      readonly tagName: string
-      readonly afterNewline: boolean
-      readonly raw?: string
-    }
-  | {
-      readonly type: 'selfClose'
-      readonly tagName: string
-      readonly attrs: ReadonlyMap<string, string>
-      readonly afterNewline: boolean
-      readonly raw?: string
-    }
-  | { readonly type: 'content'; readonly text: string }
+
+/**
+ * Streaming tokenizer for the Mact format.
+ * 
+ * Uses asymmetric delimiters:
+ * - Open: <|tag> or <|tag:variant>
+ * - Close: <tag|>
+ * - Self-close: <|tag|> or <|tag:variant|>
+ * - Parameter open: <|parameter:name>
+ * - Parameter close: <parameter|>
+ * 
+ * Architecture follows the old XML tokenizer:
+ * - Persistent state across chunks
+ * - Char-by-char state machine
+ * - No peek-ahead (enter pending state on `<`)
+ * - Known tags commit even if malformed
+ */
+
+import type { Token } from './types'
 
 export interface Tokenizer {
   push(chunk: string): void
   end(): void
 }
 
+// State machine states for tag parsing
 type TagPhase =
-  | 'name'
-  | 'attrs'
-  | 'attrKey'
-  | 'attrAfterKey'
-  | 'attrBeforeValue'
-  | 'attrValueQuoted'
-  | 'attrValueUnquoted'
-  | 'malformed'
+  | 'open_name'      // After <|, reading name
+  | 'open_colon'     // After <|name, saw :, waiting for variant
+  | 'open_variant'   // After <|name:, reading variant
+  | 'open_pipe'      // After <|name or <|name:variant, saw |, waiting for >
+  | 'close_name'     // After <, reading name for close tag
+  | 'close_pipe'     // After <name|, reading optional pipe or >
 
 type ActiveTag = {
   raw: string
   savedAfterNewline: boolean
-  isClose: boolean
-  name: string
-  attrs: Map<string, string>
   phase: TagPhase
-  pendingSelfClose: boolean
-  attrKey: string
-  attrValue: string
-  attrQuote: '"' | "'" | null
-  attrEscaping: boolean
+  name: string
+  variant: string  // Used for variant in open and pipe in close
 }
 
-type FenceState = {
-  inFence: boolean
-  fenceChar: '`' | '~' | null
-  fenceLength: number
-  lineStart: boolean
-  strip: boolean
-  partialPrefix: string
+function isNameStart(ch: string): boolean {
+  return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch === '_'
 }
 
-const CDATA_OPEN = '<' + '!' + '[CDATA['
-const CDATA_CLOSE = ']' + ']' + '>'
+function isNameContinue(ch: string): boolean {
+  return isNameStart(ch) || (ch >= '0' && ch <= '9') || ch === '-'
+}
 
 function isWhitespace(ch: string): boolean {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
 }
 
-function isNameStart(ch: string): boolean {
-  return /[a-zA-Z_]/.test(ch)
-}
-
-function isNameContinue(ch: string): boolean {
-  return /[a-zA-Z0-9_.-]/.test(ch)
-}
-
-function withAfterNewline(signal: Token): Token {
-  switch (signal.type) {
-    case 'open': return { ...signal, afterNewline: true }
-    case 'close': return { ...signal, afterNewline: true }
-    case 'selfClose': return { ...signal, afterNewline: true }
-    case 'content': return signal
-  }
-}
-
 export function createTokenizer(
-  onSignal: (signal: Token) => void,
+  onToken: (token: Token) => void,
   knownToolTags?: ReadonlySet<string>,
 ): Tokenizer {
   let contentBuffer = ''
   let afterNewline = true
-
-  const fence: FenceState = {
-    inFence: false,
-    fenceChar: null,
-    fenceLength: 0,
-    lineStart: true,
-    strip: false,
-    partialPrefix: '',
-  }
-
   let activeTag: ActiveTag | null = null
-  let pendingTag: { signal: Token; allowEofAsNewline: boolean } | null = null
-
-  let cdataBuffer: string | null = null
-  let cdataCloseProgress = 0
-
-  function updateContentFlags(text: string): void {
-    for (const ch of text) {
-      if (ch === '\n') {
-        afterNewline = true
-        fence.lineStart = true
-      } else {
-        afterNewline = false
-        fence.lineStart = false
-      }
-    }
-  }
+  let pendingLt: boolean = false  // true if we have a pending < at chunk boundary
 
   function flushContent(): void {
     if (contentBuffer.length === 0) return
     const text = contentBuffer
     contentBuffer = ''
-    onSignal({ type: 'content', text })
-    updateContentFlags(text)
+    onToken({ _tag: 'Content', text })
+    // Update afterNewline based on content
+    for (const ch of text) {
+      afterNewline = ch === '\n'
+    }
   }
 
-  function failTagAsContent(): void {
+  function emitOpen(name: string, variant: string | undefined): void {
+    flushContent()
+    onToken({ _tag: 'Open', name, variant })
+    afterNewline = false
+  }
+
+  function emitClose(name: string, pipe: string | undefined): void {
+    flushContent()
+    onToken({ _tag: 'Close', name, pipe })
+    afterNewline = false
+  }
+
+  function emitSelfClose(name: string, variant: string | undefined): void {
+    flushContent()
+    onToken({ _tag: 'SelfClose', name, variant })
+    afterNewline = false
+  }
+
+  function emitParameterOpen(name: string): void {
+    flushContent()
+    onToken({ _tag: 'Parameter', name })
+    afterNewline = false
+  }
+
+  function failAsContent(): void {
     if (!activeTag) return
     const tag = activeTag
-
-    if (tag.name.length > 0 && knownToolTags?.has(tag.name)) {
-      tag.phase = 'malformed'
-      return
-    }
-
     activeTag = null
     contentBuffer += tag.raw
   }
 
-  function emitTag(tag: ActiveTag): void {
-    flushContent()
-    const base = tag.savedAfterNewline
-    const signal: Token = tag.isClose
-      ? { type: 'close', tagName: tag.name, afterNewline: base, raw: tag.raw }
-      : tag.pendingSelfClose
-        ? {
-            type: 'selfClose',
-            tagName: tag.name,
-            attrs: new Map(tag.attrs),
-            afterNewline: base,
-            raw: tag.raw,
-          }
-        : {
-            type: 'open',
-            tagName: tag.name,
-            attrs: new Map(tag.attrs),
-            afterNewline: base,
-            raw: tag.raw,
-          }
-
-    const shouldDefer =
-      !signal.afterNewline && (
-        (signal.type === 'close' && signal.tagName === 'think') ||
-        (signal.type === 'open' && signal.tagName === 'think') ||
-        (signal.type === 'close' && signal.tagName === 'actions')
-      )
-
-    if (shouldDefer) {
-      pendingTag = {
-        signal,
-        allowEofAsNewline: signal.type === 'close' && signal.tagName === 'think',
-      }
-    } else {
-      onSignal(signal)
+  function startOpenTag(): void {
+    activeTag = {
+      raw: '<|',
+      savedAfterNewline: afterNewline,
+      phase: 'open_name',
+      name: '',
+      variant: '',
     }
-
-    afterNewline = false
   }
 
-  function startTag(): void {
+  function startCloseTag(): void {
     activeTag = {
       raw: '<',
       savedAfterNewline: afterNewline,
-      isClose: false,
+      phase: 'close_name',
       name: '',
-      attrs: new Map(),
-      phase: 'name',
-      pendingSelfClose: false,
-      attrKey: '',
-      attrValue: '',
-      attrQuote: null,
-      attrEscaping: false,
+      variant: '',
     }
-  }
-
-  function maybeFenceRun(chunk: string, index: number): number {
-    if (!fence.lineStart) return index
-    const ch = chunk[index]
-    if (ch !== '`' && ch !== '~') return index
-
-    let j = index
-    while (j < chunk.length && chunk[j] === ch) j++
-    const runLen = j - index
-    if (runLen < 3) {
-      if (j === chunk.length) {
-        fence.partialPrefix = chunk.slice(index, j)
-        return j
-      }
-      return index
-    }
-
-    let k = j
-    while (k < chunk.length && chunk[k] !== '\n' && chunk[k] !== '\r') k++
-
-    if (!fence.inFence && k === chunk.length) {
-      fence.partialPrefix = chunk.slice(index, k)
-      return k
-    }
-
-    const info = chunk.slice(j, k).trim().toLowerCase()
-
-    if (!fence.inFence) {
-      fence.inFence = true
-      fence.fenceChar = ch
-      fence.fenceLength = runLen
-      fence.strip = info.startsWith('xml')
-      if (fence.strip) {
-        if (k < chunk.length && chunk[k] === '\r') k++
-        if (k < chunk.length && chunk[k] === '\n') k++
-        afterNewline = true
-        fence.lineStart = true
-        return k
-      }
-    } else if (fence.fenceChar === ch && runLen >= fence.fenceLength) {
-      const strip = fence.strip
-      fence.inFence = false
-      fence.fenceChar = null
-      fence.fenceLength = 0
-      fence.strip = false
-      if (strip) {
-        if (k < chunk.length && chunk[k] === '\r') k++
-        if (k < chunk.length && chunk[k] === '\n') k++
-        afterNewline = true
-        fence.lineStart = true
-        return k
-      }
-    }
-
-    contentBuffer += chunk.slice(index, j)
-    afterNewline = false
-    fence.lineStart = false
-    return j
-  }
-
-  function finalizeBooleanAttr(tag: ActiveTag): void {
-    if (tag.attrKey.length > 0) {
-      tag.attrs.set(tag.attrKey, '')
-      tag.attrKey = ''
-    }
-  }
-
-  function finalizeAttrValue(tag: ActiveTag): void {
-    tag.attrs.set(tag.attrKey, tag.attrValue)
-    tag.attrKey = ''
-    tag.attrValue = ''
-    tag.attrQuote = null
   }
 
   function processTagChar(ch: string): void {
     const tag = activeTag!
-
-    if (tag.phase === 'malformed') {
-      // Known tool tags commit to tag parsing and never fall back to content.
-      // If attribute parsing breaks, we consume through the tag boundary and still emit
-      // the tag so the normal tool validation pipeline can surface the error to the LLM.
-      tag.raw += ch
-      if (ch === '>') {
-        if (!tag.isClose && tag.raw.length >= 2 && tag.raw[tag.raw.length - 2] === '/') {
-          tag.pendingSelfClose = true
-        }
-        emitTag(tag)
-        activeTag = null
-      }
-      return
-    }
-
-    if (ch === '<' && tag.phase !== 'attrValueQuoted') {
-      failTagAsContent()
-      if (activeTag) return
-      startTag()
-      return
-    }
-
     tag.raw += ch
 
-    if (tag.phase === 'name') {
-      if (tag.raw.startsWith('<!')) {
-        if (CDATA_OPEN.startsWith(tag.raw)) {
-          if (tag.raw === CDATA_OPEN) {
-            activeTag = null
-            cdataBuffer = ''
-            cdataCloseProgress = 0
+    switch (tag.phase) {
+      case 'open_name': {
+        // Reading name after <|
+        if (tag.name.length === 0) {
+          if (isNameStart(ch)) {
+            tag.name += ch
+            return
           }
+          // Invalid first character
+          failAsContent()
           return
         }
-        failTagAsContent()
+
+        // Continue reading name
+        if (isNameContinue(ch)) {
+          tag.name += ch
+          return
+        }
+
+        if (ch === ':') {
+          // Transition to variant
+          tag.phase = 'open_colon'
+          return
+        }
+
+        if (ch === '|') {
+          // Potential self-close - need to see if next is >
+          tag.phase = 'open_pipe'
+          return
+        }
+
+        if (ch === '>') {
+          // End of open tag: <|name>
+          if (tag.name === 'parameter') {
+            // <|parameter> without variant is invalid
+            failAsContent()
+            return
+          }
+          emitOpen(tag.name, undefined)
+          activeTag = null
+          return
+        }
+
+        if (isWhitespace(ch)) {
+          // Whitespace terminates tag name - invalid in strict Mact
+          failAsContent()
+          return
+        }
+
+        // Invalid character
+        failAsContent()
         return
       }
 
-      if (tag.raw.length === 2 && ch === '/') {
-        tag.isClose = true
+      case 'open_colon': {
+        // After <|name:, waiting for variant start
+        if (isNameStart(ch)) {
+          tag.variant = ch
+          tag.phase = 'open_variant'
+          return
+        }
+        // Invalid after colon
+        failAsContent()
         return
       }
 
-      if (tag.raw.length === 2 && ch === '!') {
+      case 'open_variant': {
+        // Reading variant after <|name:
+        if (isNameContinue(ch)) {
+          tag.variant += ch
+          return
+        }
+
+        if (ch === '|') {
+          // Potential self-close
+          tag.phase = 'open_pipe'
+          return
+        }
+
+        if (ch === '>') {
+          // End of open tag: <|name:variant>
+          if (tag.name === 'parameter') {
+            emitParameterOpen(tag.variant)
+          } else {
+            emitOpen(tag.name, tag.variant)
+          }
+          activeTag = null
+          return
+        }
+
+        if (isWhitespace(ch)) {
+          // Whitespace terminates variant - invalid in strict Mact
+          failAsContent()
+          return
+        }
+
+        // Invalid character in variant
+        failAsContent()
         return
       }
 
-      const firstNamePos = tag.isClose ? 2 : 1
-      const namePos = tag.raw.length - 1 - firstNamePos
-      if (namePos < 0) return
-
-      if (namePos === 0) {
-        if (!isNameStart(ch)) failTagAsContent()
-        else tag.name += ch
+      case 'open_pipe': {
+        // After | in open tag, must see > for self-close
+        if (ch === '>') {
+          // Self-close: <|name|> or <|name:variant|>
+          if (tag.name === 'parameter') {
+            // <|parameter|> is invalid, but <|parameter:name|> would have variant set
+            if (tag.variant) {
+              emitParameterOpen(tag.variant)
+            } else {
+              failAsContent()
+              return
+            }
+          } else {
+            emitSelfClose(tag.name, tag.variant || undefined)
+          }
+          activeTag = null
+          return
+        }
+        // Anything other than > after | is invalid
+        failAsContent()
         return
       }
 
-      if (isNameContinue(ch)) {
-        tag.name += ch
+      case 'close_name': {
+        // Reading name after < for close tag
+        if (tag.name.length === 0) {
+          if (isNameStart(ch)) {
+            tag.name += ch
+            return
+          }
+          // Invalid first character for close tag name
+          failAsContent()
+          return
+        }
+
+        // Continue reading name
+        if (isNameContinue(ch)) {
+          tag.name += ch
+          return
+        }
+
+        if (ch === '|') {
+          // Found pipe, could be <name|> or <name|pipe>
+          tag.phase = 'close_pipe'
+          return
+        }
+
+        if (ch === '>') {
+          // Lenient: close without pipe <name>
+          emitClose(tag.name, undefined)
+          activeTag = null
+          return
+        }
+
+        if (isWhitespace(ch)) {
+          // Whitespace - lenient close
+          emitClose(tag.name, undefined)
+          activeTag = null
+          contentBuffer += ch
+          afterNewline = ch === '\n'
+          return
+        }
+
+        // Invalid character
+        failAsContent()
         return
       }
 
-      if (isWhitespace(ch)) {
-        tag.phase = 'attrs'
+      case 'close_pipe': {
+        // After <name|, reading optional pipe name or >
+        if (ch === '>') {
+          // Simple close: <name|>
+          emitClose(tag.name, undefined)
+          activeTag = null
+          return
+        }
+
+        if (tag.variant.length === 0) {
+          if (isNameStart(ch)) {
+            tag.variant = ch
+            return
+          }
+          if (isWhitespace(ch)) {
+            // <name| > - lenient, treat as close without pipe
+            emitClose(tag.name, undefined)
+            activeTag = null
+            contentBuffer += ch
+            afterNewline = ch === '\n'
+            return
+          }
+          // Invalid after pipe
+          failAsContent()
+          return
+        }
+
+        // Continue reading pipe name
+        if (isNameContinue(ch)) {
+          tag.variant += ch
+          return
+        }
+
+        if (ch === '>') {
+          // Piped close: <name|pipe>
+          emitClose(tag.name, tag.variant)
+          activeTag = null
+          return
+        }
+
+        if (isWhitespace(ch)) {
+          // Whitespace terminates pipe
+          emitClose(tag.name, tag.variant)
+          activeTag = null
+          contentBuffer += ch
+          afterNewline = ch === '\n'
+          return
+        }
+
+        // Invalid character in pipe name
+        failAsContent()
         return
       }
-
-      if (ch === '>') {
-        emitTag(tag)
-        activeTag = null
-        return
-      }
-
-      if (ch === '/' && !tag.isClose) {
-        tag.pendingSelfClose = true
-        tag.phase = 'attrs'
-        return
-      }
-
-      failTagAsContent()
-      return
-    }
-
-    if (tag.phase === 'attrs') {
-      if (isWhitespace(ch)) return
-
-      if (ch === '>') {
-        emitTag(tag)
-        activeTag = null
-        return
-      }
-
-      if (ch === '/' && !tag.isClose) {
-        tag.pendingSelfClose = true
-        return
-      }
-
-      if (tag.pendingSelfClose) {
-        failTagAsContent()
-        return
-      }
-
-      if (!isNameStart(ch)) {
-        failTagAsContent()
-        return
-      }
-
-      tag.attrKey = ch
-      tag.phase = 'attrKey'
-      return
-    }
-
-    if (tag.phase === 'attrKey') {
-      if (isNameContinue(ch)) {
-        tag.attrKey += ch
-        return
-      }
-
-      if (isWhitespace(ch)) {
-        tag.phase = 'attrAfterKey'
-        return
-      }
-
-      if (ch === '=') {
-        tag.phase = 'attrBeforeValue'
-        return
-      }
-
-      if (ch === '>') {
-        finalizeBooleanAttr(tag)
-        emitTag(tag)
-        activeTag = null
-        return
-      }
-
-      if (ch === '/' && !tag.isClose) {
-        finalizeBooleanAttr(tag)
-        tag.pendingSelfClose = true
-        tag.phase = 'attrs'
-        return
-      }
-
-      failTagAsContent()
-      return
-    }
-
-    if (tag.phase === 'attrAfterKey') {
-      if (isWhitespace(ch)) return
-
-      if (ch === '=') {
-        tag.phase = 'attrBeforeValue'
-        return
-      }
-
-      if (ch === '>') {
-        finalizeBooleanAttr(tag)
-        emitTag(tag)
-        activeTag = null
-        return
-      }
-
-      if (ch === '/' && !tag.isClose) {
-        finalizeBooleanAttr(tag)
-        tag.pendingSelfClose = true
-        tag.phase = 'attrs'
-        return
-      }
-
-      // key with no value, then start next key
-      finalizeBooleanAttr(tag)
-      if (!isNameStart(ch)) {
-        failTagAsContent()
-        return
-      }
-      tag.attrKey = ch
-      tag.phase = 'attrKey'
-      return
-    }
-
-    if (tag.phase === 'attrBeforeValue') {
-      if (isWhitespace(ch)) return
-
-      if (ch === '"' || ch === "'") {
-        tag.attrQuote = ch
-        tag.attrValue = ''
-        tag.phase = 'attrValueQuoted'
-        return
-      }
-
-      if (ch === '>') {
-        tag.attrValue = ''
-        finalizeAttrValue(tag)
-        emitTag(tag)
-        activeTag = null
-        return
-      }
-
-      if (ch === '/' && !tag.isClose) {
-        tag.attrValue = ''
-        finalizeAttrValue(tag)
-        tag.pendingSelfClose = true
-        tag.phase = 'attrs'
-        return
-      }
-
-      tag.attrValue = ch
-      tag.phase = 'attrValueUnquoted'
-      return
-    }
-
-    if (tag.phase === 'attrValueQuoted') {
-      if (tag.attrEscaping) {
-        tag.attrEscaping = false
-        tag.attrValue += ch === '"' ? '"' : '\\' + ch
-        return
-      }
-      if (ch === '\\' && tag.attrQuote === '"') {
-        tag.attrEscaping = true
-        return
-      }
-      if (ch === tag.attrQuote) {
-        finalizeAttrValue(tag)
-        tag.phase = 'attrs'
-        return
-      }
-      tag.attrValue += ch
-      return
-    }
-
-    if (tag.phase === 'attrValueUnquoted') {
-      if (isWhitespace(ch)) {
-        finalizeAttrValue(tag)
-        tag.phase = 'attrs'
-        return
-      }
-
-      if (ch === '>') {
-        finalizeAttrValue(tag)
-        emitTag(tag)
-        activeTag = null
-        return
-      }
-
-      if (ch === '/' && !tag.isClose) {
-        finalizeAttrValue(tag)
-        tag.pendingSelfClose = true
-        tag.phase = 'attrs'
-        return
-      }
-
-      tag.attrValue += ch
     }
   }
 
   return {
     push(chunk: string): void {
-      let input = chunk
-      if (fence.partialPrefix.length > 0) {
-        input = fence.partialPrefix + input
-        fence.partialPrefix = ''
-      }
-
       let i = 0
-      while (i < input.length) {
-        if (cdataBuffer !== null) {
-          const ch = input[i]
-          if (ch === ']') {
-            if (cdataCloseProgress === 0) cdataCloseProgress = 1
-            else if (cdataCloseProgress === 1) cdataCloseProgress = 2
-            else cdataBuffer += ']'
-            i++
-            continue
-          }
-
-          if (ch === '>' && cdataCloseProgress === 2) {
-            contentBuffer += cdataBuffer
-            cdataBuffer = null
-            cdataCloseProgress = 0
-            i++
-            continue
-          }
-
-          if (cdataCloseProgress > 0) {
-            cdataBuffer += ']'.repeat(cdataCloseProgress)
-            cdataCloseProgress = 0
-          }
-
-          cdataBuffer += ch
-          i++
-          continue
+      
+      // Handle pending < from previous chunk
+      if (pendingLt) {
+        pendingLt = false
+        if (chunk.length === 0) {
+          // Empty chunk, just treat pending < as content
+          contentBuffer += '<'
+          return
         }
+        const ch = chunk[0]
+        if (ch === '|') {
+          // Open tag: <|...
+          flushContent()
+          startOpenTag()
+          i = 1  // Skip the |, we've recorded it in startOpenTag
+        } else if (isNameStart(ch)) {
+          // Close tag: <name...
+          flushContent()
+          startCloseTag()
+          // Don't skip, process this char as part of close tag
+          // i stays 0 to process this char
+        } else {
+          // Not a tag, treat pending < as content
+          contentBuffer += '<'
+          afterNewline = false
+          // i stays 0 to process current char normally
+        }
+      }
+      
+      for (; i < chunk.length; i++) {
+        const ch = chunk[i]
 
         if (activeTag) {
-          processTagChar(input[i])
-          i++
+          processTagChar(ch)
           continue
         }
 
-        const jump = maybeFenceRun(input, i)
-        if (jump !== i) {
-          i = jump
-          continue
-        }
-
-        const ch = input[i]
-
-        if (pendingTag) {
-          const useNewline = ch === '\n' || ch === '\r'
-          onSignal(useNewline ? withAfterNewline(pendingTag.signal) : pendingTag.signal)
-          pendingTag = null
-        }
-
-        if (ch === '<' && (!fence.inFence || fence.strip)) {
-          const next = i + 1 < input.length ? input[i + 1] : ''
-          if (next === '' || next === '/' || next === '!' || isNameStart(next)) {
-            flushContent()
-            startTag()
-            i++
-            continue
+        // Not in a tag - look for tag starts
+        if (ch === '<') {
+          // Check if we can determine tag type from what we've seen
+          // We need at least one more char to decide between <| and <name
+          
+          if (i + 1 < chunk.length) {
+            const next = chunk[i + 1]
+            if (next === '|') {
+              // Open tag: <|
+              flushContent()
+              startOpenTag()
+              i++ // Skip the |, we've recorded it in startOpenTag
+              continue
+            } else if (isNameStart(next)) {
+              // Close tag: <name
+              flushContent()
+              startCloseTag()
+              // Don't skip, let processTagChar handle the name char
+              continue
+            } else {
+              // < followed by non-tag char - treat as content
+              contentBuffer += ch
+              afterNewline = false
+            }
+          } else {
+            // Can't determine yet - < at end of chunk
+            // Remember we saw it and wait for next chunk
+            pendingLt = true
+            // Don't add to content yet
           }
-        }
-
-        contentBuffer += ch
-        if (ch === '\n') {
-          afterNewline = true
-          fence.lineStart = true
         } else {
-          afterNewline = false
-          fence.lineStart = false
+          contentBuffer += ch
+          afterNewline = ch === '\n'
         }
-        i++
       }
-      if (!activeTag && cdataBuffer === null && fence.partialPrefix.length === 0) {
-        flushContent()
-      }
-
     },
 
     end(): void {
+      // Handle any pending < from chunk boundary
+      if (pendingLt) {
+        contentBuffer += '<'
+        pendingLt = false
+      }
+      
       if (activeTag) {
-        if (activeTag.name.length > 0 && knownToolTags?.has(activeTag.name)) {
-          emitTag(activeTag)
-          activeTag = null
-        } else if (!activeTag.isClose && activeTag.name.length > 0 && activeTag.phase !== 'attrValueQuoted') {
-          emitTag(activeTag)
-          activeTag = null
-        } else {
-          failTagAsContent()
-        }
-      }
-      if (pendingTag) {
-        const sig = pendingTag.allowEofAsNewline
-          ? withAfterNewline(pendingTag.signal)
-          : pendingTag.signal
-        onSignal(sig)
-        pendingTag = null
-      }
-      if (cdataBuffer !== null) {
-        contentBuffer += CDATA_OPEN + cdataBuffer + ']'.repeat(cdataCloseProgress)
-        cdataBuffer = null
-        cdataCloseProgress = 0
+        // At end of stream, incomplete tags are treated as content
+        failAsContent()
       }
       flushContent()
     },

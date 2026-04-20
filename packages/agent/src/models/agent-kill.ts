@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { agentKillTool, agentKillXmlBinding } from '../tools/agent-tools'
+import { agentKillTool } from '../tools/agent-tools'
 
 export interface AgentKillState extends BaseState {
   toolKey: 'agentKill'
@@ -10,10 +10,7 @@ const initial: Omit<AgentKillState, 'phase' | 'toolKey'> = {
   agentId: undefined,
 }
 
-export const agentKillModel = defineStateModel('agentKill', {
-  tool: agentKillTool,
-  binding: agentKillXmlBinding,
-})({
+export const agentKillModel = defineStateModel('agentKill', agentKillTool)({
   initial,
   reduce: (state, event): AgentKillState => {
     switch (event.type) {

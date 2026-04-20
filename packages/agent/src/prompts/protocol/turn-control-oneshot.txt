@@ -1,8 +1,7 @@
-
 ## Turn control
 
-Use `{{YIELD_USER}}` when you are waiting on a response from the user.
-Use `{{YIELD_WORKER}}` when you are waiting on a response from a worker.
-Use `{{YIELD_TOOL}}` when you have made tool calls and are ready to wait for results.
+Use `<|yield:user|>` when you are waiting on a response from the user.
+Use `<|yield:worker|>` when you are waiting for a response from a worker.
+Use `<|yield:tool|>` when you have made tool calls and are ready to wait for results.
 
 Note: If you yield to workers but no workers are active, you will be retriggered with a reminder.

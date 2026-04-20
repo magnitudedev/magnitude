@@ -1,3 +1,4 @@
+
 /**
  * CompactionProjection (Forked)
  *
@@ -17,7 +18,7 @@ import { ConfigAmbient, getSlotConfig, type SlotConfig, type ConfigState } from 
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import type { Skill } from '@magnitudedev/skills'
 
-import { CHARS_PER_TOKEN } from '../constants'
+import { CHARS_PER_TOKEN_MACT } from '../constants'
 
 import type { AgentVariant } from '../agents/variants'
 import { getAgentDefinition, getAgentSlot, getForkInfo } from '../agents/registry'
@@ -51,18 +52,18 @@ function computeContextLimitBlocked(
   return isCompactionBlocking(tag) && tokenEstimate >= limits.hardCap
 }
 
-/** Estimate tokens for content string or content parts */
+/** Estimate tokens for content string or content parts using Mact format constant */
 function estimateContentTokens(content: string): number
 function estimateContentTokens(content: ContentPart[], modelId?: string | null, providerId?: string | null): number
 function estimateContentTokens(content: string | ContentPart[], modelId?: string | null, providerId?: string | null): number {
   if (typeof content === 'string') {
-    return Math.ceil(content.length / CHARS_PER_TOKEN)
+    return Math.ceil(content.length / CHARS_PER_TOKEN_MACT)
   }
   let tokens = 0
   for (const part of content) {
     switch (part.type) {
       case 'text':
-        tokens += Math.ceil(part.text.length / CHARS_PER_TOKEN)
+        tokens += Math.ceil(part.text.length / CHARS_PER_TOKEN_MACT)
         break
       case 'image':
         tokens += getImageTokenEstimator(modelId ?? null, providerId ?? null)(part.width, part.height)
@@ -84,7 +85,8 @@ function estimateSystemPromptTokens(variant: AgentVariant, skills: Map<string, S
   const toolSet = buildResolvedToolSet(agentDef, configState, slot)
   const prompt = renderSystemPrompt(agentDef, skills, toolSet)
   
-  const tokens = Math.ceil(prompt.length / CHARS_PER_TOKEN)
+  // Use Mact format constant for system prompt token estimation
+  const tokens = Math.ceil(prompt.length / CHARS_PER_TOKEN_MACT)
   systemPromptTokenCache.set(cacheKey, tokens)
   return tokens
 }
@@ -290,8 +292,9 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
 
     turn_completed: ({ event, fork, emit, read, ambient }) => {
       const canonical = read(CanonicalTurnProjection)
+      // Use canonicalMact instead of canonicalXml for Mact format
       const completedText = canonical.lastCompleted?.turnId === event.turnId
-        ? canonical.lastCompleted.canonicalXml
+        ? canonical.lastCompleted.canonicalMact
         : ''
       const addedTokens = estimateContentTokens(completedText)
       const tokenEstimate = event.inputTokens !== null

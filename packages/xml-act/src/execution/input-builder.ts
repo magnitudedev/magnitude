@@ -1,11 +1,55 @@
 /**
- * InputBuilder — convert ParsedElement + XmlTagBinding into a tool input object.
+ * Input Builder — builds tool input from parsed parameters.
  *
- * Maps XML structure to the tool's expected input shape based on the binding.
+ * Uses derived ParameterSchema to map flat parameter values to the tool's
+ * expected input shape. No manual binding needed — parameter names ARE
+ * field paths (with dots for nested fields).
  */
 
-import type { ParsedElement } from '../format/types'
-import type { XmlTagBinding } from '../types'
+import type { ParameterSchema, ScalarType } from './parameter-schema'
+
+// =============================================================================
+// Coercion Logic
+// =============================================================================
+
+const TRUTHY = new Set(['true', 'True', 'TRUE', '1'])
+const FALSY = new Set(['false', 'False', 'FALSE', '0'])
+
+/**
+ * Coerce a raw string value to the expected scalar type.
+ */
+export function coerceParameterValue(raw: string, type: ScalarType): string | number | boolean {
+  if (typeof type === 'object' && type._tag === 'enum') {
+    if (!type.values.includes(raw)) {
+      throw new Error(`Invalid enum value '${raw}' — expected: ${type.values.join(', ')}`)
+    }
+    return raw
+  }
+
+  switch (type) {
+    case 'string':
+      return raw
+    case 'number': {
+      if (raw === '' || raw === 'NaN' || raw === 'Infinity' || raw === '-Infinity') {
+        throw new Error(`Cannot coerce '${raw}' to number`)
+      }
+      const n = Number(raw)
+      if (isNaN(n)) throw new Error(`Cannot coerce '${raw}' to number`)
+      return n
+    }
+    case 'boolean': {
+      if (TRUTHY.has(raw)) return true
+      if (FALSY.has(raw)) return false
+      throw new Error(`Cannot coerce '${raw}' to boolean — expected: true, false, True, False, TRUE, FALSE, 0, 1`)
+    }
+    default:
+      return raw
+  }
+}
+
+// =============================================================================
+// Nested Value Setting
+// =============================================================================
 
 /** Set a value at a dotted path, creating intermediate objects as needed. */
 function setNestedValue(obj: Record<string, unknown>, path: string, value: unknown): void {
@@ -20,86 +64,69 @@ function setNestedValue(obj: Record<string, unknown>, path: string, value: unkno
   current[segments[segments.length - 1]] = value
 }
 
+// =============================================================================
+// Public API
+// =============================================================================
+
+export interface ParsedParameter {
+  name: string
+  value: string
+  isComplete: boolean
+}
+
+export interface ParsedInvoke {
+  readonly tagName: string
+  readonly toolCallId: string
+  readonly parameters: ReadonlyMap<string, ParsedParameter>
+  readonly filter?: string
+}
+
 /**
- * Build a tool input object from a parsed XML element and its binding.
+ * Build a tool input object from parsed parameters and their derived schemas.
+ *
+ * Parameter names ARE field paths — e.g., parameter 'options.type' sets
+ * input.options.type. No binding mapping needed.
+ *
+ * @param parsed - The parsed invoke with parameter values
+ * @param parameterSchemas - Map of parameter names to their schemas (from deriveParameters)
+ * @returns The constructed input object with properly coerced values
+ * @throws If a required parameter is missing, JSON parsing fails, or coercion fails
  */
-export function buildInput(element: ParsedElement, binding: XmlTagBinding): Record<string, unknown> {
+export function buildInput(
+  parsed: ParsedInvoke,
+  parameterSchemas: ReadonlyMap<string, ParameterSchema>,
+): Record<string, unknown> {
   const input: Record<string, unknown> = {}
 
-  // Attributes → input fields
-  if (binding.attributes) {
-    for (const attrSpec of binding.attributes) {
-      const value = element.attributes.get(attrSpec.attr)
-      if (value !== undefined) {
-        setNestedValue(input, attrSpec.field, value)
+  for (const [paramName, schema] of parameterSchemas) {
+    const parsedParam = parsed.parameters.get(paramName)
+
+    if (!parsedParam) {
+      if (schema.required) {
+        throw new Error(`Required parameter '${paramName}' is missing`)
       }
-    }
-  }
-
-  // Body → input field (literal, no trimming)
-  if (binding.body) {
-    setNestedValue(input, binding.body, element.body)
-  }
-
-  // ChildTags → scalar fields (fixed named child elements)
-  if (binding.childTags) {
-    for (const ct of binding.childTags) {
-      const xmlTag = ct.tag
-      const child = element.children.find(c => c.tagName === xmlTag)
-      if (child) {
-        setNestedValue(input, ct.field, child.body)
-      }
-    }
-  }
-
-  // Children → array fields (repeated child elements)
-  if (binding.children) {
-    for (const childBinding of binding.children) {
-      const childTag = childBinding.tag ?? childBinding.field
-      const matchingChildren = element.children.filter(c => c.tagName === childTag)
-      const entries: Record<string, unknown>[] = []
-
-      for (const child of matchingChildren) {
-        const entry: Record<string, unknown> = {}
-
-        // Child attributes
-        if (childBinding.attributes) {
-          for (const attrSpec of childBinding.attributes) {
-            const value = child.attributes.get(attrSpec.attr)
-            if (value !== undefined) {
-              entry[attrSpec.field] = value
-            }
-          }
-        }
-
-        // Child body (literal, no trimming)
-        if (childBinding.body) {
-          entry[childBinding.body] = child.body
-        }
-
-        entries.push(entry)
-      }
-
-      input[childBinding.field] = entries
-    }
-  }
-
-  // ChildRecord → record field (repeated elements with key attr)
-  if (binding.childRecord) {
-    const { field, tag: childTag, keyAttr } = binding.childRecord
-    const matchingChildren = element.children.filter(c => c.tagName === childTag)
-    const record: Record<string, string> = {}
-
-    for (const child of matchingChildren) {
-      const key = child.attributes.get(keyAttr)
-      if (key !== undefined) {
-        record[String(key)] = child.body
-      }
+      // Optional parameter not provided — skip, don't set
+      continue
     }
 
-    input[field] = record
+    if (!parsedParam.isComplete) {
+      throw new Error(`Parameter '${paramName}' is incomplete`)
+    }
+
+    if (schema.type === 'json') {
+      // JSON parameter — parse the JSON value
+      try {
+        const parsedJson = JSON.parse(parsedParam.value)
+        setNestedValue(input, paramName, parsedJson)
+      } catch (e) {
+        throw new Error(`Invalid JSON for parameter '${paramName}': ${e}`)
+      }
+    } else {
+      // Scalar parameter — coerce to the correct type
+      const coerced = coerceParameterValue(parsedParam.value, schema.type)
+      setNestedValue(input, paramName, coerced)
+    }
   }
 
   return input
 }
-

@@ -8,7 +8,6 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { AmbientServiceTag } from '@magnitudedev/event-core'
 import { SkillsAmbient } from '../ambient/skills-ambient'
 
@@ -73,12 +72,3 @@ export const skillTool = defineTool({
   execute: (input, _ctx) => executeSkill(input),
   label: (input) => input.name ? `Activating skill: ${input.name}` : 'Activating skill…',
 })
-
-export const skillXmlBinding = defineXmlBinding(skillTool, {
-  input: {
-    attributes: [{ field: 'name', attr: 'name' }],
-  },
-  output: {
-    childTags: [{ field: 'content', tag: 'content' }, { field: 'skillPath', tag: 'skillPath' }],
-  },
-} as const)

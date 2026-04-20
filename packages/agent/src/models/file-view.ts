@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { viewTool, viewXmlBinding } from '../tools/fs'
+import { viewTool } from '../tools/fs'
 
 export interface FileViewState extends BaseState {
   toolKey: 'fileView'
@@ -10,10 +10,7 @@ const initial: Omit<FileViewState, 'phase' | 'toolKey'> = {
   path: undefined,
 }
 
-export const fileViewModel = defineStateModel('fileView', {
-  tool: viewTool,
-  binding: viewXmlBinding,
-})({
+export const fileViewModel = defineStateModel('fileView', viewTool)({
   initial,
   reduce: (state, event): FileViewState => {
     switch (event.type) {

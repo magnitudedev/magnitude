@@ -12,7 +12,7 @@ import { Data } from 'effect'
 import { logger } from '@magnitudedev/logger'
 import type { AppEvent, TurnCompleted } from '../events'
 import type { ToolKey } from '../catalog'
-import type { XmlToolResult } from '@magnitudedev/xml-act'
+import type { ToolResult } from '@magnitudedev/xml-act'
 import { AgentRoutingProjection } from './agent-routing'
 import { UserMessageResolutionProjection } from './user-message-resolution'
 import { CompactionProjection } from './compaction'
@@ -29,7 +29,7 @@ export interface ToolCall {
   // the XML tag separately at the inbox/memory boundary.
   readonly toolKey: ToolKey
   readonly input: unknown
-  readonly result?: XmlToolResult
+  readonly result?: ToolResult
 }
 
 export type TurnTrigger =

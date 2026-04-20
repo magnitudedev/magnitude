@@ -325,7 +325,6 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       MockTurnScriptLive,
       basePersistenceLayer,
       faultWrappedPersistenceLayer,
-      makeAmbientServiceLayer(),
       ...(fakeClock ? [fakeClock.layer] : []),
       ...(options.extraLayers ?? []),
     )

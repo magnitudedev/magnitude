@@ -302,7 +302,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<yield-user reason="error"/>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<|yield:user|>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
     })
   })
 

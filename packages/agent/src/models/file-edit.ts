@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState, type EditDiff, type StreamingPartial } from '@magnitudedev/tools'
-import { editTool, editXmlBinding } from '../tools/fs'
+import { editTool } from '../tools/fs'
 
 export interface FileEditState extends BaseState {
   toolKey: 'fileEdit'
@@ -114,10 +114,7 @@ function applyReadyInputUpdate(
   return applyProvisionalDiffs(nextState)
 }
 
-export const fileEditModel = defineStateModel('fileEdit', {
-  tool: editTool,
-  binding: editXmlBinding,
-})({
+export const fileEditModel = defineStateModel('fileEdit', editTool)({
   initial,
   reduce: (state, event): FileEditState => {
     switch (event.type) {

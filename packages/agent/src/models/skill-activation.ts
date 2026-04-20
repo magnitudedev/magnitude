@@ -5,7 +5,7 @@
  */
 
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { skillTool, skillXmlBinding } from '../tools/skill-tool'
+import { skillTool } from '../tools/skill-tool'
 
 export interface SkillActivationState extends BaseState {
   toolKey: 'skill'
@@ -22,10 +22,7 @@ const initial: Omit<SkillActivationState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const skillActivationModel = defineStateModel('skill', {
-  tool: skillTool,
-  binding: skillXmlBinding,
-})({
+export const skillActivationModel = defineStateModel('skill', skillTool)({
   initial,
   reduce: (state, event): SkillActivationState => {
     switch (event.type) {

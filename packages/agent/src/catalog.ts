@@ -1,16 +1,9 @@
 import { defineCatalog } from '@magnitudedev/tools'
 import type { StateModel, ToolDefinition, ToolCatalog } from '@magnitudedev/tools'
-import type { XmlTagBinding } from '@magnitudedev/xml-act'
 
-type AgentToolBinding = {
-  toXmlTagBinding(): XmlTagBinding
-  toXmlOutputBinding(): XmlTagBinding
-}
-
-/** Agent-level catalog entry — every tool in the agent catalog has a binding and state model */
+/** Agent-level catalog entry — every tool in the agent catalog has a state model */
 export interface AgentCatalogEntry {
   readonly tool: ToolDefinition
-  readonly binding: AgentToolBinding
   readonly state: StateModel<any, any, any, any>
   readonly display?: boolean
   readonly group?: string
@@ -19,66 +12,42 @@ export interface AgentCatalogEntry {
 /** Agent catalog — a ToolCatalog whose entries satisfy AgentCatalogEntry */
 export type AgentCatalog<T extends Record<string, AgentCatalogEntry> = Record<string, AgentCatalogEntry>> = ToolCatalog<T>
 
-// Tools + Bindings
-import { shellTool, shellXmlBinding } from './tools/shell'
+// Tools
+import { shellTool } from './tools/shell'
 import {
   readTool,
-  readXmlBinding,
   writeTool,
-  writeXmlBinding,
   editTool,
-  editXmlBinding,
   treeTool,
-  treeXmlBinding,
   grepTool,
-  grepXmlBinding,
   viewTool,
-  viewXmlBinding,
 } from './tools/fs'
-import { webFetchTool, webFetchXmlBinding } from './tools/web-fetch-tool'
-import { webSearchTool, webSearchXmlBinding } from './tools/web-search'
+import { webFetchTool } from './tools/web-fetch-tool'
+import { webSearchTool } from './tools/web-search'
 
 import {
   clickTool,
-  clickXmlBinding,
   doubleClickTool,
-  doubleClickXmlBinding,
   rightClickTool,
-  rightClickXmlBinding,
   typeTool,
-  typeXmlBinding,
   scrollTool,
-  scrollXmlBinding,
   dragTool,
-  dragXmlBinding,
   navigateTool,
-  navigateXmlBinding,
   goBackTool,
-  goBackXmlBinding,
   switchTabTool,
-  switchTabXmlBinding,
   newTabTool,
-  newTabXmlBinding,
   screenshotTool,
-  screenshotXmlBinding,
   evaluateTool,
-  evaluateXmlBinding,
 } from './tools/browser-tools'
 import {
   createTaskTool,
-  createTaskXmlBinding,
   updateTaskTool,
-  updateTaskXmlBinding,
   spawnWorkerTool,
-  spawnWorkerXmlBinding,
   killWorkerTool,
-  killWorkerXmlBinding,
 } from './tools/task-tools'
 import {
   agentCreateTool,
-  agentCreateXmlBinding,
   agentKillTool,
-  agentKillXmlBinding,
 } from './tools/agent-tools'
 
 // State models
@@ -112,41 +81,41 @@ import { spawnWorkerModel } from './models/spawn-worker'
 import { killWorkerModel } from './models/kill-worker'
 import { agentCreateModel } from './models/agent-create'
 import { agentKillModel } from './models/agent-kill'
-import { skillTool, skillXmlBinding } from './tools/skill-tool'
+import { skillTool } from './tools/skill-tool'
 import { skillActivationModel } from './models/skill-activation'
 
 export const catalog = defineCatalog({
-  shell: { tool: shellTool, binding: shellXmlBinding, state: shellModel },
-  fileRead: { tool: readTool, binding: readXmlBinding, state: fileReadModel },
-  fileWrite: { tool: writeTool, binding: writeXmlBinding, state: fileWriteModel },
-  fileEdit: { tool: editTool, binding: editXmlBinding, state: fileEditModel },
-  fileTree: { tool: treeTool, binding: treeXmlBinding, state: fileTreeModel },
-  fileSearch: { tool: grepTool, binding: grepXmlBinding, state: fileSearchModel },
-  fileView: { tool: viewTool, binding: viewXmlBinding, state: fileViewModel },
-  webSearch: { tool: webSearchTool, binding: webSearchXmlBinding, state: webSearchModel },
-  webFetch: { tool: webFetchTool, binding: webFetchXmlBinding, state: webFetchModel },
+  shell: { tool: shellTool, state: shellModel },
+  fileRead: { tool: readTool, state: fileReadModel },
+  fileWrite: { tool: writeTool, state: fileWriteModel },
+  fileEdit: { tool: editTool, state: fileEditModel },
+  fileTree: { tool: treeTool, state: fileTreeModel },
+  fileSearch: { tool: grepTool, state: fileSearchModel },
+  fileView: { tool: viewTool, state: fileViewModel },
+  webSearch: { tool: webSearchTool, state: webSearchModel },
+  webFetch: { tool: webFetchTool, state: webFetchModel },
 
-  click: { tool: clickTool, binding: clickXmlBinding, state: clickModel, group: 'browser' },
-  doubleClick: { tool: doubleClickTool, binding: doubleClickXmlBinding, state: doubleClickModel, group: 'browser' },
-  rightClick: { tool: rightClickTool, binding: rightClickXmlBinding, state: rightClickModel, group: 'browser' },
-  type: { tool: typeTool, binding: typeXmlBinding, state: typeModel, group: 'browser' },
-  scroll: { tool: scrollTool, binding: scrollXmlBinding, state: scrollModel, group: 'browser' },
-  drag: { tool: dragTool, binding: dragXmlBinding, state: dragModel, group: 'browser' },
-  navigate: { tool: navigateTool, binding: navigateXmlBinding, state: navigateModel, group: 'browser' },
-  goBack: { tool: goBackTool, binding: goBackXmlBinding, state: goBackModel, group: 'browser' },
-  switchTab: { tool: switchTabTool, binding: switchTabXmlBinding, state: switchTabModel, group: 'browser' },
-  newTab: { tool: newTabTool, binding: newTabXmlBinding, state: newTabModel, group: 'browser' },
-  screenshot: { tool: screenshotTool, binding: screenshotXmlBinding, state: screenshotModel, group: 'browser' },
-  evaluate: { tool: evaluateTool, binding: evaluateXmlBinding, state: evaluateModel, group: 'browser' },
+  click: { tool: clickTool, state: clickModel, group: 'browser' },
+  doubleClick: { tool: doubleClickTool, state: doubleClickModel, group: 'browser' },
+  rightClick: { tool: rightClickTool, state: rightClickModel, group: 'browser' },
+  type: { tool: typeTool, state: typeModel, group: 'browser' },
+  scroll: { tool: scrollTool, state: scrollModel, group: 'browser' },
+  drag: { tool: dragTool, state: dragModel, group: 'browser' },
+  navigate: { tool: navigateTool, state: navigateModel, group: 'browser' },
+  goBack: { tool: goBackTool, state: goBackModel, group: 'browser' },
+  switchTab: { tool: switchTabTool, state: switchTabModel, group: 'browser' },
+  newTab: { tool: newTabTool, state: newTabModel, group: 'browser' },
+  screenshot: { tool: screenshotTool, state: screenshotModel, group: 'browser' },
+  evaluate: { tool: evaluateTool, state: evaluateModel, group: 'browser' },
 
-  agentCreate: { tool: agentCreateTool, binding: agentCreateXmlBinding, state: agentCreateModel },
-  agentKill: { tool: agentKillTool, binding: agentKillXmlBinding, state: agentKillModel },
+  agentCreate: { tool: agentCreateTool, state: agentCreateModel },
+  agentKill: { tool: agentKillTool, state: agentKillModel },
 
-  createTask: { tool: createTaskTool, binding: createTaskXmlBinding, state: createTaskModel, display: false },
-  updateTask: { tool: updateTaskTool, binding: updateTaskXmlBinding, state: updateTaskModel, display: false },
-  spawnWorker: { tool: spawnWorkerTool, binding: spawnWorkerXmlBinding, state: spawnWorkerModel, display: false },
-  killWorker: { tool: killWorkerTool, binding: killWorkerXmlBinding, state: killWorkerModel, display: false },
-  skill: { tool: skillTool, binding: skillXmlBinding, state: skillActivationModel },
+  createTask: { tool: createTaskTool, state: createTaskModel, display: false },
+  updateTask: { tool: updateTaskTool, state: updateTaskModel, display: false },
+  spawnWorker: { tool: spawnWorkerTool, state: spawnWorkerModel, display: false },
+  killWorker: { tool: killWorkerTool, state: killWorkerModel, display: false },
+  skill: { tool: skillTool, state: skillActivationModel },
 } as const)
 
 export type ToolKey = keyof typeof catalog.entries

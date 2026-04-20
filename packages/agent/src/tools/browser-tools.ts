@@ -8,7 +8,6 @@
 import { Context, Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import type { WebHarness } from '@magnitudedev/browser-harness'
 import { getBrowserActionBaseLabel } from './browser-action-visuals'
 
@@ -42,8 +41,6 @@ export const clickTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('click'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
@@ -53,11 +50,6 @@ export const clickTool = defineTool({
       return 'clicked'
     }),
 })
-
-export const clickXmlBinding = defineXmlBinding(clickTool, {
-  input: { attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }] },
-  output: {},
-} as const)
 
 // =============================================================================
 // doubleClick
@@ -73,8 +65,6 @@ export const doubleClickTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('doubleClick'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
@@ -84,11 +74,6 @@ export const doubleClickTool = defineTool({
       return 'double-clicked'
     }),
 })
-
-export const doubleClickXmlBinding = defineXmlBinding(doubleClickTool, {
-  input: { attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }] },
-  output: {},
-} as const)
 
 // =============================================================================
 // rightClick
@@ -104,8 +89,6 @@ export const rightClickTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('rightClick'),
   execute: ({ x, y }) =>
     Effect.gen(function* () {
@@ -115,11 +98,6 @@ export const rightClickTool = defineTool({
       return 'right-clicked'
     }),
 })
-
-export const rightClickXmlBinding = defineXmlBinding(rightClickTool, {
-  input: { attributes: [{ field: 'x', attr: 'x' }, { field: 'y', attr: 'y' }] },
-  output: {},
-} as const)
 
 // =============================================================================
 // type
@@ -134,8 +112,6 @@ export const typeTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('type'),
   execute: ({ content }) =>
     Effect.gen(function* () {
@@ -145,11 +121,6 @@ export const typeTool = defineTool({
       return 'typed'
     }),
 })
-
-export const typeXmlBinding = defineXmlBinding(typeTool, {
-  input: { body: 'content' },
-  output: {},
-} as const)
 
 // =============================================================================
 // scroll
@@ -162,13 +133,11 @@ export const scrollTool = defineTool({
   inputSchema: Schema.Struct({
     x: Schema.Number.annotations({ description: 'X coordinate to scroll at' }),
     y: Schema.Number.annotations({ description: 'Y coordinate to scroll at' }),
-    deltaX: Schema.optionalWith(Schema.Number, { default: () => 0 }).annotations({ description: 'Horizontal scroll amount' }),
+    deltaX: Schema.optionalWith(Schema.Number.annotations({ description: 'Horizontal scroll amount' }), { default: () => 0 }),
     deltaY: Schema.Number.annotations({ description: 'Vertical scroll amount (positive = down)' }),
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('scroll'),
   execute: ({ x, y, deltaX, deltaY }) =>
     Effect.gen(function* () {
@@ -178,18 +147,6 @@ export const scrollTool = defineTool({
       return 'scrolled'
     }),
 })
-
-export const scrollXmlBinding = defineXmlBinding(scrollTool, {
-  input: {
-    attributes: [
-      { field: 'x', attr: 'x' },
-      { field: 'y', attr: 'y' },
-      { field: 'deltaX', attr: 'deltaX' },
-      { field: 'deltaY', attr: 'deltaY' },
-    ],
-  },
-  output: {},
-} as const)
 
 // =============================================================================
 // drag
@@ -207,8 +164,6 @@ export const dragTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('drag'),
   execute: ({ x1, y1, x2, y2 }) =>
     Effect.gen(function* () {
@@ -218,18 +173,6 @@ export const dragTool = defineTool({
       return 'dragged'
     }),
 })
-
-export const dragXmlBinding = defineXmlBinding(dragTool, {
-  input: {
-    attributes: [
-      { field: 'x1', attr: 'x1' },
-      { field: 'y1', attr: 'y1' },
-      { field: 'x2', attr: 'x2' },
-      { field: 'y2', attr: 'y2' },
-    ],
-  },
-  output: {},
-} as const)
 
 // =============================================================================
 // navigate
@@ -244,8 +187,6 @@ export const navigateTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('navigate'),
   execute: ({ url }) =>
     Effect.gen(function* () {
@@ -255,11 +196,6 @@ export const navigateTool = defineTool({
       return `navigated to ${url}`
     }),
 })
-
-export const navigateXmlBinding = defineXmlBinding(navigateTool, {
-  input: { attributes: [{ field: 'url', attr: 'url' }] },
-  output: {},
-} as const)
 
 // =============================================================================
 // goBack
@@ -272,7 +208,6 @@ export const goBackTool = defineTool({
   inputSchema: Schema.Struct({}),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
   label: () => getBrowserActionBaseLabel('goBack'),
   execute: () =>
     Effect.gen(function* () {
@@ -282,11 +217,6 @@ export const goBackTool = defineTool({
       return 'went back'
     }),
 })
-
-export const goBackXmlBinding = defineXmlBinding(goBackTool, {
-  input: {},
-  output: {},
-} as const)
 
 // =============================================================================
 // switchTab
@@ -301,8 +231,6 @@ export const switchTabTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('switchTab'),
   execute: ({ index }) =>
     Effect.gen(function* () {
@@ -312,11 +240,6 @@ export const switchTabTool = defineTool({
       return `switched to tab ${index}`
     }),
 })
-
-export const switchTabXmlBinding = defineXmlBinding(switchTabTool, {
-  input: { attributes: [{ field: 'index', attr: 'index' }] },
-  output: {},
-} as const)
 
 // =============================================================================
 // newTab
@@ -329,7 +252,6 @@ export const newTabTool = defineTool({
   inputSchema: Schema.Struct({}),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
   label: () => getBrowserActionBaseLabel('newTab'),
   execute: () =>
     Effect.gen(function* () {
@@ -339,11 +261,6 @@ export const newTabTool = defineTool({
       return 'new tab opened'
     }),
 })
-
-export const newTabXmlBinding = defineXmlBinding(newTabTool, {
-  input: {},
-  output: {},
-} as const)
 
 // =============================================================================
 // screenshot
@@ -356,7 +273,6 @@ export const screenshotTool = defineTool({
   inputSchema: Schema.Struct({}),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
   label: () => getBrowserActionBaseLabel('screenshot'),
   execute: () =>
     Effect.gen(function* () {
@@ -371,11 +287,6 @@ export const screenshotTool = defineTool({
     }),
 })
 
-export const screenshotXmlBinding = defineXmlBinding(screenshotTool, {
-  input: {},
-  output: {},
-} as const)
-
 // =============================================================================
 // evaluate
 // =============================================================================
@@ -389,8 +300,6 @@ export const evaluateTool = defineTool({
   }),
   outputSchema: Schema.String,
   errorSchema: BrowserError,
-
-
   label: () => getBrowserActionBaseLabel('evaluate'),
   execute: ({ code }) =>
     Effect.gen(function* () {
@@ -404,11 +313,6 @@ export const evaluateTool = defineTool({
       }
     }),
 })
-
-export const evaluateXmlBinding = defineXmlBinding(evaluateTool, {
-  input: { body: 'code' },
-  output: {},
-} as const)
 
 // =============================================================================
 // Tool Group
@@ -427,19 +331,4 @@ export const browserTools = [
   newTabTool,
   screenshotTool,
   evaluateTool,
-]
-
-export const browserXmlBindings = [
-  clickXmlBinding,
-  doubleClickXmlBinding,
-  rightClickXmlBinding,
-  typeXmlBinding,
-  scrollXmlBinding,
-  dragXmlBinding,
-  navigateXmlBinding,
-  goBackXmlBinding,
-  switchTabXmlBinding,
-  newTabXmlBinding,
-  screenshotXmlBinding,
-  evaluateXmlBinding,
 ]

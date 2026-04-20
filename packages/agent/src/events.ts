@@ -9,7 +9,7 @@
 
 import type { ContentPart } from './content'
 import type { ImageMediaType } from './content'
-import type { ToolCallEvent } from '@magnitudedev/xml-act'
+import type { RuntimeEvent } from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { Skill } from '@magnitudedev/skills'
@@ -309,7 +309,7 @@ export interface ToolEvent {
   readonly turnId: string
   readonly toolCallId: string
   readonly toolKey: ToolKey
-  readonly event: ToolCallEvent
+  readonly event: RuntimeEvent
 }
 
 export type ToolDisplay =

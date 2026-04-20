@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { webFetchTool, webFetchXmlBinding } from '../tools/web-fetch-tool'
+import { webFetchTool } from '../tools/web-fetch-tool'
 
 export interface WebFetchState extends BaseState {
   toolKey: 'webFetch'
@@ -12,10 +12,7 @@ const initial: Omit<WebFetchState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const webFetchModel = defineStateModel('webFetch', {
-  tool: webFetchTool,
-  binding: webFetchXmlBinding,
-})({
+export const webFetchModel = defineStateModel('webFetch', webFetchTool)({
   initial,
   reduce: (state, event): WebFetchState => {
     switch (event.type) {

@@ -7,7 +7,6 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { spawn } from 'child_process'
 import { WorkingDirectoryTag } from '../execution/working-directory'
 import { agentEnv } from '../util/agent-env'
@@ -45,7 +44,7 @@ export const shellTool = defineTool({
   group: 'default',
   description: 'Execute a shell command. Do not use this for operations covered by built-in tools like read, grep, tree, write, edit, and web-fetch.',
   inputSchema: Schema.Struct({
-    command: Schema.String,
+    command: Schema.String.annotations({ description: 'Shell command to execute' }),
     timeout: Schema.optional(
       Schema.Number.annotations({ description: 'Timeout in seconds (default: 120, max: 600).' })
     ),
@@ -161,21 +160,6 @@ export const shellTool = defineTool({
       )
     }),
   label: (input) => (input.command ? `$ ${shortenCommandPreview(input.command)}` : 'Running command…'),
-})
-
-export const shellXmlBinding = defineXmlBinding(shellTool, {
-  input: {
-    attributes: [{ attr: 'timeout', field: 'timeout' }],
-    body: 'command',
-  },
-  output: {
-    childTags: [
-      { tag: 'mode', field: 'mode' },
-      { tag: 'stdout', field: 'stdout' },
-      { tag: 'stderr', field: 'stderr' },
-      { tag: 'exitCode', field: 'exitCode' },
-    ],
-  },
 })
 
 // Tool slugs

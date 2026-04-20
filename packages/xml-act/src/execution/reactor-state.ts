@@ -1,17 +1,15 @@
-import type { ReactorState, ToolOutcome, XmlRuntimeEvent } from '../types'
+import type { ReactorState, ToolOutcome, RuntimeEvent } from '../types'
 
 export function initialReactorState(): ReactorState {
   return {
     toolCallMap: new Map(),
-
     deadToolCalls: new Set(),
-    outputTrees: new Map(),
     stopped: false,
     toolOutcomes: new Map(),
   }
 }
 
-export function foldReactorState(state: ReactorState, event: XmlRuntimeEvent): ReactorState {
+export function foldReactorState(state: ReactorState, event: RuntimeEvent): ReactorState {
   switch (event._tag) {
     case 'ToolInputStarted': {
       const toolCallMap = new Map(state.toolCallMap)

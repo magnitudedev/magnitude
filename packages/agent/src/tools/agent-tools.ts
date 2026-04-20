@@ -1,3 +1,4 @@
+
 /**
  * Agent Tools
  *
@@ -11,7 +12,6 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork, WorkerBusTag } from '@magnitudedev/event-core'
 import { ExecutionManager } from '../execution/types'
 import { ConversationStateReaderTag } from './memory-reader'
@@ -145,30 +145,4 @@ export const agentKillTool = defineTool({
   }),
   label: (input) => input.agentId ? `Killing agent ${input.agentId}` : 'Killing agent…',
 })
-
-export const agentCreateXmlBinding = defineXmlBinding(agentCreateTool, {
-  input: {
-    attributes: [
-      { field: 'agentId', attr: 'id' },
-      { field: 'options.type', attr: 'type' },
-    ],
-    childTags: [
-      { field: 'options.title', tag: 'title' },
-      { field: 'options.message', tag: 'message' },
-    ],
-  },
-  output: { childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
-} as const)
-
-export const agentKillXmlBinding = defineXmlBinding(agentKillTool, {
-  input: {
-    attributes: [{ field: 'agentId', attr: 'agentId' }],
-    childTags: [{ field: 'reason', tag: 'reason' }],
-  },
-  output: { childTags: [{ field: 'agentId', tag: 'agentId' }, { field: 'forkId', tag: 'forkId' }] },
-} as const)
-// =============================================================================
-// Tool Group Export
-// =============================================================================
-
 export const agentTools = []

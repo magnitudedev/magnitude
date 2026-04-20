@@ -5,7 +5,6 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema, ToolImageSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { resolve } from 'path'
 import { validateAndApply } from '../util/edit'
 import { WorkingDirectoryTag } from '../execution/working-directory'
@@ -83,17 +82,6 @@ export const readTool = defineTool({
   })
 })
 
-export const readXmlBinding = defineXmlBinding(readTool, {
-  input: {
-    attributes: [
-      { field: 'path', attr: 'path' },
-      { field: 'offset', attr: 'offset' },
-      { field: 'limit', attr: 'limit' },
-    ],
-  },
-  output: {},
-} as const)
-
 // =============================================================================
 // fs.write()
 // =============================================================================
@@ -131,16 +119,8 @@ export const writeTool = defineTool({
   })
 })
 
-export const writeXmlBinding = defineXmlBinding(writeTool, {
-  input: {
-    attributes: [{ field: 'path', attr: 'path' }],
-    body: 'content',
-  },
-  output: {},
-} as const)
-
 // =============================================================================
-// edit() — string find-replace using <old>/<new> child tags
+// edit() — string find-replace
 // =============================================================================
 
 export const editTool = defineTool({
@@ -190,12 +170,10 @@ export const editTool = defineTool({
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
 
-    // Read current file
     const content = yield* fs.readText(fullPath).pipe(
       Effect.catchAll(() => Effect.fail(fsError(`Failed to read ${path}`)))
     )
 
-    // Validate and apply
     let applied
     try {
       applied = validateAndApply(content, oldString, newString, replaceAll ?? false)
@@ -203,12 +181,10 @@ export const editTool = defineTool({
       return yield* Effect.fail(fsError(e instanceof Error ? e.message : String(e)))
     }
 
-    // Write result to disk
     yield* fs.writeFile(fullPath, applied.result).pipe(
       Effect.catchAll(() => Effect.fail(fsError(`Failed to write ${path}`)))
     )
 
-    // Build summary
     if (applied.replaceCount > 1) {
       return `Replaced ${applied.replaceCount} occurrences in ${path}`
     }
@@ -218,20 +194,6 @@ export const editTool = defineTool({
     return `Replaced ${applied.removedLines.length} line(s) with ${applied.addedLines.length} line(s) in ${path}`
   }),
 })
-
-export const editXmlBinding = defineXmlBinding(editTool, {
-  input: {
-    attributes: [
-      { field: 'path', attr: 'path' },
-      { field: 'replaceAll', attr: 'replaceAll' },
-    ],
-    childTags: [
-      { tag: 'old', field: 'oldString' },
-      { tag: 'new', field: 'newString' },
-    ],
-  },
-  output: {},
-} as const)
 
 // =============================================================================
 // fs.tree()
@@ -290,23 +252,6 @@ export const treeTool = defineTool({
   })
 })
 
-export const treeXmlBinding = defineXmlBinding(treeTool, {
-  input: {
-    attributes: [{ field: 'path', attr: 'path' }],
-  },
-  output: {
-    items: {
-      tag: 'entry',
-      attributes: [
-        { attr: 'path', field: 'path' },
-        { attr: 'name', field: 'name' },
-        { attr: 'type', field: 'type' },
-        { attr: 'depth', field: 'depth' },
-      ],
-    },
-  },
-} as const)
-
 // =============================================================================
 // fs.search()
 // =============================================================================
@@ -317,7 +262,6 @@ const SearchMatch = Schema.Struct({
 })
 
 type SearchMatch = Schema.Schema.Type<typeof SearchMatch>
-
 
 export const grepTool = defineTool({
   name: 'grep',
@@ -336,7 +280,6 @@ export const grepTool = defineTool({
     limit: Schema.optional(Schema.Number.annotations({
       description: 'Maximum number of matches to return (default: 50)'
     })),
-    // Backward compatibility for non-XML callers still sending options object
     options: Schema.optional(Schema.Struct({
       path: Schema.optional(Schema.String),
       glob: Schema.optional(Schema.String),
@@ -362,26 +305,6 @@ export const grepTool = defineTool({
     )
   })
 })
-
-export const grepXmlBinding = defineXmlBinding(grepTool, {
-  input: {
-    attributes: [
-      { field: 'path', attr: 'path' },
-      { field: 'limit', attr: 'limit' },
-    ],
-    childTags: [
-      { field: 'pattern', tag: 'pattern' },
-      { field: 'glob', tag: 'glob' },
-    ],
-  },
-  output: {
-    items: {
-      tag: 'item',
-      attributes: [{ attr: 'file', field: 'file' }],
-      body: 'match',
-    },
-  },
-} as const)
 
 // =============================================================================
 // fs.view()
@@ -415,24 +338,8 @@ export const viewTool = defineTool({
   })
 })
 
-export const viewXmlBinding = defineXmlBinding(viewTool, {
-  input: {
-    attributes: [{ field: 'path', attr: 'path' }],
-  },
-  output: {},
-} as const)
-
 // =============================================================================
 // Filesystem Tools Group
 // =============================================================================
 
 export const fsTools = [readTool, writeTool, editTool, treeTool, grepTool, viewTool]
-
-export const fsXmlBindings = [
-  readXmlBinding,
-  writeXmlBinding,
-  editXmlBinding,
-  treeXmlBinding,
-  grepXmlBinding,
-  viewXmlBinding,
-]

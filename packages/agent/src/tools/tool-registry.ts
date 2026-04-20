@@ -4,11 +4,10 @@
  * Builds RegisteredTool map and GBNF grammar from agent definitions.
  */
 
-import type { RegisteredTool } from '@magnitudedev/xml-act'
-import { GrammarBuilder, type GrammarBuildOptions, type GrammarToolDef } from '@magnitudedev/xml-act'
+import type { RegisteredTool, GrammarToolDef, GrammarBuildOptions } from '@magnitudedev/xml-act'
+import { GrammarBuilder, deriveParameters } from '@magnitudedev/xml-act'
 import { Effect, type Layer } from 'effect'
 import type { AgentCatalogEntry } from '../catalog'
-import type { XmlBinding } from '@magnitudedev/tools'
 import type { ResolvedToolSet } from './resolved-toolset'
 
 /**
@@ -25,17 +24,13 @@ export function buildRegisteredTools(
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
     const tool = entry.tool
 
-    const binding = entry.binding.toXmlTagBinding()
-    const tagName = binding.tag
-    const rawOutputBinding = entry.binding.toXmlOutputBinding()
-    const outputBinding: XmlBinding<unknown> = { type: 'tag' as const, ...rawOutputBinding }
+    // Tool tag name is the tool's name
+    const tagName = tool.name
 
     tools.set(tagName, {
       tool,
       tagName,
       groupName: tool.group ?? 'default',
-      binding,
-      outputBinding,
       meta: { defKey },
       layerProvider: () => Effect.succeed(layers),
     })
@@ -57,12 +52,24 @@ export function generateToolGrammar(
 
   for (const defKey of toolSet.availableKeys) {
     const entry = agentDef.tools.entries[defKey] as AgentCatalogEntry
-    const binding = entry.binding.toXmlTagBinding()
+    const tool = entry.tool
+    
+    // Derive parameter schema from the tool's input schema
+    const toolSchema = deriveParameters(tool.inputSchema.ast)
+    
+    // Convert to grammar tool def
+    // Parameter name is the field path, type is 'scalar' or 'json'
+    const parameters = [...toolSchema.parameters.values()].map(p => ({
+      name: p.name,
+      field: p.name, // In new format, parameter name = field path
+      type: p.type === 'json' ? 'json' as const : 'scalar' as const,
+    }))
+    
     defs.push({
-      tagName: binding.tag,
-      binding,
-      inputSchema: entry.tool.inputSchema,
+      tagName: tool.name,
+      parameters,
     })
   }
+  
   return GrammarBuilder.create(defs).withOptions(options ?? {}).build()
 }

@@ -1,24 +1,33 @@
 import type { MockTurnResponse } from './turn-script'
+import { YIELD_USER, YIELD_TOOL } from '@magnitudedev/xml-act'
 
-type XmlAttrs = Record<string, string>
+type MactParams = Record<string, string>
 
-function openTag(tag: string, attrs?: XmlAttrs): string {
-  if (!attrs || Object.keys(attrs).length === 0) return `<${tag}>`
-  const rendered = Object.entries(attrs)
-    .map(([k, v]) => `${k}="${v}"`)
-    .join(' ')
-  return `<${tag} ${rendered}>`
+function mactParameter(name: string, value: string): string {
+  return `<|parameter:${name}>${value}<parameter|>`
 }
 
-function element(tag: string, attrs?: XmlAttrs, body?: string): string {
-  if (body === undefined) {
-    if (!attrs || Object.keys(attrs).length === 0) return `<${tag}/>`
-    const rendered = Object.entries(attrs)
-      .map(([k, v]) => `${k}="${v}"`)
-      .join(' ')
-    return `<${tag} ${rendered}/>`
+function mactInvoke(tool: string, params: MactParams, body?: string): string {
+  const paramLines = Object.entries(params)
+    .map(([k, v]) => mactParameter(k, v))
+    .join('\n')
+  
+  if (body) {
+    // Body must be wrapped in a parameter tag — find the body field name
+    // Convention: tools with body content use 'message' as the body parameter
+    const bodyParam = mactParameter('message', body)
+    return `<|invoke:${tool}>\n${paramLines}\n${bodyParam}<invoke|>`
   }
-  return `${openTag(tag, attrs)}${body}</${tag}>`
+  
+  if (paramLines) {
+    return `<|invoke:${tool}>\n${paramLines}\n<invoke|>`
+  }
+  
+  return `<|invoke:${tool}>\n<invoke|>`
+}
+
+function mactMessage(recipient: string, text: string): string {
+  return `<|message:${recipient}>${text}<message|>`
 }
 
 export class ResponseBuilder {
@@ -26,55 +35,52 @@ export class ResponseBuilder {
   private readonly tools: string[] = []
 
   message(text: string): this {
-    this.messages.push(element('message', undefined, text))
+    this.messages.push(mactMessage('user', text))
+    return this
+  }
+
+  messageTo(recipient: string, text: string): this {
+    this.messages.push(mactMessage(recipient, text))
     return this
   }
 
   spawnWorker(id: string, role: string, message: string): this {
-    this.tools.push(element('spawn-worker', { id, role }, message))
+    this.tools.push(mactInvoke('spawn-worker', { id, role }, message))
     return this
   }
 
   createTask(id: string, type: string, title: string, parent?: string): this {
-    const attrs: XmlAttrs = { id, type, title }
-    if (parent) attrs.parent = parent
-    this.tools.push(element('create-task', attrs))
+    const params: MactParams = { id, type, title }
+    if (parent) params.parent = parent
+    this.tools.push(mactInvoke('create-task', params))
     return this
   }
 
   updateTask(id: string, status: string): this {
-    this.tools.push(element('update-task', { id, status }))
+    this.tools.push(mactInvoke('update-task', { id, status }))
     return this
   }
 
   killWorker(id: string): this {
-    this.tools.push(element('kill-worker', { id }))
+    this.tools.push(mactInvoke('kill-worker', { id }))
     return this
   }
 
-  tool(tag: string, attrs?: XmlAttrs, body?: string): this {
-    this.tools.push(element(tag, attrs, body))
+  tool(tag: string, params: MactParams = {}): this {
+    this.tools.push(mactInvoke(tag, params))
     return this
   }
 
   createAgent(agentId: string, type: string, title: string, message: string): this {
-    return this.tool(
-      'agent-create',
-      { id: agentId, type },
-      `${element('title', undefined, title)}${element('message', undefined, message)}`,
-    )
+    return this.tool('agent-create', { id: agentId, type, title, message })
   }
 
   writeArtifact(id: string, content: string): this {
-    return this.tool('artifact-write', { id }, content)
+    return this.tool('artifact-write', { id, content })
   }
 
   updateArtifact(id: string, old: string, new_: string): this {
-    return this.tool(
-      'artifact-update',
-      { id },
-      `${element('old', undefined, old)}${element('new', undefined, new_)}`,
-    )
+    return this.tool('artifact-update', { id, old, new: new_ })
   }
 
   readFile(path: string): this {
@@ -82,35 +88,36 @@ export class ResponseBuilder {
   }
 
   writeFile(path: string, content: string): this {
-    return this.tool('write', { path }, content)
+    return this.tool('write', { path, content })
   }
 
   shell(command: string): this {
-    return this.tool('shell', undefined, command)
+    return this.tool('shell', { command })
   }
 
   edit(path: string, old: string, new_: string): this {
-    return this.tool(
-      'edit',
-      { path },
-      `${element('old', undefined, old)}${element('new', undefined, new_)}`,
-    )
+    return this.tool('edit', { path, old, new: new_ })
   }
 
-  private build(control: string): MockTurnResponse {
+  private build(yieldTag: string): MockTurnResponse {
     const parts: string[] = []
     parts.push(...this.messages)
     parts.push(...this.tools)
-    parts.push(`<${control}/>`)
+    parts.push(yieldTag)
     return { xml: parts.join('') }
   }
 
   yield(): MockTurnResponse {
-    return this.build('idle')
+    return this.build(YIELD_USER)
+  }
+
+  yieldTool(): MockTurnResponse {
+    return this.build(YIELD_TOOL)
   }
 
   next(): MockTurnResponse {
-    return this.build('next')
+    // 'next' is not a standard yield target, default to user
+    return this.build(YIELD_USER)
   }
 }
 

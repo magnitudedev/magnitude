@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
-import type { TagParseErrorDetail } from '../../../xml-act/src/format/types'
+import type { ParseErrorDetail } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { getRootMemory, lastInboxMessage } from './helpers'
 import { getView } from '../../src/projections/memory'
@@ -21,7 +21,7 @@ type TurnCompletedEvent = Extract<AppEvent, { type: 'turn_completed' }>
 function invalidToolInputEvent(args: {
   toolCallId: string
   tagName: string
-  error: TagParseErrorDetail
+  error: ParseErrorDetail
 }): ToolEvent['event'] {
   return {
     _tag: 'ToolInputParseError',
@@ -64,7 +64,7 @@ function toolErrorEvent(args: {
   }
 }
 
-function parseErrorFixture(error: TagParseErrorDetail): ToolEvent['event'] {
+function parseErrorFixture(error: ParseErrorDetail): ToolEvent['event'] {
   return invalidToolInputEvent({
     toolCallId: error.id,
     tagName: error.tagName,
@@ -314,7 +314,6 @@ describe('memory tool results', () => {
               _tag: 'MissingRequiredFields',
               id: 'tc-invalid-read-attr',
               tagName: 'read',
-              fields: ['path'],
               detail: 'missing required attribute "path".',
             }),
           },
@@ -347,7 +346,6 @@ describe('memory tool results', () => {
               _tag: 'UnknownAttribute',
               id: 'tc-invalid-read-unknown-attr',
               tagName: 'read',
-              attribute: 'foo',
               detail: 'unknown attribute "foo".',
             }),
           },
@@ -377,9 +375,6 @@ describe('memory tool results', () => {
               _tag: 'InvalidAttributeValue',
               id: 'tc-invalid-create-task-value',
               tagName: 'create-task',
-              attribute: 'type',
-              expected: 'one of: todo | bug | chore',
-              received: 'banana',
               detail: 'invalid value "banana" for attribute "type"; expected one of: todo | bug | chore.',
             }),
           },
@@ -501,7 +496,6 @@ describe('memory tool results', () => {
               _tag: 'MissingRequiredFields',
               id: 'tc-multiple-invalid-read',
               tagName: 'read',
-              fields: ['path'],
               detail: 'missing required attribute "path".',
             }),
           },
@@ -512,7 +506,6 @@ describe('memory tool results', () => {
               _tag: 'UnknownAttribute',
               id: 'tc-multiple-invalid-create-task',
               tagName: 'create-task',
-              attribute: 'foo',
               detail: 'unknown attribute "foo".',
             }),
           },

@@ -1,3 +1,4 @@
+
 /**
  * DisplayProjection (Forked)
  *
@@ -71,6 +72,8 @@ export interface ToolStep {
   readonly toolKey: ToolKey
   readonly cluster?: string
   readonly state?: ToolState
+  readonly filter?: string | null  // Mact filter query that was applied
+  readonly resultFilePath?: string | null  // Path to full result file for retroactive disclosure
 }
 
 export interface CommunicationStep {
@@ -842,6 +845,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
               type: 'tool',
               toolKey: event.toolKey,
               state: getVisualState(toolStateFork, event.toolCallId),
+              filter: null,
+              resultFilePath: null,
             })
           }
         }
@@ -898,7 +903,20 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
 
         case 'ToolObservation':
-          return fork
+          // Mact: Store the filter query when observation is set
+          if (fork.currentTurnId !== event.turnId) return fork
+          if (!fork.activeThinkBlockId) return fork
+          return {
+            ...fork,
+            messages: updateStepInThinkBlock(
+              fork.messages,
+              fork.activeThinkBlockId,
+              event.toolCallId,
+              (s) => s.type === 'tool'
+                ? { ...s, filter: inner.query }
+                : s
+            )
+          }
 
         default: {
           if (fork.currentTurnId !== event.turnId) return fork
@@ -1541,5 +1559,3 @@ export function finalizeCommunicationStreamInFork(
     )
   }
 }
-
-

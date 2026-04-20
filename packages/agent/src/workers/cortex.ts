@@ -18,7 +18,7 @@
 import { Effect, Stream, Either } from 'effect'
 import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
-import { LEAD_YIELD_STOP_SEQUENCES, SUBAGENT_YIELD_STOP_SEQUENCES, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, type GrammarBuildOptions, type XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import { LEAD_YIELD_STOP_SEQUENCES, SUBAGENT_YIELD_STOP_SEQUENCES, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, type GrammarBuildOptions, type TurnEngineCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
 import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError } from '@magnitudedev/providers'
@@ -199,7 +199,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const yieldTags = isSubagent ? [...SUBAGENT_YIELD_TAGS] : [...LEAD_YIELD_TAGS]
 
         const grammarOptions: GrammarBuildOptions = {
-          ...(triggeredByUser ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length } : {}),
+          // Temporarily disabled: forced message to user on user-triggered turns
+          // causes issues with the new Mact format parsing
+          // ...(triggeredByUser ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length } : {}),
           yieldTags,
         }
 
@@ -296,9 +298,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
           yield* publish(turnCompleted)
         }).pipe(Effect.orDie)),
-        Effect.catchAll((error: XmlRuntimeCrash | TurnError) => Effect.gen(function* () {
-          // XmlRuntimeCrash is an infrastructure defect — should not happen in normal operation
-          if (error._tag === 'XmlRuntimeCrash') {
+        Effect.catchAll((error: TurnEngineCrash | TurnError) => Effect.gen(function* () {
+          // TurnEngineCrash is an infrastructure defect — should not happen in normal operation
+          if (error._tag === 'TurnEngineCrash') {
             // Improvement C: if crash was caused by a typed ModelError, surface it as a turn error
             const cause = error.cause
             if (isTaggedCause(cause)) {
