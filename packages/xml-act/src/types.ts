@@ -243,11 +243,6 @@ export interface ToolObservation {
   readonly content: ContentPart[]
 }
 
-export interface StructuralParseError {
-  readonly _tag: 'StructuralParseError'
-  readonly error: StructuralParseErrorDetail
-}
-
 export interface TurnEnd {
   readonly _tag: 'TurnEnd'
   readonly result: ExecutionResult

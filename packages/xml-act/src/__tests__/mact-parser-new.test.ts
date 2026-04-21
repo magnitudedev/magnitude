@@ -148,3 +148,43 @@ describe('mact parser — new architecture', () => {
     expect(chunk).toMatchObject({ path: ['command'] })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Close-tag mismatch lenience
+// ---------------------------------------------------------------------------
+
+describe('close-tag mismatch lenience', () => {
+  it('think frame closed by <message|> emits LensEnd', () => {
+    const events = parse('<|think:turn>\nsome reasoning\n<message|>')
+    expect(events.find(e => e._tag === 'LensStart')).toMatchObject({ _tag: 'LensStart', name: 'turn' })
+    expect(events.find(e => e._tag === 'LensEnd')).toMatchObject({ _tag: 'LensEnd', name: 'turn' })
+  })
+
+  it('think frame closed by <invoke|> emits LensEnd', () => {
+    const events = parse('<|think:plan>\nreasoning\n<invoke|>')
+    expect(events.find(e => e._tag === 'LensEnd')).toMatchObject({ _tag: 'LensEnd', name: 'plan' })
+  })
+
+  it('message frame closed by <think|> emits MessageEnd', () => {
+    const events = parse('<|message:user>\nhello\n<think|>')
+    expect(events.find(e => e._tag === 'MessageStart')).toMatchObject({ _tag: 'MessageStart', to: 'user' })
+    expect(events.find(e => e._tag === 'MessageEnd')).toBeDefined()
+  })
+
+  it('invoke frame closed by <think|> finalizes tool call', () => {
+    const events = parse('<|invoke:shell>\n<|parameter:command>echo hi<parameter|>\n<think|>')
+    expect(events.find(e => e._tag === 'ToolInputReady')).toMatchObject({
+      _tag: 'ToolInputReady',
+      input: { command: 'echo hi' },
+    })
+  })
+
+  it('full turn: think closed by <message|> then message closed normally', () => {
+    const events = parse(
+      '<|think:turn>\nreasoning\n<message|>\n<|message:user>\nhello\n<message|>\n<|yield:user|>',
+    )
+    expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
+    expect(events.find(e => e._tag === 'MessageEnd')).toBeDefined()
+    expect(events.find(e => e._tag === 'TurnEnd')).toBeDefined()
+  })
+})

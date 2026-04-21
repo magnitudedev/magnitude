@@ -44,9 +44,14 @@ export function resolveToken(token: Token, top: Frame): 'structural' | 'content'
       // Close tags are structural only if the current frame matches the tag
       // (e.g., </think> only structural in a ThinkFrame, not in Prose even though think is in prose's validTags)
       switch (token.name) {
-        case 'think': return top.type === 'think' ? 'structural' : 'content'
-        case 'message': return top.type === 'message' ? 'structural' : 'content'
-        case 'invoke': return top.type === 'invoke' ? 'structural' : 'content'
+        // think/message/invoke are interchangeable closers — any of these closes
+        // whichever top-level structural frame is currently open (lenience for
+        // models that emit mismatched close tags)
+        case 'think':
+        case 'message':
+        case 'invoke':
+          return (top.type === 'think' || top.type === 'message' || top.type === 'invoke')
+            ? 'structural' : 'content'
         case 'parameter': return top.type === 'parameter' ? 'structural' : 'content'
         case 'filter': return top.type === 'filter' ? 'structural' : 'content'
         default: return 'content'

@@ -2,7 +2,7 @@
  * Think/lens frame handlers — open and close.
  */
 
-import type { TurnEngineEvent } from '../../types'
+import type { TurnEngineEvent, StructuralParseError } from '../../types'
 import type { Op } from '../../machine'
 import type { Frame, ThinkFrame } from '../types'
 import { THINK_VALID_TAGS } from '../types'
@@ -33,7 +33,7 @@ export function openThink(
 
 export function closeThink(
   top: ThinkFrame,
-  emitStructuralError: (error: { _tag: 'UnclosedThink'; message: string }) => void,
+  emitStructuralError: (error: StructuralParseError) => void,
   apply: (ops: Op<Frame, TurnEngineEvent>[]) => void,
   atEof = false,
 ): void {

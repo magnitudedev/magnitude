@@ -130,7 +130,9 @@ export function handleClose(name: string, pipe: string | undefined, top: Frame, 
     return
   }
 
-  switch (name) {
+  // Use top.type (not name) to route — close tag name may differ from frame type
+  // due to close-tag mismatch lenience (e.g. <message|> closing a think frame)
+  switch (top.type) {
     case 'think':
       closeThink(top as import('./types').ThinkFrame, ctx.emitStructuralError, (ops) => ctx.machine.apply(ops), false)
       break

@@ -107,6 +107,10 @@ Bug report → activate the bug skill to load methodology.
 Bug fix isn't one-turnable. Need to understand and delegate.
 <think|>
 
+<|message:user>
+Looking into the login redirect bug. Let me pull up the auth code and the bug methodology.
+<message|>
+
 <|invoke:skill>
 <|parameter:name>bug<parameter|>
 <invoke|>
