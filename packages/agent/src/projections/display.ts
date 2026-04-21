@@ -765,24 +765,14 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       if (fork.currentTurnId !== event.turnId) return fork
       const { fork: newState, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
       const block = findThinkBlock(newState.messages, thinkBlockId)
+      // Only create a thinking step if none exists yet
+      // If one already exists, just continue appending to it (no space, no new step)
       if (block) {
         const lastStep = block.steps[block.steps.length - 1]
-        if (lastStep && lastStep.type === 'thinking' && (lastStep.content ?? '').length > 0) {
-          // Append space separator before next lens
-          return {
-            ...newState,
-            messages: updateStepInThinkBlock(
-              newState.messages,
-              thinkBlockId,
-              lastStep.id,
-              (s) => s.type === 'thinking'
-                ? { ...s, content: s.content + ' ' }
-                : s
-            )
-          }
+        if (lastStep && lastStep.type === 'thinking') {
+          return newState
         }
       }
-      // Create new thinking step if none exists
       return {
         ...newState,
         messages: addStepToThinkBlock(newState.messages, thinkBlockId, {
