@@ -5,27 +5,6 @@
  * Knows nothing about sandboxes, groups, agents, or runtimes.
  */
 
-
-export type {
-  ToolBindings,
-  OpenAIBinding,
-  CodegenBinding,
-  XmlBinding,
-  XmlChildBinding,
-  XmlChildTagBinding,
-  XmlArrayChildBinding,
-  CustomToolFormat,
-  InputFields,
-  FieldPath,
-  ArrayFields,
-  ArrayElement,
-  ChildTagPath,
-  AttrNames,
-  ChildTagNames,
-  DeriveStreamingShape,
-  ChildAcc,
-} from './bindings'
-
 export { ToolErrorSchema } from './errors'
 export type { ToolErrorBase } from './errors'
 
@@ -41,19 +20,31 @@ export {
   schemaToTypeNode,
   printAst,
   buildKnownEntities,
+  renderToolDocs,
 } from './ets'
 export type { ToolInterfaceResult, ToolInterfaceOptions, ToolGroupInterfaceOptions, AstGenOptions, KnownEntityInfo } from './ets'
 
-// New tool system contracts
+// Tool definition
 export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type StreamHook } from './tool-definition'
+
+// Tool context
 export * from './tool-context'
-export * from './tool-state-event'
-export * from './tool-binding'
+
+// Tool lifecycle events
+export type { ToolStateEvent, ToolResult } from './tool-state-event'
+
+// Streaming partial
 export * from './streaming-partial'
-export * from './state-model'
-export { defineCatalog, type ToolCatalog, type PickableCatalog, type BaseCatalogEntry, type CatalogKeys, type CatalogEntry, type CatalogTool } from './tool-catalog'
+
+// State model
+export { defineStateModel } from './state-model'
+export type { StateModel, BaseState, Phase } from './state-model'
+
+// Tool call state
 export { ToolCallState, createToolCallState } from './tool-call-state'
-export * from './composition'
-export * from './models'
 
+// Catalog
+export { defineCatalog, type ToolCatalog, type PickableCatalog, type BaseCatalogEntry, type CatalogKeys, type CatalogEntry, type CatalogTool } from './tool-catalog'
 
+// Models
+export type { EditDiff } from './models/edit-diff'

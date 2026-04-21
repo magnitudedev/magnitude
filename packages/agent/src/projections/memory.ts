@@ -8,6 +8,8 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { AppEvent, StrategyId, ImageAttachment } from '../events'
+import { deriveParameters } from '@magnitudedev/xml-act'
+import { catalog } from '../catalog'
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
@@ -55,7 +57,6 @@ import {
   toTimelineTaskTreeView,
   toTimelineTaskUpdate,
 } from '../inbox/compose'
-import { generateXmlActToolShape, resolveXmlTagName } from '../tools/xml-tool-docs'
 
 export type MessageSource = 'user' | 'agent' | 'system'
 
@@ -319,6 +320,26 @@ function getAgentDefinitionForFork(read: <T>(projection: T) => any, forkId: stri
   return role && isValidVariant(role) ? getAgentDefinition(role) : undefined
 }
 
+/** Lazy map from tagName to correctToolShape (XML format), built once from catalog */
+const toolShapeByTagName: Map<string, string> = (() => {
+  const map = new Map<string, string>()
+  for (const [, entry] of Object.entries(catalog.entries)) {
+    const e = entry as { tool: { name: string; inputSchema: { ast: unknown } } }
+    try {
+      const params = deriveParameters(e.tool.inputSchema.ast as import('@effect/schema/AST').AST)
+      let shape = '<' + e.tool.name
+      for (const [name] of params.parameters) {
+        shape += '\n' + name + '="..."'
+      }
+      shape += '\n/>'
+      map.set(e.tool.name, shape)
+    } catch {
+      // skip tools that fail to generate
+    }
+  }
+  return map
+})()
+
 function toToolErrorResult(args: {
   tagName: string
   status: Extract<TurnResultItem, { kind: 'tool_error' }>['status']
@@ -330,42 +351,8 @@ function toToolErrorResult(args: {
     tagName: args.tagName,
     status: args.status,
     message: args.message,
-    correctToolShape: args.correctToolShape,
+    correctToolShape: args.correctToolShape ?? toolShapeByTagName.get(args.tagName),
   }
-}
-
-function toRuntimeToolErrorResult(
-  read: <T>(projection: T) => any,
-  forkId: string | null,
-  toolKey: string,
-  status: Extract<TurnResultItem, { kind: 'tool_error' }>['status'],
-  message?: string,
-): TurnResultItem {
-  const agentDef = getAgentDefinitionForFork(read, forkId)!
-  const tagName = resolveXmlTagName(agentDef, toolKey)!
-
-  return toToolErrorResult({
-    tagName,
-    status,
-    message,
-    correctToolShape: generateXmlActToolShape(agentDef, tagName),
-  })
-}
-
-function toInvalidToolInputResult(
-  read: <T>(projection: T) => any,
-  forkId: string | null,
-  tagName: string,
-  detail: string,
-): TurnResultItem {
-  const agentDef = getAgentDefinitionForFork(read, forkId)
-
-  return toToolErrorResult({
-    tagName,
-    status: 'error',
-    message: `Invalid tool input: ${detail}`,
-    correctToolShape: agentDef ? generateXmlActToolShape(agentDef, tagName) : undefined,
-  })
 }
 
 function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
@@ -495,6 +482,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       switch (event.event._tag) {
         case 'ToolExecutionEnded': {
           const result = event.event.result
+          const tagName = event.event.tagName ?? event.toolKey
           switch (result._tag) {
             case 'Success':
               return fork
@@ -503,13 +491,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  toRuntimeToolErrorResult(
-                    read,
-                    event.forkId,
-                    event.toolKey,
-                    'error',
-                    result.error,
-                  ),
+                  toToolErrorResult({
+                    tagName,
+                    status: 'error',
+                    message: result.error,
+                  }),
                 ],
               }
             case 'Rejected':
@@ -517,13 +503,11 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  toRuntimeToolErrorResult(
-                    read,
-                    event.forkId,
-                    event.toolKey,
-                    'rejected',
-                    typeof result.rejection === 'string' ? result.rejection : undefined,
-                  ),
+                  toToolErrorResult({
+                    tagName,
+                    status: 'rejected',
+                    message: typeof result.rejection === 'string' ? result.rejection : undefined,
+                  }),
                 ],
               }
             case 'Interrupted':
@@ -531,12 +515,10 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
                 ...fork,
                 pendingResultItems: [
                   ...fork.pendingResultItems,
-                  toRuntimeToolErrorResult(
-                    read,
-                    event.forkId,
-                    event.toolKey,
-                    'interrupted',
-                  ),
+                  toToolErrorResult({
+                    tagName,
+                    status: 'interrupted',
+                  }),
                 ],
               }
           }
@@ -556,14 +538,22 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
             ],
           }
 
-        case 'ToolInputParseError':
+        case 'ToolParseError':
           return {
             ...fork,
             pendingResultItems: [
               ...fork.pendingResultItems,
-              toInvalidToolInputResult(read, event.forkId, event.event.tagName, event.event.error.detail),
+              toToolErrorResult({
+                tagName: event.event.tagName,
+                status: 'error',
+                message: `Invalid tool input: ${String((event.event.error as unknown as Record<string, unknown>).detail ?? event.event.error._tag)}`,
+                correctToolShape: event.event.correctToolShape,
+              }),
             ],
           }
+
+        case 'StructuralParseError':
+          return fork
 
         default:
           return fork
@@ -635,7 +625,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
       const canonical = read(CanonicalTurnProjection)
       const canonicalText = canonical.lastCompleted?.turnId === event.turnId
-        ? canonical.lastCompleted.canonicalXml
+        ? canonical.lastCompleted.canonicalMact
         : ''
       const hasAssistantContent = canonicalText.trim().length > 0
 

@@ -87,7 +87,7 @@ export type ToolErrorResultItem = {
 export type ToolObservationResultItem = {
   readonly kind: 'tool_observation'
   readonly tagName: string
-  readonly query: string
+  readonly query: string | null
   readonly content: readonly ContentPart[]
 }
 

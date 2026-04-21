@@ -44,14 +44,16 @@ export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
       const textChars = item.content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0)
       if (textChars > INSPECT_CHAR_LIMIT) {
         const approxTokens = Math.ceil(textChars / 4)
-        builder.pushText(`\n<${item.tagName} observe="${item.query}">Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${item.tagName}>`)
+        const observeAttr = item.query ? ` observe="${item.query}"` : ''
+        builder.pushText(`\n<${item.tagName}${observeAttr}>Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${item.tagName}>`)
         for (const part of item.content) {
           if (part.type === 'image') builder.pushPart(part)
         }
         continue
       }
 
-      builder.pushText(`\n<${item.tagName} observe="${item.query}">`)
+      const observeAttr = item.query ? ` observe="${item.query}"` : ''
+      builder.pushText(`\n<${item.tagName}${observeAttr}>`)
       for (const part of item.content) {
         if (part.type === 'text') builder.pushText(part.text)
         else builder.pushPart(part)
@@ -93,5 +95,5 @@ export function formatOneshotLiveness(): string {
 
 /** Yield worker retrigger reminder — lead yielded to workers but none are active */
 export function formatYieldWorkerRetrigger(): string {
-  return `<error>You yielded to workers with <yield-worker/> but no workers are currently active. Check your task assignments or continue working.</error>`
+  return `<error>You yielded to workers with <|yield:worker|> but no workers are currently active. Check your task assignments or continue working.</error>`
 }

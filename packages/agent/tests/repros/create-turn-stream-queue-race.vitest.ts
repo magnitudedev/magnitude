@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { Effect, Scope, Stream } from 'effect'
-import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineCrash } from '@magnitudedev/xml-act'
 import { createTurnStream } from '../../src/execution/turn-stream'
 import { TurnError } from '../../src/execution/types'
 import type { TurnEvent, TurnEventSink, TurnStrategyResult } from '../../src/execution/types'
@@ -19,8 +19,8 @@ const finalTurnResult: TurnStrategyResult = {
 }
 
 function drainForTurnResultSlow(
-  turnStream: Stream.Stream<TurnEvent, XmlRuntimeCrash | TurnError, Scope.Scope>,
-): Effect.Effect<{ finalResult: TurnStrategyResult | null; seen: string[] }, XmlRuntimeCrash | TurnError> {
+  turnStream: Stream.Stream<TurnEvent, TurnEngineCrash | TurnError, Scope.Scope>,
+): Effect.Effect<{ finalResult: TurnStrategyResult | null; seen: string[] }, TurnEngineCrash | TurnError> {
   return Effect.gen(function* () {
     let finalResult: TurnStrategyResult | null = null
     const seen: string[] = []

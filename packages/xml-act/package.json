@@ -15,9 +15,11 @@
     "@magnitudedev/tools": "workspace:*",
     "effect": "^3.19.6",
     "fontoxpath": "^3.34.0",
+    "jsonpath-plus": "^10.4.0",
     "slimdom": "^4.3.5"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "gbnf": "^0.1.41"
   }
 }

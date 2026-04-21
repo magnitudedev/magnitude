@@ -1,6 +1,5 @@
-
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { webSearchTool, webSearchXmlBinding } from '../tools/web-search'
+import { webSearchTool } from '../tools/web-search'
 
 export interface WebSearchState extends BaseState {
   toolKey: 'webSearch'
@@ -15,31 +14,36 @@ const initial: Omit<WebSearchState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const webSearchModel = defineStateModel('webSearch', {
-  tool: webSearchTool,
-  binding: webSearchXmlBinding,
-})({
+export const webSearchModel = defineStateModel('webSearch', webSearchTool)({
   initial,
   reduce: (state, event): WebSearchState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming', errorDetail: undefined }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', query: event.streaming.query?.value ?? state.query }
-      case 'executionStarted':
-      case 'emission':
+      case 'ToolInputFieldChunk':
+        return event.field === 'query'
+          ? { ...state, phase: 'streaming', query: (state.query ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', query: event.input.query }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed', sources: (event.result.output as { sources?: readonly { title: string; url: string }[] }).sources ?? [] }
+          case 'Error':
+            return { ...state, phase: 'error', errorDetail: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error', errorDetail: event.error }
-      case 'completed':
-        return { ...state, phase: 'completed', sources: event.output.sources ?? [] }
-      case 'error':
-        return { ...state, phase: 'error', errorDetail: event.error.message }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
       default:
         return state
     }

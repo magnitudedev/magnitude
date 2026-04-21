@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { shellTool, shellXmlBinding } from '../tools/shell'
+import { shellTool } from '../tools/shell'
 
 export interface ShellState extends BaseState {
   toolKey: 'shell'
@@ -9,7 +9,6 @@ export interface ShellState extends BaseState {
   stdout?: string
   stderr?: string
   errorMessage?: string
-  rejectionReason?: string
 }
 
 const initial: Omit<ShellState, 'phase' | 'toolKey'> = {
@@ -19,53 +18,48 @@ const initial: Omit<ShellState, 'phase' | 'toolKey'> = {
   stdout: undefined,
   stderr: undefined,
   errorMessage: undefined,
-  rejectionReason: undefined,
 }
 
-export const shellModel = defineStateModel('shell', {
-  tool: shellTool,
-  binding: shellXmlBinding,
-})({
+export const shellModel = defineStateModel('shell', shellTool)({
   initial,
   reduce: (state, event): ShellState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming', done: null }
-      case 'inputUpdated':
-        return { ...state, command: event.streaming.command?.value ?? state.command }
-      case 'inputReady':
-        return { ...state, command: event.input.command }
-      case 'executionStarted':
+      case 'ToolInputFieldChunk':
+        return event.field === 'command'
+          ? { ...state, command: state.command + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, command: event.input.command, phase: 'streaming' }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'completed':
-        return {
-          ...state,
-          phase: 'completed',
-          done: 'completed',
-          exitCode: event.output.exitCode,
-          stdout: event.output.stdout,
-          stderr: event.output.stderr,
-          errorMessage: undefined,
-          rejectionReason: undefined,
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return {
+              ...state,
+              phase: 'completed',
+              done: 'completed',
+              exitCode: event.result.output.exitCode,
+              stdout: event.result.output.stdout,
+              stderr: event.result.output.stderr,
+              errorMessage: undefined,
+            }
+          case 'Error':
+            return { ...state, phase: 'error', errorMessage: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
         }
-      case 'error':
-        return { ...state, phase: 'error', errorMessage: event.error.message }
-      case 'rejected':
-        return {
-          ...state,
-          phase: 'rejected',
-          rejectionReason: 'rejected',
-        }
-      case 'approvalRejected':
-        return { ...state, phase: 'rejected', rejectionReason: 'approvalRejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-        return state
-      case 'parseError':
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error', errorMessage: event.error }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

@@ -1,30 +1,18 @@
-import { defineStateModel, type BaseState, type StreamingPartial, type ToolBinding } from '@magnitudedev/tools'
+import { defineStateModel, type BaseState } from '@magnitudedev/tools'
 import type { ToolKey } from '../catalog'
 import {
   clickTool,
-  clickXmlBinding,
   doubleClickTool,
-  doubleClickXmlBinding,
   rightClickTool,
-  rightClickXmlBinding,
   typeTool,
-  typeXmlBinding,
   scrollTool,
-  scrollXmlBinding,
   dragTool,
-  dragXmlBinding,
   navigateTool,
-  navigateXmlBinding,
   goBackTool,
-  goBackXmlBinding,
   switchTabTool,
-  switchTabXmlBinding,
   newTabTool,
-  newTabXmlBinding,
   screenshotTool,
-  screenshotXmlBinding,
   evaluateTool,
-  evaluateXmlBinding,
 } from '../tools/browser-tools'
 import { formatBrowserActionVisualFromStreaming } from '../tools/browser-action-visuals'
 
@@ -38,43 +26,15 @@ export interface BrowserActionState extends BaseState {
   label?: string
   detail?: string
   errorDetail?: string
-}
-
-export interface BrowserActionModelConfig<
-  K extends string,
-  TInput,
-  TOutput,
-  TEmission
-> {
-  readonly toolKey: K
-  readonly tool: {
-    inputSchema: { Type: TInput }
-    outputSchema: { Type: TOutput }
-    emissionSchema?: { Type: TEmission }
-  }
-  readonly binding: ToolBinding<TInput>
+  /** @internal accumulated raw text per field for streaming visual computation */
+  _fields: Record<string, string>
 }
 
 const initial: Omit<BrowserActionState, 'phase' | 'toolKey'> = {
   label: undefined,
   detail: undefined,
   errorDetail: undefined,
-}
-
-function unwrapStreamingLeaf(value: unknown): unknown {
-  if (!value || typeof value !== 'object') return value
-  if ('value' in value && 'isFinal' in value) {
-    return (value as { value: unknown }).value
-  }
-  return value
-}
-
-function normalizeStreamingInput(streaming: Record<string, unknown>): Record<string, unknown> {
-  const normalized: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(streaming)) {
-    normalized[key] = unwrapStreamingLeaf(value)
-  }
-  return normalized
+  _fields: {},
 }
 
 export function createBrowserActionModel<
@@ -83,119 +43,62 @@ export function createBrowserActionModel<
   TOutput,
   TEmission,
 >(
-  config: BrowserActionModelConfig<K, TInput, TOutput, TEmission>,
+  config: { readonly toolKey: K; readonly tool: { inputSchema: { Type: TInput }; outputSchema: { Type: TOutput }; emissionSchema?: { Type: TEmission } } },
 ) {
-  return defineStateModel(config.toolKey, {
-    tool: config.tool,
-    binding: config.binding,
-  })({
+  return defineStateModel(config.toolKey, config.tool)({
     initial,
     reduce: (state, event) => {
-      switch (event.type) {
-        case 'started':
+      switch (event._tag) {
+        case 'ToolInputStarted':
           return { ...state, phase: 'streaming', errorDetail: undefined }
-        case 'inputUpdated':
-        case 'inputReady': {
-          const visual = formatBrowserActionVisualFromStreaming(
-            config.toolKey,
-            normalizeStreamingInput(event.streaming as Record<string, unknown>),
-          )
-          return {
-            ...state,
-            phase: 'streaming',
-            label: visual.label,
-            detail: visual.detail,
+        case 'ToolInputFieldChunk': {
+          const fields = { ...state._fields, [event.field]: (state._fields[event.field] ?? '') + event.delta }
+          const visual = formatBrowserActionVisualFromStreaming(config.toolKey, fields)
+          return { ...state, phase: 'streaming', _fields: fields, label: visual.label, detail: visual.detail }
+        }
+        case 'ToolInputReady': {
+          const input = event.input as Record<string, unknown>
+          const fields: Record<string, string> = {}
+          for (const [k, v] of Object.entries(input)) {
+            if (v !== null && v !== undefined) fields[k] = String(v)
+          }
+          const visual = formatBrowserActionVisualFromStreaming(config.toolKey, fields)
+          return { ...state, phase: 'streaming', _fields: fields, label: visual.label, detail: visual.detail }
+        }
+        case 'ToolExecutionStarted':
+          return { ...state, phase: 'executing' }
+        case 'ToolExecutionEnded': {
+          switch (event.result._tag) {
+            case 'Success':
+              return { ...state, phase: 'completed' }
+            case 'Error':
+              return { ...state, phase: 'error', errorDetail: event.result.error }
+            case 'Rejected':
+              return { ...state, phase: 'rejected' }
+            case 'Interrupted':
+              return { ...state, phase: 'interrupted' }
           }
         }
-        case 'executionStarted':
-        case 'emission':
-        case 'awaitingApproval':
-        case 'approvalGranted':
-        case 'approvalRejected':
-          return { ...state, phase: 'executing' }
-        case 'parseError':
+        case 'ToolParseError':
           return { ...state, phase: 'error', errorDetail: event.error }
-        case 'completed':
-          return { ...state, phase: 'completed' }
-        case 'error':
-          return { ...state, phase: 'error', errorDetail: event.error.message }
-        case 'rejected':
-          return { ...state, phase: 'rejected' }
-        case 'interrupted':
-          return { ...state, phase: 'interrupted' }
+        case 'ToolEmission':
+        case 'ToolInputFieldComplete':
+        default:
+          return state
       }
     },
   })
 }
 
-export const clickModel = createBrowserActionModel({
-  toolKey: 'click',
-  tool: clickTool,
-  binding: clickXmlBinding,
-})
-
-export const doubleClickModel = createBrowserActionModel({
-  toolKey: 'doubleClick',
-  tool: doubleClickTool,
-  binding: doubleClickXmlBinding,
-})
-
-export const rightClickModel = createBrowserActionModel({
-  toolKey: 'rightClick',
-  tool: rightClickTool,
-  binding: rightClickXmlBinding,
-})
-
-export const typeModel = createBrowserActionModel({
-  toolKey: 'type',
-  tool: typeTool,
-  binding: typeXmlBinding,
-})
-
-export const scrollModel = createBrowserActionModel({
-  toolKey: 'scroll',
-  tool: scrollTool,
-  binding: scrollXmlBinding,
-})
-
-export const dragModel = createBrowserActionModel({
-  toolKey: 'drag',
-  tool: dragTool,
-  binding: dragXmlBinding,
-})
-
-export const navigateModel = createBrowserActionModel({
-  toolKey: 'navigate',
-  tool: navigateTool,
-  binding: navigateXmlBinding,
-})
-
-export const goBackModel = createBrowserActionModel({
-  toolKey: 'goBack',
-  tool: goBackTool,
-  binding: goBackXmlBinding,
-})
-
-export const switchTabModel = createBrowserActionModel({
-  toolKey: 'switchTab',
-  tool: switchTabTool,
-  binding: switchTabXmlBinding,
-})
-
-export const newTabModel = createBrowserActionModel({
-  toolKey: 'newTab',
-  tool: newTabTool,
-  binding: newTabXmlBinding,
-})
-
-export const screenshotModel = createBrowserActionModel({
-  toolKey: 'screenshot',
-  tool: screenshotTool,
-  binding: screenshotXmlBinding,
-})
-
-export const evaluateModel = createBrowserActionModel({
-  toolKey: 'evaluate',
-  tool: evaluateTool,
-  binding: evaluateXmlBinding,
-})
+export const clickModel = createBrowserActionModel({ toolKey: 'click', tool: clickTool })
+export const doubleClickModel = createBrowserActionModel({ toolKey: 'doubleClick', tool: doubleClickTool })
+export const rightClickModel = createBrowserActionModel({ toolKey: 'rightClick', tool: rightClickTool })
+export const typeModel = createBrowserActionModel({ toolKey: 'type', tool: typeTool })
+export const scrollModel = createBrowserActionModel({ toolKey: 'scroll', tool: scrollTool })
+export const dragModel = createBrowserActionModel({ toolKey: 'drag', tool: dragTool })
+export const navigateModel = createBrowserActionModel({ toolKey: 'navigate', tool: navigateTool })
+export const goBackModel = createBrowserActionModel({ toolKey: 'goBack', tool: goBackTool })
+export const switchTabModel = createBrowserActionModel({ toolKey: 'switchTab', tool: switchTabTool })
+export const newTabModel = createBrowserActionModel({ toolKey: 'newTab', tool: newTabTool })
+export const screenshotModel = createBrowserActionModel({ toolKey: 'screenshot', tool: screenshotTool })
+export const evaluateModel = createBrowserActionModel({ toolKey: 'evaluate', tool: evaluateTool })

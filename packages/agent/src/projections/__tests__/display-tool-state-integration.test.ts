@@ -79,9 +79,9 @@ describe('DisplayProjection tool state integration', () => {
       } as any,
     ])
 
-    const thinkBlock = display.messages.find((message) => message.type === 'think_block')
+    const thinkBlock = display.messages.find((message: any) => message.type === 'think_block')
     expect(thinkBlock?.type).toBe('think_block')
-    const toolStep = thinkBlock?.steps.find((step) => step.type === 'tool')
+    const toolStep = thinkBlock?.steps.find((step: any) => step.type === 'tool')
     expect(toolStep?.type).toBe('tool')
     expect(toolStep).toMatchObject({
       id: 'call-1',
@@ -122,9 +122,9 @@ describe('DisplayProjection tool state integration', () => {
       } as any,
     ])
 
-    const thinkBlock = display.messages.find((message) => message.type === 'think_block')
+    const thinkBlock = display.messages.find((message: any) => message.type === 'think_block')
     const toolSteps = thinkBlock?.type === 'think_block'
-      ? thinkBlock.steps.filter((step) => step.type === 'tool')
+      ? thinkBlock.steps.filter((step: any) => step.type === 'tool')
       : []
 
     expect(toolSteps.length).toBe(0)

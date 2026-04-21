@@ -185,7 +185,12 @@ describe('turn control interrupts', () => {
         forkId: 'sub-1',
         parentForkId: null,
         agentId: 'test-subagent',
-        message: null,
+        name: 'test-subagent',
+        role: 'subagent',
+        context: '',
+        mode: 'spawn',
+        taskId: 'test-task',
+        message: '',
       })
 
       yield* h.send({ type: 'turn_started', forkId: 'sub-1', turnId: 'sub-turn-1', chainId: 'sub-chain-1' })

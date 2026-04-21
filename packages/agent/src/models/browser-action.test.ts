@@ -3,12 +3,12 @@ import { clickModel, navigateModel } from './browser-action'
 
 describe('browser action model', () => {
   test('preserves action-specific streaming label/detail for navigate', () => {
-    const started = navigateModel.reduce(navigateModel.initial, { type: 'started' })
+    const started = navigateModel.reduce(navigateModel.initial, { _tag: 'ToolInputStarted' })
     const state = navigateModel.reduce(started, {
-      type: 'inputUpdated',
-      changed: 'field',
-      name: 'url',
-      streaming: { url: { value: 'https://example.com', isFinal: true } },
+      _tag: 'ToolInputFieldChunk',
+      field: 'url',
+      path: ['url'],
+      delta: 'https://example.com',
     })
 
     expect(state.label).toBe('Navigate')
@@ -16,14 +16,10 @@ describe('browser action model', () => {
   })
 
   test('preserves action-specific streaming label/detail for click', () => {
-    const started = clickModel.reduce(clickModel.initial, { type: 'started' })
+    const started = clickModel.reduce(clickModel.initial, { _tag: 'ToolInputStarted' })
     const state = clickModel.reduce(started, {
-      type: 'inputReady',
+      _tag: 'ToolInputReady',
       input: { x: 10, y: 20 },
-      streaming: {
-        x: { value: '10', isFinal: false },
-        y: { value: '20', isFinal: false },
-      },
     })
 
     expect(state.label).toBe('Click')

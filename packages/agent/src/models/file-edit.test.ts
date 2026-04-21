@@ -30,31 +30,38 @@ describe('computeProvisionalEditDiffs', () => {
 
 describe('fileEditModel provisional diffs', () => {
   test('populates diffs from base-content emission before completion', () => {
-    const started = fileEditModel.reduce(fileEditModel.initial, { type: 'started' })
+    const started = fileEditModel.reduce(fileEditModel.initial, { _tag: 'ToolInputStarted' })
 
-    const withInputs = fileEditModel.reduce(started, {
-      type: 'inputUpdated',
-      streaming: {
-        path: { value: 'f.ts', isFinal: true },
-        oldString: { value: 'old', isFinal: true },
-        newString: { value: 'new', isFinal: true },
-        replaceAll: { value: 'false', isFinal: false },
-      },
-      changed: 'field',
-      name: 'oldString',
+    let state = fileEditModel.reduce(started, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'path',
+      path: ['path'] as unknown as never,
+      delta: 'f.ts',
+    })
+    state = fileEditModel.reduce(state, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'oldString',
+      path: ['oldString'] as unknown as never,
+      delta: 'old',
+    })
+    state = fileEditModel.reduce(state, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'newString',
+      path: ['newString'] as unknown as never,
+      delta: 'new',
     })
 
-    expect(withInputs.phase).toBe('streaming')
-    expect(withInputs.diffs).toEqual([])
+    expect(state.phase).toBe('streaming')
+    expect(state.diffs).toEqual([])
 
-    const withBase = fileEditModel.reduce(withInputs, {
-      type: 'emission',
+    const withBase = fileEditModel.reduce(state, {
+      _tag: 'ToolEmission',
       value: {
         type: 'file_edit_base_content',
         path: 'f.ts',
         baseContent: 'a\nold\nb',
       },
-    } as any)
+    })
 
     expect(withBase.phase).toBe('executing')
     expect(withBase.diffs).toHaveLength(1)
@@ -64,45 +71,33 @@ describe('fileEditModel provisional diffs', () => {
     expect(withBase.diffs[0]?.contextAfter).toEqual(['b'])
 
     const completed = fileEditModel.reduce(withBase, {
-      type: 'completed',
-      result: '',
-      output: undefined,
-    } as any)
+      _tag: 'ToolExecutionEnded',
+      result: { _tag: 'Success', output: '', query: null },
+    })
     expect(completed.phase).toBe('completed')
     expect(completed.diffs).toHaveLength(1)
     expect(completed.diffs[0]?.addedLines).toEqual(['new'])
   })
 
   test('inputReady uses parsed input values directly', () => {
-    const started = fileEditModel.reduce(fileEditModel.initial, { type: 'started' })
+    const started = fileEditModel.reduce(fileEditModel.initial, { _tag: 'ToolInputStarted' })
 
-    const withStreaming = fileEditModel.reduce(started, {
-      type: 'inputUpdated',
-      streaming: {
-        path: { value: 'wrong.ts', isFinal: true },
-        oldString: { value: 'wrong-old', isFinal: true },
-        newString: { value: 'wrong-new', isFinal: true },
-        replaceAll: { value: 'true', isFinal: false },
-      },
-      changed: 'field',
-      name: 'oldString',
-    } as any)
+    let state = fileEditModel.reduce(started, {
+      _tag: 'ToolInputFieldChunk',
+      field: 'oldString',
+      path: ['oldString'] as unknown as never,
+      delta: 'wrong-old',
+    })
 
-    const withInputReady = fileEditModel.reduce(withStreaming, {
-      type: 'inputReady',
+    const withInputReady = fileEditModel.reduce(state, {
+      _tag: 'ToolInputReady',
       input: {
         path: 'f.ts',
         oldString: 'old',
         newString: 'new',
         replaceAll: false,
       },
-      streaming: {
-        path: { value: 'still-wrong.ts', isFinal: true },
-        oldString: { value: 'still-wrong-old', isFinal: true },
-        newString: { value: 'still-wrong-new', isFinal: true },
-        replaceAll: { value: 'true', isFinal: false },
-      },
-    } as any)
+    })
 
     expect(withInputReady.phase).toBe('streaming')
     expect(withInputReady.path).toBe('f.ts')
@@ -112,13 +107,13 @@ describe('fileEditModel provisional diffs', () => {
     expect(withInputReady.diffs).toEqual([])
 
     const withBase = fileEditModel.reduce(withInputReady, {
-      type: 'emission',
+      _tag: 'ToolEmission',
       value: {
         type: 'file_edit_base_content',
         path: 'f.ts',
         baseContent: 'a\nold\nb',
       },
-    } as any)
+    })
 
     expect(withBase.diffs).toHaveLength(1)
     expect(withBase.diffs[0]?.contextBefore).toEqual(['a'])

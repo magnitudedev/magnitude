@@ -40,7 +40,7 @@ describe('CanonicalTurn final content selection behavior', async () => {
       toolCalls: [{ tagName: 'tool', input: {}, query: '.' }],
       turnDecision: 'idle',
     }
-    const xml = serializeCanonicalTurn(trace, new Map())
+    const xml = serializeCanonicalTurn(trace)
     expect(xml).toContain('<think>t</think>')
     expect(xml).toContain('<message>m</message>')
     expect(xml).toContain('<tool observe="." />')

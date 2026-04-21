@@ -10,7 +10,6 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { AmbientServiceTag, Fork } from '@magnitudedev/event-core'
 import { ProviderState } from '@magnitudedev/providers'
 import { ConfigAmbient } from '../ambient/config-ambient'
@@ -30,8 +29,8 @@ export const webSearchTool = defineTool({
   description: 'Search the web and optionally extract structured data',
 
   inputSchema: Schema.Struct({
-    query: Schema.String,
-    schema: Schema.optional(Schema.Record({ key: Schema.String, value: Schema.Unknown }))
+    query: Schema.String.annotations({ description: 'Search query string' }),
+    schema: Schema.optional(Schema.Record({ key: Schema.String, value: Schema.Unknown }).annotations({ description: 'Optional schema for structured data extraction' }))
   }),
 
   outputSchema: Schema.Struct({
@@ -99,15 +98,3 @@ export const webSearchTool = defineTool({
 
   label: (input) => input.query ? `Searching: ${input.query.slice(0, 50)}` : 'Searching…',
 })
-
-export const webSearchXmlBinding = defineXmlBinding(webSearchTool, {
-  input: { body: 'query' },
-  output: {
-    body: 'text',
-    children: [{
-      field: 'sources',
-      tag: 'source',
-      attributes: [{ field: 'title', attr: 'title' }, { field: 'url', attr: 'url' }],
-    }],
-  },
-} as const)

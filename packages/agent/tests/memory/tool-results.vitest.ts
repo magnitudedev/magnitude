@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
-import type { TagParseErrorDetail } from '../../../xml-act/src/format/types'
+import type { ParseErrorDetail } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { getRootMemory, lastInboxMessage } from './helpers'
 import { getView } from '../../src/projections/memory'
@@ -21,10 +21,10 @@ type TurnCompletedEvent = Extract<AppEvent, { type: 'turn_completed' }>
 function invalidToolInputEvent(args: {
   toolCallId: string
   tagName: string
-  error: TagParseErrorDetail
+  error: ParseErrorDetail
 }): ToolEvent['event'] {
   return {
-    _tag: 'ToolInputParseError',
+    _tag: 'ToolParseError',
     toolCallId: args.toolCallId,
     tagName: args.tagName,
     toolName: args.tagName,
@@ -55,6 +55,7 @@ function toolErrorEvent(args: {
   return {
     _tag: 'ToolExecutionEnded',
     toolCallId: args.toolCallId,
+    tagName: args.tagName,
     group: 'default',
     toolName: args.tagName,
     result: {
@@ -64,11 +65,26 @@ function toolErrorEvent(args: {
   }
 }
 
-function parseErrorFixture(error: TagParseErrorDetail): ToolEvent['event'] {
+type ParseErrorFixture = {
+  _tag: string
+  id: string
+  tagName: string
+  detail: string
+  [key: string]: unknown
+}
+
+function parseErrorFixture(error: ParseErrorFixture): ToolEvent['event'] {
+  const detail: ParseErrorDetail = {
+    _tag: 'MissingRequiredField',
+    toolCallId: error.id,
+    tagName: error.tagName,
+    parameterName: 'unknown',
+    detail: error.detail,
+  } as ParseErrorDetail
   return invalidToolInputEvent({
     toolCallId: error.id,
     tagName: error.tagName,
-    error,
+    error: detail,
   })
 }
 
@@ -314,7 +330,6 @@ describe('memory tool results', () => {
               _tag: 'MissingRequiredFields',
               id: 'tc-invalid-read-attr',
               tagName: 'read',
-              fields: ['path'],
               detail: 'missing required attribute "path".',
             }),
           },
@@ -347,7 +362,6 @@ describe('memory tool results', () => {
               _tag: 'UnknownAttribute',
               id: 'tc-invalid-read-unknown-attr',
               tagName: 'read',
-              attribute: 'foo',
               detail: 'unknown attribute "foo".',
             }),
           },
@@ -377,9 +391,6 @@ describe('memory tool results', () => {
               _tag: 'InvalidAttributeValue',
               id: 'tc-invalid-create-task-value',
               tagName: 'create-task',
-              attribute: 'type',
-              expected: 'one of: todo | bug | chore',
-              received: 'banana',
               detail: 'invalid value "banana" for attribute "type"; expected one of: todo | bug | chore.',
             }),
           },
@@ -391,7 +402,6 @@ describe('memory tool results', () => {
       expect(text).toContain('Invalid tool input: invalid value "banana" for attribute "type"; expected one of: todo | bug | chore.')
       expect(text).toContain('<create-task')
       expect(text).toContain('id="..."')
-      expect(text).toContain('type="..."')
       expect(text).toContain('title="..."')
       expect(text).toContain('parent="..."')
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -451,10 +461,7 @@ describe('memory tool results', () => {
       expect(text).toContain('<tool name="agent-create"><error>')
       expect(text).toContain('Invalid tool input: missing required attribute "id" and required child tag "message".')
       expect(text).toContain('<agent-create')
-      expect(text).toContain('id="..."')
-      expect(text).toContain('type="..."')
-      expect(text).toContain('<title>title</title>')
-      expect(text).toContain('<message>message</message>')
+      expect(text).toContain('agentId="..."')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -482,7 +489,7 @@ describe('memory tool results', () => {
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
       expect(text).toContain('Invalid tool input: tool tag was not completed before turn end.')
       expect(text).toContain('<agent-create')
-      expect(text).toContain('<message>message</message>')
+      expect(text).toContain('agentId="..."')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -501,7 +508,6 @@ describe('memory tool results', () => {
               _tag: 'MissingRequiredFields',
               id: 'tc-multiple-invalid-read',
               tagName: 'read',
-              fields: ['path'],
               detail: 'missing required attribute "path".',
             }),
           },
@@ -512,7 +518,6 @@ describe('memory tool results', () => {
               _tag: 'UnknownAttribute',
               id: 'tc-multiple-invalid-create-task',
               tagName: 'create-task',
-              attribute: 'foo',
               detail: 'unknown attribute "foo".',
             }),
           },

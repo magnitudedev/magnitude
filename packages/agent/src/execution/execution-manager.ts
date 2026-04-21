@@ -2,27 +2,27 @@
  * ExecutionManager
  *
  * Owns per-fork lifecycle and xml-act runtime execution.
- * Maps XmlRuntimeEvents to agent TurnEvents.
+ * Maps TurnEngineEvents to agent TurnEvents.
  *
  * No sandboxes, no journals, no WASM — just xml-act streaming runtime.
  */
 
+import * as path from 'path'
 import { Effect, Stream, Layer, Ref } from 'effect'
 import type { ModelError } from '@magnitudedev/providers'
 import {
-  createXmlRuntime,
+  createTurnEngine,
   ToolInterceptorTag,
-  XmlRuntimeCrash,
-  type XmlRuntimeEvent,
-  type ReactorState,
+  TurnEngineCrash,
+  type TurnEngineEvent,
   type ToolInterceptor,
-  type OutputNode,
+  type EngineState,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
-import type { XmlToolResult } from '@magnitudedev/xml-act'
+// ToolResult type is imported from ../events above
 import { buildRegisteredTools, generateToolGrammar } from '../tools/tool-registry'
 
 import { isValidVariant, type AgentVariant } from '../agents/variants'
@@ -60,7 +60,7 @@ import { createPolicyContextProvider } from '../agents/policy-context'
 import { ExecutionManager, IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from './types'
 import type { TurnEvent, TurnEventSink, ExecuteOptions, ExecuteResult, ExecutionManagerService } from './types'
 import { WorkingDirectoryTag } from './working-directory'
-import type { StreamingLeaf, StreamingPartial, StreamHook, ToolDefinition } from '@magnitudedev/tools'
+import type { StreamingLeaf, StreamHook, ToolDefinition } from '@magnitudedev/tools'
 
 
 import { ChatPersistence } from '../persistence/chat-persistence-service'
@@ -265,22 +265,25 @@ const makeExecutionManager = Effect.gen(function* () {
 
       const executionLayer = layers
 
+      const workspacePath = forkWorkspacePaths.get(forkId)!
+
       // Build registered tools for xml-act runtime
       const registeredTools = buildRegisteredTools(options.toolSet, executionLayer)
 
-      // Create fresh xml-act runtime for this execution
-      // Surface binding validation errors as XmlRuntimeCrash so they appear as turn errors
+      // Create fresh runtime for this execution
+      // Surface validation errors as TurnEngineCrash so they appear as turn errors
       const runtime = yield* Effect.try({
-        try: () => createXmlRuntime({
+        try: () => createTurnEngine({
           tools: registeredTools,
           defaultProseDest,
+          resultsDir: path.join(workspacePath, 'results'),
         }),
-        catch: (e) => new XmlRuntimeCrash(`XML binding validation failed: ${e instanceof Error ? e.message : String(e)}`, e),
+        catch: (e) => new TurnEngineCrash(`Runtime initialization failed: ${e instanceof Error ? e.message : String(e)}`, e),
       })
 
       // Get replay state from projection for crash recovery
       const replayProjection = yield* ReplayProjection.Tag
-      const replayState: ReactorState = yield* replayProjection.getFork(forkId)
+      const replayState: EngineState = yield* replayProjection.getFork(forkId)
 
       // Build tool tagName → defKey lookup from registered metadata.
       const tagToDefKey = new Map<string, string>()
@@ -344,7 +347,6 @@ const makeExecutionManager = Effect.gen(function* () {
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
-      const workspacePath = forkWorkspacePaths.get(forkId)!
 
       const policyCtxProvider = createPolicyContextProvider(
         forkId,
@@ -375,7 +377,7 @@ const makeExecutionManager = Effect.gen(function* () {
       yield* Effect.scoped(
         eventStream.pipe(
           Stream.provideLayer(executionLayer),
-          Stream.runForEach((event: XmlRuntimeEvent) => Effect.gen(function* () {
+          Stream.runForEach((event: TurnEngineEvent) => Effect.gen(function* () {
             switch (event._tag) {
               // --- Tool Input Started ---
               case 'ToolInputStarted': {
@@ -453,28 +455,42 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              // --- Tool Input Parse Error ---
-              case 'ToolInputParseError': {
+              // --- Tool Parse Error ---
+              case 'ToolParseError': {
                 hasAnyResponseContent = true
                 const toolKey = resolveKey(event.tagName)
                 if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
 
-                // Track for turn policy so the loop continues and LLM sees the error
                 toolsCalledKeys.push(toolKey)
                 lastToolKey = toolKey
 
-                const errorResult: ToolResult = { status: 'error', message: event.error.detail }
+                const err = event.error as unknown as Record<string, unknown>
+                const errorDetail = String(err.detail ?? err.message ?? err._tag)
+                const errorResult: ToolResult = { status: 'error', message: errorDetail }
                 if (errorResult.status === 'error') {
                   hasToolErrors = true
                 }
 
-                yield* sink.emit( {
+                // Map structured error to flat string for ToolStateEvent
+                const toolParseEvent = {
+                  _tag: 'ToolParseError' as const,
+                  error: errorDetail,
+                }
+                yield* sink.emit({
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
-                  event,
+                  event: toolParseEvent,
                 })
+                break
+              }
+
+              // --- Structural Parse Error ---
+              case 'StructuralParseError': {
+                if (event.error._tag === 'UnclosedThink') {
+                  turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
+                }
                 break
               }
 
@@ -549,46 +565,20 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              // --- Tool streaming events (field values, body chunks, children) ---
-              case 'ToolInputBodyChunk':
-              case 'ToolInputFieldValue':
-              case 'ToolInputChildStarted':
-              case 'ToolInputChildComplete': {
+              // --- Tool input field chunk events ---
+              case 'ToolInputFieldChunk': {
                 const toolKey = toolCallKeys.get(event.toolCallId)
                 if (!toolKey) {
                   logger.error(`[ExecutionManager] Tool key not found for toolCallId ${event.toolCallId} (event: ${event._tag}).`)
                   break
                 }
 
-                // Accumulate fields for stream hook
-                if (event._tag === 'ToolInputFieldValue') {
-                  const fields = streamingFields.get(event.toolCallId)
-                  if (fields) {
-                    fields[event.field] = { value: event.value, isFinal: true }
-                  }
-                }
-
-                if (event._tag === 'ToolInputChildStarted') {
-                  const fields = streamingFields.get(event.toolCallId)
-                  if (fields) {
-                    fields[event.field] = { value: '', isFinal: false }
-                  }
-                }
-
-                if (event._tag === 'ToolInputChildComplete') {
-                  const fields = streamingFields.get(event.toolCallId)
-                  if (fields && fields[event.field]) {
-                    fields[event.field] = { value: fields[event.field]!.value, isFinal: true }
-                  }
-                }
-
-                if (event._tag === 'ToolInputBodyChunk') {
-                  const fields = streamingFields.get(event.toolCallId)
-                  if (fields) {
-                    const existing = fields._body
-                    const prior = typeof existing?.value === 'string' ? existing.value : ''
-                    fields._body = { value: `${prior}${event.text}`, isFinal: false }
-                  }
+                // Update streaming fields (accumulate raw text per field)
+                const fields = streamingFields.get(event.toolCallId)
+                if (fields) {
+                  const existing = fields[event.field]
+                  const prev = existing && !existing.isFinal ? String(existing.value) : ''
+                  fields[event.field] = { value: prev + event.delta, isFinal: false }
                 }
 
                 // Invoke stream hook if present
@@ -620,6 +610,21 @@ const makeExecutionManager = Effect.gen(function* () {
                 })
                 break
               }
+
+              case 'ToolInputFieldComplete':
+                // Field complete — final value comes via ToolInputReady; emit for consumers
+                {
+                  const toolKey = toolCallKeys.get(event.toolCallId)
+                  if (toolKey) {
+                    yield* sink.emit( {
+                      _tag: 'ToolEvent',
+                      toolCallId: event.toolCallId,
+                      toolKey,
+                      event,
+                    })
+                  }
+                }
+                break
 
               // --- Messages / Think prose ---
               case 'MessageStart': {
@@ -730,17 +735,13 @@ const makeExecutionManager = Effect.gen(function* () {
 
               case 'ProseChunk': {
                 hasAnyResponseContent = true
-                if (event.patternId === 'think') {
-                  yield* sink.emit( { _tag: 'ThinkingDelta', text: event.text })
-                }
+                // ProseChunk is raw text content — lenses handle think blocks separately
                 break
               }
 
               case 'ProseEnd': {
                 hasAnyResponseContent = true
-                if (event.patternId === 'think') {
-                  yield* sink.emit( { _tag: 'ThinkingEnd', about: event.about })
-                }
+                // ProseEnd marks end of prose section — lenses handle think blocks separately
                 break
               }
 
@@ -781,12 +782,8 @@ const makeExecutionManager = Effect.gen(function* () {
 
 
 
-              case 'StructuralParseError': {
-                if (event.error._tag === 'UnclosedThink') {
-                  turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
-                }
-                break
-              }
+
+              // UnclosedThink detection moved there
 
               // --- Turn End ---
               case 'TurnEnd': {
@@ -810,10 +807,10 @@ const makeExecutionManager = Effect.gen(function* () {
                     executionResult = { success: true, turnDecision: 'continue' }
                   } else {
                     // Map yield target to turn decision
-                    // yield-tool → continue (wait for tool results)
+                    // yield-invoke → continue (wait for tool results)
                     // yield-user, yield-worker, yield-parent → idle
                     const target = endResult.turnControl?.target ?? null
-                    if (target === 'tool') {
+                    if (target === 'invoke') {
                       executionResult = { success: true, turnDecision: 'continue' }
                     } else {
                       // user, worker, parent, or null → idle
@@ -878,7 +875,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 }
 
                 // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
-                if (executionResult.success && executionResult.turnDecision === 'idle' && endResult.turnControl?.target === 'worker') {
+                if (executionResult.success && executionResult.turnDecision === 'idle' && endResult._tag === 'Success' && endResult.turnControl?.target === 'worker') {
                   const pCtx = yield* policyCtxProvider.get
                   if (pCtx.activeAgentCount === 0) {
                     executionResult = {

@@ -6,7 +6,7 @@ import {
 import type { AgentAtom, ResultEntry, TimelineEntry } from './types'
 import { formatError, formatInterrupted, formatNoop, formatOneshotLiveness, formatResults, formatYieldWorkerRetrigger } from './render-results'
 import { renderCompactToolCall } from './render-tool-call'
-import { YIELD_USER, YIELD_USER_TAG } from '@magnitudedev/xml-act'
+import { YIELD_USER } from '@magnitudedev/xml-act'
 import { taskIdleReminder, taskCompleteReminder } from '../prompts/tasks/index'
 
 export interface FormatInboxInput {
@@ -76,9 +76,7 @@ function renderAgentAtom(atom: AgentAtom): string {
     case 'error':
       return `<error>${atom.message}</error>`
     case 'idle':
-      return atom.reason && atom.reason !== 'stable'
-        ? `<${YIELD_USER_TAG} reason="${atom.reason}"/>`
-        : YIELD_USER
+      return YIELD_USER
   }
 }
 

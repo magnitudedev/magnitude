@@ -59,7 +59,7 @@ Magnitude has per-provider implementations in [\`packages/agent/src/tools/web-se
 - **Google Gemini** — synchronous (but silently ignores domain filters)
 
 The router at [\`packages/agent/src/tools/web-search.ts\`](packages/agent/src/tools/web-search.ts) determines which one to call based on your active provider.</message>
-<yield-tool/>`
+<yield-invoke/>`
 
     const secondResponse = `
 
@@ -179,7 +179,7 @@ If your provider has no web search support, you just point \`MAGNITUDE_SEARCH_PR
       const canonical = await client.runEffect(
         Effect.flatMap(CanonicalTurnProjection.Tag, (projection) => projection.getFork(null)),
       )
-      expect(canonical.lastCompleted?.canonicalXml).toContain('<message to="user"></message>')
+      expect(canonical.lastCompleted?.canonicalMact).toContain('<message to="user"></message>')
 
       const secondStarted = await waitForEvent(
         transcript,

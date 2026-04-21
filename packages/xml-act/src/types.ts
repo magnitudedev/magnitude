@@ -1,132 +1,109 @@
 /**
- * xml-act Core Types
+ * Core Types for the format runtime.
  */
 
 import { Context, Effect, Layer } from "effect"
-import type { ToolDefinition, XmlBinding, XmlChildBinding, ContentPart } from "@magnitudedev/tools"
-import type { OutputNode } from './output-tree'
-import type { TagParseErrorDetail, StructuralParseErrorDetail } from './format/types'
+import type { ToolDefinition, ContentPart, DeepPaths, StreamingPartial } from "@magnitudedev/tools"
 
-export type XmlTagBinding = Omit<Extract<XmlBinding<unknown>, { type: 'tag' }>, 'type'> & { readonly tag: string }
-export type { XmlChildBinding }
+export type { DeepPaths, StreamingPartial }
 
-export type ResolvePath<T, P extends string> =
-  P extends `${infer H}.${infer R}`
-    ? H extends keyof T ? ResolvePath<NonNullable<T[H]>, R> : never
-    : P extends keyof T ? T[P] : never
+// =============================================================================
+// Token Types
+// =============================================================================
 
-export type BindingAttrs<B> = B extends { readonly attributes: readonly (infer A)[] } ? A : never
-export type BindingAttrNames<B> = BindingAttrs<B> extends { readonly attr: infer A extends string } ? A : never
-export type BindingAttrFields<B> = BindingAttrs<B> extends { readonly field: infer F extends string } ? F : never
-export type BindingBody<B> = B extends { readonly body: infer F extends string } ? F : never
-export type BindingChildren<B> = B extends { readonly children: readonly (infer C)[] } ? C : never
-export type BindingChildTags<B> = B extends { readonly childTags: readonly (infer CT)[] } ? CT : never
-export type BindingChildRecord<B> = B extends { readonly childRecord: infer CR } ? CR : never
-export type ChildBindingField<C> = C extends { readonly field: infer F extends string } ? F : never
-export type ChildBindingAttrs<C> = C extends { readonly attributes: readonly (infer A)[] } ? A : never
-export type ChildBindingAttrNames<C> = ChildBindingAttrs<C> extends { readonly attr: infer A extends string } ? A : never
-export type ChildBindingAttrFields<C> = ChildBindingAttrs<C> extends { readonly field: infer F extends string } ? F : never
-export type ChildBindingBody<C> = C extends { readonly body: infer F extends string } ? F : never
-export type ChildRecordField<CR> = CR extends { readonly field: infer F extends string } ? F : never
+/**
+ * Token types for the streaming tokenizer.
+ * Uses asymmetric delimiters: <|tag> to open, <tag|> to close.
+ */
+export type Token =
+  | { readonly _tag: 'Open'; readonly name: string; readonly variant?: string }
+  | { readonly _tag: 'Close'; readonly name: string; readonly pipe?: string }
+  | { readonly _tag: 'SelfClose'; readonly name: string; readonly variant?: string }
+  | { readonly _tag: 'Parameter'; readonly name: string }
+  | { readonly _tag: 'ParameterClose' }
+  | { readonly _tag: 'Content'; readonly text: string }
 
-export type ChildElem<TInput, C> =
-  ChildBindingField<C> extends infer CF extends string ?
-    CF extends keyof TInput ?
-      TInput[CF] extends ReadonlyArray<infer E> ? E : never
-    : never
-  : never
+// =============================================================================
+// Parse Event Types (from parser)
+// =============================================================================
 
-export type ChildAttrsPick<Elem, C> =
-  [ChildBindingAttrFields<C>] extends [never] ? {} : Pick<Elem, ChildBindingAttrFields<C> & keyof Elem>
-
-export interface ToolCallContext {
+export interface ParameterStarted {
+  readonly _tag: 'ParameterStarted'
   readonly toolCallId: string
-  readonly tagName: string
-  readonly toolName: string
-  readonly group: string
+  readonly parameterName: string
 }
 
-export interface RegisteredTool {
-  readonly tool: ToolDefinition
-  readonly tagName: string
-  readonly groupName: string
-  readonly binding: XmlTagBinding
-  readonly outputBinding?: import('@magnitudedev/tools').XmlBinding<unknown>
-  readonly meta?: unknown
-  readonly layerProvider?: () => Effect.Effect<Layer.Layer<never>, unknown>
-}
-
-export interface ToolInputStarted {
-  readonly _tag: 'ToolInputStarted'
+export interface ParameterChunk {
+  readonly _tag: 'ParameterChunk'
   readonly toolCallId: string
-  readonly tagName: string
-  readonly toolName: string
-  readonly group: string
-}
-
-export interface ToolInputFieldValue<TInput = unknown, B = unknown> {
-  readonly _tag: 'ToolInputFieldValue'
-  readonly toolCallId: string
-  readonly field: [BindingAttrNames<B>] extends [never] ? string : BindingAttrNames<B>
-  readonly value: string | number | boolean
-}
-
-export type AllBodyFields<B> = BindingBody<B> | ChildBindingBody<BindingChildren<B>>
-
-export interface ToolInputBodyChunk<_TInput = unknown, B = unknown> {
-  readonly _tag: 'ToolInputBodyChunk'
-  readonly toolCallId: string
-  readonly path: readonly string[]
-  readonly field: [AllBodyFields<B>] extends [never] ? string : AllBodyFields<B>
+  readonly parameterName: string
   readonly text: string
 }
 
-export interface ToolInputChildStarted<TInput = unknown, B = unknown> {
-  readonly _tag: 'ToolInputChildStarted'
+export interface ParameterComplete {
+  readonly _tag: 'ParameterComplete'
   readonly toolCallId: string
-  readonly field: [BindingChildren<B>] extends [never] ? string : ChildBindingField<BindingChildren<B>>
-  readonly index: number
-  readonly attributes: [BindingChildren<B>] extends [never]
-    ? Readonly<Record<string, string | number | boolean>>
-    : ChildAttrsPick<ChildElem<TInput, BindingChildren<B>>, BindingChildren<B>>
+  readonly parameterName: string
+  readonly value: string
 }
 
-export interface ToolInputChildComplete<TInput = unknown, B = unknown> {
-  readonly _tag: 'ToolInputChildComplete'
+export interface FilterStarted {
+  readonly _tag: 'FilterStarted'
   readonly toolCallId: string
-  readonly field: [BindingChildren<B>] extends [never] ? string : ChildBindingField<BindingChildren<B>>
-  readonly index: number
-  readonly value: [BindingChildren<B>] extends [never]
-    ? Readonly<Record<string, unknown>>
-    : ChildElem<TInput, BindingChildren<B>>
+  readonly filterType: string
 }
 
-export interface ToolInputReady<TInput = unknown> {
-  readonly _tag: 'ToolInputReady'
+export interface FilterChunk {
+  readonly _tag: 'FilterChunk'
   readonly toolCallId: string
-  readonly input: TInput
+  readonly text: string
 }
 
-export interface ToolInputParseError {
-  readonly _tag: 'ToolInputParseError'
+export interface FilterComplete {
+  readonly _tag: 'FilterComplete'
   readonly toolCallId: string
-  readonly tagName: string
+  readonly query: string
+}
+
+export interface InvokeStarted {
+  readonly _tag: 'InvokeStarted'
+  readonly toolCallId: string
+  readonly toolTag: string
   readonly toolName: string
   readonly group: string
-  readonly error: TagParseErrorDetail
 }
+
+export interface InvokeComplete {
+  readonly _tag: 'InvokeComplete'
+  readonly toolCallId: string
+  readonly hasFilter: boolean
+}
+
+/**
+ * Union of parse events from the parser (format-specific lifecycle).
+ */
+export type ParseEvent =
+  | ParameterStarted
+  | ParameterChunk
+  | ParameterComplete
+  | FilterStarted
+  | FilterChunk
+  | FilterComplete
+  | InvokeStarted
+  | InvokeComplete
+
+// =============================================================================
+// Structural Event Types (from parser)
+// =============================================================================
 
 export interface ProseChunk {
   readonly _tag: 'ProseChunk'
-  readonly patternId: string
   readonly text: string
 }
 
 export interface ProseEnd {
   readonly _tag: 'ProseEnd'
-  readonly patternId: string
   readonly content: string
-  readonly about: string | null
 }
 
 export interface LensStart { readonly _tag: 'LensStart'; readonly name: string }
@@ -141,74 +118,302 @@ export interface MessageStart {
 export interface MessageChunk { readonly _tag: 'MessageChunk'; readonly id: string; readonly text: string }
 export interface MessageEnd { readonly _tag: 'MessageEnd'; readonly id: string }
 
+export interface TurnControl {
+  readonly _tag: 'TurnControl'
+  readonly target: 'user' | 'invoke' | 'worker' | 'parent'
+  readonly termination: 'natural' | 'runaway'
+}
+
+export type StructuralEvent =
+  | ProseChunk
+  | ProseEnd
+  | LensStart
+  | LensChunk
+  | LensEnd
+  | MessageStart
+  | MessageChunk
+  | MessageEnd
+  | TurnControl
+
+// =============================================================================
+// Tool Registration
+// =============================================================================
+
+export interface RegisteredTool {
+  readonly tool: ToolDefinition
+  readonly tagName: string
+  readonly groupName: string
+  readonly meta?: unknown
+  readonly layerProvider?: () => Effect.Effect<Layer.Layer<never>, unknown>
+}
+
+// =============================================================================
+// Runtime Event Types (format-agnostic)
+// =============================================================================
+
+export interface ToolCallContext {
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly toolName: string
+  readonly group: string
+}
+
+export interface ToolInputStarted {
+  readonly _tag: 'ToolInputStarted'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly toolName: string
+  readonly group: string
+}
+
+
+
+/**
+ * Streaming chunk for a parameter field.
+ * path: type-safe path into TInput (e.g. ["config", "tls", "cert"] for nested JSON)
+ * delta: raw incremental text — consumer applies this to their own StreamingPartial via applyFieldChunk
+ */
+export interface ToolInputFieldChunk<TInput = unknown> {
+  readonly _tag: 'ToolInputFieldChunk'
+  readonly toolCallId: string
+  readonly field: string & keyof TInput
+  readonly path: DeepPaths<TInput>
+  readonly delta: string
+}
+
+/**
+ * Final value for a completed parameter field.
+ * value: coerced typed value for this specific field
+ */
+export interface ToolInputFieldComplete<TInput = unknown> {
+  readonly _tag: 'ToolInputFieldComplete'
+  readonly toolCallId: string
+  readonly field: string & keyof TInput
+  readonly path: DeepPaths<TInput>
+  readonly value: unknown
+}
+
+export interface ToolInputReady<TInput = unknown> {
+  readonly _tag: 'ToolInputReady'
+  readonly toolCallId: string
+  readonly input: TInput
+}
+
+/** Tool-scoped parse error event — used in ToolLifecycleEvent */
+export interface ToolParseErrorEvent {
+  readonly _tag: 'ToolParseError'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly toolName: string
+  readonly group: string
+  readonly error: ToolParseError
+  readonly correctToolShape?: string
+}
+
 export interface ToolExecutionStarted<TInput = unknown> {
   readonly _tag: 'ToolExecutionStarted'
   readonly toolCallId: string
+  readonly tagName: string
   readonly group: string
   readonly toolName: string
   readonly input: TInput
   readonly cached: boolean
 }
+
 export interface ToolExecutionEnded<TOutput = unknown> {
   readonly _tag: 'ToolExecutionEnded'
   readonly toolCallId: string
+  readonly tagName: string
   readonly group: string
   readonly toolName: string
-  readonly result: XmlToolResult<TOutput>
+  readonly result: ToolResult<TOutput>
 }
-export interface ToolEmission<TEmission = unknown> { readonly _tag: 'ToolEmission'; readonly toolCallId: string; readonly value: TEmission }
-export interface TurnEnd { readonly _tag: 'TurnEnd'; readonly result: XmlExecutionResult }
 
-export type ToolCallEvent<TInput = unknown, TOutput = unknown, B = unknown, TEmission = unknown> =
-  | ToolInputStarted
-  | ToolInputFieldValue<TInput, B>
-  | ToolInputBodyChunk<TInput, B>
-  | ToolInputChildStarted<TInput, B>
-  | ToolInputChildComplete<TInput, B>
-  | ToolInputReady<TInput>
-  | ToolInputParseError
-  | ToolExecutionStarted<TInput>
-  | ToolExecutionEnded<TOutput>
-  | ToolEmission<TEmission>
-  | ToolObservation
+export interface ToolEmission<TEmission = unknown> {
+  readonly _tag: 'ToolEmission'
+  readonly toolCallId: string
+  readonly value: TEmission
+}
 
 export interface ToolObservation {
   readonly _tag: 'ToolObservation'
   readonly toolCallId: string
   readonly tagName: string
-  readonly query: string
+  readonly query: string | null
   readonly content: ContentPart[]
 }
-export interface StructuralParseError { readonly _tag: 'StructuralParseError'; readonly error: StructuralParseErrorDetail }
 
-export type XmlRuntimeEvent<TInput = unknown, TOutput = unknown, B = unknown, TEmission = unknown> =
-  | ToolCallEvent<TInput, TOutput, B, TEmission>
-  | ProseChunk | ProseEnd | LensStart | LensChunk | LensEnd
-  | MessageStart | MessageChunk | MessageEnd
-  | StructuralParseError
-  | TurnEnd
+export interface StructuralParseError {
+  readonly _tag: 'StructuralParseError'
+  readonly error: StructuralParseErrorDetail
+}
 
-export type XmlToolResult<TOutput = unknown> =
-  | { readonly _tag: 'Success'; readonly output: TOutput; readonly outputTree: { readonly tag: string; readonly tree: OutputNode }; readonly query: string }
+export interface TurnEnd {
+  readonly _tag: 'TurnEnd'
+  readonly result: ExecutionResult
+}
+
+// =============================================================================
+// Result Types
+// =============================================================================
+
+export type ToolResult<TOutput = unknown> =
+  | { readonly _tag: 'Success'; readonly output: TOutput; readonly query: string | null }
   | { readonly _tag: 'Error'; readonly error: string }
   | { readonly _tag: 'Rejected'; readonly rejection: unknown }
   | { readonly _tag: 'Interrupted' }
 
-export type XmlExecutionResult =
-  | { readonly _tag: 'Success'; readonly turnControl: { readonly target: 'user' | 'tool' | 'worker' | 'parent' } | null; readonly termination: 'natural' | 'runaway' }
+export type ExecutionResult =
+  | { readonly _tag: 'Success'; readonly turnControl: { readonly target: 'user' | 'invoke' | 'worker' | 'parent' } | null; readonly termination: 'natural' | 'runaway' }
   | { readonly _tag: 'Failure'; readonly error: string }
   | { readonly _tag: 'Interrupted' }
   | { readonly _tag: 'GateRejected'; readonly rejection: unknown }
 
-export class XmlRuntimeCrash {
-  readonly _tag = 'XmlRuntimeCrash'
+// =============================================================================
+// Error Types
+// =============================================================================
+
+export class TurnEngineCrash {
+  readonly _tag = 'TurnEngineCrash'
   constructor(readonly message: string, readonly cause?: unknown) {}
 }
+
+// =============================================================================
+// Parse Error Detail Variants
+// =============================================================================
+
+// --- Tool-scoped (routable to a tool state model) ---
+
+export interface UnknownParameterError {
+  readonly _tag: 'UnknownParameter'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export interface IncompleteToolError {
+  readonly _tag: 'IncompleteTool'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface JsonStructuralError {
+  readonly _tag: 'JsonStructuralError'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export interface SchemaCoercionError {
+  readonly _tag: 'SchemaCoercionError'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+export interface MissingRequiredFieldError {
+  readonly _tag: 'MissingRequiredField'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
+/** Tool-scoped parse errors — routable to a tool state model */
+export type ToolParseError =
+  | UnknownParameterError
+  | IncompleteToolError
+  | JsonStructuralError
+  | SchemaCoercionError
+  | MissingRequiredFieldError
+
+// --- Structural (not routable to any tool) ---
+
+export interface UnknownToolError {
+  readonly _tag: 'UnknownTool'
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface MalformedTagError {
+  readonly _tag: 'MalformedTag'
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface UnexpectedContentError {
+  readonly _tag: 'UnexpectedContent'
+  readonly context: string
+  readonly detail: string
+}
+
+export interface UnclosedThinkError {
+  readonly _tag: 'UnclosedThink'
+  readonly message: string
+}
+
+export interface StrayCloseTagError {
+  readonly _tag: 'StrayCloseTag'
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface MissingToolNameError {
+  readonly _tag: 'MissingToolName'
+  readonly detail: string
+}
+
+/** Structural parse errors — not routable to any tool */
+export type StructuralParseError =
+  | UnknownToolError
+  | MalformedTagError
+  | UnexpectedContentError
+  | UnclosedThinkError
+  | StrayCloseTagError
+  | MissingToolNameError
+
+/** All parse error details */
+export type ParseErrorDetail =
+  | ToolParseError
+  | StructuralParseError
+
+// =============================================================================
+// ParseError Events
+// =============================================================================
+
+/** Structural parse error event */
+export interface StructuralParseErrorEvent {
+  readonly _tag: 'StructuralParseError'
+  readonly error: StructuralParseError
+}
+
+
+
+// =============================================================================
+// FilterReady (internal parser event, not in TurnEngineEvent)
+// =============================================================================
+
+export interface FilterReady {
+  readonly _tag: 'FilterReady'
+  readonly toolCallId: string
+  readonly query: string
+}
+
+export type InternalParserEvent = FilterReady
+
+// =============================================================================
+// Interceptor
+// =============================================================================
 
 export interface ToolInterceptor {
   readonly beforeExecute: (ctx: InterceptorContext) => Effect.Effect<InterceptorDecision>
   readonly afterExecute?: (ctx: InterceptorContext & { readonly result: unknown }) => Effect.Effect<InterceptorDecision>
 }
+
 export interface InterceptorContext {
   readonly toolCallId: string
   readonly tagName: string
@@ -217,28 +422,91 @@ export interface InterceptorContext {
   readonly input: unknown
   readonly meta: unknown
 }
+
 export type InterceptorDecision =
   | { readonly _tag: 'Proceed'; readonly modifiedInput?: unknown }
   | { readonly _tag: 'Reject'; readonly rejection: unknown }
 
-export class ToolInterceptorTag extends Context.Tag('xml-act/ToolInterceptor')<
+export class ToolInterceptorTag extends Context.Tag('ToolInterceptor')<
   ToolInterceptorTag, ToolInterceptor
 >() {}
 
+// =============================================================================
+// Reactor State / Engine State
+// =============================================================================
+
 export type ToolOutcome =
-  | { readonly _tag: 'Completed'; readonly result: XmlToolResult }
+  | { readonly _tag: 'Completed'; readonly result: ToolResult }
   | { readonly _tag: 'ParseError' }
 
-export interface ReactorState {
-  readonly toolCallMap: ReadonlyMap<string, string>
 
-  readonly deadToolCalls: ReadonlySet<string>
-  readonly outputTrees: ReadonlyMap<string, readonly OutputNode[]>
-  readonly stopped: boolean
+
+/** Replaces ReactorState. Owned by the turn engine. */
+export interface EngineState {
+  readonly toolCallMap: ReadonlyMap<string, string>
   readonly toolOutcomes: ReadonlyMap<string, ToolOutcome>
+  readonly deadToolCalls: ReadonlySet<string>
+  readonly stopped: boolean
 }
 
-export interface XmlRuntimeConfig {
+// =============================================================================
+// Tool Lifecycle Event (for state model consumers)
+// =============================================================================
+
+/**
+ * Subset of TurnEngineEvent relevant to tool state.
+ * Used by StateModel.reduce() — consumers get full type safety via TInput/TOutput/TEmission.
+ * No information loss — just type narrowing (structural events excluded).
+ */
+export type ToolLifecycleEvent<TInput = unknown, TOutput = unknown, TEmission = unknown> =
+  | ToolInputStarted
+  | ToolInputFieldChunk<TInput>
+  | ToolInputFieldComplete<TInput>
+  | ToolInputReady<TInput>
+  | ToolParseErrorEvent
+  | ToolExecutionStarted<TInput>
+  | ToolExecutionEnded<TOutput>
+  | ToolEmission<TEmission>
+
+/**
+ * Apply a ToolInputFieldChunk to an existing StreamingPartial, returning the updated partial.
+ * Consumers (state models, projections) call this in their reduce() to build streaming input state.
+ * Implementation lives in engine/input-builder.ts — exported from index.ts.
+ */
+export type ApplyFieldChunk = <TInput>(
+  partial: StreamingPartial<TInput>,
+  path: DeepPaths<TInput>,
+  text: string
+) => StreamingPartial<TInput>
+
+// =============================================================================
+// Runtime Event Union
+// =============================================================================
+
+export type TurnEngineEvent<TInput = unknown, TOutput = unknown, TEmission = unknown> =
+  | ToolInputStarted
+  | ToolInputFieldChunk<TInput>
+  | ToolInputFieldComplete<TInput>
+  | ToolInputReady<TInput>
+  | ToolParseErrorEvent
+  | StructuralParseErrorEvent
+  | ToolExecutionStarted<TInput>
+  | ToolExecutionEnded<TOutput>
+  | ToolEmission<TEmission>
+  | ToolObservation
+  | ProseChunk | ProseEnd
+  | LensStart | LensChunk | LensEnd
+  | MessageStart | MessageChunk | MessageEnd
+  | TurnEnd
+
+
+
+// =============================================================================
+// Runtime Config
+// =============================================================================
+
+export interface RuntimeConfig {
   readonly tools: ReadonlyMap<string, RegisteredTool>
   readonly defaultProseDest?: string
+  readonly resultsDir: string
 }

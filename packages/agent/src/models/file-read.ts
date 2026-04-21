@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { readTool, readXmlBinding } from '../tools/fs'
+import { readTool } from '../tools/fs'
 
 export interface FileReadState extends BaseState {
   toolKey: 'fileRead'
@@ -14,34 +14,38 @@ const initial: Omit<FileReadState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const fileReadModel = defineStateModel('fileRead', {
-  tool: readTool,
-  binding: readXmlBinding,
-})({
+export const fileReadModel = defineStateModel('fileRead', readTool)({
   initial,
   reduce: (state, event): FileReadState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming', errorDetail: undefined }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', path: event.streaming.path?.value ?? state.path }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolInputFieldChunk':
+        return event.field === 'path'
+          ? { ...state, phase: 'streaming', path: (state.path ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', path: event.input.path }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed', lineCount: (event.result.output as string).split('\n').length }
+          case 'Error':
+            return { ...state, phase: 'error', errorDetail: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error', errorDetail: event.error }
-      case 'completed':
-        return { ...state, phase: 'completed', lineCount: event.output.split('\n').length }
-      case 'error':
-        return { ...state, phase: 'error', errorDetail: event.error.message }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

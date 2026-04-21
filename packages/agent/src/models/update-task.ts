@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { updateTaskTool, updateTaskXmlBinding } from '../tools/task-tools'
+import { updateTaskTool } from '../tools/task-tools'
 
 export interface UpdateTaskState extends BaseState {
   toolKey: 'updateTask'
@@ -16,44 +16,42 @@ function isValidUpdateTaskStatus(value: string | undefined): value is NonNullabl
   return value === 'pending' || value === 'completed' || value === 'cancelled'
 }
 
-export const updateTaskModel = defineStateModel('updateTask', {
-  tool: updateTaskTool,
-  binding: updateTaskXmlBinding,
-})({
+export const updateTaskModel = defineStateModel('updateTask', updateTaskTool)({
   initial,
   reduce: (state, event): UpdateTaskState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-      case 'inputReady':
+      case 'ToolInputFieldChunk':
+        if (event.field === 'id') return { ...state, phase: 'streaming', id: (state.id ?? '') + event.delta }
+        return state
+      case 'ToolInputReady':
         return {
           ...state,
           phase: 'streaming',
-          id: event.streaming.id?.value ?? state.id,
-          status: (() => {
-            const streamedStatus = event.streaming.status?.value
-            return streamedStatus && isValidUpdateTaskStatus(streamedStatus)
-              ? streamedStatus
-              : state.status
-          })(),
+          id: event.input.id,
+          status: isValidUpdateTaskStatus(event.input.status) ? event.input.status : state.status,
         }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed', id: event.result.output.id, status: event.result.output.status }
+          case 'Error':
+            return { ...state, phase: 'error' }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error' }
-      case 'completed':
-        return { ...state, phase: 'completed', id: event.output.id, status: event.output.status }
-      case 'error':
-        return { ...state, phase: 'error' }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

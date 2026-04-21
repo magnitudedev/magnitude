@@ -1,47 +1,62 @@
-import type { ToolCallEvent } from '@magnitudedev/xml-act'
-import type { ToolStateEvent, StreamingAccumulatorLike } from '@magnitudedev/tools'
-import { normalizeToolEvent } from '../normalizer'
+import type { TurnEngineEvent, ToolLifecycleEvent } from '@magnitudedev/xml-act'
 import type { ToolState } from '../models/tool-state'
 import type { ToolKey, AgentCatalogEntry } from '../catalog'
 
 export type { ToolState } from '../models/tool-state'
-type AnyToolEvent = ToolStateEvent<unknown, unknown, unknown>
-type ToolReducer<S> = { bivarianceHack(state: S, event: AnyToolEvent): S }['bivarianceHack']
+type ToolReducer<S> = { bivarianceHack(state: S, event: ToolLifecycleEvent): S }['bivarianceHack']
 
 export interface ToolHandle {
   readonly toolKey: ToolKey
   readonly state: ToolState
-  process(raw: ToolCallEvent): ToolHandle
+  process(event: TurnEngineEvent): ToolHandle
   interrupt(): ToolHandle
 }
 
 type ToolStateFor<K extends ToolKey> = AgentCatalogEntry['state']['initial']
 
 export function createToolHandle(toolKey: ToolKey, entry: AgentCatalogEntry): ToolHandle {
-  const acc = entry.state.binding.createAccumulator()
-  return buildHandle(toolKey, entry.state.initial, acc, entry.state.reduce as ToolReducer<ToolStateFor<typeof toolKey>>)
+  return buildHandle(toolKey, entry.state.initial, entry.state.reduce as ToolReducer<ToolStateFor<typeof toolKey>>)
+}
+
+function isToolLifecycleEvent(event: TurnEngineEvent): event is ToolLifecycleEvent {
+  switch (event._tag) {
+    case 'ToolInputStarted':
+    case 'ToolInputFieldChunk':
+    case 'ToolInputFieldComplete':
+    case 'ToolInputReady':
+    case 'ToolParseError':
+    case 'ToolExecutionStarted':
+    case 'ToolExecutionEnded':
+    case 'ToolEmission':
+      return true
+    default:
+      return false
+  }
 }
 
 function buildHandle<K extends ToolKey>(
   toolKey: K,
   state: ToolStateFor<K>,
-  acc: StreamingAccumulatorLike<unknown>,
   reduce: ToolReducer<ToolStateFor<K>>,
 ): ToolHandle {
   return {
     toolKey,
     get state() { return state },
-    process(raw: ToolCallEvent): ToolHandle {
-      acc.ingest(raw)
-      const event = normalizeToolEvent(raw, acc.current)
-      if (event) {
-        const reduced = reduce(state, event)
-        return buildHandle(toolKey, reduced, acc, reduce)
-      }
-      return this
+    process(event: TurnEngineEvent): ToolHandle {
+      if (!isToolLifecycleEvent(event)) return this
+      const reduced = reduce(state, event)
+      return buildHandle(toolKey, reduced, reduce)
     },
     interrupt(): ToolHandle {
-      return buildHandle(toolKey, reduce(state, { type: 'interrupted' }), acc, reduce)
+      const interruptEvent: ToolLifecycleEvent = {
+        _tag: 'ToolExecutionEnded',
+        toolCallId: '',
+        tagName: '',
+        group: '',
+        toolName: '',
+        result: { _tag: 'Interrupted' },
+      }
+      return buildHandle(toolKey, reduce(state, interruptEvent), reduce)
     },
   }
 }

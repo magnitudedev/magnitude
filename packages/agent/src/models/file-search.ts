@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { grepTool, grepXmlBinding } from '../tools/fs'
+import { grepTool } from '../tools/fs'
 
 type SearchMatch = { file: string; match: string }
 
@@ -26,52 +26,54 @@ const initial: Omit<FileSearchState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const fileSearchModel = defineStateModel('fileSearch', {
-  tool: grepTool,
-  binding: grepXmlBinding,
-})({
+export const fileSearchModel = defineStateModel('fileSearch', grepTool)({
   initial,
   reduce: (state, event): FileSearchState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-      case 'inputReady': {
-        const limitValue = event.streaming.limit?.value
-        const limitStr = typeof limitValue === 'string' ? limitValue : limitValue?.toString()
+      case 'ToolInputFieldChunk':
+        if (event.field === 'pattern') return { ...state, phase: 'streaming', pattern: (state.pattern ?? '') + event.delta }
+        if (event.field === 'path') return { ...state, phase: 'streaming', path: (state.path ?? '') + event.delta }
+        if (event.field === 'glob') return { ...state, phase: 'streaming', glob: (state.glob ?? '') + event.delta }
+        return state
+      case 'ToolInputReady':
         return {
           ...state,
           phase: 'streaming',
-          pattern: event.streaming.pattern?.value ?? state.pattern,
-          path: event.streaming.path?.value ?? state.path,
-          glob: event.streaming.glob?.value ?? state.glob,
-          limit: limitStr ? parseInt(limitStr, 10) || undefined : state.limit,
+          pattern: event.input.pattern,
+          path: event.input.path,
+          glob: event.input.glob,
+          limit: event.input.limit,
         }
-      }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
-        return { ...state, phase: 'error', errorDetail: event.error }
-      case 'completed': {
-        const matches = [...event.output]
-        return {
-          ...state,
-          phase: 'completed',
-          matches,
-          matchCount: matches.length,
-          fileCount: new Set(matches.map((m) => m.file)).size,
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success': {
+            const matches = [...(event.result.output as SearchMatch[])]
+            return {
+              ...state,
+              phase: 'completed',
+              matches,
+              matchCount: matches.length,
+              fileCount: new Set(matches.map((m) => m.file)).size,
+            }
+          }
+          case 'Error':
+            return { ...state, phase: 'error', errorDetail: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
         }
       }
-      case 'error':
-        return { ...state, phase: 'error', errorDetail: event.error.message }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolParseError':
+        return { ...state, phase: 'error', errorDetail: event.error }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

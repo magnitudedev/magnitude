@@ -2,14 +2,13 @@ import type { RoleDefinition } from '@magnitudedev/roles'
 import type { Skill } from '@magnitudedev/skills'
 
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
-import { getXmlActProtocol } from './protocol'
-import { generateXmlActToolDocs } from '../tools/xml-tool-docs'
+import { getMactProtocol } from './protocol'
 import toolingSectionRaw from '../agents/prompts/lead-tooling.txt' with { type: 'text' }
 import subagentBaseRaw from '../agents/prompts/subagent-base.txt' with { type: 'text' }
 import { renderSkillReferenceTable } from './tasks/index'
 import fewShotNoteRaw from './protocol/few-shot-note.txt' with { type: 'text' }
 import type { ResolvedToolSet } from '../tools/resolved-toolset'
-//import workspaceRaw from '../agents/prompts/workspace.txt' with { type: 'text' }
+import { renderToolDocs } from '@magnitudedev/tools'
 
 export function compilePromptTemplate(raw: string): string {
   return raw
@@ -30,11 +29,17 @@ export function renderSystemPrompt(
   toolSet: ResolvedToolSet,
   options?: { implicitTools?: readonly string[] },
 ): string {
-  const toolDocs = generateXmlActToolDocs(toolSet, options?.implicitTools ?? [])
+  // Render tool docs from the resolved tool set
+  const availableTools = [...toolSet.availableKeys]
+    .map(key => toolSet.agentDef.tools.entries[key]?.tool)
+    .filter(Boolean)
+  const toolDocs = availableTools.length > 0
+    ? renderToolDocs(availableTools)
+    : ''
   return roleDef.systemPrompt
     .replaceAll(
       '{{RESPONSE_PROTOCOL}}',
-      getXmlActProtocol(roleDef.lenses, mapProtocolMode(roleDef), roleDef.defaultRecipient),
+      getMactProtocol(roleDef.lenses, mapProtocolMode(roleDef), roleDef.defaultRecipient),
     )
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)

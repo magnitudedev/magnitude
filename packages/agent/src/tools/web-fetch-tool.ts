@@ -10,7 +10,6 @@
 import { Effect, Schedule } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { extractHtml } from '@magnitudedev/dom-extract'
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
@@ -79,7 +78,7 @@ export const webFetchTool = defineTool({
   description: 'Fetch the content of a URL. Returns the page content as cleaned markdown for you to read directly. Use this instead of running curl or wget in the shell.',
 
   inputSchema: Schema.Struct({
-    url: Schema.String,
+    url: Schema.String.annotations({ description: 'URL to fetch content from' }),
   }),
 
   outputSchema: Schema.Struct({
@@ -100,10 +99,3 @@ export const webFetchTool = defineTool({
   },
   label: (input) => input.url ? `Fetching ${input.url}` : 'Fetching…',
 })
-
-export const webFetchXmlBinding = defineXmlBinding(webFetchTool, {
-  input: { body: 'url' },
-  output: {
-    childTags: [{ field: 'url', tag: 'url' }, { field: 'content', tag: 'content' }],
-  },
-} as const)

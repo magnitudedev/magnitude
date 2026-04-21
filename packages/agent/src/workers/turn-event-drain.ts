@@ -1,6 +1,6 @@
 import { Effect, Scope, Stream } from 'effect'
 import type { PublishFn } from '@magnitudedev/event-core'
-import type { XmlRuntimeCrash } from '@magnitudedev/xml-act'
+import type { TurnEngineCrash } from '@magnitudedev/xml-act'
 
 import type { AppEvent } from '../events'
 import { isToolKey } from '../catalog'
@@ -11,11 +11,11 @@ import type { TurnError, TurnEvent, TurnStrategyResult } from '../execution/type
  * Returns the final TurnStrategyResult.
  */
 export function drainTurnEventStream<R>(
-  turnStream: Stream.Stream<TurnEvent, XmlRuntimeCrash | TurnError, R | Scope.Scope>,
+  turnStream: Stream.Stream<TurnEvent, TurnEngineCrash | TurnError, R | Scope.Scope>,
   forkId: string | null,
   turnId: string,
   publish: PublishFn<AppEvent>,
-): Effect.Effect<{ finalResult: TurnStrategyResult }, XmlRuntimeCrash | TurnError, R> {
+): Effect.Effect<{ finalResult: TurnStrategyResult }, TurnEngineCrash | TurnError, R> {
   return Effect.gen(function* () {
     let finalResult: TurnStrategyResult | null = null
 

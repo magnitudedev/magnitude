@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { spawnWorkerTool, spawnWorkerXmlBinding } from '../tools/task-tools'
+import { spawnWorkerTool } from '../tools/task-tools'
 
 export interface SpawnWorkerState extends BaseState {
   toolKey: 'spawnWorker'
@@ -12,45 +12,43 @@ const initial: Omit<SpawnWorkerState, 'phase' | 'toolKey'> = {
   message: undefined,
 }
 
-export const spawnWorkerModel = defineStateModel('spawnWorker', {
-  tool: spawnWorkerTool,
-  binding: spawnWorkerXmlBinding,
-})({
+export const spawnWorkerModel = defineStateModel('spawnWorker', spawnWorkerTool)({
   initial,
   reduce: (state, event): SpawnWorkerState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-        return {
-          ...state,
-          phase: 'streaming',
-          id: event.streaming.id?.value ?? state.id,
-          message: event.streaming.message?.value ?? state.message,
-        }
-      case 'inputReady':
+      case 'ToolInputFieldChunk':
+        if (event.field === 'id') return { ...state, phase: 'streaming', id: (state.id ?? '') + event.delta }
+        if (event.field === 'message') return { ...state, phase: 'streaming', message: (state.message ?? '') + event.delta }
+        return state
+      case 'ToolInputReady':
         return {
           ...state,
           phase: 'streaming',
           id: event.input.id ?? state.id,
           message: event.input.message ?? state.message,
         }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed', id: event.result.output.id }
+          case 'Error':
+            return { ...state, phase: 'error' }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error' }
-      case 'completed':
-        return { ...state, phase: 'completed', id: event.output.id }
-      case 'error':
-        return { ...state, phase: 'error' }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

@@ -29,7 +29,6 @@ export { fileViewModel, type FileViewState } from './file-view'
 export {
   createBrowserActionModel,
   type BrowserActionState,
-  type BrowserActionModelConfig,
   clickModel,
   doubleClickModel,
   rightClickModel,

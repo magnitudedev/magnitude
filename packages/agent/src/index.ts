@@ -149,11 +149,13 @@ export { ExecutionManagerLive } from './execution/execution-manager'
 export { PermissionRejection } from './execution/permission-rejection'
 
 // Prompt Utilities
-export { generateXmlActToolDocs } from './tools/xml-tool-docs'
-export { getXmlActProtocol, buildAckTurn, buildAckTurns } from './prompts/protocol'
+// TODO: Re-add tool docs generation when implemented
+// export { generateToolDocs } from './tools/tool-docs'
+// TODO: Re-add protocol export when implemented
+// export { getProtocol } from './prompts/protocol'
 
 // Tool types (re-exported from xml-act and tools packages)
-export type { ToolCallEvent } from '@magnitudedev/xml-act'
+export type { TurnEngineEvent } from '@magnitudedev/xml-act'
 export type { ToolDefinition } from '@magnitudedev/tools'
 
 // Tools

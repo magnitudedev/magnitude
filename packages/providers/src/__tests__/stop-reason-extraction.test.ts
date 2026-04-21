@@ -8,7 +8,7 @@ import { buildClientRegistry } from '../client-registry-builder'
 import { bamlStream } from '../drivers/baml-dispatch'
 import { toIncrementalStream } from '../util/incremental-stream'
 
-const STOP_SEQUENCES = ['<yield-user/>', '<yield-tool/>', '<yield-worker/>']
+const STOP_SEQUENCES = ['<yield-user/>', '<yield-invoke/>', '<yield-worker/>']
 
 async function runWithCollector(provider: string, modelId: string, auth: any) {
   const collector = new Collector('test')

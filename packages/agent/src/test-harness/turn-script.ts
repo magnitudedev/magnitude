@@ -76,7 +76,7 @@ interface MockTurnScriptState {
 }
 
 const defaultFrame: MockTurnResponse = {
-  xml: `<message>ok</message>${YIELD_USER}`,
+  xml: `<|message:user>ok<message|>${YIELD_USER}`,
 }
 
 const initialState: MockTurnScriptState = {

@@ -10,3 +10,6 @@ export { getTypeNode, schemaToTypeNode, printAst, buildKnownEntities, type AstGe
 
 // Tool interface generation
 export { generateToolInterface, generateToolGroupInterface, generateToolGroupInterface as generateNamespaceInterface, type ToolInterfaceResult, type ToolInterfaceOptions, type ToolGroupInterfaceOptions } from "./tool-interface"
+
+// Tool docs rendering
+export { renderToolDocs } from "./render-tool-docs"

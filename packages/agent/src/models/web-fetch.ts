@@ -1,5 +1,5 @@
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { webFetchTool, webFetchXmlBinding } from '../tools/web-fetch-tool'
+import { webFetchTool } from '../tools/web-fetch-tool'
 
 export interface WebFetchState extends BaseState {
   toolKey: 'webFetch'
@@ -12,34 +12,38 @@ const initial: Omit<WebFetchState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const webFetchModel = defineStateModel('webFetch', {
-  tool: webFetchTool,
-  binding: webFetchXmlBinding,
-})({
+export const webFetchModel = defineStateModel('webFetch', webFetchTool)({
   initial,
   reduce: (state, event): WebFetchState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming', errorDetail: undefined }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', url: event.streaming.url?.value ?? state.url }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolInputFieldChunk':
+        return event.field === 'url'
+          ? { ...state, phase: 'streaming', url: (state.url ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', url: event.input.url }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return { ...state, phase: 'completed', url: (event.result.output as { url: string }).url }
+          case 'Error':
+            return { ...state, phase: 'error', errorDetail: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
+        }
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error', errorDetail: event.error }
-      case 'completed':
-        return { ...state, phase: 'completed', url: event.output.url }
-      case 'error':
-        return { ...state, phase: 'error', errorDetail: event.error.message }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

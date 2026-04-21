@@ -1,16 +1,16 @@
-import type { StateModel } from './state-model';
-import type { ToolStateEvent } from './tool-state-event';
+import type { StateModel } from "./state-model";
+import type { ToolStateEvent } from "./tool-state-event";
 
-export class ToolCallState<TState> {
+export class ToolCallState<TState, TInput = unknown, TOutput = unknown, TEmission = unknown> {
   state: TState;
 
   constructor(
-    private readonly model: StateModel<TState, any, any, any>,
+    private readonly model: StateModel<TState, TInput, TOutput, TEmission>,
   ) {
     this.state = model.initial;
   }
 
-  dispatch(event: ToolStateEvent<any, any, any>): void {
+  dispatch(event: ToolStateEvent<TInput, TOutput, TEmission>): void {
     this.state = this.model.reduce(this.state, event);
   }
 
@@ -19,8 +19,8 @@ export class ToolCallState<TState> {
   }
 }
 
-export function createToolCallState<TState>(
-  model: StateModel<TState, any, any, any>,
-): ToolCallState<TState> {
+export function createToolCallState<TState, TInput = unknown, TOutput = unknown, TEmission = unknown>(
+  model: StateModel<TState, TInput, TOutput, TEmission>,
+): ToolCallState<TState, TInput, TOutput, TEmission> {
   return new ToolCallState(model);
 }

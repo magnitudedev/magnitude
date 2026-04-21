@@ -1,16 +1,10 @@
-/**
- * Skill Activation Model
- *
- * State model for the skill tool — tracks skill activation requests.
- */
-
 import { defineStateModel, type BaseState } from '@magnitudedev/tools'
-import { skillTool, skillXmlBinding } from '../tools/skill-tool'
+import { skillTool } from '../tools/skill-tool'
 
 export interface SkillActivationState extends BaseState {
   toolKey: 'skill'
   skillName?: string
-  skillPath?: string      // resolved skill file path
+  skillPath?: string
   contentPreview?: string
   errorDetail?: string
 }
@@ -22,41 +16,46 @@ const initial: Omit<SkillActivationState, 'phase' | 'toolKey'> = {
   errorDetail: undefined,
 }
 
-export const skillActivationModel = defineStateModel('skill', {
-  tool: skillTool,
-  binding: skillXmlBinding,
-})({
+export const skillActivationModel = defineStateModel('skill', skillTool)({
   initial,
   reduce: (state, event): SkillActivationState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming', errorDetail: undefined }
-      case 'inputUpdated':
-      case 'inputReady':
-        return { ...state, phase: 'streaming', skillName: event.streaming.name?.value ?? state.skillName }
-      case 'executionStarted':
-      case 'emission':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolInputFieldChunk':
+        return event.field === 'name'
+          ? { ...state, phase: 'streaming', skillName: (state.skillName ?? '') + event.delta }
+          : state
+      case 'ToolInputReady':
+        return { ...state, phase: 'streaming', skillName: event.input.name as string | undefined }
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
-        return { ...state, phase: 'error', errorDetail: event.error }
-      case 'completed':
-        // Preview first 200 chars of content
-        const content = event.output.content as string
-        return {
-          ...state,
-          phase: 'completed',
-          skillPath: event.output.skillPath ?? state.skillPath,
-          contentPreview: content.length > 200 ? content.slice(0, 200) + '…' : content,
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success': {
+            const output = event.result.output as { content: string; skillPath?: string }
+            const content = output.content
+            return {
+              ...state,
+              phase: 'completed',
+              skillPath: output.skillPath ?? state.skillPath,
+              contentPreview: content.length > 200 ? content.slice(0, 200) + '…' : content,
+            }
+          }
+          case 'Error':
+            return { ...state, phase: 'error', errorDetail: event.result.error }
+          case 'Rejected':
+            return { ...state, phase: 'rejected' }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted' }
         }
-      case 'error':
-        return { ...state, phase: 'error', errorDetail: event.error.message }
-      case 'rejected':
-        return { ...state, phase: 'rejected' }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted' }
+      }
+      case 'ToolParseError':
+        return { ...state, phase: 'error', errorDetail: event.error }
+      case 'ToolEmission':
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })

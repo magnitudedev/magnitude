@@ -1,7 +1,6 @@
 import { Effect } from 'effect'
 import { Schema } from '@effect/schema'
 import { defineTool, ToolErrorSchema } from '@magnitudedev/tools'
-import { defineXmlBinding } from '@magnitudedev/xml-act'
 import { Fork } from '@magnitudedev/event-core'
 import { ExecutionManager } from '../execution/types'
 import { TaskGraphStateReaderTag } from './task-reader'
@@ -98,9 +97,9 @@ export const createTaskTool = defineTool({
   group: 'task' as const,
   description: 'Create a task.',
   inputSchema: Schema.Struct({
-    id: Schema.String,
-    title: Schema.String,
-    parent: Schema.optional(Schema.String),
+    id: Schema.String.annotations({ description: 'Unique task identifier' }),
+    title: Schema.String.annotations({ description: 'Task title' }),
+    parent: Schema.optional(Schema.String.annotations({ description: 'Parent task ID to nest under; omit if no parent' })),
   }),
   outputSchema: Schema.Struct({ id: Schema.String }),
   errorSchema: TaskToolErrorSchema,
@@ -109,7 +108,7 @@ export const createTaskTool = defineTool({
       yield* runDirective({
         kind: 'create',
         taskId: input.id,
-        parentId: input.parent ?? null,
+        parentId: input.parent?.trim() || null,
         title: input.title,
       })
       return { id: input.id }
@@ -122,8 +121,8 @@ export const updateTaskTool = defineTool({
   group: 'task' as const,
   description: 'Update task status.',
   inputSchema: Schema.Struct({
-    id: Schema.String,
-    status: UpdateTaskStatusSchema,
+    id: Schema.String.annotations({ description: 'Task ID to update' }),
+    status: UpdateTaskStatusSchema.annotations({ description: 'New status: pending, completed, or cancelled' }),
   }),
   outputSchema: Schema.Struct({
     id: Schema.String,
@@ -147,8 +146,8 @@ export const spawnWorkerTool = defineTool({
   group: 'task' as const,
   description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <message to="task-id"> for follow-up communications. Only use spawn-worker to create a new worker or replace the current one.',
   inputSchema: Schema.Struct({
-    id: Schema.String,
-    message: Schema.String,
+    id: Schema.String.annotations({ description: 'Task ID to spawn a worker for' }),
+    message: Schema.String.annotations({ description: 'Initial instruction message for the worker' }),
   }),
   outputSchema: Schema.Struct({
     id: Schema.String,
@@ -183,7 +182,7 @@ export const killWorkerTool = defineTool({
   group: 'task' as const,
   description: 'Kill worker for a task id.',
   inputSchema: Schema.Struct({
-    id: Schema.String,
+    id: Schema.String.annotations({ description: 'Task ID whose worker to kill' }),
   }),
   outputSchema: Schema.Struct({
     id: Schema.String,
@@ -199,55 +198,3 @@ export const killWorkerTool = defineTool({
     }),
   label: (input) => input.id ? `Killing worker for ${input.id}` : 'Killing worker…',
 })
-
-export const createTaskXmlBinding = defineXmlBinding(createTaskTool, {
-  input: {
-    attributes: [
-      { field: 'id', attr: 'id' },
-      { field: 'title', attr: 'title' },
-      { field: 'parent', attr: 'parent' },
-    ],
-  },
-  output: {
-    childTags: [{ field: 'id', tag: 'id' }],
-  },
-} as const)
-
-export const updateTaskXmlBinding = defineXmlBinding(updateTaskTool, {
-  input: {
-    attributes: [
-      { field: 'id', attr: 'id' },
-      { field: 'status', attr: 'status' },
-    ],
-  },
-  output: {
-    childTags: [
-      { field: 'id', tag: 'id' },
-      { field: 'status', tag: 'status' },
-    ],
-  },
-} as const)
-
-export const spawnWorkerXmlBinding = defineXmlBinding(spawnWorkerTool, {
-  input: {
-    attributes: [
-      { field: 'id', attr: 'id' },
-    ],
-    body: 'message',
-  },
-  output: {
-    childTags: [
-      { field: 'id', tag: 'id' },
-    ],
-  },
-} as const)
-
-export const killWorkerXmlBinding = defineXmlBinding(killWorkerTool, {
-  input: {
-    attributes: [{ field: 'id', attr: 'id' }],
-    selfClosing: true,
-  },
-  output: {
-    childTags: [{ field: 'id', tag: 'id' }],
-  },
-} as const)

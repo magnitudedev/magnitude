@@ -1,5 +1,5 @@
-import { defineStateModel, type BaseState, type EditDiff, type StreamingPartial } from '@magnitudedev/tools'
-import { editTool, editXmlBinding } from '../tools/fs'
+import { defineStateModel, type BaseState, type EditDiff } from '@magnitudedev/tools'
+import { editTool } from '../tools/fs'
 
 export interface FileEditState extends BaseState {
   toolKey: 'fileEdit'
@@ -64,44 +64,34 @@ export function applyProvisionalDiffs(state: FileEditState): FileEditState {
   }
 }
 
-function applyStreamingInputUpdate(
-  state: FileEditState,
-  streaming: StreamingPartial<{
-    path: string
-    oldString: string
-    newString: string
-    replaceAll?: boolean
-  }>,
-): FileEditState {
-  const streamingTarget = streaming.newString !== undefined ? 'new'
-    : streaming.oldString !== undefined ? 'old'
-    : state.streamingTarget
-
-  const nextState: FileEditState = {
-    ...state,
-    phase: 'streaming',
-    path: streaming.path?.value ?? state.path,
-    oldText: streaming.oldString?.value ?? state.oldText,
-    newText: streaming.newString?.value ?? state.newText,
-    replaceAll: streaming.replaceAll === undefined
-      ? state.replaceAll
-      : streaming.replaceAll.value === true || streaming.replaceAll.value === 'true',
-    streamingTarget,
+function applyFieldUpdate(state: FileEditState, field: string, text: string): FileEditState {
+  if (field === 'path') {
+    return applyProvisionalDiffs({ ...state, phase: 'streaming', path: (state.path ?? '') + text })
   }
-
-  return applyProvisionalDiffs(nextState)
+  if (field === 'oldString') {
+    return applyProvisionalDiffs({
+      ...state,
+      phase: 'streaming',
+      oldText: state.oldText + text,
+      streamingTarget: 'old',
+    })
+  }
+  if (field === 'newString') {
+    return applyProvisionalDiffs({
+      ...state,
+      phase: 'streaming',
+      newText: state.newText + text,
+      streamingTarget: 'new',
+    })
+  }
+  return state
 }
 
 function applyReadyInputUpdate(
   state: FileEditState,
-  input: {
-    path: string
-    oldString: string
-    newString: string
-    replaceAll?: boolean
-  },
+  input: { path: string; oldString: string; newString: string; replaceAll?: boolean },
 ): FileEditState {
-  const nextState: FileEditState = {
+  return applyProvisionalDiffs({
     ...state,
     phase: 'streaming',
     path: input.path,
@@ -109,48 +99,49 @@ function applyReadyInputUpdate(
     newText: input.newString,
     replaceAll: input.replaceAll ?? false,
     streamingTarget: state.streamingTarget,
-  }
-
-  return applyProvisionalDiffs(nextState)
+  })
 }
 
-export const fileEditModel = defineStateModel('fileEdit', {
-  tool: editTool,
-  binding: editXmlBinding,
-})({
+export const fileEditModel = defineStateModel('fileEdit', editTool)({
   initial,
   reduce: (state, event): FileEditState => {
-    switch (event.type) {
-      case 'started':
+    switch (event._tag) {
+      case 'ToolInputStarted':
         return { ...state, phase: 'streaming' }
-      case 'inputUpdated':
-        return applyStreamingInputUpdate(state, event.streaming)
-      case 'inputReady':
+      case 'ToolInputFieldChunk':
+        return applyFieldUpdate(state, event.field, event.delta)
+      case 'ToolInputReady':
         return applyReadyInputUpdate(state, event.input)
-      case 'executionStarted':
-      case 'awaitingApproval':
-      case 'approvalGranted':
-      case 'approvalRejected':
+      case 'ToolExecutionStarted':
         return { ...state, phase: 'executing' }
-      case 'parseError':
-        return { ...state, phase: 'error', streamingTarget: null }
-      case 'emission':
-        return event.value.type === 'file_edit_base_content'
+      case 'ToolEmission': {
+        const v = event.value as { type?: string; path?: string; baseContent?: string }
+        return v.type === 'file_edit_base_content'
           ? applyProvisionalDiffs({
               ...state,
               phase: 'executing',
-              path: event.value.path,
-              baseContent: event.value.baseContent,
+              path: v.path ?? state.path,
+              baseContent: v.baseContent ?? state.baseContent,
             })
           : state
-      case 'completed':
-        return applyProvisionalDiffs({ ...state, phase: 'completed', streamingTarget: null })
-      case 'error':
+      }
+      case 'ToolExecutionEnded': {
+        switch (event.result._tag) {
+          case 'Success':
+            return applyProvisionalDiffs({ ...state, phase: 'completed', streamingTarget: null })
+          case 'Error':
+            return { ...state, phase: 'error', streamingTarget: null }
+          case 'Rejected':
+            return { ...state, phase: 'rejected', streamingTarget: null }
+          case 'Interrupted':
+            return { ...state, phase: 'interrupted', streamingTarget: null }
+        }
+      }
+      case 'ToolParseError':
         return { ...state, phase: 'error', streamingTarget: null }
-      case 'rejected':
-        return { ...state, phase: 'rejected', streamingTarget: null }
-      case 'interrupted':
-        return { ...state, phase: 'interrupted', streamingTarget: null }
+      case 'ToolInputFieldComplete':
+      default:
+        return state
     }
   },
 })
