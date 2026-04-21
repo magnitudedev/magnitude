@@ -86,33 +86,33 @@ describe('mact parser — new architecture', () => {
     expect(ready).toMatchObject({ _tag: 'ToolInputReady', input: { command: 'echo hi' } })
   })
 
-  it('emits ToolInputParseError for unknown tool', () => {
+  it('emits StructuralParseError for unknown tool', () => {
     const events = parse('<|invoke:unknown-tool>\n<|parameter:foo>bar<parameter|>\n<invoke|>')
-    const error = events.find(e => e._tag === 'ToolInputParseError')
+    const error = events.find(e => e._tag === 'StructuralParseError')
     expect(error).toBeDefined()
-    expect(error).toMatchObject({ _tag: 'ToolInputParseError', error: { _tag: 'UnknownTool' } })
+    expect(error).toMatchObject({ _tag: 'StructuralParseError', error: { _tag: 'UnknownTool' } })
   })
 
-  it('emits ToolInputParseError for unknown parameter', () => {
+  it('emits ToolParseError for unknown parameter', () => {
     const events = parse('<|invoke:shell>\n<|parameter:nonexistent>value<parameter|>\n<invoke|>')
-    const error = events.find(e => e._tag === 'ToolInputParseError')
+    const error = events.find(e => e._tag === 'ToolParseError')
     expect(error).toBeDefined()
-    expect(error).toMatchObject({ _tag: 'ToolInputParseError', error: { _tag: 'UnknownParameter' } })
+    expect(error).toMatchObject({ _tag: 'ToolParseError', error: { _tag: 'UnknownParameter' } })
   })
 
-  it('emits ToolInputParseError for missing required field', () => {
+  it('emits ToolParseError for missing required field', () => {
     // shell requires 'command' — invoke without it
     const events = parse('<|invoke:shell>\n<invoke|>')
-    const error = events.find(e => e._tag === 'ToolInputParseError')
+    const error = events.find(e => e._tag === 'ToolParseError')
     expect(error).toBeDefined()
-    expect(error).toMatchObject({ _tag: 'ToolInputParseError', error: { _tag: 'MissingRequiredField', parameterName: 'command' } })
+    expect(error).toMatchObject({ _tag: 'ToolParseError', error: { _tag: 'MissingRequiredField', parameterName: 'command' } })
   })
 
-  it('emits ToolInputParseError for incomplete invoke at end()', () => {
+  it('emits ToolParseError for incomplete invoke at end()', () => {
     const events = parse('<|invoke:shell>\n<|parameter:command>echo hi<parameter|>')
-    const error = events.find(e => e._tag === 'ToolInputParseError')
+    const error = events.find(e => e._tag === 'ToolParseError')
     expect(error).toBeDefined()
-    expect(error).toMatchObject({ _tag: 'ToolInputParseError', error: { _tag: 'IncompleteTool' } })
+    expect(error).toMatchObject({ _tag: 'ToolParseError', error: { _tag: 'IncompleteTool' } })
   })
 
   it('emits LensStart/Chunk/End for think blocks', () => {

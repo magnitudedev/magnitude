@@ -19,6 +19,7 @@
     "slimdom": "^4.3.5"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "gbnf": "^0.1.41"
   }
 }

@@ -87,7 +87,7 @@ Effect.runPromise(
         Stream.runForEach((event: TurnEngineEvent) =>
           Effect.sync(() => {
             events.push(event)
-            if (event._tag === 'ToolInputParseError') {
+            if (event._tag === 'StructuralParseError' || event._tag === 'ToolParseError') {
               console.log(`PARSE ERROR: ${event.error.detail}`)
             } else if (event._tag === 'ToolExecutionEnded') {
               console.log(`TOOL RESULT: ${event.toolName} → ${event.result._tag}`)
@@ -98,7 +98,7 @@ Effect.runPromise(
     )
 
     const toolExecs = events.filter(e => e._tag === 'ToolExecutionEnded') as any[]
-    const parseErrors = events.filter(e => e._tag === 'ToolInputParseError') as any[]
+    const parseErrors = events.filter(e => e._tag === 'ParseError') as any[]
     
     console.log(`\nTool executions: ${toolExecs.length}`)
     for (const e of toolExecs) {

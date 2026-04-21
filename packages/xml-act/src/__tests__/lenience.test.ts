@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { createTokenizer } from '../tokenizer'
-import { generateBodyRules, buildToolRules, GrammarBuilder } from '../grammar-builder'
+import { generateBodyRules, buildToolRules, GrammarBuilder } from '../grammar/grammar-builder'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -497,13 +497,13 @@ describe('Grammar DFA leniency (generateBodyRules)', () => {
       const rules = generateBodyRules('think', 'think')
       const ruleStr = rules.join('\n')
       // Should have a slash state
-      expect(ruleStr).toContain('think-body-slash')
+      expect(ruleStr).toContain('think-body-sl')
     })
 
     it('includes a pipe-handling state', () => {
       const rules = generateBodyRules('think', 'think')
       const ruleStr = rules.join('\n')
-      expect(ruleStr).toContain('think-body-pipe')
+      expect(ruleStr).toContain('think-body-pp')
     })
 
     it('s1 state branches on "/" for slash variant', () => {
@@ -511,13 +511,13 @@ describe('Grammar DFA leniency (generateBodyRules)', () => {
       const map = parseRules(rules)
       const s1 = map.get('think-body-s1')
       expect(s1).toBeDefined()
-      expect(s1).toContain('think-body-slash')
+      expect(s1).toContain('think-body-sl')
     })
 
     it('slash state leads to s2 (shared tagname tracking)', () => {
       const rules = generateBodyRules('think', 'think')
       const map = parseRules(rules)
-      const slash = map.get('think-body-slash')
+      const slash = map.get('think-body-sl')
       expect(slash).toBeDefined()
       // Should reference s2 (first char of tagname)
       expect(slash).toContain('think-body-s2')
@@ -529,14 +529,14 @@ describe('Grammar DFA leniency (generateBodyRules)', () => {
       // tagname "think" has 5 chars, so s1 + 5 = s6 is the final state
       const finalState = map.get('think-body-s6')
       expect(finalState).toBeDefined()
-      expect(finalState).toContain('think-body-pipe')
+      expect(finalState).toContain('think-body-pp')
       expect(finalState).toContain('">"')
     })
 
     it('pipe state accepts ">" to terminate', () => {
       const rules = generateBodyRules('think', 'think')
       const map = parseRules(rules)
-      const pipeState = map.get('think-body-pipe')
+      const pipeState = map.get('think-body-pp')
       expect(pipeState).toBeDefined()
       expect(pipeState).toContain('">"')
     })
@@ -557,8 +557,8 @@ describe('Grammar DFA leniency (generateBodyRules)', () => {
       // s(n+1) where n=7 → s8 is the final state
       expect(map.has('msg-body-s0')).toBe(true)
       expect(map.has('msg-body-s8')).toBe(true)
-      expect(map.has('msg-body-slash')).toBe(true)
-      expect(map.has('msg-body-pipe')).toBe(true)
+      expect(map.has('msg-body-sl')).toBe(true)
+      expect(map.has('msg-body-pp')).toBe(true)
     })
 
     it('final state (s8) accepts pipe and no-pipe termination', () => {
@@ -567,7 +567,7 @@ describe('Grammar DFA leniency (generateBodyRules)', () => {
       // s(n+1) = s(7+1) = s8
       const s8 = map.get('msg-body-s8')
       expect(s8).toBeDefined()
-      expect(s8).toContain('msg-body-pipe')
+      expect(s8).toContain('msg-body-pp')
       expect(s8).toContain('">"')
     })
   })
@@ -587,52 +587,58 @@ describe('Grammar newline enforcement', () => {
     ]).build()
   }
 
-  it('lens open tag includes \\n + hws before and hws + \\n after', () => {
+  it('lens open tag includes ws before, mandatory \\n after open, then body', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('hws "<|think:')
-    expect(grammar).toContain('>" hws "\\n"')
+    expect(grammar).toContain('ws "<|think:')
+    expect(grammar).toContain('>" "\\n" think-body')
   })
 
-  it('lens close tag includes \\n before and after', () => {
+  it('lens close tag is handled by DFA with trailing ws + newline', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('hws "<think|>" hws "\\n"')
+    // DFA handles close tag AND trailing whitespace via tw0/tw1/tw2 states
+    expect(grammar).toContain('think-body-tw0')
+    // Outer rule ends directly with think-body (no trailing ws in outer rule)
+    expect(grammar).toContain('>" think-body')
   })
 
-  it('message open tag includes \\n before and hws + after', () => {
+  it('message open tag includes ws before, mandatory \\n after open, then body', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('hws "<|message:')
+    expect(grammar).toContain('ws "<|message:')
+    expect(grammar).toContain('>" "\\n" msg-body')
   })
 
-  it('message close tag includes \\n before and hws + after', () => {
+  it('message close tag is handled by DFA with trailing ws + newline', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('hws "<message|>" hws "\\n"')
+    // DFA has trailing whitespace states (tw0/tw1/tw2)
+    expect(grammar).toContain('msg-body-tw0')
   })
 
-  it('invoke open tag includes \\n + hws before and hws + \\n after', () => {
+  it('invoke open tag includes ws before, mandatory \\n after open', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('hws "<|invoke:shell>" hws "\\n"')
+    expect(grammar).toContain('ws "<|invoke:shell>" "\\n"')
   })
 
-  it('invoke close tag includes \\n + hws before and hws + \\n after', () => {
+  it('invoke close tag uses lenient invoke-end rule', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('hws "<invoke|>" hws "\\n"')
+    expect(grammar).toContain('invoke-end')
+    expect(grammar).toContain('"<invoke|>" | "</invoke|>" | "</invoke>" | "<invoke>"')
   })
 
-  it('yield tag includes \\n + hws before and hws + \\n after', () => {
+  it('yield tag includes ws before and no trailing content', () => {
     const grammar = buildGrammar()
-    expect(grammar).toMatch(/hws "<\|yield:[^>]+\|>" hws "\\n"/)
+    expect(grammar).toMatch(/ws "<\|yield:[^>]+\|>"/)
+    // yield has no trailing content — it's terminal
+    expect(grammar).not.toMatch(/ws "<\|yield:[^>]+\|>" "\\"\\n\\""/)
   })
 
-  it('parameter close tag includes hws + \\n after (no preceding newline required)', () => {
+  it('parameter close tag is handled by body DFA (no duplicate literal)', () => {
     const grammar = buildGrammar()
-    expect(grammar).toContain('"<parameter|>" hws "\\n"')
+    expect(grammar).not.toContain('"<parameter|>" hws')
   })
 
-  it('parameter open tag does NOT include \\n prefix', () => {
+  it('parameter open tag goes straight into body (inline)', () => {
     const grammar = buildGrammar()
-    // Parameter open has no preceding newline
-    expect(grammar).toContain('"<|parameter:cmd>" hws "\\n"')
-    // Should NOT have \n before parameter open
+    expect(grammar).toContain('"<|parameter:cmd>" param-body')
     expect(grammar).not.toContain('"\\n" hws "<|parameter:')
   })
 
@@ -643,7 +649,7 @@ describe('Grammar newline enforcement', () => {
       ])
         .withToolKeyword('tool')
         .build()
-      expect(grammar).toContain('hws "<|tool:shell>" hws "\\n"')
+      expect(grammar).toContain('ws "<|tool:shell>" "\\n"')
     })
   })
 })

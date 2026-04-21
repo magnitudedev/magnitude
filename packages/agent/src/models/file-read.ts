@@ -40,8 +40,8 @@ export const fileReadModel = defineStateModel('fileRead', readTool)({
             return { ...state, phase: 'interrupted' }
         }
       }
-      case 'ToolInputParseError':
-        return { ...state, phase: 'error', errorDetail: event.error.detail }
+      case 'ToolParseError':
+        return { ...state, phase: 'error', errorDetail: event.error }
       case 'ToolEmission':
       case 'ToolInputFieldComplete':
       default:

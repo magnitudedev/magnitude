@@ -36,7 +36,7 @@ export const killWorkerModel = defineStateModel('killWorker', killWorkerTool)({
             return { ...state, phase: 'interrupted' }
         }
       }
-      case 'ToolInputParseError':
+      case 'ToolParseError':
         return { ...state, phase: 'error' }
       case 'ToolEmission':
       case 'ToolInputFieldComplete':

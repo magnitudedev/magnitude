@@ -36,7 +36,7 @@ export const agentCreateModel = defineStateModel('agentCreate', agentCreateTool)
             return { ...state, phase: 'interrupted' }
         }
       }
-      case 'ToolInputParseError':
+      case 'ToolParseError':
         return { ...state, phase: 'error' }
       case 'ToolEmission':
       case 'ToolInputFieldComplete':

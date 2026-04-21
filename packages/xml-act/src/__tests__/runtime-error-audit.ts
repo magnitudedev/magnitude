@@ -128,8 +128,10 @@ Effect.runPromise(
               console.log(`EVENT: ToolInputStarted tagName=${event.tagName} toolCallId=${event.toolCallId}`)
             } else if (event._tag === 'ToolInputReady') {
               console.log(`EVENT: ToolInputReady toolCallId=${event.toolCallId} input=${JSON.stringify(event.input).slice(0, 100)}`)
-            } else if (event._tag === 'ToolInputParseError') {
-              console.log(`EVENT: ToolInputParseError toolCallId=${event.toolCallId} error=${event.error.detail}`)
+            } else if (event._tag === 'ToolParseError') {
+              console.log(`EVENT: ToolParseError toolCallId=${event.toolCallId} error=${event.error.detail}`)
+            } else if (event._tag === 'StructuralParseError') {
+              console.log(`EVENT: StructuralParseError error=${event.error._tag}`)
             } else if (event._tag === 'ToolExecutionStarted') {
               console.log(`EVENT: ToolExecutionStarted toolName=${event.toolName} toolCallId=${event.toolCallId}`)
             } else if (event._tag === 'ToolExecutionEnded') {

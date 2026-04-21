@@ -1,9 +1,20 @@
 /**
- * Parser types — internal frame types, ParserConfig, and field state.
+ * Parser types — internal frame types, ParserConfig, field state, and valid tag sets.
  */
 
 import type { RegisteredTool } from '../types'
 import type { StreamingJsonParser } from '../jsonish/types'
+
+// =============================================================================
+// Valid tag sets — per frame type (constant, shared)
+// =============================================================================
+
+export const PROSE_VALID_TAGS: ReadonlySet<string> = new Set(['think', 'message', 'invoke', 'yield'])
+export const THINK_VALID_TAGS: ReadonlySet<string> = new Set(['think'])
+export const MESSAGE_VALID_TAGS: ReadonlySet<string> = new Set(['message'])
+export const INVOKE_VALID_TAGS: ReadonlySet<string> = new Set(['invoke', 'parameter'])
+export const PARAMETER_VALID_TAGS: ReadonlySet<string> = new Set(['parameter'])
+export const FILTER_VALID_TAGS: ReadonlySet<string> = new Set(['filter'])
 
 // =============================================================================
 // ParserConfig
@@ -50,6 +61,7 @@ export interface ProseFrame {
   readonly body: string
   readonly pendingNewlines: number
   readonly hasContent: boolean
+  readonly validTags: ReadonlySet<string>
 }
 
 export interface ThinkFrame {
@@ -58,6 +70,7 @@ export interface ThinkFrame {
   readonly content: string
   readonly hasContent: boolean
   readonly pendingNewlines: number
+  readonly validTags: ReadonlySet<string>
 }
 
 export interface MessageFrame {
@@ -66,6 +79,7 @@ export interface MessageFrame {
   readonly to: string | null
   readonly content: string
   readonly pendingNewlines: number
+  readonly validTags: ReadonlySet<string>
 }
 
 export interface InvokeFrame {
@@ -84,6 +98,7 @@ export interface InvokeFrame {
   readonly fieldStates: Map<string, FieldState>
   /** Parameters seen so far (for duplicate detection) */
   readonly seenParams: Set<string>
+  readonly validTags: ReadonlySet<string>
 }
 
 export interface ParameterFrame {
@@ -98,6 +113,7 @@ export interface ParameterFrame {
   readonly jsonishParser: StreamingJsonParser | null
   /** Parameter type derived from schema */
   readonly fieldType: FieldType
+  readonly validTags: ReadonlySet<string>
 }
 
 export interface FilterFrame {
@@ -105,6 +121,7 @@ export interface FilterFrame {
   readonly toolCallId: string
   readonly filterType: string
   query: string
+  readonly validTags: ReadonlySet<string>
 }
 
 // =============================================================================

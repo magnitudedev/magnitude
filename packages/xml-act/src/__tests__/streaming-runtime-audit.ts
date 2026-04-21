@@ -82,7 +82,7 @@ for (const chunkSize of [1, 2, 5, 10]) {
                 if (event.result._tag === 'Success') toolSuccesses++
                 else errors++
               }
-              if (event._tag === 'ToolInputParseError') {
+              if (event._tag === 'StructuralParseError' || event._tag === 'ToolParseError') {
                 toolParseErrors++
                 console.log(`  [chunk=${chunkSize}] PARSE ERROR: ${event.error.detail}`)
               }

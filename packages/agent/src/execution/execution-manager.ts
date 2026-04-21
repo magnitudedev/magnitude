@@ -455,28 +455,42 @@ const makeExecutionManager = Effect.gen(function* () {
                 break
               }
 
-              // --- Tool Input Parse Error ---
-              case 'ToolInputParseError': {
+              // --- Tool Parse Error ---
+              case 'ToolParseError': {
                 hasAnyResponseContent = true
                 const toolKey = resolveKey(event.tagName)
                 if (!toolKey) break
                 toolCallKeys.set(event.toolCallId, toolKey)
 
-                // Track for turn policy so the loop continues and LLM sees the error
                 toolsCalledKeys.push(toolKey)
                 lastToolKey = toolKey
 
-                const errorResult: ToolResult = { status: 'error', message: event.error.detail }
+                const err = event.error as unknown as Record<string, unknown>
+                const errorDetail = String(err.detail ?? err.message ?? err._tag)
+                const errorResult: ToolResult = { status: 'error', message: errorDetail }
                 if (errorResult.status === 'error') {
                   hasToolErrors = true
                 }
 
-                yield* sink.emit( {
+                // Map structured error to flat string for ToolStateEvent
+                const toolParseEvent = {
+                  _tag: 'ToolParseError' as const,
+                  error: errorDetail,
+                }
+                yield* sink.emit({
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
-                  event,
+                  event: toolParseEvent,
                 })
+                break
+              }
+
+              // --- Structural Parse Error ---
+              case 'StructuralParseError': {
+                if (event.error._tag === 'UnclosedThink') {
+                  turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
+                }
                 break
               }
 
@@ -768,12 +782,8 @@ const makeExecutionManager = Effect.gen(function* () {
 
 
 
-              case 'StructuralParseError': {
-                if (event.error._tag === 'UnclosedThink') {
-                  turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
-                }
-                break
-              }
+
+              // UnclosedThink detection moved there
 
               // --- Turn End ---
               case 'TurnEnd': {

@@ -91,7 +91,6 @@ export type ParseEvent =
   | FilterComplete
   | InvokeStarted
   | InvokeComplete
-  | ParseError
 
 // =============================================================================
 // Structural Event Types (from parser)
@@ -123,11 +122,6 @@ export interface TurnControl {
   readonly _tag: 'TurnControl'
   readonly target: 'user' | 'invoke' | 'worker' | 'parent'
   readonly termination: 'natural' | 'runaway'
-}
-
-export interface ParseError {
-  readonly _tag: 'ParseError'
-  readonly error: StructuralParseErrorDetail
 }
 
 export type StructuralEvent =
@@ -205,13 +199,14 @@ export interface ToolInputReady<TInput = unknown> {
   readonly input: TInput
 }
 
-export interface ToolInputParseError {
-  readonly _tag: 'ToolInputParseError'
+/** Tool-scoped parse error event — used in ToolLifecycleEvent */
+export interface ToolParseErrorEvent {
+  readonly _tag: 'ToolParseError'
   readonly toolCallId: string
   readonly tagName: string
   readonly toolName: string
   readonly group: string
-  readonly error: ParseErrorDetail
+  readonly error: ToolParseError
   readonly correctToolShape?: string
 }
 
@@ -287,11 +282,7 @@ export class TurnEngineCrash {
 // Parse Error Detail Variants
 // =============================================================================
 
-export interface UnknownToolError {
-  readonly _tag: 'UnknownTool'
-  readonly tagName: string
-  readonly detail: string
-}
+// --- Tool-scoped (routable to a tool state model) ---
 
 export interface UnknownParameterError {
   readonly _tag: 'UnknownParameter'
@@ -332,20 +323,87 @@ export interface MissingRequiredFieldError {
   readonly detail: string
 }
 
-export type ParseErrorDetail =
-  | UnknownToolError
+/** Tool-scoped parse errors — routable to a tool state model */
+export type ToolParseError =
   | UnknownParameterError
   | IncompleteToolError
   | JsonStructuralError
   | SchemaCoercionError
   | MissingRequiredFieldError
 
+// --- Structural (not routable to any tool) ---
+
+export interface UnknownToolError {
+  readonly _tag: 'UnknownTool'
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface MalformedTagError {
+  readonly _tag: 'MalformedTag'
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface UnexpectedContentError {
+  readonly _tag: 'UnexpectedContent'
+  readonly context: string
+  readonly detail: string
+}
+
 export interface UnclosedThinkError {
   readonly _tag: 'UnclosedThink'
   readonly message: string
 }
 
-export type StructuralParseErrorDetail = UnclosedThinkError
+export interface StrayCloseTagError {
+  readonly _tag: 'StrayCloseTag'
+  readonly tagName: string
+  readonly detail: string
+}
+
+export interface MissingToolNameError {
+  readonly _tag: 'MissingToolName'
+  readonly detail: string
+}
+
+/** Structural parse errors — not routable to any tool */
+export type StructuralParseError =
+  | UnknownToolError
+  | MalformedTagError
+  | UnexpectedContentError
+  | UnclosedThinkError
+  | StrayCloseTagError
+  | MissingToolNameError
+
+/** All parse error details */
+export type ParseErrorDetail =
+  | ToolParseError
+  | StructuralParseError
+
+// =============================================================================
+// ParseError Events
+// =============================================================================
+
+/** Structural parse error event */
+export interface StructuralParseErrorEvent {
+  readonly _tag: 'StructuralParseError'
+  readonly error: StructuralParseError
+}
+
+
+
+// =============================================================================
+// FilterReady (internal parser event, not in TurnEngineEvent)
+// =============================================================================
+
+export interface FilterReady {
+  readonly _tag: 'FilterReady'
+  readonly toolCallId: string
+  readonly query: string
+}
+
+export type InternalParserEvent = FilterReady
 
 // =============================================================================
 // Interceptor
@@ -405,7 +463,7 @@ export type ToolLifecycleEvent<TInput = unknown, TOutput = unknown, TEmission = 
   | ToolInputFieldChunk<TInput>
   | ToolInputFieldComplete<TInput>
   | ToolInputReady<TInput>
-  | ToolInputParseError
+  | ToolParseErrorEvent
   | ToolExecutionStarted<TInput>
   | ToolExecutionEnded<TOutput>
   | ToolEmission<TEmission>
@@ -430,7 +488,8 @@ export type TurnEngineEvent<TInput = unknown, TOutput = unknown, TEmission = unk
   | ToolInputFieldChunk<TInput>
   | ToolInputFieldComplete<TInput>
   | ToolInputReady<TInput>
-  | ToolInputParseError
+  | ToolParseErrorEvent
+  | StructuralParseErrorEvent
   | ToolExecutionStarted<TInput>
   | ToolExecutionEnded<TOutput>
   | ToolEmission<TEmission>
@@ -438,7 +497,6 @@ export type TurnEngineEvent<TInput = unknown, TOutput = unknown, TEmission = unk
   | ProseChunk | ProseEnd
   | LensStart | LensChunk | LensEnd
   | MessageStart | MessageChunk | MessageEnd
-  | StructuralParseError
   | TurnEnd
 
 

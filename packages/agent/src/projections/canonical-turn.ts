@@ -207,8 +207,11 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           return { ...fork, toolCalls: nextToolCalls }
         }
 
-        case 'ToolInputParseError':
+        case 'ToolParseError':
           return { ...fork, hasParseError: true }
+
+        case 'StructuralParseError':
+          return { ...fork, hasStructuralError: true }
 
         default:
           return fork

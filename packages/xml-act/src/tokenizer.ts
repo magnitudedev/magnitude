@@ -31,6 +31,7 @@ type TagPhase =
   | 'open_pipe'      // After <|name or <|name:variant, saw |, waiting for >
   | 'close_name'     // After <, reading name for close tag
   | 'close_pipe'     // After <name|, reading optional pipe or >
+  | 'malformed'      // Known tool tag with invalid syntax — consume to > then emit
 
 type ActiveTag = {
   raw: string
@@ -54,12 +55,12 @@ function isWhitespace(ch: string): boolean {
 
 const TOP_LEVEL_TAGS = new Set(['think', 'message', 'invoke', 'yield'])
 
-const DEFAULT_TOKENIZER_OPTIONS = { strictNewlines: true, toolKeyword: 'invoke' } as const
+const DEFAULT_TOKENIZER_OPTIONS = { toolKeyword: 'invoke' } as const
 
 export function createTokenizer(
   onToken: (token: Token) => void,
   knownToolTags: ReadonlySet<string> = new Set(),
-  options: { strictNewlines: boolean; toolKeyword: string } = DEFAULT_TOKENIZER_OPTIONS,
+  options: { toolKeyword: string } = DEFAULT_TOKENIZER_OPTIONS,
 ): Tokenizer {
   const toolKeyword = options.toolKeyword
   let contentBuffer = ''
@@ -128,6 +129,16 @@ export function createTokenizer(
   function failAsContent(): void {
     if (!activeTag) return
     const tag = activeTag
+    // If this is a known tool tag (invoke keyword) being parsed as an open tag,
+    // don't abandon — enter malformed phase so the parser can produce structured
+    // error feedback instead of silently losing the call.
+    // Only applies to open tag phases, not close tag phases.
+    const isOpenPhase = tag.phase === 'open_name' || tag.phase === 'open_colon' ||
+      tag.phase === 'open_variant' || tag.phase === 'open_pipe' || tag.phase === 'malformed'
+    if (tag.name === toolKeyword && isOpenPhase && tag.phase !== 'malformed') {
+      tag.phase = 'malformed'
+      return
+    }
     activeTag = null
     contentBuffer += tag.raw
   }
@@ -150,6 +161,13 @@ export function createTokenizer(
       name: '',
       variant: '',
     }
+  }
+
+  function emitMalformedInvoke(tag: ActiveTag): void {
+    flushContent()
+    onToken({ _tag: 'Open', name: toolKeyword, variant: tag.variant || undefined })
+    activeTag = null
+    afterNewline = false
   }
 
   function processTagChar(ch: string): void {
@@ -326,6 +344,15 @@ export function createTokenizer(
         return
       }
 
+      case 'malformed': {
+        // Consume chars until > then emit the Open token so parser can produce an error
+        if (ch === '>') {
+          emitMalformedInvoke(tag)
+        }
+        // Otherwise just accumulate (raw already updated at top of processTagChar)
+        return
+      }
+
       case 'close_pipe': {
         // After <name|, reading optional pipe name or >
         if (ch === '>') {
@@ -489,8 +516,15 @@ export function createTokenizer(
       }
       
       if (activeTag) {
-        // At end of stream, incomplete tags are treated as content
-        failAsContent()
+        const tag = activeTag
+        // If we were parsing an invoke tag (or already in malformed phase),
+        // emit the Open token so the parser can produce structured error feedback
+        if (tag.name === toolKeyword || tag.phase === 'malformed') {
+          emitMalformedInvoke(tag)
+        } else {
+          // At end of stream, incomplete tags are treated as content
+          failAsContent()
+        }
       }
       flushContent()
     },

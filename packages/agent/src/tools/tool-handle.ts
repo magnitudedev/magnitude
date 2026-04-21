@@ -24,7 +24,7 @@ function isToolLifecycleEvent(event: TurnEngineEvent): event is ToolLifecycleEve
     case 'ToolInputFieldChunk':
     case 'ToolInputFieldComplete':
     case 'ToolInputReady':
-    case 'ToolInputParseError':
+    case 'ToolParseError':
     case 'ToolExecutionStarted':
     case 'ToolExecutionEnded':
     case 'ToolEmission':

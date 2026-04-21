@@ -17,7 +17,7 @@ import type { ToolContext } from '@magnitudedev/tools'
 
 import { createTokenizer } from '../tokenizer'
 import { createParser } from '../parser/index'
-import type { TurnEngineEvent, EngineState, RegisteredTool, ToolInterceptor } from '../types'
+import type { TurnEngineEvent, EngineState, RegisteredTool, ToolInterceptor, ToolParseError } from '../types'
 import { TurnEngineCrash, ToolInterceptorTag } from '../types'
 import { initialEngineState, foldEngineState } from './engine-state'
 import { dispatchTool, type DispatchContext } from './dispatcher'
@@ -175,11 +175,15 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   break
                 }
 
-                case 'ToolInputParseError': {
-                  // Always forward — error already emitted by parser
+                case 'ToolParseError': {
                   if (hasPriorOutcome(event.toolCallId)) break
-                  currentState = yield* emitAndFold(currentState, event)
                   activeInvokes.delete(event.toolCallId)
+                  currentState = yield* emitAndFold(currentState, event)
+                  break
+                }
+
+                case 'StructuralParseError': {
+                  currentState = yield* emitAndFold(currentState, event)
                   break
                 }
 
@@ -198,6 +202,14 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
                   if (!invoke) {
                     activeInvokes.delete(event.toolCallId)
+                    currentState = yield* emitAndFold(currentState, {
+                      _tag: 'StructuralParseError',
+                      error: {
+                        _tag: 'UnexpectedContent',
+                        context: 'engine',
+                        detail: `ToolInputReady for unknown toolCallId '${event.toolCallId}'`,
+                      },
+                    })
                     break
                   }
 
@@ -240,12 +252,12 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   if (result._tag === 'ParseError') {
                     const registered = config.tools.get(invoke.tagName)
                     currentState = yield* emitAndFold(currentState, {
-                      _tag: 'ToolInputParseError',
+                      _tag: 'ToolParseError',
                       toolCallId: event.toolCallId,
                       tagName: invoke.tagName,
                       toolName: registered?.tool.name ?? invoke.tagName,
                       group: registered?.groupName ?? 'default',
-                      error: result.error,
+                      error: result.error as ToolParseError,
                     })
                   } else {
                     // Check for gate rejection → TurnEnd
@@ -274,9 +286,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                 case 'MessageEnd':
                 case 'ProseChunk':
                 case 'ProseEnd':
-                case 'StructuralParseError':
-                  currentState = yield* emitAndFold(currentState, event)
-                  break
+
 
                 case 'TurnEnd':
                   currentState = yield* emitAndFold(currentState, event)
@@ -308,15 +318,24 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
           // ---------------------------------------------------------------
 
           const producer = Effect.gen(function* () {
-            const parser = createParser({
-              tools: config.tools,
-              generateId,
-            })
+            const parser = createParser(
+              {
+                tools: config.tools,
+                generateId,
+              },
+              // onFilterReady callback — store filter query for dispatch
+              (filterEvent) => {
+                const invoke = activeInvokes.get(filterEvent.toolCallId)
+                if (invoke) {
+                  activeInvokes.set(filterEvent.toolCallId, { ...invoke, filterQuery: filterEvent.query })
+                }
+              },
+            )
 
             const tokenizer = createTokenizer(
               (token) => { parser.pushToken(token) },
-              new Set(),
-              { strictNewlines: true, toolKeyword: 'invoke' },
+              new Set(config.tools.keys()),
+              { toolKeyword: 'invoke' },
             )
 
             yield* textStream.pipe(

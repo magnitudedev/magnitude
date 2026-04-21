@@ -19,14 +19,14 @@ export type {
   ToolInputFieldChunk,
   ToolInputFieldComplete,
   ToolInputReady,
-  ToolInputParseError,
+  ToolParseErrorEvent,
+  StructuralParseErrorEvent,
   ProseChunk,
   ProseEnd,
   ToolExecutionStarted,
   ToolExecutionEnded,
   ToolEmission,
   ToolObservation,
-  StructuralParseError,
   TurnEnd,
   LensStart,
   LensChunk,
@@ -55,13 +55,18 @@ export type {
 // Core types — errors
 export type {
   ParseErrorDetail,
-  StructuralParseErrorDetail,
+  ToolParseError,
+  StructuralParseError,
   UnknownToolError,
   UnknownParameterError,
   IncompleteToolError,
   JsonStructuralError,
   SchemaCoercionError,
   MissingRequiredFieldError,
+  MalformedTagError,
+  StrayCloseTagError,
+  MissingToolNameError,
+  UnexpectedContentError,
   UnclosedThinkError,
 } from './types'
 
@@ -183,7 +188,7 @@ export {
   type ProtocolConfig,
   type GrammarConfig,
   type GrammarBuildOptions,
-} from './grammar-builder'
+} from './grammar/grammar-builder'
 
 // JSONish streaming parser
 export { createStreamingJsonParser } from './jsonish/parser'

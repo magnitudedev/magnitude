@@ -34,7 +34,7 @@ describe('task creation race condition repro', () => {
         if (e.event._tag === 'ToolExecutionEnded') {
           console.log(`    result: ${JSON.stringify(e.event.result)}`)
         }
-        if (e.event._tag === 'ToolInputParseError') {
+        if (e.event._tag === 'ToolParseError' || e.event._tag === 'StructuralParseError') {
           console.log(`    error: ${JSON.stringify(e.event.error)}`)
         }
       }

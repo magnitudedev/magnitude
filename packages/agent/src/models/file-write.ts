@@ -67,7 +67,7 @@ export const fileWriteModel = defineStateModel('fileWrite', writeTool)({
             return { ...state, phase: 'interrupted' }
         }
       }
-      case 'ToolInputParseError':
+      case 'ToolParseError':
         return { ...state, phase: 'error' }
       case 'ToolInputFieldComplete':
       default:

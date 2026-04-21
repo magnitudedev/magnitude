@@ -54,8 +54,8 @@ export const shellModel = defineStateModel('shell', shellTool)({
             return { ...state, phase: 'interrupted' }
         }
       }
-      case 'ToolInputParseError':
-        return { ...state, phase: 'error', errorMessage: event.error.detail }
+      case 'ToolParseError':
+        return { ...state, phase: 'error', errorMessage: event.error }
       case 'ToolEmission':
       case 'ToolInputFieldComplete':
       default:

@@ -137,7 +137,7 @@ export const fileEditModel = defineStateModel('fileEdit', editTool)({
             return { ...state, phase: 'interrupted', streamingTarget: null }
         }
       }
-      case 'ToolInputParseError':
+      case 'ToolParseError':
         return { ...state, phase: 'error', streamingTarget: null }
       case 'ToolInputFieldComplete':
       default:

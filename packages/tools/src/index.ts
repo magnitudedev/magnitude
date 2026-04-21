@@ -31,7 +31,7 @@ export { defineTool, type ToolDefinition, type ToolDefinitionConfig, type Stream
 export * from './tool-context'
 
 // Tool lifecycle events
-export type { ToolStateEvent, ToolResult, ParseErrorDetail } from './tool-state-event'
+export type { ToolStateEvent, ToolResult } from './tool-state-event'
 
 // Streaming partial
 export * from './streaming-partial'

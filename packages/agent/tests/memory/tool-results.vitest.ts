@@ -24,7 +24,7 @@ function invalidToolInputEvent(args: {
   error: ParseErrorDetail
 }): ToolEvent['event'] {
   return {
-    _tag: 'ToolInputParseError',
+    _tag: 'ToolParseError',
     toolCallId: args.toolCallId,
     tagName: args.tagName,
     toolName: args.tagName,

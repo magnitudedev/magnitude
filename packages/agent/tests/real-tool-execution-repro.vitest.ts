@@ -44,7 +44,7 @@ describe('real tool execution repro', () => {
         
         // Check for parse error
         const parseError = yield* h.wait.event('tool_event' as any, (e: any) =>
-          e.event._tag === 'ToolInputParseError' && e.event.toolName === 'spawn-worker'
+          e.event._tag === 'ToolParseError' && e.event.toolName === 'spawn-worker'
         , { timeoutMs: 1000 }).pipe(
           Effect.catchAll(() => Effect.succeed(null))
         )

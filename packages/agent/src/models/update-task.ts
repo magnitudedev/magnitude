@@ -46,7 +46,7 @@ export const updateTaskModel = defineStateModel('updateTask', updateTaskTool)({
             return { ...state, phase: 'interrupted' }
         }
       }
-      case 'ToolInputParseError':
+      case 'ToolParseError':
         return { ...state, phase: 'error' }
       case 'ToolEmission':
       case 'ToolInputFieldComplete':

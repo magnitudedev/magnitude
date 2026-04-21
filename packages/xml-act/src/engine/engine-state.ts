@@ -24,12 +24,16 @@ export function foldEngineState(state: EngineState, event: TurnEngineEvent): Eng
       return { ...state, toolCallMap }
     }
 
-    case 'ToolInputParseError': {
+    case 'ToolParseError': {
       const deadToolCalls = new Set(state.deadToolCalls)
       deadToolCalls.add(event.toolCallId)
       const toolOutcomes = new Map(state.toolOutcomes)
       toolOutcomes.set(event.toolCallId, { _tag: 'ParseError' })
       return { ...state, deadToolCalls, toolOutcomes }
+    }
+
+    case 'StructuralParseError': {
+      return state
     }
 
     case 'ToolExecutionEnded': {

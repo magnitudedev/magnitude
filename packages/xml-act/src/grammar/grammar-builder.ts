@@ -1,5 +1,5 @@
 
-import { LEAD_YIELD_TAGS } from './constants'
+import { LEAD_YIELD_TAGS } from '../constants'
 
 // =============================================================================
 // Types
@@ -160,9 +160,11 @@ export class GrammarBuilder {
     const rules: RuleMap = new Map()
 
     this.addWhitespaceRules(rules)
+    this.addSharedBodyRules(rules)
     this.addLensRules(rules)
     this.addMessageRules(rules)
     this.addYieldRules(rules)
+    this.addInvokeCloseRule(rules)
     this.addToolRules(rules)
     this.addRootRule(rules)
 
@@ -174,55 +176,63 @@ export class GrammarBuilder {
   // ---------------------------------------------------------------------------
 
   private addWhitespaceRules(rules: RuleMap): void {
-    // ws: unbounded whitespace between elements
-    // ws1: required whitespace
-    // ws-bounded: limited whitespace (1-4 chars) for capped lens slots
+    // ws: unbounded whitespace (spaces, tabs, newlines) — used before block elements where model naturally produces whitespace
     rules.set('ws', '[ \\t\\n]*')
-    rules.set('ws1', '[ \\t\\n]+')
-    rules.set('ws-bounded', '[ \\t\\n] [ \\t\\n]? [ \\t\\n]? [ \\t\\n]?')
-    rules.set('hws', '[ \\t]*')
+    // bhws: bounded horizontal whitespace (0-4 chars, spaces/tabs only) — safe inline spacing that cannot trap the model
+    rules.set('bhws', '[ \\t]? [ \\t]? [ \\t]? [ \\t]?')
+  }
+
+  private addSharedBodyRules(rules: RuleMap): void {
+    // Shared DFAs — one per close tag name. No "" exits; body must end with close tag.
+    for (const bodyRule of generateBodyRules('param', 'parameter')) {
+      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
+      if (match) rules.set(match[1], match[2])
+    }
+    for (const bodyRule of generateBodyRules('think', 'think')) {
+      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
+      if (match) rules.set(match[1], match[2])
+    }
+    for (const bodyRule of generateBodyRules('msg', 'message')) {
+      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
+      if (match) rules.set(match[1], match[2])
+    }
+    for (const bodyRule of generateBodyRules('filter', 'filter')) {
+      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
+      if (match) rules.set(match[1], match[2])
+    }
   }
 
   private addLensRules(rules: RuleMap): void {
-    // think format: <|think:NAME> content <think|>
     const lensNames = this.config.protocol.lensNames
     const lensnameAlts = lensNames.map(n => `"${n}"`).join(' | ')
     
     rules.set('lensname', lensnameAlts)
-    rules.set('lens', '"\\n" hws "<|think:" lensname ">" hws "\\n" think-body "\\n" hws "<think|>" hws "\\n" ws')
-    rules.set('lens-tight', '"\\n" hws "<|think:" lensname ">" hws "\\n" think-body "\\n" hws "<think|>" hws "\\n" ws-bounded')
-
-    // Generate DFA body rules for think content (tracks "<think|>" close)
-    for (const rule of generateBodyRules('think', 'think')) {
-      const match = rule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
-    }
+    // DFA handles close tag — no literal "<think|>" in outer rule
+    rules.set('lens', 'ws "<|think:" lensname ">" "\\n" think-body')
+    rules.set('lens-cap', 'ws "<|think:" lensname ">" "\\n" think-body')
   }
 
   private addMessageRules(rules: RuleMap): void {
-    // message format: <|message:RECIPIENT> content <message|>
-    // Recipient is more open - can be user, parent, or task IDs
     rules.set('recipient', '[^ \\t\\n>]+')
-    rules.set('msg', '"\\n" hws "<|message:" recipient ">" hws "\\n" msg-body "\\n" hws "<message|>" hws "\\n" ws')
-
-    // Generate DFA body rules for message content (tracks "<message|>" close)
-    for (const rule of generateBodyRules('msg', 'message')) {
-      const match = rule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
-    }
+    // DFA handles close tag — no literal "<message|>" in outer rule
+    rules.set('msg', 'ws "<|message:" recipient ">" "\\n" msg-body')
 
     const requiredRecipient = this.config.protocol.requiredMessageTo
     if (requiredRecipient !== null) {
-      rules.set('forced-msg', `"\\n" hws "<|message:${requiredRecipient}>" hws "\\n" msg-body "\\n" hws "<message|>" hws "\\n" ws`)
+      rules.set('forced-msg', `ws "<|message:${requiredRecipient}>" "\\n" msg-body`)
     }
   }
 
   private addYieldRules(rules: RuleMap): void {
-    // yield format: <|yield:TARGET|>
     const alternatives = this.config.protocol.yieldTags
-      .map(target => `"\\n" hws "<|yield:${target}|>" hws "\\n"`)
+      .map(target => `ws "<|yield:${target}|>"`)
       .join(' | ')
     rules.set('yield', alternatives)
+  }
+
+  private addInvokeCloseRule(rules: RuleMap): void {
+    // Lenient invoke close — accepts all 4 close tag modes
+    rules.set('invoke-end', '"<invoke|>" | "</invoke|>" | "</invoke>" | "<invoke>"')
   }
 
   private addToolRules(rules: RuleMap): void {
@@ -243,37 +253,24 @@ export class GrammarBuilder {
     const recipient = this.config.protocol.requiredMessageTo
     const maxLenses = this.config.protocol.maxLenses
 
-    // Root rule structure:
-    // - Lenses come first (optional, for thinking/reasoning)
-    // - Then either a forced message (if required) or free-form messages/tools
-    // - Finally yield to close the turn
-
-    // Lens section
     if (recipient !== null) {
-      // Forced message case: cap lenses at maxLenses to prevent infinite loops.
       const lensCount = maxLenses ?? 6
       const lensSlots: string[] = []
       for (let i = 0; i < lensCount; i++) {
-        lensSlots.push('lens-tight?')
+        lensSlots.push('lens-cap?')
       }
       parts.push(...lensSlots)
     } else if (this.config.protocol.minLenses === 1) {
-      // No forced message, but at least one lens required
       parts.push('lens+')
     } else {
-      // Default: optional lenses with no constraints
       parts.push('lens*')
     }
 
-    // Forced message (if required)
     if (recipient !== null) {
       parts.push('forced-msg')
     }
 
-    // Middle section: messages and tools
     parts.push(this.buildMiddleAlternative())
-
-    // Yield (turn end)
     parts.push('yield')
 
     rules.set('root', parts.join(' '))
@@ -302,47 +299,58 @@ export class GrammarBuilder {
  *   - `</tagname>`   (Mode 2: slash-prefix without pipe)
  *   - `<tagname>`    (Mode 3: no slash, no pipe)
  *
- * States share tagname-tracking after the optional `/`, and accept
- * both `|>` and `>` as terminators.
+ * No `""` exits — the body MUST terminate by consuming a close tag.
+ * The DFA is the sole handler of close tag detection; outer rules
+ * do not include literal close tags.
  *
- * @param prefix - Rule name prefix (e.g., "think", "msg", "param")
- * @param tagName - The tag name for the close delimiter (e.g., "think", "message", "parameter")
+ * @param prefix - Rule name prefix (e.g., "think", "msg", "param", "filter")
+ * @param tagName - The tag name for the close delimiter (e.g., "think", "message", "parameter", "filter")
  * @returns Array of GBNF rule strings
  */
 export function generateBodyRules(prefix: string, tagName: string): string[] {
   const rules: string[] = []
   const n = tagName.length
   const s = (k: number) => `${prefix}-body-s${k}`
-  const slashState = `${prefix}-body-slash`
-  const pipeState = `${prefix}-body-pipe`
+  const slashState = `${prefix}-body-sl`
+  const pipeState = `${prefix}-body-pp`
 
   rules.push(`${prefix}-body ::= ${s(0)}`)
 
   // s0: base state — accumulate non-'<' content, or start matching on '<'
-  rules.push(`${s(0)} ::= [^<] ${s(0)} | "<" ${s(1)} | ""`)
+  // No "" exit — body must end with close tag
+  rules.push(`${s(0)} ::= [^<] ${s(0)} | "<" ${s(1)}`)
 
   // s1: after '<' — accept '/' (slash variant) or first tagname char (canonical)
   const fc = escapeGbnfChar(tagName[0])
   const fcClass = escapeGbnfCharClass(tagName[0])
-  rules.push(`${s(1)} ::= "/" ${slashState} | ${fc} ${s(2)} | [^</${fcClass}] ${s(0)} | ""`)
+  rules.push(`${s(1)} ::= "/" ${slashState} | ${fc} ${s(2)} | "<" ${s(1)} | [^</${fcClass}] ${s(0)}`)
 
-  // slashState: after '</' — expect first tagname char (shared path with canonical from s2)
-  rules.push(`${slashState} ::= ${fc} ${s(2)} | [^<${fcClass}] ${s(0)} | ""`)
+  // slashState: after '</' — expect first tagname char (shared path)
+  rules.push(`${slashState} ::= ${fc} ${s(2)} | "<" ${s(1)} | [^<${fcClass}] ${s(0)}`)
 
-  // s2..s{n}: match remaining tagname chars (shared between canonical and slash paths)
-  // s2 has matched tagName[0], s{k+1} has matched tagName[k]
+  // s2..s{n}: match remaining tagname chars
   for (let i = 1; i < n; i++) {
     const ch = tagName[i]
     const esc = escapeGbnfChar(ch)
     const ccExclude = ch === '-' ? '[^<-]' : `[^${escapeGbnfCharClass(ch)}<]`
-    rules.push(`${s(i + 1)} ::= ${esc} ${s(i + 2)} | "<" ${s(1)} | ${ccExclude} ${s(0)} | ""`)
+    rules.push(`${s(i + 1)} ::= ${esc} ${s(i + 2)} | "<" ${s(1)} | ${ccExclude} ${s(0)}`)
   }
 
-  // s{n+1}: after full tagname — accept '|' (pipe variants) or '>' (no-pipe variants)
-  rules.push(`${s(n + 1)} ::= "|" ${pipeState} | ">" | "<" ${s(1)} | [^<|>] ${s(0)} | ""`)
+  // Trailing whitespace states after close tag '>'
+  const tw0 = `${prefix}-body-tw0`
+  const tw1 = `${prefix}-body-tw1`
+  const tw2 = `${prefix}-body-tw2`
 
-  // pipeState: after '<[/]tagname|' — accept '>' to close
-  rules.push(`${pipeState} ::= ">" | "<" ${s(1)} | [^<>] ${s(0)} | ""`)
+  // s{n+1}: after full tagname — accept '|' (pipe variants) or '>' (no-pipe variants → trailing ws)
+  rules.push(`${s(n + 1)} ::= "|" ${pipeState} | ">" ${tw0} | "<" ${s(1)} | [^<|>] ${s(0)}`)
+
+  // pipeState: after '<[/]tagname|' — accept '>' to close (→ trailing ws)
+  rules.push(`${pipeState} ::= ">" ${tw0} | "<" ${s(1)} | [^<>] ${s(0)}`)
+
+  // tw0..tw2: trailing whitespace after close tag — 0-2 spaces/tabs then mandatory newline
+  rules.push(`${tw0} ::= [ \\t] ${tw1} | "\\n"`)
+  rules.push(`${tw1} ::= [ \\t] ${tw2} | "\\n"`)
+  rules.push(`${tw2} ::= "\\n"`)
 
   return rules
 }
@@ -380,35 +388,25 @@ export function generateToolRules(
 ): string[] {
   const rules: string[] = []
 
-  // Generate parameter rules
+  // Generate parameter rules — each references shared param-body DFA
   const paramAlts: string[] = []
   for (const param of parameters) {
-    const paramRuleName = `${ruleName}-param-${sanitizeRuleName(param.name)}`
+    const paramRuleName = `${ruleName}-p-${sanitizeParamName(param.name)}`
     paramAlts.push(paramRuleName)
-    
-    // Parameter rule: <|parameter:name> body <parameter|>\n
-    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>" hws "\\n" ${paramRuleName}-body "<parameter|>" hws "\\n" ws`)
-    
-    // DFA body rules for this parameter
-    for (const bodyRule of generateBodyRules(`${paramRuleName}`, 'parameter')) {
-      rules.push(bodyRule)
-    }
+    // DFA handles close tag — no literal "<parameter|>" in outer rule
+    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>" param-body`)
   }
 
-  // Tool invoke rule with optional filter
-  // <|invoke:NAME> ws parameter* invoke-close ws
-  const paramSeq = paramAlts.length > 0 ? `(${paramAlts.join(' ')})*` : ''
+  // Tool invoke rule — unordered parameters, bounded to N occurrences (one per param)
+  // "\n" after open tag consumed here (before param/close choice point)
+  // Each param slot has hws for indentation
+  const paramAlt = paramAlts.length > 0 ? `(bhws (${paramAlts.join(' | ')}))?` : ''
+  const paramSeq = paramAlts.length > 0 ? Array(paramAlts.length).fill(paramAlt).join(' ') : ''
   
-  // Invoke close: either simple <invoke|> or piped <invoke|filter>...<filter|>
-  rules.push(`${ruleName} ::= "\\n" hws "<|${toolKeyword}:${tagName}>" hws "\\n" ws ${paramSeq} ${ruleName}-close ws`)
+  rules.push(`${ruleName} ::= ws "<|${toolKeyword}:${tagName}>" "\\n" ${paramSeq} bhws ${ruleName}-close`)
   
-  // Close alternatives
-  rules.push(`${ruleName}-close ::= "\\n" hws "<invoke|>" hws "\\n" | "\\n" hws "<invoke|filter>" hws "\\n" ws ${ruleName}-filter-body "\\n" hws "<filter|>" hws "\\n"`)
-  
-  // Filter body DFA rules
-  for (const bodyRule of generateBodyRules(`${ruleName}-filter`, 'filter')) {
-    rules.push(bodyRule)
-  }
+  // Close alternatives — NO leading "\n" (consumed by open rule or previous param's DFA tw states)
+  rules.push(`${ruleName}-close ::= invoke-end bhws "\\n" | "<invoke|filter>" "\\n" filter-body`)
 
   return rules
 }
@@ -418,8 +416,11 @@ export function generateToolRules(
 // =============================================================================
 
 export function sanitizeRuleName(tagName: string): string {
-  // Remove non-alphanumeric characters and lowercase
-  return `${tagName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}tool`
+  return `t-${tagName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}`
+}
+
+export function sanitizeParamName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()
 }
 
 export function escapeGbnfChar(ch: string): string {

@@ -538,7 +538,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
             ],
           }
 
-        case 'ToolInputParseError':
+        case 'ToolParseError':
           return {
             ...fork,
             pendingResultItems: [
@@ -546,11 +546,14 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
               toToolErrorResult({
                 tagName: event.event.tagName,
                 status: 'error',
-                message: `Invalid tool input: ${event.event.error.detail}`,
+                message: `Invalid tool input: ${String((event.event.error as unknown as Record<string, unknown>).detail ?? event.event.error._tag)}`,
                 correctToolShape: event.event.correctToolShape,
               }),
             ],
           }
+
+        case 'StructuralParseError':
+          return fork
 
         default:
           return fork

@@ -24,7 +24,8 @@ export const ReplayProjection = Projection.defineForked<AppEvent, EngineState>()
       // ToolCallEvent is the inner union — forward relevant variants to foldReactorState
       switch (event.event._tag) {
         case 'ToolInputStarted':
-        case 'ToolInputParseError':
+        case 'ToolParseError':
+        case 'StructuralParseError':
         case 'ToolExecutionEnded':
           return foldEngineState(fork, event.event)
         default:
