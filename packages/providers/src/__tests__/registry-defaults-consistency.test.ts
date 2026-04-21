@@ -28,7 +28,7 @@ const MODEL_DEFAULTS: Record<string, Record<TestSlot, string>> = {
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
   'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
-  'magnitude': rest('glm-5.1'),
+  'magnitude': tiered('glm-5.1', 'kimi-k2.6', 'kimi-k2.6'),
 }
 
 const MODEL_OAUTH_DEFAULTS: Record<string, Record<TestSlot, string>> = {
@@ -75,6 +75,7 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
       'glm-5',
       'glm-5.1',
       'kimi-k2.5',
+      'kimi-k2.6',
       'minimax-m2.5',
       'minimax-m2.7',
     ])

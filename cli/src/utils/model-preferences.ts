@@ -22,7 +22,7 @@ export const MODEL_DEFAULTS: Record<string, Record<MagnitudeSlot, string>> = {
   'moonshotai': rest('kimi-k2.5'),
   'kimi-for-coding': rest('k2p5'),
   'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
-  'magnitude': tiered('glm-5.1', 'kimi-k2.5'),
+  'magnitude': tiered('glm-5.1', 'kimi-k2.6'),
 }
 
 /** OAuth-specific overrides */

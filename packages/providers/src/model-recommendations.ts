@@ -59,6 +59,7 @@ export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
   // Magnitude
   rule(/^glm-5\.1$/, ['lead'], 'magnitude'),
   rule(/^kimi-k2\.5$/, [...SUBAGENT_AND_BROWSER], 'magnitude'),
+  rule(/^kimi-k2\.6$/, [...SUBAGENT_AND_BROWSER], 'magnitude'),
 
   // Fireworks
   rule(/^accounts\/fireworks\/models\/glm-5p1$/, [...ALL_SLOTS], 'fireworks-ai'),
