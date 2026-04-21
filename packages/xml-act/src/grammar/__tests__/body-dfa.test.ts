@@ -153,9 +153,19 @@ describe('body DFA — trailing whitespace after close tag (tw0/tw1/tw2)', () =>
     v.passes(`\n<|think:alignment>\nhello\n<think|>  \n${YIELD}`)
   })
 
-  it('rejects close tag with three trailing spaces before newline', () => {
+  it('accepts close tag with three trailing spaces before newline', () => {
     const v = shellValidator()
-    v.rejects(`\n<|think:alignment>\nhello\n<think|>   \n${YIELD}`)
+    v.passes(`\n<|think:alignment>\nhello\n<think|>   \n${YIELD}`)
+  })
+
+  it('accepts close tag with four trailing spaces before newline', () => {
+    const v = shellValidator()
+    v.passes(`\n<|think:alignment>\nhello\n<think|>    \n${YIELD}`)
+  })
+
+  it('rejects close tag with five trailing spaces before newline', () => {
+    const v = shellValidator()
+    v.rejects(`\n<|think:alignment>\nhello\n<think|>     \n${YIELD}`)
   })
 })
 

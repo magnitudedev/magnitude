@@ -318,3 +318,28 @@ describe('Close tag spec: real-world examples', () => {
     expect(text).not.toContain('<invoke|>')
   })
 })
+
+// ---------------------------------------------------------------------------
+// SECTION: Close tag in backticks or without preceding newline inside think body
+// A think block discussing `<think|>` should NOT have its body cut off
+// ---------------------------------------------------------------------------
+
+describe('Close tag spec: <think|> mentioned inline in think body does not close the block', () => {
+  it('<think|> in backticks inside think body is preserved as text', () => {
+    const events = parseInput(inThink('The close tag syntax (e.g., `<think|>` instead of `<think|>`) is used to end blocks.'))
+    const text = lensText(events)
+    expect(text).toContain('`<think|>`')
+  })
+
+  it('<think|> not preceded by newline inside think body is preserved as text', () => {
+    const events = parseInput(inThink('The tag <think|> is the canonical close syntax for think blocks.'))
+    const text = lensText(events)
+    expect(text).toContain('<think|>')
+  })
+
+  it('<think|> preceded by newline DOES close the think block', () => {
+    const events = parseInput(inThink('Some reasoning here'))
+    const text = lensText(events)
+    expect(text).toBe('Some reasoning here\n')
+  })
+})

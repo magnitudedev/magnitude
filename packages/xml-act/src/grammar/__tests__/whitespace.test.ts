@@ -51,9 +51,19 @@ describe('whitespace redesign', () => {
       v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>  \n<invoke|>\n\n<|yield:user|>`)
     })
 
-    it('3 trailing spaces before newline is rejected', () => {
+    it('3 trailing spaces before newline passes', () => {
       const v = shellValidator()
-      v.rejects(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>   \n<invoke|>\n\n<|yield:user|>`)
+      v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>   \n<invoke|>\n\n<|yield:user|>`)
+    })
+
+    it('4 trailing spaces before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>    \n<invoke|>\n\n<|yield:user|>`)
+    })
+
+    it('5 trailing spaces before newline is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>     \n<invoke|>\n\n<|yield:user|>`)
     })
 
     it('1 trailing tab before newline passes', () => {
@@ -66,9 +76,19 @@ describe('whitespace redesign', () => {
       v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>\t\t\n<invoke|>\n\n<|yield:user|>`)
     })
 
-    it('3 trailing tabs before newline is rejected', () => {
+    it('3 trailing tabs before newline passes', () => {
       const v = shellValidator()
-      v.rejects(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>\t\t\t\n<invoke|>\n\n<|yield:user|>`)
+      v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>\t\t\t\n<invoke|>\n\n<|yield:user|>`)
+    })
+
+    it('4 trailing tabs before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>\t\t\t\t\n<invoke|>\n\n<|yield:user|>`)
+    })
+
+    it('5 trailing tabs before newline is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`\n<|invoke:shell>\n<|parameter:command>\nls -la\n<parameter|>\t\t\t\t\t\n<invoke|>\n\n<|yield:user|>`)
     })
   })
 
@@ -91,6 +111,86 @@ describe('whitespace redesign', () => {
     it('yield with trailing tab is rejected', () => {
       const v = shellValidator()
       v.rejects(`\n<|yield:user|>\t`)
+    })
+  })
+
+  describe('trailing whitespace after message close tag', () => {
+    it('no trailing whitespace passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|message:user>\nhello\n<message|>\n\n<|yield:user|>`)
+    })
+
+    it('1 trailing space before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|message:user>\nhello\n<message|> \n\n<|yield:user|>`)
+    })
+
+    it('2 trailing spaces before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|message:user>\nhello\n<message|>  \n\n<|yield:user|>`)
+    })
+
+    it('4 trailing spaces before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|message:user>\nhello\n<message|>    \n\n<|yield:user|>`)
+    })
+
+    it('5 trailing spaces before newline is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`\n<|message:user>\nhello\n<message|>     \n\n<|yield:user|>`)
+    })
+
+    it('4 trailing tabs before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|message:user>\nhello\n<message|>\t\t\t\t\n\n<|yield:user|>`)
+    })
+
+    it('5 trailing tabs before newline is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`\n<|message:user>\nhello\n<message|>\t\t\t\t\t\n\n<|yield:user|>`)
+    })
+
+    it('close tag followed by non-ws content does not close (treated as body, second close works)', () => {
+      const v = shellValidator()
+      // <message|>` does NOT close the message — backtick escapes back to body
+      // The second <message|>\n properly closes
+      v.passes(`\n<|message:user>\nhello\n<message|>\`more\n<message|>\n\n<|yield:user|>`)
+    })
+
+    it('close tag followed by non-ws without later close treats entire content as body', () => {
+      const v = shellValidator()
+      // <message|>` doesn't close — backtick escapes to body. Content including yield becomes body text.
+      // A second proper close is needed.
+      v.passes(`\n<|message:user>\nhello\n<message|>\`more\n<message|>\n\n<|yield:user|>`)
+    })
+  })
+
+  describe('trailing whitespace after think close tag', () => {
+    it('no trailing whitespace passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|think:alignment>\nreasoning\n<think|>\n\n<|yield:user|>`)
+    })
+
+    it('4 trailing spaces before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<|think:alignment>\nreasoning\n<think|>    \n\n<|yield:user|>`)
+    })
+
+    it('5 trailing spaces before newline is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`\n<|think:alignment>\nreasoning\n<think|>     \n\n<|yield:user|>`)
+    })
+
+    it('close tag followed by non-ws content does not close (treated as body, second close works)', () => {
+      const v = shellValidator()
+      // <think|>` does NOT close — backtick escapes back to body
+      // The second <think|>\n properly closes
+      v.passes(`\n<|think:alignment>\nreasoning\n<think|>\`more\n<think|>\n\n<|yield:user|>`)
+    })
+
+    it('close tag followed by non-ws without later close treats entire content as body', () => {
+      const v = shellValidator()
+      v.passes(`\n<|think:alignment>\nreasoning\n<think|>\`more\n<think|>\n\n<|yield:user|>`)
     })
   })
 

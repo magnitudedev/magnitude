@@ -311,6 +311,7 @@ export function generateBodyRules(prefix: string, tagName: string): string[] {
   const rules: string[] = []
   const n = tagName.length
   const s = (k: number) => `${prefix}-body-s${k}`
+  const tw = (k: number) => `${prefix}-body-tw${k}`
   const slashState = `${prefix}-body-sl`
   const pipeState = `${prefix}-body-pp`
 
@@ -336,21 +337,20 @@ export function generateBodyRules(prefix: string, tagName: string): string[] {
     rules.push(`${s(i + 1)} ::= ${esc} ${s(i + 2)} | "<" ${s(1)} | ${ccExclude} ${s(0)}`)
   }
 
-  // Trailing whitespace states after close tag '>'
-  const tw0 = `${prefix}-body-tw0`
-  const tw1 = `${prefix}-body-tw1`
-  const tw2 = `${prefix}-body-tw2`
-
   // s{n+1}: after full tagname — accept '|' (pipe variants) or '>' (no-pipe variants → trailing ws)
-  rules.push(`${s(n + 1)} ::= "|" ${pipeState} | ">" ${tw0} | "<" ${s(1)} | [^<|>] ${s(0)}`)
-
   // pipeState: after '<[/]tagname|' — accept '>' to close (→ trailing ws)
-  rules.push(`${pipeState} ::= ">" ${tw0} | "<" ${s(1)} | [^<>] ${s(0)}`)
+  rules.push(`${s(n + 1)} ::= "|" ${pipeState} | ">" ${tw(0)} | "<" ${s(1)} | [^<|>] ${s(0)}`)
+  rules.push(`${pipeState} ::= ">" ${tw(0)} | "<" ${s(1)} | [^<>] ${s(0)}`)
 
-  // tw0..tw2: trailing whitespace after close tag — 0-2 spaces/tabs then mandatory newline
-  rules.push(`${tw0} ::= [ \\t] ${tw1} | "\\n"`)
-  rules.push(`${tw1} ::= [ \\t] ${tw2} | "\\n"`)
-  rules.push(`${tw2} ::= "\\n"`)
+  // tw0..tw{MAX_TRAILING_WS}: trailing whitespace after close tag '>'
+  // Requires 0-N horizontal whitespace chars then mandatory \n to confirm close.
+  // Non-matching chars escape back to s0, treating the close tag as body content
+  // (e.g. <think|>` inside prose doesn't close the block).
+  const MAX_TRAILING_WS = 4
+  for (let i = 0; i < MAX_TRAILING_WS; i++) {
+    rules.push(`${tw(i)} ::= [ \\t] ${tw(i + 1)} | "\\n" | "<" ${s(1)} | [^ \\t\\n<] ${s(0)}`)
+  }
+  rules.push(`${tw(MAX_TRAILING_WS)} ::= "\\n" | "<" ${s(1)} | [^ \\t\\n<] ${s(0)}`)
 
   return rules
 }

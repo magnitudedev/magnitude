@@ -219,8 +219,13 @@ describe('lenient close tags — trailing whitespace', () => {
     v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls\n</parameter>  \n<invoke|>\n\n<|yield:user|>`)
   })
 
-  it('mode 3 parameter close with 3+ trailing spaces is rejected', () => {
+  it('mode 3 parameter close with 3 trailing spaces passes', () => {
     const v = shellValidator()
-    v.rejects(`\n<|invoke:shell>\n<|parameter:command>\nls\n<parameter>   \n<invoke|>\n\n<|yield:user|>`)
+    v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls\n<parameter>   \n<invoke|>\n\n<|yield:user|>`)
+  })
+
+  it('mode 3 parameter close with 5+ trailing spaces is rejected', () => {
+    const v = shellValidator()
+    v.rejects(`\n<|invoke:shell>\n<|parameter:command>\nls\n<parameter>     \n<invoke|>\n\n<|yield:user|>`)
   })
 })

@@ -476,6 +476,50 @@ describe('Grammar DFA leniency (generateBodyRules)', () => {
     return map
   }
 
+  describe('close tag only matches when followed by ws+newline (not mid-line)', () => {
+    it('tw0 has escape back to s0 for non-whitespace/non-newline chars', () => {
+      const rules = generateBodyRules('think', 'think')
+      const map = parseRules(rules)
+      const tw0 = map.get('think-body-tw0')
+      expect(tw0).toBeDefined()
+      // tw0 should allow falling back to s0 when the char after > is not ws/newline
+      // e.g. <think|>` should NOT close the block — backtick should escape to s0
+      expect(tw0).toContain('think-body-s0')
+    })
+
+    it('tw1 has escape back to s0 for non-whitespace/non-newline chars', () => {
+      const rules = generateBodyRules('think', 'think')
+      const map = parseRules(rules)
+      const tw1 = map.get('think-body-tw1')
+      expect(tw1).toBeDefined()
+      expect(tw1).toContain('think-body-s0')
+    })
+
+    it('tw2 has escape back to s0 for non-whitespace/non-newline chars', () => {
+      const rules = generateBodyRules('think', 'think')
+      const map = parseRules(rules)
+      const tw2 = map.get('think-body-tw2')
+      expect(tw2).toBeDefined()
+      expect(tw2).toContain('think-body-s0')
+    })
+
+    it('tw3 has escape back to s0 for non-whitespace/non-newline chars', () => {
+      const rules = generateBodyRules('think', 'think')
+      const map = parseRules(rules)
+      const tw3 = map.get('think-body-tw3')
+      expect(tw3).toBeDefined()
+      expect(tw3).toContain('think-body-s0')
+    })
+
+    it('tw4 has escape back to s0 for non-newline chars (max horizontal ws reached)', () => {
+      const rules = generateBodyRules('think', 'think')
+      const map = parseRules(rules)
+      const tw4 = map.get('think-body-tw4')
+      expect(tw4).toBeDefined()
+      expect(tw4).toContain('think-body-s0')
+    })
+  })
+
   it('generates rules for think body', () => {
     const rules = generateBodyRules('think', 'think')
     expect(rules.length).toBeGreaterThan(0)
