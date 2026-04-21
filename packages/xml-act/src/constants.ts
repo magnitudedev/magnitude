@@ -1,3 +1,13 @@
+// Known MACT structural tag names
+/** Tags that require newline enforcement (block-level elements) */
+export const TOP_LEVEL_TAGS: ReadonlySet<string> = new Set(['think', 'message', 'invoke', 'yield'])
+
+/** Tags that can appear as bare close `<name>` (Mode 3 leniency) */
+export const KNOWN_CLOSE_TAG_NAMES: ReadonlySet<string> = new Set(['think', 'message', 'invoke', 'parameter', 'filter', 'yield'])
+
+/** Tags that produce a stray-close error when unmatched */
+export const KNOWN_STRUCTURAL_TAGS: ReadonlySet<string> = new Set(['think', 'message', 'invoke'])
+
 // Yield target identifiers (used as the variant in <|yield:TARGET|>)
 export const YIELD_USER_TARGET = 'user'
 export const YIELD_INVOKE_TARGET = 'invoke'

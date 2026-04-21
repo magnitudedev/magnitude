@@ -16,7 +16,8 @@ import type {
   ParameterFrame,
   FilterFrame,
 } from './types'
-import { tokenRaw, resolveToken, KNOWN_STRUCTURAL_TAGS } from './resolve'
+import { tokenRaw, resolveToken } from './resolve'
+import { KNOWN_STRUCTURAL_TAGS } from '../constants'
 import { appendProse, appendMessage, appendThink, isAllWhitespace } from './content'
 import { openThink, closeThink } from './handlers/think'
 import { openMessage, closeMessage } from './handlers/message'

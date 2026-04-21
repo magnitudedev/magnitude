@@ -53,7 +53,7 @@ function isWhitespace(ch: string): boolean {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
 }
 
-const TOP_LEVEL_TAGS = new Set(['think', 'message', 'invoke', 'yield'])
+import { TOP_LEVEL_TAGS, KNOWN_CLOSE_TAG_NAMES } from './constants'
 
 const DEFAULT_TOKENIZER_OPTIONS = { toolKeyword: 'invoke' } as const
 
@@ -105,7 +105,7 @@ export function createTokenizer(
       return
     }
     flushContent()
-    onToken({ _tag: 'Close', name, pipe })
+    onToken({ _tag: 'Close', name, pipe, raw: activeTag!.raw })
     afterNewline = false
   }
 
@@ -323,19 +323,27 @@ export function createTokenizer(
         }
 
         if (ch === '>') {
-          // Lenient: close without pipe <name>
+          // Lenient: close without pipe <name> — only for known structural tags
+          if (!KNOWN_CLOSE_TAG_NAMES.has(tag.name)) {
+            failAsContent()
+            return
+          }
           emitClose(tag.name, undefined)
           activeTag = null
           return
         }
 
         if (isWhitespace(ch)) {
-          // Whitespace - lenient close
+          // Whitespace - lenient close — only for known structural tags
+          if (!KNOWN_CLOSE_TAG_NAMES.has(tag.name)) {
+            failAsContent()
+            return
+          }
           emitClose(tag.name, undefined)
           activeTag = null
           contentBuffer += ch
           if (ch === '\n') afterNewline = true
-      else if (ch !== ' ' && ch !== '\t') afterNewline = false
+          else if (ch !== ' ' && ch !== '\t') afterNewline = false
           return
         }
 

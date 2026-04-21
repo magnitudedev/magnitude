@@ -17,7 +17,7 @@ export type { DeepPaths, StreamingPartial }
  */
 export type Token =
   | { readonly _tag: 'Open'; readonly name: string; readonly variant?: string }
-  | { readonly _tag: 'Close'; readonly name: string; readonly pipe?: string }
+  | { readonly _tag: 'Close'; readonly name: string; readonly pipe?: string; readonly raw?: string }
   | { readonly _tag: 'SelfClose'; readonly name: string; readonly variant?: string }
   | { readonly _tag: 'Parameter'; readonly name: string }
   | { readonly _tag: 'ParameterClose' }

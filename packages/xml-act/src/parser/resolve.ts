@@ -6,8 +6,7 @@
 import type { Token } from '../types'
 import type { Frame } from './types'
 
-/** Structural tags that produce an error when appearing as stray closes */
-export const KNOWN_STRUCTURAL_TAGS: ReadonlySet<string> = new Set(['think', 'message', 'invoke'])
+import { KNOWN_STRUCTURAL_TAGS } from '../constants'
 
 /**
  * Reconstruct the raw text of a token for appending as literal content
@@ -18,7 +17,7 @@ export function tokenRaw(token: Token): string {
     case 'Open':
       return `<|${token.name}${token.variant ? ':' + token.variant : ''}>`
     case 'Close':
-      return `<${token.name}${token.pipe ? '|' + token.pipe : '|'}>`
+      return token.raw ?? `<${token.name}${token.pipe ? '|' + token.pipe : '|'}>`
     case 'SelfClose':
       return `<|${token.name}${token.variant ? ':' + token.variant : ''}|>`
     case 'Parameter':
