@@ -151,12 +151,13 @@ export const spawnWorkerTool = defineTool({
   }),
   outputSchema: Schema.Struct({
     id: Schema.String,
+    title: Schema.String,
   }),
   errorSchema: TaskToolErrorSchema,
   execute: (input, _ctx) =>
     Effect.gen(function* () {
       const execManager = yield* ExecutionManager
-      yield* runDirective({
+      const result = yield* runDirective({
         kind: 'spawn-worker',
         id: input.id,
         message: input.message,
@@ -172,7 +173,12 @@ export const spawnWorkerTool = defineTool({
             taskId: params.taskId,
           }),
       })
-      return { id: input.id }
+
+      if ('title' in result) {
+        return { id: input.id, title: result.title }
+      }
+
+      return { id: input.id, title: '' }
     }),
   label: (input) => input.id ? `Spawning worker for ${input.id}` : 'Spawning worker…',
 })

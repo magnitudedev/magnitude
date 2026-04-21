@@ -29,7 +29,6 @@ import { catalog, type ToolKey } from '../catalog'
 import type { ToolState } from '../tools/tool-handle'
 import { ToolStateProjection } from './tool-state'
 
-
 // =============================================================================
 // Types
 // =============================================================================
@@ -1132,18 +1131,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       if (parentForkId === null) {
         const withBlock = ensureThinkBlock(nextParentState, value.timestamp)
-        const step: SubagentStartedStep = {
-          id: generateId(),
-          type: 'subagent_started',
-          subagentType: value.role,
-          subagentId: value.agentId,
-          title: value.name,
-          resumed: false,
-        }
-        nextParentState = {
-          ...withBlock.fork,
-          messages: addStepToThinkBlock(withBlock.fork.messages, withBlock.thinkBlockId, step),
-        }
+        nextParentState = withBlock.fork
       }
 
       return {

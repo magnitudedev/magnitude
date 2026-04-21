@@ -5,11 +5,13 @@ export interface SpawnWorkerState extends BaseState {
   toolKey: 'spawnWorker'
   id?: string
   message?: string
+  title?: string
 }
 
 const initial: Omit<SpawnWorkerState, 'phase' | 'toolKey'> = {
   id: undefined,
   message: undefined,
+  title: undefined,
 }
 
 export const spawnWorkerModel = defineStateModel('spawnWorker', spawnWorkerTool)({
@@ -34,7 +36,7 @@ export const spawnWorkerModel = defineStateModel('spawnWorker', spawnWorkerTool)
       case 'ToolExecutionEnded': {
         switch (event.result._tag) {
           case 'Success':
-            return { ...state, phase: 'completed', id: event.result.output.id }
+            return { ...state, phase: 'completed', id: event.result.output.id, title: event.result.output.title }
           case 'Error':
             return { ...state, phase: 'error' }
           case 'Rejected':

@@ -113,7 +113,7 @@ export const catalog = defineCatalog({
 
   createTask: { tool: createTaskTool, state: createTaskModel, display: false },
   updateTask: { tool: updateTaskTool, state: updateTaskModel, display: false },
-  spawnWorker: { tool: spawnWorkerTool, state: spawnWorkerModel, display: false },
+  spawnWorker: { tool: spawnWorkerTool, state: spawnWorkerModel },
   killWorker: { tool: killWorkerTool, state: killWorkerModel, display: false },
   skill: { tool: skillTool, state: skillActivationModel },
 } as const)

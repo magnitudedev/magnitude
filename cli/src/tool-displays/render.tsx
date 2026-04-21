@@ -11,6 +11,7 @@ import { webFetchDisplay } from './displays/web-fetch'
 import { skillDisplay } from './displays/skill'
 import { browserActionDisplay } from './displays/browser-action'
 import { defaultDisplay } from './displays/default'
+import { spawnWorkerDisplay } from './displays/spawn-worker'
 
 type RenderableToolState = ToolState
 
@@ -25,6 +26,7 @@ export function renderToolStep(state: RenderableToolState, common: CommonToolPro
     case 'webSearch': return webSearchDisplay.render({ state, ...common })
     case 'webFetch': return webFetchDisplay.render({ state, ...common })
     case 'skill': return skillDisplay.render({ state, ...common })
+    case 'spawnWorker': return spawnWorkerDisplay.render({ state, ...common })
     case 'click':
     case 'doubleClick':
     case 'rightClick':
@@ -54,6 +56,7 @@ export function summarizeToolStep(state: RenderableToolState): string {
     case 'webSearch': return webSearchDisplay.summary(state)
     case 'webFetch': return webFetchDisplay.summary(state)
     case 'skill': return skillDisplay.summary(state)
+    case 'spawnWorker': return spawnWorkerDisplay.summary(state)
     case 'click':
     case 'doubleClick':
     case 'rightClick':

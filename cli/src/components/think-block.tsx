@@ -88,7 +88,7 @@ const WorkerKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'suba
   )
 }
 
-function buildSummary(steps: readonly { type: string; toolKey?: ToolKey }[]): string {
+function buildSummary(steps: readonly { type: string; toolKey?: ToolKey; state?: { phase?: string } }[]): string {
   let webSearches = 0
   let commands = 0
   let reads = 0
@@ -105,6 +105,10 @@ function buildSummary(steps: readonly { type: string; toolKey?: ToolKey }[]): st
   let workerKilled = 0
   for (const step of steps) {
     if (step.type === 'subagent_started') {
+      workerStarted++
+      continue
+    }
+    if (step.type === 'tool' && step.toolKey === 'spawnWorker' && step.state?.phase === 'completed') {
       workerStarted++
       continue
     }

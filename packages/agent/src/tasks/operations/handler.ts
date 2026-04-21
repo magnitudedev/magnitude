@@ -17,6 +17,7 @@ export interface TaskDirectiveContext {
 
 export type TaskDirectiveResult =
   | { success: true }
+  | { success: true; title: string }
   | { success: false; code: string; error: string }
 
 export type TaskDirectiveErrorResult = { success: false; code: string; error: string }
@@ -29,7 +30,7 @@ export type TaskDirective<R = never> =
   | SpawnWorkerDirective<R>
   | KillWorkerDirective
 
-export type HandleTaskDirectiveResult = TaskDirectiveErrorResult | { success: true } | MessageDirectiveSuccess
+export type HandleTaskDirectiveResult = TaskDirectiveErrorResult | { success: true } | { success: true; title: string } | MessageDirectiveSuccess
 
 export const handleTaskDirective = <R = never>(
   directive: TaskDirective<R>,

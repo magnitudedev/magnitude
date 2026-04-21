@@ -28,7 +28,7 @@ export const handleSpawnWorkerDirective = <R>(
   directive: SpawnWorkerDirective<R>,
   context: TaskDirectiveContext,
 ): Effect.Effect<
-  | { readonly success: true }
+  | { readonly success: true; readonly title: string }
   | { readonly success: false; readonly code: string; readonly error: string },
   never,
   TaskGraphStateReaderTag
@@ -90,5 +90,5 @@ export const handleSpawnWorkerDirective = <R>(
       replacedWorker,
     }, { forkId: parentForkId, timestamp, graph: { tasks: new Map() } }))
 
-    return { success: true } as const
+    return { success: true, title: task.title } as const
   })
