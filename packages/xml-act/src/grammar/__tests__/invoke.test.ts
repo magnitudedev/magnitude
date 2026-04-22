@@ -155,9 +155,9 @@ describe('invoke / tool call blocks', () => {
       v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>    \n</invoke>\n${YIELD}`)
     })
 
-    // Under deep confirmation, excess whitespace flows to tw-nl and waits for
-    // a valid continuation. </invoke> confirms the close.
-    it('5 trailing spaces after </parameter> is accepted (deep confirmation)', () => {
+    // Under greedy last-match, whitespace after close tag is valid content
+    // or structural whitespace — both paths are live.
+    it('5 trailing spaces after </parameter> is accepted (greedy)', () => {
       const v = shellValidator()
       v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>     \n</invoke>\n${YIELD}`)
     })

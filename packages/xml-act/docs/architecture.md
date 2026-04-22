@@ -5,13 +5,13 @@ xml-act is a streaming parser for LLM agent output in a constrained XML response
 ## Pipeline
 
 ```
-Grammar (GBNF) → Tokenizer (streaming XML) → Parser (handler pattern) → Events
+Grammar (GBNF) --> Tokenizer (streaming XML) --> Parser (handler pattern) --> Events
 ```
 
 Each layer has a single responsibility:
 
 1. **Grammar** — constrains LLM output during inference so every generated turn conforms to the format. Targets GBNF for llama.cpp and compatible providers.
-2. **Tokenizer** — streaming character-level XML tokenizer. Emits `Open`, `Close`, `SelfClose`, and `Content` tokens. Handles attribute parsing, CDATA, and close-tag lookahead confirmation.
+2. **Tokenizer** — streaming character-level XML tokenizer. Emits `Open`, `Close`, `SelfClose`, and `Content` tokens. Handles attribute parsing, CDATA, and close-tag confirmation.
 3. **Parser** — converts token stream into structured events using a typed handler pattern. Manages a frame stack via a stack machine.
 4. **Events** — `LensStart`/`LensEnd`, `MessageStart`/`MessageEnd`, `ToolInputStarted`/`ToolInputFieldChunk`, `ProseEnd`, `TurnEnd`, etc.
 
@@ -19,6 +19,7 @@ Each layer has a single responsibility:
 
 A turn consists of reasoning blocks, then messages and tool invocations, then a yield:
 
+```xml
 <reason about="analysis">thinking here</reason>
 <message to="user">response text</message>
 <invoke tool="shell">
@@ -26,20 +27,42 @@ A turn consists of reasoning blocks, then messages and tool invocations, then a 
   <filter>$.stdout</filter>
 </invoke>
 <yield_user/>
+```
 
 Phase ordering (reasons before messages/invocations) is enforced structurally by the grammar — the model cannot produce a reasoning block after a message under constrained decoding.
 
 ## Grammar
 
-The grammar uses a **chain architecture** rather than a loop. Each tag's body DFA terminates by flowing into shared continuation rules for the next element, rather than returning to an outer loop. This solves the close-tag confirmation problem: when `<` confirms a close tag, that `<` has been consumed, so the continuation rules match the next tag name without its leading `<`.
+The grammar uses two strategies for close-tag handling, chosen per tag type:
 
-Close-tag confirmation uses bounded lookahead — after matching `</tag>`, the grammar enters trailing-whitespace states that confirm on `\n` or `<`, reject on anything else, with a bounded whitespace window. See [grammar.md](grammar.md) for details.
+### Eager Confirmation (reason, message)
+
+Uses a **chain architecture** with bounded lookahead. Each tag's body DFA terminates by flowing into shared continuation rules for the next element. When `<` confirms a close tag, that `<` has been consumed, so continuation rules match the next tag name without its leading `<`. When confirmation is via newline, continuation rules expect the full tag.
+
+Close-tag confirmation uses bounded lookahead — after matching a close tag, the grammar enters trailing-whitespace states that confirm on `
+` or `<`, reject on anything else, with a bounded whitespace window.
+
+### Greedy Last-Match (parameter, filter)
+
+Uses **recursive repetition** to achieve parallel-state behavior within standard GBNF:
+
+```gbnf
+param-body ::= buc (CLOSE buc)* CLOSE continuation
+buc        ::= ([^<] | "<" [^/] | "</" [^p] | ...)*
+```
+
+At each close tag, the GBNF engine offers both "content" and "structural close" paths. The model's token choice selects the interpretation. The last close tag is structural — greedy last-match emerges naturally from how the model generates. No lookahead, no confirmation windows, no state explosion. The CFG stack handles unbounded depth.
+
+This eliminates false commits for parameter and filter bodies, which are the most likely to contain their own close tags (shell commands, code, XML output).
+
+See [grammar.md](grammar.md) for full details.
 
 ## Tokenizer
 
 A streaming character-level state machine (`tokenizer.ts`). Key features:
 
-- **Close-tag lookahead confirmation** — mirrors the grammar's trailing-whitespace mechanism exactly. After `</tag>`, enters `pendingClose` state, buffers up to 4 horizontal whitespace characters, confirms on `\n` or `<`, rejects otherwise. See [lenience.md](lenience.md).
+- **Close-tag confirmation** — for `reason`/`message` close tags: mirrors the grammar's eager confirmation. After a close tag, enters `pendingClose` state, buffers up to 4 horizontal whitespace characters, confirms on `
+` or `<`, rejects otherwise. For `parameter`/`filter` close tags: uses deep confirmation with continuation-prefix matching, buffering whitespace and validating the next structural element before committing. See [lenience.md](lenience.md).
 - **Attribute parsing** — 7-phase parser for `key="value"`, `key='value'`, `key=value`, and boolean attributes.
 - **CDATA** — `...` emitted as Content tokens, chunk-boundary safe.
 - **Chunk-boundary safety** — `pendingLt` for `<` at boundaries, `pendingClose` across boundaries.
@@ -65,7 +88,7 @@ VALID_CHILDREN = {
   invoke:    ['parameter', 'filter'],
   reason:    [],
   message:   [],
-  parameter: [],
+  parameter:    [],
   filter:    [],
 }
 ```
@@ -102,7 +125,7 @@ The parser emits events consumed by the turn engine:
 | `grammar/grammar-builder.ts` | GBNF grammar generation |
 | `tokenizer.ts` | Streaming XML tokenizer |
 | `nesting.ts` | Shared valid-children constant |
-| `parser/resolve.ts` | Token → handler resolution |
+| `parser/resolve.ts` | Token -> handler resolution |
 | `parser/dispatch.ts` | Parser loop |
 | `parser/handler.ts` | Handler type definitions |
 | `parser/handlers/` | Per-tag handler implementations |

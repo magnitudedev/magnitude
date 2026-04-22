@@ -285,26 +285,16 @@ export class GrammarBuilder {
       confirmRule: 'turn-next-post',
       confirmNoLtRule: 'turn-next-post-no-lt',
     }
-    const invokeCtx: BodyContext = {
-      confirmRule: 'invoke-next',
-      confirmNoLtRule: 'invoke-next-no-lt',
-    }
-
     for (const rule of generateBodyRules('reason-body', 'reason', lensCtx)) {
       addRule(rules, rule)
     }
     for (const rule of generateBodyRules('msg-body', 'message', postCtx)) {
       addRule(rules, rule)
     }
-    const invokeContinuations: FreeBodyContinuations = {
-      parameterBody: 'param-body-s0',
-      filterBody: 'filter-body-s0',
-      parentClose: 'turn-next-post',
-    }
-    for (const rule of generateFreeBodyRules('param-body', 'parameter', invokeCtx, invokeContinuations)) {
+    for (const rule of generateRecursiveBodyRules('param-body', 'parameter', 'invoke-next')) {
       addRule(rules, rule)
     }
-    for (const rule of generateFreeBodyRules('filter-body', 'filter', invokeCtx, invokeContinuations)) {
+    for (const rule of generateRecursiveBodyRules('filter-body', 'filter', 'invoke-next')) {
       addRule(rules, rule)
     }
   }
@@ -487,147 +477,62 @@ export function generateBodyRules(prefix: string, tagName: string, context: Body
  * Continuation targets for free body rules — where to hand off after
  * each confirmed continuation prefix.
  */
-export interface FreeBodyContinuations {
-  /** Rule for new parameter body (after matching <parameter name="...">). Always 'param-body-s0'. */
-  readonly parameterBody: string
-  /** Rule for new filter body (after matching <filter>). Always 'filter-body-s0'. */
-  readonly filterBody: string
-  /** Rule after parent invoke close (after matching </invoke>). e.g. 'turn-next-post'. */
-  readonly parentClose: string
-}
+// =============================================================================
+// Recursive Body Rule Generation (parameter, filter)
+// =============================================================================
 
-export function generateFreeBodyRules(prefix: string, tagName: string, context: BodyContext, continuations: FreeBodyContinuations): string[] {
+/**
+ * Generate recursive body rules using the greedy last-match pattern.
+ *
+ * Instead of a DFA with close-tag confirmation states, the body is defined as:
+ *   body ::= buc (CLOSE buc)* CLOSE continuation
+ *
+ * Where `buc` (body-until-close) matches any string NOT containing the close tag.
+ * The `*` repetition allows the close tag to appear as content zero or more times.
+ * The final close tag chains to the continuation rule.
+ *
+ * At each close tag, the GBNF engine offers both paths (content vs structural)
+ * and the model's token choice selects the interpretation. This achieves
+ * greedy last-match: the last close tag is structural, all earlier ones are content.
+ *
+ * @param prefix          Rule name prefix, e.g. "param-body"
+ * @param tagName         The close tag name, e.g. "parameter"
+ * @param continuationRule Rule to chain to after the structural close, e.g. "invoke-next"
+ */
+export function generateRecursiveBodyRules(prefix: string, tagName: string, continuationRule: string): string[] {
   const lines: string[] = []
-  const L = tagName.length
-  const MAX_TW = 4
+  const closeTag = '</' + tagName + '>'
+  const closeChars = closeTag.split('')
 
-  // Entry alias
-  lines.push(`${prefix} ::= ${prefix}-s0`)
+  // Build BUC (body-until-close) exclusion alternatives
+  // Each alternative matches a prefix of the close tag followed by a char that breaks the pattern
+  const alts: string[] = []
 
-  // s0: base content state
-  lines.push(`${prefix}-s0 ::= [^<] ${prefix}-s0 | "<" ${prefix}-s1`)
+  // First alt: any char that doesn't start the close tag
+  alts.push(`[^${escapeGbnfCharClass(closeChars[0])}]`)
 
-  // s1: saw '<'
-  lines.push(`${prefix}-s1 ::= "/" ${prefix}-sl | "<" ${prefix}-s1 | [^/<] ${prefix}-s0`)
-
-  // sl through gt: close-tag matching chain (same as generateBodyRules)
-  const fc = tagName[0]
-  const fcEsc = escapeGbnfCharClass(fc)
-
-  if (L === 1) {
-    const gtState = `${prefix}-gt`
-    lines.push(`${prefix}-sl ::= "${fc}" ${gtState} | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
-    lines.push(`${gtState} ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
-  } else {
-    lines.push(`${prefix}-sl ::= "${fc}" ${prefix}-s2 | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
-
-    for (let i = 2; i <= L; i++) {
-      const ch = tagName[i - 1]
-      const chEsc = escapeGbnfCharClass(ch)
-      const nextState = i === L ? `${prefix}-gt` : `${prefix}-s${i + 1}`
-      lines.push(`${prefix}-s${i} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
-    }
-
-    lines.push(`${prefix}-gt ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  // Subsequent alts: match prefix of close tag, then a char that breaks it
+  let pfx = ''
+  for (let i = 0; i < closeChars.length - 1; i++) {
+    pfx += closeChars[i]
+    const nextChar = closeChars[i + 1]
+    const nextCharEsc = escapeGbnfCharClass(nextChar)
+    alts.push(`"${pfx}" [^${nextCharEsc}]`)
   }
 
-  // tw0..tw{MAX_TW}: bounded horizontal whitespace (prevents model whitespace loops)
-  // Instead of confirming on \n or <, transition to deeper confirmation states
-  for (let i = 0; i <= MAX_TW; i++) {
-    const stateName = `${prefix}-tw${i}`
-    if (i < MAX_TW) {
-      lines.push(
-        `${stateName} ::= [ \\t] ${prefix}-tw${i + 1}` +
-        ` | "\\n" ${prefix}-tw-nl` +
-        ` | "<" ${prefix}-tw-lt` +
-        ` | [^ \\t\\n<] ${prefix}-s0`
-      )
-    } else {
-      // Final tw state: excess horizontal whitespace transitions to tw-nl
-      // (unbounded whitespace buffering) instead of rejecting back to s0.
-      // This allows arbitrary whitespace between close tag and continuation.
-      lines.push(
-        `${stateName} ::= [ \\t] ${prefix}-tw-nl` +
-        ` | "\\n" ${prefix}-tw-nl` +
-        ` | "<" ${prefix}-tw-lt` +
-        ` | [^ \\t\\n<] ${prefix}-s0`
-      )
-    }
-  }
+  // BUC rule: match zero or more safe sequences
+  lines.push(`${prefix}-buc ::= (${alts.join(' | ')})*`)
 
-  // tw-nl: buffer arbitrary whitespace until < appears or reject
-  lines.push(
-    `${prefix}-tw-nl ::= [ \\t\\n] ${prefix}-tw-nl` +
-    ` | "<" ${prefix}-tw-lt` +
-    ` | [^ \\t\\n<] ${prefix}-s0`
-  )
+  // Close tag literal — escaped for GBNF
+  const closeLiteral = `"${closeTag}"`
 
-  // tw-lt: after < — branch on first char to start continuation prefix matching
-  // p -> parameter continuation
-  // f -> filter continuation
-  // / -> invoke close continuation
-  // < -> new tag start (back to s1)
-  // anything else -> reject to s0
-  lines.push(
-    `${prefix}-tw-lt ::= "p" ${prefix}-cp1` +
-    ` | "f" ${prefix}-cf1` +
-    ` | "/" ${prefix}-ci1` +
-    ` | "<" ${prefix}-s1` +
-    ` | [^pf/<] ${prefix}-s0`
-  )
-
-  // --- Parameter continuation: match "arameter" then space ---
-  const paramRest = 'arameter'
-  for (let i = 0; i < paramRest.length; i++) {
-    const ch = paramRest[i]
-    const chEsc = escapeGbnfCharClass(ch)
-    const state = `${prefix}-cp${i + 1}`
-    const nextState = i < paramRest.length - 1
-      ? `${prefix}-cp${i + 2}`
-      : `${prefix}-cp-end`
-    lines.push(`${state} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
-  }
-  // cp-end: matched full "parameter", next must be space to confirm
-  // Space starts param-attrs (' name="..."')
-  // After space, hand off to: 'name=\\"" quoted-value "\\"" ">" param-body-s0'
-  lines.push(
-    `${prefix}-cp-end ::= " " ${prefix}-cp-attr` +
-    ` | "<" ${prefix}-s1` +
-    ` | [^ <] ${prefix}-s0`
-  )
-  // cp-attr: confirmed parameter open — match rest of attrs then new parameter body
-  lines.push(`${prefix}-cp-attr ::= "name=\\"" quoted-value "\\"" ">" ${continuations.parameterBody}`)
-
-  // --- Filter continuation: match "ilter>" ---
-  const filterRest = 'ilter'
-  for (let i = 0; i < filterRest.length; i++) {
-    const ch = filterRest[i]
-    const chEsc = escapeGbnfCharClass(ch)
-    const state = `${prefix}-cf${i + 1}`
-    const nextState = i < filterRest.length - 1
-      ? `${prefix}-cf${i + 2}`
-      : `${prefix}-cf-end`
-    lines.push(`${state} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
-  }
-  // cf-end: matched "filter", next must be ">" to confirm -> enter filter body
-  lines.push(`${prefix}-cf-end ::= ">" ${continuations.filterBody} | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
-
-  // --- Invoke close continuation: match "invoke>" ---
-  const invokeRest = 'invoke'
-  for (let i = 0; i < invokeRest.length; i++) {
-    const ch = invokeRest[i]
-    const chEsc = escapeGbnfCharClass(ch)
-    const state = `${prefix}-ci${i + 1}`
-    const nextState = i < invokeRest.length - 1
-      ? `${prefix}-ci${i + 2}`
-      : `${prefix}-ci-end`
-    lines.push(`${state} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
-  }
-  // ci-end: matched "/invoke", next must be ">" to confirm -> exit to top level
-  lines.push(`${prefix}-ci-end ::= ">" ${continuations.parentClose} | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  // Entry point: buc, then zero or more (close + buc), then final close + continuation
+  lines.push(`${prefix}-s0 ::= ${prefix}-buc (${closeLiteral} ${prefix}-buc)* ${closeLiteral} ${continuationRule}`)
 
   return lines
 }
+
+// generateFreeBodyRules removed — replaced by generateRecursiveBodyRules above.
 
 // =============================================================================
 // Utilities
