@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import workerPromptRaw from './prompts/worker.txt' with { type: 'text' }
 import { compilePromptTemplate } from '../prompts/system-prompt'
 import { catalog } from '../catalog'
-import { allowAll } from './policy'
+import { denyForbiddenCommands, denyMutatingGit, denyWritesOutside, denyMassDestructiveIn, allowAll } from './policy'
 import type { PolicyContext } from './types'
 
 const turnLens = defineThinkingLens({
@@ -54,6 +54,10 @@ export const workerRole = defineRole<typeof tools, 'worker', PolicyContext>({
   observables: [],
 
   policy: [
+    denyForbiddenCommands(),
+    denyMutatingGit(),
+    denyWritesOutside((ctx: PolicyContext) => [ctx.cwd, ctx.workspacePath, join(homedir(), '.magnitude')]),
+    denyMassDestructiveIn(() => [join(homedir(), '.magnitude')]),
     allowAll(),
   ],
 
