@@ -3,6 +3,7 @@ import { Effect, Stream } from 'effect'
 import type { BoundModel } from './bound-model'
 import { Model, type ModelCosts } from './model'
 import { ModelConnection } from './model-connection'
+import { TraceEmitter } from '../resolver/tracing'
 import {
   CodingAgentChat,
   SimpleChat,
@@ -82,6 +83,8 @@ function getLastCall(bound: BoundModel) {
   return calls.at(-1)!
 }
 
+const mockTraceEmitter = { emit: () => Effect.void, debug: false }
+
 describe('model-function codex request mapping', () => {
   it('maps OpenAI OAuth Codex systemPrompt into providerOptions.instructions + store false', async () => {
     const bound = makeModel('openai', 'gpt-5.3-codex', 'oauth')
@@ -108,7 +111,7 @@ describe('model-function codex request mapping', () => {
       SimpleChat.execute(bound, {
         systemPrompt: 'COPILOT SYSTEM',
         messages: [{ role: 'user', content: ['hi'] }],
-      }),
+      }).pipe(Effect.provideService(TraceEmitter, mockTraceEmitter)),
     )
     const call = getLastCall(bound)
     expect(call.args[2]).toBe(false)
@@ -122,7 +125,7 @@ describe('model-function codex request mapping', () => {
       CodingAgentCompact.execute(bound, {
         systemPrompt: 'SYSTEM',
         messages: [{ role: 'user', content: ['hello'] }],
-      }),
+      }).pipe(Effect.provideService(TraceEmitter, mockTraceEmitter)),
     )
     const call = getLastCall(bound)
     expect(call.args[3]).toBe(true)
@@ -135,7 +138,7 @@ describe('model-function codex request mapping', () => {
       AutopilotContinuation.execute(bound, {
         systemPrompt: 'AUTO',
         messages: [{ role: 'user', content: ['go'] }],
-      }),
+      }).pipe(Effect.provideService(TraceEmitter, mockTraceEmitter)),
     )
     const call = getLastCall(bound)
     expect(call.args[3]).toBe(false)

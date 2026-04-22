@@ -13,6 +13,7 @@ export class TraceEmitter extends Context.Tag('TraceEmitter')<
   TraceEmitter,
   {
     readonly emit: (trace: TraceInput) => Effect.Effect<void>
+    readonly debug: boolean
   }
 >() {}
 
@@ -24,6 +25,7 @@ export class TracePersister extends Context.Tag('TracePersister')<
   TracePersister,
   {
     readonly emit: (trace: TraceData) => Effect.Effect<void>
+    readonly debug: boolean
   }
 >() {}
 
@@ -33,6 +35,7 @@ export class TracePersister extends Context.Tag('TracePersister')<
 export function makeTracePersister(cb: (trace: TraceData) => void): Layer.Layer<TracePersister> {
   return Layer.succeed(TracePersister, {
     emit: (trace) => Effect.sync(() => cb(trace)),
+    debug: true,
   })
 }
 
@@ -41,8 +44,8 @@ export function makeTracePersister(cb: (trace: TraceData) => void): Layer.Layer<
  */
 export function makeNoopTracer(): Layer.Layer<TraceEmitter | TracePersister> {
   return Layer.mergeAll(
-    Layer.succeed(TraceEmitter, { emit: () => Effect.void }),
-    Layer.succeed(TracePersister, { emit: () => Effect.void }),
+    Layer.succeed(TraceEmitter, { emit: () => Effect.void, debug: false }),
+    Layer.succeed(TracePersister, { emit: () => Effect.void, debug: false }),
   )
 }
 
@@ -56,12 +59,13 @@ export interface TraceStore {
 export function makeTestTracer(): { layer: Layer.Layer<TraceEmitter | TracePersister>; store: TraceStore } {
   const store: TraceStore = { traces: [] }
   const layer = Layer.mergeAll(
-    Layer.succeed(TraceEmitter, { emit: () => Effect.void }),
+    Layer.succeed(TraceEmitter, { emit: () => Effect.void, debug: false }),
     Layer.succeed(TracePersister, {
       emit: (trace: TraceData) =>
         Effect.sync(() => {
           store.traces.push(trace)
         }),
+      debug: true,
     }),
   )
   return { layer, store }

@@ -354,6 +354,7 @@ export const PROVIDERS: ProviderDefinition[] = [
         reasoningEffort: (modelId) => ({
           reasoning_effort: modelId.toLowerCase().includes('minimax') ? 'low' : 'none',
         }),
+        logprobs: (enabled, topK = 5) => enabled ? { logprobs: true, top_logprobs: topK } : {},
         staticOptions: { stream_options: { include_usage: true } },
       },
     }),

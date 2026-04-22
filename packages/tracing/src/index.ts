@@ -3,6 +3,7 @@ export type {
   ModelSlot, CallUsage, CollectorData,
   TraceInput, TraceData, AgentTrace, AgentTraceMeta,
   TraceSessionMeta,
+  TopLogprob, TokenWithLogprob,
 } from './types'
 
 // Emission

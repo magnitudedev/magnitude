@@ -21,6 +21,7 @@ export function buildOpenAIGenericOptions(
   stopSeqs: string[],
   maxTokens: number | undefined,
   grammar: string | undefined,
+  debug: boolean = false,
 ): OpenAIGenericOptions | undefined {
   const authFields = resolveOpenAIGenericAuth(protocol.authStrategy, auth)
   if (authFields === undefined) return undefined
@@ -36,6 +37,7 @@ export function buildOpenAIGenericOptions(
     ...(stopSeqs.length > 0 ? caps.stopSequences?.(stopSeqs) ?? {} : {}),
     ...(grammar ? caps.grammar?.(grammar) ?? {} : {}),
     ...(caps.reasoningEffort?.(modelId) ?? {}),
+    ...(caps.logprobs?.(debug, 5) ?? {}),
     ...(caps.staticOptions ?? {}),
   }
 

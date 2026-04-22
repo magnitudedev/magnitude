@@ -1,5 +1,7 @@
 <script lang="ts">
-  import type { AgentTrace } from '../types'
+  import type { AgentTrace, TokenWithLogprob } from '../types'
+  import TokenRenderer from './TokenRenderer.svelte'
+  import LogprobTooltip from './LogprobTooltip.svelte'
 
   let { trace }: { trace: AgentTrace } = $props()
 
@@ -7,6 +9,9 @@
   let showInput = $state(true)
   let showOutput = $state(true)
   let expandedItems = $state<Set<number>>(new Set())
+  let hoveredToken = $state<TokenWithLogprob | null>(null)
+  let tooltipX = $state(0)
+  let tooltipY = $state(0)
 
   function toggleItem(idx: number) {
     const next = new Set(expandedItems)
@@ -177,6 +182,11 @@
       return items.length > 0 ? items.length : null
     }
     return null
+  }
+
+  function hasLogprobs(): boolean {
+    const lp = trace.response.logprobs
+    return Array.isArray(lp) && lp.length > 0
   }
 </script>
 
@@ -378,7 +388,17 @@
         {:else}
           <!-- Raw output text -->
           <div class="p-3">
-            {#if trace.response.rawOutput}
+            {#if hasLogprobs()}
+              <TokenRenderer
+                tokens={trace.response.logprobs!}
+                onHover={(token, _idx, e) => {
+                  hoveredToken = token
+                  tooltipX = e.clientX + 12
+                  tooltipY = e.clientY + 12
+                }}
+                onLeave={() => hoveredToken = null}
+              />
+            {:else if trace.response.rawOutput}
               <pre class="text-xs font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-words overflow-x-auto max-h-[600px] overflow-y-auto">{trace.response.rawOutput}</pre>
             {:else if trace.response.rawBody}
               <pre class="text-xs font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-words overflow-x-auto max-h-[600px] overflow-y-auto">{JSON.stringify(trace.response.rawBody, null, 2)}</pre>
@@ -391,3 +411,7 @@
     {/if}
   </div>
 </div>
+
+{#if hoveredToken}
+  <LogprobTooltip token={hoveredToken} x={tooltipX} y={tooltipY}/>
+{/if}

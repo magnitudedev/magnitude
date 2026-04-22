@@ -2,7 +2,7 @@ import { Effect, Stream, Schedule, Duration, Scope, Exit, Option, Sink, Cause } 
 import type { Model } from '../model/model'
 import type { ModelConnection } from '../model/model-connection'
 import type { InferenceConfig } from '../model/inference-config'
-import type { ExecutableDriver } from '../drivers/types'
+import type { ExecutableDriver, DriverRequest } from '../drivers/types'
 import type { BamlFunctionName, BamlResult, BamlStreamFunctionName } from '../drivers/baml-types'
 import type { BoundModel, CallLevelOptions, ChatStream, CompleteOptions, CompleteResult, ModelFunctionDef, StreamOptions } from '../model/bound-model'
 import type { CallUsage } from '../state/provider-state'
@@ -11,6 +11,8 @@ import type { ProviderOptions } from '../types'
 import { logger } from '@magnitudedev/logger'
 import type { ModelError } from '../errors/model-error'
 import { isRetryableError } from '../errors/classify-error'
+import { parseLogprobsFromSSE, parseLogprobsFromCompleteBody } from '../util/logprob-parser'
+import type { TokenWithLogprob } from '@magnitudedev/tracing'
 
 import { ProviderState } from '../runtime/contracts'
 import { TraceEmitter } from './tracing'
@@ -58,11 +60,21 @@ function extractTraceRequest(
 function extractTraceResponse(
   collectorData: CollectorData,
   rawOutput: string | null,
-): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string } {
+): { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string; logprobs?: TokenWithLogprob[] } {
   const rawBody = collectorData.rawResponseBody ?? null
+  const sseEvents = collectorData._tag === 'Baml' ? (collectorData as any).sseEvents ?? null : null
+
+  let logprobs: TokenWithLogprob[] | undefined
+  if (sseEvents && Array.isArray(sseEvents)) {
+    logprobs = parseLogprobsFromSSE(sseEvents)
+  } else if (rawBody) {
+    logprobs = parseLogprobsFromCompleteBody(rawBody)
+  }
+
   return {
     rawBody,
-    sseEvents: null,
+    sseEvents,
+    ...(logprobs ? { logprobs } : {}),
     ...(rawOutput != null ? { rawOutput } : {}),
   }
 }
@@ -120,7 +132,7 @@ function createBoundModelImpl<TSlot extends string>(
       const startMs = Date.now()
       const fallbackRequest = { input: args[0] }
 
-      const driverRequest = {
+      const driverRequestBase = {
         slot,
         functionName,
         args,
@@ -145,6 +157,8 @@ function createBoundModelImpl<TSlot extends string>(
       return Effect.retry(
         Effect.gen(function* () {
           const tracer = yield* TraceEmitter
+
+          const driverRequest = { ...driverRequestBase, debug: tracer.debug }
 
           attempt++
           if (attempt > 1) {
@@ -268,7 +282,8 @@ function createBoundModelImpl<TSlot extends string>(
             ...(providerOptions ?? {}),
             ...(_options?.providerOptions ?? {}),
           },
-        })
+          debug: tracer.debug,
+        } as DriverRequest)
 
         // Extract raw output text for tracing
         const rawOutput = typeof result === 'string' ? result

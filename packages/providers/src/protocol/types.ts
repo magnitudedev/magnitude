@@ -44,6 +44,8 @@ export interface OpenAIGenericOptions {
   thinking?: { type: 'disabled' | 'enabled' }
   stream?: boolean
   headers?: Record<string, string>
+  logprobs?: boolean
+  top_logprobs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ export interface OpenAIGenericCapabilities {
   stopSequences?: (seqs: string[]) => Partial<OpenAIGenericOptions>
   maxTokens?: (maxTokens: number) => Partial<OpenAIGenericOptions>
   reasoningEffort?: (modelId: string) => Partial<OpenAIGenericOptions>
+  logprobs?: (enabled: boolean, topK?: number) => Partial<OpenAIGenericOptions>
   staticOptions?: Partial<OpenAIGenericOptions>
 }
 

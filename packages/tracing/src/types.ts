@@ -24,6 +24,17 @@ export interface CollectorData {
   sseEvents: unknown[] | null
 }
 
+export interface TopLogprob {
+  token: string
+  logprob: number
+}
+
+export interface TokenWithLogprob {
+  token: string
+  logprob: number
+  topLogprobs: TopLogprob[]
+}
+
 /**
  * Transport-level trace input emitted by the driver.
  * Contains only what the driver knows — no agent-level context.
@@ -34,7 +45,7 @@ export interface TraceInput {
   provider: string | null
   slot: ModelSlot
   request: { messages?: unknown[]; input?: unknown }
-  response: { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string }
+  response: { rawBody: unknown | null; sseEvents: unknown[] | null; rawOutput?: string; logprobs?: TokenWithLogprob[] }
   usage: CallUsage
   durationMs: number
 }

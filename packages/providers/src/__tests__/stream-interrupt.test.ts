@@ -55,7 +55,7 @@ function createHangingDriver(): ExecutableDriver {
           () => new Error('stream error'),
         ) as Stream.Stream<string, ModelError>,
         getUsage: () => nullUsage,
-        getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null }),
+        getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null, sseEvents: null }),
       }),
     complete: (req: DriverRequest): Effect.Effect<CompleteResult, ModelError> =>
       Effect.die('not used in this test'),
@@ -76,7 +76,7 @@ function createProviderState(): ProviderStateShape<string> {
   }
 }
 
-const traceEmitter: typeof TraceEmitter.Type = { emit: () => Effect.void }
+const traceEmitter: { emit: () => Effect.Effect<void>; debug: boolean } = { emit: () => Effect.void, debug: false }
 
 describe('provider stream interrupt cancellation', () => {
   it('interrupting consumer fiber should cancel hanging provider stream promptly', async () => {
@@ -160,7 +160,7 @@ describe('provider stream interrupt cancellation', () => {
             }),
           ),
           getUsage: () => finalizedUsage,
-          getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null }),
+          getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null, sseEvents: null }),
         }),
       complete: () => Effect.die('not used in this test'),
     }

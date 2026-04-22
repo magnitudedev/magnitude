@@ -31,6 +31,7 @@ function buildRegistry(req: DriverRequest): ClientRegistry | undefined {
     req.inference.stopSequences ? [...req.inference.stopSequences] : undefined,
     req.grammar,
     req.inference.maxTokens,
+    req.debug,
   )
 }
 
@@ -63,7 +64,17 @@ function extractCollectorData(collector: Collector): ReturnType<typeof Collector
     rawResponseBody = lastCall?.httpResponse?.body?.json?.() ?? null
   } catch {}
 
-  return CollectorData.Baml({ rawRequestBody, rawResponseBody })
+  let sseEvents: unknown[] | null = null
+
+  try {
+    if (lastCall && 'sseResponses' in lastCall && typeof (lastCall as any).sseResponses === 'function') {
+      sseEvents = (lastCall as any).sseResponses()?.map((s: any) => {
+        try { return s.json?.() ?? null } catch { return null }
+      }) ?? null
+    }
+  } catch {}
+
+  return CollectorData.Baml({ rawRequestBody, rawResponseBody, sseEvents })
 }
 
 function toNormalizedAsyncStream(stream: AsyncIterable<string>): AsyncIterable<string> {

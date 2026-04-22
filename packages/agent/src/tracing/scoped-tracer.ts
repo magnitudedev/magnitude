@@ -29,6 +29,7 @@ export function withTraceScope<A, E, R>(
           strategyId: scope.strategyId ?? null,
           systemPrompt: scope.systemPrompt ?? null,
         }),
+      debug: persister.debug,
     }
     return yield* Effect.provideService(effect, TraceEmitter, emitter)
   })

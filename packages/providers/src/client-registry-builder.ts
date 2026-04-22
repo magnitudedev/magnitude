@@ -29,6 +29,7 @@ export function buildClientRegistry(
   stopSequences?: string[],
   grammar?: string,
   maxTokensOverride?: number,
+  debug: boolean = false,
 ): ClientRegistry | undefined {
   const def = getProvider(providerId)
   if (!def) {
@@ -40,7 +41,7 @@ export function buildClientRegistry(
   const modelDef = def.models.find(m => m.id === modelId)
   const maxOutputTokens = maxTokensOverride ?? modelDef?.maxOutputTokens
 
-  const options = buildOptions(protocol, modelId, auth, providerOptions, stopSequences, maxOutputTokens, grammar)
+  const options = buildOptions(protocol, modelId, auth, providerOptions, stopSequences, maxOutputTokens, grammar, debug)
   if (!options) return undefined
 
   const cr = new ClientRegistry()
@@ -61,6 +62,7 @@ function buildOptions(
   stopSequences?: string[],
   maxOutputTokens?: number,
   grammar?: string,
+  debug: boolean = false,
 ): AnthropicOptions | OpenAIOptions | OpenAIGenericOptions | undefined {
   const stopSeqs = stopSequences ?? []
 
@@ -70,7 +72,7 @@ function buildOptions(
     case 'openai':
       return buildOpenAIOptions(protocol, modelId, auth, providerOpts, stopSeqs, maxOutputTokens)
     case 'openai-generic':
-      return buildOpenAIGenericOptions(protocol, modelId, auth, providerOpts, stopSeqs, maxOutputTokens, grammar)
+      return buildOpenAIGenericOptions(protocol, modelId, auth, providerOpts, stopSeqs, maxOutputTokens, grammar, debug)
   }
 }
 
@@ -81,6 +83,7 @@ export function __testOnly_buildProviderOptions(
   providerOptions?: ProviderOptions,
   stopSequences?: string[],
   grammar?: string,
+  debug: boolean = false,
 ): AnthropicOptions | OpenAIOptions | OpenAIGenericOptions | undefined {
   const def = getProvider(providerId)
   if (!def) return undefined
@@ -95,5 +98,6 @@ export function __testOnly_buildProviderOptions(
     stopSequences,
     modelDef?.maxOutputTokens,
     grammar,
+    debug,
   )
 }

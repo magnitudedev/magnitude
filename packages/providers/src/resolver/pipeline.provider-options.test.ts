@@ -29,7 +29,7 @@ const providerState = {
   resetUsage: () => Effect.void,
 }
 
-const traceEmitter = { emit: () => Effect.void }
+const traceEmitter = { emit: () => Effect.void, debug: false }
 
 describe('pipeline providerOptions overrides', () => {
   it('merges per-call providerOptions over bound providerOptions for stream and complete', async () => {
@@ -51,7 +51,7 @@ describe('pipeline providerOptions overrides', () => {
             outputCost: null,
             totalCost: null,
           }),
-          getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null }),
+          getCollectorData: () => CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null, sseEvents: null }),
         })
       },
       complete: (req) => {
@@ -67,7 +67,7 @@ describe('pipeline providerOptions overrides', () => {
             outputCost: null,
             totalCost: null,
           },
-          collectorData: CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null }),
+          collectorData: CollectorData.Baml({ rawRequestBody: null, rawResponseBody: null, sseEvents: null }),
         })
       },
     }

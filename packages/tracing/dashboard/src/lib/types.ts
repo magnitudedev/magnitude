@@ -1,4 +1,4 @@
-export type { AgentTrace, AgentTraceMeta } from '@magnitudedev/tracing'
+export type { AgentTrace, AgentTraceMeta, TokenWithLogprob, TopLogprob } from '@magnitudedev/tracing'
 
 export interface SessionInfo {
   id: string
