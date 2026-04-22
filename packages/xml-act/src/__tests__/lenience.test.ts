@@ -194,13 +194,13 @@ describe('Close-tag confirmation', () => {
     expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
   })
 
-  it('treats close tag followed by prose as content', () => {
-    // </reason> followed by prose text — not a real close tag
+  it('close tag followed by prose — Close emitted immediately by tokenizer', () => {
+    // Tokenizer emits Close immediately — parser decides if it's structural
     const tokens = collect('content\n</reason> some prose here')
-    // Should NOT have a structural Close token
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(false)
-    // All text preserved as content
-    expect(joinContent(tokens)).toContain('</reason>')
+    // Tokenizer DOES emit a Close token (parser handles confirmation)
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
+    // Prose text preserved as content
+    expect(joinContent(tokens)).toContain('some prose here')
   })
 })
 

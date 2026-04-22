@@ -112,9 +112,9 @@ describe('body DFA — trailing whitespace window', () => {
     v.passes(`<message to="user">\nhello\n</message>    <yield_user/>`)
   })
 
-  it('5 trailing spaces: rejected (tw4 has no space transition)', () => {
+  it('5 trailing spaces: accepted (unbounded ws)', () => {
     const v = shellValidator()
-    v.rejects(`<message to="user">\nhello\n</message>     \n${YIELD}`)
+    v.passes(`<message to="user">\nhello\n</message>     \n${YIELD}`)
   })
 
   it('4 trailing tabs: confirmed by newline', () => {

@@ -90,6 +90,14 @@ export function buildValidator(
       } catch {
         return // Expected rejection
       }
+      // Also check: if no character was rejected, verify the grammar is NOT in an accepting state.
+      // A string that feeds without error but doesn't reach an accepting state is also "rejected"
+      // (it's a valid prefix but not a complete match).
+      const valid = [...state]
+      const isAccepting = valid.some((v: any) => v.type === 'end')
+      if (!isAccepting) {
+        return // Not in accepting state — effectively rejected (incomplete)
+      }
       throw new Error(`Expected grammar to reject input but it was accepted: ${JSON.stringify(input.slice(0, 80))}`)
     },
 

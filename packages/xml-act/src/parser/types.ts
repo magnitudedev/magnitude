@@ -116,6 +116,20 @@ export interface FilterFrame {
 }
 
 // =============================================================================
+// Tentative Close State
+// =============================================================================
+
+/**
+ * Held when the parser sees a Close token that matches the current frame.
+ * The close is not applied immediately — the next token confirms or rejects it.
+ * This implements the grammar's recursive greedy last-match pattern.
+ */
+export type PendingClose = {
+  tagName: string
+  wsBuffer: string
+}
+
+// =============================================================================
 // Field Types
 // =============================================================================
 

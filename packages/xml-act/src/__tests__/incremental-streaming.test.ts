@@ -309,6 +309,7 @@ describe('Realistic LLM streaming simulation', () => {
     const push2 = results.filter(r => r.pushIndex === 2)
     expect(push2).toEqual([{ pushIndex: 2, token: { _tag: 'Content', text: 'How can I help you today?\n' } }])
 
+    // Close emitted immediately on push 3 (tokenizer emits Close immediately now)
     const push3 = results.filter(r => r.pushIndex === 3)
     expect(push3[0].token._tag).toBe('Close')
   })

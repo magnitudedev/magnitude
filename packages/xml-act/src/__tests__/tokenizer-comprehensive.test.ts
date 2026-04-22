@@ -61,11 +61,11 @@ describe('XML tokenizer tests', () => {
       ])
     })
 
-    it('confirms close tag with spaces then newline', () => {
+    it('confirms close tag with spaces then newline (at EOF)', () => {
       const tokens = collect('</message>   \n')
       expect(tokens).toEqual([
         { _tag: 'Close', tagName: 'message', afterNewline: true },
-        { _tag: 'Content', text: '\n' },
+        { _tag: 'Content', text: '   \n' },
       ])
     })
 
@@ -73,44 +73,48 @@ describe('XML tokenizer tests', () => {
       const tokens = collect('</message>  <invoke tool="shell">')
       expect(tokens).toEqual([
         { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Content', text: '  ' },
         { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false },
       ])
     })
 
-    it('confirms close tag with tab then newline', () => {
+    it('confirms close tag with tab then newline (at EOF)', () => {
       const tokens = collect('</message>\t\n')
       expect(tokens).toEqual([
         { _tag: 'Close', tagName: 'message', afterNewline: true },
-        { _tag: 'Content', text: '\n' },
+        { _tag: 'Content', text: '\t\n' },
       ])
     })
 
-    it('rejects close tag followed by prose', () => {
+    it('close tag followed by prose — Close emitted immediately', () => {
       const tokens = collect('</message> to end your block.')
       expect(tokens).toEqual([
-        { _tag: 'Content', text: '</message> to end your block.' },
+        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Content', text: ' to end your block.' },
       ])
     })
 
-    it('rejects close tag followed immediately by non-confirming char', () => {
+    it('close tag followed by non-confirming char — Close emitted immediately', () => {
       const tokens = collect('</message>.')
       expect(tokens).toEqual([
-        { _tag: 'Content', text: '</message>.' },
+        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Content', text: '.' },
       ])
     })
 
-    it('rejects close tag with 5 spaces (exceeds MAX_TRAILING_WS)', () => {
+    it('close tag with 5 spaces confirmed at EOF (unbounded ws)', () => {
       const tokens = collect('</message>     \n')
-      // 5 spaces exceeds limit, close tag becomes content, then the newline is content
+      // unbounded ws: 5 spaces + \n buffered, EOF confirms
       expect(tokens).toEqual([
-        { _tag: 'Content', text: '</message>     \n' },
+        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Content', text: '     \n' },
       ])
     })
 
-    it('rejects close tag at end of stream', () => {
+    it('confirms close tag at end of stream (EOF confirms)', () => {
       const tokens = collect('</message>')
       expect(tokens).toEqual([
-        { _tag: 'Content', text: '</message>' },
+        { _tag: 'Close', tagName: 'message', afterNewline: true },
       ])
     })
 
@@ -126,6 +130,8 @@ describe('XML tokenizer tests', () => {
       const tokens = collect(['</message> ', ' <invoke tool="x">'])
       expect(tokens).toEqual([
         { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Content', text: ' ' },
+        { _tag: 'Content', text: ' ' },
         { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'x']]), afterNewline: false },
       ])
     })
@@ -155,6 +161,7 @@ describe('XML tokenizer tests', () => {
     })
 
     it('handles mixed content and tags', () => {
+      // Close emitted immediately — parser handles confirmation
       const tokens = collect('before\n<message to="user">\nhello\n</message>\nafter')
       expect(tokens).toEqual([
         { _tag: 'Content', text: 'before\n' },

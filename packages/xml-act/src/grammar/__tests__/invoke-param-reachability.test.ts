@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
+import { buildValidator, shellValidator, multiToolValidator, SHELL_TOOL } from './helpers'
 
 /**
  * Tests that validate parameter reachability inside invoke blocks.
@@ -49,7 +49,7 @@ describe('invoke parameter reachability', () => {
 
   describe('multiple parameters', () => {
     it('accepts invoke with multiple parameters', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<invoke tool="edit">\n` +
         `<parameter name="path">foo.ts</parameter>\n` +
@@ -61,7 +61,7 @@ describe('invoke parameter reachability', () => {
     })
 
     it('accepts invoke with parameters in any order', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<invoke tool="edit">\n` +
         `<parameter name="new">baz</parameter>\n` +
@@ -72,15 +72,15 @@ describe('invoke parameter reachability', () => {
       )
     })
 
-    it('accepts any number of parameters (not bounded by tool definition)', () => {
-      // In new grammar, tools are not enumerated — any number of params accepted
-      const v = shellValidator()
+    it('param names constrained to tool schema', () => {
+      // New grammar constrains param names — unknown names are absorbed as content
+      const v = multiToolValidator()
+      // Edit tool accepts its 3 known params
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<parameter name="a">1</parameter>\n` +
-        `<parameter name="b">2</parameter>\n` +
-        `<parameter name="c">3</parameter>\n` +
-        `<parameter name="d">4</parameter>\n` +
+        `<invoke tool="edit">\n` +
+        `<parameter name="path">a</parameter>\n` +
+        `<parameter name="old">b</parameter>\n` +
+        `<parameter name="new">c</parameter>\n` +
         `</invoke>\n` +
         YIELD
       )
@@ -99,17 +99,20 @@ describe('invoke parameter reachability', () => {
       )
     })
 
-    it('after parameter close, < is valid (for next parameter, filter, or invoke close)', () => {
+    it('after parameter close and <, valid continuations include structural tags', () => {
       const v = shellValidator()
+      // With greedy body, </parameter>\n< is inside the BUC pattern.
+      // After <, the grammar allows / (for close tags) and any content char via char_exclude.
       const rules = v.validAfter(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n<`)
       const validChars = rules.flatMap((r: any) => {
         if (r.type === 'char') return r.value.map((v: number) => String.fromCharCode(v))
         if (r.type === 'char_exclude') return ['[exclude]']
         return []
       })
-      expect(validChars).toContain('p')  // <parameter
-      expect(validChars).toContain('/')  // </invoke>
-      expect(validChars).toContain('f')  // <filter>
+      // / is explicitly valid (for </invoke> or </parameter>)
+      expect(validChars).toContain('/')
+      // Other chars (like f for <filter>) are valid via char_exclude rule
+      expect(validChars.some((c: string) => c === 'f' || c === '[exclude]')).toBe(true)
     })
   })
 

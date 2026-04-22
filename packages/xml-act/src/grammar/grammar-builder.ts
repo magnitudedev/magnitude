@@ -8,7 +8,6 @@ import { VALID_CHILDREN } from '../nesting'
 
 /**
  * Parameter binding for grammar generation.
- * Kept for API compatibility — tool parameters are no longer enumerated in the grammar.
  */
 export interface GrammarParameterDef {
   readonly name: string
@@ -18,7 +17,6 @@ export interface GrammarParameterDef {
 
 /**
  * Tool definition for grammar generation.
- * Kept for API compatibility — tools are no longer enumerated in the grammar.
  */
 export interface GrammarToolDef {
   readonly tagName: string
@@ -58,17 +56,6 @@ export interface GrammarBuildOptions {
   readonly maxLenses?: number
   readonly yieldTags?: ReadonlyArray<string>
   readonly lensNames?: ReadonlyArray<string>
-}
-
-/**
- * Context for body DFA generation — specifies which continuation rules
- * the trailing-whitespace states should reference when the close tag is confirmed.
- */
-export interface BodyContext {
-  /** Rule to invoke after "\n" confirms the close tag. */
-  readonly confirmRule: string
-  /** Rule to invoke after "<" confirms the close tag (< already consumed). */
-  readonly confirmNoLtRule: string
 }
 
 // =============================================================================
@@ -176,9 +163,10 @@ export class GrammarBuilder {
     this.addWhitespaceRules(rules)
     this.addAttributeRules(rules)
     this.addYieldRules(rules)
-    this.addInvokeInternalContinuationRules(rules)
     this.addContinuationRules(rules)
-    this.addSharedBodyRules(rules)
+    this.addSharedBucRules(rules)
+    this.addTopLevelBodyRules(rules)
+    this.addToolRules(rules)
     this.addRootRule(rules)
 
     return serializeGrammar(rules)
@@ -189,7 +177,6 @@ export class GrammarBuilder {
   // ---------------------------------------------------------------------------
 
   private addWhitespaceRules(rules: RuleMap): void {
-    // ws: unbounded whitespace — used before block elements
     rules.set('ws', '[ \\t\\n]*')
   }
 
@@ -198,8 +185,6 @@ export class GrammarBuilder {
     rules.set('reason-attrs', '" about=\\"" quoted-value "\\""')
     rules.set('reason-attrs-opt', 'reason-attrs | ""')
     rules.set('msg-attrs', '" to=\\"" quoted-value "\\""')
-    rules.set('invoke-attrs', '" tool=\\"" quoted-value "\\""')
-    rules.set('param-attrs', '" name=\\"" quoted-value "\\""')
   }
 
   private addYieldRules(rules: RuleMap): void {
@@ -210,48 +195,21 @@ export class GrammarBuilder {
     rules.set('yield-no-lt', noLt.join(' | '))
   }
 
-  private addInvokeInternalContinuationRules(rules: RuleMap): void {
-    // Derive invoke children from VALID_CHILDREN — provably in sync with the parser
-    const invokeChildren = VALID_CHILDREN.invoke  // ['parameter', 'filter']
-
-    const invokeItemAlts: string[] = []
-    const invokeItemNoLtAlts: string[] = []
-    for (const child of invokeChildren) {
-      if (child === 'parameter') {
-        invokeItemAlts.push('"<parameter" param-attrs ">" param-body-s0')
-        invokeItemNoLtAlts.push('"parameter" param-attrs ">" param-body-s0')
-      } else if (child === 'filter') {
-        invokeItemAlts.push('"<filter>" filter-body-s0')
-        invokeItemNoLtAlts.push('"filter>" filter-body-s0')
-      }
-    }
-
-    rules.set('invoke-item', invokeItemAlts.join(' | '))
-    rules.set('invoke-next', 'ws invoke-item | ws "</invoke>" turn-next-post')
-    rules.set(
-      'invoke-next-no-lt',
-      [...invokeItemNoLtAlts, '"/invoke>" turn-next-post'].join(' | ')
-    )
-  }
-
   private addContinuationRules(rules: RuleMap): void {
     const { allowMessages, allowTools } = this.config.protocol
-
-    // Derive post-lens children from VALID_CHILDREN.prose (excludes 'reason' which is lens-phase only)
-    // VALID_CHILDREN.prose = ['reason', 'message', 'invoke']
     const proseChildren = VALID_CHILDREN.prose
 
     // Post-lens phase: message and/or invoke, then yield
     const postItems: string[] = []
     const postItemsNoLt: string[] = []
     for (const child of proseChildren) {
-      if (child === 'reason') continue  // reason is lens-phase only
+      if (child === 'reason') continue
       if (child === 'message' && allowMessages) {
         postItems.push('"<message" msg-attrs ">" msg-body-s0')
         postItemsNoLt.push('"message" msg-attrs ">" msg-body-s0')
       } else if (child === 'invoke' && allowTools) {
-        postItems.push('"<invoke" invoke-attrs ">" invoke-next')
-        postItemsNoLt.push('"invoke" invoke-attrs ">" invoke-next')
+        postItems.push('"<invoke" invoke-attrs ">" invoke-body')
+        postItemsNoLt.push('"invoke" invoke-attrs ">" invoke-body')
       }
     }
 
@@ -262,7 +220,7 @@ export class GrammarBuilder {
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
     rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
 
-    // Lens phase: reason (from VALID_CHILDREN.prose) + post-lens items
+    // Lens phase: reason + post-lens items
     const hasReason = (proseChildren as readonly string[]).includes('reason')
     const lensItems = hasReason
       ? ['"<reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
@@ -276,27 +234,196 @@ export class GrammarBuilder {
     rules.set('turn-next-lens-no-lt', [...lensItemsNoLt, 'yield-no-lt'].join(' | '))
   }
 
-  private addSharedBodyRules(rules: RuleMap): void {
-    const lensCtx: BodyContext = {
-      confirmRule: 'turn-next-lens',
-      confirmNoLtRule: 'turn-next-lens-no-lt',
-    }
-    const postCtx: BodyContext = {
-      confirmRule: 'turn-next-post',
-      confirmNoLtRule: 'turn-next-post-no-lt',
-    }
-    for (const rule of generateBodyRules('reason-body', 'reason', lensCtx)) {
+  /**
+   * Shared BUC (body-until-close) rules for each close tag name.
+   * These are reused across all body rules for the same tag.
+   */
+  private addSharedBucRules(rules: RuleMap): void {
+    // param-buc: excludes </parameter>
+    for (const rule of generateBucRules('param-buc', 'parameter')) {
       addRule(rules, rule)
     }
-    for (const rule of generateBodyRules('msg-body', 'message', postCtx)) {
+    // filter-buc: excludes </filter>
+    for (const rule of generateBucRules('filter-buc', 'filter')) {
       addRule(rules, rule)
     }
-    for (const rule of generateRecursiveBodyRules('param-body', 'parameter', 'invoke-next')) {
+    // reason-buc: excludes </reason>
+    for (const rule of generateBucRules('reason-buc', 'reason')) {
       addRule(rules, rule)
     }
-    for (const rule of generateRecursiveBodyRules('filter-body', 'filter', 'invoke-next')) {
+    // msg-buc: excludes </message>
+    for (const rule of generateBucRules('msg-buc', 'message')) {
       addRule(rules, rule)
     }
+  }
+
+  /**
+   * Top-level body rules using recursive greedy last-match.
+   * Confirmation: </tagname> + ws + < (next structural tag).
+   */
+  private addTopLevelBodyRules(rules: RuleMap): void {
+    // reason body: greedy last-match, confirmed by ws + next lens-phase tag
+    const reasonClose = '"</reason>"'
+    rules.set('reason-body-s0',
+      `reason-buc (${reasonClose} reason-buc)* ${reasonClose} ws turn-item-lens-no-lt-or-yield`)
+
+    // msg body: greedy last-match, confirmed by ws + next post-phase tag
+    const msgClose = '"</message>"'
+    rules.set('msg-body-s0',
+      `msg-buc (${msgClose} msg-buc)* ${msgClose} ws turn-item-post-no-lt-or-yield`)
+
+    // Helper rules: the continuation after close + ws must start with <
+    // which is consumed by the no-lt variants, OR be a yield (which starts with <)
+    rules.set('turn-item-lens-no-lt-or-yield', 'turn-item-lens | yield')
+    rules.set('turn-item-post-no-lt-or-yield', 'turn-item-post | yield')
+  }
+
+  /**
+   * Per-tool grammar rules with constrained param names, bounded counts,
+   * and position-aware greedy matching.
+   */
+  private addToolRules(rules: RuleMap): void {
+    const tools = this.config.tools
+
+    if (tools.length === 0) {
+      // Fallback: generic invoke with free-form tool name and params
+      rules.set('invoke-attrs', '" tool=\\"" quoted-value "\\""')
+      rules.set('invoke-body', 'ws invoke-generic-item | ws "</invoke>" turn-next-post')
+      rules.set('invoke-generic-item',
+        '"<parameter" " name=\\"" quoted-value "\\"" ">" generic-param-body-s0 | "<filter>" generic-filter-body-s0')
+      // Generic param body: greedy last-match, confirmed by next invoke child or close
+      rules.set('generic-param-body-s0',
+        'param-buc ("</parameter>" param-buc)* "</parameter>" (ws invoke-generic-item | ws "</invoke>" turn-next-post)')
+      rules.set('generic-filter-body-s0',
+        'filter-buc ("</filter>" filter-buc)* "</filter>" ws "</invoke>" turn-next-post')
+      return
+    }
+
+    // Build invoke-attrs as enumerated tool names
+    const toolNameAlts = tools.map(t => `" tool=\\"${escapeGbnfString(t.tagName)}\\""`)
+    rules.set('invoke-attrs', toolNameAlts.join(' | '))
+
+    // Build invoke-body as dispatch to per-tool rules
+    // After <invoke tool="X">, we need to dispatch based on tool name.
+    // Since the tool name is already consumed as an attribute, we use per-tool invoke rules.
+    // We restructure: instead of generic invoke-body, each tool gets its own invoke rule.
+
+    // Rewrite: the continuation rules reference invoke-body which is called after
+    // <invoke invoke-attrs ">". We need invoke-body to dispatch per tool.
+    // But GBNF doesn't have conditional dispatch on previously consumed content.
+    //
+    // Solution: instead of one invoke-attrs + invoke-body, generate per-tool alternatives
+    // in the continuation rules directly.
+
+    // Build per-tool invoke alternatives
+    const invokeAlts: string[] = []
+    const invokeAltsNoLt: string[] = []
+
+    for (const tool of tools) {
+      const safeName = sanitizeRuleName(tool.tagName)
+      const toolAttr = `" tool=\\"${escapeGbnfString(tool.tagName)}\\"">`
+
+      this.addPerToolRules(rules, tool, safeName)
+
+      invokeAlts.push(`"<invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
+      invokeAltsNoLt.push(`"invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
+    }
+
+    // Override the invoke entries in continuation rules
+    // We need to replace the generic invoke references with per-tool alternatives
+    // Rebuild turn-item-post and turn-item-lens with per-tool invoke alts
+
+    const { allowMessages } = this.config.protocol
+    const proseChildren = VALID_CHILDREN.prose
+
+    const postItems: string[] = []
+    const postItemsNoLt: string[] = []
+    for (const child of proseChildren) {
+      if (child === 'reason') continue
+      if (child === 'message' && allowMessages) {
+        postItems.push('"<message" msg-attrs ">" msg-body-s0')
+        postItemsNoLt.push('"message" msg-attrs ">" msg-body-s0')
+      } else if (child === 'invoke') {
+        postItems.push(...invokeAlts)
+        postItemsNoLt.push(...invokeAltsNoLt)
+      }
+    }
+
+    const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<message" msg-attrs ">" msg-body-s0'
+    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"message" msg-attrs ">" msg-body-s0']
+
+    // Override the rules set by addContinuationRules
+    rules.set('turn-item-post', postItemRule)
+    rules.set('turn-next-post', 'ws turn-item-post | ws yield')
+    rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
+
+    const hasReason = (proseChildren as readonly string[]).includes('reason')
+    const lensItems = hasReason
+      ? ['"<reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
+      : postItems
+    const lensItemsNoLt = hasReason
+      ? ['"reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
+      : postItemsNoLt
+
+    rules.set('turn-item-lens', lensItems.join(' | '))
+    rules.set('turn-next-lens', 'ws turn-item-lens | ws yield')
+    rules.set('turn-next-lens-no-lt', [...lensItemsNoLt, 'yield-no-lt'].join(' | '))
+
+    // Re-derive the helper rules for top-level body confirmation
+    rules.set('turn-item-lens-no-lt-or-yield', 'turn-item-lens | yield')
+    rules.set('turn-item-post-no-lt-or-yield', 'turn-item-post | yield')
+  }
+
+  /**
+   * Generate per-tool rules: param name constraints, bounded count,
+   * position-aware greedy body rules.
+   */
+  private addPerToolRules(rules: RuleMap, tool: GrammarToolDef, safeName: string): void {
+    const N = tool.parameters.length
+
+    if (N === 0) {
+      // 0-param tool: invoke body is just ws + close
+      rules.set(`${safeName}-body`, `ws "</invoke>" turn-next-post`)
+      return
+    }
+
+    // Constrained param names for this tool
+    const paramNameAlts = tool.parameters.map(p =>
+      `" name=\\"${escapeGbnfString(p.name)}\\""`)
+    rules.set(`${safeName}-param-names`, paramNameAlts.join(' | '))
+
+    // Generate sequence chain: seq-N down to seq-1
+    // seq-K means K parameter slots remaining
+    for (let k = N; k >= 1; k--) {
+      const seqName = `${safeName}-seq-${k}`
+      const isLastSlot = k === 1
+
+      // Parameter open with constrained names, chaining to position-specific body
+      const bodyRule = isLastSlot ? `${safeName}-last-body-s0` : `${safeName}-nonlast-body-s0-${k}`
+      const paramAlt = `ws "<parameter" ${safeName}-param-names ">" ${bodyRule}`
+      const filterAlt = `ws "<filter>" ${safeName}-filter-body-s0`
+      const closeAlt = `ws "</invoke>" turn-next-post`
+
+      rules.set(seqName, [paramAlt, filterAlt, closeAlt].join(' | '))
+    }
+
+    // Non-last body rules: for each position K > 1, body chains to seq-(K-1)
+    for (let k = N; k >= 2; k--) {
+      const nextSeq = `${safeName}-seq-${k - 1}`
+      rules.set(`${safeName}-nonlast-body-s0-${k}`,
+        `param-buc ("</parameter>" param-buc)* "</parameter>" ${nextSeq}`)
+    }
+
+    // Last body rule: deep confirmation through invoke close + next top-level tag
+    rules.set(`${safeName}-last-body-s0`,
+      `param-buc ("</parameter>" param-buc)* "</parameter>" ws "</invoke>" turn-next-post`)
+
+    // Filter body: always deep (filter closes invoke)
+    rules.set(`${safeName}-filter-body-s0`,
+      `filter-buc ("</filter>" filter-buc)* "</filter>" ws "</invoke>" turn-next-post`)
+
+    // Entry point: invoke body starts at seq-N
+    rules.set(`${safeName}-body`, `${safeName}-seq-${N}`)
   }
 
   private addRootRule(rules: RuleMap): void {
@@ -304,9 +431,7 @@ export class GrammarBuilder {
 
     if (requiredMessageTo !== null) {
       this.addForcedMessageRules(rules, requiredMessageTo, maxLenses)
-      // root set inside addForcedMessageRules
     } else if (minLenses === 1) {
-      // Must start with at least one reason; reason body chains back to lens phase
       rules.set('root', 'ws "<reason" reason-attrs-opt ">" reason-body-s0')
     } else {
       rules.set('root', 'turn-next-lens')
@@ -314,29 +439,21 @@ export class GrammarBuilder {
   }
 
   private addForcedMessageRules(rules: RuleMap, recipient: string, maxLenses: number | undefined): void {
-    // Forced message rule (literal recipient)
     const escapedRecipient = recipient.replace(/"/g, '\\"')
     rules.set('forced-msg', `"<message to=\\"${escapedRecipient}\\">" msg-body-s0`)
     rules.set('forced-msg-no-lt', `"message to=\\"${escapedRecipient}\\">" msg-body-s0`)
 
     if (maxLenses !== undefined) {
-      // Generate N+1 forced-phase variants, each allowing one fewer reason.
-      // turn-next-forced-N allows N more reasons then forced-msg
-      // turn-next-forced-0 allows only forced-msg
       for (let k = maxLenses; k >= 0; k--) {
         if (k === 0) {
           rules.set(`turn-next-forced-0`, 'ws forced-msg')
           rules.set(`turn-next-forced-0-no-lt`, 'forced-msg-no-lt')
         } else {
           const nextK = k - 1
-          // reason body DFA for slot k chains to turn-next-forced-(k-1)
-          const reasonCtx: BodyContext = {
-            confirmRule: `turn-next-forced-${nextK}`,
-            confirmNoLtRule: `turn-next-forced-${nextK}-no-lt`,
-          }
-          for (const rule of generateBodyRules(`reason-forced-${k}-body`, 'reason', reasonCtx)) {
-            addRule(rules, rule)
-          }
+          // Reason body for forced phase — greedy last-match, chains to next forced level
+          const reasonClose = '"</reason>"'
+          rules.set(`reason-forced-${k}-body-s0`,
+            `reason-buc (${reasonClose} reason-buc)* ${reasonClose} turn-next-forced-${nextK}`)
           rules.set(
             `turn-next-forced-${k}`,
             `ws "<reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | ws forced-msg`
@@ -349,15 +466,9 @@ export class GrammarBuilder {
       }
       rules.set('root', `turn-next-forced-${maxLenses}`)
     } else {
-      // No maxLenses: unlimited reasons before forced message
-      // reason-forced-body chains back to turn-next-forced
-      const reasonCtx: BodyContext = {
-        confirmRule: 'turn-next-forced',
-        confirmNoLtRule: 'turn-next-forced-no-lt',
-      }
-      for (const rule of generateBodyRules('reason-forced-body', 'reason', reasonCtx)) {
-        addRule(rules, rule)
-      }
+      const reasonClose = '"</reason>"'
+      rules.set('reason-forced-body-s0',
+        `reason-buc (${reasonClose} reason-buc)* ${reasonClose} turn-next-forced`)
       rules.set(
         'turn-next-forced',
         'ws "<reason" reason-attrs-opt ">" reason-forced-body-s0 | ws forced-msg'
@@ -372,140 +483,21 @@ export class GrammarBuilder {
 }
 
 // =============================================================================
-// DFA Body Rule Generation
+// BUC (Body-Until-Close) Rule Generation
 // =============================================================================
 
 /**
- * Generate DFA body rules for a tag with the given close-tag name.
+ * Generate BUC exclusion rules for a given close tag.
+ * BUC matches any string NOT containing the close tag `</tagName>`.
  *
- * The DFA matches any content, rejecting false close tags (ones not followed
- * by bounded whitespace then `\n` or a known next-tag prefix).
- *
- * When the close tag IS confirmed, the DFA hands off to the specified
- * continuation rules rather than terminating — enabling the chain grammar.
- *
- * @param prefix      Rule name prefix, e.g. "reason-body"
- * @param tagName     The close tag name, e.g. "reason"
- * @param context     Which continuation rules to invoke on confirmation
+ * The pattern: for each prefix of the close tag, match that prefix
+ * followed by a character that breaks the pattern.
  */
-export function generateBodyRules(prefix: string, tagName: string, context: BodyContext): string[] {
-  const lines: string[] = []
-  const L = tagName.length
-  const MAX_TW = 4
-
-  // Entry alias
-  lines.push(`${prefix} ::= ${prefix}-s0`)
-
-  // s0: base content state — consume non-'<' freely, enter close-tag matching on '<'
-  lines.push(`${prefix}-s0 ::= [^<] ${prefix}-s0 | "<" ${prefix}-s1`)
-
-  // s1: saw '<' — check for '/' (close tag) or restart on another '<'
-  lines.push(`${prefix}-s1 ::= "/" ${prefix}-sl | "<" ${prefix}-s1 | [^/<] ${prefix}-s0`)
-
-  // sl: saw '</' — match first char of tag name
-  const fc = tagName[0]
-  const fcEsc = escapeGbnfCharClass(fc)
-
-  if (L === 1) {
-    const gtState = `${prefix}-gt`
-    lines.push(`${prefix}-sl ::= "${fc}" ${gtState} | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
-    lines.push(`${gtState} ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
-  } else {
-    lines.push(`${prefix}-sl ::= "${fc}" ${prefix}-s2 | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
-
-    for (let i = 2; i <= L; i++) {
-      const ch = tagName[i - 1]
-      const chEsc = escapeGbnfCharClass(ch)
-      const nextState = i === L ? `${prefix}-gt` : `${prefix}-s${i + 1}`
-      lines.push(`${prefix}-s${i} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
-    }
-
-    // gt: consumed full tag name, now consume '>'
-    lines.push(`${prefix}-gt ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
-  }
-
-  // tw0..tw{MAX_TW}: trailing whitespace states after the '>'
-  // The model is NEVER constrained here — every character has a valid transition.
-  // Horizontal whitespace advances the window; \n or < confirms the close;
-  // any other character (including excess whitespace at twMAX) rejects back to s0.
-  for (let i = 0; i <= MAX_TW; i++) {
-    const stateName = `${prefix}-tw${i}`
-    if (i < MAX_TW) {
-      lines.push(
-        `${stateName} ::= [ \\t] ${prefix}-tw${i + 1}` +
-        ` | "\\n" ${context.confirmRule}` +
-        ` | "<" ${context.confirmNoLtRule}` +
-        ` | [^ \\t\\n<] ${prefix}-s0`
-      )
-    } else {
-      // Final tw state: no more whitespace advancement.
-      // [^\n<] (no space excluded) ensures excess spaces/tabs escape to s0 rather than dead-ending.
-      lines.push(
-        `${stateName} ::= "\\n" ${context.confirmRule}` +
-        ` | "<" ${context.confirmNoLtRule}` +
-        ` | [^ \\n<] ${prefix}-s0`
-      )
-    }
-  }
-
-  return lines
-}
-
-// =============================================================================
-// Free Body Rule Generation (parameter, filter)
-// =============================================================================
-
-/**
- * Generate DFA body rules for free-text bodies (parameter, filter).
- *
- * Like generateBodyRules, but with deeper close-tag confirmation:
- * instead of confirming on bare \n or <, the DFA validates the full
- * continuation prefix before committing. This allows the model to write
- * the close tag in content as long as what follows isn't a valid
- * structural continuation.
- *
- * Valid continuations after parameter/filter close (inside invoke):
- *   - "<parameter " (sibling parameter open)
- *   - "<filter>"    (sibling filter open)
- *   - "</invoke>"   (parent invoke close)
- *
- * @param prefix   Rule name prefix, e.g. "param-body"
- * @param tagName  The close tag name, e.g. "parameter"
- * @param context  Which continuation rules to invoke on confirmation
- */
-/**
- * Continuation targets for free body rules — where to hand off after
- * each confirmed continuation prefix.
- */
-// =============================================================================
-// Recursive Body Rule Generation (parameter, filter)
-// =============================================================================
-
-/**
- * Generate recursive body rules using the greedy last-match pattern.
- *
- * Instead of a DFA with close-tag confirmation states, the body is defined as:
- *   body ::= buc (CLOSE buc)* CLOSE continuation
- *
- * Where `buc` (body-until-close) matches any string NOT containing the close tag.
- * The `*` repetition allows the close tag to appear as content zero or more times.
- * The final close tag chains to the continuation rule.
- *
- * At each close tag, the GBNF engine offers both paths (content vs structural)
- * and the model's token choice selects the interpretation. This achieves
- * greedy last-match: the last close tag is structural, all earlier ones are content.
- *
- * @param prefix          Rule name prefix, e.g. "param-body"
- * @param tagName         The close tag name, e.g. "parameter"
- * @param continuationRule Rule to chain to after the structural close, e.g. "invoke-next"
- */
-export function generateRecursiveBodyRules(prefix: string, tagName: string, continuationRule: string): string[] {
+export function generateBucRules(prefix: string, tagName: string): string[] {
   const lines: string[] = []
   const closeTag = '</' + tagName + '>'
   const closeChars = closeTag.split('')
 
-  // Build BUC (body-until-close) exclusion alternatives
-  // Each alternative matches a prefix of the close tag followed by a char that breaks the pattern
   const alts: string[] = []
 
   // First alt: any char that doesn't start the close tag
@@ -520,19 +512,9 @@ export function generateRecursiveBodyRules(prefix: string, tagName: string, cont
     alts.push(`"${pfx}" [^${nextCharEsc}]`)
   }
 
-  // BUC rule: match zero or more safe sequences
-  lines.push(`${prefix}-buc ::= (${alts.join(' | ')})*`)
-
-  // Close tag literal — escaped for GBNF
-  const closeLiteral = `"${closeTag}"`
-
-  // Entry point: buc, then zero or more (close + buc), then final close + continuation
-  lines.push(`${prefix}-s0 ::= ${prefix}-buc (${closeLiteral} ${prefix}-buc)* ${closeLiteral} ${continuationRule}`)
-
+  lines.push(`${prefix} ::= (${alts.join(' | ')})*`)
   return lines
 }
-
-// generateFreeBodyRules removed — replaced by generateRecursiveBodyRules above.
 
 // =============================================================================
 // Utilities
@@ -560,10 +542,105 @@ export function escapeGbnfCharClass(ch: string): string {
   }
 }
 
+export function escapeGbnfString(s: string): string {
+  return s.replace(/"/g, '\\"').replace(/\\/g, '\\\\')
+}
+
 export function sanitizeRuleName(tagName: string): string {
   return `t-${tagName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}`
 }
 
 export function sanitizeParamName(name: string): string {
   return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()
+}
+
+// =============================================================================
+// Legacy exports (kept for API compatibility)
+// =============================================================================
+
+/**
+ * @deprecated Use GrammarBuilder directly. This is kept for existing callers.
+ */
+export interface BodyContext {
+  readonly confirmRule: string
+  readonly confirmNoLtRule: string
+}
+
+/**
+ * @deprecated Replaced by recursive greedy body rules.
+ */
+export function generateBodyRules(prefix: string, tagName: string, context: BodyContext): string[] {
+  // Legacy: generate DFA body rules with tw states
+  // This is no longer used by the builder but may be referenced by tests
+  const lines: string[] = []
+  const L = tagName.length
+  const MAX_TW = 4
+
+  lines.push(`${prefix} ::= ${prefix}-s0`)
+  lines.push(`${prefix}-s0 ::= [^<] ${prefix}-s0 | "<" ${prefix}-s1`)
+  lines.push(`${prefix}-s1 ::= "/" ${prefix}-sl | "<" ${prefix}-s1 | [^/<] ${prefix}-s0`)
+
+  const fc = tagName[0]
+  const fcEsc = escapeGbnfCharClass(fc)
+
+  if (L === 1) {
+    const gtState = `${prefix}-gt`
+    lines.push(`${prefix}-sl ::= "${fc}" ${gtState} | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
+    lines.push(`${gtState} ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  } else {
+    lines.push(`${prefix}-sl ::= "${fc}" ${prefix}-s2 | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
+    for (let i = 2; i <= L; i++) {
+      const ch = tagName[i - 1]
+      const chEsc = escapeGbnfCharClass(ch)
+      const nextState = i === L ? `${prefix}-gt` : `${prefix}-s${i + 1}`
+      lines.push(`${prefix}-s${i} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
+    }
+    lines.push(`${prefix}-gt ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  }
+
+  for (let i = 0; i <= MAX_TW; i++) {
+    const stateName = `${prefix}-tw${i}`
+    if (i < MAX_TW) {
+      lines.push(
+        `${stateName} ::= [ \\t] ${prefix}-tw${i + 1}` +
+        ` | "\\n" ${context.confirmRule}` +
+        ` | "<" ${context.confirmNoLtRule}` +
+        ` | [^ \\t\\n<] ${prefix}-s0`
+      )
+    } else {
+      lines.push(
+        `${stateName} ::= "\\n" ${context.confirmRule}` +
+        ` | "<" ${context.confirmNoLtRule}` +
+        ` | [^ \\n<] ${prefix}-s0`
+      )
+    }
+  }
+
+  return lines
+}
+
+/**
+ * @deprecated Replaced by per-tool body rules with position-aware continuations.
+ */
+export function generateRecursiveBodyRules(prefix: string, tagName: string, continuationRule: string): string[] {
+  const lines: string[] = []
+  const closeTag = '</' + tagName + '>'
+  const closeChars = closeTag.split('')
+
+  const alts: string[] = []
+  alts.push(`[^${escapeGbnfCharClass(closeChars[0])}]`)
+
+  let pfx = ''
+  for (let i = 0; i < closeChars.length - 1; i++) {
+    pfx += closeChars[i]
+    const nextChar = closeChars[i + 1]
+    const nextCharEsc = escapeGbnfCharClass(nextChar)
+    alts.push(`"${pfx}" [^${nextCharEsc}]`)
+  }
+
+  lines.push(`${prefix}-buc ::= (${alts.join(' | ')})*`)
+  const closeLiteral = `"${closeTag}"`
+  lines.push(`${prefix}-s0 ::= ${prefix}-buc (${closeLiteral} ${prefix}-buc)* ${closeLiteral} ${continuationRule}`)
+
+  return lines
 }

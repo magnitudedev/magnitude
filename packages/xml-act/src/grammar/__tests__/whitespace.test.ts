@@ -50,9 +50,9 @@ describe('whitespace handling', () => {
       v.passes(`<message to="user">\nhello\n</message>    \n<yield_user/>`)
     })
 
-    it('5 trailing spaces before newline is rejected (exceeds tw window)', () => {
+    it('5 trailing spaces before newline is accepted (unbounded ws)', () => {
       const v = shellValidator()
-      v.rejects(`<message to="user">\nhello\n</message>     \n<yield_user/>`)
+      v.passes(`<message to="user">\nhello\n</message>     \n<yield_user/>`)
     })
 
     it('4 trailing tabs before newline passes', () => {
@@ -72,9 +72,9 @@ describe('whitespace handling', () => {
       v.passes(`<reason about="turn">\nreasoning\n</reason>    \n<yield_user/>`)
     })
 
-    it('5 trailing spaces after </reason> is rejected', () => {
+    it('5 trailing spaces after </reason> is accepted (unbounded ws)', () => {
       const v = shellValidator()
-      v.rejects(`<reason about="turn">\nreasoning\n</reason>     \n<yield_user/>`)
+      v.passes(`<reason about="turn">\nreasoning\n</reason>     \n<yield_user/>`)
     })
   })
 

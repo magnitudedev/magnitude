@@ -1,3 +1,5 @@
+import { KNOWN_CLOSE_TAG_NAMES } from './constants'
+
 /**
  * Streaming XML tokenizer for the new response format.
  *
@@ -8,10 +10,9 @@
  *   Content:   raw text between tags
  *   CDATA:     <![CDATA[...]]>>  (emitted as Content)
  *
- * Key feature: close-tag lookahead confirmation.
- * After reading </tag>, the tokenizer enters pendingClose state and waits
- * for a confirming character (\n or <) before emitting the Close token.
- * This mirrors the grammar tw-state mechanism exactly.
+ * Close tags for known structural names (reason, message, invoke, parameter, filter)
+ * are emitted immediately as Close tokens. The parser handles confirmation logic
+ * (greedy last-match, tentative close state). Unknown close tags become Content.
  */
 
 export type Token =
@@ -49,29 +50,10 @@ type ActiveTag = {
   attrEscaping: boolean
 }
 
-type PendingClose = {
-  tagName: string
-  raw: string
-  afterNewline: boolean
-  wsBuffer: string
-  /** For parameter/filter: continuation prefix matching state */
-  continuationBuffer: string
-  /** Whether we're in deep confirmation mode (parameter/filter close tags) */
-  deepConfirm: boolean
-  /** Whether we've seen '<' and are now matching the continuation prefix */
-  matchingContinuation: boolean
-}
-
-const MAX_TRAILING_WS = 4
-
 const CDATA_OPEN = '<![CDATA['
 
 function isWhitespace(ch: string): boolean {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
-}
-
-function isHorizontalWs(ch: string): boolean {
-  return ch === ' ' || ch === '\t'
 }
 
 function isNameStart(ch: string): boolean {
@@ -90,10 +72,8 @@ export function createTokenizer(
   let afterNewline = true
   let activeTag: ActiveTag | null = null
   let pendingLt = false
-  let pendingClose: PendingClose | null = null
   let cdataBuffer: string | null = null
   let cdataCloseProgress = 0
-  let replayBuffer = ''
 
   function flushContent(): void {
     if (contentBuffer.length === 0) return
@@ -120,15 +100,14 @@ export function createTokenizer(
   function emitTag(tag: ActiveTag): void {
     flushContent()
     if (tag.isClose) {
-      pendingClose = {
-        tagName: tag.name,
-        raw: tag.raw,
-        afterNewline: tag.savedAfterNewline,
-        wsBuffer: '',
-        continuationBuffer: '',
-        deepConfirm: tag.name === 'parameter' || tag.name === 'filter',
-        matchingContinuation: false,
+      if (!KNOWN_CLOSE_TAG_NAMES.has(tag.name)) {
+        // Unknown close tag — treat as content
+        contentBuffer += tag.raw
+        return
       }
+      // Emit Close immediately — parser handles confirmation
+      onToken({ _tag: 'Close', tagName: tag.name, afterNewline: tag.savedAfterNewline, raw: tag.raw })
+      afterNewline = false
     } else if (tag.pendingSelfClose) {
       onToken({
         _tag: 'SelfClose',
@@ -180,127 +159,6 @@ export function createTokenizer(
     tag.attrQuote = null
   }
 
-  // Valid continuation prefixes after parameter/filter close (inside invoke)
-  const PARAM_FILTER_CONTINUATIONS = ['parameter ', 'filter>', '/invoke>']
-
-  /**
-   * Process a character while in pendingClose state.
-   * Returns true if consumed, false if caller should process ch normally.
-   *
-   * For reason/message close tags: original behavior (confirm on \n or <).
-   * For parameter/filter close tags: deep confirmation — buffer whitespace,
-   * then match a full continuation prefix before confirming.
-   */
-  function processPendingClose(ch: string): boolean {
-    const pc = pendingClose!
-
-    // --- Standard confirmation for reason/message ---
-    if (!pc.deepConfirm) {
-      if (isHorizontalWs(ch)) {
-        if (pc.wsBuffer.length < MAX_TRAILING_WS) {
-          pc.wsBuffer += ch
-          return true
-        } else {
-          contentBuffer += pc.raw + pc.wsBuffer
-          pendingClose = null
-          return false
-        }
-      }
-
-      if (ch === '\n') {
-        flushContent()
-        onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
-        afterNewline = true
-        contentBuffer += '\n'
-        pendingClose = null
-        return true
-      }
-
-      if (ch === '<') {
-        flushContent()
-        onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
-        afterNewline = false
-        pendingClose = null
-        pendingLt = true
-        return true
-      }
-
-      contentBuffer += pc.raw + pc.wsBuffer
-      pendingClose = null
-      return false
-    }
-
-    // --- Deep confirmation for parameter/filter ---
-
-    if (pc.matchingContinuation) {
-      // We're matching a continuation prefix after seeing '<'
-      pc.continuationBuffer += ch
-
-      // Check if any continuation still matches
-      let anyMatch = false
-      let fullMatch = false
-      for (const cont of PARAM_FILTER_CONTINUATIONS) {
-        if (cont.startsWith(pc.continuationBuffer)) {
-          anyMatch = true
-          if (cont === pc.continuationBuffer) {
-            fullMatch = true
-          }
-        }
-      }
-
-      if (fullMatch) {
-        // Full continuation prefix matched — CONFIRM the close tag
-        flushContent()
-        onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
-        afterNewline = false
-
-        // Feed back the continuation characters (< + continuationBuffer) as new input
-        // The '<' + continuation prefix is the start of the next structural element
-        // We need to re-process these characters through the tokenizer
-        const replay = '<' + pc.continuationBuffer
-        pendingClose = null
-        // Push the continuation back through — start a new tag
-        pendingLt = false
-        flushContent()
-        startTag()
-        for (let j = 1; j < replay.length; j++) {
-          processTagChar(replay[j])
-        }
-        return true
-      }
-
-      if (anyMatch) {
-        // Partial match — keep buffering
-        return true
-      }
-
-      // No continuation matches — REJECT
-      // Dump close tag raw + wsBuffer as content, replay '<' + continuationBuffer
-      contentBuffer += pc.raw + pc.wsBuffer
-      replayBuffer = '<' + pc.continuationBuffer
-      pendingClose = null
-      return true
-    }
-
-    // Not yet matching continuation — buffering whitespace
-    if (isWhitespace(ch)) {
-      // Buffer all whitespace (unbounded for parameter/filter)
-      pc.wsBuffer += ch
-      return true
-    }
-
-    if (ch === '<') {
-      // Start matching continuation prefix
-      pc.matchingContinuation = true
-      pc.continuationBuffer = ''
-      return true
-    }
-
-    // Non-whitespace, non-< — REJECT
-    contentBuffer += pc.raw + pc.wsBuffer
-    pendingClose = null
-    return false
-  }
 
   function processTagChar(ch: string): void {
     const tag = activeTag!
@@ -621,41 +479,6 @@ export function createTokenizer(
           continue
         }
 
-        // Drain replay buffer (from deep confirmation rejection)
-        if (replayBuffer.length > 0) {
-          const rb = replayBuffer
-          replayBuffer = ''
-          // Prepend replay chars to unprocessed input and restart loop
-          chunk = rb + chunk.slice(i)
-          i = -1 // will be incremented to 0 by for-loop
-          continue
-        }
-
-        // Pending close confirmation
-        if (pendingClose) {
-          const consumed = processPendingClose(ch)
-          if (consumed) {
-            // processPendingClose may have set pendingLt (when ch was <)
-            // Resolve inline since we are mid-loop
-            if (pendingLt) {
-              pendingLt = false
-              if (i + 1 < chunk.length) {
-                const next = chunk[i + 1]
-                if (next === '/' || isNameStart(next) || next === '!') {
-                  flushContent()
-                  startTag()
-                } else {
-                  contentBuffer += '<'
-                }
-              } else {
-                pendingLt = true
-              }
-            }
-            continue
-          }
-          // Not consumed — pendingClose rejected, fall through to process ch normally
-        }
-
         // Content / tag-start
         if (ch === '<') {
           if (i + 1 < chunk.length) {
@@ -688,20 +511,6 @@ export function createTokenizer(
       if (pendingLt) {
         contentBuffer += '<'
         pendingLt = false
-      }
-
-      if (pendingClose) {
-        if (pendingClose.deepConfirm) {
-          // EOF confirms parameter/filter close tags
-          flushContent()
-          onToken({ _tag: 'Close', tagName: pendingClose.tagName, afterNewline: pendingClose.afterNewline, raw: pendingClose.raw })
-          afterNewline = false
-          if (pendingClose.wsBuffer) contentBuffer += pendingClose.wsBuffer
-          if (pendingClose.matchingContinuation) contentBuffer += '<' + pendingClose.continuationBuffer
-        } else {
-          contentBuffer += pendingClose.raw + pendingClose.wsBuffer
-        }
-        pendingClose = null
       }
 
       if (activeTag) {

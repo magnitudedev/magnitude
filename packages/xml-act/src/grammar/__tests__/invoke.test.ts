@@ -35,9 +35,9 @@ describe('invoke / tool call blocks', () => {
       )
     })
 
-    it('any tool name is accepted (free-form)', () => {
+    it('unknown tool name is rejected (constrained)', () => {
       const v = shellValidator()
-      v.passes(
+      v.rejects(
         `<invoke tool="anything">\n` +
         `<parameter name="foo">bar</parameter>\n` +
         `</invoke>\n` +
@@ -55,7 +55,7 @@ describe('invoke / tool call blocks', () => {
 
   describe('multiple parameters', () => {
     it('invoke with multiple parameters', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<invoke tool="edit">\n` +
         `<parameter name="path">src/foo.ts</parameter>\n` +
@@ -67,7 +67,7 @@ describe('invoke / tool call blocks', () => {
     })
 
     it('parameters in any order', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<invoke tool="edit">\n` +
         `<parameter name="new">const x = 2</parameter>\n` +
@@ -125,10 +125,10 @@ describe('invoke / tool call blocks', () => {
 
   describe('no-newline between tags', () => {
     it('parameter immediately followed by another parameter (no newline)', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<invoke tool="edit">\n` +
-        `<parameter name="a">val</parameter><parameter name="b">val2</parameter>\n` +
+        `<parameter name="path">val</parameter><parameter name="old">val2</parameter><parameter name="new">val3</parameter>\n` +
         `</invoke>\n` +
         YIELD
       )

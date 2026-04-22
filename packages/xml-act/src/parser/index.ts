@@ -23,6 +23,7 @@ import { classifyEvent, mergeEvent, type CoalescingBuffer } from './coalesce'
 import { endTopProse } from './content'
 import { flushAllFrames } from './flush'
 import { pushToken, type ParserLoopContext } from './dispatch'
+import { resolveCloseHandler } from './resolve'
 import type { ParserOp } from './ops'
 
 export type { ParserConfig } from './types'
@@ -108,10 +109,25 @@ export function createParser(
     machine,
     handlerCtx,
     deferredYield,
+    pendingCloseStack: [],
   }
 
   function end(): void {
     if (machine.mode === 'done') return
+
+    // EOF confirms any tentative close stack
+    if (loopCtx.pendingCloseStack.length > 0) {
+      for (const pc of loopCtx.pendingCloseStack) {
+        const top = machine.peek()
+        if (top) {
+          const handler = resolveCloseHandler(pc.tagName, top)
+          if (handler) {
+            machine.apply(handler.close(handlerCtx))
+          }
+        }
+      }
+      loopCtx.pendingCloseStack = []
+    }
 
     flushCoalescing()
 
