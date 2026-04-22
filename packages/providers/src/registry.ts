@@ -425,6 +425,7 @@ export const PROVIDERS: ProviderDefinition[] = [
         grammar: (g) => ({ grammar: g }),
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
+        logprobs: (enabled, topK = 5) => enabled ? { logprobs: true, top_logprobs: topK } : {},
         staticOptions: { stream_options: { include_usage: true } },
       },
     }),
