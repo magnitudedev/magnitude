@@ -9,6 +9,7 @@ import type { AuthInfo, BamlProviderType, ProviderDefinition, ModelDefinition } 
 import type { ProviderProtocol, OpenAIOptions } from './protocol/types'
 
 const STATIC_MODEL_COST = { input: 0, output: 0 } as const
+const DEFAULT_TEMPERATURE = 1.0
 
 function staticModel(model: Omit<ModelDefinition, 'contextWindow' | 'supportsReasoning' | 'cost' | 'family' | 'releaseDate' | 'discovery'> & {
   contextWindow?: number
@@ -62,7 +63,7 @@ export const PROVIDERS: ProviderDefinition[] = [
         reasoningEffort: (modelId) => ({
           reasoning_effort: modelId.toLowerCase().includes('minimax') ? 'low' : 'none',
         }),
-        staticOptions: { stream_options: { include_usage: true }, stream: true },
+        staticOptions: { stream_options: { include_usage: true }, stream: true, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -92,7 +93,7 @@ export const PROVIDERS: ProviderDefinition[] = [
           return {}
         },
         staticOptions: {
-          temperature: 0.7,
+          temperature: DEFAULT_TEMPERATURE,
           allowed_role_metadata: ['cache_control'],
         },
       },
@@ -173,7 +174,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -196,7 +197,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -218,7 +219,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop_sequences: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { temperature: 0.7 },
+        staticOptions: { temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -240,7 +241,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         reasoningEffort: (_modelId) => ({ thinking: { type: 'disabled' } }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -263,7 +264,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         reasoningEffort: (_modelId) => ({ thinking: { type: 'disabled' } }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -284,7 +285,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         reasoningEffort: (_modelId) => ({ thinking: { type: 'disabled' } }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -306,7 +307,7 @@ export const PROVIDERS: ProviderDefinition[] = [
         stopSequences: (seqs) => ({ stop_sequences: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
         reasoningEffort: (_modelId) => ({ thinking: { type: 'disabled' } }),
-        staticOptions: { temperature: 0.7 },
+        staticOptions: { temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -327,7 +328,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -355,7 +356,7 @@ export const PROVIDERS: ProviderDefinition[] = [
           reasoning_effort: modelId.toLowerCase().includes('minimax') ? 'low' : 'none',
         }),
         logprobs: (enabled, topK = 5) => enabled ? { logprobs: true, top_logprobs: topK } : {},
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -378,7 +379,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -401,7 +402,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -426,7 +427,7 @@ export const PROVIDERS: ProviderDefinition[] = [
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
         logprobs: (enabled, topK = 5) => enabled ? { logprobs: true, top_logprobs: topK } : {},
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },
@@ -447,7 +448,7 @@ export const PROVIDERS: ProviderDefinition[] = [
       capabilities: {
         stopSequences: (seqs) => ({ stop: seqs }),
         maxTokens: (n) => ({ max_tokens: n }),
-        staticOptions: { stream_options: { include_usage: true } },
+        staticOptions: { stream_options: { include_usage: true }, temperature: DEFAULT_TEMPERATURE },
       },
     }),
   },

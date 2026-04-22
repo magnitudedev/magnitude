@@ -22,6 +22,7 @@ export interface AnthropicOptions {
 export interface OpenAIOptions {
   model: string
   api_key?: string
+  temperature?: number
   max_tokens?: number
   stop?: string[]
   reasoning?: { effort: 'low' | 'medium' | 'high' }
@@ -35,6 +36,7 @@ export interface OpenAIGenericOptions {
   model: string
   api_key?: string
   base_url?: string
+  temperature?: number
   max_tokens?: number
   stop?: string[]
   response_format?: { type: 'grammar'; grammar: string }
