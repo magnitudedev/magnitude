@@ -30,7 +30,6 @@ function parseIncremental(chunks: string[]): TurnEngineEvent[] {
   const tokenizer = createTokenizer(
     (token) => parser.pushToken(token),
     new Set(['shell']),
-    { toolKeyword: 'invoke' },
   )
   for (const chunk of chunks) {
     tokenizer.push(chunk)
@@ -44,31 +43,28 @@ function parseIncremental(chunks: string[]): TurnEngineEvent[] {
 
 describe('field coalescing', () => {
   it('coalesces adjacent ToolInputFieldChunk events within same drain', () => {
-    // Send multiple chars in one push — they should coalesce within that drain
     const allEvents: TurnEngineEvent[] = []
     const parser = createParser({ tools: makeTools() })
     const tokenizer = createTokenizer(
       (token) => parser.pushToken(token),
       new Set(['shell']),
-      { toolKeyword: 'invoke' },
     )
-    tokenizer.push('\n<|invoke:shell>\n<|parameter:command>ls -la<parameter|>\n<invoke|>')
+    tokenizer.push('<invoke tool="shell">\n<parameter name="command">ls -la</parameter>\n</invoke>')
     tokenizer.end()
     parser.end()
     allEvents.push(...parser.drain())
 
     const fieldChunks = allEvents.filter(e => e._tag === 'ToolInputFieldChunk')
-    // All content in one push → should coalesce to 1 chunk
     expect(fieldChunks.length).toBe(1)
     expect((fieldChunks[0] as any).delta).toBe('ls -la')
   })
 
   it('preserves total delta across drains', () => {
     const events = parseIncremental([
-      '\n<|invoke:shell>\n<|parameter:command>',
+      '<invoke tool="shell">\n<parameter name="command">',
       'ls',
       ' -la',
-      '<parameter|>\n<invoke|>',
+      '</parameter>\n</invoke>',
     ])
     const fieldChunks = events.filter(e => e._tag === 'ToolInputFieldChunk')
     const totalDelta = fieldChunks.map(e => (e as any).delta).join('')
@@ -81,7 +77,6 @@ describe('field coalescing', () => {
     const tokenizer = createTokenizer(
       (token) => parser.pushToken(token),
       new Set(['shell']),
-      { toolKeyword: 'invoke' },
     )
     tokenizer.push('Hello world')
     tokenizer.end()
@@ -89,7 +84,6 @@ describe('field coalescing', () => {
     allEvents.push(...parser.drain())
 
     const proseChunks = allEvents.filter(e => e._tag === 'ProseChunk')
-    // All in one push → should coalesce
     expect(proseChunks.length).toBe(1)
     expect((proseChunks[0] as any).text).toBe('Hello world')
   })

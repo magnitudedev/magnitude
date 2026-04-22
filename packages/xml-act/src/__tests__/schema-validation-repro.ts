@@ -7,7 +7,7 @@ const CreateTaskInputSchema = Schema.Struct({
   parent: Schema.optional(Schema.String),
 })
 
-// Test 1: With empty parent string (what the Mact parser produces)
+// Test 1: With empty parent string (what the xml-act parser produces)
 const input1 = { id: 'dummy-task', title: 'Dummy task for testing', parent: '' }
 console.log('Test 1: parent=""')
 try {

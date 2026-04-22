@@ -73,7 +73,7 @@ const fetchPage = (url: string) =>
 // =============================================================================
 
 export const webFetchTool = defineTool({
-  name: 'web-fetch',
+  name: 'web_fetch',
   group: 'default',
   description: 'Fetch the content of a URL. Returns the page content as cleaned markdown for you to read directly. Use this instead of running curl or wget in the shell.',
 

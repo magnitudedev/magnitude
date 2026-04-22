@@ -35,14 +35,14 @@ describe('CanonicalTurn final content selection behavior', async () => {
   test('serializer can produce canonical xml for completed clean trace', async () => {
     const trace: CanonicalTrace = {
       lenses: null,
-      thinkBlocks: [{ about: null, content: 't' }],
+      reasonBlocks: [{ about: null, content: 't' }],
       messages: [{ text: 'm', destination: { kind: 'user' } }],
-      toolCalls: [{ tagName: 'tool', input: {}, query: '.' }],
+      toolCalls: [{ tagName: 'tool', input: {}, query: null }],
       turnDecision: 'idle',
     }
     const xml = serializeCanonicalTurn(trace)
-    expect(xml).toContain('<think>t</think>')
-    expect(xml).toContain('<message>m</message>')
-    expect(xml).toContain('<tool observe="." />')
+    expect(xml).toContain('<reason about="reason">')
+    expect(xml).toContain('<message to="user">')
+    expect(xml).toContain('<invoke tool="tool"/>')
   })
 })

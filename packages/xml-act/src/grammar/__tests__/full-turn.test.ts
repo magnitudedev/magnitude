@@ -1,98 +1,95 @@
 import { describe, it } from 'vitest'
-import { buildValidator, shellValidator, multiToolValidator, SHELL_TOOL, SKILL_TOOL, MULTI_PARAM_TOOL, NO_PARAM_TOOL } from './helpers'
+import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
 
-// Convenience snippets for building turn sequences
-const THINK = (name: string, content: string) =>
-  `\n<|think:${name}>\n${content}\n<think|>\n`
+const REASON = (name: string, content: string) =>
+  `<reason about="${name}">\n${content}\n</reason>\n`
 
 const MSG = (recipient: string, content: string) =>
-  `\n<|message:${recipient}>\n${content}\n<message|>\n`
+  `<message to="${recipient}">\n${content}\n</message>\n`
 
-const INVOKE_SHELL = (cmd: string) =>
-  `\n<|invoke:shell>\n<|parameter:command>\n${cmd}\n<parameter|>\n<invoke|>\n`
+const INVOKE = (tool: string, params: Record<string, string> = {}) => {
+  const paramLines = Object.entries(params)
+    .map(([k, v]) => `<parameter name="${k}">${v}</parameter>`)
+    .join('\n')
+  return `<invoke tool="${tool}">\n${paramLines ? paramLines + '\n' : ''}</invoke>\n`
+}
 
-const INVOKE_SKILL = (name: string) =>
-  `\n<|invoke:skill>\n<|parameter:name>\n${name}\n<parameter|>\n<invoke|>\n`
-
-const INVOKE_TREE = () =>
-  `\n<|invoke:tree>\n<invoke|>\n`
-
-const YIELD = (tag = 'user') => `\n<|yield:${tag}|>`
+const YIELD = (tag = 'user') => `<yield_${tag}/>`
 
 describe('full turn sequences', () => {
   describe('yield only', () => {
-    it('yield:user alone passes', () => {
+    it('yield_user alone passes', () => {
       const v = shellValidator()
       v.passes(YIELD('user'))
     })
 
-    it('yield:invoke alone passes', () => {
+    it('yield_invoke alone passes', () => {
       const v = shellValidator()
       v.passes(YIELD('invoke'))
     })
 
-    it('yield:worker alone passes', () => {
+    it('yield_worker alone passes', () => {
       const v = shellValidator()
       v.passes(YIELD('worker'))
     })
   })
 
-  describe('lens → yield', () => {
-    it('single think block then yield passes', () => {
+  describe('reason → yield', () => {
+    it('single reason block then yield passes', () => {
       const v = shellValidator()
-      v.passes(THINK('turn', 'some thought') + YIELD())
+      v.passes(REASON('turn', 'some thought') + YIELD())
     })
 
-    it('multiple think blocks then yield passes', () => {
+    it('multiple reason blocks then yield passes', () => {
       const v = shellValidator()
       v.passes(
-        THINK('turn', 'first thought') +
-        THINK('alignment', 'second thought') +
+        REASON('turn', 'first thought') +
+        REASON('alignment', 'second thought') +
         YIELD()
       )
     })
 
-    it('think with multi-line content then yield passes', () => {
+    it('reason with multi-line content then yield passes', () => {
       const v = shellValidator()
-      v.passes(THINK('turn', 'line one\nline two\nline three') + YIELD())
+      v.passes(REASON('turn', 'line one\nline two\nline three') + YIELD())
     })
   })
 
-  describe('lens → message → yield', () => {
-    it('think then message then yield passes', () => {
+  describe('reason → message → yield', () => {
+    it('reason then message then yield passes', () => {
       const v = shellValidator()
       v.passes(
-        THINK('turn', 'I should respond') +
+        REASON('turn', 'I should respond') +
         MSG('user', 'Hello there') +
         YIELD()
       )
     })
 
-    it('think then forced message then yield passes', () => {
+    it('reason then forced message then yield passes', () => {
       const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('user'))
       v.passes(
-        THINK('turn', 'planning') +
+        REASON('turn', 'planning') +
         MSG('user', 'Here is my response') +
         YIELD()
       )
     })
   })
 
-  describe('lens → invoke → yield', () => {
-    it('think then invoke then yield passes', () => {
+  describe('reason → invoke → yield', () => {
+    it('reason then invoke then yield passes', () => {
       const v = shellValidator()
       v.passes(
-        THINK('turn', 'I will run ls') +
-        INVOKE_SHELL('ls -la') +
+        REASON('turn', 'I will run ls') +
+        INVOKE('shell', { command: 'ls -la' }) +
         YIELD('invoke')
       )
     })
 
-    it('think then no-param invoke then yield passes', () => {
-      const v = multiToolValidator()
+    it('reason then no-param invoke then yield passes', () => {
+      const v = shellValidator()
       v.passes(
-        THINK('turn', 'checking tree') +
-        INVOKE_TREE() +
+        REASON('turn', 'checking tree') +
+        INVOKE('tree') +
         YIELD('invoke')
       )
     })
@@ -100,111 +97,86 @@ describe('full turn sequences', () => {
 
   describe('multiple invokes', () => {
     it('two invokes then yield passes', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        INVOKE_SHELL('echo hello') +
-        INVOKE_SKILL('review') +
+        INVOKE('shell', { command: 'echo hello' }) +
+        INVOKE('skill', { name: 'review' }) +
         YIELD('invoke')
       )
     })
 
     it('three invokes then yield passes', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        INVOKE_SHELL('ls') +
-        INVOKE_SKILL('review') +
-        INVOKE_TREE() +
+        INVOKE('shell', { command: 'ls' }) +
+        INVOKE('skill', { name: 'review' }) +
+        INVOKE('tree') +
         YIELD('invoke')
       )
     })
   })
 
-  describe('mixed lens + message + invoke', () => {
-    it('lens → message → invoke → yield passes', () => {
+  describe('mixed reason + message + invoke', () => {
+    it('reason → message → invoke → yield passes', () => {
       const v = shellValidator()
       v.passes(
-        THINK('turn', 'planning') +
+        REASON('turn', 'planning') +
         MSG('user', 'Running a command') +
-        INVOKE_SHELL('ls') +
+        INVOKE('shell', { command: 'ls' }) +
         YIELD('invoke')
       )
     })
 
-    it('lens → invoke → message → yield passes', () => {
+    it('reason → invoke → message → yield passes', () => {
       const v = shellValidator()
       v.passes(
-        THINK('turn', 'planning') +
-        INVOKE_SHELL('ls') +
+        REASON('turn', 'planning') +
+        INVOKE('shell', { command: 'ls' }) +
         MSG('user', 'Done') +
         YIELD()
       )
     })
 
-    it('multiple lenses → message → invoke → yield passes', () => {
-      const v = multiToolValidator()
+    it('multiple reasons → message → invoke → yield passes', () => {
+      const v = shellValidator()
       v.passes(
-        THINK('turn', 'first') +
-        THINK('alignment', 'second') +
+        REASON('turn', 'first') +
+        REASON('alignment', 'second') +
         MSG('user', 'Doing things') +
-        INVOKE_SHELL('echo hi') +
+        INVOKE('shell', { command: 'echo hi' }) +
         YIELD('invoke')
       )
     })
 
-    it('lens → message → invoke → message → yield passes', () => {
+    it('reason → message → invoke → message → yield passes', () => {
       const v = shellValidator()
       v.passes(
-        THINK('turn', 'plan') +
+        REASON('turn', 'plan') +
         MSG('user', 'Starting') +
-        INVOKE_SHELL('ls') +
+        INVOKE('shell', { command: 'ls' }) +
         MSG('user', 'Done') +
         YIELD()
       )
     })
 
     it('full complex sequence passes', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        THINK('turn', 'I need to do several things') +
-        THINK('diligence', 'check quality') +
+        REASON('turn', 'I need to do several things') +
+        REASON('diligence', 'check quality') +
         MSG('user', 'Starting work') +
-        INVOKE_SHELL('ls -la') +
-        INVOKE_SKILL('review') +
+        INVOKE('shell', { command: 'ls -la' }) +
+        INVOKE('skill', { name: 'review' }) +
         MSG('user', 'All done') +
         YIELD()
       )
     })
   })
 
-  describe('multi-param invokes in sequences', () => {
-    it('multi-param invoke in sequence passes', () => {
-      const v = multiToolValidator()
-      v.passes(
-        THINK('turn', 'editing a file') +
-        `\n<|invoke:edit>\n<|parameter:path>\nfoo.ts\n<parameter|>\n<|parameter:old>\nold content\n<parameter|>\n<|parameter:new>\nnew content\n<parameter|>\n<invoke|>\n` +
-        YIELD('invoke')
-      )
-    })
-
-    it('multi-param invoke with subset of params passes', () => {
-      const v = multiToolValidator()
-      v.passes(
-        `\n<|invoke:edit>\n<|parameter:path>\nfoo.ts\n<parameter|>\n<invoke|>\n` +
-        YIELD('invoke')
-      )
-    })
-  })
-
   describe('forbidden sequences', () => {
-    // Note: the gbnf library checks prefix validity. Sequences that are valid
-    // prefixes but can never be completed are tested by checking that adding
-    // the next expected character fails. Full-sequence rejection tests only
-    // apply to sequences that fail mid-stream.
-
     it('yield before invoke is rejected', () => {
       const v = shellValidator()
-      // After yield, the grammar is done — cannot start an invoke
-      v.rejects(YIELD() + INVOKE_SHELL('ls'))
+      v.rejects(YIELD() + INVOKE('shell', { command: 'ls' }))
     })
 
     it('yield before message is rejected', () => {
@@ -219,17 +191,16 @@ describe('full turn sequences', () => {
 
     it('content after yield is rejected', () => {
       const v = shellValidator()
-      v.rejects(YIELD() + THINK('turn', 'extra'))
+      v.rejects(YIELD() + REASON('turn', 'extra'))
     })
 
-    it('invoking unknown tool is rejected', () => {
+    it('reason after message is rejected (ordering)', () => {
       const v = shellValidator()
-      v.rejects(`\n<|invoke:unknown>\n\n<invoke|>\n` + YIELD('invoke'))
-    })
-
-    it('yield tag with wrong name is rejected', () => {
-      const v = shellValidator()
-      v.rejects(`\n<|yield:badtag|>\n`)
+      v.rejects(
+        MSG('user', 'hello') +
+        REASON('turn', 'thinking') +
+        YIELD()
+      )
     })
   })
 })

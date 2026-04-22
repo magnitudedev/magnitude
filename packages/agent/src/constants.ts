@@ -8,8 +8,8 @@ export const DEFAULT_CHAT_NAME = 'New Chat'
 /** Characters per token estimate (conservative) - for legacy XML format */
 export const CHARS_PER_TOKEN = 3
 
-/** Characters per token estimate for Mact format (slightly more compact) */
-export const CHARS_PER_TOKEN_MACT = 3.2
+/** Characters per token estimate for XML format */
+export const CHARS_PER_TOKEN_XML = 3.2
 
 /** Max tokens for a resolved ref in an inspect block */
 export const INSPECT_TOKEN_LIMIT = 25_000

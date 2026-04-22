@@ -1,205 +1,131 @@
 import { describe, it } from 'vitest'
-import { shellValidator } from './helpers'
+import { shellValidator, buildValidator, SHELL_TOOL } from './helpers'
 
 // Helpers to build full valid sequences
-const YIELD = '\n<|yield:user|>'
+const YIELD = '<yield_user/>'
 
-/** Wrap content in a think block + yield */
-function withThink(body: string): string {
-  return `\n<|think:alignment>\n${body}<think|>\n${YIELD}`
+/** Wrap content in a reason block + yield */
+function withReason(body: string): string {
+  return `<reason about="alignment">\n${body}</reason>\n${YIELD}`
 }
 
-/**
- * Wrap content in a shell invoke with command param + yield.
- *
- * After param-body DFA exits (consuming close tag + trailing \n),
- * the invoke-close rule is `hws invoke-end hws "\n"` — no leading \n.
- */
+/** Wrap content in a message block + yield */
+function withMessage(body: string): string {
+  return `<message to="user">\n${body}</message>\n${YIELD}`
+}
+
+/** Wrap content in a shell invoke with command param + yield */
 function withShellCommand(body: string): string {
-  return `\n<|invoke:shell>\n<|parameter:command>\n${body}<parameter|>\n<invoke|>\n${YIELD}`
+  return `<invoke tool="shell">\n<parameter name="command">\n${body}</parameter>\n</invoke>\n${YIELD}`
 }
 
 describe('body DFA — content with < that is not a close tag', () => {
   it('accepts < followed by a space (unrelated char)', () => {
     const v = shellValidator()
-    v.passes(withThink('foo < bar\n'))
+    v.passes(withReason('foo < bar\n'))
   })
 
   it('accepts partial tag name that does not complete', () => {
-    // <para is a prefix of <parameter but doesn't complete it — goes back to s0
     const v = shellValidator()
-    v.passes(withThink('see <para something here\n'))
+    v.passes(withReason('see <rea something here\n'))
   })
 
-  it('accepts HTML-like content in think body', () => {
-    // </div> — "d" is not "t" so DFA returns to s0 after "/"
+  it('accepts HTML-like content in reason body', () => {
     const v = shellValidator()
-    v.passes(withThink('<div>hello</div>\n'))
+    v.passes(withReason('<div>hello</div>\n'))
   })
 
   it('accepts </foo> (wrong tag name) in parameter body', () => {
-    // </foo> — "f" is not "p" so DFA returns to s0 after "/"
     const v = shellValidator()
     v.passes(withShellCommand('echo </foo> hello\n'))
   })
 
   it('accepts code with < comparison operators', () => {
     const v = shellValidator()
-    v.passes(withThink('if a < b then do something\n'))
+    v.passes(withReason('if a < b then do something\n'))
   })
 
-  it('accepts the word "parameter" without angle brackets', () => {
+  it('accepts </rea (partial close tag name) in reason body', () => {
     const v = shellValidator()
-    v.passes(withShellCommand('# parameter value here\n'))
+    v.passes(withReason('</rea partial\n'))
   })
 
-  it('accepts </shell> (wrong tag name) in parameter body', () => {
-    // </shell> — "s" is not "p" so DFA returns to s0 after "/"
+  it('accepts < at end of line (followed by newline)', () => {
     const v = shellValidator()
-    v.passes(withShellCommand('echo </shell> done\n'))
-  })
-
-  it('accepts <thinx (wrong char after "thin") in think body', () => {
-    // <thinx — "x" is not "k" so DFA returns to s0
-    const v = shellValidator()
-    v.passes(withThink('<thinx is not a close tag\n'))
-  })
-
-  it('accepts << in think body (s1 loops back to s1 on <)', () => {
-    const v = shellValidator()
-    v.passes(withThink('<<< >>>\n'))
-  })
-
-  it('accepts << in parameter body (s1 loops back to s1 on <)', () => {
-    const v = shellValidator()
-    v.passes(withShellCommand('a << b\n'))
+    v.passes(withReason('line ending with <\n'))
   })
 })
 
-describe('body DFA — close tag variants (think body)', () => {
-  it('terminates think body with canonical <think|>', () => {
+describe('body DFA — false close tag rejection', () => {
+  it('close tag followed by non-ws char is treated as body content', () => {
+    // </reason>` — backtick at tw0 matches [^ \t\n<] → back to s0
     const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|>\n${YIELD}`)
+    v.passes(withReason('content\n</reason>`more content\n'))
   })
 
-  it('terminates think body with </think|> (Mode 1 — slash)', () => {
+  it('close tag followed by letter is treated as body content', () => {
     const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n</think|>\n${YIELD}`)
+    v.passes(withMessage('hello\n</message>foo\n'))
   })
 
-  it('terminates think body with </think> (Mode 2 — slash no pipe)', () => {
+  it('close tag followed by space then letter is treated as body content', () => {
     const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n</think>\n${YIELD}`)
+    v.passes(withMessage('hello\n</message> to end your message\n'))
   })
 
-  it('terminates think body with <think> (Mode 3 — no pipe)', () => {
+  it('false close tag in prose: real close later', () => {
     const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think>\n${YIELD}`)
-  })
-})
-
-describe('body DFA — close tag variants (parameter body)', () => {
-  it('terminates parameter body with canonical <parameter|>', () => {
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>\necho hi\n<parameter|>\n<invoke|>\n${YIELD}`)
-  })
-
-  it('terminates parameter body with </parameter|> (Mode 1 — slash)', () => {
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>\necho hi\n</parameter|>\n<invoke|>\n${YIELD}`)
-  })
-
-  it('terminates parameter body with </parameter> (Mode 2 — slash no pipe)', () => {
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>\necho hi\n</parameter>\n<invoke|>\n${YIELD}`)
-  })
-
-  it('terminates parameter body with <parameter> (Mode 3 — no pipe)', () => {
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>\necho hi\n<parameter>\n<invoke|>\n${YIELD}`)
-  })
-})
-
-describe('body DFA — empty body (close tag immediately after open)', () => {
-  it('accepts empty think body (just close tag)', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\n<think|>\n${YIELD}`)
-  })
-
-  it('accepts empty parameter body (just close tag)', () => {
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>\n<parameter|>\n<invoke|>\n${YIELD}`)
-  })
-})
-
-describe('body DFA — trailing whitespace after close tag (tw0/tw1/tw2)', () => {
-  it('accepts close tag followed directly by newline', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|>\n${YIELD}`)
-  })
-
-  it('accepts close tag with one trailing space before newline', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|> \n${YIELD}`)
-  })
-
-  it('accepts close tag with one trailing tab before newline', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|>\t\n${YIELD}`)
-  })
-
-  it('accepts close tag with two trailing spaces before newline', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|>  \n${YIELD}`)
-  })
-
-  it('accepts close tag with three trailing spaces before newline', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|>   \n${YIELD}`)
-  })
-
-  it('accepts close tag with four trailing spaces before newline', () => {
-    const v = shellValidator()
-    v.passes(`\n<|think:alignment>\nhello\n<think|>    \n${YIELD}`)
-  })
-
-  it('rejects close tag with five trailing spaces before newline', () => {
-    const v = shellValidator()
-    v.rejects(`\n<|think:alignment>\nhello\n<think|>     \n${YIELD}`)
-  })
-})
-
-describe('body DFA — open tag requires newline before body', () => {
-  it('accepts parameter value on same line as open tag (inline)', () => {
-    // Parameters are inline — content immediately after open tag
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>echo hi<parameter|>\n<invoke|>\n${YIELD}`)
-  })
-
-  it('accepts parameter value starting on next line', () => {
-    const v = shellValidator()
-    v.passes(`\n<|invoke:shell>\n<|parameter:command>\necho hi\n<parameter|>\n<invoke|>\n${YIELD}`)
+    v.passes(`<message to="user">\nhello</message> to end your message</message>\n${YIELD}`)
   })
 })
 
 describe('body DFA — multiline content', () => {
-  it('accepts multiline think content', () => {
+  it('accepts content with blank lines in reason body', () => {
     const v = shellValidator()
-    v.passes(withThink('line one\nline two\nline three\n'))
+    v.passes(withReason('line one\n\nline two\n\nline three\n'))
   })
 
-  it('accepts multiline parameter content', () => {
+  it('accepts content with blank lines in message body', () => {
     const v = shellValidator()
-    v.passes(withShellCommand('line one\nline two\nline three\n'))
-  })
-
-  it('accepts content with blank lines in think body', () => {
-    const v = shellValidator()
-    v.passes(withThink('first paragraph\n\nsecond paragraph\n'))
+    v.passes(withMessage('paragraph one\n\nparagraph two\n'))
   })
 
   it('accepts content with blank lines in parameter body', () => {
     const v = shellValidator()
-    v.passes(withShellCommand('first line\n\nthird line\n'))
+    v.passes(withShellCommand('line one\n\nline two\n'))
+  })
+})
+
+describe('body DFA — trailing whitespace window', () => {
+  it('0 trailing spaces after close tag: confirmed by next tag', () => {
+    const v = shellValidator()
+    v.passes(`<message to="user">\nhello\n</message><yield_user/>`)
+  })
+
+  it('1 trailing space after close tag: confirmed by newline', () => {
+    const v = shellValidator()
+    v.passes(`<message to="user">\nhello\n</message> \n${YIELD}`)
+  })
+
+  it('4 trailing spaces after close tag: confirmed by <', () => {
+    const v = shellValidator()
+    v.passes(`<message to="user">\nhello\n</message>    <yield_user/>`)
+  })
+
+  it('5 trailing spaces: rejected (tw4 has no space transition)', () => {
+    const v = shellValidator()
+    v.rejects(`<message to="user">\nhello\n</message>     \n${YIELD}`)
+  })
+
+  it('4 trailing tabs: confirmed by newline', () => {
+    const v = shellValidator()
+    v.passes(`<message to="user">\nhello\n</message>\t\t\t\t\n${YIELD}`)
+  })
+
+  it('5 trailing tabs: close tag treated as content (tab escapes to s0 at tw4)', () => {
+    // 5th tab at tw4 matches [^ \n<] → back to s0, close tag becomes content
+    // Need real close after
+    const v = shellValidator()
+    v.passes(`<message to="user">\nhello\n</message>\t\t\t\t\tmore content\n</message>\n${YIELD}`)
   })
 })

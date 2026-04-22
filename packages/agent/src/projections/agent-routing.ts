@@ -286,7 +286,7 @@ export const AgentRoutingProjection = Projection.define<AppEvent, AgentRoutingSt
       }
 
       if (entry.destination.kind === 'worker') {
-        // Re-resolve target at message_end to handle same-turn spawn-worker + message flows.
+        // Re-resolve target at message_end to handle same-turn spawn_worker + message flows.
         const taskGraph = read(TaskGraphProjection)
         const resolvedTargetAgentId =
           entry.targetAgentId ?? findTaskWorkerAgentId(taskGraph, entry.destination.taskId)

@@ -115,7 +115,7 @@ describe('task operation handlers validation', () => {
     }
   })
 
-  test('spawn-worker on unassigned task spawns worker and publishes task_assigned', async () => {
+  test('spawn_worker on unassigned task spawns worker and publishes task_assigned', async () => {
     const published: AppEvent[] = []
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
@@ -129,7 +129,7 @@ describe('task operation handlers validation', () => {
     })
 
     const result = await runOp(handleSpawnWorkerDirective({
-      kind: 'spawn-worker',
+      kind: 'spawn_worker',
       id: 't2',
       message: 'Test instruction',
       spawnWorker: () => Effect.succeed('fork-2'),
@@ -140,7 +140,7 @@ describe('task operation handlers validation', () => {
     expect(published.some((e) => e.type === 'agent_killed')).toBe(false)
   })
 
-  test('spawn-worker on assigned task kills existing worker first', async () => {
+  test('spawn_worker on assigned task kills existing worker first', async () => {
     const published: AppEvent[] = []
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
@@ -155,7 +155,7 @@ describe('task operation handlers validation', () => {
     })
 
     const result = await runOp(handleSpawnWorkerDirective({
-      kind: 'spawn-worker',
+      kind: 'spawn_worker',
       id: 't3',
       message: 'Test instruction',
       spawnWorker: () => Effect.succeed('fork-3-new'),
@@ -166,7 +166,7 @@ describe('task operation handlers validation', () => {
     expect(published.some((e) => e.type === 'task_assigned')).toBe(true)
   })
 
-  test('kill-worker on task without worker errors', async () => {
+  test('kill_worker on task without worker errors', async () => {
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
         ['t4', {
@@ -179,7 +179,7 @@ describe('task operation handlers validation', () => {
     })
 
     const result = await runOp(handleKillWorkerDirective({
-      kind: 'kill-worker',
+      kind: 'kill_worker',
       id: 't4',
     }, mkCtx()), state)
 
@@ -189,7 +189,7 @@ describe('task operation handlers validation', () => {
     }
   })
 
-  test('kill-worker kills existing worker and clears assignment', async () => {
+  test('kill_worker kills existing worker and clears assignment', async () => {
     const published: AppEvent[] = []
     const state = mkTaskState({
       tasks: new Map<string, TaskRecord>([
@@ -204,7 +204,7 @@ describe('task operation handlers validation', () => {
     })
 
     const result = await runOp(handleKillWorkerDirective({
-      kind: 'kill-worker',
+      kind: 'kill_worker',
       id: 't5',
     }, mkCtx()), state, published)
 

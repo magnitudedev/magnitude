@@ -111,21 +111,21 @@ export function renderResultBody(toolName: string, output: unknown): string {
  * Render a void result (no content).
  */
 export function renderVoidResult(toolName: string): string {
-  return `<|result:${toolName}>\n<result|>`
+  return `<result tool="${toolName}"/>`
 }
 
 /**
  * Render a pure string result (content is the entire block body).
  */
 export function renderStringResult(toolName: string, content: string): string {
-  return `<|result:${toolName}>\n${content}\n<result|>`
+  return `<result tool="${toolName}">\n${content}\n</result>`
 }
 
 /**
  * Render a scalar (number/boolean) result.
  */
 export function renderScalarResult(toolName: string, value: number | boolean | unknown): string {
-  return `<|result:${toolName}>\n${String(value)}\n<result|>`
+  return `<result tool="${toolName}">\n${String(value)}\n</result>`
 }
 
 /**
@@ -133,7 +133,7 @@ export function renderScalarResult(toolName: string, value: number | boolean | u
  */
 export function renderArrayResult(toolName: string, items: unknown[]): string {
   const json = JSON.stringify(items)
-  return `<|result:${toolName}>\n<|out:items>${json}<out|>\n<result|>`
+  return `<result tool="${toolName}">\n<out name="items">${json}</out>\n</result>`
 }
 
 /**
@@ -143,13 +143,13 @@ export function renderObjectResult(
   toolName: string,
   fields: Record<string, unknown>
 ): string {
-  const lines: string[] = [`<|result:${toolName}>`]
+  const lines: string[] = [`<result tool="${toolName}">`]
   
   for (const [name, value] of Object.entries(fields)) {
     lines.push(renderOutField(name, value))
   }
   
-  lines.push(`<result|>`)
+  lines.push(`</result>`)
   return lines.join('\n')
 }
 
@@ -165,15 +165,15 @@ export function renderOutField(name: string, value: unknown): string {
   if (typeof value === 'string') {
     // Multi-line or long strings get their own lines
     if (value.includes('\n') || value.length > 80) {
-      return `<|out:${name}>\n${value}\n<out|>`
+      return `<out name="${name}">\n${value}\n</out>`
     }
     // Short strings inline
-    return `<|out:${name}>${value}<out|>`
+    return `<out name="${name}">${value}</out>`
   }
   
   // Non-string values - JSON
   const json = JSON.stringify(value)
-  return `<|out:${name}>${json}<out|>`
+  return `<out name="${name}">${json}</out>`
 }
 
 /**
@@ -290,32 +290,41 @@ export function parseResultBlock(text: string): {
   fields: Map<string, unknown>
   content?: string
 } | null {
-  const openMatch = text.match(/^<\|result:([^>]+)>\n?/)
+  const trimmed = text.trim()
+
+  // Self-closing void result: <result tool="NAME"/>
+  const voidMatch = trimmed.match(/^<result tool="([^"]+)"\/>\s*$/)
+  if (voidMatch) {
+    return { toolName: voidMatch[1], fields: new Map() }
+  }
+
+  // Open tag: <result tool="NAME">
+  const openMatch = trimmed.match(/^<result tool="([^"]+)">\n?/)
   if (!openMatch) return null
-  
+
   const toolName = openMatch[1]
-  const remaining = text.slice(openMatch[0].length)
-  
+  const remaining = trimmed.slice(openMatch[0].length)
+
   // Check for pure string result (no out blocks)
-  const closeMatch = remaining.match(/\n?<result\|>$/)
+  const closeMatch = remaining.match(/\n?<\/result>\s*$/)
   if (closeMatch) {
     const content = remaining.slice(0, -closeMatch[0].length)
-    
+
     // Check if it contains out blocks
-    if (!content.includes('<|out:')) {
+    if (!content.includes('<out name=')) {
       return { toolName, fields: new Map(), content }
     }
   }
-  
-  // Parse out blocks
+
+  // Parse out blocks: <out name="NAME">VALUE</out>
   const fields = new Map<string, unknown>()
-  const outRegex = /<\|out:([^>]+)>([\s\S]*?)<out\|>/g
+  const outRegex = /<out name="([^"]+)">([\s\S]*?)<\/out>/g
   let match
-  
+
   while ((match = outRegex.exec(remaining)) !== null) {
     const name = match[1]
     const value = match[2].trim()
-    
+
     // Try to parse as JSON, fall back to string
     try {
       fields.set(name, JSON.parse(value))
@@ -323,7 +332,7 @@ export function parseResultBlock(text: string): {
       fields.set(name, value)
     }
   }
-  
+
   return { toolName, fields }
 }
 
@@ -335,13 +344,17 @@ export function parseResultBlock(text: string): {
  * Check if a string is a valid result block.
  */
 export function isValidResultBlock(text: string): boolean {
-  return /^<\|result:[^>]+>[\s\S]*<result\|>$/.test(text.trim())
+  const trimmed = text.trim()
+  return (
+    /^<result tool="[^"]+"\/>$/.test(trimmed) ||
+    /^<result tool="[^"]+">[\s\S]*<\/result>$/.test(trimmed)
+  )
 }
 
 /**
  * Extract the tool name from a result block.
  */
 export function extractToolName(text: string): string | null {
-  const match = text.match(/^<\|result:([^>]+)>/)
+  const match = text.match(/^<result tool="([^"]+)"/)
   return match ? match[1] : null
 }

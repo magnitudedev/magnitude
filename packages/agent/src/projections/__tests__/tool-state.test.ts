@@ -39,7 +39,7 @@ const makeToolState = async (events: AppEvent[], forkId: string | null = null) =
 }
 
 describe('ToolStateProjection', () => {
-  it('tracks model-backed hidden spawn-worker state outside DisplayProjection', async () => {
+  it('tracks model-backed hidden spawn_worker state outside DisplayProjection', async () => {
     const state = await makeToolState([
       {
         type: 'tool_event',
@@ -84,7 +84,7 @@ describe('ToolStateProjection', () => {
     })
   })
 
-  it('tracks kill-worker parsed task id via existing tool model', async () => {
+  it('tracks kill_worker parsed task id via existing tool model', async () => {
     const state = await makeToolState([
       {
         type: 'tool_event',

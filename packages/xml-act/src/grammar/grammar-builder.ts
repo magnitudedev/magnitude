@@ -1,5 +1,6 @@
 
 import { LEAD_YIELD_TAGS } from '../constants'
+import { VALID_CHILDREN } from '../nesting'
 
 // =============================================================================
 // Types
@@ -7,6 +8,7 @@ import { LEAD_YIELD_TAGS } from '../constants'
 
 /**
  * Parameter binding for grammar generation.
+ * Kept for API compatibility — tool parameters are no longer enumerated in the grammar.
  */
 export interface GrammarParameterDef {
   readonly name: string
@@ -16,6 +18,7 @@ export interface GrammarParameterDef {
 
 /**
  * Tool definition for grammar generation.
+ * Kept for API compatibility — tools are no longer enumerated in the grammar.
  */
 export interface GrammarToolDef {
   readonly tagName: string
@@ -34,10 +37,8 @@ export interface ProtocolConfig {
   readonly maxLenses: number | undefined
   /** Yield tags to use at turn end. */
   readonly yieldTags: ReadonlyArray<string>
-  /** Available lens names. */
+  /** Available lens names (kept for metadata; no longer affects grammar generation). */
   readonly lensNames: ReadonlyArray<string>
-  /** Tool keyword (default: "invoke"). */
-  readonly toolKeyword: string
 }
 
 /**
@@ -57,7 +58,17 @@ export interface GrammarBuildOptions {
   readonly maxLenses?: number
   readonly yieldTags?: ReadonlyArray<string>
   readonly lensNames?: ReadonlyArray<string>
-  readonly toolKeyword?: string
+}
+
+/**
+ * Context for body DFA generation — specifies which continuation rules
+ * the trailing-whitespace states should reference when the close tag is confirmed.
+ */
+export interface BodyContext {
+  /** Rule to invoke after "\n" confirms the close tag. */
+  readonly confirmRule: string
+  /** Rule to invoke after "<" confirms the close tag (< already consumed). */
+  readonly confirmNoLtRule: string
 }
 
 // =============================================================================
@@ -74,6 +85,11 @@ function serializeGrammar(rules: RuleMap): string {
   return lines.join('\n')
 }
 
+function addRule(rules: RuleMap, line: string): void {
+  const match = line.match(/^(\S+) ::= (.+)$/)
+  if (match) rules.set(match[1], match[2])
+}
+
 // =============================================================================
 // Defaults
 // =============================================================================
@@ -86,7 +102,6 @@ const defaultProtocol: ProtocolConfig = {
   maxLenses: undefined,
   yieldTags: LEAD_YIELD_TAGS,
   lensNames: ['alignment', 'tasks', 'diligence', 'skills', 'turn', 'pivot'],
-  toolKeyword: 'invoke',
 }
 
 // =============================================================================
@@ -138,13 +153,6 @@ export class GrammarBuilder {
     })
   }
 
-  withToolKeyword(toolKeyword: string): GrammarBuilder {
-    return new GrammarBuilder({
-      ...this.config,
-      protocol: { ...this.config.protocol, toolKeyword },
-    })
-  }
-
   withOptions(options: GrammarBuildOptions): GrammarBuilder {
     let next = this as GrammarBuilder
     if (options.minLenses !== undefined) next = next.withMinLenses(options.minLenses)
@@ -152,20 +160,25 @@ export class GrammarBuilder {
     if (options.maxLenses !== undefined) next = next.withMaxLenses(options.maxLenses)
     if (options.yieldTags !== undefined) next = next.withYieldTags(options.yieldTags)
     if (options.lensNames !== undefined) next = next.withLensNames(options.lensNames)
-    if (options.toolKeyword !== undefined) next = next.withToolKeyword(options.toolKeyword)
     return next
   }
 
   build(): string {
+    const { requiredMessageTo, maxLenses } = this.config.protocol
+
+    // Validation
+    if (maxLenses !== undefined && requiredMessageTo === null) {
+      throw new Error('maxLenses requires requiredMessageTo to be set')
+    }
+
     const rules: RuleMap = new Map()
 
     this.addWhitespaceRules(rules)
-    this.addSharedBodyRules(rules)
-    this.addLensRules(rules)
-    this.addMessageRules(rules)
+    this.addAttributeRules(rules)
     this.addYieldRules(rules)
-    this.addInvokeCloseRule(rules)
-    this.addToolRules(rules)
+    this.addInvokeInternalContinuationRules(rules)
+    this.addContinuationRules(rules)
+    this.addSharedBodyRules(rules)
     this.addRootRule(rules)
 
     return serializeGrammar(rules)
@@ -176,115 +189,190 @@ export class GrammarBuilder {
   // ---------------------------------------------------------------------------
 
   private addWhitespaceRules(rules: RuleMap): void {
-    // ws: unbounded whitespace (spaces, tabs, newlines) — used before block elements where model naturally produces whitespace
+    // ws: unbounded whitespace — used before block elements
     rules.set('ws', '[ \\t\\n]*')
-    // bhws: bounded horizontal whitespace (0-4 chars, spaces/tabs only) — safe inline spacing that cannot trap the model
-    rules.set('bhws', '[ \\t]? [ \\t]? [ \\t]? [ \\t]?')
   }
 
-  private addSharedBodyRules(rules: RuleMap): void {
-    // Shared DFAs — one per close tag name. No "" exits; body must end with close tag.
-    for (const bodyRule of generateBodyRules('param', 'parameter')) {
-      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
-    }
-    for (const bodyRule of generateBodyRules('think', 'think')) {
-      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
-    }
-    for (const bodyRule of generateBodyRules('msg', 'message')) {
-      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
-    }
-    for (const bodyRule of generateBodyRules('filter', 'filter')) {
-      const match = bodyRule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
-    }
-  }
-
-  private addLensRules(rules: RuleMap): void {
-    const lensNames = this.config.protocol.lensNames
-    const lensnameAlts = lensNames.map(n => `"${n}"`).join(' | ')
-    
-    rules.set('lensname', lensnameAlts)
-    // DFA handles close tag — no literal "<think|>" in outer rule
-    rules.set('lens', 'ws "<|think:" lensname ">" "\\n" think-body')
-    rules.set('lens-cap', 'ws "<|think:" lensname ">" "\\n" think-body')
-  }
-
-  private addMessageRules(rules: RuleMap): void {
-    rules.set('recipient', '[^ \\t\\n>]+')
-    // DFA handles close tag — no literal "<message|>" in outer rule
-    rules.set('msg', 'ws "<|message:" recipient ">" "\\n" msg-body')
-
-    const requiredRecipient = this.config.protocol.requiredMessageTo
-    if (requiredRecipient !== null) {
-      rules.set('forced-msg', `ws "<|message:${requiredRecipient}>" "\\n" msg-body`)
-    }
+  private addAttributeRules(rules: RuleMap): void {
+    rules.set('quoted-value', '[^"]*')
+    rules.set('reason-attrs', '" about=\\"" quoted-value "\\""')
+    rules.set('reason-attrs-opt', 'reason-attrs | ""')
+    rules.set('msg-attrs', '" to=\\"" quoted-value "\\""')
+    rules.set('invoke-attrs', '" tool=\\"" quoted-value "\\""')
+    rules.set('param-attrs', '" name=\\"" quoted-value "\\""')
   }
 
   private addYieldRules(rules: RuleMap): void {
-    const alternatives = this.config.protocol.yieldTags
-      .map(target => `ws "<|yield:${target}|>"`)
-      .join(' | ')
-    rules.set('yield', alternatives)
+    const yieldTags = this.config.protocol.yieldTags
+    const withLt = yieldTags.map(t => `"<${t}/>"`)
+    const noLt = yieldTags.map(t => `"${t}/>"`)
+    rules.set('yield', withLt.join(' | '))
+    rules.set('yield-no-lt', noLt.join(' | '))
   }
 
-  private addInvokeCloseRule(rules: RuleMap): void {
-    // Lenient invoke close — accepts all 4 close tag modes
-    rules.set('invoke-end', '"<invoke|>" | "</invoke|>" | "</invoke>" | "<invoke>"')
+  private addInvokeInternalContinuationRules(rules: RuleMap): void {
+    // Derive invoke children from VALID_CHILDREN — provably in sync with the parser
+    const invokeChildren = VALID_CHILDREN.invoke  // ['parameter', 'filter']
+
+    const invokeItemAlts: string[] = []
+    const invokeItemNoLtAlts: string[] = []
+    for (const child of invokeChildren) {
+      if (child === 'parameter') {
+        invokeItemAlts.push('"<parameter" param-attrs ">" param-body-s0')
+        invokeItemNoLtAlts.push('"parameter" param-attrs ">" param-body-s0')
+      } else if (child === 'filter') {
+        invokeItemAlts.push('"<filter>" filter-body-s0')
+        invokeItemNoLtAlts.push('"filter>" filter-body-s0')
+      }
+    }
+
+    rules.set('invoke-item', invokeItemAlts.join(' | '))
+    rules.set('invoke-next', 'ws invoke-item | ws "</invoke>" turn-next-post')
+    rules.set(
+      'invoke-next-no-lt',
+      [...invokeItemNoLtAlts, '"/invoke>" turn-next-post'].join(' | ')
+    )
   }
 
-  private addToolRules(rules: RuleMap): void {
-    const toolKeyword = this.config.protocol.toolKeyword
-    const { toolRule, rules: toolRuleStrings } = buildToolRules(this.config.tools, toolKeyword)
+  private addContinuationRules(rules: RuleMap): void {
+    const { allowMessages, allowTools } = this.config.protocol
 
-    const toolMatch = toolRule.match(/^(\S+) ::= (.+)$/)
-    if (toolMatch) rules.set(toolMatch[1], toolMatch[2])
+    // Derive post-lens children from VALID_CHILDREN.prose (excludes 'reason' which is lens-phase only)
+    // VALID_CHILDREN.prose = ['reason', 'message', 'invoke']
+    const proseChildren = VALID_CHILDREN.prose
 
-    for (const rule of toolRuleStrings) {
-      const match = rule.match(/^(\S+) ::= (.+)$/)
-      if (match) rules.set(match[1], match[2])
+    // Post-lens phase: message and/or invoke, then yield
+    const postItems: string[] = []
+    const postItemsNoLt: string[] = []
+    for (const child of proseChildren) {
+      if (child === 'reason') continue  // reason is lens-phase only
+      if (child === 'message' && allowMessages) {
+        postItems.push('"<message" msg-attrs ">" msg-body-s0')
+        postItemsNoLt.push('"message" msg-attrs ">" msg-body-s0')
+      } else if (child === 'invoke' && allowTools) {
+        postItems.push('"<invoke" invoke-attrs ">" invoke-next')
+        postItemsNoLt.push('"invoke" invoke-attrs ">" invoke-next')
+      }
+    }
+
+    const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<message" msg-attrs ">" msg-body-s0'
+    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"message" msg-attrs ">" msg-body-s0']
+
+    rules.set('turn-item-post', postItemRule)
+    rules.set('turn-next-post', 'ws turn-item-post | ws yield')
+    rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
+
+    // Lens phase: reason (from VALID_CHILDREN.prose) + post-lens items
+    const hasReason = (proseChildren as readonly string[]).includes('reason')
+    const lensItems = hasReason
+      ? ['"<reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
+      : postItems
+    const lensItemsNoLt = hasReason
+      ? ['"reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
+      : postItemsNoLt
+
+    rules.set('turn-item-lens', lensItems.join(' | '))
+    rules.set('turn-next-lens', 'ws turn-item-lens | ws yield')
+    rules.set('turn-next-lens-no-lt', [...lensItemsNoLt, 'yield-no-lt'].join(' | '))
+  }
+
+  private addSharedBodyRules(rules: RuleMap): void {
+    const lensCtx: BodyContext = {
+      confirmRule: 'turn-next-lens',
+      confirmNoLtRule: 'turn-next-lens-no-lt',
+    }
+    const postCtx: BodyContext = {
+      confirmRule: 'turn-next-post',
+      confirmNoLtRule: 'turn-next-post-no-lt',
+    }
+    const invokeCtx: BodyContext = {
+      confirmRule: 'invoke-next',
+      confirmNoLtRule: 'invoke-next-no-lt',
+    }
+
+    for (const rule of generateBodyRules('reason-body', 'reason', lensCtx)) {
+      addRule(rules, rule)
+    }
+    for (const rule of generateBodyRules('msg-body', 'message', postCtx)) {
+      addRule(rules, rule)
+    }
+    for (const rule of generateBodyRules('param-body', 'parameter', invokeCtx)) {
+      addRule(rules, rule)
+    }
+    for (const rule of generateBodyRules('filter-body', 'filter', invokeCtx)) {
+      addRule(rules, rule)
     }
   }
 
   private addRootRule(rules: RuleMap): void {
-    const parts: string[] = []
-    const recipient = this.config.protocol.requiredMessageTo
-    const maxLenses = this.config.protocol.maxLenses
+    const { minLenses, requiredMessageTo, maxLenses } = this.config.protocol
 
-    if (recipient !== null) {
-      const lensCount = maxLenses ?? 6
-      const lensSlots: string[] = []
-      for (let i = 0; i < lensCount; i++) {
-        lensSlots.push('lens-cap?')
-      }
-      parts.push(...lensSlots)
-    } else if (this.config.protocol.minLenses === 1) {
-      parts.push('lens+')
+    if (requiredMessageTo !== null) {
+      this.addForcedMessageRules(rules, requiredMessageTo, maxLenses)
+      // root set inside addForcedMessageRules
+    } else if (minLenses === 1) {
+      // Must start with at least one reason; reason body chains back to lens phase
+      rules.set('root', 'ws "<reason" reason-attrs-opt ">" reason-body-s0')
     } else {
-      parts.push('lens*')
+      rules.set('root', 'turn-next-lens')
     }
-
-    if (recipient !== null) {
-      parts.push('forced-msg')
-    }
-
-    parts.push(this.buildMiddleAlternative())
-    parts.push('yield')
-
-    rules.set('root', parts.join(' '))
   }
 
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
+  private addForcedMessageRules(rules: RuleMap, recipient: string, maxLenses: number | undefined): void {
+    // Forced message rule (literal recipient)
+    const escapedRecipient = recipient.replace(/"/g, '\\"')
+    rules.set('forced-msg', `"<message to=\\"${escapedRecipient}\\">" msg-body-s0`)
+    rules.set('forced-msg-no-lt', `"message to=\\"${escapedRecipient}\\">" msg-body-s0`)
 
-  private buildMiddleAlternative(): string {
-    const middle: string[] = []
-    if (this.config.protocol.allowMessages) middle.push('msg')
-    if (this.config.protocol.allowTools) middle.push('invoke')
-    return middle.length > 0 ? `(${middle.join(' | ')})*` : 'msg*'
+    if (maxLenses !== undefined) {
+      // Generate N+1 forced-phase variants, each allowing one fewer reason.
+      // turn-next-forced-N allows N more reasons then forced-msg
+      // turn-next-forced-0 allows only forced-msg
+      for (let k = maxLenses; k >= 0; k--) {
+        if (k === 0) {
+          rules.set(`turn-next-forced-0`, 'ws forced-msg')
+          rules.set(`turn-next-forced-0-no-lt`, 'forced-msg-no-lt')
+        } else {
+          const nextK = k - 1
+          // reason body DFA for slot k chains to turn-next-forced-(k-1)
+          const reasonCtx: BodyContext = {
+            confirmRule: `turn-next-forced-${nextK}`,
+            confirmNoLtRule: `turn-next-forced-${nextK}-no-lt`,
+          }
+          for (const rule of generateBodyRules(`reason-forced-${k}-body`, 'reason', reasonCtx)) {
+            addRule(rules, rule)
+          }
+          rules.set(
+            `turn-next-forced-${k}`,
+            `ws "<reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | ws forced-msg`
+          )
+          rules.set(
+            `turn-next-forced-${k}-no-lt`,
+            `"reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | forced-msg-no-lt`
+          )
+        }
+      }
+      rules.set('root', `turn-next-forced-${maxLenses}`)
+    } else {
+      // No maxLenses: unlimited reasons before forced message
+      // reason-forced-body chains back to turn-next-forced
+      const reasonCtx: BodyContext = {
+        confirmRule: 'turn-next-forced',
+        confirmNoLtRule: 'turn-next-forced-no-lt',
+      }
+      for (const rule of generateBodyRules('reason-forced-body', 'reason', reasonCtx)) {
+        addRule(rules, rule)
+      }
+      rules.set(
+        'turn-next-forced',
+        'ws "<reason" reason-attrs-opt ">" reason-forced-body-s0 | ws forced-msg'
+      )
+      rules.set(
+        'turn-next-forced-no-lt',
+        '"reason" reason-attrs-opt ">" reason-forced-body-s0 | forced-msg-no-lt'
+      )
+      rules.set('root', 'turn-next-forced')
+    }
   }
 }
 
@@ -293,135 +381,84 @@ export class GrammarBuilder {
 // =============================================================================
 
 /**
- * Generate DFA body rules that accept all 4 close tag variants:
- *   - `<tagname|>`   (canonical)
- *   - `</tagname|>`  (Mode 1: slash-prefix with pipe)
- *   - `</tagname>`   (Mode 2: slash-prefix without pipe)
- *   - `<tagname>`    (Mode 3: no slash, no pipe)
+ * Generate DFA body rules for a tag with the given close-tag name.
  *
- * No `""` exits — the body MUST terminate by consuming a close tag.
- * The DFA is the sole handler of close tag detection; outer rules
- * do not include literal close tags.
+ * The DFA matches any content, rejecting false close tags (ones not followed
+ * by bounded whitespace then `\n` or a known next-tag prefix).
  *
- * @param prefix - Rule name prefix (e.g., "think", "msg", "param", "filter")
- * @param tagName - The tag name for the close delimiter (e.g., "think", "message", "parameter", "filter")
- * @returns Array of GBNF rule strings
+ * When the close tag IS confirmed, the DFA hands off to the specified
+ * continuation rules rather than terminating — enabling the chain grammar.
+ *
+ * @param prefix      Rule name prefix, e.g. "reason-body"
+ * @param tagName     The close tag name, e.g. "reason"
+ * @param context     Which continuation rules to invoke on confirmation
  */
-export function generateBodyRules(prefix: string, tagName: string): string[] {
-  const rules: string[] = []
-  const n = tagName.length
-  const s = (k: number) => `${prefix}-body-s${k}`
-  const tw = (k: number) => `${prefix}-body-tw${k}`
-  const slashState = `${prefix}-body-sl`
-  const pipeState = `${prefix}-body-pp`
+export function generateBodyRules(prefix: string, tagName: string, context: BodyContext): string[] {
+  const lines: string[] = []
+  const L = tagName.length
+  const MAX_TW = 4
 
-  rules.push(`${prefix}-body ::= ${s(0)}`)
+  // Entry alias
+  lines.push(`${prefix} ::= ${prefix}-s0`)
 
-  // s0: base state — accumulate non-'<' content, or start matching on '<'
-  // No "" exit — body must end with close tag
-  rules.push(`${s(0)} ::= [^<] ${s(0)} | "<" ${s(1)}`)
+  // s0: base content state — consume non-'<' freely, enter close-tag matching on '<'
+  lines.push(`${prefix}-s0 ::= [^<] ${prefix}-s0 | "<" ${prefix}-s1`)
 
-  // s1: after '<' — accept '/' (slash variant) or first tagname char (canonical)
-  const fc = escapeGbnfChar(tagName[0])
-  const fcClass = escapeGbnfCharClass(tagName[0])
-  rules.push(`${s(1)} ::= "/" ${slashState} | ${fc} ${s(2)} | "<" ${s(1)} | [^</${fcClass}] ${s(0)}`)
+  // s1: saw '<' — check for '/' (close tag) or restart on another '<'
+  lines.push(`${prefix}-s1 ::= "/" ${prefix}-sl | "<" ${prefix}-s1 | [^/<] ${prefix}-s0`)
 
-  // slashState: after '</' — expect first tagname char (shared path)
-  rules.push(`${slashState} ::= ${fc} ${s(2)} | "<" ${s(1)} | [^<${fcClass}] ${s(0)}`)
+  // sl: saw '</' — match first char of tag name
+  const fc = tagName[0]
+  const fcEsc = escapeGbnfCharClass(fc)
 
-  // s2..s{n}: match remaining tagname chars
-  for (let i = 1; i < n; i++) {
-    const ch = tagName[i]
-    const esc = escapeGbnfChar(ch)
-    const ccExclude = ch === '-' ? '[^<-]' : `[^${escapeGbnfCharClass(ch)}<]`
-    rules.push(`${s(i + 1)} ::= ${esc} ${s(i + 2)} | "<" ${s(1)} | ${ccExclude} ${s(0)}`)
+  if (L === 1) {
+    const gtState = `${prefix}-gt`
+    lines.push(`${prefix}-sl ::= "${fc}" ${gtState} | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
+    lines.push(`${gtState} ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  } else {
+    lines.push(`${prefix}-sl ::= "${fc}" ${prefix}-s2 | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
+
+    for (let i = 2; i <= L; i++) {
+      const ch = tagName[i - 1]
+      const chEsc = escapeGbnfCharClass(ch)
+      const nextState = i === L ? `${prefix}-gt` : `${prefix}-s${i + 1}`
+      lines.push(`${prefix}-s${i} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
+    }
+
+    // gt: consumed full tag name, now consume '>'
+    lines.push(`${prefix}-gt ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
   }
 
-  // s{n+1}: after full tagname — accept '|' (pipe variants) or '>' (no-pipe variants → trailing ws)
-  // pipeState: after '<[/]tagname|' — accept '>' to close (→ trailing ws)
-  rules.push(`${s(n + 1)} ::= "|" ${pipeState} | ">" ${tw(0)} | "<" ${s(1)} | [^<|>] ${s(0)}`)
-  rules.push(`${pipeState} ::= ">" ${tw(0)} | "<" ${s(1)} | [^<>] ${s(0)}`)
-
-  // tw0..tw{MAX_TRAILING_WS}: trailing whitespace after close tag '>'
-  // Requires 0-N horizontal whitespace chars then mandatory \n to confirm close.
-  // Non-matching chars escape back to s0, treating the close tag as body content
-  // (e.g. <think|>` inside prose doesn't close the block).
-  const MAX_TRAILING_WS = 4
-  for (let i = 0; i < MAX_TRAILING_WS; i++) {
-    rules.push(`${tw(i)} ::= [ \\t] ${tw(i + 1)} | "\\n" | "<" ${s(1)} | [^ \\t\\n<] ${s(0)}`)
-  }
-  rules.push(`${tw(MAX_TRAILING_WS)} ::= "\\n" | "<" ${s(1)} | [^ \\t\\n<] ${s(0)}`)
-
-  return rules
-}
-
-// =============================================================================
-// Tool Rule Generation
-// =============================================================================
-
-export interface GrammarToolDefInternal extends GrammarToolDef {}
-
-export function buildToolRules(
-  tools: ReadonlyArray<GrammarToolDef>,
-  toolKeyword: string
-): { toolRule: string; rules: string[] } {
-  const rules: string[] = []
-  const toolNames: string[] = []
-
-  for (const tool of tools) {
-    const safeName = sanitizeRuleName(tool.tagName)
-    toolNames.push(safeName)
-    rules.push(...generateToolRules(safeName, tool.tagName, tool.parameters, toolKeyword))
+  // tw0..tw{MAX_TW}: trailing whitespace states after the '>'
+  // The model is NEVER constrained here — every character has a valid transition.
+  // Horizontal whitespace advances the window; \n or < confirms the close;
+  // any other character (including excess whitespace at twMAX) rejects back to s0.
+  for (let i = 0; i <= MAX_TW; i++) {
+    const stateName = `${prefix}-tw${i}`
+    if (i < MAX_TW) {
+      lines.push(
+        `${stateName} ::= [ \\t] ${prefix}-tw${i + 1}` +
+        ` | "\\n" ${context.confirmRule}` +
+        ` | "<" ${context.confirmNoLtRule}` +
+        ` | [^ \\t\\n<] ${prefix}-s0`
+      )
+    } else {
+      // Final tw state: no more whitespace advancement.
+      // [^\n<] (no space excluded) ensures excess spaces/tabs escape to s0 rather than dead-ending.
+      lines.push(
+        `${stateName} ::= "\\n" ${context.confirmRule}` +
+        ` | "<" ${context.confirmNoLtRule}` +
+        ` | [^ \\n<] ${prefix}-s0`
+      )
+    }
   }
 
-  return {
-    toolRule: toolNames.length > 0 ? `invoke ::= ${toolNames.join(' | ')}` : 'invoke ::= msg',
-    rules,
-  }
-}
-
-export function generateToolRules(
-  ruleName: string,
-  tagName: string,
-  parameters: ReadonlyArray<GrammarParameterDef>,
-  toolKeyword: string
-): string[] {
-  const rules: string[] = []
-
-  // Generate parameter rules — each references shared param-body DFA
-  const paramAlts: string[] = []
-  for (const param of parameters) {
-    const paramRuleName = `${ruleName}-p-${sanitizeParamName(param.name)}`
-    paramAlts.push(paramRuleName)
-    // DFA handles close tag — no literal "<parameter|>" in outer rule
-    rules.push(`${paramRuleName} ::= "<|parameter:${param.name}>" param-body`)
-  }
-
-  // Tool invoke rule — unordered parameters, bounded to N occurrences (one per param)
-  // "\n" after open tag consumed here (before param/close choice point)
-  // Each param slot has hws for indentation
-  const paramAlt = paramAlts.length > 0 ? `(bhws (${paramAlts.join(' | ')}))?` : ''
-  const paramSeq = paramAlts.length > 0 ? Array(paramAlts.length).fill(paramAlt).join(' ') : ''
-  
-  rules.push(`${ruleName} ::= ws "<|${toolKeyword}:${tagName}>" "\\n" ${paramSeq} bhws ${ruleName}-close`)
-  
-  // Close alternatives — NO leading "\n" (consumed by open rule or previous param's DFA tw states)
-  rules.push(`${ruleName}-close ::= invoke-end bhws "\\n" | "<invoke|filter>" "\\n" filter-body`)
-
-  return rules
+  return lines
 }
 
 // =============================================================================
 // Utilities
 // =============================================================================
-
-export function sanitizeRuleName(tagName: string): string {
-  return `t-${tagName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}`
-}
-
-export function sanitizeParamName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()
-}
 
 export function escapeGbnfChar(ch: string): string {
   switch (ch) {
@@ -431,7 +468,6 @@ export function escapeGbnfChar(ch: string): string {
     case '\t': return '"\\t"'
     case '<': return '"<"'
     case '>': return '">"'
-    case '|': return '"|"'
     default: return `"${ch}"`
   }
 }
@@ -444,4 +480,12 @@ export function escapeGbnfCharClass(ch: string): string {
     case '-': return '\\-'
     default: return ch
   }
+}
+
+export function sanitizeRuleName(tagName: string): string {
+  return `t-${tagName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}`
+}
+
+export function sanitizeParamName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()
 }

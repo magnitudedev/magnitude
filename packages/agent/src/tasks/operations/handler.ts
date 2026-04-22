@@ -45,9 +45,9 @@ export const handleTaskDirective = <R = never>(
       return handleCancelDirective(directive, context)
     case 'message':
       return handleMessageDirective(directive, context)
-    case 'spawn-worker':
+    case 'spawn_worker':
       return handleSpawnWorkerDirective(directive, context)
-    case 'kill-worker':
+    case 'kill_worker':
       return handleKillWorkerDirective(directive, context)
   }
 }

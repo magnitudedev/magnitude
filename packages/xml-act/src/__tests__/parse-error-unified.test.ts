@@ -29,9 +29,8 @@ function parse(input: string): TurnEngineEvent[] {
   const tokenizer = createTokenizer(
     (token) => parser.pushToken(token),
     new Set(['shell']),
-    { toolKeyword: 'invoke' },
   )
-  tokenizer.push(input)
+  tokenizer.push(input + '\n')
   tokenizer.end()
   parser.end()
   return [...parser.drain()]
@@ -47,32 +46,31 @@ function getStructuralErrors(events: TurnEngineEvent[]): StructuralParseErrorEve
 
 describe('parse errors', () => {
   it('produces UnknownTool as structural error for unregistered tool', () => {
-    const errors = getStructuralErrors(parse('\n<|invoke:unknown_tool>\n<invoke|>'))
+    const errors = getStructuralErrors(parse('<invoke tool="unknown_tool">\n</invoke>'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('UnknownTool')
   })
 
-  it('produces MissingToolName as structural error for invoke without variant', () => {
-    const errors = getStructuralErrors(parse('\n<|invoke>\n<invoke|>'))
+  it('produces MissingToolName as structural error for invoke without tool attribute', () => {
+    const errors = getStructuralErrors(parse('<invoke>\n</invoke>'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('MissingToolName')
   })
 
   it('produces StrayCloseTag as structural error for unmatched close', () => {
-    const errors = getStructuralErrors(parse('\n<think|>\ntext'))
+    const errors = getStructuralErrors(parse('</reason>\ntext'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
   })
 
-  it('produces UnclosedThink as structural error at EOF', () => {
-    const errors = getStructuralErrors(parse('\n<|think:reasoning>\nSome thinking'))
+  it('produces UnclosedThink (UnclosedReason) as structural error at EOF', () => {
+    const errors = getStructuralErrors(parse('<reason about="reasoning">\nSome thinking'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors.some(e => e.error._tag === 'UnclosedThink')).toBe(true)
   })
 
   it('tool-scoped errors have toolCallId and are ToolParseError events', () => {
-    // UnknownParameter is tool-scoped
-    const errors = getToolErrors(parse('\n<|invoke:shell>\n<|parameter:bogus>value<parameter|>\n<invoke|>'))
+    const errors = getToolErrors(parse('<invoke tool="shell">\n<parameter name="bogus">value</parameter>\n</invoke>'))
     const paramError = errors.find(e => e.error._tag === 'UnknownParameter')
     expect(paramError).toBeDefined()
     expect(paramError!.toolCallId).toBeDefined()
@@ -80,7 +78,7 @@ describe('parse errors', () => {
   })
 
   it('structural errors do not have toolCallId', () => {
-    const errors = getStructuralErrors(parse('\n<think|>\ntext'))
+    const errors = getStructuralErrors(parse('</reason>\ntext'))
     const strayError = errors.find(e => e.error._tag === 'StrayCloseTag')
     expect(strayError).toBeDefined()
     expect((strayError as any).toolCallId).toBeUndefined()

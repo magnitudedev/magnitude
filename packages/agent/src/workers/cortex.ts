@@ -200,7 +200,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         const grammarOptions: GrammarBuildOptions = {
           // Temporarily disabled: forced message to user on user-triggered turns
-          // causes issues with the new Mact format parsing
+          // causes issues with XML format parsing
           // ...(triggeredByUser ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length } : {}),
           yieldTags,
         }

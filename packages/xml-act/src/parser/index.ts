@@ -1,9 +1,9 @@
 /**
- * Mact Parser — context-aware architecture.
+ * Parser — context-aware XML turn parser.
  *
- * Each frame carries a `validTags` set. Only tokens whose name is in the current
- * frame's validTags are treated as structural; everything else becomes literal content.
- * This prevents `<div>`, `<strong>`, etc. inside a message from being parsed as tags.
+ * Each token is routed through resolveOpenHandler / resolveCloseHandler /
+ * resolveSelfCloseHandler in resolve.ts. Resolution returns typed bound handlers
+ * that capture the narrowed parent frame. No as-casts in the dispatch path.
  *
  * Emits ToolParseError and StructuralParseError events.
  * FilterReady is surfaced via an onFilterReady callback (not in TurnEngineEvent).
@@ -14,20 +14,16 @@ import { deriveParameters } from '../engine/parameter-schema'
 import type {
   TurnEngineEvent,
   FilterReady,
-  StructuralParseError,
-  ToolParseError,
 } from '../types'
-import type {
-  Frame,
-  InvokeFrame,
-} from './types'
+import type { Frame } from './types'
 import type { ParserConfig } from './types'
-import { PROSE_VALID_TAGS } from './types'
+import type { InvokeContext } from './handler-context'
+import type { HandlerContext } from './handler-context'
 import { classifyEvent, mergeEvent, type CoalescingBuffer } from './coalesce'
 import { endTopProse } from './content'
 import { flushAllFrames } from './flush'
-import { finalizeInvoke, type InvokeContext } from './handlers/invoke'
-import { pushToken, type DispatchContext } from './dispatch'
+import { pushToken, type ParserLoopContext } from './dispatch'
+import type { ParserOp } from './ops'
 
 export type { ParserConfig } from './types'
 
@@ -35,7 +31,7 @@ export type { ParserConfig } from './types'
 // Parser
 // =============================================================================
 
-export interface MactParser {
+export interface XmlActParser {
   pushToken(token: import('../types').Token): void
   end(): void
   drain(): readonly TurnEngineEvent[]
@@ -44,9 +40,9 @@ export interface MactParser {
 export function createParser(
   config: ParserConfig,
   onFilterReady?: (event: FilterReady) => void,
-): MactParser {
+): XmlActParser {
   let idCounter = 0
-  const generateId = config.generateId ?? (() => `mact-${++idCounter}-${Date.now().toString(36)}`)
+  const generateId = config.generateId ?? (() => `xact-${++idCounter}-${Date.now().toString(36)}`)
 
   // Derive tool schemas eagerly
   const toolSchemas = new Map<string, ReturnType<typeof deriveParameters>>()
@@ -83,66 +79,37 @@ export function createParser(
     coalescingBuffer = { key, event: { ...event } as CoalescingBuffer['event'] }
   }
 
-  function emitStructuralError(error: StructuralParseError): void {
-    emit({ _tag: 'StructuralParseError', error })
-  }
-
-  function emitToolError(
-    error: ToolParseError,
-    context: { toolCallId: string; tagName: string; toolName: string; group: string; correctToolShape?: string },
-  ): void {
-    emit({ _tag: 'ToolParseError', error, ...context })
-  }
-
   const machine = createStackMachine<Frame, TurnEngineEvent>(
-    { type: 'prose', body: '', pendingNewlines: 0, hasContent: false, validTags: PROSE_VALID_TAGS },
+    { type: 'prose', body: '', pendingNewlines: 0, hasContent: false },
     emit,
   )
 
-  function findFrame<T extends Frame['type']>(type: T): Extract<Frame, { type: T }> | undefined {
-    for (let i = machine.stack.length - 1; i >= 0; i--) {
-      if (machine.stack[i].type === type) return machine.stack[i] as Extract<Frame, { type: T }>
-    }
-    return undefined
-  }
-
-  function endCurrentProse(): void {
-    const top = machine.peek()
-    if (top?.type === 'prose') {
-      machine.apply(endTopProse(top) as import('../machine').Op<Frame, TurnEngineEvent>[])
-    }
-  }
-
-  // InvokeContext — shared by all invoke handlers
+  // InvokeContext — tool registry and schema access for invoke-related handlers
   const invokeCtx: InvokeContext = {
     tools: config.tools,
     toolSchemas,
-    endCurrentProse,
-    apply: (ops) => machine.apply(ops),
-    emit,
-    emitStructuralError,
-    emitToolError,
-    findFrame,
-    finalizeInvoke: null as unknown as InvokeContext['finalizeInvoke'],
     onFilterReady,
-    generateId,
   }
-  invokeCtx.finalizeInvoke = (frame: InvokeFrame) => finalizeInvoke(frame, invokeCtx)
 
-  // DispatchContext — shared state for token dispatch
-  const deferredYield = { target: null as 'user' | 'invoke' | 'worker' | 'parent' | null, postYieldHasContent: false }
-  const dispatchCtx: DispatchContext = {
-    machine,
-    emit,
-    emitStructuralError,
-    emitToolError,
-    invokeCtx,
-    endCurrentProse,
+  // HandlerContext — minimal context passed to all handlers
+  const handlerCtx: HandlerContext = {
     generateId,
+    invokeCtx,
+  }
+
+  // Deferred yield state
+  const deferredYield = {
+    target: null as 'user' | 'invoke' | 'worker' | 'parent' | null,
+    postYieldHasContent: false,
+  }
+
+  // ParserLoopContext — wires machine + handlerCtx + deferredYield for pushToken
+  const loopCtx: ParserLoopContext = {
+    machine,
+    handlerCtx,
     deferredYield,
   }
 
-  // end — finalize all open frames top-to-bottom
   function end(): void {
     if (machine.mode === 'done') return
 
@@ -159,29 +126,15 @@ export function createParser(
       return
     }
 
-    flushAllFrames({
-      peek: () => machine.peek(),
-      apply: (ops) => machine.apply(ops),
-      emit,
-      emitStructuralError,
-    emitToolError,
+    flushAllFrames(
+      () => machine.peek(),
+      (ops) => machine.apply(ops),
       invokeCtx,
-      getCorrectToolShape: (toolTag) => {
-        const registered = config.tools.get(toolTag)
-        if (!registered) return undefined
-        try {
-          const { generateToolInterface } = require('@magnitudedev/tools')
-          const result = generateToolInterface(registered.tool, registered.groupName ?? 'tools', undefined, { extractCommon: false, showErrors: false })
-          return result.signature
-        } catch {
-          return undefined
-        }
-      },
-    })
+    )
   }
 
   return {
-    pushToken: (token) => pushToken(token, dispatchCtx),
+    pushToken: (token) => pushToken(token, loopCtx),
     end,
     drain(): readonly TurnEngineEvent[] {
       flushCoalescing()

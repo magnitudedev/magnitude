@@ -26,14 +26,12 @@ function makeTools(): ReadonlyMap<string, RegisteredTool> {
 }
 
 function parse(input: string, tools?: ReadonlyMap<string, RegisteredTool>): TurnEngineEvent[] {
-  const events: TurnEngineEvent[] = []
   const parser = createParser({ tools: tools ?? makeTools() })
   const tokenizer = createTokenizer(
     (token) => parser.pushToken(token),
     new Set(tools?.keys() ?? ['shell']),
-    { toolKeyword: 'invoke' },
   )
-  tokenizer.push(input)
+  tokenizer.push(input + '\n')
   tokenizer.end()
   parser.end()
   return [...parser.drain()]
@@ -41,74 +39,66 @@ function parse(input: string, tools?: ReadonlyMap<string, RegisteredTool>): Turn
 
 describe('context-aware tag resolution', () => {
   it('treats <div> inside message as literal content', () => {
-    // Tokenizer parses <div> as Close { name: 'div' }, parser resolves as content
-    // tokenRaw reconstructs as <div|> (canonical close form)
-    const events = parse('\n<|message:user>\nHere is <div>some</div> text\n<message|>')
+    const events = parse('<message to="user">\nHere is <div>some</div> text\n</message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    // Content preserved (in canonical token form)
     expect(text).toContain('some')
     expect(text).toContain('text')
-    // No structural events for div
     expect(events.filter(e => e._tag === 'StructuralParseError' || e._tag === 'ToolParseError')).toHaveLength(0)
-    // No tool events
     expect(events.filter(e => e._tag === 'ToolInputStarted')).toHaveLength(0)
   })
 
   it('treats <strong>bold</strong> inside message as literal content', () => {
-    const events = parse('\n<|message:user>\n<strong>bold</strong>\n<message|>')
+    const events = parse('<message to="user">\n<strong>bold</strong>\n</message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('bold')
-    // No structural events
     expect(events.filter(e => e._tag === 'ToolInputStarted')).toHaveLength(0)
   })
 
   it('treats <foo> inside message as literal content (not structural)', () => {
-    const events = parse('\n<|message:user>\nSee <foo> here\n<message|>')
+    const events = parse('<message to="user">\nSee <foo> here\n</message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('See')
     expect(text).toContain('here')
-    // No tool or structural events
     expect(events.filter(e => e._tag === 'ToolInputStarted')).toHaveLength(0)
   })
 
-  it('treats <|invoke:shell> inside message as literal content', () => {
-    const events = parse('\n<|message:user>\nRun <|invoke:shell> to test\n<message|>')
+  it('treats <invoke tool="shell"> inside message as literal content', () => {
+    const events = parse('<message to="user">\nRun <invoke tool="shell"> to test\n</message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('Run')
     expect(text).toContain('to test')
-    // No ToolInputStarted — invoke inside message is not structural
     expect(events.filter(e => e._tag === 'ToolInputStarted')).toHaveLength(0)
   })
 
-  it('treats <think|> in prose (no open think) as stray close + content', () => {
-    const events = parse('\n<think|>\nsome text')
+  it('treats </reason> in prose (no open reason) as stray close + content', () => {
+    const events = parse('</reason>\nsome text')
     const errors = events.filter(e => e._tag === 'StructuralParseError') as any[]
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
   })
 
-  it('treats <|think:foo> inside think frame as content', () => {
-    const events = parse('\n<|think:outer>\nSome <|think:inner> text\n<think|>')
+  it('treats <reason about="foo"> inside reason frame as content', () => {
+    const events = parse('<reason about="outer">\nSome <reason about="inner"> text\n</reason>')
     const lensChunks = events.filter(e => e._tag === 'LensChunk')
     const text = lensChunks.map(e => (e as any).text).join('')
-    expect(text).toContain('<|think:inner>')
+    expect(text).toContain('<reason about="inner">')
   })
 
-  it('treats <|parameter:x> in prose as content (no invoke frame)', () => {
-    const events = parse('\n<|message:user>\n<|parameter:x>\n<message|>')
+  it('treats <parameter name="x"> in message as content (no invoke frame)', () => {
+    const events = parse('<message to="user">\n<parameter name="x">\n</message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('<|parameter:x>')
+    expect(text).toContain('<parameter name="x">')
   })
 
-  it('treats <parameter|> in prose as content', () => {
-    const events = parse('\n<|message:user>\n<parameter|>\n<message|>')
+  it('treats </parameter> in message as content', () => {
+    const events = parse('<message to="user">\n</parameter>\n</message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('<parameter|>')
+    expect(text).toContain('</parameter>')
   })
 })

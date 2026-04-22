@@ -3,101 +3,108 @@ import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
 
 describe('yield tags', () => {
   describe('default yield tags', () => {
-    it('yield:user passes', () => {
+    it('yield_user passes', () => {
       const v = shellValidator()
-      v.passes(`\n<|yield:user|>`)
+      v.passes(`<yield_user/>`)
     })
 
-    it('yield:invoke passes', () => {
+    it('yield_invoke passes', () => {
       const v = shellValidator()
-      v.passes(`\n<|yield:invoke|>`)
+      v.passes(`<yield_invoke/>`)
     })
 
-    it('yield:worker passes', () => {
+    it('yield_worker passes', () => {
       const v = shellValidator()
-      v.passes(`\n<|yield:worker|>`)
+      v.passes(`<yield_worker/>`)
     })
   })
 
-  describe('indentation before yield', () => {
-    it('yield with leading spaces passes', () => {
+  describe('whitespace before yield', () => {
+    it('yield with leading spaces passes (ws rule)', () => {
       const v = shellValidator()
-      v.passes(`\n  <|yield:user|>`)
+      v.passes(`  <yield_user/>`)
+    })
+
+    it('yield with leading newline passes', () => {
+      const v = shellValidator()
+      v.passes(`\n<yield_user/>`)
     })
 
     it('yield with leading tab passes', () => {
       const v = shellValidator()
-      v.passes(`\n\t<|yield:user|>`)
+      v.passes(`\t<yield_user/>`)
     })
   })
 
-  describe('trailing whitespace after yield', () => {
-    it('yield with 1 trailing space is rejected (no trailing content)', () => {
+  describe('trailing content after yield', () => {
+    it('yield with trailing space is rejected', () => {
       const v = shellValidator()
-      v.rejects(`\n<|yield:user|> `)
+      v.rejects(`<yield_user/> `)
     })
 
-    it('yield with trailing newline is rejected (no trailing content)', () => {
+    it('yield with trailing newline is rejected', () => {
       const v = shellValidator()
-      v.rejects(`\n<|yield:user|>\n`)
+      v.rejects(`<yield_user/>\n`)
     })
 
-    it('yield with trailing tab is rejected (no trailing content)', () => {
+    it('yield with trailing tab is rejected', () => {
       const v = shellValidator()
-      v.rejects(`\n<|yield:user|>\t`)
+      v.rejects(`<yield_user/>\t`)
     })
   })
 
   describe('yield after other blocks', () => {
-    it('yield after think block passes', () => {
+    it('yield after reason block passes', () => {
       const v = buildValidator([SHELL_TOOL])
-      v.passes(`\n<|think:turn>\nsome thought\n<think|>\n\n<|yield:user|>`)
+      v.passes(`<reason about="turn">\nsome thought\n</reason>\n<yield_user/>`)
     })
 
     it('yield after message block passes', () => {
       const v = buildValidator([SHELL_TOOL])
-      v.passes(`\n<|message:user>\nhello\n<message|>\n\n<|yield:user|>`)
+      v.passes(`<message to="user">\nhello\n</message>\n<yield_user/>`)
     })
 
     it('yield after invoke passes', () => {
       const v = shellValidator()
-      v.passes(`\n<|invoke:shell>\n<|parameter:command>\nls\n<parameter|>\n<invoke|>\n\n<|yield:user|>`)
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n<yield_user/>`)
     })
 
-    it('yield after think + invoke passes', () => {
+    it('yield after reason + invoke passes', () => {
       const v = shellValidator()
       v.passes(
-        `\n<|think:turn>\nsome thought\n<think|>\n\n<|invoke:shell>\n<|parameter:command>\nls\n<parameter|>\n<invoke|>\n\n<|yield:user|>`
+        `<reason about="turn">\nsome thought\n</reason>\n` +
+        `<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n` +
+        `<yield_user/>`
       )
     })
   })
 
   describe('custom yield tags', () => {
-    it('custom yield tag idle passes', () => {
-      const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['idle', 'continue']))
-      v.passes(`\n<|yield:idle|>`)
+    it('custom yield tag passes', () => {
+      const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['yield_idle', 'yield_continue']))
+      v.passes(`<yield_idle/>`)
     })
 
-    it('custom yield tag continue passes', () => {
-      const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['idle', 'continue']))
-      v.passes(`\n<|yield:continue|>`)
+    it('second custom yield tag passes', () => {
+      const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['yield_idle', 'yield_continue']))
+      v.passes(`<yield_continue/>`)
     })
 
     it('default yield tag rejected when custom tags set', () => {
-      const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['idle', 'continue']))
-      v.rejects(`\n<|yield:user|>`)
+      const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['yield_idle', 'yield_continue']))
+      v.rejects(`<yield_user/>`)
     })
   })
 
   describe('forbidden sequences', () => {
-    it('unknown yield tag is rejected', () => {
-      const v = shellValidator()
-      v.rejects(`\n<|yield:unknown|>`)
-    })
-
     it('content after yield is rejected', () => {
       const v = shellValidator()
-      v.rejects(`\n<|yield:user|>\nextra content`)
+      v.rejects(`<yield_user/>\nextra content`)
+    })
+
+    it('two yields is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`<yield_user/><yield_user/>`)
     })
   })
 })

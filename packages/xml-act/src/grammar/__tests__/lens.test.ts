@@ -1,93 +1,92 @@
 import { describe, it } from 'vitest'
-import { shellValidator } from './helpers'
+import { shellValidator, buildValidator, SHELL_TOOL } from './helpers'
 
-const YIELD = '\n<|yield:user|>'
+const YIELD = '<yield_user/>'
 
-describe('lens/think blocks', () => {
+describe('lens/reason blocks', () => {
   describe('passing sequences', () => {
-    it('minimal lens with alignment', () => {
+    it('minimal reason block with about attribute', () => {
       const v = shellValidator()
-      v.passes('\n<|think:alignment>\nsome thought\n<think|>\n' + YIELD)
+      v.passes(`<reason about="alignment">\nsome thought\n</reason>\n${YIELD}`)
     })
 
-    it('lens name: tasks', () => {
+    it('any lens name is accepted (free-form)', () => {
       const v = shellValidator()
-      v.passes('\n<|think:tasks>\nthink about tasks\n<think|>\n' + YIELD)
+      v.passes(`<reason about="tasks">\nthink about tasks\n</reason>\n${YIELD}`)
     })
 
-    it('lens name: diligence', () => {
+    it('unknown lens name also accepted (not enumerated)', () => {
       const v = shellValidator()
-      v.passes('\n<|think:diligence>\nbe diligent\n<think|>\n' + YIELD)
+      v.passes(`<reason about="anything-at-all">\nsome thought\n</reason>\n${YIELD}`)
     })
 
-    it('lens name: skills', () => {
+    it('reason without about attribute (optional)', () => {
       const v = shellValidator()
-      v.passes('\n<|think:skills>\ncheck skills\n<think|>\n' + YIELD)
+      v.passes(`<reason>\nsome thought\n</reason>\n${YIELD}`)
     })
 
-    it('lens name: turn', () => {
-      const v = shellValidator()
-      v.passes('\n<|think:turn>\nplan the turn\n<think|>\n' + YIELD)
-    })
-
-    it('lens name: pivot', () => {
-      const v = shellValidator()
-      v.passes('\n<|think:pivot>\npivot strategy\n<think|>\n' + YIELD)
-    })
-
-    it('multiple lenses before yield', () => {
+    it('multiple reasons before yield', () => {
       const v = shellValidator()
       v.passes(
-        '\n<|think:alignment>\nfirst thought\n<think|>\n' +
-        '\n<|think:turn>\nsecond thought\n<think|>\n' +
+        `<reason about="alignment">\nfirst thought\n</reason>\n` +
+        `<reason about="turn">\nsecond thought\n</reason>\n` +
         YIELD
       )
     })
 
-    it('lens with multi-line content', () => {
+    it('reason with multi-line content', () => {
       const v = shellValidator()
       v.passes(
-        '\n<|think:alignment>\n' +
-        'line one\n' +
-        'line two\n' +
-        'line three\n' +
-        '<think|>\n' +
+        `<reason about="alignment">\n` +
+        `line one\n` +
+        `line two\n` +
+        `line three\n` +
+        `</reason>\n` +
         YIELD
       )
     })
 
-    it('lens body with < that does not form close tag', () => {
+    it('reason body with < that does not form close tag', () => {
       const v = shellValidator()
-      v.passes('\n<|think:turn>\nfoo < bar\n<think|>\n' + YIELD)
+      v.passes(`<reason about="turn">\nfoo < bar\n</reason>\n${YIELD}`)
     })
 
-    it('lens with indentation before open tag', () => {
+    it('reason with no newline before next tag', () => {
       const v = shellValidator()
-      v.passes('\n  <|think:turn>\ncontent\n<think|>\n' + YIELD)
+      v.passes(`<reason about="turn">\nreasoning\n</reason><reason about="alignment">\nmore\n</reason>\n${YIELD}`)
     })
 
-    it('lenient close tag: </think|>', () => {
+    it('reason then message then yield', () => {
       const v = shellValidator()
-      v.passes('\n<|think:alignment>\nsome thought\n</think|>\n' + YIELD)
-    })
-
-    it('lenient close tag: </think>', () => {
-      const v = shellValidator()
-      v.passes('\n<|think:alignment>\nsome thought\n</think>\n' + YIELD)
-    })
-
-    it('lenient close tag: <think>', () => {
-      const v = shellValidator()
-      v.passes('\n<|think:alignment>\nsome thought\n<think>\n' + YIELD)
+      v.passes(`<reason about="turn">\nplan\n</reason>\n<message to="user">\nhello\n</message>\n${YIELD}`)
     })
   })
 
-  describe('forbidden sequences', () => {
-    it('unknown lens name rejected', () => {
-      const v = shellValidator()
-      v.rejects('\n<|think:unknown>\nsome thought\n<think|>\n' + YIELD)
+  describe('minLenses: 1', () => {
+    it('reason first with minLenses:1 passes', () => {
+      const v = buildValidator([SHELL_TOOL], b => b.withMinLenses(1))
+      v.passes(`<reason about="turn">\nthinking\n</reason>\n${YIELD}`)
     })
 
+    it('yield only with minLenses:1 is rejected (reason required first)', () => {
+      const v = buildValidator([SHELL_TOOL], b => b.withMinLenses(1))
+      v.rejects(YIELD)
+    })
 
+    it('message without reason with minLenses:1 is rejected', () => {
+      const v = buildValidator([SHELL_TOOL], b => b.withMinLenses(1))
+      v.rejects(`<message to="user">\nhello\n</message>\n${YIELD}`)
+    })
+  })
+
+  describe('ordering enforcement', () => {
+    it('reason after message is rejected (post-lens phase)', () => {
+      const v = shellValidator()
+      v.rejects(
+        `<message to="user">\nhello\n</message>\n` +
+        `<reason about="turn">\nthinking\n</reason>\n` +
+        YIELD
+      )
+    })
   })
 })

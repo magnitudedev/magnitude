@@ -1,165 +1,47 @@
 /**
- * Token dispatch — routes tokens to structural handlers or content paths.
+ * Token dispatch — routes tokens to bound handlers or content paths.
+ *
+ * pushToken is the main entry point. For each token:
+ * - Open:      resolveOpenHandler → if found, end prose if needed, apply handler ops
+ * - Close:     resolveCloseHandler → if found, apply handler ops; else content
+ * - SelfClose: resolveSelfCloseHandler → if found, end prose if needed, apply handler ops
+ * - Content:   onContent(top, text) → apply ops
+ *
+ * endCurrentProse is the loop's responsibility — handlers do NOT call it.
+ * All effects go through ParserOp[] returned by handlers and applied by machine.apply().
  */
 
-import type { Op } from '../machine'
-import type {
-  Token,
-  TurnEngineEvent,
-  StructuralParseError,
-  ToolParseError,
-  DeepPaths,
-} from '../types'
-import type {
-  Frame,
-  InvokeFrame,
-  ParameterFrame,
-  FilterFrame,
-} from './types'
-import { tokenRaw, resolveToken } from './resolve'
+import type { Token } from '../types'
+import type { Frame } from './types'
+import type { ParserOp } from './ops'
+import type { HandlerContext } from './handler-context'
+import { resolveOpenHandler, resolveCloseHandler, resolveSelfCloseHandler, tokenRaw } from './resolve'
+import { onContent, endTopProse, isAllWhitespace } from './content'
+import { emitStructuralError } from './ops'
 import { KNOWN_STRUCTURAL_TAGS } from '../constants'
-import { appendProse, appendMessage, appendThink, isAllWhitespace } from './content'
-import { openThink, closeThink } from './handlers/think'
-import { openMessage, closeMessage } from './handlers/message'
-import { handleYield } from './handlers/yield'
-import {
-  openInvoke,
-  openFilter,
-  closeFilter,
-  openParameter,
-  finalizeParameter,
-  finalizeInvoke,
-  type InvokeContext,
-} from './handlers/invoke'
 
 // =============================================================================
-// DispatchContext — all shared state needed for token dispatch
+// ParserLoopContext — all shared state needed for token dispatch
 // =============================================================================
 
-export interface DispatchContext {
+export interface ParserLoopContext {
   machine: {
     mode: string
     peek(): Frame | undefined
-    apply(ops: Op<Frame, TurnEngineEvent>[]): void
+    apply(ops: ParserOp[]): void
     readonly stack: readonly Frame[]
   }
-  emit: (event: TurnEngineEvent) => void
-  emitStructuralError: (error: StructuralParseError) => void
-  emitToolError: (error: ToolParseError, context: { toolCallId: string; tagName: string; toolName: string; group: string; correctToolShape?: string }) => void
-  invokeCtx: InvokeContext
-  endCurrentProse: () => void
-  generateId: () => string
+  handlerCtx: HandlerContext
   deferredYield: { target: 'user' | 'invoke' | 'worker' | 'parent' | null; postYieldHasContent: boolean }
 }
 
 // =============================================================================
-// appendContentToFrame — route content to the correct per-frame handler
+// pushToken — main entry point
 // =============================================================================
 
-export function appendContentToFrame(top: Frame, text: string, ctx: DispatchContext): void {
-  switch (top.type) {
-    case 'prose':
-      ctx.machine.apply(appendProse(top, text) as Op<Frame, TurnEngineEvent>[])
-      break
-    case 'think':
-      ctx.machine.apply(appendThink(top, text) as Op<Frame, TurnEngineEvent>[])
-      break
-    case 'message':
-      ctx.machine.apply(appendMessage(top, text) as Op<Frame, TurnEngineEvent>[])
-      break
-    case 'parameter': {
-      const paramTop = top as ParameterFrame
-      if (!paramTop.dead) {
-        paramTop.rawValue += text
-        if (paramTop.jsonishParser !== null) paramTop.jsonishParser.push(text)
-        const jsonPath = paramTop.jsonishParser !== null ? paramTop.jsonishParser.currentPath : []
-        const path = [paramTop.paramName, ...jsonPath] as unknown as DeepPaths<unknown>
-        ctx.machine.apply([{
-          type: 'emit',
-          event: {
-            _tag: 'ToolInputFieldChunk',
-            toolCallId: paramTop.toolCallId,
-            field: paramTop.paramName as string & keyof unknown,
-            path,
-            delta: text,
-          },
-        }])
-      }
-      break
-    }
-    case 'filter': {
-      const filterTop = top as FilterFrame
-      filterTop.query += text
-      break
-    }
-    case 'invoke':
-      if (!isAllWhitespace(text)) {
-        ctx.emitStructuralError(
-          { _tag: 'UnexpectedContent', context: 'invoke:' + top.toolTag, detail: `Unexpected content between parameters: "${text.slice(0, 40)}"` },
-        )
-      }
-      break
-  }
-}
-
-// =============================================================================
-// handleOpen — dispatch Open tokens to tag-specific handlers
-// =============================================================================
-
-export function handleOpen(name: string, variant: string | undefined, ctx: DispatchContext): void {
-  switch (name) {
-    case 'think':
-      openThink(variant, ctx.endCurrentProse, (ops) => ctx.machine.apply(ops))
-      break
-    case 'message':
-      openMessage(variant, ctx.generateId, ctx.endCurrentProse, (ops) => ctx.machine.apply(ops))
-      break
-    case 'invoke':
-      openInvoke(variant, ctx.invokeCtx)
-      break
-  }
-}
-
-// =============================================================================
-// handleClose — dispatch Close tokens to tag-specific handlers
-// =============================================================================
-
-export function handleClose(name: string, pipe: string | undefined, top: Frame, ctx: DispatchContext): void {
-  if (pipe) {
-    openFilter(top as InvokeFrame, pipe, ctx.invokeCtx)
-    return
-  }
-
-  // Use top.type (not name) to route — close tag name may differ from frame type
-  // due to close-tag mismatch lenience (e.g. <message|> closing a think frame)
-  switch (top.type) {
-    case 'think':
-      closeThink(top as import('./types').ThinkFrame, ctx.emitStructuralError, (ops) => ctx.machine.apply(ops), false)
-      break
-    case 'message':
-      closeMessage(top as import('./types').MessageFrame, (ops) => ctx.machine.apply(ops))
-      break
-    case 'invoke':
-      finalizeInvoke(top as InvokeFrame, ctx.invokeCtx)
-      break
-    case 'parameter':
-      finalizeParameter(top as ParameterFrame, ctx.invokeCtx)
-      break
-    case 'filter':
-      closeFilter(top as FilterFrame, ctx.invokeCtx)
-      break
-  }
-}
-
-// =============================================================================
-// pushToken — main entry point for token dispatch
-// =============================================================================
-
-export function pushToken(token: Token, ctx: DispatchContext): void {
+export function pushToken(token: Token, ctx: ParserLoopContext): void {
   if (ctx.machine.mode === 'observing') {
-    if (token._tag === 'Content' && !isAllWhitespace(token.text)) {
-      ctx.deferredYield.postYieldHasContent = true
-    } else if (token._tag !== 'Content') {
+    if (token._tag !== 'Content' || !isAllWhitespace(token.text)) {
       ctx.deferredYield.postYieldHasContent = true
     }
     return
@@ -169,43 +51,64 @@ export function pushToken(token: Token, ctx: DispatchContext): void {
   const top = ctx.machine.peek()
   if (!top) return
 
-  const resolution = resolveToken(token, top)
-
-  if (resolution === 'content') {
-    if (token._tag === 'Close' && !token.pipe && KNOWN_STRUCTURAL_TAGS.has(token.name)) {
-      ctx.emitStructuralError({
-        _tag: 'StrayCloseTag',
-        tagName: token.name,
-        detail: `Unexpected close '<${token.name}|>' with no matching open in current context`,
-      })
-    }
-    appendContentToFrame(top, tokenRaw(token), ctx)
-    return
-  }
-
   switch (token._tag) {
-    case 'Open':
-      handleOpen(token.name, token.variant, ctx)
-      break
-    case 'Close':
-      handleClose(token.name, token.pipe, top, ctx)
-      break
-    case 'SelfClose':
-      if (token.name === 'yield') {
-        handleYield(token.variant, ctx.endCurrentProse, (ops) => ctx.machine.apply(ops), (target) => {
-          ctx.deferredYield.target = target
-          ctx.deferredYield.postYieldHasContent = false
-        })
+    case 'Open': {
+      const handler = resolveOpenHandler(token.tagName, top)
+      if (handler) {
+        // Loop responsibility: end prose before any structural open tag in prose context.
+        // resolveOpenHandler returns a handler for reason/message/invoke only when top.type === 'prose'.
+        // For parameter/filter, top.type === 'invoke' — no prose to end.
+        if (top.type === 'prose') {
+          ctx.machine.apply(endTopProse(top) as ParserOp[])
+        }
+        ctx.machine.apply(handler.open(token.attrs ?? new Map(), ctx.handlerCtx))
+      } else {
+        ctx.machine.apply(onContent(top, tokenRaw(token)))
       }
       break
-    case 'Parameter':
-      openParameter(token.name, top as InvokeFrame, ctx.invokeCtx)
+    }
+
+    case 'Close': {
+      const handler = resolveCloseHandler(token.tagName, top)
+      if (handler) {
+        ctx.machine.apply(handler.close(ctx.handlerCtx))
+      } else {
+        if (KNOWN_STRUCTURAL_TAGS.has(token.tagName)) {
+          ctx.machine.apply([emitStructuralError({
+            _tag: 'StrayCloseTag',
+            tagName: token.tagName,
+            detail: `Unexpected close '</${token.tagName}>' with no matching open in current context`,
+          })])
+        }
+        ctx.machine.apply(onContent(top, tokenRaw(token)))
+      }
       break
-    case 'ParameterClose':
-      finalizeParameter(top as ParameterFrame, ctx.invokeCtx)
+    }
+
+    case 'SelfClose': {
+      const handler = resolveSelfCloseHandler(token.tagName, top)
+      if (handler) {
+        if (top.type === 'prose') {
+          ctx.machine.apply(endTopProse(top) as ParserOp[])
+        }
+        const ops = handler.selfClose(token.attrs ?? new Map(), ctx.handlerCtx)
+        // Extract yield target from observe op before applying
+        for (const op of ops) {
+          if (op.type === 'observe' && op.target) {
+            ctx.deferredYield.target = op.target as 'user' | 'invoke' | 'worker' | 'parent'
+            ctx.deferredYield.postYieldHasContent = false
+          }
+        }
+        ctx.machine.apply(ops)
+      } else {
+        ctx.machine.apply(onContent(top, tokenRaw(token)))
+      }
       break
-    case 'Content':
-      appendContentToFrame(top, token.text, ctx)
+    }
+
+    case 'Content': {
+      ctx.machine.apply(onContent(top, token.text))
       break
+    }
   }
 }

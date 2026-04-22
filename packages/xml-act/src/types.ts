@@ -16,12 +16,10 @@ export type { DeepPaths, StreamingPartial }
  * Uses asymmetric delimiters: <|tag> to open, <tag|> to close.
  */
 export type Token =
-  | { readonly _tag: 'Open'; readonly name: string; readonly variant?: string }
-  | { readonly _tag: 'Close'; readonly name: string; readonly pipe?: string; readonly raw?: string }
-  | { readonly _tag: 'SelfClose'; readonly name: string; readonly variant?: string }
-  | { readonly _tag: 'Parameter'; readonly name: string }
-  | { readonly _tag: 'ParameterClose' }
-  | { readonly _tag: 'Content'; readonly text: string }
+  | { readonly _tag: 'Open';      readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
+  | { readonly _tag: 'Close';     readonly tagName: string; readonly afterNewline: boolean; readonly raw?: string }
+  | { readonly _tag: 'SelfClose'; readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
+  | { readonly _tag: 'Content';   readonly text: string }
 
 // =============================================================================
 // Parse Event Types (from parser)

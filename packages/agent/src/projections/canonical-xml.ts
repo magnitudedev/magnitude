@@ -1,23 +1,20 @@
-import { YIELD_USER, YIELD_INVOKE } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, deriveParameters } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
+import type { ResolvedToolSet } from '../tools/resolved-toolset'
+import { buildRegisteredTools } from '../tools/tool-registry'
+import { Layer } from 'effect'
 
-export interface ThinkBlock {
+export interface ReasonBlock {
   about: string | null
   content: string
 }
 
 export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
-  thinkBlocks: ThinkBlock[]
+  reasonBlocks: ReasonBlock[]
   messages: Array<{ text: string; destination: MessageDestination }>
-  toolCalls: Array<{ tagName: string; input: unknown; query: string }>
+  toolCalls: Array<{ tagName: string; input: unknown; query: string | null }>
   turnDecision: 'continue' | 'idle'
-}
-
-function attrsToString(attrs: Record<string, string>): string {
-  const entries = Object.entries(attrs).sort(([a], [b]) => a.localeCompare(b))
-  if (entries.length === 0) return ''
-  return entries.map(([k, v]) => ` ${k}="${v}"`).join('')
 }
 
 function getByPath(obj: Record<string, unknown>, path: string): unknown {
@@ -30,73 +27,72 @@ function getByPath(obj: Record<string, unknown>, path: string): unknown {
   return current
 }
 
-function setByPath(obj: Record<string, unknown>, path: string, value: unknown): void {
-  const segments = path.split('.')
-  let current = obj
-  for (let i = 0; i < segments.length - 1; i++) {
-    if (!(segments[i] in current) || typeof current[segments[i]] !== 'object' || current[segments[i]] === null) {
-      current[segments[i]] = {}
-    }
-    current = current[segments[i]] as Record<string, unknown>
-  }
-  current[segments[segments.length - 1]] = value
+function serializeParameter(name: string, value: unknown): string {
+  const serialized = (value !== null && typeof value === 'object') ? JSON.stringify(value) : String(value ?? '')
+  return `<parameter name="${name}">${serialized}</parameter>`
 }
 
-function serializeTag(name: string, attrs: Record<string, string>, body: string | null, children: string[]): string {
-  const attrStr = attrsToString(attrs)
-  if (body === null && children.length === 0) {
-    return `<${name}${attrStr} />`
-  }
-  return `<${name}${attrStr}>${children.join('')}${body ?? ''}</${name}>`
-}
-
-function serializeToolCall(tagName: string, input: unknown, query: string | null): string {
+function serializeToolCall(tagName: string, input: unknown, query: string | null, toolSet: ResolvedToolSet): string {
   const obj = (input && typeof input === 'object') ? input as Record<string, unknown> : {}
-  const observeAttr = query ? ` observe="${query}"` : ''
 
-  // Serialize as JSON body for simplicity
-  return Object.keys(obj).length === 0
-    ? `<${tagName}${observeAttr} />`
-    : `<${tagName}${observeAttr}>${JSON.stringify(input)}</${tagName}>`
+  const tool = buildRegisteredTools(toolSet, Layer.empty).get(tagName)
+  let params: string[]
+  if (tool) {
+    const paramSchemas = deriveParameters(tool.tool.inputSchema.ast)
+    params = []
+    for (const [, param] of paramSchemas.parameters) {
+      const value = getByPath(obj, param.name)
+      if (value !== undefined) {
+        params.push(serializeParameter(param.name, value))
+      }
+    }
+  } else {
+    // Unknown tool — fall back to object key order
+    params = Object.entries(obj).map(([key, value]) => serializeParameter(key, value))
+  }
+
+  const filterPart = query ? `<filter>\n${query}\n</filter>` : ''
+  const children = [...params, ...(filterPart ? [filterPart] : [])]
+  if (children.length === 0) return `<invoke tool="${tagName}"/>`
+  return `<invoke tool="${tagName}">\n${children.join('\n')}\n</invoke>`
 }
 
+/**
+ * Serialize a canonical trace to XML string.
+ * toolSet is required to derive parameter schemas — parameters are emitted
+ * in schema-defined order for deterministic output.
+ */
 export function serializeCanonicalTurn(
   trace: CanonicalTrace,
+  toolSet: ResolvedToolSet,
 ): string {
   const parts: string[] = []
 
   if (trace.lenses !== null) {
-    const activeLenses = trace.lenses.filter((lens) => lens.content !== null)
-    if (activeLenses.length > 0) {
-      const lensLines = activeLenses.map((lens) =>
-        `<lens name="${lens.name}">${lens.content}</lens>`
-      )
-      parts.push(lensLines.join('\n'))
+    const activeLenses = trace.lenses.filter((lens) => lens.content !== null && lens.content.trim().length > 0)
+    for (const lens of activeLenses) {
+      parts.push(`<reason about="${lens.name}">\n${lens.content!.trim()}\n</reason>`)
     }
   }
 
-  for (const block of trace.thinkBlocks) {
+  for (const block of trace.reasonBlocks) {
     const trimmed = block.content.trim()
     if (trimmed.length === 0) continue
-    const aboutAttr = block.about ? ` about="${block.about}"` : ''
-    parts.push(`<think${aboutAttr}>${trimmed}</think>`)
+    const name = block.about ?? 'reason'
+    parts.push(`<reason about="${name}">\n${trimmed}\n</reason>`)
   }
 
-  if (trace.messages.length > 0) {
-    for (const msg of trace.messages) {
-      const trimmedText = msg.text.trim()
-      const attrs: Record<string, string> = {}
-      if (msg.destination.kind === 'worker') attrs.to = msg.destination.taskId
-      else if (msg.destination.kind === 'parent') attrs.to = 'parent'
-      else if (msg.destination.kind === 'user') attrs.to = 'user'
-      parts.push(serializeTag('message', attrs, trimmedText, []))
-    }
+  for (const msg of trace.messages) {
+    const trimmedText = msg.text.trim()
+    let to: string
+    if (msg.destination.kind === 'worker') to = msg.destination.taskId
+    else if (msg.destination.kind === 'parent') to = 'parent'
+    else to = 'user'
+    parts.push(`<message to="${to}">\n${trimmedText}\n</message>`)
   }
 
-  if (trace.toolCalls.length > 0) {
-    for (const call of trace.toolCalls) {
-      parts.push(serializeToolCall(call.tagName, call.input, call.query))
-    }
+  for (const call of trace.toolCalls) {
+    parts.push(serializeToolCall(call.tagName, call.input, call.query, toolSet))
   }
 
   if (trace.turnDecision === 'idle') {

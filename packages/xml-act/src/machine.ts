@@ -6,7 +6,7 @@ export type Op<F, E> =
   | { readonly type: 'replace'; readonly frame: F }
   | { readonly type: 'emit'; readonly event: E }
   | { readonly type: 'done' }
-  | { readonly type: 'observe' }
+  | { readonly type: 'observe'; readonly target?: string }
 
 export interface StackMachine<F, E> {
   apply(ops: ReadonlyArray<Op<F, E>>): void

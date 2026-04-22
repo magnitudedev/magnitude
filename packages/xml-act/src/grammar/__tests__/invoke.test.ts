@@ -1,115 +1,102 @@
 import { describe, it } from 'vitest'
-import { multiToolValidator, buildValidator, SHELL_TOOL, NO_PARAM_TOOL, MULTI_PARAM_TOOL } from './helpers'
+import { buildValidator, shellValidator, multiToolValidator, SHELL_TOOL } from './helpers'
 
-const YIELD = '\n<|yield:user|>'
+const YIELD = '<yield_user/>'
 
 describe('invoke / tool call blocks', () => {
   describe('single-parameter tool', () => {
     it('invoke shell with command parameter', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'ls\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">ls</parameter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
 
     it('invoke shell with multi-word command', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'git diff --stat --cached\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">git diff --stat --cached</parameter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
 
     it('invoke shell with multi-line command', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'cd /tmp\nls -la\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">cd /tmp\nls -la</parameter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
 
-    it('invoke skill with name parameter', () => {
-      const v = multiToolValidator()
+    it('any tool name is accepted (free-form)', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:skill>\n' +
-        '<|parameter:name>\n' +
-        'review\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="anything">\n` +
+        `<parameter name="foo">bar</parameter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
   })
 
-  describe('no-parameter tool', () => {
-    it('invoke tree with no parameters', () => {
-      const v = multiToolValidator()
+  describe('no-parameter invoke', () => {
+    it('invoke with no parameters (direct close)', () => {
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n</invoke>\n${YIELD}`)
+    })
+  })
+
+  describe('multiple parameters', () => {
+    it('invoke with multiple parameters', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:tree>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="edit">\n` +
+        `<parameter name="path">src/foo.ts</parameter>\n` +
+        `<parameter name="old">const x = 1</parameter>\n` +
+        `<parameter name="new">const x = 2</parameter>\n` +
+        `</invoke>\n` +
+        YIELD
+      )
+    })
+
+    it('parameters in any order', () => {
+      const v = shellValidator()
+      v.passes(
+        `<invoke tool="edit">\n` +
+        `<parameter name="new">const x = 2</parameter>\n` +
+        `<parameter name="path">src/foo.ts</parameter>\n` +
+        `<parameter name="old">const x = 1</parameter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
   })
 
-  describe('multi-parameter tool', () => {
-    it('invoke edit with all three parameters', () => {
-      const v = multiToolValidator()
+  describe('invoke with filter', () => {
+    it('invoke with parameter and filter', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:edit>\n' +
-        '<|parameter:path>\n' +
-        'src/foo.ts\n' +
-        '<parameter|>\n' +
-        '<|parameter:old>\n' +
-        'const x = 1\n' +
-        '<parameter|>\n' +
-        '<|parameter:new>\n' +
-        'const x = 2\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">ls</parameter>\n` +
+        `<filter>$.stdout</filter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
 
-    it('invoke edit with parameters in different order (unordered)', () => {
-      const v = multiToolValidator()
+    it('invoke with filter only (no parameter)', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:edit>\n' +
-        '<|parameter:new>\n' +
-        'const x = 2\n' +
-        '<parameter|>\n' +
-        '<|parameter:path>\n' +
-        'src/foo.ts\n' +
-        '<parameter|>\n' +
-        '<|parameter:old>\n' +
-        'const x = 1\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
-        YIELD
-      )
-    })
-
-    it('invoke edit with only one parameter provided', () => {
-      const v = multiToolValidator()
-      v.passes(
-        '\n<|invoke:edit>\n' +
-        '<|parameter:path>\n' +
-        'src/foo.ts\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n` +
+        `<filter>$.result</filter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
@@ -117,125 +104,67 @@ describe('invoke / tool call blocks', () => {
 
   describe('multiple invokes', () => {
     it('two invokes before yield', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'echo hello\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
-        '\n<|invoke:tree>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n<parameter name="command">echo hello</parameter>\n</invoke>\n` +
+        `<invoke tool="tree">\n</invoke>\n` +
         YIELD
       )
     })
 
     it('three invokes before yield', () => {
-      const v = multiToolValidator()
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'pwd\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
-        '\n<|invoke:skill>\n' +
-        '<|parameter:name>\n' +
-        'review\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
-        '\n<|invoke:tree>\n' +
-        '<invoke|>\n' +
+        `<invoke tool="shell">\n<parameter name="command">pwd</parameter>\n</invoke>\n` +
+        `<invoke tool="skill">\n<parameter name="name">review</parameter>\n</invoke>\n` +
+        `<invoke tool="tree">\n</invoke>\n` +
         YIELD
       )
     })
   })
 
-  describe('lenient invoke close tag forms', () => {
-    it('close with </invoke|>', () => {
-      const v = multiToolValidator()
+  describe('no-newline between tags', () => {
+    it('parameter immediately followed by another parameter (no newline)', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'ls\n' +
-        '<parameter|>\n' +
-        '</invoke|>\n' +
+        `<invoke tool="edit">\n` +
+        `<parameter name="a">val</parameter><parameter name="b">val2</parameter>\n` +
+        `</invoke>\n` +
         YIELD
       )
     })
 
-    it('close with </invoke>', () => {
-      const v = multiToolValidator()
+    it('parameter followed by close invoke (no newline)', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'ls\n' +
-        '<parameter|>\n' +
-        '</invoke>\n' +
-        YIELD
-      )
-    })
-
-    it('close with <invoke>', () => {
-      const v = multiToolValidator()
-      v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'ls\n' +
-        '<parameter|>\n' +
-        '<invoke>\n' +
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">ls</parameter></invoke>\n` +
         YIELD
       )
     })
   })
 
-  describe('invoke close with trailing spaces', () => {
-    it('close with one trailing space', () => {
-      const v = multiToolValidator()
-      v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'ls\n' +
-        '<parameter|>\n' +
-        '<invoke|> \n' +
-        YIELD
-      )
+  describe('trailing whitespace after close tags', () => {
+    it('0 trailing spaces before newline passes', () => {
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n${YIELD}`)
     })
 
-    it('close with two trailing spaces', () => {
-      const v = multiToolValidator()
-      v.passes(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:command>\n' +
-        'ls\n' +
-        '<parameter|>\n' +
-        '<invoke|>  \n' +
-        YIELD
-      )
+    it('4 trailing spaces after </parameter> passes', () => {
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>    \n</invoke>\n${YIELD}`)
+    })
+
+    it('5 trailing spaces after </parameter> is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`<invoke tool="shell">\n<parameter name="command">ls</parameter>     \n</invoke>\n${YIELD}`)
     })
   })
 
   describe('forbidden sequences', () => {
-    it('unknown tool name rejected', () => {
-      const v = multiToolValidator()
-      v.rejects(
-        '\n<|invoke:unknown-tool>\n' +
-        '<invoke|>\n' +
-        YIELD
-      )
-    })
-
-
-
-    it('unknown parameter name rejected', () => {
-      const v = multiToolValidator()
-      v.rejects(
-        '\n<|invoke:shell>\n' +
-        '<|parameter:unknown>\n' +
-        'value\n' +
-        '<parameter|>\n' +
-        '<invoke|>\n' +
-        YIELD
-      )
+    it('invoke after yield is rejected', () => {
+      const v = shellValidator()
+      v.rejects(`<yield_user/><invoke tool="shell">\n</invoke>\n`)
     })
   })
 })

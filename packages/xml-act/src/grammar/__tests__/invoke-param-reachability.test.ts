@@ -1,104 +1,127 @@
 import { describe, it, expect } from 'vitest'
-import { buildValidator, SHELL_TOOL, SKILL_TOOL, MULTI_PARAM_TOOL, NO_PARAM_TOOL } from './helpers'
+import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
 
 /**
- * These tests validate that the grammar allows models to reach parameters
- * after an invoke open tag. This was the core bug: the close rule consumed
- * the newline after the open tag, preventing the model from ever starting
- * a parameter.
+ * Tests that validate parameter reachability inside invoke blocks.
+ * In the new XML grammar, invoke-next handles the choice between
+ * parameters, filter, and close tag.
  */
 
+const YIELD = '<yield_user/>'
+
 describe('invoke parameter reachability', () => {
-  describe('single-param tool (skill)', () => {
+  describe('basic parameter access', () => {
     it('accepts invoke with parameter', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<|parameter:name>review<parameter|>\n<invoke|>\n\n<|yield:user|>')
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n${YIELD}`)
     })
 
-    it('accepts invoke with no parameters (skip to close)', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<invoke|>\n\n<|yield:user|>')
+    it('accepts invoke with no parameters (direct close)', () => {
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n</invoke>\n${YIELD}`)
     })
 
-    it('after invoke open + newline, parameter open is valid', () => {
-      const v = buildValidator([SKILL_TOOL])
-      const rules = v.validAfter('\n<|invoke:skill>\n')
+    it('after invoke open + newline, < is valid (for parameter or close)', () => {
+      const v = shellValidator()
+      const rules = v.validAfter(`<invoke tool="shell">\n`)
       const validChars = rules.flatMap((r: any) => {
         if (r.type === 'char') return r.value.map((v: number) => String.fromCharCode(v))
         if (r.type === 'char_exclude') return ['[exclude]']
         return []
       })
-      // '<' must be valid (for both parameter and close paths)
       expect(validChars).toContain('<')
     })
 
-    it('after invoke open + newline + <, both | and i are valid', () => {
-      const v = buildValidator([SKILL_TOOL])
-      const rules = v.validAfter('\n<|invoke:skill>\n<')
+    it('after invoke open + newline + <, parameter and close paths are valid', () => {
+      const v = shellValidator()
+      const rules = v.validAfter(`<invoke tool="shell">\n<`)
       const validChars = rules.flatMap((r: any) => {
         if (r.type === 'char') return r.value.map((v: number) => String.fromCharCode(v))
         if (r.type === 'char_exclude') return ['[exclude]']
         return []
       })
-      // '|' for parameter path, 'i' for canonical close, '/' for lenient close
-      expect(validChars).toContain('|')  // <|parameter:...
-      expect(validChars).toContain('i')  // <invoke|>
-      expect(validChars).toContain('/')  // </invoke|>
+      // 'p' for <parameter, '/' for </invoke>, 'f' for <filter
+      expect(validChars).toContain('p')  // <parameter ...
+      expect(validChars).toContain('/')  // </invoke>
+      expect(validChars).toContain('f')  // <filter>
     })
   })
 
-  describe('multi-param tool (edit with path, old, new)', () => {
-    it('accepts invoke with all 3 parameters', () => {
-      const v = buildValidator([MULTI_PARAM_TOOL])
+  describe('multiple parameters', () => {
+    it('accepts invoke with multiple parameters', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:edit>\n' +
-        '<|parameter:path>foo.ts<parameter|>\n' +
-        '<|parameter:old>bar<parameter|>\n' +
-        '<|parameter:new>baz<parameter|>\n' +
-        '<invoke|>\n' +
-        '\n<|yield:user|>'
+        `<invoke tool="edit">\n` +
+        `<parameter name="path">foo.ts</parameter>\n` +
+        `<parameter name="old">bar</parameter>\n` +
+        `<parameter name="new">baz</parameter>\n` +
+        `</invoke>\n` +
+        YIELD
       )
     })
 
-    it('accepts invoke with subset of parameters', () => {
-      const v = buildValidator([MULTI_PARAM_TOOL])
+    it('accepts invoke with parameters in any order', () => {
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:edit>\n' +
-        '<|parameter:path>foo.ts<parameter|>\n' +
-        '<invoke|>\n' +
-        '\n<|yield:user|>'
+        `<invoke tool="edit">\n` +
+        `<parameter name="new">baz</parameter>\n` +
+        `<parameter name="old">bar</parameter>\n` +
+        `<parameter name="path">foo.ts</parameter>\n` +
+        `</invoke>\n` +
+        YIELD
       )
     })
 
-    it('accepts invoke with parameters in different order', () => {
-      const v = buildValidator([MULTI_PARAM_TOOL])
+    it('accepts any number of parameters (not bounded by tool definition)', () => {
+      // In new grammar, tools are not enumerated — any number of params accepted
+      const v = shellValidator()
       v.passes(
-        '\n<|invoke:edit>\n' +
-        '<|parameter:new>baz<parameter|>\n' +
-        '<|parameter:old>bar<parameter|>\n' +
-        '<|parameter:path>foo.ts<parameter|>\n' +
-        '<invoke|>\n' +
-        '\n<|yield:user|>'
+        `<invoke tool="shell">\n` +
+        `<parameter name="a">1</parameter>\n` +
+        `<parameter name="b">2</parameter>\n` +
+        `<parameter name="c">3</parameter>\n` +
+        `<parameter name="d">4</parameter>\n` +
+        `</invoke>\n` +
+        YIELD
       )
     })
   })
 
-  describe('no-param tool', () => {
-    it('accepts invoke with no parameters', () => {
-      const v = buildValidator([NO_PARAM_TOOL])
-      v.passes('\n<|invoke:tree>\n<invoke|>\n\n<|yield:user|>')
+  describe('filter reachability', () => {
+    it('accepts invoke with filter', () => {
+      const v = shellValidator()
+      v.passes(
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">ls</parameter>\n` +
+        `<filter>$.stdout</filter>\n` +
+        `</invoke>\n` +
+        YIELD
+      )
+    })
+
+    it('after parameter close, < is valid (for next parameter, filter, or invoke close)', () => {
+      const v = shellValidator()
+      const rules = v.validAfter(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n<`)
+      const validChars = rules.flatMap((r: any) => {
+        if (r.type === 'char') return r.value.map((v: number) => String.fromCharCode(v))
+        if (r.type === 'char_exclude') return ['[exclude]']
+        return []
+      })
+      expect(validChars).toContain('p')  // <parameter
+      expect(validChars).toContain('/')  // </invoke>
+      expect(validChars).toContain('f')  // <filter>
     })
   })
 
-  describe('parameter is inline (no newline after open tag)', () => {
+  describe('inline parameter values (no newline after open)', () => {
     it('accepts value immediately after parameter open tag', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<|parameter:name>review<parameter|>\n<invoke|>\n\n<|yield:user|>')
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls -la</parameter>\n</invoke>\n${YIELD}`)
     })
 
     it('after parameter open tag, content chars are valid', () => {
-      const v = buildValidator([SKILL_TOOL])
-      const rules = v.validAfter('\n<|invoke:skill>\n<|parameter:name>')
+      const v = shellValidator()
+      const rules = v.validAfter(`<invoke tool="shell">\n<parameter name="command">`)
       const hasContentChars = rules.some((r: any) => {
         if (r.type === 'char_exclude') return true  // [^<] means any non-< char
         if (r.type === 'char') return r.value.some((v: number) => v >= 33 && v <= 126 && v !== 60)
@@ -108,39 +131,22 @@ describe('invoke parameter reachability', () => {
     })
   })
 
-  describe('bounded parameter repetition', () => {
-    it('rejects more parameters than the tool defines', () => {
-      const v = buildValidator([SKILL_TOOL])  // 1 param
-      // Try to put 2 parameters — should fail since skill only has 1 param slot
-      v.rejects(
-        '\n<|invoke:skill>\n' +
-        '<|parameter:name>review<parameter|>\n' +
-        '<|parameter:name>again<parameter|>\n' +  // second occurrence — exceeds 1 slot
-        '<invoke|>\n' +
-        '\n<|yield:user|>'
+  describe('close tag variants', () => {
+    it('standard </invoke> closes invoke block', () => {
+      const v = shellValidator()
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n${YIELD}`)
+    })
+
+    it('old MACT-style <invoke|> is treated as body content (not a close tag)', () => {
+      // <invoke|> doesn't match </invoke> — treated as content in param body
+      // A real </invoke> is needed after
+      const v = shellValidator()
+      v.passes(
+        `<invoke tool="shell">\n` +
+        `<parameter name="command">ls\n<invoke|>\nmore</parameter>\n` +
+        `</invoke>\n` +
+        YIELD
       )
-    })
-  })
-
-  describe('close tag variants after parameters', () => {
-    it('canonical close: <invoke|>', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<|parameter:name>review<parameter|>\n<invoke|>\n\n<|yield:user|>')
-    })
-
-    it('lenient close: </invoke|>', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<|parameter:name>review<parameter|>\n</invoke|>\n\n<|yield:user|>')
-    })
-
-    it('lenient close: </invoke>', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<|parameter:name>review<parameter|>\n</invoke>\n\n<|yield:user|>')
-    })
-
-    it('lenient close: <invoke>', () => {
-      const v = buildValidator([SKILL_TOOL])
-      v.passes('\n<|invoke:skill>\n<|parameter:name>review<parameter|>\n<invoke>\n\n<|yield:user|>')
     })
   })
 })

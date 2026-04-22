@@ -1,71 +1,163 @@
 /**
- * Token resolution — context-aware structural vs content classification,
- * and raw text reconstruction for non-structural tokens.
+ * Token resolution — returns typed bound handlers for structural tokens.
+ *
+ * resolveOpenHandler:     tagName + top → BoundOpenHandler | undefined
+ * resolveCloseHandler:    tagName + top → BoundCloseHandler | undefined
+ * resolveSelfCloseHandler: tagName + top → BoundSelfCloseHandler | undefined
+ *
+ * If undefined is returned, the token is treated as content (tokenRaw appended).
+ *
+ * Architecture:
+ * - resolveOpenHandler switches on tagName, then checks top.type.
+ *   TypeScript narrows top in the fall-through of each type guard.
+ *   bindOpen(handler, narrowedTop) captures the narrowed frame in a closure.
+ * - resolveCloseHandler switches on top.type first.
+ *   TypeScript narrows top in every case branch.
+ *   bindClose(handler, narrowedTop) captures the narrowed frame.
+ * - No as-casts. No validTags sets. One layer, not two.
+ *
+ * Compile-time lockstep with grammar via nesting.ts:
+ *   import type { _VerifyProseChildren, _VerifyInvokeChildren } from '../nesting'
  */
 
 import type { Token } from '../types'
 import type { Frame } from './types'
-
+import type { BoundOpenHandler, BoundCloseHandler, BoundSelfCloseHandler } from './handler'
+import { bindOpen, bindClose } from './handler'
 import { KNOWN_STRUCTURAL_TAGS } from '../constants'
 
-/**
- * Reconstruct the raw text of a token for appending as literal content
- * when the token is not structural in the current context.
- */
-export function tokenRaw(token: Token): string {
-  switch (token._tag) {
-    case 'Open':
-      return `<|${token.name}${token.variant ? ':' + token.variant : ''}>`
-    case 'Close':
-      return token.raw ?? `<${token.name}${token.pipe ? '|' + token.pipe : '|'}>`
-    case 'SelfClose':
-      return `<|${token.name}${token.variant ? ':' + token.variant : ''}|>`
-    case 'Parameter':
-      return `<|parameter:${token.name}>`
-    case 'ParameterClose':
-      return '<parameter|>'
-    case 'Content':
-      return token.text
+// Compile-time verification that this file stays in lockstep with nesting.ts
+import type { _VerifyProseChildren, _VerifyInvokeChildren } from '../nesting'
+type _AssertProseChildren = _VerifyProseChildren extends true ? true : never
+type _AssertInvokeChildren = _VerifyInvokeChildren extends true ? true : never
+declare const _assertProseChildren: _AssertProseChildren
+declare const _assertInvokeChildren: _AssertInvokeChildren
+
+import {
+  reasonOpenHandler,
+  reasonCloseHandler,
+} from './handlers/reason'
+import {
+  messageOpenHandler,
+  messageCloseHandler,
+} from './handlers/message'
+import {
+  invokeOpenHandler,
+  invokeCloseHandler,
+  parameterOpenHandler,
+  parameterCloseHandler,
+  filterOpenHandler,
+  filterCloseHandler,
+} from './handlers/invoke'
+import { makeYieldHandler } from './handlers/yield'
+
+// =============================================================================
+// resolveOpenHandler
+// =============================================================================
+
+export function resolveOpenHandler(tagName: string, top: Frame): BoundOpenHandler | undefined {
+  switch (tagName) {
+    case 'reason':
+      if (top.type !== 'prose') return undefined
+      // top is narrowed to ProseFrame — TypeScript verifies reasonOpenHandler: OpenHandler<ProseFrame, ...>
+      return bindOpen(reasonOpenHandler, top)
+
+    case 'message':
+      if (top.type !== 'prose') return undefined
+      // top is narrowed to ProseFrame
+      return bindOpen(messageOpenHandler, top)
+
+    case 'invoke':
+      if (top.type !== 'prose') return undefined
+      // top is narrowed to ProseFrame
+      return bindOpen(invokeOpenHandler, top)
+
+    case 'parameter':
+      if (top.type !== 'invoke') return undefined
+      // top is narrowed to InvokeFrame — TypeScript verifies parameterOpenHandler: OpenHandler<InvokeFrame, ...>
+      return bindOpen(parameterOpenHandler, top)
+
+    case 'filter':
+      if (top.type !== 'invoke') return undefined
+      // top is narrowed to InvokeFrame
+      return bindOpen(filterOpenHandler, top)
+
+    default:
+      return undefined
   }
 }
 
+// =============================================================================
+// resolveCloseHandler
+// =============================================================================
+
+export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHandler | undefined {
+  // Switch on top.type first — TypeScript narrows top in every case
+  switch (top.type) {
+    case 'reason':
+      // top is ReasonFrame — TypeScript verifies reasonCloseHandler: CloseHandler<ReasonFrame>
+      return tagName === 'reason' ? bindClose(reasonCloseHandler, top) : undefined
+
+    case 'message':
+      // top is MessageFrame
+      return tagName === 'message' ? bindClose(messageCloseHandler, top) : undefined
+
+    case 'invoke':
+      // top is InvokeFrame
+      return tagName === 'invoke' ? bindClose(invokeCloseHandler, top) : undefined
+
+    case 'parameter':
+      // top is ParameterFrame
+      return tagName === 'parameter' ? bindClose(parameterCloseHandler, top) : undefined
+
+    case 'filter':
+      // top is FilterFrame
+      return tagName === 'filter' ? bindClose(filterCloseHandler, top) : undefined
+
+    case 'prose':
+      return undefined
+  }
+}
+
+// =============================================================================
+// resolveSelfCloseHandler
+// =============================================================================
+
+export function resolveSelfCloseHandler(tagName: string, top: Frame): BoundSelfCloseHandler | undefined {
+  if (top.type === 'prose' && tagName.startsWith('yield_')) {
+    return makeYieldHandler(tagName)
+  }
+  return undefined
+}
+
+// =============================================================================
+// tokenRaw — reconstruct raw text for non-structural tokens
+// =============================================================================
+
 /**
- * Resolve a token against the current top frame.
- * Returns 'structural' if the token should be handled as a parser event,
- * or 'content' if it should be appended as literal text.
+ * Reconstruct the raw text of a token for appending as literal content.
+ *
+ * attrs is always ReadonlyMap<string, string> — the tokenizer always constructs it as a Map.
+ * The previous instanceof Map defensive branch is removed. If a non-Map path is ever found
+ * in the tokenizer, fix the tokenizer — not this function.
  */
-export function resolveToken(token: Token, top: Frame): 'structural' | 'content' {
+export function tokenRaw(token: Token): string {
   switch (token._tag) {
-    case 'Open':
-      return top.validTags.has(token.name) ? 'structural' : 'content'
+    case 'Open': {
+      const attrsStr = token.attrs
+        ? Array.from(token.attrs.entries()).map(([k, v]) => ` ${k}="${v}"`).join('')
+        : ''
+      return `<${token.tagName}${attrsStr}>`
+    }
     case 'Close':
-      // Piped close (filter start) only valid in invoke
-      if (token.pipe) return top.type === 'invoke' ? 'structural' : 'content'
-      // Close tags are structural only if the current frame matches the tag
-      // (e.g., </think> only structural in a ThinkFrame, not in Prose even though think is in prose's validTags)
-      switch (token.name) {
-        // think/message/invoke are interchangeable closers — any of these closes
-        // whichever top-level structural frame is currently open (lenience for
-        // models that emit mismatched close tags)
-        case 'think':
-        case 'message':
-        case 'invoke':
-          return (top.type === 'think' || top.type === 'message' || top.type === 'invoke')
-            ? 'structural' : 'content'
-        case 'parameter': return top.type === 'parameter' ? 'structural' : 'content'
-        case 'filter': return top.type === 'filter' ? 'structural' : 'content'
-        default: return 'content'
-      }
-    case 'SelfClose':
-      // yield only valid in prose
-      return (top.type === 'prose' && token.name === 'yield') ? 'structural' : 'content'
-    case 'Parameter':
-      // Parameter tokens only valid in invoke
-      return top.type === 'invoke' ? 'structural' : 'content'
-    case 'ParameterClose':
-      // ParameterClose only valid in parameter frame
-      return top.type === 'parameter' ? 'structural' : 'content'
+      return token.raw ?? `</${token.tagName}>`
+    case 'SelfClose': {
+      const attrsStr = token.attrs
+        ? Array.from(token.attrs.entries()).map(([k, v]) => ` ${k}="${v}"`).join('')
+        : ''
+      return `<${token.tagName}${attrsStr}/>`
+    }
     case 'Content':
-      return 'structural'
+      return token.text
   }
 }

@@ -1,10 +1,10 @@
-import { describe, it } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { Schema } from '@effect/schema'
 import { defineTool } from '@magnitudedev/tools'
 import { Effect } from 'effect'
-import { createParser } from './src/parser/index'
-import { createTokenizer } from './src/tokenizer'
-import type { RegisteredTool } from './src/types'
+import { createParser } from '../parser/index'
+import { createTokenizer } from '../tokenizer'
+import type { RegisteredTool } from '../types'
 
 const shellTool = defineTool({
   name: 'shell', label: 'Shell', description: 'Run a shell command',
@@ -17,7 +17,7 @@ const tools = new Map<string, RegisteredTool>([['shell', { tool: shellTool, tagN
 function parse(input: string) {
   const p = createParser({ tools })
   const tokenizer = createTokenizer((token) => p.pushToken(token), new Set(tools.keys()))
-  tokenizer.push(input)
+  tokenizer.push(input + '\n')
   const fromPush = p.drain()
   tokenizer.end()
   p.end()
@@ -26,8 +26,9 @@ function parse(input: string) {
 }
 
 describe('debug', () => {
-  it('timeout', () => {
-    const events = parse('<|invoke:shell>\n<|parameter:command>ls<parameter|>\n<|parameter:timeout>30<parameter|>\n<invoke|>')
-    console.log(JSON.stringify(events, null, 2))
+  it('handles optional timeout parameter', () => {
+    const events = parse('<invoke tool="shell">\n<parameter name="command">ls</parameter>\n<parameter name="timeout">30</parameter>\n</invoke>')
+    const ready = events.find(e => e._tag === 'ToolInputReady')
+    expect(ready).toMatchObject({ _tag: 'ToolInputReady', input: { command: 'ls', timeout: 30 } })
   })
 })

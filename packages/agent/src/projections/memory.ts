@@ -625,7 +625,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
       const canonical = read(CanonicalTurnProjection)
       const canonicalText = canonical.lastCompleted?.turnId === event.turnId
-        ? canonical.lastCompleted.canonicalMact
+        ? canonical.lastCompleted.canonicalXml
         : ''
       const hasAssistantContent = canonicalText.trim().length > 0
 

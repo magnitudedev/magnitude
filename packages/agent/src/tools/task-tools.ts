@@ -93,7 +93,7 @@ const runDirective = (directive: Parameters<typeof handleTaskDirective>[0]) =>
 const UpdateTaskStatusSchema = Schema.Literal('pending', 'completed', 'cancelled')
 
 export const createTaskTool = defineTool({
-  name: 'create-task' as const,
+  name: 'create_task' as const,
   group: 'task' as const,
   description: 'Create a task.',
   inputSchema: Schema.Struct({
@@ -117,7 +117,7 @@ export const createTaskTool = defineTool({
 })
 
 export const updateTaskTool = defineTool({
-  name: 'update-task' as const,
+  name: 'update_task' as const,
   group: 'task' as const,
   description: 'Update task status.',
   inputSchema: Schema.Struct({
@@ -142,9 +142,9 @@ export const updateTaskTool = defineTool({
 })
 
 export const spawnWorkerTool = defineTool({
-  name: 'spawn-worker' as const,
+  name: 'spawn_worker' as const,
   group: 'task' as const,
-  description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <message to="task-id"> for follow-up communications. Only use spawn-worker to create a new worker or replace the current one.',
+  description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <message to="task-id"> for follow-up communications. Only use spawn_worker to create a new worker or replace the current one.',
   inputSchema: Schema.Struct({
     id: Schema.String.annotations({ description: 'Task ID to spawn a worker for' }),
     message: Schema.String.annotations({ description: 'Initial instruction message for the worker' }),
@@ -158,7 +158,7 @@ export const spawnWorkerTool = defineTool({
     Effect.gen(function* () {
       const execManager = yield* ExecutionManager
       const result = yield* runDirective({
-        kind: 'spawn-worker',
+        kind: 'spawn_worker',
         id: input.id,
         message: input.message,
         spawnWorker: (params): ReturnType<typeof execManager.fork> =>
@@ -184,7 +184,7 @@ export const spawnWorkerTool = defineTool({
 })
 
 export const killWorkerTool = defineTool({
-  name: 'kill-worker' as const,
+  name: 'kill_worker' as const,
   group: 'task' as const,
   description: 'Kill worker for a task id.',
   inputSchema: Schema.Struct({
@@ -197,7 +197,7 @@ export const killWorkerTool = defineTool({
   execute: (input, _ctx) =>
     Effect.gen(function* () {
       yield* runDirective({
-        kind: 'kill-worker',
+        kind: 'kill_worker',
         id: input.id,
       })
       return { id: input.id }

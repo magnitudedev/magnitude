@@ -1,100 +1,102 @@
 /**
  * EOF handling — finalize all open frames top-to-bottom.
+ *
+ * Uses switch (top.type) narrowing — TypeScript narrows top in every case.
+ * All effects via ParserOp[] — no direct emit/apply calls inside switch branches.
+ * No as-casts needed: each case receives a narrowed frame type.
  */
 
-import type { TurnEngineEvent } from '../types'
-import type { Op } from '../machine'
-import type { Frame, ThinkFrame, MessageFrame, InvokeFrame, ParameterFrame } from './types'
-import { PROSE_VALID_TAGS } from './types'
+import type { ParserOp } from './ops'
+import type { Frame } from './types'
+import type { InvokeContext } from './handler-context'
+import { emitEvent, emitStructuralError, emitToolError } from './ops'
 import { stripTrailingWhitespace } from './content'
-import type { StructuralParseError, ToolParseError } from '../types'
-import type { InvokeContext } from './handlers/invoke'
-import { finalizeParameter, finalizeInvoke } from './handlers/invoke'
+import { finalizeParameterOps, finalizeInvokeOps } from './handlers/invoke'
+import { closeReasonAtEof } from './handlers/reason'
 import { generateToolInterface } from '@magnitudedev/tools'
 
-interface FlushContext {
-  peek: () => Frame | undefined
-  apply: (ops: Op<Frame, TurnEngineEvent>[]) => void
-  emit: (event: TurnEngineEvent) => void
-  emitStructuralError: (error: StructuralParseError) => void
-  emitToolError: (error: ToolParseError, context: { toolCallId: string; tagName: string; toolName: string; group: string; correctToolShape?: string }) => void
-  invokeCtx: InvokeContext
-  getCorrectToolShape: (toolTag: string) => string | undefined
+function getCorrectToolShape(toolTag: string, invokeCtx: InvokeContext): string | undefined {
+  const registered = invokeCtx.tools.get(toolTag)
+  if (!registered) return undefined
+  try {
+    const result = generateToolInterface(registered.tool, registered.groupName ?? 'tools', undefined, { extractCommon: false, showErrors: false })
+    return result.signature
+  } catch {
+    return undefined
+  }
 }
 
-export function flushAllFrames(ctx: FlushContext): void {
+export function flushAllFrames(
+  peek: () => Frame | undefined,
+  apply: (ops: ParserOp[]) => void,
+  invokeCtx: InvokeContext,
+): void {
   let safety = 0
   while (safety++ < 100) {
-    const top = ctx.peek()
+    const top = peek()
     if (!top) break
 
     switch (top.type) {
       case 'parameter':
-        finalizeParameter(top as ParameterFrame, ctx.invokeCtx)
+        // top is ParameterFrame — TypeScript narrows
+        apply(finalizeParameterOps(top, invokeCtx))
         break
 
       case 'filter':
-        // Lost filter at EOF — just pop silently
-        ctx.apply([{ type: 'pop' }])
+        // top is FilterFrame — TypeScript narrows. Lost filter at EOF — pop silently.
+        apply([{ type: 'pop' }])
         break
 
-      case 'invoke': {
-        const invokeFrame = top as InvokeFrame
-        if (!invokeFrame.dead) {
-          ctx.emitToolError(
+      case 'invoke':
+        // top is InvokeFrame — TypeScript narrows
+        if (!top.dead) {
+          apply([emitToolError(
             {
               _tag: 'IncompleteTool',
-              toolCallId: invokeFrame.toolCallId,
-              tagName: invokeFrame.toolTag,
-              detail: `Invoke for '${invokeFrame.toolTag}' was never closed`,
+              toolCallId: top.toolCallId,
+              tagName: top.toolTag,
+              detail: `Invoke for '${top.toolTag}' was never closed`,
             },
             {
-              toolCallId: invokeFrame.toolCallId,
-              tagName: invokeFrame.toolTag,
-              toolName: invokeFrame.toolName,
-              group: invokeFrame.group,
-              correctToolShape: ctx.getCorrectToolShape(invokeFrame.toolTag),
+              toolCallId: top.toolCallId,
+              tagName: top.toolTag,
+              toolName: top.toolName,
+              group: top.group,
+              correctToolShape: getCorrectToolShape(top.toolTag, invokeCtx),
             },
-          )
+          )])
         }
-        ctx.apply([{ type: 'pop' }])
+        apply([{ type: 'pop' }])
         break
-      }
 
-      case 'message': {
-        const msgFrame = top as MessageFrame
-        ctx.apply([
-          { type: 'emit', event: { _tag: 'MessageEnd', id: msgFrame.id } },
+      case 'message':
+        // top is MessageFrame — TypeScript narrows
+        apply([
+          emitEvent({ _tag: 'MessageEnd', id: top.id }),
           { type: 'pop' },
         ])
         break
-      }
 
-      case 'think': {
-        const thinkFrame = top as ThinkFrame
-        const trimmed = stripTrailingWhitespace(thinkFrame.content)
-        ctx.emitStructuralError({ _tag: 'UnclosedThink', message: `Unclosed think tag: ${thinkFrame.name}` })
-        ctx.apply([
-          { type: 'emit', event: { _tag: 'LensEnd', name: thinkFrame.name, content: trimmed } },
-          { type: 'pop' },
-        ])
+      case 'reason':
+        // top is ReasonFrame — TypeScript narrows
+        apply(closeReasonAtEof(top))
         break
-      }
 
       case 'prose': {
+        // top is ProseFrame — TypeScript narrows
         const trimmed = stripTrailingWhitespace(top.body)
         if (trimmed.length > 0 || top.hasContent) {
-          ctx.apply([
-            { type: 'emit', event: { _tag: 'ProseEnd', content: trimmed } },
+          apply([
+            emitEvent({ _tag: 'ProseEnd', content: trimmed }),
             { type: 'done' },
           ])
         } else {
-          ctx.apply([{ type: 'done' }])
+          apply([{ type: 'done' }])
         }
         return
       }
     }
   }
 
-  ctx.apply([{ type: 'done' }])
+  apply([{ type: 'done' }])
 }

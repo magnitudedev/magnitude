@@ -174,7 +174,7 @@ export type { Tokenizer } from './tokenizer'
 
 // Parser (emits TurnEngineEvent directly, integrates jsonish)
 export { createParser } from './parser/index'
-export type { MactParser, ParserConfig } from './parser/index'
+export type { XmlActParser, ParserConfig } from './parser/index'
 
 // Machine
 export { createStackMachine } from './machine'

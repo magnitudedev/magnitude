@@ -11,7 +11,7 @@ import type { TaskDirectiveContext } from './handler'
 const { ForkContext } = Fork
 
 export interface SpawnWorkerDirective<R = never> {
-  readonly kind: 'spawn-worker'
+  readonly kind: 'spawn_worker'
   readonly id: string
   readonly message: string
   readonly spawnWorker: (params: {

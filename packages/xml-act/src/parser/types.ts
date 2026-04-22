@@ -1,27 +1,19 @@
 /**
- * Parser types — internal frame types, ParserConfig, field state, and valid tag sets.
+ * Parser types — internal frame types, ParserConfig, and field state.
+ *
+ * validTags sets have been removed — valid nesting is enforced by resolveOpenHandler
+ * in resolve.ts, which uses VALID_CHILDREN from nesting.ts as the single source of truth.
  */
 
 import type { RegisteredTool } from '../types'
 import type { StreamingJsonParser } from '../jsonish/types'
 
 // =============================================================================
-// Valid tag sets — per frame type (constant, shared)
-// =============================================================================
-
-export const PROSE_VALID_TAGS: ReadonlySet<string> = new Set(['think', 'message', 'invoke', 'yield'])
-export const THINK_VALID_TAGS: ReadonlySet<string> = new Set(['think'])
-export const MESSAGE_VALID_TAGS: ReadonlySet<string> = new Set(['message'])
-export const INVOKE_VALID_TAGS: ReadonlySet<string> = new Set(['invoke', 'parameter'])
-export const PARAMETER_VALID_TAGS: ReadonlySet<string> = new Set(['parameter'])
-export const FILTER_VALID_TAGS: ReadonlySet<string> = new Set(['filter'])
-
-// =============================================================================
 // ParserConfig
 // =============================================================================
 
 /**
- * Configuration for creating a new mact parser.
+ * Configuration for creating a new parser.
  * The parser needs the tool registry to validate invocations and parameters at parse time.
  */
 export interface ParserConfig {
@@ -50,7 +42,7 @@ export interface ParserConfig {
 
 export type Frame =
   | ProseFrame
-  | ThinkFrame
+  | ReasonFrame
   | MessageFrame
   | InvokeFrame
   | ParameterFrame
@@ -61,16 +53,14 @@ export interface ProseFrame {
   readonly body: string
   readonly pendingNewlines: number
   readonly hasContent: boolean
-  readonly validTags: ReadonlySet<string>
 }
 
-export interface ThinkFrame {
-  readonly type: 'think'
+export interface ReasonFrame {
+  readonly type: 'reason'
   readonly name: string
   readonly content: string
   readonly hasContent: boolean
   readonly pendingNewlines: number
-  readonly validTags: ReadonlySet<string>
 }
 
 export interface MessageFrame {
@@ -79,7 +69,6 @@ export interface MessageFrame {
   readonly to: string | null
   readonly content: string
   readonly pendingNewlines: number
-  readonly validTags: ReadonlySet<string>
 }
 
 export interface InvokeFrame {
@@ -94,11 +83,10 @@ export interface InvokeFrame {
   readonly dead: boolean
   /** Whether a filter has been started */
   readonly hasFilter: boolean
-  /** Per-field state */
+  /** Per-field state — mutable Map, accumulated during streaming */
   readonly fieldStates: Map<string, FieldState>
-  /** Parameters seen so far (for duplicate detection) */
+  /** Parameters seen so far — mutable Set, for duplicate detection */
   readonly seenParams: Set<string>
-  readonly validTags: ReadonlySet<string>
 }
 
 export interface ParameterFrame {
@@ -107,21 +95,24 @@ export interface ParameterFrame {
   readonly paramName: string
   /** Whether this parameter frame is dead (unknown param, duplicate, etc.) */
   readonly dead: boolean
-  /** Accumulated raw text value */
+  /** Accumulated raw text value — mutable, written by parameterContent */
   rawValue: string
   /** Jsonish parser for JSON-type fields, null for scalar fields */
   readonly jsonishParser: StreamingJsonParser | null
   /** Parameter type derived from schema */
   readonly fieldType: FieldType
-  readonly validTags: ReadonlySet<string>
+  /** Reference to the parent InvokeFrame — eliminates findFrame in finalizeParameter */
+  readonly invokeFrame: InvokeFrame
 }
 
 export interface FilterFrame {
   readonly type: 'filter'
   readonly toolCallId: string
   readonly filterType: string
+  /** Accumulated query string — mutable, written by filterContent */
   query: string
-  readonly validTags: ReadonlySet<string>
+  /** Reference to the parent InvokeFrame — eliminates findFrame in filterCloseHandler */
+  readonly invokeFrame: InvokeFrame
 }
 
 // =============================================================================

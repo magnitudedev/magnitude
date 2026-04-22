@@ -1,34 +1,45 @@
 /**
  * Invoke, parameter, and filter frame handlers.
+ *
+ * All handlers are stateless objects implementing OpenHandler<TParent, TChild>
+ * or CloseHandler<TFrame>. Parent frames are passed at call time via bindOpen/bindClose.
+ * All effects are returned as ParserOp[] — no direct emit/apply calls.
+ *
+ * invokeOpenHandler:     OpenHandler<ProseFrame, InvokeFrame>
+ * invokeCloseHandler:    CloseHandler<InvokeFrame>
+ * parameterOpenHandler:  OpenHandler<InvokeFrame, ParameterFrame>
+ * parameterCloseHandler: CloseHandler<ParameterFrame>
+ * filterOpenHandler:     OpenHandler<InvokeFrame, FilterFrame>
+ * filterCloseHandler:    CloseHandler<FilterFrame>
  */
 
-import type { TurnEngineEvent, RegisteredTool, ToolParseErrorEvent, FilterReady, DeepPaths, StructuralParseError, ToolParseError } from '../../types'
+import type {
+  TurnEngineEvent,
+  RegisteredTool,
+  ToolParseErrorEvent,
+  FilterReady,
+  DeepPaths,
+} from '../../types'
 import type { Op } from '../../machine'
-import type { Frame, InvokeFrame, ParameterFrame, FilterFrame, FieldType } from '../types'
-import { INVOKE_VALID_TAGS, PARAMETER_VALID_TAGS, FILTER_VALID_TAGS } from '../types'
+import type {
+  Frame,
+  ProseFrame,
+  InvokeFrame,
+  ParameterFrame,
+  FilterFrame,
+  FieldType,
+} from '../types'
+import type { OpenHandler, CloseHandler } from '../handler'
+import type { HandlerContext, InvokeContext } from '../handler-context'
+import { emitEvent, emitStructuralError, emitToolError, type ParserOp } from '../ops'
 import { coerceScalarValue } from '../coerce'
 import { createStreamingJsonParser } from '../../jsonish/parser'
 import { coerceToStreamingPartial } from '../../jsonish/coercer'
 import { deriveParameters } from '../../engine/parameter-schema'
 import { generateToolInterface } from '@magnitudedev/tools'
 
-// =============================================================================
-// InvokeContext — shared state passed to all invoke-related handlers
-// =============================================================================
-
-export interface InvokeContext {
-  tools: ReadonlyMap<string, RegisteredTool>
-  toolSchemas: Map<string, ReturnType<typeof deriveParameters>>
-  endCurrentProse: () => void
-  apply: (ops: Op<Frame, TurnEngineEvent>[]) => void
-  emit: (event: TurnEngineEvent) => void
-  emitStructuralError: (error: StructuralParseError) => void
-  emitToolError: (error: ToolParseError, context: { toolCallId: string; tagName: string; toolName: string; group: string; correctToolShape?: string }) => void
-  findFrame: <T extends Frame['type']>(type: T) => Extract<Frame, { type: T }> | undefined
-  finalizeInvoke: (frame: InvokeFrame) => void
-  onFilterReady?: (event: FilterReady) => void
-  generateId: () => string
-}
+// Re-export InvokeContext so index.ts can import it from here
+export type { InvokeContext }
 
 // =============================================================================
 // Helpers
@@ -48,7 +59,7 @@ function getCorrectToolShape(toolTag: string, tools: ReadonlyMap<string, Registe
 function getFieldType(
   toolTag: string,
   paramName: string,
-  toolSchemas: Map<string, ReturnType<typeof deriveParameters>>,
+  toolSchemas: ReadonlyMap<string, ReturnType<typeof deriveParameters>>,
 ): FieldType {
   const schema = toolSchemas.get(toolTag)
   if (!schema) return 'unknown'
@@ -59,228 +70,90 @@ function getFieldType(
   return param.type as FieldType
 }
 
+function makeDeadParamFrame(invokeFrame: InvokeFrame, paramName: string): ParameterFrame {
+  return {
+    type: 'parameter',
+    toolCallId: invokeFrame.toolCallId,
+    paramName,
+    dead: true,
+    rawValue: '',
+    jsonishParser: null,
+    fieldType: 'unknown',
+    invokeFrame,
+  }
+}
+
 // =============================================================================
-// openInvoke
+// finalizeInvokeOps — shared by invokeCloseHandler and filterCloseHandler
 // =============================================================================
 
-export function openInvoke(variant: string | undefined, ctx: InvokeContext): void {
-  if (!variant) {
-    ctx.emitStructuralError({ _tag: 'MissingToolName', detail: '<|invoke> requires a tool name, e.g. <|invoke:shell>' })
-    return
+export function finalizeInvokeOps(invokeFrame: InvokeFrame, invokeCtx: InvokeContext): ParserOp[] {
+  if (invokeFrame.dead) {
+    return [{ type: 'pop' }]
   }
 
-  const toolCallId = ctx.generateId()
-  const toolTag = variant
-  const parts = toolTag.split(':')
-  const group = parts.length > 1 ? parts[0] : 'default'
-  const toolName = parts.length > 1 ? parts.slice(1).join(':') : toolTag
+  const { toolCallId, toolTag, toolName, group } = invokeFrame
+  const schema = invokeCtx.toolSchemas.get(toolTag)
+  const correctToolShape = getCorrectToolShape(toolTag, invokeCtx.tools)
+  const errorOps: ParserOp[] = []
 
-  ctx.endCurrentProse()
-
-  const registered = ctx.tools.get(toolTag)
-
-  if (!registered) {
-    ctx.apply([{
-      type: 'push',
-      frame: {
-        type: 'invoke',
-        toolCallId,
-        toolTag,
-        toolName,
-        group,
-        known: false,
-        dead: true,
-        hasFilter: false,
-        fieldStates: new Map(),
-        seenParams: new Set(),
-        validTags: INVOKE_VALID_TAGS,
-      },
-    }])
-    ctx.emitStructuralError(
-      { _tag: 'UnknownTool', tagName: toolTag, detail: `Unknown tool tag: '${toolTag}'` },
-    )
-  } else {
-    ctx.apply([
-      {
-        type: 'push',
-        frame: {
-          type: 'invoke',
-          toolCallId,
-          toolTag,
-          toolName: registered.tool.name,
-          group: registered.groupName,
-          known: true,
-          dead: false,
-          hasFilter: false,
-          fieldStates: new Map(),
-          seenParams: new Set(),
-          validTags: INVOKE_VALID_TAGS,
-        },
-      },
-      {
-        type: 'emit',
-        event: {
-          _tag: 'ToolInputStarted',
+  // Collect all errored fields
+  for (const [, fieldState] of invokeFrame.fieldStates) {
+    if (fieldState.errored) {
+      errorOps.push(emitToolError(
+        {
+          _tag: 'SchemaCoercionError',
           toolCallId,
           tagName: toolTag,
-          toolName: registered.tool.name,
-          group: registered.groupName,
+          parameterName: fieldState.paramName,
+          detail: fieldState.errorDetail ?? 'Coercion failed',
         },
-      },
-    ])
+        { toolCallId, tagName: toolTag, toolName, group, correctToolShape },
+      ))
+    }
   }
+
+  // Collect all missing required fields
+  if (schema) {
+    for (const [paramName, paramSchema] of schema.parameters) {
+      if (paramSchema.required && !invokeFrame.fieldStates.has(paramName)) {
+        errorOps.push(emitToolError(
+          {
+            _tag: 'MissingRequiredField',
+            toolCallId,
+            tagName: toolTag,
+            parameterName: paramName,
+            detail: `Missing required field '${paramName}' for tool '${toolTag}'`,
+          },
+          { toolCallId, tagName: toolTag, toolName, group, correctToolShape },
+        ))
+      }
+    }
+  }
+
+  if (errorOps.length > 0) {
+    return [{ type: 'pop' }, ...errorOps]
+  }
+
+  // Happy path
+  const input: Record<string, unknown> = {}
+  for (const [paramName, fieldState] of invokeFrame.fieldStates) {
+    input[paramName] = fieldState.coercedValue
+  }
+
+  return [
+    emitEvent({ _tag: 'ToolInputReady', toolCallId, input }),
+    { type: 'pop' },
+  ]
 }
 
 // =============================================================================
-// openFilter (piped close = filter start)
+// finalizeParameterOps — used by parameterCloseHandler and flush
 // =============================================================================
 
-export function openFilter(invokeFrame: InvokeFrame, pipe: string, ctx: InvokeContext): void {
-  ctx.apply([
-    { type: 'replace', frame: { ...invokeFrame, hasFilter: true } },
-    {
-      type: 'push',
-      frame: {
-        type: 'filter',
-        toolCallId: invokeFrame.toolCallId,
-        filterType: pipe,
-        query: '',
-        validTags: FILTER_VALID_TAGS,
-      },
-    },
-  ])
-}
-
-// =============================================================================
-// closeFilter
-// =============================================================================
-
-export function closeFilter(filterFrame: FilterFrame, ctx: InvokeContext): void {
-  ctx.apply([{ type: 'pop' }])
-  if (ctx.onFilterReady) {
-    ctx.onFilterReady({ _tag: 'FilterReady', toolCallId: filterFrame.toolCallId, query: filterFrame.query })
-  }
-  const invokeFrame = ctx.findFrame('invoke')
-  if (invokeFrame) {
-    ctx.finalizeInvoke(invokeFrame)
-  }
-}
-
-// =============================================================================
-// openParameter
-// =============================================================================
-
-export function openParameter(paramName: string, invokeFrame: InvokeFrame, ctx: InvokeContext): void {
-  // Dead invoke — absorb parameter silently
-  if (invokeFrame.dead) {
-    ctx.apply([{
-      type: 'push',
-      frame: {
-        type: 'parameter',
-        toolCallId: invokeFrame.toolCallId,
-        paramName,
-        dead: true,
-        rawValue: '',
-        jsonishParser: null,
-        fieldType: 'unknown',
-        validTags: PARAMETER_VALID_TAGS,
-      },
-    }])
-    return
-  }
-
-  const schema = ctx.toolSchemas.get(invokeFrame.toolTag)
-  const knownParams = schema ? schema.parameters : null
-
-  // Unknown parameter
-  if (knownParams !== null && !knownParams.has(paramName)) {
-    ctx.apply([{
-      type: 'push',
-      frame: {
-        type: 'parameter',
-        toolCallId: invokeFrame.toolCallId,
-        paramName,
-        dead: true,
-        rawValue: '',
-        jsonishParser: null,
-        fieldType: 'unknown',
-        validTags: PARAMETER_VALID_TAGS,
-      },
-    }])
-    ctx.emitToolError(
-      {
-        _tag: 'UnknownParameter',
-        toolCallId: invokeFrame.toolCallId,
-        tagName: invokeFrame.toolTag,
-        parameterName: paramName,
-        detail: `Unknown parameter '${paramName}' for tool '${invokeFrame.toolTag}'`,
-      },
-      {
-        toolCallId: invokeFrame.toolCallId,
-        tagName: invokeFrame.toolTag,
-        toolName: invokeFrame.toolName,
-        group: invokeFrame.group,
-        correctToolShape: getCorrectToolShape(invokeFrame.toolTag, ctx.tools),
-      },
-    )
-    return
-  }
-
-  // Duplicate parameter — silently absorb
-  if (invokeFrame.seenParams.has(paramName)) {
-    ctx.apply([{
-      type: 'push',
-      frame: {
-        type: 'parameter',
-        toolCallId: invokeFrame.toolCallId,
-        paramName,
-        dead: true,
-        rawValue: '',
-        jsonishParser: null,
-        fieldType: 'unknown',
-        validTags: PARAMETER_VALID_TAGS,
-      },
-    }])
-    return
-  }
-
-  invokeFrame.seenParams.add(paramName)
-
-  const fieldType = getFieldType(invokeFrame.toolTag, paramName, ctx.toolSchemas)
-  const jsonishParser = fieldType === 'json' ? createStreamingJsonParser() : null
-
-  invokeFrame.fieldStates.set(paramName, {
-    paramName,
-    rawValue: '',
-    coercedValue: undefined,
-    errored: false,
-    errorDetail: undefined,
-    complete: false,
-  })
-
-  ctx.apply([{
-    type: 'push',
-    frame: {
-      type: 'parameter',
-      toolCallId: invokeFrame.toolCallId,
-      paramName,
-      dead: false,
-      rawValue: '',
-      jsonishParser,
-      fieldType,
-      validTags: PARAMETER_VALID_TAGS,
-    },
-  }])
-}
-
-// =============================================================================
-// finalizeParameter
-// =============================================================================
-
-export function finalizeParameter(paramFrame: ParameterFrame, ctx: InvokeContext): void {
+export function finalizeParameterOps(paramFrame: ParameterFrame, invokeCtx: InvokeContext): ParserOp[] {
   if (paramFrame.dead) {
-    ctx.apply([{ type: 'pop' }])
-    return
+    return [{ type: 'pop' }]
   }
 
   if (paramFrame.jsonishParser !== null) {
@@ -291,17 +164,17 @@ export function finalizeParameter(paramFrame: ParameterFrame, ctx: InvokeContext
   let errored = false
   let errorDetail: string | undefined
 
-  const invokeFrame = ctx.findFrame('invoke')
+  const invokeFrame = paramFrame.invokeFrame  // stored at open time — no findFrame needed
 
   if (paramFrame.jsonishParser !== null) {
     const partial = paramFrame.jsonishParser.partial
     if (partial === undefined) {
       coercedValue = paramFrame.rawValue.trim() || undefined
     } else {
-      const invokeTag = invokeFrame?.toolTag ?? ''
-      const paramSchema = ctx.toolSchemas.get(invokeTag)?.parameters.get(paramFrame.paramName)
+      const invokeTag = invokeFrame.toolTag
+      const paramSchema = invokeCtx.toolSchemas.get(invokeTag)?.parameters.get(paramFrame.paramName)
       if (paramSchema) {
-        const registered = ctx.tools.get(invokeTag)
+        const registered = invokeCtx.tools.get(invokeTag)
         if (registered) {
           try {
             const result = coerceToStreamingPartial(partial, registered.tool.inputSchema.ast)
@@ -327,108 +200,211 @@ export function finalizeParameter(paramFrame: ParameterFrame, ctx: InvokeContext
     }
   }
 
-  if (invokeFrame) {
-    const fieldState = invokeFrame.fieldStates.get(paramFrame.paramName)
-    if (fieldState) {
-      fieldState.rawValue = paramFrame.rawValue
-      fieldState.coercedValue = coercedValue
-      fieldState.errored = errored
-      fieldState.errorDetail = errorDetail
-      fieldState.complete = true
-    }
+  // Update fieldState on the parent InvokeFrame
+  const fieldState = invokeFrame.fieldStates.get(paramFrame.paramName)
+  if (fieldState) {
+    fieldState.rawValue = paramFrame.rawValue
+    fieldState.coercedValue = coercedValue
+    fieldState.errored = errored
+    fieldState.errorDetail = errorDetail
+    fieldState.complete = true
   }
 
   const path = [paramFrame.paramName] as unknown as DeepPaths<unknown>
-  ctx.apply([
-    {
-      type: 'emit',
-      event: {
-        _tag: 'ToolInputFieldComplete',
-        toolCallId: paramFrame.toolCallId,
-        field: paramFrame.paramName as string & keyof unknown,
-        path,
-        value: coercedValue,
-      },
-    },
+  return [
+    emitEvent({
+      _tag: 'ToolInputFieldComplete',
+      toolCallId: paramFrame.toolCallId,
+      field: paramFrame.paramName as string & keyof unknown,
+      path,
+      value: coercedValue,
+    }),
     { type: 'pop' },
-  ])
+  ]
 }
 
 // =============================================================================
-// finalizeInvoke
+// invokeOpenHandler / invokeCloseHandler
 // =============================================================================
 
-export function finalizeInvoke(invokeFrame: InvokeFrame, ctx: InvokeContext): void {
-  if (invokeFrame.dead) {
-    ctx.apply([{ type: 'pop' }])
-    return
-  }
+export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
+  open(attrs, _parent, ctx) {
+    const toolTag = attrs.get('tool')
+    if (!toolTag) {
+      return [emitStructuralError({ _tag: 'MissingToolName', detail: '<invoke> requires a tool attribute, e.g. <invoke tool="shell">' })]
+    }
 
-  const { toolCallId, toolTag, toolName, group } = invokeFrame
-  const schema = ctx.toolSchemas.get(toolTag)
-  const correctToolShape = getCorrectToolShape(toolTag, ctx.tools)
-  const errors: ToolParseErrorEvent[] = []
+    const toolCallId = ctx.generateId()
+    const parts = toolTag.split(':')
+    const group = parts.length > 1 ? parts[0] : 'default'
+    const toolName = parts.length > 1 ? parts.slice(1).join(':') : toolTag
 
-  // Collect all errored fields
-  for (const [, fieldState] of invokeFrame.fieldStates) {
-    if (fieldState.errored) {
-      errors.push({
-        _tag: 'ToolParseError',
+    const registered = ctx.invokeCtx.tools.get(toolTag)
+
+    if (!registered) {
+      return [
+        {
+          type: 'push',
+          frame: {
+            type: 'invoke',
+            toolCallId,
+            toolTag,
+            toolName,
+            group,
+            known: false,
+            dead: true,
+            hasFilter: false,
+            fieldStates: new Map(),
+            seenParams: new Set(),
+          },
+        },
+        emitStructuralError({ _tag: 'UnknownTool', tagName: toolTag, detail: `Unknown tool tag: '${toolTag}'` }),
+      ]
+    }
+
+    return [
+      {
+        type: 'push',
+        frame: {
+          type: 'invoke',
+          toolCallId,
+          toolTag,
+          toolName: registered.tool.name,
+          group: registered.groupName,
+          known: true,
+          dead: false,
+          hasFilter: false,
+          fieldStates: new Map(),
+          seenParams: new Set(),
+        },
+      },
+      emitEvent({
+        _tag: 'ToolInputStarted',
         toolCallId,
         tagName: toolTag,
-        toolName,
-        group,
-        correctToolShape,
-        error: {
-          _tag: 'SchemaCoercionError',
-          toolCallId,
-          tagName: toolTag,
-          parameterName: fieldState.paramName,
-          detail: fieldState.errorDetail ?? 'Coercion failed',
-        },
-      })
-    }
-  }
+        toolName: registered.tool.name,
+        group: registered.groupName,
+      }),
+    ]
+  },
+}
 
-  // Collect all missing required fields
-  if (schema) {
-    for (const [paramName, paramSchema] of schema.parameters) {
-      if (paramSchema.required && !invokeFrame.fieldStates.has(paramName)) {
-        errors.push({
-          _tag: 'ToolParseError',
-          toolCallId,
-          tagName: toolTag,
-          toolName,
-          group,
-          correctToolShape,
-          error: {
-            _tag: 'MissingRequiredField',
-            toolCallId,
-            tagName: toolTag,
+export const invokeCloseHandler: CloseHandler<InvokeFrame> = {
+  close(top, ctx) {
+    return finalizeInvokeOps(top, ctx.invokeCtx)
+  },
+}
+
+// =============================================================================
+// parameterOpenHandler / parameterCloseHandler
+// =============================================================================
+
+export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
+  open(attrs, parent, ctx) {
+    // parent is InvokeFrame — TypeScript enforces this at handler definition
+    const paramName = attrs.get('name') ?? ''
+
+    if (parent.dead) {
+      return [{ type: 'push', frame: makeDeadParamFrame(parent, paramName) }]
+    }
+
+    const schema = ctx.invokeCtx.toolSchemas.get(parent.toolTag)
+    const knownParams = schema ? schema.parameters : null
+
+    if (knownParams !== null && !knownParams.has(paramName)) {
+      return [
+        { type: 'push', frame: makeDeadParamFrame(parent, paramName) },
+        emitToolError(
+          {
+            _tag: 'UnknownParameter',
+            toolCallId: parent.toolCallId,
+            tagName: parent.toolTag,
             parameterName: paramName,
-            detail: `Missing required field '${paramName}' for tool '${toolTag}'`,
+            detail: `Unknown parameter '${paramName}' for tool '${parent.toolTag}'`,
           },
-        })
-      }
+          {
+            toolCallId: parent.toolCallId,
+            tagName: parent.toolTag,
+            toolName: parent.toolName,
+            group: parent.group,
+            correctToolShape: getCorrectToolShape(parent.toolTag, ctx.invokeCtx.tools),
+          },
+        ),
+      ]
     }
-  }
 
-  if (errors.length > 0) {
-    ctx.apply([{ type: 'pop' }])
-    for (const err of errors) {
-      ctx.emit(err)
+    if (parent.seenParams.has(paramName)) {
+      return [{ type: 'push', frame: makeDeadParamFrame(parent, paramName) }]
     }
-    return
-  }
 
-  // Happy path
-  const input: Record<string, unknown> = {}
-  for (const [paramName, fieldState] of invokeFrame.fieldStates) {
-    input[paramName] = fieldState.coercedValue
-  }
+    // Mutate seenParams and fieldStates on the InvokeFrame.
+    // These Maps/Sets are mutable by design — accumulated during streaming.
+    parent.seenParams.add(paramName)
+    const fieldType = getFieldType(parent.toolTag, paramName, ctx.invokeCtx.toolSchemas)
+    const jsonishParser = fieldType === 'json' ? createStreamingJsonParser() : null
+    parent.fieldStates.set(paramName, {
+      paramName,
+      rawValue: '',
+      coercedValue: undefined,
+      errored: false,
+      errorDetail: undefined,
+      complete: false,
+    })
 
-  ctx.apply([
-    { type: 'emit', event: { _tag: 'ToolInputReady', toolCallId, input } },
-    { type: 'pop' },
-  ])
+    return [{
+      type: 'push',
+      frame: {
+        type: 'parameter',
+        toolCallId: parent.toolCallId,
+        paramName,
+        dead: false,
+        rawValue: '',
+        jsonishParser,
+        fieldType,
+        invokeFrame: parent,  // stored reference — eliminates findFrame in finalizeParameterOps
+      },
+    }]
+  },
+}
+
+export const parameterCloseHandler: CloseHandler<ParameterFrame> = {
+  close(top, ctx) {
+    return finalizeParameterOps(top, ctx.invokeCtx)
+  },
+}
+
+// =============================================================================
+// filterOpenHandler / filterCloseHandler
+// =============================================================================
+
+export const filterOpenHandler: OpenHandler<InvokeFrame, FilterFrame> = {
+  open(attrs, parent, ctx) {
+    const filterType = attrs.get('type') ?? 'jsonpath'
+    return [
+      { type: 'replace', frame: { ...parent, hasFilter: true } },
+      {
+        type: 'push',
+        frame: {
+          type: 'filter',
+          toolCallId: parent.toolCallId,
+          filterType,
+          query: '',
+          invokeFrame: parent,  // stored reference — eliminates findFrame in filterCloseHandler
+        },
+      },
+    ]
+  },
+}
+
+export const filterCloseHandler: CloseHandler<FilterFrame> = {
+  close(top, ctx) {
+    // top.invokeFrame is the parent InvokeFrame — captured at open time, no findFrame
+    if (ctx.invokeCtx.onFilterReady) {
+      ctx.invokeCtx.onFilterReady({ _tag: 'FilterReady', toolCallId: top.toolCallId, query: top.query })
+    }
+    return [
+      { type: 'pop' },
+      ...finalizeInvokeOps(top.invokeFrame, ctx.invokeCtx),
+    ]
+  },
 }

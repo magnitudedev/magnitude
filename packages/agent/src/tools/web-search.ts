@@ -24,7 +24,7 @@ const WebSearchErrorSchema = ToolErrorSchema('WebSearchError', {})
 // =============================================================================
 
 export const webSearchTool = defineTool({
-  name: 'web-search',
+  name: 'web_search',
   group: 'default',
   description: 'Search the web and optionally extract structured data',
 

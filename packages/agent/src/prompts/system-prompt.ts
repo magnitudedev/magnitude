@@ -2,7 +2,7 @@ import type { RoleDefinition } from '@magnitudedev/roles'
 import type { Skill } from '@magnitudedev/skills'
 
 import { PROSE_DELIM_OPEN, PROSE_DELIM_CLOSE } from '../constants'
-import { getMactProtocol } from './protocol'
+import { getProtocol } from './protocol'
 import toolingSectionRaw from '../agents/prompts/lead-tooling.txt' with { type: 'text' }
 import subagentBaseRaw from '../agents/prompts/subagent-base.txt' with { type: 'text' }
 import { renderSkillReferenceTable } from './tasks/index'
@@ -39,7 +39,7 @@ export function renderSystemPrompt(
   return roleDef.systemPrompt
     .replaceAll(
       '{{RESPONSE_PROTOCOL}}',
-      getMactProtocol(roleDef.lenses, mapProtocolMode(roleDef), roleDef.defaultRecipient),
+      getProtocol(roleDef.lenses, mapProtocolMode(roleDef), roleDef.defaultRecipient),
     )
     .replaceAll('{{TOOL_DOCS}}', toolDocs)
     .replaceAll('{{SUBAGENT_BASE}}', subagentBaseRaw)

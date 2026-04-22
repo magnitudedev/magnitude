@@ -26,9 +26,8 @@ export {
   formatMissingAssignmentMessageError,
 } from './error-states'
 
-// Mact protocol exports
 export {
-  getMactProtocol,
+  getProtocol,
   buildAckTurn,
   buildAckTurns,
   type AckTurnMessage,

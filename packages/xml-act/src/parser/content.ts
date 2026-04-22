@@ -2,14 +2,20 @@
  * Per-frame content handlers — append text to the current frame and emit
  * the appropriate streaming chunk events.
  *
- * All functions are pure: they take a frame + text and return Op[].
- * The caller (index.ts) applies the ops via the stack machine.
+ * ContentHandlers is a mapped type — exhaustive by construction. Adding a new frame type
+ * without a corresponding entry here is a compile-time error.
+ *
+ * onContent routes content to the correct per-frame handler via the ContentHandlers map.
+ * One cast at the call site is unavoidable (TypeScript cannot correlate a runtime string key
+ * with the specific function overload in the map), but the mapped type guarantees every
+ * case is handled correctly.
  */
 
-import type { TurnEngineEvent } from '../types'
+import type { TurnEngineEvent, DeepPaths } from '../types'
 import type { Op } from '../machine'
-import type { ProseFrame, MessageFrame, ThinkFrame } from './types'
-import { PROSE_VALID_TAGS } from './types'
+import type { Frame, ProseFrame, MessageFrame, ReasonFrame, ParameterFrame, FilterFrame, InvokeFrame } from './types'
+import type { ParserOp } from './ops'
+import { emitEvent, emitStructuralError } from './ops'
 
 // =============================================================================
 // Character helpers
@@ -44,6 +50,49 @@ export function stripTrailingWhitespace(text: string): string {
   let i = text.length - 1
   while (i >= 0 && isWhitespace(text[i])) i--
   return i < 0 ? '' : text.slice(0, i + 1)
+}
+
+// =============================================================================
+// ContentHandlers — exhaustive mapped type
+// =============================================================================
+
+/**
+ * ContentHandlers — maps every frame type to its content accumulation function.
+ *
+ * This mapped type is exhaustive by construction: TypeScript errors if a new frame type
+ * is added to the Frame union without a corresponding entry here.
+ * "Property 'newFrame' is missing in type" — impossible to miss.
+ */
+type ContentHandlers = {
+  readonly [K in Frame['type']]: (frame: Extract<Frame, { type: K }>, text: string) => ParserOp[]
+}
+
+const contentHandlers: ContentHandlers = {
+  prose:     (frame, text) => appendProse(frame, text) as ParserOp[],
+  reason:    (frame, text) => appendReason(frame, text) as ParserOp[],
+  message:   (frame, text) => appendMessage(frame, text) as ParserOp[],
+  parameter: parameterContent,
+  filter:    filterContent,
+  invoke:    invokeContent,
+}
+
+/**
+ * onContent — route content text to the current frame's handler.
+ *
+ * CONTRACT:
+ * - prose, reason, message: returns Op[] only, no mutation
+ * - parameter: mutates frame.rawValue and frame.jsonishParser, returns Op[] for ToolInputFieldChunk
+ * - filter: mutates frame.query, returns []
+ * - invoke: returns error op for unexpected non-whitespace content
+ *
+ * Mutation for parameter and filter is intentional — see types.ts for justification.
+ */
+export function onContent(top: Frame, text: string): ParserOp[] {
+  // One cast at the call site. The ContentHandlers mapped type guarantees every case is handled
+  // and each handler is typed to its specific frame type. TypeScript cannot correlate top.type
+  // (a runtime string) with the handler's parameter type through a map lookup — the cast is
+  // unavoidable but safe by construction.
+  return (contentHandlers[top.type] as (frame: Frame, text: string) => ParserOp[])(top, text)
 }
 
 // =============================================================================
@@ -84,7 +133,7 @@ export function endTopProse(top: ProseFrame): Op<ProseFrame, TurnEngineEvent>[] 
   }
   ops.push({
     type: 'replace',
-    frame: { type: 'prose', body: '', pendingNewlines: 0, hasContent: false, validTags: PROSE_VALID_TAGS },
+    frame: { type: 'prose', body: '', pendingNewlines: 0, hasContent: false },
   })
   return ops
 }
@@ -133,11 +182,11 @@ export function appendMessage(top: MessageFrame, text: string): Op<MessageFrame,
 }
 
 // =============================================================================
-// Think / Lens
+// Reason / Lens
 // =============================================================================
 
-export function appendThink(top: ThinkFrame, text: string): Op<ThinkFrame, TurnEngineEvent>[] {
-  const ops: Op<ThinkFrame, TurnEngineEvent>[] = []
+export function appendReason(top: ReasonFrame, text: string): Op<ReasonFrame, TurnEngineEvent>[] {
+  const ops: Op<ReasonFrame, TurnEngineEvent>[] = []
 
   if (!top.hasContent) {
     const stripped = stripLeadingWhitespace(text)
@@ -160,4 +209,49 @@ export function appendThink(top: ThinkFrame, text: string): Op<ThinkFrame, TurnE
     ops.push({ type: 'emit', event: { _tag: 'LensChunk', text } })
   }
   return ops
+}
+
+// =============================================================================
+// Parameter — mutable frame accumulation
+// =============================================================================
+
+function parameterContent(frame: ParameterFrame, text: string): ParserOp[] {
+  if (frame.dead) return []
+  frame.rawValue += text  // mutation — see types.ts for justification
+  if (frame.jsonishParser !== null) frame.jsonishParser.push(text)
+  const jsonPath = frame.jsonishParser !== null ? frame.jsonishParser.currentPath : []
+  const path = [frame.paramName, ...jsonPath] as unknown as DeepPaths<unknown>
+  return [
+    emitEvent({
+      _tag: 'ToolInputFieldChunk',
+      toolCallId: frame.toolCallId,
+      field: frame.paramName as string & keyof unknown,
+      path,
+      delta: text,
+    }),
+  ]
+}
+
+// =============================================================================
+// Filter — mutable frame accumulation
+// =============================================================================
+
+function filterContent(frame: FilterFrame, text: string): ParserOp[] {
+  frame.query += text  // mutation — see types.ts for justification
+  return []
+}
+
+// =============================================================================
+// Invoke — unexpected content between parameters
+// =============================================================================
+
+function invokeContent(frame: InvokeFrame, text: string): ParserOp[] {
+  if (isAllWhitespace(text)) return []
+  return [
+    emitStructuralError({
+      _tag: 'UnexpectedContent',
+      context: 'invoke:' + frame.toolTag,
+      detail: `Unexpected content between parameters: "${text.slice(0, 40)}"`,
+    }),
+  ]
 }

@@ -1,43 +1,41 @@
 /**
  * Message frame handlers — open and close.
+ *
+ * messageOpenHandler: OpenHandler<ProseFrame, MessageFrame>
+ * messageCloseHandler: CloseHandler<MessageFrame>
+ *
+ * Both are stateless objects. All effects returned as ParserOp[].
  */
 
-import type { TurnEngineEvent } from '../../types'
-import type { Op } from '../../machine'
-import type { Frame, MessageFrame } from '../types'
-import { MESSAGE_VALID_TAGS } from '../types'
+import type { ProseFrame, MessageFrame } from '../types'
+import type { OpenHandler, CloseHandler } from '../handler'
+import { emitEvent } from '../ops'
 
-export function openMessage(
-  variant: string | undefined,
-  generateId: () => string,
-  endCurrentProse: () => void,
-  apply: (ops: Op<Frame, TurnEngineEvent>[]) => void,
-): void {
-  const id = generateId()
-  const to = variant ?? null
-  endCurrentProse()
-  apply([
-    {
-      type: 'push',
-      frame: {
-        type: 'message',
-        id,
-        to,
-        content: '',
-        pendingNewlines: 0,
-        validTags: MESSAGE_VALID_TAGS,
+export const messageOpenHandler: OpenHandler<ProseFrame, MessageFrame> = {
+  open(attrs, _parent, ctx) {
+    const id = ctx.generateId()
+    const to = attrs.get('to') ?? null
+    return [
+      {
+        type: 'push',
+        frame: {
+          type: 'message',
+          id,
+          to,
+          content: '',
+          pendingNewlines: 0,
+        },
       },
-    },
-    { type: 'emit', event: { _tag: 'MessageStart', id, to } },
-  ])
+      emitEvent({ _tag: 'MessageStart', id, to }),
+    ]
+  },
 }
 
-export function closeMessage(
-  top: MessageFrame,
-  apply: (ops: Op<Frame, TurnEngineEvent>[]) => void,
-): void {
-  apply([
-    { type: 'emit', event: { _tag: 'MessageEnd', id: top.id } },
-    { type: 'pop' },
-  ])
+export const messageCloseHandler: CloseHandler<MessageFrame> = {
+  close(top, _ctx) {
+    return [
+      emitEvent({ _tag: 'MessageEnd', id: top.id }),
+      { type: 'pop' },
+    ]
+  },
 }

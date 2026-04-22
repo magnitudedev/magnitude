@@ -1,7 +1,7 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { AppEvent, TurnResultError, MessageDestination } from '../events'
 
-import { serializeMactTurn, type MactTrace } from './mact-canonical'
+import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { buildResolvedToolSet, type ResolvedToolSet } from '../tools/resolved-toolset'
 import { ConfigAmbient } from '../ambient/config-ambient'
 import { isValidVariant, type AgentVariant } from '../agents/variants'
@@ -9,7 +9,7 @@ import { getAgentDefinition, getAgentSlot } from '../agents/registry'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 
-export interface ThinkBlock {
+export interface ReasonBlock {
   about: string | null
   content: string
 }
@@ -17,7 +17,7 @@ export interface ThinkBlock {
 export interface CanonicalTurnState {
   turnId: string | null
   lenses: readonly { name: string; content: string }[] | null
-  thinkBlocks: ThinkBlock[]
+  reasonBlocks: ReasonBlock[]
   messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string | null; order: number }>
@@ -26,14 +26,14 @@ export interface CanonicalTurnState {
   hasStructuralError: boolean
   rawResponse: string
   orderCounter: number
-  lastCompleted: { turnId: string; canonicalMact: string; clean: boolean } | null
+  lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
   resolvedTurnDecision: 'continue' | 'idle' | null
 }
 
 export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   turnId: null,
   lenses: null,
-  thinkBlocks: [],
+  reasonBlocks: [],
   messages: [],
   messageMap: new Map(),
   toolCalls: [],
@@ -56,7 +56,7 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     ...state,
     turnId: null,
     lenses: null,
-    thinkBlocks: [],
+    reasonBlocks: [],
     messages: [],
     messageMap: new Map(),
     toolCalls: [],
@@ -83,23 +83,23 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     thinking_chunk: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      const blocks = [...fork.thinkBlocks]
+      const blocks = [...fork.reasonBlocks]
       if (blocks.length === 0) {
         blocks.push({ about: null, content: event.text })
       } else {
         const last = blocks[blocks.length - 1]
         blocks[blocks.length - 1] = { ...last, content: last.content + event.text }
       }
-      return { ...fork, thinkBlocks: blocks }
+      return { ...fork, reasonBlocks: blocks }
     },
 
     thinking_end: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      if (fork.thinkBlocks.length === 0) return fork
-      const blocks = [...fork.thinkBlocks]
+      if (fork.reasonBlocks.length === 0) return fork
+      const blocks = [...fork.reasonBlocks]
       const last = blocks[blocks.length - 1]
       blocks[blocks.length - 1] = { ...last, about: event.about }
-      return { ...fork, thinkBlocks: blocks }
+      return { ...fork, reasonBlocks: blocks }
     },
 
     lens_start: ({ event, fork }) => {
@@ -224,7 +224,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
       const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
       const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
 
-      let canonicalMact: string
+      let canonicalXml: string
       if (clean) {
         const agentState = read(AgentStatusProjection)
         const variant: AgentVariant = event.forkId
@@ -240,20 +240,20 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         const configState = ambient.get(ConfigAmbient)
         const toolSet = buildResolvedToolSet(agentDef, configState, slot)
         
-        const trace: MactTrace = {
+        const trace: CanonicalTrace = {
           lenses: fork.lenses,
-          thinkBlocks: fork.thinkBlocks,
+          reasonBlocks: fork.reasonBlocks,
           messages: [...fork.messages]
             .sort((a, b) => a.order - b.order)
             .map(({ text, destination }) => ({ text, destination })),
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
-            .map(({ tagName, input, query }) => ({ tagName, input, filter: query })),
+            .map(({ tagName, input, query }) => ({ tagName, input, query })),
           turnDecision: event.result.turnDecision === 'idle' ? 'idle' : 'continue',
         }
-        canonicalMact = serializeMactTurn(trace, toolSet)
+        canonicalXml = serializeCanonicalTurn(trace, toolSet)
       } else {
-        canonicalMact = fork.rawResponse
+        canonicalXml = fork.rawResponse
       }
 
       const finalized: CanonicalTurnState = {
@@ -261,7 +261,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         hasStructuralError,
         lastCompleted: {
           turnId: event.turnId,
-          canonicalMact,
+          canonicalXml,
           clean,
         }
       }

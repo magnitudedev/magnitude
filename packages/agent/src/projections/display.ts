@@ -71,7 +71,7 @@ export interface ToolStep {
   readonly toolKey: ToolKey
   readonly cluster?: string
   readonly state?: ToolState
-  readonly filter?: string | null  // Mact filter query that was applied
+  readonly filter?: string | null  // Filter query that was applied
   readonly resultFilePath?: string | null  // Path to full result file for retroactive disclosure
 }
 
@@ -893,7 +893,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
 
         case 'ToolObservation':
-          // Mact: Store the filter query when observation is set
+          // Store the filter query when observation is set
           if (fork.currentTurnId !== event.turnId) return fork
           if (!fork.activeThinkBlockId) return fork
           return {

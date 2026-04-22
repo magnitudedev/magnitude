@@ -9,7 +9,7 @@ import type { TaskDirectiveContext } from './handler'
 const { ForkContext } = Fork
 
 export interface KillWorkerDirective {
-  readonly kind: 'kill-worker'
+  readonly kind: 'kill_worker'
   readonly id: string
 }
 
