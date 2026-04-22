@@ -155,9 +155,11 @@ describe('invoke / tool call blocks', () => {
       v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>    \n</invoke>\n${YIELD}`)
     })
 
-    it('5 trailing spaces after </parameter> is rejected', () => {
+    // Under deep confirmation, excess whitespace flows to tw-nl and waits for
+    // a valid continuation. </invoke> confirms the close.
+    it('5 trailing spaces after </parameter> is accepted (deep confirmation)', () => {
       const v = shellValidator()
-      v.rejects(`<invoke tool="shell">\n<parameter name="command">ls</parameter>     \n</invoke>\n${YIELD}`)
+      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>     \n</invoke>\n${YIELD}`)
     })
   })
 

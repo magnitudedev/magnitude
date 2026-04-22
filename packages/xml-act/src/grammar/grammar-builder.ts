@@ -296,10 +296,15 @@ export class GrammarBuilder {
     for (const rule of generateBodyRules('msg-body', 'message', postCtx)) {
       addRule(rules, rule)
     }
-    for (const rule of generateBodyRules('param-body', 'parameter', invokeCtx)) {
+    const invokeContinuations: FreeBodyContinuations = {
+      parameterBody: 'param-body-s0',
+      filterBody: 'filter-body-s0',
+      parentClose: 'turn-next-post',
+    }
+    for (const rule of generateFreeBodyRules('param-body', 'parameter', invokeCtx, invokeContinuations)) {
       addRule(rules, rule)
     }
-    for (const rule of generateBodyRules('filter-body', 'filter', invokeCtx)) {
+    for (const rule of generateFreeBodyRules('filter-body', 'filter', invokeCtx, invokeContinuations)) {
       addRule(rules, rule)
     }
   }
@@ -452,6 +457,174 @@ export function generateBodyRules(prefix: string, tagName: string, context: Body
       )
     }
   }
+
+  return lines
+}
+
+// =============================================================================
+// Free Body Rule Generation (parameter, filter)
+// =============================================================================
+
+/**
+ * Generate DFA body rules for free-text bodies (parameter, filter).
+ *
+ * Like generateBodyRules, but with deeper close-tag confirmation:
+ * instead of confirming on bare \n or <, the DFA validates the full
+ * continuation prefix before committing. This allows the model to write
+ * the close tag in content as long as what follows isn't a valid
+ * structural continuation.
+ *
+ * Valid continuations after parameter/filter close (inside invoke):
+ *   - "<parameter " (sibling parameter open)
+ *   - "<filter>"    (sibling filter open)
+ *   - "</invoke>"   (parent invoke close)
+ *
+ * @param prefix   Rule name prefix, e.g. "param-body"
+ * @param tagName  The close tag name, e.g. "parameter"
+ * @param context  Which continuation rules to invoke on confirmation
+ */
+/**
+ * Continuation targets for free body rules — where to hand off after
+ * each confirmed continuation prefix.
+ */
+export interface FreeBodyContinuations {
+  /** Rule for new parameter body (after matching <parameter name="...">). Always 'param-body-s0'. */
+  readonly parameterBody: string
+  /** Rule for new filter body (after matching <filter>). Always 'filter-body-s0'. */
+  readonly filterBody: string
+  /** Rule after parent invoke close (after matching </invoke>). e.g. 'turn-next-post'. */
+  readonly parentClose: string
+}
+
+export function generateFreeBodyRules(prefix: string, tagName: string, context: BodyContext, continuations: FreeBodyContinuations): string[] {
+  const lines: string[] = []
+  const L = tagName.length
+  const MAX_TW = 4
+
+  // Entry alias
+  lines.push(`${prefix} ::= ${prefix}-s0`)
+
+  // s0: base content state
+  lines.push(`${prefix}-s0 ::= [^<] ${prefix}-s0 | "<" ${prefix}-s1`)
+
+  // s1: saw '<'
+  lines.push(`${prefix}-s1 ::= "/" ${prefix}-sl | "<" ${prefix}-s1 | [^/<] ${prefix}-s0`)
+
+  // sl through gt: close-tag matching chain (same as generateBodyRules)
+  const fc = tagName[0]
+  const fcEsc = escapeGbnfCharClass(fc)
+
+  if (L === 1) {
+    const gtState = `${prefix}-gt`
+    lines.push(`${prefix}-sl ::= "${fc}" ${gtState} | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
+    lines.push(`${gtState} ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  } else {
+    lines.push(`${prefix}-sl ::= "${fc}" ${prefix}-s2 | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
+
+    for (let i = 2; i <= L; i++) {
+      const ch = tagName[i - 1]
+      const chEsc = escapeGbnfCharClass(ch)
+      const nextState = i === L ? `${prefix}-gt` : `${prefix}-s${i + 1}`
+      lines.push(`${prefix}-s${i} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
+    }
+
+    lines.push(`${prefix}-gt ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+  }
+
+  // tw0..tw{MAX_TW}: bounded horizontal whitespace (prevents model whitespace loops)
+  // Instead of confirming on \n or <, transition to deeper confirmation states
+  for (let i = 0; i <= MAX_TW; i++) {
+    const stateName = `${prefix}-tw${i}`
+    if (i < MAX_TW) {
+      lines.push(
+        `${stateName} ::= [ \\t] ${prefix}-tw${i + 1}` +
+        ` | "\\n" ${prefix}-tw-nl` +
+        ` | "<" ${prefix}-tw-lt` +
+        ` | [^ \\t\\n<] ${prefix}-s0`
+      )
+    } else {
+      // Final tw state: excess horizontal whitespace transitions to tw-nl
+      // (unbounded whitespace buffering) instead of rejecting back to s0.
+      // This allows arbitrary whitespace between close tag and continuation.
+      lines.push(
+        `${stateName} ::= [ \\t] ${prefix}-tw-nl` +
+        ` | "\\n" ${prefix}-tw-nl` +
+        ` | "<" ${prefix}-tw-lt` +
+        ` | [^ \\t\\n<] ${prefix}-s0`
+      )
+    }
+  }
+
+  // tw-nl: buffer arbitrary whitespace until < appears or reject
+  lines.push(
+    `${prefix}-tw-nl ::= [ \\t\\n] ${prefix}-tw-nl` +
+    ` | "<" ${prefix}-tw-lt` +
+    ` | [^ \\t\\n<] ${prefix}-s0`
+  )
+
+  // tw-lt: after < — branch on first char to start continuation prefix matching
+  // p -> parameter continuation
+  // f -> filter continuation
+  // / -> invoke close continuation
+  // < -> new tag start (back to s1)
+  // anything else -> reject to s0
+  lines.push(
+    `${prefix}-tw-lt ::= "p" ${prefix}-cp1` +
+    ` | "f" ${prefix}-cf1` +
+    ` | "/" ${prefix}-ci1` +
+    ` | "<" ${prefix}-s1` +
+    ` | [^pf/<] ${prefix}-s0`
+  )
+
+  // --- Parameter continuation: match "arameter" then space ---
+  const paramRest = 'arameter'
+  for (let i = 0; i < paramRest.length; i++) {
+    const ch = paramRest[i]
+    const chEsc = escapeGbnfCharClass(ch)
+    const state = `${prefix}-cp${i + 1}`
+    const nextState = i < paramRest.length - 1
+      ? `${prefix}-cp${i + 2}`
+      : `${prefix}-cp-end`
+    lines.push(`${state} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
+  }
+  // cp-end: matched full "parameter", next must be space to confirm
+  // Space starts param-attrs (' name="..."')
+  // After space, hand off to: 'name=\\"" quoted-value "\\"" ">" param-body-s0'
+  lines.push(
+    `${prefix}-cp-end ::= " " ${prefix}-cp-attr` +
+    ` | "<" ${prefix}-s1` +
+    ` | [^ <] ${prefix}-s0`
+  )
+  // cp-attr: confirmed parameter open — match rest of attrs then new parameter body
+  lines.push(`${prefix}-cp-attr ::= "name=\\"" quoted-value "\\"" ">" ${continuations.parameterBody}`)
+
+  // --- Filter continuation: match "ilter>" ---
+  const filterRest = 'ilter'
+  for (let i = 0; i < filterRest.length; i++) {
+    const ch = filterRest[i]
+    const chEsc = escapeGbnfCharClass(ch)
+    const state = `${prefix}-cf${i + 1}`
+    const nextState = i < filterRest.length - 1
+      ? `${prefix}-cf${i + 2}`
+      : `${prefix}-cf-end`
+    lines.push(`${state} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
+  }
+  // cf-end: matched "filter", next must be ">" to confirm -> enter filter body
+  lines.push(`${prefix}-cf-end ::= ">" ${continuations.filterBody} | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
+
+  // --- Invoke close continuation: match "invoke>" ---
+  const invokeRest = 'invoke'
+  for (let i = 0; i < invokeRest.length; i++) {
+    const ch = invokeRest[i]
+    const chEsc = escapeGbnfCharClass(ch)
+    const state = `${prefix}-ci${i + 1}`
+    const nextState = i < invokeRest.length - 1
+      ? `${prefix}-ci${i + 2}`
+      : `${prefix}-ci-end`
+    lines.push(`${state} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
+  }
+  // ci-end: matched "/invoke", next must be ">" to confirm -> exit to top level
+  lines.push(`${prefix}-ci-end ::= ">" ${continuations.parentClose} | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
 
   return lines
 }

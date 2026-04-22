@@ -54,6 +54,12 @@ type PendingClose = {
   raw: string
   afterNewline: boolean
   wsBuffer: string
+  /** For parameter/filter: continuation prefix matching state */
+  continuationBuffer: string
+  /** Whether we're in deep confirmation mode (parameter/filter close tags) */
+  deepConfirm: boolean
+  /** Whether we've seen '<' and are now matching the continuation prefix */
+  matchingContinuation: boolean
 }
 
 const MAX_TRAILING_WS = 4
@@ -87,6 +93,7 @@ export function createTokenizer(
   let pendingClose: PendingClose | null = null
   let cdataBuffer: string | null = null
   let cdataCloseProgress = 0
+  let replayBuffer = ''
 
   function flushContent(): void {
     if (contentBuffer.length === 0) return
@@ -118,6 +125,9 @@ export function createTokenizer(
         raw: tag.raw,
         afterNewline: tag.savedAfterNewline,
         wsBuffer: '',
+        continuationBuffer: '',
+        deepConfirm: tag.name === 'parameter' || tag.name === 'filter',
+        matchingContinuation: false,
       }
     } else if (tag.pendingSelfClose) {
       onToken({
@@ -170,46 +180,123 @@ export function createTokenizer(
     tag.attrQuote = null
   }
 
+  // Valid continuation prefixes after parameter/filter close (inside invoke)
+  const PARAM_FILTER_CONTINUATIONS = ['parameter ', 'filter>', '/invoke>']
+
   /**
    * Process a character while in pendingClose state.
    * Returns true if consumed, false if caller should process ch normally.
+   *
+   * For reason/message close tags: original behavior (confirm on \n or <).
+   * For parameter/filter close tags: deep confirmation — buffer whitespace,
+   * then match a full continuation prefix before confirming.
    */
   function processPendingClose(ch: string): boolean {
     const pc = pendingClose!
 
-    if (isHorizontalWs(ch)) {
-      if (pc.wsBuffer.length < MAX_TRAILING_WS) {
-        pc.wsBuffer += ch
-        return true
-      } else {
-        // Exceeded max whitespace — REJECT
-        contentBuffer += pc.raw + pc.wsBuffer
-        pendingClose = null
-        return false
+    // --- Standard confirmation for reason/message ---
+    if (!pc.deepConfirm) {
+      if (isHorizontalWs(ch)) {
+        if (pc.wsBuffer.length < MAX_TRAILING_WS) {
+          pc.wsBuffer += ch
+          return true
+        } else {
+          contentBuffer += pc.raw + pc.wsBuffer
+          pendingClose = null
+          return false
+        }
       }
+
+      if (ch === '\n') {
+        flushContent()
+        onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
+        afterNewline = true
+        contentBuffer += '\n'
+        pendingClose = null
+        return true
+      }
+
+      if (ch === '<') {
+        flushContent()
+        onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
+        afterNewline = false
+        pendingClose = null
+        pendingLt = true
+        return true
+      }
+
+      contentBuffer += pc.raw + pc.wsBuffer
+      pendingClose = null
+      return false
     }
 
-    if (ch === '\n') {
-      // CONFIRM via newline
-      flushContent()
-      onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
-      afterNewline = true
-      contentBuffer += '\n'
+    // --- Deep confirmation for parameter/filter ---
+
+    if (pc.matchingContinuation) {
+      // We're matching a continuation prefix after seeing '<'
+      pc.continuationBuffer += ch
+
+      // Check if any continuation still matches
+      let anyMatch = false
+      let fullMatch = false
+      for (const cont of PARAM_FILTER_CONTINUATIONS) {
+        if (cont.startsWith(pc.continuationBuffer)) {
+          anyMatch = true
+          if (cont === pc.continuationBuffer) {
+            fullMatch = true
+          }
+        }
+      }
+
+      if (fullMatch) {
+        // Full continuation prefix matched — CONFIRM the close tag
+        flushContent()
+        onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
+        afterNewline = false
+
+        // Feed back the continuation characters (< + continuationBuffer) as new input
+        // The '<' + continuation prefix is the start of the next structural element
+        // We need to re-process these characters through the tokenizer
+        const replay = '<' + pc.continuationBuffer
+        pendingClose = null
+        // Push the continuation back through — start a new tag
+        pendingLt = false
+        flushContent()
+        startTag()
+        for (let j = 1; j < replay.length; j++) {
+          processTagChar(replay[j])
+        }
+        return true
+      }
+
+      if (anyMatch) {
+        // Partial match — keep buffering
+        return true
+      }
+
+      // No continuation matches — REJECT
+      // Dump close tag raw + wsBuffer as content, replay '<' + continuationBuffer
+      contentBuffer += pc.raw + pc.wsBuffer
+      replayBuffer = '<' + pc.continuationBuffer
       pendingClose = null
+      return true
+    }
+
+    // Not yet matching continuation — buffering whitespace
+    if (isWhitespace(ch)) {
+      // Buffer all whitespace (unbounded for parameter/filter)
+      pc.wsBuffer += ch
       return true
     }
 
     if (ch === '<') {
-      // CONFIRM via next tag start
-      flushContent()
-      onToken({ _tag: 'Close', tagName: pc.tagName, afterNewline: pc.afterNewline, raw: pc.raw })
-      afterNewline = false
-      pendingClose = null
-      pendingLt = true
+      // Start matching continuation prefix
+      pc.matchingContinuation = true
+      pc.continuationBuffer = ''
       return true
     }
 
-    // Any other character — REJECT
+    // Non-whitespace, non-< — REJECT
     contentBuffer += pc.raw + pc.wsBuffer
     pendingClose = null
     return false
@@ -534,6 +621,16 @@ export function createTokenizer(
           continue
         }
 
+        // Drain replay buffer (from deep confirmation rejection)
+        if (replayBuffer.length > 0) {
+          const rb = replayBuffer
+          replayBuffer = ''
+          // Prepend replay chars to unprocessed input and restart loop
+          chunk = rb + chunk.slice(i)
+          i = -1 // will be incremented to 0 by for-loop
+          continue
+        }
+
         // Pending close confirmation
         if (pendingClose) {
           const consumed = processPendingClose(ch)
@@ -594,7 +691,16 @@ export function createTokenizer(
       }
 
       if (pendingClose) {
-        contentBuffer += pendingClose.raw + pendingClose.wsBuffer
+        if (pendingClose.deepConfirm) {
+          // EOF confirms parameter/filter close tags
+          flushContent()
+          onToken({ _tag: 'Close', tagName: pendingClose.tagName, afterNewline: pendingClose.afterNewline, raw: pendingClose.raw })
+          afterNewline = false
+          if (pendingClose.wsBuffer) contentBuffer += pendingClose.wsBuffer
+          if (pendingClose.matchingContinuation) contentBuffer += '<' + pendingClose.continuationBuffer
+        } else {
+          contentBuffer += pendingClose.raw + pendingClose.wsBuffer
+        }
         pendingClose = null
       }
 
