@@ -114,12 +114,12 @@ function tags(events: TurnEngineEvent[]): string[] {
 // ---------------------------------------------------------------------------
 
 describe('crash scenarios (redesign must fix these)', () => {
-  it('BUG: <parameter> inside <reason> is treated as content, not a crash', () => {
-    // In the current parser, PARAMETER_VALID_TAGS includes 'parameter', so a <parameter>
+  it('BUG: <magnitude:parameter> inside <magnitude:reason> is treated as content, not a crash', () => {
+    // In the current parser, PARAMETER_VALID_TAGS includes 'parameter', so a <magnitude:parameter>
     // inside a reason frame resolves as structural and causes a cast crash.
-    // After redesign: <parameter> inside <reason> is content.
+    // After redesign: <magnitude:parameter> inside <magnitude:reason> is content.
     expect(() => {
-      const events = parse('<reason about="test">\n<parameter name="command">ls</parameter>\n</reason>')
+      const events = parse('<magnitude:reason about="test">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:reason>')
       // Should complete without throwing
       expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
       expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
@@ -128,14 +128,14 @@ describe('crash scenarios (redesign must fix these)', () => {
     }).not.toThrow()
   })
 
-  it('BUG: <parameter> inside <parameter> is treated as content, not a crash', () => {
-    // The original crash: nested <parameter> inside <parameter> resolves as structural,
+  it('BUG: <magnitude:parameter> inside <magnitude:parameter> is treated as content, not a crash', () => {
+    // The original crash: nested <magnitude:parameter> inside <magnitude:parameter> resolves as structural,
     // then dispatch casts ParameterFrame to InvokeFrame → seenParams is undefined → crash.
     expect(() => {
       const events = parse(
-        '<invoke tool="shell">\n' +
-        '<parameter name="command">echo <parameter name="nested">bad</parameter></parameter>\n' +
-        '</invoke>'
+        '<magnitude:invoke tool="shell">\n' +
+        '<magnitude:parameter name="command">echo <magnitude:parameter name="nested">bad</magnitude:parameter></magnitude:parameter>\n' +
+        '</magnitude:invoke>'
       )
       // Should not crash. The outer parameter should complete.
       const ready = events.find(e => e._tag === 'ToolInputReady')
@@ -143,13 +143,13 @@ describe('crash scenarios (redesign must fix these)', () => {
     }).not.toThrow()
   })
 
-  it('BUG: <message> inside <message> is treated as content, not a crash', () => {
+  it('BUG: <magnitude:message> inside <magnitude:message> is treated as content, not a crash', () => {
     // MESSAGE_VALID_TAGS contains 'message' — allows nested messages.
-    // CURRENT behavior: inner <message> opens a second MessageFrame (2 MessageStarts).
-    // EXPECTED after redesign: inner <message> is content, only 1 MessageStart.
+    // CURRENT behavior: inner <magnitude:message> opens a second MessageFrame (2 MessageStarts).
+    // EXPECTED after redesign: inner <magnitude:message> is content, only 1 MessageStart.
     // This test documents the bug — it will FAIL on the current parser (2 starts instead of 1)
     // and should PASS after the redesign.
-    const events = parse('<message to="user">\nhello <message to="other">world</message>\n</message>')
+    const events = parse('<magnitude:message to="user">\nhello <magnitude:message to="other">world</magnitude:message>\n</magnitude:message>')
     expect(events.find(e => e._tag === 'MessageStart')).toBeDefined()
     expect(events.find(e => e._tag === 'MessageEnd')).toBeDefined()
     // Only one MessageStart (not two)
@@ -157,23 +157,23 @@ describe('crash scenarios (redesign must fix these)', () => {
     expect(starts).toHaveLength(1)
   })
 
-  it('BUG: <invoke> inside <invoke> is treated as content, not a crash', () => {
+  it('BUG: <magnitude:yield_user/> inside <magnitude:yield_user/> is treated as content, not a crash', () => {
     // INVOKE_VALID_TAGS contains 'invoke' — allows nested invokes.
-    // After redesign: inner <invoke> is content.
+    // After redesign: inner <magnitude:yield_user/> is content.
     expect(() => {
       const events = parse(
-        '<invoke tool="shell">\n' +
-        '<parameter name="command">run <invoke tool="read">this</invoke></parameter>\n' +
-        '</invoke>'
+        '<magnitude:invoke tool="shell">\n' +
+        '<magnitude:parameter name="command">run <magnitude:invoke tool="read">this</magnitude:invoke></magnitude:parameter>\n' +
+        '</magnitude:invoke>'
       )
       const starts = events.filter(e => e._tag === 'ToolInputStarted')
       expect(starts).toHaveLength(1)
     }).not.toThrow()
   })
 
-  it('BUG: <filter> inside <reason> is treated as content, not a crash', () => {
+  it('BUG: <magnitude:filter> inside <magnitude:reason> is treated as content, not a crash', () => {
     expect(() => {
-      const events = parse('<reason about="test">\n<filter>$.foo</filter>\n</reason>')
+      const events = parse('<magnitude:reason about="test">\n<magnitude:filter>$.foo</magnitude:filter>\n</magnitude:reason>')
       expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
       expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
       // No FilterStarted — filter was not structural inside reason
@@ -181,9 +181,9 @@ describe('crash scenarios (redesign must fix these)', () => {
     }).not.toThrow()
   })
 
-  it('BUG: <parameter> in prose (top-level) is treated as content, not a crash', () => {
+  it('BUG: <magnitude:parameter> in prose (top-level) is treated as content, not a crash', () => {
     expect(() => {
-      const events = parse('some prose <parameter name="foo">bar</parameter> more prose')
+      const events = parse('some prose <magnitude:parameter name="foo">bar</magnitude:parameter> more prose')
       // Should not crash. No ToolInputStarted.
       expect(events.find(e => e._tag === 'ToolInputStarted')).toBeUndefined()
     }).not.toThrow()
@@ -196,7 +196,7 @@ describe('crash scenarios (redesign must fix these)', () => {
 
 describe('reason blocks', () => {
   it('emits LensStart with correct name', () => {
-    const events = parse('<reason about="alignment">\nsome reasoning\n</reason>')
+    const events = parse('<magnitude:reason about="alignment">\nsome reasoning\n</magnitude:reason>')
     expect(events.find(e => e._tag === 'LensStart')).toMatchObject({
       _tag: 'LensStart',
       name: 'alignment',
@@ -204,7 +204,7 @@ describe('reason blocks', () => {
   })
 
   it('emits LensChunk with content', () => {
-    const events = parse('<reason about="x">\nhello world\n</reason>')
+    const events = parse('<magnitude:reason about="x">\nhello world\n</magnitude:reason>')
     const chunks = events.filter(e => e._tag === 'LensChunk')
     expect(chunks.length).toBeGreaterThan(0)
     const allText = chunks.map((c: any) => c.text).join('')
@@ -212,14 +212,14 @@ describe('reason blocks', () => {
   })
 
   it('emits LensEnd with correct name and full content', () => {
-    const events = parse('<reason about="plan">\nmy plan\n</reason>')
+    const events = parse('<magnitude:reason about="plan">\nmy plan\n</magnitude:reason>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toMatchObject({ _tag: 'LensEnd', name: 'plan' })
     expect(end.content).toContain('my plan')
   })
 
   it('emits LensStart/Chunk/End in correct order', () => {
-    const events = parse('<reason about="x">\nfoo\n</reason>')
+    const events = parse('<magnitude:reason about="x">\nfoo\n</magnitude:reason>')
     const t = tags(events)
     const startIdx = t.indexOf('LensStart')
     const chunkIdx = t.indexOf('LensChunk')
@@ -231,8 +231,8 @@ describe('reason blocks', () => {
 
   it('handles multiple reason blocks in sequence', () => {
     const events = parse(
-      '<reason about="first">\nfoo\n</reason>\n' +
-      '<reason about="second">\nbar\n</reason>'
+      '<magnitude:reason about="first">\nfoo\n</magnitude:reason>\n' +
+      '<magnitude:reason about="second">\nbar\n</magnitude:reason>'
     )
     const starts = events.filter(e => e._tag === 'LensStart') as any[]
     expect(starts).toHaveLength(2)
@@ -243,7 +243,7 @@ describe('reason blocks', () => {
 
 describe('message blocks', () => {
   it('emits MessageStart with correct recipient', () => {
-    const events = parse('<message to="user">\nhello\n</message>')
+    const events = parse('<magnitude:message to="user">\nhello\n</magnitude:message>')
     expect(events.find(e => e._tag === 'MessageStart')).toMatchObject({
       _tag: 'MessageStart',
       to: 'user',
@@ -251,7 +251,7 @@ describe('message blocks', () => {
   })
 
   it('emits MessageChunk with content', () => {
-    const events = parse('<message to="user">\nhello world\n</message>')
+    const events = parse('<magnitude:message to="user">\nhello world\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     expect(chunks.length).toBeGreaterThan(0)
     const allText = chunks.map((c: any) => c.text).join('')
@@ -259,12 +259,12 @@ describe('message blocks', () => {
   })
 
   it('emits MessageEnd', () => {
-    const events = parse('<message to="user">\nhello\n</message>')
+    const events = parse('<magnitude:message to="user">\nhello\n</magnitude:message>')
     expect(events.find(e => e._tag === 'MessageEnd')).toBeDefined()
   })
 
   it('MessageStart/Chunk/End share the same id', () => {
-    const events = parse('<message to="user">\nfoo\n</message>')
+    const events = parse('<magnitude:message to="user">\nfoo\n</magnitude:message>')
     const start = events.find(e => e._tag === 'MessageStart') as any
     const chunk = events.find(e => e._tag === 'MessageChunk') as any
     const end = events.find(e => e._tag === 'MessageEnd') as any
@@ -274,7 +274,7 @@ describe('message blocks', () => {
   })
 
   it('emits MessageStart/Chunk/End in correct order', () => {
-    const events = parse('<message to="user">\nfoo\n</message>')
+    const events = parse('<magnitude:message to="user">\nfoo\n</magnitude:message>')
     const t = tags(events)
     const startIdx = t.indexOf('MessageStart')
     const chunkIdx = t.indexOf('MessageChunk')
@@ -287,7 +287,7 @@ describe('message blocks', () => {
 
 describe('invoke / tool calls', () => {
   it('emits ToolInputStarted with correct tool name', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>')
     expect(events.find(e => e._tag === 'ToolInputStarted')).toMatchObject({
       _tag: 'ToolInputStarted',
       toolName: 'shell',
@@ -295,14 +295,14 @@ describe('invoke / tool calls', () => {
   })
 
   it('emits ToolInputFieldChunk for parameter content', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">echo hi</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hi</magnitude:parameter>\n</magnitude:invoke>')
     const chunks = events.filter(e => e._tag === 'ToolInputFieldChunk')
     expect(chunks.length).toBeGreaterThan(0)
     expect(chunks[0]).toMatchObject({ _tag: 'ToolInputFieldChunk', field: 'command' })
   })
 
   it('emits ToolInputFieldComplete with coerced value', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">echo hi</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hi</magnitude:parameter>\n</magnitude:invoke>')
     expect(events.find(e => e._tag === 'ToolInputFieldComplete')).toMatchObject({
       _tag: 'ToolInputFieldComplete',
       field: 'command',
@@ -311,7 +311,7 @@ describe('invoke / tool calls', () => {
   })
 
   it('emits ToolInputReady with assembled input', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">echo hi</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hi</magnitude:parameter>\n</magnitude:invoke>')
     expect(events.find(e => e._tag === 'ToolInputReady')).toMatchObject({
       _tag: 'ToolInputReady',
       input: { command: 'echo hi' },
@@ -320,10 +320,10 @@ describe('invoke / tool calls', () => {
 
   it('handles multiple parameters', () => {
     const events = parse(
-      '<invoke tool="multi">\n' +
-      '<parameter name="a">hello</parameter>\n' +
-      '<parameter name="b">world</parameter>\n' +
-      '</invoke>'
+      '<magnitude:invoke tool="multi">\n' +
+      '<magnitude:parameter name="a">hello</magnitude:parameter>\n' +
+      '<magnitude:parameter name="b">world</magnitude:parameter>\n' +
+      '</magnitude:invoke>'
     )
     const ready = events.find(e => e._tag === 'ToolInputReady') as any
     expect(ready).toMatchObject({ _tag: 'ToolInputReady', input: { a: 'hello', b: 'world' } })
@@ -331,23 +331,23 @@ describe('invoke / tool calls', () => {
 
   it('handles optional numeric parameter', () => {
     const events = parse(
-      '<invoke tool="shell">\n' +
-      '<parameter name="command">ls</parameter>\n' +
-      '<parameter name="timeout">30</parameter>\n' +
-      '</invoke>'
+      '<magnitude:invoke tool="shell">\n' +
+      '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
+      '<magnitude:parameter name="timeout">30</magnitude:parameter>\n' +
+      '</magnitude:invoke>'
     )
     const ready = events.find(e => e._tag === 'ToolInputReady') as any
     expect(ready).toMatchObject({ _tag: 'ToolInputReady', input: { command: 'ls', timeout: 30 } })
   })
 
   it('ToolInputFieldChunk path is [paramName] for top-level string fields', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">echo</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo</magnitude:parameter>\n</magnitude:invoke>')
     const chunk = events.find(e => e._tag === 'ToolInputFieldChunk') as any
     expect(chunk.path).toEqual(['command'])
   })
 
   it('emits events in correct order: Started → FieldChunk → FieldComplete → Ready', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>')
     const t = tags(events)
     const started = t.indexOf('ToolInputStarted')
     const chunk = t.indexOf('ToolInputFieldChunk')
@@ -361,10 +361,10 @@ describe('invoke / tool calls', () => {
 
   it('handles filter inside invoke', () => {
     const events = parse(
-      '<invoke tool="read">\n' +
-      '<parameter name="path">foo.json</parameter>\n' +
-      '<filter>$.bar</filter>\n' +
-      '</invoke>'
+      '<magnitude:invoke tool="read">\n' +
+      '<magnitude:parameter name="path">foo.json</magnitude:parameter>\n' +
+      '<magnitude:filter>$.bar</magnitude:filter>\n' +
+      '</magnitude:invoke>'
     )
     const ready = events.find(e => e._tag === 'ToolInputReady') as any
     expect(ready).toBeDefined()
@@ -373,8 +373,8 @@ describe('invoke / tool calls', () => {
 })
 
 describe('yield', () => {
-  it('emits TurnEnd on <yield_user/>', () => {
-    const events = parse('<yield_user/>')
+  it('emits TurnEnd on <magnitude:yield_user/>', () => {
+    const events = parse('<magnitude:yield_user/>')
     const end = events.find(e => e._tag === 'TurnEnd') as any
     expect(end).toBeDefined()
     expect(end.result._tag).toBe('Success')
@@ -382,13 +382,13 @@ describe('yield', () => {
   })
 
   it('TurnEnd has correct target for yield_user', () => {
-    const events = parse('<yield_user/>')
+    const events = parse('<magnitude:yield_user/>')
     const end = events.find(e => e._tag === 'TurnEnd') as any
     expect(end.result.turnControl?.target).toBe('user')
   })
 
   it('TurnEnd has correct target for yield_invoke', () => {
-    const events = parse('<yield_invoke/>')
+    const events = parse('<magnitude:yield_invoke/>')
     const end = events.find(e => e._tag === 'TurnEnd') as any
     expect(end.result.turnControl?.target).toBe('invoke')
   })
@@ -397,8 +397,8 @@ describe('yield', () => {
 describe('mixed turn sequences', () => {
   it('reason + message in sequence', () => {
     const events = parse(
-      '<reason about="plan">\nthinking\n</reason>\n' +
-      '<message to="user">\nhello\n</message>'
+      '<magnitude:reason about="plan">\nthinking\n</magnitude:reason>\n' +
+      '<magnitude:message to="user">\nhello\n</magnitude:message>'
     )
     expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
     expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
@@ -408,8 +408,8 @@ describe('mixed turn sequences', () => {
 
   it('reason + invoke in sequence', () => {
     const events = parse(
-      '<reason about="plan">\nthinking\n</reason>\n' +
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>'
+      '<magnitude:reason about="plan">\nthinking\n</magnitude:reason>\n' +
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>'
     )
     expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
     expect(events.find(e => e._tag === 'ToolInputReady')).toBeDefined()
@@ -417,8 +417,8 @@ describe('mixed turn sequences', () => {
 
   it('multiple invokes in sequence', () => {
     const events = parse(
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n' +
-      '<invoke tool="read">\n<parameter name="path">foo.ts</parameter>\n</invoke>'
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:invoke tool="read">\n<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n</magnitude:invoke>'
     )
     const readyEvents = events.filter(e => e._tag === 'ToolInputReady')
     expect(readyEvents).toHaveLength(2)
@@ -426,10 +426,10 @@ describe('mixed turn sequences', () => {
 
   it('reason + message + invoke + yield', () => {
     const events = parse(
-      '<reason about="plan">\nthinking\n</reason>\n' +
-      '<message to="user">\nhello\n</message>\n' +
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n' +
-      '<yield_user/>'
+      '<magnitude:reason about="plan">\nthinking\n</magnitude:reason>\n' +
+      '<magnitude:message to="user">\nhello\n</magnitude:message>\n' +
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:yield_user/>'
     )
     expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
     expect(events.find(e => e._tag === 'MessageStart')).toBeDefined()
@@ -439,8 +439,8 @@ describe('mixed turn sequences', () => {
 
   it('events from reason come before events from message', () => {
     const events = parse(
-      '<reason about="x">\nfoo\n</reason>\n' +
-      '<message to="user">\nbar\n</message>'
+      '<magnitude:reason about="x">\nfoo\n</magnitude:reason>\n' +
+      '<magnitude:message to="user">\nbar\n</magnitude:message>'
     )
     const t = tags(events)
     const lensStart = t.indexOf('LensStart')
@@ -456,26 +456,26 @@ describe('mixed turn sequences', () => {
 
 describe('content preservation', () => {
   it('close tag in backticks inside reason body is content', () => {
-    // `</reason>` — the backtick after > rejects the lookahead → stays as content
-    const events = parse('<reason about="x">\nthink about `</reason>` tags\n</reason>')
+    // `</magnitude:reason>` — the backtick after > rejects the lookahead → stays as content
+    const events = parse('<magnitude:reason about="x">\nthink about `</magnitude:reason>` tags\n</magnitude:reason>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toBeDefined()
-    expect(end.content).toContain('`</reason>` tags')
+    expect(end.content).toContain('`</magnitude:reason>` tags')
   })
 
   it('close tag in quotes inside parameter body is content', () => {
     const events = parse(
-      '<invoke tool="shell">\n' +
-      '<parameter name="command">echo "</parameter>"</parameter>\n' +
-      '</invoke>'
+      '<magnitude:invoke tool="shell">\n' +
+      '<magnitude:parameter name="command">echo "</magnitude:parameter>"</magnitude:parameter>\n' +
+      '</magnitude:invoke>'
     )
     const complete = events.find(e => e._tag === 'ToolInputFieldComplete') as any
     expect(complete).toBeDefined()
-    expect(complete.value).toContain('</parameter>')
+    expect(complete.value).toContain('</magnitude:parameter>')
   })
 
   it('unknown tags inside reason body are content', () => {
-    const events = parse('<reason about="x">\nhello <unknown-tag>world</unknown-tag>\n</reason>')
+    const events = parse('<magnitude:reason about="x">\nhello <unknown-tag>world</unknown-tag>\n</magnitude:reason>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toBeDefined()
     expect(end.content).toContain('<unknown-tag>')
@@ -483,9 +483,9 @@ describe('content preservation', () => {
 
   it('unknown tags inside parameter body are content', () => {
     const events = parse(
-      '<invoke tool="shell">\n' +
-      '<parameter name="command">echo <unknown>hi</unknown></parameter>\n' +
-      '</invoke>'
+      '<magnitude:invoke tool="shell">\n' +
+      '<magnitude:parameter name="command">echo <unknown>hi</unknown></magnitude:parameter>\n' +
+      '</magnitude:invoke>'
     )
     const complete = events.find(e => e._tag === 'ToolInputFieldComplete') as any
     expect(complete).toBeDefined()
@@ -493,7 +493,7 @@ describe('content preservation', () => {
   })
 
   it('unknown tags inside message body are content', () => {
-    const events = parse('<message to="user">\nhello <em>world</em>\n</message>')
+    const events = parse('<magnitude:message to="user">\nhello <em>world</em>\n</magnitude:message>')
     const end = events.find(e => e._tag === 'MessageEnd')
     expect(end).toBeDefined()
     const chunks = events.filter(e => e._tag === 'MessageChunk') as any[]
@@ -502,21 +502,21 @@ describe('content preservation', () => {
   })
 
   it('mismatched close tag is treated as content (no lenience)', () => {
-    // </message> inside a reason block is content, not structural
-    const events = parse('<reason about="turn">\nsome reasoning</message>\n</reason>')
+    // </magnitude:message> inside a reason block is content, not structural
+    const events = parse('<magnitude:reason about="turn">\nsome reasoning</magnitude:message>\n</magnitude:reason>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
-    // No MessageEnd — </message> was treated as content
+    // No MessageEnd — </magnitude:message> was treated as content
     expect(events.find(e => e._tag === 'MessageEnd')).toBeUndefined()
   })
 
   it('prose before structural tags emits ProseChunk', () => {
-    const events = parse('some prose text\n<message to="user">\nhello\n</message>')
+    const events = parse('some prose text\n<magnitude:message to="user">\nhello\n</magnitude:message>')
     expect(events.find(e => e._tag === 'ProseChunk')).toBeDefined()
   })
 
   it('whitespace between tags does not generate spurious events', () => {
     const events = parse(
-      '<reason about="x">\nfoo\n</reason>\n\n\n<message to="user">\nbar\n</message>'
+      '<magnitude:reason about="x">\nfoo\n</magnitude:reason>\n\n\n<magnitude:message to="user">\nbar\n</magnitude:message>'
     )
     const starts = events.filter(e => e._tag === 'LensStart')
     const msgStarts = events.filter(e => e._tag === 'MessageStart')
@@ -531,21 +531,21 @@ describe('content preservation', () => {
 
 describe('error cases', () => {
   it('emits StructuralParseError for unknown tool', () => {
-    const events = parse('<invoke tool="nonexistent">\n<parameter name="foo">bar</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="nonexistent">\n<magnitude:parameter name="foo">bar</magnitude:parameter>\n</magnitude:invoke>')
     const error = events.find(e => e._tag === 'StructuralParseError') as any
     expect(error).toBeDefined()
     expect(error.error._tag).toBe('UnknownTool')
   })
 
   it('emits ToolParseError for unknown parameter', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="nonexistent">value</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="nonexistent">value</magnitude:parameter>\n</magnitude:invoke>')
     const error = events.find(e => e._tag === 'ToolParseError') as any
     expect(error).toBeDefined()
     expect(error.error._tag).toBe('UnknownParameter')
   })
 
   it('emits ToolParseError for missing required field', () => {
-    const events = parse('<invoke tool="shell">\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n</magnitude:invoke>')
     const error = events.find(e => e._tag === 'ToolParseError') as any
     expect(error).toBeDefined()
     expect(error.error._tag).toBe('MissingRequiredField')
@@ -553,45 +553,45 @@ describe('error cases', () => {
   })
 
   it('emits ToolParseError for incomplete invoke at EOF', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">echo hi</parameter>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hi</magnitude:parameter>')
     const error = events.find(e => e._tag === 'ToolParseError') as any
     expect(error).toBeDefined()
     expect(error.error._tag).toBe('IncompleteTool')
   })
 
-  it('emits StructuralParseError for <invoke> without tool attribute', () => {
-    const events = parse('<invoke>\n<parameter name="command">ls</parameter>\n</invoke>')
+  it('emits StructuralParseError for <magnitude:invoke> without tool attribute', () => {
+    const events = parse('<magnitude:invoke>\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>')
     const error = events.find(e => e._tag === 'StructuralParseError') as any
     expect(error).toBeDefined()
     expect(error.error._tag).toBe('MissingToolName')
   })
 
-  it('stray </reason> with no open reason is treated as content or error', () => {
+  it('stray </magnitude:reason> with no open reason is treated as content or error', () => {
     // A stray close tag with no matching open should not crash
     expect(() => {
-      const events = parse('some prose </reason> more prose')
+      const events = parse('some prose </magnitude:reason> more prose')
       // Should not crash. No LensEnd event.
       expect(events.find(e => e._tag === 'LensEnd')).toBeUndefined()
     }).not.toThrow()
   })
 
-  it('stray </invoke> with no open invoke is treated as content or error', () => {
+  it('stray </magnitude:invoke> with no open invoke is treated as content or error', () => {
     expect(() => {
-      const events = parse('some prose </invoke> more prose')
+      const events = parse('some prose </magnitude:invoke> more prose')
       expect(events.find(e => e._tag === 'ToolInputReady')).toBeUndefined()
     }).not.toThrow()
   })
 
   it('EOF with unclosed reason frame — flushes without crash', () => {
     expect(() => {
-      const events = parse('<reason about="x">\nsome content without close')
+      const events = parse('<magnitude:reason about="x">\nsome content without close')
       // Should not crash
       expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
     }).not.toThrow()
   })
 
   it('EOF with unclosed invoke frame — emits IncompleteTool', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">ls</parameter>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>')
     const error = events.find(e => e._tag === 'ToolParseError') as any
     expect(error).toBeDefined()
     expect(error.error._tag).toBe('IncompleteTool')
@@ -599,13 +599,13 @@ describe('error cases', () => {
 
   it('EOF with unclosed message frame — flushes without crash', () => {
     expect(() => {
-      const events = parse('<message to="user">\nhello without close')
+      const events = parse('<magnitude:message to="user">\nhello without close')
       expect(events.find(e => e._tag === 'MessageStart')).toBeDefined()
     }).not.toThrow()
   })
 
   it('multiple missing required fields — all reported', () => {
-    const events = parse('<invoke tool="multi">\n</invoke>')
+    const events = parse('<magnitude:invoke tool="multi">\n</magnitude:invoke>')
     const errors = events.filter(e => e._tag === 'ToolParseError') as any[]
     expect(errors.length).toBeGreaterThanOrEqual(2)
     const missingFields = errors
@@ -623,9 +623,9 @@ describe('error cases', () => {
 describe('event sequence verification', () => {
   it('full invoke sequence has no gaps or out-of-order events', () => {
     const events = parse(
-      '<invoke tool="shell">\n' +
-      '<parameter name="command">ls -la</parameter>\n' +
-      '</invoke>'
+      '<magnitude:invoke tool="shell">\n' +
+      '<magnitude:parameter name="command">ls -la</magnitude:parameter>\n' +
+      '</magnitude:invoke>'
     )
     const t = tags(events)
     // ToolInputStarted before any field events
@@ -641,8 +641,8 @@ describe('event sequence verification', () => {
 
   it('two invokes produce interleaved events in document order', () => {
     const events = parse(
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n' +
-      '<invoke tool="read">\n<parameter name="path">foo.ts</parameter>\n</invoke>'
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:invoke tool="read">\n<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n</magnitude:invoke>'
     )
     const t = tags(events)
     const starts = events.filter(e => e._tag === 'ToolInputStarted') as any[]
@@ -661,9 +661,9 @@ describe('event sequence verification', () => {
 
   it('TurnEnd is always the last event', () => {
     const events = parse(
-      '<reason about="x">\nfoo\n</reason>\n' +
-      '<message to="user">\nbar\n</message>\n' +
-      '<yield_user/>'
+      '<magnitude:reason about="x">\nfoo\n</magnitude:reason>\n' +
+      '<magnitude:message to="user">\nbar\n</magnitude:message>\n' +
+      '<magnitude:yield_user/>'
     )
     const t = tags(events)
     const turnEndIdx = t.lastIndexOf('TurnEnd')
@@ -672,9 +672,9 @@ describe('event sequence verification', () => {
 
   it('LensStart/LensEnd pairs are balanced across multiple reasons', () => {
     const events = parse(
-      '<reason about="a">\nfoo\n</reason>\n' +
-      '<reason about="b">\nbar\n</reason>\n' +
-      '<reason about="c">\nbaz\n</reason>'
+      '<magnitude:reason about="a">\nfoo\n</magnitude:reason>\n' +
+      '<magnitude:reason about="b">\nbar\n</magnitude:reason>\n' +
+      '<magnitude:reason about="c">\nbaz\n</magnitude:reason>'
     )
     const starts = events.filter(e => e._tag === 'LensStart')
     const ends = events.filter(e => e._tag === 'LensEnd')
@@ -684,8 +684,8 @@ describe('event sequence verification', () => {
 
   it('parameter events are scoped to their toolCallId', () => {
     const events = parse(
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n' +
-      '<invoke tool="read">\n<parameter name="path">foo.ts</parameter>\n</invoke>'
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:invoke tool="read">\n<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n</magnitude:invoke>'
     )
     const starts = events.filter(e => e._tag === 'ToolInputStarted') as any[]
     const readyEvents = events.filter(e => e._tag === 'ToolInputReady') as any[]
@@ -697,7 +697,7 @@ describe('event sequence verification', () => {
   })
 
   it('no events emitted after TurnEnd', () => {
-    const events = parse('<yield_user/>\nsome trailing text')
+    const events = parse('<magnitude:yield_user/>\nsome trailing text')
     const t = tags(events)
     const turnEndIdx = t.indexOf('TurnEnd')
     expect(turnEndIdx).toBeGreaterThanOrEqual(0)

@@ -12,70 +12,70 @@ import {
 const v = () => grammarValidator()
 
 describe('self-referential content in parameters', () => {
-  it('01: param contains </parameter> as text', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">echo "</parameter>"</parameter></invoke><${YIELD.slice(1)}`
+  it('01: param contains </magnitude:parameter> as text', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo "</magnitude:parameter>"</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('echo "</parameter>"')
+    expect(getToolInput(parse(input))?.command).toBe('echo "</magnitude:parameter>"')
   })
 
-  it('02: param contains </parameter></invoke> as text', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">The sequence </parameter></invoke> ends it</parameter></invoke><${YIELD.slice(1)}`
+  it('02: param contains </magnitude:parameter></magnitude:invoke> as text', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">The sequence </magnitude:parameter></magnitude:invoke> ends it</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('The sequence </parameter></invoke> ends it')
+    expect(getToolInput(parse(input))?.command).toBe('The sequence </magnitude:parameter></magnitude:invoke> ends it')
   })
 
-  it('03: param contains <parameter name="..."> as text', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">Use <parameter name="foo"> for params</parameter></invoke><${YIELD.slice(1)}`
+  it('03: param contains <magnitude:parameter name="..."> as text', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">Use <magnitude:parameter name="foo"> for params</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('Use <parameter name="foo"> for params')
+    expect(getToolInput(parse(input))?.command).toBe('Use <magnitude:parameter name="foo"> for params')
   })
 
   it('04: param contains full tool call example as text', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">echo '<invoke tool="shell"><parameter name="command">ls</parameter></invoke>'</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo '<magnitude:invoke tool="shell"><magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>'</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toContain('<invoke tool="shell">')
+    expect(getToolInput(parse(input))?.command).toContain('<magnitude:invoke tool="shell">')
   })
 
   it('05: param contains close sequence minus final < (not confirmed)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">text</parameter></invoke>\nstill content</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke>\nstill content</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toContain('text')
   })
 
   it('06: param content with nested XML', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">cat << 'EOF'\n<root><child attr="val">text</child></root>\nEOF</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">cat << 'EOF'\n<root><child attr="val">text</child></root>\nEOF</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toContain('<root>')
   })
 
-  it('07: param contains </parameter> followed by invalid param name', () => {
+  it('07: param contains </magnitude:parameter> followed by invalid param name', () => {
     // In shell context (1 param), this is the last param — deep confirmation needed
-    // </parameter><parameter name="invalid"> — "invalid" is not valid for shell
-    // Also <parameter name="invalid"> doesn't match </invoke>, so structural path fails
+    // </magnitude:parameter><magnitude:parameter name="invalid"> — "invalid" is not valid for shell
+    // Also <magnitude:parameter name="invalid"> doesn't match </magnitude:invoke>, so structural path fails
     // Content loop absorbs it
-    const input = `<invoke tool="shell">\n<parameter name="command">text</parameter><parameter name="invalid">more</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter><magnitude:parameter name="invalid">more</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('text</parameter><parameter name="invalid">more')
+    expect(getToolInput(parse(input))?.command).toBe('text</magnitude:parameter><magnitude:parameter name="invalid">more')
   })
 
-  it('08: param body is the string "</parameter>"', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command"></parameter></parameter></invoke><${YIELD.slice(1)}`
+  it('08: param body is the string "</magnitude:parameter>"', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</parameter>')
+    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter>')
   })
 
   it('09: param contains multiple interleaved false sequences', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command"></parameter></invoke></parameter></invoke></parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke></magnitude:parameter></magnitude:invoke></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</parameter></invoke></parameter></invoke>')
+    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke></magnitude:parameter></magnitude:invoke>')
   })
 
-  it('10: edit non-last param contains </parameter><parameter name="wrong">', () => {
+  it('10: edit non-last param contains </magnitude:parameter><magnitude:parameter name="wrong">', () => {
     // "wrong" is not a valid edit param, so greedy matching rejects structural path
-    const input = `<invoke tool="edit">\n<parameter name="path">a</parameter><parameter name="wrong">b</parameter><parameter name="old">c</parameter><parameter name="new">d</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">a</magnitude:parameter><magnitude:parameter name="wrong">b</magnitude:parameter><magnitude:parameter name="old">c</magnitude:parameter><magnitude:parameter name="new">d</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     // path content should include the false close + invalid param as content
-    expect(getToolInput(parse(input))?.path).toBe('a</parameter><parameter name="wrong">b')
+    expect(getToolInput(parse(input))?.path).toBe('a</magnitude:parameter><magnitude:parameter name="wrong">b')
     expect(getToolInput(parse(input))?.old).toBe('c')
   })
 })

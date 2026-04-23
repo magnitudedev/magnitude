@@ -1,16 +1,16 @@
 import { describe, it } from 'vitest'
 import { buildValidator, shellValidator, multiToolValidator, SHELL_TOOL } from './helpers'
 
-const YIELD = '<yield_user/>'
+const YIELD = '<magnitude:yield_user/>'
 
 describe('invoke / tool call blocks', () => {
   describe('single-parameter tool', () => {
     it('invoke shell with command parameter', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<parameter name="command">ls</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n` +
+        `<magnitude:parameter name="command">ls</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -18,9 +18,9 @@ describe('invoke / tool call blocks', () => {
     it('invoke shell with multi-word command', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<parameter name="command">git diff --stat --cached</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n` +
+        `<magnitude:parameter name="command">git diff --stat --cached</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -28,9 +28,9 @@ describe('invoke / tool call blocks', () => {
     it('invoke shell with multi-line command', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<parameter name="command">cd /tmp\nls -la</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n` +
+        `<magnitude:parameter name="command">cd /tmp\nls -la</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -38,9 +38,9 @@ describe('invoke / tool call blocks', () => {
     it('unknown tool name is rejected (constrained)', () => {
       const v = shellValidator()
       v.rejects(
-        `<invoke tool="anything">\n` +
-        `<parameter name="foo">bar</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="anything">\n` +
+        `<magnitude:parameter name="foo">bar</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -49,7 +49,7 @@ describe('invoke / tool call blocks', () => {
   describe('no-parameter invoke', () => {
     it('invoke with no parameters (direct close)', () => {
       const v = shellValidator()
-      v.passes(`<invoke tool="shell">\n</invoke>\n${YIELD}`)
+      v.passes(`<magnitude:invoke tool="shell">\n</magnitude:invoke>\n${YIELD}`)
     })
   })
 
@@ -57,11 +57,11 @@ describe('invoke / tool call blocks', () => {
     it('invoke with multiple parameters', () => {
       const v = multiToolValidator()
       v.passes(
-        `<invoke tool="edit">\n` +
-        `<parameter name="path">src/foo.ts</parameter>\n` +
-        `<parameter name="old">const x = 1</parameter>\n` +
-        `<parameter name="new">const x = 2</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="edit">\n` +
+        `<magnitude:parameter name="path">src/foo.ts</magnitude:parameter>\n` +
+        `<magnitude:parameter name="old">const x = 1</magnitude:parameter>\n` +
+        `<magnitude:parameter name="new">const x = 2</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -69,11 +69,11 @@ describe('invoke / tool call blocks', () => {
     it('parameters in any order', () => {
       const v = multiToolValidator()
       v.passes(
-        `<invoke tool="edit">\n` +
-        `<parameter name="new">const x = 2</parameter>\n` +
-        `<parameter name="path">src/foo.ts</parameter>\n` +
-        `<parameter name="old">const x = 1</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="edit">\n` +
+        `<magnitude:parameter name="new">const x = 2</magnitude:parameter>\n` +
+        `<magnitude:parameter name="path">src/foo.ts</magnitude:parameter>\n` +
+        `<magnitude:parameter name="old">const x = 1</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -83,10 +83,10 @@ describe('invoke / tool call blocks', () => {
     it('invoke with parameter and filter', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<parameter name="command">ls</parameter>\n` +
-        `<filter>$.stdout</filter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n` +
+        `<magnitude:parameter name="command">ls</magnitude:parameter>\n` +
+        `<magnitude:filter>$.stdout</magnitude:filter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -94,9 +94,9 @@ describe('invoke / tool call blocks', () => {
     it('invoke with filter only (no parameter)', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<filter>$.result</filter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n` +
+        `<magnitude:filter>$.result</magnitude:filter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -106,8 +106,8 @@ describe('invoke / tool call blocks', () => {
     it('two invokes before yield', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n<parameter name="command">echo hello</parameter>\n</invoke>\n` +
-        `<invoke tool="tree">\n</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hello</magnitude:parameter>\n</magnitude:invoke>\n` +
+        `<magnitude:invoke tool="tree">\n</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -115,9 +115,9 @@ describe('invoke / tool call blocks', () => {
     it('three invokes before yield', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n<parameter name="command">pwd</parameter>\n</invoke>\n` +
-        `<invoke tool="skill">\n<parameter name="name">review</parameter>\n</invoke>\n` +
-        `<invoke tool="tree">\n</invoke>\n` +
+        `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">pwd</magnitude:parameter>\n</magnitude:invoke>\n` +
+        `<magnitude:invoke tool="skill">\n<magnitude:parameter name="name">review</magnitude:parameter>\n</magnitude:invoke>\n` +
+        `<magnitude:invoke tool="tree">\n</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -127,9 +127,9 @@ describe('invoke / tool call blocks', () => {
     it('parameter immediately followed by another parameter (no newline)', () => {
       const v = multiToolValidator()
       v.passes(
-        `<invoke tool="edit">\n` +
-        `<parameter name="path">val</parameter><parameter name="old">val2</parameter><parameter name="new">val3</parameter>\n` +
-        `</invoke>\n` +
+        `<magnitude:invoke tool="edit">\n` +
+        `<magnitude:parameter name="path">val</magnitude:parameter><magnitude:parameter name="old">val2</magnitude:parameter><magnitude:parameter name="new">val3</magnitude:parameter>\n` +
+        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -137,8 +137,8 @@ describe('invoke / tool call blocks', () => {
     it('parameter followed by close invoke (no newline)', () => {
       const v = shellValidator()
       v.passes(
-        `<invoke tool="shell">\n` +
-        `<parameter name="command">ls</parameter></invoke>\n` +
+        `<magnitude:invoke tool="shell">\n` +
+        `<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -147,26 +147,26 @@ describe('invoke / tool call blocks', () => {
   describe('trailing whitespace after close tags', () => {
     it('0 trailing spaces before newline passes', () => {
       const v = shellValidator()
-      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n${YIELD}`)
+      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${YIELD}`)
     })
 
-    it('4 trailing spaces after </parameter> passes', () => {
+    it('4 trailing spaces after </magnitude:parameter> passes', () => {
       const v = shellValidator()
-      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>    \n</invoke>\n${YIELD}`)
+      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>    \n</magnitude:invoke>\n${YIELD}`)
     })
 
     // Under greedy last-match, whitespace after close tag is valid content
     // or structural whitespace — both paths are live.
-    it('5 trailing spaces after </parameter> is accepted (greedy)', () => {
+    it('5 trailing spaces after </magnitude:parameter> is accepted (greedy)', () => {
       const v = shellValidator()
-      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>     \n</invoke>\n${YIELD}`)
+      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>     \n</magnitude:invoke>\n${YIELD}`)
     })
   })
 
   describe('forbidden sequences', () => {
     it('invoke after yield is rejected', () => {
       const v = shellValidator()
-      v.rejects(`<yield_user/><invoke tool="shell">\n</invoke>\n`)
+      v.rejects(`<magnitude:yield_user/><magnitude:invoke tool="shell">\n</magnitude:invoke>\n`)
     })
   })
 })

@@ -19,23 +19,23 @@ function collect(input: string | string[], knownToolTags?: ReadonlySet<string>):
 describe('XML tokenizer tests', () => {
   describe('basic open tags', () => {
     it('parses simple open tag', () => {
-      const tokens = collect('<message>')
-      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'message', attrs: new Map(), afterNewline: true }])
+      const tokens = collect('<magnitude:message>')
+      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'magnitude:message', attrs: new Map(), afterNewline: true }])
     })
 
     it('parses open tag with attribute', () => {
-      const tokens = collect('<message to="user">')
-      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'message', attrs: new Map([['to', 'user']]), afterNewline: true }])
+      const tokens = collect('<magnitude:message to="user">')
+      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'magnitude:message', attrs: new Map([['to', 'user']]), afterNewline: true }])
     })
 
     it('parses open tag with multiple attributes', () => {
-      const tokens = collect('<invoke tool="shell" extra="val">')
-      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'shell'], ['extra', 'val']]), afterNewline: true }])
+      const tokens = collect('<magnitude:invoke tool="shell" extra="val">')
+      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'magnitude:invoke', attrs: new Map([['tool', 'shell'], ['extra', 'val']]), afterNewline: true }])
     })
 
     it('parses open tag with single-quoted attribute', () => {
-      const tokens = collect("<message to='user'>")
-      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'message', attrs: new Map([['to', 'user']]), afterNewline: true }])
+      const tokens = collect("<magnitude:message to='user'>")
+      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'magnitude:message', attrs: new Map([['to', 'user']]), afterNewline: true }])
     })
 
     it('parses open tag with boolean attribute', () => {
@@ -46,101 +46,101 @@ describe('XML tokenizer tests', () => {
 
   describe('close tags with confirmation', () => {
     it('confirms close tag on newline', () => {
-      const tokens = collect('</message>\n')
+      const tokens = collect('</magnitude:message>\n')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '\n' },
       ])
     })
 
     it('confirms close tag on following open tag', () => {
-      const tokens = collect('</message><invoke tool="shell">')
+      const tokens = collect('</magnitude:message><magnitude:invoke tool="shell">')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
-        { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
+        { _tag: 'Open', tagName: 'magnitude:invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false },
       ])
     })
 
     it('confirms close tag with spaces then newline (at EOF)', () => {
-      const tokens = collect('</message>   \n')
+      const tokens = collect('</magnitude:message>   \n')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '   \n' },
       ])
     })
 
     it('confirms close tag with spaces then next tag', () => {
-      const tokens = collect('</message>  <invoke tool="shell">')
+      const tokens = collect('</magnitude:message>  <magnitude:invoke tool="shell">')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '  ' },
-        { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false },
+        { _tag: 'Open', tagName: 'magnitude:invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false },
       ])
     })
 
     it('confirms close tag with tab then newline (at EOF)', () => {
-      const tokens = collect('</message>\t\n')
+      const tokens = collect('</magnitude:message>\t\n')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '\t\n' },
       ])
     })
 
     it('close tag followed by prose — Close emitted immediately', () => {
-      const tokens = collect('</message> to end your block.')
+      const tokens = collect('</magnitude:message> to end your block.')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: ' to end your block.' },
       ])
     })
 
     it('close tag followed by non-confirming char — Close emitted immediately', () => {
-      const tokens = collect('</message>.')
+      const tokens = collect('</magnitude:message>.')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '.' },
       ])
     })
 
     it('close tag with 5 spaces confirmed at EOF (unbounded ws)', () => {
-      const tokens = collect('</message>     \n')
+      const tokens = collect('</magnitude:message>     \n')
       // unbounded ws: 5 spaces + \n buffered, EOF confirms
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '     \n' },
       ])
     })
 
     it('confirms close tag at end of stream (EOF confirms)', () => {
-      const tokens = collect('</message>')
+      const tokens = collect('</magnitude:message>')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
       ])
     })
 
     it('handles close tag confirmation across chunk boundary', () => {
-      const tokens = collect(['</message>', '\n'])
+      const tokens = collect(['</magnitude:message>', '\n'])
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '\n' },
       ])
     })
 
     it('handles close tag with spaces split across chunks', () => {
-      const tokens = collect(['</message> ', ' <invoke tool="x">'])
+      const tokens = collect(['</magnitude:message> ', ' <magnitude:invoke tool="x">'])
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: ' ' },
         { _tag: 'Content', text: ' ' },
-        { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'x']]), afterNewline: false },
+        { _tag: 'Open', tagName: 'magnitude:invoke', attrs: new Map([['tool', 'x']]), afterNewline: false },
       ])
     })
   })
 
   describe('self-closing tags', () => {
     it('parses self-close tag', () => {
-      const tokens = collect('<yield_user/>')
-      expect(tokens).toEqual([{ _tag: 'SelfClose', tagName: 'yield_user', attrs: new Map(), afterNewline: true }])
+      const tokens = collect('<magnitude:yield_user/>')
+      expect(tokens).toEqual([{ _tag: 'SelfClose', tagName: 'magnitude:yield_user', attrs: new Map(), afterNewline: true }])
     })
 
     it('parses self-close with attribute', () => {
@@ -162,12 +162,12 @@ describe('XML tokenizer tests', () => {
 
     it('handles mixed content and tags', () => {
       // Close emitted immediately — parser handles confirmation
-      const tokens = collect('before\n<message to="user">\nhello\n</message>\nafter')
+      const tokens = collect('before\n<magnitude:message to="user">\nhello\n</magnitude:message>\nafter')
       expect(tokens).toEqual([
         { _tag: 'Content', text: 'before\n' },
-        { _tag: 'Open', tagName: 'message', attrs: new Map([['to', 'user']]), afterNewline: true },
+        { _tag: 'Open', tagName: 'magnitude:message', attrs: new Map([['to', 'user']]), afterNewline: true },
         { _tag: 'Content', text: '\nhello\n' },
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '\nafter' },
       ])
     })
@@ -175,14 +175,14 @@ describe('XML tokenizer tests', () => {
 
   describe('parameter tags', () => {
     it('parses parameter open tag', () => {
-      const tokens = collect('<parameter name="command">')
-      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'parameter', attrs: new Map([['name', 'command']]), afterNewline: true }])
+      const tokens = collect('<magnitude:parameter name="command">')
+      expect(tokens).toEqual([{ _tag: 'Open', tagName: 'magnitude:parameter', attrs: new Map([['name', 'command']]), afterNewline: true }])
     })
 
     it('parses parameter close tag (confirmed by newline)', () => {
-      const tokens = collect('</parameter>\n')
+      const tokens = collect('</magnitude:parameter>\n')
       expect(tokens).toEqual([
-        { _tag: 'Close', tagName: 'parameter', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:parameter', afterNewline: true },
         { _tag: 'Content', text: '\n' },
       ])
     })
@@ -217,19 +217,19 @@ describe('XML tokenizer tests', () => {
 
   describe('chunk boundary handling', () => {
     it('handles < at chunk boundary', () => {
-      const tokens = collect(['<', 'message to="user">\n</message>\n'])
+      const tokens = collect(['<magnitude:', 'message to="user">\n</magnitude:message>\n'])
       expect(tokens).toEqual([
-        { _tag: 'Open', tagName: 'message', attrs: new Map([['to', 'user']]), afterNewline: true },
+        { _tag: 'Open', tagName: 'magnitude:message', attrs: new Map([['to', 'user']]), afterNewline: true },
         { _tag: 'Content', text: '\n' },
-        { _tag: 'Close', tagName: 'message', afterNewline: true },
+        { _tag: 'Close', tagName: 'magnitude:message', afterNewline: true },
         { _tag: 'Content', text: '\n' },
       ])
     })
 
     it('handles tag split across many chunks', () => {
-      const tokens = collect(['<', 'inv', 'oke', ' to', 'ol', '="s', 'hell', '">\n'])
+      const tokens = collect(['<magnitude:', 'invoke', ' to', 'ol', '="s', 'hell', '">\n'])
       expect(tokens).toEqual([
-        { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'shell']]), afterNewline: true },
+        { _tag: 'Open', tagName: 'magnitude:invoke', attrs: new Map([['tool', 'shell']]), afterNewline: true },
         { _tag: 'Content', text: '\n' },
       ])
     })
@@ -242,39 +242,39 @@ describe('XML tokenizer tests', () => {
 
   describe('malformed invoke tags', () => {
     it('emits Open for malformed invoke so parser can surface error', () => {
-      const tokens = collect('<invoke @@@>', new Set(['invoke']))
+      const tokens = collect('<magnitude:invoke @@@>', new Set(['magnitude:invoke']))
       expect(tokens).toEqual([
-        { _tag: 'Open', tagName: 'invoke', attrs: new Map(), afterNewline: true },
+        { _tag: 'Open', tagName: 'magnitude:invoke', attrs: new Map(), afterNewline: true },
       ])
     })
   })
 
   describe('tag names with underscores', () => {
     it('parses yield_user self-close', () => {
-      const tokens = collect('<yield_user/>')
-      expect(tokens).toEqual([{ _tag: 'SelfClose', tagName: 'yield_user', attrs: new Map(), afterNewline: true }])
+      const tokens = collect('<magnitude:yield_user/>')
+      expect(tokens).toEqual([{ _tag: 'SelfClose', tagName: 'magnitude:yield_user', attrs: new Map(), afterNewline: true }])
     })
 
     it('parses yield_parent self-close', () => {
-      const tokens = collect('<yield_parent/>')
-      expect(tokens).toEqual([{ _tag: 'SelfClose', tagName: 'yield_parent', attrs: new Map(), afterNewline: true }])
+      const tokens = collect('<magnitude:yield_parent/>')
+      expect(tokens).toEqual([{ _tag: 'SelfClose', tagName: 'magnitude:yield_parent', attrs: new Map(), afterNewline: true }])
     })
   })
 
   describe('afterNewline tracking', () => {
     it('sets afterNewline=true at start', () => {
-      const tokens = collect('<message to="x">')
+      const tokens = collect('<magnitude:message to="x">')
       expect(tokens[0]).toMatchObject({ _tag: 'Open', afterNewline: true })
     })
 
     it('sets afterNewline=false when no preceding newline', () => {
-      const tokens = collect('text<message to="x">')
+      const tokens = collect('text<magnitude:message to="x">')
       const open = tokens.find(t => t._tag === 'Open')
       expect(open?.afterNewline).toBe(false)
     })
 
     it('sets afterNewline=true after newline in content', () => {
-      const tokens = collect('text\n<message to="x">')
+      const tokens = collect('text\n<magnitude:message to="x">')
       const open = tokens.find(t => t._tag === 'Open')
       expect(open?.afterNewline).toBe(true)
     })

@@ -45,33 +45,33 @@ function joinContent(tokens: any[]): string {
 // ---------------------------------------------------------------------------
 
 describe('Open tags', () => {
-  it('parses <reason about="turn">', () => {
-    const tokens = collect('<reason about="turn">')
-    expect(tokens).toEqual([{ _tag: 'Open', name: 'reason', attrs: { about: 'turn' } }])
+  it('parses <magnitude:reason about="turn">', () => {
+    const tokens = collect('<magnitude:reason about="turn">')
+    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:reason', attrs: { about: 'turn' } }])
   })
 
-  it('parses <message to="user">', () => {
-    const tokens = collect('<message to="user">')
-    expect(tokens).toEqual([{ _tag: 'Open', name: 'message', attrs: { to: 'user' } }])
+  it('parses <magnitude:message to="user">', () => {
+    const tokens = collect('<magnitude:message to="user">')
+    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:message', attrs: { to: 'user' } }])
   })
 
-  it('parses <invoke tool="shell">', () => {
-    const tokens = collect('<invoke tool="shell">')
-    expect(tokens).toEqual([{ _tag: 'Open', name: 'invoke', attrs: { tool: 'shell' } }])
+  it('parses <magnitude:invoke tool="shell">', () => {
+    const tokens = collect('<magnitude:invoke tool="shell">')
+    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:invoke', attrs: { tool: 'shell' } }])
   })
 
-  it('parses <parameter name="command">', () => {
-    const tokens = collect('<parameter name="command">')
-    expect(tokens).toEqual([{ _tag: 'Open', name: 'parameter', attrs: { name: 'command' } }])
+  it('parses <magnitude:parameter name="command">', () => {
+    const tokens = collect('<magnitude:parameter name="command">')
+    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:parameter', attrs: { name: 'command' } }])
   })
 
-  it('parses <filter>', () => {
-    const tokens = collect('<filter>')
-    expect(tokens).toEqual([{ _tag: 'Open', name: 'filter', attrs: {} }])
+  it('parses <magnitude:filter>', () => {
+    const tokens = collect('<magnitude:filter>')
+    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:filter', attrs: {} }])
   })
 
   it('parses multiple attributes', () => {
-    const tokens = collect('<invoke tool="shell" observe=".">')
+    const tokens = collect('<magnitude:invoke tool="shell" observe=".">')
     expect(tokens[0]._tag).toBe('Open')
     expect(tokens[0].attrs.tool).toBe('shell')
     expect(tokens[0].attrs.observe).toBe('.')
@@ -89,29 +89,29 @@ describe('Open tags', () => {
 // ---------------------------------------------------------------------------
 
 describe('Close tags', () => {
-  it('parses </reason>', () => {
-    const tokens = collect('\n</reason>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
+  it('parses </magnitude:reason>', () => {
+    const tokens = collect('\n</magnitude:reason>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
   })
 
-  it('parses </message>', () => {
-    const tokens = collect('\n</message>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'message')).toBe(true)
+  it('parses </magnitude:message>', () => {
+    const tokens = collect('\n</magnitude:message>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:message')).toBe(true)
   })
 
-  it('parses </invoke>', () => {
-    const tokens = collect('\n</invoke>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'invoke')).toBe(true)
+  it('parses </magnitude:invoke>', () => {
+    const tokens = collect('\n</magnitude:invoke>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:invoke')).toBe(true)
   })
 
-  it('parses </parameter>', () => {
-    const tokens = collect('\n</parameter>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'parameter')).toBe(true)
+  it('parses </magnitude:parameter>', () => {
+    const tokens = collect('\n</magnitude:parameter>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:parameter')).toBe(true)
   })
 
-  it('parses </filter>', () => {
-    const tokens = collect('\n</filter>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'filter')).toBe(true)
+  it('parses </magnitude:filter>', () => {
+    const tokens = collect('\n</magnitude:filter>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:filter')).toBe(true)
   })
 
   it('unknown close tag → Content', () => {
@@ -130,24 +130,24 @@ describe('Close tags', () => {
 // ---------------------------------------------------------------------------
 
 describe('Self-closing yield tags', () => {
-  it('parses <yield_user/>', () => {
-    const tokens = collect('<yield_user/>')
-    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'yield_user', attrs: {} }])
+  it('parses <magnitude:yield_user/>', () => {
+    const tokens = collect('<magnitude:yield_user/>')
+    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'magnitude:yield_user', attrs: {} }])
   })
 
-  it('parses <yield_invoke/>', () => {
-    const tokens = collect('<yield_invoke/>')
-    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'yield_invoke', attrs: {} }])
+  it('parses <magnitude:yield_invoke/>', () => {
+    const tokens = collect('<magnitude:yield_invoke/>')
+    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'magnitude:yield_invoke', attrs: {} }])
   })
 
-  it('parses <yield_parent/>', () => {
-    const tokens = collect('<yield_parent/>')
-    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'yield_parent', attrs: {} }])
+  it('parses <magnitude:yield_parent/>', () => {
+    const tokens = collect('<magnitude:yield_parent/>')
+    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'magnitude:yield_parent', attrs: {} }])
   })
 
-  it('parses <yield_worker/>', () => {
-    const tokens = collect('<yield_worker/>')
-    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'yield_worker', attrs: {} }])
+  it('parses <magnitude:yield_worker/>', () => {
+    const tokens = collect('<magnitude:yield_worker/>')
+    expect(tokens).toEqual([{ _tag: 'SelfClose', name: 'magnitude:yield_worker', attrs: {} }])
   })
 })
 
@@ -157,19 +157,19 @@ describe('Self-closing yield tags', () => {
 
 describe('Attribute parsing', () => {
   it('handles single-quoted attribute values', () => {
-    const tokens = collect("<message to='user'>")
+    const tokens = collect("<magnitude:message to='user'>")
     expect(tokens[0]._tag).toBe('Open')
     expect(tokens[0].attrs.to).toBe('user')
   })
 
   it('handles attribute with special chars in value', () => {
-    const tokens = collect('<invoke tool="my-tool:v2">')
+    const tokens = collect('<magnitude:invoke tool="my-tool:v2">')
     expect(tokens[0].attrs.tool).toBe('my-tool:v2')
   })
 
   it('handles tag with no attributes', () => {
-    const tokens = collect('<filter>')
-    expect(tokens[0]).toEqual({ _tag: 'Open', name: 'filter', attrs: {} })
+    const tokens = collect('<magnitude:filter>')
+    expect(tokens[0]).toEqual({ _tag: 'Open', name: 'magnitude:filter', attrs: {} })
   })
 })
 
@@ -179,26 +179,26 @@ describe('Attribute parsing', () => {
 
 describe('Close-tag confirmation', () => {
   it('confirms close tag followed by newline', () => {
-    const tokens = collect('content\n</reason>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
+    const tokens = collect('content\n</magnitude:reason>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
   })
 
   it('confirms close tag followed by next open tag', () => {
-    const tokens = collect('content\n</reason><message to="user">')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
-    expect(tokens.some(t => t._tag === 'Open' && t.name === 'message')).toBe(true)
+    const tokens = collect('content\n</magnitude:reason><magnitude:message to="user">')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
+    expect(tokens.some(t => t._tag === 'Open' && t.name === 'magnitude:message')).toBe(true)
   })
 
   it('confirms close tag with whitespace then newline', () => {
-    const tokens = collect('content\n</reason>  \n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
+    const tokens = collect('content\n</magnitude:reason>  \n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
   })
 
   it('close tag followed by prose — Close emitted immediately by tokenizer', () => {
     // Tokenizer emits Close immediately — parser decides if it's structural
-    const tokens = collect('content\n</reason> some prose here')
+    const tokens = collect('content\n</magnitude:reason> some prose here')
     // Tokenizer DOES emit a Close token (parser handles confirmation)
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'reason')).toBe(true)
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
     // Prose text preserved as content
     expect(joinContent(tokens)).toContain('some prose here')
   })

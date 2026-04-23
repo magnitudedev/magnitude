@@ -110,6 +110,7 @@ export function createParser(
     handlerCtx,
     deferredYield,
     pendingCloseStack: [],
+    escapeDepth: 0,
   }
 
   function end(): void {

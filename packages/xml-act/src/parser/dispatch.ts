@@ -18,7 +18,7 @@ import type { HandlerContext } from './handler-context'
 import { resolveOpenHandler, resolveCloseHandler, resolveSelfCloseHandler, tokenRaw } from './resolve'
 import { onContent, endTopProse, isAllWhitespace } from './content'
 import { emitStructuralError } from './ops'
-import { KNOWN_STRUCTURAL_TAGS } from '../constants'
+import { KNOWN_STRUCTURAL_TAGS, ESCAPE_TAG } from '../constants'
 
 // =============================================================================
 // ParserLoopContext — all shared state needed for token dispatch
@@ -34,6 +34,8 @@ export interface ParserLoopContext {
   handlerCtx: HandlerContext
   deferredYield: { target: 'user' | 'invoke' | 'worker' | 'parent' | null; postYieldHasContent: boolean }
   pendingCloseStack: PendingClose[]
+  /** Escape nesting depth — when > 0, all tokens become raw content */
+  escapeDepth: number
 }
 
 // =============================================================================
@@ -164,7 +166,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
       const handler = resolveCloseHandler(token.tagName, effectiveFrame)
       if (handler) {
         // Extend cascade — push another pending close
-        stack.push({ tagName: token.tagName, wsBuffer: '', sawNewline: false })
+        stack.push({ tagName: token.tagName, frameType: effectiveFrame.type, wsBuffer: '', sawNewline: false })
         return 'consumed'
       }
     }
@@ -176,7 +178,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
       if (handler) {
         // Same-frame close — replace (greedy last-match)
         ctx.machine.apply(onContent(top, `</${lastPc.tagName}>` + lastPc.wsBuffer))
-        ctx.pendingCloseStack = [{ tagName: token.tagName, wsBuffer: '', sawNewline: false }]
+        ctx.pendingCloseStack = [{ tagName: token.tagName, frameType: top.type, wsBuffer: '', sawNewline: false }]
         return 'consumed'
       }
     }
@@ -189,8 +191,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
   // Open or SelfClose
   // Check if valid continuation for the frame being closed by the last pending close
   // The last pending close's tagName tells us the frame type (e.g., 'parameter' → parameter frame)
-  const lastClosedFrameType = lastPc.tagName  // tagName matches frame type for structural tags
-  if (isValidContinuation(token, lastClosedFrameType, ctx)) {
+  if (isValidContinuation(token, lastPc.frameType, ctx)) {
     confirmAllPendingCloses(ctx)
     return 'passthrough'
   } else {
@@ -212,6 +213,21 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
   }
   if (ctx.machine.mode !== 'active') return
 
+  // Escape mode: all tokens become raw content until escape close
+  if (ctx.escapeDepth > 0) {
+    if (token._tag === 'Close' && token.tagName === ESCAPE_TAG) {
+      ctx.escapeDepth--
+      // Silently consume the close tag — don't emit as content
+    } else {
+      // Everything else is raw content on the current top frame
+      const top = ctx.machine.peek()
+      if (top) {
+        ctx.machine.apply(onContent(top, tokenRaw(token)))
+      }
+    }
+    return
+  }
+
   // Resolve tentative close against incoming token
   if (ctx.pendingCloseStack.length > 0) {
     const result = resolvePendingClose(token, ctx)
@@ -221,6 +237,13 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
 
   const top = ctx.machine.peek()
   if (!top) return
+
+  // Check for escape open — enter escape mode (after pending close resolution)
+  if (token._tag === 'Open' && token.tagName === ESCAPE_TAG) {
+    ctx.escapeDepth++
+    // Silently consume the open tag — don't emit as content
+    return
+  }
 
   switch (token._tag) {
     case 'Open': {
@@ -240,7 +263,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
       const handler = resolveCloseHandler(token.tagName, top)
       if (handler) {
         // Enter tentative close — confirmed by next token
-        ctx.pendingCloseStack.push({ tagName: token.tagName, wsBuffer: '', sawNewline: false })
+        ctx.pendingCloseStack.push({ tagName: token.tagName, frameType: top.type, wsBuffer: '', sawNewline: false })
       } else {
         if (KNOWN_STRUCTURAL_TAGS.has(token.tagName)) {
           ctx.machine.apply([emitStructuralError({

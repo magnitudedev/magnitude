@@ -46,31 +46,31 @@ function getStructuralErrors(events: TurnEngineEvent[]): StructuralParseErrorEve
 
 describe('parse errors', () => {
   it('produces UnknownTool as structural error for unregistered tool', () => {
-    const errors = getStructuralErrors(parse('<invoke tool="unknown_tool">\n</invoke>'))
+    const errors = getStructuralErrors(parse('<magnitude:invoke tool="unknown_tool">\n</magnitude:invoke>'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('UnknownTool')
   })
 
   it('produces MissingToolName as structural error for invoke without tool attribute', () => {
-    const errors = getStructuralErrors(parse('<invoke>\n</invoke>'))
+    const errors = getStructuralErrors(parse('<magnitude:invoke>\n</magnitude:invoke>'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('MissingToolName')
   })
 
   it('produces StrayCloseTag as structural error for unmatched close', () => {
-    const errors = getStructuralErrors(parse('</reason>\ntext'))
+    const errors = getStructuralErrors(parse('</magnitude:reason>\ntext'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
   })
 
   it('produces UnclosedThink (UnclosedReason) as structural error at EOF', () => {
-    const errors = getStructuralErrors(parse('<reason about="reasoning">\nSome thinking'))
+    const errors = getStructuralErrors(parse('<magnitude:reason about="reasoning">\nSome thinking'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors.some(e => e.error._tag === 'UnclosedThink')).toBe(true)
   })
 
   it('tool-scoped errors have toolCallId and are ToolParseError events', () => {
-    const errors = getToolErrors(parse('<invoke tool="shell">\n<parameter name="bogus">value</parameter>\n</invoke>'))
+    const errors = getToolErrors(parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="bogus">value</magnitude:parameter>\n</magnitude:invoke>'))
     const paramError = errors.find(e => e.error._tag === 'UnknownParameter')
     expect(paramError).toBeDefined()
     expect(paramError!.toolCallId).toBeDefined()
@@ -78,7 +78,7 @@ describe('parse errors', () => {
   })
 
   it('structural errors do not have toolCallId', () => {
-    const errors = getStructuralErrors(parse('</reason>\ntext'))
+    const errors = getStructuralErrors(parse('</magnitude:reason>\ntext'))
     const strayError = errors.find(e => e.error._tag === 'StrayCloseTag')
     expect(strayError).toBeDefined()
     expect((strayError as any).toolCallId).toBeUndefined()

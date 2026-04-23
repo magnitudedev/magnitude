@@ -3,10 +3,20 @@
 export const TOP_LEVEL_TAGS: ReadonlySet<string> = new Set(['magnitude:reason', 'magnitude:message', 'magnitude:invoke'])
 
 /** All known close tag names (structural + parameter/filter children) */
-export const KNOWN_CLOSE_TAG_NAMES: ReadonlySet<string> = new Set(['magnitude:reason', 'magnitude:message', 'magnitude:invoke', 'magnitude:parameter', 'magnitude:filter'])
+export const KNOWN_CLOSE_TAG_NAMES: ReadonlySet<string> = new Set(['magnitude:reason', 'magnitude:message', 'magnitude:invoke', 'magnitude:parameter', 'magnitude:filter', 'magnitude:escape'])
+
+// Individual tag name constants
+export const TAG_REASON = 'magnitude:reason' as const
+export const TAG_MESSAGE = 'magnitude:message' as const
+export const TAG_INVOKE = 'magnitude:invoke' as const
+export const TAG_PARAMETER = 'magnitude:parameter' as const
+export const TAG_FILTER = 'magnitude:filter' as const
+export const TAG_ESCAPE = 'magnitude:escape' as const
+
+export const ESCAPE_TAG = TAG_ESCAPE
 
 /** Tags that produce a stray-close error when unmatched */
-export const KNOWN_STRUCTURAL_TAGS: ReadonlySet<string> = new Set(['magnitude:reason', 'magnitude:message', 'magnitude:invoke'])
+export const KNOWN_STRUCTURAL_TAGS: ReadonlySet<string> = new Set(['magnitude:reason', 'magnitude:message', 'magnitude:invoke', 'magnitude:escape'])
 
 // Yield target string values (used by parser and ExecutionManager)
 export const YIELD_USER_TARGET = 'user' as const

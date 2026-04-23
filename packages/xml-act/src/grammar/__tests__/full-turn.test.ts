@@ -2,19 +2,19 @@ import { describe, it } from 'vitest'
 import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
 
 const REASON = (name: string, content: string) =>
-  `<reason about="${name}">\n${content}\n</reason>\n`
+  `<magnitude:reason about="${name}">\n${content}\n</magnitude:reason>\n`
 
 const MSG = (recipient: string, content: string) =>
-  `<message to="${recipient}">\n${content}\n</message>\n`
+  `<magnitude:message to="${recipient}">\n${content}\n</magnitude:message>\n`
 
 const INVOKE = (tool: string, params: Record<string, string> = {}) => {
   const paramLines = Object.entries(params)
-    .map(([k, v]) => `<parameter name="${k}">${v}</parameter>`)
+    .map(([k, v]) => `<magnitude:parameter name="${k}">${v}</magnitude:parameter>`)
     .join('\n')
-  return `<invoke tool="${tool}">\n${paramLines ? paramLines + '\n' : ''}</invoke>\n`
+  return `<magnitude:invoke tool="${tool}">\n${paramLines ? paramLines + '\n' : ''}</magnitude:invoke>\n`
 }
 
-const YIELD = (tag = 'user') => `<yield_${tag}/>`
+const YIELD = (tag = 'user') => `<magnitude:yield_${tag}/>`
 
 describe('full turn sequences', () => {
   describe('yield only', () => {

@@ -49,7 +49,7 @@ describe('field coalescing', () => {
       (token) => parser.pushToken(token),
       new Set(['shell']),
     )
-    tokenizer.push('<invoke tool="shell">\n<parameter name="command">ls -la</parameter>\n</invoke>')
+    tokenizer.push('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls -la</magnitude:parameter>\n</magnitude:invoke>')
     tokenizer.end()
     parser.end()
     allEvents.push(...parser.drain())
@@ -61,10 +61,10 @@ describe('field coalescing', () => {
 
   it('preserves total delta across drains', () => {
     const events = parseIncremental([
-      '<invoke tool="shell">\n<parameter name="command">',
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">',
       'ls',
       ' -la',
-      '</parameter>\n</invoke>',
+      '</magnitude:parameter>\n</magnitude:invoke>',
     ])
     const fieldChunks = events.filter(e => e._tag === 'ToolInputFieldChunk')
     const totalDelta = fieldChunks.map(e => (e as any).delta).join('')

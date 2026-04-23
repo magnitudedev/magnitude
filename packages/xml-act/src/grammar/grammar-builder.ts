@@ -216,6 +216,9 @@ export class GrammarBuilder {
     const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<magnitude:message" msg-attrs ">" msg-body-s0'
     const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"magnitude:message" msg-attrs ">" msg-body-s0']
 
+    postItems.push('"<magnitude:escape>" escape-body-post-s0')
+    postItemsNoLt.push('"magnitude:escape>" escape-body-post-s0')
+
     rules.set('turn-item-post', postItemRule)
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
     rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
@@ -229,6 +232,9 @@ export class GrammarBuilder {
       ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
       : postItemsNoLt
 
+    lensItems.push('"<magnitude:escape>" escape-body-lens-s0')
+    lensItemsNoLt.push('"magnitude:escape>" escape-body-lens-s0')
+
     rules.set('turn-item-lens', lensItems.join(' | '))
     rules.set('turn-next-lens', 'ws turn-item-lens | ws yield')
     rules.set('turn-next-lens-no-lt', [...lensItemsNoLt, 'yield-no-lt'].join(' | '))
@@ -239,6 +245,9 @@ export class GrammarBuilder {
    * These are reused across all body rules for the same tag.
    */
   private addSharedBucRules(rules: RuleMap): void {
+    const escapeTag = 'magnitude:escape'
+
+    // Plain BUC rules (exclude only their close tag)
     // param-buc: excludes </magnitude:parameter>
     for (const rule of generateBucRules('param-buc', 'magnitude:parameter')) {
       addRule(rules, rule)
@@ -255,6 +264,33 @@ export class GrammarBuilder {
     for (const rule of generateBucRules('msg-buc', 'magnitude:message')) {
       addRule(rules, rule)
     }
+    // escape-buc: excludes </magnitude:escape> (no compound needed — escape doesn't nest)
+    for (const rule of generateBucRules('escape-buc', escapeTag)) {
+      addRule(rules, rule)
+    }
+
+    // Compound BUC rules (exclude close tag AND <magnitude:escape> open tag)
+    // These allow inline escape blocks to be recognized inside body content
+    for (const rule of generateCompoundBucRules('param-esc-buc', 'magnitude:parameter', escapeTag)) {
+      addRule(rules, rule)
+    }
+    for (const rule of generateCompoundBucRules('filter-esc-buc', 'magnitude:filter', escapeTag)) {
+      addRule(rules, rule)
+    }
+    for (const rule of generateCompoundBucRules('reason-esc-buc', 'magnitude:reason', escapeTag)) {
+      addRule(rules, rule)
+    }
+    for (const rule of generateCompoundBucRules('msg-esc-buc', 'magnitude:message', escapeTag)) {
+      addRule(rules, rule)
+    }
+
+    // Escape-aware body content rules: BUC interleaved with escape blocks
+    // Pattern: buc (escape-block buc)* — no nested repetition ambiguity
+    const escBlock = `"<${escapeTag}>" escape-buc "</${escapeTag}>"`
+    rules.set('param-esc-body', `param-esc-buc (${escBlock} param-esc-buc)*`)
+    rules.set('filter-esc-body', `filter-esc-buc (${escBlock} filter-esc-buc)*`)
+    rules.set('reason-esc-body', `reason-esc-buc (${escBlock} reason-esc-buc)*`)
+    rules.set('msg-esc-body', `msg-esc-buc (${escBlock} msg-esc-buc)*`)
   }
 
   /**
@@ -262,20 +298,28 @@ export class GrammarBuilder {
    * Confirmation: </tagname> + ws + < (next structural tag).
    */
   private addTopLevelBodyRules(rules: RuleMap): void {
-    // reason body: greedy last-match, confirmed by ws + next lens-phase tag
+    // reason body: greedy last-match with inline escape support
     const reasonClose = '"</magnitude:reason>"'
     rules.set('reason-body-s0',
-      `reason-buc (${reasonClose} reason-buc)* ${reasonClose} ws turn-item-lens-no-lt-or-yield`)
+      `reason-esc-body (${reasonClose} reason-esc-body)* ${reasonClose} ws turn-item-lens-no-lt-or-yield`)
 
-    // msg body: greedy last-match, confirmed by ws + next post-phase tag
+    // msg body: greedy last-match with inline escape support
     const msgClose = '"</magnitude:message>"'
     rules.set('msg-body-s0',
-      `msg-buc (${msgClose} msg-buc)* ${msgClose} ws turn-item-post-no-lt-or-yield`)
+      `msg-esc-body (${msgClose} msg-esc-body)* ${msgClose} ws turn-item-post-no-lt-or-yield`)
 
     // Helper rules: the continuation after close + ws must start with <
     // which is consumed by the no-lt variants, OR be a yield (which starts with <)
     rules.set('turn-item-lens-no-lt-or-yield', 'turn-item-lens | yield')
     rules.set('turn-item-post-no-lt-or-yield', 'turn-item-post | yield')
+
+    // escape body (lens phase): first close ends block (no nesting, no greedy)
+    rules.set('escape-body-lens-s0',
+      `escape-buc "</magnitude:escape>" ws turn-item-lens-no-lt-or-yield`)
+
+    // escape body (post phase): first close ends block (no nesting, no greedy)
+    rules.set('escape-body-post-s0',
+      `escape-buc "</magnitude:escape>" ws turn-item-post-no-lt-or-yield`)
   }
 
   /**
@@ -293,9 +337,9 @@ export class GrammarBuilder {
         '"<magnitude:parameter" " name=\\"" quoted-value "\\"" ">" generic-param-body-s0 | "<magnitude:filter>" generic-filter-body-s0')
       // Generic param body: greedy last-match, confirmed by next invoke child or close
       rules.set('generic-param-body-s0',
-        'param-buc ("</magnitude:parameter>" param-buc)* "</magnitude:parameter>" (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)')
+        'param-esc-body ("</magnitude:parameter>" param-esc-body)* "</magnitude:parameter>" (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)')
       rules.set('generic-filter-body-s0',
-        'filter-buc ("</magnitude:filter>" filter-buc)* "</magnitude:filter>" ws "</magnitude:invoke>" turn-next-post')
+        'filter-esc-body ("</magnitude:filter>" filter-esc-body)* "</magnitude:filter>" ws "</magnitude:invoke>" turn-next-post')
       return
     }
 
@@ -352,18 +396,30 @@ export class GrammarBuilder {
     const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<magnitude:message" msg-attrs ">" msg-body-s0'
     const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"magnitude:message" msg-attrs ">" msg-body-s0']
 
+    // Add escape alternatives to post items
+    postItems.push('"<magnitude:escape>" escape-body-post-s0')
+    postItemsNoLt.push('"magnitude:escape>" escape-body-post-s0')
+
+    const postItemRuleWithEscape = postItems.join(' | ')
+    const postNoLtWithEscape = [...postItemsNoLt]
+
     // Override the rules set by addContinuationRules
-    rules.set('turn-item-post', postItemRule)
+    rules.set('turn-item-post', postItemRuleWithEscape)
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
-    rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
+    rules.set('turn-next-post-no-lt', [...postNoLtWithEscape, 'yield-no-lt'].join(' | '))
 
     const hasReason = (proseChildren as readonly string[]).includes('magnitude:reason')
+    // Build lens items from post items WITHOUT escape, then add escape with lens body
     const lensItems = hasReason
-      ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
-      : postItems
+      ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems.filter(i => !i.includes('escape'))]
+      : postItems.filter(i => !i.includes('escape'))
     const lensItemsNoLt = hasReason
-      ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
-      : postItemsNoLt
+      ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt.filter(i => !i.includes('escape'))]
+      : postItemsNoLt.filter(i => !i.includes('escape'))
+
+    // Add escape with lens-phase body rule
+    lensItems.push('"<magnitude:escape>" escape-body-lens-s0')
+    lensItemsNoLt.push('"magnitude:escape>" escape-body-lens-s0')
 
     rules.set('turn-item-lens', lensItems.join(' | '))
     rules.set('turn-next-lens', 'ws turn-item-lens | ws yield')
@@ -372,6 +428,14 @@ export class GrammarBuilder {
     // Re-derive the helper rules for top-level body confirmation
     rules.set('turn-item-lens-no-lt-or-yield', 'turn-item-lens | yield')
     rules.set('turn-item-post-no-lt-or-yield', 'turn-item-post | yield')
+
+    // escape body (lens phase): first close ends block (no nesting, no greedy)
+    rules.set('escape-body-lens-s0',
+      `escape-buc "</magnitude:escape>" ws turn-item-lens-no-lt-or-yield`)
+
+    // escape body (post phase): first close ends block (no nesting, no greedy)
+    rules.set('escape-body-post-s0',
+      `escape-buc "</magnitude:escape>" ws turn-item-post-no-lt-or-yield`)
   }
 
   /**
@@ -411,16 +475,16 @@ export class GrammarBuilder {
     for (let k = N; k >= 2; k--) {
       const nextSeq = `${safeName}-seq-${k - 1}`
       rules.set(`${safeName}-nonlast-body-s0-${k}`,
-        `param-buc ("</magnitude:parameter>" param-buc)* "</magnitude:parameter>" ${nextSeq}`)
+        `param-esc-body ("</magnitude:parameter>" param-esc-body)* "</magnitude:parameter>" ${nextSeq}`)
     }
 
     // Last body rule: deep confirmation through invoke close + next top-level tag
     rules.set(`${safeName}-last-body-s0`,
-      `param-buc ("</magnitude:parameter>" param-buc)* "</magnitude:parameter>" ws "</magnitude:invoke>" turn-next-post`)
+      `param-esc-body ("</magnitude:parameter>" param-esc-body)* "</magnitude:parameter>" ws "</magnitude:invoke>" turn-next-post`)
 
     // Filter body: always deep (filter closes invoke)
     rules.set(`${safeName}-filter-body-s0`,
-      `filter-buc ("</magnitude:filter>" filter-buc)* "</magnitude:filter>" ws "</magnitude:invoke>" turn-next-post`)
+      `filter-esc-body ("</magnitude:filter>" filter-esc-body)* "</magnitude:filter>" ws "</magnitude:invoke>" turn-next-post`)
 
     // Entry point: invoke body starts at seq-N
     rules.set(`${safeName}-body`, `${safeName}-seq-${N}`)
@@ -513,6 +577,66 @@ export function generateBucRules(prefix: string, tagName: string): string[] {
   }
 
   lines.push(`${prefix} ::= (${alts.join(' | ')})*`)
+  return lines
+}
+
+/**
+ * Generate BUC rules that exclude BOTH a close tag AND an open tag.
+ * Used to make body rules escape-aware: the body content excludes
+ * its own close tag AND `<magnitude:escape>` so that escape blocks
+ * can be recognized inline.
+ *
+ * Since close tags start with `</` and open tags start with `<` + letter,
+ * after `<` the paths diverge and form independent prefix chains.
+ */
+export function generateCompoundBucRules(
+  prefix: string,
+  closeTagName: string,
+  openTagName: string,
+  options?: { plus?: boolean },
+): string[] {
+  const lines: string[] = []
+  const closeTag = '</' + closeTagName + '>'
+  const openTag = '<' + openTagName + '>'
+  const closeChars = closeTag.split('')
+  const openChars = openTag.split('')
+
+  const alts: string[] = []
+
+  // Both start with '<', so first alt excludes '<'
+  alts.push(`[^${escapeGbnfCharClass(closeChars[0])}]`)
+
+  // After '<': close tag goes to '/', open tag goes to first letter of openTagName
+  // Branch character for close: closeChars[1] = '/'
+  // Branch character for open: openChars[1] = first char of openTagName
+  const closeBranch = closeChars[1]
+  const openBranch = openChars[1]
+
+  // '<' followed by neither branch char
+  alts.push(`"<" [^${escapeGbnfCharClass(closeBranch)}${escapeGbnfCharClass(openBranch)}]`)
+
+  // Close tag chain: "</" then prefix matching
+  let pfx = '</'
+  for (let i = 2; i < closeChars.length - 1; i++) {
+    const nextChar = closeChars[i]
+    const nextCharEsc = escapeGbnfCharClass(nextChar)
+    alts.push(`"${pfx}" [^${nextCharEsc}]`)
+    pfx += closeChars[i]
+  }
+  // Note: we don't add the final close char alt because the loop already covers
+  // the prefix up to the second-to-last char
+
+  // Open tag chain: "<" + first char of open tag name, then prefix matching
+  let opfx = '<' + openBranch
+  for (let i = 2; i < openChars.length - 1; i++) {
+    const nextChar = openChars[i]
+    const nextCharEsc = escapeGbnfCharClass(nextChar)
+    alts.push(`"${opfx}" [^${nextCharEsc}]`)
+    opfx += openChars[i]
+  }
+
+  const quantifier = options?.plus ? '+' : '*'
+  lines.push(`${prefix} ::= (${alts.join(' | ')})${quantifier}`)
   return lines
 }
 

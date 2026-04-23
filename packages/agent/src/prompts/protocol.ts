@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, TAG_REASON, TAG_MESSAGE, TAG_INVOKE, TAG_PARAMETER, TAG_ESCAPE } from '@magnitudedev/xml-act'
 import protocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -93,6 +93,13 @@ export interface AckTurnMessage {
   content: string[]
 }
 
+// Tag helpers for few-shot construction
+const reason = (about: string, content: string) => `<${TAG_REASON} about="${about}">${content}</${TAG_REASON}>`
+const msg = (to: string, ...lines: string[]) => `<${TAG_MESSAGE} to="${to}">\n${lines.join('\n')}\n</${TAG_MESSAGE}>`
+const invoke = (tool: string, ...params: string[]) => `<${TAG_INVOKE} tool="${tool}">\n${params.join('\n')}\n</${TAG_INVOKE}>`
+const param = (name: string, value: string) => `<${TAG_PARAMETER} name="${name}">${value}</${TAG_PARAMETER}>`
+const esc = (content: string) => `<${TAG_ESCAPE}>${content}</${TAG_ESCAPE}>`
+
 /**
  * Build the few-shot example turns for protocol demonstration.
  */
@@ -101,85 +108,99 @@ export function buildAckTurns(
   defaultRecipient: 'user' | 'parent' = 'user',
 ): AckTurnMessage[] {
   return [
+    // Turn 1: User asks about the response format
     {
       role: 'user',
-      content: [`--- FEW-SHOT EXAMPLE START ---
-<system>
-Respond using the required turn format. The user reports a bug in the login redirect.
-</system>`]
+      content: [`--- FEW-SHOT EXAMPLE START ---\n<${TAG_MESSAGE} from="user">How does your response format work?</${TAG_MESSAGE}>`]
     },
+    // Turn 2: Explain format using escape blocks to show tag examples
     {
       role: 'assistant',
       content: [[
-        '<magnitude:reason about="skills">',
-        'Bug report → activate the bug skill to load methodology.',
-        '</magnitude:reason>',
+        reason('alignment', 'Format question — explain with examples using escape blocks.'),
         '',
-        '<magnitude:reason about="tasks">',
-        "Bug fix isn't one-turnable. Need to understand and delegate.",
-        '</magnitude:reason>',
+        msg(defaultRecipient,
+          'I respond in a structured format with these elements:',
+          '',
+          `- **Reasons** for internal thinking: ${esc(`\`<${TAG_REASON} about="topic">thinking</${TAG_REASON}>\``)}`,
+          `- **Messages** to communicate: ${esc(`\`<${TAG_MESSAGE} to="user">content</${TAG_MESSAGE}>\``)}`,
+          `- **Tool calls** to take action: ${esc(`\`<${TAG_INVOKE} tool="name"><${TAG_PARAMETER} name="key">value</${TAG_PARAMETER}></${TAG_INVOKE}>\``)}`,
+          '- **Yield** to end my turn and wait',
+          '',
+          'I think first, then communicate and act, then yield.',
+        ),
         '',
-        '<magnitude:message to="user">',
-        'Looking into the login redirect bug. Let me pull up the auth code and the bug methodology.',
-        '</magnitude:message>',
+        YIELD_USER,
+      ].join('\n')]
+    },
+    // Turn 3: User asks to write a reference doc
+    {
+      role: 'user',
+      content: [`<${TAG_MESSAGE} from="user">Write that up as a quick reference doc.</${TAG_MESSAGE}>`]
+    },
+    // Turn 4: Activate skill
+    {
+      role: 'assistant',
+      content: [[
+        reason('skills', 'Clear objective — activate the example skill.'),
         '',
-        '<magnitude:invoke tool="skill">',
-        '<magnitude:parameter name="name">bug</magnitude:parameter>',
-        '</magnitude:invoke>',
+        msg(defaultRecipient, 'On it — let me pull up the methodology first.'),
         '',
-        '<magnitude:invoke tool="read">',
-        '<magnitude:parameter name="path">src/auth/redirect.ts</magnitude:parameter>',
-        '</magnitude:invoke>',
+        invoke('skill', param('name', 'example')),
         '',
         YIELD_INVOKE,
       ].join('\n')]
     },
+    // Turn 5: Skill results
     {
       role: 'user',
       content: [`<turn_result>
 <result tool="skill">
 <out field="content">
-# Skill: Bug
+# Skill: Example
 
-Provides methodology for diagnosing and fixing bugs.
+Provides methodology for the example task.
 
 ## Steps
-1. Identify root cause
-2. Write minimal fix
-3. Test the fix
+1. Understand the objective
+2. Execute precisely
+3. Verify the result
 </out>
-</result>
-<result tool="read">
-export function redirectAfterLogout(req, res) {
-  res.redirect('/home') // Bug: should redirect to '/login'
-}
 </result>
 </turn_result>`]
     },
+    // Turn 6: Write doc with escape in parameter value + message
     {
       role: 'assistant',
       content: [[
-        '<magnitude:reason about="skills">',
-        'Skill loaded. Bug skill says: diagnose root cause first, then fix.',
-        '</magnitude:reason>',
+        reason('skills', 'Skill loaded. Write the doc to $M.'),
         '',
-        '<magnitude:reason about="tasks">',
-        'Create a bug task and spawn a debugger worker.',
-        '</magnitude:reason>',
+        invoke('write',
+          param('path', '$M/reports/response-format.md'),
+          param('content', [
+            '# Response Format Quick Reference',
+            '',
+            '## Reasons',
+            esc(`\`<${TAG_REASON} about="topic">internal thinking</${TAG_REASON}>\``),
+            '',
+            '## Messages',
+            esc(`\`<${TAG_MESSAGE} to="recipient">content</${TAG_MESSAGE}>\``),
+            '',
+            '## Tool Calls',
+            esc([
+              '```',
+              `<${TAG_INVOKE} tool="name">`,
+              `<${TAG_PARAMETER} name="key">value</${TAG_PARAMETER}>`,
+              `</${TAG_INVOKE}>`,
+              '```',
+            ].join('\n')),
+            '',
+            '## Yield',
+            'End each turn with a yield tag to wait for results or user input.',
+          ].join('\n')),
+        ),
         '',
-        '<magnitude:invoke tool="create_task">',
-        '<magnitude:parameter name="id">fix-redirect</magnitude:parameter>',
-        '<magnitude:parameter name="title">Fix login redirect bug</magnitude:parameter>',
-        '</magnitude:invoke>',
-        '',
-        '<magnitude:invoke tool="spawn_worker">',
-        '<magnitude:parameter name="id">fix-redirect</magnitude:parameter>',
-        "<magnitude:parameter name=\"message\">The redirect function is using '/home' instead of '/login'. Diagnose and fix.</magnitude:parameter>",
-        '</magnitude:invoke>',
-        '',
-        `<magnitude:message to="${defaultRecipient}">`,
-        'Found the bug — redirectAfterLogout sends to `/home` instead of `/login`. Worker is fixing it now.',
-        '</magnitude:message>',
+        msg(defaultRecipient, 'Done — written to [$M/reports/response-format.md]($M/reports/response-format.md).'),
         '',
         YIELD_USER,
       ].join('\n')]

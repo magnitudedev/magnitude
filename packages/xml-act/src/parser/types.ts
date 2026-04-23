@@ -126,6 +126,7 @@ export interface FilterFrame {
  */
 export type PendingClose = {
   tagName: string
+  frameType: string
   wsBuffer: string
   sawNewline: boolean
 }

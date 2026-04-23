@@ -1,7 +1,7 @@
 /**
  * Tests for newline-based close confirmation of top-level tags.
  *
- * After a closing tag (</reason>, </message>), the grammar should accept
+ * After a closing tag (</magnitude:reason>, </magnitude:message>), the grammar should accept
  * EITHER a newline OR a left-angle-bracket as valid close confirmation indicators.
  *
  * These tests are currently FAILING — they document the desired behavior.
@@ -10,40 +10,40 @@
 import { describe, it } from 'vitest'
 import { shellValidator } from './helpers'
 
-const YIELD = '<yield_user/>'
+const YIELD = '<magnitude:yield_user/>'
 
 describe('newline close confirmation (currently failing — desired behavior)', () => {
-  describe('</reason> + newline + structural tag or yield', () => {
-    it('01: </reason> + \\n + yield — newline should confirm the close', () => {
+  describe('</magnitude:reason> + newline + structural tag or yield', () => {
+    it('01: </magnitude:reason> + \\n + yield — newline should confirm the close', () => {
       const v = shellValidator()
-      // Currently fails: grammar requires < immediately after </reason>, not \n
-      v.passes(`<reason about="turn">\nthinking\n</reason>\n${YIELD}`)
+      // Currently fails: grammar requires < immediately after </magnitude:reason>, not \n
+      v.passes(`<magnitude:reason about="turn">\nthinking\n</magnitude:reason>\n${YIELD}`)
     })
 
-    it('02: </reason> + \\n + \\n + yield — multiple newlines should still confirm', () => {
+    it('02: </magnitude:reason> + \\n + \\n + yield — multiple newlines should still confirm', () => {
       const v = shellValidator()
-      v.passes(`<reason about="turn">\nthinking\n</reason>\n\n${YIELD}`)
+      v.passes(`<magnitude:reason about="turn">\nthinking\n</magnitude:reason>\n\n${YIELD}`)
     })
 
-    it('03: </reason> + space + \\n + yield — horizontal whitespace then newline', () => {
+    it('03: </magnitude:reason> + space + \\n + yield — horizontal whitespace then newline', () => {
       const v = shellValidator()
-      v.passes(`<reason about="turn">\nthinking\n</reason>  \n${YIELD}`)
+      v.passes(`<magnitude:reason about="turn">\nthinking\n</magnitude:reason>  \n${YIELD}`)
     })
 
-    it('04: </reason> + \\n + <message ...> — newline confirm then message tag', () => {
+    it('04: </magnitude:reason> + \\n + <magnitude:message ...> — newline confirm then message tag', () => {
       const v = shellValidator()
       v.passes(
-        `<reason about="turn">\nplan\n</reason>\n` +
-        `<message to="user">\nhello\n</message>\n` +
+        `<magnitude:reason about="turn">\nplan\n</magnitude:reason>\n` +
+        `<magnitude:message to="user">\nhello\n</magnitude:message>\n` +
         YIELD
       )
     })
 
-    it('05: </reason> + \\n + <invoke> — newline confirm then invoke tag', () => {
+    it('05: </magnitude:reason> + \\n + <magnitude:invoke> — newline confirm then invoke tag', () => {
       const v = shellValidator()
       v.passes(
-        `<reason about="turn">\nplan\n</reason>\n` +
-        `<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n` +
+        `<magnitude:reason about="turn">\nplan\n</magnitude:reason>\n` +
+        `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -51,45 +51,45 @@ describe('newline close confirmation (currently failing — desired behavior)', 
     it('06: multiple reasons separated by newlines only', () => {
       const v = shellValidator()
       v.passes(
-        `<reason about="alignment">\nfirst\n</reason>\n` +
-        `<reason about="turn">\nsecond\n</reason>\n` +
+        `<magnitude:reason about="alignment">\nfirst\n</magnitude:reason>\n` +
+        `<magnitude:reason about="turn">\nsecond\n</magnitude:reason>\n` +
         YIELD
       )
     })
   })
 
-  describe('</message> + newline + yield', () => {
-    it('07: </message> + \\n + yield — newline should confirm the close', () => {
+  describe('</magnitude:message> + newline + yield', () => {
+    it('07: </magnitude:message> + \\n + yield — newline should confirm the close', () => {
       const v = shellValidator()
-      v.passes(`<message to="user">\nhello\n</message>\n${YIELD}`)
+      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\n${YIELD}`)
     })
 
-    it('08: </message> + \\n + \\n + yield — multiple newlines', () => {
+    it('08: </magnitude:message> + \\n + \\n + yield — multiple newlines', () => {
       const v = shellValidator()
-      v.passes(`<message to="user">\nhello\n</message>\n\n${YIELD}`)
+      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\n\n${YIELD}`)
     })
 
     it('09: reason then message with newline separators', () => {
       const v = shellValidator()
       v.passes(
-        `<reason about="turn">\nthinking\n</reason>\n` +
-        `<message to="user">\nhello\n</message>\n` +
+        `<magnitude:reason about="turn">\nthinking\n</magnitude:reason>\n` +
+        `<magnitude:message to="user">\nhello\n</magnitude:message>\n` +
         YIELD
       )
     })
   })
 
   describe('existing < confirmation still works (should stay passing)', () => {
-    it('10: </reason> + < + yield — angle bracket still confirms (regression guard)', () => {
+    it('10: </magnitude:reason> + < + yield — angle bracket still confirms (regression guard)', () => {
       const v = shellValidator()
-      v.passes(`<reason about="turn">\nthinking\n</reason>${YIELD}`)
+      v.passes(`<magnitude:reason about="turn">\nthinking\n</magnitude:reason>${YIELD}`)
     })
 
-    it('11: </reason> + < + message — angle bracket confirms into message (regression guard)', () => {
+    it('11: </magnitude:reason> + < + message — angle bracket confirms into message (regression guard)', () => {
       const v = shellValidator()
       v.passes(
-        `<reason about="turn">\nplan\n</reason>` +
-        `<message to="user">\nhello\n</message>\n` +
+        `<magnitude:reason about="turn">\nplan\n</magnitude:reason>` +
+        `<magnitude:message to="user">\nhello\n</magnitude:message>\n` +
         YIELD
       )
     })

@@ -3,22 +3,22 @@ import { shellValidator } from './helpers'
 
 /**
  * Regression test: the LLM produced `<turn>...</turn>` instead of
- * `<reason about="turn">...</reason>`. The grammar should reject this
+ * `<magnitude:reason about="turn">...</magnitude:reason>`. The grammar should reject this
  * because `<turn>` is not a valid top-level tag.
  *
  * Observed raw output:
- *   <reason about="skills">...</reason>
- *   <reason about="alignment">...</reason>
- *   <reason about="tasks">...</reason>
- *   <reason about="diligence">...</reason>
+ *   <magnitude:reason about="skills">...</magnitude:reason>
+ *   <magnitude:reason about="alignment">...</magnitude:reason>
+ *   <magnitude:reason about="tasks">...</magnitude:reason>
+ *   <magnitude:reason about="diligence">...</magnitude:reason>
  *   <turn>
  *   I'll start by activating the relevant skills...
  *   </turn>
- *   <invoke tool="skill">...
+ *   <magnitude:invoke tool="skill">...
  */
 
 const REASON = (name: string, content: string) =>
-  `<reason about="${name}">\n${content}\n</reason>\n`
+  `<magnitude:reason about="${name}">\n${content}\n</magnitude:reason>\n`
 
 describe('<turn> tag rejection', () => {
   it('rejects <turn>...</turn> after reason blocks', () => {
@@ -29,8 +29,8 @@ describe('<turn> tag rejection', () => {
       REASON('tasks', 'This is a large multi-step refactor.') +
       REASON('diligence', 'Need to verify the codebase.') +
       '<turn>\nI\'ll start by activating the relevant skills.\n</turn>\n' +
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n' +
-      '<yield_invoke/>'
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:yield_invoke/>'
     )
   })
 
@@ -38,7 +38,7 @@ describe('<turn> tag rejection', () => {
     const v = shellValidator()
     v.rejects(
       '<turn>\nSome content.\n</turn>\n' +
-      '<yield_invoke/>'
+      '<magnitude:yield_invoke/>'
     )
   })
 
@@ -47,18 +47,18 @@ describe('<turn> tag rejection', () => {
     v.rejects(
       REASON('turn', 'planning') +
       '<turn>\nDoing stuff.\n</turn>\n' +
-      '<invoke tool="shell">\n<parameter name="command">echo hi</parameter>\n</invoke>\n' +
-      '<yield_invoke/>'
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hi</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:yield_invoke/>'
     )
   })
 
-  it('accepts <reason about="turn"> (the correct form)', () => {
+  it('accepts <magnitude:reason about="turn"> (the correct form)', () => {
     const v = shellValidator()
     v.passes(
       REASON('skills', 'refactor skill applies') +
       REASON('turn', 'I\'ll start by activating skills.') +
-      '<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n' +
-      '<yield_invoke/>'
+      '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
+      '<magnitude:yield_invoke/>'
     )
   })
 })

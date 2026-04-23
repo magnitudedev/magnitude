@@ -41,7 +41,7 @@ export const GREP_TOOL_DEF: GrammarToolDef = {
 }
 
 export const DEFAULT_GRAMMAR_TOOLS = [SHELL_TOOL_DEF, EDIT_TOOL_DEF, TREE_TOOL_DEF]
-export const YIELD = '<yield_user/>'
+export const YIELD = '<magnitude:yield_user/>'
 
 // ============================================================================
 // Parser Tool Definitions (real tools with schemas)
@@ -110,7 +110,7 @@ const GREP_PARSER_TOOLS = makeTools(
   { tool: grepTool, tagName: 'grep' },
 )
 
-const KNOWN_TAGS = new Set(['shell', 'edit', 'tree', 'grep', 'invoke'])
+const KNOWN_TAGS = new Set(['shell', 'edit', 'tree', 'grep', 'magnitude:invoke', 'magnitude:parameter', 'magnitude:filter', 'magnitude:reason', 'magnitude:message', 'magnitude:yield_user', 'magnitude:yield_invoke', 'magnitude:yield_parent', 'magnitude:yield_worker', 'magnitude:escape'])
 
 // ============================================================================
 // Grammar Validator

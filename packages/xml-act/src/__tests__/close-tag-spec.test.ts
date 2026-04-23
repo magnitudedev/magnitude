@@ -41,53 +41,53 @@ function parse(input: string): TurnEngineEvent[] {
 }
 
 describe('close tag behavior', () => {
-  it('</reason> closes a reason frame', () => {
-    const events = parse('<reason about="turn">\ncontent\n</reason>')
+  it('</magnitude:reason> closes a reason frame', () => {
+    const events = parse('<magnitude:reason about="turn">\ncontent\n</magnitude:reason>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
   })
 
-  it('</message> closes a message frame', () => {
-    const events = parse('<message to="user">\nhello\n</message>')
+  it('</magnitude:message> closes a message frame', () => {
+    const events = parse('<magnitude:message to="user">\nhello\n</magnitude:message>')
     expect(events.find(e => e._tag === 'MessageEnd')).toBeDefined()
   })
 
-  it('</invoke> closes an invoke frame', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>')
+  it('</magnitude:invoke> closes an invoke frame', () => {
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>')
     expect(events.find(e => e._tag === 'ToolInputReady')).toBeDefined()
   })
 
-  it('</message> inside reason frame → literal content', () => {
-    const events = parse('<reason about="turn">\ncontent</message>\n</reason>')
+  it('</magnitude:message> inside reason frame → literal content', () => {
+    const events = parse('<magnitude:reason about="turn">\ncontent</magnitude:message>\n</magnitude:reason>')
     const chunks = events.filter(e => e._tag === 'LensChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</message>')
+    expect(text).toContain('</magnitude:message>')
     expect(events.find(e => e._tag === 'MessageEnd')).toBeUndefined()
   })
 
-  it('</reason> inside message frame → literal content', () => {
-    const events = parse('<message to="user">\ncontent</reason>\n</message>')
+  it('</magnitude:reason> inside message frame → literal content', () => {
+    const events = parse('<magnitude:message to="user">\ncontent</magnitude:reason>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</reason>')
+    expect(text).toContain('</magnitude:reason>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeUndefined()
   })
 
-  it('</invoke> inside message frame → literal content', () => {
-    const events = parse('<message to="user">\ncontent</invoke>\n</message>')
+  it('</magnitude:invoke> inside message frame → literal content', () => {
+    const events = parse('<magnitude:message to="user">\ncontent</magnitude:invoke>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</invoke>')
+    expect(text).toContain('</magnitude:invoke>')
   })
 
-  it('</parameter> inside message frame → literal content', () => {
-    const events = parse('<message to="user">\n</parameter>\n</message>')
+  it('</magnitude:parameter> inside message frame → literal content', () => {
+    const events = parse('<magnitude:message to="user">\n</magnitude:parameter>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</parameter>')
+    expect(text).toContain('</magnitude:parameter>')
   })
 
   it('unknown close tag → literal content', () => {
-    const events = parse('<message to="user">\n<skill-name>\n</message>')
+    const events = parse('<magnitude:message to="user">\n<skill-name>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('<skill-name>')

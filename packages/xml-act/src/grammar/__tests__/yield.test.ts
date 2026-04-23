@@ -5,76 +5,76 @@ describe('yield tags', () => {
   describe('default yield tags', () => {
     it('yield_user passes', () => {
       const v = shellValidator()
-      v.passes(`<yield_user/>`)
+      v.passes(`<magnitude:yield_user/>`)
     })
 
     it('yield_invoke passes', () => {
       const v = shellValidator()
-      v.passes(`<yield_invoke/>`)
+      v.passes(`<magnitude:yield_invoke/>`)
     })
 
     it('yield_worker passes', () => {
       const v = shellValidator()
-      v.passes(`<yield_worker/>`)
+      v.passes(`<magnitude:yield_worker/>`)
     })
   })
 
   describe('whitespace before yield', () => {
     it('yield with leading spaces passes (ws rule)', () => {
       const v = shellValidator()
-      v.passes(`  <yield_user/>`)
+      v.passes(`  <magnitude:yield_user/>`)
     })
 
     it('yield with leading newline passes', () => {
       const v = shellValidator()
-      v.passes(`\n<yield_user/>`)
+      v.passes(`\n<magnitude:yield_user/>`)
     })
 
     it('yield with leading tab passes', () => {
       const v = shellValidator()
-      v.passes(`\t<yield_user/>`)
+      v.passes(`\t<magnitude:yield_user/>`)
     })
   })
 
   describe('trailing content after yield', () => {
     it('yield with trailing space is rejected', () => {
       const v = shellValidator()
-      v.rejects(`<yield_user/> `)
+      v.rejects(`<magnitude:yield_user/> `)
     })
 
     it('yield with trailing newline is rejected', () => {
       const v = shellValidator()
-      v.rejects(`<yield_user/>\n`)
+      v.rejects(`<magnitude:yield_user/>\n`)
     })
 
     it('yield with trailing tab is rejected', () => {
       const v = shellValidator()
-      v.rejects(`<yield_user/>\t`)
+      v.rejects(`<magnitude:yield_user/>\t`)
     })
   })
 
   describe('yield after other blocks', () => {
     it('yield after reason block passes', () => {
       const v = buildValidator([SHELL_TOOL])
-      v.passes(`<reason about="turn">\nsome thought\n</reason>\n<yield_user/>`)
+      v.passes(`<magnitude:reason about="turn">\nsome thought\n</magnitude:reason>\n<magnitude:yield_user/>`)
     })
 
     it('yield after message block passes', () => {
       const v = buildValidator([SHELL_TOOL])
-      v.passes(`<message to="user">\nhello\n</message>\n<yield_user/>`)
+      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
     it('yield after invoke passes', () => {
       const v = shellValidator()
-      v.passes(`<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n<yield_user/>`)
+      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n<magnitude:yield_user/>`)
     })
 
     it('yield after reason + invoke passes', () => {
       const v = shellValidator()
       v.passes(
-        `<reason about="turn">\nsome thought\n</reason>\n` +
-        `<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke>\n` +
-        `<yield_user/>`
+        `<magnitude:reason about="turn">\nsome thought\n</magnitude:reason>\n` +
+        `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n` +
+        `<magnitude:yield_user/>`
       )
     })
   })
@@ -92,19 +92,19 @@ describe('yield tags', () => {
 
     it('default yield tag rejected when custom tags set', () => {
       const v = buildValidator([SHELL_TOOL], b => b.withYieldTags(['yield_idle', 'yield_continue']))
-      v.rejects(`<yield_user/>`)
+      v.rejects(`<magnitude:yield_user/>`)
     })
   })
 
   describe('forbidden sequences', () => {
     it('content after yield is rejected', () => {
       const v = shellValidator()
-      v.rejects(`<yield_user/>\nextra content`)
+      v.rejects(`<magnitude:yield_user/>\nextra content`)
     })
 
     it('two yields is rejected', () => {
       const v = shellValidator()
-      v.rejects(`<yield_user/><yield_user/>`)
+      v.rejects(`<magnitude:yield_user/><magnitude:yield_user/>`)
     })
   })
 })
