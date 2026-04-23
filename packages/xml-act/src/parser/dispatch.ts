@@ -139,12 +139,16 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
 
   if (token._tag === 'Content') {
     if (isAllWs(token.text)) {
+      if (token.text.includes('\n')) {
+        lastPc.sawNewline = true
+      }
       lastPc.wsBuffer += token.text
       return 'consumed'
     }
     // Non-whitespace content
-    // For top-level effective frame + content starts with <: confirm
-    if (effectiveFrame && PROSE_LEVEL_FRAME_TYPES.has(effectiveFrame.type) && token.text.length > 0 && token.text[0] === '<') {
+    // For top-level effective frame: confirm on '<', newline as first char, or if we saw a newline in buffered whitespace
+    if (effectiveFrame && PROSE_LEVEL_FRAME_TYPES.has(effectiveFrame.type) && token.text.length > 0
+        && (token.text[0] === '<' || token.text[0] === '\n' || lastPc.sawNewline)) {
       confirmAllPendingCloses(ctx)
       return 'passthrough'
     }
@@ -160,7 +164,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
       const handler = resolveCloseHandler(token.tagName, effectiveFrame)
       if (handler) {
         // Extend cascade — push another pending close
-        stack.push({ tagName: token.tagName, wsBuffer: '' })
+        stack.push({ tagName: token.tagName, wsBuffer: '', sawNewline: false })
         return 'consumed'
       }
     }
@@ -172,7 +176,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
       if (handler) {
         // Same-frame close — replace (greedy last-match)
         ctx.machine.apply(onContent(top, `</${lastPc.tagName}>` + lastPc.wsBuffer))
-        ctx.pendingCloseStack = [{ tagName: token.tagName, wsBuffer: '' }]
+        ctx.pendingCloseStack = [{ tagName: token.tagName, wsBuffer: '', sawNewline: false }]
         return 'consumed'
       }
     }
@@ -236,7 +240,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
       const handler = resolveCloseHandler(token.tagName, top)
       if (handler) {
         // Enter tentative close — confirmed by next token
-        ctx.pendingCloseStack.push({ tagName: token.tagName, wsBuffer: '' })
+        ctx.pendingCloseStack.push({ tagName: token.tagName, wsBuffer: '', sawNewline: false })
       } else {
         if (KNOWN_STRUCTURAL_TAGS.has(token.tagName)) {
           ctx.machine.apply([emitStructuralError({
