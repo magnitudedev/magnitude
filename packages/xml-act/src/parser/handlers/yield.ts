@@ -13,7 +13,7 @@ const VALID_TARGETS = new Set(['user', 'invoke', 'worker', 'parent'])
 export function makeYieldHandler(tagName: string): SelfCloseHandler {
   return {
     selfClose(_attrs, _ctx) {
-      const suffix = tagName.replace(/^yield_/, '')
+      const suffix = tagName.replace(/^magnitude:yield_/, '')
       const target = (VALID_TARGETS.has(suffix) ? suffix : 'user') as 'user' | 'invoke' | 'worker' | 'parent'
       return [{ type: 'observe', target }]
     },

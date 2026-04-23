@@ -1,8 +1,20 @@
 # Response Protocol
 
-You respond using XML tags. Each response must be exactly one turn.
+## Magnitude Interpreter
+
+You response in a format that is interpreted as your response streams.
+
+Your response stream is interpreted live by a completely custom streaming parser.
+
+This format is reminiscient of XML, but is not parsed like normal XML at all.
+
+This streaming parser ALWAYS INTERPRETS tags prefixed with `magnitude:`.
+
+NEVER use a `magnitude:` tag inside of a thought, message, or file content - it will ALWAYS be interpreted, even if nested in other content.
 
 ## Turn structure
+
+You respond using Magnitude tags. Each response must be exactly one turn.
 
 ```
 turn      := {{TAG_REASON}}* ({{TAG_MESSAGE}} | {{TAG_INVOKE}})* yield
@@ -13,7 +25,6 @@ turn      := {{TAG_REASON}}* ({{TAG_MESSAGE}} | {{TAG_INVOKE}})* yield
 {{TAG_FILTER}}    := <{{TAG_FILTER}}>jsonpath</{{TAG_FILTER}}>
 yield     := {{YIELD_OPTIONS}}
 ```
-
 
 ## Agentic operation
 
@@ -38,9 +49,9 @@ WRONG: `&lt;div&gt;`, `&amp;`, `&quot;`
 RIGHT: `<div>`, `&`, `"`
 This applies everywhere — reason bodies, message bodies, and parameter values. Escaping will corrupt your output (e.g., a file edit with `&lt;` instead of `<` will fail to match).
 
-Only structural tags are parsed: `reason`, `message`, `invoke`, `parameter`, `filter`, and yield tags. Other tag-like text (e.g. HTML snippets, code examples) inside a body is treated as raw content and never interpreted.
+Only structural tags are parsed: `magnitude:reason`, `magnitude:message`, `magnitude:invoke`, `magnitude:parameter`, `magnitude:filter`, and yield tags. Other tag-like text (e.g. HTML snippets, code examples) inside a body is treated as raw content and never interpreted.
 
-To discuss a structural tag in prose, use a backtick code span: `` `<invoke tool="shell">` ``.
+To discuss a structural tag in prose, use a backtick code span: `` `<magnitude:invoke tool="shell">` ``.
 
 ## Think
 
@@ -67,9 +78,9 @@ You must use exactly and exclusively the lenses where the trigger condition is t
 Tool calls use child parameter elements with a `name` attribute.
 
 ```
-<invoke tool="NAME">
-<parameter name="key">value</parameter>
-</invoke>
+<magnitude:invoke tool="NAME">
+<magnitude:parameter name="key">value</magnitude:parameter>
+</magnitude:invoke>
 ```
 
 Parameters are inline: opening tag, value, and closing tag on the same line. Exception: long string content may span multiple lines.
@@ -80,10 +91,10 @@ Tool results support two disclosure modes:
 
 **Pre-emptive**: Specify what subset to see inline when calling:
 ```
-<invoke tool="shell">
-<parameter name="command">npm test</parameter>
-<filter>$.stdout</filter>
-</invoke>
+<magnitude:invoke tool="shell">
+<magnitude:parameter name="command">npm test</magnitude:parameter>
+<magnitude:filter>$.stdout</magnitude:filter>
+</magnitude:invoke>
 ```
 
 **Retroactive**: Access the full result later by reading the persisted file (shown in result footer).

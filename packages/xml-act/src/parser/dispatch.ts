@@ -57,8 +57,8 @@ function isAllWs(text: string): boolean {
 function isValidContinuation(token: Token, frameType: string, ctx: ParserLoopContext): boolean {
   if (token._tag === 'Open') {
     if (frameType === 'parameter') {
-      if (token.tagName === 'filter') return true
-      if (token.tagName === 'parameter') {
+      if (token.tagName === 'magnitude:filter') return true
+      if (token.tagName === 'magnitude:parameter') {
         // Validate param name against tool schema
         const paramName = (token.attrs ?? new Map()).get('name') ?? ''
         // Find the invoke frame — it's the parent of the parameter frame on the machine stack

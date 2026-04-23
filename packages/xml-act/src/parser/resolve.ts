@@ -57,27 +57,27 @@ import { makeYieldHandler } from './handlers/yield'
 
 export function resolveOpenHandler(tagName: string, top: Frame): BoundOpenHandler | undefined {
   switch (tagName) {
-    case 'reason':
+    case 'magnitude:reason':
       if (top.type !== 'prose') return undefined
       // top is narrowed to ProseFrame — TypeScript verifies reasonOpenHandler: OpenHandler<ProseFrame, ...>
       return bindOpen(reasonOpenHandler, top)
 
-    case 'message':
+    case 'magnitude:message':
       if (top.type !== 'prose') return undefined
       // top is narrowed to ProseFrame
       return bindOpen(messageOpenHandler, top)
 
-    case 'invoke':
+    case 'magnitude:invoke':
       if (top.type !== 'prose') return undefined
       // top is narrowed to ProseFrame
       return bindOpen(invokeOpenHandler, top)
 
-    case 'parameter':
+    case 'magnitude:parameter':
       if (top.type !== 'invoke') return undefined
       // top is narrowed to InvokeFrame — TypeScript verifies parameterOpenHandler: OpenHandler<InvokeFrame, ...>
       return bindOpen(parameterOpenHandler, top)
 
-    case 'filter':
+    case 'magnitude:filter':
       if (top.type !== 'invoke') return undefined
       // top is narrowed to InvokeFrame
       return bindOpen(filterOpenHandler, top)
@@ -96,23 +96,23 @@ export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHand
   switch (top.type) {
     case 'reason':
       // top is ReasonFrame — TypeScript verifies reasonCloseHandler: CloseHandler<ReasonFrame>
-      return tagName === 'reason' ? bindClose(reasonCloseHandler, top) : undefined
+      return tagName === 'magnitude:reason' ? bindClose(reasonCloseHandler, top) : undefined
 
     case 'message':
       // top is MessageFrame
-      return tagName === 'message' ? bindClose(messageCloseHandler, top) : undefined
+      return tagName === 'magnitude:message' ? bindClose(messageCloseHandler, top) : undefined
 
     case 'invoke':
       // top is InvokeFrame
-      return tagName === 'invoke' ? bindClose(invokeCloseHandler, top) : undefined
+      return tagName === 'magnitude:invoke' ? bindClose(invokeCloseHandler, top) : undefined
 
     case 'parameter':
       // top is ParameterFrame
-      return tagName === 'parameter' ? bindClose(parameterCloseHandler, top) : undefined
+      return tagName === 'magnitude:parameter' ? bindClose(parameterCloseHandler, top) : undefined
 
     case 'filter':
       // top is FilterFrame
-      return tagName === 'filter' ? bindClose(filterCloseHandler, top) : undefined
+      return tagName === 'magnitude:filter' ? bindClose(filterCloseHandler, top) : undefined
 
     case 'prose':
       return undefined
@@ -124,7 +124,7 @@ export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHand
 // =============================================================================
 
 export function resolveSelfCloseHandler(tagName: string, top: Frame): BoundSelfCloseHandler | undefined {
-  if (top.type === 'prose' && tagName.startsWith('yield_')) {
+  if (top.type === 'prose' && tagName.startsWith('magnitude:yield_')) {
     return makeYieldHandler(tagName)
   }
   return undefined

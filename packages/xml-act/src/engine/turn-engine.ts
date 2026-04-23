@@ -372,7 +372,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
             const tokenizer = createTokenizer(
               (token) => { parser.pushToken(token) },
               new Set(config.tools.keys()),
-              { toolKeyword: 'invoke' },
+              { toolKeyword: 'magnitude:invoke' },
             )
 
             yield* textStream.pipe(

@@ -7,7 +7,7 @@ export const UNCLOSED_TASK_REMINDER = 'Your response had an unclosed task block.
 export const ONESHOT_LIVENESS_REMINDER = 'You idled but no subagents are active and there is no user to respond. Continue working toward the task or call <finish/> when complete.'
 
 export function formatSpawnNoMessageReminder(taskId: string, taskTitle: string, role: string): string {
-  return `Worker \`${role}\` was spawned on task ${taskId} ("${taskTitle}") but has no instructions yet — it is idle until it receives a message. Send a \`<message to="${taskId}">\` to assign it work.`
+  return `Worker \`${role}\` was spawned on task ${taskId} ("${taskTitle}") but has no instructions yet — it is idle until it receives a message. Send a \`<magnitude:message to="${taskId}">\` to assign it work.`
 }
 
 export function formatNonexistentAgentError(destList: string): string {

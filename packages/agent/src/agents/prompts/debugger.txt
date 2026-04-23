@@ -20,7 +20,7 @@ Your job is to root-cause bugs and understand why something is broken.
 
 ## Output
 
-When done, send a message to the parent with a structured report via `<message to="parent">...</message>`:
+When done, send a message to the parent with a structured report via `<magnitude:message to="parent">...</magnitude:message>`:
 If your findings are substantial, also write them to `$M/reports/` and mention the file via markdown link syntax in your message (e.g., `[findings.md]($M/reports/example-findings.md)`).
 - **Symptom**: What was observed
 - **Root cause**: What's actually wrong and where (with file:line references)

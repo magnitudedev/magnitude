@@ -203,30 +203,30 @@ export class GrammarBuilder {
     const postItems: string[] = []
     const postItemsNoLt: string[] = []
     for (const child of proseChildren) {
-      if (child === 'reason') continue
-      if (child === 'message' && allowMessages) {
-        postItems.push('"<message" msg-attrs ">" msg-body-s0')
-        postItemsNoLt.push('"message" msg-attrs ">" msg-body-s0')
-      } else if (child === 'invoke' && allowTools) {
-        postItems.push('"<invoke" invoke-attrs ">" invoke-body')
-        postItemsNoLt.push('"invoke" invoke-attrs ">" invoke-body')
+      if (child === 'magnitude:reason') continue
+      if (child === 'magnitude:message' && allowMessages) {
+        postItems.push('"<magnitude:message" msg-attrs ">" msg-body-s0')
+        postItemsNoLt.push('"magnitude:message" msg-attrs ">" msg-body-s0')
+      } else if (child === 'magnitude:invoke' && allowTools) {
+        postItems.push('"<magnitude:invoke" invoke-attrs ">" invoke-body')
+        postItemsNoLt.push('"magnitude:invoke" invoke-attrs ">" invoke-body')
       }
     }
 
-    const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<message" msg-attrs ">" msg-body-s0'
-    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"message" msg-attrs ">" msg-body-s0']
+    const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<magnitude:message" msg-attrs ">" msg-body-s0'
+    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"magnitude:message" msg-attrs ">" msg-body-s0']
 
     rules.set('turn-item-post', postItemRule)
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
     rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
 
     // Lens phase: reason + post-lens items
-    const hasReason = (proseChildren as readonly string[]).includes('reason')
+    const hasReason = (proseChildren as readonly string[]).includes('magnitude:reason')
     const lensItems = hasReason
-      ? ['"<reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
+      ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
       : postItems
     const lensItemsNoLt = hasReason
-      ? ['"reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
+      ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
       : postItemsNoLt
 
     rules.set('turn-item-lens', lensItems.join(' | '))
@@ -239,20 +239,20 @@ export class GrammarBuilder {
    * These are reused across all body rules for the same tag.
    */
   private addSharedBucRules(rules: RuleMap): void {
-    // param-buc: excludes </parameter>
-    for (const rule of generateBucRules('param-buc', 'parameter')) {
+    // param-buc: excludes </magnitude:parameter>
+    for (const rule of generateBucRules('param-buc', 'magnitude:parameter')) {
       addRule(rules, rule)
     }
-    // filter-buc: excludes </filter>
-    for (const rule of generateBucRules('filter-buc', 'filter')) {
+    // filter-buc: excludes </magnitude:filter>
+    for (const rule of generateBucRules('filter-buc', 'magnitude:filter')) {
       addRule(rules, rule)
     }
-    // reason-buc: excludes </reason>
-    for (const rule of generateBucRules('reason-buc', 'reason')) {
+    // reason-buc: excludes </magnitude:reason>
+    for (const rule of generateBucRules('reason-buc', 'magnitude:reason')) {
       addRule(rules, rule)
     }
-    // msg-buc: excludes </message>
-    for (const rule of generateBucRules('msg-buc', 'message')) {
+    // msg-buc: excludes </magnitude:message>
+    for (const rule of generateBucRules('msg-buc', 'magnitude:message')) {
       addRule(rules, rule)
     }
   }
@@ -263,12 +263,12 @@ export class GrammarBuilder {
    */
   private addTopLevelBodyRules(rules: RuleMap): void {
     // reason body: greedy last-match, confirmed by ws + next lens-phase tag
-    const reasonClose = '"</reason>"'
+    const reasonClose = '"</magnitude:reason>"'
     rules.set('reason-body-s0',
       `reason-buc (${reasonClose} reason-buc)* ${reasonClose} ws turn-item-lens-no-lt-or-yield`)
 
     // msg body: greedy last-match, confirmed by ws + next post-phase tag
-    const msgClose = '"</message>"'
+    const msgClose = '"</magnitude:message>"'
     rules.set('msg-body-s0',
       `msg-buc (${msgClose} msg-buc)* ${msgClose} ws turn-item-post-no-lt-or-yield`)
 
@@ -288,14 +288,14 @@ export class GrammarBuilder {
     if (tools.length === 0) {
       // Fallback: generic invoke with free-form tool name and params
       rules.set('invoke-attrs', '" tool=\\"" quoted-value "\\""')
-      rules.set('invoke-body', 'ws invoke-generic-item | ws "</invoke>" turn-next-post')
+      rules.set('invoke-body', 'ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post')
       rules.set('invoke-generic-item',
-        '"<parameter" " name=\\"" quoted-value "\\"" ">" generic-param-body-s0 | "<filter>" generic-filter-body-s0')
+        '"<magnitude:parameter" " name=\\"" quoted-value "\\"" ">" generic-param-body-s0 | "<magnitude:filter>" generic-filter-body-s0')
       // Generic param body: greedy last-match, confirmed by next invoke child or close
       rules.set('generic-param-body-s0',
-        'param-buc ("</parameter>" param-buc)* "</parameter>" (ws invoke-generic-item | ws "</invoke>" turn-next-post)')
+        'param-buc ("</magnitude:parameter>" param-buc)* "</magnitude:parameter>" (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)')
       rules.set('generic-filter-body-s0',
-        'filter-buc ("</filter>" filter-buc)* "</filter>" ws "</invoke>" turn-next-post')
+        'filter-buc ("</magnitude:filter>" filter-buc)* "</magnitude:filter>" ws "</magnitude:invoke>" turn-next-post')
       return
     }
 
@@ -325,8 +325,8 @@ export class GrammarBuilder {
 
       this.addPerToolRules(rules, tool, safeName)
 
-      invokeAlts.push(`"<invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
-      invokeAltsNoLt.push(`"invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
+      invokeAlts.push(`"<magnitude:invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
+      invokeAltsNoLt.push(`"magnitude:invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
     }
 
     // Override the invoke entries in continuation rules
@@ -339,30 +339,30 @@ export class GrammarBuilder {
     const postItems: string[] = []
     const postItemsNoLt: string[] = []
     for (const child of proseChildren) {
-      if (child === 'reason') continue
-      if (child === 'message' && allowMessages) {
-        postItems.push('"<message" msg-attrs ">" msg-body-s0')
-        postItemsNoLt.push('"message" msg-attrs ">" msg-body-s0')
-      } else if (child === 'invoke') {
+      if (child === 'magnitude:reason') continue
+      if (child === 'magnitude:message' && allowMessages) {
+        postItems.push('"<magnitude:message" msg-attrs ">" msg-body-s0')
+        postItemsNoLt.push('"magnitude:message" msg-attrs ">" msg-body-s0')
+      } else if (child === 'magnitude:invoke') {
         postItems.push(...invokeAlts)
         postItemsNoLt.push(...invokeAltsNoLt)
       }
     }
 
-    const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<message" msg-attrs ">" msg-body-s0'
-    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"message" msg-attrs ">" msg-body-s0']
+    const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<magnitude:message" msg-attrs ">" msg-body-s0'
+    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"magnitude:message" msg-attrs ">" msg-body-s0']
 
     // Override the rules set by addContinuationRules
     rules.set('turn-item-post', postItemRule)
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
     rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
 
-    const hasReason = (proseChildren as readonly string[]).includes('reason')
+    const hasReason = (proseChildren as readonly string[]).includes('magnitude:reason')
     const lensItems = hasReason
-      ? ['"<reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
+      ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
       : postItems
     const lensItemsNoLt = hasReason
-      ? ['"reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
+      ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
       : postItemsNoLt
 
     rules.set('turn-item-lens', lensItems.join(' | '))
@@ -383,7 +383,7 @@ export class GrammarBuilder {
 
     if (N === 0) {
       // 0-param tool: invoke body is just ws + close
-      rules.set(`${safeName}-body`, `ws "</invoke>" turn-next-post`)
+      rules.set(`${safeName}-body`, `ws "</magnitude:invoke>" turn-next-post`)
       return
     }
 
@@ -400,9 +400,9 @@ export class GrammarBuilder {
 
       // Parameter open with constrained names, chaining to position-specific body
       const bodyRule = isLastSlot ? `${safeName}-last-body-s0` : `${safeName}-nonlast-body-s0-${k}`
-      const paramAlt = `ws "<parameter" ${safeName}-param-names ">" ${bodyRule}`
-      const filterAlt = `ws "<filter>" ${safeName}-filter-body-s0`
-      const closeAlt = `ws "</invoke>" turn-next-post`
+      const paramAlt = `ws "<magnitude:parameter" ${safeName}-param-names ">" ${bodyRule}`
+      const filterAlt = `ws "<magnitude:filter>" ${safeName}-filter-body-s0`
+      const closeAlt = `ws "</magnitude:invoke>" turn-next-post`
 
       rules.set(seqName, [paramAlt, filterAlt, closeAlt].join(' | '))
     }
@@ -411,16 +411,16 @@ export class GrammarBuilder {
     for (let k = N; k >= 2; k--) {
       const nextSeq = `${safeName}-seq-${k - 1}`
       rules.set(`${safeName}-nonlast-body-s0-${k}`,
-        `param-buc ("</parameter>" param-buc)* "</parameter>" ${nextSeq}`)
+        `param-buc ("</magnitude:parameter>" param-buc)* "</magnitude:parameter>" ${nextSeq}`)
     }
 
     // Last body rule: deep confirmation through invoke close + next top-level tag
     rules.set(`${safeName}-last-body-s0`,
-      `param-buc ("</parameter>" param-buc)* "</parameter>" ws "</invoke>" turn-next-post`)
+      `param-buc ("</magnitude:parameter>" param-buc)* "</magnitude:parameter>" ws "</magnitude:invoke>" turn-next-post`)
 
     // Filter body: always deep (filter closes invoke)
     rules.set(`${safeName}-filter-body-s0`,
-      `filter-buc ("</filter>" filter-buc)* "</filter>" ws "</invoke>" turn-next-post`)
+      `filter-buc ("</magnitude:filter>" filter-buc)* "</magnitude:filter>" ws "</magnitude:invoke>" turn-next-post`)
 
     // Entry point: invoke body starts at seq-N
     rules.set(`${safeName}-body`, `${safeName}-seq-${N}`)
@@ -432,7 +432,7 @@ export class GrammarBuilder {
     if (requiredMessageTo !== null) {
       this.addForcedMessageRules(rules, requiredMessageTo, maxLenses)
     } else if (minLenses === 1) {
-      rules.set('root', 'ws "<reason" reason-attrs-opt ">" reason-body-s0')
+      rules.set('root', 'ws "<magnitude:reason" reason-attrs-opt ">" reason-body-s0')
     } else {
       rules.set('root', 'turn-next-lens')
     }
@@ -440,8 +440,8 @@ export class GrammarBuilder {
 
   private addForcedMessageRules(rules: RuleMap, recipient: string, maxLenses: number | undefined): void {
     const escapedRecipient = recipient.replace(/"/g, '\\"')
-    rules.set('forced-msg', `"<message to=\\"${escapedRecipient}\\">" msg-body-s0`)
-    rules.set('forced-msg-no-lt', `"message to=\\"${escapedRecipient}\\">" msg-body-s0`)
+    rules.set('forced-msg', `"<magnitude:message to=\\"${escapedRecipient}\\">" msg-body-s0`)
+    rules.set('forced-msg-no-lt', `"magnitude:message to=\\"${escapedRecipient}\\">" msg-body-s0`)
 
     if (maxLenses !== undefined) {
       for (let k = maxLenses; k >= 0; k--) {
@@ -451,31 +451,31 @@ export class GrammarBuilder {
         } else {
           const nextK = k - 1
           // Reason body for forced phase — greedy last-match, chains to next forced level
-          const reasonClose = '"</reason>"'
+          const reasonClose = '"</magnitude:reason>"'
           rules.set(`reason-forced-${k}-body-s0`,
             `reason-buc (${reasonClose} reason-buc)* ${reasonClose} turn-next-forced-${nextK}`)
           rules.set(
             `turn-next-forced-${k}`,
-            `ws "<reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | ws forced-msg`
+            `ws "<magnitude:reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | ws forced-msg`
           )
           rules.set(
             `turn-next-forced-${k}-no-lt`,
-            `"reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | forced-msg-no-lt`
+            `"magnitude:reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | forced-msg-no-lt`
           )
         }
       }
       rules.set('root', `turn-next-forced-${maxLenses}`)
     } else {
-      const reasonClose = '"</reason>"'
+      const reasonClose = '"</magnitude:reason>"'
       rules.set('reason-forced-body-s0',
         `reason-buc (${reasonClose} reason-buc)* ${reasonClose} turn-next-forced`)
       rules.set(
         'turn-next-forced',
-        'ws "<reason" reason-attrs-opt ">" reason-forced-body-s0 | ws forced-msg'
+        'ws "<magnitude:reason" reason-attrs-opt ">" reason-forced-body-s0 | ws forced-msg'
       )
       rules.set(
         'turn-next-forced-no-lt',
-        '"reason" reason-attrs-opt ">" reason-forced-body-s0 | forced-msg-no-lt'
+        '"magnitude:reason" reason-attrs-opt ">" reason-forced-body-s0 | forced-msg-no-lt'
       )
       rules.set('root', 'turn-next-forced')
     }

@@ -23,7 +23,7 @@ ${lens.description}`).join('\n\n')
 
 function renderLensesExample(lenses: ThinkingLens[]): string {
   return lenses
-    .map((lens) => `<reason about="${lens.name}">...${lens.name} reasoning if relevant</reason>`)
+    .map((lens) => `<magnitude:reason about="${lens.name}">...${lens.name} reasoning if relevant</magnitude:reason>`)
     .join('\n')
 }
 
@@ -50,11 +50,11 @@ export function getProtocol(
   const yieldOptions = yieldTags.map(t => `<${t}/>`).join(' | ')
 
   return PROTOCOL_RAW
-    .replaceAll('{{TAG_REASON}}', 'reason')
-    .replaceAll('{{TAG_MESSAGE}}', 'message')
-    .replaceAll('{{TAG_INVOKE}}', 'invoke')
-    .replaceAll('{{TAG_PARAMETER}}', 'parameter')
-    .replaceAll('{{TAG_FILTER}}', 'filter')
+    .replaceAll('{{TAG_REASON}}', 'magnitude:reason')
+    .replaceAll('{{TAG_MESSAGE}}', 'magnitude:message')
+    .replaceAll('{{TAG_INVOKE}}', 'magnitude:invoke')
+    .replaceAll('{{TAG_PARAMETER}}', 'magnitude:parameter')
+    .replaceAll('{{TAG_FILTER}}', 'magnitude:filter')
     .replaceAll('{{YIELD_OPTIONS}}', yieldOptions)
     .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
     .replaceAll('{{TASK_AND_ROUTING_SECTION}}', taskAndRoutingSection)
@@ -77,12 +77,12 @@ export function buildAckTurn(
   const lensName = lenses.find(lens => lens.name === 'turn')?.name ?? lenses[0]?.name ?? 'turn'
 
   return [
-    `<reason about="${lensName}">`,
+    `<magnitude:reason about="${lensName}">`,
     `Acknowledge readiness and continue.`,
-    `</reason>`,
-    `<message to="${defaultRecipient}">`,
+    `</magnitude:reason>`,
+    `<magnitude:message to="${defaultRecipient}">`,
     `Ready.`,
-    `</message>`,
+    `</magnitude:message>`,
     YIELD_INVOKE,
     '',
   ].join('\n')
@@ -111,25 +111,25 @@ Respond using the required turn format. The user reports a bug in the login redi
     {
       role: 'assistant',
       content: [[
-        '<reason about="skills">',
+        '<magnitude:reason about="skills">',
         'Bug report → activate the bug skill to load methodology.',
-        '</reason>',
+        '</magnitude:reason>',
         '',
-        '<reason about="tasks">',
+        '<magnitude:reason about="tasks">',
         "Bug fix isn't one-turnable. Need to understand and delegate.",
-        '</reason>',
+        '</magnitude:reason>',
         '',
-        '<message to="user">',
+        '<magnitude:message to="user">',
         'Looking into the login redirect bug. Let me pull up the auth code and the bug methodology.',
-        '</message>',
+        '</magnitude:message>',
         '',
-        '<invoke tool="skill">',
-        '<parameter name="name">bug</parameter>',
-        '</invoke>',
+        '<magnitude:invoke tool="skill">',
+        '<magnitude:parameter name="name">bug</magnitude:parameter>',
+        '</magnitude:invoke>',
         '',
-        '<invoke tool="read">',
-        '<parameter name="path">src/auth/redirect.ts</parameter>',
-        '</invoke>',
+        '<magnitude:invoke tool="read">',
+        '<magnitude:parameter name="path">src/auth/redirect.ts</magnitude:parameter>',
+        '</magnitude:invoke>',
         '',
         YIELD_INVOKE,
       ].join('\n')]
@@ -159,27 +159,27 @@ export function redirectAfterLogout(req, res) {
     {
       role: 'assistant',
       content: [[
-        '<reason about="skills">',
+        '<magnitude:reason about="skills">',
         'Skill loaded. Bug skill says: diagnose root cause first, then fix.',
-        '</reason>',
+        '</magnitude:reason>',
         '',
-        '<reason about="tasks">',
+        '<magnitude:reason about="tasks">',
         'Create a bug task and spawn a debugger worker.',
-        '</reason>',
+        '</magnitude:reason>',
         '',
-        '<invoke tool="create_task">',
-        '<parameter name="id">fix-redirect</parameter>',
-        '<parameter name="title">Fix login redirect bug</parameter>',
-        '</invoke>',
+        '<magnitude:invoke tool="create_task">',
+        '<magnitude:parameter name="id">fix-redirect</magnitude:parameter>',
+        '<magnitude:parameter name="title">Fix login redirect bug</magnitude:parameter>',
+        '</magnitude:invoke>',
         '',
-        '<invoke tool="spawn_worker">',
-        '<parameter name="id">fix-redirect</parameter>',
-        "<parameter name=\"message\">The redirect function is using '/home' instead of '/login'. Diagnose and fix.</parameter>",
-        '</invoke>',
+        '<magnitude:invoke tool="spawn_worker">',
+        '<magnitude:parameter name="id">fix-redirect</magnitude:parameter>',
+        "<magnitude:parameter name=\"message\">The redirect function is using '/home' instead of '/login'. Diagnose and fix.</magnitude:parameter>",
+        '</magnitude:invoke>',
         '',
-        `<message to="${defaultRecipient}">`,
+        `<magnitude:message to="${defaultRecipient}">`,
         'Found the bug — redirectAfterLogout sends to `/home` instead of `/login`. Worker is fixing it now.',
-        '</message>',
+        '</magnitude:message>',
         '',
         YIELD_USER,
       ].join('\n')]

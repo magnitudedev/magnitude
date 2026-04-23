@@ -144,7 +144,7 @@ export const updateTaskTool = defineTool({
 export const spawnWorkerTool = defineTool({
   name: 'spawn_worker' as const,
   group: 'task' as const,
-  description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <message to="task-id"> for follow-up communications. Only use spawn_worker to create a new worker or replace the current one.',
+  description: 'Spawn a worker for a task id. The body is the worker\'s initial instruction (same mechanics as a normal message). Use <magnitude:message to="task-id"> for follow-up communications. Only use spawn_worker to create a new worker or replace the current one.',
   inputSchema: Schema.Struct({
     id: Schema.String.annotations({ description: 'Task ID to spawn a worker for' }),
     message: Schema.String.annotations({ description: 'Initial instruction message for the worker' }),

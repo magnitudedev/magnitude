@@ -29,7 +29,7 @@ function getByPath(obj: Record<string, unknown>, path: string): unknown {
 
 function serializeParameter(name: string, value: unknown): string {
   const serialized = (value !== null && typeof value === 'object') ? JSON.stringify(value) : String(value ?? '')
-  return `<parameter name="${name}">${serialized}</parameter>`
+  return `<magnitude:parameter name="${name}">${serialized}</magnitude:parameter>`
 }
 
 function serializeToolCall(tagName: string, input: unknown, query: string | null, toolSet: ResolvedToolSet): string {
@@ -51,10 +51,10 @@ function serializeToolCall(tagName: string, input: unknown, query: string | null
     params = Object.entries(obj).map(([key, value]) => serializeParameter(key, value))
   }
 
-  const filterPart = query ? `<filter>\n${query}\n</filter>` : ''
+  const filterPart = query ? `<magnitude:filter>\n${query}\n</magnitude:filter>` : ''
   const children = [...params, ...(filterPart ? [filterPart] : [])]
-  if (children.length === 0) return `<invoke tool="${tagName}"/>`
-  return `<invoke tool="${tagName}">\n${children.join('\n')}\n</invoke>`
+  if (children.length === 0) return `<magnitude:invoke tool="${tagName}"/>`
+  return `<magnitude:invoke tool="${tagName}">\n${children.join('\n')}\n</magnitude:invoke>`
 }
 
 /**
@@ -71,7 +71,7 @@ export function serializeCanonicalTurn(
   if (trace.lenses !== null) {
     const activeLenses = trace.lenses.filter((lens) => lens.content !== null && lens.content.trim().length > 0)
     for (const lens of activeLenses) {
-      parts.push(`<reason about="${lens.name}">\n${lens.content!.trim()}\n</reason>`)
+      parts.push(`<magnitude:reason about="${lens.name}">\n${lens.content!.trim()}\n</magnitude:reason>`)
     }
   }
 
@@ -79,7 +79,7 @@ export function serializeCanonicalTurn(
     const trimmed = block.content.trim()
     if (trimmed.length === 0) continue
     const name = block.about ?? 'reason'
-    parts.push(`<reason about="${name}">\n${trimmed}\n</reason>`)
+    parts.push(`<magnitude:reason about="${name}">\n${trimmed}\n</magnitude:reason>`)
   }
 
   for (const msg of trace.messages) {
@@ -88,7 +88,7 @@ export function serializeCanonicalTurn(
     if (msg.destination.kind === 'worker') to = msg.destination.taskId
     else if (msg.destination.kind === 'parent') to = 'parent'
     else to = 'user'
-    parts.push(`<message to="${to}">\n${trimmedText}\n</message>`)
+    parts.push(`<magnitude:message to="${to}">\n${trimmedText}\n</magnitude:message>`)
   }
 
   for (const call of trace.toolCalls) {

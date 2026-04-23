@@ -231,7 +231,7 @@ export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
   open(attrs, _parent, ctx) {
     const toolTag = attrs.get('tool')
     if (!toolTag) {
-      return [emitStructuralError({ _tag: 'MissingToolName', detail: '<invoke> requires a tool attribute, e.g. <invoke tool="shell">' })]
+      return [emitStructuralError({ _tag: 'MissingToolName', detail: '<magnitude:invoke> requires a tool attribute, e.g. <magnitude:invoke tool="shell">' })]
     }
 
     const toolCallId = ctx.generateId()

@@ -1,4 +1,4 @@
 ## Turn control
 
-Use `<yield_parent/>` when you are waiting on a response from the parent.
-Use `<yield_invoke/>` when you have made tool calls and are ready to wait for results.
+Use `<magnitude:yield_parent/>` when you are waiting on a response from the parent.
+Use `<magnitude:yield_invoke/>` when you have made tool calls and are ready to wait for results.

@@ -28,7 +28,7 @@ function createMockToolSet(variant: 'lead' | 'worker'): ResolvedToolSet {
 function frameToChunks(frame: MockTurnResponse): readonly string[] {
   if (frame.xmlChunks && frame.xmlChunks.length > 0) return frame.xmlChunks
   if (frame.xml !== undefined) return [frame.xml]
-  return [`<message>ok</message>${YIELD_USER}`]
+  return [`<magnitude:message>ok</magnitude:message>${YIELD_USER}`]
 }
 
 function buildStream(frame: MockTurnResponse): Stream.Stream<string, import('@magnitudedev/providers').ModelError> {

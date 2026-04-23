@@ -4,7 +4,7 @@ import { YIELD_USER, YIELD_INVOKE } from '@magnitudedev/xml-act'
 type ToolParams = Record<string, string>
 
 function xmlParameter(name: string, value: string): string {
-  return `<parameter name="${name}">${value}</parameter>`
+  return `<magnitude:parameter name="${name}">${value}</magnitude:parameter>`
 }
 
 function xmlInvoke(tool: string, params: ToolParams, body?: string): string {
@@ -14,18 +14,18 @@ function xmlInvoke(tool: string, params: ToolParams, body?: string): string {
   
   if (body) {
     const bodyParam = xmlParameter('message', body)
-    return `<invoke tool="${tool}">\n${paramLines}\n${bodyParam}\n</invoke>`
+    return `<magnitude:invoke tool="${tool}">\n${paramLines}\n${bodyParam}\n</magnitude:invoke>`
   }
   
   if (paramLines) {
-    return `<invoke tool="${tool}">\n${paramLines}\n</invoke>`
+    return `<magnitude:invoke tool="${tool}">\n${paramLines}\n</magnitude:invoke>`
   }
   
-  return `<invoke tool="${tool}"/>`
+  return `<magnitude:invoke tool="${tool}"/>`
 }
 
 function xmlMessage(recipient: string, text: string): string {
-  return `<message to="${recipient}">${text}</message>`
+  return `<magnitude:message to="${recipient}">${text}</magnitude:message>`
 }
 
 export class ResponseBuilder {

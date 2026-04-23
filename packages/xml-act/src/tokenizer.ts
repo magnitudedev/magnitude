@@ -61,7 +61,7 @@ function isNameStart(ch: string): boolean {
 }
 
 function isNameContinue(ch: string): boolean {
-  return /[a-zA-Z0-9_.-]/.test(ch)
+  return /[a-zA-Z0-9_.:-]/.test(ch)
 }
 
 export function createTokenizer(
@@ -89,7 +89,7 @@ export function createTokenizer(
   function failTagAsContent(): void {
     if (!activeTag) return
     const tag = activeTag
-    if (tag.name.length > 0 && !tag.isClose && (knownToolTags?.has(tag.name) || tag.name === 'invoke')) {
+    if (tag.name.length > 0 && !tag.isClose && (knownToolTags?.has(tag.name) || tag.name === 'magnitude:invoke')) {
       tag.phase = 'malformed'
       return
     }
@@ -515,7 +515,7 @@ export function createTokenizer(
 
       if (activeTag) {
         const tag = activeTag
-        if (!tag.isClose && tag.name.length > 0 && (knownToolTags?.has(tag.name) || tag.name === 'invoke')) {
+        if (!tag.isClose && tag.name.length > 0 && (knownToolTags?.has(tag.name) || tag.name === 'magnitude:invoke')) {
           flushContent()
           onToken({
             _tag: 'Open',
