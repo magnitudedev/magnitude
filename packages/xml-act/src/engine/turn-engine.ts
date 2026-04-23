@@ -66,7 +66,7 @@ export interface TurnEngine {
 
 export interface TurnEngineConfig {
   readonly tools: ReadonlyMap<string, RegisteredTool>
-  readonly defaultProseDest?: string
+  readonly defaultProseDest: string
   readonly resultsDir: string
 }
 
@@ -104,6 +104,10 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
           // Per-invoke tracking: tagName needed at ToolInputReady for dispatch
           // filterQuery: currently not surfaced by parser in events (tracked as null)
           const activeInvokes = new Map<string, { tagName: string; filterQuery: string | null }>()
+
+          // Prose-to-message conversion state
+          let proseMessageId: string | null = null
+          let proseMessageOrdinal = 0
 
           // ---------------------------------------------------------------
           // Emit + fold helpers
@@ -284,9 +288,42 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                 case 'MessageStart':
                 case 'MessageChunk':
                 case 'MessageEnd':
-                case 'ProseChunk':
-                case 'ProseEnd':
+                  currentState = yield* emitAndFold(currentState, event)
+                  break
 
+                case 'ProseChunk': {
+                  if (config.defaultProseDest) {
+                    if (!proseMessageId) {
+                      proseMessageId = `prose-msg-${++proseMessageOrdinal}-${Date.now().toString(36)}`
+                      currentState = yield* emitAndFold(currentState, {
+                        _tag: 'MessageStart',
+                        id: proseMessageId,
+                        to: config.defaultProseDest,
+                      })
+                    }
+                    currentState = yield* emitAndFold(currentState, {
+                      _tag: 'MessageChunk',
+                      id: proseMessageId,
+                      text: event.text,
+                    })
+                  } else {
+                    currentState = yield* emitAndFold(currentState, event)
+                  }
+                  break
+                }
+
+                case 'ProseEnd': {
+                  if (config.defaultProseDest && proseMessageId) {
+                    currentState = yield* emitAndFold(currentState, {
+                      _tag: 'MessageEnd',
+                      id: proseMessageId,
+                    })
+                    proseMessageId = null
+                  } else {
+                    currentState = yield* emitAndFold(currentState, event)
+                  }
+                  break
+                }
 
                 case 'TurnEnd':
                   currentState = yield* emitAndFold(currentState, event)
