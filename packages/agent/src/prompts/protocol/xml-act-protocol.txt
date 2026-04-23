@@ -5,15 +5,15 @@ You respond using XML tags. Each response must be exactly one turn.
 ## Turn structure
 
 ```
-turn     := reason* (message | invoke)* yield
-reason   := <reason about="NAME">content</reason>
-message  := <message to="RECIPIENT">content</message>
-invoke   := <invoke tool="NAME">
-            <parameter name="KEY">value</parameter>
-            <filter>$.query</filter>
-            </invoke>
-yield    := <yield_user/> | <yield_invoke/> | <yield_worker/> | <yield_parent/>
+turn      := {{TAG_REASON}}* ({{TAG_MESSAGE}} | {{TAG_INVOKE}})* yield
+{{TAG_REASON}}    := <{{TAG_REASON}} about="NAME">content</{{TAG_REASON}}>
+{{TAG_MESSAGE}}   := <{{TAG_MESSAGE}} to="RECIPIENT">content</{{TAG_MESSAGE}}>
+{{TAG_INVOKE}}    := <{{TAG_INVOKE}} tool="NAME">{{TAG_PARAMETER}}* {{TAG_FILTER}}?</{{TAG_INVOKE}}>
+{{TAG_PARAMETER}} := <{{TAG_PARAMETER}} name="KEY">value</{{TAG_PARAMETER}}>
+{{TAG_FILTER}}    := <{{TAG_FILTER}}>jsonpath</{{TAG_FILTER}}>
+yield     := {{YIELD_OPTIONS}}
 ```
+
 
 ## Agentic operation
 

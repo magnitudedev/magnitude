@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS } from '@magnitudedev/xml-act'
 import protocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -44,7 +44,18 @@ export function getProtocol(
     ? TASK_ROUTING_WORKER_RAW
     : TASK_ROUTING_LEAD_RAW
 
+  const yieldTags = role === 'subagent'
+    ? SUBAGENT_YIELD_TAGS
+    : LEAD_YIELD_TAGS
+  const yieldOptions = yieldTags.map(t => `<${t}/>`).join(' | ')
+
   return PROTOCOL_RAW
+    .replaceAll('{{TAG_REASON}}', 'reason')
+    .replaceAll('{{TAG_MESSAGE}}', 'message')
+    .replaceAll('{{TAG_INVOKE}}', 'invoke')
+    .replaceAll('{{TAG_PARAMETER}}', 'parameter')
+    .replaceAll('{{TAG_FILTER}}', 'filter')
+    .replaceAll('{{YIELD_OPTIONS}}', yieldOptions)
     .replaceAll('{{TURN_CONTROL_SECTION}}', turnControlSection)
     .replaceAll('{{TASK_AND_ROUTING_SECTION}}', taskAndRoutingSection)
     .replaceAll('{{LENSES_EXAMPLE}}', renderLensesExample(lenses))

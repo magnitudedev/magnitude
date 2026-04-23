@@ -1,8 +1,13 @@
 ## Turn control
 
-Use `<yield_user/>` when you are waiting on a response from the user.
-Use `<yield_worker/>` when you are waiting for a response from a worker.
-Use `<yield_invoke/>` when you have made tool calls and are ready to wait for results.
+Yield user: End the turn, cannot send more messages or invoke more tools until the user responds.
+- Use AFTER you've sent the user a message and are awaiting a response
+
+Yield worker: End the turn, cannot send more messages or invoke more tools until a worker follows up.
+- Use when you have ongoing workers that you are waiting on
+
+Yield invoke: End the turn, observe tool results, and immediately take another where you can send messages or invoke additional tools.
+- Use when you need to chain additional messages or tools but need to see results of invoked messages from this turn first
 
 ## Communication standards
 
