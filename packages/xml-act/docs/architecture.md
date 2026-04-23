@@ -11,8 +11,8 @@ Grammar (GBNF) --> Tokenizer (streaming XML) --> Parser (handler pattern) --> Ev
 Each layer has a single responsibility:
 
 1. **Grammar** — constrains LLM output during inference so every generated turn conforms to the format. Targets GBNF for llama.cpp and compatible providers.
-2. **Tokenizer** — streaming character-level XML tokenizer. Emits `Open`, `Close`, `SelfClose`, and `Content` tokens. Handles attribute parsing, CDATA, and close-tag confirmation.
-3. **Parser** — converts token stream into structured events using a typed handler pattern. Manages a frame stack via a stack machine.
+2. **Tokenizer** — streaming character-level XML tokenizer. Emits `Open`, `Close`, `SelfClose`, and `Content` tokens. Handles attribute parsing and CDATA. Known structural close tags are emitted immediately; unknown close tags become Content.
+3. **Parser** — converts token stream into structured events using a typed handler pattern. Manages a frame stack via a stack machine. Implements tentative close confirmation with greedy last-match semantics.
 4. **Events** — `LensStart`/`LensEnd`, `MessageStart`/`MessageEnd`, `ToolInputStarted`/`ToolInputFieldChunk`, `ProseEnd`, `TurnEnd`, etc.
 
 ## Response Format
@@ -33,18 +33,7 @@ Phase ordering (reasons before messages/invocations) is enforced structurally by
 
 ## Grammar
 
-The grammar uses two strategies for close-tag handling, chosen per tag type:
-
-### Eager Confirmation (reason, message)
-
-Uses a **chain architecture** with bounded lookahead. Each tag's body DFA terminates by flowing into shared continuation rules for the next element. When `<` confirms a close tag, that `<` has been consumed, so continuation rules match the next tag name without its leading `<`. When confirmation is via newline, continuation rules expect the full tag.
-
-Close-tag confirmation uses bounded lookahead — after matching a close tag, the grammar enters trailing-whitespace states that confirm on `
-` or `<`, reject on anything else, with a bounded whitespace window.
-
-### Greedy Last-Match (parameter, filter)
-
-Uses **recursive repetition** to achieve parallel-state behavior within standard GBNF:
+All body types use a single **greedy last-match** strategy:
 
 ```gbnf
 param-body ::= buc (CLOSE buc)* CLOSE continuation
@@ -53,7 +42,11 @@ buc        ::= ([^<] | "<" [^/] | "</" [^p] | ...)*
 
 At each close tag, the GBNF engine offers both "content" and "structural close" paths. The model's token choice selects the interpretation. The last close tag is structural — greedy last-match emerges naturally from how the model generates. No lookahead, no confirmation windows, no state explosion. The CFG stack handles unbounded depth.
 
-This eliminates false commits for parameter and filter bodies, which are the most likely to contain their own close tags (shell commands, code, XML output).
+This applies to all body types: `reason`, `message`, `parameter`, and `filter`. The continuation rules differ per tag type. Top-level bodies (`reason`, `message`) confirm on the next top-level tag or yield. Inside invoke blocks, the last parameter uses **deep confirmation** — `</parameter>` is confirmed through `</invoke>` all the way to the next top-level tag as a single grammar unit. Non-last parameters confirm on the next parameter, filter, or invoke close.
+
+Tool names and parameter names are **constrained per-tool** in the grammar. The grammar enumerates valid tool names and, for each tool, the valid sequence of parameter names. Grammar size scales with the number of tools and their parameter schemas.
+
+Whitespace between structural tags is unbounded — the grammar uses an unconstrained `ws` rule rather than a bounded whitespace window.
 
 See [grammar.md](grammar.md) for full details.
 
@@ -61,11 +54,10 @@ See [grammar.md](grammar.md) for full details.
 
 A streaming character-level state machine (`tokenizer.ts`). Key features:
 
-- **Close-tag confirmation** — for `reason`/`message` close tags: mirrors the grammar's eager confirmation. After a close tag, enters `pendingClose` state, buffers up to 4 horizontal whitespace characters, confirms on `
-` or `<`, rejects otherwise. For `parameter`/`filter` close tags: uses deep confirmation with continuation-prefix matching, buffering whitespace and validating the next structural element before committing. See [lenience.md](lenience.md).
+- **Immediate close-tag emission** — known structural close tag names (`invoke`, `parameter`, `filter`, `reason`, `message`) are emitted as `Close` tokens immediately. Unknown close tags (e.g. `</div>`) are emitted as `Content`. No confirmation, no lookahead, no buffering for close tags.
 - **Attribute parsing** — 7-phase parser for `key="value"`, `key='value'`, `key=value`, and boolean attributes.
 - **CDATA** — `...` emitted as Content tokens, chunk-boundary safe.
-- **Chunk-boundary safety** — `pendingLt` for `<` at boundaries, `pendingClose` across boundaries.
+- **Chunk-boundary safety** — `pendingLt` for `<` at boundaries.
 
 ## Parser
 
@@ -77,6 +69,16 @@ Key properties:
 - **One layer** — resolution and dispatch are unified. `resolveOpenHandler` returns a `BoundOpenHandler` that knows both whether a token is structural AND how to handle it.
 - **Pure handlers** — all handlers return `ParserOp[]` (stack operations + events). No side effects.
 - **Exhaustive content dispatch** — a mapped type ensures every frame type has a content handler at compile time.
+- **Tentative close confirmation** — `dispatch.ts` maintains a `pendingCloseStack`. When a `Close` token matches the current frame, it is held tentatively rather than applied immediately. The next token resolves it: whitespace Content extends the buffer; valid structural continuation (Open, SelfClose, or Content starting with `<`) confirms; non-whitespace non-`<` Content rejects (the close tag and buffered whitespace are emitted as content). Cascade is supported — confirming a `</parameter>` may immediately make `</invoke>` tentative if no more parameters follow. This implements greedy last-match at the parser level, using nesting context and schema info that the tokenizer does not have.
+
+## Confirmation Layers
+
+Close-tag confirmation operates at two levels:
+
+1. **Grammar** (primary) — under constrained decoding, the greedy last-match pattern (`buc (close buc)* close continuation`) is the primary confirmation mechanism. The continuation rule forces the last close tag to be structural. The model cannot produce a false close under grammar constraint.
+2. **Parser** (fallback) — when constrained decoding is not active, the parser's `pendingCloseStack` tentative close mechanism implements equivalent logic. It holds close tags tentatively and confirms or rejects based on what follows.
+
+The tokenizer is a simple structural scanner — it emits close tags immediately with no confirmation. This keeps the tokenizer small and puts confirmation logic where nesting context and schema info are available (grammar and parser).
 
 ## Grammar-Parser Lockstep
 

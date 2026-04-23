@@ -1,37 +1,67 @@
 # Close-Tag Confirmation
 
-The tokenizer and grammar use a bounded lookahead mechanism to distinguish real close tags from incidental mentions in body content.
+The grammar and parser work together to distinguish real close tags from incidental mentions in body content.
 
 ## The Problem
 
-LLMs sometimes mention their own tags inside prose — for example, explaining how `</message>` works. The parser must not treat these as structural close tags.
+LLMs sometimes mention their own tags inside prose — for example, explaining how `</message>` works, or writing documentation that references `</parameter>`. The parser must not treat these as structural close tags.
 
 ## Mechanism
 
-When the tokenizer encounters `</tagname>`, it does not immediately emit a Close token. Instead, it enters a **pending close** state and examines subsequent characters:
+Close-tag confirmation is handled in two cooperating layers.
 
-- **`\n`** (newline) → **confirm**. The close tag is real. Emit Close token.
-- **`<`** (start of next tag) → **confirm**. The close tag is real. Emit Close token, then process `<` as the start of the next tag.
-- **Horizontal whitespace** (space, tab) → **buffer**, up to a bounded maximum (4 characters). Continue waiting for a confirming signal.
-- **Any other character** → **reject**. The close tag was incidental. The entire sequence (`</tagname>` + buffered whitespace) is emitted as content text.
-- **Excess whitespace** (more than 4 characters) → **reject**. Same as above.
+### Layer 1: Grammar (constrained decoding)
+
+All body types — reason, message, invoke, parameter, filter — use a **greedy last-match** rule:
+
+```
+body = buc (close buc)* close continuation
+```
+
+Where `buc` is "body until close" (any content not starting the close tag), `close` is the structural close tag, and `continuation` is the next valid token after this frame closes (e.g. another tag, or end of turn).
+
+This means the grammar allows the model to write `</tagname>` as content any number of times. Only the *last* occurrence — the one followed by a valid continuation — is structural. Under constrained decoding, the model is guided to produce exactly this pattern naturally.
+
+The model is never trapped: at every point, the grammar allows content continuation. The structural close only "locks in" when the continuation is unambiguous.
+
+For the last parameter in an invoke block, the grammar uses **deep confirmation**: `</parameter>` is confirmed through `</invoke>` all the way to the next top-level tag as a single grammar unit. This eliminates false commits at invoke boundaries.
+
+### Layer 2: Parser (tentative close)
+
+When constrained decoding is not active (cloud providers, etc.), the parser implements the same logic via a **`pendingCloseStack`** tentative close mechanism.
+
+When a `Close` token arrives matching the current frame, the parser does not apply it immediately. Instead it enters a tentative state, buffering the close and waiting for the next token:
+
+| Next token | Action |
+|---|---|
+| Whitespace Content | Buffer and stay tentative |
+| Non-whitespace Content | **Reject** — close tag was incidental; emit as content |
+| Valid structural Open / SelfClose | **Confirm** — pop the frame |
+| Close matching current frame | **Replace** — greedy last-match; discard earlier tentative close |
+| Close matching parent frame | **Cascade** — push to stack alongside current entry; both confirm or reject together |
+| EOF | **Confirm** |
+
+"Valid structural" means the Open tag is a known tag type that can legally follow the current frame's close. For example, after `</parameter>` inside an invoke, another `<parameter>` or `<filter>` or `</invoke>` is valid; a random word is not.
 
 ## Key Properties
 
-1. **The model is never trapped.** At every point in the lookahead window, any character is valid — it either confirms, continues buffering, or rejects back to content.
+1. **The model is never trapped.** The grammar always allows content continuation. The parser always allows rejection back to content if the next token is not a valid continuation.
 
-2. **Grammar and tokenizer are in lockstep.** The grammar's trailing-whitespace (tw) states implement the same logic: bounded horizontal whitespace slots, confirm on `\n` or `<`, escape to content body on anything else.
+2. **Grammar and parser work in concert.** Under constrained decoding, the grammar guides the model to produce the correct pattern. Without it, the parser's tentative close handles confirmation independently.
 
-3. **Applies to all close tags equally.** `</reason>`, `</message>`, `</invoke>`, `</parameter>`, `</filter>` — all go through the same confirmation mechanism. There is no special handling per tag.
+3. **Cascade support.** Stacked close tags like `</parameter></invoke>` are handled together. The `</parameter>` goes tentative; when `</invoke>` arrives, it is pushed onto the stack alongside the parameter entry. Both entries confirm or reject as a unit when the final continuation arrives.
+
+4. **Schema-aware.** Param name validation uses the tool schema. `<parameter name="unknown">` after `</parameter>` is not a valid continuation and will reject the tentative close back to content.
 
 ## Practical Implications
 
-- `</reason>` inside backticks (`` `</reason>` ``) → the backtick after `>` rejects → content. ✅
-- `</reason>` followed by a newline → confirmed close. ✅
-- `</reason>` followed by `<message` → confirmed close, then `<message` starts. ✅
-- Bare `</reason>` in prose followed by a letter → rejected → content. ✅
-- `</reason>` followed by 5+ spaces → rejected (exceeds bound) → content.
+- `</reason>` inside backticks (`` `</reason>` ``) → the backtick rejects → content. ✅
+- `</reason>` at end of turn, followed by `<message` → confirmed, then `<message` starts. ✅
+- `</parameter>` followed by `</invoke>` followed by `<yield_user/>` → cascade confirms both. ✅
+- `</parameter>` followed by `<parameter name="next">` (valid next param) → confirms, opens next param. ✅
+- `</parameter>` followed by ` and more prose` → non-whitespace Content → rejected → content. ✅
+- `</parameter>` followed by another `</parameter>` → greedy last-match; earlier one absorbed as content. ✅
 
-## Bound Tradeoff
+## Without Constrained Decoding
 
-The 4-character bound is a tradeoff. A larger bound catches more edge cases but adds grammar states. A smaller bound is simpler but rejects legitimate close tags with trailing indentation. Under constrained decoding, the grammar guides the model to stay within the bound.
+The parser's tentative close mechanism is fully self-contained — it does not require the grammar to be active. The same confirmation logic applies: hold the close tentatively, confirm on a valid structural continuation, reject on anything else. This makes the parser robust across all providers.

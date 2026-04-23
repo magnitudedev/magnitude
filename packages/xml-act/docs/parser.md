@@ -15,7 +15,7 @@ graph LR
     E -->|Events| F[Consumers]
 ```
 
-- **Tokenizer** — pure XML syntax. Emits tokens (Open, Close, SelfClose, Content). No semantic awareness.
+- **Tokenizer** — pure XML syntax. Emits tokens (Open, Close, SelfClose, Content). No semantic awareness. Close tokens for known structural tag names are emitted immediately — the tokenizer does not buffer or confirm them.
 - **Resolve** — context-sensitive layer. Determines which tags are structural vs literal text based on the current stack frame. Returns a typed bound handler, or `undefined` (literal text).
 - **Handlers** — pure functions. Receive the narrowed parent frame and attributes, return `ParserOp[]` describing stack changes and events.
 - **Stack Machine** — generic state manager. Applies ops (push/pop/replace/emit/observe/done) to a frame stack.
@@ -110,6 +110,58 @@ The machine has three modes:
 - **`active`** — normal parsing. Ops are applied to the frame stack.
 - **`observing`** — entered when a yield tag fires. Tracks whether non-whitespace content appears after the yield (runaway detection). No ops applied.
 - **`done`** — terminal. Emits `TurnEnd` with termination reason (`natural` vs `runaway`).
+
+## Tentative Close
+
+Close tokens from the tokenizer are not immediately acted on. When dispatch receives a `Close` token that resolves to a handler for the current frame, it pushes a **tentative close entry** onto `pendingCloseStack` rather than executing the handler right away.
+
+```typescript
+interface PendingClose {
+  tagName: string;
+  handler: BoundCloseHandler;
+  frame: StackFrame;
+}
+```
+
+The stack is resolved when the **next token** arrives:
+
+| Next token | Action |
+|---|---|
+| Whitespace-only Content | Buffer; stay tentative |
+| Non-whitespace Content (not starting with `<`) | **Reject** — close tag becomes literal text; buffered whitespace is prepended |
+| Non-whitespace Content starting with `<` | **Confirm** (top-level frames only) — unknown open tags are tokenized as Content; `<` is still a valid structural signal |
+| Matching Close for the same frame | **Replace** — greedy last-match: discard the earlier tentative close, push a new one |
+| Cascading Close for the parent frame | **Cascade** — push a second entry; both must be confirmed together |
+| Valid structural Open or SelfClose | **Confirm** — execute all pending close handlers in order |
+| EOF | **Confirm all** — execute every pending close handler |
+
+### Greedy Last-Match
+
+For content frames (parameter, filter, reason, message), the grammar uses a recursive greedy body:
+
+```
+body ::= buc (close buc)* close continuation
+```
+
+This means a close tag is only real if followed by a valid continuation — not by more content. When the parser sees `</parameter>` and then more text, it rejects the close (the text is part of the parameter value). When it later sees another `</parameter>`, it replaces the old tentative entry. The close that ultimately confirms is the **last** one before a valid structural continuation.
+
+### Cascade
+
+When `</parameter></invoke>` appears together (as with the last parameter of an invoke), the `</invoke>` close arrives while `</parameter>` is already tentative. The parser pushes a second entry onto `pendingCloseStack`. Both entries are then confirmed or rejected together when the next token arrives. If the chain is broken (e.g. `</parameter></invoke>then some text`), the entire stack is rejected and all close tags become literal text.
+
+### Schema-Aware Continuation Validation
+
+`isValidContinuation` checks whether an incoming Open token constitutes a valid structural continuation for the top pending close:
+
+- For **invoke frames**: any `<parameter>` or `<filter>` open confirms.
+- For **parameter/filter frames**: `<parameter>` or `<filter>` (next sibling) confirms, as does `</invoke>` (cascade).
+- For **top-level frames** (reason, message): any Open tag confirms, since the grammar confirms on `<`.
+
+For parameter frames, `isValidContinuation` additionally validates that the incoming parameter name is present in the tool's schema. An unrecognized param name does not confirm — it is treated as content. This prevents false confirmation from self-referential LLM output that happens to contain a valid-looking open tag with a nonsense name.
+
+### EOF Confirmation
+
+When `end()` is called, all entries in `pendingCloseStack` are confirmed unconditionally. A model that stops generating mid-response has implicitly closed all open frames.
 
 ## Frame Mutability
 
