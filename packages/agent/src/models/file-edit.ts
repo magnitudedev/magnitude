@@ -68,7 +68,7 @@ function applyFieldUpdate(state: FileEditState, field: string, text: string): Fi
   if (field === 'path') {
     return applyProvisionalDiffs({ ...state, phase: 'streaming', path: (state.path ?? '') + text })
   }
-  if (field === 'oldString') {
+  if (field === 'old') {
     return applyProvisionalDiffs({
       ...state,
       phase: 'streaming',
@@ -76,7 +76,7 @@ function applyFieldUpdate(state: FileEditState, field: string, text: string): Fi
       streamingTarget: 'old',
     })
   }
-  if (field === 'newString') {
+  if (field === 'new') {
     return applyProvisionalDiffs({
       ...state,
       phase: 'streaming',
@@ -89,14 +89,14 @@ function applyFieldUpdate(state: FileEditState, field: string, text: string): Fi
 
 function applyReadyInputUpdate(
   state: FileEditState,
-  input: { path: string; oldString: string; newString: string; replaceAll?: boolean },
+  input: { path: string; old: string; new: string; replaceAll?: boolean },
 ): FileEditState {
   return applyProvisionalDiffs({
     ...state,
     phase: 'streaming',
     path: input.path,
-    oldText: input.oldString,
-    newText: input.newString,
+    oldText: input.old,
+    newText: input.new,
     replaceAll: input.replaceAll ?? false,
     streamingTarget: state.streamingTarget,
   })

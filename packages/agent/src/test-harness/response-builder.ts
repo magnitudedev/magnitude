@@ -42,13 +42,13 @@ export class ResponseBuilder {
     return this
   }
 
-  spawnWorker(id: string, role: string, message: string): this {
-    this.tools.push(xmlInvoke('spawn_worker', { id, role }, message))
+  spawnWorker(id: string, message: string): this {
+    this.tools.push(xmlInvoke('spawn_worker', { id }, message))
     return this
   }
 
-  createTask(id: string, type: string, title: string, parent?: string): this {
-    const params: ToolParams = { id, type, title }
+  createTask(id: string, title: string, parent?: string): this {
+    const params: ToolParams = { id, title }
     if (parent) params.parent = parent
     this.tools.push(xmlInvoke('create_task', params))
     return this
@@ -70,7 +70,7 @@ export class ResponseBuilder {
   }
 
   createAgent(agentId: string, type: string, title: string, message: string): this {
-    return this.tool('agent_create', { id: agentId, type, title, message })
+    return this.tool('agent_create', { agentId, type, title, message })
   }
 
   writeArtifact(id: string, content: string): this {

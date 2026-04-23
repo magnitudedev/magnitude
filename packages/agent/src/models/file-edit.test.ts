@@ -40,14 +40,14 @@ describe('fileEditModel provisional diffs', () => {
     })
     state = fileEditModel.reduce(state, {
       _tag: 'ToolInputFieldChunk',
-      field: 'oldString',
-      path: ['oldString'] as unknown as never,
+      field: 'old',
+      path: ['old'] as unknown as never,
       delta: 'old',
     })
     state = fileEditModel.reduce(state, {
       _tag: 'ToolInputFieldChunk',
-      field: 'newString',
-      path: ['newString'] as unknown as never,
+      field: 'new',
+      path: ['new'] as unknown as never,
       delta: 'new',
     })
 
@@ -84,8 +84,8 @@ describe('fileEditModel provisional diffs', () => {
 
     let state = fileEditModel.reduce(started, {
       _tag: 'ToolInputFieldChunk',
-      field: 'oldString',
-      path: ['oldString'] as unknown as never,
+      field: 'old',
+      path: ['old'] as unknown as never,
       delta: 'wrong-old',
     })
 
@@ -93,8 +93,8 @@ describe('fileEditModel provisional diffs', () => {
       _tag: 'ToolInputReady',
       input: {
         path: 'f.ts',
-        oldString: 'old',
-        newString: 'new',
+        old: 'old',
+        new: 'new',
         replaceAll: false,
       },
     })

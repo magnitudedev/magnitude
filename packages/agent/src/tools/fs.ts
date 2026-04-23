@@ -125,15 +125,15 @@ export const writeTool = defineTool({
 
 export const editTool = defineTool({
   name: 'edit',
-  description: 'Edit a file by replacing exact text. The <old> content must match the file exactly. Read the file first. Use this instead of running sed, perl, or awk in the shell.',
+  description: 'Edit a file by replacing exact text. The "old" parameter content must match the file exactly. Read the file first. Use this instead of running sed, perl, or awk in the shell.',
   inputSchema: Schema.Struct({
     path: Schema.String.annotations({
       description: 'Relative path from cwd'
     }),
-    oldString: Schema.String.annotations({
+    old: Schema.String.annotations({
       description: 'Exact text to find in the file'
     }),
-    newString: Schema.String.annotations({
+    new: Schema.String.annotations({
       description: 'Replacement text'
     }),
     replaceAll: Schema.optional(Schema.Boolean.annotations({
@@ -164,7 +164,7 @@ export const editTool = defineTool({
     }),
   },
   label: (input) => input.path ? `Editing ${input.path}` : 'Editing file...',
-  execute: ({ path, oldString, newString, replaceAll }, _ctx) => Effect.gen(function* () {
+  execute: ({ path, old: oldStr, new: newStr, replaceAll }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const fs = yield* Fs
     const expandedPath = expandWorkspacePath(path, workspacePath)
@@ -176,7 +176,7 @@ export const editTool = defineTool({
 
     let applied
     try {
-      applied = validateAndApply(content, oldString, newString, replaceAll ?? false)
+      applied = validateAndApply(content, oldStr, newStr, replaceAll ?? false)
     } catch (e) {
       return yield* Effect.fail(fsError(e instanceof Error ? e.message : String(e)))
     }
@@ -216,28 +216,25 @@ export const treeTool = defineTool({
     path: Schema.String.annotations({
       description: 'Relative path from cwd'
     }),
-    options: Schema.optional(Schema.Struct({
-      recursive: Schema.optional(Schema.Boolean.annotations({
-        description: 'Include subdirectories (default: true)'
-      })),
-      maxDepth: Schema.optional(Schema.Number.annotations({
-        description: 'Maximum depth to traverse'
-      })),
-      gitignore: Schema.optional(Schema.Boolean.annotations({
-        description: 'Respect .gitignore patterns (default: true)'
-      }))
-    }))
+    recursive: Schema.optional(Schema.Boolean.annotations({
+      description: 'Include subdirectories (default: true)'
+    })),
+    maxDepth: Schema.optional(Schema.Number.annotations({
+      description: 'Maximum depth to traverse'
+    })),
+    gitignore: Schema.optional(Schema.Boolean.annotations({
+      description: 'Respect .gitignore patterns (default: true)'
+    })),
   }),
   outputSchema: Schema.Array(TreeEntry),
   errorSchema: FsErrorSchema,
   label: (input) => input.path ? `Listing ${input.path}` : 'Listing directory...',
-  execute: ({ path, options }, _ctx) => Effect.gen(function* () {
+  execute: ({ path, gitignore, maxDepth }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const fs = yield* Fs
     const expandedPath = expandWorkspacePath(path, workspacePath)
     const fullPath = resolve(cwd, expandedPath)
-    const respectGitignore = options?.gitignore ?? true
-    const maxDepth = options?.maxDepth
+    const respectGitignore = gitignore ?? true
 
     const entries = yield* fs.walk(fullPath, { maxDepth, respectGitignore }).pipe(
       Effect.catchAll(() => Effect.fail(fsError(`Failed to list ${path}`)))
@@ -280,21 +277,16 @@ export const grepTool = defineTool({
     limit: Schema.optional(Schema.Number.annotations({
       description: 'Maximum number of matches to return (default: 50)'
     })),
-    options: Schema.optional(Schema.Struct({
-      path: Schema.optional(Schema.String),
-      glob: Schema.optional(Schema.String),
-      limit: Schema.optional(Schema.Number),
-    })),
   }),
   outputSchema: Schema.Array(SearchMatch),
   errorSchema: FsErrorSchema,
   label: (input) => input.pattern ? `Searching for ${input.pattern}` : 'Searching files...',
-  execute: ({ pattern, path, glob, limit, options }, _ctx) => Effect.gen(function* () {
+  execute: ({ pattern, path, glob, limit }, _ctx) => Effect.gen(function* () {
     const { cwd, workspacePath } = yield* WorkingDirectoryTag
     const fs = yield* Fs
-    const resolvedPath = expandWorkspacePath(path ?? options?.path ?? '', workspacePath) || undefined
-    const resolvedGlob = glob ?? options?.glob
-    const resolvedLimit = limit ?? options?.limit ?? 50
+    const resolvedPath = expandWorkspacePath(path ?? '', workspacePath) || undefined
+    const resolvedGlob = glob
+    const resolvedLimit = limit ?? 50
 
     const searchPath = resolvedPath
       ? resolve(cwd, resolvedPath)

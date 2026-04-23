@@ -64,7 +64,7 @@ export function validateAndApply(
   replaceAll: boolean,
 ): AppliedEdit {
   if (oldStr.length === 0) {
-    throw new Error('<old> content must not be empty.')
+    throw new Error('"old" parameter content must not be empty.')
   }
 
   const occurrences = countOccurrences(content, oldStr)
@@ -76,12 +76,12 @@ export function validateAndApply(
     // when the matched content is at file boundaries.
     const virtualResult = tryVirtualMatch(content, oldStr, newStr, replaceAll)
     if (virtualResult) return virtualResult
-    throw new Error('<old> content not found in file. Ensure it matches the file exactly.')
+    throw new Error('"old" parameter content not found in file. Ensure it matches the file exactly.')
   }
 
   if (!replaceAll && occurrences > 1) {
     throw new Error(
-      `<old> content matches ${occurrences} locations in the file. ` +
+      `"old" parameter content matches ${occurrences} locations in the file. ` +
       `Include more surrounding context to make the match unique, or use replaceAll="true".`
     )
   }
@@ -152,7 +152,7 @@ function tryVirtualMatch(
 
   if (matches.length > 1 && !replaceAll) {
     throw new Error(
-      `<old> content matches ${matches.length} locations in the file. ` +
+      `"old" parameter content matches ${matches.length} locations in the file. ` +
       `Include more surrounding context to make the match unique, or use replaceAll="true".`,
     )
   }

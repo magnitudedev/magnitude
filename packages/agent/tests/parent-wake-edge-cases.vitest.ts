@@ -15,7 +15,7 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: `<agent-create id="error-sub" type="explorer"><title>err</title><message>go</message></agent-create>\n${YIELD_USER}`,
+              xml: `<invoke tool="agent_create">\n<parameter name="agentId">error-sub</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">err</parameter>\n<parameter name="message">go</parameter>\n</invoke>\n${YIELD_USER}`,
             }
           }
           return { xml: YIELD_USER }
@@ -61,7 +61,7 @@ describe('parent wake edge cases', () => {
           rootTurns += 1
           if (rootTurns === 1) {
             return {
-              xml: `<agent-create id="kill-sub" type="explorer"><title>will be killed</title><message>do work</message></agent-create>\n${YIELD_USER}`,
+              xml: `<invoke tool="agent_create">\n<parameter name="agentId">kill-sub</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">will be killed</parameter>\n<parameter name="message">do work</parameter>\n</invoke>\n${YIELD_USER}`,
             }
           }
           return { xml: YIELD_USER }

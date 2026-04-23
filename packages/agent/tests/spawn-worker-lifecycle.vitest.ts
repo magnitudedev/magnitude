@@ -9,22 +9,22 @@ describe('spawn-worker lifecycle integration', () => {
 
       // Turn 1 (root): create task
       yield* h.script.next({
-        xml: '<create-task id="flow-task" title="Flow task"/><idle/>',
+        xml: '<invoke tool="create_task">\n<parameter name="id">flow-task</parameter>\n<parameter name="title">Flow task</parameter>\n</invoke>\n<yield_user/>',
       }, null)
 
       // Turn 2 (root): spawn worker with initial instructions
       yield* h.script.next({
-        xml: '<spawn-worker id="flow-task" role="builder">Write output.txt with content "hello"</spawn-worker><idle/>',
+        xml: '<invoke tool="spawn_worker">\n<parameter name="id">flow-task</parameter>\n<parameter name="message">Write output.txt with content "hello"</parameter>\n</invoke>\n<yield_user/>',
       }, null)
 
       // Turn 3 (worker): execute tool + respond to parent
       yield* h.script.next({
-        xml: '<write path="output.txt">hello</write><message to="parent">done</message><idle/>',
+        xml: '<invoke tool="write">\n<parameter name="path">output.txt</parameter>\n<parameter name="content">hello</parameter>\n</invoke>\n<message to="parent">done</message>\n<yield_parent/>',
       })
 
       // Turn 4 (root): follow-up to user
       yield* h.script.next({
-        xml: '<message to="user">received</message><idle/>',
+        xml: '<message to="user">received</message>\n<yield_user/>',
       }, null)
 
       yield* h.user('run spawn-worker lifecycle flow')

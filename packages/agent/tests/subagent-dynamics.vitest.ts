@@ -13,7 +13,7 @@ describe('subagent dynamics', () => {
         Effect.flatMap(MockTurnScriptTag, (s) =>
           s.enqueue(
             {
-              xml: '<agent-create id="test-explorer" type="explorer"><title>test</title><message>do something</message></agent-create><idle/>',
+              xml: '<invoke tool="agent_create">\n<parameter name="agentId">test-explorer</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">test</parameter>\n<parameter name="message">do something</parameter>\n</invoke>\n<yield_user/>',
             },
             null,
           ),
@@ -44,7 +44,7 @@ describe('subagent dynamics', () => {
           s.setResolver(({ forkId }) => {
             if (forkId === null) {
               return {
-                xml: '<agent-create id="test-explorer" type="explorer"><title>test</title><message>do something</message></agent-create><idle/>',
+                xml: '<invoke tool="agent_create">\n<parameter name="agentId">test-explorer</parameter>\n<parameter name="type">explorer</parameter>\n<parameter name="title">test</parameter>\n<parameter name="message">do something</parameter>\n</invoke>\n<yield_user/>',
               }
             }
 

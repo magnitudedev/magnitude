@@ -29,12 +29,14 @@ const AgentErrorSchema = ToolErrorSchema('AgentError', {})
 // =============================================================================
 
 /** Execute logic for agent_create */
-function executeAgentCreate({ agentId, options }: {
+function executeAgentCreate({ agentId, type, title, message }: {
   agentId: string;
-  options: { type: string; title: string; message: string };
+  type: string;
+  title: string;
+  message: string;
 }) {
   return Effect.gen(function* () {
-    const { type: agentType, title, message } = options
+    const agentType = type
 
     const normalizedType = agentType.toLowerCase()
     const spawnable = getSpawnableVariants()
@@ -84,11 +86,9 @@ export const agentCreateTool = defineTool({
   description: 'Create a new agent and dispatch it with a title and message.',
   inputSchema: Schema.Struct({
     agentId: Schema.String.annotations({ description: 'Unique agent ID. Must be prefixed with the type (e.g. explorer-auth, builder-api)' }),
-    options: Schema.Struct({
-      type: Schema.String.annotations({ description: 'Agent type: explorer, planner, builder, reviewer, debugger, browser' }),
-      title: Schema.String.annotations({ description: 'Concise title of what this agent should accomplish' }),
-      message: Schema.String.annotations({ description: 'Detailed message/instructions for the agent' }),
-    }),
+    type: Schema.String.annotations({ description: 'Agent type: explorer, planner, builder, reviewer, debugger, browser' }),
+    title: Schema.String.annotations({ description: 'Concise title of what this agent should accomplish' }),
+    message: Schema.String.annotations({ description: 'Detailed message/instructions for the agent' }),
   }),
   outputSchema: Schema.Struct({ agentId: Schema.String, forkId: Schema.String }),
   errorSchema: AgentErrorSchema,

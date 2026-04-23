@@ -5,7 +5,10 @@
  * - What parameters a tool accepts
  * - Each parameter's type (scalar or json)
  * - Whether each parameter is required
- * - Field paths (supports dotted paths for nested fields)
+ *
+ * Top-level scalar fields become individual parameters by name.
+ * Top-level complex fields (nested structs, arrays) become a single json parameter.
+ * No dotted-path recursion into nested structs.
  *
  * This replaces the old binding-validator approach. No manual binding needed —
  * the schema has all the information.
@@ -140,7 +143,7 @@ function isComplexType(ast: AST.AST): boolean {
 // =============================================================================
 
 export interface ParameterSchema {
-  /** Parameter name (may be dotted like 'options.type') */
+  /** Parameter name (top-level field name only, no dotted paths) */
   readonly name: string
   /** Parameter type — scalar types are raw text, json types are parsed */
   readonly type: ScalarType | 'json'
@@ -161,14 +164,14 @@ export interface ToolSchema {
 
 /**
  * Derive parameter schema from a tool's input schema AST.
- * Walks top-level properties and nested structs to build the parameter map.
+ * Walks top-level properties to build the parameter map.
  *
  * Rules:
  * - Each top-level property becomes a parameter with name = property name
- * - Nested struct properties become dotted parameters (e.g., 'options.type')
  * - Scalar types (string, number, boolean, enum) → type is the scalar type
- * - Complex types (object, array) → type is 'json'
+ * - Complex types (object, array, nested struct) → type is 'json'
  * - Required/optional derived from schema
+ * - No dotted-path recursion into nested structs
  */
 export function deriveParameters(schemaAst: AST.AST, prefix?: string): ToolSchema {
   const parameters = new Map<string, ParameterSchema>()
@@ -201,19 +204,12 @@ export function deriveParameters(schemaAst: AST.AST, prefix?: string): ToolSchem
         }
 
         if (typeToInspect._tag === 'TypeLiteral') {
-          // Nested struct — recurse with dotted prefix
-          // Only recurse if the struct has properties; otherwise treat as json
-          const nestedProps = getPropertySignatures(typeToInspect)
-          if (nestedProps.length > 0) {
-            walkProperties(typeToInspect, fullName)
-          } else {
-            // Empty struct — treat as json
-            parameters.set(fullName, {
-              name: fullName,
-              type: 'json',
-              required: !prop.isOptional,
-            })
-          }
+          // Nested struct — treat as single json param (do NOT recurse into dotted paths)
+          parameters.set(fullName, {
+            name: fullName,
+            type: 'json',
+            required: !prop.isOptional,
+          })
         } else {
           // Array or other complex type — treat as json
           parameters.set(fullName, {

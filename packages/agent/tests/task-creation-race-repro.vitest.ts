@@ -11,8 +11,8 @@ describe('task creation + spawn-worker', () => {
       // Turn 1: create task AND spawn worker in the SAME turn
       yield* h.script.next(
         response()
-          .createTask('my-task', 'builder', 'My task')
-          .spawnWorker('my-task', 'builder', 'Do the work')
+          .createTask('my-task', 'My task')
+          .spawnWorker('my-task', 'Do the work')
           .message('Created task and spawned worker.')
           .yield()
       )
