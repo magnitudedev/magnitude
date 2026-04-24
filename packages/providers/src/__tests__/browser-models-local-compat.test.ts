@@ -15,7 +15,7 @@ describe('isBrowserCompatible local provider matching', () => {
   })
 
   test('does not change non-local behavior', () => {
-    expect(isBrowserCompatible('openai', 'gpt-5.2-codex')).toBe(true)
+    expect(isBrowserCompatible('openai', 'gpt-5.5')).toBe(true)
     expect(isBrowserCompatible('openai', 'gpt-4.1-mini')).toBe(false)
   })
 })

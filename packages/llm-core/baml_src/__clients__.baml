@@ -43,7 +43,7 @@ client<llm> CerebrasGLM {
   provider openai-generic
   options {
     base_url "https://api.cerebras.ai/v1"
-    model "zai-glm-4.7"
+    model "zai-glm-5.1"
     api_key env.CEREBRAS_API_KEY
     temperature 1.0
   }

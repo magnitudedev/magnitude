@@ -99,13 +99,13 @@ describe('resolveLocalWizardSlotDefaults', () => {
 
   test('does not overwrite existing saved slot assignments when defaults are not explicitly applied', () => {
     const existing = {
-      lead: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
-      explorer: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
-      planner: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
-      builder: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
-      reviewer: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
-      debugger: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
-      browser: { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4.6' },
+      lead: { providerId: 'openrouter', modelId: 'z-ai/glm-5.1' },
+      explorer: { providerId: 'openrouter', modelId: 'moonshotai/kimi-k2.6' },
+      planner: { providerId: 'openrouter', modelId: 'moonshotai/kimi-k2.6' },
+      builder: { providerId: 'openrouter', modelId: 'moonshotai/kimi-k2.6' },
+      reviewer: { providerId: 'openrouter', modelId: 'moonshotai/kimi-k2.6' },
+      debugger: { providerId: 'openrouter', modelId: 'moonshotai/kimi-k2.6' },
+      browser: { providerId: 'openrouter', modelId: 'moonshotai/kimi-k2.6' },
     }
 
     const result = resolveLocalWizardSlotDefaults({

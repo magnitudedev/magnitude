@@ -23,7 +23,7 @@ describe('catalog source merge order', () => {
     const merged = mergeProviderModels(
       [],
       [
-        model('accounts/fireworks/routers/kimi-k2p5-turbo'),
+        model('accounts/fireworks/models/kimi-k2p6'),
         model('accounts/fireworks/models/glm-5p1', { name: 'Static GLM' }),
       ],
       [
@@ -35,7 +35,7 @@ describe('catalog source merge order', () => {
       ],
     )
 
-    expect(merged.some((entry) => entry.id === 'accounts/fireworks/routers/kimi-k2p5-turbo')).toBe(true)
+    expect(merged.some((entry) => entry.id === 'accounts/fireworks/models/kimi-k2p6')).toBe(true)
     expect(merged.find((entry) => entry.id === 'accounts/fireworks/models/glm-5p1')?.name).toBe('Live GLM')
   })
 

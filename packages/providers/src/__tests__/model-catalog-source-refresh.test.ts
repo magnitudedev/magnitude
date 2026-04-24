@@ -52,7 +52,7 @@ describe('ModelCatalog source refresh', () => {
         priority: 0,
         supports: (provider) => provider.id === 'fireworks-ai',
         refresh: () => Effect.succeed([
-          model('accounts/fireworks/routers/kimi-k2p5-turbo'),
+          model('accounts/fireworks/models/kimi-k2p6'),
         ]),
       },
       {
@@ -82,7 +82,7 @@ describe('ModelCatalog source refresh', () => {
     await Effect.runPromise(catalog.refresh())
     const models = await Effect.runPromise(catalog.getModels(fireworks.id))
 
-    expect(models.some((entry) => entry.id === 'accounts/fireworks/routers/kimi-k2p5-turbo')).toBe(true)
+    expect(models.some((entry) => entry.id === 'accounts/fireworks/models/kimi-k2p6')).toBe(true)
   })
 
   it('overlays successful source layers in priority order', async () => {

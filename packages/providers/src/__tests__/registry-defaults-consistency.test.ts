@@ -1,38 +1,36 @@
 import { describe, it, expect } from 'vitest'
 import type { MagnitudeSlot } from '@magnitudedev/agent'
 
-type TestSlot = 'lead' | 'worker' | 'browser'
+type TestSlot = 'lead' | 'worker'
 import { getProvider, getStaticProviderModels } from '../registry'
 
 const rest = (model: string): Record<TestSlot, string> => ({
   lead: model,
   worker: model,
-  browser: model,
 })
 
-const tiered = (lead: string, sub: string, browser: string): Record<TestSlot, string> => ({
+const tiered = (lead: string, worker: string): Record<TestSlot, string> => ({
   lead,
-  worker: sub,
-  browser,
+  worker,
 })
 
 const MODEL_DEFAULTS: Record<string, Record<TestSlot, string>> = {
-  'anthropic': tiered('claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'),
-  'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
-  'openrouter': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'),
-  'vercel': tiered('anthropic/claude-opus-4.6', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-haiku-4.5'),
+  'anthropic': tiered('claude-opus-4-7', 'claude-sonnet-4-6'),
+  'openai': rest('gpt-5.5'),
+  'openrouter': tiered('z-ai/glm-5.1', 'moonshotai/kimi-k2.6'),
+  'vercel': tiered('zai/glm-5.1', 'moonshotai/kimi-k2.6'),
   'cerebras': rest('gpt-oss-120b'),
   'minimax': rest('MiniMax-M2.7'),
-  'zai': rest('glm-4.7'),
-  'zai-coding-plan': rest('glm-4.7'),
-  'moonshotai': rest('kimi-k2.5'),
-  'kimi-for-coding': rest('k2p5'),
-  'fireworks-ai': rest('accounts/fireworks/routers/kimi-k2p5-turbo'),
-  'magnitude': tiered('glm-5.1', 'kimi-k2.6', 'kimi-k2.6'),
+  'zai': rest('glm-5.1'),
+  'zai-coding-plan': rest('glm-5.1'),
+  'moonshotai': rest('kimi-k2.6'),
+  'kimi-for-coding': rest('k2p6'),
+  'fireworks-ai': rest('accounts/fireworks/models/kimi-k2p6'),
+  'magnitude': tiered('glm-5.1', 'kimi-k2.6'),
 }
 
 const MODEL_OAUTH_DEFAULTS: Record<string, Record<TestSlot, string>> = {
-  'openai': tiered('gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex'),
+  'openai': rest('gpt-5.5'),
 }
 
 describe('MODEL_DEFAULTS consistency with static registry', () => {
@@ -50,10 +48,10 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
 
     const staticModels = getStaticProviderModels('fireworks-ai')
     expect(staticModels.map((model) => model.id)).toEqual([
-      'accounts/fireworks/routers/kimi-k2p5-turbo',
+      'accounts/fireworks/models/kimi-k2p6',
       'accounts/fireworks/models/glm-5p1',
     ])
-    expect(staticModels.some((model) => model.id === 'accounts/fireworks/routers/kimi-k2p5-turbo')).toBe(true)
+    expect(staticModels.some((model) => model.id === 'accounts/fireworks/models/kimi-k2p6')).toBe(true)
   })
 
   it('registers Magnitude with static OpenAI-compatible API-key config', () => {
@@ -70,7 +68,6 @@ describe('MODEL_DEFAULTS consistency with static registry', () => {
 
     const staticModels = getStaticProviderModels('magnitude')
     expect(staticModels.map((model) => model.id)).toEqual([
-      'qwen3.6-plus',
       'glm-4.7',
       'glm-5',
       'glm-5.1',

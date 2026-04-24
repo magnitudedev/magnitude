@@ -21,49 +21,48 @@ function rule(
 
 const ALL_SLOTS = ['lead', 'worker'] as const
 const SUBAGENT_SLOTS = ['worker'] as const
-const NON_BROWSER_SLOTS = ['lead', 'worker'] as const
-const SUBAGENT_AND_BROWSER = ['worker'] as const
 
 export const MODEL_RECOMMENDATION_RULES: ModelRecommendationRule[] = [
-  // Anthropic
-  rule(/^claude-opus-4[.-]6(-v1:0)?$/, ['lead']),
-  rule(/^claude-sonnet-4[.-]6(-v1:0)?$/, [...SUBAGENT_AND_BROWSER]),
-  rule(/^claude-haiku-4[.-]5(-v1:0)?$/, ['browser']),
+  // OpenRouter
+  rule(/^glm-5\.1$/, [...ALL_SLOTS], 'openrouter'),
+  rule(/^kimi-k2\.6$/, [...ALL_SLOTS], 'openrouter'),
+  rule(/^deepseek-v4-pro$/, [...SUBAGENT_SLOTS], 'openrouter'),
 
-  // OpenAI
-  rule(/^gpt-5\.4$/, ['lead']),
-  rule(/^gpt-5\.3-codex$/, [...SUBAGENT_AND_BROWSER]),
+  // Vercel
+  rule(/^glm-5\.1$/, [...ALL_SLOTS], 'vercel'),
+  rule(/^kimi-k2\.6$/, [...ALL_SLOTS], 'vercel'),
+  rule(/^deepseek-v4-pro$/, [...SUBAGENT_SLOTS], 'vercel'),
 
-  // Qwen
-  rule(/^qwen3\.5-(397b-a17b|max-thinking|coder-next)$/, [...NON_BROWSER_SLOTS]),
-  rule(/^qwen3\.5-27b$/, [...SUBAGENT_AND_BROWSER]),
-  rule(/^qwen3\.5-9b$/, ['browser']),
+  // Anthropic (direct provider only)
+  rule(/^claude-opus-4[.-]7(-v1:0)?$/, ['lead'], 'anthropic'),
+  rule(/^claude-sonnet-4[.-]6(-v1:0)?$/, [...SUBAGENT_SLOTS], 'anthropic'),
+  rule(/^claude-haiku-4[.-]5(-v1:0)?$/, [...SUBAGENT_SLOTS], 'anthropic'),
+
+  // OpenAI (direct provider only)
+  rule(/^gpt-5\.5$/, [...ALL_SLOTS], 'openai'),
 
   // ZAI standard
-  rule(/^glm-4\.7$/, [...ALL_SLOTS], 'zai'),
-  rule(/^glm-5$/, ['lead'], 'zai'),
-  rule(/^glm-4\.7-flash$/, ['browser'], 'zai'),
+  rule(/^glm-5\.1$/, [...ALL_SLOTS], 'zai'),
 
   // ZAI Coding Plan
-  rule(/^glm-4\.7$/, [...ALL_SLOTS], 'zai-coding-plan'),
-  rule(/^glm-5\.1$/, ['lead'], 'zai-coding-plan'),
-  rule(/^glm-4\.7-flash$/, ['browser'], 'zai-coding-plan'),
+  rule(/^glm-5\.1$/, [...ALL_SLOTS], 'zai-coding-plan'),
 
-  // MiniMax
-  rule(/^MiniMax-M2\.7$/, [...ALL_SLOTS]),
+  // MiniMax (direct provider only)
+  rule(/^MiniMax-M2\.7$/, [...ALL_SLOTS], 'minimax'),
 
   // Moonshot
-  rule(/^kimi-k2\.5$/, [...ALL_SLOTS], 'moonshotai'),
-  rule(/^k2p5$/, [...ALL_SLOTS], 'kimi-for-coding'),
+  rule(/^kimi-k2\.6$/, [...ALL_SLOTS], 'moonshotai'),
+
+  // Kimi-for-coding
+  rule(/^k2p6$/, [...ALL_SLOTS], 'kimi-for-coding'),
 
   // Magnitude
   rule(/^glm-5\.1$/, ['lead'], 'magnitude'),
-  rule(/^kimi-k2\.5$/, [...SUBAGENT_AND_BROWSER], 'magnitude'),
-  rule(/^kimi-k2\.6$/, [...SUBAGENT_AND_BROWSER], 'magnitude'),
+  rule(/^kimi-k2\.6$/, [...SUBAGENT_SLOTS], 'magnitude'),
 
   // Fireworks
   rule(/^accounts\/fireworks\/models\/glm-5p1$/, [...ALL_SLOTS], 'fireworks-ai'),
-  rule(/^accounts\/fireworks\/routers\/kimi-k2p5-turbo$/, [...ALL_SLOTS], 'fireworks-ai'),
+  rule(/^accounts\/fireworks\/models\/kimi-k2p6$/, [...ALL_SLOTS], 'fireworks-ai'),
 
   // Local intentionally omitted: recommendations depend on user-local inventory
 ]

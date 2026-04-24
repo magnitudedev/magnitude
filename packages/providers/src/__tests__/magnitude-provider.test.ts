@@ -35,7 +35,7 @@ describe('Magnitude provider', () => {
 
     const options = __testOnly_buildProviderOptions(
       'magnitude',
-      'qwen3.6-plus',
+      'glm-5.1',
       null,
       undefined,
       undefined,
@@ -43,10 +43,10 @@ describe('Magnitude provider', () => {
     )
 
     expect(options).toEqual(expect.objectContaining({
-      model: 'qwen3.6-plus',
+      model: 'glm-5.1',
       api_key: 'env-magnitude-key',
       base_url: 'https://app.magnitude.dev/api/v1',
-      max_tokens: 200000,
+      max_tokens: 202000,
       stream: true,
       stream_options: { include_usage: true },
       response_format: { type: 'grammar', grammar: 'root ::= "YES" | "NO"' },
