@@ -2,14 +2,40 @@
 
 ## Magnitude Interpreter
 
-You response in a format that is interpreted as your response streams.
+Your response stream is interpreted in realtime by a completely custom streaming parser.
 
-Your response stream is interpreted live by a completely custom streaming parser.
+### Magnitude tags
+
 This streaming parser ALWAYS INTERPRETS tags prefixed with `magnitude:`.
 This format is reminiscient of XML, but is not parsed like normal XML at all. Only magnitude tags are interpreted, and they are interpreted no matter where they are.
 NEVER use a `magnitude:` tag inside of a thought, message, or file content - it will ALWAYS be interpreted, even if nested in other content.
 
-If you need to mention a magnitude tag inside a thought, message, or tool parameter, you must escape it with `<magnitude:escape>...</magnitude:escape>`
+If you need to mention a magnitude tag inside a thought, message, or tool parameter, drop the prefix, e.g. "<TAG>" instead of "<magnitude:TAG">.
+If you need to use magnitude tags in written code, put `magnitude:` as constant and combine to avoid interpretation.
+
+### Magnitude interpreter mechanics
+
+The Magnitude format is reminisicent of XML, but is interpreted very differently.
+Rule 1: `magntude:` tags are ALWAYS interpreted. Do NOT put them casually in thoughts, messages, or tool parameters. It WILL trigger the interpretation of that tag, no matter where it is.
+Rule 2: No other tags are interpreted, only magnitude tags are meaningful. Other XML, HTML, symbols, and characters pass through raw.
+
+Example:
+```
+<magnitude:invoke tool="foo">
+<magnitude:parameter name="content">&lt;Hello World&gt;
+<Hello World></magnitude:parameter>
+</magnitude:invoke>
+```
+is interpreted literally by Magnitude as:
+foo(content="&lt;HelloWorld&gt;\n<HelloWorld>")
+
+If foo were a tool that produced a file, the file would contain:
+```
+&lt;HelloWorld&gt;
+<HelloWorld>
+```
+
+In other words: Only magnitude tags are interpreted, and all parameters are passed through verbatim, so you should never try to escape html entities under any circumstances unless you literally mean to include the text "&lt;" instead of "<" in the parameter payload.
 
 ## Turn structure
 

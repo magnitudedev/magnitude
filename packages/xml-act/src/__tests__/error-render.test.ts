@@ -21,7 +21,7 @@ describe('renderParseError', () => {
     expect(result).toContain('Unrecognized tag <magnitude:foo> at the top level.')
     expect(result).toContain('2|<magnitude:foo>bar</magnitude:foo>')
     expect(result).toContain('Hints:')
-    expect(result).toContain('magnitude:escape')
+    expect(result).toContain('Only valid magnitude tags are recognized at the top level')
   })
 
   it('renders InvalidMagnitudeOpen inside invoke', () => {

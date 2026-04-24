@@ -88,7 +88,7 @@ export function renderParseError(
   const tag = event.error._tag as ParseErrorDetail['_tag']
   const catalog = ERROR_CATALOG[tag] as ErrorPresentation<ParseErrorDetail>
   const headline = catalog.headline(event.error)
-  const hints = catalog.hints
+  const hints = catalog.hints(event.error)
   const strategy = catalog.snippetStrategy
 
   const anchor = getAnchor(event)

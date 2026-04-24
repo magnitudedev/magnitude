@@ -92,12 +92,12 @@ function getParentTagName(frame: Frame): string | undefined {
 
 function invalidMagnitudeOpenDetail(raw: string, top: Frame): string {
   if (top.type === 'prose') {
-    return `Unknown tag ${raw} at top level. Did you mean to invoke a tool? To include literal markup, use <magnitude:escape>.`
+    return `Unknown tag ${raw} at top level. Did you mean to invoke a tool?`
   }
   if (top.type === 'invoke') {
-    return `Invalid tag ${raw} inside magnitude:invoke. Did you mean <magnitude:parameter name="...">? To include literal markup, wrap the parent in <magnitude:escape>.`
+    return `Invalid tag ${raw} inside magnitude:invoke. Did you mean <magnitude:parameter name="...">?`
   }
-  return `Invalid tag ${raw} inside ${getParentTagName(top)}. Nested magnitude: tags are not allowed here. To include literal markup, use <magnitude:escape>.`
+  return `Invalid tag ${raw} inside ${getParentTagName(top)}. Nested magnitude: tags are not allowed here.`
 }
 
 function absorbInvalidSubtreeToken(ctx: ParserLoopContext, token: Token): void {
@@ -515,7 +515,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           tagName: token.tagName,
           expectedTagName: getCanonicalClose(top).replace('magnitude:', ''),
           raw: tokenRaw(token),
-          detail: `Close tag ${tokenRaw(token)} does not match the current ${getParentTagName(top)} block. Did you mean </${getCanonicalClose(top)}>? To include literal markup, use <magnitude:escape>.`,
+          detail: `Close tag ${tokenRaw(token)} does not match the current ${getParentTagName(top)} block. Did you mean </${getCanonicalClose(top)}>?`,
         })])
         ctx.machine.apply(onContent(top, tokenRaw(token)))
       } else {

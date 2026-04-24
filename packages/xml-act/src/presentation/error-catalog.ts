@@ -18,7 +18,7 @@ import type {
 
 export interface ErrorPresentation<E = unknown> {
   headline: (error: E) => string
-  hints: string[]
+  hints: (error: E) => string[]
   snippetStrategy: 'point' | 'block'
 }
 
@@ -28,6 +28,8 @@ type ErrorCatalog = {
 
 const asTag = (tagName: string) => `<${tagName}>`
 const asCloseTag = (tagName: string) => `</${tagName}>`
+const stripPrefix = (tagName: string) =>
+  tagName.startsWith('magnitude:') ? tagName.slice('magnitude:'.length) : tagName
 
 export const ERROR_CATALOG: ErrorCatalog = {
   InvalidMagnitudeOpen: {
@@ -40,10 +42,42 @@ export const ERROR_CATALOG: ErrorCatalog = {
       }
       return `Invalid nested tag ${error.raw} inside ${asTag(error.parentTagName)}. Magnitude tags cannot be nested.`
     },
-    hints: [
-      'Tags with the magnitude: prefix are always structural — they cannot appear as literal content.',
-      'Use <magnitude:escape> to include literal magnitude markup.',
-    ],
+    hints: (error) => {
+      const base = 'Tags with the magnitude: prefix are ALWAYS interpreted, no matter where they appear.'
+      switch (error.parentTagName) {
+        case 'magnitude:reason':
+          return [
+            base,
+            `You are not allowed to use magnitude: tags inside a reason block. Drop the prefix when reasoning about a tag — write ${asTag(stripPrefix(error.tagName))} instead of ${error.raw}.`,
+          ]
+        case 'magnitude:message':
+          return [
+            base,
+            `You are not allowed to use magnitude: tags inside a message. Drop the prefix when referring to a tag — write ${asTag(stripPrefix(error.tagName))} instead of ${error.raw}.`,
+          ]
+        case 'magnitude:parameter':
+          return [
+            base,
+            `You are not allowed to use magnitude: tags inside a parameter value. Drop the prefix when discussing the tag — write ${asTag(stripPrefix(error.tagName))} instead of ${error.raw}.`,
+            `If you need the literal text "magnitude:" inside written code, build it from a constant (e.g. \`const PREFIX = "magnitude:"\`) and concatenate at runtime.`,
+          ]
+        case 'magnitude:invoke':
+          return [
+            'Only <magnitude:parameter name="..."> and <magnitude:filter> are allowed inside <magnitude:invoke>.',
+            'Move plain text or other content outside the tool call.',
+          ]
+        case 'magnitude:filter':
+          return [
+            'A <magnitude:filter> body must be a JSONPath string only — no nested tags.',
+          ]
+        default:
+          return [
+            base,
+            'Only valid magnitude tags are recognized at the top level (reason, message, invoke, yield).',
+            'Check the tag name spelling.',
+          ]
+      }
+    },
     snippetStrategy: 'point',
   },
 
@@ -52,25 +86,28 @@ export const ERROR_CATALOG: ErrorCatalog = {
       const expected = error.expectedTagName ? asTag(error.expectedTagName) : 'the current open tag'
       return `Mismatched close ${error.raw} while inside ${expected}.`
     },
-    hints: [
-      'Close the tag that is actually open, not a different one.',
-      'Use <magnitude:escape> if the close tag is meant as literal content.',
-    ],
+    hints: (error) => {
+      const expected = error.expectedTagName ? asCloseTag(error.expectedTagName) : 'the matching close tag'
+      return [
+        `Close the tag that is actually open: emit ${expected} before closing anything else.`,
+        'Magnitude close tags are always interpreted — do not write them as literal text inside reasons, messages, or parameters.',
+      ]
+    },
     snippetStrategy: 'point',
   },
 
   StrayCloseTag: {
     headline: (error) => `Unexpected close ${asCloseTag(error.tagName)} with no matching open.`,
-    hints: [
+    hints: () => [
       'A close tag can only appear after its corresponding open tag.',
-      'Use <magnitude:escape> for literal close-tag text.',
+      'Magnitude close tags are always interpreted — drop the magnitude: prefix if you meant to refer to the tag in prose.',
     ],
     snippetStrategy: 'point',
   },
 
   UnknownTool: {
     headline: (error) => `Unknown tool '${error.tagName}'.`,
-    hints: [
+    hints: () => [
       'Invoke only tools that are available in this session.',
       'Check the tool name spelling.',
     ],
@@ -79,7 +116,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   MissingToolName: {
     headline: () => 'Tool invocation is missing its tool name.',
-    hints: [
+    hints: () => [
       'Use <magnitude:invoke tool="..."> with a tool name.',
       'Or use a tool alias like <magnitude:shell> instead.',
     ],
@@ -88,7 +125,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   UnexpectedContent: {
     headline: () => 'Unexpected content inside tool call.',
-    hints: [
+    hints: () => [
       'Move plain text outside the tool call into a message or reason block.',
       'Inside <magnitude:invoke>, wrap all input in <magnitude:parameter> or <magnitude:filter>.',
     ],
@@ -97,7 +134,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   UnclosedThink: {
     headline: () => 'Reasoning block was left open when the response ended.',
-    hints: [
+    hints: () => [
       'Close every <magnitude:reason> block with </magnitude:reason> before yielding.',
     ],
     snippetStrategy: 'block',
@@ -105,7 +142,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   MalformedTag: {
     headline: () => 'Malformed tag could not be interpreted.',
-    hints: [
+    hints: () => [
       'Ensure tag attributes are properly quoted: tool="name".',
     ],
     snippetStrategy: 'point',
@@ -113,7 +150,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   UnknownParameter: {
     headline: (error) => `Unknown parameter '${error.parameterName}' for tool '${error.tagName}'.`,
-    hints: [
+    hints: () => [
       'Use only parameters defined by the tool.',
       'Check the parameter name spelling.',
     ],
@@ -122,7 +159,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   DuplicateParameter: {
     headline: (error) => `Duplicate parameter '${error.parameterName}' for tool '${error.tagName}'.`,
-    hints: [
+    hints: () => [
       'Each parameter may only appear once per tool call.',
       'Rewrite the tool call with a single value instead of repeating the parameter.',
     ],
@@ -131,7 +168,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   MissingRequiredField: {
     headline: (error) => `Missing required parameter '${error.parameterName}' for tool '${error.tagName}'.`,
-    hints: [
+    hints: () => [
       'Include all required parameters before closing the tool call.',
     ],
     snippetStrategy: 'block',
@@ -139,7 +176,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   SchemaCoercionError: {
     headline: (error) => `Parameter '${error.parameterName}' for tool '${error.tagName}' could not be parsed as the expected type.`,
-    hints: [
+    hints: () => [
       'Format the parameter value to match the expected type.',
     ],
     snippetStrategy: 'block',
@@ -147,7 +184,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   JsonStructuralError: {
     headline: (error) => `Parameter '${error.parameterName}' for tool '${error.tagName}' contains invalid structured data.`,
-    hints: [
+    hints: () => [
       'Ensure the parameter body contains valid structured data.',
       'Check that objects, arrays, quotes, and commas are balanced correctly.',
     ],
@@ -156,7 +193,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
 
   IncompleteTool: {
     headline: (error) => `Tool call '${error.tagName}' was not closed before the response ended.`,
-    hints: [
+    hints: () => [
       'Close the tool call with </magnitude:invoke> before yielding.',
       'Ensure all parameters and filters are closed first.',
     ],
