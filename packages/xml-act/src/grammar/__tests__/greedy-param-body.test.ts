@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest'
 import { shellValidator, multiToolValidator, buildValidator, SHELL_TOOL, MULTI_PARAM_TOOL } from './helpers'
 
 const YIELD = '<magnitude:yield_user/>'
-const CP = '</' + 'parameter>'
-const CI = '</' + 'invoke>'
-const CF = '</' + 'filter>'
+const CP = '</magnitude:parameter>'
+const CI = '</magnitude:invoke>'
+const CF = '</magnitude:filter>'
 const OP = '<magnitude:parameter'
 const OF = '<magnitude:filter>'
 const OI = '<magnitude:invoke>'
@@ -306,8 +306,8 @@ describe('greedy param-body — realistic content with close-tag-like text', () 
     )
   })
 
-  it('echo command outputting XML', () => {
-    shellValidator().passes(
+  it('echo command outputting XML — rejected (magnitude open in body must be escaped)', () => {
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo "${OP} name=\\"x\\">val${CP}"${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -324,8 +324,8 @@ describe('greedy param-body — realistic content with close-tag-like text', () 
     )
   })
 
-  it('python code with XML string', () => {
-    shellValidator().passes(
+  it('python code with XML string — rejected (magnitude open in body must be escaped)', () => {
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">python3 -c "print('${OP} name=x>val${CP}')"${CP}\n${CI}\n${YIELD}`
     )
   })

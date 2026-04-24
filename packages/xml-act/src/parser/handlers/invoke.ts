@@ -333,15 +333,39 @@ export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
       ]
     }
 
-    if (parent.seenParams.has(paramName)) {
-      return [{ type: 'push', frame: makeDeadParamFrame(parent, paramName) }]
-    }
+    const isDuplicate = parent.seenParams.has(paramName)
 
     // Mutate seenParams and fieldStates on the InvokeFrame.
     // These Maps/Sets are mutable by design — accumulated during streaming.
-    parent.seenParams.add(paramName)
+    if (!isDuplicate) {
+      parent.seenParams.add(paramName)
+    }
     const fieldType = getFieldType(parent.toolTag, paramName, ctx.invokeCtx.toolSchemas)
     const jsonishParser = fieldType === 'json' ? createStreamingJsonParser() : null
+
+    if (isDuplicate) {
+      // Duplicate parameter — fail the tool call
+      return [
+        emitToolError(
+          {
+            _tag: 'DuplicateParameter',
+            toolCallId: parent.toolCallId,
+            tagName: parent.toolTag,
+            parameterName: paramName,
+            detail: `Duplicate parameter '${paramName}' for tool '${parent.toolTag}'.`,
+          },
+          {
+            toolCallId: parent.toolCallId,
+            tagName: parent.toolTag,
+            toolName: parent.toolTag,
+            group: 'fs',
+            correctToolShape: getCorrectToolShape(parent.toolTag, ctx.invokeCtx.tools),
+          },
+        ),
+        { type: 'push', frame: makeDeadParamFrame(parent, paramName) },
+      ]
+    }
+
     parent.fieldStates.set(paramName, {
       paramName,
       rawValue: '',
@@ -398,13 +422,9 @@ export const filterOpenHandler: OpenHandler<InvokeFrame, FilterFrame> = {
 
 export const filterCloseHandler: CloseHandler<FilterFrame> = {
   close(top, ctx) {
-    // top.invokeFrame is the parent InvokeFrame — captured at open time, no findFrame
     if (ctx.invokeCtx.onFilterReady) {
       ctx.invokeCtx.onFilterReady({ _tag: 'FilterReady', toolCallId: top.toolCallId, query: top.query })
     }
-    return [
-      { type: 'pop' },
-      ...finalizeInvokeOps(top.invokeFrame, ctx.invokeCtx),
-    ]
+    return [{ type: 'pop' }]
   },
 }

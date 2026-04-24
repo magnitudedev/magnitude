@@ -24,16 +24,14 @@ describe('self-referential content in parameters', () => {
     expect(getToolInput(parse(input))?.command).toBe('The sequence </magnitude:parameter></magnitude:invoke> ends it')
   })
 
-  it('03: param contains <magnitude:parameter name="..."> as text', () => {
+  it('03: param contains <magnitude:parameter name="..."> as text — rejected (magnitude open in body must be escaped)', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">Use <magnitude:parameter name="foo"> for params</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('Use <magnitude:parameter name="foo"> for params')
+    v().rejects(input)
   })
 
-  it('04: param contains full tool call example as text', () => {
+  it('04: param contains full tool call example as text — rejected (magnitude open in body must be escaped)', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo '<magnitude:invoke tool="shell"><magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>'</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toContain('<magnitude:invoke tool="shell">')
+    v().rejects(input)
   })
 
   it('05: param contains close sequence minus final < (not confirmed)', () => {

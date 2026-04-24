@@ -111,6 +111,7 @@ export function createParser(
     deferredYield,
     pendingCloseStack: [],
     escapeDepth: 0,
+    invalidSubtree: null,
   }
 
   function end(): void {
@@ -121,7 +122,7 @@ export function createParser(
       for (const pc of loopCtx.pendingCloseStack) {
         const top = machine.peek()
         if (top) {
-          const handler = resolveCloseHandler(pc.tagName, top)
+          const handler = resolveCloseHandler(pc.effectiveTagName, top)
           if (handler) {
             machine.apply(handler.close(handlerCtx))
           }

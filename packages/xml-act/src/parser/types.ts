@@ -125,7 +125,10 @@ export interface FilterFrame {
  * This implements the grammar's recursive greedy last-match pattern.
  */
 export type PendingClose = {
-  tagName: string
+  tagName: string           // raw tag name seen (e.g., 'magnitude:reason')
+  effectiveTagName: string  // tag name to use for confirmation (same as tagName for exact match,
+                            // canonical close tag for mismatch recovery)
+  mismatchRecovery: boolean // true if this is a mismatch candidate
   frameType: string
   wsBuffer: string
   sawNewline: boolean

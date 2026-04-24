@@ -100,8 +100,8 @@ export function createTokenizer(
   function emitTag(tag: ActiveTag): void {
     flushContent()
     if (tag.isClose) {
-      if (!KNOWN_CLOSE_TAG_NAMES.has(tag.name)) {
-        // Unknown close tag — treat as content
+      if (!KNOWN_CLOSE_TAG_NAMES.has(tag.name) && !tag.name.startsWith('magnitude:')) {
+        // Unknown close tag (non-magnitude) — treat as content
         contentBuffer += tag.raw
         return
       }

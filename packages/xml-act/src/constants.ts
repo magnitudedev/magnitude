@@ -14,6 +14,7 @@ export const TAG_FILTER = 'magnitude:filter' as const
 export const TAG_ESCAPE = 'magnitude:escape' as const
 
 export const ESCAPE_TAG = TAG_ESCAPE
+export const MAGNITUDE_PREFIX = 'magnitude:' as const
 
 /** Tags that produce a stray-close error when unmatched */
 export const KNOWN_STRUCTURAL_TAGS: ReadonlySet<string> = new Set(['magnitude:reason', 'magnitude:message', 'magnitude:invoke', 'magnitude:escape'])

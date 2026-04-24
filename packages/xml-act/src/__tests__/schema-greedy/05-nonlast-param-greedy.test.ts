@@ -106,10 +106,9 @@ describe('non-last parameter greedy matching', () => {
     expect(getToolInput(parse(input))?.command).toBe('echo "<div>hello</div>"')
   })
 
-  it('11: content with other XML close tags (not </magnitude:parameter>)', () => {
+  it('11: content with magnitude close tags — rejected (magnitude closes must be escaped)', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">cat </magnitude:invoke> </magnitude:filter> </magnitude:message></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('cat </magnitude:invoke> </magnitude:filter> </magnitude:message>')
+    v().rejects(input)
   })
 
   it('12: </magnitude:parameter> followed by invalid param name — absorbed as content', () => {

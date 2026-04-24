@@ -61,12 +61,13 @@ describe('bounded parameter count', () => {
     expect(ti?.new).toBe('y')
   })
 
-  it('08: 2nd param (duplicate) absorbed as content of 1st (greedy)', () => {
+  it('08: 2nd param (duplicate) emits DuplicateParameter error', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    // Duplicate "command" absorbed as content of first "command"
-    const ti = getToolInput(parse(input))
-    expect(ti?.command).toBe('ls')
+    const events = parse(input)
+    const errors = events.filter(e => e._tag === 'ToolParseError' && (e as any).error._tag === 'DuplicateParameter')
+    expect(errors.length).toBe(1)
+    expect((errors[0] as any).error.parameterName).toBe('command')
   })
 
   // 4-param tool (grep)

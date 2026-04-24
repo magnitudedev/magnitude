@@ -23,8 +23,9 @@
 import type { Token } from '../types'
 import type { Frame } from './types'
 import type { BoundOpenHandler, BoundCloseHandler, BoundSelfCloseHandler } from './handler'
+import type { HandlerContext } from './handler-context'
 import { bindOpen, bindClose } from './handler'
-import { KNOWN_STRUCTURAL_TAGS } from '../constants'
+import { KNOWN_STRUCTURAL_TAGS, MAGNITUDE_PREFIX } from '../constants'
 
 // Compile-time verification that this file stays in lockstep with nesting.ts
 import type { _VerifyProseChildren, _VerifyInvokeChildren } from '../nesting'
@@ -50,6 +51,13 @@ import {
   filterCloseHandler,
 } from './handlers/invoke'
 import { makeYieldHandler } from './handlers/yield'
+
+export type OpenResolution =
+  | { kind: 'handler'; handler: BoundOpenHandler }
+  | { kind: 'heuristicInvoke'; toolTag: string }
+  | { kind: 'heuristicParameter'; paramName: string }
+  | { kind: 'invalidMagnitudeOpen' }
+  | { kind: 'unresolved' }
 
 // =============================================================================
 // resolveOpenHandler
@@ -91,6 +99,41 @@ export function resolveOpenHandler(tagName: string, top: Frame): BoundOpenHandle
 // resolveCloseHandler
 // =============================================================================
 
+export function resolveOpen(
+  tagName: string,
+  top: Frame,
+  isSelfClose: boolean,
+  handlerCtx: HandlerContext,
+): OpenResolution {
+  const handler = resolveOpenHandler(tagName, top)
+  if (handler) return { kind: 'handler', handler }
+
+  if (!tagName.startsWith(MAGNITUDE_PREFIX)) {
+    return { kind: 'unresolved' }
+  }
+
+  if (isSelfClose) {
+    return { kind: 'invalidMagnitudeOpen' }
+  }
+
+  const suffix = tagName.slice(MAGNITUDE_PREFIX.length)
+
+  if (top.type === 'prose') {
+    return handlerCtx.invokeCtx.tools.has(suffix)
+      ? { kind: 'heuristicInvoke', toolTag: suffix }
+      : { kind: 'invalidMagnitudeOpen' }
+  }
+
+  if (top.type === 'invoke') {
+    const schema = handlerCtx.invokeCtx.toolSchemas.get(top.toolTag)
+    return schema && schema.parameters.has(suffix)
+      ? { kind: 'heuristicParameter', paramName: suffix }
+      : { kind: 'invalidMagnitudeOpen' }
+  }
+
+  return { kind: 'invalidMagnitudeOpen' }
+}
+
 export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHandler | undefined {
   // Switch on top.type first — TypeScript narrows top in every case
   switch (top.type) {
@@ -104,11 +147,15 @@ export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHand
 
     case 'invoke':
       // top is InvokeFrame
-      return tagName === 'magnitude:invoke' ? bindClose(invokeCloseHandler, top) : undefined
+      if (tagName === 'magnitude:invoke') return bindClose(invokeCloseHandler, top)
+      if (tagName === `magnitude:${top.toolTag}`) return bindClose(invokeCloseHandler, top)
+      return undefined
 
     case 'parameter':
       // top is ParameterFrame
-      return tagName === 'magnitude:parameter' ? bindClose(parameterCloseHandler, top) : undefined
+      if (tagName === 'magnitude:parameter') return bindClose(parameterCloseHandler, top)
+      if (tagName === `magnitude:${top.paramName}`) return bindClose(parameterCloseHandler, top)
+      return undefined
 
     case 'filter':
       // top is FilterFrame

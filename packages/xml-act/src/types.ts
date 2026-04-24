@@ -317,8 +317,17 @@ export interface MissingRequiredFieldError {
 }
 
 /** Tool-scoped parse errors — routable to a tool state model */
+export interface DuplicateParameterError {
+  readonly _tag: 'DuplicateParameter'
+  readonly toolCallId: string
+  readonly tagName: string
+  readonly parameterName: string
+  readonly detail: string
+}
+
 export type ToolParseError =
   | UnknownParameterError
+  | DuplicateParameterError
   | IncompleteToolError
   | JsonStructuralError
   | SchemaCoercionError
@@ -360,6 +369,22 @@ export interface MissingToolNameError {
   readonly detail: string
 }
 
+export interface InvalidMagnitudeOpenError {
+  readonly _tag: 'InvalidMagnitudeOpen'
+  readonly tagName: string
+  readonly parentTagName: string | undefined
+  readonly raw: string
+  readonly detail: string
+}
+
+export interface AmbiguousMagnitudeCloseError {
+  readonly _tag: 'AmbiguousMagnitudeClose'
+  readonly tagName: string
+  readonly expectedTagName: string | undefined
+  readonly raw: string
+  readonly detail: string
+}
+
 /** Structural parse errors — not routable to any tool */
 export type StructuralParseError =
   | UnknownToolError
@@ -368,6 +393,8 @@ export type StructuralParseError =
   | UnclosedThinkError
   | StrayCloseTagError
   | MissingToolNameError
+  | InvalidMagnitudeOpenError
+  | AmbiguousMagnitudeCloseError
 
 /** All parse error details */
 export type ParseErrorDetail =
