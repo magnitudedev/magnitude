@@ -1,3 +1,4 @@
+import { existsSync, readdirSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import type { ImageMediaType } from '@magnitudedev/agent'
@@ -47,7 +48,7 @@ function tokenizeShellWords(value: string): string[] {
       continue
     }
 
-    if (!inSingle && !inDouble && /\s/.test(char)) {
+    if (!inSingle && !inDouble && char === ' ') {
       if (current.trim().length > 0) {
         tokens.push(current)
       }
@@ -165,6 +166,46 @@ function mimeFromExtension(filePath: string): ImageMediaType | null {
   return null
 }
 
+/**
+ * Normalize all Unicode White_Space characters to regular ASCII space (U+0020).
+ * Handles the mismatch between terminals (which always send U+0020) and
+ * filesystems (which may contain U+202F, U+00A0, etc. — notably macOS
+ * screenshots use U+202F before AM/PM).
+ */
+function normalizeUnicodeWhitespace(str: string): string {
+  return str.replace(/[\p{White_Space}]/gu, ' ')
+}
+
+/**
+ * Resolve a candidate file path to an actual on-disk path, tolerating
+ * Unicode whitespace differences between the query and the filesystem.
+ *
+ * 1. Fast path: exact match via existsSync
+ * 2. Fallback: scan parent directory, comparing filenames after
+ *    normalizing all Unicode whitespace to ASCII space
+ * 3. Return the real on-disk path so subsequent file I/O uses actual bytes
+ */
+function resolveFilePath(candidatePath: string): string | null {
+  if (existsSync(candidatePath)) return candidatePath
+
+  const dir = path.dirname(candidatePath)
+  const targetBasename = path.basename(candidatePath)
+  const normalizedTarget = normalizeUnicodeWhitespace(targetBasename)
+
+  try {
+    for (const entry of readdirSync(dir)) {
+      if (normalizeUnicodeWhitespace(entry) === normalizedTarget) {
+        const resolved = path.join(dir, entry)
+        if (existsSync(resolved)) return resolved
+      }
+    }
+  } catch {
+    // parent directory doesn't exist or isn't readable
+  }
+
+  return null
+}
+
 export async function tryReadPastedImageFileCandidate(
   candidatePath: string,
 ): Promise<PastedImageFileResult | null> {
@@ -173,11 +214,14 @@ export async function tryReadPastedImageFileCandidate(
 
   if (!isSupportedImageExtension(normalizedPath)) return null
 
-  const file = Bun.file(normalizedPath)
+  const resolvedPath = resolveFilePath(normalizedPath)
+  if (!resolvedPath) return null
+
+  const file = Bun.file(resolvedPath)
   if (!(await file.exists())) return null
   if (file.type === 'application/x-directory') return null
 
-  const mediaType = mimeFromExtension(normalizedPath)
+  const mediaType = mimeFromExtension(resolvedPath)
   if (!mediaType) return null
 
   const buffer = Buffer.from(await file.arrayBuffer())
@@ -187,8 +231,8 @@ export async function tryReadPastedImageFileCandidate(
   if (!dimensions) return null
 
   return {
-    path: normalizedPath,
-    filename: path.basename(normalizedPath),
+    path: resolvedPath,
+    filename: path.basename(resolvedPath),
     base64: buffer.toString('base64'),
     mediaType,
     width: dimensions.width,
