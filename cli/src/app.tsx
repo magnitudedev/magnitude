@@ -589,6 +589,17 @@ function AppInner({
     return unsubscribe
   }, [client])
 
+  // Subscribe to tool state for file panel streaming support
+  useEffect(() => {
+    if (!client) return
+
+    const unsubscribe = client.state.toolState.subscribeFork(null, (state) => {
+      setToolState(state)
+    })
+
+    return unsubscribe
+  }, [client])
+
   const tasks = useTasks({
     client,
   })
