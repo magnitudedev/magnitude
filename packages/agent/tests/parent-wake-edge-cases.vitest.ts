@@ -27,7 +27,7 @@ describe('parent wake edge cases', () => {
       yield* h.user('start')
 
       const rootFirst = yield* h.wait.turnCompleted(null)
-      expect(rootFirst.result.success).toBe(true)
+      expect(rootFirst.result._tag).toBe('Completed')
 
       const created = yield* h.wait.agentCreated((e) => e.agentId === 'error-sub')
 
@@ -67,13 +67,13 @@ describe('parent wake edge cases', () => {
           return { xml: YIELD_USER }
         }
 
-        return { xml: `<message to="parent">subagent done</message>\n${YIELD_USER}` }
+        return { xml: `<magnitude:message to="parent">subagent done</magnitude:message>\n${YIELD_USER}` }
       })
 
       yield* h.user('start killable subagent')
 
       const rootFirst = yield* h.wait.turnCompleted(null)
-      expect(rootFirst.result.success).toBe(true)
+      expect(rootFirst.result._tag).toBe('Completed')
 
       const created = yield* h.wait.agentCreated((e) => e.agentId === 'kill-sub')
       yield* h.wait.turnCompleted(created.forkId)

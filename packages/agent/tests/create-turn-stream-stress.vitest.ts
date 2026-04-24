@@ -2,7 +2,7 @@ import { describe, expect, it } from '@effect/vitest'
 import { Cause, Effect, Exit, Ref, Scope, Stream } from 'effect'
 import type { TurnEngineEvent, TurnEngineCrash } from '@magnitudedev/xml-act'
 import type { CallUsage } from '@magnitudedev/providers'
-import type { MessageDestination, TurnResult } from '../src/events'
+import type { MessageDestination, TurnOutcome } from '../src/events'
 import { createTurnStream } from '../src/execution/turn-stream'
 import { TurnError } from '../src/execution/types'
 import type { TurnEvent, TurnError as TurnErrorType, TurnEventSink, TurnStrategyResult } from '../src/execution/types'
@@ -19,9 +19,9 @@ type PublishedEvent =
   | { readonly type: 'lens_end'; readonly name: string }
   | { readonly type: 'tool_event'; readonly toolCallId: string; readonly toolKey: string; readonly event: TurnEngineEvent }
 
-const successfulTurnResult: TurnResult = {
-  success: true,
-  turnDecision: 'idle',
+const successfulTurnResult: TurnOutcome = {
+  _tag: 'Completed',
+  completion: { decision: 'idle', feedback: [] },
 }
 
 const usage: CallUsage = {

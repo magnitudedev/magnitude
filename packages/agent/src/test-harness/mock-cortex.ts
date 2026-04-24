@@ -124,7 +124,7 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
             turnId,
             chainId,
             strategyId: 'xml-act',
-            result: { success: false, error: 'Interrupted', cancelled: true },
+            result: { _tag: 'Cancelled' },
             inputTokens: null,
             outputTokens: null,
             cacheReadTokens: null,

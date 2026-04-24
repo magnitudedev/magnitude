@@ -40,7 +40,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>`,
+          `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hello</magnitude:message>`,
       },
     ])
   })
@@ -68,7 +68,7 @@ describe('formatInbox', () => {
     expect(formatInbox({ results: [], timeline, timezone: 'UTC' })).toEqual([
       {
         type: 'text',
-        text: '--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
+        text: '--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hello</magnitude:message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
       },
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
     ])
@@ -84,7 +84,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          `--- 2024-03-28 16:00 ---\n<message from="user">a</message>\n\n--- 16:01 ---\n<message from="user">b</message>`,
+          `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">a</magnitude:message>\n\n--- 16:01 ---\n<magnitude:message from="user">b</magnitude:message>`,
       },
     ])
   })
@@ -98,7 +98,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:01 ---\n<message from="user">second</message>\n\n--- 16:00 ---\n<message from="user">first</message>`,
+        `--- 2024-03-28 16:01 ---\n<magnitude:message from="user">second</magnitude:message>\n\n--- 16:00 ---\n<magnitude:message from="user">first</magnitude:message>`,
     })
   })
 
@@ -127,7 +127,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<message from="user">see this</message>\n<mention path="b.ts" type="text" truncated="true" original_bytes="123">const x = 1</mention>\n<mention path="c.ts" type="text" error="not found"/>',
+          '--- 2024-03-28 16:00 ---\n<magnitude:message from="user">see this</magnitude:message>\n<mention path="b.ts" type="text" truncated="true" original_bytes="123">const x = 1</mention>\n<mention path="c.ts" type="text" error="not found"/>',
       },
       { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1, height: 1 },
     ])
@@ -158,7 +158,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">first-input</message>\n<message from="user">second-input</message>`,
+        `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">first-input</magnitude:message>\n<magnitude:message from="user">second-input</magnitude:message>`,
     })
   })
 
@@ -181,7 +181,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">hi</message>\n<agent id="builder-a" role="builder" status="idle">\n${YIELD_USER}\n</agent>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hi</magnitude:message>\n<agent id="builder-a" role="builder" status="idle">\n${YIELD_USER}\n</agent>\n\n<attention>\n- user message at 16:00\n- builder-a went idle at 16:00\n</attention>`,
     })
   })
 
@@ -266,7 +266,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n\n<task_updates>\n- Task t1 created: "Title"\n</task_updates>`,
+          `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hello</magnitude:message>\n\n<task_updates>\n- Task t1 created: "Title"\n</task_updates>`,
       },
     ])
   })
@@ -302,7 +302,7 @@ describe('formatInbox', () => {
     expect(out[0]).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<message to="lead">done?</message>\n<error>oops</error>\n<|yield:user|>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
+        `--- 2024-03-28 16:00 ---\n<agent id="builder-x" role="builder" status="idle">\nthinking\n<read path="src/a.ts"/>\n<magnitude:message to="lead">done?</magnitude:message>\n<error>oops</error>\n${YIELD_USER}\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>\n\n<attention>\n- builder-x errored at 16:00\n</attention>`,
     })
   })
 
@@ -349,7 +349,7 @@ describe('formatInbox', () => {
     expect(text).toEqual({
       type: 'text',
       text:
-        `--- 2024-03-28 16:00 ---\n<message from="user">u</message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>`,
+        `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">u</magnitude:message>\n<user-to-agent agent="a1">direct</user-to-agent>\n<subagent-user-killed agent="a2" type="builder"/>\n<user-presence confirmed="true">back</user-presence>`,
     })
   })
 
@@ -364,7 +364,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          '--- 2024-03-28 16:00 ---\n<message from="parent">from parent</message>',
+          '--- 2024-03-28 16:00 ---\n<magnitude:message from="parent">from parent</magnitude:message>',
       },
     ])
   })
@@ -439,7 +439,7 @@ describe('formatInbox', () => {
       {
         type: 'text',
         text:
-          `--- 2024-03-28 16:00 ---\n<message from="user">hello</message>\n<agent id="builder-x" role="builder" status="working">\n<message to="lead">progress update</message>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>`,
+          `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hello</magnitude:message>\n<agent id="builder-x" role="builder" status="working">\n<magnitude:message to="lead">progress update</magnitude:message>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>`,
       },
     ])
   })

@@ -36,7 +36,7 @@ describe('memory/timeline-events', () => {
         strategyId: 'xml-act',
 
 
-        result: { success: true, turnDecision: 'idle' },
+        result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -101,9 +101,11 @@ describe('memory/timeline-events', () => {
 
 
         result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'follow up on deployment checks' }],
+          _tag: 'Completed',
+          completion: {
+            decision: 'idle',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'follow up on deployment checks' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,

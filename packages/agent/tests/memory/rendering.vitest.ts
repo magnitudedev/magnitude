@@ -17,7 +17,7 @@ describe('memory rendering', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-render-simple-flush', chainId: 'c-render-simple-flush' })
 
       const userTexts = yield* getRenderedUserText(h)
-      expect(userTexts).toContain('<message from="user">hello there</message>')
+      expect(userTexts).toContain('<magnitude:message from="user">hello there</magnitude:message>')
       expect(userTexts).toContain('--- ')
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
@@ -81,9 +81,11 @@ describe('memory rendering', () => {
 
 
         result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'check this' }],
+          _tag: 'Completed',
+          completion: {
+            decision: 'idle',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'check this' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -237,9 +239,11 @@ describe('memory rendering', () => {
 
 
         result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'after turn' }],
+          _tag: 'Completed',
+          completion: {
+            decision: 'idle',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'after turn' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,

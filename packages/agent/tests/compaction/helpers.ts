@@ -71,7 +71,7 @@ export const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'tu
   cacheWriteTokens: null,
   providerId: null,
   modelId: null,
-  result: { success: true, turnDecision: 'idle' },
+  result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
 
   ...overrides,
 })

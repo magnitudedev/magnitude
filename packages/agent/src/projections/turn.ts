@@ -284,7 +284,9 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       if (fork._tag === 'idle') return fork
       if (fork.turnId !== event.turnId) return fork
 
-      const turnWantsContinue = event.result.success ? event.result.turnDecision === 'continue' : !event.result.cancelled
+      const turnWantsContinue =
+        (event.result._tag === 'Completed' && event.result.completion.decision === 'continue')
+        || event.result._tag === 'ParseFailure'
       const shouldEnqueueContinue = turnWantsContinue && !fork.softInterrupted
 
       const nextTriggers = shouldEnqueueContinue
@@ -294,7 +296,12 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       emit.turnTerminated({
         forkId: event.forkId,
         turnId: event.turnId,
-        reason: event.result.success ? 'completed' : event.result.cancelled ? 'cancelled' : 'error',
+        reason:
+          event.result._tag === 'Cancelled'
+            ? 'cancelled'
+            : event.result._tag === 'Completed'
+              ? 'completed'
+              : 'error',
         result: event.result,
         triggersQueued: nextTriggers.length > 0,
       })

@@ -124,9 +124,11 @@ describe('prompt caching consistency', () => {
         chainId: 'c-1',
         strategyId: 'xml-act',
         result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'latest only' }],
+          _tag: 'Completed',
+          completion: {
+            decision: 'idle',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'latest only' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,

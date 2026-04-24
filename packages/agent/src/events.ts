@@ -9,7 +9,11 @@
 
 import type { ContentPart } from './content'
 import type { ImageMediaType } from './content'
-import type { TurnEngineEvent } from '@magnitudedev/xml-act'
+import type {
+  TurnEngineEvent,
+  StructuralParseErrorEvent,
+  ToolParseErrorEvent,
+} from '@magnitudedev/xml-act'
 import type { ToolKey } from './catalog'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { Skill } from '@magnitudedev/skills'
@@ -162,7 +166,7 @@ export interface TurnCompleted {
   readonly turnId: string
   readonly chainId: string
   readonly strategyId: StrategyId
-  readonly result: TurnResult
+  readonly result: TurnOutcome
   /** Actual input token count from LLM provider (via BAML Collector). Null when unavailable (e.g. Codex path, interrupted turns). */
   readonly inputTokens: number | null
   /** Output token count from LLM provider. Null when unavailable. */
@@ -179,26 +183,21 @@ export interface TurnCompleted {
 
 export type TurnDecision = 'continue' | 'idle'
 
-export type TurnResultErrorCode =
-  | 'unclosed_think'
-  | 'nonexistent_agent_destination'
-  | 'task_outside_assigned_subtree'
-  | 'task_operation_error'
-
-export interface TurnResultError {
-  readonly code: TurnResultErrorCode
-  readonly message: string
+export interface TurnCompletion {
+  readonly decision: TurnDecision
+  readonly feedback: readonly TurnFeedback[]
 }
 
-export type TurnResult =
-  | {
-      readonly success: true
-      readonly turnDecision: 'continue' | 'idle'
-      readonly errors?: readonly TurnResultError[]
-      readonly oneshotLivenessTriggered?: boolean
-      readonly yieldWorkerRetriggered?: boolean
-    }
-  | { readonly success: false; readonly error: string; readonly cancelled: boolean }
+export type TurnFeedback =
+  | { readonly _tag: 'InvalidMessageDestination'; readonly destination: string; readonly message: string }
+  | { readonly _tag: 'OneshotLivenessRetriggered' }
+  | { readonly _tag: 'YieldWorkerRetriggered' }
+
+export type TurnOutcome =
+  | { readonly _tag: 'Completed'; readonly completion: TurnCompletion }
+  | { readonly _tag: 'ParseFailure'; readonly error: StructuralParseErrorEvent | ToolParseErrorEvent }
+  | { readonly _tag: 'SystemError'; readonly message: string }
+  | { readonly _tag: 'Cancelled' }
 
 // Turn unexpected error (irrecoverable - e.g. LLM connection failure after all retries)
 export interface TurnUnexpectedError {

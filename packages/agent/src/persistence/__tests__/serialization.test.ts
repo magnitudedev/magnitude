@@ -61,8 +61,11 @@ describe('Event Serialization', () => {
         strategyId: 'xml-act',
 
         result: {
-          success: true,
-          turnDecision: 'idle'
+          _tag: 'Completed',
+          completion: {
+            decision: 'idle',
+            feedback: [],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -76,7 +79,7 @@ describe('Event Serialization', () => {
       const deserialized = JSON.parse(serialized) as AppEvent
       
       expect(deserialized).toEqual(event)
-      expect(deserialized.result.success).toBe(true)
+      expect(deserialized.result._tag).toBe('Completed')
     })
 
     test('serializes and deserializes fork events', () => {
@@ -338,9 +341,8 @@ describe('Event Serialization', () => {
         strategyId: 'xml-act',
 
         result: {
-          success: false,
-          error: 'Syntax error',
-          cancelled: false
+          _tag: 'SystemError',
+          message: 'Syntax error',
         },
         inputTokens: null,
         outputTokens: null,
@@ -351,9 +353,9 @@ describe('Event Serialization', () => {
       }
 
       const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent
-      expect(deserialized.result.success).toBe(false)
-      if (!deserialized.result.success) {
-        expect(deserialized.result.error).toBe('Syntax error')
+      expect(deserialized.result._tag).toBe('SystemError')
+      if (deserialized.result._tag === 'SystemError') {
+        expect(deserialized.result.message).toBe('Syntax error')
       }
     })
   })

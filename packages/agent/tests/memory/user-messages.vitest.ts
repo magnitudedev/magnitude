@@ -46,7 +46,7 @@ describe('memory/user-messages', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-user-simple-flush', chainId: 'c-user-simple-flush' })
 
       const rendered = yield* renderedUserText(h, null)
-      expect(rendered).toContain('<message from="user">hello from user</message>')
+      expect(rendered).toContain('<magnitude:message from="user">hello from user</magnitude:message>')
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 

@@ -358,11 +358,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
             chainId: forkTurnState.chainId,
             strategyId: 'xml-act',
 
-            result: {
-              success: false,
-              error: 'Hydration recovery: cancelled in-flight turn',
-              cancelled: true,
-            },
+            result: { _tag: 'Cancelled' },
             inputTokens: null,
             outputTokens: null,
             cacheReadTokens: null,
@@ -382,11 +378,7 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
           turnId: rootTurnState.turnId,
           chainId: rootTurnState.chainId,
           strategyId: 'xml-act',
-          result: {
-            success: false,
-            error: 'Hydration recovery: cancelled in-flight turn',
-            cancelled: true,
-          },
+          result: { _tag: 'Cancelled' },
           inputTokens: null,
           outputTokens: null,
           cacheReadTokens: null,

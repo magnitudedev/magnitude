@@ -17,7 +17,7 @@ import type { ToolContext } from '@magnitudedev/tools'
 
 import { createTokenizer } from '../tokenizer'
 import { createParser } from '../parser/index'
-import type { TurnEngineEvent, EngineState, RegisteredTool, ToolInterceptor, ToolParseError } from '../types'
+import type { TurnEngineEvent, EngineState, RegisteredTool, ToolInterceptor, ToolParseError, StructuralParseError } from '../types'
 import { TurnEngineCrash, ToolInterceptorTag } from '../types'
 import { initialEngineState, foldEngineState } from './engine-state'
 import { dispatchTool, type DispatchContext } from './dispatcher'
@@ -48,6 +48,19 @@ function describeDefect(defect: unknown): string {
     try { return JSON.stringify(defect) } catch { /* ignore */ }
   }
   return String(defect)
+}
+
+function describeStructuralParseFailure(error: StructuralParseError): string {
+  const detail = 'detail' in error ? error.detail : error._tag
+  return `Structural parse error: ${detail}`
+}
+
+function describeToolParseFailure(tagName: string, error: ToolParseError): string {
+  return `Tool parse error for <${tagName}>: ${error.detail}`
+}
+
+function describeToolExecutionFailure(tagName: string, error: string): string {
+  return `Tool execution failed for <${tagName}>: ${error}`
 }
 
 // =============================================================================
@@ -183,11 +196,19 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   if (hasPriorOutcome(event.toolCallId)) break
                   activeInvokes.delete(event.toolCallId)
                   currentState = yield* emitAndFold(currentState, event)
+                  currentState = yield* emitAndFold(currentState, {
+                    _tag: 'TurnEnd',
+                    result: { _tag: 'Failure', error: describeToolParseFailure(event.tagName, event.error) },
+                  })
                   break
                 }
 
                 case 'StructuralParseError': {
                   currentState = yield* emitAndFold(currentState, event)
+                  currentState = yield* emitAndFold(currentState, {
+                    _tag: 'TurnEnd',
+                    result: { _tag: 'Failure', error: describeStructuralParseFailure(event.error) },
+                  })
                   break
                 }
 
@@ -206,13 +227,18 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
                   if (!invoke) {
                     activeInvokes.delete(event.toolCallId)
+                    const error: StructuralParseError = {
+                      _tag: 'UnexpectedContent',
+                      context: 'engine',
+                      detail: `ToolInputReady for unknown toolCallId '${event.toolCallId}'`,
+                    }
                     currentState = yield* emitAndFold(currentState, {
                       _tag: 'StructuralParseError',
-                      error: {
-                        _tag: 'UnexpectedContent',
-                        context: 'engine',
-                        detail: `ToolInputReady for unknown toolCallId '${event.toolCallId}'`,
-                      },
+                      error,
+                    })
+                    currentState = yield* emitAndFold(currentState, {
+                      _tag: 'TurnEnd',
+                      result: { _tag: 'Failure', error: describeStructuralParseFailure(error) },
                     })
                     break
                   }
@@ -264,12 +290,20 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                       error: result.error as ToolParseError,
                     })
                   } else {
-                    // Check for gate rejection → TurnEnd
+                    // Check for terminal dispatch outcomes → TurnEnd
                     const outcome = currentState.toolOutcomes.get(event.toolCallId)
                     if (outcome?._tag === 'Completed' && outcome.result._tag === 'Rejected') {
                       currentState = yield* emitAndFold(currentState, {
                         _tag: 'TurnEnd',
                         result: { _tag: 'GateRejected', rejection: outcome.result.rejection },
+                      })
+                    } else if (outcome?._tag === 'Completed' && outcome.result._tag === 'Error') {
+                      currentState = yield* emitAndFold(currentState, {
+                        _tag: 'TurnEnd',
+                        result: {
+                          _tag: 'Failure',
+                          error: describeToolExecutionFailure(invoke.tagName, outcome.result.error),
+                        },
                       })
                     }
                   }

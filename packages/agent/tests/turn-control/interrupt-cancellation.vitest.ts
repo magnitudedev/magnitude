@@ -9,7 +9,7 @@ describe('interrupt cancellation latency (regression)', () => {
       const h = yield* TestHarness
 
       yield* h.script.next({
-        xmlChunks: ['<message to="user">hello', ' world</message><idle/>'],
+        xmlChunks: ['<magnitude:message to="user">hello', ' world</magnitude:message><magnitude:yield_user/>'],
         delayMsBetweenChunks: 10_000,
       })
 
@@ -20,14 +20,11 @@ describe('interrupt cancellation latency (regression)', () => {
 
       const completed = yield* h.wait.event(
         'turn_completed',
-        (e) => e.forkId === null && e.result.success === false && !e.result.success && e.result.cancelled === true,
+        (e) => e.forkId === null && e.result._tag === 'Cancelled',
         { timeoutMs: 1000 },
       )
 
-      expect(completed.result.success).toBe(false)
-      if (!completed.result.success) {
-        expect(completed.result.cancelled).toBe(true)
-      }
+      expect(completed.result._tag).toBe('Cancelled')
 
       const unexpected = h.events().find((e) => e.type === 'turn_unexpected_error' && e.forkId === null)
       expect(unexpected).toBeUndefined()

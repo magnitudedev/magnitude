@@ -370,7 +370,7 @@ export const TaskWorkerProjection = Projection.define<AppEvent, TaskWorkerState>
 
     turn_completed: ({ event, state, read }) => {
       if (event.forkId === null) return rebuild({ state, read })
-      if (event.result.success && event.result.turnDecision === 'continue') {
+      if (event.result._tag === 'Completed' && event.result.completion.decision === 'continue') {
         return rebuild({ state, read })
       }
       return rebuild({ state, read, workerActivityByForkId: markWorkerIdle(state.workerActivityByForkId, event.forkId, event.timestamp) })

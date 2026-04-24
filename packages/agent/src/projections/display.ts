@@ -937,12 +937,8 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
 
       // Determine if we'll continue (same logic as TurnProjection)
-      let willContinue: boolean
-      if (event.result.success) {
-        willContinue = event.result.turnDecision === 'continue'
-      } else {
-        willContinue = !event.result.cancelled
-      }
+      const willContinue =
+        event.result._tag === 'Completed' && event.result.completion.decision === 'continue'
 
       // Close ThinkBlock only if we're becoming stable (won't continue)
       // If we will continue, keep ThinkBlock open for next turn's steps

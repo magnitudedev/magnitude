@@ -527,19 +527,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
             ],
           }
 
-        case 'StructuralParseError':
-          return {
-            ...fork,
-            pendingResultItems: [
-              ...fork.pendingResultItems,
-              {
-                kind: 'structural_parse_error',
-                event: event.event,
-                rawResponse: '',
-              },
-            ],
-          }
-
         default:
           return fork
       }
@@ -606,8 +593,6 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
     turn_completed: ({ event, fork, read }) => {
       if (fork.currentTurnId !== event.turnId) return fork
 
-      const newMessages: Message[] = [...fork.messages]
-      const isCancelled = !event.result.success && 'cancelled' in event.result && event.result.cancelled
       const canonical = read(CanonicalTurnProjection)
       const canonicalText = canonical.lastCompleted?.turnId === event.turnId
         ? canonical.lastCompleted.canonicalXml
@@ -617,6 +602,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
         : ''
       const hasAssistantContent = canonicalText.trim().length > 0
 
+      const newMessages: Message[] = [...fork.messages]
       if (hasAssistantContent) {
         newMessages.push({
           type: 'assistant_turn',
@@ -628,64 +614,96 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
 
       let nextFork: ForkMemoryState = { ...fork, messages: newMessages, currentTurnId: null }
 
-      if (fork.pendingResultItems.length === 0 && !isCancelled && event.result.success) {
-        nextFork = {
-          ...nextFork,
-          pendingResultItems: [
-            ...nextFork.pendingResultItems,
-            { kind: 'no_tools_or_messages' },
-          ],
-        }
-      }
+      switch (event.result._tag) {
+        case 'Completed': {
+          if (fork.pendingResultItems.length === 0) {
+            nextFork = {
+              ...nextFork,
+              pendingResultItems: [
+                ...nextFork.pendingResultItems,
+                { kind: 'no_tools_or_messages' },
+              ],
+            }
+          }
 
-      const hasSubstantivePendingResults = nextFork.pendingResultItems.some(item => item.kind !== 'no_tools_or_messages')
+          const hasSubstantivePendingResults = nextFork.pendingResultItems.some(item => item.kind !== 'no_tools_or_messages')
 
-      if (!hasAssistantContent && !isCancelled && event.result.success && !hasSubstantivePendingResults) {
-        nextFork = {
-          ...nextFork,
-          messages: [
-            ...nextFork.messages,
-            {
-              type: 'assistant_turn',
-              source: 'agent',
-              content: textParts('(empty response)'),
-              strategyId: event.strategyId,
-            },
-          ],
-        }
-        nextFork = enqueueResult(nextFork, toResultError({ message: EMPTY_RESPONSE_ERROR }), event.timestamp)
-      }
+          if (!hasAssistantContent && !hasSubstantivePendingResults) {
+            nextFork = {
+              ...nextFork,
+              messages: [
+                ...nextFork.messages,
+                {
+                  type: 'assistant_turn',
+                  source: 'agent',
+                  content: textParts('(empty response)'),
+                  strategyId: event.strategyId,
+                },
+              ],
+            }
+            nextFork = enqueueResult(nextFork, toResultError({ message: EMPTY_RESPONSE_ERROR }), event.timestamp)
+          }
 
-      const hasError = !event.result.success
-      const errorMessage = hasError && 'error' in event.result ? event.result.error : undefined
-      if (nextFork.pendingResultItems.length > 0) {
-        const completedTurnItems = nextFork.pendingResultItems.map(item =>
-          item.kind === 'tool_parse_error' || item.kind === 'structural_parse_error'
-            ? { ...item, rawResponse }
-            : item,
-        )
-        nextFork = enqueueResult(
-          nextFork,
-          toResultTurnResults({ items: completedTurnItems }),
-          event.timestamp,
-        )
-      }
-      if (errorMessage) {
-        nextFork = enqueueResult(nextFork, toResultError({ message: errorMessage }), event.timestamp)
-      }
-      if (event.result.success && event.result.errors && event.result.errors.length > 0) {
-        for (const err of event.result.errors) {
-          nextFork = enqueueResult(nextFork, toResultError({ message: err.message }), event.timestamp)
+          if (nextFork.pendingResultItems.length > 0) {
+            nextFork = enqueueResult(
+              nextFork,
+              toResultTurnResults({ items: nextFork.pendingResultItems }),
+              event.timestamp,
+            )
+          }
+
+          for (const feedback of event.result.completion.feedback) {
+            switch (feedback._tag) {
+              case 'InvalidMessageDestination':
+                nextFork = enqueueResult(nextFork, toResultError({ message: feedback.message }), event.timestamp)
+                break
+              case 'OneshotLivenessRetriggered':
+                nextFork = enqueueResult(nextFork, { kind: 'oneshot_liveness' }, event.timestamp)
+                break
+              case 'YieldWorkerRetriggered':
+                nextFork = enqueueResult(nextFork, { kind: 'yield_worker_retrigger' }, event.timestamp)
+                break
+            }
+          }
+
+          break
         }
-      }
-      if (event.result.success && event.result.oneshotLivenessTriggered) {
-        nextFork = enqueueResult(nextFork, { kind: 'oneshot_liveness' }, event.timestamp)
-      }
-      if (event.result.success && event.result.yieldWorkerRetriggered) {
-        nextFork = enqueueResult(nextFork, { kind: 'yield_worker_retrigger' }, event.timestamp)
-      }
-      if (isCancelled) {
-        nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
+
+        case 'ParseFailure': {
+          const parseErrorItem: TurnResultItem =
+            event.result.error._tag === 'ToolParseError'
+              ? {
+                  kind: 'tool_parse_error',
+                  event: event.result.error,
+                  rawResponse,
+                }
+              : {
+                  kind: 'structural_parse_error',
+                  event: event.result.error,
+                  rawResponse,
+                }
+
+          nextFork = enqueueResult(
+            nextFork,
+            toResultTurnResults({ items: [parseErrorItem] }),
+            event.timestamp,
+          )
+          break
+        }
+
+        case 'SystemError': {
+          nextFork = enqueueResult(
+            nextFork,
+            toResultError({ message: event.result.message }),
+            event.timestamp,
+          )
+          break
+        }
+
+        case 'Cancelled': {
+          nextFork = enqueueResult(nextFork, toResultInterrupted(), event.timestamp)
+          break
+        }
       }
 
       return resetPendingTurnState(nextFork)

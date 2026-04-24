@@ -22,8 +22,8 @@ describe('task creation + spawn-worker', () => {
       const rootTurn = yield* h.wait.turnCompleted(null)
       
       // Turn should succeed (idle, not continue which means errors)
-      expect(rootTurn.result.success).toBe(true)
-      expect(rootTurn.result.turnDecision).toBe('idle')
+      expect(rootTurn.result._tag).toBe('Completed')
+      expect(rootTurn.result.completion.decision).toBe('idle')
 
       // spawn-worker should create the agent
       const agentCreated = yield* h.wait.event('agent_created' as any, (e: any) => e.agentId === 'my-task', { timeoutMs: 5000 })

@@ -350,9 +350,11 @@ describe('TaskWorkerProjection', () => {
         chainId: 'chain-worker',
         strategyId: 'xml-act',
         result: {
-          success: true,
-          turnDecision: 'yield',
-          errors: [],
+          _tag: 'Completed',
+          completion: {
+            decision: 'idle',
+            feedback: [],
+          },
         },
         inputTokens: null,
         outputTokens: null,

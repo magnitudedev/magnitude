@@ -44,7 +44,7 @@ describe('write policy permissions', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.result._tag).toBe('Completed')
       if (writeEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
@@ -66,7 +66,7 @@ describe('write policy permissions', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.result._tag).toBe('Completed')
       if (writeEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
@@ -100,7 +100,7 @@ describe('write policy permissions', () => {
         (e) => e.forkId === agentCreated.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.result._tag).toBe('Completed')
       if (writeEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
@@ -138,10 +138,10 @@ describe('write policy permissions', () => {
         throw new Error('Expected ToolExecutionEnded')
       }
       expect(writeEnded.event.result._tag).not.toBe('Success')
-      if (completed.result.success) {
-        expect(completed.result.turnDecision).toBe('continue')
+      if (completed.result._tag === 'Completed') {
+        expect(completed.result.completion.decision).toBe('continue')
       } else {
-        expect(completed.result.cancelled).toBe(false)
+        expect(completed.result._tag).not.toBe('Cancelled')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )

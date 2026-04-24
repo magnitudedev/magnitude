@@ -31,7 +31,7 @@ import type { ObservationPart } from '@magnitudedev/roles'
 import { buildAckTurns } from '../prompts/protocol'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
-import type { AppEvent } from '../events'
+import type { AppEvent, TurnOutcome } from '../events'
 
 import { createTurnStream } from '../execution/turn-stream'
 import { TurnError as TurnErrorCtor } from '../execution/types'
@@ -250,7 +250,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           // Extract usage — tag as partial if execution failed
           const usage = cs.getUsage()
-          const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
+          const usageWithStatus = { ...usage, partial: executeResult.result._tag !== 'Completed' }
 
           // Offer final result
           yield* sink.emit({ _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus } })
@@ -272,8 +272,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           && boundModel.model.maxOutputTokens !== null
           && usage.outputTokens >= boundModel.model.maxOutputTokens
 
-        const turnResult = outputTruncated
-          ? { success: false as const, error: `Your response was truncated because it hit the maximum output token limit (${boundModel.model.maxOutputTokens} tokens). You MUST split your work into smaller steps — make fewer tool calls per turn, write shorter files, or break large operations into multiple turns.`, cancelled: false }
+        const turnResult: TurnOutcome = outputTruncated
+          ? { _tag: 'SystemError', message: `Your response was truncated because it hit the maximum output token limit (${boundModel.model.maxOutputTokens} tokens). You MUST split your work into smaller steps — make fewer tool calls per turn, write shorter files, or break large operations into multiple turns.` }
           : executeResult.result
 
         // Publish turn_completed for this fork
@@ -376,7 +376,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               turnId,
               chainId,
               strategyId: 'xml-act',
-              result: { success: false, error: `Context limit exceeded, waiting for compaction: ${errorMessage}`, cancelled: false },
+              result: { _tag: 'SystemError', message: `Context limit exceeded, waiting for compaction: ${errorMessage}` },
               inputTokens: null,
               outputTokens: null,
               cacheReadTokens: null,

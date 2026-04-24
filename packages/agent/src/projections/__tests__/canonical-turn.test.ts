@@ -15,7 +15,7 @@ describe('CanonicalTurn state accumulation primitives', async () => {
 describe('CanonicalTurn clean gate semantics', async () => {
   test('parse error should make turn unclean', async () => {
     const state = createInitialCanonicalTurnState()
-    const clean = !true && !state.hasStructuralError && true
+    const clean = !true && true
     expect(clean).toBe(false)
   })
 

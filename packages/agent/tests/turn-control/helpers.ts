@@ -25,7 +25,7 @@ export const mkTurnCompletedSuccess = (
   turnId: 'turn-1',
   chainId: 'chain-1',
   strategyId: 'xml-act',
-  result: { success: true, turnDecision: 'idle' },
+  result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
 
   inputTokens: null,
   outputTokens: null,
@@ -40,7 +40,7 @@ export const mkTurnCompletedFailure = (
   overrides: Partial<Extract<AppEvent, { type: 'turn_completed' }>> = {},
 ): Extract<AppEvent, { type: 'turn_completed' }> => ({
   ...mkTurnCompletedSuccess({
-    result: { success: false, error: 'failed', cancelled: false },
+    result: { _tag: 'SystemError', message: 'failed' },
   }),
   ...overrides,
 })

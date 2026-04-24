@@ -141,7 +141,7 @@ function turnCompletedEvent(turnId: string, chainId = 'c-1'): TurnCompletedEvent
     turnId,
     chainId,
     strategyId: 'xml-act',
-    result: { success: true, turnDecision: 'idle' },
+    result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
     inputTokens: null,
     outputTokens: null,
     cacheReadTokens: null,
@@ -259,7 +259,7 @@ describe('memory tool results', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: { success: false, error: 'boom', cancelled: false },
+        result: { _tag: 'SystemError', message: 'boom' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -295,7 +295,7 @@ describe('memory tool results', () => {
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: { success: false, error: 'cancelled', cancelled: true },
+        result: { _tag: 'Cancelled' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -644,27 +644,33 @@ describe('memory tool results', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-structural', chainId: 'c-1' })
       yield* h.send({
-        type: 'response.output_text.delta',
+        type: 'raw_response_chunk',
         forkId: null,
         turnId: 't-structural',
-        chainId: 'c-1',
         text: '<magnitude:message to="parent">Hi</magnitude:message>\n</magnitude:message>',
       })
       yield* h.send({
-        type: 'tool_event',
+        type: 'turn_completed',
         forkId: null,
         turnId: 't-structural',
-        toolCallId: 'tc-structural',
-        toolKey: 'fileRead',
-        event: structuralParseErrorFixture('</magnitude:message>'),
+        chainId: 'c-1',
+        strategyId: 'xml-act',
+        result: {
+          _tag: 'ParseFailure',
+          error: structuralParseErrorFixture('</magnitude:message>'),
+        },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       })
-      yield* h.send(turnCompletedEvent('t-structural'))
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-after-structural', chainId: 'c-1' })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
       expect(text).toContain('<parse_error>')
       expect(text).toContain('Unexpected close </magnitude:message>')
-      expect(text).toContain('Location:')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
