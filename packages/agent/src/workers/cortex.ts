@@ -56,6 +56,7 @@ import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import {
   authReconnectMessage,
+  buildGeneralErrorPayload,
   classifyRetryability,
   isAuthReconnectMessage,
   resolveFailureMessage,
@@ -400,11 +401,14 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               error: errorMessage
             }, 'Cortex: LLM stream failed after all retries')
 
+            const { message, errorCode } = buildGeneralErrorPayload(errorMessage, errorCause)
+
             yield* publish({
               type: 'turn_unexpected_error',
               forkId,
               turnId,
-              message: `Unexpected error while executing turn: ${errorMessage}`
+              message,
+              errorCode,
             })
           }
         }))

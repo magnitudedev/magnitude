@@ -44,14 +44,58 @@ function parseRetryAfterMs(message: string): number | null {
   return unit === 'ms' ? value : value * 1000
 }
 
-function tryParseErrorCode(text: string): string | null {
+/**
+ * Try to find and parse a JSON object within mixed text.
+ * First attempts direct JSON.parse on the full text, then
+ * scans for `{` positions and tries slices if direct parse fails.
+ */
+function tryParseJson(text: string): Record<string, unknown> | null {
+  // Try direct parse first (pure JSON text)
   try {
     const parsed = JSON.parse(text)
-    const code = parsed?.error?.code
-    return typeof code === 'string' ? code : null
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
   } catch {
-    return null
+    // Fall through to scanning
   }
+
+  // Scan for JSON objects embedded in text
+  let idx = 0
+  while ((idx = text.indexOf('{', idx)) !== -1) {
+    try {
+      const slice = text.slice(idx)
+      const parsed = JSON.parse(slice)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      // Try next occurrence
+    }
+    idx++
+  }
+
+  return null
+}
+
+function tryParseErrorCode(text: string): string | null {
+  const parsed = tryParseJson(text)
+  const code = parsed?.error
+  if (code && typeof code === 'object') {
+    const c = (code as Record<string, unknown>).code
+    return typeof c === 'string' ? c : null
+  }
+  return null
+}
+
+function tryParseErrorMessage(text: string): string | null {
+  const parsed = tryParseJson(text)
+  const msg = parsed?.error
+  if (msg && typeof msg === 'object') {
+    const m = (msg as Record<string, unknown>).message
+    return typeof m === 'string' ? m : null
+  }
+  return null
 }
 
 /**
@@ -68,12 +112,14 @@ export function classifyHttpError(status: number, message: string): ModelError {
   }
   if (status === 402) {
     const code = tryParseErrorCode(message) ?? 'subscription_required'
-    return new SubscriptionRequired({ message, code })
+    const userMessage = tryParseErrorMessage(message) ?? message
+    return new SubscriptionRequired({ message: userMessage, code })
   }
   if (status === 429) {
     const code = tryParseErrorCode(message)
     if (code?.startsWith('usage_limit_exceeded')) {
-      return new UsageLimitExceeded({ message, code })
+      const userMessage = tryParseErrorMessage(message) ?? message
+      return new UsageLimitExceeded({ message: userMessage, code })
     }
     return new RateLimited({ message, retryAfterMs: parseRetryAfterMs(message) })
   }

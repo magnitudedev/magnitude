@@ -10,15 +10,11 @@
   <strong>Open source coding agent for open source models</strong>
 </p>
 
-Magnitude is ruthlessly optimized to achieve frontier level (or greater) performance on coding tasks using open source models. For way cheaper than frontier APIs and with no lock in.
-
-How we do that:
-- Model agnostic response syntax + parser that is continuously tested
-- Custom [GBNF](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md) grammars that enforce our response syntax
-- Built-in software development skills (that are hackable)
-- Task tree primitive that keeps agent on track
-
-Everything is open source and can be set up to run locally. However, we do offer the [Magnitude Provider](https://app.magnitude.dev) that has generous rate limits and native support for our GBNF grammars.
+Magnitude is ruthlessly optimized for coding with open source models. How we do that:
+- **Custom response handling** — Native thinking and tool calls require the model template, provider, and harness to line up perfectly. Often they don't, and things break. We solve this with a custom response format, grammar, and streaming parser which work consistently across open models.
+- **Efficient subagents** — Our subagents work async and can be configured with a different model. Plan with a strong model while it delegates to faster/cheaper ones.
+- **Flexible behavior** — Instead of baking behavior into a system prompt meant for a specific model, Magnitude uses skills as a core part of its workflow. Use the robust defaults or tweak them to fit your workflow.
+- **Purpose-built provider** — Our [provider](https://app.magnitude.dev) enables grammar-constrained decoding with our response format for maximum reliability, on a flat-rate plan with generous limits. We also support major open model providers (OpenRouter, Vercel, Z.AI, etc.) and first-class local inference via llama.cpp, Ollama, and LMStudio.
 
 <p align="center">
   <img src="interface.png" alt="Magnitude interface" width="100%" />
@@ -63,31 +59,33 @@ You can also provide project-specific skills in `(cwd)/.magnitude/skills/` which
 
 ## Applying grammars
 
-Magnitude uses custom [GBNF](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md) grammars to enforce our response syntax. This can meaningfully improves adherence to the syntax and prevents malformed outputs. 
+Magnitude uses a formal [GBNF](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md) grammar, which constrains the model's vocabulary during generation to only our response format. This helps further reduce edge cases.
 
-Grammars are generated automatically from the tool definitions. They're sent to providers that support them (Magnitude Provider, Fireworks, and llama.cpp) and silently skipped for providers that don't. Set `MAGNITUDE_ENABLE_GRAMMAR=false`  to disable grammar constraints entirely.
+The grammar is generated automatically from the tool definitions. It's sent to providers that support it (Magnitude Provider, Fireworks, and llama.cpp) and silently skipped for providers that don't. Set `MAGNITUDE_ENABLE_GRAMMAR=false`  to disable grammar constraints entirely.
 
 ## Magnitude Provider
 
 We offer a $20/mo coding plan. This includes:
-- The newest open source models like GLM 5.1 and Kimi K2.5
-- Native support for Magnitude GBNF grammars with no setup
+- The newest open source models like GLM 5.1 and Kimi K2.6
+- Native support for Magnitude GBNF grammar with no setup
 - Generous usage limits that reset every 5 hours
 - Built-in web search support using Exa
 - Very fast models with global infrastructure
 - Zero data retention for all models
 
-Sign up at [app.magnitude.dev](https://app.magnitude.dev).
+Sign up at [app.magnitude.dev](https://app.magnitude.dev). There's a 3 day free trial with no card required.
 
 ## Why we built this
 
-Open source models have caught up to the frontier. But no one is building a harness for them.
+Right now there are two categories of harnesses:
+- Harnesses that optimize for a single model family (Claude Code, Codex)
+- Harnesses that support a wide variety of models (Opencode, Cursor, etc)
 
-Even open source harnesses seem to be geared towards Claude and Codex models. It's understandable. Open source models were not good enough for a long time. And the subsidized subscriptions from the frontier labs are compelling.
+The problem is, open source models have their own challenges and quirks that need be to addressed in the harness. Without careful attention, you get: broken thinking/tool calls, model behavior failures (doom loops, randomly stopping), and generally subpar performance.
 
-But the time is now for open source. You can get the same (or even better) performance in the right harness. For way cheaper.
+For the teams building Claude Code and Codex: they have consistent thinking, tool calling, provider, and model behaviors, which enables them to build a reliable agent experience. Current model-agnostic harnesses need to support a broad range of closed and open models, which means open models don't get the necessary attention.
 
-Not to mention you won't be locked in to one ecosystem. We all know how that ends up. 
+We're giving them the necessary attention to make their performance equivalent to closed source models at coding tasks. For way cheaper.
 
 ## Acknowledgments
 

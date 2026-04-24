@@ -41,6 +41,40 @@ export function resolveFailureMessage(error: ModelError): string {
   return `Authentication failed: ${error.message}`
 }
 
+/**
+ * Build the error message and errorCode for the general TurnError fallback path (Path 3).
+ * Extracts errorCode from the cause for CTA rendering and truncates long messages.
+ * Uses resolveFailureMessage for known ModelError types to avoid noisy prefixes.
+ */
+export function buildGeneralErrorPayload(errorMessage: string, errorCause: unknown): {
+  message: string
+  errorCode: string | undefined
+} {
+  // Extract errorCode from the cause for CTA rendering (e.g., usage_limit_exceeded_weekly)
+  const errorCode = errorCause !== null && typeof errorCause === 'object' && 'code' in errorCause
+    ? (errorCause as any).code as string | undefined
+    : undefined
+
+  // If the cause has a known _tag, use its clean message instead of the raw error text
+  const hasTag = typeof errorCause === 'object' && errorCause !== null && '_tag' in errorCause
+  const resolved = hasTag ? resolveFailureMessage(errorCause as ModelError) : null
+
+  let message: string
+  if (resolved) {
+    message = resolved
+  } else {
+    // Truncate and prefix only for unclassified errors
+    const suffix = 'Unexpected error while executing turn: '
+    const maxLen = 500
+    const truncated = (suffix + errorMessage).length > maxLen
+      ? (suffix + errorMessage).slice(0, maxLen) + '...'
+      : suffix + errorMessage
+    message = truncated
+  }
+
+  return { message, errorCode }
+}
+
 export function classifyRetryability(error: unknown): NonRetryableReason {
   if (error instanceof ContextLimitExceeded) return 'context-limit'
   if (error instanceof AuthFailed) return 'auth'
