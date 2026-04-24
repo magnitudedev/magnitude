@@ -65,7 +65,7 @@ function getFieldType(
   if (!schema) return 'unknown'
   const param = schema.parameters.get(paramName)
   if (!param) return 'unknown'
-  if (param.type === 'json') return 'json'
+  if (param.type === 'json_object' || param.type === 'json_array') return 'json'
   if (typeof param.type === 'object' && param.type._tag === 'enum') return 'string'
   return param.type as FieldType
 }

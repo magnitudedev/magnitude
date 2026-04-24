@@ -146,7 +146,7 @@ export interface ParameterSchema {
   /** Parameter name (top-level field name only, no dotted paths) */
   readonly name: string
   /** Parameter type — scalar types are raw text, json types are parsed */
-  readonly type: ScalarType | 'json'
+  readonly type: ScalarType | 'json_object' | 'json_array'
   /** Whether this parameter must be provided */
   readonly required: boolean
 }
@@ -169,7 +169,7 @@ export interface ToolSchema {
  * Rules:
  * - Each top-level property becomes a parameter with name = property name
  * - Scalar types (string, number, boolean, enum) → type is the scalar type
- * - Complex types (object, array, nested struct) → type is 'json'
+ * - Complex types (object, array, nested struct) → type is 'json_object' or 'json_array'
  * - Required/optional derived from schema
  * - No dotted-path recursion into nested structs
  */
@@ -204,25 +204,24 @@ export function deriveParameters(schemaAst: AST.AST, prefix?: string): ToolSchem
         }
 
         if (typeToInspect._tag === 'TypeLiteral') {
-          // Nested struct — treat as single json param (do NOT recurse into dotted paths)
           parameters.set(fullName, {
             name: fullName,
-            type: 'json',
+            type: 'json_object',
             required: !prop.isOptional,
           })
         } else {
-          // Array or other complex type — treat as json
+          // TupleType or other complex type — array
           parameters.set(fullName, {
             name: fullName,
-            type: 'json',
+            type: 'json_array',
             required: !prop.isOptional,
           })
         }
       } else {
-        // Unknown type — treat as json as fallback
+        // Unknown type — treat as object fallback
         parameters.set(fullName, {
           name: fullName,
-          type: 'json',
+          type: 'json_object',
           required: !prop.isOptional,
         })
       }

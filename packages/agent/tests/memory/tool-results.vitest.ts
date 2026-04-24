@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
-import type { ParseErrorDetail } from '@magnitudedev/xml-act'
+import type { ToolParseError, StructuralParseErrorEvent, ToolParseErrorEvent } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
 import { getRootMemory, lastInboxMessage } from './helpers'
 import { getView } from '../../src/projections/memory'
@@ -21,14 +21,15 @@ type TurnCompletedEvent = Extract<AppEvent, { type: 'turn_completed' }>
 function invalidToolInputEvent(args: {
   toolCallId: string
   tagName: string
-  error: ParseErrorDetail
-}): ToolEvent['event'] {
+  error: ToolParseError
+}): ToolParseErrorEvent {
   return {
     _tag: 'ToolParseError',
     toolCallId: args.toolCallId,
     tagName: args.tagName,
     toolName: args.tagName,
     group: 'default',
+    correctToolShape: '',
     error: args.error,
   }
 }
@@ -73,19 +74,64 @@ type ParseErrorFixture = {
   [key: string]: unknown
 }
 
+function exampleShapeForTag(tagName: string): string {
+  switch (tagName) {
+    case 'read':
+      return [
+        '<magnitude:invoke tool="read">',
+        '<magnitude:parameter name="path">...</magnitude:parameter>',
+        '<magnitude:parameter name="offset">...</magnitude:parameter> <!-- optional -->',
+        '<magnitude:parameter name="limit">...</magnitude:parameter> <!-- optional -->',
+        '</magnitude:invoke>',
+      ].join('\n')
+    case 'create-task':
+      return [
+        '<magnitude:invoke tool="create-task">',
+        '<magnitude:parameter name="id">...</magnitude:parameter> <!-- optional -->',
+        '<magnitude:parameter name="title">...</magnitude:parameter>',
+        '<magnitude:parameter name="parent">...</magnitude:parameter> <!-- optional -->',
+        '</magnitude:invoke>',
+      ].join('\n')
+    case 'agent-create':
+      return [
+        '<magnitude:invoke tool="agent-create">',
+        '<magnitude:parameter name="agentId">...</magnitude:parameter>',
+        '<magnitude:parameter name="message">...</magnitude:parameter>',
+        '</magnitude:invoke>',
+      ].join('\n')
+    default:
+      return ''
+  }
+}
+
 function parseErrorFixture(error: ParseErrorFixture): ToolEvent['event'] {
-  const detail: ParseErrorDetail = {
+  const detail: ToolParseError = {
     _tag: 'MissingRequiredField',
     toolCallId: error.id,
     tagName: error.tagName,
     parameterName: 'unknown',
     detail: error.detail,
-  } as ParseErrorDetail
-  return invalidToolInputEvent({
-    toolCallId: error.id,
-    tagName: error.tagName,
-    error: detail,
-  })
+  }
+
+  return {
+    ...invalidToolInputEvent({
+      toolCallId: error.id,
+      tagName: error.tagName,
+      error: detail,
+    }),
+    correctToolShape: exampleShapeForTag(error.tagName),
+  }
+}
+
+function structuralParseErrorFixture(_raw: string): StructuralParseErrorEvent {
+  return {
+    _tag: 'StructuralParseError',
+    error: {
+      _tag: 'StrayCloseTag',
+      tagName: 'magnitude:message',
+      detail: '',
+    },
+  }
 }
 
 function turnCompletedEvent(turnId: string, chainId = 'c-1'): TurnCompletedEvent {
@@ -315,7 +361,7 @@ describe('memory tool results', () => {
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('missing required read attr renders invalid tool input with correct shape', () =>
+  it.live('missing required read attr renders parse_error presentation', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -337,13 +383,11 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('<tool name="read"><error>')
-      expect(text).toContain('Invalid tool input: missing required attribute "path".')
-      expect(text).toContain('Correct tool shape:')
-      expect(text).toContain('<read')
-      expect(text).toContain('path="..."')
-      expect(text).toContain('offset="..."')
-      expect(text).toContain('limit="..."')
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain("Missing required parameter 'unknown' for tool 'read'.")
+      expect(text).toContain('Tool: read')
+      expect(text).toContain('Expected:')
+      expect(text).toContain('<magnitude:invoke tool="read">')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -369,10 +413,10 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('Invalid tool input: unknown attribute "foo".')
-      expect(text).toContain('Correct tool shape:')
-      expect(text).toContain('<read')
-      expect(text).toContain('path="..."')
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain("Missing required parameter 'unknown' for tool 'read'.")
+      expect(text).toContain('Tool: read')
+      expect(text).toContain('Expected:')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -398,16 +442,14 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('<tool name="create-task"><error>')
-      expect(text).toContain('Invalid tool input: invalid value "banana" for attribute "type"; expected one of: todo | bug | chore.')
-      expect(text).toContain('<create-task')
-      expect(text).toContain('id="..."')
-      expect(text).toContain('title="..."')
-      expect(text).toContain('parent="..."')
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain('Tool: create-task')
+      expect(text).toContain('Expected:')
+      expect(text).toContain('<magnitude:invoke tool="create-task">')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('unexpected read body renders invalid tool input with correct shape', () =>
+  it.live('unexpected read body renders parse_error presentation', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -429,11 +471,9 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('Invalid tool input: unexpected body content.')
-      expect(text).toContain('Correct tool shape:')
-      expect(text).toContain('<read')
-      expect(text).toContain('path="..."')
-    }).pipe(Effect.provide(TestHarnessLive()))
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain('</parse_error>')
+      expect(text).toContain("Missing required parameter 'unknown' for tool 'read'.")    }).pipe(Effect.provide(TestHarnessLive()))
   )
 
   it.live('agent-create validation failure renders invalid tool input with correct shape', () =>
@@ -458,14 +498,13 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('<tool name="agent-create"><error>')
-      expect(text).toContain('Invalid tool input: missing required attribute "id" and required child tag "message".')
-      expect(text).toContain('<agent-create')
-      expect(text).toContain('agentId="..."')
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain('Tool: agent-create')
+      expect(text).toContain('Expected:')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('incomplete agent-create tag renders invalid tool input with correct shape', () =>
+  it.live('incomplete agent-create tag renders parse_error presentation with expected example', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -487,13 +526,13 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('Invalid tool input: tool tag was not completed before turn end.')
-      expect(text).toContain('<agent-create')
-      expect(text).toContain('agentId="..."')
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain('Tool: agent-create')
+      expect(text).toContain('Expected:')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('multiple invalid tool calls in one turn all render separately', () =>
+  it.live('multiple invalid tool calls in one turn all render separately as parse errors', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -525,11 +564,9 @@ describe('memory tool results', () => {
       })
 
       const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
-      expect(text).toContain('<tool name="read"><error>')
-      expect(text).toContain('<tool name="create-task"><error>')
-      expect(text).toContain('Invalid tool input: missing required attribute "path".')
-      expect(text).toContain('Invalid tool input: unknown attribute "foo".')
-      expect(text.match(/Correct tool shape:/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+      expect(text.match(/<parse_error>/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+      expect(text).toContain('Tool: read')
+      expect(text).toContain('Tool: create-task')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -591,12 +628,43 @@ describe('memory tool results', () => {
       const inbox = lastInboxMessage(memory)
       const text = renderedUserTextFromMemory(memory.messages)
 
-      expect(text).toContain('Invalid tool input: unexpected body content.')
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain("Missing required parameter 'unknown' for tool 'read'.")
       expect(text).not.toContain('empty response')
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
         expect(inbox.results.some(r => r.kind === 'noop')).toBe(false)
       }
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('structural parse errors are preserved and rendered', () =>
+    Effect.gen(function* () {
+      const h = yield* TestHarness
+
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-structural', chainId: 'c-1' })
+      yield* h.send({
+        type: 'response.output_text.delta',
+        forkId: null,
+        turnId: 't-structural',
+        chainId: 'c-1',
+        text: '<magnitude:message to="parent">Hi</magnitude:message>\n</magnitude:message>',
+      })
+      yield* h.send({
+        type: 'tool_event',
+        forkId: null,
+        turnId: 't-structural',
+        toolCallId: 'tc-structural',
+        toolKey: 'fileRead',
+        event: structuralParseErrorFixture('</magnitude:message>'),
+      })
+      yield* h.send(turnCompletedEvent('t-structural'))
+      yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-after-structural', chainId: 'c-1' })
+
+      const text = renderedUserTextFromMemory((yield* getRootMemory(h)).messages)
+      expect(text).toContain('<parse_error>')
+      expect(text).toContain('Unexpected close </magnitude:message>')
+      expect(text).toContain('Location:')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 

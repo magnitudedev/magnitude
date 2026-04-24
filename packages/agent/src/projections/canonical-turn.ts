@@ -26,7 +26,7 @@ export interface CanonicalTurnState {
   hasStructuralError: boolean
   rawResponse: string
   orderCounter: number
-  lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
+  lastCompleted: { turnId: string; canonicalXml: string; rawResponse: string; clean: boolean } | null
   resolvedTurnDecision: 'continue' | 'idle' | null
 }
 
@@ -262,6 +262,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         lastCompleted: {
           turnId: event.turnId,
           canonicalXml,
+          rawResponse: fork.rawResponse,
           clean,
         }
       }

@@ -8,8 +8,6 @@
 import { Projection } from '@magnitudedev/event-core'
 import type { ObservationPart } from '@magnitudedev/roles'
 import type { AppEvent, StrategyId, ImageAttachment } from '../events'
-import { deriveParameters } from '@magnitudedev/xml-act'
-import { catalog } from '../catalog'
 import { getAgentByForkId, AgentStatusProjection } from './agent-status'
 import { SubagentActivityProjection } from './subagent-activity'
 import { CanonicalTurnProjection } from './canonical-turn'
@@ -320,38 +318,16 @@ function getAgentDefinitionForFork(read: <T>(projection: T) => any, forkId: stri
   return role && isValidVariant(role) ? getAgentDefinition(role) : undefined
 }
 
-/** Lazy map from tagName to correctToolShape (XML format), built once from catalog */
-const toolShapeByTagName: Map<string, string> = (() => {
-  const map = new Map<string, string>()
-  for (const [, entry] of Object.entries(catalog.entries)) {
-    const e = entry as { tool: { name: string; inputSchema: { ast: unknown } } }
-    try {
-      const params = deriveParameters(e.tool.inputSchema.ast as import('@effect/schema/AST').AST)
-      let shape = '<' + e.tool.name
-      for (const [name] of params.parameters) {
-        shape += '\n' + name + '="..."'
-      }
-      shape += '\n/>'
-      map.set(e.tool.name, shape)
-    } catch {
-      // skip tools that fail to generate
-    }
-  }
-  return map
-})()
-
 function toToolErrorResult(args: {
   tagName: string
   status: Extract<TurnResultItem, { kind: 'tool_error' }>['status']
   message?: string
-  correctToolShape?: string
 }): TurnResultItem {
   return {
     kind: 'tool_error',
     tagName: args.tagName,
     status: args.status,
     message: args.message,
-    correctToolShape: args.correctToolShape ?? toolShapeByTagName.get(args.tagName),
   }
 }
 
@@ -543,17 +519,26 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
             ...fork,
             pendingResultItems: [
               ...fork.pendingResultItems,
-              toToolErrorResult({
-                tagName: event.event.tagName,
-                status: 'error',
-                message: `Invalid tool input: ${String((event.event.error as unknown as Record<string, unknown>).detail ?? event.event.error._tag)}`,
-                correctToolShape: event.event.correctToolShape,
-              }),
+              {
+                kind: 'tool_parse_error',
+                event: event.event,
+                rawResponse: '',
+              },
             ],
           }
 
         case 'StructuralParseError':
-          return fork
+          return {
+            ...fork,
+            pendingResultItems: [
+              ...fork.pendingResultItems,
+              {
+                kind: 'structural_parse_error',
+                event: event.event,
+                rawResponse: '',
+              },
+            ],
+          }
 
         default:
           return fork
@@ -627,6 +612,9 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const canonicalText = canonical.lastCompleted?.turnId === event.turnId
         ? canonical.lastCompleted.canonicalXml
         : ''
+      const rawResponse = canonical.lastCompleted?.turnId === event.turnId
+        ? canonical.lastCompleted.rawResponse
+        : ''
       const hasAssistantContent = canonicalText.trim().length > 0
 
       if (hasAssistantContent) {
@@ -671,9 +659,14 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const hasError = !event.result.success
       const errorMessage = hasError && 'error' in event.result ? event.result.error : undefined
       if (nextFork.pendingResultItems.length > 0) {
+        const completedTurnItems = nextFork.pendingResultItems.map(item =>
+          item.kind === 'tool_parse_error' || item.kind === 'structural_parse_error'
+            ? { ...item, rawResponse }
+            : item,
+        )
         nextFork = enqueueResult(
           nextFork,
-          toResultTurnResults({ items: nextFork.pendingResultItems }),
+          toResultTurnResults({ items: completedTurnItems }),
           event.timestamp,
         )
       }

@@ -472,16 +472,11 @@ const makeExecutionManager = Effect.gen(function* () {
                   hasToolErrors = true
                 }
 
-                // Map structured error to flat string for ToolStateEvent
-                const toolParseEvent = {
-                  _tag: 'ToolParseError' as const,
-                  error: errorDetail,
-                }
                 yield* sink.emit({
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
-                  event: toolParseEvent,
+                  event,
                 })
                 break
               }
