@@ -2,7 +2,7 @@ import { describe, it } from '@effect/vitest'
 import { expect } from 'vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
-import { assertNoTurnIdMismatch, eventsForFork, mkTurnCompletedSuccess, mkTurnStarted } from './helpers'
+import { assertNoTurnIdMismatch, eventsForFork, mkTurnOutcomeEventSuccess, mkTurnStarted } from './helpers'
 
 describe('turn control interleavings', () => {
   it.live('delayed completion after a new start is detected as mismatch', () =>
@@ -10,7 +10,7 @@ describe('turn control interleavings', () => {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ turnId: 't-old', chainId: 'c-race' }))
       yield* h.send(mkTurnStarted({ turnId: 't-new', chainId: 'c-race' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-old', chainId: 'c-race' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-old', chainId: 'c-race' }))
 
       expect(() => assertNoTurnIdMismatch(eventsForFork(h, null))).toThrow()
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -22,9 +22,9 @@ describe('turn control interleavings', () => {
       yield* h.send({ type: 'wake', forkId: null })
       yield* h.send(mkTurnStarted({ turnId: 't-rp-1', chainId: 'c-rp' }))
       yield* h.send({ type: 'wake', forkId: null })
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-rp-1', chainId: 'c-rp', result: { _tag: 'Completed', completion: { decision: 'continue', feedback: [] } } }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-rp-1', chainId: 'c-rp', result: { _tag: 'Completed', completion: { yieldTarget: 'invoke', feedback: [] } } }))
       yield* h.send(mkTurnStarted({ turnId: 't-rp-2', chainId: 'c-rp' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-rp-2', chainId: 'c-rp' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-rp-2', chainId: 'c-rp' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -35,9 +35,9 @@ describe('turn control interleavings', () => {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ forkId: null, turnId: 'root-1', chainId: 'root-c' }))
       yield* h.send(mkTurnStarted({ forkId: 'fork-b', turnId: 'sub-1', chainId: 'sub-c' }))
-      yield* h.send(mkTurnCompletedSuccess({ forkId: 'fork-b', turnId: 'sub-1', chainId: 'sub-c' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ forkId: 'fork-b', turnId: 'sub-1', chainId: 'sub-c' }))
       yield* h.send({ type: 'wake', forkId: null })
-      yield* h.send(mkTurnCompletedSuccess({ forkId: null, turnId: 'root-1', chainId: 'root-c' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ forkId: null, turnId: 'root-1', chainId: 'root-c' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
       assertNoTurnIdMismatch(eventsForFork(h, 'fork-b'))
@@ -48,7 +48,7 @@ describe('turn control interleavings', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ turnId: 't-good', chainId: 'c-neg' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-wrong', chainId: 'c-neg' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-wrong', chainId: 'c-neg' }))
 
       expect(() => assertNoTurnIdMismatch(eventsForFork(h, null))).toThrow()
     }).pipe(Effect.provide(TestHarnessLive()))

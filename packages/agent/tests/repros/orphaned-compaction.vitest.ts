@@ -15,7 +15,7 @@ import { getCompaction, getTurn, mkContextLimitHit } from '../compaction/helpers
  *   149100: turn_started(w5dsuyqz7q1q)
  *   149101: compaction_started
  *   149102: interrupt
- *   149103: turn_completed(w5dsuyqz7q1q)
+ *   149103: turn_outcome(w5dsuyqz7q1q)
  *   ... turns continue, but compaction never recovers
  *
  * The compaction worker's async summarization fiber should be cleaned up
@@ -54,7 +54,7 @@ describe('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
 
       // Interrupt immediately (reproducing the production sequence)
       yield* h.send({ type: 'interrupt', forkId: null })
-      yield* h.wait.event('turn_completed', (e) => e.forkId === null)
+      yield* h.wait.event('turn_outcome', (e) => e.forkId === null)
 
       const turn = yield* getTurn(h)
       expect(turn._tag).toBe('idle')
@@ -77,7 +77,7 @@ describe('orphaned compaction after interrupt (mnb0dvn5 reproduction)', () => {
       yield* h.send(mkContextLimitHit())
       yield* h.wait.event('compaction_started', (e) => e.forkId === null)
       yield* h.send({ type: 'interrupt', forkId: null })
-      yield* h.wait.event('turn_completed', (e) => e.forkId === null)
+      yield* h.wait.event('turn_outcome', (e) => e.forkId === null)
 
       // Second compaction: trigger again — should work
       yield* h.send({ ...largeUserMessage, messageId: 'orphan-msg-2' })

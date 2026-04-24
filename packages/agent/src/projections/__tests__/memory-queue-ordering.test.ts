@@ -270,7 +270,7 @@ describe('MemoryProjection queue ordering regressions', () => {
     expect(rootFork.queuedEntries).toEqual([])
   })
 
-  it('turn_unexpected_error queues + flushes immediately and clears currentTurnId', async () => {
+  it('turn_outcome queues + flushes immediately and clears currentTurnId', async () => {
     const rootFork = await runEvents([
       {
         type: 'session_initialized',
@@ -298,7 +298,7 @@ describe('MemoryProjection queue ordering regressions', () => {
         message: undefined,
       } as any,
       {
-        type: 'turn_unexpected_error',
+        type: 'turn_outcome',
         timestamp: ts(20),
         forkId: null,
         turnId: 'turn-1',
@@ -307,8 +307,8 @@ describe('MemoryProjection queue ordering regressions', () => {
     ])
 
     const inbox = getLastInbox(rootFork)
-    expect(inbox.results.map(r => r.kind)).toEqual(['error'])
-    expect((inbox.results[0] as any).message).toBe('boom')
+    expect(inbox.outcomes.map(r => r.kind)).toEqual(['error'])
+    expect((inbox.outcomes[0] as any).message).toBe('boom')
     expect(inbox.timeline.map(e => e.kind)).toEqual(['user_message'])
     expect((inbox.timeline[0] as any).text).toBe('/review')
     expect(rootFork.queuedEntries).toEqual([])
@@ -343,7 +343,7 @@ describe('MemoryProjection queue ordering regressions', () => {
         message: undefined,
       } as any,
       {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         timestamp: ts(20),
         forkId: null,
         turnId: 'turn-1',
@@ -361,8 +361,8 @@ describe('MemoryProjection queue ordering regressions', () => {
     ])
 
     const inbox = getLastInbox(rootFork)
-    expect(inbox.results.map(r => r.kind)).toEqual(['error'])
-    expect((inbox.results[0] as any).message).toBe('turn failed')
+    expect(inbox.outcomes.map(r => r.kind)).toEqual(['error'])
+    expect((inbox.outcomes[0] as any).message).toBe('turn failed')
     expect(inbox.timeline.map(e => e.kind)).toEqual(['user_message'])
     expect((inbox.timeline[0] as any).text).toBe('/plan')
     expect(rootFork.queuedEntries).toEqual([])

@@ -81,10 +81,18 @@ describe('prompt caching consistency', () => {
       const before = snapshotMessageRefs(beforeMemory)
 
       yield* h.send({
-        type: 'turn_unexpected_error',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 't-1',
-        message: 'fatal failure',
+        chainId: 'c-1',
+        strategyId: 'xml-act',
+        outcome: { _tag: 'UnexpectedError', message: 'fatal failure' },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       })
 
       const afterRendered = yield* getRenderedUserText(h)
@@ -117,16 +125,16 @@ describe('prompt caching consistency', () => {
       assertPrefixUnchanged(before, midMemory)
 
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: {
+        outcome: {
           _tag: 'Completed',
           completion: {
-            decision: 'idle',
+            yieldTarget: 'user',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'latest only' }],
           },
         },

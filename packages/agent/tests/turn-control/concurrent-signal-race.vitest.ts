@@ -35,7 +35,7 @@ describe('turn-control/concurrent-signal-race', () => {
       // Complete the turn with chain_continue to re-trigger
       const firstTurn = h.events().find((e): e is Extract<typeof e, { type: 'turn_started' }> => e.type === 'turn_started' && e.forkId === null)!
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: firstTurn.turnId,
@@ -43,7 +43,7 @@ describe('turn-control/concurrent-signal-race', () => {
         strategyId: 'xml-act',
         result: {
           _tag: 'Completed',
-          completion: { decision: 'continue', feedback: [] },
+          completion: { yieldTarget: 'invoke', feedback: [] },
         },
         inputTokens: null,
         outputTokens: null,
@@ -57,21 +57,21 @@ describe('turn-control/concurrent-signal-race', () => {
       const allTurnStarted = yield* h.wait.event('turn_started', (e) => e.forkId === null)
 
       // Count total turn_started events — should never exceed the number of
-      // turn_completed + 1 (initial). Each turn_started must correspond to an idle state.
+      // turn_outcome + 1 (initial). Each turn_started must correspond to an idle state.
       const turnStartedCount = h.events().filter(e => e.type === 'turn_started' && e.forkId === null).length
-      const turnCompletedCount = h.events().filter(e => e.type === 'turn_completed' && e.forkId === null).length
+      const turnCompletedCount = h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length
 
       // There should be exactly turnCompletedCount + 1 turn_started events (one pending)
       // or turnCompletedCount if the last one completed
       expect(turnStartedCount).toBeLessThanOrEqual(turnCompletedCount + 1)
 
-      // More importantly: no two consecutive turn_started events without a turn_completed between them
+      // More importantly: no two consecutive turn_started events without a turn_outcome between them
       const turnEvents = h.events().filter(e =>
-        (e.type === 'turn_started' || e.type === 'turn_completed') && e.forkId === null
+        (e.type === 'turn_started' || e.type === 'turn_outcome') && e.forkId === null
       )
       for (let i = 1; i < turnEvents.length; i++) {
         if (turnEvents[i].type === 'turn_started' && turnEvents[i - 1].type === 'turn_started') {
-          expect.fail(`Consecutive turn_started without turn_completed at index ${i}: ${turnEvents.map(e => e.type).join(', ')}`)
+          expect.fail(`Consecutive turn_started without turn_outcome at index ${i}: ${turnEvents.map(e => e.type).join(', ')}`)
         }
       }
     }).pipe(Effect.provide(TestHarnessLive())))

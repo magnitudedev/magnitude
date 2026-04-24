@@ -116,8 +116,8 @@ describe('runon bug: yield not terminating', () => {
 
     const turnEnd = events.find(e => e._tag === 'TurnEnd')
     expect(turnEnd).toBeDefined()
-    if (turnEnd && turnEnd._tag === 'TurnEnd' && turnEnd.result._tag === 'Success') {
-      expect(turnEnd.result.turnControl.target).toBe('invoke')
+    if (turnEnd && turnEnd._tag === 'TurnEnd' && turnEnd.outcome._tag === 'Success') {
+      expect(turnEnd.outcome.turnControl.target).toBe('invoke')
     }
   })
 
@@ -127,8 +127,8 @@ describe('runon bug: yield not terminating', () => {
 
     const turnEnd = events.find(e => e._tag === 'TurnEnd')
     expect(turnEnd).toBeDefined()
-    if (turnEnd && turnEnd._tag === 'TurnEnd' && turnEnd.result._tag === 'Success') {
-      expect(turnEnd.result.turnControl.target).toBe('invoke')
+    if (turnEnd && turnEnd._tag === 'TurnEnd' && turnEnd.outcome._tag === 'Success') {
+      expect(turnEnd.outcome.turnControl.target).toBe('invoke')
     }
   })
 
@@ -137,8 +137,8 @@ describe('runon bug: yield not terminating', () => {
       const events = parseChunked(BUG_INPUT, size)
       const turnEnd = events.find(e => e._tag === 'TurnEnd')
       expect(turnEnd).toBeDefined()
-      if (turnEnd && turnEnd._tag === 'TurnEnd' && turnEnd.result._tag === 'Success') {
-        expect(turnEnd.result.turnControl.target).toBe('invoke')
+      if (turnEnd && turnEnd._tag === 'TurnEnd' && turnEnd.outcome._tag === 'Success') {
+        expect(turnEnd.outcome.turnControl.target).toBe('invoke')
       }
     })
   }

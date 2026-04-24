@@ -75,7 +75,7 @@ export type { ToolCallContext } from './types'
 // Core types — results
 export type {
   ToolResult,
-  ExecutionResult,
+  TurnEngineOutcome,
 } from './types'
 
 // Core types — configuration

@@ -53,7 +53,7 @@ export const AgentLifecycle = Worker.define<AppEvent>()({
       yield* execManager.disposeFork(event.forkId)
     }).pipe(Effect.orDie),
 
-    turn_completed: (event, _publish, read) => Effect.gen(function* () {
+    turn_outcome: (event, _publish, read) => Effect.gen(function* () {
       if (event.forkId === null) return
       const turnState = yield* read(TurnProjection)
       if (turnState.triggers.length > 0) return

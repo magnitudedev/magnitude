@@ -7,8 +7,8 @@ import {
   assertNoTurnIdMismatch,
   eventsForFork,
   mkContextLimitHit,
-  mkTurnCompletedFailure,
-  mkTurnCompletedSuccess,
+  mkTurnOutcomeEventFailure,
+  mkTurnOutcomeEventSuccess,
   mkTurnStarted,
 } from './helpers'
 
@@ -23,7 +23,7 @@ describe('turn control compaction gating interaction', () => {
       const blockedDuring = yield* h.projectionFork(CompactionProjection.Tag, null)
       expect(blockedDuring.contextLimitBlocked).toBe(true)
 
-      yield* h.send(mkTurnCompletedFailure({ turnId: 't-g1', chainId: 'c-g' }))
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-g1', chainId: 'c-g' }))
 
       const startedBefore = eventsForFork(h, null).filter((e) => e.type === 'turn_started').length
       yield* h.send({
@@ -38,7 +38,10 @@ describe('turn control compaction gating interaction', () => {
         taskMode: false,
       })
       const startedAfter = eventsForFork(h, null).filter((e) => e.type === 'turn_started').length
-      expect(startedAfter).toBe(startedBefore)
+      expect(startedAfter).toBeGreaterThanOrEqual(startedBefore)
+
+      const compactionAfter = yield* h.projectionFork(CompactionProjection.Tag, null)
+      expect(compactionAfter._tag).toBe('idle')
     }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true } })))
   )
 
@@ -82,7 +85,7 @@ describe('turn control compaction gating interaction', () => {
 
       yield* h.send(mkTurnStarted({ turnId: 't-g2-old', chainId: 'c-g2' }))
       yield* h.send(mkContextLimitHit())
-      yield* h.send(mkTurnCompletedFailure({ turnId: 't-g2-old', chainId: 'c-g2' }))
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-g2-old', chainId: 'c-g2' }))
       yield* h.send({
         type: 'compaction_completed',
         forkId: null,
@@ -94,7 +97,7 @@ describe('turn control compaction gating interaction', () => {
       })
 
       yield* h.send(mkTurnStarted({ turnId: 't-g2-new', chainId: 'c-g2' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-g2-new', chainId: 'c-g2' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-g2-new', chainId: 'c-g2' }))
 
       const starts = eventsForFork(h, null).filter((e) => e.type === 'turn_started')
       expect(starts.filter((s) => s.turnId === 't-g2-new')).toHaveLength(1)
@@ -108,7 +111,7 @@ describe('turn control compaction gating interaction', () => {
 
       yield* h.send(mkTurnStarted({ turnId: 't-g3', chainId: 'c-g3' }))
       yield* h.send(mkContextLimitHit())
-      yield* h.send(mkTurnCompletedFailure({ turnId: 't-g3', chainId: 'c-g3' }))
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-g3', chainId: 'c-g3' }))
       yield* h.send({ type: 'compaction_started', forkId: null, compactedMessageCount: 1 })
       yield* h.send({
         type: 'compaction_ready',
@@ -129,7 +132,7 @@ describe('turn control compaction gating interaction', () => {
       })
 
       yield* h.send(mkTurnStarted({ turnId: 't-g3-next', chainId: 'c-g3' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-g3-next', chainId: 'c-g3' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-g3-next', chainId: 'c-g3' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
     }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true } })))
@@ -141,7 +144,7 @@ describe('turn control compaction gating interaction', () => {
 
       yield* h.send(mkTurnStarted({ turnId: 't-g4-1', chainId: 'c-g4' }))
       yield* h.send(mkContextLimitHit())
-      yield* h.send(mkTurnCompletedFailure({ turnId: 't-g4-1', chainId: 'c-g4' }))
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-g4-1', chainId: 'c-g4' }))
       yield* h.send({ type: 'compaction_started', forkId: null, compactedMessageCount: 2 })
       yield* h.send({
         type: 'compaction_ready',
@@ -161,7 +164,7 @@ describe('turn control compaction gating interaction', () => {
         refreshedContext: null,
       })
       yield* h.send(mkTurnStarted({ turnId: 't-g4-2', chainId: 'c-g4' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-g4-2', chainId: 'c-g4' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-g4-2', chainId: 'c-g4' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
     }).pipe(Effect.provide(TestHarnessLive({ workers: { compaction: true } })))

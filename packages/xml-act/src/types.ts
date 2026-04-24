@@ -243,7 +243,7 @@ export interface ToolObservation {
 
 export interface TurnEnd {
   readonly _tag: 'TurnEnd'
-  readonly result: ExecutionResult
+  readonly outcome: TurnEngineOutcome
 }
 
 // =============================================================================
@@ -256,11 +256,19 @@ export type ToolResult<TOutput = unknown> =
   | { readonly _tag: 'Rejected'; readonly rejection: unknown }
   | { readonly _tag: 'Interrupted' }
 
-export type ExecutionResult =
-  | { readonly _tag: 'Success'; readonly turnControl: { readonly target: 'user' | 'invoke' | 'worker' | 'parent' } | null; readonly termination: 'natural' | 'runaway' }
-  | { readonly _tag: 'Failure'; readonly error: string }
-  | { readonly _tag: 'Interrupted' }
+export type TurnEngineOutcome =
+  | {
+      readonly _tag: 'Completed'
+      readonly turnControl: { readonly target: 'user' | 'invoke' | 'worker' | 'parent' } | null
+      readonly termination: 'natural' | 'runaway'
+    }
+  | { readonly _tag: 'StructuralParseError'; readonly error: StructuralParseErrorEvent }
+  | { readonly _tag: 'ToolParseError'; readonly error: ToolParseErrorEvent }
+  | { readonly _tag: 'ToolExecutionError' }
   | { readonly _tag: 'GateRejected'; readonly rejection: unknown }
+  | { readonly _tag: 'EngineDefect'; readonly message: string; readonly cause?: unknown }
+
+
 
 // =============================================================================
 // Error Types

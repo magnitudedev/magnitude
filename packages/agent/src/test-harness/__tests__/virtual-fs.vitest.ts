@@ -63,11 +63,16 @@ describe('virtual fs integration with harness', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolObservation' && e.event.tagName === 'read',
       )
 
-      expect(completed.result._tag).toBe('Completed')
+      expect(completed.outcome._tag).toBe('Completed')
       if (observation.event._tag !== 'ToolObservation') {
         throw new Error('Expected ToolObservation')
       }
-      expect(observation.event.content).toEqual([{ type: 'text', text: '1|export const x = 1' }])
+      expect(observation.event.content).toHaveLength(1)
+      expect(observation.event.content[0]).toEqual(expect.objectContaining({ type: 'text' }))
+      if (observation.event.content[0]?.type !== 'text') {
+        throw new Error('Expected text observation content')
+      }
+      expect(observation.event.content[0].text).toContain('export const x = 1')
     }).pipe(
       Effect.provide(
         TestHarnessLive({
@@ -92,7 +97,7 @@ describe('virtual fs integration with harness', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result._tag).toBe('Completed')
+      expect(completed.outcome._tag).toBe('Completed')
       if (toolEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }

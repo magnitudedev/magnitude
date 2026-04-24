@@ -72,7 +72,7 @@ describe('memory rendering', () => {
         chainId: 'c-1',
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
@@ -80,10 +80,10 @@ describe('memory rendering', () => {
         strategyId: 'xml-act',
 
 
-        result: {
+        outcome: {
           _tag: 'Completed',
           completion: {
-            decision: 'idle',
+            yieldTarget: 'user',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'check this' }],
           },
         },
@@ -230,7 +230,7 @@ describe('memory rendering', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
@@ -238,10 +238,10 @@ describe('memory rendering', () => {
         strategyId: 'xml-act',
 
 
-        result: {
+        outcome: {
           _tag: 'Completed',
           completion: {
-            decision: 'idle',
+            yieldTarget: 'user',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'after turn' }],
           },
         },

@@ -160,13 +160,13 @@ export interface ObservedResult {
   readonly content: ContentPart[]
 }
 
-export interface TurnCompleted {
-  readonly type: 'turn_completed'
+export interface TurnOutcomeEvent {
+  readonly type: 'turn_outcome'
   readonly forkId: string | null
   readonly turnId: string
   readonly chainId: string
   readonly strategyId: StrategyId
-  readonly result: TurnOutcome
+  readonly outcome: TurnOutcome
   /** Actual input token count from LLM provider (via BAML Collector). Null when unavailable (e.g. Codex path, interrupted turns). */
   readonly inputTokens: number | null
   /** Output token count from LLM provider. Null when unavailable. */
@@ -181,10 +181,10 @@ export interface TurnCompleted {
   readonly modelId: string | null
 }
 
-export type TurnDecision = 'continue' | 'idle'
+export type TurnYieldTarget = 'user' | 'invoke' | 'worker' | 'parent'
 
 export interface TurnCompletion {
-  readonly decision: TurnDecision
+  readonly yieldTarget: TurnYieldTarget
   readonly feedback: readonly TurnFeedback[]
 }
 
@@ -193,20 +193,52 @@ export type TurnFeedback =
   | { readonly _tag: 'OneshotLivenessRetriggered' }
   | { readonly _tag: 'YieldWorkerRetriggered' }
 
+export type ParseFailureEvent = StructuralParseErrorEvent | ToolParseErrorEvent
+
+export type MagnitudeBillingReason =
+  | { readonly _tag: 'SubscriptionRequired'; readonly message: string }
+  | { readonly _tag: 'TrialExpired'; readonly message: string }
+  | { readonly _tag: 'UsageLimitExceeded'; readonly message: string }
+
+export type ProviderNotReadyDetail =
+  | { readonly _tag: 'NotConfigured' }
+  | { readonly _tag: 'ProviderDisconnected'; readonly providerId: string; readonly providerName: string }
+  | { readonly _tag: 'AuthFailed'; readonly providerId: string; readonly providerName: string }
+  | { readonly _tag: 'MagnitudeBilling'; readonly reason: MagnitudeBillingReason }
+  | { readonly _tag: 'ClientRequestRejected' }
+
+export type ConnectionFailureDetail =
+  | { readonly _tag: 'ProviderError'; readonly httpStatus: number }
+  | { readonly _tag: 'TransportError'; readonly httpStatus?: number }
+  | { readonly _tag: 'StreamError' }
+
+export type CancelledReason =
+  | { readonly _tag: 'UserInterrupt' }
+  | { readonly _tag: 'WorkerKilled' }
+  | { readonly _tag: 'TurnSuperseded' }
+
+export type SafetyStopReason =
+  | { readonly _tag: 'IdenticalResponseCircuitBreaker'; readonly threshold: number }
+  | { readonly _tag: 'Other'; readonly message: string }
+
+export type UnexpectedErrorDetail =
+  | { readonly _tag: 'EngineDefect' }
+  | { readonly _tag: 'ExecutionManagerDefect' }
+  | { readonly _tag: 'CortexDefect' }
+  | { readonly _tag: 'ProviderDefect' }
+  | { readonly _tag: 'ToolRuntimeDefect' }
+  | { readonly _tag: 'Unknown' }
+
 export type TurnOutcome =
   | { readonly _tag: 'Completed'; readonly completion: TurnCompletion }
-  | { readonly _tag: 'ParseFailure'; readonly error: StructuralParseErrorEvent | ToolParseErrorEvent }
-  | { readonly _tag: 'SystemError'; readonly message: string }
-  | { readonly _tag: 'Cancelled' }
-
-// Turn unexpected error (irrecoverable - e.g. LLM connection failure after all retries)
-export interface TurnUnexpectedError {
-  readonly type: 'turn_unexpected_error'
-  readonly forkId: string | null
-  readonly turnId: string
-  readonly message: string
-  readonly errorCode?: string
-}
+  | { readonly _tag: 'ParseFailure'; readonly error: ParseFailureEvent }
+  | { readonly _tag: 'ProviderNotReady'; readonly detail: ProviderNotReadyDetail }
+  | { readonly _tag: 'ConnectionFailure'; readonly detail: ConnectionFailureDetail }
+  | { readonly _tag: 'ContextWindowExceeded' }
+  | { readonly _tag: 'OutputTruncated' }
+  | { readonly _tag: 'SafetyStop'; readonly reason: SafetyStopReason }
+  | { readonly _tag: 'Cancelled'; readonly reason: CancelledReason }
+  | { readonly _tag: 'UnexpectedError'; readonly message: string; readonly detail?: UnexpectedErrorDetail }
 
 // =============================================================================
 // Streaming Events
@@ -584,8 +616,7 @@ export type AppEvent =
   | UserBashCommand
   | UserMessageReady
   | TurnStarted
-  | TurnCompleted
-  | TurnUnexpectedError
+  | TurnOutcomeEvent
   | MessageStart
   | MessageChunkEvent
   | ThinkingChunk

@@ -103,12 +103,12 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
         const { executeResult, usage } = drained.finalResult
 
         yield* publish({
-          type: 'turn_completed',
+          type: 'turn_outcome',
           forkId,
           turnId,
           chainId,
           strategyId: 'xml-act',
-          result: executeResult.result,
+          outcome: executeResult.result,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
           cacheReadTokens: usage.cacheReadTokens,
@@ -119,12 +119,12 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
       }).pipe(
         Effect.onInterrupt(() => {
           return publish({
-            type: 'turn_completed',
+            type: 'turn_outcome',
             forkId,
             turnId,
             chainId,
             strategyId: 'xml-act',
-            result: { _tag: 'Cancelled' },
+            outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
             inputTokens: null,
             outputTokens: null,
             cacheReadTokens: null,
@@ -143,10 +143,18 @@ export const MockCortex = Worker.defineForked<AppEvent>()({
               : Cause.pretty(cause)
 
           return publish({
-            type: 'turn_unexpected_error',
+            type: 'turn_outcome',
             forkId,
             turnId,
-            message: `MockCortex turn failed: ${message}`,
+            chainId,
+            strategyId: 'xml-act',
+            outcome: { _tag: 'UnexpectedError', message: `MockCortex turn failed: ${message}` },
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadTokens: null,
+            cacheWriteTokens: null,
+            providerId: null,
+            modelId: null,
           })
         })
       )

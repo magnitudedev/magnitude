@@ -6,12 +6,12 @@ import {
   assertNoTurnIdMismatch,
   eventsForFork,
   getTurn,
-  mkTurnCompletedSuccess,
+  mkTurnOutcomeEventSuccess,
   mkTurnStarted,
 } from '../turn-control/helpers'
 
 /**
- * Reproduces the stale turn_completed bug found in session mnb0dvn5.
+ * Reproduces the stale turn_outcome bug found in session mnb0dvn5.
  *
  * Root cause: When a user interrupts and sends a new message, the turn
  * controller starts a new turn BEFORE the interrupted turn's completion
@@ -24,7 +24,7 @@ import {
  *   151888: interrupt
  *   151889: user_message
  *   151891: turn_started(rxafl22aulgl)       ← new turn before old completes
- *   151892: turn_completed(osxghp8wux0k)     ← STALE
+ *   151892: turn_outcome(osxghp8wux0k)     ← STALE
  */
 describe('interrupt stale turn race (mnb0dvn5 reproduction)', () => {
   const mkUserMessage = (id: string, text: string) => ({
@@ -39,7 +39,7 @@ describe('interrupt stale turn race (mnb0dvn5 reproduction)', () => {
     taskMode: false,
   })
 
-  it.live('interrupt + new user message must not produce stale turn_completed', () =>
+  it.live('interrupt + new user message must not produce stale turn_outcome', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -56,13 +56,13 @@ describe('interrupt stale turn race (mnb0dvn5 reproduction)', () => {
       yield* h.send(mkUserMessage('msg-2', 'second message'))
 
       // Complete interrupted turn A first
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 'turn-A', chainId: 'chain-1' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 'turn-A', chainId: 'chain-1' }))
 
       // Then turn B starts for queued work
       yield* h.send(mkTurnStarted({ turnId: 'turn-B', chainId: 'chain-2' }))
 
       // Send a stale/duplicate completion for turn A while B is active
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 'turn-A', chainId: 'chain-1' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 'turn-A', chainId: 'chain-1' }))
 
       // Projection must keep active turn B unchanged
       const turn = yield* getTurn(h, null)
@@ -84,7 +84,7 @@ describe('interrupt stale turn race (mnb0dvn5 reproduction)', () => {
       const firstTurn = yield* h.wait.event('turn_started', (e) => e.forkId === null)
 
       // Wait for it to complete (mock model will auto-complete)
-      yield* h.wait.event('turn_completed', (e) => e.forkId === null && e.turnId === firstTurn.turnId)
+      yield* h.wait.event('turn_outcome', (e) => e.forkId === null && e.turnId === firstTurn.turnId)
 
       // Now simulate the race: send message, interrupt, send another message rapidly
       yield* h.send(mkUserMessage('msg-w2', 'do something'))
@@ -98,9 +98,9 @@ describe('interrupt stale turn race (mnb0dvn5 reproduction)', () => {
       yield* h.send(mkUserMessage('msg-w3', 'new instruction'))
 
       // Wait for the interrupted turn to complete
-      yield* h.wait.event('turn_completed', (e) => e.forkId === null && e.turnId === secondTurn.turnId)
+      yield* h.wait.event('turn_outcome', (e) => e.forkId === null && e.turnId === secondTurn.turnId)
 
-      // Check: every turn_completed must match the active turn at that point
+      // Check: every turn_outcome must match the active turn at that point
       const events = eventsForFork(h, null)
       assertNoTurnIdMismatch(events)
     }).pipe(Effect.provide(TestHarnessLive()))

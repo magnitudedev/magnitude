@@ -137,7 +137,7 @@ export function createParser(
       const termination = deferredYield.postYieldHasContent ? 'runaway' : 'natural'
       events.push({
         _tag: 'TurnEnd',
-        result: { _tag: 'Success', turnControl: { target: deferredYield.target }, termination },
+        outcome: { _tag: 'Completed', turnControl: { target: deferredYield.target }, termination },
       })
       deferredYield.target = null
       machine.apply([{ type: 'done' }])

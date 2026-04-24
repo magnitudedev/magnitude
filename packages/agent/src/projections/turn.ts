@@ -10,7 +10,7 @@ import { FSM } from '@magnitudedev/event-core'
 const { defineFSM } = FSM
 import { Data } from 'effect'
 import { logger } from '@magnitudedev/logger'
-import type { AppEvent, TurnCompleted } from '../events'
+import type { AppEvent, TurnOutcomeEvent } from '../events'
 import type { ToolKey } from '../catalog'
 import type { ToolResult } from '@magnitudedev/xml-act'
 import { AgentRoutingProjection } from './agent-routing'
@@ -142,7 +142,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       forkId: string | null
       turnId: string
       reason: TurnTerminationReason
-      result?: TurnCompleted['result']
+      result?: TurnOutcomeEvent['outcome']
       triggersQueued: boolean
     }>('Turn/turnTerminated'),
     pendingInboundCommunicationsRead: Signal.create<{
@@ -280,13 +280,14 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       }
     },
 
-    turn_completed: ({ event, fork, emit }) => {
+    turn_outcome: ({ event, fork, emit }) => {
       if (fork._tag === 'idle') return fork
       if (fork.turnId !== event.turnId) return fork
 
       const turnWantsContinue =
-        (event.result._tag === 'Completed' && event.result.completion.decision === 'continue')
-        || event.result._tag === 'ParseFailure'
+        (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke')
+        || event.outcome._tag === 'ParseFailure'
+        || event.outcome._tag === 'ConnectionFailure'
       const shouldEnqueueContinue = turnWantsContinue && !fork.softInterrupted
 
       const nextTriggers = shouldEnqueueContinue
@@ -297,16 +298,14 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
         forkId: event.forkId,
         turnId: event.turnId,
         reason:
-          event.result._tag === 'Cancelled'
+          event.outcome._tag === 'Cancelled'
             ? 'cancelled'
-            : event.result._tag === 'Completed'
+            : event.outcome._tag === 'Completed'
               ? 'completed'
               : 'error',
-        result: event.result,
+        result: event.outcome,
         triggersQueued: nextTriggers.length > 0,
       })
-
-      // Always emit — lifecycle returning to idle is a readiness change
 
       return TurnLifecycle.transition(fork, 'idle', {
         completedTurns: fork.completedTurns + 1,
@@ -314,51 +313,15 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
         softInterrupted: false,
       })
     },
-
-    turn_unexpected_error: ({ event, fork, emit }) => {
-      if (fork._tag === 'idle') return fork
-      if (fork.turnId !== event.turnId) return fork
-
-      emit.turnTerminated({
-        forkId: event.forkId,
-        turnId: event.turnId,
-        reason: 'error',
-        triggersQueued: fork.triggers.length > 0,
-      })
-
-
-      return TurnLifecycle.transition(fork, 'idle', {
-        completedTurns: fork.completedTurns + 1,
-        softInterrupted: false,
-      })
-    },
   },
 
   globalEventHandlers: {
-    turn_completed: ({ event, state }) => {
+    turn_outcome: ({ event, state }) => {
       if (event.forkId === null) return state
 
       const subFork = state.forks.get(event.forkId)
       if (!subFork) return state
       if (!isStable(subFork)) return state
-
-      const parentId = subFork.parentForkId
-
-      const parentFork = state.forks.get(parentId)
-      if (!parentFork) return state
-
-      const nextParent = enqueueTrigger(parentFork, { _tag: 'wake' })
-      return {
-        ...state,
-        forks: new Map(state.forks).set(parentId, nextParent),
-      }
-    },
-
-    turn_unexpected_error: ({ event, state }) => {
-      if (event.forkId === null) return state
-
-      const subFork = state.forks.get(event.forkId)
-      if (!subFork) return state
 
       const parentId = subFork.parentForkId
 

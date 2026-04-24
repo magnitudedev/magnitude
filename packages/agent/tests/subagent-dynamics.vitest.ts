@@ -57,12 +57,12 @@ describe('subagent dynamics', () => {
 
       yield* h.user('create then run subagent')
       const rootCompleted = yield* h.wait.turnCompleted(null)
-      expect(rootCompleted.result._tag).toBe('Completed')
+      expect(rootCompleted.outcome._tag).toBe('Completed')
 
       const created = yield* h.wait.event('agent_created', (e) => e.agentId === 'test-explorer')
       const subCompleted = yield* h.wait.turnCompleted(created.forkId)
 
-      expect(subCompleted.type).toBe('turn_completed')
+      expect(subCompleted.type).toBe('turn_outcome')
       expect(subCompleted.forkId).toBe(created.forkId)
 
       const hasSubagentTurn = h

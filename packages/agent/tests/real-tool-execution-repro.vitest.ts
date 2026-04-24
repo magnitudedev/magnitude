@@ -22,7 +22,7 @@ describe('real tool execution repro', () => {
       // Wait for root turn to complete
       const rootTurn = yield* h.wait.turnCompleted(null)
       
-      console.log('root turn result:', JSON.stringify(rootTurn.result))
+      console.log('root turn outcome:', JSON.stringify(rootTurn.outcome))
 
       // Check if create-task tool actually executed
       const createTaskExec = yield* h.wait.event('tool_event' as any, (e: any) =>

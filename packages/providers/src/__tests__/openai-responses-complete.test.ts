@@ -11,6 +11,7 @@ describe('openai-responses complete path', () => {
     const model = new Model({
       id: 'gpt-5.4',
       providerId: 'openai',
+      providerName: 'OpenAI',
       name: 'GPT 5.4',
       contextWindow: 128_000,
       maxOutputTokens: 8_192,

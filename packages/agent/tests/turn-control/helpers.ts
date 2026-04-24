@@ -17,15 +17,15 @@ export const mkTurnStarted = (
   ...overrides,
 })
 
-export const mkTurnCompletedSuccess = (
-  overrides: Partial<Extract<AppEvent, { type: 'turn_completed' }>> = {},
-): Extract<AppEvent, { type: 'turn_completed' }> => ({
-  type: 'turn_completed',
+export const mkTurnOutcomeEventSuccess = (
+  overrides: Partial<Extract<AppEvent, { type: 'turn_outcome' }>> = {},
+): Extract<AppEvent, { type: 'turn_outcome' }> => ({
+  type: 'turn_outcome',
   forkId: null,
   turnId: 'turn-1',
   chainId: 'chain-1',
   strategyId: 'xml-act',
-  result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
+  outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
 
   inputTokens: null,
   outputTokens: null,
@@ -36,11 +36,11 @@ export const mkTurnCompletedSuccess = (
   ...overrides,
 })
 
-export const mkTurnCompletedFailure = (
-  overrides: Partial<Extract<AppEvent, { type: 'turn_completed' }>> = {},
-): Extract<AppEvent, { type: 'turn_completed' }> => ({
-  ...mkTurnCompletedSuccess({
-    result: { _tag: 'SystemError', message: 'failed' },
+export const mkTurnOutcomeEventFailure = (
+  overrides: Partial<Extract<AppEvent, { type: 'turn_outcome' }>> = {},
+): Extract<AppEvent, { type: 'turn_outcome' }> => ({
+  ...mkTurnOutcomeEventSuccess({
+    outcome: { _tag: 'UnexpectedError', message: 'failed' },
   }),
   ...overrides,
 })
@@ -68,17 +68,9 @@ export const assertNoTurnIdMismatch = (events: readonly AppEvent[], forkId: stri
       current = event.turnId
       continue
     }
-    if (event.type === 'turn_completed') {
+    if (event.type === 'turn_outcome') {
       expect(current).toBe(event.turnId)
       current = null
-      continue
-    }
-    if (event.type === 'turn_unexpected_error') {
-      // This event can appear for related forks in transcript ordering.
-      // Only enforce if it is for the currently tracked turn.
-      if (current !== null && event.turnId === current) {
-        current = null
-      }
       continue
     }
     if (event.type === 'interrupt') {

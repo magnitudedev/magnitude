@@ -1,4 +1,4 @@
-import { YIELD_USER, YIELD_INVOKE, deriveParameters } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, deriveParameters } from '@magnitudedev/xml-act'
 import type { MessageDestination } from '../events'
 import type { ResolvedToolSet } from '../tools/resolved-toolset'
 import { buildRegisteredTools } from '../tools/tool-registry'
@@ -14,7 +14,7 @@ export interface CanonicalTrace {
   reasonBlocks: ReasonBlock[]
   messages: Array<{ text: string; destination: MessageDestination }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string | null }>
-  turnDecision: 'continue' | 'idle'
+  yieldTarget: 'user' | 'invoke' | 'worker' | 'parent'
 }
 
 function getByPath(obj: Record<string, unknown>, path: string): unknown {
@@ -95,10 +95,19 @@ export function serializeCanonicalTurn(
     parts.push(serializeToolCall(call.tagName, call.input, call.query, toolSet))
   }
 
-  if (trace.turnDecision === 'idle') {
-    parts.push(YIELD_USER)
-  } else if (trace.turnDecision === 'continue') {
-    parts.push(YIELD_INVOKE)
+  switch (trace.yieldTarget) {
+    case 'user':
+      parts.push(YIELD_USER)
+      break
+    case 'invoke':
+      parts.push(YIELD_INVOKE)
+      break
+    case 'worker':
+      parts.push(YIELD_WORKER)
+      break
+    case 'parent':
+      parts.push(YIELD_PARENT)
+      break
   }
   return parts.join('\n')
 }

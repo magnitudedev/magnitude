@@ -15,7 +15,7 @@ describe('harness shell behavior', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'shell',
       )
 
-      expect(completed.result._tag).toBe('Completed')
+      expect(completed.outcome._tag).toBe('Completed')
       if (toolEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }

@@ -50,17 +50,17 @@ describe('memory queue and flush', () => {
         },
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        result: {
+        outcome: {
           _tag: 'Completed',
           completion: {
-            decision: 'idle',
+            yieldTarget: 'user',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'after turn' }],
           },
         },
@@ -78,7 +78,7 @@ describe('memory queue and flush', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.length).toBeGreaterThan(0)
+        expect(inbox.outcomes.length).toBeGreaterThan(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -148,14 +148,14 @@ describe('memory queue and flush', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
+        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -169,7 +169,7 @@ describe('memory queue and flush', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'noop')).toBe(false)
+        expect(inbox.outcomes.some(r => r.kind === 'noop')).toBe(false)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -185,17 +185,17 @@ describe('memory queue and flush', () => {
         text: 'from user',
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        result: {
+        outcome: {
           _tag: 'Completed',
           completion: {
-            decision: 'idle',
+            yieldTarget: 'user',
             feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'remember me' }],
           },
         },

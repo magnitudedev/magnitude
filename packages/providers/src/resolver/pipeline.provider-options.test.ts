@@ -11,6 +11,7 @@ import { TraceEmitter } from './tracing'
 const model = new Model({
   id: 'gpt-5.3-codex',
   providerId: 'openai',
+  providerName: 'OpenAI',
   name: 'test',
   contextWindow: 100_000,
   maxOutputTokens: 8192,

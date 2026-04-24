@@ -2,6 +2,7 @@ import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../harness'
 import { MockTurnScriptTag } from '../turn-script'
+import { response } from '../response-builder'
 import { TurnProjection } from '../../projections/turn'
 
 describe('baseline harness lifecycle', () => {
@@ -22,9 +23,9 @@ describe('baseline harness lifecycle', () => {
       yield* harness.user('hello')
       const completed = yield* harness.wait.turnCompleted(null)
 
-      expect(completed.result._tag).toBe('Completed')
-      if (completed.result._tag === 'Completed') {
-        expect(completed.result.completion.decision).toBe('idle')
+      expect(completed.outcome._tag).toBe('Completed')
+      if (completed.outcome._tag === 'Completed') {
+        expect(completed.outcome.completion.yieldTarget).toBe('user')
       }
 
       const root = yield* harness.projectionFork(TurnProjection.Tag, null)
@@ -43,18 +44,18 @@ describe('baseline harness lifecycle', () => {
 
       const first = yield* harness.wait.turnCompleted(null)
       const second = yield* harness.wait.event(
-        'turn_completed',
+        'turn_outcome',
         (e) => e.forkId === null && e.turnId !== first.turnId,
       )
 
-      expect(first.result._tag).toBe('Completed')
-      if (first.result._tag === 'Completed') {
-        expect(first.result.completion.decision).toBe('continue')
+      expect(first.outcome._tag).toBe('Completed')
+      if (first.outcome._tag === 'Completed') {
+        expect(first.outcome.completion.yieldTarget).toBe('invoke')
       }
 
-      expect(second.result._tag).toBe('Completed')
-      if (second.result._tag === 'Completed') {
-        expect(second.result.completion.decision).toBe('idle')
+      expect(second.outcome._tag).toBe('Completed')
+      if (second.outcome._tag === 'Completed') {
+        expect(second.outcome.completion.yieldTarget).toBe('user')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -73,12 +74,26 @@ describe('baseline harness lifecycle', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result._tag).toBe('Completed')
+      expect(completed.outcome._tag).toBe('Completed')
       if (toolEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
       expect(toolEnded.event.result._tag).toBe('Success')
       expect(harness.files.get('output.txt')).toBe('content')
+    }).pipe(Effect.provide(TestHarnessLive()))
+  )
+
+  it.live('4b) malformed tool input becomes ParseFailure instead of UnexpectedError', () =>
+    Effect.gen(function* () {
+      const harness = yield* TestHarness
+      yield* harness.script.next({
+        xml: '<magnitude:invoke tool="write">\n<magnitude:parameter name="path">output.txt</magnitude:parameter>\n<magnitude:parameter name="content">unterminated\n</magnitude:invoke>',
+      })
+
+      yield* harness.user('write a malformed file command')
+      const completed = yield* harness.wait.turnCompleted(null)
+
+      expect(completed.outcome._tag).toBe('ParseFailure')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -94,7 +109,7 @@ describe('baseline harness lifecycle', () => {
               rootTurns += 1
               if (rootTurns === 1) {
                 return {
-                  xml: '<magnitude:invoke tool="agent_create">\n<magnitude:parameter name="agentId">baseline-sub</magnitude:parameter>\n<magnitude:parameter name="type">explorer</magnitude:parameter>\n<magnitude:parameter name="title">baseline</magnitude:parameter>\n<magnitude:parameter name="message">do work</magnitude:parameter>\n</magnitude:invoke><magnitude:yield_user/>',
+                  ...response().createAgent('baseline-sub', 'explorer', 'baseline', 'do work').yield(),
                 }
               }
               return { xml: '<magnitude:yield_user/>' }
@@ -108,19 +123,19 @@ describe('baseline harness lifecycle', () => {
       yield* harness.user('start subagent flow')
 
       const rootFirst = yield* harness.wait.turnCompleted(null)
-      expect(rootFirst.result._tag).toBe('Completed')
+      expect(rootFirst.outcome._tag).toBe('Completed')
 
       const created = yield* harness.wait.agentCreated((e) => e.agentId === 'baseline-sub')
       expect(created.forkId).not.toBeNull()
 
       const subCompleted = yield* harness.wait.turnCompleted(created.forkId)
-      expect(subCompleted.result._tag).toBe('Completed')
+      expect(subCompleted.outcome._tag).toBe('Completed')
 
       const rootSecond = yield* harness.wait.event(
-        'turn_completed',
+        'turn_outcome',
         (e) => e.forkId === null && e.turnId !== rootFirst.turnId,
       )
-      expect(rootSecond.result._tag).toBe('Completed')
+      expect(rootSecond.outcome._tag).toBe('Completed')
 
       expect(rootTurns).toBeGreaterThanOrEqual(2)
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -138,13 +153,13 @@ describe('baseline harness lifecycle', () => {
               rootTurns += 1
               if (rootTurns === 1) {
                 return {
-                  xml: '<magnitude:invoke tool="agent_create">\n<magnitude:parameter name="agentId">baseline-sub-silent</magnitude:parameter>\n<magnitude:parameter name="type">explorer</magnitude:parameter>\n<magnitude:parameter name="title">baseline</magnitude:parameter>\n<magnitude:parameter name="message">do work</magnitude:parameter>\n</magnitude:invoke><magnitude:yield_user/>',
+                  ...response().createAgent('baseline-sub-silent', 'explorer', 'baseline', 'do work').yield(),
                 }
               }
               return { xml: '<magnitude:yield_user/>' }
             }
 
-            return { xml: '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hello</magnitude:parameter>\n</magnitude:invoke><magnitude:yield_user/>' }
+            return response().shell('echo hello').yield()
           }),
         ),
       )
@@ -152,18 +167,18 @@ describe('baseline harness lifecycle', () => {
       yield* harness.user('start subagent silent flow')
 
       const rootFirst = yield* harness.wait.turnCompleted(null)
-      expect(rootFirst.result._tag).toBe('Completed')
+      expect(rootFirst.outcome._tag).toBe('Completed')
 
       const created = yield* harness.wait.agentCreated((e) => e.agentId === 'baseline-sub-silent')
       expect(created.forkId).not.toBeNull()
 
       const subCompleted = yield* harness.wait.turnCompleted(created.forkId)
-      expect(subCompleted.result._tag).toBe('Completed')
+      expect(subCompleted.outcome._tag).toBe('Completed')
 
       let parentTriggered = false
       try {
         yield* harness.wait.event(
-          'turn_completed',
+          'turn_outcome',
           (e) => e.forkId === null && e.turnId !== rootFirst.turnId,
           { timeoutMs: 3000 },
         )

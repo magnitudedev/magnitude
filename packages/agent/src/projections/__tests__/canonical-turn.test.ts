@@ -38,9 +38,9 @@ describe('CanonicalTurn final content selection behavior', async () => {
       reasonBlocks: [{ about: null, content: 't' }],
       messages: [{ text: 'm', destination: { kind: 'user' } }],
       toolCalls: [{ tagName: 'tool', input: {}, query: null }],
-      turnDecision: 'idle',
+      yieldTarget: 'user',
     }
-    const xml = serializeCanonicalTurn(trace)
+    const xml = serializeCanonicalTurn(trace, { tools: new Map(), groups: new Map() })
     expect(xml).toContain('<reason about="reason">')
     expect(xml).toContain('<message to="user">')
     expect(xml).toContain('<invoke tool="tool"/>')

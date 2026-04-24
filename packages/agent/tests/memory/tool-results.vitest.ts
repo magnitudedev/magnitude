@@ -16,7 +16,7 @@ function renderedUserTextFromMemory(messages: Parameters<typeof getView>[0]): st
 
 type Harness = Effect.Effect.Success<typeof TestHarness>
 type ToolEvent = Extract<AppEvent, { type: 'tool_event' }>
-type TurnCompletedEvent = Extract<AppEvent, { type: 'turn_completed' }>
+type TurnOutcomeEventEvent = Extract<AppEvent, { type: 'turn_outcome' }>
 
 function invalidToolInputEvent(args: {
   toolCallId: string
@@ -134,14 +134,14 @@ function structuralParseErrorFixture(_raw: string): StructuralParseErrorEvent {
   }
 }
 
-function turnCompletedEvent(turnId: string, chainId = 'c-1'): TurnCompletedEvent {
+function turnCompletedEvent(turnId: string, chainId = 'c-1'): TurnOutcomeEventEvent {
   return {
-    type: 'turn_completed',
+    type: 'turn_outcome',
     forkId: null,
     turnId,
     chainId,
     strategyId: 'xml-act',
-    result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
+    outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
     inputTokens: null,
     outputTokens: null,
     cacheReadTokens: null,
@@ -254,12 +254,12 @@ describe('memory tool results', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: { _tag: 'SystemError', message: 'boom' },
+        outcome: { _tag: 'UnexpectedError', message: 'boom' },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -273,8 +273,8 @@ describe('memory tool results', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        const tr = inbox.results.find(r => r.kind === 'turn_results')
-        const err = inbox.results.find(r => r.kind === 'error')
+        const tr = inbox.outcomes.find(r => r.kind === 'turn_results')
+        const err = inbox.outcomes.find(r => r.kind === 'error')
         expect(tr).toBeUndefined()
         expect(err?.kind).toBe('error')
         if (err?.kind === 'error') {
@@ -290,12 +290,12 @@ describe('memory tool results', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: { _tag: 'Cancelled' },
+        outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -309,7 +309,7 @@ describe('memory tool results', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'interrupted')).toBe(true)
+        expect(inbox.outcomes.some(r => r.kind === 'interrupted')).toBe(true)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -327,7 +327,7 @@ describe('memory tool results', () => {
       const text = renderedUserTextFromMemory(memory.messages)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'noop')).toBe(false)
+        expect(inbox.outcomes.some(r => r.kind === 'noop')).toBe(false)
       }
       expect(text).toContain('(no tools or messages were used this turn)')
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -633,7 +633,7 @@ describe('memory tool results', () => {
       expect(text).not.toContain('empty response')
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'noop')).toBe(false)
+        expect(inbox.outcomes.some(r => r.kind === 'noop')).toBe(false)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -650,12 +650,12 @@ describe('memory tool results', () => {
         text: '<magnitude:message to="parent">Hi</magnitude:message>\n</magnitude:message>',
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 't-structural',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: {
+        outcome: {
           _tag: 'ParseFailure',
           error: structuralParseErrorFixture('</magnitude:message>'),
         },

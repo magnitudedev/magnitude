@@ -9,8 +9,8 @@ import {
   assertTurnStateAligned,
   eventsForFork,
   mkContextLimitHit,
-  mkTurnCompletedFailure,
-  mkTurnCompletedSuccess,
+  mkTurnOutcomeEventFailure,
+  mkTurnOutcomeEventSuccess,
   mkTurnStarted,
 } from './helpers'
 
@@ -44,11 +44,11 @@ describe('turn control interrupts', () => {
 
       yield* h.send(mkTurnStarted({ turnId: 't-int-2', chainId: 'c-int' }))
       yield* h.send({ type: 'interrupt', forkId: null })
-      yield* h.send(mkTurnCompletedFailure({ turnId: 't-int-2', chainId: 'c-int' }))
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-int-2', chainId: 'c-int' }))
 
       const events = eventsForFork(h, null)
       const started = events.find((e): e is Extract<AppEvent, { type: 'turn_started' }> => e.type === 'turn_started' && e.turnId === 't-int-2')
-      const completed = events.find((e): e is Extract<AppEvent, { type: 'turn_completed' }> => e.type === 'turn_completed' && e.turnId === 't-int-2')
+      const completed = events.find((e): e is Extract<AppEvent, { type: 'turn_outcome' }> => e.type === 'turn_outcome' && e.turnId === 't-int-2')
       expect(started).toBeDefined()
       expect(completed).toBeDefined()
       expect(completed!.turnId).toBe(started!.turnId)
@@ -63,7 +63,7 @@ describe('turn control interrupts', () => {
       yield* h.send(mkContextLimitHit())
       yield* h.send({ type: 'interrupt', forkId: null })
       yield* h.send(mkTurnStarted({ turnId: 't-int-4', chainId: 'c-int-4' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-int-4', chainId: 'c-int-4' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-int-4', chainId: 'c-int-4' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -75,7 +75,7 @@ describe('turn control interrupts', () => {
 
       yield* h.send(mkTurnStarted({ forkId: 'fork-soft', turnId: 'soft-1', chainId: 'soft-c' }))
       yield* h.send({ type: 'soft_interrupt', forkId: 'fork-soft' })
-      yield* h.send(mkTurnCompletedSuccess({ forkId: 'fork-soft', turnId: 'soft-1', chainId: 'soft-c' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ forkId: 'fork-soft', turnId: 'soft-1', chainId: 'soft-c' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, 'fork-soft'))
     }).pipe(Effect.provide(TestHarnessLive()))
@@ -87,7 +87,7 @@ describe('turn control interrupts', () => {
 
       yield* h.send(mkTurnStarted({ turnId: 't-fresh-1', chainId: 'c-fresh-1' }))
       yield* h.send({ type: 'interrupt', forkId: null })
-      yield* h.send(mkTurnCompletedFailure({
+      yield* h.send(mkTurnOutcomeEventFailure({
         turnId: 't-fresh-1',
         chainId: 'c-fresh-1',
         result: { _tag: 'Cancelled' },
@@ -123,7 +123,7 @@ describe('turn control interrupts', () => {
       expect(stillInterrupting.pendingInboundCommunications).toHaveLength(1)
       expect(stillInterrupting.pendingInboundCommunications[0]?.content).toBe('resume with this')
 
-      yield* h.send(mkTurnCompletedFailure({
+      yield* h.send(mkTurnOutcomeEventFailure({
         turnId: 't-buffer-1',
         chainId: 'c-buffer-1',
         result: { _tag: 'Cancelled' },
@@ -149,13 +149,13 @@ describe('turn control interrupts', () => {
 
       yield* h.send(mkTurnStarted({ turnId: 't-stale-1', chainId: 'c-stale-1' }))
       yield* h.send({ type: 'interrupt', forkId: null })
-      yield* h.send(mkTurnCompletedFailure({
+      yield* h.send(mkTurnOutcomeEventFailure({
         turnId: 't-stale-1',
         chainId: 'c-stale-1',
         result: { _tag: 'Cancelled' },
       }))
 
-      yield* h.send(mkTurnCompletedSuccess({
+      yield* h.send(mkTurnOutcomeEventSuccess({
         turnId: 't-stale-1',
         chainId: 'c-stale-1',
       }))
@@ -197,7 +197,7 @@ describe('turn control interrupts', () => {
       yield* h.send(mkUserMessage('msg-parent', 'parent follow-up'))
       yield* h.send({ type: 'interrupt', forkId: null })
 
-      yield* h.send(mkTurnCompletedSuccess({
+      yield* h.send(mkTurnOutcomeEventSuccess({
         forkId: 'sub-1',
         turnId: 'sub-turn-1',
         chainId: 'sub-chain-1',

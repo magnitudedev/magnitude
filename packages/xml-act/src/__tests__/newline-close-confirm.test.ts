@@ -123,7 +123,7 @@ describe('newline close confirmation (streaming)', () => {
     expect(turnEnd).toBeDefined()
     expect(turnEnd).toMatchObject({
       _tag: 'TurnEnd',
-      result: { _tag: 'Success' },
+      outcome: { _tag: 'Completed' },
     })
   })
 
@@ -225,7 +225,7 @@ describe('newline close confirmation (streaming)', () => {
     expect(turnEnd).toBeDefined()
     expect(turnEnd).toMatchObject({
       _tag: 'TurnEnd',
-      result: { _tag: 'Success', termination: 'natural' },
+      outcome: { _tag: 'Completed', termination: 'natural' },
     })
   })
 

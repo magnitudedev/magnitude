@@ -152,7 +152,7 @@ Effect.runPromise(
             } else if (event._tag === 'MessageEnd') {
               console.log(`EVENT: MessageEnd id=${event.id}`)
             } else if (event._tag === 'TurnEnd') {
-              console.log(`EVENT: TurnEnd result=${event.result._tag}`)
+              console.log(`EVENT: TurnEnd outcome=${event.outcome._tag}`)
             } else {
               console.log(`EVENT: ${event._tag}`)
             }

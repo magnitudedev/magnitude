@@ -24,8 +24,9 @@ function toLine(index: number, event: AppEvent): string | null {
       return `[${index}] ${ts} user_message\n${contentText}`
     }
 
-    case 'turn_unexpected_error':
-      return `[${index}] ${ts} turn_unexpected_error\n${event.message}`
+    case 'turn_outcome':
+      if (event.outcome._tag !== 'UnexpectedError') return null
+      return `[${index}] ${ts} turn_outcome.unexpected_error\n${event.outcome.message}`
 
     case 'agent_created':
       return `[${index}] ${ts} agent_created role=${event.role} taskId=${event.taskId}`
@@ -37,7 +38,7 @@ function toLine(index: number, event: AppEvent): string | null {
 
 function assistantTurnLine(index: number, timestamp: string, text: string): string | null {
   if (!text) return null
-  return `[${index}] ${timestamp} assistant_turn_completed\n${text}`
+  return `[${index}] ${timestamp} assistant_turn_outcome\n${text}`
 }
 
 function truncateTranscript(lines: string[], maxChars: number): string {

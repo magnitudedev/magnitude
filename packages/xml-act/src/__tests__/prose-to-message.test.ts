@@ -78,6 +78,6 @@ describe('prose-to-message conversion', () => {
 
     const turnEnd = events.find(e => e._tag === 'TurnEnd') as any
     expect(turnEnd).toBeDefined()
-    expect(turnEnd.result.turnControl?.target).toBe('user')
+    expect(turnEnd.outcome.turnControl?.target).toBe('user')
   })
 })

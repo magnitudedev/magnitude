@@ -52,9 +52,9 @@ describe('Event Serialization', () => {
       expect(deserialized).toEqual(event)
     })
 
-    test('serializes and deserializes turn_completed', () => {
+    test('serializes and deserializes turn_outcome', () => {
       const event: AppEvent = {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-123',
         chainId: 'chain-456',
@@ -63,7 +63,7 @@ describe('Event Serialization', () => {
         result: {
           _tag: 'Completed',
           completion: {
-            decision: 'idle',
+            yieldTarget: 'user',
             feedback: [],
           },
         },
@@ -79,7 +79,7 @@ describe('Event Serialization', () => {
       const deserialized = JSON.parse(serialized) as AppEvent
       
       expect(deserialized).toEqual(event)
-      expect(deserialized.result._tag).toBe('Completed')
+      expect(deserialized.outcome._tag).toBe('Completed')
     })
 
     test('serializes and deserializes fork events', () => {
@@ -334,7 +334,7 @@ describe('Event Serialization', () => {
 
     test('handles turn failure results', () => {
       const event: AppEvent = {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-1',
         chainId: 'chain-1',
@@ -353,9 +353,9 @@ describe('Event Serialization', () => {
       }
 
       const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent
-      expect(deserialized.result._tag).toBe('SystemError')
-      if (deserialized.result._tag === 'SystemError') {
-        expect(deserialized.result.message).toBe('Syntax error')
+      expect(deserialized.outcome._tag).toBe('SystemError')
+      if (deserialized.outcome._tag === 'SystemError') {
+        expect(deserialized.outcome.message).toBe('Syntax error')
       }
     })
   })

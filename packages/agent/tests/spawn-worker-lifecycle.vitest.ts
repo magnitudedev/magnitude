@@ -30,16 +30,16 @@ describe('spawn-worker lifecycle integration', () => {
       yield* h.user('run spawn-worker lifecycle flow')
 
       const rootFirst = yield* h.wait.turnCompleted(null)
-      expect(rootFirst.result._tag).toBe('Completed')
+      expect(rootFirst.outcome._tag).toBe('Completed')
 
       // Trigger second root turn to run spawn-worker frame
       yield* h.user('continue')
 
       const rootSecond = yield* h.wait.event(
-        'turn_completed',
+        'turn_outcome',
         (e) => e.forkId === null && e.turnId !== rootFirst.turnId,
       )
-      expect(rootSecond.result._tag).toBe('Completed')
+      expect(rootSecond.outcome._tag).toBe('Completed')
 
       const created = yield* h.wait.event('agent_created', (e) => e.agentId === 'flow-task')
       const workerCompleted = yield* h.wait.turnCompleted(created.forkId)
@@ -47,17 +47,17 @@ describe('spawn-worker lifecycle integration', () => {
         'tool_event',
         (e) => e.forkId === created.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
-      expect(workerCompleted.result._tag).toBe('Completed')
+      expect(workerCompleted.outcome._tag).toBe('Completed')
       if (workerWrite.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
       expect(workerWrite.event.result._tag).toBe('Success')
 
       const rootFollowUp = yield* h.wait.event(
-        'turn_completed',
+        'turn_outcome',
         (e) => e.forkId === null && e.turnId !== rootFirst.turnId && e.turnId !== rootSecond.turnId,
       )
-      expect(rootFollowUp.result._tag).toBe('Completed')
+      expect(rootFollowUp.outcome._tag).toBe('Completed')
 
       expect(h.files.get('output.txt')).toBe('hello')
     }).pipe(Effect.provide(TestHarnessLive()))

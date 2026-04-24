@@ -86,7 +86,7 @@ describe('display subagent lifecycle think steps', () => {
         event: { _tag: 'ToolInputStarted' },
       } as any,
       {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         timestamp: ts(10),
         forkId: 'fork-sub',
         turnId: 't-sub-1',
@@ -113,7 +113,7 @@ describe('display subagent lifecycle think steps', () => {
         event: { _tag: 'ToolInputStarted' },
       } as any,
       {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         timestamp: ts(20),
         forkId: 'fork-sub',
         turnId: 't-sub-2',

@@ -80,7 +80,7 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
       }
     },
 
-    turn_completed: ({ event, state, read }) => {
+    turn_outcome: ({ event, state, read }) => {
       if (event.forkId === null) return state
 
       const agentState = read(AgentStatusProjection)
@@ -111,22 +111,6 @@ export const SubagentActivityProjection = Projection.define<AppEvent, SubagentAc
         entriesByParent: new Map(state.entriesByParent).set(parentForkId, [...existing, entry]),
         pendingProse: newPendingProse,
         userMessageIdsByFork: newUserMessageIdsByFork,
-      }
-    },
-
-    turn_unexpected_error: ({ event, state }) => {
-      if (event.forkId === null) return state
-
-      const pendingProse = new Map(state.pendingProse)
-      pendingProse.delete(event.forkId)
-
-      const userMessageIdsByFork = new Map(state.userMessageIdsByFork)
-      userMessageIdsByFork.delete(event.forkId)
-
-      return {
-        ...state,
-        pendingProse,
-        userMessageIdsByFork,
       }
     },
 

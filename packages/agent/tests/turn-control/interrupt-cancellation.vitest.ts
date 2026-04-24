@@ -19,15 +19,16 @@ describe('interrupt cancellation latency (regression)', () => {
       yield* h.send({ type: 'interrupt', forkId: null })
 
       const completed = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && e.result._tag === 'Cancelled',
+        'turn_outcome',
+        (e) => e.forkId === null && e.outcome._tag === 'Cancelled',
         { timeoutMs: 1000 },
       )
 
-      expect(completed.result._tag).toBe('Cancelled')
+      expect(completed.outcome._tag).toBe('Cancelled')
 
-      const unexpected = h.events().find((e) => e.type === 'turn_unexpected_error' && e.forkId === null)
-      expect(unexpected).toBeUndefined()
+      const outcomes = h.events().filter((e) => e.type === 'turn_outcome' && e.forkId === null)
+      expect(outcomes).toHaveLength(1)
+      expect(outcomes[0]?.outcome._tag).toBe('Cancelled')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

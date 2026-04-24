@@ -20,7 +20,7 @@ describe('task creation race condition repro', () => {
       yield* h.user('test')
 
       const rootTurn = yield* h.wait.turnCompleted(null)
-      console.log('root turn result:', JSON.stringify(rootTurn.result))
+      console.log('root turn result:', JSON.stringify(rootTurn.outcome))
 
       // Check if task was created
       const taskCreated = yield* h.wait.event('task_created', (e) => e.taskId === 'my-task')

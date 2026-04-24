@@ -15,6 +15,7 @@ function makeModel(providerId: string, id: string, authType: 'oauth' | 'api' | n
   const model = new Model({
     id,
     providerId,
+    providerName: 'Test Provider',
     name: id,
     contextWindow: 100_000,
     maxOutputTokens: 8192,

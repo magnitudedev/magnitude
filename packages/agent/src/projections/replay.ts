@@ -34,9 +34,9 @@ export const ReplayProjection = Projection.defineForked<AppEvent, EngineState>()
     },
 
     // Keep state through turn_started so crash recovery can read it.
-    // Reset on turn_completed — completed turns don't need replay.
-    // Only a crashed turn (no turn_completed) retains its state for recovery.
+    // Reset on turn_outcome — terminal turns don't need replay.
+    // Only a crashed turn (no turn_outcome) retains its state for recovery.
     turn_started: ({ fork }) => fork,
-    turn_completed: () => initialEngineState(),
+    turn_outcome: () => initialEngineState(),
   },
 })

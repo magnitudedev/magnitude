@@ -216,12 +216,19 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
     },
 
 
-    turn_completed: ({ event, state, emit }) => {
+    turn_outcome: ({ event, state, emit }) => {
       if (event.forkId === null) return state
-      if (event.result._tag === 'Completed' && event.result.completion.decision === 'continue') return state
+      if (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke') return state
 
       const agent = getAgentByForkId(state, event.forkId)
       if (!agent) return state
+
+      const reason =
+        event.outcome._tag === 'Cancelled'
+          ? 'interrupt'
+          : event.outcome._tag === 'Completed'
+            ? 'stable'
+            : 'error'
 
       if (agent.status !== 'idle') {
         emit.agentBecameIdle({
@@ -229,30 +236,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
           forkId: agent.forkId,
           role: agent.role,
           parentForkId: agent.parentForkId,
-          reason: 'stable',
-          timestamp: event.timestamp,
-        })
-      }
-
-      return {
-        ...state,
-        agents: new Map(state.agents).set(agent.agentId, { ...agent, status: 'idle' }),
-      }
-    },
-
-    turn_unexpected_error: ({ event, state, emit }) => {
-      if (event.forkId === null) return state
-
-      const agent = getAgentByForkId(state, event.forkId)
-      if (!agent) return state
-
-      if (agent.status !== 'idle') {
-        emit.agentBecameIdle({
-          agentId: agent.agentId,
-          forkId: agent.forkId,
-          role: agent.role,
-          parentForkId: agent.parentForkId,
-          reason: 'error',
+          reason,
           timestamp: event.timestamp,
         })
       }

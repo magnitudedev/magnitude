@@ -18,6 +18,7 @@ export interface TestModelConfig {
 const fakeModel = new Model({
   id: 'test-model',
   providerId: 'test',
+  providerName: 'Test Provider',
   name: 'Test Model',
   contextWindow: 200_000,
   maxOutputTokens: null,

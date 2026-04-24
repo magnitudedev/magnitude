@@ -133,7 +133,7 @@ describe('xml parser', () => {
     const events = parse('some text\n<magnitude:yield_user/>')
     const turnEnd = events.find(e => e._tag === 'TurnEnd')
     expect(turnEnd).toBeDefined()
-    expect(turnEnd).toMatchObject({ _tag: 'TurnEnd', result: { _tag: 'Success', termination: 'natural' } })
+    expect(turnEnd).toMatchObject({ _tag: 'TurnEnd', outcome: { _tag: 'Completed', termination: 'natural' } })
   })
 
   it('handles optional number parameter', () => {

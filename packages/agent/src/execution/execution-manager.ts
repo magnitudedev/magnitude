@@ -24,7 +24,7 @@ import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusServic
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import type {
   AppEvent,
-  TurnDecision,
+  TurnYieldTarget,
   ToolResult,
   MessageDestination,
   TurnFeedback,
@@ -351,11 +351,10 @@ const makeExecutionManager = Effect.gen(function* () {
       const toolCallTagNames = new Map<string, string>()
 
       const feedback: TurnFeedback[] = []
-      let capturedParseFailure: StructuralParseErrorEvent | ToolParseErrorEvent | null = null
       let sawToolExecutionError = false
 
       // Store execution result
-      let executionResult: TurnOutcome = { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } }
+      let executionResult: TurnOutcome = { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } }
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
@@ -477,7 +476,6 @@ const makeExecutionManager = Effect.gen(function* () {
                 toolsCalledKeys.push(toolKey)
                 lastToolKey = toolKey
 
-                capturedParseFailure = event
                 hasToolErrors = true
 
                 yield* sink.emit({
@@ -492,7 +490,6 @@ const makeExecutionManager = Effect.gen(function* () {
               // --- Structural Parse Error ---
               case 'StructuralParseError': {
                 hasAnyResponseContent = true
-                capturedParseFailure = event
                 break
               }
 
@@ -790,87 +787,87 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Turn End ---
               case 'TurnEnd': {
-                const endResult = event.result
+                const outcome = event.outcome
 
-                const completed = (decision: TurnDecision): TurnOutcome => ({
+                const completed = (yieldTarget: TurnYieldTarget): TurnOutcome => ({
                   _tag: 'Completed',
                   completion: {
-                    decision,
+                    yieldTarget,
                     feedback: [...feedback],
                   } satisfies TurnCompletion,
                 })
 
-                if (endResult._tag === 'Success') {
-                  let decision: TurnDecision
+                switch (outcome._tag) {
+                  case 'Completed': {
+                    let yieldTarget: TurnYieldTarget
 
-                  if (hasToolErrors || feedback.length > 0) {
-                    decision = 'continue'
-                  } else if (endResult.turnControl === null && !hasAnyResponseContent) {
-                    // Empty LLM response (no messages/tools/think/lens output).
-                    // Always retrigger so memory-injected corrective feedback is visible next turn.
-                    decision = 'continue'
-                  } else {
-                    // Map yield target to turn decision
-                    // yield-invoke → continue (wait for tool results)
-                    // yield-user, yield-worker, yield-parent → idle
-                    const target = endResult.turnControl?.target ?? null
-                    if (target === 'invoke') {
-                      decision = 'continue'
+                    if (hasToolErrors || feedback.length > 0) {
+                      yieldTarget = 'invoke'
+                    } else if (outcome.turnControl === null && !hasAnyResponseContent) {
+                      // Empty LLM response (no messages/tools/think/lens output).
+                      // Always retrigger so memory-injected corrective feedback is visible next turn.
+                      yieldTarget = 'invoke'
                     } else {
-                      // user, worker, parent, or null → idle
-                      decision = 'idle'
+                      const target = outcome.turnControl?.target ?? null
+                      if (target === null) {
+                        const policyCtx = yield* policyCtxProvider.get
+                        const turnResult = agentDef.getTurn({
+                          toolsCalled: toolsCalledKeys,
+                          lastTool: lastToolKey,
+                          messagesSent,
+                          state: policyCtx,
+                        })
+                        yieldTarget = turnResult.action === 'continue' ? 'invoke' : 'user'
+                      } else {
+                        yieldTarget = target
+                      }
                     }
 
-                    // Apply turn policy when no explicit yield (null case)
-                    if (target === null) {
-                      const policyCtx = yield* policyCtxProvider.get
-                      const turnResult = agentDef.getTurn({
-                        toolsCalled: toolsCalledKeys,
-                        lastTool: lastToolKey,
-                        messagesSent,
-                        state: policyCtx,
-                      })
-                      decision = turnResult.action === 'continue' ? 'continue' : 'idle'
+                    // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
+                    if (yieldTarget === 'worker') {
+                      const pCtx = yield* policyCtxProvider.get
+                      if (pCtx.activeAgentCount === 0) {
+                        feedback.push({ _tag: 'YieldWorkerRetriggered' })
+                        yieldTarget = 'invoke'
+                      }
                     }
+
+                    // Oneshot liveness guard: prevent stalling when nothing is active
+                    if (yieldTarget !== 'invoke' && oneshotEnabled) {
+                      const pCtx = yield* policyCtxProvider.get
+                      if (pCtx.activeAgentCount === 0) {
+                        feedback.push({ _tag: 'OneshotLivenessRetriggered' })
+                        yieldTarget = 'invoke'
+                      }
+                    }
+
+                    executionResult = completed(yieldTarget)
+                    break
                   }
 
-                  // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
-                  if (decision === 'idle' && endResult.turnControl?.target === 'worker') {
-                    const pCtx = yield* policyCtxProvider.get
-                    if (pCtx.activeAgentCount === 0) {
-                      feedback.push({ _tag: 'YieldWorkerRetriggered' })
-                      decision = 'continue'
-                    }
-                  }
+                  case 'StructuralParseError':
+                  case 'ToolParseError':
+                    executionResult = { _tag: 'ParseFailure', error: outcome.error }
+                    break
 
-                  // Oneshot liveness guard: prevent stalling when nothing is active
-                  if (decision === 'idle' && oneshotEnabled) {
-                    const pCtx = yield* policyCtxProvider.get
-                    if (pCtx.activeAgentCount === 0) {
-                      feedback.push({ _tag: 'OneshotLivenessRetriggered' })
-                      decision = 'continue'
-                    }
-                  }
+                  case 'ToolExecutionError':
+                  case 'GateRejected':
+                    executionResult = completed('invoke')
+                    break
 
-                  executionResult = completed(decision)
-                } else if (endResult._tag === 'Interrupted') {
-                  executionResult = { _tag: 'Cancelled' }
-                } else if (endResult._tag === 'Failure') {
-                  if (capturedParseFailure !== null) {
-                    executionResult = { _tag: 'ParseFailure', error: capturedParseFailure }
-                  } else if (sawToolExecutionError) {
-                    executionResult = completed('continue')
-                  } else {
-                    executionResult = { _tag: 'SystemError', message: endResult.error }
-                  }
-                } else if (endResult._tag === 'GateRejected') {
-                  executionResult = completed('continue')
+                  case 'EngineDefect':
+                    executionResult = {
+                      _tag: 'UnexpectedError',
+                      message: outcome.message,
+                      detail: { _tag: 'EngineDefect' },
+                    }
+                    break
                 }
 
                 // Circuit breaker: stop tight loops of identical consecutive responses that would retrigger.
                 // This covers Completed+continue and ParseFailure (which also retriggers).
                 const willRetrigger =
-                  (executionResult._tag === 'Completed' && executionResult.completion.decision === 'continue')
+                  (executionResult._tag === 'Completed' && executionResult.completion.yieldTarget === 'invoke')
                   || executionResult._tag === 'ParseFailure'
 
                 if (willRetrigger) {
@@ -886,8 +883,11 @@ const makeExecutionManager = Effect.gen(function* () {
 
                   if (nextCount >= IDENTICAL_RESPONSE_BREAKER_THRESHOLD) {
                     executionResult = {
-                      _tag: 'SystemError',
-                      message: `Circuit breaker tripped after ${nextCount} identical consecutive responses.`,
+                      _tag: 'SafetyStop',
+                      reason: {
+                        _tag: 'IdenticalResponseCircuitBreaker',
+                        threshold: nextCount,
+                      },
                     }
                     identicalContinueTracker.delete(forkId)
                   }

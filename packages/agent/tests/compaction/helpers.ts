@@ -2,7 +2,7 @@ import { expect } from '@effect/vitest'
 import { Effect } from 'effect'
 import { createId } from '../../src/util/id'
 import type { AppEvent, SessionContext } from '../../src/events'
-import { CHARS_PER_TOKEN } from '../../src/constants'
+import { CHARS_PER_TOKEN_XML } from '../../src/constants'
 import { CompactionProjection } from '../../src/projections/compaction'
 import { MemoryProjection } from '../../src/projections/memory'
 import { TurnProjection } from '../../src/projections/turn'
@@ -30,7 +30,7 @@ export const baseContext = (overrides: Partial<SessionContext> = {}): SessionCon
   ...overrides,
 })
 
-export const estimateTokens = (text: string) => Math.ceil(text.length / CHARS_PER_TOKEN)
+export const estimateTokens = (text: string) => Math.ceil(text.length / CHARS_PER_TOKEN_XML)
 
 export const mkUserMessage = (options: {
   forkId?: string | null
@@ -59,8 +59,8 @@ export const mkTurnStarted = (options: {
   chainId: options.chainId ?? createId(),
 })
 
-export const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'turn_completed' }>> = {}): Extract<AppEvent, { type: 'turn_completed' }> => ({
-  type: 'turn_completed',
+export const mkTurnOutcomeEvent = (overrides: Partial<Extract<AppEvent, { type: 'turn_outcome' }>> = {}): Extract<AppEvent, { type: 'turn_outcome' }> => ({
+  type: 'turn_outcome',
   forkId: ROOT_FORK_ID,
   turnId: 'turn-1',
   chainId: 'chain-1',
@@ -71,10 +71,12 @@ export const mkTurnCompleted = (overrides: Partial<Extract<AppEvent, { type: 'tu
   cacheWriteTokens: null,
   providerId: null,
   modelId: null,
-  result: { _tag: 'Completed', completion: { decision: 'idle', feedback: [] } },
+  outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
 
   ...overrides,
 })
+
+export const mkTurnCompleted = mkTurnOutcomeEvent
 
 export const mkCompactionStarted = (forkId: string | null = ROOT_FORK_ID): Extract<AppEvent, { type: 'compaction_started' }> => ({
   type: 'compaction_started',

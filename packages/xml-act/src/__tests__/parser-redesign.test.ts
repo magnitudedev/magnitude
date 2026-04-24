@@ -377,20 +377,20 @@ describe('yield', () => {
     const events = parse('<magnitude:yield_user/>')
     const end = events.find(e => e._tag === 'TurnEnd') as any
     expect(end).toBeDefined()
-    expect(end.result._tag).toBe('Success')
-    expect(end.result.termination).toBe('natural')
+    expect(end.outcome._tag).toBe('Completed')
+    expect(end.outcome.termination).toBe('natural')
   })
 
   it('TurnEnd has correct target for yield_user', () => {
     const events = parse('<magnitude:yield_user/>')
     const end = events.find(e => e._tag === 'TurnEnd') as any
-    expect(end.result.turnControl?.target).toBe('user')
+    expect(end.outcome.turnControl?.target).toBe('user')
   })
 
   it('TurnEnd has correct target for yield_invoke', () => {
     const events = parse('<magnitude:yield_invoke/>')
     const end = events.find(e => e._tag === 'TurnEnd') as any
-    expect(end.result.turnControl?.target).toBe('invoke')
+    expect(end.outcome.turnControl?.target).toBe('invoke')
   })
 })
 
