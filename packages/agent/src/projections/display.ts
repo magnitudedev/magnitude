@@ -97,6 +97,13 @@ export interface CommunicationStep {
   readonly status?: 'streaming' | 'completed'
 }
 
+export interface StatusIndicatorStep {
+  readonly id: string
+  readonly type: 'status_indicator'
+  readonly message: string
+  readonly style: 'dim'
+}
+
 export interface SubagentStartedStep {
   readonly id: string
   readonly type: 'subagent_started'
@@ -136,6 +143,7 @@ export type ThinkBlockStep =
   | ThinkingStep
   | ToolStep
   | CommunicationStep
+  | StatusIndicatorStep
   | SubagentStartedStep
   | SubagentFinishedStep
   | SubagentKilledStep
@@ -448,48 +456,11 @@ function describeSafetyStop(reason: SafetyStopReason): string {
   }
 }
 
-function toErrorDisplayMessage(outcome: Exclude<TurnOutcome, { _tag: 'Completed' } | { _tag: 'Cancelled' }>, timestamp: number): ErrorDisplayMessage {
+function toErrorDisplayMessage(
+  outcome: Extract<TurnOutcome, { _tag: 'SafetyStop' } | { _tag: 'UnexpectedError' }>,
+  timestamp: number
+): ErrorDisplayMessage {
   switch (outcome._tag) {
-    case 'ParseFailure':
-      return {
-        id: generateId(),
-        type: 'error',
-        message: outcome.error._tag === 'ToolParseError'
-          ? `Tool parse error for <${outcome.error.tagName}>: ${outcome.error.error.detail}`
-          : `Structural parse error: ${'detail' in outcome.error ? outcome.error.detail : outcome.error._tag}`,
-        timestamp,
-      }
-    case 'ConnectionFailure':
-      return {
-        id: generateId(),
-        type: 'error',
-        message: describeConnectionFailure(outcome.detail),
-        timestamp,
-      }
-    case 'ProviderNotReady': {
-      const described = describeProviderNotReady(outcome.detail)
-      return {
-        id: generateId(),
-        type: 'error',
-        message: described.message,
-        timestamp,
-        cta: described.cta,
-      }
-    }
-    case 'ContextWindowExceeded':
-      return {
-        id: generateId(),
-        type: 'error',
-        message: 'Context window exceeded',
-        timestamp,
-      }
-    case 'OutputTruncated':
-      return {
-        id: generateId(),
-        type: 'error',
-        message: 'Output truncated; respond in smaller steps',
-        timestamp,
-      }
     case 'SafetyStop':
       return {
         id: generateId(),
@@ -1068,6 +1039,19 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
         }
       }
 
+      if (event.outcome._tag === 'ConnectionFailure') {
+        const { fork: stateWithBlock, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
+        return {
+          ...stateWithBlock,
+          messages: addStepToThinkBlock(stateWithBlock.messages, thinkBlockId, {
+            type: 'status_indicator' as const,
+            id: generateId(),
+            message: 'Connection issue: retrying',
+            style: 'dim' as const,
+          }),
+        }
+      }
+
       const closedState = closeThinkBlock(fork, event.timestamp)
 
       if (event.outcome._tag === 'Completed') {
@@ -1097,6 +1081,21 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
                   context: event.forkId === null ? 'root' as const : 'fork' as const,
                 },
               ],
+          currentTurnId: null,
+          status: 'idle' as const,
+          streamingMessageId: null,
+          showButton: 'send' as const,
+        }
+      }
+
+      if (
+        event.outcome._tag === 'ParseFailure'
+        || event.outcome._tag === 'ProviderNotReady'
+        || event.outcome._tag === 'ContextWindowExceeded'
+        || event.outcome._tag === 'OutputTruncated'
+      ) {
+        return {
+          ...closedState,
           currentTurnId: null,
           status: 'idle' as const,
           streamingMessageId: null,

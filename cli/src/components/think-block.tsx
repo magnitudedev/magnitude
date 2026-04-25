@@ -88,6 +88,15 @@ const WorkerKilledRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'suba
   )
 }
 
+const StatusIndicatorRow = ({ step }: { step: Extract<ThinkBlockStep, { type: 'status_indicator' }> }) => {
+  const theme = useTheme()
+  return (
+    <text attributes={TextAttributes.DIM}>
+      <span style={{ fg: theme.muted }}>{step.message}</span>
+    </text>
+  )
+}
+
 function buildSummary(steps: readonly { type: string; toolKey?: ToolKey; state?: { phase?: string } }[]): string {
   let webSearches = 0
   let commands = 0
@@ -370,6 +379,10 @@ const StepGroupView = memo(function StepGroupView({
           }
 
           return <AgentCommunicationCard key={step.id} message={message} widthAdjustment={2} onFileClick={onFileClick} />
+        }
+
+        if (step.type === 'status_indicator') {
+          return <StatusIndicatorRow key={step.id} step={step} />
         }
 
         if (step.type !== 'tool') return null

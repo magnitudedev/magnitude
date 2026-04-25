@@ -288,6 +288,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
         (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke')
         || event.outcome._tag === 'ParseFailure'
         || event.outcome._tag === 'ConnectionFailure'
+        || event.outcome._tag === 'ContextWindowExceeded'
       const shouldEnqueueContinue = turnWantsContinue && !fork.softInterrupted
 
       const nextTriggers = shouldEnqueueContinue
