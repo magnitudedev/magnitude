@@ -92,14 +92,12 @@ You must use exactly and exclusively the lenses where the trigger condition is t
 Tool calls use child parameter elements with a `name` attribute.
 
 Example:
-<magnitude:escape>
 ```
 <magnitude:invoke tool="NAME">
 <magnitude:parameter name="key1">value1</magnitude:parameter>
 <magnitude:parameter name="key2">value2</magnitude:parameter>
 </magnitude:invoke>
 ```
-</magnitude:escape>
 
 Parameters are inline: opening tag, value, and closing tag on the same line. Exception: long string content may span multiple lines.
 
@@ -108,14 +106,12 @@ Parameters are inline: opening tag, value, and closing tag on the same line. Exc
 Tool results support two disclosure modes:
 
 **Pre-emptive**: Specify what subset to see inline when calling:
-<magnitude:escape>
 ```
 <magnitude:invoke tool="shell">
 <magnitude:parameter name="command">npm test</magnitude:parameter>
 <magnitude:filter>$.stdout</magnitude:filter>
 </magnitude:invoke>
 ```
-</magnitude:escape>
 
 **Retroactive**: Access the full result later by reading the persisted file (shown in result footer).
 

@@ -229,7 +229,7 @@ function rejectAllPendingCloses(ctx: ParserLoopContext, extraContent?: string): 
         tagName: pc.tagName,
         expectedTagName: pc.effectiveTagName,
         raw: `</${pc.tagName}>`,
-        detail: `Close tag </${pc.tagName}> does not match the current ${pc.effectiveTagName} block. Did you mean </${pc.effectiveTagName}>? To include literal markup, use <magnitude:escape>.`,
+        detail: `Close tag </${pc.tagName}> does not match the current ${pc.effectiveTagName} block. Did you mean </${pc.effectiveTagName}>?`,
         primarySpan: pc.tokenSpan,
       })])
     }
