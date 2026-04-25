@@ -68,7 +68,7 @@ describe('prefix heuristics: tool alias edge cases', () => {
 
   it('06: shell alias mixed with canonical invoke', () => {
     const input = '<magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:invoke tool="tree"></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(getToolInput(events, 0)).toEqual({ command: 'pwd' })
@@ -77,7 +77,7 @@ describe('prefix heuristics: tool alias edge cases', () => {
 
   it('07: canonical invoke mixed with shell alias', () => {
     const input = '<magnitude:invoke tool="tree"></magnitude:invoke><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(getToolInput(events, 0)).toEqual({})
@@ -86,7 +86,7 @@ describe('prefix heuristics: tool alias edge cases', () => {
 
   it('08: grep alias as known tool under grep schema', () => {
     const input = '<magnitude:grep><magnitude:pattern>TODO</magnitude:pattern></magnitude:grep><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({ pattern: 'TODO' })
@@ -105,7 +105,7 @@ describe('prefix heuristics: tool alias edge cases', () => {
 
   it('10: tree alias followed by message', () => {
     const input = '<magnitude:tree></magnitude:tree><magnitude:message>done</magnitude:message><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({})

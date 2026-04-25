@@ -2,7 +2,7 @@
  * Category 3: Constrained Parameter Names
  *
  * Per-tool parameter names are constrained to the known schema.
- * Any ordering accepted. Duplicates accepted by grammar (parser validates).
+ * Any ordering accepted. Duplicates are now rejected by the grammar.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -53,10 +53,9 @@ describe('constrained parameter names', () => {
     v().rejects(input)
   })
 
-  it('08: duplicate param name accepted by grammar', () => {
+  it('08: duplicate param name rejected by grammar', () => {
     const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">a</magnitude:parameter><magnitude:parameter name="path">b</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    // Parser uses last value or flags duplicate — implementation detail
+    v().rejects(input)
   })
 
   it('09: shell param name in edit context rejected', () => {

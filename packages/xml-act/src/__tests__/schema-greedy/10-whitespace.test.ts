@@ -24,12 +24,12 @@ describe('whitespace variations', () => {
   })
 
   it('03: multiple newlines between params', () => {
-    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter>\n\n\n<magnitude:parameter name="old">x</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter>\n\n\n<magnitude:parameter name="old">x</magnitude:parameter>\n<magnitude:parameter name="new">y</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 
   it('04: tabs between params', () => {
-    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter>\t\t<magnitude:parameter name="old">x</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter>\t\t<magnitude:parameter name="old">x</magnitude:parameter>\t<magnitude:parameter name="new">y</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 

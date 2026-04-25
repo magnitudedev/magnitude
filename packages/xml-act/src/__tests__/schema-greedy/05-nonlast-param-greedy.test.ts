@@ -2,9 +2,9 @@
  * Category 5: Non-Last Parameter Greedy Matching
  *
  * Non-last params use recursive greedy last-match.
- * Confirmation: </magnitude:parameter> + ws + next valid invoke child
- * (constrained param open, filter, or invoke close).
- * False </magnitude:parameter> in content is absorbed by the buc loop.
+ * Confirmation: </magnitude:parameter> + ws + next valid invoke child.
+ * Under the stricter contract, malformed or invalid `<magnitude:` continuations are rejected,
+ * not absorbed as body content.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -35,10 +35,9 @@ describe('non-last parameter greedy matching', () => {
     expect(getToolInput(parse(input))?.path).toBe('foo')
   })
 
-  it('04: </magnitude:parameter> confirmed by <magnitude:filter>', () => {
+  it('04: </magnitude:parameter> followed by filter path is rejected in current grammar', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:filter>$.stdout</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('ls')
+    v().rejects(input)
   })
 
   it('05: </magnitude:parameter> confirmed by </magnitude:invoke> (early close)', () => {
@@ -47,30 +46,9 @@ describe('non-last parameter greedy matching', () => {
     expect(getToolInput(parse(input))?.command).toBe('foo.ts')
   })
 
-  it('06: false </magnitude:parameter> followed by text — absorbed as content', () => {
+  it('06: false </magnitude:parameter> followed by text and then structural open is rejected', () => {
     const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">file</magnitude:parameter>xxx<magnitude:parameter name="old">x</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    // "file</magnitude:parameter>xxx" is all content of path param — false close absorbed
-    // Then real </magnitude:parameter> confirmed by <magnitude:parameter name="old">
-    // Actually: depends on whether "xxx" breaks the continuation. Let me think...
-    // After </magnitude:parameter>, grammar tries continuation. "xxx" doesn't match <magnitude:parameter, <magnitude:filter, or </magnitude:invoke>
-    // So structural path fails, content loop absorbs </magnitude:parameter>xxx as content
-    // But then we need another </magnitude:parameter> to close path. The next one is before <magnitude:parameter name="old">
-    // Hmm, "file</magnitude:parameter>xxx" — the BUC matches "file", then </magnitude:parameter> is the close,
-    // then continuation tries to match "xxx<magnitude:parameter..." — "xxx" doesn't match ws + valid child.
-    // So the content loop takes over: </magnitude:parameter> is absorbed, "xxx" continues in BUC.
-    // Then the NEXT </magnitude:parameter> (before <magnitude:parameter name="old">) — wait, there's only one more </magnitude:parameter>.
-    // Let me re-read: "file</magnitude:parameter>xxx<magnitude:parameter name="old">x</magnitude:parameter>"
-    // The BUC for path starts. "file" is BUC. Then </magnitude:parameter>. Two paths:
-    //   1. Content: absorb </magnitude:parameter>, continue BUC with "xxx<magnitude:parameter name="old">x"
-    //      Then another </magnitude:parameter>. Two paths again:
-    //        1a. Content: absorb, continue BUC... but no more </magnitude:parameter> and no continuation. Dead end.
-    //        1b. Structural: </magnitude:parameter> + continuation. What follows? </magnitude:invoke>< — that's valid!
-    //   2. Structural: </magnitude:parameter> + continuation. What follows? "xxx<magnitude:parameter..." — "xxx" is not ws.
-    //      Fails.
-    // So path 1 → 1b wins. Path param content = "file</magnitude:parameter>xxx<magnitude:parameter name="old">x"
-    // That means old param never opens! This test is wrong.
-    // Let me fix: the content should not contain another param's content.
+    v().rejects(input)
   })
 
   it('06-fixed: false </magnitude:parameter> followed by non-ws — absorbed as content, real close later', () => {
@@ -111,12 +89,8 @@ describe('non-last parameter greedy matching', () => {
     v().rejects(input)
   })
 
-  it('12: </magnitude:parameter> followed by invalid param name — absorbed as content', () => {
-    // </magnitude:parameter><magnitude:parameter name="wrong"> — "wrong" is not a valid shell param
-    // Grammar rejects structural path, content loop absorbs
+  it('12: </magnitude:parameter> followed by invalid param name is rejected', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter><magnitude:parameter name="invalid">more</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    const ti = getToolInput(parse(input))
-    expect(ti?.command).toBe('text</magnitude:parameter><magnitude:parameter name="invalid">more')
+    v().rejects(input)
   })
 })

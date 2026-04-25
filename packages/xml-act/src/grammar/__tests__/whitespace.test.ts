@@ -60,11 +60,9 @@ describe('whitespace handling', () => {
       v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\n<magnitude:yield_user/>`)
     })
 
-    it('5 trailing tabs causes close tag to be treated as content (5th tab escapes to s0)', () => {
-      // 5th tab at tw4 matches [^ \n<] → back to s0, close tag becomes content
-      // A real close tag is needed later
+    it('5 trailing tabs before a structural tag is rejected', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\t<magnitude:invoke tool="x">\n</magnitude:invoke>\n</magnitude:message>\n<magnitude:yield_user/>`)
+      v.rejects(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\t<magnitude:invoke tool="x">\n</magnitude:invoke>\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
     it('4 trailing spaces after </magnitude:reason> passes', () => {
@@ -129,9 +127,9 @@ describe('whitespace handling', () => {
       v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\t\t\t\t\n</magnitude:invoke>\n<magnitude:yield_user/>`)
     })
 
-    it('5 trailing tabs after </magnitude:parameter> causes it to be treated as content', () => {
+    it('5 trailing tabs after </magnitude:parameter> before a new parameter is rejected', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\t\t\t\t\t<magnitude:parameter name="x">y</magnitude:parameter>\n</magnitude:invoke>\n<magnitude:yield_user/>`)
+      v.rejects(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\t\t\t\t\t<magnitude:parameter name="x">y</magnitude:parameter>\n</magnitude:invoke>\n<magnitude:yield_user/>`)
     })
   })
 

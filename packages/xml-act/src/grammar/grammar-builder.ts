@@ -13,6 +13,7 @@ export interface GrammarParameterDef {
   readonly name: string
   readonly field: string
   readonly type: 'scalar' | 'json'
+  readonly required: boolean
 }
 
 /**
@@ -297,10 +298,6 @@ export class GrammarBuilder {
     // Escape-aware body content rules: BUC interleaved with escape blocks
     // Pattern: buc (escape-block buc)* — no nested repetition ambiguity
     const escBlock = `"<${escapeTag}>" escape-buc "</${escapeTag}>"`
-    // Magnitude open absorber: matches rest of any <magnitude:X...> or <magnitude:X.../> open tag
-    // Used to consume false <magnitude:...> opens as content in greedy body patterns
-    rules.set('mag-open-rest', '[^>]* ">"')
-
     // Magnitude close absorber: matches any </magnitude:X> close tag
     rules.set('mag-close-rest', '[a-z_:]* ">"')
 
@@ -350,10 +347,9 @@ export class GrammarBuilder {
     rules.set('filter-esc-body', `${filterLineBuc} (${escBlock} ${filterLineBuc} | ${nlMagClose} ${filterLineBuc} | ${nlOnly} ${filterLineBuc} | ${ltRecoveryFilterLine} (${escBlock} ${filterLineBuc} | ${nlMagClose} ${filterLineBuc} | ${nlOnly} ${filterLineBuc})*)*`)
 
     // Permissive body rules: used AFTER false closes in greedy patterns.
-    // These absorb <magnitude:...> opens as content since after a false close, everything is content.
-    const magOpenAbsorb = `"<magnitude:" mag-open-rest`
-    rules.set('param-greedy-body', `param-esc-buc (${escBlock} param-esc-buc | ${magOpenAbsorb} param-esc-buc | ${ltRecoveryParam} (${escBlock} param-esc-buc | ${magOpenAbsorb} param-esc-buc)*)*`)
-    rules.set('filter-greedy-body', `filter-esc-buc (${escBlock} filter-esc-buc | ${magOpenAbsorb} filter-esc-buc | ${ltRecoveryFilter} (${escBlock} filter-esc-buc | ${magOpenAbsorb} filter-esc-buc)*)*`)
+    // They preserve close-tag leniency and lt-recovery, but no longer absorb <magnitude: opens as body text.
+    rules.set('param-greedy-body', `param-esc-buc (${escBlock} param-esc-buc | ${ltRecoveryParam} (${escBlock} param-esc-buc)*)*`)
+    rules.set('filter-greedy-body', `filter-esc-buc (${escBlock} filter-esc-buc | ${ltRecoveryFilter} (${escBlock} filter-esc-buc)*)*`)
 
     // Line-aware body rules for reason/message: support newline-confirmed mismatch recovery
     const reasonLineBuc = 'reason-line-buc'
@@ -441,8 +437,6 @@ export class GrammarBuilder {
 
       invokeAlts.push(`"<magnitude:invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
       invokeAltsNoLt.push(`"magnitude:invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
-      invokeAlts.push(`"<magnitude:${escapeGbnfString(tool.tagName)}" ">" ${safeName}-alias-body`)
-      invokeAltsNoLt.push(`"magnitude:${escapeGbnfString(tool.tagName)}" ">" ${safeName}-alias-body`)
     }
 
     // Override the invoke entries in continuation rules
@@ -516,35 +510,18 @@ export class GrammarBuilder {
    */
   private addPerToolRules(rules: RuleMap, tool: GrammarToolDef, safeName: string): void {
     const N = tool.parameters.length
+    const requiredCount = tool.parameters.filter(p => p.required).length
     const invokeClose = '"</magnitude:invoke>"'
-    const aliasInvokeClose = `"</magnitude:${escapeGbnfString(tool.tagName)}>"`
-    const aliasInvokeCloseAlt = `${invokeClose} | ${aliasInvokeClose}`
-    const escBlock = `"<magnitude:escape>" escape-buc "</magnitude:escape>"`
 
     const canonicalParamBodyRule = (k: number): string =>
       k === 1 ? `${safeName}-last-body-s0` : `${safeName}-nonlast-body-s0-${k}`
 
-    const aliasParamBodyRule = (k: number): string =>
-      k === 1 ? `${safeName}-alias-last-body-s0` : `${safeName}-alias-nonlast-body-s0-${k}`
-
-    const aliasParamSpecificBodyRule = (k: number, pSafe: string, aliasInvoke: boolean): string => {
-      if (k === 1) return aliasInvoke ? `${safeName}-alias-last-body-s0-${pSafe}` : `${safeName}-last-body-s0-${pSafe}`
-      return aliasInvoke ? `${safeName}-alias-nonlast-body-s0-${k}-${pSafe}` : `${safeName}-nonlast-body-s0-${k}-${pSafe}`
-    }
-
     const canonicalParamAlt = (bodyRule: string): string =>
       `ws "<magnitude:parameter" ${safeName}-param-names ">" ${bodyRule}`
-
-    const aliasParamAlts = (k: number, aliasInvoke: boolean): string[] =>
-      tool.parameters.map(param => {
-        const pSafe = sanitizeParamName(param.name)
-        return `ws "<magnitude:${escapeGbnfString(param.name)}>" ${aliasParamSpecificBodyRule(k, pSafe, aliasInvoke)}`
-      })
 
     if (N === 0) {
       // 0-param tool: invoke body is just ws + close
       rules.set(`${safeName}-body`, `ws ${invokeClose} turn-next-post`)
-      rules.set(`${safeName}-alias-body`, `ws (${aliasInvokeCloseAlt}) turn-next-post`)
       return
     }
 
@@ -553,65 +530,20 @@ export class GrammarBuilder {
       `" name=\\"${escapeGbnfString(p.name)}\\""`)
     rules.set(`${safeName}-param-names`, paramNameAlts.join(' | '))
 
-    for (const param of tool.parameters) {
-      const pSafe = sanitizeParamName(param.name)
-
-      for (const rule of generateCompoundBucRules(
-        `${safeName}-${pSafe}-esc-buc`,
-        `magnitude:${param.name}`,
-        'magnitude:',
-        { excludeOpenPrefix: true },
-      )) {
-        addRule(rules, rule)
-      }
-
-      const aliasBuc = `${safeName}-${pSafe}-esc-buc`
-      // Generate after-lt variant for this alias BUC
-      for (const rule of generateCompoundBucRules(
-        `${safeName}-${pSafe}-alt-buc`,
-        `magnitude:${param.name}`,
-        'magnitude:',
-        { excludeOpenPrefix: true, afterLt: true },
-      )) {
-        addRule(rules, rule)
-      }
-      const aliasAltBuc = `${safeName}-${pSafe}-alt-buc`
-      const aliasLtRecovery = `"<" ${aliasAltBuc}`
-      rules.set(
-        `${safeName}-${pSafe}-esc-body`,
-        `${aliasBuc} (${escBlock} ${aliasBuc} | ${aliasLtRecovery} (${escBlock} ${aliasBuc})*)*`,
-      )
-      // Greedy variant: also absorbs <magnitude:...> opens as content after false closes
-      const magOpen = `"<magnitude:" mag-open-rest`
-      rules.set(
-        `${safeName}-${pSafe}-greedy-body`,
-        `${aliasBuc} (${escBlock} ${aliasBuc} | ${magOpen} ${aliasBuc} | ${aliasLtRecovery} (${escBlock} ${aliasBuc} | ${magOpen} ${aliasBuc})*)*`,
-      )
-    }
-
-    // Magnitude open absorber: consumes false <magnitude:...> opens as content after false closes in greedy patterns
     // Generate sequence chain: seq-N down to seq-1
     // seq-K means K parameter slots remaining
     for (let k = N; k >= 1; k--) {
+      const consumed = N - k
+      const closeAllowed = consumed >= requiredCount
       const canonicalBodyRule = canonicalParamBodyRule(k)
-      const aliasBodyRule = aliasParamBodyRule(k)
       const canonicalParam = canonicalParamAlt(canonicalBodyRule)
-      const aliasCanonicalParams = aliasParamAlts(k, false)
-      const aliasInvokeParams = aliasParamAlts(k, true)
       // Filter chains back to same seq-K (filter doesn't consume a parameter slot)
       const canonicalFilterAlt = `ws "<magnitude:filter>" ${safeName}-filter-cont-body-s0-${k}`
-      const aliasFilterAlt = `ws "<magnitude:filter>" ${safeName}-alias-filter-cont-body-s0-${k}`
       const canonicalCloseAlt = `ws ${invokeClose} turn-next-post`
-      const aliasCloseAlt = `ws (${aliasInvokeCloseAlt}) turn-next-post`
 
       rules.set(
         `${safeName}-seq-${k}`,
-        [canonicalParam, ...aliasCanonicalParams, canonicalFilterAlt, canonicalCloseAlt].join(' | '),
-      )
-
-      rules.set(
-        `${safeName}-alias-seq-${k}`,
-        [canonicalParamAlt(aliasBodyRule), ...aliasInvokeParams, aliasFilterAlt, aliasCloseAlt].join(' | '),
+        [canonicalParam, canonicalFilterAlt, ...(closeAllowed ? [canonicalCloseAlt] : [])].join(' | '),
       )
 
       // Filter continuation: after filter close, chain back to same seq-K
@@ -619,16 +551,11 @@ export class GrammarBuilder {
         `${safeName}-filter-cont-body-s0-${k}`,
         `filter-esc-body (("</magnitude:filter>" | "/magnitude:filter>") filter-greedy-body)* ("</magnitude:filter>" | "/magnitude:filter>") ${safeName}-seq-${k}`,
       )
-      rules.set(
-        `${safeName}-alias-filter-cont-body-s0-${k}`,
-        `filter-esc-body (("</magnitude:filter>" | "/magnitude:filter>") filter-greedy-body)* ("</magnitude:filter>" | "/magnitude:filter>") ${safeName}-alias-seq-${k}`,
-      )
     }
 
     // Non-last body rules: for each position K > 1, body chains to seq-(K-1)
     for (let k = N; k >= 2; k--) {
       const nextSeq = `${safeName}-seq-${k - 1}`
-      const nextAliasSeq = `${safeName}-alias-seq-${k - 1}`
 
       const paramClose = invokeClose.replace('invoke', 'parameter')
       const paramSlashClose = `"/${invokeClose.replace('invoke', 'parameter').slice(2)}`  // "/magnitude:parameter>"
@@ -638,70 +565,20 @@ export class GrammarBuilder {
         `${safeName}-nonlast-body-s0-${k}`,
         `param-esc-body (${paramDualClose} param-greedy-body)* ${paramDualClose} ${nextSeq}`,
       )
-      rules.set(
-        `${safeName}-alias-nonlast-body-s0-${k}`,
-        `param-esc-body (${paramDualClose} param-greedy-body)* ${paramDualClose} ${nextAliasSeq}`,
-      )
-
-      for (const param of tool.parameters) {
-        const pSafe = sanitizeParamName(param.name)
-        const aliasEscBody = `${safeName}-${pSafe}-esc-body`
-        const aliasGreedyBody = `${safeName}-${pSafe}-greedy-body`
-        const aliasClose = `"</magnitude:${escapeGbnfString(param.name)}>"`
-        const aliasSlashClose = `"/magnitude:${escapeGbnfString(param.name)}>"`
-        const aliasDualClose = `(${aliasClose} | ${aliasSlashClose})`
-
-        rules.set(
-          `${safeName}-nonlast-body-s0-${k}-${pSafe}`,
-          `${aliasEscBody} (${aliasDualClose} ${aliasGreedyBody})* ${aliasDualClose} ${nextSeq}`,
-        )
-        rules.set(
-          `${safeName}-alias-nonlast-body-s0-${k}-${pSafe}`,
-          `${aliasEscBody} (${aliasDualClose} ${aliasGreedyBody})* ${aliasDualClose} ${nextAliasSeq}`,
-        )
-      }
-
     }
 
     // Post-last-param: after the last parameter closes, accept filter or invoke close
     const postLastCanonical = `ws "<magnitude:filter>" ${safeName}-filter-cont-body-s0-1 | ws ${invokeClose} turn-next-post`
-    const postLastAlias = `ws "<magnitude:filter>" ${safeName}-alias-filter-cont-body-s0-1 | ws (${aliasInvokeCloseAlt}) turn-next-post`
     rules.set(`${safeName}-post-last-param`, postLastCanonical)
-    rules.set(`${safeName}-alias-post-last-param`, postLastAlias)
 
     const paramDualClose = `("</magnitude:parameter>" | "/magnitude:parameter>")`
     rules.set(
       `${safeName}-last-body-s0`,
       `param-esc-body (${paramDualClose} param-greedy-body)* ${paramDualClose} ${safeName}-post-last-param`,
     )
-    rules.set(
-      `${safeName}-alias-last-body-s0`,
-      `param-esc-body (${paramDualClose} param-greedy-body)* ${paramDualClose} ${safeName}-alias-post-last-param`,
-    )
-
-    for (const param of tool.parameters) {
-      const pSafe = sanitizeParamName(param.name)
-      const aliasEscBody = `${safeName}-${pSafe}-esc-body`
-      const aliasGreedyBody = `${safeName}-${pSafe}-greedy-body`
-      const aliasClose = `"</magnitude:${escapeGbnfString(param.name)}>"`
-      const aliasSlashClose = `"/magnitude:${escapeGbnfString(param.name)}>"`
-      const aliasDualClose = `(${aliasClose} | ${aliasSlashClose})`
-
-      rules.set(
-        `${safeName}-last-body-s0-${pSafe}`,
-        `${aliasEscBody} (${aliasDualClose} ${aliasGreedyBody})* ${aliasDualClose} ${safeName}-post-last-param`,
-      )
-      rules.set(
-        `${safeName}-alias-last-body-s0-${pSafe}`,
-        `${aliasEscBody} (${aliasDualClose} ${aliasGreedyBody})* ${aliasDualClose} ${safeName}-alias-post-last-param`,
-      )
-    }
-
-
 
     // Entry points
     rules.set(`${safeName}-body`, `${safeName}-seq-${N}`)
-    rules.set(`${safeName}-alias-body`, `${safeName}-alias-seq-${N}`)
   }
 
   private addRootRule(rules: RuleMap): void {

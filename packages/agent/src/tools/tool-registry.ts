@@ -63,6 +63,7 @@ export function generateToolGrammar(
       name: p.name,
       field: p.name, // In new format, parameter name = field path
       type: p.type === 'json_object' || p.type === 'json_array' ? 'json' as const : 'scalar' as const,
+      required: p.required,
     }))
     
     defs.push({

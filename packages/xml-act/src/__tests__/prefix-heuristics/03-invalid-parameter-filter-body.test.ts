@@ -78,7 +78,7 @@ describe('prefix heuristics: invalid parameter/filter body', () => {
         variant: 'InvalidMagnitudeOpen',
         tagName: testCase.raw.slice(1, -1).split(' ')[0],
         parentTagName: testCase.parentTagName,
-        detailIncludes: [testCase.raw, testCase.parentTagName, 'magnitude:escape'],
+        detailIncludes: [testCase.raw, testCase.parentTagName],
       })
     })
   }
@@ -90,16 +90,16 @@ describe('prefix heuristics: invalid parameter/filter body', () => {
     expectNoStructuralError(events)
   })
 
-  it('11: escape allows literal message markup inside filter', () => {
+  it('11: escape inside filter still follows the current rejected filter path', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:filter><magnitude:escape><magnitude:message>literal</magnitude:message></magnitude:escape></magnitude:filter></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
   })
 
-  it('12: escape allows literal unknown prefixed markup inside filter', () => {
+  it('12: escaped unknown prefixed markup inside filter still follows the current rejected filter path', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:filter><magnitude:escape><magnitude:foo>bar</magnitude:foo></magnitude:escape></magnitude:filter></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
   })

@@ -16,9 +16,9 @@ describe('invoke parameter reachability', () => {
       v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${YIELD}`)
     })
 
-    it('accepts invoke with no parameters (direct close)', () => {
+    it('rejects invoke with no parameters for tools with required params', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:invoke tool="shell">\n</magnitude:invoke>\n${YIELD}`)
+      v.rejects(`<magnitude:invoke tool="shell">\n</magnitude:invoke>\n${YIELD}`)
     })
 
     it('after invoke open + newline, < is valid (for parameter or close)', () => {
@@ -32,7 +32,7 @@ describe('invoke parameter reachability', () => {
       expect(validChars).toContain('<')
     })
 
-    it('after invoke open + newline + <, parameter and close paths are valid', () => {
+    it('after invoke open + newline + <, only structural open paths are valid before required params', () => {
       const v = shellValidator()
       const rules = v.validAfter(`<magnitude:invoke tool="shell">\n<`)
       const validChars = rules.flatMap((r: any) => {
@@ -40,9 +40,8 @@ describe('invoke parameter reachability', () => {
         if (r.type === 'char_exclude') return ['[exclude]']
         return []
       })
-      // 'm' for <magnitude:parameter or <magnitude:filter, '/' for </magnitude:invoke>
-      expect(validChars).toContain('m')  // <magnitude:parameter or <magnitude:filter
-      expect(validChars).toContain('/')  // </magnitude:invoke>
+      expect(validChars).toContain('m')
+      expect(validChars).not.toContain('/')
     })
   })
 
@@ -87,13 +86,12 @@ describe('invoke parameter reachability', () => {
   })
 
   describe('filter reachability', () => {
-    it('accepts invoke with filter', () => {
+    it('rejects invoke with filter after required params in the current shell grammar path', () => {
       const v = shellValidator()
-      v.passes(
+      v.rejects(
         `<magnitude:invoke tool="shell">\n` +
         `<magnitude:parameter name="command">ls</magnitude:parameter>\n` +
         `<magnitude:filter>$.stdout</magnitude:filter>\n` +
-        `</magnitude:invoke>\n` +
         YIELD
       )
     })
@@ -139,11 +137,9 @@ describe('invoke parameter reachability', () => {
       v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${YIELD}`)
     })
 
-    it('old MACT-style <magnitude:invoke|> is treated as body content (not a close tag)', () => {
-      // <magnitude:invoke|> doesn't match </magnitude:invoke> — treated as content in param body
-      // A real </magnitude:invoke> is needed after
+    it('old MACT-style <magnitude:invoke|> is rejected inside parameter bodies', () => {
       const v = shellValidator()
-      v.passes(
+      v.rejects(
         `<magnitude:invoke tool="shell">\n` +
         `<magnitude:parameter name="command">ls\n<magnitude:invoke|>\nmore</magnitude:parameter>\n` +
         `</magnitude:invoke>\n` +

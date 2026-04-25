@@ -1,5 +1,6 @@
 /**
- * Rule: parameter aliases are semantically equivalent to canonical parameter forms.
+ * Rule: parser parameter aliases are semantically equivalent to canonical parameter forms,
+ * even though the grammar no longer generates alias syntax.
  */
 import { describe, it } from 'vitest'
 import {
@@ -53,7 +54,7 @@ describe('prefix heuristics: parameter alias equivalence', () => {
 
   for (const testCase of defaultCases) {
     it(testCase.label, () => {
-      v().passes(testCase.aliasInput)
+      v().rejects(testCase.aliasInput)
       v().passes(testCase.canonicalInput)
       expectParameterAliasEquivalent(testCase.aliasInput, testCase.canonicalInput)
     })
@@ -62,15 +63,14 @@ describe('prefix heuristics: parameter alias equivalence', () => {
   it('04: grep pattern alias equals canonical', () => {
     const aliasInput = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern></magnitude:invoke><magnitude:yield_user/>'
     const canonicalInput = '<magnitude:invoke tool="grep"><magnitude:parameter name="pattern">TODO</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(aliasInput)
-    vg().passes(canonicalInput)
+    vg().rejects(aliasInput)
     expectParameterAliasEquivalent(aliasInput, canonicalInput, parseWithGrep)
   })
 
   it('05: grep full alias payload equals canonical', () => {
     const aliasInput = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern><magnitude:glob>*.ts</magnitude:glob><magnitude:path>src</magnitude:path><magnitude:limit>10</magnitude:limit></magnitude:invoke><magnitude:yield_user/>'
     const canonicalInput = '<magnitude:invoke tool="grep"><magnitude:parameter name="pattern">TODO</magnitude:parameter><magnitude:parameter name="glob">*.ts</magnitude:parameter><magnitude:parameter name="path">src</magnitude:parameter><magnitude:parameter name="limit">10</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(aliasInput)
+    vg().rejects(aliasInput)
     vg().passes(canonicalInput)
     expectParameterAliasEquivalent(aliasInput, canonicalInput, parseWithGrep)
   })
@@ -78,8 +78,7 @@ describe('prefix heuristics: parameter alias equivalence', () => {
   it('10: grep alias equivalence with optional params omitted', () => {
     const aliasInput = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern></magnitude:invoke><magnitude:yield_user/>'
     const canonicalInput = '<magnitude:invoke tool="grep"><magnitude:parameter name="pattern">TODO</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(aliasInput)
-    vg().passes(canonicalInput)
+    vg().rejects(aliasInput)
     expectParameterAliasEquivalent(aliasInput, canonicalInput, parseWithGrep)
   })
 })

@@ -1,7 +1,7 @@
 import { buildValidator } from '../../grammar/__tests__/helpers'
 import { createTokenizer } from '../../tokenizer'
 import { createParser } from '../../parser/index'
-import type { Token } from '../../tokenizer'
+import type { Token } from '../../types'
 import type { TurnEngineEvent, RegisteredTool } from '../../types'
 import type { GrammarToolDef } from '../../grammar/grammar-builder'
 import { Schema } from 'effect'
@@ -13,15 +13,15 @@ import { defineTool } from '@magnitudedev/tools'
 
 export const SHELL_TOOL_DEF: GrammarToolDef = {
   tagName: 'shell',
-  parameters: [{ name: 'command', field: 'command', type: 'scalar' }],
+  parameters: [{ name: 'command', field: 'command', type: 'scalar', required: true }],
 }
 
 export const EDIT_TOOL_DEF: GrammarToolDef = {
   tagName: 'edit',
   parameters: [
-    { name: 'path', field: 'path', type: 'scalar' },
-    { name: 'old', field: 'old', type: 'scalar' },
-    { name: 'new', field: 'new', type: 'scalar' },
+    { name: 'path', field: 'path', type: 'scalar', required: true },
+    { name: 'old', field: 'old', type: 'scalar', required: true },
+    { name: 'new', field: 'new', type: 'scalar', required: true },
   ],
 }
 
@@ -33,10 +33,10 @@ export const TREE_TOOL_DEF: GrammarToolDef = {
 export const GREP_TOOL_DEF: GrammarToolDef = {
   tagName: 'grep',
   parameters: [
-    { name: 'pattern', field: 'pattern', type: 'scalar' },
-    { name: 'glob', field: 'glob', type: 'scalar' },
-    { name: 'path', field: 'path', type: 'scalar' },
-    { name: 'limit', field: 'limit', type: 'scalar' },
+    { name: 'pattern', field: 'pattern', type: 'scalar', required: true },
+    { name: 'glob', field: 'glob', type: 'scalar', required: true },
+    { name: 'path', field: 'path', type: 'scalar', required: true },
+    { name: 'limit', field: 'limit', type: 'scalar', required: true },
   ],
 }
 

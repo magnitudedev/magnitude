@@ -64,27 +64,19 @@ describe('prefix heuristics: parameter alias edge cases', () => {
     })
   })
 
-  it('05: duplicate field alias then canonical emits DuplicateParameter error', () => {
+  it('05: duplicate field alias then canonical rejected by grammar', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:command>pwd</magnitude:command><magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
-    const events = parse(input)
-    const errors = events.filter(e => e._tag === 'ToolParseError' && (e as any).error._tag === 'DuplicateParameter')
-    expect(errors.length).toBe(1)
-    expect((errors[0] as any).error.parameterName).toBe('command')
+    v().rejects(input)
   })
 
-  it('06: duplicate field canonical then alias emits DuplicateParameter error', () => {
+  it('06: duplicate field canonical then alias rejected by grammar', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:parameter name="command">pwd</magnitude:parameter><magnitude:command>ls</magnitude:command></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
-    const events = parse(input)
-    const errors = events.filter(e => e._tag === 'ToolParseError' && (e as any).error._tag === 'DuplicateParameter')
-    expect(errors.length).toBe(1)
-    expect((errors[0] as any).error.parameterName).toBe('command')
+    v().rejects(input)
   })
 
   it('07: edit aliases out of canonical order', () => {
     const input = '<magnitude:invoke tool="edit"><magnitude:new>y</magnitude:new><magnitude:path>a.ts</magnitude:path><magnitude:old>x</magnitude:old></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({ new: 'y', path: 'a.ts', old: 'x' })
@@ -92,7 +84,7 @@ describe('prefix heuristics: parameter alias edge cases', () => {
 
   it('08: grep mixed aliases and canonical params', () => {
     const input = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern><magnitude:parameter name="glob">*.ts</magnitude:parameter><magnitude:path>src</magnitude:path></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({ pattern: 'TODO', glob: '*.ts', path: 'src' })

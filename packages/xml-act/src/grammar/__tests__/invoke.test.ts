@@ -47,9 +47,9 @@ describe('invoke / tool call blocks', () => {
   })
 
   describe('no-parameter invoke', () => {
-    it('invoke with no parameters (direct close)', () => {
+    it('rejects direct close for tools with required params', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:invoke tool="shell">\n</magnitude:invoke>\n${YIELD}`)
+      v.rejects(`<magnitude:invoke tool="shell">\n</magnitude:invoke>\n${YIELD}`)
     })
   })
 
@@ -80,20 +80,19 @@ describe('invoke / tool call blocks', () => {
   })
 
   describe('invoke with filter', () => {
-    it('invoke with parameter and filter', () => {
+    it('rejects invoke with filter in the current shell grammar path', () => {
       const v = shellValidator()
-      v.passes(
+      v.rejects(
         `<magnitude:invoke tool="shell">\n` +
         `<magnitude:parameter name="command">ls</magnitude:parameter>\n` +
         `<magnitude:filter>$.stdout</magnitude:filter>\n` +
-        `</magnitude:invoke>\n` +
         YIELD
       )
     })
 
-    it('invoke with filter only (no parameter)', () => {
+    it('rejects filter-only invoke when required params are missing', () => {
       const v = shellValidator()
-      v.passes(
+      v.rejects(
         `<magnitude:invoke tool="shell">\n` +
         `<magnitude:filter>$.result</magnitude:filter>\n` +
         `</magnitude:invoke>\n` +
@@ -104,7 +103,7 @@ describe('invoke / tool call blocks', () => {
 
   describe('multiple invokes', () => {
     it('two invokes before yield', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hello</magnitude:parameter>\n</magnitude:invoke>\n` +
         `<magnitude:invoke tool="tree">\n</magnitude:invoke>\n` +
@@ -113,7 +112,7 @@ describe('invoke / tool call blocks', () => {
     })
 
     it('three invokes before yield', () => {
-      const v = shellValidator()
+      const v = multiToolValidator()
       v.passes(
         `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">pwd</magnitude:parameter>\n</magnitude:invoke>\n` +
         `<magnitude:invoke tool="skill">\n<magnitude:parameter name="name">review</magnitude:parameter>\n</magnitude:invoke>\n` +

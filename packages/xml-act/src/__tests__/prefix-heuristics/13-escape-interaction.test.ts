@@ -53,8 +53,8 @@ describe('prefix heuristics: escape interaction', () => {
     expectNoStructuralError(events)
   })
 
-  it('06: escaped unknown top-level-like text then valid tree', () => {
-    const input = '<magnitude:message><magnitude:escape><magnitude:foo>bar</magnitude:foo></magnitude:escape></magnitude:message><magnitude:tree></magnitude:tree><magnitude:yield_user/>'
+  it('06: escaped unknown top-level-like text then valid canonical tree invoke', () => {
+    const input = '<magnitude:message><magnitude:escape><magnitude:foo>bar</magnitude:foo></magnitude:escape></magnitude:message><magnitude:invoke tool="tree"></magnitude:invoke><magnitude:yield_user/>'
     v().passes(input)
     const events = parse(input)
     expectNoStructuralError(events)
@@ -93,7 +93,7 @@ describe('prefix heuristics: escape interaction', () => {
       variant: 'InvalidMagnitudeOpen',
       tagName: 'magnitude:foo',
       parentTagName: 'magnitude:message',
-      detailIncludes: ['<magnitude:foo>', 'magnitude:message', 'magnitude:escape'],
+      detailIncludes: ['<magnitude:foo>', 'magnitude:message'],
     })
     expectPreservedInMessage(events, '<magnitude:foo>')
   })

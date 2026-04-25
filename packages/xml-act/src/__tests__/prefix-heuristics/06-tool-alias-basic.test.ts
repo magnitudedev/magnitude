@@ -1,5 +1,5 @@
 /**
- * Rule: top-level <magnitude:toolname> aliases canonical invoke.
+ * Rule: grammar is canonical-only, but parser alias heuristics still resolve tool aliases.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -70,7 +70,7 @@ describe('prefix heuristics: tool alias basic', () => {
 
   for (const testCase of defaultCases) {
     it(testCase.label, () => {
-      v().passes(testCase.input)
+      v().rejects(testCase.input)
       const events = parse(testCase.input)
       expectNoStructuralError(events)
       if ('expectedInputs' in testCase) {
@@ -84,7 +84,7 @@ describe('prefix heuristics: tool alias basic', () => {
 
   it('09: grep alias with required param', () => {
     const input = '<magnitude:grep><magnitude:pattern>TODO</magnitude:pattern></magnitude:grep><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({ pattern: 'TODO' })
@@ -92,7 +92,7 @@ describe('prefix heuristics: tool alias basic', () => {
 
   it('10: grep alias with all params', () => {
     const input = '<magnitude:grep><magnitude:pattern>TODO</magnitude:pattern><magnitude:glob>*.ts</magnitude:glob><magnitude:path>src</magnitude:path><magnitude:limit>10</magnitude:limit></magnitude:grep><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({

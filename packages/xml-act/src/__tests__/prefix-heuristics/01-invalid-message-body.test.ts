@@ -75,7 +75,7 @@ describe('prefix heuristics: invalid message body', () => {
         variant: 'InvalidMagnitudeOpen',
         tagName: testCase.raw.slice(1, -1).split(' ')[0],
         parentTagName: 'magnitude:message',
-        detailIncludes: [testCase.raw, 'magnitude:message', 'magnitude:escape'],
+        detailIncludes: [testCase.raw, 'magnitude:message'],
       })
       expectPreservedInMessage(events, testCase.raw)
     })

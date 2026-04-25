@@ -116,22 +116,22 @@ export function buildValidator(
 /** Standard shell tool with one scalar parameter */
 export const SHELL_TOOL: GrammarToolDef = {
   tagName: 'shell',
-  parameters: [{ name: 'command', field: 'command', type: 'scalar' }],
+  parameters: [{ name: 'command', field: 'command', type: 'scalar', required: true }],
 }
 
 /** Skill tool with one scalar parameter */
 export const SKILL_TOOL: GrammarToolDef = {
   tagName: 'skill',
-  parameters: [{ name: 'name', field: 'name', type: 'scalar' }],
+  parameters: [{ name: 'name', field: 'name', type: 'scalar', required: true }],
 }
 
 /** Tool with multiple parameters */
 export const MULTI_PARAM_TOOL: GrammarToolDef = {
   tagName: 'edit',
   parameters: [
-    { name: 'path', field: 'path', type: 'scalar' },
-    { name: 'old', field: 'old', type: 'scalar' },
-    { name: 'new', field: 'new', type: 'scalar' },
+    { name: 'path', field: 'path', type: 'scalar', required: true },
+    { name: 'old', field: 'old', type: 'scalar', required: true },
+    { name: 'new', field: 'new', type: 'scalar', required: true },
   ],
 }
 

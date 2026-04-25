@@ -21,7 +21,7 @@ const v = () => grammarValidator()
 describe('prefix heuristics: mixed sequences', () => {
   it('01: reason then shell alias then message', () => {
     const input = '<magnitude:reason>prep</magnitude:reason><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:message>done</magnitude:message><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(collectLensChunks(events)).toContain('prep')
@@ -31,7 +31,7 @@ describe('prefix heuristics: mixed sequences', () => {
 
   it('02: message then canonical invoke then tree alias', () => {
     const input = '<magnitude:message>prep</magnitude:message><magnitude:invoke tool="shell"><magnitude:command>pwd</magnitude:command></magnitude:invoke><magnitude:tree></magnitude:tree><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(collectMessageChunks(events)).toContain('prep')
@@ -115,7 +115,7 @@ describe('prefix heuristics: mixed sequences', () => {
 
   it('10: reason then tree alias then escaped close-like text in final message', () => {
     const input = '<magnitude:reason>prep</magnitude:reason><magnitude:tree></magnitude:tree><magnitude:message><magnitude:escape></magnitude:reason></magnitude:escape></magnitude:message><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
     expect(collectLensChunks(events)).toContain('prep')

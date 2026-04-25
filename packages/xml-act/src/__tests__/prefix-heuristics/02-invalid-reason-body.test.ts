@@ -77,7 +77,7 @@ describe('prefix heuristics: invalid reason body', () => {
         variant: 'InvalidMagnitudeOpen',
         tagName: testCase.raw.slice(1, -1).split(' ')[0],
         parentTagName: 'magnitude:reason',
-        detailIncludes: [testCase.raw, 'magnitude:reason', 'magnitude:escape'],
+        detailIncludes: [testCase.raw, 'magnitude:reason'],
       })
       expectPreservedInLens(events, testCase.raw)
     })

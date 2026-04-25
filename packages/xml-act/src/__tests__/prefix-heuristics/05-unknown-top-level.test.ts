@@ -62,14 +62,14 @@ describe('prefix heuristics: unknown top-level', () => {
       expectStructuralError(events, {
         variant: 'InvalidMagnitudeOpen',
         tagName: testCase.raw.slice(1, -1).split(' ')[0],
-        detailIncludes: [testCase.raw, 'top level', 'magnitude:escape'],
+        detailIncludes: [testCase.raw, 'top level'],
       })
     })
   }
 
-  it('06: known tool alias shell remains valid', () => {
+  it('06: known tool alias shell is rejected by grammar', () => {
     const input = '<magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
   })

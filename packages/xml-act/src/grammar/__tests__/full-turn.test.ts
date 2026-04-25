@@ -86,7 +86,7 @@ describe('full turn sequences', () => {
     })
 
     it('reason then no-param invoke then yield passes', () => {
-      const v = shellValidator()
+      const v = buildValidator([SHELL_TOOL, { tagName: 'tree', parameters: [] }])
       v.passes(
         REASON('turn', 'checking tree') +
         INVOKE('tree') +
@@ -97,7 +97,10 @@ describe('full turn sequences', () => {
 
   describe('multiple invokes', () => {
     it('two invokes then yield passes', () => {
-      const v = shellValidator()
+      const v = buildValidator([
+        SHELL_TOOL,
+        { tagName: 'skill', parameters: [{ name: 'name', field: 'name', type: 'scalar', required: true }] },
+      ])
       v.passes(
         INVOKE('shell', { command: 'echo hello' }) +
         INVOKE('skill', { name: 'review' }) +
@@ -106,7 +109,11 @@ describe('full turn sequences', () => {
     })
 
     it('three invokes then yield passes', () => {
-      const v = shellValidator()
+      const v = buildValidator([
+        SHELL_TOOL,
+        { tagName: 'skill', parameters: [{ name: 'name', field: 'name', type: 'scalar', required: true }] },
+        { tagName: 'tree', parameters: [] },
+      ])
       v.passes(
         INVOKE('shell', { command: 'ls' }) +
         INVOKE('skill', { name: 'review' }) +
@@ -160,7 +167,10 @@ describe('full turn sequences', () => {
     })
 
     it('full complex sequence passes', () => {
-      const v = shellValidator()
+      const v = buildValidator([
+        SHELL_TOOL,
+        { tagName: 'skill', parameters: [{ name: 'name', field: 'name', type: 'scalar', required: true }] },
+      ])
       v.passes(
         REASON('turn', 'I need to do several things') +
         REASON('diligence', 'check quality') +

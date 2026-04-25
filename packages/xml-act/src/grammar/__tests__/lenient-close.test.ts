@@ -27,27 +27,26 @@ describe('close tag behavior', () => {
       v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${YIELD}`)
     })
 
-    it('</magnitude:invoke> closes invoke block', () => {
+    it('</magnitude:invoke> closes invoke block after required params', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:invoke tool="shell">\n</magnitude:invoke>\n${YIELD}`)
+      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${YIELD}`)
     })
 
-    it('</magnitude:filter> closes filter block', () => {
+    it('</magnitude:filter> does not complete a valid shell invoke path on its own', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:invoke tool="shell">\n<magnitude:filter>$.stdout</magnitude:filter>\n</magnitude:invoke>\n${YIELD}`)
+      v.rejects(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n<magnitude:filter>$.stdout</magnitude:filter>\n${YIELD}`)
     })
   })
 
   describe('old MACT-style close variants treated as body content', () => {
-    it('<magnitude:reason|> in reason body is treated as content (not a close tag)', () => {
-      // <magnitude:reason|> does not match </magnitude:reason> — treated as content, real close follows
+    it('<magnitude:reason|> in reason body is rejected as malformed structural syntax', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nsome thought\n<magnitude:reason|>\nmore content\n</magnitude:reason>\n${YIELD}`)
+      v.rejects(`<magnitude:reason about="turn">\nsome thought\n<magnitude:reason|>\nmore content\n</magnitude:reason>\n${YIELD}`)
     })
 
-    it('<magnitude:message|> in message body is treated as content', () => {
+    it('<magnitude:message|> in message body is rejected as malformed structural syntax', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:message to="user">\nhello\n<magnitude:message|>\nmore\n</magnitude:message>\n${YIELD}`)
+      v.rejects(`<magnitude:message to="user">\nhello\n<magnitude:message|>\nmore\n</magnitude:message>\n${YIELD}`)
     })
 
     it('</message|> in message body is treated as content', () => {

@@ -61,7 +61,7 @@ describe('constrained tool names', () => {
   })
 
   it('08: namespaced tool accepted when in schema', () => {
-    const nsTool: GrammarToolDef = { tagName: 'fs:read', parameters: [{ name: 'path', field: 'path', type: 'scalar' }] }
+    const nsTool: GrammarToolDef = { tagName: 'fs:read', parameters: [{ name: 'path', field: 'path', type: 'scalar', required: true }] }
     const nv = buildValidator([nsTool])
     const input = `<magnitude:invoke tool="fs:read">\n<magnitude:parameter name="path">/tmp</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     nv.passes(input)

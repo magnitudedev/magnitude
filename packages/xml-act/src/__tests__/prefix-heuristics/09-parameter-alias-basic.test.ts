@@ -1,5 +1,5 @@
 /**
- * Rule: inside invoke, <magnitude:paramname> aliases canonical parameter.
+ * Rule: grammar is canonical-only inside invoke, but parser parameter aliases still resolve.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -61,7 +61,11 @@ describe('prefix heuristics: parameter alias basic', () => {
 
   for (const testCase of defaultPositiveCases) {
     it(testCase.label, () => {
-      v().passes(testCase.input)
+      if (testCase.label === '09: canonical parameters remain valid control') {
+        v().passes(testCase.input)
+      } else {
+        v().rejects(testCase.input)
+      }
       const events = parse(testCase.input)
       expectNoStructuralError(events)
       expect(getToolInput(events)).toEqual(testCase.expected)
@@ -82,7 +86,7 @@ describe('prefix heuristics: parameter alias basic', () => {
 
   it('06: grep pattern alias', () => {
     const input = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({ pattern: 'TODO' })
@@ -90,7 +94,7 @@ describe('prefix heuristics: parameter alias basic', () => {
 
   it('07: grep optional alias glob', () => {
     const input = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern><magnitude:glob>*.ts</magnitude:glob></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({ pattern: 'TODO', glob: '*.ts' })
@@ -98,7 +102,7 @@ describe('prefix heuristics: parameter alias basic', () => {
 
   it('08: grep full alias payload', () => {
     const input = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern><magnitude:glob>*.ts</magnitude:glob><magnitude:path>src</magnitude:path><magnitude:limit>10</magnitude:limit></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(input)
+    vg().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
     expect(getToolInput(events)).toEqual({

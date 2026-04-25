@@ -1,5 +1,6 @@
 /**
- * Rule: tool aliases are semantically equivalent to canonical invoke forms.
+ * Rule: parser tool aliases are semantically equivalent to canonical invoke forms,
+ * even though the grammar no longer generates alias syntax.
  */
 import { describe, it } from 'vitest'
 import {
@@ -58,7 +59,7 @@ describe('prefix heuristics: tool alias equivalence', () => {
 
   for (const testCase of defaultCases) {
     it(testCase.label, () => {
-      v().passes(testCase.aliasInput)
+      v().rejects(testCase.aliasInput)
       v().passes(testCase.canonicalInput)
       expectToolAliasEquivalent(testCase.aliasInput, testCase.canonicalInput)
     })
@@ -67,15 +68,14 @@ describe('prefix heuristics: tool alias equivalence', () => {
   it('05: grep alias equals canonical', () => {
     const aliasInput = '<magnitude:grep><magnitude:pattern>TODO</magnitude:pattern></magnitude:grep><magnitude:yield_user/>'
     const canonicalInput = '<magnitude:invoke tool="grep"><magnitude:parameter name="pattern">TODO</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(aliasInput)
-    vg().passes(canonicalInput)
+    vg().rejects(aliasInput)
     expectToolAliasEquivalent(aliasInput, canonicalInput, parseWithGrep)
   })
 
   it('10: grep full payload equivalence', () => {
     const aliasInput = '<magnitude:grep><magnitude:pattern>TODO</magnitude:pattern><magnitude:glob>*.ts</magnitude:glob><magnitude:path>src</magnitude:path><magnitude:limit>10</magnitude:limit></magnitude:grep><magnitude:yield_user/>'
     const canonicalInput = '<magnitude:invoke tool="grep"><magnitude:parameter name="pattern">TODO</magnitude:parameter><magnitude:parameter name="glob">*.ts</magnitude:parameter><magnitude:parameter name="path">src</magnitude:parameter><magnitude:parameter name="limit">10</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    vg().passes(aliasInput)
+    vg().rejects(aliasInput)
     vg().passes(canonicalInput)
     expectToolAliasEquivalent(aliasInput, canonicalInput, parseWithGrep)
   })

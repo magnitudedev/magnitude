@@ -2,7 +2,7 @@ import { GrammarBuilder } from '../src/grammar/grammar-builder'
 import { sanitizeForGbnf } from '../src/grammar/__tests__/helpers'
 import GBNF from 'gbnf'
 
-const g = GrammarBuilder.create([{tagName:'shell',parameters:[{name:'command',field:'command',type:'scalar'}]}]).build()
+const g = GrammarBuilder.create([{tagName:'shell',parameters:[{name:'command',field:'command',type:'scalar',required:true}]}]).build()
 const s = sanitizeForGbnf(g)
 
 const input = `<message to="user">\nhello\n</message>\n<reason about="turn">\nthinking\n</reason>\n<yield_user/>`

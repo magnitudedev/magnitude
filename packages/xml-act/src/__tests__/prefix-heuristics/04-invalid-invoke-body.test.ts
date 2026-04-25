@@ -72,16 +72,16 @@ describe('prefix heuristics: invalid invoke body', () => {
     expectNoStructuralError(events)
   })
 
-  it('07: command alias remains valid', () => {
+  it('07: command alias is rejected by grammar but still parsed heuristically', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:command>pwd</magnitude:command></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
   })
 
-  it('09: grep pattern alias valid under grep schema', () => {
+  it('09: grep pattern alias valid under parser heuristics but rejected by grammar', () => {
     const input = '<magnitude:invoke tool="grep"><magnitude:pattern>TODO</magnitude:pattern></magnitude:invoke><magnitude:yield_user/>'
-    grepGrammarValidator().passes(input)
+    grepGrammarValidator().rejects(input)
     const events = parseWithGrep(input)
     expectNoStructuralError(events)
   })
@@ -98,7 +98,7 @@ describe('prefix heuristics: invalid invoke body', () => {
     })
   })
 
-  it('11: filter remains valid', () => {
+  it('11: filter + canonical parameter remains valid', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:filter>*.ts</magnitude:filter><magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
     v().passes(input)
     const events = parse(input)

@@ -102,12 +102,11 @@ describe('last-parameter deep greedy matching', () => {
     expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke>a</magnitude:parameter></magnitude:invoke>b')
   })
 
-  // ---- Last param still allows filter ----
+  // ---- Filter path tightened ----
 
-  it('15: last param slot but filter follows instead', () => {
+  it('15: last param slot but filter follows instead — rejected in current grammar', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:filter>$.stdout</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('ls')
+    v().rejects(input)
   })
 
   // ---- Multiple invokes ----
