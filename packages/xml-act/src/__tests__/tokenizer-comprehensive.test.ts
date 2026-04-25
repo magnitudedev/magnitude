@@ -4,7 +4,7 @@ import { createTokenizer } from '../tokenizer'
 function collect(input: string | string[], knownToolTags?: ReadonlySet<string>): any[] {
   const out: any[] = []
   const tokenizer = createTokenizer((token) => {
-    const { raw, ...rest } = token as any
+    const { raw, span, ...rest } = token as any
     out.push(rest)
   }, knownToolTags)
   if (Array.isArray(input)) {

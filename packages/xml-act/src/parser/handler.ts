@@ -14,6 +14,7 @@
  */
 
 import type { Frame } from './types'
+import type { SourceSpan } from '../types'
 import type { HandlerContext } from './handler-context'
 import type { ParserOp } from './ops'
 
@@ -55,7 +56,8 @@ export interface OpenHandler<TParent extends Frame, TChild extends Frame> {
     attrs: ReadonlyMap<string, string>,
     parent: TParent,
     ctx: HandlerContext,
-  ): Array<PushOp<TChild> | EmitOp | PopOp | ReplaceOp<Frame>>
+    tokenSpan: SourceSpan,
+  ): ParserOp[]
 }
 
 /**
@@ -65,7 +67,7 @@ export interface OpenHandler<TParent extends Frame, TChild extends Frame> {
  * TypeScript narrows `top` via the discriminant check in resolveCloseHandler.
  */
 export interface CloseHandler<TFrame extends Frame> {
-  close(top: TFrame, ctx: HandlerContext): ParserOp[]
+  close(top: TFrame, ctx: HandlerContext, tokenSpan: SourceSpan): ParserOp[]
 }
 
 /**
@@ -73,7 +75,7 @@ export interface CloseHandler<TFrame extends Frame> {
  * Used for yield_* tags which have no parent/child relationship to enforce.
  */
 export interface SelfCloseHandler {
-  selfClose(attrs: ReadonlyMap<string, string>, ctx: HandlerContext): ParserOp[]
+  selfClose(attrs: ReadonlyMap<string, string>, ctx: HandlerContext, tokenSpan: SourceSpan): ParserOp[]
 }
 
 // =============================================================================
@@ -87,7 +89,7 @@ export interface SelfCloseHandler {
  * needing to know TParent — the type safety was enforced at bindOpen() call time.
  */
 export interface BoundOpenHandler {
-  open(attrs: ReadonlyMap<string, string>, ctx: HandlerContext): ParserOp[]
+  open(attrs: ReadonlyMap<string, string>, ctx: HandlerContext, tokenSpan: SourceSpan): ParserOp[]
 }
 
 /**
@@ -97,7 +99,7 @@ export interface BoundOpenHandler {
  * needing to know TFrame.
  */
 export interface BoundCloseHandler {
-  close(ctx: HandlerContext): ParserOp[]
+  close(ctx: HandlerContext, tokenSpan: SourceSpan): ParserOp[]
 }
 
 /** BoundSelfCloseHandler is identical to SelfCloseHandler (no frame to capture). */
@@ -113,16 +115,13 @@ export type BoundSelfCloseHandler = SelfCloseHandler
  * The binding is explicit and localized to resolveOpenHandler.
  * TypeScript verifies that `parent` satisfies `TParent` at the call site.
  *
- * The cast `as ParserOp[]` is safe: OpenHandler's return type is a subset of ParserOp.
- * It's needed because TypeScript can't verify that Array<PushOp<TChild> | EmitOp | ...>
- * is assignable to ParserOp[] without knowing TChild at the call site.
  */
 export function bindOpen<TParent extends Frame, TChild extends Frame>(
   handler: OpenHandler<TParent, TChild>,
   parent: TParent,
 ): BoundOpenHandler {
   return {
-    open: (attrs, ctx) => handler.open(attrs, parent, ctx) as ParserOp[],
+    open: (attrs, ctx, tokenSpan) => handler.open(attrs, parent, ctx, tokenSpan),
   }
 }
 
@@ -136,6 +135,6 @@ export function bindClose<TFrame extends Frame>(
   top: TFrame,
 ): BoundCloseHandler {
   return {
-    close: (ctx) => handler.close(top, ctx),
+    close: (ctx, tokenSpan) => handler.close(top, ctx, tokenSpan),
   }
 }

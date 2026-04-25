@@ -103,10 +103,14 @@ function invalidMagnitudeOpenDetail(raw: string, top: Frame): string {
 function absorbInvalidSubtreeToken(ctx: ParserLoopContext, token: Token): void {
   const top = ctx.machine.peek()
   if (!top || ctx.invalidSubtree?.invoke) return
-  ctx.machine.apply(onContent(top, tokenRaw(token)))
+  ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
 }
 
-function handleInvalidMagnitudeOpen(ctx: ParserLoopContext, top: Frame, token: Token): void {
+function handleInvalidMagnitudeOpen(
+  ctx: ParserLoopContext,
+  top: Frame,
+  token: Extract<Token, { readonly _tag: 'Open' | 'SelfClose' }>,
+): void {
   const raw = tokenRaw(token)
   ctx.machine.apply([emitStructuralError({
     _tag: 'InvalidMagnitudeOpen',
@@ -114,13 +118,14 @@ function handleInvalidMagnitudeOpen(ctx: ParserLoopContext, top: Frame, token: T
     parentTagName: getParentTagName(top),
     raw,
     detail: invalidMagnitudeOpenDetail(raw, top),
+    primarySpan: token.span,
   })])
 
   if (top.type !== 'invoke' && top.type !== 'prose') {
-    ctx.machine.apply(onContent(top, raw))
+    ctx.machine.apply(onContent(top, raw, token.span))
   }
 
-  if (token._tag === 'Open') {
+  if (token._tag === 'Open' || token._tag === 'SelfClose') {
     ctx.invalidSubtree = {
       tag: token.tagName,
       depth: 1,
@@ -198,17 +203,17 @@ function confirmAllPendingCloses(ctx: ParserLoopContext): void {
     const handler = resolveCloseHandler(pc.effectiveTagName, top)
     if (!handler) {
       if (pc.wsBuffer.length > 0) {
-        ctx.machine.apply(onContent(top, pc.wsBuffer))
+        ctx.machine.apply(onContent(top, pc.wsBuffer, pc.tokenSpan))
       }
       continue
     }
-    ctx.machine.apply(handler.close(ctx.handlerCtx))
+    ctx.machine.apply(handler.close(ctx.handlerCtx, pc.tokenSpan))
 
     // Apply buffered whitespace to the NEW top frame (after close)
     if (pc.wsBuffer.length > 0) {
       const newTop = ctx.machine.peek()
       if (newTop) {
-        ctx.machine.apply(onContent(newTop, pc.wsBuffer))
+        ctx.machine.apply(onContent(newTop, pc.wsBuffer, pc.tokenSpan))
       }
     }
   }
@@ -225,13 +230,14 @@ function rejectAllPendingCloses(ctx: ParserLoopContext, extraContent?: string): 
         expectedTagName: pc.effectiveTagName,
         raw: `</${pc.tagName}>`,
         detail: `Close tag </${pc.tagName}> does not match the current ${pc.effectiveTagName} block. Did you mean </${pc.effectiveTagName}>? To include literal markup, use <magnitude:escape>.`,
+        primarySpan: pc.tokenSpan,
       })])
     }
   }
 
   const top = ctx.machine.peek()!
   const raw = pendingCloseRaw(ctx.pendingCloseStack) + (extraContent ?? '')
-  ctx.machine.apply(onContent(top, raw))
+  ctx.machine.apply(onContent(top, raw, ctx.pendingCloseStack[0].tokenSpan))
   ctx.pendingCloseStack = []
 }
 
@@ -280,7 +286,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
       const handler = resolveCloseHandler(token.tagName, top)
       if (handler) {
         // Same-frame close — replace (greedy last-match)
-        ctx.machine.apply(onContent(top, `</${lastPc.tagName}>` + lastPc.wsBuffer))
+        ctx.machine.apply(onContent(top, `</${lastPc.tagName}>` + lastPc.wsBuffer, lastPc.tokenSpan))
         ctx.pendingCloseStack = [{
           tagName: token.tagName,
           effectiveTagName: token.tagName,
@@ -288,6 +294,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
           frameType: top.type,
           wsBuffer: '',
           sawNewline: false,
+          tokenSpan: token.span,
         }]
         return 'consumed'
       }
@@ -306,6 +313,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
           frameType: effectiveFrame.type,
           wsBuffer: '',
           sawNewline: false,
+          tokenSpan: token.span,
         })
         return 'consumed'
       }
@@ -317,6 +325,7 @@ function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' |
           frameType: effectiveFrame.type,
           wsBuffer: '',
           sawNewline: false,
+          tokenSpan: token.span,
         })
         return 'consumed'
       }
@@ -364,7 +373,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
       // Everything else is raw content on the current top frame
       const top = ctx.machine.peek()
       if (top) {
-        ctx.machine.apply(onContent(top, tokenRaw(token)))
+        ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
       }
     }
     return
@@ -452,7 +461,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           if (top.type === 'prose') {
             ctx.machine.apply(endTopProse(top) as ParserOp[])
           }
-          ctx.machine.apply(resolution.handler.open(token.attrs ?? new Map(), ctx.handlerCtx))
+          ctx.machine.apply(resolution.handler.open(token.attrs ?? new Map(), ctx.handlerCtx, token.span))
           break
         }
         case 'heuristicInvoke': {
@@ -460,12 +469,12 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
             ctx.machine.apply(endTopProse(top) as ParserOp[])
           }
           const bound = bindOpen(invokeOpenHandler, top)
-          ctx.machine.apply(bound.open(new Map([['tool', resolution.toolTag]]), ctx.handlerCtx))
+          ctx.machine.apply(bound.open(new Map([['tool', resolution.toolTag]]), ctx.handlerCtx, token.span))
           break
         }
         case 'heuristicParameter': {
           const bound = bindOpen(parameterOpenHandler, top as InvokeFrame)
-          ctx.machine.apply(bound.open(new Map([['name', resolution.paramName]]), ctx.handlerCtx))
+          ctx.machine.apply(bound.open(new Map([['name', resolution.paramName]]), ctx.handlerCtx, token.span))
           break
         }
         case 'invalidMagnitudeOpen': {
@@ -473,7 +482,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           break
         }
         case 'unresolved': {
-          ctx.machine.apply(onContent(top, tokenRaw(token)))
+          ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
           break
         }
       }
@@ -490,6 +499,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           frameType: top.type,
           wsBuffer: '',
           sawNewline: false,
+          tokenSpan: token.span,
         })
       } else if (token.tagName.startsWith(MAGNITUDE_PREFIX) && top.type !== 'prose') {
         ctx.pendingCloseStack.push({
@@ -499,6 +509,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           frameType: top.type,
           wsBuffer: '',
           sawNewline: false,
+          tokenSpan: token.span,
         })
       } else if (token.tagName.startsWith(MAGNITUDE_PREFIX) && top.type === 'prose') {
         // Stray magnitude close at prose level — no matching open
@@ -506,8 +517,9 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           _tag: 'StrayCloseTag',
           tagName: token.tagName,
           detail: `Unexpected close '</${token.tagName}>' with no matching open in current context`,
+          primarySpan: token.span,
         })])
-        ctx.machine.apply(onContent(top, tokenRaw(token)))
+        ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
       } else if (token.tagName.startsWith(MAGNITUDE_PREFIX)) {
         // Magnitude close mismatch inside a body frame
         ctx.machine.apply([emitStructuralError({
@@ -516,17 +528,19 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           expectedTagName: getCanonicalClose(top).replace('magnitude:', ''),
           raw: tokenRaw(token),
           detail: `Close tag ${tokenRaw(token)} does not match the current ${getParentTagName(top)} block. Did you mean </${getCanonicalClose(top)}>?`,
+          primarySpan: token.span,
         })])
-        ctx.machine.apply(onContent(top, tokenRaw(token)))
+        ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
       } else {
         if (KNOWN_STRUCTURAL_TAGS.has(token.tagName)) {
           ctx.machine.apply([emitStructuralError({
             _tag: 'StrayCloseTag',
             tagName: token.tagName,
             detail: `Unexpected close '</${token.tagName}>' with no matching open in current context`,
+            primarySpan: token.span,
           })])
         }
-        ctx.machine.apply(onContent(top, tokenRaw(token)))
+        ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
       }
       break
     }
@@ -537,7 +551,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
         if (top.type === 'prose') {
           ctx.machine.apply(endTopProse(top) as ParserOp[])
         }
-        const ops = handler.selfClose(token.attrs ?? new Map(), ctx.handlerCtx)
+        const ops = handler.selfClose(token.attrs ?? new Map(), ctx.handlerCtx, token.span)
         for (const op of ops) {
           if (op.type === 'observe' && op.target) {
             ctx.deferredYield.target = op.target as 'user' | 'invoke' | 'worker' | 'parent'
@@ -550,14 +564,14 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
         if (resolution.kind === 'invalidMagnitudeOpen') {
           handleInvalidMagnitudeOpen(ctx, top, token)
         } else {
-          ctx.machine.apply(onContent(top, tokenRaw(token)))
+          ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
         }
       }
       break
     }
 
     case 'Content': {
-      ctx.machine.apply(onContent(top, token.text))
+      ctx.machine.apply(onContent(top, token.text, token.span))
       break
     }
   }

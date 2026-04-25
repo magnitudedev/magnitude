@@ -253,7 +253,7 @@ export function normalizeToolEvents(events: TurnEngineEvent[]) {
   return events
     .filter(e => e._tag.startsWith('ToolInput') || e._tag.startsWith('Invoke'))
     .map((event: any) => {
-      const { toolCallId, callId, id, invocationId, ...rest } = event
+      const { toolCallId, callId, id, invocationId, openSpan, ...rest } = event
       return rest
     })
 }

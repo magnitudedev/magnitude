@@ -1,35 +1,34 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildSnippet, findErrorLine } from '../presentation/error-locate'
+import { buildSnippet, getErrorLineFromSpan, getBlockStartLineFromSpan } from '../presentation/error-locate'
 
-describe('findErrorLine', () => {
-  it('finds the 1-indexed line where the anchor first appears', () => {
-    const response = [
-      '<magnitude:reason>',
-      'thinking',
-      '</magnitude:reason>',
-      '<magnitude:message>Hello</magnitude:message>',
-    ].join('\n')
-
-    expect(findErrorLine(response, '<magnitude:message>')).toBe(4)
+describe('getErrorLineFromSpan', () => {
+  it('returns the line from primarySpan', () => {
+    expect(getErrorLineFromSpan({
+      primarySpan: { start: { offset: 0, line: 4, col: 1 }, end: { offset: 10, line: 4, col: 11 } },
+    })).toBe(4)
   })
 
-  it('returns the first matching line when the anchor appears multiple times', () => {
-    const response = [
-      '<magnitude:message>one</magnitude:message>',
-      '<magnitude:message>two</magnitude:message>',
-    ].join('\n')
+  it('returns null when no primarySpan', () => {
+    expect(getErrorLineFromSpan({})).toBeNull()
+  })
+})
 
-    expect(findErrorLine(response, '<magnitude:message>')).toBe(1)
+describe('getBlockStartLineFromSpan', () => {
+  it('returns the line from the first relatedSpan', () => {
+    expect(getBlockStartLineFromSpan({
+      relatedSpans: [
+        { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } },
+      ],
+    })).toBe(1)
   })
 
-  it('returns null when the anchor is not found', () => {
-    expect(findErrorLine('alpha\nbeta', '<magnitude:message>')).toBeNull()
+  it('returns null when no relatedSpans', () => {
+    expect(getBlockStartLineFromSpan({})).toBeNull()
   })
 
-  it('returns null for empty response text or empty anchor', () => {
-    expect(findErrorLine('', 'alpha')).toBeNull()
-    expect(findErrorLine('alpha', '')).toBeNull()
+  it('returns null for empty relatedSpans', () => {
+    expect(getBlockStartLineFromSpan({ relatedSpans: [] })).toBeNull()
   })
 })
 

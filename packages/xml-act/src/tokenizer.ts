@@ -1,4 +1,5 @@
 import { KNOWN_CLOSE_TAG_NAMES } from './constants'
+import type { Token, SourcePos, SourceSpan } from './types'
 
 /**
  * Streaming XML tokenizer for the new response format.
@@ -14,12 +15,6 @@ import { KNOWN_CLOSE_TAG_NAMES } from './constants'
  * are emitted immediately as Close tokens. The parser handles confirmation logic
  * (greedy last-match, tentative close state). Unknown close tags become Content.
  */
-
-export type Token =
-  | { readonly _tag: 'Open';      readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
-  | { readonly _tag: 'Close';     readonly tagName: string; readonly afterNewline: boolean; readonly raw?: string }
-  | { readonly _tag: 'SelfClose'; readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
-  | { readonly _tag: 'Content';   readonly text: string }
 
 export interface Tokenizer {
   push(chunk: string): void
@@ -38,6 +33,7 @@ type TagPhase =
 
 type ActiveTag = {
   raw: string
+  startPos: SourcePos
   savedAfterNewline: boolean
   isClose: boolean
   name: string
@@ -69,21 +65,64 @@ export function createTokenizer(
   knownToolTags?: ReadonlySet<string>,
 ): Tokenizer {
   let contentBuffer = ''
+  let contentStartPos: SourcePos | null = null
   let afterNewline = true
   let activeTag: ActiveTag | null = null
   let pendingLt = false
+  let pendingLtPos: SourcePos | null = null
   let cdataBuffer: string | null = null
   let cdataCloseProgress = 0
 
-  function flushContent(): void {
-    if (contentBuffer.length === 0) return
-    const text = contentBuffer
-    contentBuffer = ''
-    onToken({ _tag: 'Content', text })
+  let cursorOffset = 0
+  let cursorLine = 1
+  let cursorCol = 1
+
+  function pos(): SourcePos {
+    return { offset: cursorOffset, line: cursorLine, col: cursorCol }
+  }
+
+  function span(start: SourcePos, end: SourcePos): SourceSpan {
+    return { start, end }
+  }
+
+  function advanceCursor(ch: string): void {
+    cursorOffset += 1
+    if (ch === '\n') {
+      cursorLine += 1
+      cursorCol = 1
+    } else {
+      cursorCol += 1
+    }
+  }
+
+  function appendContentChar(ch: string, chPos: SourcePos): void {
+    if (contentBuffer.length === 0) {
+      contentStartPos = chPos
+    }
+    contentBuffer += ch
+    if (ch === '\n') afterNewline = true
+    else if (ch !== ' ' && ch !== '\t') afterNewline = false
+  }
+
+  function appendContentText(text: string, startPos: SourcePos): void {
+    if (text.length === 0) return
+    if (contentBuffer.length === 0) {
+      contentStartPos = startPos
+    }
+    contentBuffer += text
     for (const ch of text) {
       if (ch === '\n') afterNewline = true
       else if (ch !== ' ' && ch !== '\t') afterNewline = false
     }
+  }
+
+  function flushContent(endPos: SourcePos): void {
+    if (contentBuffer.length === 0 || contentStartPos === null) return
+    const text = contentBuffer
+    const startPos = contentStartPos
+    contentBuffer = ''
+    contentStartPos = null
+    onToken({ _tag: 'Content', span: span(startPos, endPos), text })
   }
 
   function failTagAsContent(): void {
@@ -94,23 +133,25 @@ export function createTokenizer(
       return
     }
     activeTag = null
-    contentBuffer += tag.raw
+    appendContentText(tag.raw, tag.startPos)
   }
 
   function emitTag(tag: ActiveTag): void {
-    flushContent()
+    flushContent(tag.startPos)
+    const tokenSpan = span(tag.startPos, pos())
     if (tag.isClose) {
       if (!KNOWN_CLOSE_TAG_NAMES.has(tag.name) && !tag.name.startsWith('magnitude:')) {
         // Unknown close tag (non-magnitude) — treat as content
-        contentBuffer += tag.raw
+        appendContentText(tag.raw, tag.startPos)
         return
       }
       // Emit Close immediately — parser handles confirmation
-      onToken({ _tag: 'Close', tagName: tag.name, afterNewline: tag.savedAfterNewline, raw: tag.raw })
+      onToken({ _tag: 'Close', span: tokenSpan, tagName: tag.name, afterNewline: tag.savedAfterNewline, raw: tag.raw })
       afterNewline = false
     } else if (tag.pendingSelfClose) {
       onToken({
         _tag: 'SelfClose',
+        span: tokenSpan,
         tagName: tag.name,
         attrs: new Map(tag.attrs),
         afterNewline: tag.savedAfterNewline,
@@ -120,6 +161,7 @@ export function createTokenizer(
     } else {
       onToken({
         _tag: 'Open',
+        span: tokenSpan,
         tagName: tag.name,
         attrs: new Map(tag.attrs),
         afterNewline: tag.savedAfterNewline,
@@ -129,9 +171,10 @@ export function createTokenizer(
     }
   }
 
-  function startTag(): void {
+  function startTag(startPos: SourcePos): void {
     activeTag = {
       raw: '<',
+      startPos,
       savedAfterNewline: afterNewline,
       isClose: false,
       name: '',
@@ -160,15 +203,16 @@ export function createTokenizer(
   }
 
 
-  function processTagChar(ch: string): void {
+  function processTagChar(ch: string, chPos: SourcePos): void {
     const tag = activeTag!
 
     if (tag.phase === 'malformed') {
       tag.raw += ch
       if (ch === '>') {
-        flushContent()
+        flushContent(tag.startPos)
         onToken({
           _tag: 'Open',
+          span: span(tag.startPos, pos()),
           tagName: tag.name,
           attrs: new Map(tag.attrs),
           afterNewline: tag.savedAfterNewline,
@@ -183,7 +227,7 @@ export function createTokenizer(
     if (ch === '<' && tag.phase !== 'attrValueQuoted') {
       failTagAsContent()
       if (activeTag) return
-      startTag()
+      startTag(chPos)
       return
     }
 
@@ -196,6 +240,7 @@ export function createTokenizer(
             activeTag = null
             cdataBuffer = ''
             cdataCloseProgress = 0
+            contentStartPos = tag.startPos
           }
           return
         }
@@ -435,23 +480,27 @@ export function createTokenizer(
       // Resolve pending < from previous chunk boundary
       if (pendingLt) {
         pendingLt = false
+        const ltPos = pendingLtPos ?? pos()
+        pendingLtPos = null
         if (chunk.length === 0) {
-          contentBuffer += '<'
+          appendContentText('<', ltPos)
           return
         }
         const ch0 = chunk[0]
         if (ch0 === '/' || isNameStart(ch0) || ch0 === '!') {
-          flushContent()
-          startTag()
+          flushContent(ltPos)
+          startTag(ltPos)
           // i stays 0 — main loop feeds chunk[0] into processTagChar
         } else {
-          contentBuffer += '<'
+          appendContentText('<', ltPos)
           // i stays 0, process ch0 normally
         }
       }
 
       for (; i < chunk.length; i++) {
         const ch = chunk[i]
+        const chPos = pos()
+        advanceCursor(ch)
 
         // CDATA mode
         if (cdataBuffer !== null) {
@@ -460,7 +509,7 @@ export function createTokenizer(
             else if (cdataCloseProgress === 1) cdataCloseProgress = 2
             else cdataBuffer += ']'
           } else if (ch === '>' && cdataCloseProgress === 2) {
-            contentBuffer += cdataBuffer
+            appendContentText(cdataBuffer, contentStartPos ?? chPos)
             cdataBuffer = null
             cdataCloseProgress = 0
           } else {
@@ -475,7 +524,7 @@ export function createTokenizer(
 
         // Active tag parsing
         if (activeTag) {
-          processTagChar(ch)
+          processTagChar(ch, chPos)
           continue
         }
 
@@ -484,41 +533,41 @@ export function createTokenizer(
           if (i + 1 < chunk.length) {
             const next = chunk[i + 1]
             if (next === '/' || isNameStart(next) || next === '!') {
-              flushContent()
-              startTag()
+              flushContent(chPos)
+              startTag(chPos)
               // Skip < — startTag sets raw='<', main loop increments i
               // so chunk[i+1] is processed next as first char of tag
             } else {
-              contentBuffer += '<'
-              afterNewline = false
+              appendContentChar('<', chPos)
             }
           } else {
             pendingLt = true
+            pendingLtPos = chPos
           }
         } else {
-          contentBuffer += ch
-          if (ch === '\n') afterNewline = true
-          else if (ch !== ' ' && ch !== '\t') afterNewline = false
+          appendContentChar(ch, chPos)
         }
       }
 
       if (!activeTag && !pendingLt && cdataBuffer === null) {
-        flushContent()
+        flushContent(pos())
       }
     },
 
     end(): void {
       if (pendingLt) {
-        contentBuffer += '<'
+        appendContentText('<', pendingLtPos ?? pos())
         pendingLt = false
+        pendingLtPos = null
       }
 
       if (activeTag) {
         const tag = activeTag
         if (!tag.isClose && tag.name.length > 0 && (knownToolTags?.has(tag.name) || tag.name === 'magnitude:invoke')) {
-          flushContent()
+          flushContent(tag.startPos)
           onToken({
             _tag: 'Open',
+            span: span(tag.startPos, pos()),
             tagName: tag.name,
             attrs: new Map(tag.attrs),
             afterNewline: tag.savedAfterNewline,
@@ -526,9 +575,10 @@ export function createTokenizer(
           })
           activeTag = null
         } else if (!tag.isClose && tag.name.length > 0 && tag.phase !== 'attrValueQuoted') {
-          flushContent()
+          flushContent(tag.startPos)
           onToken({
             _tag: tag.pendingSelfClose ? 'SelfClose' : 'Open',
+            span: span(tag.startPos, pos()),
             tagName: tag.name,
             attrs: new Map(tag.attrs),
             afterNewline: tag.savedAfterNewline,
@@ -541,12 +591,12 @@ export function createTokenizer(
       }
 
       if (cdataBuffer !== null) {
-        contentBuffer += CDATA_OPEN + cdataBuffer + ']'.repeat(cdataCloseProgress)
+        appendContentText(CDATA_OPEN + cdataBuffer + ']'.repeat(cdataCloseProgress), contentStartPos ?? pos())
         cdataBuffer = null
         cdataCloseProgress = 0
       }
 
-      flushContent()
+      flushContent(pos())
     },
   }
 }

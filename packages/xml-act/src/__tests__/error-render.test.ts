@@ -12,6 +12,7 @@ describe('renderParseError', () => {
         parentTagName: undefined as any,
         raw: '<magnitude:foo>',
         detail: '',
+        primarySpan: { start: { offset: 55, line: 2, col: 1 }, end: { offset: 70, line: 2, col: 16 } },
       },
     }
     const response = '<magnitude:message to="user">Hello</magnitude:message>\n<magnitude:foo>bar</magnitude:foo>\n<magnitude:yield_user/>'
@@ -33,6 +34,7 @@ describe('renderParseError', () => {
         parentTagName: 'magnitude:invoke',
         raw: '<magnitude:message>',
         detail: '',
+        primarySpan: { start: { offset: 31, line: 2, col: 1 }, end: { offset: 50, line: 2, col: 20 } },
       },
     }
     const response = '<magnitude:invoke tool="shell">\n<magnitude:message>oops</magnitude:message>\n</magnitude:invoke>'
@@ -48,6 +50,7 @@ describe('renderParseError', () => {
         _tag: 'StrayCloseTag',
         tagName: 'magnitude:foo',
         detail: '',
+        primarySpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 16, line: 1, col: 17 } },
       },
     }
     const response = '</magnitude:foo>\n<magnitude:yield_user/>'

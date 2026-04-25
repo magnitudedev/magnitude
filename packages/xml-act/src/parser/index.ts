@@ -124,7 +124,7 @@ export function createParser(
         if (top) {
           const handler = resolveCloseHandler(pc.effectiveTagName, top)
           if (handler) {
-            machine.apply(handler.close(handlerCtx))
+            machine.apply(handler.close(handlerCtx, pc.tokenSpan))
           }
         }
       }

@@ -11,7 +11,7 @@
  * case is handled correctly.
  */
 
-import type { TurnEngineEvent, DeepPaths } from '../types'
+import type { TurnEngineEvent, DeepPaths, SourceSpan } from '../types'
 import type { Op } from '../machine'
 import type { Frame, ProseFrame, MessageFrame, ReasonFrame, ParameterFrame, FilterFrame, InvokeFrame } from './types'
 import type { ParserOp } from './ops'
@@ -64,7 +64,7 @@ export function stripTrailingWhitespace(text: string): string {
  * "Property 'newFrame' is missing in type" — impossible to miss.
  */
 type ContentHandlers = {
-  readonly [K in Frame['type']]: (frame: Extract<Frame, { type: K }>, text: string) => ParserOp[]
+  readonly [K in Frame['type']]: (frame: Extract<Frame, { type: K }>, text: string, tokenSpan: SourceSpan) => ParserOp[]
 }
 
 const contentHandlers: ContentHandlers = {
@@ -87,12 +87,12 @@ const contentHandlers: ContentHandlers = {
  *
  * Mutation for parameter and filter is intentional — see types.ts for justification.
  */
-export function onContent(top: Frame, text: string): ParserOp[] {
+export function onContent(top: Frame, text: string, tokenSpan: SourceSpan): ParserOp[] {
   // One cast at the call site. The ContentHandlers mapped type guarantees every case is handled
   // and each handler is typed to its specific frame type. TypeScript cannot correlate top.type
   // (a runtime string) with the handler's parameter type through a map lookup — the cast is
   // unavoidable but safe by construction.
-  return (contentHandlers[top.type] as (frame: Frame, text: string) => ParserOp[])(top, text)
+  return (contentHandlers[top.type] as (frame: Frame, text: string, tokenSpan: SourceSpan) => ParserOp[])(top, text, tokenSpan)
 }
 
 // =============================================================================
@@ -245,13 +245,14 @@ function filterContent(frame: FilterFrame, text: string): ParserOp[] {
 // Invoke — unexpected content between parameters
 // =============================================================================
 
-function invokeContent(frame: InvokeFrame, text: string): ParserOp[] {
+function invokeContent(frame: InvokeFrame, text: string, tokenSpan: SourceSpan): ParserOp[] {
   if (isAllWhitespace(text)) return []
   return [
     emitStructuralError({
       _tag: 'UnexpectedContent',
       context: 'invoke:' + frame.toolTag,
       detail: `Unexpected content between parameters: "${text.slice(0, 40)}"`,
+      primarySpan: tokenSpan,
     }),
   ]
 }

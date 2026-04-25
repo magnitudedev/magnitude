@@ -12,7 +12,7 @@ import type { OpenHandler, CloseHandler } from '../handler'
 import { emitEvent } from '../ops'
 
 export const messageOpenHandler: OpenHandler<ProseFrame, MessageFrame> = {
-  open(attrs, _parent, ctx) {
+  open(attrs, _parent, ctx, tokenSpan) {
     const id = ctx.generateId()
     const to = attrs.get('to') ?? null
     return [
@@ -20,6 +20,7 @@ export const messageOpenHandler: OpenHandler<ProseFrame, MessageFrame> = {
         type: 'push',
         frame: {
           type: 'message',
+          openSpan: tokenSpan,
           id,
           to,
           content: '',
@@ -32,7 +33,7 @@ export const messageOpenHandler: OpenHandler<ProseFrame, MessageFrame> = {
 }
 
 export const messageCloseHandler: CloseHandler<MessageFrame> = {
-  close(top, _ctx) {
+  close(top, _ctx, _tokenSpan) {
     return [
       emitEvent({ _tag: 'MessageEnd', id: top.id }),
       { type: 'pop' },

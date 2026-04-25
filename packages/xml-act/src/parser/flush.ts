@@ -56,6 +56,7 @@ export function flushAllFrames(
               toolCallId: top.toolCallId,
               tagName: top.toolTag,
               detail: `Invoke for '${top.toolTag}' was never closed`,
+              primarySpan: top.openSpan,
             },
             {
               toolCallId: top.toolCallId,

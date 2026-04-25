@@ -8,6 +8,21 @@ import type { ToolDefinition, ContentPart, DeepPaths, StreamingPartial } from "@
 export type { DeepPaths, StreamingPartial }
 
 // =============================================================================
+// Source Location Types
+// =============================================================================
+
+export interface SourcePos {
+  readonly offset: number
+  readonly line: number
+  readonly col: number
+}
+
+export interface SourceSpan {
+  readonly start: SourcePos
+  readonly end: SourcePos
+}
+
+// =============================================================================
 // Token Types
 // =============================================================================
 
@@ -16,10 +31,10 @@ export type { DeepPaths, StreamingPartial }
  * Uses asymmetric delimiters: <|tag> to open, <tag|> to close.
  */
 export type Token =
-  | { readonly _tag: 'Open';      readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
-  | { readonly _tag: 'Close';     readonly tagName: string; readonly afterNewline: boolean; readonly raw?: string }
-  | { readonly _tag: 'SelfClose'; readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
-  | { readonly _tag: 'Content';   readonly text: string }
+  | { readonly _tag: 'Open';      readonly span: SourceSpan; readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
+  | { readonly _tag: 'Close';     readonly span: SourceSpan; readonly tagName: string; readonly afterNewline: boolean; readonly raw?: string }
+  | { readonly _tag: 'SelfClose'; readonly span: SourceSpan; readonly tagName: string; readonly attrs: ReadonlyMap<string, string>; readonly afterNewline: boolean; readonly raw?: string }
+  | { readonly _tag: 'Content';   readonly span: SourceSpan; readonly text: string }
 
 // =============================================================================
 // Parse Event Types (from parser)
@@ -162,6 +177,7 @@ export interface ToolInputStarted {
   readonly tagName: string
   readonly toolName: string
   readonly group: string
+  readonly openSpan: SourceSpan
 }
 
 
@@ -291,6 +307,8 @@ export interface UnknownParameterError {
   readonly tagName: string
   readonly parameterName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface IncompleteToolError {
@@ -298,6 +316,8 @@ export interface IncompleteToolError {
   readonly toolCallId: string
   readonly tagName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface JsonStructuralError {
@@ -306,6 +326,8 @@ export interface JsonStructuralError {
   readonly tagName: string
   readonly parameterName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface SchemaCoercionError {
@@ -314,6 +336,8 @@ export interface SchemaCoercionError {
   readonly tagName: string
   readonly parameterName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface MissingRequiredFieldError {
@@ -322,6 +346,8 @@ export interface MissingRequiredFieldError {
   readonly tagName: string
   readonly parameterName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 /** Tool-scoped parse errors — routable to a tool state model */
@@ -331,6 +357,8 @@ export interface DuplicateParameterError {
   readonly tagName: string
   readonly parameterName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export type ToolParseError =
@@ -347,34 +375,46 @@ export interface UnknownToolError {
   readonly _tag: 'UnknownTool'
   readonly tagName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface MalformedTagError {
   readonly _tag: 'MalformedTag'
   readonly tagName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface UnexpectedContentError {
   readonly _tag: 'UnexpectedContent'
   readonly context: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface UnclosedThinkError {
   readonly _tag: 'UnclosedThink'
   readonly message: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface StrayCloseTagError {
   readonly _tag: 'StrayCloseTag'
   readonly tagName: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface MissingToolNameError {
   readonly _tag: 'MissingToolName'
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface InvalidMagnitudeOpenError {
@@ -383,6 +423,8 @@ export interface InvalidMagnitudeOpenError {
   readonly parentTagName: string | undefined
   readonly raw: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 export interface AmbiguousMagnitudeCloseError {
@@ -391,6 +433,8 @@ export interface AmbiguousMagnitudeCloseError {
   readonly expectedTagName: string | undefined
   readonly raw: string
   readonly detail: string
+  readonly primarySpan?: SourceSpan
+  readonly relatedSpans?: readonly SourceSpan[]
 }
 
 /** Structural parse errors — not routable to any tool */

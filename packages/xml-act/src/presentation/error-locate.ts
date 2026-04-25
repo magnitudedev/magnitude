@@ -1,13 +1,7 @@
+import type { ParseErrorDetail } from '../types'
+
 function getLines(responseText: string): string[] {
   return responseText.split('\n')
-}
-
-function countLineForIndex(responseText: string, index: number): number {
-  let line = 1
-  for (let i = 0; i < index; i += 1) {
-    if (responseText[i] === '\n') line += 1
-  }
-  return line
 }
 
 function formatLine(lineNumber: number, content: string): string {
@@ -26,13 +20,14 @@ function sliceFormattedLines(lines: string[], startLine: number, endLine: number
   return result
 }
 
-export function findErrorLine(responseText: string, anchor: string): number | null {
-  if (anchor.length === 0 || responseText.length === 0) return null
+/** Extract error line from a parse error's primarySpan */
+export function getErrorLineFromSpan(error: { primarySpan?: { start: { line: number } } }): number | null {
+  return error.primarySpan?.start.line ?? null
+}
 
-  const index = responseText.indexOf(anchor)
-  if (index === -1) return null
-
-  return countLineForIndex(responseText, index)
+/** Extract block start line from relatedSpans (first entry = parent/block open) */
+export function getBlockStartLineFromSpan(error: { relatedSpans?: readonly { start: { line: number } }[] }): number | null {
+  return error.relatedSpans?.[0]?.start.line ?? null
 }
 
 export function buildSnippet(

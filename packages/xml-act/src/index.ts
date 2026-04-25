@@ -115,7 +115,7 @@ export { deriveParameters } from './engine/parameter-schema'
 export type { ParameterSchema, ToolSchema, ScalarType } from './engine/parameter-schema'
 
 // Presentation
-export { buildSnippet, findErrorLine } from './presentation/error-locate'
+export { buildSnippet, getErrorLineFromSpan, getBlockStartLineFromSpan } from './presentation/error-locate'
 export { renderParseError } from './presentation/error-render'
 export { generateInvocationExample } from './presentation/invocation-example'
 export type {

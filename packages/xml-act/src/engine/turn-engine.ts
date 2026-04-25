@@ -103,7 +103,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
           // Per-invoke tracking: tagName needed at ToolInputReady for dispatch
           // filterQuery: currently not surfaced by parser in events (tracked as null)
-          const activeInvokes = new Map<string, { tagName: string; filterQuery: string | null }>()
+          const activeInvokes = new Map<string, { tagName: string; filterQuery: string | null; openSpan?: import('../types').SourceSpan }>()
 
           // Prose-to-message conversion state
           let proseMessageId: string | null = null
@@ -155,10 +155,10 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   if (hasPriorOutcome(event.toolCallId)) break
                   if (isInFlight(event.toolCallId)) {
                     // In-flight: track but suppress the event
-                    activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null })
+                    activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null, openSpan: event.openSpan })
                     break
                   }
-                  activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null })
+                  activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null, openSpan: event.openSpan })
                   currentState = yield* emitAndFold(currentState, event)
                   break
                 }
@@ -269,13 +269,14 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
                   if (result._tag === 'ParseError') {
                     const registered = config.tools.get(invoke.tagName)
+                    const errorWithSpan = { ...result.error, primarySpan: invoke.openSpan } as ToolParseError
                     currentState = yield* emitAndFold(currentState, {
                       _tag: 'ToolParseError',
                       toolCallId: event.toolCallId,
                       tagName: invoke.tagName,
                       toolName: registered?.tool.name ?? invoke.tagName,
                       group: registered?.groupName ?? 'default',
-                      error: result.error as ToolParseError,
+                      error: errorWithSpan,
                     })
                   } else {
                     // Check for terminal dispatch outcomes → TurnEnd
