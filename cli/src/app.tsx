@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useKeyboard, useRenderer } from '@opentui/react'
 import { Effect, Layer, Cause } from 'effect'
 
-import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type UnexpectedErrorMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type ToolStateProjectionState } from '@magnitudedev/agent'
+import { createCodingAgentClient, ChatPersistence, getSessionTitleFromTaskGraph, type DisplayState, type AgentStatusState, type DebugSnapshot, type AppEvent, type ErrorDisplayMessage, PROVIDERS, getProvider, type ProviderDefinition, type AuthMethodDef, type ModelSelection, type ProviderAuthMethodStatus, type ForkMemoryState, type CompactionState, type ToolStateProjectionState } from '@magnitudedev/agent'
 import { loadSkills } from '@magnitudedev/skills'
 import { textParts } from '@magnitudedev/agent'
 import { JsonChatPersistence, loadSessionSummary } from './persistence'
@@ -453,11 +453,10 @@ function AppInner({
       // Framework errors bypass the event system entirely — render directly in the TUI
       client.onError((error) => {
         if (!mounted) return
-        const errorMsg: UnexpectedErrorMessage = {
+        const errorMsg: ErrorDisplayMessage = {
           id: createId(),
-          type: 'unexpected_error',
-          tag: error._tag,
-          message: Cause.pretty(error.cause),
+          type: 'error',
+          message: `[${error._tag}] ${Cause.pretty(error.cause)}`,
           timestamp: Date.now()
         }
         setDisplay(prev => prev ? { ...prev, messages: [...prev.messages, errorMsg] } : prev)

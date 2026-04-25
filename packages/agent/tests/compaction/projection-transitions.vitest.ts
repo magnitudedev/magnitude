@@ -1,7 +1,7 @@
 import { describe, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { expect } from 'vitest'
-import { CHARS_PER_TOKEN } from '../../src/constants'
+import { CHARS_PER_TOKEN_XML } from '../../src/constants'
 import { getAgentDefinition, getAgentSlot } from '../../src/agents'
 import { renderSystemPrompt } from '../../src/prompts/system-prompt'
 import { buildResolvedToolSet } from '../../src/tools/resolved-toolset'
@@ -31,7 +31,7 @@ const mockConfigState: ConfigState = {
 
 const leadDef = getAgentDefinition('lead')
 const leadToolSet = buildResolvedToolSet(leadDef, mockConfigState, getAgentSlot('lead'))
-const leadSystemPromptTokens = Math.ceil(renderSystemPrompt(leadDef, new Map(), leadToolSet).length / CHARS_PER_TOKEN)
+const leadSystemPromptTokens = Math.ceil(renderSystemPrompt(leadDef, new Map(), leadToolSet).length / CHARS_PER_TOKEN_XML)
 
 describe('compaction/projection-transitions', () => {
   it.effect('initial token estimate includes system prompt tokens', () =>

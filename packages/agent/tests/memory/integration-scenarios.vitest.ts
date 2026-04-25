@@ -21,16 +21,18 @@ describe('memory integration scenarios', () => {
       yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-t1', text: 'first answer' })
       yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-t1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'follow-up reminder' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'follow-up reminder' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -132,13 +134,13 @@ describe('memory integration scenarios', () => {
       yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-obs', text: 'done' })
       yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-obs' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: { success: true, turnDecision: 'idle' },
+        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -176,10 +178,18 @@ describe('memory integration scenarios', () => {
       const before = snapshotMessageRefs(yield* getRootMemory(h))
 
       yield* h.send({
-        type: 'turn_unexpected_error',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 't-1',
-        message: 'boom',
+        chainId: 'c-1',
+        strategyId: 'xml-act',
+        outcome: { _tag: 'UnexpectedError', message: 'boom' },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       })
 
       const afterError = yield* getRootMemory(h)
@@ -216,13 +226,13 @@ describe('memory integration scenarios', () => {
       yield* h.send({ type: 'message_chunk', forkId: null, turnId: 't-1', id: 'm-done', text: 'assistant done' })
       yield* h.send({ type: 'message_end', forkId: null, turnId: 't-1', id: 'm-done' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: { success: true, turnDecision: 'idle' },
+        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,

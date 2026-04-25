@@ -290,7 +290,22 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
       return nextState
     },
 
-    turn_completed: ({ event, fork, emit, read, ambient }) => {
+    turn_outcome: ({ event, fork, emit, ambient, read }) => {
+      const configState = ambient.get(ConfigAmbient)
+      const agentStatus = read(AgentStatusProjection)
+      const limits = getForkConfig(configState, agentStatus, event.forkId)
+      if (!limits) return fork
+
+      if (event.outcome._tag === 'UnexpectedError') {
+        const tokenEstimate = fork.tokenEstimate + estimateContentTokens(event.outcome.message)
+        const nextState = recomputeOperationalFields(fork, limits, {
+          tokenEstimate,
+        })
+
+        emitLifecycleSignals(fork, nextState, event.forkId, emit)
+        return nextState
+      }
+
       const canonical = read(CanonicalTurnProjection)
       // Use canonical XML serialization for compaction
       const completedText = canonical.lastCompleted?.turnId === event.turnId
@@ -301,30 +316,12 @@ export const CompactionProjection = Projection.defineForked<AppEvent, Compaction
         ? event.inputTokens + addedTokens
         : fork.tokenEstimate + addedTokens
 
-      const configState = ambient.get(ConfigAmbient)
-      const agentStatus = read(AgentStatusProjection)
-      const limits = getForkConfig(configState, agentStatus, event.forkId)
-      if (!limits) return fork
       const nextState = recomputeOperationalFields(fork, limits, {
         tokenEstimate,
         lastActualInputTokens: event.inputTokens ?? fork.lastActualInputTokens,
         hasCompletedTurn: true,
         modelId: event.modelId ?? fork.modelId,
         providerId: event.providerId ?? fork.providerId,
-      })
-
-      emitLifecycleSignals(fork, nextState, event.forkId, emit)
-      return nextState
-    },
-
-    turn_unexpected_error: ({ event, fork, emit, ambient, read }) => {
-      const tokenEstimate = fork.tokenEstimate + estimateContentTokens(event.message)
-      const configState = ambient.get(ConfigAmbient)
-      const agentStatus = read(AgentStatusProjection)
-      const limits = getForkConfig(configState, agentStatus, event.forkId)
-      if (!limits) return fork
-      const nextState = recomputeOperationalFields(fork, limits, {
-        tokenEstimate,
       })
 
       emitLifecycleSignals(fork, nextState, event.forkId, emit)

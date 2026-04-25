@@ -10,6 +10,7 @@ export interface ModelCosts {
 export class Model extends Data.Class<{
   readonly id: string
   readonly providerId: string
+  readonly providerName: string
   readonly name: string
   readonly contextWindow: number
   readonly maxOutputTokens: number | null

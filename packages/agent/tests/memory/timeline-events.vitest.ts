@@ -28,7 +28,7 @@ describe('memory/timeline-events', () => {
       yield* h.send({ type: 'message_chunk', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1', text: 'working on auth flow' })
       yield* h.send({ type: 'message_end', forkId: subforkId, turnId: 'sub-turn-1', id: 'm1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: subforkId,
         turnId: 'sub-turn-1',
@@ -36,7 +36,7 @@ describe('memory/timeline-events', () => {
         strategyId: 'xml-act',
 
 
-        result: { success: true, turnDecision: 'idle' },
+        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -66,7 +66,7 @@ describe('memory/timeline-events', () => {
       const rendered = yield* getRenderedUserText(h)
       expect(rendered).toContain('<agent id="builder-auth"')
       expect(rendered).toContain('status="idle"')
-      expect(rendered).toContain('<idle')
+      expect(rendered).toContain('<magnitude:yield_user/>')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -92,7 +92,7 @@ describe('memory/timeline-events', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-rem-1', chainId: 'c-rem-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-rem-1',
@@ -100,10 +100,12 @@ describe('memory/timeline-events', () => {
         strategyId: 'xml-act',
 
 
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'follow up on deployment checks' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'follow up on deployment checks' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -118,7 +120,7 @@ describe('memory/timeline-events', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'error' && r.message.includes('follow up on deployment checks'))).toBe(true)
+        expect(inbox.outcomes.some(r => r.kind === 'error' && r.message.includes('follow up on deployment checks'))).toBe(true)
       }
 
       const rendered = yield* getRenderedUserText(h)

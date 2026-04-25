@@ -39,7 +39,7 @@ function parse(input: string, tools?: ReadonlyMap<string, RegisteredTool>): Turn
 
 describe('context-aware tag resolution', () => {
   it('treats <div> inside message as literal content', () => {
-    const events = parse('<message to="user">\nHere is <div>some</div> text\n</message>')
+    const events = parse('<magnitude:message to="user">\nHere is <div>some</div> text\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('some')
@@ -49,7 +49,7 @@ describe('context-aware tag resolution', () => {
   })
 
   it('treats <strong>bold</strong> inside message as literal content', () => {
-    const events = parse('<message to="user">\n<strong>bold</strong>\n</message>')
+    const events = parse('<magnitude:message to="user">\n<strong>bold</strong>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('bold')
@@ -57,7 +57,7 @@ describe('context-aware tag resolution', () => {
   })
 
   it('treats <foo> inside message as literal content (not structural)', () => {
-    const events = parse('<message to="user">\nSee <foo> here\n</message>')
+    const events = parse('<magnitude:message to="user">\nSee <foo> here\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('See')
@@ -66,7 +66,7 @@ describe('context-aware tag resolution', () => {
   })
 
   it('treats <invoke tool="shell"> inside message as literal content', () => {
-    const events = parse('<message to="user">\nRun <invoke tool="shell"> to test\n</message>')
+    const events = parse('<magnitude:message to="user">\nRun <invoke tool="shell"> to test\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('Run')
@@ -74,31 +74,31 @@ describe('context-aware tag resolution', () => {
     expect(events.filter(e => e._tag === 'ToolInputStarted')).toHaveLength(0)
   })
 
-  it('treats </reason> in prose (no open reason) as stray close + content', () => {
-    const events = parse('</reason>\nsome text')
+  it('treats </magnitude:reason> in prose (no open reason) as stray close + content', () => {
+    const events = parse('</magnitude:reason>\nsome text')
     const errors = events.filter(e => e._tag === 'StructuralParseError') as any[]
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
   })
 
-  it('treats <reason about="foo"> inside reason frame as content', () => {
-    const events = parse('<reason about="outer">\nSome <reason about="inner"> text\n</reason>')
+  it('treats <magnitude:reason about="foo"> inside reason frame as content', () => {
+    const events = parse('<magnitude:reason about="outer">\nSome <magnitude:reason about="inner"> text\n</magnitude:reason>')
     const lensChunks = events.filter(e => e._tag === 'LensChunk')
     const text = lensChunks.map(e => (e as any).text).join('')
-    expect(text).toContain('<reason about="inner">')
+    expect(text).toContain('<magnitude:reason about="inner">')
   })
 
   it('treats <parameter name="x"> in message as content (no invoke frame)', () => {
-    const events = parse('<message to="user">\n<parameter name="x">\n</message>')
+    const events = parse('<magnitude:message to="user">\n<parameter name="x">\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('<parameter name="x">')
   })
 
-  it('treats </parameter> in message as content', () => {
-    const events = parse('<message to="user">\n</parameter>\n</message>')
+  it('treats </magnitude:parameter> in message as content', () => {
+    const events = parse('<magnitude:message to="user">\n</magnitude:parameter>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</parameter>')
+    expect(text).toContain('</magnitude:parameter>')
   })
 })

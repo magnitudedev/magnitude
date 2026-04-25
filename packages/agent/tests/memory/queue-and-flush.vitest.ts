@@ -50,17 +50,19 @@ describe('memory queue and flush', () => {
         },
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'after turn' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'after turn' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -76,7 +78,7 @@ describe('memory queue and flush', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.length).toBeGreaterThan(0)
+        expect(inbox.outcomes.length).toBeGreaterThan(0)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -136,24 +138,24 @@ describe('memory queue and flush', () => {
       const memory = yield* getRootMemory(h)
       const text = renderedUserTextFromMemory(memory.messages)
 
-      expect(text).toContain('<message from="user">@src/a.ts again</message>')
+      expect(text).toContain('<magnitude:message from="user">@src/a.ts again</magnitude:message>')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('empty flush after assistant turn injects noop', () =>
+  it.live('empty flush after assistant turn does not inject noop', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        result: { success: true, turnDecision: 'idle' },
+        outcome: { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } },
         inputTokens: null,
         outputTokens: null,
         cacheReadTokens: null,
@@ -167,7 +169,7 @@ describe('memory queue and flush', () => {
       const inbox = lastInboxMessage(memory)
       expect(inbox?.type).toBe('inbox')
       if (inbox?.type === 'inbox') {
-        expect(inbox.results.some(r => r.kind === 'noop')).toBe(true)
+        expect(inbox.outcomes.some(r => r.kind === 'noop')).toBe(false)
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -183,17 +185,19 @@ describe('memory queue and flush', () => {
         text: 'from user',
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
 
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'remember me' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'remember me' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -207,11 +211,11 @@ describe('memory queue and flush', () => {
       const memory = yield* getRootMemory(h)
       const text = renderedUserTextFromMemory(memory.messages)
 
-      expect(text).toContain('<message from="user">from user</message>')
+      expect(text).toContain('<magnitude:message from="user">from user</magnitude:message>')
       expect(text).toContain('<error>remember me</error>')
       // Results (including turn errors) render before timeline
       expect(text.indexOf('<error>remember me</error>')).toBeLessThan(
-        text.indexOf('<message from="user">from user</message>'),
+        text.indexOf('<magnitude:message from="user">from user</magnitude:message>'),
       )
     }).pipe(Effect.provide(TestHarnessLive()))
   )

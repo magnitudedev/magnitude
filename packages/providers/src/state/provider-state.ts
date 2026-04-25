@@ -102,6 +102,7 @@ export function makeProviderStateStore<TSlot extends string>(): ProviderStateSto
         model: new Model({
           id: s.modelId,
           providerId: s.providerId,
+          providerName: provider!.name,
           name: def?.name ?? s.modelId,
           contextWindow: def?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
           maxOutputTokens: def?.maxOutputTokens ?? null,

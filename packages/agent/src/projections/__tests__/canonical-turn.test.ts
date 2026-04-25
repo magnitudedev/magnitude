@@ -15,7 +15,7 @@ describe('CanonicalTurn state accumulation primitives', async () => {
 describe('CanonicalTurn clean gate semantics', async () => {
   test('parse error should make turn unclean', async () => {
     const state = createInitialCanonicalTurnState()
-    const clean = !true && !state.hasStructuralError && true
+    const clean = !true && true
     expect(clean).toBe(false)
   })
 
@@ -38,9 +38,9 @@ describe('CanonicalTurn final content selection behavior', async () => {
       reasonBlocks: [{ about: null, content: 't' }],
       messages: [{ text: 'm', destination: { kind: 'user' } }],
       toolCalls: [{ tagName: 'tool', input: {}, query: null }],
-      turnDecision: 'idle',
+      yieldTarget: 'user',
     }
-    const xml = serializeCanonicalTurn(trace)
+    const xml = serializeCanonicalTurn(trace, { tools: new Map(), groups: new Map() })
     expect(xml).toContain('<reason about="reason">')
     expect(xml).toContain('<message to="user">')
     expect(xml).toContain('<invoke tool="tool"/>')

@@ -12,7 +12,14 @@
  */
 
 import { Signal, Projection } from '@magnitudedev/event-core'
-import type { AppEvent, ToolDisplay } from '../events'
+import type {
+  AppEvent,
+  ToolDisplay,
+  TurnOutcome,
+  ProviderNotReadyDetail,
+  ConnectionFailureDetail,
+  SafetyStopReason,
+} from '../events'
 
 import { AgentRoutingProjection } from './agent-routing'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
@@ -90,6 +97,13 @@ export interface CommunicationStep {
   readonly status?: 'streaming' | 'completed'
 }
 
+export interface StatusIndicatorStep {
+  readonly id: string
+  readonly type: 'status_indicator'
+  readonly message: string
+  readonly style: 'dim'
+}
+
 export interface SubagentStartedStep {
   readonly id: string
   readonly type: 'subagent_started'
@@ -129,6 +143,7 @@ export type ThinkBlockStep =
   | ThinkingStep
   | ToolStep
   | CommunicationStep
+  | StatusIndicatorStep
   | SubagentStartedStep
   | SubagentFinishedStep
   | SubagentKilledStep
@@ -151,13 +166,15 @@ export interface InterruptedMessage {
   readonly allKilled?: boolean
 }
 
-export interface UnexpectedErrorMessage {
+export interface ErrorDisplayMessage {
   readonly id: string
-  readonly type: 'unexpected_error'
-  readonly tag: string | null
+  readonly type: 'error'
   readonly message: string
   readonly timestamp: number
-  readonly errorCode?: string
+  readonly cta?: {
+    readonly label: string
+    readonly url: string
+  }
 }
 
 export interface ForkResultMessage {
@@ -234,7 +251,7 @@ export type DisplayMessage =
   | AssistantMessageDisplay
   | ThinkBlockMessage
   | InterruptedMessage
-  | UnexpectedErrorMessage
+  | ErrorDisplayMessage
   | ForkResultMessage
   | ForkActivityMessage
   | AgentCommunicationMessage
@@ -381,6 +398,83 @@ function closeThinkBlock(state: DisplayState, timestamp: number): DisplayState {
       (b) => ({ ...b, status: 'completed', completedAt: timestamp })
     ),
     activeThinkBlockId: null
+  }
+}
+
+function describeProviderNotReady(detail: ProviderNotReadyDetail): { message: string; cta?: { readonly label: string; readonly url: string } } {
+  switch (detail._tag) {
+    case 'NotConfigured':
+      return { message: 'No model configured' }
+    case 'ProviderDisconnected':
+      return { message: `Provider ${detail.providerName} disconnected` }
+    case 'AuthFailed':
+      return { message: `Authentication failed for ${detail.providerName}` }
+    case 'MagnitudeBilling':
+      switch (detail.reason._tag) {
+        case 'SubscriptionRequired':
+        case 'TrialExpired':
+          return {
+            message: detail.reason.message,
+            cta: {
+              label: 'Upgrade to Pro',
+              url: 'https://app.magnitude.dev'
+            }
+          }
+        case 'UsageLimitExceeded':
+          return {
+            message: detail.reason.message,
+            cta: {
+              label: 'Manage your subscription',
+              url: 'https://app.magnitude.dev'
+            }
+          }
+      }
+    case 'ClientRequestRejected':
+      return { message: 'Provider request rejected' }
+  }
+}
+
+function describeConnectionFailure(detail: ConnectionFailureDetail): string {
+  switch (detail._tag) {
+    case 'ProviderError':
+      return `Connection issue with provider (HTTP ${detail.httpStatus}); retrying`
+    case 'TransportError':
+      return detail.httpStatus !== undefined
+        ? `Transport connection issue (HTTP ${detail.httpStatus}); retrying`
+        : 'Transport connection issue; retrying'
+    case 'StreamError':
+      return 'Connection issue while reading response; retrying'
+  }
+}
+
+function describeSafetyStop(reason: SafetyStopReason): string {
+  switch (reason._tag) {
+    case 'IdenticalResponseCircuitBreaker':
+      return `Stopped after ${reason.threshold} identical responses`
+    case 'Other':
+      return reason.message
+  }
+}
+
+function toErrorDisplayMessage(
+  outcome: Extract<TurnOutcome, { _tag: 'SafetyStop' } | { _tag: 'UnexpectedError' }>,
+  timestamp: number
+): ErrorDisplayMessage {
+  switch (outcome._tag) {
+    case 'SafetyStop':
+      return {
+        id: generateId(),
+        type: 'error',
+        message: describeSafetyStop(outcome.reason),
+        timestamp,
+      }
+    case 'UnexpectedError':
+      return {
+        id: generateId(),
+        type: 'error',
+        message: outcome.message,
+        timestamp,
+      }
   }
 }
 
@@ -712,7 +806,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
 
       // Create optimistic ThinkBlock for potential follow-up work
-      // It will be removed if empty when turn_completed arrives
+      // It will be removed if empty when the turn outcome arrives
       const { fork: newState } = ensureThinkBlock(fork, event.timestamp)
 
       return {
@@ -930,57 +1024,86 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
       }
     },
 
-    turn_completed: ({ event, fork }) => {
-      // Ignore if not for current turn
+    turn_outcome: ({ event, fork }) => {
       if (fork.currentTurnId !== event.turnId) {
         return fork
       }
 
-      // Determine if we'll continue (same logic as TurnProjection)
-      let willContinue: boolean
-      if (event.result.success) {
-        willContinue = event.result.turnDecision === 'continue'
-      } else {
-        willContinue = !event.result.cancelled
+      if (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke') {
+        return {
+          ...fork,
+          currentTurnId: null,
+          status: 'idle' as const,
+          streamingMessageId: null,
+          showButton: 'send' as const,
+        }
       }
 
-      // Close ThinkBlock only if we're becoming stable (won't continue)
-      // If we will continue, keep ThinkBlock open for next turn's steps
-      if (!willContinue) {
-        const closedState = closeThinkBlock(fork, event.timestamp)
+      if (event.outcome._tag === 'ConnectionFailure') {
+        const { fork: stateWithBlock, thinkBlockId } = ensureThinkBlock(fork, event.timestamp)
+        return {
+          ...stateWithBlock,
+          messages: addStepToThinkBlock(stateWithBlock.messages, thinkBlockId, {
+            type: 'status_indicator' as const,
+            id: generateId(),
+            message: 'Connection issue: retrying',
+            style: 'dim' as const,
+          }),
+        }
+      }
+
+      const closedState = closeThinkBlock(fork, event.timestamp)
+
+      if (event.outcome._tag === 'Completed') {
         return {
           ...closedState,
           currentTurnId: null,
           status: 'idle' as const,
           streamingMessageId: null,
           showButton: 'send' as const,
-      
         }
       }
 
-      // Keep ThinkBlock open - more work coming
-      // Clear currentTurnId so next turn_started can set it
-      return {
-        ...fork,
-        currentTurnId: null,
-        status: 'idle' as const,
-        streamingMessageId: null,
-        showButton: 'send' as const,
-    
+      if (event.outcome._tag === 'Cancelled') {
+        const alreadyInterrupted = closedState.messages.some(
+          (message) => message.type === 'interrupted' && message.timestamp === event.timestamp,
+        )
+        return {
+          ...closedState,
+          messages: alreadyInterrupted
+            ? closedState.messages
+            : [
+                ...closedState.messages,
+                {
+                  id: generateId(),
+                  type: 'interrupted' as const,
+                  timestamp: event.timestamp,
+                  context: event.forkId === null ? 'root' as const : 'fork' as const,
+                },
+              ],
+          currentTurnId: null,
+          status: 'idle' as const,
+          streamingMessageId: null,
+          showButton: 'send' as const,
+        }
       }
-    },
 
-    turn_unexpected_error: ({ event, fork }) => {
-      const closedState = closeThinkBlock(fork, event.timestamp)
-
-      const errorMessage: UnexpectedErrorMessage = {
-        id: generateId(),
-        type: 'unexpected_error',
-        tag: null,
-        message: event.message,
-        timestamp: event.timestamp,
-        errorCode: event.errorCode,
+      if (
+        event.outcome._tag === 'ParseFailure'
+        || event.outcome._tag === 'ProviderNotReady'
+        || event.outcome._tag === 'ContextWindowExceeded'
+        || event.outcome._tag === 'OutputTruncated'
+      ) {
+        return {
+          ...closedState,
+          currentTurnId: null,
+          status: 'idle' as const,
+          streamingMessageId: null,
+          showButton: 'send' as const,
+        }
       }
+
+      const errorMessage = toErrorDisplayMessage(event.outcome, event.timestamp)
 
       return {
         ...closedState,

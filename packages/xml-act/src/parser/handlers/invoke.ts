@@ -65,7 +65,7 @@ function getFieldType(
   if (!schema) return 'unknown'
   const param = schema.parameters.get(paramName)
   if (!param) return 'unknown'
-  if (param.type === 'json') return 'json'
+  if (param.type === 'json_object' || param.type === 'json_array') return 'json'
   if (typeof param.type === 'object' && param.type._tag === 'enum') return 'string'
   return param.type as FieldType
 }
@@ -73,6 +73,7 @@ function getFieldType(
 function makeDeadParamFrame(invokeFrame: InvokeFrame, paramName: string): ParameterFrame {
   return {
     type: 'parameter',
+    openSpan: invokeFrame.openSpan,
     toolCallId: invokeFrame.toolCallId,
     paramName,
     dead: true,
@@ -107,6 +108,8 @@ export function finalizeInvokeOps(invokeFrame: InvokeFrame, invokeCtx: InvokeCon
           tagName: toolTag,
           parameterName: fieldState.paramName,
           detail: fieldState.errorDetail ?? 'Coercion failed',
+          primarySpan: fieldState.openSpan,
+          relatedSpans: [invokeFrame.openSpan],
         },
         { toolCallId, tagName: toolTag, toolName, group, correctToolShape },
       ))
@@ -124,6 +127,7 @@ export function finalizeInvokeOps(invokeFrame: InvokeFrame, invokeCtx: InvokeCon
             tagName: toolTag,
             parameterName: paramName,
             detail: `Missing required field '${paramName}' for tool '${toolTag}'`,
+            primarySpan: invokeFrame.openSpan,
           },
           { toolCallId, tagName: toolTag, toolName, group, correctToolShape },
         ))
@@ -228,10 +232,10 @@ export function finalizeParameterOps(paramFrame: ParameterFrame, invokeCtx: Invo
 // =============================================================================
 
 export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
-  open(attrs, _parent, ctx) {
+  open(attrs, _parent, ctx, tokenSpan) {
     const toolTag = attrs.get('tool')
     if (!toolTag) {
-      return [emitStructuralError({ _tag: 'MissingToolName', detail: '<invoke> requires a tool attribute, e.g. <invoke tool="shell">' })]
+      return [emitStructuralError({ _tag: 'MissingToolName', detail: '<magnitude:invoke> requires a tool attribute, e.g. <magnitude:invoke tool="shell">', primarySpan: tokenSpan })]
     }
 
     const toolCallId = ctx.generateId()
@@ -247,6 +251,7 @@ export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
           type: 'push',
           frame: {
             type: 'invoke',
+            openSpan: tokenSpan,
             toolCallId,
             toolTag,
             toolName,
@@ -258,7 +263,7 @@ export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
             seenParams: new Set(),
           },
         },
-        emitStructuralError({ _tag: 'UnknownTool', tagName: toolTag, detail: `Unknown tool tag: '${toolTag}'` }),
+        emitStructuralError({ _tag: 'UnknownTool', tagName: toolTag, detail: `Unknown tool tag: '${toolTag}'`, primarySpan: tokenSpan }),
       ]
     }
 
@@ -267,6 +272,7 @@ export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
         type: 'push',
         frame: {
           type: 'invoke',
+          openSpan: tokenSpan,
           toolCallId,
           toolTag,
           toolName: registered.tool.name,
@@ -284,13 +290,14 @@ export const invokeOpenHandler: OpenHandler<ProseFrame, InvokeFrame> = {
         tagName: toolTag,
         toolName: registered.tool.name,
         group: registered.groupName,
+        openSpan: tokenSpan,
       }),
     ]
   },
 }
 
 export const invokeCloseHandler: CloseHandler<InvokeFrame> = {
-  close(top, ctx) {
+  close(top, ctx, _tokenSpan) {
     return finalizeInvokeOps(top, ctx.invokeCtx)
   },
 }
@@ -300,7 +307,7 @@ export const invokeCloseHandler: CloseHandler<InvokeFrame> = {
 // =============================================================================
 
 export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
-  open(attrs, parent, ctx) {
+  open(attrs, parent, ctx, tokenSpan) {
     // parent is InvokeFrame — TypeScript enforces this at handler definition
     const paramName = attrs.get('name') ?? ''
 
@@ -318,6 +325,8 @@ export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
           {
             _tag: 'UnknownParameter',
             toolCallId: parent.toolCallId,
+            primarySpan: tokenSpan,
+            relatedSpans: [parent.openSpan],
             tagName: parent.toolTag,
             parameterName: paramName,
             detail: `Unknown parameter '${paramName}' for tool '${parent.toolTag}'`,
@@ -333,17 +342,44 @@ export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
       ]
     }
 
-    if (parent.seenParams.has(paramName)) {
-      return [{ type: 'push', frame: makeDeadParamFrame(parent, paramName) }]
-    }
+    const isDuplicate = parent.seenParams.has(paramName)
 
     // Mutate seenParams and fieldStates on the InvokeFrame.
     // These Maps/Sets are mutable by design — accumulated during streaming.
-    parent.seenParams.add(paramName)
+    if (!isDuplicate) {
+      parent.seenParams.add(paramName)
+    }
     const fieldType = getFieldType(parent.toolTag, paramName, ctx.invokeCtx.toolSchemas)
     const jsonishParser = fieldType === 'json' ? createStreamingJsonParser() : null
+
+    if (isDuplicate) {
+      // Duplicate parameter — fail the tool call
+      return [
+        emitToolError(
+          {
+            _tag: 'DuplicateParameter',
+            toolCallId: parent.toolCallId,
+            primarySpan: tokenSpan,
+            relatedSpans: [parent.openSpan],
+            tagName: parent.toolTag,
+            parameterName: paramName,
+            detail: `Duplicate parameter '${paramName}' for tool '${parent.toolTag}'.`,
+          },
+          {
+            toolCallId: parent.toolCallId,
+            tagName: parent.toolTag,
+            toolName: parent.toolTag,
+            group: 'fs',
+            correctToolShape: getCorrectToolShape(parent.toolTag, ctx.invokeCtx.tools),
+          },
+        ),
+        { type: 'push', frame: makeDeadParamFrame(parent, paramName) },
+      ]
+    }
+
     parent.fieldStates.set(paramName, {
       paramName,
+      openSpan: tokenSpan,
       rawValue: '',
       coercedValue: undefined,
       errored: false,
@@ -355,6 +391,7 @@ export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
       type: 'push',
       frame: {
         type: 'parameter',
+        openSpan: tokenSpan,
         toolCallId: parent.toolCallId,
         paramName,
         dead: false,
@@ -368,7 +405,7 @@ export const parameterOpenHandler: OpenHandler<InvokeFrame, ParameterFrame> = {
 }
 
 export const parameterCloseHandler: CloseHandler<ParameterFrame> = {
-  close(top, ctx) {
+  close(top, ctx, _tokenSpan) {
     return finalizeParameterOps(top, ctx.invokeCtx)
   },
 }
@@ -378,7 +415,7 @@ export const parameterCloseHandler: CloseHandler<ParameterFrame> = {
 // =============================================================================
 
 export const filterOpenHandler: OpenHandler<InvokeFrame, FilterFrame> = {
-  open(attrs, parent, ctx) {
+  open(attrs, parent, _ctx, tokenSpan) {
     const filterType = attrs.get('type') ?? 'jsonpath'
     return [
       { type: 'replace', frame: { ...parent, hasFilter: true } },
@@ -386,6 +423,7 @@ export const filterOpenHandler: OpenHandler<InvokeFrame, FilterFrame> = {
         type: 'push',
         frame: {
           type: 'filter',
+          openSpan: tokenSpan,
           toolCallId: parent.toolCallId,
           filterType,
           query: '',
@@ -397,14 +435,10 @@ export const filterOpenHandler: OpenHandler<InvokeFrame, FilterFrame> = {
 }
 
 export const filterCloseHandler: CloseHandler<FilterFrame> = {
-  close(top, ctx) {
-    // top.invokeFrame is the parent InvokeFrame — captured at open time, no findFrame
+  close(top, ctx, _tokenSpan) {
     if (ctx.invokeCtx.onFilterReady) {
       ctx.invokeCtx.onFilterReady({ _tag: 'FilterReady', toolCallId: top.toolCallId, query: top.query })
     }
-    return [
-      { type: 'pop' },
-      ...finalizeInvokeOps(top.invokeFrame, ctx.invokeCtx),
-    ]
+    return [{ type: 'pop' }]
   },
 }

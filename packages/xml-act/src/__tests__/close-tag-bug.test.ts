@@ -6,7 +6,10 @@
 import { describe, expect, it } from 'vitest'
 import { createTokenizer } from '../tokenizer'
 import { tokenRaw } from '../parser/resolve'
-import type { Token } from '../types'
+import type { Token, SourcePos, SourceSpan } from '../types'
+
+const ZERO_POS: SourcePos = { offset: 0, line: 1, col: 1 }
+const ZERO_SPAN: SourceSpan = { start: ZERO_POS, end: ZERO_POS }
 
 function normalizeToken(token: any): any {
   const { raw, afterNewline, ...rest } = token
@@ -46,17 +49,17 @@ describe('unknown tags in content', () => {
   })
 
   it('tokenRaw for Close reconstructs as </name>', () => {
-    const token: Token = { _tag: 'Close', tagName: 'reason', afterNewline: false }
+    const token: Token = { _tag: 'Close', span: ZERO_SPAN, tagName: 'reason', afterNewline: false }
     expect(tokenRaw(token)).toBe('</reason>')
   })
 
   it('tokenRaw for Open reconstructs as <name attr="val">', () => {
-    const token: Token = { _tag: 'Open', tagName: 'invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false }
+    const token: Token = { _tag: 'Open', span: ZERO_SPAN, tagName: 'invoke', attrs: new Map([['tool', 'shell']]), afterNewline: false }
     expect(tokenRaw(token)).toBe('<invoke tool="shell">')
   })
 
   it('tokenRaw for SelfClose reconstructs as <name/>', () => {
-    const token: Token = { _tag: 'SelfClose', tagName: 'yield_user', attrs: new Map(), afterNewline: false }
+    const token: Token = { _tag: 'SelfClose', span: ZERO_SPAN, tagName: 'yield_user', attrs: new Map(), afterNewline: false }
     expect(tokenRaw(token)).toBe('<yield_user/>')
   })
 })

@@ -12,33 +12,31 @@
  * 2. Building system prompt (XML_ACT_PROTOCOL + role + tool docs)
  * 3. Streaming LLM response
  * 4. Executing via xml-act runtime (execution manager)
- * 5. Publishing turn_completed
+ * 5. Publishing turn_outcome
  */
 
 import { Effect, Stream, Either } from 'effect'
 import { Worker, AmbientServiceTag } from '@magnitudedev/event-core'
 
-import { LEAD_YIELD_STOP_SEQUENCES, SUBAGENT_YIELD_STOP_SEQUENCES, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, type GrammarBuildOptions, type TurnEngineCrash } from '@magnitudedev/xml-act'
+import { LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, type GrammarBuildOptions, type TurnEngineCrash } from '@magnitudedev/xml-act'
 import { logger } from '@magnitudedev/logger'
 
-import { ContextLimitExceeded, AuthFailed, TransportError as ProviderTransportError, ParseError as ProviderParseError, SubscriptionRequired, UsageLimitExceeded } from '@magnitudedev/providers'
 import type { ModelError } from '@magnitudedev/providers'
+import { ModelResolver, CodingAgentChat, ContextLimitExceeded } from '@magnitudedev/providers'
 import { drainTurnEventStream } from './turn-event-drain'
 import type { ChatMessage } from '@magnitudedev/llm-core'
-import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
 import { Image as BamlImage } from '@boundaryml/baml'
 import type { ObservationPart } from '@magnitudedev/roles'
 import { buildAckTurns } from '../prompts/protocol'
 import { renderSystemPrompt } from '../prompts/system-prompt'
 import { ContentPart } from '../content'
-import type { AppEvent } from '../events'
+import type { AppEvent, TurnOutcome } from '../events'
 
 import { createTurnStream } from '../execution/turn-stream'
 import { TurnError as TurnErrorCtor } from '../execution/types'
 import type { TurnError } from '../execution/types'
-import { MemoryProjection, getView } from '../projections/memory'
+import { MemoryProjection, getView, LLMMessage } from '../projections/memory'
 
-import { LLMMessage } from '../projections/memory'
 import { CompactionProjection } from '../projections/compaction'
 import { SessionContextProjection } from '../projections/session-context'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
@@ -49,17 +47,13 @@ import { getAgentDefinition, getForkInfo } from '../agents/registry'
 import { generateToolGrammar } from '../tools/tool-registry'
 import { buildResolvedToolSet } from '../tools/resolved-toolset'
 
-import { ModelResolver, CodingAgentChat } from '@magnitudedev/providers'
 import { withTraceScope } from '../tracing/scoped-tracer'
-import { buildInterruptedTurnCompleted } from '../util/interrupt-utils'
+import { buildInterruptedTurnOutcome } from '../util/interrupt-utils'
 import { ConfigAmbient, getSlotConfig } from '../ambient/config-ambient'
 import { SkillsAmbient } from '../ambient/skills-ambient'
 import {
-  authReconnectMessage,
-  buildGeneralErrorPayload,
+  classifyModelError,
   classifyRetryability,
-  isAuthReconnectMessage,
-  resolveFailureMessage,
 } from './cortex-auth'
 
 type TaggedCause = {
@@ -69,6 +63,19 @@ type TaggedCause = {
 
 function isTaggedCause(cause: unknown): cause is TaggedCause {
   return typeof cause === 'object' && cause !== null && '_tag' in cause
+}
+
+function classifyUnknownTurnFailure(message: string): TurnOutcome {
+  return {
+    _tag: 'UnexpectedError',
+    message: truncateUnexpectedError(`Unexpected error while executing turn: ${message}`),
+    detail: { _tag: 'CortexDefect' },
+  }
+}
+
+function truncateUnexpectedError(message: string): string {
+  const maxLen = 500
+  return message.length > maxLen ? `${message.slice(0, maxLen)}...` : message
 }
 
 function toLLMContent(parts: ContentPart[]): (BamlImage | string)[] {
@@ -112,7 +119,9 @@ export const Cortex = Worker.defineForked<AppEvent>()({
       const { forkId, turnId, chainId } = event
 
       let resolvedProviderId: string | null = null
+      let resolvedProviderName: string | null = null
       let resolvedModelId: string | null = null
+
       return Effect.gen(function* () {
         const sessionCtx = yield* read(SessionContextProjection)
         const agentState = yield* read(AgentStatusProjection)
@@ -129,8 +138,6 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         const timezone = sessionCtx.context?.timezone ?? null
 
         const runtime = yield* ModelResolver
-
-
 
         // Run agent observables
         const execManager = yield* ExecutionManager
@@ -169,13 +176,26 @@ export const Cortex = Worker.defineForked<AppEvent>()({
         // Step 1: Ensure model ready
         const resolveResult = yield* runtime.resolve(modelSlot).pipe(Effect.either)
         if (Either.isLeft(resolveResult)) {
-          const e = resolveResult.left
-          const message = resolveFailureMessage(e)
-          yield* publish({ type: 'turn_unexpected_error', forkId, turnId, message })
+          const outcome = classifyModelError(resolveResult.left)
+          yield* publish({
+            type: 'turn_outcome',
+            forkId,
+            turnId,
+            chainId,
+            strategyId: 'xml-act',
+            outcome,
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadTokens: null,
+            cacheWriteTokens: null,
+            providerId: null,
+            modelId: null,
+          })
           return
         }
         const boundModel = resolveResult.right
         resolvedProviderId = boundModel.model.providerId
+        resolvedProviderName = boundModel.model.providerName
         resolvedModelId = boundModel.model.id
 
         // 2b. Provide input token estimate so provider can clamp max_tokens
@@ -190,19 +210,10 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           return normalized !== '0' && normalized !== 'false' && normalized !== ''
         })()
         const grammarSafe = boundModel.model.supportsGrammar !== false
-        // Select stop sequences and yield tags based on protocol role
         const isSubagent = agentDef.protocolRole === 'subagent'
-        // Stop sequences not passed for now — yield tags are self-closing and would be
-        // cut from the stream if used as stop sequences, losing the decision info.
-        // Grammar-constrained models end naturally after yield. Non-grammar models
-        // are handled by PostYieldObserver runaway detection.
-        // const stopSequences = isSubagent ? [...SUBAGENT_YIELD_STOP_SEQUENCES] : [...LEAD_YIELD_STOP_SEQUENCES]
         const yieldTags = isSubagent ? [...SUBAGENT_YIELD_TAGS] : [...LEAD_YIELD_TAGS]
 
         const grammarOptions: GrammarBuildOptions = {
-          // Temporarily disabled: forced message to user on user-triggered turns
-          // causes issues with XML format parsing
-          // ...(triggeredByUser ? { requiredMessageTo: 'user', maxLenses: agentDef.lenses.length } : {}),
           yieldTags,
         }
 
@@ -251,7 +262,7 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           // Extract usage — tag as partial if execution failed
           const usage = cs.getUsage()
-          const usageWithStatus = { ...usage, partial: executeResult.result.success === false }
+          const usageWithStatus = { ...usage, partial: executeResult.result._tag !== 'Completed' }
 
           // Offer final result
           yield* sink.emit({ _tag: 'TurnResult', value: { executeResult, usage: usageWithStatus } })
@@ -273,18 +284,17 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           && boundModel.model.maxOutputTokens !== null
           && usage.outputTokens >= boundModel.model.maxOutputTokens
 
-        const turnResult = outputTruncated
-          ? { success: false as const, error: `Your response was truncated because it hit the maximum output token limit (${boundModel.model.maxOutputTokens} tokens). You MUST split your work into smaller steps — make fewer tool calls per turn, write shorter files, or break large operations into multiple turns.`, cancelled: false }
+        const turnResult: TurnOutcome = outputTruncated
+          ? { _tag: 'OutputTruncated' }
           : executeResult.result
 
-        // Publish turn_completed for this fork
         yield* publish({
-          type: 'turn_completed',
+          type: 'turn_outcome',
           forkId,
           turnId,
           chainId,
           strategyId: 'xml-act',
-          result: turnResult,
+          outcome: turnResult,
           inputTokens,
           outputTokens: usage.outputTokens,
           cacheReadTokens: usage.cacheReadTokens,
@@ -292,42 +302,36 @@ export const Cortex = Worker.defineForked<AppEvent>()({
           providerId: boundModel.model.providerId,
           modelId: boundModel.model.id,
         })
-
-
       }).pipe(
         Effect.onInterrupt(() => Effect.gen(function* () {
-          const turnCompleted = yield* buildInterruptedTurnCompleted({ forkId, turnId, chainId })
-          yield* publish(turnCompleted)
+          const turnOutcome = yield* buildInterruptedTurnOutcome({ forkId, turnId, chainId })
+          yield* publish(turnOutcome)
         }).pipe(Effect.orDie)),
         Effect.catchAll((error: TurnEngineCrash | TurnError) => Effect.gen(function* () {
-          // TurnEngineCrash is an infrastructure defect — should not happen in normal operation
           if (error._tag === 'TurnEngineCrash') {
-            // Improvement C: if crash was caused by a typed ModelError, surface it as a turn error
             const cause = error.cause
             if (isTaggedCause(cause)) {
               const errorType = cause._tag
               const errorMessage = cause.message ?? error.message
               logger.error({ context: 'Cortex', forkId, turnId, errorType }, `Cortex: Mid-stream ModelError (${errorType}): ${errorMessage}`)
 
-              let message: string
-              if (errorType === 'AuthFailed') {
-                message = authReconnectMessage()
-              } else if (errorType === 'ProviderDisconnected' && isAuthReconnectMessage(errorMessage)) {
-                message = errorMessage
-              } else if (errorType === 'SubscriptionRequired') {
-                message = errorMessage
-              } else if (errorType === 'UsageLimitExceeded') {
-                message = errorMessage
-              } else {
-                message = `Stream error (${errorType}): ${errorMessage}`
-              }
+              const outcome = errorType === 'ChannelException' || errorType === 'StreamError'
+                ? { _tag: 'ConnectionFailure', detail: { _tag: 'StreamError' } } satisfies TurnOutcome
+                : classifyModelError(cause as ModelError)
 
               yield* publish({
-                type: 'turn_unexpected_error',
+                type: 'turn_outcome',
                 forkId,
                 turnId,
-                message,
-                errorCode: 'code' in cause ? (cause as any).code : undefined,
+                chainId,
+                strategyId: 'xml-act',
+                outcome,
+                inputTokens: null,
+                outputTokens: null,
+                cacheReadTokens: null,
+                cacheWriteTokens: null,
+                providerId: resolvedProviderId,
+                modelId: resolvedModelId,
               })
               return
             }
@@ -336,11 +340,8 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
           const errorMessage = error.message
           const errorCause = error.cause
-
-          // Tier 1: Definitive context-limit error (known provider patterns)
           const definiteContextLimit = classifyRetryability(errorCause) === 'context-limit'
 
-          // Tier 2: Heuristic — if over soft cap and compacting, any error is likely context-related
           let probableContextLimit = false
           if (!definiteContextLimit) {
             const compactionState = yield* read(CompactionProjection, forkId)
@@ -371,13 +372,17 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               error: errorMessage,
             })
 
+            const outcome = errorCause instanceof ContextLimitExceeded
+              ? classifyModelError(errorCause)
+              : { _tag: 'ContextWindowExceeded' } satisfies TurnOutcome
+
             yield* publish({
-              type: 'turn_completed',
+              type: 'turn_outcome',
               forkId,
               turnId,
               chainId,
               strategyId: 'xml-act',
-              result: { success: false, error: `Context limit exceeded, waiting for compaction: ${errorMessage}`, cancelled: false },
+              outcome,
               inputTokens: null,
               outputTokens: null,
               cacheReadTokens: null,
@@ -385,32 +390,49 @@ export const Cortex = Worker.defineForked<AppEvent>()({
               providerId: resolvedProviderId,
               modelId: resolvedModelId,
             })
-          } else if (classifyRetryability(errorCause) === 'auth') {
-            yield* publish({
-              type: 'turn_unexpected_error',
-              forkId,
-              turnId,
-              message: authReconnectMessage(),
-            })
-          } else {
-            logger.error({
-              context: 'Cortex',
-              forkId,
-              turnId,
-              chainId,
-              error: errorMessage
-            }, 'Cortex: LLM stream failed after all retries')
-
-            const { message, errorCode } = buildGeneralErrorPayload(errorMessage, errorCause)
-
-            yield* publish({
-              type: 'turn_unexpected_error',
-              forkId,
-              turnId,
-              message,
-              errorCode,
-            })
+            return
           }
+
+          logger.error({
+            context: 'Cortex',
+            forkId,
+            turnId,
+            chainId,
+            error: errorMessage
+          }, 'Cortex: LLM stream failed after all retries')
+
+          const outcome = errorCause !== null && typeof errorCause === 'object' && '_tag' in errorCause
+            ? classifyModelError(errorCause as ModelError)
+            : classifyUnknownTurnFailure(errorMessage)
+
+          const patchedOutcome =
+            outcome._tag === 'ProviderNotReady'
+            && outcome.detail._tag === 'AuthFailed'
+            && resolvedProviderId !== null
+              ? {
+                  _tag: 'ProviderNotReady',
+                  detail: {
+                    _tag: 'AuthFailed',
+                    providerId: resolvedProviderId,
+                    providerName: resolvedProviderName ?? resolvedProviderId,
+                  },
+                } satisfies TurnOutcome
+              : outcome
+
+          yield* publish({
+            type: 'turn_outcome',
+            forkId,
+            turnId,
+            chainId,
+            strategyId: 'xml-act',
+            outcome: patchedOutcome,
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadTokens: null,
+            cacheWriteTokens: null,
+            providerId: resolvedProviderId,
+            modelId: resolvedModelId,
+          })
         }))
       )
     }

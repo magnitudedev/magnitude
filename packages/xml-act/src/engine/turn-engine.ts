@@ -17,7 +17,7 @@ import type { ToolContext } from '@magnitudedev/tools'
 
 import { createTokenizer } from '../tokenizer'
 import { createParser } from '../parser/index'
-import type { TurnEngineEvent, EngineState, RegisteredTool, ToolInterceptor, ToolParseError } from '../types'
+import type { TurnEngineEvent, EngineState, RegisteredTool, ToolInterceptor } from '../types'
 import { TurnEngineCrash, ToolInterceptorTag } from '../types'
 import { initialEngineState, foldEngineState } from './engine-state'
 import { dispatchTool, type DispatchContext } from './dispatcher'
@@ -103,7 +103,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
           // Per-invoke tracking: tagName needed at ToolInputReady for dispatch
           // filterQuery: currently not surfaced by parser in events (tracked as null)
-          const activeInvokes = new Map<string, { tagName: string; filterQuery: string | null }>()
+          const activeInvokes = new Map<string, { tagName: string; filterQuery: string | null; openSpan?: import('../types').SourceSpan }>()
 
           // Prose-to-message conversion state
           let proseMessageId: string | null = null
@@ -155,10 +155,10 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   if (hasPriorOutcome(event.toolCallId)) break
                   if (isInFlight(event.toolCallId)) {
                     // In-flight: track but suppress the event
-                    activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null })
+                    activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null, openSpan: event.openSpan })
                     break
                   }
-                  activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null })
+                  activeInvokes.set(event.toolCallId, { tagName: event.tagName, filterQuery: null, openSpan: event.openSpan })
                   currentState = yield* emitAndFold(currentState, event)
                   break
                 }
@@ -183,11 +183,19 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   if (hasPriorOutcome(event.toolCallId)) break
                   activeInvokes.delete(event.toolCallId)
                   currentState = yield* emitAndFold(currentState, event)
+                  currentState = yield* emitAndFold(currentState, {
+                    _tag: 'TurnEnd',
+                    outcome: { _tag: 'ToolParseError', error: event },
+                  })
                   break
                 }
 
                 case 'StructuralParseError': {
                   currentState = yield* emitAndFold(currentState, event)
+                  currentState = yield* emitAndFold(currentState, {
+                    _tag: 'TurnEnd',
+                    outcome: { _tag: 'StructuralParseError', error: event },
+                  })
                   break
                 }
 
@@ -206,13 +214,19 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
                   if (!invoke) {
                     activeInvokes.delete(event.toolCallId)
+                    const error = {
+                      _tag: 'UnexpectedContent' as const,
+                      context: 'engine',
+                      detail: `ToolInputReady for unknown toolCallId '${event.toolCallId}'`,
+                    }
+                    const structuralParseErrorEvent = {
+                      _tag: 'StructuralParseError' as const,
+                      error,
+                    }
+                    currentState = yield* emitAndFold(currentState, structuralParseErrorEvent)
                     currentState = yield* emitAndFold(currentState, {
-                      _tag: 'StructuralParseError',
-                      error: {
-                        _tag: 'UnexpectedContent',
-                        context: 'engine',
-                        detail: `ToolInputReady for unknown toolCallId '${event.toolCallId}'`,
-                      },
+                      _tag: 'TurnEnd',
+                      outcome: { _tag: 'StructuralParseError', error: structuralParseErrorEvent },
                     })
                     break
                   }
@@ -255,21 +269,27 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
 
                   if (result._tag === 'ParseError') {
                     const registered = config.tools.get(invoke.tagName)
+                    const errorWithSpan = { ...result.error, primarySpan: invoke.openSpan } as ToolParseError
                     currentState = yield* emitAndFold(currentState, {
                       _tag: 'ToolParseError',
                       toolCallId: event.toolCallId,
                       tagName: invoke.tagName,
                       toolName: registered?.tool.name ?? invoke.tagName,
                       group: registered?.groupName ?? 'default',
-                      error: result.error as ToolParseError,
+                      error: errorWithSpan,
                     })
                   } else {
-                    // Check for gate rejection → TurnEnd
+                    // Check for terminal dispatch outcomes → TurnEnd
                     const outcome = currentState.toolOutcomes.get(event.toolCallId)
                     if (outcome?._tag === 'Completed' && outcome.result._tag === 'Rejected') {
                       currentState = yield* emitAndFold(currentState, {
                         _tag: 'TurnEnd',
-                        result: { _tag: 'GateRejected', rejection: outcome.result.rejection },
+                        outcome: { _tag: 'GateRejected', rejection: outcome.result.rejection },
+                      })
+                    } else if (outcome?._tag === 'Completed' && outcome.result._tag === 'Error') {
+                      currentState = yield* emitAndFold(currentState, {
+                        _tag: 'TurnEnd',
+                        outcome: { _tag: 'ToolExecutionError' },
                       })
                     }
                   }
@@ -372,7 +392,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
             const tokenizer = createTokenizer(
               (token) => { parser.pushToken(token) },
               new Set(config.tools.keys()),
-              { toolKeyword: 'invoke' },
+              { toolKeyword: 'magnitude:invoke' },
             )
 
             yield* textStream.pipe(
@@ -413,7 +433,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
             if (!finalState.stopped) {
               yield* Queue.offer(queue, {
                 _tag: 'TurnEnd',
-                result: { _tag: 'Success', turnControl: null, termination: 'natural' },
+                outcome: { _tag: 'Completed', turnControl: null, termination: 'natural' },
               } satisfies TurnEngineEvent)
             }
 
@@ -428,7 +448,7 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                   }
                   yield* Queue.offer(queue, {
                     _tag: 'TurnEnd',
-                    result: { _tag: 'Failure', error: crash.message },
+                    outcome: { _tag: 'EngineDefect', message: crash.message, cause: crash.cause },
                   } satisfies TurnEngineEvent)
                 }
                 yield* Queue.offer(queue, END)
@@ -440,9 +460,9 @@ export function createTurnEngine(config: TurnEngineConfig): TurnEngine {
                 const message = describeDefect(defect)
                 yield* Queue.offer(queue, {
                   _tag: 'TurnEnd',
-                  result: {
-                    _tag: 'Failure',
-                    error: `Tool defect (bug — use Effect.tryPromise, not Effect.promise): ${message}`,
+                  outcome: {
+                    _tag: 'EngineDefect',
+                    message,
                   },
                 } satisfies TurnEngineEvent)
                 yield* Queue.offer(queue, END)

@@ -2,18 +2,18 @@
 
 Messages use a `to` attribute for recipient targeting:
 
-- `<message to="user">` routes to the user.
-- `<message to="TASK-ID">` routes to the worker spawned on that task.
+- `<magnitude:message to="user">` routes to the user.
+- `<magnitude:message to="TASK-ID">` routes to the worker spawned on that task.
 
 Example showing both in one turn:
 
-<message to="user">
+<magnitude:message to="user">
 Quick status update: parser work has started.
-</message>
+</magnitude:message>
 
-<message to="impl-parser">
+<magnitude:message to="impl-parser">
 Prioritize parser tests first.
-</message>
+</magnitude:message>
 
 You can send multiple messages in one turn. If the recipient specifies an invalid or unresolvable target, it is an error.
 
@@ -23,48 +23,48 @@ When mentioning files in communications, always prefer using an inline link so t
 
 ## Task and worker operations
 
-Tasks and workers are managed with invoke calls using child parameter elements.
+Tasks and workers are managed with magnitude:invoke calls using child magnitude:parameter elements.
 
 ### Creating tasks
 
-<invoke tool="create_task">
-<parameter name="id">impl-parser</parameter>
-<parameter name="title">Implement parser updates</parameter>
-</invoke>
+<magnitude:invoke tool="create_task">
+<magnitude:parameter name="id">impl-parser</magnitude:parameter>
+<magnitude:parameter name="title">Implement parser updates</magnitude:parameter>
+</magnitude:invoke>
 
 A task requires `id` and `title`. Use `parent` to nest under an existing task:
 
-<invoke tool="create_task">
-<parameter name="id">impl-parser</parameter>
-<parameter name="title">Implement parser updates</parameter>
-<parameter name="parent">parser-feature</parameter>
-</invoke>
+<magnitude:invoke tool="create_task">
+<magnitude:parameter name="id">impl-parser</magnitude:parameter>
+<magnitude:parameter name="title">Implement parser updates</magnitude:parameter>
+<magnitude:parameter name="parent">parser-feature</magnitude:parameter>
+</magnitude:invoke>
 
 ### Spawning workers
 
-<invoke tool="spawn_worker">
-<parameter name="id">impl-parser</parameter>
-<parameter name="message">Implement Unit A from the [plan]($M/plans/the-plan.md).</parameter>
-</invoke>
+<magnitude:invoke tool="spawn_worker">
+<magnitude:parameter name="id">impl-parser</magnitude:parameter>
+<magnitude:parameter name="message">Implement Unit A from the [plan]($M/plans/the-plan.md).</magnitude:parameter>
+</magnitude:invoke>
 
-`spawn_worker` creates a worker for a task. The `id` must match an existing task. The `message` parameter is the worker's initial instruction with the same semantics as a normal `<message to="TASK-ID">...</message>`.
+`spawn_worker` creates a worker for a task. The `id` must match an existing task. The `message` parameter is the worker's initial instruction with the same semantics as a normal `<magnitude:message to="TASK-ID">...</magnitude:message>`.
 
 If a worker already exists on that task, `spawn_worker` kills the old worker and spawns a new one.
 
 ### Killing workers
 
-<invoke tool="kill_worker">
-<parameter name="id">impl-parser</parameter>
-</invoke>
+<magnitude:invoke tool="kill_worker">
+<magnitude:parameter name="id">impl-parser</magnitude:parameter>
+</magnitude:invoke>
 
 Explicitly kills the worker on a task. Errors if no worker exists.
 
 ### Updating tasks
 
-<invoke tool="update_task">
-<parameter name="id">impl-parser</parameter>
-<parameter name="status">completed</parameter>
-</invoke>
+<magnitude:invoke tool="update_task">
+<magnitude:parameter name="id">impl-parser</magnitude:parameter>
+<magnitude:parameter name="status">completed</magnitude:parameter>
+</magnitude:invoke>
 
 Valid status values:
 - `pending` — Reopens the task. Does not affect the worker.
@@ -75,8 +75,8 @@ The `working` status is derived — it reflects that a task has a live worker. Y
 
 ### Messaging workers
 
-To send instructions or follow-ups to a worker, use `<message to="TASK-ID">`:
+To send instructions or follow-ups to a worker, use `<magnitude:message to="TASK-ID">`:
 
-<message to="impl-parser">
+<magnitude:message to="impl-parser">
 Focus on test coverage before refactors.
-</message>
+</magnitude:message>

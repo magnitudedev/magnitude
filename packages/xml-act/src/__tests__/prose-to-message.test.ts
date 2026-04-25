@@ -55,11 +55,11 @@ describe('prose-to-message conversion', () => {
 
   it('converts prose after reason block to message', async () => {
     const NL = String.fromCharCode(10)
-    const input = '<reason about="test">' + NL +
+    const input = '<magnitude:reason about="test">' + NL +
       'Some thinking.' + NL +
-      '</reason>' + NL + NL +
+      '</magnitude:reason>' + NL + NL +
       'Let me help you with that.' + NL + NL +
-      '<yield_user/>'
+      '<magnitude:yield_user/>'
 
     const events = await collectEvents(input)
     console.log('Events:', events.map(e => e._tag))
@@ -78,6 +78,6 @@ describe('prose-to-message conversion', () => {
 
     const turnEnd = events.find(e => e._tag === 'TurnEnd') as any
     expect(turnEnd).toBeDefined()
-    expect(turnEnd.result.turnControl?.target).toBe('user')
+    expect(turnEnd.outcome.turnControl?.target).toBe('user')
   })
 })

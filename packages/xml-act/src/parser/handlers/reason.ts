@@ -14,13 +14,14 @@ import { emitEvent, emitStructuralError, type ParserOp } from '../ops'
 import { stripTrailingWhitespace } from '../content'
 
 export const reasonOpenHandler: OpenHandler<ProseFrame, ReasonFrame> = {
-  open(attrs, _parent, _ctx) {
+  open(attrs, _parent, _ctx, tokenSpan) {
     const lensName = attrs.get('about') ?? 'analyze'
     return [
       {
         type: 'push',
         frame: {
           type: 'reason',
+          openSpan: tokenSpan,
           name: lensName,
           content: '',
           hasContent: false,
@@ -33,7 +34,7 @@ export const reasonOpenHandler: OpenHandler<ProseFrame, ReasonFrame> = {
 }
 
 export const reasonCloseHandler: CloseHandler<ReasonFrame> = {
-  close(top, _ctx) {
+  close(top, _ctx, _tokenSpan) {
     const trimmed = stripTrailingWhitespace(top.content)
     return [
       emitEvent({ _tag: 'LensEnd', name: top.name, content: trimmed }),
@@ -49,7 +50,7 @@ export const reasonCloseHandler: CloseHandler<ReasonFrame> = {
 export function closeReasonAtEof(top: ReasonFrame): ParserOp[] {
   const trimmed = stripTrailingWhitespace(top.content)
   return [
-    emitStructuralError({ _tag: 'UnclosedThink', message: `Unclosed reason tag: ${top.name}` }),
+    emitStructuralError({ _tag: 'UnclosedThink', message: `Unclosed reason tag: ${top.name}`, primarySpan: top.openSpan }),
     emitEvent({ _tag: 'LensEnd', name: top.name, content: trimmed }),
     { type: 'pop' },
   ]

@@ -18,7 +18,7 @@ describe('event observation', () => {
       expect(types).toContain('session_initialized')
       expect(types).toContain('user_message')
       expect(types).toContain('turn_started')
-      expect(types).toContain('turn_completed')
+      expect(types).toContain('turn_outcome')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -43,7 +43,7 @@ describe('event observation', () => {
       yield* harness.user('root turn')
       const completed = yield* harness.wait.turnCompleted(null)
 
-      expect(completed.type).toBe('turn_completed')
+      expect(completed.type).toBe('turn_outcome')
       expect(completed.forkId).toBeNull()
     }).pipe(Effect.provide(TestHarnessLive()))
   )

@@ -54,7 +54,7 @@ describe('virtual fs integration with harness', () => {
   it.live('Agent reads seeded file', () =>
     Effect.gen(function* () {
       const harness = yield* TestHarness
-      yield* harness.script.next({ xml: '<read path="src/index.ts"/><idle/>' }, null)
+      yield* harness.script.next({ xml: '<magnitude:invoke tool="read">\n<magnitude:parameter name="path">src/index.ts</magnitude:parameter>\n</magnitude:invoke><magnitude:yield_user/>' }, null)
 
       yield* harness.user('read file')
       const completed = yield* harness.wait.turnCompleted(null)
@@ -63,11 +63,16 @@ describe('virtual fs integration with harness', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolObservation' && e.event.tagName === 'read',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.outcome._tag).toBe('Completed')
       if (observation.event._tag !== 'ToolObservation') {
         throw new Error('Expected ToolObservation')
       }
-      expect(observation.event.content).toEqual([{ type: 'text', text: 'export const x = 1' }])
+      expect(observation.event.content).toHaveLength(1)
+      expect(observation.event.content[0]).toEqual(expect.objectContaining({ type: 'text' }))
+      if (observation.event.content[0]?.type !== 'text') {
+        throw new Error('Expected text observation content')
+      }
+      expect(observation.event.content[0].text).toContain('export const x = 1')
     }).pipe(
       Effect.provide(
         TestHarnessLive({
@@ -81,7 +86,7 @@ describe('virtual fs integration with harness', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next(
-        { xml: '<write path="output.txt">content</write><idle/>' },
+        { xml: '<magnitude:invoke tool="write">\n<magnitude:parameter name="path">output.txt</magnitude:parameter>\n<magnitude:parameter name="content">content</magnitude:parameter>\n</magnitude:invoke><magnitude:yield_user/>' },
         null,
       )
 
@@ -92,7 +97,7 @@ describe('virtual fs integration with harness', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.outcome._tag).toBe('Completed')
       if (toolEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }

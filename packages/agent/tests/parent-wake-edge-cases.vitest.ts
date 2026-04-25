@@ -20,20 +20,20 @@ describe('parent wake edge cases', () => {
           }
           return { xml: YIELD_USER }
         }
-        // Subagent resolver throws -> triggers turn_unexpected_error
+        // Subagent resolver throws -> triggers turn_outcome
         throw new Error('simulated subagent crash')
       })
 
       yield* h.user('start')
 
       const rootFirst = yield* h.wait.turnCompleted(null)
-      expect(rootFirst.result.success).toBe(true)
+      expect(rootFirst.outcome._tag).toBe('Completed')
 
       const created = yield* h.wait.agentCreated((e) => e.agentId === 'error-sub')
 
-      // Subagent should get turn_unexpected_error
+      // Subagent should get turn_outcome
       const subError = yield* h.wait.event(
-        'turn_unexpected_error',
+        'turn_outcome',
         (e) => e.forkId === created.forkId,
       )
       expect(subError.message).toContain('simulated subagent crash')
@@ -41,7 +41,7 @@ describe('parent wake edge cases', () => {
       // Parent should be woken
       const parentWake = yield* Effect.exit(
         h.wait.event(
-          'turn_completed',
+          'turn_outcome',
           (e) => e.forkId === null && e.turnId !== rootFirst.turnId,
           { timeoutMs: 3000 },
         ),
@@ -67,19 +67,19 @@ describe('parent wake edge cases', () => {
           return { xml: YIELD_USER }
         }
 
-        return { xml: `<message to="parent">subagent done</message>\n${YIELD_USER}` }
+        return { xml: `<magnitude:message to="parent">subagent done</magnitude:message>\n${YIELD_USER}` }
       })
 
       yield* h.user('start killable subagent')
 
       const rootFirst = yield* h.wait.turnCompleted(null)
-      expect(rootFirst.result.success).toBe(true)
+      expect(rootFirst.outcome._tag).toBe('Completed')
 
       const created = yield* h.wait.agentCreated((e) => e.agentId === 'kill-sub')
       yield* h.wait.turnCompleted(created.forkId)
 
       const rootSecond = yield* h.wait.event(
-        'turn_completed',
+        'turn_outcome',
         (e) => e.forkId === null && e.turnId !== rootFirst.turnId,
       )
 
@@ -95,7 +95,7 @@ describe('parent wake edge cases', () => {
       // Parent should NOT be woken — killing idle subagent is just cleanup
       const parentWake = yield* Effect.exit(
         h.wait.event(
-          'turn_completed',
+          'turn_outcome',
           (e) => e.forkId === null && e.turnId !== rootFirst.turnId && e.turnId !== rootSecond.turnId,
           { timeoutMs: 3000 },
         ),

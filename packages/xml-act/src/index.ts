@@ -75,7 +75,7 @@ export type { ToolCallContext } from './types'
 // Core types — results
 export type {
   ToolResult,
-  ExecutionResult,
+  TurnEngineOutcome,
 } from './types'
 
 // Core types — configuration
@@ -113,6 +113,15 @@ export {
 // Parameter schema derivation
 export { deriveParameters } from './engine/parameter-schema'
 export type { ParameterSchema, ToolSchema, ScalarType } from './engine/parameter-schema'
+
+// Presentation
+export { buildSnippet, getErrorLineFromSpan, getBlockStartLineFromSpan } from './presentation/error-locate'
+export { renderParseError } from './presentation/error-render'
+export { generateInvocationExample } from './presentation/invocation-example'
+export type {
+  InvocationExampleParameter,
+  GenerateInvocationExampleOptions,
+} from './presentation/invocation-example'
 
 // Output (query, rendering, persistence)
 export {
@@ -166,6 +175,12 @@ export {
   SUBAGENT_YIELD_STOP_SEQUENCES,
   LEAD_YIELD_TAGS,
   SUBAGENT_YIELD_TAGS,
+  TAG_REASON,
+  TAG_MESSAGE,
+  TAG_INVOKE,
+  TAG_PARAMETER,
+  TAG_FILTER,
+  TAG_ESCAPE,
 } from './constants'
 
 // Tokenizer

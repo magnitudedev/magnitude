@@ -23,8 +23,9 @@
 import type { Token } from '../types'
 import type { Frame } from './types'
 import type { BoundOpenHandler, BoundCloseHandler, BoundSelfCloseHandler } from './handler'
+import type { HandlerContext } from './handler-context'
 import { bindOpen, bindClose } from './handler'
-import { KNOWN_STRUCTURAL_TAGS } from '../constants'
+import { KNOWN_STRUCTURAL_TAGS, MAGNITUDE_PREFIX } from '../constants'
 
 // Compile-time verification that this file stays in lockstep with nesting.ts
 import type { _VerifyProseChildren, _VerifyInvokeChildren } from '../nesting'
@@ -51,33 +52,40 @@ import {
 } from './handlers/invoke'
 import { makeYieldHandler } from './handlers/yield'
 
+export type OpenResolution =
+  | { kind: 'handler'; handler: BoundOpenHandler }
+  | { kind: 'heuristicInvoke'; toolTag: string }
+  | { kind: 'heuristicParameter'; paramName: string }
+  | { kind: 'invalidMagnitudeOpen' }
+  | { kind: 'unresolved' }
+
 // =============================================================================
 // resolveOpenHandler
 // =============================================================================
 
 export function resolveOpenHandler(tagName: string, top: Frame): BoundOpenHandler | undefined {
   switch (tagName) {
-    case 'reason':
+    case 'magnitude:reason':
       if (top.type !== 'prose') return undefined
       // top is narrowed to ProseFrame — TypeScript verifies reasonOpenHandler: OpenHandler<ProseFrame, ...>
       return bindOpen(reasonOpenHandler, top)
 
-    case 'message':
+    case 'magnitude:message':
       if (top.type !== 'prose') return undefined
       // top is narrowed to ProseFrame
       return bindOpen(messageOpenHandler, top)
 
-    case 'invoke':
+    case 'magnitude:invoke':
       if (top.type !== 'prose') return undefined
       // top is narrowed to ProseFrame
       return bindOpen(invokeOpenHandler, top)
 
-    case 'parameter':
+    case 'magnitude:parameter':
       if (top.type !== 'invoke') return undefined
       // top is narrowed to InvokeFrame — TypeScript verifies parameterOpenHandler: OpenHandler<InvokeFrame, ...>
       return bindOpen(parameterOpenHandler, top)
 
-    case 'filter':
+    case 'magnitude:filter':
       if (top.type !== 'invoke') return undefined
       // top is narrowed to InvokeFrame
       return bindOpen(filterOpenHandler, top)
@@ -91,28 +99,67 @@ export function resolveOpenHandler(tagName: string, top: Frame): BoundOpenHandle
 // resolveCloseHandler
 // =============================================================================
 
+export function resolveOpen(
+  tagName: string,
+  top: Frame,
+  isSelfClose: boolean,
+  handlerCtx: HandlerContext,
+): OpenResolution {
+  const handler = resolveOpenHandler(tagName, top)
+  if (handler) return { kind: 'handler', handler }
+
+  if (!tagName.startsWith(MAGNITUDE_PREFIX)) {
+    return { kind: 'unresolved' }
+  }
+
+  if (isSelfClose) {
+    return { kind: 'invalidMagnitudeOpen' }
+  }
+
+  const suffix = tagName.slice(MAGNITUDE_PREFIX.length)
+
+  if (top.type === 'prose') {
+    return handlerCtx.invokeCtx.tools.has(suffix)
+      ? { kind: 'heuristicInvoke', toolTag: suffix }
+      : { kind: 'invalidMagnitudeOpen' }
+  }
+
+  if (top.type === 'invoke') {
+    const schema = handlerCtx.invokeCtx.toolSchemas.get(top.toolTag)
+    return schema && schema.parameters.has(suffix)
+      ? { kind: 'heuristicParameter', paramName: suffix }
+      : { kind: 'invalidMagnitudeOpen' }
+  }
+
+  return { kind: 'invalidMagnitudeOpen' }
+}
+
 export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHandler | undefined {
   // Switch on top.type first — TypeScript narrows top in every case
   switch (top.type) {
     case 'reason':
       // top is ReasonFrame — TypeScript verifies reasonCloseHandler: CloseHandler<ReasonFrame>
-      return tagName === 'reason' ? bindClose(reasonCloseHandler, top) : undefined
+      return tagName === 'magnitude:reason' ? bindClose(reasonCloseHandler, top) : undefined
 
     case 'message':
       // top is MessageFrame
-      return tagName === 'message' ? bindClose(messageCloseHandler, top) : undefined
+      return tagName === 'magnitude:message' ? bindClose(messageCloseHandler, top) : undefined
 
     case 'invoke':
       // top is InvokeFrame
-      return tagName === 'invoke' ? bindClose(invokeCloseHandler, top) : undefined
+      if (tagName === 'magnitude:invoke') return bindClose(invokeCloseHandler, top)
+      if (tagName === `magnitude:${top.toolTag}`) return bindClose(invokeCloseHandler, top)
+      return undefined
 
     case 'parameter':
       // top is ParameterFrame
-      return tagName === 'parameter' ? bindClose(parameterCloseHandler, top) : undefined
+      if (tagName === 'magnitude:parameter') return bindClose(parameterCloseHandler, top)
+      if (tagName === `magnitude:${top.paramName}`) return bindClose(parameterCloseHandler, top)
+      return undefined
 
     case 'filter':
       // top is FilterFrame
-      return tagName === 'filter' ? bindClose(filterCloseHandler, top) : undefined
+      return tagName === 'magnitude:filter' ? bindClose(filterCloseHandler, top) : undefined
 
     case 'prose':
       return undefined
@@ -124,7 +171,7 @@ export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHand
 // =============================================================================
 
 export function resolveSelfCloseHandler(tagName: string, top: Frame): BoundSelfCloseHandler | undefined {
-  if (top.type === 'prose' && tagName.startsWith('yield_')) {
+  if (top.type === 'prose' && tagName.startsWith('magnitude:yield_')) {
     return makeYieldHandler(tagName)
   }
   return undefined

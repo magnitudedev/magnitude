@@ -83,6 +83,7 @@ describe('provider stream interrupt cancellation', () => {
     const model = new Model({
       id: 'test-model',
       providerId: 'test-provider',
+      providerName: 'Test Provider',
       name: 'Test Model',
       contextWindow: 100_000,
       maxOutputTokens: 8_192,
@@ -125,6 +126,7 @@ describe('provider stream interrupt cancellation', () => {
     const model = new Model({
       id: 'test-model',
       providerId: 'test-provider',
+      providerName: 'Test Provider',
       name: 'Test Model',
       contextWindow: 100_000,
       maxOutputTokens: 8_192,

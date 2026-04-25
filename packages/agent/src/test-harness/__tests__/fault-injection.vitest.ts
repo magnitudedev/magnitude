@@ -12,10 +12,10 @@ describe('fault injection', () => {
 
       const result = yield* Effect.race(
         harness.wait.turnCompleted(null),
-        harness.wait.event('turn_unexpected_error'),
+        harness.wait.event('turn_outcome'),
       )
 
-      expect(result.type === 'turn_completed' || result.type === 'turn_unexpected_error').toBe(true)
+      expect(result.type === 'turn_outcome' || result.type === 'turn_outcome').toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -34,10 +34,10 @@ describe('fault injection', () => {
 
       const result = yield* Effect.race(
         harness.wait.turnCompleted(null),
-        harness.wait.event('turn_unexpected_error'),
+        harness.wait.event('turn_outcome'),
       )
 
-      expect(result.type === 'turn_completed' || result.type === 'turn_unexpected_error').toBe(true)
+      expect(result.type === 'turn_outcome' || result.type === 'turn_outcome').toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -55,11 +55,11 @@ describe('fault injection', () => {
       yield* harness.user('fail after chunk')
 
       const result = yield* Effect.race(
-        harness.wait.event('turn_unexpected_error'),
+        harness.wait.event('turn_outcome'),
         harness.wait.turnCompleted(null),
       )
 
-      expect(result.type === 'turn_unexpected_error' || result.type === 'turn_completed').toBe(true)
+      expect(result.type === 'turn_outcome' || result.type === 'turn_outcome').toBe(true)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 })

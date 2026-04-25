@@ -16,7 +16,7 @@ const v = () => grammarValidator()
 
 describe('constrained tool names', () => {
   it('01: known tool "shell" accepted', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     const events = parse(input)
     expect(hasEvent(events, 'ToolInputReady')).toBe(true)
@@ -24,7 +24,7 @@ describe('constrained tool names', () => {
   })
 
   it('02: known tool "edit" accepted', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter><parameter name="new">y</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter><magnitude:parameter name="new">y</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     const events = parse(input)
     expect(hasEvent(events, 'ToolInputReady')).toBe(true)
@@ -32,13 +32,13 @@ describe('constrained tool names', () => {
   })
 
   it('03: known tool "tree" (0 params) accepted', () => {
-    const input = `<invoke tool="tree">\n</invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="tree">\n</magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'ToolInputReady')).toBe(true)
   })
 
   it('04: unknown tool name rejected by grammar', () => {
-    const input = `<invoke tool="unknown">\n</invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="unknown">\n</magnitude:invoke><${YIELD.slice(1)}`
     v().rejects(input)
     // Parser still handles it (emits UnknownTool error)
     const events = parse(input)
@@ -46,32 +46,32 @@ describe('constrained tool names', () => {
   })
 
   it('05: similar-to-known tool name rejected', () => {
-    const input = `<invoke tool="shells">\n<parameter name="command">ls</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shells">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().rejects(input)
   })
 
   it('06: empty tool name rejected', () => {
-    const input = `<invoke tool="">\n</invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="">\n</magnitude:invoke><${YIELD.slice(1)}`
     v().rejects(input)
   })
 
   it('07: case-sensitive — "Shell" rejected', () => {
-    const input = `<invoke tool="Shell">\n<parameter name="command">ls</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="Shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().rejects(input)
   })
 
   it('08: namespaced tool accepted when in schema', () => {
     const nsTool: GrammarToolDef = { tagName: 'fs:read', parameters: [{ name: 'path', field: 'path', type: 'scalar' }] }
     const nv = buildValidator([nsTool])
-    const input = `<invoke tool="fs:read">\n<parameter name="path">/tmp</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="fs:read">\n<magnitude:parameter name="path">/tmp</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     nv.passes(input)
   })
 
   it('09: multiple different tools in one turn', () => {
     const input =
-      `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke>` +
-      `<invoke tool="tree">\n</invoke>` +
-      `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter><parameter name="new">y</parameter></invoke><${YIELD.slice(1)}`
+      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>` +
+      `<magnitude:invoke tool="tree">\n</magnitude:invoke>` +
+      `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter><magnitude:parameter name="new">y</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     const events = parse(input)
     expect(getToolInputs(events).length).toBe(3)
@@ -79,8 +79,8 @@ describe('constrained tool names', () => {
 
   it('10: same tool used multiple times', () => {
     const input =
-      `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke>` +
-      `<invoke tool="shell">\n<parameter name="command">pwd</parameter></invoke><${YIELD.slice(1)}`
+      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>` +
+      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     const inputs = getToolInputs(parse(input))
     expect(inputs.length).toBe(2)
@@ -89,7 +89,7 @@ describe('constrained tool names', () => {
   })
 
   it('11: tool name with extra space rejected', () => {
-    const input = `<invoke tool=" shell">\n<parameter name="command">ls</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool=" shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().rejects(input)
   })
 })

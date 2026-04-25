@@ -1,7 +1,7 @@
 /**
  * Tests for newline-based close tag confirmation.
  *
- * After a top-level close tag (</reason>, </message>), EITHER a newline OR
+ * After a top-level close tag (</magnitude:reason>, </magnitude:message>), EITHER a newline OR
  * a left-angle-bracket should confirm the close. The bug manifests during
  * streaming: if the '\n' after a close tag arrives as a separate chunk, it
  * gets absorbed into wsBuffer by isAllWs(). The next non-whitespace content
@@ -78,7 +78,7 @@ function parseStreaming(chunks: string[], customTools = tools): TurnEngineEvent[
 
 describe('newline close confirmation (streaming)', () => {
   /**
-   * Test 1: </reason> then '\n' as separate chunk then prose text then invoke then yield
+   * Test 1: </magnitude:reason> then '\n' as separate chunk then prose text then invoke then yield
    *
    * The '\n' arrives as a separate whitespace-only Content token → goes into wsBuffer.
    * "some prose text\n" arrives next → 's' !== '<' and 's' !== '\n' → rejectAllPendingCloses.
@@ -89,15 +89,15 @@ describe('newline close confirmation (streaming)', () => {
    */
   it('reason closed with \\n (separate chunk) then prose then invoke then yield', () => {
     const chunks = [
-      '<reason about="planning">',
+      '<magnitude:reason about="planning">',
       '\nsome reasoning here\n',
-      '</reason>',
+      '</magnitude:reason>',
       '\n',                                          // newline as its own chunk
       'some prose text\n',
-      '<invoke tool="shell">\n',
-      '<parameter name="command">echo hi</parameter>\n',
-      '</invoke>\n',
-      '<yield_invoke/>',
+      '<magnitude:invoke tool="shell">\n',
+      '<magnitude:parameter name="command">echo hi</magnitude:parameter>\n',
+      '</magnitude:invoke>\n',
+      '<magnitude:yield_invoke/>',
     ]
 
     const events = parseStreaming(chunks)
@@ -123,15 +123,15 @@ describe('newline close confirmation (streaming)', () => {
     expect(turnEnd).toBeDefined()
     expect(turnEnd).toMatchObject({
       _tag: 'TurnEnd',
-      result: { _tag: 'Success' },
+      outcome: { _tag: 'Completed' },
     })
   })
 
   /**
    * Test 2: Two consecutive reason blocks where '\n' between them arrives separately
    *
-   * The '\n' between </reason> and <reason> arrives as its own chunk → wsBuffer.
-   * Then '<reason' arrives → '<' IS the check, so this might already work.
+   * The '\n' between </magnitude:reason> and <magnitude:reason> arrives as its own chunk → wsBuffer.
+   * Then '<magnitude:reason' arrives → '<' IS the check, so this might already work.
    * But testing it explicitly to guard against regressions.
    *
    * This test may already pass (< is the current confirmation trigger).
@@ -139,15 +139,15 @@ describe('newline close confirmation (streaming)', () => {
    */
   it('two consecutive reason blocks with \\n (separate chunk) between them', () => {
     const chunks = [
-      '<reason about="first">',
+      '<magnitude:reason about="first">',
       '\nfirst reasoning\n',
-      '</reason>',
+      '</magnitude:reason>',
       '\n',                      // separate newline chunk
-      '<reason about="second">',
+      '<magnitude:reason about="second">',
       '\nsecond reasoning\n',
-      '</reason>',
+      '</magnitude:reason>',
       '\n',
-      '<yield_user/>',
+      '<magnitude:yield_user/>',
     ]
 
     const events = parseStreaming(chunks)
@@ -169,21 +169,21 @@ describe('newline close confirmation (streaming)', () => {
   /**
    * Test 3: Reason then message, '\n' between them as separate chunk
    *
-   * </reason>\n (separate) <message to="user"> ...
+   * </magnitude:reason>\n (separate) <magnitude:message to="user"> ...
    * The '\n' goes to wsBuffer, then '<' arrives → should confirm.
    * Similar to test 2 but with different tag types.
    */
   it('reason then message with \\n (separate chunk) between them', () => {
     const chunks = [
-      '<reason about="turn">',
+      '<magnitude:reason about="turn">',
       '\nsome reasoning\n',
-      '</reason>',
+      '</magnitude:reason>',
       '\n',
-      '<message to="user">',
+      '<magnitude:message to="user">',
       '\nhello world\n',
-      '</message>',
+      '</magnitude:message>',
       '\n',
-      '<yield_user/>',
+      '<magnitude:yield_user/>',
     ]
 
     const events = parseStreaming(chunks)
@@ -200,17 +200,17 @@ describe('newline close confirmation (streaming)', () => {
   /**
    * Test 4: Message closed with '\n' (separate chunk) then non-'<' prose then yield
    *
-   * Same core bug as test 1 but for message blocks. The '\n' after </message>
+   * Same core bug as test 1 but for message blocks. The '\n' after </magnitude:message>
    * goes into wsBuffer, then plain text starts with non-'<' → close rejected.
    */
   it('message closed with \\n (separate chunk) then prose then yield', () => {
     const chunks = [
-      '<message to="user">',
+      '<magnitude:message to="user">',
       '\nhello world\n',
-      '</message>',
+      '</magnitude:message>',
       '\n',                      // separate newline chunk
       'This is some trailing prose.\n',
-      '<yield_user/>',
+      '<magnitude:yield_user/>',
     ]
 
     const events = parseStreaming(chunks)
@@ -225,7 +225,7 @@ describe('newline close confirmation (streaming)', () => {
     expect(turnEnd).toBeDefined()
     expect(turnEnd).toMatchObject({
       _tag: 'TurnEnd',
-      result: { _tag: 'Success', termination: 'natural' },
+      outcome: { _tag: 'Completed', termination: 'natural' },
     })
   })
 
@@ -237,16 +237,16 @@ describe('newline close confirmation (streaming)', () => {
    */
   it('reason closed with multiple separate \\n chunks then prose then invoke', () => {
     const chunks = [
-      '<reason about="analysis">',
+      '<magnitude:reason about="analysis">',
       '\nreasoning content\n',
-      '</reason>',
+      '</magnitude:reason>',
       '\n',   // first newline
       '\n',   // second newline (blank line)
       'prose content here\n',
-      '<invoke tool="shell">\n',
-      '<parameter name="command">ls</parameter>\n',
-      '</invoke>\n',
-      '<yield_invoke/>',
+      '<magnitude:invoke tool="shell">\n',
+      '<magnitude:parameter name="command">ls</magnitude:parameter>\n',
+      '</magnitude:invoke>\n',
+      '<magnitude:yield_invoke/>',
     ]
 
     const events = parseStreaming(chunks)

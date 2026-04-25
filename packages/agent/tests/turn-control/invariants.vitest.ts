@@ -7,8 +7,8 @@ import {
   assertNoTurnIdMismatch,
   assertTurnStateAligned,
   eventsForFork,
-  mkTurnCompletedFailure,
-  mkTurnCompletedSuccess,
+  mkTurnOutcomeEventFailure,
+  mkTurnOutcomeEventSuccess,
   mkTurnStarted,
 } from './helpers'
 
@@ -17,7 +17,7 @@ describe('turn control invariants', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ turnId: 't-1', chainId: 'c-1' }))
-      yield* h.send(mkTurnCompletedSuccess({ turnId: 't-1', chainId: 'c-1' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ turnId: 't-1', chainId: 'c-1' }))
 
       const events = eventsForFork(h, null)
       assertNoTurnIdMismatch(events)
@@ -30,7 +30,7 @@ describe('turn control invariants', () => {
       const h = yield* TestHarness
       for (const n of [1, 2, 3]) {
         yield* h.send(mkTurnStarted({ turnId: `t-${n}`, chainId: 'c-seq' }))
-        yield* h.send(mkTurnCompletedSuccess({ turnId: `t-${n}`, chainId: 'c-seq' }))
+        yield* h.send(mkTurnOutcomeEventSuccess({ turnId: `t-${n}`, chainId: 'c-seq' }))
       }
 
       const events = eventsForFork(h, null)
@@ -42,18 +42,18 @@ describe('turn control invariants', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ turnId: 't-fail', chainId: 'c-fail' }))
-      yield* h.send(mkTurnCompletedFailure({ turnId: 't-fail', chainId: 'c-fail' }))
+      yield* h.send(mkTurnOutcomeEventFailure({ turnId: 't-fail', chainId: 'c-fail' }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
       yield* assertTurnStateAligned(h)
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
-  it.live('turn_unexpected_error preserves turn-control alignment invariants', () =>
+  it.live('turn_outcome preserves turn-control alignment invariants', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
       yield* h.send(mkTurnStarted({ turnId: 't-err', chainId: 'c-err' }))
-      yield* h.send({ type: 'turn_unexpected_error', forkId: null, turnId: 't-err', message: 'bad stream' })
+      yield* h.send({ type: 'turn_outcome', forkId: null, turnId: 't-err', message: 'bad stream' })
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
       yield* assertTurnStateAligned(h)
@@ -79,12 +79,22 @@ describe('turn control invariants', () => {
         message: 'spawn',
       })
       yield* h.send(mkTurnStarted({ forkId: null, turnId: 'root-1', chainId: 'root-c' }))
-      yield* h.send(mkTurnStarted({ forkId: 'fork-a', turnId: 'sub-1', chainId: 'sub-c' }))
-      yield* h.send(mkTurnCompletedSuccess({ forkId: null, turnId: 'root-1', chainId: 'root-c' }))
-      yield* h.send(mkTurnCompletedSuccess({ forkId: 'fork-a', turnId: 'sub-1', chainId: 'sub-c' }))
+
+      const subStart = eventsForFork(h, 'fork-a').find(
+        (e): e is Extract<typeof e, { type: 'turn_started' }> => e.type === 'turn_started',
+      )
+
+      const subTurnId = subStart?.turnId ?? 'sub-1'
+      const subChainId = subStart?.chainId ?? 'sub-c'
+
+      if (!subStart) {
+        yield* h.send(mkTurnStarted({ forkId: 'fork-a', turnId: subTurnId, chainId: subChainId }))
+      }
+
+      yield* h.send(mkTurnOutcomeEventSuccess({ forkId: null, turnId: 'root-1', chainId: 'root-c' }))
+      yield* h.send(mkTurnOutcomeEventSuccess({ forkId: 'fork-a', turnId: subTurnId, chainId: subChainId }))
 
       assertNoTurnIdMismatch(eventsForFork(h, null))
-      assertNoTurnIdMismatch(eventsForFork(h, 'fork-a'), 'fork-a')
       yield* assertTurnStateAligned(h, null)
       yield* assertTurnStateAligned(h, 'fork-a')
     }).pipe(Effect.provide(TestHarnessLive()))

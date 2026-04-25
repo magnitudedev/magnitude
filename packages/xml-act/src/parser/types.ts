@@ -5,7 +5,7 @@
  * in resolve.ts, which uses VALID_CHILDREN from nesting.ts as the single source of truth.
  */
 
-import type { RegisteredTool } from '../types'
+import type { RegisteredTool, SourceSpan } from '../types'
 import type { StreamingJsonParser } from '../jsonish/types'
 
 // =============================================================================
@@ -57,6 +57,7 @@ export interface ProseFrame {
 
 export interface ReasonFrame {
   readonly type: 'reason'
+  readonly openSpan: SourceSpan
   readonly name: string
   readonly content: string
   readonly hasContent: boolean
@@ -65,6 +66,7 @@ export interface ReasonFrame {
 
 export interface MessageFrame {
   readonly type: 'message'
+  readonly openSpan: SourceSpan
   readonly id: string
   readonly to: string | null
   readonly content: string
@@ -73,6 +75,7 @@ export interface MessageFrame {
 
 export interface InvokeFrame {
   readonly type: 'invoke'
+  readonly openSpan: SourceSpan
   readonly toolCallId: string
   readonly toolTag: string
   readonly toolName: string
@@ -91,6 +94,7 @@ export interface InvokeFrame {
 
 export interface ParameterFrame {
   readonly type: 'parameter'
+  readonly openSpan: SourceSpan
   readonly toolCallId: string
   readonly paramName: string
   /** Whether this parameter frame is dead (unknown param, duplicate, etc.) */
@@ -107,6 +111,7 @@ export interface ParameterFrame {
 
 export interface FilterFrame {
   readonly type: 'filter'
+  readonly openSpan: SourceSpan
   readonly toolCallId: string
   readonly filterType: string
   /** Accumulated query string — mutable, written by filterContent */
@@ -125,9 +130,14 @@ export interface FilterFrame {
  * This implements the grammar's recursive greedy last-match pattern.
  */
 export type PendingClose = {
-  tagName: string
+  tagName: string           // raw tag name seen (e.g., 'magnitude:reason')
+  effectiveTagName: string  // tag name to use for confirmation (same as tagName for exact match,
+                            // canonical close tag for mismatch recovery)
+  mismatchRecovery: boolean // true if this is a mismatch candidate
+  frameType: string
   wsBuffer: string
   sawNewline: boolean
+  tokenSpan: SourceSpan
 }
 
 // =============================================================================
@@ -138,6 +148,7 @@ export type FieldType = 'string' | 'number' | 'boolean' | 'json' | 'unknown'
 
 export interface FieldState {
   readonly paramName: string
+  readonly openSpan?: SourceSpan
   rawValue: string
   coercedValue: unknown
   errored: boolean

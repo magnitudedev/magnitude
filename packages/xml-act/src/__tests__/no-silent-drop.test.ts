@@ -57,7 +57,7 @@ function getToolErrors(events: TurnEngineEvent[]): ToolParseErrorEvent[] {
 
 describe('no silent drops', () => {
   it('stray close of known structural tag → error + content', () => {
-    const events = parse('</message>\nsome text')
+    const events = parse('</magnitude:message>\nsome text')
     const errors = getStructuralErrors(events)
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
@@ -65,28 +65,28 @@ describe('no silent drops', () => {
     expect(proseChunks.length).toBeGreaterThan(0)
   })
 
-  it('<invoke> without tool attribute → MissingToolName error', () => {
-    const errors = getStructuralErrors(parse('<invoke>\n</invoke>'))
+  it('<magnitude:yield_user/> without tool attribute → MissingToolName error', () => {
+    const errors = getStructuralErrors(parse('<magnitude:invoke>\n</magnitude:invoke>'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('MissingToolName')
   })
 
   it('non-whitespace content between parameters → UnexpectedContent error', () => {
-    const events = parse('<invoke tool="shell">\nstray content\n<parameter name="command">ls</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\nstray content\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>')
     const errors = getStructuralErrors(events)
     const unexpectedContent = errors.find(e => e.error._tag === 'UnexpectedContent')
     expect(unexpectedContent).toBeDefined()
   })
 
-  it('orphan </parameter> in message → literal content', () => {
-    const events = parse('<message to="user">\n</parameter>\n</message>')
+  it('orphan </magnitude:parameter> in message → literal content', () => {
+    const events = parse('<magnitude:message to="user">\n</magnitude:parameter>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</parameter>')
+    expect(text).toContain('</magnitude:parameter>')
   })
 
   it('all missing required fields reported', () => {
-    const events = parse('<invoke tool="multi">\n</invoke>')
+    const events = parse('<magnitude:invoke tool="multi">\n</magnitude:invoke>')
     const errors = getToolErrors(events)
     const missingFields = errors.filter(e => e.error._tag === 'MissingRequiredField')
     expect(missingFields.length).toBe(3) // a, b, c all missing

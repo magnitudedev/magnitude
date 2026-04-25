@@ -27,7 +27,7 @@ function parse(input: string) {
 
 describe('debug', () => {
   it('handles optional timeout parameter', () => {
-    const events = parse('<invoke tool="shell">\n<parameter name="command">ls</parameter>\n<parameter name="timeout">30</parameter>\n</invoke>')
+    const events = parse('<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n<magnitude:parameter name="timeout">30</magnitude:parameter>\n</magnitude:invoke>')
     const ready = events.find(e => e._tag === 'ToolInputReady')
     expect(ready).toMatchObject({ _tag: 'ToolInputReady', input: { command: 'ls', timeout: 30 } })
   })

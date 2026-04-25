@@ -5,13 +5,19 @@
  * and no-action nudges into the XML structures injected into conversation history.
  */
 
-import { YIELD_USER } from '@magnitudedev/xml-act'
+import { renderParseError, YIELD_USER } from '@magnitudedev/xml-act'
 
 import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
 import { ONESHOT_LIVENESS_REMINDER } from '../prompts/error-states'
 import { ContentPartBuilder, type ContentPart } from '../content'
-import type { MessageAckResultItem, ToolErrorResultItem, TurnResultItem } from './types'
+import type {
+  MessageAckResultItem,
+  StructuralParseErrorResultItem,
+  ToolErrorResultItem,
+  ToolParseErrorResultItem,
+  TurnResultItem,
+} from './types'
 
 function formatMessageAck(item: MessageAckResultItem): string {
   return `\n<message-sent to="${item.destination}" chars="${item.chars}"/>`
@@ -23,11 +29,11 @@ function formatToolError(item: ToolErrorResultItem): string {
   }
 
   const message = item.message ?? 'Unknown error'
-  if (item.correctToolShape) {
-    return `\n<tool name="${item.tagName}"><error>\n${message}\n\nCorrect tool shape:\n${item.correctToolShape}\n</error></tool>`
-  }
-
   return `\n<tool name="${item.tagName}"><error>${message}</error></tool>`
+}
+
+function formatParseError(item: ToolParseErrorResultItem | StructuralParseErrorResultItem): string {
+  return `\n${renderParseError(item.event, item.rawResponse ?? '')}`
 }
 
 /** Format ordered turn results for LLM context */
@@ -37,6 +43,11 @@ export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
   for (const item of items) {
     if (item.kind === 'tool_error') {
       builder.pushText(formatToolError(item))
+      continue
+    }
+
+    if (item.kind === 'tool_parse_error' || item.kind === 'structural_parse_error') {
+      builder.pushText(formatParseError(item))
       continue
     }
 

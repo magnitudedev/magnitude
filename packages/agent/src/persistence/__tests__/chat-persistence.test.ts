@@ -223,7 +223,7 @@ describe('ChatPersistenceService - JSON Backend', () => {
 
     test('preserves event structure', async () => {
       const event: AppEvent = {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-1',
         chainId: 'chain-1',

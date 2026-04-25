@@ -343,16 +343,18 @@ describe('TaskWorkerProjection', () => {
         chainId: 'chain-worker',
       } as any)
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
         timestamp: ts(10),
         forkId: 'fork-worker',
         turnId: 'turn-worker',
         chainId: 'chain-worker',
         strategyId: 'xml-act',
         result: {
-          success: true,
-          turnDecision: 'yield',
-          errors: [],
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -370,7 +372,7 @@ describe('TaskWorkerProjection', () => {
         accumulatedMs: 6,
         resumeCount: 0,
       })
-      // Note: completedAt may be affected by test infrastructure events (turn_unexpected_error)
+      // Note: completedAt may be affected by test infrastructure events (turn_outcome)
       // The important thing is the accumulated time is correct
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )

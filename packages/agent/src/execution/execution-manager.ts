@@ -17,10 +17,20 @@ import {
   type TurnEngineEvent,
   type ToolInterceptor,
   type EngineState,
+  type StructuralParseErrorEvent,
+  type ToolParseErrorEvent,
 } from '@magnitudedev/xml-act'
 import { Fork, Projection, WorkerBusTag, AmbientServiceTag, type WorkerBusService, type AmbientService } from '@magnitudedev/event-core'
 import { SkillsAmbient } from '../ambient/skills-ambient'
-import type { AppEvent, TurnResult, TurnDecision, ToolResult, TurnResultError, MessageDestination } from '../events'
+import type {
+  AppEvent,
+  TurnYieldTarget,
+  ToolResult,
+  MessageDestination,
+  TurnFeedback,
+  TurnCompletion,
+  TurnOutcome,
+} from '../events'
 import { catalog, isToolKey, type ToolKey } from '../catalog'
 // ToolResult type is imported from ../events above
 import { buildRegisteredTools, generateToolGrammar } from '../tools/tool-registry'
@@ -37,7 +47,7 @@ import { BrowserHarnessTag } from '../tools/browser-tools'
 import { AgentStateReaderTag, type AgentStateReader } from '../tools/fork'
 import { AgentRegistryStateReaderTag, type AgentRegistryStateReader } from '../tools/agent-registry-reader'
 import { buildCloneContext, buildSpawnContext } from '../prompts/fork-context'
-import { UNCLOSED_THINK_REMINDER, formatTaskOutsideSubtreeError } from '../prompts/error-states'
+import { formatTaskOutsideSubtreeError } from '../prompts/error-states'
 import type { JsonSchema } from '@magnitudedev/llm-core'
 import { ConversationStateReaderTag, type ConversationStateReader } from '../tools/memory-reader'
 import { TaskGraphStateReaderTag, canCompleteRecord, getChildRecords, canAssignRecord, collectSubtreeRecords } from '../tools/task-reader'
@@ -340,10 +350,11 @@ const makeExecutionManager = Effect.gen(function* () {
       // Track tag names for ToolStarted events
       const toolCallTagNames = new Map<string, string>()
 
-      const turnErrors: TurnResultError[] = []
+      const feedback: TurnFeedback[] = []
+      let sawToolExecutionError = false
 
       // Store execution result
-      let executionResult: TurnResult = { success: true, turnDecision: 'idle' }
+      let executionResult: TurnOutcome = { _tag: 'Completed', completion: { yieldTarget: 'user', feedback: [] } }
 
       // Create the PolicyContextProvider for turn policy evaluation
       const cwd = forkCwds.get(forkId) ?? process.cwd()
@@ -465,32 +476,20 @@ const makeExecutionManager = Effect.gen(function* () {
                 toolsCalledKeys.push(toolKey)
                 lastToolKey = toolKey
 
-                const err = event.error as unknown as Record<string, unknown>
-                const errorDetail = String(err.detail ?? err.message ?? err._tag)
-                const errorResult: ToolResult = { status: 'error', message: errorDetail }
-                if (errorResult.status === 'error') {
-                  hasToolErrors = true
-                }
+                hasToolErrors = true
 
-                // Map structured error to flat string for ToolStateEvent
-                const toolParseEvent = {
-                  _tag: 'ToolParseError' as const,
-                  error: errorDetail,
-                }
                 yield* sink.emit({
                   _tag: 'ToolEvent',
                   toolCallId: event.toolCallId,
                   toolKey,
-                  event: toolParseEvent,
+                  event,
                 })
                 break
               }
 
               // --- Structural Parse Error ---
               case 'StructuralParseError': {
-                if (event.error._tag === 'UnclosedThink') {
-                  turnErrors.push({ code: 'unclosed_think', message: UNCLOSED_THINK_REMINDER })
-                }
+                hasAnyResponseContent = true
                 break
               }
 
@@ -555,6 +554,7 @@ const makeExecutionManager = Effect.gen(function* () {
                 const toolResult: ToolResult = mapXmlToolResult(event.result)
                 if (toolResult.status === 'error') {
                   hasToolErrors = true
+                  sawToolExecutionError = true
                 }
                 yield* sink.emit( {
                   _tag: 'ToolEvent',
@@ -640,8 +640,9 @@ const makeExecutionManager = Effect.gen(function* () {
                 if (explicitTo !== null) {
                   if (explicitTo === 'user') {
                     if (forkId !== null) {
-                      turnErrors.push({
-                        code: 'nonexistent_agent_destination',
+                      feedback.push({
+                        _tag: 'InvalidMessageDestination',
+                        destination: explicitTo,
                         message: `Invalid message destination "${explicitTo}": only root fork can send to user`,
                       })
                       break
@@ -649,8 +650,9 @@ const makeExecutionManager = Effect.gen(function* () {
                     destination = { kind: 'user' }
                   } else if (explicitTo === 'parent') {
                     if (forkId === null) {
-                      turnErrors.push({
-                        code: 'nonexistent_agent_destination',
+                      feedback.push({
+                        _tag: 'InvalidMessageDestination',
+                        destination: explicitTo,
                         message: `Invalid message destination "${explicitTo}": root fork has no parent`,
                       })
                       break
@@ -659,15 +661,17 @@ const makeExecutionManager = Effect.gen(function* () {
                   } else {
                     const targetTask = taskState.tasks.get(explicitTo)
                     if (!targetTask) {
-                      turnErrors.push({
-                        code: 'nonexistent_agent_destination',
+                      feedback.push({
+                        _tag: 'InvalidMessageDestination',
+                        destination: explicitTo,
                         message: `Invalid message destination "${explicitTo}": task not found`,
                       })
                       break
                     }
                     if (!targetTask.worker) {
-                      turnErrors.push({
-                        code: 'nonexistent_agent_destination',
+                      feedback.push({
+                        _tag: 'InvalidMessageDestination',
+                        destination: explicitTo,
                         message: `Invalid message destination "${explicitTo}": task has no active worker`,
                       })
                       break
@@ -697,10 +701,6 @@ const makeExecutionManager = Effect.gen(function* () {
                   )
 
                   if (!messageResult.success) {
-                    turnErrors.push({
-                      code: 'task_operation_error',
-                      message: messageResult.error,
-                    })
                     break
                   }
 
@@ -787,71 +787,90 @@ const makeExecutionManager = Effect.gen(function* () {
 
               // --- Turn End ---
               case 'TurnEnd': {
-                const endResult = event.result
-                if (endResult._tag === 'Success') {
-                  // 'Success' here is a bit misleading — it only means the xml-act runtime finished
-                  // parsing the stream without crashing. Tool errors, invalid refs, etc. are
-                  // all considered "successful" executions at the runtime level.
-                  //
-                  // Errors within the turn always force continuation so the agent sees
-                  // the error feedback and can retry. The turn policy only decides for clean turns.
-                  if (hasToolErrors || turnErrors.length > 0) {
-                    executionResult = {
-                      success: true,
-                      turnDecision: 'continue',
-                      ...(turnErrors.length > 0 ? { errors: turnErrors } : {}),
-                    }
-                  } else if (endResult.turnControl === null && !hasAnyResponseContent) {
-                    // Empty LLM response (no messages/tools/think/lens output).
-                    // Always retrigger so memory-injected corrective feedback is visible next turn.
-                    executionResult = { success: true, turnDecision: 'continue' }
-                  } else {
-                    // Map yield target to turn decision
-                    // yield-invoke → continue (wait for tool results)
-                    // yield-user, yield-worker, yield-parent → idle
-                    const target = endResult.turnControl?.target ?? null
-                    if (target === 'invoke') {
-                      executionResult = { success: true, turnDecision: 'continue' }
-                    } else {
-                      // user, worker, parent, or null → idle
-                      executionResult = { success: true, turnDecision: 'idle' }
-                    }
+                const outcome = event.outcome
 
-                    // Apply turn policy when no explicit yield (null case)
-                    if (target === null) {
-                      const policyCtx = yield* policyCtxProvider.get
-                      const turnResult = agentDef.getTurn({
-                        toolsCalled: toolsCalledKeys,
-                        lastTool: lastToolKey,
-                        messagesSent,
-                        state: policyCtx,
-                      })
-                      if (turnResult.action === 'continue') {
-                        executionResult = { success: true, turnDecision: 'continue' }
+                const completed = (yieldTarget: TurnYieldTarget): TurnOutcome => ({
+                  _tag: 'Completed',
+                  completion: {
+                    yieldTarget,
+                    feedback: [...feedback],
+                  } satisfies TurnCompletion,
+                })
+
+                switch (outcome._tag) {
+                  case 'Completed': {
+                    let yieldTarget: TurnYieldTarget
+
+                    if (hasToolErrors || feedback.length > 0) {
+                      yieldTarget = 'invoke'
+                    } else if (outcome.turnControl === null && !hasAnyResponseContent) {
+                      // Empty LLM response (no messages/tools/think/lens output).
+                      // Always retrigger so memory-injected corrective feedback is visible next turn.
+                      yieldTarget = 'invoke'
+                    } else {
+                      const target = outcome.turnControl?.target ?? null
+                      if (target === null) {
+                        const policyCtx = yield* policyCtxProvider.get
+                        const turnResult = agentDef.getTurn({
+                          toolsCalled: toolsCalledKeys,
+                          lastTool: lastToolKey,
+                          messagesSent,
+                          state: policyCtx,
+                        })
+                        yieldTarget = turnResult.action === 'continue' ? 'invoke' : 'user'
                       } else {
-                        executionResult = { success: true, turnDecision: 'idle' }
+                        yieldTarget = target
                       }
                     }
+
+                    // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
+                    if (yieldTarget === 'worker') {
+                      const pCtx = yield* policyCtxProvider.get
+                      if (pCtx.activeAgentCount === 0) {
+                        feedback.push({ _tag: 'YieldWorkerRetriggered' })
+                        yieldTarget = 'invoke'
+                      }
+                    }
+
+                    // Oneshot liveness guard: prevent stalling when nothing is active
+                    if (yieldTarget !== 'invoke' && oneshotEnabled) {
+                      const pCtx = yield* policyCtxProvider.get
+                      if (pCtx.activeAgentCount === 0) {
+                        feedback.push({ _tag: 'OneshotLivenessRetriggered' })
+                        yieldTarget = 'invoke'
+                      }
+                    }
+
+                    executionResult = completed(yieldTarget)
+                    break
                   }
-                } else if (endResult._tag === 'Interrupted') {
-                  executionResult = { success: false, error: 'Interrupted', cancelled: true }
-                } else if (endResult._tag === 'Failure') {
-                  executionResult = { success: false, error: endResult.error, cancelled: false }
-                } else if (endResult._tag === 'GateRejected') {
-                  const rejection = endResult.rejection
-                  if (rejection && typeof rejection === 'object' && '_tag' in rejection) {
-                    const reason = 'reason' in rejection && typeof rejection.reason === 'string'
-                      ? rejection.reason
-                      : 'Gate rejected'
-                    const cancelled = rejection._tag === 'UserRejection'
-                    executionResult = { success: false, error: reason, cancelled }
-                  } else {
-                    executionResult = { success: false, error: String(rejection) || 'Gate rejected', cancelled: true }
-                  }
+
+                  case 'StructuralParseError':
+                  case 'ToolParseError':
+                    executionResult = { _tag: 'ParseFailure', error: outcome.error }
+                    break
+
+                  case 'ToolExecutionError':
+                  case 'GateRejected':
+                    executionResult = completed('invoke')
+                    break
+
+                  case 'EngineDefect':
+                    executionResult = {
+                      _tag: 'UnexpectedError',
+                      message: outcome.message,
+                      detail: { _tag: 'EngineDefect' },
+                    }
+                    break
                 }
 
-                // Circuit breaker: stop tight loops of identical consecutive continue responses.
-                if (executionResult.success && executionResult.turnDecision === 'continue') {
+                // Circuit breaker: stop tight loops of identical consecutive responses that would retrigger.
+                // This covers Completed+continue and ParseFailure (which also retriggers).
+                const willRetrigger =
+                  (executionResult._tag === 'Completed' && executionResult.completion.yieldTarget === 'invoke')
+                  || executionResult._tag === 'ParseFailure'
+
+                if (willRetrigger) {
                   const previous = identicalContinueTracker.get(forkId)
                   const nextCount = previous && previous.lastResponseText === rawResponseText
                     ? previous.consecutiveCount + 1
@@ -864,38 +883,16 @@ const makeExecutionManager = Effect.gen(function* () {
 
                   if (nextCount >= IDENTICAL_RESPONSE_BREAKER_THRESHOLD) {
                     executionResult = {
-                      success: false,
-                      error: `Circuit breaker tripped after ${nextCount} identical consecutive responses.`,
-                      cancelled: false,
+                      _tag: 'SafetyStop',
+                      reason: {
+                        _tag: 'IdenticalResponseCircuitBreaker',
+                        threshold: nextCount,
+                      },
                     }
                     identicalContinueTracker.delete(forkId)
                   }
                 } else {
                   identicalContinueTracker.delete(forkId)
-                }
-
-                // yield-worker retrigger guard: if lead yields to workers but none are active, retrigger
-                if (executionResult.success && executionResult.turnDecision === 'idle' && endResult._tag === 'Success' && endResult.turnControl?.target === 'worker') {
-                  const pCtx = yield* policyCtxProvider.get
-                  if (pCtx.activeAgentCount === 0) {
-                    executionResult = {
-                      success: true,
-                      turnDecision: 'continue',
-                      yieldWorkerRetriggered: true,
-                    }
-                  }
-                }
-
-                // Oneshot liveness guard: prevent stalling when nothing is active
-                if (executionResult.success && executionResult.turnDecision === 'idle' && oneshotEnabled) {
-                  const pCtx = yield* policyCtxProvider.get
-                  if (pCtx.activeAgentCount === 0) {
-                    executionResult = {
-                      success: true,
-                      turnDecision: 'continue',
-                      oneshotLivenessTriggered: true,
-                    }
-                  }
                 }
                 break
               }

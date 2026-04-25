@@ -352,17 +352,13 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
         const forkTurnState = yield* turnProjection.getFork(agent.forkId)
         if (forkTurnState._tag === 'active' || forkTurnState._tag === 'interrupting') {
           yield* Effect.promise(() => client.send({
-            type: 'turn_completed',
+            type: 'turn_outcome',
             forkId: agent.forkId,
             turnId: forkTurnState.turnId,
             chainId: forkTurnState.chainId,
             strategyId: 'xml-act',
 
-            result: {
-              success: false,
-              error: 'Hydration recovery: cancelled in-flight turn',
-              cancelled: true,
-            },
+            outcome: { _tag: 'Cancelled', reason: { _tag: 'WorkerKilled' } },
             inputTokens: null,
             outputTokens: null,
             cacheReadTokens: null,
@@ -377,16 +373,12 @@ export async function createCodingAgentClient(options: CreateClientOptions) {
       const rootTurnState = yield* turnProjection.getFork(null)
       if (rootTurnState._tag === 'active' || rootTurnState._tag === 'interrupting') {
         yield* Effect.promise(() => client.send({
-          type: 'turn_completed',
+          type: 'turn_outcome',
           forkId: null,
           turnId: rootTurnState.turnId,
           chainId: rootTurnState.chainId,
           strategyId: 'xml-act',
-          result: {
-            success: false,
-            error: 'Hydration recovery: cancelled in-flight turn',
-            cancelled: true,
-          },
+          outcome: { _tag: 'Cancelled', reason: { _tag: 'WorkerKilled' } },
           inputTokens: null,
           outputTokens: null,
           cacheReadTokens: null,

@@ -5,7 +5,7 @@
  * Per-fork worker that responds to signals and events for compaction lifecycle:
  *
  * 1. shouldCompactChanged signal → start BAML summarization, publish compaction_ready
- * 2. turn_completed event → if pending compaction and not working, finalize:
+ * 2. turn_outcome event → if pending compaction and not working, finalize:
  *    capture vars, reset sandbox, publish compaction_completed + sandbox_reset
  *
  * Design decisions:
@@ -65,7 +65,7 @@ export const CompactionWorker = Worker.defineForked<AppEvent>()({
   },
 
   eventHandlers: {
-    turn_completed: (event, publish, read) =>
+    turn_outcome: (event, publish, read) =>
       Effect.gen(function* () {
         const compactionState = (yield* read(CompactionProjection, event.forkId)) as CompactionState
         if (compactionState._tag !== 'pendingFinalization') return

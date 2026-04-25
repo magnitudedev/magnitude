@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
-import { YIELD_USER } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE } from '@magnitudedev/xml-act'
 import { TestHarness, TestHarnessLive } from '../src/test-harness/harness'
 import { IDENTICAL_RESPONSE_BREAKER_THRESHOLD } from '../src/execution/execution-manager'
 
@@ -8,15 +8,15 @@ describe('turn lifecycle', () => {
   it.live('Single turn with yield', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: `<message to="user">hi</message>\n${YIELD_USER}` })
+      yield* h.script.next({ xml: `<magnitude:message to="user">hi</magnitude:message>\n${YIELD_USER}` })
 
       yield* h.user('hello')
       const completed = yield* h.wait.turnCompleted(null)
 
-      expect(completed.type).toBe('turn_completed')
-      expect(completed.result.success).toBe(true)
-      if (completed.result.success) {
-        expect(completed.result.turnDecision).toBe('idle')
+      expect(completed.type).toBe('turn_outcome')
+      expect(completed.outcome._tag).toBe('Completed')
+      if (completed.outcome._tag === 'Completed') {
+        expect(completed.outcome.completion.yieldTarget).toBe('user')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -24,13 +24,13 @@ describe('turn lifecycle', () => {
   it.live('Single turn with next', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
-      yield* h.script.next({ xml: `<message to="user">first</message>\n${YIELD_USER}` })
+      yield* h.script.next({ xml: `<magnitude:message to="user">first</magnitude:message>\n${YIELD_USER}` })
 
       yield* h.user('run')
       const completed = yield* h.wait.turnCompleted(null)
 
-      expect(completed.type).toBe('turn_completed')
-      expect(completed.result.success).toBe(true)
+      expect(completed.type).toBe('turn_outcome')
+      expect(completed.outcome._tag).toBe('Completed')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -38,21 +38,25 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      yield* h.script.next({ xml: `<message to="user">response 1</message>\n${YIELD_USER}` })
+      yield* h.script.next({ xml: `<magnitude:message to="user">response 1</magnitude:message>\n${YIELD_USER}` })
       yield* h.user('message 1')
       const first = yield* h.wait.turnCompleted(null)
 
-      yield* h.script.next({ xml: `<message to="user">response 2</message>\n${YIELD_USER}` })
+      yield* h.script.next({ xml: `<magnitude:message to="user">response 2</magnitude:message>\n${YIELD_USER}` })
+      const beforeSecond = h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length
       yield* h.user('message 2')
-      const second = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && e.turnId !== first.turnId,
+      yield* h.until('second root completion', () =>
+        h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length > beforeSecond,
       )
+      const second = h.events()
+        .filter((e): e is Extract<typeof e, { type: 'turn_outcome' }> => e.type === 'turn_outcome' && e.forkId === null)
+        .find(e => e.turnId !== first.turnId)
+      if (!second) throw new Error('Expected second turn completion')
 
-      expect(first.type).toBe('turn_completed')
-      expect(second.type).toBe('turn_completed')
-      expect(first.result.success).toBe(true)
-      expect(second.result.success).toBe(true)
+      expect(first.type).toBe('turn_outcome')
+      expect(second.type).toBe('turn_outcome')
+      expect(first.outcome._tag).toBe('Completed')
+      expect(second.outcome._tag).toBe('Completed')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
 
@@ -67,8 +71,8 @@ describe('turn lifecycle', () => {
         (e) => e.forkId === null && e.turnId === completed.turnId,
       )
 
-      expect(completed.type).toBe('turn_completed')
-      expect(completed.result.success).toBe(true)
+      expect(completed.type).toBe('turn_outcome')
+      expect(completed.outcome._tag).toBe('Completed')
       expect(chunk.text).toContain('ok')
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -81,19 +85,22 @@ describe('turn lifecycle', () => {
 
       yield* h.user('trigger empty response')
       const first = yield* h.wait.turnCompleted(null)
-      const second = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && e.turnId !== first.turnId,
+      yield* h.until('second root completion after retrigger', () =>
+        h.events().some(e => e.type === 'turn_outcome' && e.forkId === null && e.turnId !== first.turnId),
       )
+      const second = h.events().find((e): e is Extract<typeof e, { type: 'turn_outcome' }> =>
+        e.type === 'turn_outcome' && e.forkId === null && e.turnId !== first.turnId,
+      )
+      if (!second) throw new Error('Expected second turn completion')
 
-      expect(first.result.success).toBe(true)
-      if (first.result.success) {
-        expect(first.result.turnDecision).toBe('continue')
+      expect(first.outcome._tag).toBe('Completed')
+      if (first.outcome._tag === 'Completed') {
+        expect(first.outcome.completion.yieldTarget).toBe('invoke')
       }
 
-      expect(second.result.success).toBe(true)
-      if (second.result.success) {
-        expect(second.result.turnDecision).toBe('idle')
+      expect(second.outcome._tag).toBe('Completed')
+      if (second.outcome._tag === 'Completed') {
+        expect(second.outcome.completion.yieldTarget).toBe('user')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -112,17 +119,18 @@ describe('turn lifecycle', () => {
         timestamp: Date.now(),
       })
 
-      yield* h.script.next({ xml: `<message to="${taskId}">hello</message>\n${YIELD_USER}` })
+      yield* h.script.next({ xml: `<magnitude:message to="${taskId}">hello</magnitude:message>\n${YIELD_USER}` })
 
       yield* h.user('trigger workerless task message')
       const completed = yield* h.wait.turnCompleted(null)
 
-      expect(completed.result.success).toBe(true)
-      if (completed.result.success) {
-        expect(completed.result.turnDecision).toBe('continue')
-        expect(completed.result.errors).toEqual([
+      expect(completed.outcome._tag).toBe('Completed')
+      if (completed.outcome._tag === 'Completed') {
+        expect(completed.outcome.completion.yieldTarget).toBe('invoke')
+        expect(completed.outcome.completion.feedback).toEqual([
           {
-            code: 'nonexistent_agent_destination',
+            _tag: 'InvalidMessageDestination',
+            destination: taskId,
             message: `Invalid message destination "${taskId}": task has no active worker`,
           },
         ])
@@ -136,37 +144,36 @@ describe('turn lifecycle', () => {
 
       const N = IDENTICAL_RESPONSE_BREAKER_THRESHOLD
       // Invalid tool call body forces turn continue with tool parse error.
-      const repeated = '<read>foo</read>'
+      const repeated = `<magnitude:message to="user">repeat</magnitude:message>\n${YIELD_INVOKE}`
       for (let i = 0; i < N; i++) {
         yield* h.script.next({ xml: repeated })
       }
 
       yield* h.user('trigger repeated identical invalid response loop')
 
-      const turnIds: string[] = []
       const turns: any[] = []
-      for (let i = 0; i < N; i++) {
-        const turn = yield* h.wait.event(
-          'turn_completed',
-          (e) => e.forkId === null && !turnIds.includes(e.turnId),
-        )
-        turnIds.push(turn.turnId)
-        turns.push(turn)
-      }
+      yield* h.until('N root completions for circuit breaker', () =>
+        h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length >= N,
+      )
+      turns.push(
+        ...h.events().filter((e): e is Extract<typeof e, { type: 'turn_outcome' }> =>
+          e.type === 'turn_outcome' && e.forkId === null,
+        ).slice(0, N),
+      )
 
       // All but last should continue
       for (let i = 0; i < N - 1; i++) {
-        expect(turns[i].result.success).toBe(true)
-        if (turns[i].result.success) {
-          expect(turns[i].result.turnDecision).toBe('continue')
+        expect(turns[i].outcome._tag).toBe('Completed')
+        if (turns[i].outcome._tag === 'Completed') {
+          expect(turns[i].outcome.completion.yieldTarget).toBe('invoke')
         }
       }
 
       // Last should trip
       const last = turns[N - 1]
-      expect(last.result.success).toBe(false)
-      if (!last.result.success) {
-        expect(last.result.error).toContain('Circuit breaker')
+      expect(last.outcome._tag).toBe('SafetyStop')
+      if (last.outcome._tag === 'SafetyStop') {
+        expect(last.outcome.reason._tag).toBe('IdenticalResponseCircuitBreaker')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -175,41 +182,32 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      const a = '<read>foo</read>'
-      const b = '<read>bar</read>'
+      const a = `<magnitude:message to="user">foo</magnitude:message>\n${YIELD_INVOKE}`
+      const b = `<magnitude:message to="user">bar</magnitude:message>\n${YIELD_INVOKE}`
       yield* h.script.next({ xml: a })
       yield* h.script.next({ xml: a })
       yield* h.script.next({ xml: b })
       yield* h.script.next({ xml: a })
-      yield* h.script.next({ xml: YIELD_USER })
+      yield* h.script.next({ xml: `<magnitude:message to="user">done</magnitude:message>\n${YIELD_USER}` })
 
       yield* h.user('trigger reset on different response sequence')
-
-      const first = yield* h.wait.turnCompleted(null)
-      const second = yield* h.wait.event('turn_completed', (e) => e.forkId === null && e.turnId !== first.turnId)
-      const third = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && e.turnId !== first.turnId && e.turnId !== second.turnId,
+      yield* h.until('five root completions', () =>
+        h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length >= 5,
       )
-      const fourth = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && ![first.turnId, second.turnId, third.turnId].includes(e.turnId),
-      )
-      const fifth = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && ![first.turnId, second.turnId, third.turnId, fourth.turnId].includes(e.turnId),
+      const [first, second, third, fourth, fifth] = h.events().filter(
+        (e): e is Extract<typeof e, { type: 'turn_outcome' }> => e.type === 'turn_outcome' && e.forkId === null,
       )
 
       for (const turn of [first, second, third, fourth]) {
-        expect(turn.result.success).toBe(true)
-        if (turn.result.success) {
-          expect(turn.result.turnDecision).toBe('continue')
+        expect(turn.outcome._tag).toBe('Completed')
+        if (turn.outcome._tag === 'Completed') {
+          expect(turn.outcome.completion.yieldTarget).toBe('invoke')
         }
       }
 
-      expect(fifth.result.success).toBe(true)
-      if (fifth.result.success) {
-        expect(fifth.result.turnDecision).toBe('idle')
+      expect(fifth.outcome._tag).toBe('Completed')
+      if (fifth.outcome._tag === 'Completed') {
+        expect(fifth.outcome.completion.yieldTarget).toBe('user')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )
@@ -218,8 +216,8 @@ describe('turn lifecycle', () => {
     Effect.gen(function* () {
       const h = yield* TestHarness
 
-      const a = '<read>foo</read>'
-      const idleWithMessage = `<message to="user">boundary</message>\n${YIELD_USER}`
+      const a = `<magnitude:message to="user">foo</magnitude:message>\n${YIELD_INVOKE}`
+      const idleWithMessage = `<magnitude:message to="user">boundary</magnitude:message>\n${YIELD_USER}`
       yield* h.script.next({ xml: a })                 // continue
       yield* h.script.next({ xml: a })                 // continue
       yield* h.script.next({ xml: idleWithMessage })   // idle boundary (reset)
@@ -229,47 +227,46 @@ describe('turn lifecycle', () => {
       yield* h.user('trigger reset on idle boundary sequence')
 
       const first = yield* h.wait.turnCompleted(null)
-      const second = yield* h.wait.event('turn_completed', (e) => e.forkId === null && e.turnId !== first.turnId)
-      const third = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && e.turnId !== first.turnId && e.turnId !== second.turnId,
+      yield* h.until('three root completions before idle boundary', () =>
+        h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length >= 3,
+      )
+      const [, second, third] = h.events().filter(
+        (e): e is Extract<typeof e, { type: 'turn_outcome' }> => e.type === 'turn_outcome' && e.forkId === null,
       )
 
       // After idle boundary, need a new user message to resume
       yield* h.user('continue after idle')
 
-      const fourth = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && ![first.turnId, second.turnId, third.turnId].includes(e.turnId),
+      yield* h.until('five root completions after resume', () =>
+        h.events().filter(e => e.type === 'turn_outcome' && e.forkId === null).length >= 5,
       )
-      const fifth = yield* h.wait.event(
-        'turn_completed',
-        (e) => e.forkId === null && ![first.turnId, second.turnId, third.turnId, fourth.turnId].includes(e.turnId),
+      const [, , , fourth, fifth] = h.events().filter(
+        (e): e is Extract<typeof e, { type: 'turn_outcome' }> => e.type === 'turn_outcome' && e.forkId === null,
       )
 
-      expect(first.result.success).toBe(true)
-      if (first.result.success) {
-        expect(first.result.turnDecision).toBe('continue')
+      expect(first.outcome._tag).toBe('Completed')
+      if (first.outcome._tag === 'Completed') {
+        expect(first.outcome.completion.yieldTarget).toBe('invoke')
       }
 
-      expect(second.result.success).toBe(true)
-      if (second.result.success) {
-        expect(second.result.turnDecision).toBe('continue')
+      expect(second.outcome._tag).toBe('Completed')
+      if (second.outcome._tag === 'Completed') {
+        expect(second.outcome.completion.yieldTarget).toBe('invoke')
       }
 
-      expect(third.result.success).toBe(true)
-      if (third.result.success) {
-        expect(third.result.turnDecision).toBe('idle')
+      expect(third.outcome._tag).toBe('Completed')
+      if (third.outcome._tag === 'Completed') {
+        expect(third.outcome.completion.yieldTarget).toBe('user')
       }
 
-      expect(fourth.result.success).toBe(true)
-      if (fourth.result.success) {
-        expect(fourth.result.turnDecision).toBe('continue')
+      expect(fourth.outcome._tag).toBe('Completed')
+      if (fourth.outcome._tag === 'Completed') {
+        expect(fourth.outcome.completion.yieldTarget).toBe('invoke')
       }
 
-      expect(fifth.result.success).toBe(true)
-      if (fifth.result.success) {
-        expect(fifth.result.turnDecision).toBe('idle')
+      expect(fifth.outcome._tag).toBe('Completed')
+      if (fifth.outcome._tag === 'Completed') {
+        expect(fifth.outcome.completion.yieldTarget).toBe('user')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )

@@ -1,11 +1,11 @@
 import { Effect } from 'effect'
-import type { TurnCompleted } from '../events'
+import type { TurnOutcomeEvent } from '../events'
 import { isValidVariant, type AgentVariant } from '../agents/variants'
 import { getAgentDefinition } from '../agents/registry'
 import { CanonicalTurnProjection } from '../projections/canonical-turn'
 import { AgentStatusProjection, getAgentByForkId } from '../projections/agent-status'
 
-export const buildInterruptedTurnCompleted = (params: {
+export const buildInterruptedTurnOutcome = (params: {
   forkId: string | null
   turnId: string
   chainId: string | null
@@ -27,13 +27,13 @@ export const buildInterruptedTurnCompleted = (params: {
 
   getAgentDefinition(variant)
 
-  const event: TurnCompleted = {
-    type: 'turn_completed',
+  const event: TurnOutcomeEvent = {
+    type: 'turn_outcome',
     forkId,
     turnId,
     chainId: chainId ?? '',
     strategyId: 'xml-act',
-    result: { success: false, error: 'Interrupted', cancelled: true },
+    outcome: { _tag: 'Cancelled', reason: { _tag: 'UserInterrupt' } },
     inputTokens: null,
     outputTokens: null,
     cacheReadTokens: null,

@@ -13,28 +13,28 @@ const v = () => grammarValidator()
 
 describe('filter handling', () => {
   it('01: filter after single param', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter><filter>$.stdout</filter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:filter>$.stdout</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls')
   })
 
   it('02: filter only (no params)', () => {
-    const input = `<invoke tool="shell">\n<filter>$.result</filter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:filter>$.result</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 
   it('03: filter after multiple params', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter><filter>//item</filter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter><magnitude:filter>//item</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 
-  it('04: filter with </filter> in content (greedy match)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter><filter>$.</filter>more</filter></invoke><${YIELD.slice(1)}`
+  it('04: filter with </magnitude:filter> in content (greedy match)', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:filter>$.</magnitude:filter>more</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 
-  it('05: filter with whitespace before </invoke>', () => {
-    const input = `<invoke tool="shell">\n<filter>$.x</filter>\n</invoke><${YIELD.slice(1)}`
+  it('05: filter with whitespace before </magnitude:invoke>', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:filter>$.x</magnitude:filter>\n</magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 })

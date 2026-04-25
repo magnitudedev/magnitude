@@ -47,7 +47,7 @@ describe('memory/append-only-invariant', () => {
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
 
-  it.live('after turn_unexpected_error prior messages remain unchanged', () =>
+  it.live('after turn_outcome prior messages remain unchanged', () =>
     Effect.gen(function* () {
       const h = yield* TestHarness
 
@@ -58,7 +58,7 @@ describe('memory/append-only-invariant', () => {
       const snap = snapshotMessageRefs(before)
 
       yield* h.send({
-        type: 'turn_unexpected_error',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-err',
         message: 'boom',
@@ -101,7 +101,7 @@ describe('memory/append-only-invariant', () => {
       snap = snapshotMessageRefs(state)
 
       yield* h.send({
-        type: 'turn_unexpected_error',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-mixed',
         message: 'mixed error',

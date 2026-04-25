@@ -8,19 +8,19 @@ export function coerceScalarValue(rawValue: string, fieldType: FieldType): { val
   const trimmed = rawValue.trim()
   switch (fieldType) {
     case 'string':
-      return { value: trimmed, ok: true }
+      return { value: rawValue, ok: true }
     case 'number': {
       const num = parseFloat(trimmed)
-      if (isNaN(num)) return { value: trimmed, ok: false }
+      if (isNaN(num)) return { value: rawValue, ok: false }
       return { value: num, ok: true }
     }
     case 'boolean': {
       const lower = trimmed.toLowerCase()
       if (lower === 'true' || lower === '1') return { value: true, ok: true }
       if (lower === 'false' || lower === '0') return { value: false, ok: true }
-      return { value: trimmed, ok: false }
+      return { value: rawValue, ok: false }
     }
     default:
-      return { value: trimmed, ok: true }
+      return { value: rawValue, ok: true }
   }
 }

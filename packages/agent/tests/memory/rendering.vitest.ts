@@ -17,7 +17,7 @@ describe('memory rendering', () => {
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-render-simple-flush', chainId: 'c-render-simple-flush' })
 
       const userTexts = yield* getRenderedUserText(h)
-      expect(userTexts).toContain('<message from="user">hello there</message>')
+      expect(userTexts).toContain('<magnitude:message from="user">hello there</magnitude:message>')
       expect(userTexts).toContain('--- ')
     }).pipe(Effect.provide(TestHarnessLive({ workers: { turnController: false } })))
   )
@@ -72,7 +72,7 @@ describe('memory rendering', () => {
         chainId: 'c-1',
       })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
@@ -80,10 +80,12 @@ describe('memory rendering', () => {
         strategyId: 'xml-act',
 
 
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'check this' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'check this' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -228,7 +230,7 @@ describe('memory rendering', () => {
 
       yield* h.send({ type: 'turn_started', forkId: null, turnId: 't-1', chainId: 'c-1' })
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
@@ -236,10 +238,12 @@ describe('memory rendering', () => {
         strategyId: 'xml-act',
 
 
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'after turn' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'after turn' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,

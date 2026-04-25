@@ -1,32 +1,20 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect } from 'effect'
 import { TestHarness, TestHarnessLive } from '../../src/test-harness/harness'
+import { response } from '../../src/test-harness/response-builder'
 
-// Build XML strings from chars to avoid triggering the response parser
-const WR = ['<','w','r','i','t','e',' ','p','a','t','h','='].join('')
-const WRC = ['<','/','w','r','i','t','e','>'].join('')
-const YIELD = ['<','i','d','l','e','/','>'].join('')
-const MSG_OPEN = ['<','m','e','s','s','a','g','e',' ','t','o','=','"','p','a','r','e','n','t','"','>'].join('')
-const MSG_CLOSE = ['<','/','m','e','s','s','a','g','e','>'].join('')
-const AC_OPEN = ['<','a','g','e','n','t','-','c','r','e','a','t','e',' '].join('')
-const AC_CLOSE = ['<','/','a','g','e','n','t','-','c','r','e','a','t','e','>'].join('')
-
-function writeTag(path: string, content: string) {
-  return `${WR}"${path}">${content}${WRC}`
+function writeTurn(path: string, content: string) {
+  return response().writeFile(path, content).yield()
 }
 
-function agentCreate(agentId: string, type: string, title: string, message: string) {
-  const titleTag = ['<','t','i','t','l','e','>'].join('') + title + ['<','/','t','i','t','l','e','>'].join('')
-  const msgTag = ['<','m','e','s','s','a','g','e','>'].join('') + message + ['<','/','m','e','s','s','a','g','e','>'].join('')
-  return `${AC_OPEN}id="${agentId}" type="${type}">${titleTag}${msgTag}${AC_CLOSE}`
+function agentCreateTurn(agentId: string, type: string, title: string, message: string) {
+  return response().createAgent(agentId, type, title, message).yield()
 }
 
-function actions(...tools: string[]) {
-  return `${tools.join('')}${YIELD}`
-}
-
-function actionsWithMessage(...tools: string[]) {
-  return `${tools.join('')}${MSG_OPEN}Done${MSG_CLOSE}${YIELD}`
+function writeTurnWithParentMessage(path: string, content: string) {
+  return {
+    xml: `${response().messageTo('parent', 'Done').writeFile(path, content).yield().xml.replace('<magnitude:yield_user/>', '')}<magnitude:yield_user/>`,
+  }
 }
 
 describe('write policy permissions', () => {
@@ -34,7 +22,7 @@ describe('write policy permissions', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next({
-        xml: actions(writeTag('$M/reports/test.md', 'hello')),
+        ...writeTurn('$M/reports/test.md', 'hello'),
       }, null)
 
       yield* harness.user('write a report')
@@ -44,7 +32,7 @@ describe('write policy permissions', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.outcome._tag).toBe('Completed')
       if (writeEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
@@ -56,7 +44,7 @@ describe('write policy permissions', () => {
     Effect.gen(function* () {
       const harness = yield* TestHarness
       yield* harness.script.next({
-        xml: actions(writeTag('src/test.txt', 'hello')),
+        ...writeTurn('src/test.txt', 'hello'),
       }, null)
 
       yield* harness.user('write a file')
@@ -66,7 +54,7 @@ describe('write policy permissions', () => {
         (e) => e.forkId === null && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.outcome._tag).toBe('Completed')
       if (writeEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
@@ -80,7 +68,7 @@ describe('write policy permissions', () => {
 
       // Lead spawns an explorer
       yield* harness.script.next({
-        xml: actions(agentCreate('explorer-test', 'explorer', 'Test', 'Write a report')),
+        ...agentCreateTurn('explorer-test', 'explorer', 'Test', 'Write a report'),
       }, null)
 
       yield* harness.user('explore and write report')
@@ -91,7 +79,7 @@ describe('write policy permissions', () => {
 
       // Explorer writes to $M/
       yield* harness.script.next({
-        xml: actionsWithMessage(writeTag('$M/reports/test.md', 'hello from explorer')),
+        ...writeTurnWithParentMessage('$M/reports/test.md', 'hello from explorer'),
       }, agentCreated.forkId)
 
       const completed = yield* harness.wait.turnCompleted(agentCreated.forkId)
@@ -100,7 +88,7 @@ describe('write policy permissions', () => {
         (e) => e.forkId === agentCreated.forkId && e.event._tag === 'ToolExecutionEnded' && e.event.toolName === 'write',
       )
 
-      expect(completed.result.success).toBe(true)
+      expect(completed.outcome._tag).toBe('Completed')
       if (writeEnded.event._tag !== 'ToolExecutionEnded') {
         throw new Error('Expected ToolExecutionEnded')
       }
@@ -114,7 +102,7 @@ describe('write policy permissions', () => {
 
       // Lead spawns an explorer
       yield* harness.script.next({
-        xml: actions(agentCreate('explorer-cwd', 'explorer', 'Test', 'Try writing to cwd')),
+        ...agentCreateTurn('explorer-cwd', 'explorer', 'Test', 'Try writing to cwd'),
       }, null)
 
       yield* harness.user('explore')
@@ -125,7 +113,7 @@ describe('write policy permissions', () => {
 
       // Explorer tries to write to cwd - should be denied
       yield* harness.script.next({
-        xml: actionsWithMessage(writeTag('src/test.txt', 'hello from explorer')),
+        ...writeTurnWithParentMessage('src/test.txt', 'hello from explorer'),
       }, agentCreated.forkId)
 
       const completed = yield* harness.wait.turnCompleted(agentCreated.forkId)
@@ -138,10 +126,10 @@ describe('write policy permissions', () => {
         throw new Error('Expected ToolExecutionEnded')
       }
       expect(writeEnded.event.result._tag).not.toBe('Success')
-      if (completed.result.success) {
-        expect(completed.result.turnDecision).toBe('continue')
+      if (completed.outcome._tag === 'Completed') {
+        expect(completed.outcome.completion.yieldTarget).toBe('invoke')
       } else {
-        expect(completed.result.cancelled).toBe(false)
+        expect(completed.outcome._tag).not.toBe('Cancelled')
       }
     }).pipe(Effect.provide(TestHarnessLive()))
   )

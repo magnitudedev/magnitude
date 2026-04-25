@@ -48,8 +48,11 @@ describe('exact session-shaped two-turn repro', () => {
 
     const firstResponse = `
 
-<update-task id="explore-web-search" status="completed" />
-<message to="user">Great question — here's how it works:
+<magnitude:invoke tool="update_task">
+<magnitude:parameter name="id">explore-web-search</magnitude:parameter>
+<magnitude:parameter name="status">completed</magnitude:parameter>
+</magnitude:invoke>
+<magnitude:message to="user">Great question — here's how it works:
 
 ### How Web Search Works
 
@@ -58,8 +61,8 @@ Magnitude has per-provider implementations in [\`packages/agent/src/tools/web-se
 - **OpenAI** — synchronous
 - **Google Gemini** — synchronous (but silently ignores domain filters)
 
-The router at [\`packages/agent/src/tools/web-search.ts\`](packages/agent/src/tools/web-search.ts) determines which one to call based on your active provider.</message>
-<yield-invoke/>`
+The router at [\`packages/agent/src/tools/web-search.ts\`](packages/agent/src/tools/web-search.ts) determines which one to call based on your active provider.</magnitude:message>
+<magnitude:yield_invoke/>`
 
     const secondResponse = `
 
@@ -171,15 +174,15 @@ If your provider has no web search support, you just point \`MAGNITUDE_SEARCH_PR
 
       const firstCompleted = await waitForEvent(
         transcript,
-        (e) => e.type === 'turn_completed' && e.forkId === null,
+        (e) => e.type === 'turn_outcome' && e.forkId === null,
         3000,
       )
-      const firstTurnId = (firstCompleted as Extract<AppEvent, { type: 'turn_completed' }>).turnId
+      const firstTurnId = (firstCompleted as Extract<AppEvent, { type: 'turn_outcome' }>).turnId
 
       const canonical = await client.runEffect(
         Effect.flatMap(CanonicalTurnProjection.Tag, (projection) => projection.getFork(null)),
       )
-      expect(canonical.lastCompleted?.canonicalXml).toContain('<message to="user"></message>')
+      expect(canonical.lastCompleted?.canonicalXml).toContain('<magnitude:message to="user">')
 
       const secondStarted = await waitForEvent(
         transcript,
@@ -193,7 +196,7 @@ If your provider has no web search support, you just point \`MAGNITUDE_SEARCH_PR
         secondTerminal = await waitForEvent(
           transcript,
           (e) =>
-            (e.type === 'turn_completed' || e.type === 'turn_unexpected_error')
+            (e.type === 'turn_outcome' || e.type === 'turn_outcome')
             && 'turnId' in e
             && e.turnId === secondTurnId,
           3000,

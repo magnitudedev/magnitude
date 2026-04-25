@@ -81,10 +81,18 @@ describe('prompt caching consistency', () => {
       const before = snapshotMessageRefs(beforeMemory)
 
       yield* h.send({
-        type: 'turn_unexpected_error',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 't-1',
-        message: 'fatal failure',
+        chainId: 'c-1',
+        strategyId: 'xml-act',
+        outcome: { _tag: 'UnexpectedError', message: 'fatal failure' },
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        providerId: null,
+        modelId: null,
       })
 
       const afterRendered = yield* getRenderedUserText(h)
@@ -110,23 +118,25 @@ describe('prompt caching consistency', () => {
       const beforeMemory = yield* getRootMemory(h)
       const before = snapshotMessageRefs(beforeMemory)
 
-      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs',  } })
-      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs',  } })
+      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs', openSpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } } } })
+      yield* h.send({ type: 'tool_event', forkId: null, turnId: 't-1', toolCallId: 'x', toolKey: 'fileRead', event: { _tag: 'ToolInputStarted', toolCallId: 'x', tagName: 'read', toolName: 'fileRead', group: 'fs', openSpan: { start: { offset: 0, line: 1, col: 1 }, end: { offset: 10, line: 1, col: 11 } } } })
 
       const midMemory = yield* getRootMemory(h)
       assertPrefixUnchanged(before, midMemory)
 
       yield* h.send({
-        type: 'turn_completed',
+        type: 'turn_outcome',
 
         forkId: null,
         turnId: 't-1',
         chainId: 'c-1',
         strategyId: 'xml-act',
-        result: {
-          success: true,
-          turnDecision: 'idle',
-          errors: [{ code: 'nonexistent_agent_destination', message: 'latest only' }],
+        outcome: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [{ _tag: 'InvalidMessageDestination', destination: 'unknown', message: 'latest only' }],
+          },
         },
         inputTokens: null,
         outputTokens: null,

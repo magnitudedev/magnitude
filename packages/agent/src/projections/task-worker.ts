@@ -368,16 +368,11 @@ export const TaskWorkerProjection = Projection.define<AppEvent, TaskWorkerState>
       return rebuild({ state, read, workerActivityByForkId: markWorkerWorking(state.workerActivityByForkId, event.forkId, event.timestamp) })
     },
 
-    turn_completed: ({ event, state, read }) => {
+    turn_outcome: ({ event, state, read }) => {
       if (event.forkId === null) return rebuild({ state, read })
-      if (event.result.success && event.result.turnDecision === 'continue') {
+      if (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke') {
         return rebuild({ state, read })
       }
-      return rebuild({ state, read, workerActivityByForkId: markWorkerIdle(state.workerActivityByForkId, event.forkId, event.timestamp) })
-    },
-
-    turn_unexpected_error: ({ event, state, read }) => {
-      if (event.forkId === null) return rebuild({ state, read })
       return rebuild({ state, read, workerActivityByForkId: markWorkerIdle(state.workerActivityByForkId, event.forkId, event.timestamp) })
     },
 

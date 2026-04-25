@@ -69,7 +69,7 @@ export const ConversationProjection = Projection.define<AppEvent, ConversationSt
       }
     },
 
-    turn_completed: ({ event, state }) => {
+    turn_outcome: ({ event, state }) => {
       // Only track root fork
       if (event.forkId !== null) return state
 

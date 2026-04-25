@@ -11,7 +11,7 @@
 
 import { Effect, Data, Context, Stream } from 'effect'
 import type { TurnEngineEvent, TurnEngineCrash, EngineState } from '@magnitudedev/xml-act'
-import type { MessageDestination, TurnResult } from '../events'
+import type { MessageDestination, TurnOutcome } from '../events'
 import type { CallUsage, ModelError } from '@magnitudedev/providers'
 import type { Projection, WorkerBusService, AmbientService } from '@magnitudedev/event-core'
 import type { AgentVariant } from '../agents/variants'
@@ -109,7 +109,7 @@ export interface ExecuteOptions {
 }
 
 export interface ExecuteResult {
-  readonly result: TurnResult
+  readonly result: TurnOutcome
 }
 
 export interface ExecutionManagerService {

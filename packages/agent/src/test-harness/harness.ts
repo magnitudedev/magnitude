@@ -121,18 +121,28 @@ export interface TestHarnessService {
   readonly send: (event: AppEvent) => Effect.Effect<void>
   readonly user: (text: string) => Effect.Effect<void>
   readonly events: () => readonly AppEvent[]
+  readonly until: (
+    label: string,
+    pred: () => boolean | Promise<boolean>,
+    opts?: WaitUntilOptions,
+  ) => Effect.Effect<void>
   readonly wait: {
     readonly event: <T extends AppEvent['type']>(
       type: T,
       pred?: (e: Extract<AppEvent, { type: T }>) => boolean,
       opts?: WaitOptions,
     ) => Effect.Effect<Extract<AppEvent, { type: T }>>
-    readonly turnCompleted: (forkId?: string | null, opts?: WaitOptions) => Effect.Effect<Extract<AppEvent, { type: 'turn_completed' }>>
+    readonly turnCompleted: (forkId?: string | null, opts?: WaitOptions) => Effect.Effect<Extract<AppEvent, { type: 'turn_outcome' }>>
     readonly idle: (forkId?: string | null, opts?: WaitOptions) => Effect.Effect<void>
     readonly agentCreated: (
       pred?: (e: Extract<AppEvent, { type: 'agent_created' }>) => boolean,
       opts?: WaitOptions,
     ) => Effect.Effect<Extract<AppEvent, { type: 'agent_created' }>>
+    readonly until: (
+      label: string,
+      pred: () => boolean | Promise<boolean>,
+      opts?: WaitUntilOptions,
+    ) => Effect.Effect<void>
   }
   readonly script: {
     readonly next: (frame: MockTurnResponse, forkId?: string | null) => Effect.Effect<void>
@@ -164,11 +174,13 @@ export function TestHarnessLive(options: HarnessOptions = {}): Layer.Layer<TestH
         send: (event) => Effect.promise(() => harness.send(event)),
         user: (text) => Effect.promise(() => harness.user(text)),
         events: () => harness.events(),
+        until: (label, pred, opts) => Effect.promise(() => harness.until(label, pred, opts)),
         wait: {
           event: (type, pred, opts) => Effect.promise(() => harness.wait.event(type, pred as never, opts)),
           turnCompleted: (forkId = null, opts) => Effect.promise(() => harness.wait.turnCompleted(forkId, opts)),
           idle: (forkId = null, opts) => Effect.promise(() => harness.wait.idle(forkId, opts)),
           agentCreated: (pred, opts) => Effect.promise(() => harness.wait.agentCreated(pred, opts)),
+          until: (label, pred, opts) => Effect.promise(() => harness.wait.until(label, pred, opts)),
         },
         script: {
           next: (frame, forkId = null) => Effect.promise(() => harness.script.next(frame, forkId)),
@@ -432,12 +444,13 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
       },
       events: () => transcript,
       onEvent,
+      until: waitUntil,
       wait: {
         event: waitEvent,
         turnCompleted: (forkId: string | null = null, opts?: WaitOptions) =>
-          waitEvent('turn_completed', (e) => e.forkId === forkId, opts),
+          waitEvent('turn_outcome', (e) => e.forkId === forkId, opts),
         idle: async (forkId: string | null = null, opts?: WaitOptions) => {
-          await waitEvent('turn_completed', (e) => e.forkId === forkId, opts)
+          await waitEvent('turn_outcome', (e) => e.forkId === forkId, opts)
         },
         agentCreated: (
           pred?: (e: Extract<AppEvent, { type: 'agent_created' }>) => boolean,

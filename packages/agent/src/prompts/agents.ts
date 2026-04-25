@@ -36,7 +36,7 @@ export function buildConversationSummary(entries: readonly ConversationEntry[]):
   if (entries.length === 0) return null
 
   const formatted = entries.map(e =>
-    `<message role="${e.role}">\n${e.text}\n</message>`
+    `<magnitude:message role="${e.role}">\n${e.text}\n</magnitude:message>`
   )
 
   // Always keep the first entry

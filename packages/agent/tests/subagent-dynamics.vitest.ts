@@ -49,7 +49,7 @@ describe('subagent dynamics', () => {
             }
 
             return {
-              xml: '<message to="parent">subagent done</message><idle/>',
+              xml: '<magnitude:message to="parent">subagent done</magnitude:message><magnitude:yield_user/>',
             }
           }),
         ),
@@ -57,12 +57,12 @@ describe('subagent dynamics', () => {
 
       yield* h.user('create then run subagent')
       const rootCompleted = yield* h.wait.turnCompleted(null)
-      expect(rootCompleted.result.success).toBe(true)
+      expect(rootCompleted.outcome._tag).toBe('Completed')
 
       const created = yield* h.wait.event('agent_created', (e) => e.agentId === 'test-explorer')
       const subCompleted = yield* h.wait.turnCompleted(created.forkId)
 
-      expect(subCompleted.type).toBe('turn_completed')
+      expect(subCompleted.type).toBe('turn_outcome')
       expect(subCompleted.forkId).toBe(created.forkId)
 
       const hasSubagentTurn = h

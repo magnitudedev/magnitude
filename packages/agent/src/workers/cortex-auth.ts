@@ -2,14 +2,16 @@ import {
   AuthFailed,
   ContextLimitExceeded,
   ParseError as ProviderParseError,
+  RateLimited,
   SubscriptionRequired,
   TransportError as ProviderTransportError,
   UsageLimitExceeded,
 } from '@magnitudedev/providers'
 import type { ModelError } from '@magnitudedev/providers'
 import { BamlClientHttpError, BamlValidationError } from '@magnitudedev/llm-core'
+import type { TurnOutcome } from '../events'
 
-export type NonRetryableReason = 'context-limit' | 'auth' | 'parse' | 'client-error' | 'not-configured' | 'disconnected' | null
+export type NonRetryableReason = 'context-limit' | 'auth' | 'parse' | 'client-error' | null
 
 export function authReconnectMessage(providerName?: string | null): string {
   return providerName
@@ -17,62 +19,67 @@ export function authReconnectMessage(providerName?: string | null): string {
     : 'Your provider session expired or became invalid. Please reconnect in /settings.'
 }
 
-export function isAuthReconnectMessage(message: string): boolean {
-  const lower = message.toLowerCase()
-  return lower.includes('session expired or became invalid') && lower.includes('/settings')
+function truncateUnexpectedError(message: string): string {
+  const maxLen = 500
+  return message.length > maxLen ? `${message.slice(0, maxLen)}...` : message
 }
 
-export function resolveFailureMessage(error: ModelError): string {
-  if (error._tag === 'NotConfigured') {
-    return 'No model configured. Please connect a provider and select a model in /settings.'
+export function classifyModelError(error: ModelError): TurnOutcome {
+  switch (error._tag) {
+    case 'NotConfigured':
+      return { _tag: 'ProviderNotReady', detail: { _tag: 'NotConfigured' } }
+    case 'ProviderDisconnected':
+      return {
+        _tag: 'ProviderNotReady',
+        detail: {
+          _tag: 'ProviderDisconnected',
+          providerId: error.providerId,
+          providerName: error.providerName,
+        },
+      }
+    case 'AuthFailed':
+      return {
+        _tag: 'ProviderNotReady',
+        detail: {
+          _tag: 'AuthFailed',
+          providerId: 'unknown',
+          providerName: 'Unknown provider',
+        },
+      }
+    case 'SubscriptionRequired':
+      return {
+        _tag: 'ProviderNotReady',
+        detail: {
+          _tag: 'MagnitudeBilling',
+          reason: { _tag: 'SubscriptionRequired', message: error.message },
+        },
+      }
+    case 'UsageLimitExceeded':
+      return {
+        _tag: 'ProviderNotReady',
+        detail: {
+          _tag: 'MagnitudeBilling',
+          reason: { _tag: 'UsageLimitExceeded', message: error.message },
+        },
+      }
+    case 'ContextLimitExceeded':
+      return { _tag: 'ContextWindowExceeded' }
+    case 'RateLimited':
+      return {
+        _tag: 'ConnectionFailure',
+        detail: { _tag: 'ProviderError', httpStatus: 429 },
+      }
+    case 'TransportError':
+      return error.status !== null && (error.status === 408 || error.status === 429 || error.status >= 500)
+        ? { _tag: 'ConnectionFailure', detail: { _tag: 'ProviderError', httpStatus: error.status } }
+        : { _tag: 'ConnectionFailure', detail: { _tag: 'TransportError', ...(error.status !== null ? { httpStatus: error.status } : {}) } }
+    case 'ParseError':
+      return {
+        _tag: 'UnexpectedError',
+        message: truncateUnexpectedError(`Provider returned unparseable response: ${error.message}`),
+        detail: { _tag: 'CortexDefect' },
+      }
   }
-  if (error._tag === 'ProviderDisconnected') {
-    return error.message
-  }
-  if (error._tag === 'AuthFailed') {
-    return authReconnectMessage()
-  }
-  if (error._tag === 'SubscriptionRequired') {
-    return error.message
-  }
-  if (error._tag === 'UsageLimitExceeded') {
-    return error.message
-  }
-  return `Authentication failed: ${error.message}`
-}
-
-/**
- * Build the error message and errorCode for the general TurnError fallback path (Path 3).
- * Extracts errorCode from the cause for CTA rendering and truncates long messages.
- * Uses resolveFailureMessage for known ModelError types to avoid noisy prefixes.
- */
-export function buildGeneralErrorPayload(errorMessage: string, errorCause: unknown): {
-  message: string
-  errorCode: string | undefined
-} {
-  // Extract errorCode from the cause for CTA rendering (e.g., usage_limit_exceeded_weekly)
-  const errorCode = errorCause !== null && typeof errorCause === 'object' && 'code' in errorCause
-    ? (errorCause as any).code as string | undefined
-    : undefined
-
-  // If the cause has a known _tag, use its clean message instead of the raw error text
-  const hasTag = typeof errorCause === 'object' && errorCause !== null && '_tag' in errorCause
-  const resolved = hasTag ? resolveFailureMessage(errorCause as ModelError) : null
-
-  let message: string
-  if (resolved) {
-    message = resolved
-  } else {
-    // Truncate and prefix only for unclassified errors
-    const suffix = 'Unexpected error while executing turn: '
-    const maxLen = 500
-    const truncated = (suffix + errorMessage).length > maxLen
-      ? (suffix + errorMessage).slice(0, maxLen) + '...'
-      : suffix + errorMessage
-    message = truncated
-  }
-
-  return { message, errorCode }
 }
 
 export function classifyRetryability(error: unknown): NonRetryableReason {
@@ -92,5 +99,6 @@ export function classifyRetryability(error: unknown): NonRetryableReason {
     return null
   }
   if (error instanceof BamlValidationError) return 'parse'
+  if (error instanceof RateLimited) return null
   return null
 }

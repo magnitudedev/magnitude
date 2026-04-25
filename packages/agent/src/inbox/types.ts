@@ -1,5 +1,9 @@
 import type { ContentPart } from '../content'
-import type { ResolvedMention, ToolResultStatus } from '../events'
+import type {
+  ResolvedMention,
+  ToolResultStatus,
+} from '../events'
+import type { StructuralParseErrorEvent, ToolParseErrorEvent } from '@magnitudedev/xml-act'
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -81,7 +85,18 @@ export type ToolErrorResultItem = {
   readonly tagName: string
   readonly status: Exclude<ToolResultStatus, 'success'>
   readonly message?: string
-  readonly correctToolShape?: string
+}
+
+export type ToolParseErrorResultItem = {
+  readonly kind: 'tool_parse_error'
+  readonly event: ToolParseErrorEvent
+  readonly rawResponse: string
+}
+
+export type StructuralParseErrorResultItem = {
+  readonly kind: 'structural_parse_error'
+  readonly event: StructuralParseErrorEvent
+  readonly rawResponse: string
 }
 
 export type ToolObservationResultItem = {
@@ -103,6 +118,8 @@ export type NoToolsOrMessagesResultItem = {
 
 export type TurnResultItem =
   | ToolErrorResultItem
+  | ToolParseErrorResultItem
+  | StructuralParseErrorResultItem
   | ToolObservationResultItem
   | MessageAckResultItem
   | NoToolsOrMessagesResultItem

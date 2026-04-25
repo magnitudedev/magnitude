@@ -15,32 +15,32 @@ const v = () => grammarValidator()
 
 describe('bounded parameter count', () => {
   it('01: 0 params for 0-param tool accepted', () => {
-    const input = `<invoke tool="tree">\n</invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="tree">\n</magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'ToolInputReady')).toBe(true)
   })
 
   it('02: 1 param for 1-param tool accepted', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))).toEqual({ command: 'ls' })
   })
 
   it('03: 0 params for 1-param tool accepted (early close)', () => {
-    const input = `<invoke tool="shell">\n</invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n</magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     // Parser may emit MissingRequiredField error but tool still closes
     expect(hasEvent(parse(input), 'ToolParseError') || hasEvent(parse(input), 'ToolInputReady')).toBe(true)
   })
 
   it('04: 3 params for 3-param tool accepted', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter><parameter name="new">y</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter><magnitude:parameter name="new">y</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))).toEqual({ path: 'f', old: 'x', new: 'y' })
   })
 
   it('05: 2 params for 3-param tool accepted (early close, ToolParseError for missing new)', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     const events = parse(input)
     // Missing required 'new' param → ToolParseError, no ToolInputReady
@@ -49,48 +49,49 @@ describe('bounded parameter count', () => {
   })
 
   it('06: 1 param for 3-param tool accepted (early close)', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 
   it('07: 4th param (duplicate) absorbed as content of 3rd (greedy)', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter><parameter name="new">y</parameter><parameter name="path">z</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter><magnitude:parameter name="new">y</magnitude:parameter><magnitude:parameter name="path">z</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     // Duplicate "path" absorbed as content of "new" param
     const ti = getToolInput(parse(input))
     expect(ti?.new).toBe('y')
   })
 
-  it('08: 2nd param (duplicate) absorbed as content of 1st (greedy)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter><parameter name="command">pwd</parameter></invoke><${YIELD.slice(1)}`
+  it('08: 2nd param (duplicate) emits DuplicateParameter error', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    // Duplicate "command" absorbed as content of first "command"
-    const ti = getToolInput(parse(input))
-    expect(ti?.command).toBe('ls')
+    const events = parse(input)
+    const errors = events.filter(e => e._tag === 'ToolParseError' && (e as any).error._tag === 'DuplicateParameter')
+    expect(errors.length).toBe(1)
+    expect((errors[0] as any).error.parameterName).toBe('command')
   })
 
   // 4-param tool (grep)
   it('09: all 4 params for 4-param tool accepted', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
-    const input = `<invoke tool="grep">\n<parameter name="pattern">TODO</parameter><parameter name="glob">*.ts</parameter><parameter name="path">src</parameter><parameter name="limit">10</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">TODO</magnitude:parameter><magnitude:parameter name="glob">*.ts</magnitude:parameter><magnitude:parameter name="path">src</magnitude:parameter><magnitude:parameter name="limit">10</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     gv.passes(input)
   })
 
   it('10: 3 of 4 params accepted (early close)', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
-    const input = `<invoke tool="grep">\n<parameter name="pattern">TODO</parameter><parameter name="glob">*.ts</parameter><parameter name="path">src</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">TODO</magnitude:parameter><magnitude:parameter name="glob">*.ts</magnitude:parameter><magnitude:parameter name="path">src</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     gv.passes(input)
   })
 
   it('11: 1 of 4 params accepted (early close)', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
-    const input = `<invoke tool="grep">\n<parameter name="pattern">TODO</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">TODO</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     gv.passes(input)
   })
 
   it('12: 5th param (duplicate) absorbed as content of 4th (greedy)', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
-    const input = `<invoke tool="grep">\n<parameter name="pattern">a</parameter><parameter name="glob">b</parameter><parameter name="path">c</parameter><parameter name="limit">d</parameter><parameter name="pattern">e</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">a</magnitude:parameter><magnitude:parameter name="glob">b</magnitude:parameter><magnitude:parameter name="path">c</magnitude:parameter><magnitude:parameter name="limit">d</magnitude:parameter><magnitude:parameter name="pattern">e</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     gv.passes(input)
     const events = parseWithGrep(input)
     const ti = getToolInput(events)

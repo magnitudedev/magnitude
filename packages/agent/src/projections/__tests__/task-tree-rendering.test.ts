@@ -66,7 +66,7 @@ const getLastInbox = (fork: ForkMemoryState) => {
 
 const inboxText = (inbox: Extract<ForkMemoryState['messages'][number], { type: 'inbox' }>) =>
   formatInbox({
-    results: inbox.results,
+    results: inbox.outcomes,
     timeline: inbox.timeline,
     timezone: null,
   })
@@ -516,12 +516,18 @@ describe('task tree rendering mechanics', () => {
         chainId: null,
       } as any,
       {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         timestamp: ts(3),
         turnId: 'turn-1',
         forkId: null,
         strategyId: 'lead',
-        result: { success: true, errors: [], oneshotLivenessTriggered: false },
+        result: {
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [],
+          },
+        },
       } as any,
       {
         type: 'task_cancelled',

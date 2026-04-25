@@ -62,7 +62,7 @@ export function generateToolGrammar(
     const parameters = [...toolSchema.parameters.values()].map(p => ({
       name: p.name,
       field: p.name, // In new format, parameter name = field path
-      type: p.type === 'json' ? 'json' as const : 'scalar' as const,
+      type: p.type === 'json_object' || p.type === 'json_array' ? 'json' as const : 'scalar' as const,
     }))
     
     defs.push({

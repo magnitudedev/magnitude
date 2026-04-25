@@ -7,16 +7,18 @@ import { formatShortTimestamp } from '../utils/strings'
 import { BOX_CHARS } from '../utils/ui-constants'
 
 const COPY_FEEDBACK_RESET_MS = 2000
-const MAGNITUDE_URL = 'app.magnitude.dev'
 
 interface ErrorMessageProps {
-  tag: string | null
+  tag?: string | null
   message: string
   timestamp: number
-  errorCode?: string
+  cta?: {
+    readonly label: string
+    readonly url: string
+  }
 }
 
-export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp, errorCode }: ErrorMessageProps) {
+export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp, cta }: ErrorMessageProps) {
   const theme = useTheme()
   const [isHovered, setIsHovered] = useState(false)
   const [isCopied, setIsCopied] = useState(false)
@@ -44,23 +46,15 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
   const prefix = tag ? `[${tag}]` : '[Error]'
   const fullError = `${prefix} ${message}`
 
-  // Detect Magnitude-specific errors using error code
-  const isSubscriptionError = errorCode === 'subscription_required' || errorCode === 'trial_expired'
-  const isUsageLimitError = errorCode?.startsWith('usage_limit_exceeded') ?? false
-  const magnitudeCtaText = isSubscriptionError
-    ? { label: 'Upgrade to Pro', url: MAGNITUDE_URL }
-    : isUsageLimitError
-      ? { label: 'Manage your subscription', url: MAGNITUDE_URL }
-      : null
-
   const handleCopyLink = useCallback(async () => {
+    if (!cta) return
     try {
-      await writeTextToClipboard(`https://${MAGNITUDE_URL}`)
+      await writeTextToClipboard(cta.url)
       showLinkCopied()
     } catch {
       // Error logged by writeTextToClipboard
     }
-  }, [showLinkCopied])
+  }, [cta, showLinkCopied])
 
   const handleCopy = async () => {
     try {
@@ -96,8 +90,8 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
   return (
     <box
       style={{ flexDirection: 'column', position: 'relative', marginBottom: 1 }}
-      onMouseDown={magnitudeCtaText ? undefined : handleMouseDown}
-      onMouseUp={magnitudeCtaText ? undefined : handleMouseUp}
+      onMouseDown={cta ? undefined : handleMouseDown}
+      onMouseUp={cta ? undefined : handleMouseUp}
       onMouseOver={handleMouseOver}
       onMouseOut={handleMouseOut}
     >
@@ -113,11 +107,11 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
         <text style={{ fg: theme.error }}>
           {fullError}
         </text>
-        {magnitudeCtaText && (
+        {cta && (
           <box style={{ flexDirection: 'row' }}>
-            <text style={{ fg: theme.muted }}>{magnitudeCtaText.label}</text>
-            <text style={{ fg: theme.muted }}>{' at '}</text>
-            <text style={{ fg: theme.primary }} attributes={TextAttributes.UNDERLINE}>{magnitudeCtaText.url}</text>
+            <text style={{ fg: theme.muted }}>{'→ '}</text>
+            <text style={{ fg: theme.primary }} attributes={TextAttributes.UNDERLINE}>{cta.url}</text>
+            <text style={{ fg: theme.muted }}>{` — ${cta.label.toLowerCase()}`}</text>
             <text style={{ fg: theme.muted }}>{' '}</text>
             <Button
               onClick={handleCopyLink}
@@ -132,8 +126,8 @@ export const ErrorMessage = memo(function ErrorMessage({ tag, message, timestamp
         )}
       </box>
 
-      {/* Only show copy overlay when there's no Magnitude CTA */}
-      {magnitudeCtaText === null && (isHovered || isCopied) && (
+      {/* Only show copy overlay when there's no CTA */}
+      {!cta && (isHovered || isCopied) && (
         <box style={{ position: 'absolute', bottom: 0, right: 0, flexDirection: 'row', backgroundColor: theme.terminalDetectedBg ?? 'transparent',  }}>
           <text style={{ fg: isCopied ? 'green' : theme.muted }} attributes={TextAttributes.DIM}>
             {isCopied ? '[Copied ✔] ' : '[Copy ⧉ ] '}

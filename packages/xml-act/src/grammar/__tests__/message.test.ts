@@ -1,40 +1,40 @@
 import { describe, it } from 'vitest'
 import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
 
-const YIELD = '<yield_user/>'
+const YIELD = '<magnitude:yield_user/>'
 
 describe('message blocks', () => {
   describe('passing sequences', () => {
     it('accepts a simple message to user', () => {
       const v = shellValidator()
-      v.passes(`<message to="user">\nhello world\n</message>\n${YIELD}`)
+      v.passes(`<magnitude:message to="user">\nhello world\n</magnitude:message>\n${YIELD}`)
     })
 
     it('accepts a message to parent', () => {
       const v = shellValidator()
-      v.passes(`<message to="parent">\nhello\n</message>\n${YIELD}`)
+      v.passes(`<magnitude:message to="parent">\nhello\n</magnitude:message>\n${YIELD}`)
     })
 
     it('accepts a message to task-123', () => {
       const v = shellValidator()
-      v.passes(`<message to="task-123">\nsome content\n</message>\n${YIELD}`)
+      v.passes(`<magnitude:message to="task-123">\nsome content\n</magnitude:message>\n${YIELD}`)
     })
 
     it('accepts a multi-line body', () => {
       const v = shellValidator()
-      v.passes(`<message to="user">\nline one\nline two\nline three\n</message>\n${YIELD}`)
+      v.passes(`<magnitude:message to="user">\nline one\nline two\nline three\n</magnitude:message>\n${YIELD}`)
     })
 
     it('accepts a body containing <', () => {
       const v = shellValidator()
-      v.passes(`<message to="user">\nuse <b>bold</b> text here\n</message>\n${YIELD}`)
+      v.passes(`<magnitude:message to="user">\nuse <b>bold</b> text here\n</magnitude:message>\n${YIELD}`)
     })
 
     it('accepts multiple messages before yield', () => {
       const v = shellValidator()
       v.passes(
-        `<message to="user">\nfirst\n</message>\n` +
-        `<message to="parent">\nsecond\n</message>\n` +
+        `<magnitude:message to="user">\nfirst\n</magnitude:message>\n` +
+        `<magnitude:message to="parent">\nsecond\n</magnitude:message>\n` +
         YIELD
       )
     })
@@ -42,28 +42,28 @@ describe('message blocks', () => {
     it('accepts message followed by invoke then yield', () => {
       const v = buildValidator([SHELL_TOOL])
       v.passes(
-        `<message to="user">\nrunning now\n</message>\n` +
-        `<invoke tool="shell">\n<parameter name="command">echo hi</parameter>\n</invoke>\n` +
+        `<magnitude:message to="user">\nrunning now\n</magnitude:message>\n` +
+        `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo hi</magnitude:parameter>\n</magnitude:invoke>\n` +
         YIELD
       )
     })
 
     it('accepts message with no newline before next tag', () => {
       const v = shellValidator()
-      v.passes(`<message to="user">\nhello\n</message><yield_user/>`)
+      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message><magnitude:yield_user/>`)
     })
 
     describe('requiredMessageTo', () => {
       it('accepts message to required recipient', () => {
         const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('parent'))
-        v.passes(`<message to="parent">\nhello\n</message>\n${YIELD}`)
+        v.passes(`<magnitude:message to="parent">\nhello\n</magnitude:message>\n${YIELD}`)
       })
 
       it('accepts required message followed by another message', () => {
         const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('parent'))
         v.passes(
-          `<message to="parent">\nrequired\n</message>\n` +
-          `<message to="user">\ninfo\n</message>\n` +
+          `<magnitude:message to="parent">\nrequired\n</magnitude:message>\n` +
+          `<magnitude:message to="user">\ninfo\n</magnitude:message>\n` +
           YIELD
         )
       })
@@ -71,8 +71,8 @@ describe('message blocks', () => {
       it('accepts reason before required message', () => {
         const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('parent'))
         v.passes(
-          `<reason about="turn">\nplanning\n</reason>\n` +
-          `<message to="parent">\nhello\n</message>\n` +
+          `<magnitude:reason about="turn">\nplanning\n</magnitude:reason>\n` +
+          `<magnitude:message to="parent">\nhello\n</magnitude:message>\n` +
           YIELD
         )
       })
@@ -87,7 +87,7 @@ describe('message blocks', () => {
 
     it('rejects required message to wrong recipient', () => {
       const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('parent'))
-      v.rejects(`<message to="user">\nhello\n</message>\n${YIELD}`)
+      v.rejects(`<magnitude:message to="user">\nhello\n</magnitude:message>\n${YIELD}`)
     })
   })
 })

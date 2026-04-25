@@ -1,5 +1,5 @@
 import { Projection } from '@magnitudedev/event-core'
-import type { AppEvent, TurnResultError, MessageDestination } from '../events'
+import type { AppEvent, MessageDestination } from '../events'
 
 import { serializeCanonicalTurn, type CanonicalTrace } from './canonical-xml'
 import { buildResolvedToolSet, type ResolvedToolSet } from '../tools/resolved-toolset'
@@ -23,11 +23,10 @@ export interface CanonicalTurnState {
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string | null; order: number }>
   toolCallMap: Map<string, number>
   hasParseError: boolean
-  hasStructuralError: boolean
   rawResponse: string
   orderCounter: number
-  lastCompleted: { turnId: string; canonicalXml: string; clean: boolean } | null
-  resolvedTurnDecision: 'continue' | 'idle' | null
+  lastCompleted: { turnId: string; canonicalXml: string; rawResponse: string; clean: boolean } | null
+  resolvedTurnYieldTarget: 'user' | 'invoke' | 'worker' | 'parent' | null
 }
 
 export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
@@ -39,17 +38,11 @@ export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   toolCalls: [],
   toolCallMap: new Map(),
   hasParseError: false,
-  hasStructuralError: false,
   rawResponse: '',
   orderCounter: 0,
   lastCompleted: null,
-  resolvedTurnDecision: null,
+  resolvedTurnYieldTarget: null,
 })
-
-function hasStructuralTurnError(errors?: readonly TurnResultError[]): boolean {
-  if (!errors || errors.length === 0) return false
-  return errors.some((error) => error.code === 'unclosed_think')
-}
 
 function resetActive(state: CanonicalTurnState): CanonicalTurnState {
   return {
@@ -62,10 +55,9 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     toolCalls: [],
     toolCallMap: new Map(),
     hasParseError: false,
-    hasStructuralError: false,
     rawResponse: '',
     orderCounter: 0,
-    resolvedTurnDecision: null,
+    resolvedTurnYieldTarget: null,
   }
 }
 
@@ -210,19 +202,15 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
         case 'ToolParseError':
           return { ...fork, hasParseError: true }
 
-        case 'StructuralParseError':
-          return { ...fork, hasStructuralError: true }
-
         default:
           return fork
       }
     },
 
-    turn_completed: ({ event, fork, read, ambient }) => {
+    turn_outcome: ({ event, fork, read, ambient }) => {
       if (fork.turnId !== event.turnId) return fork
 
-      const hasStructuralError = fork.hasStructuralError || (event.result.success ? hasStructuralTurnError(event.result.errors) : false)
-      const clean = !fork.hasParseError && !hasStructuralError && event.result.success === true
+      const clean = !fork.hasParseError && event.outcome._tag === 'Completed'
 
       let canonicalXml: string
       if (clean) {
@@ -235,11 +223,10 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           : 'lead'
         const agentDef = getAgentDefinition(variant)
         const slot = getAgentSlot(variant)
-        
-        // Build toolSet for serialization using ConfigAmbient
+
         const configState = ambient.get(ConfigAmbient)
         const toolSet = buildResolvedToolSet(agentDef, configState, slot)
-        
+
         const trace: CanonicalTrace = {
           lenses: fork.lenses,
           reasonBlocks: fork.reasonBlocks,
@@ -249,7 +236,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
           toolCalls: [...fork.toolCalls]
             .sort((a, b) => a.order - b.order)
             .map(({ tagName, input, query }) => ({ tagName, input, query })),
-          turnDecision: event.result.turnDecision === 'idle' ? 'idle' : 'continue',
+          yieldTarget: event.outcome._tag === 'Completed' ? event.outcome.completion.yieldTarget : 'invoke',
         }
         canonicalXml = serializeCanonicalTurn(trace, toolSet)
       } else {
@@ -258,18 +245,16 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
       const finalized: CanonicalTurnState = {
         ...fork,
-        hasStructuralError,
         lastCompleted: {
           turnId: event.turnId,
           canonicalXml,
+          rawResponse: fork.rawResponse,
           clean,
         }
       }
 
       return resetActive(finalized)
     },
-
-    turn_unexpected_error: ({ fork }) => resetActive(fork),
 
     interrupt: ({ fork }) => fork,
 

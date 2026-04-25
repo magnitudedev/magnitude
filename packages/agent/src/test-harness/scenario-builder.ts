@@ -7,7 +7,7 @@ export type TurnFrame = MockTurnResponse | ResponseBuilder
 
 export interface TurnsResult {
   readonly forks: Map<string, string>
-  readonly turns: Extract<AppEvent, { type: 'turn_completed' }>[]
+  readonly turns: Extract<AppEvent, { type: 'turn_outcome' }>[]
 }
 
 export interface TurnsBuilder {
@@ -45,7 +45,7 @@ interface TurnsHarness {
       type: T,
       pred?: (e: Extract<AppEvent, { type: T }>) => boolean,
     ): Promise<Extract<AppEvent, { type: T }>>
-    turnCompleted(forkId?: string | null): Promise<Extract<AppEvent, { type: 'turn_completed' }>>
+    turnCompleted(forkId?: string | null): Promise<Extract<AppEvent, { type: 'turn_outcome' }>>
     agentCreated(
       pred?: (e: Extract<AppEvent, { type: 'agent_created' }>) => boolean,
     ): Promise<Extract<AppEvent, { type: 'agent_created' }>>
@@ -113,9 +113,9 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
       const consumedTurnIds = new Set<string>()
       const waitForNextTurnCompleted = async (
         forkId: string | null,
-      ): Promise<Extract<AppEvent, { type: 'turn_completed' }>> => {
+      ): Promise<Extract<AppEvent, { type: 'turn_outcome' }>> => {
         for (const event of harness.events()) {
-          if (event.type !== 'turn_completed') continue
+          if (event.type !== 'turn_outcome') continue
           if (event.forkId !== forkId) continue
           if (consumedTurnIds.has(event.turnId)) continue
           consumedTurnIds.add(event.turnId)
@@ -123,7 +123,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
         }
 
         const next = await harness.wait.event(
-          'turn_completed',
+          'turn_outcome',
           (event) => event.forkId === forkId && !consumedTurnIds.has(event.turnId),
         )
         consumedTurnIds.add(next.turnId)
@@ -213,7 +213,7 @@ export function createTurnsBuilder(harness: TurnsHarness): TurnsBuilder {
 
       const turns = harness
         .events()
-        .filter((event): event is Extract<AppEvent, { type: 'turn_completed' }> => event.type === 'turn_completed')
+        .filter((event): event is Extract<AppEvent, { type: 'turn_outcome' }> => event.type === 'turn_outcome')
 
       return {
         forks: new Map(forkByAgent),

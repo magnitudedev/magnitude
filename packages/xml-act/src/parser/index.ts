@@ -110,6 +110,8 @@ export function createParser(
     handlerCtx,
     deferredYield,
     pendingCloseStack: [],
+    escapeDepth: 0,
+    invalidSubtree: null,
   }
 
   function end(): void {
@@ -120,9 +122,9 @@ export function createParser(
       for (const pc of loopCtx.pendingCloseStack) {
         const top = machine.peek()
         if (top) {
-          const handler = resolveCloseHandler(pc.tagName, top)
+          const handler = resolveCloseHandler(pc.effectiveTagName, top)
           if (handler) {
-            machine.apply(handler.close(handlerCtx))
+            machine.apply(handler.close(handlerCtx, pc.tokenSpan))
           }
         }
       }
@@ -135,7 +137,7 @@ export function createParser(
       const termination = deferredYield.postYieldHasContent ? 'runaway' : 'natural'
       events.push({
         _tag: 'TurnEnd',
-        result: { _tag: 'Success', turnControl: { target: deferredYield.target }, termination },
+        outcome: { _tag: 'Completed', turnControl: { target: deferredYield.target }, termination },
       })
       deferredYield.target = null
       machine.apply([{ type: 'done' }])

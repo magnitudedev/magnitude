@@ -52,17 +52,20 @@ describe('Event Serialization', () => {
       expect(deserialized).toEqual(event)
     })
 
-    test('serializes and deserializes turn_completed', () => {
+    test('serializes and deserializes turn_outcome', () => {
       const event: AppEvent = {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-123',
         chainId: 'chain-456',
         strategyId: 'xml-act',
 
         result: {
-          success: true,
-          turnDecision: 'idle'
+          _tag: 'Completed',
+          completion: {
+            yieldTarget: 'user',
+            feedback: [],
+          },
         },
         inputTokens: null,
         outputTokens: null,
@@ -76,7 +79,7 @@ describe('Event Serialization', () => {
       const deserialized = JSON.parse(serialized) as AppEvent
       
       expect(deserialized).toEqual(event)
-      expect(deserialized.result.success).toBe(true)
+      expect(deserialized.outcome._tag).toBe('Completed')
     })
 
     test('serializes and deserializes fork events', () => {
@@ -331,16 +334,15 @@ describe('Event Serialization', () => {
 
     test('handles turn failure results', () => {
       const event: AppEvent = {
-        type: 'turn_completed',
+        type: 'turn_outcome',
         forkId: null,
         turnId: 'turn-1',
         chainId: 'chain-1',
         strategyId: 'xml-act',
 
         result: {
-          success: false,
-          error: 'Syntax error',
-          cancelled: false
+          _tag: 'SystemError',
+          message: 'Syntax error',
         },
         inputTokens: null,
         outputTokens: null,
@@ -351,9 +353,9 @@ describe('Event Serialization', () => {
       }
 
       const deserialized = JSON.parse(JSON.stringify(event)) as AppEvent
-      expect(deserialized.result.success).toBe(false)
-      if (!deserialized.result.success) {
-        expect(deserialized.result.error).toBe('Syntax error')
+      expect(deserialized.outcome._tag).toBe('SystemError')
+      if (deserialized.outcome._tag === 'SystemError') {
+        expect(deserialized.outcome.message).toBe('Syntax error')
       }
     })
   })

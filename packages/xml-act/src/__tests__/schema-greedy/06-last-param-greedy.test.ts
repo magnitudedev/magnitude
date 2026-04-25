@@ -2,7 +2,7 @@
  * Category 6: Last-Parameter Deep Greedy Matching
  *
  * When we know with certainty this is the last parameter (all N slots consumed),
- * confirmation deepens: </parameter> + ws + </invoke> + ws + < (next top-level tag).
+ * confirmation deepens: </magnitude:parameter> + ws + </magnitude:invoke> + ws + < (next top-level tag).
  * This is the strongest possible signal.
  */
 import { describe, it, expect } from 'vitest'
@@ -17,95 +17,95 @@ const v = () => grammarValidator()
 describe('last-parameter deep greedy matching', () => {
   // ---- Confirmed ----
 
-  it('01: last param (1/1 shell) confirmed by </parameter></invoke><', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls -la</parameter></invoke><${YIELD.slice(1)}`
+  it('01: last param (1/1 shell) confirmed by </magnitude:parameter></magnitude:invoke><', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls -la</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls -la')
   })
 
-  it('02: last param (3/3 edit) confirmed by </parameter></invoke><', () => {
-    const input = `<invoke tool="edit">\n<parameter name="path">f</parameter><parameter name="old">x</parameter><parameter name="new">y</parameter></invoke><${YIELD.slice(1)}`
+  it('02: last param (3/3 edit) confirmed by </magnitude:parameter></magnitude:invoke><', () => {
+    const input = `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:parameter><magnitude:parameter name="old">x</magnitude:parameter><magnitude:parameter name="new">y</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))).toEqual({ path: 'f', old: 'x', new: 'y' })
   })
 
-  it('03: last param with ws between </parameter> and </invoke>', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter> </invoke><${YIELD.slice(1)}`
+  it('03: last param with ws between </magnitude:parameter> and </magnitude:invoke>', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter> </magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls')
   })
 
-  it('04: last param with \\n between </parameter> and </invoke>', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter>\n</invoke><${YIELD.slice(1)}`
+  it('04: last param with \\n between </magnitude:parameter> and </magnitude:invoke>', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls')
   })
 
-  it('05: last param with ws between </invoke> and next tag', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke> <${YIELD.slice(1)}`
+  it('05: last param with ws between </magnitude:invoke> and next tag', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke> <${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls')
   })
 
-  it('06: last param with \\n between </invoke> and next tag', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke>\n<${YIELD.slice(1)}`
+  it('06: last param with \\n between </magnitude:invoke> and next tag', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>\n<${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls')
   })
 
   it('07: last param empty body', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command"></parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('')
   })
 
   it('08: last param body is only whitespace', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">   </parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">   </magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
   })
 
   // ---- False closes absorbed ----
 
-  it('09: false </parameter> in last param content', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">echo </parameter>; ls</parameter></invoke><${YIELD.slice(1)}`
+  it('09: false </magnitude:parameter> in last param content', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo </magnitude:parameter>; ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('echo </parameter>; ls')
+    expect(getToolInput(parse(input))?.command).toBe('echo </magnitude:parameter>; ls')
   })
 
-  it('10: false </parameter></invoke> in content (no < after)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">text</parameter></invoke>MORE text</parameter></invoke><${YIELD.slice(1)}`
+  it('10: false </magnitude:parameter></magnitude:invoke> in content (no < after)', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke>MORE text</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('text</parameter></invoke>MORE text')
+    expect(getToolInput(parse(input))?.command).toBe('text</magnitude:parameter></magnitude:invoke>MORE text')
   })
 
-  it('11: false </parameter></invoke> followed by \\n (not <)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">text</parameter></invoke>\nmore</parameter></invoke><${YIELD.slice(1)}`
+  it('11: false </magnitude:parameter></magnitude:invoke> followed by \\n (not <)', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke>\nmore</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toContain('text')
   })
 
-  it('12: false </parameter></invoke> followed by space (not <)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">text</parameter></invoke> still content</parameter></invoke><${YIELD.slice(1)}`
+  it('12: false </magnitude:parameter></magnitude:invoke> followed by space (not <)', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke> still content</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toContain('text</parameter></invoke> still content')
+    expect(getToolInput(parse(input))?.command).toContain('text</magnitude:parameter></magnitude:invoke> still content')
   })
 
-  it('13: content is exactly </parameter></invoke> (needs real close after)', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command"></parameter></invoke>!</parameter></invoke><${YIELD.slice(1)}`
+  it('13: content is exactly </magnitude:parameter></magnitude:invoke> (needs real close after)', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke>!</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</parameter></invoke>!')
+    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke>!')
   })
 
-  it('14: multiple false </parameter></invoke> sequences', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command"></parameter></invoke>a</parameter></invoke>b</parameter></invoke><${YIELD.slice(1)}`
+  it('14: multiple false </magnitude:parameter></magnitude:invoke> sequences', () => {
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke>a</magnitude:parameter></magnitude:invoke>b</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</parameter></invoke>a</parameter></invoke>b')
+    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke>a</magnitude:parameter></magnitude:invoke>b')
   })
 
   // ---- Last param still allows filter ----
 
   it('15: last param slot but filter follows instead', () => {
-    const input = `<invoke tool="shell">\n<parameter name="command">ls</parameter><filter>$.stdout</filter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter><magnitude:filter>$.stdout</magnitude:filter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(getToolInput(parse(input))?.command).toBe('ls')
   })
@@ -114,8 +114,8 @@ describe('last-parameter deep greedy matching', () => {
 
   it('16: two invokes, each with last-param deep confirmation', () => {
     const input =
-      `<invoke tool="shell">\n<parameter name="command">ls</parameter></invoke>` +
-      `<invoke tool="shell">\n<parameter name="command">pwd</parameter></invoke><${YIELD.slice(1)}`
+      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>` +
+      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     const inputs = getToolInputs(parse(input))
     expect(inputs.length).toBe(2)
@@ -127,13 +127,13 @@ describe('last-parameter deep greedy matching', () => {
 
   it('17: 4/4 grep params, last gets deep confirmation', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
-    const input = `<invoke tool="grep">\n<parameter name="pattern">TODO</parameter><parameter name="glob">*.ts</parameter><parameter name="path">src</parameter><parameter name="limit">10</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">TODO</magnitude:parameter><magnitude:parameter name="glob">*.ts</magnitude:parameter><magnitude:parameter name="path">src</magnitude:parameter><magnitude:parameter name="limit">10</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     gv.passes(input)
   })
 
-  it('18: false </parameter></invoke> in 4th param of grep', () => {
+  it('18: false </magnitude:parameter></magnitude:invoke> in 4th param of grep', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
-    const input = `<invoke tool="grep">\n<parameter name="pattern">a</parameter><parameter name="glob">b</parameter><parameter name="path">c</parameter><parameter name="limit">text</parameter></invoke>NOT_LT more</parameter></invoke><${YIELD.slice(1)}`
+    const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">a</magnitude:parameter><magnitude:parameter name="glob">b</magnitude:parameter><magnitude:parameter name="path">c</magnitude:parameter><magnitude:parameter name="limit">text</magnitude:parameter></magnitude:invoke>NOT_LT more</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
     gv.passes(input)
   })
 })
