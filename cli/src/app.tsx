@@ -157,6 +157,12 @@ function AppInner({
   const storage = useStorage()
   const { state: providerUiState, reload: reloadProviderState } = useProviderUiState()
   const { client, workspacePath, send: clientSend, ensureReady: ensureClientReady, setFactory: setClientFactory, setClient: setLazyClient } = useLazyClient()
+
+  const reloadProviderAndConfig = useCallback(async () => {
+    await reloadProviderState()
+    await client?.refreshConfig()
+  }, [reloadProviderState, client])
+
   const [display, setDisplay] = useState<DisplayState | null>(null)
   const [toolState, setToolState] = useState<ToolStateProjectionState | null>(null)
   const [agentStatusState, setAgentStatusState] = useState<AgentStatusState | null>(null)
@@ -945,9 +951,9 @@ function AppInner({
     })
     setSlotModels(prev => ({ ...prev, [selectingModelFor]: selection }))
 
-    await reloadProviderState()
+    await reloadProviderAndConfig()
     setSelectingModelFor(null)
-  }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderState, storage])
+  }, [selectingModelFor, providerUiState, providerRuntime, reloadProviderAndConfig, storage])
 
   const applySlotModelMap = useCallback(async (models: Preset['models']) => {
     for (const slot of MAGNITUDE_SLOTS) {
@@ -965,8 +971,8 @@ function AppInner({
       MAGNITUDE_SLOTS.map((slot) => [slot, models[slot] ?? null])
     ) as Record<MagnitudeSlot, ModelSelection | null>
     setSlotModels(slotMap)
-    await reloadProviderState()
-  }, [providerRuntime, storage, reloadProviderState])
+    await reloadProviderAndConfig()
+  }, [providerRuntime, storage, reloadProviderAndConfig])
 
   const refreshPresets = useCallback(async () => {
     const loaded: Preset[] = await storage.config.getPresets()
@@ -1192,7 +1198,7 @@ function AppInner({
     onMessage: (msg) => showSystemMessage(msg),
     showEphemeral,
     theme,
-    reloadProviderState,
+    reloadProviderState: reloadProviderAndConfig,
   })
 
   // --- Setup wizard handlers ---
@@ -1224,7 +1230,7 @@ function AppInner({
       }
 
       await providerRuntime.catalog.refresh().catch(() => undefined)
-      await reloadProviderState().catch(() => undefined)
+      await reloadProviderAndConfig().catch(() => undefined)
 
       const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
       const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
@@ -1285,7 +1291,7 @@ function AppInner({
       // Multiple auth methods — show picker
       authFlow.openAuthMethodPicker(provider)
     }
-  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds, localProviderSet, storage, providerRuntime, reloadProviderState, slotModels])
+  }, [authFlow.startAuthForProvider, authFlow.openAuthMethodPicker, detectedProviders, connectedProviderIds, localProviderSet, storage, providerRuntime, reloadProviderAndConfig, slotModels])
 
   const finishWizard = useCallback(async () => {
     setShowSetupWizard(false)
@@ -1317,29 +1323,29 @@ function AppInner({
     setSlotModels(result)
 
     if (wizardNeedsChromium !== false) {
-      await reloadProviderState()
+      await reloadProviderAndConfig()
       setWizardStep('browser')
     } else {
       await storage.config.setSetupComplete(true)
-      await reloadProviderState()
+      await reloadProviderAndConfig()
       finishWizard()
     }
-  }, [authFlow.cancelAll, wizardNeedsChromium, finishWizard, providerUiState, providerRuntime, reloadProviderState, storage])
+  }, [authFlow.cancelAll, wizardNeedsChromium, finishWizard, providerUiState, providerRuntime, reloadProviderAndConfig, storage])
 
   const handleWizardBrowserComplete = useCallback(async () => {
     if (!providerUiState) return
     await storage.config.setSetupComplete(true)
-    await reloadProviderState()
+    await reloadProviderAndConfig()
     finishWizard()
-  }, [finishWizard, providerUiState, reloadProviderState, storage])
+  }, [finishWizard, providerUiState, reloadProviderAndConfig, storage])
 
   const handleWizardSkip = useCallback(async () => {
     if (!providerUiState) return
     authFlow.cancelAll()
     await storage.config.setSetupComplete(true)
-    await reloadProviderState()
+    await reloadProviderAndConfig()
     finishWizard()
-  }, [authFlow.cancelAll, finishWizard, providerUiState, reloadProviderState, storage])
+  }, [authFlow.cancelAll, finishWizard, providerUiState, reloadProviderAndConfig, storage])
 
   const handleWizardContinueFromLocalProvider = useCallback(() => {
     setWizardStep('models')
@@ -1407,11 +1413,11 @@ function AppInner({
       return { ...current, providers }
     })
 
-    await reloadProviderState()
+    await reloadProviderAndConfig()
     setProviderDetailSelectedIndex(0)
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(`Disconnected ${getProvider(providerId)?.name ?? providerId}`, theme.warning)
-  }, [slotModels, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderState, storage])
+  }, [slotModels, showEphemeral, theme.warning, providerUiState, providerRuntime, reloadProviderAndConfig, storage])
 
   const handleProviderDetailBack = useCallback(() => {
     setProviderDetailId(null)
@@ -1439,7 +1445,7 @@ function AppInner({
       handleProviderDisconnect(providerDetailId)
     } else if (action.type === 'retry-discovery') {
       void providerRuntime.catalog.refresh()
-        .then(() => reloadProviderState())
+        .then(() => reloadProviderAndConfig())
         .then(() => {
           setProviderRefreshKey(prev => prev + 1)
           showEphemeral(`Discovery refreshed for ${getProvider(providerDetailId)?.name ?? providerDetailId}`, theme.success)
@@ -1456,7 +1462,7 @@ function AppInner({
         authFlow.startAuthForProvider(provider, action.methodIndex)
       }
     }
-  }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider, providerRuntime, reloadProviderState, showEphemeral, theme.success, theme.warning])
+  }, [providerDetailId, providerDetailActions, handleProviderUpdateKey, handleProviderDisconnect, authFlow.startAuthForProvider, providerRuntime, reloadProviderAndConfig, showEphemeral, theme.success, theme.warning])
 
 
   const handleLocalProviderSaveEndpoint = useCallback(async (providerId: string, url: string) => {
@@ -1477,7 +1483,7 @@ function AppInner({
       }
     })
     await providerRuntime.catalog.refresh().catch(() => undefined)
-    await reloadProviderState().catch(() => undefined)
+    await reloadProviderAndConfig().catch(() => undefined)
     const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
     if (wizardSelectedProviderId === providerId) {
       const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
@@ -1493,11 +1499,11 @@ function AppInner({
     }
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(localProviderSavedEndpointToast(getProvider(providerId)?.name ?? providerId), theme.success)
-  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success, wizardSelectedProviderId])
+  }, [storage, providerRuntime, reloadProviderAndConfig, showEphemeral, theme.success, wizardSelectedProviderId])
 
   const handleLocalProviderRefreshModels = useCallback(async (providerId: string) => {
     await providerRuntime.catalog.refresh().catch(() => undefined)
-    await reloadProviderState().catch(() => undefined)
+    await reloadProviderAndConfig().catch(() => undefined)
     const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
     if (wizardSelectedProviderId === providerId) {
       const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
@@ -1512,7 +1518,7 @@ function AppInner({
       setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
     }
     setProviderRefreshKey(prev => prev + 1)
-  }, [providerRuntime, reloadProviderState, storage, wizardSelectedProviderId])
+  }, [providerRuntime, reloadProviderAndConfig, storage, wizardSelectedProviderId])
 
   const handleLocalProviderAddManualModel = useCallback(async (providerId: string, modelId: string) => {
     const trimmed = modelId.trim()
@@ -1533,7 +1539,7 @@ function AppInner({
       }
     })
     await providerRuntime.catalog.refresh().catch(() => undefined)
-    await reloadProviderState().catch(() => undefined)
+    await reloadProviderAndConfig().catch(() => undefined)
     const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
     if (wizardSelectedProviderId === providerId) {
       const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
@@ -1549,7 +1555,7 @@ function AppInner({
     }
     setProviderRefreshKey(prev => prev + 1)
     showEphemeral(localProviderAddedModelToast(trimmed), theme.success)
-  }, [storage, providerRuntime, reloadProviderState, showEphemeral, theme.success, wizardSelectedProviderId])
+  }, [storage, providerRuntime, reloadProviderAndConfig, showEphemeral, theme.success, wizardSelectedProviderId])
 
   const handleLocalProviderRemoveManualModel = useCallback(async (providerId: string, modelId: string) => {
     await storage.config.updateFull((current) => {
@@ -1568,7 +1574,7 @@ function AppInner({
       }
     })
     await providerRuntime.catalog.refresh().catch(() => undefined)
-    await reloadProviderState().catch(() => undefined)
+    await reloadProviderAndConfig().catch(() => undefined)
     const latestOptions = await storage.config.getProviderOptions(providerId).catch(() => null)
     if (wizardSelectedProviderId === providerId) {
       const discoveredModels = Array.isArray((latestOptions as any)?.discoveredModels)
@@ -1583,7 +1589,7 @@ function AppInner({
       setWizardSelectedProviderRememberedModelIds(rememberedModelIds)
     }
     setProviderRefreshKey(prev => prev + 1)
-  }, [storage, providerRuntime, reloadProviderState, wizardSelectedProviderId])
+  }, [storage, providerRuntime, reloadProviderAndConfig, wizardSelectedProviderId])
 
   const handleLocalProviderSaveOptionalApiKey = useCallback(async (providerId: string, apiKey: string) => {
     const trimmed = apiKey.trim()
@@ -1594,9 +1600,9 @@ function AppInner({
       await storage.auth.set(providerId, { type: 'api', key: trimmed })
       showEphemeral(localProviderSavedApiKeyToast(getProvider(providerId)?.name ?? providerId), theme.success)
     }
-    await reloadProviderState().catch(() => undefined)
+    await reloadProviderAndConfig().catch(() => undefined)
     setProviderRefreshKey(prev => prev + 1)
-  }, [storage, reloadProviderState, showEphemeral, theme.success])
+  }, [storage, reloadProviderAndConfig, showEphemeral, theme.success])
 
   const handleChangeSlot = useCallback((slot: MagnitudeSlot) => {
     resetModelPickerState()
@@ -1903,11 +1909,11 @@ function AppInner({
 
   const onWizardCtrlCExit = useCallback(() => {
     if (providerUiState) {
-      void storage.config.setSetupComplete(true).then(() => reloadProviderState())
+      void storage.config.setSetupComplete(true).then(() => reloadProviderAndConfig())
     }
     authFlow.cancelAll()
     process.kill(process.pid, 'SIGINT')
-  }, [providerUiState, storage, reloadProviderState, authFlow])
+  }, [providerUiState, storage, reloadProviderAndConfig, authFlow])
 
   const onSettingsClose = useCallback(() => {
     setSettingsTab(null)
