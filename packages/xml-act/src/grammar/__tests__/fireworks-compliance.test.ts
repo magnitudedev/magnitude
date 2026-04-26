@@ -39,7 +39,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
   describe('valid turns', () => {
     it('accepts simple shell invoke with yield', () => {
       v.passes(
-        '<magnitude:reason>I need to list files.</magnitude:reason>\n' +
+        '<magnitude:think>I need to list files.</magnitude:think>\n' +
         '<magnitude:invoke tool="shell"><magnitude:parameter name="command">ls -la</magnitude:parameter></magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
       )
@@ -47,17 +47,17 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
 
     it('accepts canonical shell invoke with parameter tag', () => {
       v.passes(
-        '<magnitude:reason>I need to list files.</magnitude:reason>\n' +
+        '<magnitude:think>I need to list files.</magnitude:think>\n' +
         '<magnitude:invoke tool="shell"><magnitude:parameter name="command">ls -la</magnitude:parameter></magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
       )
     })
 
-    it('accepts multiple reason tags then tools then yield', () => {
+    it('accepts multiple think tags then tools then yield', () => {
       v.passes(
-        '<magnitude:reason about="alignment">\nUser approved the plan.\n</magnitude:reason>\n' +
-        '<magnitude:reason about="tasks">\nCreate tasks for each phase.\n</magnitude:reason>\n' +
-        '<magnitude:reason about="turn">\nI will create the phase tasks.\n</magnitude:reason>\n' +
+        '<magnitude:think about="alignment">\nUser approved the plan.\n</magnitude:think>\n' +
+        '<magnitude:think about="tasks">\nCreate tasks for each phase.\n</magnitude:think>\n' +
+        '<magnitude:think about="turn">\nI will create the phase tasks.\n</magnitude:think>\n' +
         '<magnitude:message to="user">\nStarting the build now.\n</magnitude:message>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="id">phase1</magnitude:parameter>\n' +
@@ -71,7 +71,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
 
     it('accepts multiple create_task invocations', () => {
       v.passes(
-        '<magnitude:reason about="alignment">Planning.</magnitude:reason>\n' +
+        '<magnitude:think about="alignment">Planning.</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="id">phase1</magnitude:parameter>\n' +
         '<magnitude:parameter name="type">implementation</magnitude:parameter>\n' +
@@ -92,7 +92,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
   describe('empty bodies - should these be rejected?', () => {
     it('should reject empty shell alias body', () => {
       v.rejects(
-        '<magnitude:reason>thinking</magnitude:reason>\n' +
+        '<magnitude:think>thinking</magnitude:think>\n' +
         '<magnitude:shell></magnitude:shell>\n' +
         '<magnitude:yield_invoke/>'
       )
@@ -100,7 +100,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
 
     it('should reject empty invoke body with no parameters', () => {
       v.rejects(
-        '<magnitude:reason>thinking</magnitude:reason>\n' +
+        '<magnitude:think>thinking</magnitude:think>\n' +
         '<magnitude:invoke tool="shell"></magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
       )
@@ -110,7 +110,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
   describe('malformed tags - should be rejected', () => {
     it('should reject malformed parameter attribute (missing = and quote)', () => {
       v.rejects(
-        '<magnitude:reason about="alignment">\nUser approved.\n</magnitude:reason>\n' +
+        '<magnitude:think about="alignment">\nUser approved.\n</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="id">phase3</magnitude:parameter>\n' +
         '<magnitude:parameter name">Phase 3: Board</magnitude:parameter>\n' +
@@ -121,7 +121,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
 
     it('should reject unknown parameter names', () => {
       v.rejects(
-        '<magnitude:reason>thinking</magnitude:reason>\n' +
+        '<magnitude:think>thinking</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="bogus">value</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -131,7 +131,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
 
     it('should reject unknown tool names', () => {
       v.rejects(
-        '<magnitude:reason>thinking</magnitude:reason>\n' +
+        '<magnitude:think>thinking</magnitude:think>\n' +
         '<magnitude:invoke tool="nonexistent">\n' +
         '</magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
@@ -142,14 +142,14 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
   describe('yield termination', () => {
     it('accepts yield_user', () => {
       v.passes(
-        '<magnitude:reason>Done.</magnitude:reason>\n' +
+        '<magnitude:think>Done.</magnitude:think>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
     it('accepts yield_invoke', () => {
       v.passes(
-        '<magnitude:reason>Running tools.</magnitude:reason>\n' +
+        '<magnitude:think>Running tools.</magnitude:think>\n' +
         '<magnitude:invoke tool="shell"><magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
       )
@@ -157,7 +157,7 @@ describe('grammar compliance - Fireworks reproduction cases', () => {
 
     it('rejects turn with no yield', () => {
       v.rejects(
-        '<magnitude:reason>thinking</magnitude:reason>\n' +
+        '<magnitude:think>thinking</magnitude:think>\n' +
         '<magnitude:invoke tool="shell"><magnitude:parameter name="command">ls</magnitude:parameter></magnitude:invoke>'
       )
     })

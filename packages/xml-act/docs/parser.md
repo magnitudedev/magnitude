@@ -22,7 +22,7 @@ graph LR
 
 ## Context-Sensitive Resolution
 
-The core problem: the same tag name means different things in different contexts. `<parameter>` is structural inside an invoke, but literal text inside a reason block or prose.
+The core problem: the same tag name means different things in different contexts. `<parameter>` is structural inside an invoke, but literal text inside a think block or prose.
 
 Resolution is split into three functions that check the current top frame:
 
@@ -36,7 +36,7 @@ This is **correct by construction**: resolution checks the frame type before ret
 
 | Context (top frame) | Structural tags | Everything else |
 |---------------------|----------------|-----------------|
-| Prose | reason, message, invoke, yield_* | Literal text |
+| Prose | think, message, invoke, yield_* | Literal text |
 | Reason | — | Literal text |
 | Message | — | Literal text |
 | Invoke | parameter, filter | Literal text |
@@ -137,7 +137,7 @@ The stack is resolved when the **next token** arrives:
 
 ### Greedy Last-Match
 
-For content frames (parameter, filter, reason, message), the grammar uses a recursive greedy body:
+For content frames (parameter, filter, think, message), the grammar uses a recursive greedy body:
 
 ```
 body ::= buc (close buc)* close continuation
@@ -155,7 +155,7 @@ When `</parameter></invoke>` appears together (as with the last parameter of an 
 
 - For **invoke frames**: any `<parameter>` or `<filter>` open confirms.
 - For **parameter/filter frames**: `<parameter>` or `<filter>` (next sibling) confirms, as does `</invoke>` (cascade).
-- For **top-level frames** (reason, message): any Open tag confirms, since the grammar confirms on `<`.
+- For **top-level frames** (think, message): any Open tag confirms, since the grammar confirms on `<`.
 
 For parameter frames, `isValidContinuation` additionally validates that the incoming parameter name is present in the tool's schema. An unrecognized param name does not confirm — it is treated as content. This prevents false confirmation from self-referential LLM output that happens to contain a valid-looking open tag with a nonsense name.
 

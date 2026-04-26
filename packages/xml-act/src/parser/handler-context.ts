@@ -51,7 +51,7 @@ export interface HandlerContext {
 
   /**
    * Tool registry and schema access for invoke-related handlers.
-   * Reason, message, and prose handlers do not use this.
+   * Think, message, and prose handlers do not use this.
    */
   invokeCtx: InvokeContext
 }

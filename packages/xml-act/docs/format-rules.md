@@ -22,7 +22,7 @@ The grammar constrains LLM generation to prevent invalid output. The parser inte
 
 ### 1.3 Fail Fast, Preserve Content
 
-When the parser encounters invalid `magnitude:` markup, it emits a structural error immediately. In body contexts (message, reason, parameter, filter), the raw text of the invalid tag is preserved as content so downstream consumers can still see what the model intended. In invoke context, invalid subtrees are silently discarded to avoid corrupting tool call structure.
+When the parser encounters invalid `magnitude:` markup, it emits a structural error immediately. In body contexts (message, think, parameter, filter), the raw text of the invalid tag is preserved as content so downstream consumers can still see what the model intended. In invoke context, invalid subtrees are silently discarded to avoid corrupting tool call structure.
 
 ---
 
@@ -31,16 +31,16 @@ When the parser encounters invalid `magnitude:` markup, it emits a structural er
 A turn follows a strict phase ordering:
 
 1. **Optional leading whitespace**
-2. **Zero or more reason blocks** (thinking/reasoning)
+2. **Zero or more think blocks** (thinking/reasoning)
 3. **Zero or more message and invoke blocks** (interleaved in any order)
 4. **Exactly one yield** (turn termination)
 
-Once a message or invoke appears, no further reason blocks are allowed. This is enforced by the grammar.
+Once a message or invoke appears, no further think blocks are allowed. This is enforced by the grammar.
 
-### 2.1 Reason
+### 2.1 Think
 
 ```
-<magnitude:reason name="...">body</magnitude:reason>
+<magnitude:think name="...">body</magnitude:think>
 ```
 
 - The `name` attribute labels the reasoning lens.
@@ -97,7 +97,7 @@ The canonical structural vocabulary:
 
 | Tag | Context | Purpose |
 |---|---|---|
-| `magnitude:reason` | Prose | Thinking/reasoning block |
+| `magnitude:think` | Prose | Thinking/reasoning block |
 | `magnitude:message` | Prose | Message to a recipient |
 | `magnitude:invoke` | Prose | Tool invocation |
 | `magnitude:parameter` | Invoke | Tool parameter |
@@ -154,7 +154,7 @@ In all body contexts, body scanning stops at any `</magnitude:*>` prefix, not ju
 
 ### 4.2 Invalid `magnitude:` Opens in Bodies
 
-Any `magnitude:`-prefixed open tag inside a body (reason, message, parameter, filter) is an `InvalidMagnitudeOpen` error. The raw tag text is preserved as content in the body.
+Any `magnitude:`-prefixed open tag inside a body (think, message, parameter, filter) is an `InvalidMagnitudeOpen` error. The raw tag text is preserved as content in the body.
 
 Examples of invalid opens:
 - `<magnitude:invoke>` inside a message body
@@ -166,7 +166,7 @@ Examples of invalid opens:
 
 Inside an invoke frame, only `<magnitude:parameter>` (or valid parameter aliases) and `<magnitude:filter>` are valid children. Everything else is `InvalidMagnitudeOpen`, including:
 - `<magnitude:message>`
-- `<magnitude:reason>`
+- `<magnitude:think>`
 - `<magnitude:invoke>` (nested)
 - Unknown `magnitude:` tags
 - Tool aliases or parameter aliases from other tools
@@ -213,11 +213,11 @@ Examples:
 
 ```
 <magnitude:message>hello
-</magnitude:reason>
+</magnitude:think>
 <magnitude:yield_user/>
 ```
 
-The mismatched `</magnitude:reason>` is treated as closing the message.
+The mismatched `</magnitude:think>` is treated as closing the message.
 
 ```
 <magnitude:parameter name="command">echo hi
@@ -232,10 +232,10 @@ The mismatched `</magnitude:filter>` is treated as closing the parameter, and th
 If a mismatched close appears on the same line as preceding content:
 
 ```
-<magnitude:message>hello</magnitude:reason> world</magnitude:message>
+<magnitude:message>hello</magnitude:think> world</magnitude:message>
 ```
 
-The `</magnitude:reason>` is on the same line as `hello`. This is ambiguous — it could be a typo or intentional content. The grammar rejects this input. The parser emits `AmbiguousMagnitudeClose` and preserves the raw close as content.
+The `</magnitude:think>` is on the same line as `hello`. This is ambiguous — it could be a typo or intentional content. The grammar rejects this input. The parser emits `AmbiguousMagnitudeClose` and preserves the raw close as content.
 
 A mismatch is also rejected when non-whitespace content follows without a newline, or when a following close does not form a valid cascade. In those cases the raw close is dumped as content and `AmbiguousMagnitudeClose` is emitted.
 

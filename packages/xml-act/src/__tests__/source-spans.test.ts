@@ -379,8 +379,8 @@ describe('parser error spans', () => {
   })
 
   describe('UnclosedThink', () => {
-    it('points at the reason open tag', () => {
-      const input = '<magnitude:reason about="test">some thinking'
+    it('points at the think open tag', () => {
+      const input = '<magnitude:think about="test">some thinking'
       const events = parse(input)
       const err = findStructuralError(events, 'UnclosedThink')
       expect(err).toBeDefined()
@@ -389,8 +389,8 @@ describe('parser error spans', () => {
       expect(err!.error.primarySpan!.start.col).toBe(1)
     })
 
-    it('reason on later line points at correct line', () => {
-      const input = 'some prose\n<magnitude:reason about="test">unclosed thinking'
+    it('think on later line points at correct line', () => {
+      const input = 'some prose\n<magnitude:think about="test">unclosed thinking'
       const events = parse(input)
       const err = findStructuralError(events, 'UnclosedThink')
       expect(err).toBeDefined()

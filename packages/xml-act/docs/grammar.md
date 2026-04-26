@@ -6,7 +6,7 @@ The grammar constrains LLM output during inference so that every generated turn 
 
 A turn consists of zero or more reasoning blocks, followed by zero or more messages or tool invocations, followed by exactly one yield token. Reasoning blocks must come before messages and invocations — once a message or invocation appears, no further reasoning blocks are allowed.
 
-<reason about="...">...</reason>
+<think about="...">...</think>
 <message to="...">...</message>
 <invoke tool="...">
   <parameter name="...">value</parameter>
@@ -24,7 +24,7 @@ This is hard because the close tag sequence is just bytes — there's nothing sy
 
 ## Greedy Last-Match
 
-All body types — `reason`, `message`, `parameter`, `filter` — use a single unified strategy: **greedy last-match via recursive repetition**.
+All body types — `think`, `message`, `parameter`, `filter` — use a single unified strategy: **greedy last-match via recursive repetition**.
 
 The grammar defines every body as:
 
@@ -93,12 +93,12 @@ This mirrors the grammar's `(CLOSE buc)*` repetition at the semantic level. See 
 
 ## Phase Enforcement
 
-The ordering constraint — reasons before messages and invocations — is enforced structurally through two sets of continuation rules:
+The ordering constraint — think blocks before messages and invocations — is enforced structurally through two sets of continuation rules:
 
-- **Lens phase** continuations allow `<reason>`, `<message>`, `<invoke`, and yield as valid next elements. Reason bodies chain back to the lens phase, so multiple consecutive reasons are allowed.
-- **Post-lens phase** continuations allow only `<message>`, `<invoke`, and yield. Once a message or invocation appears, all subsequent continuations use this phase. `<reason>` is simply not a valid option.
+- **Lens phase** continuations allow `<think>`, `<message>`, `<invoke`, and yield as valid next elements. Think bodies chain back to the lens phase, so multiple consecutive thinks are allowed.
+- **Post-lens phase** continuations allow only `<message>`, `<invoke`, and yield. Once a message or invocation appears, all subsequent continuations use this phase. `<think>` is simply not a valid option.
 
-This means the ordering constraint is a structural guarantee of the grammar, not a runtime check. Under constrained decoding, the model physically cannot produce a reasoning block after a message.
+This means the ordering constraint is a structural guarantee of the grammar, not a runtime check. Under constrained decoding, the model physically cannot produce a think block after a message.
 
 ## Invoke Nesting and Deep Confirmation
 
@@ -124,9 +124,9 @@ Grammar size is driven by the number of tools and their parameters. Each tool co
 
 Adding a tool with N parameters adds O(N) rules to the grammar. Grammar size scales linearly with total parameter count across all tools.
 
-BUC DFAs are **shared** across all tools — there are only four: `param-buc`, `filter-buc`, `reason-buc`, and `msg-buc`. Each has O(L) alternatives where L is the close tag length.
+BUC DFAs are **shared** across all tools — there are only four: `param-buc`, `filter-buc`, `think-buc`, and `msg-buc`. Each has O(L) alternatives where L is the close tag length.
 
-Top-level tag types (`reason`, `message`) each contribute one body rule chaining to their respective continuation. Yield tags contribute one alternative each. The `maxLenses` protocol option (bounded lens counting) adds one body rule per lens slot, which is the only source of grammar growth independent of tool count.
+Top-level tag types (`think`, `message`) each contribute one body rule chaining to their respective continuation. Yield tags contribute one alternative each. The `maxLenses` protocol option (bounded lens counting) adds one body rule per lens slot, which is the only source of grammar growth independent of tool count.
 
 ## Whitespace Strategy
 
@@ -139,9 +139,9 @@ Whitespace after a close tag and before the next element is handled by the `ws` 
 The grammar entry point varies based on protocol options:
 
 - **`minLenses: 0`** — the chain starts in the lens phase; the model may immediately produce a message, invocation, or yield.
-- **`minLenses: 1`** — the first element is forced to be a reasoning block. After it, the lens phase continues normally.
+- **`minLenses: 1`** — the first element is forced to be a think block. After it, the lens phase continues normally.
 - **`requiredMessageTo`** — a forced-message phase is inserted between the lens phase and the post-lens phase. The model must produce a specific message before any free messages or invocations.
-- **`maxLenses`** — generates multiple lens-phase variants, each allowing one fewer reasoning block, counting down to zero. This is the only protocol option that significantly increases grammar size independent of tool schema.
+- **`maxLenses`** — generates multiple lens-phase variants, each allowing one fewer think block, counting down to zero. This is the only protocol option that significantly increases grammar size independent of tool schema.
 
 ## Limitations
 

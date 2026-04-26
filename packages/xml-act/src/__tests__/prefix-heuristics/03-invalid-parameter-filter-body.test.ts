@@ -45,9 +45,9 @@ describe('prefix heuristics: invalid parameter/filter body', () => {
       parentTagName: 'magnitude:filter',
     },
     {
-      label: '07: reason open inside filter body',
-      input: '<magnitude:invoke tool="shell"><magnitude:filter>pre <magnitude:reason>x</magnitude:reason> post</magnitude:filter></magnitude:invoke><magnitude:yield_user/>',
-      raw: '<magnitude:reason>',
+      label: '07: think open inside filter body',
+      input: '<magnitude:invoke tool="shell"><magnitude:filter>pre <magnitude:think>x</magnitude:think> post</magnitude:filter></magnitude:invoke><magnitude:yield_user/>',
+      raw: '<magnitude:think>',
       parentTagName: 'magnitude:filter',
     },
     {

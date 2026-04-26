@@ -45,9 +45,9 @@ function joinContent(tokens: any[]): string {
 // ---------------------------------------------------------------------------
 
 describe('Open tags', () => {
-  it('parses <magnitude:reason about="turn">', () => {
-    const tokens = collect('<magnitude:reason about="turn">')
-    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:reason', attrs: { about: 'turn' } }])
+  it('parses <magnitude:think about="turn">', () => {
+    const tokens = collect('<magnitude:think about="turn">')
+    expect(tokens).toEqual([{ _tag: 'Open', name: 'magnitude:think', attrs: { about: 'turn' } }])
   })
 
   it('parses <magnitude:message to="user">', () => {
@@ -89,9 +89,9 @@ describe('Open tags', () => {
 // ---------------------------------------------------------------------------
 
 describe('Close tags', () => {
-  it('parses </magnitude:reason>', () => {
-    const tokens = collect('\n</magnitude:reason>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
+  it('parses </magnitude:think>', () => {
+    const tokens = collect('\n</magnitude:think>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:think')).toBe(true)
   })
 
   it('parses </magnitude:message>', () => {
@@ -179,26 +179,26 @@ describe('Attribute parsing', () => {
 
 describe('Close-tag confirmation', () => {
   it('confirms close tag followed by newline', () => {
-    const tokens = collect('content\n</magnitude:reason>\n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
+    const tokens = collect('content\n</magnitude:think>\n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:think')).toBe(true)
   })
 
   it('confirms close tag followed by next open tag', () => {
-    const tokens = collect('content\n</magnitude:reason><magnitude:message to="user">')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
+    const tokens = collect('content\n</magnitude:think><magnitude:message to="user">')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:think')).toBe(true)
     expect(tokens.some(t => t._tag === 'Open' && t.name === 'magnitude:message')).toBe(true)
   })
 
   it('confirms close tag with whitespace then newline', () => {
-    const tokens = collect('content\n</magnitude:reason>  \n')
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
+    const tokens = collect('content\n</magnitude:think>  \n')
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:think')).toBe(true)
   })
 
   it('close tag followed by prose — Close emitted immediately by tokenizer', () => {
     // Tokenizer emits Close immediately — parser decides if it's structural
-    const tokens = collect('content\n</magnitude:reason> some prose here')
+    const tokens = collect('content\n</magnitude:think> some prose here')
     // Tokenizer DOES emit a Close token (parser handles confirmation)
-    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:reason')).toBe(true)
+    expect(tokens.some(t => t._tag === 'Close' && t.name === 'magnitude:think')).toBe(true)
     // Prose text preserved as content
     expect(joinContent(tokens)).toContain('some prose here')
   })

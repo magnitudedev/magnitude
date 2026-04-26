@@ -53,11 +53,11 @@ describe('prose-to-message conversion', () => {
     expect((msgStart as any).to).toBe('parent')
   })
 
-  it('converts prose after reason block to message', async () => {
+  it('converts prose after think block to message', async () => {
     const NL = String.fromCharCode(10)
-    const input = '<magnitude:reason about="test">' + NL +
+    const input = '<magnitude:think about="test">' + NL +
       'Some thinking.' + NL +
-      '</magnitude:reason>' + NL + NL +
+      '</magnitude:think>' + NL + NL +
       'Let me help you with that.' + NL + NL +
       '<magnitude:yield_user/>'
 

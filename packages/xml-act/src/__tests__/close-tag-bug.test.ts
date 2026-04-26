@@ -49,8 +49,8 @@ describe('unknown tags in content', () => {
   })
 
   it('tokenRaw for Close reconstructs as </name>', () => {
-    const token: Token = { _tag: 'Close', span: ZERO_SPAN, tagName: 'reason', afterNewline: false }
-    expect(tokenRaw(token)).toBe('</reason>')
+    const token: Token = { _tag: 'Close', span: ZERO_SPAN, tagName: 'think', afterNewline: false }
+    expect(tokenRaw(token)).toBe('</think>')
   })
 
   it('tokenRaw for Open reconstructs as <name attr="val">', () => {

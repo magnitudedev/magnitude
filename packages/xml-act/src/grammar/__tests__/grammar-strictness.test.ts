@@ -72,7 +72,7 @@ describe('grammar strictness', () => {
     describe('top-level tool opens', () => {
       it('accepts canonical invoke open', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
           '</magnitude:invoke>\n' +
@@ -82,7 +82,7 @@ describe('grammar strictness', () => {
 
       it('rejects tool alias open (shell)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:shell>\n' +
           '<magnitude:command>ls</magnitude:command>\n' +
           '</magnitude:shell>\n' +
@@ -92,7 +92,7 @@ describe('grammar strictness', () => {
 
       it('rejects tool alias open (edit)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:edit>\n' +
           '<magnitude:path>foo.ts</magnitude:path>\n' +
           '</magnitude:edit>\n' +
@@ -102,7 +102,7 @@ describe('grammar strictness', () => {
 
       it('rejects tool alias open (read)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:read>\n' +
           '<magnitude:path>foo.ts</magnitude:path>\n' +
           '</magnitude:read>\n' +
@@ -112,7 +112,7 @@ describe('grammar strictness', () => {
 
       it('rejects tool alias open (create_task)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:create_task>\n' +
           '<magnitude:id>t1</magnitude:id>\n' +
           '</magnitude:create_task>\n' +
@@ -124,7 +124,7 @@ describe('grammar strictness', () => {
     describe('parameter opens', () => {
       it('accepts canonical parameter open', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
           '</magnitude:invoke>\n' +
@@ -134,7 +134,7 @@ describe('grammar strictness', () => {
 
       it('rejects parameter alias open (command)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:command>ls</magnitude:command>\n' +
           '</magnitude:invoke>\n' +
@@ -144,7 +144,7 @@ describe('grammar strictness', () => {
 
       it('rejects parameter alias open (path)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="edit">\n' +
           '<magnitude:path>foo.ts</magnitude:path>\n' +
           '</magnitude:invoke>\n' +
@@ -156,7 +156,7 @@ describe('grammar strictness', () => {
     describe('invoke close must be canonical', () => {
       it('accepts canonical invoke close', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
           '</magnitude:invoke>\n' +
@@ -166,7 +166,7 @@ describe('grammar strictness', () => {
 
       it('accepts alias invoke close (</magnitude:shell>)', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
           '</magnitude:shell>\n' +
@@ -176,7 +176,7 @@ describe('grammar strictness', () => {
 
       it('accepts alias invoke close (</magnitude:edit>)', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="edit">\n' +
           '<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n' +
           '<magnitude:parameter name="old">a</magnitude:parameter>\n' +
@@ -195,7 +195,7 @@ describe('grammar strictness', () => {
     describe('empty tool bodies', () => {
       it('rejects empty invoke body (shell)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell"></magnitude:invoke>\n' +
           '<magnitude:yield_invoke/>'
         )
@@ -203,7 +203,7 @@ describe('grammar strictness', () => {
 
       it('rejects empty invoke body (create_task)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="create_task"></magnitude:invoke>\n' +
           '<magnitude:yield_invoke/>'
         )
@@ -211,7 +211,7 @@ describe('grammar strictness', () => {
 
       it('rejects empty invoke body (edit)', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="edit"></magnitude:invoke>\n' +
           '<magnitude:yield_invoke/>'
         )
@@ -219,7 +219,7 @@ describe('grammar strictness', () => {
 
       it('allows empty invoke body for zero-param tool (tree)', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="tree"></magnitude:invoke>\n' +
           '<magnitude:yield_invoke/>'
         )
@@ -229,7 +229,7 @@ describe('grammar strictness', () => {
     describe('partial required parameters', () => {
       it('rejects create_task with 1 of 4 params', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="create_task">\n' +
           '<magnitude:parameter name="id">t1</magnitude:parameter>\n' +
           '</magnitude:invoke>\n' +
@@ -239,7 +239,7 @@ describe('grammar strictness', () => {
 
       it('rejects create_task with 2 of 4 params', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="create_task">\n' +
           '<magnitude:parameter name="id">t1</magnitude:parameter>\n' +
           '<magnitude:parameter name="title">Task</magnitude:parameter>\n' +
@@ -250,7 +250,7 @@ describe('grammar strictness', () => {
 
       it('rejects create_task with 3 of 4 params', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="create_task">\n' +
           '<magnitude:parameter name="id">t1</magnitude:parameter>\n' +
           '<magnitude:parameter name="type">implement</magnitude:parameter>\n' +
@@ -262,7 +262,7 @@ describe('grammar strictness', () => {
 
       it('accepts create_task with all 4 params', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="create_task">\n' +
           '<magnitude:parameter name="id">t1</magnitude:parameter>\n' +
           '<magnitude:parameter name="type">implement</magnitude:parameter>\n' +
@@ -275,7 +275,7 @@ describe('grammar strictness', () => {
 
       it('rejects edit with 1 of 3 params', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="edit">\n' +
           '<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n' +
           '</magnitude:invoke>\n' +
@@ -285,7 +285,7 @@ describe('grammar strictness', () => {
 
       it('rejects edit with 2 of 3 params', () => {
         v.rejects(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="edit">\n' +
           '<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n' +
           '<magnitude:parameter name="old">old</magnitude:parameter>\n' +
@@ -296,7 +296,7 @@ describe('grammar strictness', () => {
 
       it('accepts edit with all 3 params', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="edit">\n' +
           '<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n' +
           '<magnitude:parameter name="old">old</magnitude:parameter>\n' +
@@ -308,7 +308,7 @@ describe('grammar strictness', () => {
 
       it('accepts shell with its one param', () => {
         v.passes(
-          '<magnitude:reason>r</magnitude:reason>\n' +
+          '<magnitude:think>r</magnitude:think>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
           '</magnitude:invoke>\n' +
@@ -324,7 +324,7 @@ describe('grammar strictness', () => {
   describe('greedy body: <magnitude: is always structural', () => {
     it('rejects <magnitude: inside parameter body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">echo <magnitude:foo>bar</magnitude:foo></magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -332,16 +332,16 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('rejects <magnitude: inside reason body', () => {
+    it('rejects <magnitude: inside think body', () => {
       v.rejects(
-        '<magnitude:reason>I want to use <magnitude:broken tag</magnitude:reason>\n' +
+        '<magnitude:think>I want to use <magnitude:broken tag</magnitude:think>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
     it('rejects <magnitude: inside message body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:message to="user">Here is <magnitude:something>weird</magnitude:something></magnitude:message>\n' +
         '<magnitude:yield_user/>'
       )
@@ -349,7 +349,7 @@ describe('grammar strictness', () => {
 
     it('rejects <magnitude: after false close in parameter body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">echo </magnitude:parameter> <magnitude:garbage>stuff</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -359,7 +359,7 @@ describe('grammar strictness', () => {
 
     it('rejects <magnitude: after false close in filter body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
         '<magnitude:filter>$.stdout </magnitude:filter> <magnitude:garbage>x</magnitude:filter>\n' +
@@ -375,7 +375,7 @@ describe('grammar strictness', () => {
   describe('malformed parameter attributes', () => {
     it('rejects parameter with missing = and quote (name">)', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="id">t1</magnitude:parameter>\n' +
         '<magnitude:parameter name">Phase 3</magnitude:parameter>\n' +
@@ -386,7 +386,7 @@ describe('grammar strictness', () => {
 
     it('rejects parameter with missing closing quote', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="id>t1</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -396,7 +396,7 @@ describe('grammar strictness', () => {
 
     it('rejects parameter with no name attribute', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter>t1</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -406,7 +406,7 @@ describe('grammar strictness', () => {
 
     it('rejects parameter with wrong attribute name', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter label="id">t1</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -421,7 +421,7 @@ describe('grammar strictness', () => {
   describe('unknown names', () => {
     it('rejects unknown tool name', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="nonexistent"></magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
       )
@@ -429,7 +429,7 @@ describe('grammar strictness', () => {
 
     it('rejects unknown parameter name', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="bogus">ls</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -444,7 +444,7 @@ describe('grammar strictness', () => {
   describe('first-close-wins strictness', () => {
     it('rejects false close followed by more text then real close in parameter body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">echo </magnitude:parameter> more text </magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -454,7 +454,7 @@ describe('grammar strictness', () => {
 
     it('rejects false close followed by HTML then real close in parameter body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">cat </magnitude:parameter> <div>html</div> </magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -462,16 +462,16 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('rejects multiple false closes then real close in reason body', () => {
+    it('rejects multiple false closes then real close in think body', () => {
       v.rejects(
-        '<magnitude:reason>The tag </magnitude:reason> is used for </magnitude:reason> reasoning</magnitude:reason>\n' +
+        '<magnitude:think>The tag </magnitude:think> is used for </magnitude:think> reasoning</magnitude:think>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
     it('rejects false close in message body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:message to="user">Use </magnitude:message> for messages</magnitude:message>\n' +
         '<magnitude:yield_user/>'
       )
@@ -484,7 +484,7 @@ describe('grammar strictness', () => {
   describe('escape removal', () => {
     it('rejects escape block in parameter body', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">echo <magnitude:escape><magnitude:foo/></magnitude:escape> done</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -492,9 +492,9 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('rejects escape block in reason body', () => {
+    it('rejects escape block in think body', () => {
       v.rejects(
-        '<magnitude:reason>Use <magnitude:escape><magnitude:invoke tool="x"></magnitude:escape> for tools</magnitude:reason>\n' +
+        '<magnitude:think>Use <magnitude:escape><magnitude:invoke tool="x"></magnitude:escape> for tools</magnitude:think>\n' +
         '<magnitude:yield_user/>'
       )
     })
@@ -504,9 +504,9 @@ describe('grammar strictness', () => {
   // 8. VALID COMPLETE TURNS — sanity checks
   // =========================================================================
   describe('valid complete turns', () => {
-    it('reason + shell invoke + yield_invoke', () => {
+    it('think + shell invoke + yield_invoke', () => {
       v.passes(
-        '<magnitude:reason>listing files</magnitude:reason>\n' +
+        '<magnitude:think>listing files</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">ls -la</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -514,18 +514,18 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('reason + message + yield_user', () => {
+    it('think + message + yield_user', () => {
       v.passes(
-        '<magnitude:reason>responding</magnitude:reason>\n' +
+        '<magnitude:think>responding</magnitude:think>\n' +
         '<magnitude:message to="user">Hello!</magnitude:message>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
-    it('multiple reasons + message + multiple tools + yield', () => {
+    it('multiple thinks + message + multiple tools + yield', () => {
       v.passes(
-        '<magnitude:reason about="alignment">Aligned.</magnitude:reason>\n' +
-        '<magnitude:reason about="tasks">Tasks planned.</magnitude:reason>\n' +
+        '<magnitude:think about="alignment">Aligned.</magnitude:think>\n' +
+        '<magnitude:think about="tasks">Tasks planned.</magnitude:think>\n' +
         '<magnitude:message to="user">Starting.</magnitude:message>\n' +
         '<magnitude:invoke tool="create_task">\n' +
         '<magnitude:parameter name="id">t1</magnitude:parameter>\n' +
@@ -542,22 +542,22 @@ describe('grammar strictness', () => {
 
     it('zero-param tool', () => {
       v.passes(
-        '<magnitude:reason>checking</magnitude:reason>\n' +
+        '<magnitude:think>checking</magnitude:think>\n' +
         '<magnitude:invoke tool="tree"></magnitude:invoke>\n' +
         '<magnitude:yield_invoke/>'
       )
     })
 
-    it('reason-only + yield_user', () => {
+    it('think-only + yield_user', () => {
       v.passes(
-        '<magnitude:reason>thinking</magnitude:reason>\n' +
+        '<magnitude:think>thinking</magnitude:think>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
     it('tool with multiple params in different order', () => {
       v.passes(
-        '<magnitude:reason>editing</magnitude:reason>\n' +
+        '<magnitude:think>editing</magnitude:think>\n' +
         '<magnitude:invoke tool="edit">\n' +
         '<magnitude:parameter name="new">new text</magnitude:parameter>\n' +
         '<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n' +
@@ -574,7 +574,7 @@ describe('grammar strictness', () => {
   describe('yield termination', () => {
     it('rejects turn with no yield', () => {
       v.rejects(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
         '</magnitude:invoke>'
@@ -583,14 +583,14 @@ describe('grammar strictness', () => {
 
     it('accepts yield_user', () => {
       v.passes(
-        '<magnitude:reason>done</magnitude:reason>\n' +
+        '<magnitude:think>done</magnitude:think>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
     it('accepts yield_invoke', () => {
       v.passes(
-        '<magnitude:reason>r</magnitude:reason>\n' +
+        '<magnitude:think>r</magnitude:think>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
         '</magnitude:invoke>\n' +
@@ -600,7 +600,7 @@ describe('grammar strictness', () => {
 
     it('accepts yield_worker', () => {
       v.passes(
-        '<magnitude:reason>delegating</magnitude:reason>\n' +
+        '<magnitude:think>delegating</magnitude:think>\n' +
         '<magnitude:yield_worker/>'
       )
     })

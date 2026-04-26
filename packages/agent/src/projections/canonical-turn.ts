@@ -9,7 +9,7 @@ import { getAgentDefinition, getAgentSlot } from '../agents/registry'
 import { AgentStatusProjection, getAgentByForkId } from './agent-status'
 
 
-export interface ReasonBlock {
+export interface ThinkBlock {
   about: string | null
   content: string
 }
@@ -17,7 +17,7 @@ export interface ReasonBlock {
 export interface CanonicalTurnState {
   turnId: string | null
   lenses: readonly { name: string; content: string }[] | null
-  reasonBlocks: ReasonBlock[]
+  thinkBlocks: ThinkBlock[]
   messages: Array<{ id: string; destination: MessageDestination; text: string; order: number }>
   messageMap: Map<string, number>
   toolCalls: Array<{ toolCallId: string; tagName: string; input: unknown; query: string | null; order: number }>
@@ -32,7 +32,7 @@ export interface CanonicalTurnState {
 export const createInitialCanonicalTurnState = (): CanonicalTurnState => ({
   turnId: null,
   lenses: null,
-  reasonBlocks: [],
+  thinkBlocks: [],
   messages: [],
   messageMap: new Map(),
   toolCalls: [],
@@ -49,7 +49,7 @@ function resetActive(state: CanonicalTurnState): CanonicalTurnState {
     ...state,
     turnId: null,
     lenses: null,
-    reasonBlocks: [],
+    thinkBlocks: [],
     messages: [],
     messageMap: new Map(),
     toolCalls: [],
@@ -75,23 +75,23 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
     thinking_chunk: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      const blocks = [...fork.reasonBlocks]
+      const blocks = [...fork.thinkBlocks]
       if (blocks.length === 0) {
         blocks.push({ about: null, content: event.text })
       } else {
         const last = blocks[blocks.length - 1]
         blocks[blocks.length - 1] = { ...last, content: last.content + event.text }
       }
-      return { ...fork, reasonBlocks: blocks }
+      return { ...fork, thinkBlocks: blocks }
     },
 
     thinking_end: ({ event, fork }) => {
       if (fork.turnId !== event.turnId) return fork
-      if (fork.reasonBlocks.length === 0) return fork
-      const blocks = [...fork.reasonBlocks]
+      if (fork.thinkBlocks.length === 0) return fork
+      const blocks = [...fork.thinkBlocks]
       const last = blocks[blocks.length - 1]
       blocks[blocks.length - 1] = { ...last, about: event.about }
-      return { ...fork, reasonBlocks: blocks }
+      return { ...fork, thinkBlocks: blocks }
     },
 
     lens_start: ({ event, fork }) => {
@@ -229,7 +229,7 @@ export const CanonicalTurnProjection = Projection.defineForked<AppEvent, Canonic
 
         const trace: CanonicalTrace = {
           lenses: fork.lenses,
-          reasonBlocks: fork.reasonBlocks,
+          thinkBlocks: fork.thinkBlocks,
           messages: [...fork.messages]
             .sort((a, b) => a.order - b.order)
             .map(({ text, destination }) => ({ text, destination })),

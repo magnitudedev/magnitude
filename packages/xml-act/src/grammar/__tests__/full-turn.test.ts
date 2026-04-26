@@ -2,7 +2,7 @@ import { describe, it } from 'vitest'
 import { buildValidator, shellValidator, SHELL_TOOL } from './helpers'
 
 const REASON = (name: string, content: string) =>
-  `<magnitude:reason about="${name}">\n${content}\n</magnitude:reason>\n`
+  `<magnitude:think about="${name}">\n${content}\n</magnitude:think>\n`
 
 const MSG = (recipient: string, content: string) =>
   `<magnitude:message to="${recipient}">\n${content}\n</magnitude:message>\n`
@@ -34,13 +34,13 @@ describe('full turn sequences', () => {
     })
   })
 
-  describe('reason → yield', () => {
-    it('single reason block then yield passes', () => {
+  describe('think → yield', () => {
+    it('single think block then yield passes', () => {
       const v = shellValidator()
       v.passes(REASON('turn', 'some thought') + YIELD())
     })
 
-    it('multiple reason blocks then yield passes', () => {
+    it('multiple think blocks then yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'first thought') +
@@ -49,14 +49,14 @@ describe('full turn sequences', () => {
       )
     })
 
-    it('reason with multi-line content then yield passes', () => {
+    it('think with multi-line content then yield passes', () => {
       const v = shellValidator()
       v.passes(REASON('turn', 'line one\nline two\nline three') + YIELD())
     })
   })
 
-  describe('reason → message → yield', () => {
-    it('reason then message then yield passes', () => {
+  describe('think → message → yield', () => {
+    it('think then message then yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'I should respond') +
@@ -65,7 +65,7 @@ describe('full turn sequences', () => {
       )
     })
 
-    it('reason then forced message then yield passes', () => {
+    it('think then forced message then yield passes', () => {
       const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('user'))
       v.passes(
         REASON('turn', 'planning') +
@@ -75,8 +75,8 @@ describe('full turn sequences', () => {
     })
   })
 
-  describe('reason → invoke → yield', () => {
-    it('reason then invoke then yield passes', () => {
+  describe('think → invoke → yield', () => {
+    it('think then invoke then yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'I will run ls') +
@@ -85,7 +85,7 @@ describe('full turn sequences', () => {
       )
     })
 
-    it('reason then no-param invoke then yield passes', () => {
+    it('think then no-param invoke then yield passes', () => {
       const v = buildValidator([SHELL_TOOL, { tagName: 'tree', parameters: [] }])
       v.passes(
         REASON('turn', 'checking tree') +
@@ -123,8 +123,8 @@ describe('full turn sequences', () => {
     })
   })
 
-  describe('mixed reason + message + invoke', () => {
-    it('reason → message → invoke → yield passes', () => {
+  describe('mixed think + message + invoke', () => {
+    it('think → message → invoke → yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'planning') +
@@ -134,7 +134,7 @@ describe('full turn sequences', () => {
       )
     })
 
-    it('reason → invoke → message → yield passes', () => {
+    it('think → invoke → message → yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'planning') +
@@ -144,7 +144,7 @@ describe('full turn sequences', () => {
       )
     })
 
-    it('multiple reasons → message → invoke → yield passes', () => {
+    it('multiple thinks → message → invoke → yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'first') +
@@ -155,7 +155,7 @@ describe('full turn sequences', () => {
       )
     })
 
-    it('reason → message → invoke → message → yield passes', () => {
+    it('think → message → invoke → message → yield passes', () => {
       const v = shellValidator()
       v.passes(
         REASON('turn', 'plan') +
@@ -204,7 +204,7 @@ describe('full turn sequences', () => {
       v.rejects(YIELD() + REASON('turn', 'extra'))
     })
 
-    it('reason after message is rejected (ordering)', () => {
+    it('think after message is rejected (ordering)', () => {
       const v = shellValidator()
       v.rejects(
         MSG('user', 'hello') +

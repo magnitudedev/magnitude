@@ -12,9 +12,9 @@ const YIELD = '<magnitude:yield_user/>'
 
 describe('close tag behavior', () => {
   describe('standard close tags accepted', () => {
-    it('</magnitude:reason> closes reason block', () => {
+    it('</magnitude:think> closes think block', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nsome thought\n</magnitude:reason>\n${YIELD}`)
+      v.passes(`<magnitude:think about="turn">\nsome thought\n</magnitude:think>\n${YIELD}`)
     })
 
     it('</magnitude:message> closes message block', () => {
@@ -39,9 +39,9 @@ describe('close tag behavior', () => {
   })
 
   describe('old MACT-style close variants treated as body content', () => {
-    it('<magnitude:reason|> in reason body is rejected as malformed structural syntax', () => {
+    it('<magnitude:think|> in think body is rejected as malformed structural syntax', () => {
       const v = shellValidator()
-      v.rejects(`<magnitude:reason about="turn">\nsome thought\n<magnitude:reason|>\nmore content\n</magnitude:reason>\n${YIELD}`)
+      v.rejects(`<magnitude:think about="turn">\nsome thought\n<magnitude:think|>\nmore content\n</magnitude:think>\n${YIELD}`)
     })
 
     it('<magnitude:message|> in message body is rejected as malformed structural syntax', () => {

@@ -13,27 +13,27 @@ function minLensValidator() {
 }
 
 describe('Category 11: minLenses=1 mode', () => {
-  it('01: reason then yield', () => {
-    minLensValidator().passes(`<magnitude:reason about="t">think</magnitude:reason>\n${Y}`)
+  it('01: think then yield', () => {
+    minLensValidator().passes(`<magnitude:think about="t">think</magnitude:think>\n${Y}`)
   })
 
-  it('02: reason then message then yield', () => {
-    minLensValidator().passes(`<magnitude:reason about="t">think</magnitude:reason>\n<magnitude:message to="u">hi</magnitude:message>\n${Y}`)
+  it('02: think then message then yield', () => {
+    minLensValidator().passes(`<magnitude:think about="t">think</magnitude:think>\n<magnitude:message to="u">hi</magnitude:message>\n${Y}`)
   })
 
-  it('03: yield only → REJECT (need at least one reason)', () => {
+  it('03: yield only → REJECT (need at least one think)', () => {
     minLensValidator().rejects(Y)
   })
 
-  it('04: message only → REJECT (need reason first)', () => {
+  it('04: message only → REJECT (need think first)', () => {
     minLensValidator().rejects(`<magnitude:message to="u">hi</magnitude:message>\n${Y}`)
   })
 
-  it('05: false close in reason → REJECT', () => {
-    minLensValidator().rejects(`<magnitude:reason about="t">text</magnitude:reason>more</magnitude:reason>\n${Y}`)
+  it('05: false close in think → REJECT', () => {
+    minLensValidator().rejects(`<magnitude:think about="t">text</magnitude:think>more</magnitude:think>\n${Y}`)
   })
 
-  it('06: reason then invoke with alias close', () => {
-    minLensValidator().passes(`<magnitude:reason about="t">think</magnitude:reason>\n<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:shell>\n${Y}`)
+  it('06: think then invoke with alias close', () => {
+    minLensValidator().passes(`<magnitude:think about="t">think</magnitude:think>\n<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:shell>\n${Y}`)
   })
 })

@@ -13,7 +13,7 @@
 
 import type { TurnEngineEvent, DeepPaths, SourceSpan } from '../types'
 import type { Op } from '../machine'
-import type { Frame, ProseFrame, MessageFrame, ReasonFrame, ParameterFrame, FilterFrame, InvokeFrame } from './types'
+import type { Frame, ProseFrame, MessageFrame, ThinkFrame, ParameterFrame, FilterFrame, InvokeFrame } from './types'
 import type { ParserOp } from './ops'
 import { emitEvent, emitStructuralError } from './ops'
 
@@ -69,7 +69,7 @@ type ContentHandlers = {
 
 const contentHandlers: ContentHandlers = {
   prose:     (frame, text) => appendProse(frame, text) as ParserOp[],
-  reason:    (frame, text) => appendReason(frame, text) as ParserOp[],
+  think:    (frame, text) => appendThink(frame, text) as ParserOp[],
   message:   (frame, text) => appendMessage(frame, text) as ParserOp[],
   parameter: parameterContent,
   filter:    filterContent,
@@ -80,7 +80,7 @@ const contentHandlers: ContentHandlers = {
  * onContent — route content text to the current frame's handler.
  *
  * CONTRACT:
- * - prose, reason, message: returns Op[] only, no mutation
+ * - prose, think, message: returns Op[] only, no mutation
  * - parameter: mutates frame.rawValue and frame.jsonishParser, returns Op[] for ToolInputFieldChunk
  * - filter: mutates frame.query, returns []
  * - invoke: returns error op for unexpected non-whitespace content
@@ -182,11 +182,11 @@ export function appendMessage(top: MessageFrame, text: string): Op<MessageFrame,
 }
 
 // =============================================================================
-// Reason / Lens
+// Think / Lens
 // =============================================================================
 
-export function appendReason(top: ReasonFrame, text: string): Op<ReasonFrame, TurnEngineEvent>[] {
-  const ops: Op<ReasonFrame, TurnEngineEvent>[] = []
+export function appendThink(top: ThinkFrame, text: string): Op<ThinkFrame, TurnEngineEvent>[] {
+  const ops: Op<ThinkFrame, TurnEngineEvent>[] = []
 
   if (!top.hasContent) {
     const stripped = stripLeadingWhitespace(text)

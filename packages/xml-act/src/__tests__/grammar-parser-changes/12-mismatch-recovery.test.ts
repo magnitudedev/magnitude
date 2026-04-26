@@ -12,8 +12,8 @@ describe('Category 12: mismatch recovery', () => {
   const Y = YIELD_USER
 
   describe('message closed by wrong close tag on newline', () => {
-    it('01: message closed by reason close on newline → recovers', () => {
-      const input = `<magnitude:message to="user">hello\n</magnitude:reason>\n<magnitude:message to="user">world</magnitude:message>\n${Y}`
+    it('01: message closed by think close on newline → recovers', () => {
+      const input = `<magnitude:message to="user">hello\n</magnitude:think>\n<magnitude:message to="user">world</magnitude:message>\n${Y}`
       const events = parse(input)
       // Recovery should produce two separate messages
       const messageStarts = events.filter((e: any) => e._tag === 'MessageStart')
@@ -32,16 +32,16 @@ describe('Category 12: mismatch recovery', () => {
     })
   })
 
-  describe('reason closed by wrong close tag on newline', () => {
-    it('03: reason closed by message close on newline → recovers', () => {
-      const input = `<magnitude:reason about="t">thinking\n</magnitude:message>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`
+  describe('think closed by wrong close tag on newline', () => {
+    it('03: think closed by message close on newline → recovers', () => {
+      const input = `<magnitude:think about="t">thinking\n</magnitude:message>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`
       const events = parse(input)
       const body = collectLensChunks(events)
       expect(body).toContain('thinking')
     })
 
-    it('04: reason closed by parameter close on newline → recovers', () => {
-      const input = `<magnitude:reason about="t">thinking\n</magnitude:parameter>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`
+    it('04: think closed by parameter close on newline → recovers', () => {
+      const input = `<magnitude:think about="t">thinking\n</magnitude:parameter>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`
       const events = parse(input)
       const body = collectLensChunks(events)
       expect(body).toContain('thinking')
@@ -49,19 +49,19 @@ describe('Category 12: mismatch recovery', () => {
   })
 
   describe('same-line mismatch emits AmbiguousMagnitudeClose', () => {
-    it('05: message closed by reason close same-line → error + content', () => {
-      const input = `<magnitude:message to="user">hello</magnitude:reason>more</magnitude:message>\n${Y}`
+    it('05: message closed by think close same-line → error + content', () => {
+      const input = `<magnitude:message to="user">hello</magnitude:think>more</magnitude:message>\n${Y}`
       const events = parse(input)
       const errors = events.filter((e: any) => e._tag === 'StructuralParseError')
       const ambiguous = errors.filter((e: any) => e.error._tag === 'AmbiguousMagnitudeClose')
       expect(ambiguous.length).toBeGreaterThanOrEqual(1)
       // The mismatched close should be dumped as content, message continues
       const body = collectMessageChunks(events)
-      expect(body).toContain('</magnitude:reason>')
+      expect(body).toContain('</magnitude:think>')
     })
 
-    it('06: reason closed by message close same-line → error + content', () => {
-      const input = `<magnitude:reason about="t">thinking</magnitude:message>more</magnitude:reason>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`
+    it('06: think closed by message close same-line → error + content', () => {
+      const input = `<magnitude:think about="t">thinking</magnitude:message>more</magnitude:think>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`
       const events = parse(input)
       const errors = events.filter((e: any) => e._tag === 'StructuralParseError')
       const ambiguous = errors.filter((e: any) => e.error._tag === 'AmbiguousMagnitudeClose')

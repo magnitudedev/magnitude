@@ -1,13 +1,13 @@
 /**
  * Tests for newline-based close tag confirmation.
  *
- * After a top-level close tag (</magnitude:reason>, </magnitude:message>), EITHER a newline OR
+ * After a top-level close tag (</magnitude:think>, </magnitude:message>), EITHER a newline OR
  * a left-angle-bracket should confirm the close. The bug manifests during
  * streaming: if the '\n' after a close tag arrives as a separate chunk, it
  * gets absorbed into wsBuffer by isAllWs(). The next non-whitespace content
  * token (e.g. "some prose text") then fails the '<' check in resolvePendingClose
  * and the close tag is rejected — swallowing everything that follows into the
- * (incorrectly still-open) reason/message body.
+ * (incorrectly still-open) think/message body.
  *
  * These tests FAIL until the parser (and grammar) fix is applied.
  * They use multiple tokenizer.push() calls to simulate streaming, so that '\n'
@@ -78,20 +78,20 @@ function parseStreaming(chunks: string[], customTools = tools): TurnEngineEvent[
 
 describe('newline close confirmation (streaming)', () => {
   /**
-   * Test 1: </magnitude:reason> then '\n' as separate chunk then prose text then invoke then yield
+   * Test 1: </magnitude:think> then '\n' as separate chunk then prose text then invoke then yield
    *
    * The '\n' arrives as a separate whitespace-only Content token → goes into wsBuffer.
    * "some prose text\n" arrives next → 's' !== '<' and 's' !== '\n' → rejectAllPendingCloses.
-   * Result: reason block never closes, invoke is swallowed as body content.
+   * Result: think block never closes, invoke is swallowed as body content.
    *
    * Expected: LensEnd fires, ToolInputStarted fires, TurnEnd fires.
    * Currently FAILS: ToolInputStarted is never emitted.
    */
-  it('reason closed with \\n (separate chunk) then prose then invoke then yield', () => {
+  it('think closed with \\n (separate chunk) then prose then invoke then yield', () => {
     const chunks = [
-      '<magnitude:reason about="planning">',
+      '<magnitude:think about="planning">',
       '\nsome reasoning here\n',
-      '</magnitude:reason>',
+      '</magnitude:think>',
       '\n',                                          // newline as its own chunk
       'some prose text\n',
       '<magnitude:invoke tool="shell">\n',
@@ -102,7 +102,7 @@ describe('newline close confirmation (streaming)', () => {
 
     const events = parseStreaming(chunks)
 
-    // Reason block must close
+    // Think block must close
     expect(events.find(e => e._tag === 'LensStart')).toMatchObject({
       _tag: 'LensStart',
       name: 'planning',
@@ -128,24 +128,24 @@ describe('newline close confirmation (streaming)', () => {
   })
 
   /**
-   * Test 2: Two consecutive reason blocks where '\n' between them arrives separately
+   * Test 2: Two consecutive think blocks where '\n' between them arrives separately
    *
-   * The '\n' between </magnitude:reason> and <magnitude:reason> arrives as its own chunk → wsBuffer.
-   * Then '<magnitude:reason' arrives → '<' IS the check, so this might already work.
+   * The '\n' between </magnitude:think> and <magnitude:think> arrives as its own chunk → wsBuffer.
+   * Then '<magnitude:think' arrives → '<' IS the check, so this might already work.
    * But testing it explicitly to guard against regressions.
    *
    * This test may already pass (< is the current confirmation trigger).
    * If it passes, good. If not, it must also be fixed.
    */
-  it('two consecutive reason blocks with \\n (separate chunk) between them', () => {
+  it('two consecutive think blocks with \\n (separate chunk) between them', () => {
     const chunks = [
-      '<magnitude:reason about="first">',
+      '<magnitude:think about="first">',
       '\nfirst reasoning\n',
-      '</magnitude:reason>',
+      '</magnitude:think>',
       '\n',                      // separate newline chunk
-      '<magnitude:reason about="second">',
+      '<magnitude:think about="second">',
       '\nsecond reasoning\n',
-      '</magnitude:reason>',
+      '</magnitude:think>',
       '\n',
       '<magnitude:yield_user/>',
     ]
@@ -167,17 +167,17 @@ describe('newline close confirmation (streaming)', () => {
   })
 
   /**
-   * Test 3: Reason then message, '\n' between them as separate chunk
+   * Test 3: Think then message, '\n' between them as separate chunk
    *
-   * </magnitude:reason>\n (separate) <magnitude:message to="user"> ...
+   * </magnitude:think>\n (separate) <magnitude:message to="user"> ...
    * The '\n' goes to wsBuffer, then '<' arrives → should confirm.
    * Similar to test 2 but with different tag types.
    */
-  it('reason then message with \\n (separate chunk) between them', () => {
+  it('think then message with \\n (separate chunk) between them', () => {
     const chunks = [
-      '<magnitude:reason about="turn">',
+      '<magnitude:think about="turn">',
       '\nsome reasoning\n',
-      '</magnitude:reason>',
+      '</magnitude:think>',
       '\n',
       '<magnitude:message to="user">',
       '\nhello world\n',
@@ -235,11 +235,11 @@ describe('newline close confirmation (streaming)', () => {
    * Multiple separate '\n' chunks go into wsBuffer one by one.
    * Then "some prose" arrives → 's' fails the check → reject.
    */
-  it('reason closed with multiple separate \\n chunks then prose then invoke', () => {
+  it('think closed with multiple separate \\n chunks then prose then invoke', () => {
     const chunks = [
-      '<magnitude:reason about="analysis">',
+      '<magnitude:think about="analysis">',
       '\nreasoning content\n',
-      '</magnitude:reason>',
+      '</magnitude:think>',
       '\n',   // first newline
       '\n',   // second newline (blank line)
       'prose content here\n',

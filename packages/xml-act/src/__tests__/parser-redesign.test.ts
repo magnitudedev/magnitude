@@ -114,12 +114,12 @@ function tags(events: TurnEngineEvent[]): string[] {
 // ---------------------------------------------------------------------------
 
 describe('crash scenarios (redesign must fix these)', () => {
-  it('BUG: <magnitude:parameter> inside <magnitude:reason> is treated as content, not a crash', () => {
+  it('BUG: <magnitude:parameter> inside <magnitude:think> is treated as content, not a crash', () => {
     // In the current parser, PARAMETER_VALID_TAGS includes 'parameter', so a <magnitude:parameter>
-    // inside a reason frame resolves as structural and causes a cast crash.
-    // After redesign: <magnitude:parameter> inside <magnitude:reason> is content.
+    // inside a think frame resolves as structural and causes a cast crash.
+    // After redesign: <magnitude:parameter> inside <magnitude:think> is content.
     expect(() => {
-      const events = parse('<magnitude:reason about="test">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:reason>')
+      const events = parse('<magnitude:think about="test">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:think>')
       // Should complete without throwing
       expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
       expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
@@ -171,12 +171,12 @@ describe('crash scenarios (redesign must fix these)', () => {
     }).not.toThrow()
   })
 
-  it('BUG: <magnitude:filter> inside <magnitude:reason> is treated as content, not a crash', () => {
+  it('BUG: <magnitude:filter> inside <magnitude:think> is treated as content, not a crash', () => {
     expect(() => {
-      const events = parse('<magnitude:reason about="test">\n<magnitude:filter>$.foo</magnitude:filter>\n</magnitude:reason>')
+      const events = parse('<magnitude:think about="test">\n<magnitude:filter>$.foo</magnitude:filter>\n</magnitude:think>')
       expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
       expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
-      // No FilterStarted — filter was not structural inside reason
+      // No FilterStarted — filter was not structural inside think
       expect(events.find(e => e._tag === 'ToolInputStarted')).toBeUndefined()
     }).not.toThrow()
   })
@@ -194,9 +194,9 @@ describe('crash scenarios (redesign must fix these)', () => {
 // 2. NORMAL STRUCTURAL BEHAVIOR (regression tests)
 // ---------------------------------------------------------------------------
 
-describe('reason blocks', () => {
+describe('think blocks', () => {
   it('emits LensStart with correct name', () => {
-    const events = parse('<magnitude:reason about="alignment">\nsome reasoning\n</magnitude:reason>')
+    const events = parse('<magnitude:think about="alignment">\nsome reasoning\n</magnitude:think>')
     expect(events.find(e => e._tag === 'LensStart')).toMatchObject({
       _tag: 'LensStart',
       name: 'alignment',
@@ -204,7 +204,7 @@ describe('reason blocks', () => {
   })
 
   it('emits LensChunk with content', () => {
-    const events = parse('<magnitude:reason about="x">\nhello world\n</magnitude:reason>')
+    const events = parse('<magnitude:think about="x">\nhello world\n</magnitude:think>')
     const chunks = events.filter(e => e._tag === 'LensChunk')
     expect(chunks.length).toBeGreaterThan(0)
     const allText = chunks.map((c: any) => c.text).join('')
@@ -212,14 +212,14 @@ describe('reason blocks', () => {
   })
 
   it('emits LensEnd with correct name and full content', () => {
-    const events = parse('<magnitude:reason about="plan">\nmy plan\n</magnitude:reason>')
+    const events = parse('<magnitude:think about="plan">\nmy plan\n</magnitude:think>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toMatchObject({ _tag: 'LensEnd', name: 'plan' })
     expect(end.content).toContain('my plan')
   })
 
   it('emits LensStart/Chunk/End in correct order', () => {
-    const events = parse('<magnitude:reason about="x">\nfoo\n</magnitude:reason>')
+    const events = parse('<magnitude:think about="x">\nfoo\n</magnitude:think>')
     const t = tags(events)
     const startIdx = t.indexOf('LensStart')
     const chunkIdx = t.indexOf('LensChunk')
@@ -229,10 +229,10 @@ describe('reason blocks', () => {
     expect(endIdx).toBeGreaterThan(chunkIdx)
   })
 
-  it('handles multiple reason blocks in sequence', () => {
+  it('handles multiple think blocks in sequence', () => {
     const events = parse(
-      '<magnitude:reason about="first">\nfoo\n</magnitude:reason>\n' +
-      '<magnitude:reason about="second">\nbar\n</magnitude:reason>'
+      '<magnitude:think about="first">\nfoo\n</magnitude:think>\n' +
+      '<magnitude:think about="second">\nbar\n</magnitude:think>'
     )
     const starts = events.filter(e => e._tag === 'LensStart') as any[]
     expect(starts).toHaveLength(2)
@@ -395,9 +395,9 @@ describe('yield', () => {
 })
 
 describe('mixed turn sequences', () => {
-  it('reason + message in sequence', () => {
+  it('think + message in sequence', () => {
     const events = parse(
-      '<magnitude:reason about="plan">\nthinking\n</magnitude:reason>\n' +
+      '<magnitude:think about="plan">\nthinking\n</magnitude:think>\n' +
       '<magnitude:message to="user">\nhello\n</magnitude:message>'
     )
     expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
@@ -406,9 +406,9 @@ describe('mixed turn sequences', () => {
     expect(events.find(e => e._tag === 'MessageEnd')).toBeDefined()
   })
 
-  it('reason + invoke in sequence', () => {
+  it('think + invoke in sequence', () => {
     const events = parse(
-      '<magnitude:reason about="plan">\nthinking\n</magnitude:reason>\n' +
+      '<magnitude:think about="plan">\nthinking\n</magnitude:think>\n' +
       '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>'
     )
     expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
@@ -424,9 +424,9 @@ describe('mixed turn sequences', () => {
     expect(readyEvents).toHaveLength(2)
   })
 
-  it('reason + message + invoke + yield', () => {
+  it('think + message + invoke + yield', () => {
     const events = parse(
-      '<magnitude:reason about="plan">\nthinking\n</magnitude:reason>\n' +
+      '<magnitude:think about="plan">\nthinking\n</magnitude:think>\n' +
       '<magnitude:message to="user">\nhello\n</magnitude:message>\n' +
       '<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n' +
       '<magnitude:yield_user/>'
@@ -437,9 +437,9 @@ describe('mixed turn sequences', () => {
     expect(events.find(e => e._tag === 'TurnEnd')).toBeDefined()
   })
 
-  it('events from reason come before events from message', () => {
+  it('events from think come before events from message', () => {
     const events = parse(
-      '<magnitude:reason about="x">\nfoo\n</magnitude:reason>\n' +
+      '<magnitude:think about="x">\nfoo\n</magnitude:think>\n' +
       '<magnitude:message to="user">\nbar\n</magnitude:message>'
     )
     const t = tags(events)
@@ -455,12 +455,12 @@ describe('mixed turn sequences', () => {
 // ---------------------------------------------------------------------------
 
 describe('content preservation', () => {
-  it('close tag in backticks inside reason body closes immediately under first-close-wins', () => {
-    const events = parse('<magnitude:reason about="x">\nthink about `</magnitude:reason>` tags\n</magnitude:reason>')
+  it('close tag in backticks inside think body closes immediately under first-close-wins', () => {
+    const events = parse('<magnitude:think about="x">\nthink about `</magnitude:think>` tags\n</magnitude:think>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toBeDefined()
     expect(end.content).toContain('think about `')
-    expect(end.content).not.toContain('</magnitude:reason>` tags')
+    expect(end.content).not.toContain('</magnitude:think>` tags')
   })
 
   it('close tag in quotes inside parameter body closes immediately under first-close-wins', () => {
@@ -474,8 +474,8 @@ describe('content preservation', () => {
     expect(complete.value).toBe('echo "')
   })
 
-  it('unknown tags inside reason body are content', () => {
-    const events = parse('<magnitude:reason about="x">\nhello <unknown-tag>world</unknown-tag>\n</magnitude:reason>')
+  it('unknown tags inside think body are content', () => {
+    const events = parse('<magnitude:think about="x">\nhello <unknown-tag>world</unknown-tag>\n</magnitude:think>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toBeDefined()
     expect(end.content).toContain('<unknown-tag>')
@@ -502,8 +502,8 @@ describe('content preservation', () => {
   })
 
   it('mismatched close tag is treated as content (no lenience)', () => {
-    // </magnitude:message> inside a reason block is content, not structural
-    const events = parse('<magnitude:reason about="turn">\nsome reasoning</magnitude:message>\n</magnitude:reason>')
+    // </magnitude:message> inside a think block is content, not structural
+    const events = parse('<magnitude:think about="turn">\nsome reasoning</magnitude:message>\n</magnitude:think>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
     // No MessageEnd — </magnitude:message> was treated as content
     expect(events.find(e => e._tag === 'MessageEnd')).toBeUndefined()
@@ -516,7 +516,7 @@ describe('content preservation', () => {
 
   it('whitespace between tags does not generate spurious events', () => {
     const events = parse(
-      '<magnitude:reason about="x">\nfoo\n</magnitude:reason>\n\n\n<magnitude:message to="user">\nbar\n</magnitude:message>'
+      '<magnitude:think about="x">\nfoo\n</magnitude:think>\n\n\n<magnitude:message to="user">\nbar\n</magnitude:message>'
     )
     const starts = events.filter(e => e._tag === 'LensStart')
     const msgStarts = events.filter(e => e._tag === 'MessageStart')
@@ -566,10 +566,10 @@ describe('error cases', () => {
     expect(error.error._tag).toBe('MissingToolName')
   })
 
-  it('stray </magnitude:reason> with no open reason is treated as content or error', () => {
+  it('stray </magnitude:think> with no open think is treated as content or error', () => {
     // A stray close tag with no matching open should not crash
     expect(() => {
-      const events = parse('some prose </magnitude:reason> more prose')
+      const events = parse('some prose </magnitude:think> more prose')
       // Should not crash. No LensEnd event.
       expect(events.find(e => e._tag === 'LensEnd')).toBeUndefined()
     }).not.toThrow()
@@ -582,9 +582,9 @@ describe('error cases', () => {
     }).not.toThrow()
   })
 
-  it('EOF with unclosed reason frame — flushes without crash', () => {
+  it('EOF with unclosed think frame — flushes without crash', () => {
     expect(() => {
-      const events = parse('<magnitude:reason about="x">\nsome content without close')
+      const events = parse('<magnitude:think about="x">\nsome content without close')
       // Should not crash
       expect(events.find(e => e._tag === 'LensStart')).toBeDefined()
     }).not.toThrow()
@@ -661,7 +661,7 @@ describe('event sequence verification', () => {
 
   it('TurnEnd is always the last event', () => {
     const events = parse(
-      '<magnitude:reason about="x">\nfoo\n</magnitude:reason>\n' +
+      '<magnitude:think about="x">\nfoo\n</magnitude:think>\n' +
       '<magnitude:message to="user">\nbar\n</magnitude:message>\n' +
       '<magnitude:yield_user/>'
     )
@@ -670,11 +670,11 @@ describe('event sequence verification', () => {
     expect(turnEndIdx).toBe(t.length - 1)
   })
 
-  it('LensStart/LensEnd pairs are balanced across multiple reasons', () => {
+  it('LensStart/LensEnd pairs are balanced across multiple thinks', () => {
     const events = parse(
-      '<magnitude:reason about="a">\nfoo\n</magnitude:reason>\n' +
-      '<magnitude:reason about="b">\nbar\n</magnitude:reason>\n' +
-      '<magnitude:reason about="c">\nbaz\n</magnitude:reason>'
+      '<magnitude:think about="a">\nfoo\n</magnitude:think>\n' +
+      '<magnitude:think about="b">\nbar\n</magnitude:think>\n' +
+      '<magnitude:think about="c">\nbaz\n</magnitude:think>'
     )
     const starts = events.filter(e => e._tag === 'LensStart')
     const ends = events.filter(e => e._tag === 'LensEnd')

@@ -3,14 +3,14 @@ import { shellValidator } from './helpers'
 
 /**
  * Regression test: the LLM produced `<turn>...</turn>` instead of
- * `<magnitude:reason about="turn">...</magnitude:reason>`. The grammar should reject this
+ * `<magnitude:think about="turn">...</magnitude:think>`. The grammar should reject this
  * because `<turn>` is not a valid top-level tag.
  *
  * Observed raw output:
- *   <magnitude:reason about="skills">...</magnitude:reason>
- *   <magnitude:reason about="alignment">...</magnitude:reason>
- *   <magnitude:reason about="tasks">...</magnitude:reason>
- *   <magnitude:reason about="diligence">...</magnitude:reason>
+ *   <magnitude:think about="skills">...</magnitude:think>
+ *   <magnitude:think about="alignment">...</magnitude:think>
+ *   <magnitude:think about="tasks">...</magnitude:think>
+ *   <magnitude:think about="diligence">...</magnitude:think>
  *   <turn>
  *   I'll start by activating the relevant skills...
  *   </turn>
@@ -18,10 +18,10 @@ import { shellValidator } from './helpers'
  */
 
 const REASON = (name: string, content: string) =>
-  `<magnitude:reason about="${name}">\n${content}\n</magnitude:reason>\n`
+  `<magnitude:think about="${name}">\n${content}\n</magnitude:think>\n`
 
 describe('<turn> tag rejection', () => {
-  it('rejects <turn>...</turn> after reason blocks', () => {
+  it('rejects <turn>...</turn> after think blocks', () => {
     const v = shellValidator()
     v.rejects(
       REASON('skills', 'This is a refactor task.') +
@@ -42,7 +42,7 @@ describe('<turn> tag rejection', () => {
     )
   })
 
-  it('rejects <turn>...</turn> between reasons and invoke', () => {
+  it('rejects <turn>...</turn> between thinks and invoke', () => {
     const v = shellValidator()
     v.rejects(
       REASON('turn', 'planning') +
@@ -52,7 +52,7 @@ describe('<turn> tag rejection', () => {
     )
   })
 
-  it('accepts <magnitude:reason about="turn"> (the correct form)', () => {
+  it('accepts <magnitude:think about="turn"> (the correct form)', () => {
     const v = shellValidator()
     v.passes(
       REASON('skills', 'refactor skill applies') +

@@ -41,9 +41,9 @@ describe('prefix heuristics: tool alias equivalence', () => {
       canonicalInput: '<magnitude:message>prep</magnitude:message><magnitude:invoke tool="shell"><magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>',
     },
     {
-      label: '07: alias equivalence after reason',
-      aliasInput: '<magnitude:reason>prep</magnitude:reason><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>',
-      canonicalInput: '<magnitude:reason>prep</magnitude:reason><magnitude:invoke tool="shell"><magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>',
+      label: '07: alias equivalence after think',
+      aliasInput: '<magnitude:think>prep</magnitude:think><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>',
+      canonicalInput: '<magnitude:think>prep</magnitude:think><magnitude:invoke tool="shell"><magnitude:parameter name="command">pwd</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>',
     },
     {
       label: '08: alias equivalence with filter child',

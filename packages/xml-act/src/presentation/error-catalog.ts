@@ -45,10 +45,10 @@ export const ERROR_CATALOG: ErrorCatalog = {
     hints: (error) => {
       const base = 'Tags with the magnitude: prefix are ALWAYS interpreted, no matter where they appear.'
       switch (error.parentTagName) {
-        case 'magnitude:reason':
+        case 'magnitude:think':
           return [
             base,
-            `You are not allowed to use magnitude: tags inside a reason block. Drop the prefix when reasoning about a tag — write ${asTag(stripPrefix(error.tagName))} instead of ${error.raw}.`,
+            `You are not allowed to use magnitude: tags inside a think block. Drop the prefix when reasoning about a tag — write ${asTag(stripPrefix(error.tagName))} instead of ${error.raw}.`,
           ]
         case 'magnitude:message':
           return [
@@ -73,7 +73,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
         default:
           return [
             base,
-            'Only valid magnitude tags are recognized at the top level (reason, message, invoke, yield).',
+            'Only valid magnitude tags are recognized at the top level (think, message, invoke, yield).',
             'Check the tag name spelling.',
           ]
       }
@@ -90,7 +90,7 @@ export const ERROR_CATALOG: ErrorCatalog = {
       const expected = error.expectedTagName ? asCloseTag(error.expectedTagName) : 'the matching close tag'
       return [
         `Close the tag that is actually open: emit ${expected} before closing anything else.`,
-        'Magnitude close tags are always interpreted — do not write them as literal text inside reasons, messages, or parameters.',
+        'Magnitude close tags are always interpreted — do not write them as literal text inside think blocks, messages, or parameters.',
       ]
     },
     snippetStrategy: 'point',
@@ -126,16 +126,16 @@ export const ERROR_CATALOG: ErrorCatalog = {
   UnexpectedContent: {
     headline: () => 'Unexpected content inside tool call.',
     hints: () => [
-      'Move plain text outside the tool call into a message or reason block.',
+      'Move plain text outside the tool call into a message or think block.',
       'Inside <magnitude:invoke>, wrap all input in <magnitude:parameter> or <magnitude:filter>.',
     ],
     snippetStrategy: 'point',
   },
 
   UnclosedThink: {
-    headline: () => 'Reasoning block was left open when the response ended.',
+    headline: () => 'Think block was left open when the response ended.',
     hints: () => [
-      'Close every <magnitude:reason> block with </magnitude:reason> before yielding.',
+      'Close every <magnitude:think> block with </magnitude:think> before yielding.',
     ],
     snippetStrategy: 'block',
   },

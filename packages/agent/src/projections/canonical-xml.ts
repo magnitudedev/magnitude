@@ -4,14 +4,14 @@ import type { ResolvedToolSet } from '../tools/resolved-toolset'
 import { buildRegisteredTools } from '../tools/tool-registry'
 import { Layer } from 'effect'
 
-export interface ReasonBlock {
+export interface ThinkBlock {
   about: string | null
   content: string
 }
 
 export interface CanonicalTrace {
   lenses: readonly { name: string; content: string | null }[] | null
-  reasonBlocks: ReasonBlock[]
+  thinkBlocks: ThinkBlock[]
   messages: Array<{ text: string; destination: MessageDestination }>
   toolCalls: Array<{ tagName: string; input: unknown; query: string | null }>
   yieldTarget: 'user' | 'invoke' | 'worker' | 'parent'
@@ -71,15 +71,15 @@ export function serializeCanonicalTurn(
   if (trace.lenses !== null) {
     const activeLenses = trace.lenses.filter((lens) => lens.content !== null && lens.content.trim().length > 0)
     for (const lens of activeLenses) {
-      parts.push(`<magnitude:reason about="${lens.name}">\n${lens.content!.trim()}\n</magnitude:reason>`)
+      parts.push(`<magnitude:think about="${lens.name}">\n${lens.content!.trim()}\n</magnitude:think>`)
     }
   }
 
-  for (const block of trace.reasonBlocks) {
+  for (const block of trace.thinkBlocks) {
     const trimmed = block.content.trim()
     if (trimmed.length === 0) continue
-    const name = block.about ?? 'reason'
-    parts.push(`<magnitude:reason about="${name}">\n${trimmed}\n</magnitude:reason>`)
+    const name = block.about ?? 'think'
+    parts.push(`<magnitude:think about="${name}">\n${trimmed}\n</magnitude:think>`)
   }
 
   for (const msg of trace.messages) {

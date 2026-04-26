@@ -56,8 +56,8 @@ describe('whitespace variations', () => {
     v().passes(input)
   })
 
-  it('09: whitespace between reason close and message open', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason>  \t\n  <magnitude:message to="u">\nh\n</magnitude:message><${YIELD.slice(1)}`
+  it('09: whitespace between think close and message open', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think>  \t\n  <magnitude:message to="u">\nh\n</magnitude:message><${YIELD.slice(1)}`
     v().passes(input)
   })
 

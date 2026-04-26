@@ -11,7 +11,7 @@ import type { Token, SourcePos, SourceSpan } from './types'
  *   Content:   raw text between tags
  *   CDATA:     <![CDATA[...]]>>  (emitted as Content)
  *
- * Close tags for known structural names (reason, message, invoke, parameter, filter)
+ * Close tags for known structural names (think, message, invoke, parameter, filter)
  * are emitted immediately as Close tokens. The parser handles confirmation logic
  * (greedy last-match, tentative close state). Unknown close tags become Content.
  */

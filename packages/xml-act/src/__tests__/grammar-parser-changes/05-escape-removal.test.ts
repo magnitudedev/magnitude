@@ -23,12 +23,12 @@ describe('Category 5: escape removal', () => {
       v().rejects(`<magnitude:escape>content</magnitude:escape>\n${Y}`)
     })
 
-    it('02: escape at top level between reason and yield', () => {
-      v().rejects(`<magnitude:reason about="t">r</magnitude:reason>\n<magnitude:escape>x</magnitude:escape>\n${Y}`)
+    it('02: escape at top level between think and yield', () => {
+      v().rejects(`<magnitude:think about="t">r</magnitude:think>\n<magnitude:escape>x</magnitude:escape>\n${Y}`)
     })
 
-    it('03: escape in reason body', () => {
-      v().rejects(`<magnitude:reason about="t">text <magnitude:escape>inner</magnitude:escape> more</magnitude:reason>\n${Y}`)
+    it('03: escape in think body', () => {
+      v().rejects(`<magnitude:think about="t">text <magnitude:escape>inner</magnitude:escape> more</magnitude:think>\n${Y}`)
     })
 
     it('04: escape in message body', () => {
@@ -57,8 +57,8 @@ describe('Category 5: escape removal', () => {
   // =========================================================================
 
   describe('parser treats escape as InvalidMagnitudeOpen', () => {
-    it('09: escape open in reason body → StructuralParseError with InvalidMagnitudeOpen', () => {
-      const input = `<magnitude:reason about="t">text <magnitude:escape>inner</magnitude:escape> more</magnitude:reason>\n${Y}`
+    it('09: escape open in think body → StructuralParseError with InvalidMagnitudeOpen', () => {
+      const input = `<magnitude:think about="t">text <magnitude:escape>inner</magnitude:escape> more</magnitude:think>\n${Y}`
       const events = parse(input)
       const errors = events.filter((e): e is any => e._tag === 'StructuralParseError')
       expect(errors.some((e: any) => e.error._tag === 'InvalidMagnitudeOpen' && e.error.tagName === 'magnitude:escape')).toBe(true)

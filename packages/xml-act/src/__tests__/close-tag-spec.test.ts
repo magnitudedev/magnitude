@@ -41,8 +41,8 @@ function parse(input: string): TurnEngineEvent[] {
 }
 
 describe('close tag behavior', () => {
-  it('</magnitude:reason> closes a reason frame', () => {
-    const events = parse('<magnitude:reason about="turn">\ncontent\n</magnitude:reason>')
+  it('</magnitude:think> closes a think frame', () => {
+    const events = parse('<magnitude:think about="turn">\ncontent\n</magnitude:think>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
   })
 
@@ -56,19 +56,19 @@ describe('close tag behavior', () => {
     expect(events.find(e => e._tag === 'ToolInputReady')).toBeDefined()
   })
 
-  it('</magnitude:message> inside reason frame → literal content', () => {
-    const events = parse('<magnitude:reason about="turn">\ncontent</magnitude:message>\n</magnitude:reason>')
+  it('</magnitude:message> inside think frame → literal content', () => {
+    const events = parse('<magnitude:think about="turn">\ncontent</magnitude:message>\n</magnitude:think>')
     const chunks = events.filter(e => e._tag === 'LensChunk')
     const text = chunks.map(e => (e as any).text).join('')
     expect(text).toContain('</magnitude:message>')
     expect(events.find(e => e._tag === 'MessageEnd')).toBeUndefined()
   })
 
-  it('</magnitude:reason> inside message frame → literal content', () => {
-    const events = parse('<magnitude:message to="user">\ncontent</magnitude:reason>\n</magnitude:message>')
+  it('</magnitude:think> inside message frame → literal content', () => {
+    const events = parse('<magnitude:message to="user">\ncontent</magnitude:think>\n</magnitude:message>')
     const chunks = events.filter(e => e._tag === 'MessageChunk')
     const text = chunks.map(e => (e as any).text).join('')
-    expect(text).toContain('</magnitude:reason>')
+    expect(text).toContain('</magnitude:think>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeUndefined()
   })
 

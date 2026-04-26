@@ -25,9 +25,9 @@ const invalidCases = [
     minStructuralErrors: 1,
   },
   {
-    label: '03: reason open inside message',
-    input: '<magnitude:message>before <magnitude:reason>nested</magnitude:reason> after</magnitude:message><magnitude:yield_user/>',
-    raw: '<magnitude:reason>',
+    label: '03: think open inside message',
+    input: '<magnitude:message>before <magnitude:think>nested</magnitude:think> after</magnitude:message><magnitude:yield_user/>',
+    raw: '<magnitude:think>',
   },
   {
     label: '04: parameter open inside message',

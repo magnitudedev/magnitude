@@ -21,9 +21,9 @@ describe('prefix heuristics: invalid invoke body', () => {
       raw: '<magnitude:message>',
     },
     {
-      label: '02: reason open inside invoke',
-      input: '<magnitude:invoke tool="shell"><magnitude:reason>x</magnitude:reason></magnitude:invoke><magnitude:yield_user/>',
-      raw: '<magnitude:reason>',
+      label: '02: think open inside invoke',
+      input: '<magnitude:invoke tool="shell"><magnitude:think>x</magnitude:think></magnitude:invoke><magnitude:yield_user/>',
+      raw: '<magnitude:think>',
     },
     {
       label: '03: invoke open inside invoke',

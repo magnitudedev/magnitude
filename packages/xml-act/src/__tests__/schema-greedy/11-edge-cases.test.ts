@@ -58,14 +58,14 @@ describe('edge cases', () => {
     expect(getToolInput(parse(input))?.command).toContain('</parameterX>')
   })
 
-  it('09: reason with < in content', () => {
-    const input = `<magnitude:reason about="t">\nfoo < bar\n</magnitude:reason><${YIELD.slice(1)}`
+  it('09: think with < in content', () => {
+    const input = `<magnitude:think about="t">\nfoo < bar\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     expect(collectLensChunks(parse(input))).toContain('foo < bar')
   })
 
-  it('10: reason body empty', () => {
-    const input = `<magnitude:reason about="t">\n\n</magnitude:reason><${YIELD.slice(1)}`
+  it('10: think body empty', () => {
+    const input = `<magnitude:think about="t">\n\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })

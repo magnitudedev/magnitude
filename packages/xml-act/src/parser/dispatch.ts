@@ -52,7 +52,7 @@ export interface ParserLoopContext {
 // Shared helpers
 // =============================================================================
 
-const PROSE_LEVEL_FRAME_TYPES = new Set(['prose', 'reason', 'message'])
+const PROSE_LEVEL_FRAME_TYPES = new Set(['prose', 'think', 'message'])
 
 function isValidContinuation(token: Token, frameType: string, ctx: ParserLoopContext): boolean {
   if (token._tag === 'Open') {
@@ -244,8 +244,8 @@ function getCanonicalClose(frame: Frame): string {
       return 'magnitude:filter'
     case 'message':
       return 'magnitude:message'
-    case 'reason':
-      return 'magnitude:reason'
+    case 'think':
+      return 'magnitude:think'
     case 'prose':
       return ''
   }
@@ -263,8 +263,8 @@ function getParentTagName(frame: Frame): string | undefined {
       return 'magnitude:filter'
     case 'message':
       return 'magnitude:message'
-    case 'reason':
-      return 'magnitude:reason'
+    case 'think':
+      return 'magnitude:think'
   }
 }
 

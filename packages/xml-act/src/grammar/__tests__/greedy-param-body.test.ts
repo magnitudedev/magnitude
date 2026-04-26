@@ -153,9 +153,9 @@ describe('greedy param-body — structural magnitude opens are rejected', () => 
     )
   })
 
-  it('close + invoke close + reason block + real close', () => {
+  it('close + invoke close + think block + real close', () => {
     shellValidator().rejects(
-      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">fake${CP}\n${CI}\n<magnitude:reason about="x">thought</magnitude:reason>\nreal${CP}\n${CI}\n${YIELD}`
+      `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">fake${CP}\n${CI}\n<magnitude:think about="x">thought</magnitude:think>\nreal${CP}\n${CI}\n${YIELD}`
     )
   })
 
@@ -303,9 +303,9 @@ describe('greedy param-body — whitespace edge cases', () => {
 // =============================================================================
 
 describe('greedy param-body — full turn', () => {
-  it('reason + message + invoke with embedded close', () => {
+  it('think + message + invoke with embedded close', () => {
     shellValidator().rejects(
-      `<magnitude:reason about="test">thinking</magnitude:reason>\n` +
+      `<magnitude:think about="test">thinking</magnitude:think>\n` +
       `<magnitude:message to="user">hello</magnitude:message>\n` +
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo ${CP} works${CP}\n${CI}\n${YIELD}`
     )

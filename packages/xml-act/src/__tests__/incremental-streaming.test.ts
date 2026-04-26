@@ -75,12 +75,12 @@ describe('Incremental content emission', () => {
     expect(push1).toEqual([{ pushIndex: 1, token: { _tag: 'Content', text: 'world' } }])
   })
 
-  it('emits content per push inside a reason block', () => {
+  it('emits content per push inside a think block', () => {
     const results = collectWithPushIndex([
-      '<magnitude:reason about="strategy">\n',
+      '<magnitude:think about="strategy">\n',
       'Line 1\n',
       'Line 2\n',
-      '</magnitude:reason>\n',
+      '</magnitude:think>\n',
     ])
     const push1 = results.filter(r => r.pushIndex === 1)
     expect(push1).toEqual([{ pushIndex: 1, token: { _tag: 'Content', text: 'Line 1\n' } }])
@@ -103,7 +103,7 @@ describe('Incremental content emission', () => {
 
   it('does NOT flush mid-tag parse (content buffered until tag resolves)', () => {
     const results = collectWithPushIndex([
-      'hello\n<magnitude:reason',
+      'hello\n<magnitude:think',
       ' about="strategy">\n',
     ])
     const push0 = results.filter(r => r.pushIndex === 0)
@@ -115,7 +115,7 @@ describe('Incremental content emission', () => {
   it('does NOT flush when pending < at chunk boundary', () => {
     const results = collectWithPushIndex([
       'content\n<',
-      'reason about="strategy">\n',
+      'think about="strategy">\n',
     ])
     const push0 = results.filter(r => r.pushIndex === 0)
     // < pending — nothing emitted yet
@@ -141,10 +141,10 @@ describe('Incremental content emission', () => {
 
 describe('Token boundary correctness', () => {
   // Trailing newline ensures close tags are confirmed
-  const fullInput = `<magnitude:reason about="alignment">
+  const fullInput = `<magnitude:think about="alignment">
 User is asking about capabilities.
 Keep it concise.
-</magnitude:reason>
+</magnitude:think>
 <magnitude:message to="user">
 I can help with software development tasks.
 </magnitude:message>
@@ -159,8 +159,8 @@ I can help with software development tasks.
       const contentJoined = joinContent(tokens)
 
       expect(structural).toEqual([
-        { _tag: 'Open', name: 'magnitude:reason', attrs: { about: 'alignment' } },
-        { _tag: 'Close', name: 'magnitude:reason' },
+        { _tag: 'Open', name: 'magnitude:think', attrs: { about: 'alignment' } },
+        { _tag: 'Close', name: 'magnitude:think' },
         { _tag: 'Open', name: 'magnitude:message', attrs: { to: 'user' } },
         { _tag: 'Close', name: 'magnitude:message' },
         { _tag: 'SelfClose', name: 'magnitude:yield_user', attrs: {} },
@@ -171,30 +171,30 @@ I can help with software development tasks.
   })
 
   it('char-by-char produces one content token per non-tag char', () => {
-    const input = 'hello\n<magnitude:reason about="strategy">\nreasoning\n</magnitude:reason>\n'
+    const input = 'hello\n<magnitude:think about="strategy">\nreasoning\n</magnitude:think>\n'
     const chars = input.split('')
     const tokens = collectChunked(chars)
     const contentTokens = tokens.filter(t => t._tag === 'Content')
     expect(contentTokens.length).toBeGreaterThan(1)
-    // trailing \n after </magnitude:reason> is emitted as content (confirmation character)
+    // trailing \n after </magnitude:think> is emitted as content (confirmation character)
     expect(joinContent(tokens)).toBe('hello\n\nreasoning\n\n')
   })
 
   it('whole-input produces minimal content tokens', () => {
-    const input = 'hello\n<magnitude:reason about="strategy">\nreasoning\n</magnitude:reason>\n'
+    const input = 'hello\n<magnitude:think about="strategy">\nreasoning\n</magnitude:think>\n'
     const tokens = collectChunked([input])
     const contentTokens = tokens.filter(t => t._tag === 'Content')
     expect(contentTokens.length).toBeLessThanOrEqual(3)
-    // trailing \n after </magnitude:reason> is emitted as content (confirmation character)
+    // trailing \n after </magnitude:think> is emitted as content (confirmation character)
     expect(joinContent(tokens)).toBe('hello\n\nreasoning\n\n')
   })
 
   it('line-by-line produces one content token per content line', () => {
-    const input = `<magnitude:reason about="alignment">
+    const input = `<magnitude:think about="alignment">
 Line one
 Line two
 Line three
-</magnitude:reason>
+</magnitude:think>
 `
     const lines = input.split('\n')
     const chunks = lines.map((l, i) => i < lines.length - 1 ? l + '\n' : l)
@@ -205,7 +205,7 @@ Line three
       'Line one\n',
       'Line two\n',
       'Line three\n',
-      '\n', // trailing \n after </magnitude:reason> (confirmation character)
+      '\n', // trailing \n after </magnitude:think> (confirmation character)
     ])
   })
 })
@@ -222,19 +222,19 @@ describe('Tag split across chunks — no content leakage', () => {
   })
 
   it('open tag split at <: no partial tag in content', () => {
-    const tokens = collectChunked(['before\n<magnitude:', 'reason about="strategy">\nafter'])
+    const tokens = collectChunked(['before\n<magnitude:', 'think about="strategy">\nafter'])
   })
 
   it('close tag split mid-name: no partial tag in content', () => {
-    const tokens = collectChunked(['\n</magnitude:rea', 'son>\n'])
+    const tokens = collectChunked(['\n</magnitude:thi', 'nk>\n'])
     const structural = tokens.filter(t => t._tag === 'Close')
-    expect(structural).toEqual([{ _tag: 'Close', name: 'magnitude:reason' }])
+    expect(structural).toEqual([{ _tag: 'Close', name: 'magnitude:think' }])
   })
 
   it('close tag split at /: no partial tag in content', () => {
-    const tokens = collectChunked(['\n</', 'magnitude:reason>\n'])
+    const tokens = collectChunked(['\n</', 'magnitude:think>\n'])
     const structural = tokens.filter(t => t._tag === 'Close')
-    expect(structural).toEqual([{ _tag: 'Close', name: 'magnitude:reason' }])
+    expect(structural).toEqual([{ _tag: 'Close', name: 'magnitude:think' }])
   })
 
   it('self-close <magnitude:yield_user/> split mid-name: correct parse', () => {
@@ -256,11 +256,11 @@ describe('Tag split across chunks — no content leakage', () => {
 describe('Realistic LLM streaming simulation', () => {
   it('simulates token-by-token LLM output with proper incremental emission', () => {
     const results = collectWithPushIndex([
-      '<magnitude:reason about="alignment">\n',
+      '<magnitude:think about="alignment">\n',
       'User wants help ',
       'with a bug. ',
       'Let me investigate.\n',
-      '</magnitude:reason>\n',
+      '</magnitude:think>\n',
       '\n',
       '<magnitude:message to="user">\n',
       "I'll look into that ",

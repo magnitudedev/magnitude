@@ -1,8 +1,8 @@
 /**
  * Category 7: Forced message mode
  *
- * When requiredMessageTo is set, the grammar forces reason(s) -> message.
- * First-close-wins applies to reason bodies in forced mode too.
+ * When requiredMessageTo is set, the grammar forces think(s) -> message.
+ * First-close-wins applies to think bodies in forced mode too.
  */
 import { describe, it, expect } from 'vitest'
 import {
@@ -27,29 +27,29 @@ describe('Category 7: forced message mode', () => {
   // Basic forced message → ACCEPT
   // =========================================================================
 
-  it('01: message only (no reason)', () => {
+  it('01: message only (no think)', () => {
     const v = forcedValidator()
     v.passes(`<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
   })
 
-  it('02: reason then message', () => {
+  it('02: think then message', () => {
     const v = forcedValidator()
-    v.passes(`<magnitude:reason about="t">think</magnitude:reason>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
+    v.passes(`<magnitude:think about="t">think</magnitude:think>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
   })
 
-  it('03: two reasons then message', () => {
+  it('03: two thinks then message', () => {
     const v = forcedValidator()
-    v.passes(`<magnitude:reason about="a">1</magnitude:reason>\n<magnitude:reason about="b">2</magnitude:reason>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
+    v.passes(`<magnitude:think about="a">1</magnitude:think>\n<magnitude:think about="b">2</magnitude:think>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
   })
 
-  it('04: maxLenses=2, two reasons then message', () => {
+  it('04: maxLenses=2, two thinks then message', () => {
     const v = forcedValidator(2)
-    v.passes(`<magnitude:reason about="a">1</magnitude:reason>\n<magnitude:reason about="b">2</magnitude:reason>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
+    v.passes(`<magnitude:think about="a">1</magnitude:think>\n<magnitude:think about="b">2</magnitude:think>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
   })
 
-  it('05: maxLenses=1, one reason then message', () => {
+  it('05: maxLenses=1, one think then message', () => {
     const v = forcedValidator(1)
-    v.passes(`<magnitude:reason about="t">think</magnitude:reason>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
+    v.passes(`<magnitude:think about="t">think</magnitude:think>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
   })
 
   // =========================================================================
@@ -75,9 +75,9 @@ describe('Category 7: forced message mode', () => {
   // First-close-wins in forced mode
   // =========================================================================
 
-  it('09: false close in forced reason → REJECT', () => {
+  it('09: false close in forced think → REJECT', () => {
     const v = forcedValidator()
-    v.rejects(`<magnitude:reason about="t">text</magnitude:reason>more</magnitude:reason>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
+    v.rejects(`<magnitude:think about="t">text</magnitude:think>more</magnitude:think>\n<magnitude:message to="user">hi</magnitude:message>\n${Y}`)
   })
 
   it('10: false close in forced message → REJECT', () => {

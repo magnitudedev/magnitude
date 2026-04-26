@@ -18,9 +18,9 @@ import {
 const v = () => grammarValidator()
 
 describe('prefix heuristics: close mismatch recovery', () => {
-  it('01: message closed by reason close on newline', () => {
+  it('01: message closed by think close on newline', () => {
     const input = `<magnitude:message>hello
-</magnitude:reason>
+</magnitude:think>
 <magnitude:message>next</magnitude:message><magnitude:yield_user/>`
     v().rejects(input)
     const events = parse(input)
@@ -42,8 +42,8 @@ describe('prefix heuristics: close mismatch recovery', () => {
     expect(countEvents(events, 'MessageChunk')).toBeGreaterThan(1)
   })
 
-  it('03: reason closed by message close on newline', () => {
-    const input = `<magnitude:reason>thinking
+  it('03: think closed by message close on newline', () => {
+    const input = `<magnitude:think>thinking
 </magnitude:message>
 <magnitude:invoke tool="tree"></magnitude:invoke><magnitude:yield_user/>`
     v().rejects(input)
@@ -53,8 +53,8 @@ describe('prefix heuristics: close mismatch recovery', () => {
     expect(getToolInput(events)).toEqual({})
   })
 
-  it('04: reason closed by parameter close on newline', () => {
-    const input = `<magnitude:reason>thinking
+  it('04: think closed by parameter close on newline', () => {
+    const input = `<magnitude:think>thinking
 </magnitude:parameter>
 <magnitude:yield_user/>`
     v().rejects(input)
@@ -72,9 +72,9 @@ describe('prefix heuristics: close mismatch recovery', () => {
     expect(getToolInput(events)).toEqual({ command: 'pwd\n' })
   })
 
-  it('06: command alias closed by reason close', () => {
+  it('06: command alias closed by think close', () => {
     const input = `<magnitude:invoke tool="shell"><magnitude:command>pwd
-</magnitude:reason></magnitude:invoke><magnitude:yield_user/>`
+</magnitude:think></magnitude:invoke><magnitude:yield_user/>`
     v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
@@ -90,9 +90,9 @@ describe('prefix heuristics: close mismatch recovery', () => {
     expect(getToolInput(events)).toEqual({ command: 'pwd' })
   })
 
-  it('08: tool alias invoke body closed by mismatched reason close', () => {
+  it('08: tool alias invoke body closed by mismatched think close', () => {
     const input = `<magnitude:shell><magnitude:command>pwd</magnitude:command>
-</magnitude:reason><magnitude:message>done</magnitude:message><magnitude:yield_user/>`
+</magnitude:think><magnitude:message>done</magnitude:message><magnitude:yield_user/>`
     v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
@@ -101,27 +101,27 @@ describe('prefix heuristics: close mismatch recovery', () => {
   })
 
   it('09: same-line message mismatch is ambiguous', () => {
-    const input = '<magnitude:message>hello</magnitude:reason> world</magnitude:message><magnitude:yield_user/>'
+    const input = '<magnitude:message>hello</magnitude:think> world</magnitude:message><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectStructuralError(events, {
       variant: 'AmbiguousMagnitudeClose',
-      tagName: 'magnitude:reason',
+      tagName: 'magnitude:think',
       expectedTagName: 'magnitude:message',
-      detailIncludes: ['</magnitude:reason>', 'magnitude:message'],
+      detailIncludes: ['</magnitude:think>', 'magnitude:message'],
     })
-    expectPreservedInMessage(events, '</magnitude:reason>')
+    expectPreservedInMessage(events, '</magnitude:think>')
   })
 
-  it('10: same-line reason mismatch is ambiguous', () => {
-    const input = '<magnitude:reason>hello</magnitude:message> world</magnitude:reason><magnitude:yield_user/>'
+  it('10: same-line think mismatch is ambiguous', () => {
+    const input = '<magnitude:think>hello</magnitude:message> world</magnitude:think><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectStructuralError(events, {
       variant: 'AmbiguousMagnitudeClose',
       tagName: 'magnitude:message',
-      expectedTagName: 'magnitude:reason',
-      detailIncludes: ['</magnitude:message>', 'magnitude:reason'],
+      expectedTagName: 'magnitude:think',
+      detailIncludes: ['</magnitude:message>', 'magnitude:think'],
     })
     expectPreservedInLens(events, '</magnitude:message>')
   })
@@ -172,7 +172,7 @@ describe('prefix heuristics: close mismatch recovery', () => {
 
   it('15: repeated newline mismatch recovery across two messages', () => {
     const input = `<magnitude:message>hello
-</magnitude:reason>
+</magnitude:think>
 <magnitude:message>next
 </magnitude:invoke>
 <magnitude:yield_user/>`
@@ -185,7 +185,7 @@ describe('prefix heuristics: close mismatch recovery', () => {
   })
 
   it('16: escape open inside message is invalid, so inner mismatched close is not escaped', () => {
-    const input = '<magnitude:message><magnitude:escape></magnitude:reason></magnitude:escape></magnitude:message><magnitude:yield_user/>'
+    const input = '<magnitude:message><magnitude:escape></magnitude:think></magnitude:escape></magnitude:message><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectStructuralError(events, {

@@ -58,13 +58,13 @@ describe('parse errors', () => {
   })
 
   it('produces StrayCloseTag as structural error for unmatched close', () => {
-    const errors = getStructuralErrors(parse('</magnitude:reason>\ntext'))
+    const errors = getStructuralErrors(parse('</magnitude:think>\ntext'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
   })
 
   it('produces UnclosedThink (UnclosedReason) as structural error at EOF', () => {
-    const errors = getStructuralErrors(parse('<magnitude:reason about="reasoning">\nSome thinking'))
+    const errors = getStructuralErrors(parse('<magnitude:think about="reasoning">\nSome thinking'))
     expect(errors.length).toBeGreaterThan(0)
     expect(errors.some(e => e.error._tag === 'UnclosedThink')).toBe(true)
   })
@@ -78,7 +78,7 @@ describe('parse errors', () => {
   })
 
   it('structural errors do not have toolCallId', () => {
-    const errors = getStructuralErrors(parse('</magnitude:reason>\ntext'))
+    const errors = getStructuralErrors(parse('</magnitude:think>\ntext'))
     const strayError = errors.find(e => e.error._tag === 'StrayCloseTag')
     expect(strayError).toBeDefined()
     expect((strayError as any).toolCallId).toBeUndefined()

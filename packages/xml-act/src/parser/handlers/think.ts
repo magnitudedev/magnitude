@@ -1,26 +1,26 @@
 /**
- * Reason/lens frame handlers — open and close.
+ * Think/lens frame handlers — open and close.
  *
- * reasonOpenHandler: OpenHandler<ProseFrame, ReasonFrame>
- * reasonCloseHandler: CloseHandler<ReasonFrame>
+ * thinkOpenHandler: OpenHandler<ProseFrame, ThinkFrame>
+ * thinkCloseHandler: CloseHandler<ThinkFrame>
  *
  * Both are stateless objects. The parent frame is passed at call time by bindOpen/bindClose.
  * All effects are returned as ParserOp[] — no direct emit calls.
  */
 
-import type { ProseFrame, ReasonFrame } from '../types'
+import type { ProseFrame, ThinkFrame } from '../types'
 import type { OpenHandler, CloseHandler } from '../handler'
 import { emitEvent, emitStructuralError, type ParserOp } from '../ops'
 import { stripTrailingWhitespace } from '../content'
 
-export const reasonOpenHandler: OpenHandler<ProseFrame, ReasonFrame> = {
+export const thinkOpenHandler: OpenHandler<ProseFrame, ThinkFrame> = {
   open(attrs, _parent, _ctx, tokenSpan) {
     const lensName = attrs.get('about') ?? 'analyze'
     return [
       {
         type: 'push',
         frame: {
-          type: 'reason',
+          type: 'think',
           openSpan: tokenSpan,
           name: lensName,
           content: '',
@@ -33,7 +33,7 @@ export const reasonOpenHandler: OpenHandler<ProseFrame, ReasonFrame> = {
   },
 }
 
-export const reasonCloseHandler: CloseHandler<ReasonFrame> = {
+export const thinkCloseHandler: CloseHandler<ThinkFrame> = {
   close(top, _ctx, _tokenSpan) {
     const trimmed = stripTrailingWhitespace(top.content)
     return [
@@ -44,13 +44,13 @@ export const reasonCloseHandler: CloseHandler<ReasonFrame> = {
 }
 
 /**
- * closeReasonAtEof — used by flush when a reason frame is unclosed at EOF.
+ * closeThinkAtEof — used by flush when a think frame is unclosed at EOF.
  * Emits an UnclosedThink structural error before the normal LensEnd.
  */
-export function closeReasonAtEof(top: ReasonFrame): ParserOp[] {
+export function closeThinkAtEof(top: ThinkFrame): ParserOp[] {
   const trimmed = stripTrailingWhitespace(top.content)
   return [
-    emitStructuralError({ _tag: 'UnclosedThink', message: `Unclosed reason tag: ${top.name}`, primarySpan: top.openSpan }),
+    emitStructuralError({ _tag: 'UnclosedThink', message: `Unclosed think tag: ${top.name}`, primarySpan: top.openSpan }),
     emitEvent({ _tag: 'LensEnd', name: top.name, content: trimmed }),
     { type: 'pop' },
   ]

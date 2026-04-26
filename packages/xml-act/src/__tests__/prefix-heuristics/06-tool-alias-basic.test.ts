@@ -47,8 +47,8 @@ describe('prefix heuristics: tool alias basic', () => {
       expected: { command: 'pwd' },
     },
     {
-      label: '07: shell alias after reason',
-      input: '<magnitude:reason>prep</magnitude:reason><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>',
+      label: '07: shell alias after think',
+      input: '<magnitude:think>prep</magnitude:think><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>',
       expected: { command: 'pwd' },
     },
     {

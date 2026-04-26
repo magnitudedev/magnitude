@@ -47,9 +47,9 @@ describe('Category 9: multi-tool interactions', () => {
     v().passes(input)
   })
 
-  it('05: reason + message + two invokes with alias closes', () => {
+  it('05: think + message + two invokes with alias closes', () => {
     const input =
-      `<magnitude:reason about="t">plan</magnitude:reason>\n` +
+      `<magnitude:think about="t">plan</magnitude:think>\n` +
       `<magnitude:message to="u">doing</magnitude:message>\n` +
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:command>\n</magnitude:shell>\n` +
       `<magnitude:invoke tool="edit">\n<magnitude:parameter name="path">f</magnitude:path>\n<magnitude:parameter name="old">x</magnitude:old>\n<magnitude:parameter name="new">y</magnitude:new>\n</magnitude:edit>\n${Y}`

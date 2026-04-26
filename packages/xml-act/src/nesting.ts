@@ -13,7 +13,7 @@
 import type { Frame } from './parser/types'
 
 export type FrameType = Frame['type']
-export type StructuralTagName = 'magnitude:reason' | 'magnitude:message' | 'magnitude:invoke' | 'magnitude:parameter' | 'magnitude:filter'
+export type StructuralTagName = 'magnitude:think' | 'magnitude:message' | 'magnitude:invoke' | 'magnitude:parameter' | 'magnitude:filter'
 
 /**
  * VALID_CHILDREN — maps each frame type to the structural tags it may contain.
@@ -22,9 +22,9 @@ export type StructuralTagName = 'magnitude:reason' | 'magnitude:message' | 'magn
  * so downstream consumers get the narrow `readonly string[]` literal types.
  */
 export const VALID_CHILDREN = {
-  prose:     ['magnitude:reason', 'magnitude:message', 'magnitude:invoke'] as const,
+  prose:     ['magnitude:think', 'magnitude:message', 'magnitude:invoke'] as const,
   invoke:    ['magnitude:parameter', 'magnitude:filter'] as const,
-  reason:    [] as const,
+  think:    [] as const,
   message:   [] as const,
   parameter: [] as const,
   filter:    [] as const,
@@ -47,7 +47,7 @@ export type ValidChildren = typeof VALID_CHILDREN
 
 /** Verifies that prose children are exactly the expected structural tags. */
 export type _VerifyProseChildren =
-  (typeof VALID_CHILDREN)['prose'][number] extends 'magnitude:reason' | 'magnitude:message' | 'magnitude:invoke' ? true : never
+  (typeof VALID_CHILDREN)['prose'][number] extends 'magnitude:think' | 'magnitude:message' | 'magnitude:invoke' ? true : never
 
 /** Verifies that invoke children are exactly the expected structural tags. */
 export type _VerifyInvokeChildren =

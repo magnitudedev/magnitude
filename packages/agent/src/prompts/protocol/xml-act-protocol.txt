@@ -59,8 +59,8 @@ This is NOT HTML. This is garbage text. Every tag is mangled by unnecessary `&lt
 You respond using Magnitude tags. Each response must be exactly one turn.
 
 ```
-turn      := {{TAG_REASON}}* ({{TAG_MESSAGE}} | {{TAG_INVOKE}})* yield
-{{TAG_REASON}}    := <{{TAG_REASON}} about="NAME">content</{{TAG_REASON}}>
+turn      := {{TAG_THINK}}* ({{TAG_MESSAGE}} | {{TAG_INVOKE}})* yield
+{{TAG_THINK}}    := <{{TAG_THINK}} about="NAME">content</{{TAG_THINK}}>
 {{TAG_MESSAGE}}   := <{{TAG_MESSAGE}} to="RECIPIENT">content</{{TAG_MESSAGE}}>
 {{TAG_INVOKE}}    := <{{TAG_INVOKE}} tool="NAME">{{TAG_PARAMETER}}* {{TAG_FILTER}}?</{{TAG_INVOKE}}>
 {{TAG_PARAMETER}} := <{{TAG_PARAMETER}} name="KEY">value</{{TAG_PARAMETER}}>
@@ -86,9 +86,9 @@ Based on these principles, any reasonable agent should:
 
 ## Think
 
-You leverage an advanced form of thinking where thinking is separated into targeted "reasons", in order to better reason about different aspects of your turn.
-Reason content is internal reasoning — it is not shown to the user. Use reasons to think through your approach before responding.
-You should use every reason with an applicable trigger condition on a given turn.
+You leverage an advanced form of thinking where thinking is separated into targeted "thinks", in order to better think about different aspects of your turn.
+Think content is internal thinking — it is not shown to the user. Use thinks to think through your approach before responding.
+You should use every think with an applicable trigger condition on a given turn.
 
 ### Thinking lenses
 
@@ -98,7 +98,7 @@ Use this format:
 ### Thinking lens activation
 
 Each thinking lens has a prescribed, specific trigger condition.
-You must use exactly and exclusively the lenses where the trigger condition is true this turn, in order to best reason about the relevant topics.
+You must use exactly and exclusively the lenses where the trigger condition is true this turn, in order to best think about the relevant topics.
 
 {{THINKING_LENSES}}
 

@@ -5,27 +5,27 @@ describe('whitespace handling', () => {
   describe('whitespace between tags', () => {
     it('newline between close and next open passes', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason>\n<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think>\n<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
     it('no whitespace between close and next open passes', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason><magnitude:message to="user">\nhello\n</magnitude:message><magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think><magnitude:message to="user">\nhello\n</magnitude:message><magnitude:yield_user/>`)
     })
 
     it('spaces between close and next open passes (up to 4)', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason>    <magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think>    <magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
     it('tab between close and next open passes', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason>\t<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think>\t<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
     it('blank lines between tags pass (ws handles multiple newlines)', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason>\n\n<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think>\n\n<magnitude:message to="user">\nhello\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
   })
 
@@ -65,14 +65,14 @@ describe('whitespace handling', () => {
       v.rejects(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\t<magnitude:invoke tool="x">\n</magnitude:invoke>\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
-    it('4 trailing spaces after </magnitude:reason> passes', () => {
+    it('4 trailing spaces after </magnitude:think> passes', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason>    \n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think>    \n<magnitude:yield_user/>`)
     })
 
-    it('5 trailing spaces after </magnitude:reason> is accepted (unbounded ws)', () => {
+    it('5 trailing spaces after </magnitude:think> is accepted (unbounded ws)', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:reason about="turn">\nreasoning\n</magnitude:reason>     \n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nreasoning\n</magnitude:think>     \n<magnitude:yield_user/>`)
     })
   })
 
@@ -132,10 +132,10 @@ describe('whitespace handling', () => {
   })
 
   describe('full sequences', () => {
-    it('full turn: reason + invoke + yield passes', () => {
+    it('full turn: think + invoke + yield passes', () => {
       const v = shellValidator()
       v.passes(
-        `<magnitude:reason about="alignment">\nsome thought\n</magnitude:reason>\n` +
+        `<magnitude:think about="alignment">\nsome thought\n</magnitude:think>\n` +
         `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls -la</magnitude:parameter>\n</magnitude:invoke>\n` +
         `<magnitude:yield_user/>`
       )

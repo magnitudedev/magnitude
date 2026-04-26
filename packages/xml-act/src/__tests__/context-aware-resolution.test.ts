@@ -74,18 +74,18 @@ describe('context-aware tag resolution', () => {
     expect(events.filter(e => e._tag === 'ToolInputStarted')).toHaveLength(0)
   })
 
-  it('treats </magnitude:reason> in prose (no open reason) as stray close + content', () => {
-    const events = parse('</magnitude:reason>\nsome text')
+  it('treats </magnitude:think> in prose (no open think) as stray close + content', () => {
+    const events = parse('</magnitude:think>\nsome text')
     const errors = events.filter(e => e._tag === 'StructuralParseError') as any[]
     expect(errors.length).toBeGreaterThan(0)
     expect(errors[0].error._tag).toBe('StrayCloseTag')
   })
 
-  it('treats <magnitude:reason about="foo"> inside reason frame as content', () => {
-    const events = parse('<magnitude:reason about="outer">\nSome <magnitude:reason about="inner"> text\n</magnitude:reason>')
+  it('treats <magnitude:think about="foo"> inside think frame as content', () => {
+    const events = parse('<magnitude:think about="outer">\nSome <magnitude:think about="inner"> text\n</magnitude:think>')
     const lensChunks = events.filter(e => e._tag === 'LensChunk')
     const text = lensChunks.map(e => (e as any).text).join('')
-    expect(text).toContain('<magnitude:reason about="inner">')
+    expect(text).toContain('<magnitude:think about="inner">')
   })
 
   it('treats <parameter name="x"> in message as content (no invoke frame)', () => {

@@ -115,8 +115,8 @@ describe('xml parser', () => {
     expect(error).toMatchObject({ _tag: 'ToolParseError', error: { _tag: 'IncompleteTool' } })
   })
 
-  it('emits LensStart/Chunk/End for reason blocks', () => {
-    const events = parse('<magnitude:reason about="analyze">\nsome reasoning\n</magnitude:reason>')
+  it('emits LensStart/Chunk/End for think blocks', () => {
+    const events = parse('<magnitude:think about="analyze">\nsome reasoning\n</magnitude:think>')
     expect(events.find(e => e._tag === 'LensStart')).toMatchObject({ _tag: 'LensStart', name: 'analyze' })
     expect(events.find(e => e._tag === 'LensChunk')).toBeDefined()
     expect(events.find(e => e._tag === 'LensEnd')).toMatchObject({ _tag: 'LensEnd', name: 'analyze' })
@@ -149,8 +149,8 @@ describe('xml parser', () => {
   })
 
   it('mismatched close tag is treated as content (no lenience)', () => {
-    // </magnitude:message> inside a reason block is not structural — treated as content
-    const events = parse('<magnitude:reason about="turn">\nsome reasoning</magnitude:message>\n</magnitude:reason>')
+    // </magnitude:message> inside a think block is not structural — treated as content
+    const events = parse('<magnitude:think about="turn">\nsome reasoning</magnitude:message>\n</magnitude:think>')
     expect(events.find(e => e._tag === 'LensEnd')).toBeDefined()
     // No MessageEnd since </magnitude:message> was content
     expect(events.find(e => e._tag === 'MessageEnd')).toBeUndefined()

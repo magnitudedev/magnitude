@@ -4,9 +4,9 @@ import { shellValidator, buildValidator, SHELL_TOOL } from './helpers'
 // Helpers to build full valid sequences
 const YIELD = '<magnitude:yield_user/>'
 
-/** Wrap content in a reason block + yield */
+/** Wrap content in a think block + yield */
 function withReason(body: string): string {
-  return `<magnitude:reason about="alignment">\n${body}</magnitude:reason>\n${YIELD}`
+  return `<magnitude:think about="alignment">\n${body}</magnitude:think>\n${YIELD}`
 }
 
 /** Wrap content in a message block + yield */
@@ -30,7 +30,7 @@ describe('body DFA — content with < that is not a close tag', () => {
     v.passes(withReason('see <rea something here\n'))
   })
 
-  it('accepts HTML-like content in reason body', () => {
+  it('accepts HTML-like content in think body', () => {
     const v = shellValidator()
     v.passes(withReason('<div>hello</div>\n'))
   })
@@ -45,7 +45,7 @@ describe('body DFA — content with < that is not a close tag', () => {
     v.passes(withReason('if a < b then do something\n'))
   })
 
-  it('accepts </rea (partial close tag name) in reason body', () => {
+  it('accepts </rea (partial close tag name) in think body', () => {
     const v = shellValidator()
     v.passes(withReason('</rea partial\n'))
   })
@@ -58,9 +58,9 @@ describe('body DFA — content with < that is not a close tag', () => {
 
 describe('body DFA — false close tag rejection', () => {
   it('close tag followed by non-ws char is treated as body content', () => {
-    // </magnitude:reason>` — backtick at tw0 matches [^ \t\n<] → back to s0
+    // </magnitude:think>` — backtick at tw0 matches [^ \t\n<] → back to s0
     const v = shellValidator()
-    v.rejects(withReason('content\n</magnitude:reason>`more content\n'))
+    v.rejects(withReason('content\n</magnitude:think>`more content\n'))
   })
 
   it('close tag followed by letter is treated as body content', () => {
@@ -80,7 +80,7 @@ describe('body DFA — false close tag rejection', () => {
 })
 
 describe('body DFA — multiline content', () => {
-  it('accepts content with blank lines in reason body', () => {
+  it('accepts content with blank lines in think body', () => {
     const v = shellValidator()
     v.passes(withReason('line one\n\nline two\n\nline three\n'))
   })

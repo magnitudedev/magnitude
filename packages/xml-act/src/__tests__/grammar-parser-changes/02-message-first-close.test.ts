@@ -53,15 +53,15 @@ describe('Category 2: first-close-wins for message', () => {
     v().passes(input)
   })
 
-  it('08: reason then message then yield', () => {
-    const input = `<magnitude:reason about="t">think</magnitude:reason>\n<magnitude:message to="u">hi</magnitude:message>\n${Y}`
+  it('08: think then message then yield', () => {
+    const input = `<magnitude:think about="t">think</magnitude:think>\n<magnitude:message to="u">hi</magnitude:message>\n${Y}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
     expect(hasEvent(parse(input), 'MessageEnd')).toBe(true)
   })
 
-  it('09: reason then message then invoke then yield', () => {
-    const input = `<magnitude:reason about="t">think</magnitude:reason>\n<magnitude:message to="u">hi</magnitude:message>\n<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${Y}`
+  it('09: think then message then invoke then yield', () => {
+    const input = `<magnitude:think about="t">think</magnitude:think>\n<magnitude:message to="u">hi</magnitude:message>\n<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${Y}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
     expect(hasEvent(parse(input), 'MessageEnd')).toBe(true)
@@ -94,8 +94,8 @@ describe('Category 2: first-close-wins for message', () => {
     expect(collectMessageChunks(parse(input))).toBe('text')
   })
 
-  it('13: false close in message after reason → REJECT', () => {
-    const input = `<magnitude:reason about="t">r</magnitude:reason>\n<magnitude:message to="u">text</magnitude:message>extra</magnitude:message>\n${Y}`
+  it('13: false close in message after think → REJECT', () => {
+    const input = `<magnitude:think about="t">r</magnitude:think>\n<magnitude:message to="u">text</magnitude:message>extra</magnitude:message>\n${Y}`
     v().rejects(input)
   })
 })

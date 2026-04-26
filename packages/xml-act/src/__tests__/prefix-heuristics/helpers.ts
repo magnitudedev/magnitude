@@ -122,7 +122,7 @@ const KNOWN_TAGS = new Set([
   'magnitude:invoke',
   'magnitude:parameter',
   'magnitude:filter',
-  'magnitude:reason',
+  'magnitude:think',
   'magnitude:message',
   'magnitude:yield_user',
   'magnitude:yield_invoke',

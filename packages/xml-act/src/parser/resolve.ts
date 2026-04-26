@@ -35,9 +35,9 @@ declare const _assertProseChildren: _AssertProseChildren
 declare const _assertInvokeChildren: _AssertInvokeChildren
 
 import {
-  reasonOpenHandler,
-  reasonCloseHandler,
-} from './handlers/reason'
+  thinkOpenHandler,
+  thinkCloseHandler,
+} from './handlers/think'
 import {
   messageOpenHandler,
   messageCloseHandler,
@@ -65,10 +65,10 @@ export type OpenResolution =
 
 export function resolveOpenHandler(tagName: string, top: Frame): BoundOpenHandler | undefined {
   switch (tagName) {
-    case 'magnitude:reason':
+    case 'magnitude:think':
       if (top.type !== 'prose') return undefined
-      // top is narrowed to ProseFrame — TypeScript verifies reasonOpenHandler: OpenHandler<ProseFrame, ...>
-      return bindOpen(reasonOpenHandler, top)
+      // top is narrowed to ProseFrame — TypeScript verifies thinkOpenHandler: OpenHandler<ProseFrame, ...>
+      return bindOpen(thinkOpenHandler, top)
 
     case 'magnitude:message':
       if (top.type !== 'prose') return undefined
@@ -137,9 +137,10 @@ export function resolveOpen(
 export function resolveCloseHandler(tagName: string, top: Frame): BoundCloseHandler | undefined {
   // Switch on top.type first — TypeScript narrows top in every case
   switch (top.type) {
-    case 'reason':
-      // top is ReasonFrame — TypeScript verifies reasonCloseHandler: CloseHandler<ReasonFrame>
-      return tagName === 'magnitude:reason' ? bindClose(reasonCloseHandler, top) : undefined
+    case 'think':
+      // top is ThinkFrame — TypeScript verifies thinkCloseHandler: CloseHandler<ThinkFrame>
+      // 'think' is the short-form close alias for 'magnitude:think'
+      return (tagName === 'magnitude:think' || tagName === 'think') ? bindClose(thinkCloseHandler, top) : undefined
 
     case 'message':
       // top is MessageFrame

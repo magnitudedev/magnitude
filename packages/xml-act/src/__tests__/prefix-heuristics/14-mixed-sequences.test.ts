@@ -19,8 +19,8 @@ import {
 const v = () => grammarValidator()
 
 describe('prefix heuristics: mixed sequences', () => {
-  it('01: reason then shell alias then message', () => {
-    const input = '<magnitude:reason>prep</magnitude:reason><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:message>done</magnitude:message><magnitude:yield_user/>'
+  it('01: think then shell alias then message', () => {
+    const input = '<magnitude:think>prep</magnitude:think><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:message>done</magnitude:message><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectNoStructuralError(events)
@@ -39,7 +39,7 @@ describe('prefix heuristics: mixed sequences', () => {
   })
 
   it('03: top-level unknown between valid items', () => {
-    const input = '<magnitude:reason>prep</magnitude:reason><magnitude:foo>bar</magnitude:foo><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>'
+    const input = '<magnitude:think>prep</magnitude:think><magnitude:foo>bar</magnitude:foo><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectStructuralError(events, {
@@ -64,7 +64,7 @@ describe('prefix heuristics: mixed sequences', () => {
 
   it('05: recovered message close followed by shell alias', () => {
     const input = `<magnitude:message>hello
-</magnitude:reason>
+</magnitude:think>
 <magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell><magnitude:yield_user/>`
     v().rejects(input)
     const events = parse(input)
@@ -105,20 +105,20 @@ describe('prefix heuristics: mixed sequences', () => {
   })
 
   it('09: ambiguous same-line mismatch followed by valid message', () => {
-    const input = '<magnitude:message>hello</magnitude:reason> world</magnitude:message><magnitude:message>next</magnitude:message><magnitude:yield_user/>'
+    const input = '<magnitude:message>hello</magnitude:think> world</magnitude:message><magnitude:message>next</magnitude:message><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectStructuralError(events, {
       variant: 'AmbiguousMagnitudeClose',
-      tagName: 'magnitude:reason',
+      tagName: 'magnitude:think',
       expectedTagName: 'magnitude:message',
-      detailIncludes: ['</magnitude:reason>', 'magnitude:message'],
+      detailIncludes: ['</magnitude:think>', 'magnitude:message'],
     })
-    expectPreservedInMessage(events, '</magnitude:reason>')
+    expectPreservedInMessage(events, '</magnitude:think>')
   })
 
-  it('10: reason then tree alias then message escape open is invalid', () => {
-    const input = '<magnitude:reason>prep</magnitude:reason><magnitude:tree></magnitude:tree><magnitude:message><magnitude:escape></magnitude:reason></magnitude:escape></magnitude:message><magnitude:yield_user/>'
+  it('10: think then tree alias then message escape open is invalid', () => {
+    const input = '<magnitude:think>prep</magnitude:think><magnitude:tree></magnitude:tree><magnitude:message><magnitude:escape></magnitude:think></magnitude:escape></magnitude:message><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
     expectStructuralError(events, {

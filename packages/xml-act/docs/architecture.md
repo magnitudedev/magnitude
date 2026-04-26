@@ -20,7 +20,7 @@ Each layer has a single responsibility:
 A turn consists of reasoning blocks, then messages and tool invocations, then a yield:
 
 ```xml
-<reason about="analysis">thinking here</reason>
+<think about="analysis">thinking here</think>
 <message to="user">response text</message>
 <invoke tool="shell">
   <parameter name="command">ls -la</parameter>
@@ -42,7 +42,7 @@ buc        ::= ([^<] | "<" [^/] | "</" [^p] | ...)*
 
 At each close tag, the GBNF engine offers both "content" and "structural close" paths. The model's token choice selects the interpretation. The last close tag is structural — greedy last-match emerges naturally from how the model generates. No lookahead, no confirmation windows, no state explosion. The CFG stack handles unbounded depth.
 
-This applies to all body types: `reason`, `message`, `parameter`, and `filter`. The continuation rules differ per tag type. Top-level bodies (`reason`, `message`) confirm on the next top-level tag or yield. Inside invoke blocks, the last parameter uses **deep confirmation** — `</parameter>` is confirmed through `</invoke>` all the way to the next top-level tag as a single grammar unit. Non-last parameters confirm on the next parameter, filter, or invoke close.
+This applies to all body types: `think`, `message`, `parameter`, and `filter`. The continuation rules differ per tag type. Top-level bodies (`think`, `message`) confirm on the next top-level tag or yield. Inside invoke blocks, the last parameter uses **deep confirmation** — `</parameter>` is confirmed through `</invoke>` all the way to the next top-level tag as a single grammar unit. Non-last parameters confirm on the next parameter, filter, or invoke close.
 
 Tool names and parameter names are **constrained per-tool** in the grammar. The grammar enumerates valid tool names and, for each tool, the valid sequence of parameter names. Grammar size scales with the number of tools and their parameter schemas.
 
@@ -54,7 +54,7 @@ See [grammar.md](grammar.md) for full details.
 
 A streaming character-level state machine (`tokenizer.ts`). Key features:
 
-- **Immediate close-tag emission** — known structural close tag names (`invoke`, `parameter`, `filter`, `reason`, `message`) are emitted as `Close` tokens immediately. Unknown close tags (e.g. `</div>`) are emitted as `Content`. No confirmation, no lookahead, no buffering for close tags.
+- **Immediate close-tag emission** — known structural close tag names (`invoke`, `parameter`, `filter`, `think`, `message`) are emitted as `Close` tokens immediately. Unknown close tags (e.g. `</div>`) are emitted as `Content`. No confirmation, no lookahead, no buffering for close tags.
 - **Attribute parsing** — 7-phase parser for `key="value"`, `key='value'`, `key=value`, and boolean attributes.
 - **CDATA** — `...` emitted as Content tokens, chunk-boundary safe.
 - **Chunk-boundary safety** — `pendingLt` for `<` at boundaries.
@@ -86,9 +86,9 @@ The tokenizer is a simple structural scanner — it emits close tags immediately
 
 ```ts
 VALID_CHILDREN = {
-  prose:     ['reason', 'message', 'invoke'],
+  prose:     ['think', 'message', 'invoke'],
   invoke:    ['parameter', 'filter'],
-  reason:    [],
+  think:    [],
   message:   [],
   parameter:    [],
   filter:    [],

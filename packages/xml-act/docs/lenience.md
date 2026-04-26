@@ -12,7 +12,7 @@ Close-tag confirmation is handled in two cooperating layers.
 
 ### Layer 1: Grammar (constrained decoding)
 
-All body types — reason, message, invoke, parameter, filter — use a **greedy last-match** rule:
+All body types — think, message, invoke, parameter, filter — use a **greedy last-match** rule:
 
 ```
 body = buc (close buc)* close continuation
@@ -55,8 +55,8 @@ When a `Close` token arrives matching the current frame, the parser does not app
 
 ## Practical Implications
 
-- `</reason>` inside backticks (`` `</reason>` ``) → the backtick rejects → content. ✅
-- `</reason>` at end of turn, followed by `<message` → confirmed, then `<message` starts. ✅
+- `</think>` inside backticks (`` `</think>` ``) → the backtick rejects → content. ✅
+- `</think>` at end of turn, followed by `<message` → confirmed, then `<message` starts. ✅
 - `</parameter>` followed by `</invoke>` followed by `<yield_user/>` → cascade confirms both. ✅
 - `</parameter>` followed by `<parameter name="next">` (valid next param) → confirms, opens next param. ✅
 - `</parameter>` followed by ` and more prose` → non-whitespace Content → rejected → content. ✅

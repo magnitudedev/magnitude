@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, TAG_REASON, TAG_MESSAGE, TAG_INVOKE, TAG_PARAMETER } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, TAG_THINK, TAG_MESSAGE, TAG_INVOKE, TAG_PARAMETER } from '@magnitudedev/xml-act'
 import protocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -23,7 +23,7 @@ ${lens.description}`).join('\n\n')
 
 function renderLensesExample(lenses: ThinkingLens[]): string {
   return lenses
-    .map((lens) => `<magnitude:reason about="${lens.name}">...${lens.name} reasoning if relevant</magnitude:reason>`)
+    .map((lens) => `<magnitude:think about="${lens.name}">...${lens.name} thinking if relevant</magnitude:think>`)
     .join('\n')
 }
 
@@ -50,7 +50,7 @@ export function getProtocol(
   const yieldOptions = yieldTags.map(t => `<${t}/>`).join(' | ')
 
   return PROTOCOL_RAW
-    .replaceAll('{{TAG_REASON}}', 'magnitude:reason')
+    .replaceAll('{{TAG_THINK}}', 'magnitude:think')
     .replaceAll('{{TAG_MESSAGE}}', 'magnitude:message')
     .replaceAll('{{TAG_INVOKE}}', 'magnitude:invoke')
     .replaceAll('{{TAG_PARAMETER}}', 'magnitude:parameter')
@@ -77,9 +77,9 @@ export function buildAckTurn(
   const lensName = lenses.find(lens => lens.name === 'turn')?.name ?? lenses[0]?.name ?? 'turn'
 
   return [
-    `<magnitude:reason about="${lensName}">`,
+    `<magnitude:think about="${lensName}">`,
     `Acknowledge readiness and continue.`,
-    `</magnitude:reason>`,
+    `</magnitude:think>`,
     `<magnitude:message to="${defaultRecipient}">`,
     `Ready.`,
     `</magnitude:message>`,
@@ -94,7 +94,7 @@ export interface AckTurnMessage {
 }
 
 // Tag helpers for few-shot construction
-const reason = (about: string, content: string) => `<${TAG_REASON} about="${about}">${content}</${TAG_REASON}>`
+const think = (about: string, content: string) => `<${TAG_THINK} about="${about}">${content}</${TAG_THINK}>`
 const msg = (to: string, ...lines: string[]) => `<${TAG_MESSAGE} to="${to}">\n${lines.join('\n')}\n</${TAG_MESSAGE}>`
 const invoke = (tool: string, ...params: string[]) => `<${TAG_INVOKE} tool="${tool}">\n${params.join('\n')}\n</${TAG_INVOKE}>`
 const param = (name: string, value: string) => `<${TAG_PARAMETER} name="${name}">${value}</${TAG_PARAMETER}>`
@@ -115,7 +115,7 @@ export function buildAckTurns(
     {
       role: 'assistant',
       content: [[
-        reason('turn', 'Need to write an HTML guide. Let me activate the foobar skill first.'),
+        think('turn', 'Need to write an HTML guide. Let me activate the foobar skill first.'),
         '',
         invoke('skill', param('name', 'foobar')),
         '',
@@ -144,7 +144,7 @@ Methodology for fooing bars into bazzes.
     {
       role: 'assistant',
       content: [[
-        reason('turn', 'Skill loaded. Write the HTML guide page for foo.'),
+        think('turn', 'Skill loaded. Write the HTML guide page for foo.'),
         '',
         invoke('write',
           param('path', 'foo-guide.html'),
@@ -166,7 +166,7 @@ Methodology for fooing bars into bazzes.
     {
       role: 'assistant',
       content: [[
-        reason('turn', 'File written. Read it back to verify.'),
+        think('turn', 'File written. Read it back to verify.'),
         '',
         invoke('read', param('path', 'foo-guide.html')),
         '',

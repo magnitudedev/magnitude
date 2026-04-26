@@ -68,10 +68,10 @@ describe('message blocks', () => {
         )
       })
 
-      it('accepts reason before required message', () => {
+      it('accepts think before required message', () => {
         const v = buildValidator([SHELL_TOOL], b => b.requireMessageTo('parent'))
         v.passes(
-          `<magnitude:reason about="turn">\nplanning\n</magnitude:reason>\n` +
+          `<magnitude:think about="turn">\nplanning\n</magnitude:think>\n` +
           `<magnitude:message to="parent">\nhello\n</magnitude:message>\n` +
           YIELD
         )

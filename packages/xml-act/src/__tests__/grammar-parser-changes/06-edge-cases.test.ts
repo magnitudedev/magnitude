@@ -15,21 +15,21 @@ describe('Category 6: edge cases', () => {
   // Wrong-case and non-magnitude close tags in bodies
   // =========================================================================
 
-  it('01: wrong-case </Magnitude:reason> is body content', () => {
-    const input = `<magnitude:reason about="t">text </Magnitude:reason> more</magnitude:reason>\n${Y}`
+  it('01: wrong-case </Magnitude:think> is body content', () => {
+    const input = `<magnitude:think about="t">text </Magnitude:think> more</magnitude:think>\n${Y}`
     v().passes(input)
     const chunks = collectLensChunks(parse(input))
-    expect(chunks).toContain('</Magnitude:reason>')
+    expect(chunks).toContain('</Magnitude:think>')
     expect(chunks).toContain('more')
   })
 
-  it('02: </magnitude:REASON> (wrong case) in reason body → REJECT (pre-existing)', () => {
-    // The BUC stops at </magnitude: prefix, then expects "reason>" but sees "REASON>"
-    v().rejects(`<magnitude:reason about="t">text </magnitude:REASON> more</magnitude:reason>\n${Y}`)
+  it('02: </magnitude:REASON> (wrong case) in think body → REJECT (pre-existing)', () => {
+    // The BUC stops at </magnitude: prefix, then expects "think>" but sees "REASON>"
+    v().rejects(`<magnitude:think about="t">text </magnitude:REASON> more</magnitude:think>\n${Y}`)
   })
 
   it('03: non-magnitude close tag in body', () => {
-    const input = `<magnitude:reason about="t">text </div> more</magnitude:reason>\n${Y}`
+    const input = `<magnitude:think about="t">text </div> more</magnitude:think>\n${Y}`
     v().passes(input)
     expect(collectLensChunks(parse(input))).toContain('</div>')
   })
@@ -38,12 +38,12 @@ describe('Category 6: edge cases', () => {
   // Whitespace-only between elements (no prose allowed)
   // =========================================================================
 
-  it('04: prose text between reason and yield → REJECT', () => {
-    v().rejects(`<magnitude:reason about="t">x</magnitude:reason>\nSome text\n${Y}`)
+  it('04: prose text between think and yield → REJECT', () => {
+    v().rejects(`<magnitude:think about="t">x</magnitude:think>\nSome text\n${Y}`)
   })
 
-  it('05: prose text between reason and message → REJECT', () => {
-    v().rejects(`<magnitude:reason about="t">x</magnitude:reason>\nSome text\n<magnitude:message to="u">hi</magnitude:message>\n${Y}`)
+  it('05: prose text between think and message → REJECT', () => {
+    v().rejects(`<magnitude:think about="t">x</magnitude:think>\nSome text\n<magnitude:message to="u">hi</magnitude:message>\n${Y}`)
   })
 
   it('06: prose text between message and yield → REJECT', () => {
@@ -66,9 +66,9 @@ describe('Category 6: edge cases', () => {
   // Multiple structural elements
   // =========================================================================
 
-  it('09: reason + message + invoke + yield', () => {
+  it('09: think + message + invoke + yield', () => {
     const input =
-      `<magnitude:reason about="t">think</magnitude:reason>\n` +
+      `<magnitude:think about="t">think</magnitude:think>\n` +
       `<magnitude:message to="u">hi</magnitude:message>\n` +
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n${Y}`
     v().passes(input)

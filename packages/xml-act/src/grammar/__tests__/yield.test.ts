@@ -54,9 +54,9 @@ describe('yield tags', () => {
   })
 
   describe('yield after other blocks', () => {
-    it('yield after reason block passes', () => {
+    it('yield after think block passes', () => {
       const v = buildValidator([SHELL_TOOL])
-      v.passes(`<magnitude:reason about="turn">\nsome thought\n</magnitude:reason>\n<magnitude:yield_user/>`)
+      v.passes(`<magnitude:think about="turn">\nsome thought\n</magnitude:think>\n<magnitude:yield_user/>`)
     })
 
     it('yield after message block passes', () => {
@@ -69,10 +69,10 @@ describe('yield tags', () => {
       v.passes(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n<magnitude:yield_user/>`)
     })
 
-    it('yield after reason + invoke passes', () => {
+    it('yield after think + invoke passes', () => {
       const v = shellValidator()
       v.passes(
-        `<magnitude:reason about="turn">\nsome thought\n</magnitude:reason>\n` +
+        `<magnitude:think about="turn">\nsome thought\n</magnitude:think>\n` +
         `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n</magnitude:invoke>\n` +
         `<magnitude:yield_user/>`
       )

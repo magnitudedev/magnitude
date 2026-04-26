@@ -12,7 +12,7 @@ import type { InvokeContext } from './handler-context'
 import { emitEvent, emitStructuralError, emitToolError } from './ops'
 import { stripTrailingWhitespace } from './content'
 import { finalizeParameterOps, finalizeInvokeOps } from './handlers/invoke'
-import { closeReasonAtEof } from './handlers/reason'
+import { closeThinkAtEof } from './handlers/think'
 import { generateToolInterface } from '@magnitudedev/tools'
 
 function getCorrectToolShape(toolTag: string, invokeCtx: InvokeContext): string | undefined {
@@ -78,9 +78,9 @@ export function flushAllFrames(
         ])
         break
 
-      case 'reason':
-        // top is ReasonFrame — TypeScript narrows
-        apply(closeReasonAtEof(top))
+      case 'think':
+        // top is ThinkFrame — TypeScript narrows
+        apply(closeThinkAtEof(top))
         break
 
       case 'prose': {

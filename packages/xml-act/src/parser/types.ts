@@ -42,7 +42,7 @@ export interface ParserConfig {
 
 export type Frame =
   | ProseFrame
-  | ReasonFrame
+  | ThinkFrame
   | MessageFrame
   | InvokeFrame
   | ParameterFrame
@@ -55,8 +55,8 @@ export interface ProseFrame {
   readonly hasContent: boolean
 }
 
-export interface ReasonFrame {
-  readonly type: 'reason'
+export interface ThinkFrame {
+  readonly type: 'think'
   readonly openSpan: SourceSpan
   readonly name: string
   readonly content: string
@@ -132,7 +132,7 @@ export interface FilterFrame {
  * when structural context confirms the intent.
  */
 export type PendingClose = {
-  tagName: string           // raw tag name seen (e.g., 'magnitude:reason')
+  tagName: string           // raw tag name seen (e.g., 'magnitude:think')
   effectiveTagName: string  // canonical close tag for the current frame (e.g., 'magnitude:message')
   wsBuffer: string          // buffered whitespace after the close tag
   sawNewline: boolean       // whether a newline was seen in the buffered whitespace

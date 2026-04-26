@@ -14,118 +14,118 @@ import {
 const v = () => grammarValidator()
 
 describe('top-level close tag confirmation', () => {
-  // ---- Reason: confirmed ----
+  // ---- Think: confirmed ----
 
-  it('01: </magnitude:reason>< confirms (immediate)', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason><${YIELD.slice(1)}`
+  it('01: </magnitude:think>< confirms (immediate)', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     const events = parse(input)
     expect(hasEvent(events, 'LensEnd')).toBe(true)
   })
 
-  it('02: </magnitude:reason> + 1 space + < confirms', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason> <${YIELD.slice(1)}`
+  it('02: </magnitude:think> + 1 space + < confirms', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think> <${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  it('03: </magnitude:reason> + 10 spaces + < confirms (no bound)', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason>          <${YIELD.slice(1)}`
+  it('03: </magnitude:think> + 10 spaces + < confirms (no bound)', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think>          <${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  it('04: </magnitude:reason> + tab + < confirms', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason>\t<${YIELD.slice(1)}`
+  it('04: </magnitude:think> + tab + < confirms', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think>\t<${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  it('05: </magnitude:reason> + \\n + < confirms', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason>\n<${YIELD.slice(1)}`
+  it('05: </magnitude:think> + \\n + < confirms', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think>\n<${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  it('06: </magnitude:reason> + multiple \\n + < confirms', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason>\n\n\n<${YIELD.slice(1)}`
+  it('06: </magnitude:think> + multiple \\n + < confirms', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think>\n\n\n<${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  it('07: </magnitude:reason> + mixed ws + < confirms', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason> \t\n \t\n<${YIELD.slice(1)}`
+  it('07: </magnitude:think> + mixed ws + < confirms', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think> \t\n \t\n<${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  // ---- Reason: rejected (false close tags) ----
+  // ---- Think: rejected (false close tags) ----
 
-  it('08: </magnitude:reason> + non-ws char rejects under first-close-wins', () => {
-    const input = `<magnitude:reason about="t">\n</magnitude:reason>x more\n</magnitude:reason><${YIELD.slice(1)}`
+  it('08: </magnitude:think> + non-ws char rejects under first-close-wins', () => {
+    const input = `<magnitude:think about="t">\n</magnitude:think>x more\n</magnitude:think><${YIELD.slice(1)}`
     v().rejects(input)
   })
 
-  it('09: </magnitude:reason> + \\n without ever seeing < — incomplete', () => {
-    const input = `<magnitude:reason about="t">\nx\n</magnitude:reason>\n`
+  it('09: </magnitude:think> + \\n without ever seeing < — incomplete', () => {
+    const input = `<magnitude:think about="t">\nx\n</magnitude:think>\n`
     v().rejects(input)
   })
 
-  it('10: false </magnitude:reason> then real close rejects', () => {
-    const input = `<magnitude:reason about="t">\nThe tag </magnitude:reason>x is used\n</magnitude:reason><${YIELD.slice(1)}`
+  it('10: false </magnitude:think> then real close rejects', () => {
+    const input = `<magnitude:think about="t">\nThe tag </magnitude:think>x is used\n</magnitude:think><${YIELD.slice(1)}`
     v().rejects(input)
   })
 
-  it('11: multiple false </magnitude:reason> before real one rejects', () => {
-    const input = `<magnitude:reason about="t">\n</magnitude:reason>a\n</magnitude:reason>b\n</magnitude:reason><${YIELD.slice(1)}`
+  it('11: multiple false </magnitude:think> before real one rejects', () => {
+    const input = `<magnitude:think about="t">\n</magnitude:think>a\n</magnitude:think>b\n</magnitude:think><${YIELD.slice(1)}`
     v().rejects(input)
   })
 
-  // ---- Reason: chaining ----
+  // ---- Think: chaining ----
 
-  it('12: </magnitude:reason> confirmed by <magnitude:reason (another lens)', () => {
-    const input = `<magnitude:reason about="a">\nx\n</magnitude:reason><magnitude:reason about="b">\ny\n</magnitude:reason><${YIELD.slice(1)}`
+  it('12: </magnitude:think> confirmed by <magnitude:think (another lens)', () => {
+    const input = `<magnitude:think about="a">\nx\n</magnitude:think><magnitude:think about="b">\ny\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     expect(countEvents(parse(input), 'LensEnd')).toBe(2)
   })
 
-  it('13: </magnitude:reason> confirmed by <invoke', () => {
-    const input = `<magnitude:reason about="a">\nx\n</magnitude:reason><magnitude:invoke tool="tree">\n</magnitude:invoke><${YIELD.slice(1)}`
+  it('13: </magnitude:think> confirmed by <invoke', () => {
+    const input = `<magnitude:think about="a">\nx\n</magnitude:think><magnitude:invoke tool="tree">\n</magnitude:invoke><${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
-  it('14: </magnitude:reason> confirmed by <magnitude:message', () => {
-    const input = `<magnitude:reason about="a">\nx\n</magnitude:reason><magnitude:message to="u">\nh\n</magnitude:message><${YIELD.slice(1)}`
+  it('14: </magnitude:think> confirmed by <magnitude:message', () => {
+    const input = `<magnitude:think about="a">\nx\n</magnitude:think><magnitude:message to="u">\nh\n</magnitude:message><${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
     expect(hasEvent(parse(input), 'MessageEnd')).toBe(true)
   })
 
-  // ---- Reason: content edge cases ----
+  // ---- Think: content edge cases ----
 
   it('15: content with < that is not a close tag', () => {
-    const input = `<magnitude:reason about="t">\nfoo < bar\n</magnitude:reason><${YIELD.slice(1)}`
+    const input = `<magnitude:think about="t">\nfoo < bar\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     const text = collectLensChunks(parse(input))
     expect(text).toContain('foo < bar')
   })
 
   it('16: content with HTML-like tags', () => {
-    const input = `<magnitude:reason about="t">\n<div>hello</div>\n</magnitude:reason><${YIELD.slice(1)}`
+    const input = `<magnitude:think about="t">\n<div>hello</div>\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     const text = collectLensChunks(parse(input))
     expect(text).toContain('<div>hello</div>')
   })
 
   it('17: content with partial close tag </rea', () => {
-    const input = `<magnitude:reason about="t">\n</rea partial\n</magnitude:reason><${YIELD.slice(1)}`
+    const input = `<magnitude:think about="t">\n</rea partial\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     expect(hasEvent(parse(input), 'LensEnd')).toBe(true)
   })
 
   it('18: content with </reasonX (wrong close tag name)', () => {
-    const input = `<magnitude:reason about="t">\n</reasonX> stuff\n</magnitude:reason><${YIELD.slice(1)}`
+    const input = `<magnitude:think about="t">\n</reasonX> stuff\n</magnitude:think><${YIELD.slice(1)}`
     v().passes(input)
     const text = collectLensChunks(parse(input))
     expect(text).toContain('</reasonX>')

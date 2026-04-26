@@ -14,64 +14,64 @@ const Y = YIELD_USER
 
 describe('Category 10: body content edge cases', () => {
   // =========================================================================
-  // Reason body content
+  // Think body content
   // =========================================================================
 
-  describe('reason body', () => {
+  describe('think body', () => {
     it('01: body with multiple < chars', () => {
-      const input = `<magnitude:reason about="t">a < b < c</magnitude:reason>\n${Y}`
+      const input = `<magnitude:think about="t">a < b < c</magnitude:think>\n${Y}`
       v().passes(input)
       expect(collectLensChunks(parse(input))).toBe('a < b < c')
     })
 
     it('02: body with HTML tags', () => {
-      const input = `<magnitude:reason about="t"><div><span>x</span></div></magnitude:reason>\n${Y}`
+      const input = `<magnitude:think about="t"><div><span>x</span></div></magnitude:think>\n${Y}`
       v().passes(input)
       expect(collectLensChunks(parse(input))).toContain('<div>')
     })
 
     it('03: body with code block containing close tag text', () => {
-      // The close tag text is just text — but with first-close-wins, the BUC stops at </magnitude:reason>
-      // This means we can't have literal </magnitude:reason> in reason body anymore
-      const input = `<magnitude:reason about="t">Use </magnitude:reason> to close</magnitude:reason>\n${Y}`
+      // The close tag text is just text — but with first-close-wins, the BUC stops at </magnitude:think>
+      // This means we can't have literal </magnitude:think> in think body anymore
+      const input = `<magnitude:think about="t">Use </magnitude:think> to close</magnitude:think>\n${Y}`
       // First close wins — body is "Use ", then grammar rejects " to close"
       v().rejects(input)
     })
 
     it('04: body with partial close prefix </magnitude:reax — REJECT (pre-existing: BUC stops at </magnitude: prefix)', () => {
       // Current BUC uses excludeClosePrefix: 'magnitude:' — stops at </magnitude:
-      // After changes: reason-body won't use excludeClosePrefix, so this would PASS
-      v().rejects(`<magnitude:reason about="t">text </magnitude:reax more</magnitude:reason>\n${Y}`)
+      // After changes: think-body won't use excludeClosePrefix, so this would PASS
+      v().rejects(`<magnitude:think about="t">text </magnitude:reax more</magnitude:think>\n${Y}`)
     })
 
-    it('05: body with </magnitude:message> in reason body — REJECT (pre-existing: BUC stops at </magnitude: prefix)', () => {
-      // Current BUC stops at </magnitude: — then expects "reason>" but sees "message>"
-      // After changes: reason-body won't use excludeClosePrefix, so this would PASS
-      v().rejects(`<magnitude:reason about="t">text </magnitude:message> more</magnitude:reason>\n${Y}`)
+    it('05: body with </magnitude:message> in think body — REJECT (pre-existing: BUC stops at </magnitude: prefix)', () => {
+      // Current BUC stops at </magnitude: — then expects "think>" but sees "message>"
+      // After changes: think-body won't use excludeClosePrefix, so this would PASS
+      v().rejects(`<magnitude:think about="t">text </magnitude:message> more</magnitude:think>\n${Y}`)
     })
 
     it('06: body with newlines', () => {
-      const input = `<magnitude:reason about="t">line1\nline2\nline3</magnitude:reason>\n${Y}`
+      const input = `<magnitude:think about="t">line1\nline2\nline3</magnitude:think>\n${Y}`
       v().passes(input)
       expect(collectLensChunks(parse(input))).toContain('line1')
     })
 
     it('07: body with only newlines', () => {
-      v().passes(`<magnitude:reason about="t">\n\n\n</magnitude:reason>\n${Y}`)
+      v().passes(`<magnitude:think about="t">\n\n\n</magnitude:think>\n${Y}`)
     })
 
     it('08: very long body', () => {
       const longText = 'x'.repeat(1000)
-      v().passes(`<magnitude:reason about="t">${longText}</magnitude:reason>\n${Y}`)
+      v().passes(`<magnitude:think about="t">${longText}</magnitude:think>\n${Y}`)
     })
 
     it('09: body with backticks and code', () => {
-      const input = `<magnitude:reason about="t">Run \`ls -la\` to check</magnitude:reason>\n${Y}`
+      const input = `<magnitude:think about="t">Run \`ls -la\` to check</magnitude:think>\n${Y}`
       v().passes(input)
     })
 
     it('10: body with quotes', () => {
-      const input = `<magnitude:reason about="t">He said "hello" and 'goodbye'</magnitude:reason>\n${Y}`
+      const input = `<magnitude:think about="t">He said "hello" and 'goodbye'</magnitude:think>\n${Y}`
       v().passes(input)
     })
   })

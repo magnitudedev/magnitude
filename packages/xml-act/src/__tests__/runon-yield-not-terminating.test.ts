@@ -10,7 +10,7 @@ import { createParser } from '../parser/index'
 import { createTokenizer } from '../tokenizer'
 import type { RegisteredTool, TurnEngineEvent } from '../types'
 import {
-  TAG_REASON,
+  TAG_THINK,
   TAG_INVOKE,
   TAG_MESSAGE,
   TAG_PARAMETER,
@@ -97,7 +97,7 @@ function parseChunked(input: string, chunkSize: number): TurnEngineEvent[] {
 }
 
 const BUG_INPUT =
-  `<${TAG_REASON} about="alignment">User added a requirement: show the date the trial expired on in the billing card.</${TAG_REASON}>\n` +
+  `<${TAG_THINK} about="alignment">User added a requirement: show the date the trial expired on in the billing card.</${TAG_THINK}>\n` +
   `\n` +
   `Got it — I'll include the trial expiration date in the card as well. Let me read the billing page code first. <${TAG_INVOKE} tool="read">\n` +
   `<${TAG_PARAMETER} name="path">app/(console)/billing/billing-client.tsx</${TAG_PARAMETER}>\n` +
