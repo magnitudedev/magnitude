@@ -1,9 +1,10 @@
 import type { TurnEngineEvent, ToolLifecycleEvent } from '@magnitudedev/xml-act'
+import type { ToolStateEvent } from '@magnitudedev/tools'
 import type { ToolState } from '../models/tool-state'
 import type { ToolKey, AgentCatalogEntry } from '../catalog'
 
 export type { ToolState } from '../models/tool-state'
-type ToolReducer<S> = { bivarianceHack(state: S, event: ToolLifecycleEvent): S }['bivarianceHack']
+type ToolReducer<S> = { bivarianceHack(state: S, event: ToolStateEvent): S }['bivarianceHack']
 
 export interface ToolHandle {
   readonly toolKey: ToolKey
@@ -44,16 +45,16 @@ function buildHandle<K extends ToolKey>(
     get state() { return state },
     process(event: TurnEngineEvent): ToolHandle {
       if (!isToolLifecycleEvent(event)) return this
-      const reduced = reduce(state, event)
+      // Map xml-act ToolLifecycleEvent → ToolStateEvent (only ToolParseError differs)
+      const mapped: ToolStateEvent = event._tag === 'ToolParseError'
+        ? { _tag: 'ToolParseError', error: event.error.detail }
+        : event as ToolStateEvent
+      const reduced = reduce(state, mapped)
       return buildHandle(toolKey, reduced, reduce)
     },
     interrupt(): ToolHandle {
-      const interruptEvent: ToolLifecycleEvent = {
+      const interruptEvent: ToolStateEvent = {
         _tag: 'ToolExecutionEnded',
-        toolCallId: '',
-        tagName: '',
-        group: '',
-        toolName: '',
         result: { _tag: 'Interrupted' },
       }
       return buildHandle(toolKey, reduce(state, interruptEvent), reduce)
