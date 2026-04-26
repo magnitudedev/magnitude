@@ -1,13 +1,12 @@
 /**
- * Rule: inside <magnitude:message>, any nested magnitude: open tag other than
- * <magnitude:escape> is invalid.
+ * Rule: inside <magnitude:message>, any nested magnitude: open tag is invalid.
  */
-import { describe, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   grammarValidator,
   parse,
   expectStructuralError,
-  expectNoStructuralError,
+  getStructuralErrors,
   expectPreservedInMessage,
 } from './helpers'
 
@@ -23,6 +22,7 @@ const invalidCases = [
     label: '02: message open inside message',
     input: '<magnitude:message>before <magnitude:message>nested</magnitude:message> after</magnitude:message><magnitude:yield_user/>',
     raw: '<magnitude:message>',
+    minStructuralErrors: 1,
   },
   {
     label: '03: reason open inside message',
@@ -71,29 +71,53 @@ describe('prefix heuristics: invalid message body', () => {
     it(testCase.label, () => {
       v().rejects(testCase.input)
       const events = parse(testCase.input)
-      expectStructuralError(events, {
-        variant: 'InvalidMagnitudeOpen',
-        tagName: testCase.raw.slice(1, -1).split(' ')[0],
-        parentTagName: 'magnitude:message',
-        detailIncludes: [testCase.raw, 'magnitude:message'],
-      })
+      if ('minStructuralErrors' in testCase) {
+        const structuralErrors = getStructuralErrors(events)
+        expect(structuralErrors.length).toBeGreaterThanOrEqual(
+          testCase.minStructuralErrors
+        )
+        const error = structuralErrors[0].error as any
+        expect(error._tag).toBe('InvalidMagnitudeOpen')
+        expect(error.tagName).toBe(testCase.raw.slice(1, -1).split(' ')[0])
+        expect(error.parentTagName).toBe('magnitude:message')
+        for (const snippet of [testCase.raw, 'magnitude:message']) {
+          expect(String(error.detail ?? '')).toContain(snippet)
+        }
+      } else {
+        expectStructuralError(events, {
+          variant: 'InvalidMagnitudeOpen',
+          tagName: testCase.raw.slice(1, -1).split(' ')[0],
+          parentTagName: 'magnitude:message',
+          detailIncludes: [testCase.raw, 'magnitude:message'],
+        })
+      }
       expectPreservedInMessage(events, testCase.raw)
     })
   }
 
-  it('11: escape is allowed', () => {
+  it('11: escape open inside message is invalid', () => {
     const input = '<magnitude:message>before <magnitude:escape><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell></magnitude:escape> after</magnitude:message><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
-    expectPreservedInMessage(events, '<magnitude:shell>')
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:message',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:message'],
+    })
+    expectPreservedInMessage(events, '<magnitude:escape>')
   })
 
-  it('12: escaped yield-looking syntax remains literal', () => {
+  it('12: escape-wrapped yield-looking syntax is invalid', () => {
     const input = '<magnitude:message><magnitude:escape><magnitude:yield_user/></magnitude:escape></magnitude:message><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
-    expectPreservedInMessage(events, '<magnitude:yield_user/>')
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:message',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:message'],
+    })
+    expectPreservedInMessage(events, '<magnitude:escape>')
   })
 })

@@ -94,11 +94,9 @@ describe('whitespace handling', () => {
   })
 
   describe('false close tag in body', () => {
-    it('close tag followed by non-ws does not close (treated as body)', () => {
+    it('close tag followed by non-ws rejects under first-close-wins', () => {
       const v = shellValidator()
-      // </magnitude:message>` — backtick at tw0 matches [^ \t\n<] → back to s0
-      // Real close later
-      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\`more\n</magnitude:message>\n<magnitude:yield_user/>`)
+      v.rejects(`<magnitude:message to="user">\nhello\n</magnitude:message>\`more\n</magnitude:message>\n<magnitude:yield_user/>`)
     })
 
     it('close tag in prose confirmed by newline (false positive)', () => {

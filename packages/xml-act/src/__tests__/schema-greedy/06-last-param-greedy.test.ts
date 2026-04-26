@@ -66,40 +66,34 @@ describe('last-parameter deep greedy matching', () => {
 
   // ---- False closes absorbed ----
 
-  it('09: false </magnitude:parameter> in last param content', () => {
+  it('09: false </magnitude:parameter> in last param content rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo </magnitude:parameter>; ls</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('echo </magnitude:parameter>; ls')
+    v().rejects(input)
   })
 
-  it('10: false </magnitude:parameter></magnitude:invoke> in content (no < after)', () => {
+  it('10: false </magnitude:parameter></magnitude:invoke> in content (no < after) rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke>MORE text</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('text</magnitude:parameter></magnitude:invoke>MORE text')
+    v().rejects(input)
   })
 
-  it('11: false </magnitude:parameter></magnitude:invoke> followed by \\n (not <)', () => {
+  it('11: false </magnitude:parameter></magnitude:invoke> followed by \\n (not <) rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke>\nmore</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toContain('text')
+    v().rejects(input)
   })
 
-  it('12: false </magnitude:parameter></magnitude:invoke> followed by space (not <)', () => {
+  it('12: false </magnitude:parameter></magnitude:invoke> followed by space (not <) rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke> still content</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toContain('text</magnitude:parameter></magnitude:invoke> still content')
+    v().rejects(input)
   })
 
-  it('13: content is exactly </magnitude:parameter></magnitude:invoke> (needs real close after)', () => {
+  it('13: content is exactly </magnitude:parameter></magnitude:invoke> (needs real close after) rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke>!</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke>!')
+    v().rejects(input)
   })
 
-  it('14: multiple false </magnitude:parameter></magnitude:invoke> sequences', () => {
+  it('14: multiple false </magnitude:parameter></magnitude:invoke> sequences reject', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke>a</magnitude:parameter></magnitude:invoke>b</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke>a</magnitude:parameter></magnitude:invoke>b')
+    v().rejects(input)
   })
 
   // ---- Filter path tightened ----
@@ -130,9 +124,9 @@ describe('last-parameter deep greedy matching', () => {
     gv.passes(input)
   })
 
-  it('18: false </magnitude:parameter></magnitude:invoke> in 4th param of grep', () => {
+  it('18: false </magnitude:parameter></magnitude:invoke> in 4th param of grep rejects', () => {
     const gv = buildValidator([GREP_TOOL_DEF])
     const input = `<magnitude:invoke tool="grep">\n<magnitude:parameter name="pattern">a</magnitude:parameter><magnitude:parameter name="glob">b</magnitude:parameter><magnitude:parameter name="path">c</magnitude:parameter><magnitude:parameter name="limit">text</magnitude:parameter></magnitude:invoke>NOT_LT more</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    gv.passes(input)
+    gv.rejects(input)
   })
 })

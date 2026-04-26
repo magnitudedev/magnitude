@@ -60,22 +60,22 @@ describe('body DFA — false close tag rejection', () => {
   it('close tag followed by non-ws char is treated as body content', () => {
     // </magnitude:reason>` — backtick at tw0 matches [^ \t\n<] → back to s0
     const v = shellValidator()
-    v.passes(withReason('content\n</magnitude:reason>`more content\n'))
+    v.rejects(withReason('content\n</magnitude:reason>`more content\n'))
   })
 
   it('close tag followed by letter is treated as body content', () => {
     const v = shellValidator()
-    v.passes(withMessage('hello\n</magnitude:message>foo\n'))
+    v.rejects(withMessage('hello\n</magnitude:message>foo\n'))
   })
 
   it('close tag followed by space then letter is treated as body content', () => {
     const v = shellValidator()
-    v.passes(withMessage('hello\n</magnitude:message> to end your message\n'))
+    v.rejects(withMessage('hello\n</magnitude:message> to end your message\n'))
   })
 
   it('false close tag in prose: real close later', () => {
     const v = shellValidator()
-    v.passes(`<magnitude:message to="user">\nhello</magnitude:message> to end your message</magnitude:message>\n${YIELD}`)
+    v.rejects(`<magnitude:message to="user">\nhello</magnitude:message> to end your message</magnitude:message>\n${YIELD}`)
   })
 })
 
@@ -122,10 +122,8 @@ describe('body DFA — trailing whitespace window', () => {
     v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\n${YIELD}`)
   })
 
-  it('5 trailing tabs: close tag treated as content (tab escapes to s0 at tw4)', () => {
-    // 5th tab at tw4 matches [^ \n<] → back to s0, close tag becomes content
-    // Need real close after
+  it('5 trailing tabs: close tag stays closed; non-ws after whitespace rejects', () => {
     const v = shellValidator()
-    v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\tmore content\n</magnitude:message>\n${YIELD}`)
+    v.rejects(`<magnitude:message to="user">\nhello\n</magnitude:message>\t\t\t\t\tmore content\n</magnitude:message>\n${YIELD}`)
   })
 })

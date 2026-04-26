@@ -1,5 +1,5 @@
 /**
- * Rule: aliases, fail-fast, recovery, escape, and canonical forms compose in full turns.
+ * Rule: aliases, fail-fast, recovery, and canonical forms compose in full turns.
  */
 import { describe, expect, it } from 'vitest'
 import {
@@ -83,13 +83,17 @@ describe('prefix heuristics: mixed sequences', () => {
     expect(collectMessageChunks(events)).toContain('done')
   })
 
-  it('07: escaped literal unknown plus canonical invoke', () => {
+  it('07: message escape open is invalid before canonical invoke', () => {
     const input = '<magnitude:message><magnitude:escape><magnitude:foo>bar</magnitude:foo></magnitude:escape></magnitude:message><magnitude:invoke tool="tree"></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
-    expectPreservedInMessage(events, '<magnitude:foo>')
-    expect(getToolInput(events)).toEqual({})
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:message',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:message'],
+    })
+    expectPreservedInMessage(events, '<magnitude:escape>')
   })
 
   it('08: mixed grep alias then edit canonical', () => {
@@ -113,13 +117,18 @@ describe('prefix heuristics: mixed sequences', () => {
     expectPreservedInMessage(events, '</magnitude:reason>')
   })
 
-  it('10: reason then tree alias then escaped close-like text in final message', () => {
+  it('10: reason then tree alias then message escape open is invalid', () => {
     const input = '<magnitude:reason>prep</magnitude:reason><magnitude:tree></magnitude:tree><magnitude:message><magnitude:escape></magnitude:reason></magnitude:escape></magnitude:message><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:message',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:message'],
+    })
     expect(collectLensChunks(events)).toContain('prep')
     expect(getToolInputs(events).map(x => x.input)).toEqual([{}])
-    expectPreservedInMessage(events, '</magnitude:reason>')
+    expectPreservedInMessage(events, '<magnitude:escape>')
   })
 })

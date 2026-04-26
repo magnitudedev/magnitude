@@ -164,8 +164,8 @@ describe('grammar strictness', () => {
         )
       })
 
-      it('rejects alias invoke close (</magnitude:shell>)', () => {
-        v.rejects(
+      it('accepts alias invoke close (</magnitude:shell>)', () => {
+        v.passes(
           '<magnitude:reason>r</magnitude:reason>\n' +
           '<magnitude:invoke tool="shell">\n' +
           '<magnitude:parameter name="command">ls</magnitude:parameter>\n' +
@@ -174,8 +174,8 @@ describe('grammar strictness', () => {
         )
       })
 
-      it('rejects alias invoke close (</magnitude:edit>)', () => {
-        v.rejects(
+      it('accepts alias invoke close (</magnitude:edit>)', () => {
+        v.passes(
           '<magnitude:reason>r</magnitude:reason>\n' +
           '<magnitude:invoke tool="edit">\n' +
           '<magnitude:parameter name="path">foo.ts</magnitude:parameter>\n' +
@@ -441,9 +441,9 @@ describe('grammar strictness', () => {
   // =========================================================================
   // 6. PRESERVED LENIENCY — close-tag greedy last-match
   // =========================================================================
-  describe('preserved leniency: close-tag greedy last-match', () => {
-    it('accepts false close followed by more text then real close in parameter body', () => {
-      v.passes(
+  describe('first-close-wins strictness', () => {
+    it('rejects false close followed by more text then real close in parameter body', () => {
+      v.rejects(
         '<magnitude:reason>r</magnitude:reason>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">echo </magnitude:parameter> more text </magnitude:parameter>\n' +
@@ -452,8 +452,8 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('accepts false close followed by HTML then real close in parameter body', () => {
-      v.passes(
+    it('rejects false close followed by HTML then real close in parameter body', () => {
+      v.rejects(
         '<magnitude:reason>r</magnitude:reason>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">cat </magnitude:parameter> <div>html</div> </magnitude:parameter>\n' +
@@ -462,15 +462,15 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('accepts multiple false closes then real close in reason body', () => {
-      v.passes(
+    it('rejects multiple false closes then real close in reason body', () => {
+      v.rejects(
         '<magnitude:reason>The tag </magnitude:reason> is used for </magnitude:reason> reasoning</magnitude:reason>\n' +
         '<magnitude:yield_user/>'
       )
     })
 
-    it('accepts false close in message body', () => {
-      v.passes(
+    it('rejects false close in message body', () => {
+      v.rejects(
         '<magnitude:reason>r</magnitude:reason>\n' +
         '<magnitude:message to="user">Use </magnitude:message> for messages</magnitude:message>\n' +
         '<magnitude:yield_user/>'
@@ -479,11 +479,11 @@ describe('grammar strictness', () => {
   })
 
   // =========================================================================
-  // 7. PRESERVED LENIENCY — escape blocks
+  // 7. ESCAPE REMOVAL
   // =========================================================================
-  describe('preserved leniency: escape blocks', () => {
-    it('accepts escape block in parameter body', () => {
-      v.passes(
+  describe('escape removal', () => {
+    it('rejects escape block in parameter body', () => {
+      v.rejects(
         '<magnitude:reason>r</magnitude:reason>\n' +
         '<magnitude:invoke tool="shell">\n' +
         '<magnitude:parameter name="command">echo <magnitude:escape><magnitude:foo/></magnitude:escape> done</magnitude:parameter>\n' +
@@ -492,8 +492,8 @@ describe('grammar strictness', () => {
       )
     })
 
-    it('accepts escape block in reason body', () => {
-      v.passes(
+    it('rejects escape block in reason body', () => {
+      v.rejects(
         '<magnitude:reason>Use <magnitude:escape><magnitude:invoke tool="x"></magnitude:escape> for tools</magnitude:reason>\n' +
         '<magnitude:yield_user/>'
       )

@@ -10,8 +10,6 @@ Comprehensive reference for the xml-act response format — what is accepted, wh
 
 All tags prefixed with `magnitude:` are **always interpreted as structural**. They are never treated as literal content. If a `magnitude:`-prefixed tag appears in a context where it is not structurally valid, it is a parse error — not content.
 
-To include literal `magnitude:`-prefixed markup in output, wrap it in `<magnitude:escape>...</magnitude:escape>`.
-
 This rule applies to both opening and closing tags.
 
 ### 1.2 Grammar–Parser Agreement
@@ -46,8 +44,8 @@ Once a message or invoke appears, no further reason blocks are allowed. This is 
 ```
 
 - The `name` attribute labels the reasoning lens.
-- Body may contain arbitrary text and escape blocks.
-- Body may NOT contain other `magnitude:` opens (except escape).
+- Body may contain arbitrary text.
+- Body may NOT contain other `magnitude:` opens.
 - Leading and trailing whitespace is stripped.
 
 ### 2.2 Message
@@ -57,8 +55,8 @@ Once a message or invoke appears, no further reason blocks are allowed. This is 
 ```
 
 - The `to` attribute specifies the message recipient.
-- Body may contain arbitrary text and escape blocks.
-- Body may NOT contain other `magnitude:` opens (except escape).
+- Body may contain arbitrary text.
+- Body may NOT contain other `magnitude:` opens.
 - Leading whitespace is stripped while body is empty.
 - Trailing newline runs are deferred until followed by more content.
 
@@ -74,7 +72,6 @@ Once a message or invoke appears, no further reason blocks are allowed. This is 
 - The `tool` attribute is required. Missing it emits `MissingToolName`.
 - If the tool is not registered, emits `UnknownTool` and the invoke is dead.
 - Direct content between parameters (non-whitespace) emits `UnexpectedContent`.
-- `<magnitude:escape>` is NOT valid inside invoke (it is not a parameter or filter).
 
 ### 2.4 Yield
 
@@ -105,7 +102,6 @@ The canonical structural vocabulary:
 | `magnitude:invoke` | Prose | Tool invocation |
 | `magnitude:parameter` | Invoke | Tool parameter |
 | `magnitude:filter` | Invoke | Output filter query |
-| `magnitude:escape` | Body (not invoke) | Literal markup wrapper |
 | `magnitude:yield_*` | Prose | Turn termination |
 
 ### 3.2 Tool Aliases
@@ -146,17 +142,19 @@ Parameter aliases:
 
 ### 4.1 What Bodies May Contain
 
-| Body Type | Plain Text | Escape Blocks | `magnitude:` Opens | `magnitude:` Closes |
-|---|---|---|---|---|
-| Reason | ✅ | ✅ | ❌ Error | ❌ Error (same-line) |
-| Message | ✅ | ✅ | ❌ Error | ❌ Error (same-line) |
-| Parameter | ✅ | ✅ | ❌ Error | ❌ Error (same-line) |
-| Filter | ✅ | ✅ | ❌ Error | ❌ Error (same-line) |
-| Invoke | ❌ (only whitespace) | ❌ Error | Only parameter/filter | N/A |
+| Body Type | Plain Text | `magnitude:` Opens | `magnitude:` Closes |
+|---|---|---|---|
+| Reason | ✅ | ❌ Error | ❌ Error (same-line) |
+| Message | ✅ | ❌ Error | ❌ Error (same-line) |
+| Parameter | ✅ | ❌ Error | ❌ Error (same-line) |
+| Filter | ✅ | ❌ Error | ❌ Error (same-line) |
+| Invoke | ❌ (only whitespace) | Only parameter/filter | N/A |
+
+In all body contexts, body scanning stops at any `</magnitude:*>` prefix, not just the canonical close for the current frame. This is what allows alias close tags (such as `</magnitude:shell>` or `</magnitude:command>`) to participate in normal close handling.
 
 ### 4.2 Invalid `magnitude:` Opens in Bodies
 
-Any `magnitude:`-prefixed open tag inside a body (reason, message, parameter, filter) that is not `<magnitude:escape>` is an `InvalidMagnitudeOpen` error. The raw tag text is preserved as content in the body.
+Any `magnitude:`-prefixed open tag inside a body (reason, message, parameter, filter) is an `InvalidMagnitudeOpen` error. The raw tag text is preserved as content in the body.
 
 Examples of invalid opens:
 - `<magnitude:invoke>` inside a message body
@@ -170,7 +168,6 @@ Inside an invoke frame, only `<magnitude:parameter>` (or valid parameter aliases
 - `<magnitude:message>`
 - `<magnitude:reason>`
 - `<magnitude:invoke>` (nested)
-- `<magnitude:escape>` (not a valid invoke child)
 - Unknown `magnitude:` tags
 - Tool aliases or parameter aliases from other tools
 
@@ -182,78 +179,55 @@ Unknown `magnitude:`-prefixed opens at the prose level (e.g., `<magnitude:foo>`)
 
 ---
 
-## 5. Escape Mechanism
+## 5. Close Tag Semantics
 
-```
-<magnitude:escape>literal magnitude: markup here</magnitude:escape>
-```
+Matching close tags use **first-close-wins** semantics.
 
-- Valid in reason, message, parameter, and filter bodies.
-- **Not** valid inside invoke (invoke only accepts parameter and filter children).
-- While inside an escape block, ALL tokens become literal content — no structural interpretation occurs.
-- Escape uses first-close semantics: the first `</magnitude:escape>` ends the block. Escape blocks do not nest.
-- The escape open and close tags themselves are consumed (not included in output).
+The first close tag that matches the current frame closes it immediately. There is no greedy last-match behavior and no pending close confirmation for matching closes.
 
-Use escape when body content must contain literal `magnitude:`-prefixed tags, such as:
-- Code examples containing the format itself
-- Shell commands that output magnitude markup
-- Documentation about the format
+Examples:
+- Inside `<magnitude:message>`, the first `</magnitude:message>` closes the message.
+- Inside `<magnitude:parameter name="command">`, the first valid parameter close — canonical `</magnitude:parameter>` or alias `</magnitude:command>` — closes the parameter.
+- Inside `<magnitude:invoke tool="shell">`, the first valid invoke close — canonical `</magnitude:invoke>` or alias `</magnitude:shell>` — closes the invoke.
+
+This means body content that naturally contains close-tag-like sequences (for example, documentation or code samples showing the format itself) will be truncated at the first matching close. There is no escape mechanism to preserve such sequences as literal content.
 
 ---
 
-## 6. Greedy Close Matching
-
-Parameter and filter bodies use **greedy last-match** semantics for close tags. This handles content that naturally contains close-tag-like sequences.
-
-### 6.1 How It Works
-
-When the parser sees a potential close tag (e.g., `</magnitude:parameter>`), it does not close the frame immediately. Instead, it stores a **pending close** and waits for the next token to decide:
-
-- **If the next token is valid structural continuation** (e.g., another parameter, filter, invoke close, or yield): the pending close is **confirmed** and the frame closes.
-- **If the next token is another close for the same frame**: the earlier close becomes content (**greedy replace**) and the new close becomes pending.
-- **If the next token is non-structural content**: the pending close is **rejected** — the close tag becomes body content and the frame stays open.
-
-### 6.2 Close Cascades
-
-Pending closes can cascade. For example, `</magnitude:parameter></magnitude:invoke>` creates a two-entry pending stack. The cascade is confirmed or rejected as a unit when the next token arrives.
-
-### 6.3 Valid Continuation
-
-A token is valid continuation after a pending parameter close if:
-- It is a `<magnitude:filter>` open
-- It is a `<magnitude:parameter>` open with a parameter name that exists in the current tool's schema AND has not already been seen (duplicates are not valid continuation)
-- It is a parameter alias open for a valid, unseen parameter
-- It is any self-closing tag (e.g., yield)
-- The effective frame after confirmation would be prose-level
-
-### 6.4 Greedy Body Phases
-
-The grammar distinguishes two body phases:
-
-1. **Strict initial body**: Before any false close has been identified. Invalid `magnitude:` opens are rejected. Invalid `magnitude:` closes (same-line) are rejected.
-
-2. **Permissive greedy body**: After a false close has been reclassified as content. False `magnitude:` opens are absorbed as content (since the false close already proved the content is adversarial).
-
----
-
-## 7. Close Mismatch Recovery
+## 6. Close Mismatch Recovery
 
 When a `magnitude:`-prefixed close tag does not match the current frame, the parser applies context-dependent recovery.
 
-### 7.1 Newline-Separated Mismatch (Recovery)
+### 6.1 Recoverable Mismatch (Silent Close)
 
-If a mismatched close appears after a newline, it may be recovered silently:
+A mismatched close may be treated as if it were the correct close for the current frame. When that happens, the current frame closes silently and no structural error is emitted.
+
+A mismatch is confirmed in any of these cases:
+
+- **Newline boundary:** whitespace containing a newline follows the mismatched close, and then a structural token arrives.
+- **Cascade close:** the next close tag matches the parent frame.
+- **Valid structural continuation:** the next open tag is a valid structural continuation for the parent frame.
+- **Magnitude open at prose level:** the next open tag is a `magnitude:` tag and the parent frame is prose.
+
+Examples:
 
 ```
 <magnitude:message>hello
 </magnitude:reason>
+<magnitude:yield_user/>
 ```
 
-The `</magnitude:reason>` is on a new line after message content. The grammar and parser treat this as a recoverable mismatch — the close is absorbed as content, and the message continues. No structural error is emitted.
+The mismatched `</magnitude:reason>` is treated as closing the message.
 
-This recovery applies to reason, message, parameter, and filter bodies.
+```
+<magnitude:parameter name="command">echo hi
+</magnitude:filter>
+</magnitude:invoke>
+```
 
-### 7.2 Same-Line Mismatch (Ambiguous — Error)
+The mismatched `</magnitude:filter>` is treated as closing the parameter, and the following invoke close confirms the cascade.
+
+### 6.2 Same-Line Mismatch (Ambiguous — Error)
 
 If a mismatched close appears on the same line as preceding content:
 
@@ -263,7 +237,9 @@ If a mismatched close appears on the same line as preceding content:
 
 The `</magnitude:reason>` is on the same line as `hello`. This is ambiguous — it could be a typo or intentional content. The grammar rejects this input. The parser emits `AmbiguousMagnitudeClose` and preserves the raw close as content.
 
-### 7.3 Stray Close at Prose Level
+A mismatch is also rejected when non-whitespace content follows without a newline, or when a following close does not form a valid cascade. In those cases the raw close is dumped as content and `AmbiguousMagnitudeClose` is emitted.
+
+### 6.3 Stray Close at Prose Level
 
 A `magnitude:`-prefixed close at the prose level with no matching open:
 
@@ -273,66 +249,62 @@ A `magnitude:`-prefixed close at the prose level with no matching open:
 
 This emits `StrayCloseTag`. The raw close is preserved as prose content.
 
-### 7.4 Mismatch Inside Escape
-
-Mismatched closes inside `<magnitude:escape>` are literal content — no structural interpretation or error.
-
 ---
 
-## 8. Parameter Validation
+## 7. Parameter Validation
 
-### 8.1 Unknown Parameters
+### 7.1 Unknown Parameters
 
 A `<magnitude:parameter name="foo">` where `foo` is not in the tool's schema emits `UnknownParameter`. The parameter frame is dead — its content is parsed but not included in the tool input.
 
-### 8.2 Duplicate Parameters
+### 7.2 Duplicate Parameters
 
 Opening a parameter with the same name as one already seen in the current invoke emits `DuplicateParameter`. The duplicate frame is dead — the first value is preserved.
 
-### 8.3 Missing Required Fields
+### 7.3 Missing Required Fields
 
 When an invoke closes, any required parameters not provided emit `MissingRequiredField`. The tool call does not produce `ToolInputReady`.
 
-### 8.4 Schema Coercion Errors
+### 7.4 Schema Coercion Errors
 
 If a parameter value cannot be coerced to the expected schema type, `SchemaCoercionError` is emitted. The tool call does not produce `ToolInputReady`.
 
 ---
 
-## 9. Whitespace Handling
+## 8. Whitespace Handling
 
 Whitespace handling varies by context:
 
-### 9.1 Prose
+### 8.1 Prose
 - Leading whitespace before first content is stripped.
 - Trailing whitespace at end is stripped.
 - Internal whitespace is preserved.
 
-### 9.2 Reason
+### 8.2 Reason
 - Leading whitespace is stripped.
 - Trailing whitespace is stripped.
 - Internal whitespace is preserved.
 
-### 9.3 Message
+### 8.3 Message
 - Leading whitespace is stripped while body is empty.
 - Trailing newline runs are deferred — they are only emitted if followed by more content.
 - Internal whitespace is preserved.
 
-### 9.4 Parameter
+### 8.4 Parameter
 - All content is preserved as-is (no stripping).
 - Content is emitted as `ToolInputFieldChunk` events.
 
-### 9.5 Filter
+### 8.5 Filter
 - All content is preserved as-is.
 - No chunk events are emitted (filter content is accumulated internally).
 
-### 9.6 Between Structural Tags
+### 8.6 Between Structural Tags
 - Whitespace between structural tags (e.g., between `</magnitude:parameter>` and `<magnitude:parameter>`) is allowed and ignored.
 - Non-whitespace content between parameters inside invoke emits `UnexpectedContent`.
 
 ---
 
-## 10. EOF Behavior
+## 9. EOF Behavior
 
 If the stream ends without a yield or with unclosed frames, the parser applies salvage:
 
@@ -345,13 +317,13 @@ If the stream ends without a yield or with unclosed frames, the parser applies s
 | Reason | `UnclosedThink` error emitted, `LensEnd` emitted |
 | Prose | `ProseEnd` emitted if any content |
 
-Pending close stacks are confirmed unconditionally at EOF.
+Pending mismatch closes are confirmed at EOF.
 
 ---
 
-## 11. Error Reference
+## 10. Error Reference
 
-### 11.1 Structural Errors
+### 10.1 Structural Errors
 
 | Error | When |
 |---|---|
@@ -363,7 +335,7 @@ Pending close stacks are confirmed unconditionally at EOF.
 | `UnknownTool` | Tool name not in registry |
 | `UnclosedThink` | Reason block not closed before EOF |
 
-### 11.2 Tool Errors
+### 10.2 Tool Errors
 
 | Error | When |
 |---|---|
@@ -375,7 +347,7 @@ Pending close stacks are confirmed unconditionally at EOF.
 
 ---
 
-## 12. Non-`magnitude:` Tags
+## 11. Non-`magnitude:` Tags
 
 Tags without the `magnitude:` prefix follow standard XML-like behavior:
 - Known structural close tags are tokenized as `Close` tokens.

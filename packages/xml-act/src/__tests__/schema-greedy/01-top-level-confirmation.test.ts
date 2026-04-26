@@ -61,13 +61,9 @@ describe('top-level close tag confirmation', () => {
 
   // ---- Reason: rejected (false close tags) ----
 
-  it('08: </magnitude:reason> + non-ws char rejects — false close becomes content', () => {
+  it('08: </magnitude:reason> + non-ws char rejects under first-close-wins', () => {
     const input = `<magnitude:reason about="t">\n</magnitude:reason>x more\n</magnitude:reason><${YIELD.slice(1)}`
-    v().passes(input)
-    const events = parse(input)
-    expect(hasEvent(events, 'LensEnd')).toBe(true)
-    const text = collectLensChunks(events)
-    expect(text).toContain('</magnitude:reason>x more')
+    v().rejects(input)
   })
 
   it('09: </magnitude:reason> + \\n without ever seeing < — incomplete', () => {
@@ -75,23 +71,14 @@ describe('top-level close tag confirmation', () => {
     v().rejects(input)
   })
 
-  it('10: false </magnitude:reason> then real close', () => {
+  it('10: false </magnitude:reason> then real close rejects', () => {
     const input = `<magnitude:reason about="t">\nThe tag </magnitude:reason>x is used\n</magnitude:reason><${YIELD.slice(1)}`
-    v().passes(input)
-    const events = parse(input)
-    expect(countEvents(events, 'LensEnd')).toBe(1)
-    const text = collectLensChunks(events)
-    expect(text).toContain('</magnitude:reason>x is used')
+    v().rejects(input)
   })
 
-  it('11: multiple false </magnitude:reason> before real one', () => {
+  it('11: multiple false </magnitude:reason> before real one rejects', () => {
     const input = `<magnitude:reason about="t">\n</magnitude:reason>a\n</magnitude:reason>b\n</magnitude:reason><${YIELD.slice(1)}`
-    v().passes(input)
-    const events = parse(input)
-    expect(countEvents(events, 'LensEnd')).toBe(1)
-    const text = collectLensChunks(events)
-    expect(text).toContain('</magnitude:reason>a')
-    expect(text).toContain('</magnitude:reason>b')
+    v().rejects(input)
   })
 
   // ---- Reason: chaining ----
@@ -172,20 +159,14 @@ describe('top-level close tag confirmation', () => {
 
   // ---- Message: rejected ----
 
-  it('23: false </magnitude:message> in content', () => {
+  it('23: false </magnitude:message> in content rejects', () => {
     const input = `<magnitude:message to="u">\nuse </magnitude:message>x to close\n</magnitude:message><${YIELD.slice(1)}`
-    v().passes(input)
-    const events = parse(input)
-    expect(countEvents(events, 'MessageEnd')).toBe(1)
-    const text = collectMessageChunks(events)
-    expect(text).toContain('</magnitude:message>x to close')
+    v().rejects(input)
   })
 
   it('24: </magnitude:message> + non-ws rejects', () => {
     const input = `<magnitude:message to="u">\n</magnitude:message>foo\n</magnitude:message><${YIELD.slice(1)}`
-    v().passes(input)
-    const text = collectMessageChunks(parse(input))
-    expect(text).toContain('</magnitude:message>foo')
+    v().rejects(input)
   })
 
   it('25: </magnitude:message> + \\n alone (no <) does not terminate', () => {

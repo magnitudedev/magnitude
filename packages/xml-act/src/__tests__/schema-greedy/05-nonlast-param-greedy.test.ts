@@ -51,18 +51,14 @@ describe('non-last parameter greedy matching', () => {
     v().rejects(input)
   })
 
-  it('06-fixed: false </magnitude:parameter> followed by non-ws — absorbed as content, real close later', () => {
+  it('06-fixed: false </magnitude:parameter> followed by non-ws rejects under first-close-wins', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo "</magnitude:parameter>"; echo done</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    const ti = getToolInput(parse(input))
-    expect(ti?.command).toBe('echo "</magnitude:parameter>"; echo done')
+    v().rejects(input)
   })
 
-  it('07: multiple false </magnitude:parameter> in content before real one', () => {
+  it('07: multiple false </magnitude:parameter> in content before real one rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">a</magnitude:parameter>b</magnitude:parameter>c</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    const ti = getToolInput(parse(input))
-    expect(ti?.command).toBe('a</magnitude:parameter>b</magnitude:parameter>c')
+    v().rejects(input)
   })
 
   it('08: </magnitude:parameter> with tabs before next param', () => {
@@ -71,11 +67,9 @@ describe('non-last parameter greedy matching', () => {
     expect(getToolInput(parse(input))?.path).toBe('f')
   })
 
-  it('09: </magnitude:parameter> followed by unknown tag — absorbed as content', () => {
+  it('09: </magnitude:parameter> followed by unknown tag rejects under first-close-wins', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">a</magnitude:parameter><div>b</div></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    const ti = getToolInput(parse(input))
-    expect(ti?.command).toBe('a</magnitude:parameter><div>b</div>')
+    v().rejects(input)
   })
 
   it('10: content with HTML-like tags inside parameter', () => {

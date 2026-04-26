@@ -64,31 +64,31 @@ describe('greedy param-body — basic', () => {
 
 describe('greedy param-body — simple embedded close tags', () => {
   it('close tag + space + word', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo ${CP} done${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('close tag + newline + plain text', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">code${CP}\nhello world${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('two embedded close tags', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">A${CP}B${CP}C${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('close tag followed by HTML', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">code${CP}<div>more</div>${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('close tag mid-sentence', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">use ${CP} to end${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -190,7 +190,7 @@ describe('greedy param-body — structural magnitude opens are rejected', () => 
 
 describe('greedy param-body — realistic content with close-tag-like text', () => {
   it('sed command replacing XML tags', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">sed 's/${CP}/${CF}/g' file.xml${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -202,13 +202,13 @@ describe('greedy param-body — realistic content with close-tag-like text', () 
   })
 
   it('grep for close tag pattern', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">grep '${CP}' src/*.ts${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('documentation about the XML format itself', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo "Use ${CP} to close a param and ${CI} to close an invoke"${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -220,13 +220,13 @@ describe('greedy param-body — realistic content with close-tag-like text', () 
   })
 
   it('code comment mentioning close tag', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">cat << EOF\n# close with ${CP}\n# then ${CI}\nEOF${CP}\n${CI}\n${YIELD}`
     )
   })
 
-  it('escaped magnitude parameter markup is accepted', () => {
-    shellValidator().passes(
+  it('escaped magnitude parameter markup is rejected after escape removal', () => {
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo "${ESC_OPEN}${OP} name=\\"x\\">val${CP}${ESC_CLOSE}"${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -304,7 +304,7 @@ describe('greedy param-body — whitespace edge cases', () => {
 
 describe('greedy param-body — full turn', () => {
   it('reason + message + invoke with embedded close', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:reason about="test">thinking</magnitude:reason>\n` +
       `<magnitude:message to="user">hello</magnitude:message>\n` +
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo ${CP} works${CP}\n${CI}\n${YIELD}`
@@ -312,14 +312,14 @@ describe('greedy param-body — full turn', () => {
   })
 
   it('multiple invokes, second has embedded close', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls${CP}\n${CI}\n` +
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo ${CP} test${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('invoke with close-tag text + second invoke', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">fake${CP}${CI}real${CP}\n${CI}\n` +
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">pwd${CP}\n${CI}\n${YIELD}`
     )
@@ -332,7 +332,7 @@ describe('greedy param-body — full turn', () => {
 
 describe('greedy param-body — token mask verification', () => {
   it('after close tag, content continuation is accepted', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">hello${CP}world${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -344,7 +344,7 @@ describe('greedy param-body — token mask verification', () => {
   })
 
   it('after close tag + newline, content continuation is accepted', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">hello${CP}\nworld${CP}\n${CI}\n${YIELD}`
     )
   })
@@ -368,7 +368,7 @@ describe('greedy param-body — token mask verification', () => {
 
 describe('greedy param-body — stress tests', () => {
   it('5 embedded close tags', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">` +
       `a${CP}b${CP}c${CP}d${CP}e${CP}f${CP}\n${CI}\n${YIELD}`
     )
@@ -376,13 +376,13 @@ describe('greedy param-body — stress tests', () => {
 
   it('10 embedded close tags', () => {
     const body = Array.from({ length: 10 }, (_, i) => String.fromCharCode(65 + i) + CP).join('')
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">${body}END${CP}\n${CI}\n${YIELD}`
     )
   })
 
   it('embedded close tags with varied separators', () => {
-    shellValidator().passes(
+    shellValidator().rejects(
       `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">` +
       `a${CP} b${CP}\nc${CP}\t\td${CP}<div>${CP}end${CP}\n${CI}\n${YIELD}`
     )

@@ -12,16 +12,14 @@ import {
 const v = () => grammarValidator()
 
 describe('self-referential content in parameters', () => {
-  it('01: param contains </magnitude:parameter> as text', () => {
+  it('01: param contains </magnitude:parameter> as text rejects under first-close-wins', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">echo "</magnitude:parameter>"</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('echo "</magnitude:parameter>"')
+    v().rejects(input)
   })
 
-  it('02: param contains </magnitude:parameter></magnitude:invoke> as text', () => {
+  it('02: param contains </magnitude:parameter></magnitude:invoke> as text rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">The sequence </magnitude:parameter></magnitude:invoke> ends it</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('The sequence </magnitude:parameter></magnitude:invoke> ends it')
+    v().rejects(input)
   })
 
   it('03: param contains <magnitude:parameter name="..."> as text — rejected (magnitude open in body must be escaped)', () => {
@@ -34,10 +32,9 @@ describe('self-referential content in parameters', () => {
     v().rejects(input)
   })
 
-  it('05: param contains close sequence minus final < (not confirmed)', () => {
+  it('05: param contains close sequence minus final < rejects under first-close-wins', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">text</magnitude:parameter></magnitude:invoke>\nstill content</magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toContain('text')
+    v().rejects(input)
   })
 
   it('06: param content with nested XML', () => {
@@ -51,16 +48,14 @@ describe('self-referential content in parameters', () => {
     v().rejects(input)
   })
 
-  it('08: param body is the string "</magnitude:parameter>"', () => {
+  it('08: param body is the string "</magnitude:parameter>" rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter>')
+    v().rejects(input)
   })
 
-  it('09: param contains multiple interleaved false sequences', () => {
+  it('09: param contains multiple interleaved false sequences rejects', () => {
     const input = `<magnitude:invoke tool="shell">\n<magnitude:parameter name="command"></magnitude:parameter></magnitude:invoke></magnitude:parameter></magnitude:invoke></magnitude:parameter></magnitude:invoke><${YIELD.slice(1)}`
-    v().passes(input)
-    expect(getToolInput(parse(input))?.command).toBe('</magnitude:parameter></magnitude:invoke></magnitude:parameter></magnitude:invoke>')
+    v().rejects(input)
   })
 
   it('10: edit non-last param contains </magnitude:parameter><magnitude:parameter name="wrong"> — rejected', () => {

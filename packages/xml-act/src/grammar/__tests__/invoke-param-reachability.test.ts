@@ -96,20 +96,17 @@ describe('invoke parameter reachability', () => {
       )
     })
 
-    it('after parameter close and <, valid continuations include structural tags', () => {
+    it('after parameter close and <, valid continuations are structural only', () => {
       const v = shellValidator()
-      // With greedy body, </magnitude:parameter>\n< is inside the BUC pattern.
-      // After <, the grammar allows / (for close tags) and any content char via char_exclude.
       const rules = v.validAfter(`<magnitude:invoke tool="shell">\n<magnitude:parameter name="command">ls</magnitude:parameter>\n<`)
       const validChars = rules.flatMap((r: any) => {
         if (r.type === 'char') return r.value.map((v: number) => String.fromCharCode(v))
         if (r.type === 'char_exclude') return ['[exclude]']
         return []
       })
-      // / is explicitly valid (for </magnitude:invoke> or </magnitude:parameter>)
       expect(validChars).toContain('/')
-      // Other chars (like f for <magnitude:filter>) are valid via char_exclude rule
-      expect(validChars.some((c: string) => c === 'f' || c === '[exclude]')).toBe(true)
+      expect(validChars).toContain('m')
+      expect(validChars).not.toContain('[exclude]')
     })
   })
 

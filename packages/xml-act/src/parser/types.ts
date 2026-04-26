@@ -125,18 +125,17 @@ export interface FilterFrame {
 // =============================================================================
 
 /**
- * Held when the parser sees a Close token that matches the current frame.
- * The close is not applied immediately — the next token confirms or rejects it.
- * This implements the grammar's recursive greedy last-match pattern.
+ * Held when the parser sees a Close token that doesn't match the current frame
+ * but starts with the magnitude: prefix. The close is not applied immediately —
+ * the next token confirms or rejects it. This implements mismatch recovery:
+ * if the model uses the wrong close tag, the parser can still close the frame
+ * when structural context confirms the intent.
  */
 export type PendingClose = {
   tagName: string           // raw tag name seen (e.g., 'magnitude:reason')
-  effectiveTagName: string  // tag name to use for confirmation (same as tagName for exact match,
-                            // canonical close tag for mismatch recovery)
-  mismatchRecovery: boolean // true if this is a mismatch candidate
-  frameType: string
-  wsBuffer: string
-  sawNewline: boolean
+  effectiveTagName: string  // canonical close tag for the current frame (e.g., 'magnitude:message')
+  wsBuffer: string          // buffered whitespace after the close tag
+  sawNewline: boolean       // whether a newline was seen in the buffered whitespace
   tokenSpan: SourceSpan
 }
 

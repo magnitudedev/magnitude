@@ -455,15 +455,15 @@ describe('mixed turn sequences', () => {
 // ---------------------------------------------------------------------------
 
 describe('content preservation', () => {
-  it('close tag in backticks inside reason body is content', () => {
-    // `</magnitude:reason>` — the backtick after > rejects the lookahead → stays as content
+  it('close tag in backticks inside reason body closes immediately under first-close-wins', () => {
     const events = parse('<magnitude:reason about="x">\nthink about `</magnitude:reason>` tags\n</magnitude:reason>')
     const end = events.find(e => e._tag === 'LensEnd') as any
     expect(end).toBeDefined()
-    expect(end.content).toContain('`</magnitude:reason>` tags')
+    expect(end.content).toContain('think about `')
+    expect(end.content).not.toContain('</magnitude:reason>` tags')
   })
 
-  it('close tag in quotes inside parameter body is content', () => {
+  it('close tag in quotes inside parameter body closes immediately under first-close-wins', () => {
     const events = parse(
       '<magnitude:invoke tool="shell">\n' +
       '<magnitude:parameter name="command">echo "</magnitude:parameter>"</magnitude:parameter>\n' +
@@ -471,7 +471,7 @@ describe('content preservation', () => {
     )
     const complete = events.find(e => e._tag === 'ToolInputFieldComplete') as any
     expect(complete).toBeDefined()
-    expect(complete.value).toContain('</magnitude:parameter>')
+    expect(complete.value).toBe('echo "')
   })
 
   it('unknown tags inside reason body are content', () => {

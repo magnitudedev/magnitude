@@ -1,5 +1,5 @@
 import type { ThinkingLens } from '@magnitudedev/roles'
-import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, TAG_REASON, TAG_MESSAGE, TAG_INVOKE, TAG_PARAMETER, TAG_ESCAPE } from '@magnitudedev/xml-act'
+import { YIELD_USER, YIELD_INVOKE, YIELD_WORKER, YIELD_PARENT, LEAD_YIELD_TAGS, SUBAGENT_YIELD_TAGS, TAG_REASON, TAG_MESSAGE, TAG_INVOKE, TAG_PARAMETER } from '@magnitudedev/xml-act'
 import protocolRaw from './protocol/xml-act-protocol.txt'
 import turnControlOneshotRaw from './protocol/turn-control-oneshot.txt'
 import turnControlLeadRaw from './protocol/turn-control-lead.txt'
@@ -98,8 +98,6 @@ const reason = (about: string, content: string) => `<${TAG_REASON} about="${abou
 const msg = (to: string, ...lines: string[]) => `<${TAG_MESSAGE} to="${to}">\n${lines.join('\n')}\n</${TAG_MESSAGE}>`
 const invoke = (tool: string, ...params: string[]) => `<${TAG_INVOKE} tool="${tool}">\n${params.join('\n')}\n</${TAG_INVOKE}>`
 const param = (name: string, value: string) => `<${TAG_PARAMETER} name="${name}">${value}</${TAG_PARAMETER}>`
-const esc = (content: string) => `<${TAG_ESCAPE}>${content}</${TAG_ESCAPE}>`
-
 /**
  * Build the few-shot example turns for protocol demonstration.
  */
@@ -108,99 +106,68 @@ export function buildAckTurns(
   defaultRecipient: 'user' | 'parent' = 'user',
 ): AckTurnMessage[] {
   return [
-    // Turn 1: User asks about the response format
+    // Turn 1: User asks something nonsense
     {
       role: 'user',
-      content: [`--- FEW-SHOT EXAMPLE START ---\n<${TAG_MESSAGE} from="user">How does your response format work?</${TAG_MESSAGE}>`]
+      content: [`--- FEW-SHOT EXAMPLE START ---\n<${TAG_MESSAGE} from="user">Foo the bar into a baz.</${TAG_MESSAGE}>`]
     },
-    // Turn 2: Explain format using escape blocks to show tag examples
+    // Turn 2: Activate skill, make tool call
     {
       role: 'assistant',
       content: [[
-        reason('alignment', 'Format question — explain with examples using escape blocks.'),
+        reason('alignment', 'Need to foo the bar. Let me activate the foobar skill first.'),
         '',
-        msg(defaultRecipient,
-          'I respond in a structured format with these elements:',
-          '',
-          `- **Reasons** for internal thinking: ${esc(`\`<${TAG_REASON} about="topic">thinking</${TAG_REASON}>\``)}`,
-          `- **Messages** to communicate: ${esc(`\`<${TAG_MESSAGE} to="user">content</${TAG_MESSAGE}>\``)}`,
-          `- **Tool calls** to take action: ${esc(`\`<${TAG_INVOKE} tool="name"><${TAG_PARAMETER} name="key">value</${TAG_PARAMETER}></${TAG_INVOKE}>\``)}`,
-          '- **Yield** to end my turn and wait',
-          '',
-          'I think first, then communicate and act, then yield.',
-        ),
-        '',
-        YIELD_USER,
-      ].join('\n')]
-    },
-    // Turn 3: User asks to write a reference doc
-    {
-      role: 'user',
-      content: [`<${TAG_MESSAGE} from="user">Write that up as a quick reference doc.</${TAG_MESSAGE}>`]
-    },
-    // Turn 4: Activate skill
-    {
-      role: 'assistant',
-      content: [[
-        reason('skills', 'Clear objective — activate the example skill.'),
-        '',
-        msg(defaultRecipient, 'On it — let me pull up the methodology first.'),
-        '',
-        invoke('skill', param('name', 'example')),
+        invoke('skill', param('name', 'foobar')),
         '',
         YIELD_INVOKE,
       ].join('\n')]
     },
-    // Turn 5: Skill results
+    // Turn 3: Skill result
     {
       role: 'user',
       content: [`<turn_result>
 <result tool="skill">
 <out field="content">
-# Skill: Example
+# Skill: Foobar
 
-Provides methodology for the example task.
+Methodology for fooing bars into bazzes.
 
 ## Steps
-1. Understand the objective
-2. Execute precisely
-3. Verify the result
+1. Read the bar
+2. Foo it
+3. Output the baz
 </out>
 </result>
 </turn_result>`]
     },
-    // Turn 6: Write doc with escape in parameter value + message
+    // Turn 4: Execute the foo, message user
     {
       role: 'assistant',
       content: [[
-        reason('skills', 'Skill loaded. Write the doc to $M.'),
+        reason('strategy', 'Skill loaded. Foo the bar by writing the baz file.'),
         '',
-        invoke('write',
-          param('path', '$M/reports/response-format.md'),
-          param('content', [
-            '# Response Format Quick Reference',
-            '',
-            '## Reasons',
-            esc(`\`<${TAG_REASON} about="topic">internal thinking</${TAG_REASON}>\``),
-            '',
-            '## Messages',
-            esc(`\`<${TAG_MESSAGE} to="recipient">content</${TAG_MESSAGE}>\``),
-            '',
-            '## Tool Calls',
-            esc([
-              '```',
-              `<${TAG_INVOKE} tool="name">`,
-              `<${TAG_PARAMETER} name="key">value</${TAG_PARAMETER}>`,
-              `</${TAG_INVOKE}>`,
-              '```',
-            ].join('\n')),
-            '',
-            '## Yield',
-            'End each turn with a yield tag to wait for results or user input.',
-          ].join('\n')),
+        invoke('fooify',
+          param('input', 'bar'),
+          param('mode', 'baz'),
         ),
         '',
-        msg(defaultRecipient, 'Done — written to [$M/reports/response-format.md]($M/reports/response-format.md).'),
+        YIELD_INVOKE,
+      ].join('\n')]
+    },
+    // Turn 5: Write result
+    {
+      role: 'user',
+      content: [`<turn_result>
+<result tool="fooify">
+<out field="output">baz-42</out>
+</result>
+</turn_result>`]
+    },
+    // Turn 6: Confirm to user
+    {
+      role: 'assistant',
+      content: [[
+        msg(defaultRecipient, 'Done — fooed the bar into baz-42.'),
         '',
         YIELD_USER,
       ].join('\n')]

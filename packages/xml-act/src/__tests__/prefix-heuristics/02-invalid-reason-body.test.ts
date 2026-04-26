@@ -1,15 +1,14 @@
 /**
- * Rule: inside <magnitude:reason>, any nested magnitude: open tag other than
- * <magnitude:escape> is invalid.
+ * Rule: inside <magnitude:reason>, any nested magnitude: open tag is invalid.
  */
-import { describe, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   grammarValidator,
   grepGrammarValidator,
   parse,
   parseWithGrep,
   expectStructuralError,
-  expectNoStructuralError,
+  getStructuralErrors,
   expectPreservedInLens,
 } from './helpers'
 
@@ -30,6 +29,7 @@ const invalidCases = [
     label: '03: reason open inside reason',
     input: '<magnitude:reason>before <magnitude:reason>nested</magnitude:reason> after</magnitude:reason><magnitude:yield_user/>',
     raw: '<magnitude:reason>',
+    minStructuralErrors: 1,
   },
   {
     label: '04: parameter open inside reason',
@@ -73,29 +73,53 @@ describe('prefix heuristics: invalid reason body', () => {
     it(testCase.label, () => {
       v().rejects(testCase.input)
       const events = parse(testCase.input)
-      expectStructuralError(events, {
-        variant: 'InvalidMagnitudeOpen',
-        tagName: testCase.raw.slice(1, -1).split(' ')[0],
-        parentTagName: 'magnitude:reason',
-        detailIncludes: [testCase.raw, 'magnitude:reason'],
-      })
+      if ('minStructuralErrors' in testCase) {
+        const structuralErrors = getStructuralErrors(events)
+        expect(structuralErrors.length).toBeGreaterThanOrEqual(
+          testCase.minStructuralErrors
+        )
+        const error = structuralErrors[0].error as any
+        expect(error._tag).toBe('InvalidMagnitudeOpen')
+        expect(error.tagName).toBe(testCase.raw.slice(1, -1).split(' ')[0])
+        expect(error.parentTagName).toBe('magnitude:reason')
+        for (const snippet of [testCase.raw, 'magnitude:reason']) {
+          expect(String(error.detail ?? '')).toContain(snippet)
+        }
+      } else {
+        expectStructuralError(events, {
+          variant: 'InvalidMagnitudeOpen',
+          tagName: testCase.raw.slice(1, -1).split(' ')[0],
+          parentTagName: 'magnitude:reason',
+          detailIncludes: [testCase.raw, 'magnitude:reason'],
+        })
+      }
       expectPreservedInLens(events, testCase.raw)
     })
   }
 
-  it('11: escape allows literal message markup', () => {
+  it('11: escape open inside reason is invalid', () => {
     const input = '<magnitude:reason><magnitude:escape><magnitude:message>literal</magnitude:message></magnitude:escape></magnitude:reason><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
-    expectPreservedInLens(events, '<magnitude:message>')
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:reason',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:reason'],
+    })
+    expectPreservedInLens(events, '<magnitude:escape>')
   })
 
-  it('12: escape allows literal grep alias markup', () => {
+  it('12: escape open inside reason is invalid with grep toolset too', () => {
     const input = '<magnitude:reason><magnitude:escape><magnitude:grep><magnitude:pattern>TODO</magnitude:pattern></magnitude:grep></magnitude:escape></magnitude:reason><magnitude:yield_user/>'
-    grepGrammarValidator().passes(input)
+    grepGrammarValidator().rejects(input)
     const events = parseWithGrep(input)
-    expectNoStructuralError(events)
-    expectPreservedInLens(events, '<magnitude:grep>')
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:reason',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:reason'],
+    })
+    expectPreservedInLens(events, '<magnitude:escape>')
   })
 })

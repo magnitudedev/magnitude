@@ -72,10 +72,9 @@ describe('close tag behavior', () => {
       v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message>  <magnitude:yield_user/>`)
     })
 
-    it('false close tag in prose rejected by trailing non-ws', () => {
-      // </magnitude:message> followed by prose → close tag treated as content
+    it('false close tag in prose rejects under first-close-wins', () => {
       const v = shellValidator()
-      v.passes(`<magnitude:message to="user">\nhello\n</magnitude:message> to end your message\n</magnitude:message>\n${YIELD}`)
+      v.rejects(`<magnitude:message to="user">\nhello\n</magnitude:message> to end your message\n</magnitude:message>\n${YIELD}`)
     })
   })
 })

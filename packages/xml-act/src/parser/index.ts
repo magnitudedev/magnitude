@@ -24,6 +24,7 @@ import { endTopProse } from './content'
 import { flushAllFrames } from './flush'
 import { pushToken, type ParserLoopContext } from './dispatch'
 import { resolveCloseHandler } from './resolve'
+
 import type { ParserOp } from './ops'
 
 export type { ParserConfig } from './types'
@@ -109,29 +110,27 @@ export function createParser(
     machine,
     handlerCtx,
     deferredYield,
-    pendingCloseStack: [],
-    escapeDepth: 0,
     invalidSubtree: null,
+    pendingMismatch: null,
   }
 
   function end(): void {
     if (machine.mode === 'done') return
 
-    // EOF confirms any tentative close stack
-    if (loopCtx.pendingCloseStack.length > 0) {
-      for (const pc of loopCtx.pendingCloseStack) {
-        const top = machine.peek()
-        if (top) {
-          const handler = resolveCloseHandler(pc.effectiveTagName, top)
-          if (handler) {
-            machine.apply(handler.close(handlerCtx, pc.tokenSpan))
-          }
+    flushCoalescing()
+
+    // Confirm any pending mismatch at EOF (treat as recovery)
+    if (loopCtx.pendingMismatch !== null) {
+      const pm = loopCtx.pendingMismatch
+      const top = machine.peek()
+      if (top) {
+        const handler = resolveCloseHandler(pm.effectiveTagName, top)
+        if (handler) {
+          machine.apply(handler.close(handlerCtx, pm.tokenSpan))
         }
       }
-      loopCtx.pendingCloseStack = []
+      loopCtx.pendingMismatch = null
     }
-
-    flushCoalescing()
 
     if (deferredYield.target !== null) {
       const termination = deferredYield.postYieldHasContent ? 'runaway' : 'natural'

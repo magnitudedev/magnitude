@@ -11,7 +11,7 @@
  * All effects go through ParserOp[] returned by handlers and applied by machine.apply().
  */
 
-import type { Token } from '../types'
+import type { Token, SourceSpan } from '../types'
 import type { Frame, InvokeFrame, PendingClose } from './types'
 import type { ParserOp } from './ops'
 import type { HandlerContext } from './handler-context'
@@ -21,7 +21,7 @@ import { onContent, endTopProse, isAllWhitespace } from './content'
 import { emitStructuralError } from './ops'
 import { bindOpen } from './handler'
 import { invokeOpenHandler, parameterOpenHandler } from './handlers/invoke'
-import { KNOWN_STRUCTURAL_TAGS, ESCAPE_TAG, MAGNITUDE_PREFIX } from '../constants'
+import { KNOWN_STRUCTURAL_TAGS, MAGNITUDE_PREFIX } from '../constants'
 
 // =============================================================================
 // ParserLoopContext — all shared state needed for token dispatch
@@ -36,14 +36,12 @@ export interface ParserLoopContext {
   }
   handlerCtx: HandlerContext
   deferredYield: { target: 'user' | 'invoke' | 'worker' | 'parent' | null; postYieldHasContent: boolean }
-  pendingCloseStack: PendingClose[]
-  /** Escape nesting depth — when > 0, all tokens become raw content */
-  escapeDepth: number
   invalidSubtree: {
     tag: string
     depth: number
     invoke: boolean
   } | null
+  pendingMismatch: PendingClose | null
 }
 
 // =============================================================================
@@ -51,10 +49,190 @@ export interface ParserLoopContext {
 // =============================================================================
 
 // =============================================================================
-// Tentative close helpers (stack-based for cascade support)
+// Shared helpers
 // =============================================================================
 
 const PROSE_LEVEL_FRAME_TYPES = new Set(['prose', 'reason', 'message'])
+
+function isValidContinuation(token: Token, frameType: string, ctx: ParserLoopContext): boolean {
+  if (token._tag === 'Open') {
+    if (frameType === 'parameter') {
+      if (token.tagName === 'magnitude:filter') return true
+
+      let invokeFrame: Frame | undefined
+      const stack = ctx.machine.stack
+      for (let i = stack.length - 1; i >= 0; i--) {
+        const frame = stack[i]
+        if (frame.type === 'invoke') {
+          invokeFrame = frame
+          break
+        }
+      }
+
+      if (token.tagName === 'magnitude:parameter') {
+        const paramName = (token.attrs ?? new Map()).get('name') ?? ''
+        if (invokeFrame?.type === 'invoke') {
+          const schema = ctx.handlerCtx.invokeCtx.toolSchemas.get(invokeFrame.toolTag)
+          if (schema && !schema.parameters.has(paramName)) {
+            return false
+          }
+        }
+        return true
+      }
+
+      if (token.tagName.startsWith(MAGNITUDE_PREFIX) && invokeFrame?.type === 'invoke') {
+        const suffix = token.tagName.slice(MAGNITUDE_PREFIX.length)
+        const schema = ctx.handlerCtx.invokeCtx.toolSchemas.get(invokeFrame.toolTag)
+        return schema ? schema.parameters.has(suffix) : false
+      }
+
+      return false
+    }
+    return true
+  }
+  if (token._tag === 'SelfClose') {
+    return true
+  }
+  return false
+}
+
+// =============================================================================
+// Mismatch recovery helpers
+// =============================================================================
+
+function isAllWs(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') return false
+  }
+  return true
+}
+
+/** Confirm a pending mismatch — silently close the frame using the effective (canonical) close tag */
+function confirmMismatch(ctx: ParserLoopContext): void {
+  const pm = ctx.pendingMismatch!
+  const top = ctx.machine.peek()
+  if (!top) { ctx.pendingMismatch = null; return }
+
+  const handler = resolveCloseHandler(pm.effectiveTagName, top)
+  if (handler) {
+    // Silent recovery — no structural error emitted
+    ctx.machine.apply(handler.close(ctx.handlerCtx, pm.tokenSpan))
+    // Apply buffered whitespace to the new top frame
+    if (pm.wsBuffer.length > 0) {
+      const newTop = ctx.machine.peek()
+      if (newTop) {
+        ctx.machine.apply(onContent(newTop, pm.wsBuffer, pm.tokenSpan))
+      }
+    }
+  }
+  ctx.pendingMismatch = null
+}
+
+/** Reject a pending mismatch — dump as content */
+function rejectMismatch(ctx: ParserLoopContext, extraContent?: string): void {
+  const pm = ctx.pendingMismatch!
+  const top = ctx.machine.peek()!
+
+  ctx.machine.apply([emitStructuralError({
+    _tag: 'AmbiguousMagnitudeClose',
+    tagName: pm.tagName,
+    expectedTagName: pm.effectiveTagName,
+    raw: `</${pm.tagName}>`,
+    detail: `Close tag </${pm.tagName}> does not match the current ${getParentTagName(top)} block. Did you mean </${pm.effectiveTagName}>?`,
+    primarySpan: pm.tokenSpan,
+  })])
+
+  const raw = `</${pm.tagName}>` + pm.wsBuffer + (extraContent ?? '')
+  ctx.machine.apply(onContent(top, raw, pm.tokenSpan))
+  ctx.pendingMismatch = null
+}
+
+/**
+ * Resolve a pending mismatch against the incoming token.
+ * Returns 'consumed' if the token was absorbed, 'passthrough' if the caller should process it.
+ */
+function resolvePendingMismatch(token: Token, ctx: ParserLoopContext): 'consumed' | 'passthrough' {
+  const pm = ctx.pendingMismatch!
+
+  if (token._tag === 'Content') {
+    if (isAllWs(token.text)) {
+      if (token.text.includes('\n')) {
+        pm.sawNewline = true
+      }
+      pm.wsBuffer += token.text
+      return 'consumed'
+    }
+    // Non-whitespace content after mismatch
+    if (pm.sawNewline) {
+      // Newline was seen — confirm the mismatch recovery
+      confirmMismatch(ctx)
+      return 'passthrough'
+    }
+    // No newline — reject, dump as content
+    rejectMismatch(ctx, token.text)
+    return 'consumed'
+  }
+
+  if (token._tag === 'Close') {
+    // Check if this close matches the frame ABOVE the current one (cascade)
+    // e.g., mismatched param close followed by invoke close
+    const machineStack = ctx.machine.stack
+    const parentIdx = machineStack.length - 2
+    const parentFrame = parentIdx >= 0 ? machineStack[parentIdx] : null
+    if (parentFrame) {
+      const parentHandler = resolveCloseHandler(token.tagName, parentFrame)
+      if (parentHandler) {
+        // Cascade: confirm mismatch (close current frame), then passthrough for parent close
+        confirmMismatch(ctx)
+        return 'passthrough'
+      }
+    }
+
+    // For Close tokens, only confirm via cascade (above). Don't use sawNewline alone —
+    // a newline after a mismatch followed by another close that doesn't cascade should reject.
+    rejectMismatch(ctx)
+    return 'passthrough'
+  }
+
+  if (token._tag === 'Open' || token._tag === 'SelfClose') {
+    // Check if this open is a valid structural continuation for the parent frame
+    // e.g., mismatched filter close followed by <magnitude:command> in invoke
+    const machineStack = ctx.machine.stack
+    const parentIdx = machineStack.length - 2
+    const parentFrame = parentIdx >= 0 ? machineStack[parentIdx] : null
+    if (parentFrame) {
+      if (parentFrame.type !== 'prose' && isValidContinuation(token, parentFrame.type, ctx)) {
+        confirmMismatch(ctx)
+        return 'passthrough'
+      }
+      // For prose-level parent: confirm if the open is a recognized structural tag
+      if (parentFrame.type === 'prose' && token.tagName.startsWith(MAGNITUDE_PREFIX)) {
+        confirmMismatch(ctx)
+        return 'passthrough'
+      }
+    }
+
+    if (pm.sawNewline) {
+      // At prose level, only confirm if the open is a magnitude structural tag
+      if (token.tagName.startsWith(MAGNITUDE_PREFIX)) {
+        confirmMismatch(ctx)
+        return 'passthrough'
+      }
+      confirmMismatch(ctx)
+      return 'passthrough'
+    }
+    rejectMismatch(ctx)
+    return 'passthrough'
+  }
+
+  rejectMismatch(ctx)
+  return 'passthrough'
+}
+
+// =============================================================================
+// Close-tag helpers
+// =============================================================================
 
 function getCanonicalClose(frame: Frame): string {
   switch (frame.type) {
@@ -134,223 +312,6 @@ function handleInvalidMagnitudeOpen(
   }
 }
 
-function isAllWs(text: string): boolean {
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') return false
-  }
-  return true
-}
-
-function isValidContinuation(token: Token, frameType: string, ctx: ParserLoopContext): boolean {
-  if (token._tag === 'Open') {
-    if (frameType === 'parameter') {
-      if (token.tagName === 'magnitude:filter') return true
-
-      let invokeFrame: Frame | undefined
-      const stack = ctx.machine.stack
-      for (let i = stack.length - 1; i >= 0; i--) {
-        const frame = stack[i]
-        if (frame.type === 'invoke') {
-          invokeFrame = frame
-          break
-        }
-      }
-
-      if (token.tagName === 'magnitude:parameter') {
-        const paramName = (token.attrs ?? new Map()).get('name') ?? ''
-        if (invokeFrame?.type === 'invoke') {
-          const schema = ctx.handlerCtx.invokeCtx.toolSchemas.get(invokeFrame.toolTag)
-          if (schema && !schema.parameters.has(paramName)) {
-            return false
-          }
-        }
-        return true
-      }
-
-      if (token.tagName.startsWith(MAGNITUDE_PREFIX) && invokeFrame?.type === 'invoke') {
-        const suffix = token.tagName.slice(MAGNITUDE_PREFIX.length)
-        const schema = ctx.handlerCtx.invokeCtx.toolSchemas.get(invokeFrame.toolTag)
-        return schema ? schema.parameters.has(suffix) : false
-      }
-
-      return false
-    }
-    return true
-  }
-  if (token._tag === 'SelfClose') {
-    return true
-  }
-  return false
-}
-
-/** Build the raw text for all pending closes (for rejection) */
-function pendingCloseRaw(stack: PendingClose[]): string {
-  let raw = ''
-  for (const pc of stack) {
-    raw += `</${pc.tagName}>` + pc.wsBuffer
-  }
-  return raw
-}
-
-/** Confirm all pending closes — apply close handlers top-down */
-function confirmAllPendingCloses(ctx: ParserLoopContext): void {
-  for (let i = 0; i < ctx.pendingCloseStack.length; i++) {
-    const pc = ctx.pendingCloseStack[i]
-    const top = ctx.machine.peek()
-    if (!top) break
-
-    const handler = resolveCloseHandler(pc.effectiveTagName, top)
-    if (!handler) {
-      if (pc.wsBuffer.length > 0) {
-        ctx.machine.apply(onContent(top, pc.wsBuffer, pc.tokenSpan))
-      }
-      continue
-    }
-    ctx.machine.apply(handler.close(ctx.handlerCtx, pc.tokenSpan))
-
-    // Apply buffered whitespace to the NEW top frame (after close)
-    if (pc.wsBuffer.length > 0) {
-      const newTop = ctx.machine.peek()
-      if (newTop) {
-        ctx.machine.apply(onContent(newTop, pc.wsBuffer, pc.tokenSpan))
-      }
-    }
-  }
-  ctx.pendingCloseStack = []
-}
-
-/** Reject all pending closes — dump as content */
-function rejectAllPendingCloses(ctx: ParserLoopContext, extraContent?: string): void {
-  for (const pc of ctx.pendingCloseStack) {
-    if (pc.mismatchRecovery) {
-      ctx.machine.apply([emitStructuralError({
-        _tag: 'AmbiguousMagnitudeClose',
-        tagName: pc.tagName,
-        expectedTagName: pc.effectiveTagName,
-        raw: `</${pc.tagName}>`,
-        detail: `Close tag </${pc.tagName}> does not match the current ${pc.effectiveTagName} block. Did you mean </${pc.effectiveTagName}>?`,
-        primarySpan: pc.tokenSpan,
-      })])
-    }
-  }
-
-  const top = ctx.machine.peek()!
-  const raw = pendingCloseRaw(ctx.pendingCloseStack) + (extraContent ?? '')
-  ctx.machine.apply(onContent(top, raw, ctx.pendingCloseStack[0].tokenSpan))
-  ctx.pendingCloseStack = []
-}
-
-/**
- * Resolve the tentative close stack against the incoming token.
- * Returns 'consumed' if the token was absorbed, or 'passthrough' if the
- * token should be processed normally (stack was cleared).
- */
-function resolvePendingClose(token: Token, ctx: ParserLoopContext): 'consumed' | 'passthrough' {
-  const stack = ctx.pendingCloseStack
-  const lastPc = stack[stack.length - 1]
-  const top = ctx.machine.peek()!
-
-  // Determine the "effective frame" — the frame that would be on top if all pending closes were confirmed
-  // For a single pending close, this is the current top.
-  // For cascade (e.g., </parameter></invoke>), the effective frame is computed by looking
-  // past the pending close count on the machine stack.
-  const machineStack = ctx.machine.stack
-  const effectiveFrameIdx = machineStack.length - 1 - stack.length
-  const effectiveFrame = effectiveFrameIdx >= 0 ? machineStack[effectiveFrameIdx] : null
-
-  if (token._tag === 'Content') {
-    if (isAllWs(token.text)) {
-      if (token.text.includes('\n')) {
-        lastPc.sawNewline = true
-      }
-      lastPc.wsBuffer += token.text
-      return 'consumed'
-    }
-    // Non-whitespace content
-    // For top-level effective frame: confirm on '<', newline as first char, or if we saw a newline in buffered whitespace
-    if (effectiveFrame && PROSE_LEVEL_FRAME_TYPES.has(effectiveFrame.type) && token.text.length > 0
-        && (token.text[0] === '<' || token.text[0] === '\n' || lastPc.sawNewline)) {
-      confirmAllPendingCloses(ctx)
-      return 'passthrough'
-    }
-    // Reject entire stack
-    rejectAllPendingCloses(ctx, token.text)
-    return 'consumed'
-  }
-
-  if (token._tag === 'Close') {
-    // Check greedy replace FIRST — if the close matches the same frame as the
-    // last pending close, it's a greedy last-match replacement
-    if (stack.length === 1) {
-      const handler = resolveCloseHandler(token.tagName, top)
-      if (handler) {
-        // Same-frame close — replace (greedy last-match)
-        ctx.machine.apply(onContent(top, `</${lastPc.tagName}>` + lastPc.wsBuffer, lastPc.tokenSpan))
-        ctx.pendingCloseStack = [{
-          tagName: token.tagName,
-          effectiveTagName: token.tagName,
-          mismatchRecovery: false,
-          frameType: top.type,
-          wsBuffer: '',
-          sawNewline: false,
-          tokenSpan: token.span,
-        }]
-        return 'consumed'
-      }
-    }
-
-    // Check if matches the frame that would be on top after all pending confirms
-    // i.e., would this close extend the cascade?
-    if (effectiveFrame) {
-      const handler = resolveCloseHandler(token.tagName, effectiveFrame)
-      if (handler) {
-        // Extend cascade — push another pending close
-        stack.push({
-          tagName: token.tagName,
-          effectiveTagName: token.tagName,
-          mismatchRecovery: false,
-          frameType: effectiveFrame.type,
-          wsBuffer: '',
-          sawNewline: false,
-          tokenSpan: token.span,
-        })
-        return 'consumed'
-      }
-      if (token.tagName.startsWith(MAGNITUDE_PREFIX) && effectiveFrame.type !== 'prose') {
-        stack.push({
-          tagName: token.tagName,
-          effectiveTagName: getCanonicalClose(effectiveFrame),
-          mismatchRecovery: true,
-          frameType: effectiveFrame.type,
-          wsBuffer: '',
-          sawNewline: false,
-          tokenSpan: token.span,
-        })
-        return 'consumed'
-      }
-    }
-
-    // Matches neither — reject entire stack
-    rejectAllPendingCloses(ctx, tokenRaw(token))
-    return 'consumed'
-  }
-
-  // Open or SelfClose
-  // Check if valid continuation for the frame being closed by the last pending close
-  // The last pending close's tagName tells us the frame type (e.g., 'parameter' → parameter frame)
-  if (isValidContinuation(token, lastPc.frameType, ctx)) {
-    confirmAllPendingCloses(ctx)
-    return 'passthrough'
-  }
-  if (effectiveFrame && PROSE_LEVEL_FRAME_TYPES.has(effectiveFrame.type)) {
-    confirmAllPendingCloses(ctx)
-    return 'passthrough'
-  }
-  rejectAllPendingCloses(ctx)
-  return 'passthrough'
-}
-
 // =============================================================================
 // pushToken — main entry point
 // =============================================================================
@@ -364,19 +325,11 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
   }
   if (ctx.machine.mode !== 'active') return
 
-  // Escape mode: all tokens become raw content until escape close
-  if (ctx.escapeDepth > 0) {
-    if (token._tag === 'Close' && token.tagName === ESCAPE_TAG) {
-      ctx.escapeDepth--
-      // Silently consume the close tag — don't emit as content
-    } else {
-      // Everything else is raw content on the current top frame
-      const top = ctx.machine.peek()
-      if (top) {
-        ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
-      }
-    }
-    return
+  // Resolve pending mismatch against incoming token
+  if (ctx.pendingMismatch !== null) {
+    const result = resolvePendingMismatch(token, ctx)
+    if (result === 'consumed') return
+    // passthrough — mismatch was resolved, process token normally
   }
 
   if (ctx.invalidSubtree !== null) {
@@ -432,26 +385,8 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
     }
   }
 
-  // Resolve tentative close against incoming token
-  if (ctx.pendingCloseStack.length > 0) {
-    const result = resolvePendingClose(token, ctx)
-    if (result === 'consumed') return
-    // passthrough — pendingClose was cleared, process token normally
-  }
-
   const top = ctx.machine.peek()
   if (!top) return
-
-  // Check for escape open — enter escape mode (after pending close resolution)
-  // Valid everywhere except inside invoke frames (where only parameter/filter are valid children)
-  if (token._tag === 'Open' && token.tagName === ESCAPE_TAG) {
-    if (top.type !== 'invoke') {
-      ctx.escapeDepth++
-      // Silently consume the open tag — don't emit as content
-      return
-    }
-    // Fall through to normal Open handling — will be resolved as invalidMagnitudeOpen
-  }
 
   switch (token._tag) {
     case 'Open': {
@@ -492,25 +427,7 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
     case 'Close': {
       const handler = resolveCloseHandler(token.tagName, top)
       if (handler) {
-        ctx.pendingCloseStack.push({
-          tagName: token.tagName,
-          effectiveTagName: token.tagName,
-          mismatchRecovery: false,
-          frameType: top.type,
-          wsBuffer: '',
-          sawNewline: false,
-          tokenSpan: token.span,
-        })
-      } else if (token.tagName.startsWith(MAGNITUDE_PREFIX) && top.type !== 'prose') {
-        ctx.pendingCloseStack.push({
-          tagName: token.tagName,
-          effectiveTagName: getCanonicalClose(top),
-          mismatchRecovery: true,
-          frameType: top.type,
-          wsBuffer: '',
-          sawNewline: false,
-          tokenSpan: token.span,
-        })
+        ctx.machine.apply(handler.close(ctx.handlerCtx, token.span))
       } else if (token.tagName.startsWith(MAGNITUDE_PREFIX) && top.type === 'prose') {
         // Stray magnitude close at prose level — no matching open
         ctx.machine.apply([emitStructuralError({
@@ -520,17 +437,15 @@ export function pushToken(token: Token, ctx: ParserLoopContext): void {
           primarySpan: token.span,
         })])
         ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
-      } else if (token.tagName.startsWith(MAGNITUDE_PREFIX)) {
-        // Magnitude close mismatch inside a body frame
-        ctx.machine.apply([emitStructuralError({
-          _tag: 'AmbiguousMagnitudeClose',
+      } else if (token.tagName.startsWith(MAGNITUDE_PREFIX) && top.type !== 'prose') {
+        // Magnitude close mismatch inside a body frame — buffer for mismatch recovery
+        ctx.pendingMismatch = {
           tagName: token.tagName,
-          expectedTagName: getCanonicalClose(top).replace('magnitude:', ''),
-          raw: tokenRaw(token),
-          detail: `Close tag ${tokenRaw(token)} does not match the current ${getParentTagName(top)} block. Did you mean </${getCanonicalClose(top)}>?`,
-          primarySpan: token.span,
-        })])
-        ctx.machine.apply(onContent(top, tokenRaw(token), token.span))
+          effectiveTagName: getCanonicalClose(top),
+          wsBuffer: '',
+          sawNewline: false,
+          tokenSpan: token.span,
+        }
       } else {
         if (KNOWN_STRUCTURAL_TAGS.has(token.tagName)) {
           ctx.machine.apply([emitStructuralError({

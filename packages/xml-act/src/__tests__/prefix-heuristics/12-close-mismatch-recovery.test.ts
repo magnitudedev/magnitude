@@ -184,11 +184,16 @@ describe('prefix heuristics: close mismatch recovery', () => {
     expect(countEvents(events, 'MessageChunk')).toBeGreaterThan(1)
   })
 
-  it('16: mismatched close inside escape is literal', () => {
+  it('16: escape open inside message is invalid, so inner mismatched close is not escaped', () => {
     const input = '<magnitude:message><magnitude:escape></magnitude:reason></magnitude:escape></magnitude:message><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
-    expectPreservedInMessage(events, '</magnitude:reason>')
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:message',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:message'],
+    })
+    expectPreservedInMessage(events, '<magnitude:escape>')
   })
 })

@@ -126,11 +126,15 @@ describe('prefix heuristics: parameter alias edge cases', () => {
     })
   })
 
-  it('12: escaped alias-looking text inside parameter remains literal', () => {
+  it('12: escape open inside parameter body is invalid', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:parameter name="command"><magnitude:escape><magnitude:path>a.ts</magnitude:path></magnitude:escape></magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
-    expect(getToolInput(events)).toEqual({ command: '<magnitude:path>a.ts</magnitude:path>' })
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:parameter',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:parameter'],
+    })
   })
 })

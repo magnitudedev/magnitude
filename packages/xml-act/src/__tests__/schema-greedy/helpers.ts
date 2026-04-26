@@ -110,7 +110,7 @@ const GREP_PARSER_TOOLS = makeTools(
   { tool: grepTool, tagName: 'grep' },
 )
 
-const KNOWN_TAGS = new Set(['shell', 'edit', 'tree', 'grep', 'magnitude:invoke', 'magnitude:parameter', 'magnitude:filter', 'magnitude:reason', 'magnitude:message', 'magnitude:yield_user', 'magnitude:yield_invoke', 'magnitude:yield_parent', 'magnitude:yield_worker', 'magnitude:escape'])
+const KNOWN_TAGS = new Set(['shell', 'edit', 'tree', 'grep', 'magnitude:invoke', 'magnitude:parameter', 'magnitude:filter', 'magnitude:reason', 'magnitude:message', 'magnitude:yield_user', 'magnitude:yield_invoke', 'magnitude:yield_parent', 'magnitude:yield_worker', ])
 
 // ============================================================================
 // Grammar Validator

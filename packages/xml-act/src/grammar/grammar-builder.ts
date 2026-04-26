@@ -203,43 +203,28 @@ export class GrammarBuilder {
 
     // Post-lens phase: message and/or invoke, then yield
     const postItems: string[] = []
-    const postItemsNoLt: string[] = []
     for (const child of proseChildren) {
       if (child === 'magnitude:reason') continue
       if (child === 'magnitude:message' && allowMessages) {
         postItems.push('"<magnitude:message" msg-attrs-opt ">" msg-body-s0')
-        postItemsNoLt.push('"magnitude:message" msg-attrs-opt ">" msg-body-s0')
       } else if (child === 'magnitude:invoke' && allowTools) {
         postItems.push('"<magnitude:invoke" invoke-attrs ">" invoke-body')
-        postItemsNoLt.push('"magnitude:invoke" invoke-attrs ">" invoke-body')
       }
     }
 
     const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<magnitude:message" msg-attrs-opt ">" msg-body-s0'
-    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"magnitude:message" msg-attrs-opt ">" msg-body-s0']
-
-    postItems.push('"<magnitude:escape>" escape-body-post-s0')
-    postItemsNoLt.push('"magnitude:escape>" escape-body-post-s0')
 
     rules.set('turn-item-post', postItemRule)
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
-    rules.set('turn-next-post-no-lt', [...postNoLtItems, 'yield-no-lt'].join(' | '))
 
     // Lens phase: reason + post-lens items
     const hasReason = (proseChildren as readonly string[]).includes('magnitude:reason')
     const lensItems = hasReason
       ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
       : postItems
-    const lensItemsNoLt = hasReason
-      ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt]
-      : postItemsNoLt
-
-    lensItems.push('"<magnitude:escape>" escape-body-lens-s0')
-    lensItemsNoLt.push('"magnitude:escape>" escape-body-lens-s0')
 
     rules.set('turn-item-lens', lensItems.join(' | '))
     rules.set('turn-next-lens', 'ws turn-item-lens | ws yield')
-    rules.set('turn-next-lens-no-lt', [...lensItemsNoLt, 'yield-no-lt'].join(' | '))
   }
 
   /**
@@ -247,115 +232,37 @@ export class GrammarBuilder {
    * These are reused across all body rules for the same tag.
    */
   private addSharedBucRules(rules: RuleMap): void {
-    const escapeTag = 'magnitude:escape'
     const magnitudePrefix = 'magnitude:'
 
-    // Plain BUC rules (exclude only their close tag)
-    // param-buc: excludes </magnitude:parameter>
-    for (const rule of generateBucRules('param-buc', 'magnitude:parameter')) {
-      addRule(rules, rule)
-    }
-    // filter-buc: excludes </magnitude:filter>
-    for (const rule of generateBucRules('filter-buc', 'magnitude:filter')) {
-      addRule(rules, rule)
-    }
-    // reason-buc: excludes </magnitude:reason>
     for (const rule of generateBucRules('reason-buc', 'magnitude:reason')) {
       addRule(rules, rule)
     }
-    // msg-buc: excludes </magnitude:message>
-    for (const rule of generateBucRules('msg-buc', 'magnitude:message')) {
-      addRule(rules, rule)
-    }
-    // escape-buc: excludes </magnitude:escape> (no compound needed — escape doesn't nest)
-    for (const rule of generateBucRules('escape-buc', escapeTag)) {
-      addRule(rules, rule)
-    }
 
-    // Compound BUC rules for param/filter: exclude close tag AND <magnitude: open prefix
-    for (const rule of generateCompoundBucRules('param-esc-buc', 'magnitude:parameter', magnitudePrefix, { excludeOpenPrefix: true })) {
+    for (const rule of generateCompoundBucRules('reason-body', 'magnitude:reason', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:' })) {
       addRule(rules, rule)
     }
-    for (const rule of generateCompoundBucRules('filter-esc-buc', 'magnitude:filter', magnitudePrefix, { excludeOpenPrefix: true })) {
+    for (const rule of generateCompoundBucRules('msg-body', 'magnitude:message', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:' })) {
       addRule(rules, rule)
     }
-    for (const rule of generateCompoundBucRules('reason-esc-buc', 'magnitude:reason', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:' })) {
+    // param-body and filter-body: BUC stops at '<' that looks like close/open prefix.
+    // To handle bare '<' in content (e.g., '<</magnitude:parameter>'), we use a
+    // '<' recovery pattern: buc ("<" alt-buc)* — the outer rule consumes '<' and
+    // enters an afterLt BUC that checks for '/magnitude:' without the leading '<'.
+    for (const rule of generateCompoundBucRules('param-body-buc', 'magnitude:parameter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:' })) {
       addRule(rules, rule)
     }
-    for (const rule of generateCompoundBucRules('msg-esc-buc', 'magnitude:message', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:' })) {
+    for (const rule of generateCompoundBucRules('param-body-alt', 'magnitude:parameter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', afterLt: true })) {
       addRule(rules, rule)
     }
+    rules.set('param-body', 'param-body-buc ("<" param-body-alt)*')
 
-    // Line-aware BUC variants: also exclude \n so we can track line boundaries
-    // Used in body rules that need newline-confirmed mismatch recovery
-    for (const rule of generateCompoundBucRules('reason-line-buc', 'magnitude:reason', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', excludeChars: ['\n'] })) {
+    for (const rule of generateCompoundBucRules('filter-body-buc', 'magnitude:filter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:' })) {
       addRule(rules, rule)
     }
-    for (const rule of generateCompoundBucRules('msg-line-buc', 'magnitude:message', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', excludeChars: ['\n'] })) {
+    for (const rule of generateCompoundBucRules('filter-body-alt', 'magnitude:filter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', afterLt: true })) {
       addRule(rules, rule)
     }
-
-    // Escape-aware body content rules: BUC interleaved with escape blocks
-    // Pattern: buc (escape-block buc)* — no nested repetition ambiguity
-    const escBlock = `"<${escapeTag}>" escape-buc "</${escapeTag}>"`
-    // Magnitude close absorber: matches any </magnitude:X> close tag
-    rules.set('mag-close-rest', '[a-z_:]* ">"')
-
-    // Line-aware BUC variants for param/filter: also exclude \n and </magnitude: close prefix
-    // Used in strict body rules to detect same-line mismatched closes
-    for (const rule of generateCompoundBucRules('param-line-buc', 'magnitude:parameter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', excludeChars: ['\n'] })) {
-      addRule(rules, rule)
-    }
-    for (const rule of generateCompoundBucRules('filter-line-buc', 'magnitude:filter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', excludeChars: ['\n'] })) {
-      addRule(rules, rule)
-    }
-
-    // After-lt BUC variants: used after body-level '<' recovery.
-    // These also stop at '/magnitude:parameter>' (close tag without leading '<').
-    for (const rule of generateCompoundBucRules('param-alt-buc', 'magnitude:parameter', magnitudePrefix, { excludeOpenPrefix: true, afterLt: true })) {
-      addRule(rules, rule)
-    }
-    for (const rule of generateCompoundBucRules('filter-alt-buc', 'magnitude:filter', magnitudePrefix, { excludeOpenPrefix: true, afterLt: true })) {
-      addRule(rules, rule)
-    }
-
-    // Line-aware after-lt BUC variants for param/filter strict body
-    for (const rule of generateCompoundBucRules('param-line-alt-buc', 'magnitude:parameter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', excludeChars: ['\n'], afterLt: true })) {
-      addRule(rules, rule)
-    }
-    for (const rule of generateCompoundBucRules('filter-line-alt-buc', 'magnitude:filter', magnitudePrefix, { excludeOpenPrefix: true, excludeClosePrefix: 'magnitude:', excludeChars: ['\n'], afterLt: true })) {
-      addRule(rules, rule)
-    }
-
-    // Strict body rules: BUC stops at <magnitude: prefix and at '<<'.
-    // Body has '<' recovery that switches to after-lt BUC (which also stops at '/close>').
-    // If an invalid <magnitude:...> open appears before any false close, the grammar rejects.
-    const ltRecoveryParam = `"<" param-alt-buc`
-    const ltRecoveryFilter = `"<" filter-alt-buc`
-
-    // Shared newline + close absorber patterns
-    const nlMagClose = `"\\n" "</magnitude:" mag-close-rest`
-    const nlOnly = `"\\n"`
-
-    // Strict body rules for param/filter: use line-aware BUCs to detect same-line mismatched closes
-    // Pattern: line-buc (\n mag-close line-buc | \n line-buc | escape line-buc | < line-alt-buc ...)*
-    const paramLineBuc = 'param-line-buc'
-    const filterLineBuc = 'filter-line-buc'
-    const ltRecoveryParamLine = `"<" param-line-alt-buc`
-    const ltRecoveryFilterLine = `"<" filter-line-alt-buc`
-    rules.set('param-esc-body', `${paramLineBuc} (${escBlock} ${paramLineBuc} | ${nlMagClose} ${paramLineBuc} | ${nlOnly} ${paramLineBuc} | ${ltRecoveryParamLine} (${escBlock} ${paramLineBuc} | ${nlMagClose} ${paramLineBuc} | ${nlOnly} ${paramLineBuc})*)*`)
-    rules.set('filter-esc-body', `${filterLineBuc} (${escBlock} ${filterLineBuc} | ${nlMagClose} ${filterLineBuc} | ${nlOnly} ${filterLineBuc} | ${ltRecoveryFilterLine} (${escBlock} ${filterLineBuc} | ${nlMagClose} ${filterLineBuc} | ${nlOnly} ${filterLineBuc})*)*`)
-
-    // Permissive body rules: used AFTER false closes in greedy patterns.
-    // They preserve close-tag leniency and lt-recovery, but no longer absorb <magnitude: opens as body text.
-    rules.set('param-greedy-body', `param-esc-buc (${escBlock} param-esc-buc | ${ltRecoveryParam} (${escBlock} param-esc-buc)*)*`)
-    rules.set('filter-greedy-body', `filter-esc-buc (${escBlock} filter-esc-buc | ${ltRecoveryFilter} (${escBlock} filter-esc-buc)*)*`)
-
-    // Line-aware body rules for reason/message: support newline-confirmed mismatch recovery
-    const reasonLineBuc = 'reason-line-buc'
-    const msgLineBuc = 'msg-line-buc'
-    rules.set('reason-esc-body', `${reasonLineBuc} (${escBlock} ${reasonLineBuc} | ${nlMagClose} ${reasonLineBuc} | ${nlOnly} ${reasonLineBuc})*`)
-    rules.set('msg-esc-body', `${msgLineBuc} (${escBlock} ${msgLineBuc} | ${nlMagClose} ${msgLineBuc} | ${nlOnly} ${msgLineBuc})*`)
+    rules.set('filter-body', 'filter-body-buc ("<" filter-body-alt)*')
   }
 
   /**
@@ -363,30 +270,8 @@ export class GrammarBuilder {
    * Confirmation: </tagname> + ws + < (next structural tag).
    */
   private addTopLevelBodyRules(rules: RuleMap): void {
-    // reason body: greedy last-match with inline escape support
-    // Uses non-ext body: <magnitude:...> opens are rejected (only escape is allowed)
-    const reasonClose = '"</magnitude:reason>"'
-    rules.set('reason-body-s0',
-      `reason-esc-body (${reasonClose} reason-esc-body)* ${reasonClose} ws turn-item-lens-no-lt-or-yield`)
-
-    // msg body: greedy last-match with inline escape support
-    // Uses non-ext body: <magnitude:...> opens are rejected (only escape is allowed)
-    const msgClose = '"</magnitude:message>"'
-    rules.set('msg-body-s0',
-      `msg-esc-body (${msgClose} msg-esc-body)* ${msgClose} ws turn-item-post-no-lt-or-yield`)
-
-    // Helper rules: the continuation after close + ws must start with <
-    // which is consumed by the no-lt variants, OR be a yield (which starts with <)
-    rules.set('turn-item-lens-no-lt-or-yield', 'turn-item-lens | yield')
-    rules.set('turn-item-post-no-lt-or-yield', 'turn-item-post | yield')
-
-    // escape body (lens phase): first close ends block (no nesting, no greedy)
-    rules.set('escape-body-lens-s0',
-      `escape-buc "</magnitude:escape>" ws turn-item-lens-no-lt-or-yield`)
-
-    // escape body (post phase): first close ends block (no nesting, no greedy)
-    rules.set('escape-body-post-s0',
-      `escape-buc "</magnitude:escape>" ws turn-item-post-no-lt-or-yield`)
+    rules.set('reason-body-s0', 'reason-body "</magnitude:reason>" turn-next-lens')
+    rules.set('msg-body-s0', 'msg-body "</magnitude:message>" turn-next-post')
   }
 
   /**
@@ -397,38 +282,21 @@ export class GrammarBuilder {
     const tools = this.config.tools
 
     if (tools.length === 0) {
-      // Fallback: generic invoke with free-form tool name and params
       rules.set('invoke-attrs', '" tool=\\"" quoted-value "\\""')
       rules.set('invoke-body', 'ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post')
       rules.set('invoke-generic-item',
         '"<magnitude:parameter" " name=\\"" quoted-value "\\"" ">" generic-param-body-s0 | "<magnitude:filter>" generic-filter-body-s0')
-      // Generic param body: greedy last-match, confirmed by next invoke child or close
       rules.set('generic-param-body-s0',
-        `param-esc-body (("</magnitude:parameter>" | "/magnitude:parameter>") param-greedy-body)* ("</magnitude:parameter>" | "/magnitude:parameter>") (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)`)
+        'param-body "</magnitude:parameter>" (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)')
       rules.set('generic-filter-body-s0',
-        `filter-esc-body (("</magnitude:filter>" | "/magnitude:filter>") filter-greedy-body)* ("</magnitude:filter>" | "/magnitude:filter>") (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)`)
+        'filter-body "</magnitude:filter>" (ws invoke-generic-item | ws "</magnitude:invoke>" turn-next-post)')
       return
     }
 
-    // Build invoke-attrs as enumerated tool names
     const toolNameAlts = tools.map(t => `" tool=\\"${escapeGbnfString(t.tagName)}\\""`)
     rules.set('invoke-attrs', toolNameAlts.join(' | '))
 
-    // Build invoke-body as dispatch to per-tool rules
-    // After <invoke tool="X">, we need to dispatch based on tool name.
-    // Since the tool name is already consumed as an attribute, we use per-tool invoke rules.
-    // We restructure: instead of generic invoke-body, each tool gets its own invoke rule.
-
-    // Rewrite: the continuation rules reference invoke-body which is called after
-    // <invoke invoke-attrs ">". We need invoke-body to dispatch per tool.
-    // But GBNF doesn't have conditional dispatch on previously consumed content.
-    //
-    // Solution: instead of one invoke-attrs + invoke-body, generate per-tool alternatives
-    // in the continuation rules directly.
-
-    // Build per-tool invoke alternatives
     const invokeAlts: string[] = []
-    const invokeAltsNoLt: string[] = []
 
     for (const tool of tools) {
       const safeName = sanitizeRuleName(tool.tagName)
@@ -436,72 +304,33 @@ export class GrammarBuilder {
       this.addPerToolRules(rules, tool, safeName)
 
       invokeAlts.push(`"<magnitude:invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
-      invokeAltsNoLt.push(`"magnitude:invoke" " tool=\\"${escapeGbnfString(tool.tagName)}\\"" ">" ${safeName}-body`)
     }
-
-    // Override the invoke entries in continuation rules
-    // We need to replace the generic invoke references with per-tool alternatives
-    // Rebuild turn-item-post and turn-item-lens with per-tool invoke alts
 
     const { allowMessages } = this.config.protocol
     const proseChildren = VALID_CHILDREN.prose
 
     const postItems: string[] = []
-    const postItemsNoLt: string[] = []
     for (const child of proseChildren) {
       if (child === 'magnitude:reason') continue
       if (child === 'magnitude:message' && allowMessages) {
         postItems.push('"<magnitude:message" msg-attrs-opt ">" msg-body-s0')
-        postItemsNoLt.push('"magnitude:message" msg-attrs-opt ">" msg-body-s0')
       } else if (child === 'magnitude:invoke') {
         postItems.push(...invokeAlts)
-        postItemsNoLt.push(...invokeAltsNoLt)
       }
     }
 
     const postItemRule = postItems.length > 0 ? postItems.join(' | ') : '"<magnitude:message" msg-attrs-opt ">" msg-body-s0'
-    const postNoLtItems = postItemsNoLt.length > 0 ? postItemsNoLt : ['"magnitude:message" msg-attrs-opt ">" msg-body-s0']
 
-    // Add escape alternatives to post items
-    postItems.push('"<magnitude:escape>" escape-body-post-s0')
-    postItemsNoLt.push('"magnitude:escape>" escape-body-post-s0')
-
-    const postItemRuleWithEscape = postItems.join(' | ')
-    const postNoLtWithEscape = [...postItemsNoLt]
-
-    // Override the rules set by addContinuationRules
-    rules.set('turn-item-post', postItemRuleWithEscape)
+    rules.set('turn-item-post', postItemRule)
     rules.set('turn-next-post', 'ws turn-item-post | ws yield')
-    rules.set('turn-next-post-no-lt', [...postNoLtWithEscape, 'yield-no-lt'].join(' | '))
 
     const hasReason = (proseChildren as readonly string[]).includes('magnitude:reason')
-    // Build lens items from post items WITHOUT escape, then add escape with lens body
     const lensItems = hasReason
-      ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems.filter(i => !i.includes('escape'))]
-      : postItems.filter(i => !i.includes('escape'))
-    const lensItemsNoLt = hasReason
-      ? ['"magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItemsNoLt.filter(i => !i.includes('escape'))]
-      : postItemsNoLt.filter(i => !i.includes('escape'))
-
-    // Add escape with lens-phase body rule
-    lensItems.push('"<magnitude:escape>" escape-body-lens-s0')
-    lensItemsNoLt.push('"magnitude:escape>" escape-body-lens-s0')
+      ? ['"<magnitude:reason" reason-attrs-opt ">" reason-body-s0', ...postItems]
+      : postItems
 
     rules.set('turn-item-lens', lensItems.join(' | '))
     rules.set('turn-next-lens', 'ws turn-item-lens | ws yield')
-    rules.set('turn-next-lens-no-lt', [...lensItemsNoLt, 'yield-no-lt'].join(' | '))
-
-    // Re-derive the helper rules for top-level body confirmation
-    rules.set('turn-item-lens-no-lt-or-yield', 'turn-item-lens | yield')
-    rules.set('turn-item-post-no-lt-or-yield', 'turn-item-post | yield')
-
-    // escape body (lens phase): first close ends block (no nesting, no greedy)
-    rules.set('escape-body-lens-s0',
-      `escape-buc "</magnitude:escape>" ws turn-item-lens-no-lt-or-yield`)
-
-    // escape body (post phase): first close ends block (no nesting, no greedy)
-    rules.set('escape-body-post-s0',
-      `escape-buc "</magnitude:escape>" ws turn-item-post-no-lt-or-yield`)
   }
 
   /**
@@ -511,7 +340,7 @@ export class GrammarBuilder {
   private addPerToolRules(rules: RuleMap, tool: GrammarToolDef, safeName: string): void {
     const N = tool.parameters.length
     const requiredCount = tool.parameters.filter(p => p.required).length
-    const invokeClose = '"</magnitude:invoke>"'
+    const invokeClose = `${safeName}-invoke-close`
 
     const canonicalParamBodyRule = (k: number): string =>
       k === 1 ? `${safeName}-last-body-s0` : `${safeName}-nonlast-body-s0-${k}`
@@ -519,25 +348,28 @@ export class GrammarBuilder {
     const canonicalParamAlt = (bodyRule: string): string =>
       `ws "<magnitude:parameter" ${safeName}-param-names ">" ${bodyRule}`
 
+    const paramNameAlts = tool.parameters.map(p =>
+      `" name=\\"${escapeGbnfString(p.name)}\\""`)
+    if (paramNameAlts.length > 0) {
+      rules.set(`${safeName}-param-names`, paramNameAlts.join(' | '))
+    }
+
+    const paramCloseAlts = ['"</magnitude:parameter>"', ...tool.parameters.map(
+      p => `"</magnitude:${escapeGbnfString(p.name)}>"`,
+    )]
+    rules.set(`${safeName}-param-close`, paramCloseAlts.join(' | '))
+    rules.set(`${safeName}-invoke-close`, `"</magnitude:invoke>" | "</magnitude:${escapeGbnfString(tool.tagName)}>"`)
+
     if (N === 0) {
-      // 0-param tool: invoke body is just ws + close
       rules.set(`${safeName}-body`, `ws ${invokeClose} turn-next-post`)
       return
     }
 
-    // Constrained param names for this tool
-    const paramNameAlts = tool.parameters.map(p =>
-      `" name=\\"${escapeGbnfString(p.name)}\\""`)
-    rules.set(`${safeName}-param-names`, paramNameAlts.join(' | '))
-
-    // Generate sequence chain: seq-N down to seq-1
-    // seq-K means K parameter slots remaining
     for (let k = N; k >= 1; k--) {
       const consumed = N - k
       const closeAllowed = consumed >= requiredCount
       const canonicalBodyRule = canonicalParamBodyRule(k)
       const canonicalParam = canonicalParamAlt(canonicalBodyRule)
-      // Filter chains back to same seq-K (filter doesn't consume a parameter slot)
       const canonicalFilterAlt = `ws "<magnitude:filter>" ${safeName}-filter-cont-body-s0-${k}`
       const canonicalCloseAlt = `ws ${invokeClose} turn-next-post`
 
@@ -546,38 +378,29 @@ export class GrammarBuilder {
         [canonicalParam, canonicalFilterAlt, ...(closeAllowed ? [canonicalCloseAlt] : [])].join(' | '),
       )
 
-      // Filter continuation: after filter close, chain back to same seq-K
       rules.set(
         `${safeName}-filter-cont-body-s0-${k}`,
-        `filter-esc-body (("</magnitude:filter>" | "/magnitude:filter>") filter-greedy-body)* ("</magnitude:filter>" | "/magnitude:filter>") ${safeName}-seq-${k}`,
+        `filter-body "</magnitude:filter>" ${safeName}-seq-${k}`,
       )
     }
 
-    // Non-last body rules: for each position K > 1, body chains to seq-(K-1)
     for (let k = N; k >= 2; k--) {
       const nextSeq = `${safeName}-seq-${k - 1}`
 
-      const paramClose = invokeClose.replace('invoke', 'parameter')
-      const paramSlashClose = `"/${invokeClose.replace('invoke', 'parameter').slice(2)}`  // "/magnitude:parameter>"
-      const paramDualClose = `(${paramClose} | ${paramSlashClose})`
-
       rules.set(
         `${safeName}-nonlast-body-s0-${k}`,
-        `param-esc-body (${paramDualClose} param-greedy-body)* ${paramDualClose} ${nextSeq}`,
+        `param-body ${safeName}-param-close ${nextSeq}`,
       )
     }
 
-    // Post-last-param: after the last parameter closes, accept filter or invoke close
     const postLastCanonical = `ws "<magnitude:filter>" ${safeName}-filter-cont-body-s0-1 | ws ${invokeClose} turn-next-post`
     rules.set(`${safeName}-post-last-param`, postLastCanonical)
 
-    const paramDualClose = `("</magnitude:parameter>" | "/magnitude:parameter>")`
     rules.set(
       `${safeName}-last-body-s0`,
-      `param-esc-body (${paramDualClose} param-greedy-body)* ${paramDualClose} ${safeName}-post-last-param`,
+      `param-body ${safeName}-param-close ${safeName}-post-last-param`,
     )
 
-    // Entry points
     rules.set(`${safeName}-body`, `${safeName}-seq-${N}`)
   }
 
@@ -596,41 +419,28 @@ export class GrammarBuilder {
   private addForcedMessageRules(rules: RuleMap, recipient: string, maxLenses: number | undefined): void {
     const escapedRecipient = recipient.replace(/"/g, '\\"')
     rules.set('forced-msg', `"<magnitude:message to=\\"${escapedRecipient}\\">" msg-body-s0`)
-    rules.set('forced-msg-no-lt', `"magnitude:message to=\\"${escapedRecipient}\\">" msg-body-s0`)
 
     if (maxLenses !== undefined) {
       for (let k = maxLenses; k >= 0; k--) {
         if (k === 0) {
           rules.set(`turn-next-forced-0`, 'ws forced-msg')
-          rules.set(`turn-next-forced-0-no-lt`, 'forced-msg-no-lt')
         } else {
           const nextK = k - 1
-          // Reason body for forced phase — greedy last-match, chains to next forced level
-          const reasonClose = '"</magnitude:reason>"'
           rules.set(`reason-forced-${k}-body-s0`,
-            `reason-buc (${reasonClose} reason-buc)* ${reasonClose} turn-next-forced-${nextK}`)
+            `reason-buc "</magnitude:reason>" turn-next-forced-${nextK}`)
           rules.set(
             `turn-next-forced-${k}`,
             `ws "<magnitude:reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | ws forced-msg`
-          )
-          rules.set(
-            `turn-next-forced-${k}-no-lt`,
-            `"magnitude:reason" reason-attrs-opt ">" reason-forced-${k}-body-s0 | forced-msg-no-lt`
           )
         }
       }
       rules.set('root', `turn-next-forced-${maxLenses}`)
     } else {
-      const reasonClose = '"</magnitude:reason>"'
       rules.set('reason-forced-body-s0',
-        `reason-buc (${reasonClose} reason-buc)* ${reasonClose} turn-next-forced`)
+        'reason-buc "</magnitude:reason>" turn-next-forced')
       rules.set(
         'turn-next-forced',
         'ws "<magnitude:reason" reason-attrs-opt ">" reason-forced-body-s0 | ws forced-msg'
-      )
-      rules.set(
-        'turn-next-forced-no-lt',
-        '"magnitude:reason" reason-attrs-opt ">" reason-forced-body-s0 | forced-msg-no-lt'
       )
       rules.set('root', 'turn-next-forced')
     }
@@ -672,10 +482,9 @@ export function generateBucRules(prefix: string, tagName: string): string[] {
 }
 
 /**
- * Generate BUC rules that exclude BOTH a close tag AND an open tag.
- * Used to make body rules escape-aware: the body content excludes
- * its own close tag AND `<magnitude:escape>` so that escape blocks
- * can be recognized inline.
+ * Generate BUC rules that exclude BOTH a close tag AND an open tag prefix.
+ * The body content stops at both the close tag prefix and the open tag prefix,
+ * allowing structural tags to be recognized at body boundaries.
  *
  * Since close tags start with `</` and open tags start with `<` + letter,
  * after `<` the paths diverge and form independent prefix chains.
@@ -754,6 +563,7 @@ export function generateCompoundBucRules(
     // else: open prefix is just '<m' — seeing 'm' means prefix complete → no alt
   }
 
+  // Catch-all: '<' followed by char that's neither branch char nor '<'
   // Catch-all: '<' followed by char that's neither branch char nor '<'
   // Excluding '<' ensures '<<' doesn't consume both chars — the BUC stops,
   // letting the body-level '<' recovery handle lone '<' in content.
@@ -867,93 +677,4 @@ export function sanitizeParamName(name: string): string {
   return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()
 }
 
-// =============================================================================
-// Legacy exports (kept for API compatibility)
-// =============================================================================
 
-/**
- * @deprecated Use GrammarBuilder directly. This is kept for existing callers.
- */
-export interface BodyContext {
-  readonly confirmRule: string
-  readonly confirmNoLtRule: string
-}
-
-/**
- * @deprecated Replaced by recursive greedy body rules.
- */
-export function generateBodyRules(prefix: string, tagName: string, context: BodyContext): string[] {
-  // Legacy: generate DFA body rules with tw states
-  // This is no longer used by the builder but may be referenced by tests
-  const lines: string[] = []
-  const L = tagName.length
-  const MAX_TW = 4
-
-  lines.push(`${prefix} ::= ${prefix}-s0`)
-  lines.push(`${prefix}-s0 ::= [^<] ${prefix}-s0 | "<" ${prefix}-s1`)
-  lines.push(`${prefix}-s1 ::= "/" ${prefix}-sl | "<" ${prefix}-s1 | [^/<] ${prefix}-s0`)
-
-  const fc = tagName[0]
-  const fcEsc = escapeGbnfCharClass(fc)
-
-  if (L === 1) {
-    const gtState = `${prefix}-gt`
-    lines.push(`${prefix}-sl ::= "${fc}" ${gtState} | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
-    lines.push(`${gtState} ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
-  } else {
-    lines.push(`${prefix}-sl ::= "${fc}" ${prefix}-s2 | "<" ${prefix}-s1 | [^<${fcEsc}] ${prefix}-s0`)
-    for (let i = 2; i <= L; i++) {
-      const ch = tagName[i - 1]
-      const chEsc = escapeGbnfCharClass(ch)
-      const nextState = i === L ? `${prefix}-gt` : `${prefix}-s${i + 1}`
-      lines.push(`${prefix}-s${i} ::= "${ch}" ${nextState} | "<" ${prefix}-s1 | [^<${chEsc}] ${prefix}-s0`)
-    }
-    lines.push(`${prefix}-gt ::= ">" ${prefix}-tw0 | "<" ${prefix}-s1 | [^<>] ${prefix}-s0`)
-  }
-
-  for (let i = 0; i <= MAX_TW; i++) {
-    const stateName = `${prefix}-tw${i}`
-    if (i < MAX_TW) {
-      lines.push(
-        `${stateName} ::= [ \\t] ${prefix}-tw${i + 1}` +
-        ` | "\\n" ${context.confirmRule}` +
-        ` | "<" ${context.confirmNoLtRule}` +
-        ` | [^ \\t\\n<] ${prefix}-s0`
-      )
-    } else {
-      lines.push(
-        `${stateName} ::= "\\n" ${context.confirmRule}` +
-        ` | "<" ${context.confirmNoLtRule}` +
-        ` | [^ \\n<] ${prefix}-s0`
-      )
-    }
-  }
-
-  return lines
-}
-
-/**
- * @deprecated Replaced by per-tool body rules with position-aware continuations.
- */
-export function generateRecursiveBodyRules(prefix: string, tagName: string, continuationRule: string): string[] {
-  const lines: string[] = []
-  const closeTag = '</' + tagName + '>'
-  const closeChars = closeTag.split('')
-
-  const alts: string[] = []
-  alts.push(`[^${escapeGbnfCharClass(closeChars[0])}]`)
-
-  let pfx = ''
-  for (let i = 0; i < closeChars.length - 1; i++) {
-    pfx += closeChars[i]
-    const nextChar = closeChars[i + 1]
-    const nextCharEsc = escapeGbnfCharClass(nextChar)
-    alts.push(`"${pfx}" [^${nextCharEsc}]`)
-  }
-
-  lines.push(`${prefix}-buc ::= (${alts.join(' | ')})*`)
-  const closeLiteral = `"${closeTag}"`
-  lines.push(`${prefix}-s0 ::= ${prefix}-buc (${closeLiteral} ${prefix}-buc)* ${closeLiteral} ${continuationRule}`)
-
-  return lines
-}

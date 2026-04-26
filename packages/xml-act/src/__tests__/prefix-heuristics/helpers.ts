@@ -128,7 +128,7 @@ const KNOWN_TAGS = new Set([
   'magnitude:yield_invoke',
   'magnitude:yield_parent',
   'magnitude:yield_worker',
-  'magnitude:escape',
+
 ])
 
 // ============================================================================

@@ -180,7 +180,6 @@ export {
   TAG_INVOKE,
   TAG_PARAMETER,
   TAG_FILTER,
-  TAG_ESCAPE,
 } from './constants'
 
 // Tokenizer

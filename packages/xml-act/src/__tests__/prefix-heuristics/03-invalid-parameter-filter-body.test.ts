@@ -1,13 +1,13 @@
 /**
- * Rule: inside parameter/filter bodies, nested magnitude: opens are invalid
- * except escape.
+ * Rule: inside parameter/filter bodies, nested magnitude: opens are invalid.
  */
-import { describe, it } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import {
   grammarValidator,
   parse,
   expectStructuralError,
   expectNoStructuralError,
+  getStructuralErrors,
 } from './helpers'
 
 const v = () => grammarValidator()
@@ -83,24 +83,38 @@ describe('prefix heuristics: invalid parameter/filter body', () => {
     })
   }
 
-  it('05: escape allows literal alias-like text inside parameter', () => {
+  it('05: escape open inside parameter body is invalid', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:parameter name="command">pre <magnitude:escape><magnitude:shell><magnitude:command>pwd</magnitude:command></magnitude:shell></magnitude:escape> post</magnitude:parameter></magnitude:invoke><magnitude:yield_user/>'
-    v().passes(input)
+    v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
+    // Multiple structural errors: escape open + nested tags inside parameter
+    const errors = getStructuralErrors(events)
+    expect(errors.length).toBeGreaterThanOrEqual(1)
+    const escapeError = errors.find((e: any) => e.error._tag === 'InvalidMagnitudeOpen' && e.error.tagName === 'magnitude:escape')
+    expect(escapeError).toBeDefined()
   })
 
-  it('11: escape inside filter still follows the current rejected filter path', () => {
+  it('11: escape open inside filter body is invalid', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:filter><magnitude:escape><magnitude:message>literal</magnitude:message></magnitude:escape></magnitude:filter></magnitude:invoke><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:filter',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:filter'],
+    })
   })
 
-  it('12: escaped unknown prefixed markup inside filter still follows the current rejected filter path', () => {
+  it('12: escape-wrapped unknown prefixed markup inside filter is invalid', () => {
     const input = '<magnitude:invoke tool="shell"><magnitude:filter><magnitude:escape><magnitude:foo>bar</magnitude:foo></magnitude:escape></magnitude:filter></magnitude:invoke><magnitude:yield_user/>'
     v().rejects(input)
     const events = parse(input)
-    expectNoStructuralError(events)
+    expectStructuralError(events, {
+      variant: 'InvalidMagnitudeOpen',
+      tagName: 'magnitude:escape',
+      parentTagName: 'magnitude:filter',
+      detailIncludes: ['<magnitude:escape>', 'magnitude:filter'],
+    })
   })
 })
