@@ -106,16 +106,16 @@ export function buildAckTurns(
   defaultRecipient: 'user' | 'parent' = 'user',
 ): AckTurnMessage[] {
   return [
-    // Turn 1: User asks something nonsense
+    // Turn 1: User asks something
     {
       role: 'user',
-      content: [`--- FEW-SHOT EXAMPLE START ---\n<${TAG_MESSAGE} from="user">Foo the bar into a baz.</${TAG_MESSAGE}>`]
+      content: [`--- FEW-SHOT EXAMPLE START ---\n<${TAG_MESSAGE} from="user">Write an HTML guide page for foo.</${TAG_MESSAGE}>`]
     },
     // Turn 2: Activate skill, make tool call
     {
       role: 'assistant',
       content: [[
-        reason('alignment', 'Need to foo the bar. Let me activate the foobar skill first.'),
+        reason('turn', 'Need to write an HTML guide. Let me activate the foobar skill first.'),
         '',
         invoke('skill', param('name', 'foobar')),
         '',
@@ -140,15 +140,15 @@ Methodology for fooing bars into bazzes.
 </result>
 </turn_result>`]
     },
-    // Turn 4: Execute the foo, message user
+    // Turn 4: Write the HTML file with both raw tags and escaped entities
     {
       role: 'assistant',
       content: [[
-        reason('strategy', 'Skill loaded. Foo the bar by writing the baz file.'),
+        reason('turn', 'Skill loaded. Write the HTML guide page for foo.'),
         '',
-        invoke('fooify',
-          param('input', 'bar'),
-          param('mode', 'baz'),
+        invoke('write',
+          param('path', 'foo-guide.html'),
+          param('content', '<html>\n<body>\n<h1>Foo Guide</h1>\n<p>Links use &lt;a&gt; tags: &lt;a href="url"&gt;text&lt;/a&gt;</p>\n</body>\n</html>'),
         ),
         '',
         YIELD_INVOKE,
@@ -158,16 +158,40 @@ Methodology for fooing bars into bazzes.
     {
       role: 'user',
       content: [`<turn_result>
-<result tool="fooify">
-<out field="output">baz-42</out>
+<result tool="write">
 </result>
 </turn_result>`]
     },
-    // Turn 6: Confirm to user
+    // Turn 6: Read the file back
     {
       role: 'assistant',
       content: [[
-        msg(defaultRecipient, 'Done — fooed the bar into baz-42.'),
+        reason('turn', 'File written. Read it back to verify.'),
+        '',
+        invoke('read', param('path', 'foo-guide.html')),
+        '',
+        YIELD_INVOKE,
+      ].join('\n')]
+    },
+    // Turn 7: Read result
+    {
+      role: 'user',
+      content: [`<turn_result>
+<result tool="read">
+<html>
+<body>
+<h1>Foo Guide</h1>
+<p>Links use &lt;a&gt; tags: &lt;a href="url"&gt;text&lt;/a&gt;</p>
+</body>
+</html>
+</result>
+</turn_result>`]
+    },
+    // Turn 8: Confirm to user
+    {
+      role: 'assistant',
+      content: [[
+        msg(defaultRecipient, 'Done — wrote and verified foo-guide.html.'),
         '',
         YIELD_USER,
       ].join('\n')]

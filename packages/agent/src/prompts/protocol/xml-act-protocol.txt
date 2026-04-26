@@ -15,27 +15,44 @@ If you need to use magnitude tags in written code, put `magnitude:` as constant 
 
 ### Magnitude interpreter mechanics
 
-The Magnitude format is reminisicent of XML, but is interpreted very differently.
-Rule 1: `magntude:` tags are ALWAYS interpreted. Do NOT put them casually in thoughts, messages, or tool parameters. It WILL trigger the interpretation of that tag, no matter where it is.
-Rule 2: No other tags are interpreted, only magnitude tags are meaningful. Other XML, HTML, symbols, and characters pass through raw.
+This is NOT XML. This is NOT HTML. The Magnitude format only interprets tags prefixed with `magnitude:`. Everything else passes through as literal characters, completely unmodified.
 
-Example:
-```
-<magnitude:invoke tool="foo">
-<magnitude:parameter name="content">&lt;Hello World&gt;
-<Hello World></magnitude:parameter>
-</magnitude:invoke>
-```
-is interpreted literally by Magnitude as:
-foo(content="&lt;HelloWorld&gt;\n<HelloWorld>")
+**Rule 1:** `magnitude:` tags are ALWAYS interpreted, everywhere. Never use them casually.
+**Rule 2:** All other tags and characters pass through raw. `<div>`, `</html>`, `<p class="foo">` — these are just text. The interpreter does not touch them.
 
-If foo were a tool that produced a file, the file would contain:
-```
-&lt;HelloWorld&gt;
-<HelloWorld>
-```
+Parameter values become file content verbatim. Write exactly what you want in the file. There is no escaping from `<` because `<` is not special in Magnitude — only `magnitude:` is.
 
-In other words: Only magnitude tags are interpreted, and all parameters are passed through verbatim, so you should never try to escape html entities under any circumstances unless you literally mean to include the text "&lt;" instead of "<" in the parameter payload.
+**CORRECT — writing an HTML guide page:**
+```
+<{{TAG_INVOKE}} tool="write">
+<{{TAG_PARAMETER}} name="path">guide.html</{{TAG_PARAMETER}}>
+<{{TAG_PARAMETER}} name="content"><h1>HTML Guide</h1>
+<p>Links use &lt;a&gt; tags: &lt;a href="url"&gt;text&lt;/a&gt;</p></{{TAG_PARAMETER}}>
+</{{TAG_INVOKE}}>
+```
+File `guide.html` contains:
+```
+<h1>HTML Guide</h1>
+<p>Links use &lt;a&gt; tags: &lt;a href="url"&gt;text&lt;/a&gt;</p>
+```
+This is correct HTML. `<h1>` is a real heading tag. `&lt;a&gt;` is an intentional entity — it displays `<a>` as visible text on the page. Both are exactly what belongs in the file.
+
+**WRONG — escaping `<` because it "feels safe":**
+```
+<{{TAG_INVOKE}} tool="write">
+<{{TAG_PARAMETER}} name="path">guide.html</{{TAG_PARAMETER}}>
+<{{TAG_PARAMETER}} name="content">&lt;h1&gt;HTML Guide&lt;/h1&gt;
+&lt;p&gt;Links use &lt;a&gt; tags: &lt;a href="url"&gt;text&lt;/a&gt;&lt;/p&gt;</{{TAG_PARAMETER}}>
+</{{TAG_INVOKE}}>
+```
+File `guide.html` contains:
+```
+&lt;h1&gt;HTML Guide&lt;/h1&gt;
+&lt;p&gt;Links use &lt;a&gt; tags: &lt;a href="url"&gt;text&lt;/a&gt;&lt;/p&gt;
+```
+This is NOT HTML. This is garbage text. Every tag is mangled by unnecessary `&lt;` / `&gt;` entities. The page is ruined.
+
+**Do NOT escape `<` to `&lt;`.** `&lt;` does not "safely" produce `<`. It produces the literal text `&lt;`. Only `magnitude:`-prefixed tags are special. Everything else passes through raw. When you want `<h1>` in a file, write `<h1>`. When you want `&lt;a&gt;` in a file (to show code examples), write `&lt;a&gt;`. Write exactly what you want in the file. No escaping.
 
 ## Turn structure
 
