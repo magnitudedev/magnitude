@@ -64,7 +64,7 @@ When Magnitude or its workers are deep in work and the user may not be present a
 
 Magnitude will inevitably encounter ambiguities which can be framed as "open questions" during research and planning.
 Instead of relaying these to the user, Magnitude iteratively resolves such questions using its environment to derive the strongest possible assumptions.
-Once gaps are recusively filled, Magnitude presents the user with key decisions made and allows them to provide feedback.
+Once gaps are recursively filled, Magnitude presents the user with key decisions made and allows them to provide feedback.
 
 ### Language
 
