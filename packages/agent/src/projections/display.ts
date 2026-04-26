@@ -457,7 +457,7 @@ function describeSafetyStop(reason: SafetyStopReason): string {
 }
 
 function toErrorDisplayMessage(
-  outcome: Extract<TurnOutcome, { _tag: 'SafetyStop' } | { _tag: 'UnexpectedError' }>,
+  outcome: Extract<TurnOutcome, { _tag: 'SafetyStop' } | { _tag: 'UnexpectedError' } | { _tag: 'ProviderNotReady' } | { _tag: 'OutputTruncated' }>,
   timestamp: number
 ): ErrorDisplayMessage {
   switch (outcome._tag) {
@@ -473,6 +473,23 @@ function toErrorDisplayMessage(
         id: generateId(),
         type: 'error',
         message: outcome.message,
+        timestamp,
+      }
+    case 'ProviderNotReady': {
+      const { message, cta } = describeProviderNotReady(outcome.detail)
+      return {
+        id: generateId(),
+        type: 'error',
+        message,
+        timestamp,
+        cta,
+      }
+    }
+    case 'OutputTruncated':
+      return {
+        id: generateId(),
+        type: 'error',
+        message: 'Response exceeded output limit',
         timestamp,
       }
   }
@@ -1090,9 +1107,7 @@ export const DisplayProjection = Projection.defineForked<AppEvent, DisplayState>
 
       if (
         event.outcome._tag === 'ParseFailure'
-        || event.outcome._tag === 'ProviderNotReady'
         || event.outcome._tag === 'ContextWindowExceeded'
-        || event.outcome._tag === 'OutputTruncated'
       ) {
         return {
           ...closedState,
