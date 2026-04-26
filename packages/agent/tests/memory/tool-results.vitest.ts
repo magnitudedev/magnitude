@@ -7,7 +7,7 @@ import { getView } from '../../src/projections/memory'
 import type { AppEvent } from '../../src/events'
 
 function renderedUserTextFromMemory(messages: Parameters<typeof getView>[0]): string {
-  const rendered = getView(messages, 'UTC', 'agent')
+  const rendered = getView(messages, 'UTC', 'agent', true)
   return rendered
     .filter(m => m.role === 'user')
     .map(m => m.content.map(p => p.type === 'text' ? p.text : '').join('\n'))

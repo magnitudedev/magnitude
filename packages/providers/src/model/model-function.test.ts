@@ -20,6 +20,7 @@ function makeModel(providerId: string, id: string, authType: 'oauth' | 'api' | n
     contextWindow: 100_000,
     maxOutputTokens: 8192,
     costs: null as unknown as ModelCosts,
+    supportsVision: true,
   })
 
   const calls: Array<{ kind: 'stream' | 'complete'; functionName: string; args: readonly unknown[]; options: any }> = []

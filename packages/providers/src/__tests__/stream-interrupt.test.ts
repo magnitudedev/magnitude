@@ -88,6 +88,7 @@ describe('provider stream interrupt cancellation', () => {
       contextWindow: 100_000,
       maxOutputTokens: 8_192,
       costs: null,
+      supportsVision: true,
     })
 
     const connection = ModelConnection.Baml({ auth: null })

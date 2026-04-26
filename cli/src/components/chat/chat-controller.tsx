@@ -254,6 +254,11 @@ export function ChatController(props: ChatControllerProps) {
   }, [])
 
   const addImageAttachment = useCallback(async () => {
+    if (!env.supportsVision) {
+      const modelName = env.modelSummary?.model ?? 'this model'
+      services.showToast(`${modelName} does not support images`)
+      return false
+    }
     const result = await readClipboardBitmap()
     if (!result) return false
     const scaled = await autoScaleImageAttachmentIfNeeded({
@@ -273,14 +278,19 @@ export function ChatController(props: ChatControllerProps) {
       filename: 'clipboard-' + Date.now() + extension,
     }])
     return true
-  }, [])
+  }, [env.supportsVision, services])
 
   const addImageAttachmentFromFilePath = useCallback(async (rawPasteText: string) => {
+    if (!env.supportsVision) {
+      const modelName = env.modelSummary?.model ?? 'this model'
+      services.showToast(`${modelName} does not support images`)
+      return false
+    }
     return addImageAttachmentsFromPastedText({
       rawPasteText,
       appendAttachments: (newAttachments) => setAttachments(prev => [...prev, ...newAttachments]),
     })
-  }, [])
+  }, [env.supportsVision, services])
 
   const removeAttachment = useCallback((index: number) => {
     setAttachments(prev => prev.filter((_, i) => i !== index))

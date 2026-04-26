@@ -139,6 +139,31 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         const runtime = yield* ModelResolver
 
+        // Step 1: Ensure model ready and capture vision support
+        const resolveResult = yield* runtime.resolve(modelSlot).pipe(Effect.either)
+        if (Either.isLeft(resolveResult)) {
+          const outcome = classifyModelError(resolveResult.left)
+          yield* publish({
+            type: 'turn_outcome',
+            forkId,
+            turnId,
+            chainId,
+            strategyId: 'xml-act',
+            outcome,
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadTokens: null,
+            cacheWriteTokens: null,
+            providerId: null,
+            modelId: null,
+          })
+          return
+        }
+        const boundModel = resolveResult.right
+        resolvedProviderId = boundModel.model.providerId
+        resolvedProviderName = boundModel.model.providerName
+        resolvedModelId = boundModel.model.id
+
         // Run agent observables
         const execManager = yield* ExecutionManager
         const observations: ObservationPart[] = []
@@ -168,35 +193,10 @@ export const Cortex = Worker.defineForked<AppEvent>()({
 
         // Build messages array (now includes observations in system inbox)
         const forkMemory = yield* read(MemoryProjection)
-        const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent'))
+        const chatMessages: ChatMessage[] = toBamlMessages(getView(forkMemory.messages, timezone, 'agent', boundModel.model.supportsVision))
         const systemPrompt = renderSystemPrompt(agentDef, skills, toolSet)
 
         logger.info({ variant, forkId, turnId }, '[Cortex] Executing turn via xml-act')
-
-        // Step 1: Ensure model ready
-        const resolveResult = yield* runtime.resolve(modelSlot).pipe(Effect.either)
-        if (Either.isLeft(resolveResult)) {
-          const outcome = classifyModelError(resolveResult.left)
-          yield* publish({
-            type: 'turn_outcome',
-            forkId,
-            turnId,
-            chainId,
-            strategyId: 'xml-act',
-            outcome,
-            inputTokens: null,
-            outputTokens: null,
-            cacheReadTokens: null,
-            cacheWriteTokens: null,
-            providerId: null,
-            modelId: null,
-          })
-          return
-        }
-        const boundModel = resolveResult.right
-        resolvedProviderId = boundModel.model.providerId
-        resolvedProviderName = boundModel.model.providerName
-        resolvedModelId = boundModel.model.id
 
         // 2b. Provide input token estimate so provider can clamp max_tokens
         const compactionState = yield* read(CompactionProjection, forkId)

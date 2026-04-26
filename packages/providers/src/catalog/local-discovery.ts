@@ -2,7 +2,7 @@ import { Effect } from 'effect'
 import type { ModelDefinition, ProviderDefinition } from '../types'
 
 type OpenAIModelsResponse = {
-  data?: Array<{ id?: string; name?: string }>
+  data?: Array<{ id?: string; name?: string; capabilities?: string[] }>
 }
 
 type OllamaTagsResponse = {
@@ -26,6 +26,7 @@ interface LmStudioModelV1 {
   model_name?: string
   max_context_length?: number | string
   loaded_instances?: LmStudioLoadedInstance[]
+  capabilities?: { vision?: boolean }
 }
 
 interface LmStudioModelV0 {
@@ -41,6 +42,7 @@ interface LmStudioModelV0 {
   loaded_context_length?: number | string
   loadedContextLength?: number | string
   context_length?: number | string
+  capabilities?: { vision?: boolean }
 }
 
 type LmStudioModel = LmStudioModelV1 | LmStudioModelV0
@@ -54,6 +56,7 @@ interface LmStudioResponse {
 interface OllamaShowResponse {
   num_ctx?: number | string
   parameters?: string
+  capabilities?: string[]
   model_info?: {
     context_length?: number | string
     [key: string]: unknown
@@ -124,7 +127,7 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '')
 }
 
-function toModel(id: string, name?: string, maxContextTokens: number | null = null): ModelDefinition {
+function toModel(id: string, name?: string, maxContextTokens: number | null = null, supportsVision: boolean = false): ModelDefinition {
   const now = new Date().toISOString()
   return {
     id,
@@ -133,6 +136,7 @@ function toModel(id: string, name?: string, maxContextTokens: number | null = nu
     maxContextTokens,
     supportsToolCalls: true,
     supportsReasoning: false,
+    supportsVision,
     cost: { ...STATIC_COST },
     family: 'local',
     releaseDate: now,
@@ -145,7 +149,8 @@ function fromOpenAIModels(payload: OpenAIModelsResponse): ModelDefinition[] {
   for (const model of payload.data ?? []) {
     const id = model.id?.trim()
     if (!id) continue
-    out.push(toModel(id, model.name?.trim() || id))
+    const supportsVision = model.capabilities?.includes('multimodal') ?? false
+    out.push(toModel(id, model.name?.trim() || id, null, supportsVision))
   }
   return out
 }
@@ -281,7 +286,8 @@ function fromLmStudioNativeModels(payload: unknown): ModelDefinition[] {
     const loadedContext = readLmStudioLoadedContext(item) ?? readLmStudioLoadedContextV0(item)
     const staticMax = readNumber(item.max_context_length)
     const maxContextTokens = loadedContext ?? staticMax
-    out.push(toModel(id, name ?? id, maxContextTokens))
+    const supportsVision = item.capabilities?.vision ?? false
+    out.push(toModel(id, name ?? id, maxContextTokens, supportsVision))
   }
   return out
 }
@@ -405,6 +411,11 @@ function parseOllamaShowModelInfoContextLength(payload: unknown): number | null 
     }
   }
   return null
+}
+
+function parseOllamaShowVision(payload: unknown): boolean | null {
+  if (!isOllamaShowResponse(payload) || !payload.capabilities) return null
+  return payload.capabilities.includes('vision')
 }
 
 function isLlamaCppPropsResponse(payload: unknown): payload is LlamaCppPropsResponse {
@@ -589,6 +600,7 @@ async function enrichOllamaContext(
 ): Promise<ModelDefinition[]> {
   const root = ollamaRoot(baseUrl)
   const maxById = new Map<string, number>()
+  const visionById = new Map<string, boolean>()
   let runtimeEntries: OllamaPsEntry[] | null = null
 
   const getRuntimeEntries = async (): Promise<OllamaPsEntry[]> => {
@@ -634,9 +646,20 @@ async function enrichOllamaContext(
     ])
 
     if (value != null) maxById.set(model.id, value)
+
+    try {
+      const vision = parseOllamaShowVision(await getShowPayload())
+      if (vision != null) visionById.set(model.id, vision)
+    } catch {
+      // ignore vision parsing failures
+    }
   }
 
-  return mergeContextMetadata(models, maxById)
+  return mergeContextMetadata(models, maxById).map((model) => {
+    const vision = visionById.get(model.id)
+    if (vision == null) return model
+    return { ...model, supportsVision: vision }
+  })
 }
 
 function isLlamaV1MetaResponse(payload: unknown): payload is LlamaV1MetaResponse {

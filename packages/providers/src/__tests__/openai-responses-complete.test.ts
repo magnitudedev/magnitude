@@ -16,6 +16,7 @@ describe('openai-responses complete path', () => {
       contextWindow: 128_000,
       maxOutputTokens: 8_192,
       costs: null,
+      supportsVision: true,
     })
 
     const req: DriverRequest = {

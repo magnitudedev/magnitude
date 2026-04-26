@@ -680,6 +680,25 @@ function AppInner({
     }
   }, [selectedForkId, agentStatusState, slotModels])
 
+  const activeModelSupportsVision = useMemo(() => {
+    const leadModel = slotModels.lead
+    const rootModelDef = leadModel
+      ? getProvider(leadModel.providerId)?.models.find(m => m.id === leadModel.modelId)
+      : undefined
+    const rootSupportsVision = rootModelDef?.supportsVision ?? false
+    if (!selectedForkId || !agentStatusState) return rootSupportsVision
+    const agentId = agentStatusState.agentByForkId.get(selectedForkId)
+    const agent = agentId ? agentStatusState.agents.get(agentId) : undefined
+    if (!agent) return rootSupportsVision
+    const slot = (MAGNITUDE_SLOTS as readonly string[]).includes(agent.role)
+      ? agent.role as MagnitudeSlot
+      : 'lead' as MagnitudeSlot
+    const selection = slotModels[slot]
+    if (!selection) return false
+    const modelDef = getProvider(selection.providerId)?.models.find(m => m.id === selection.modelId)
+    return modelDef?.supportsVision ?? false
+  }, [selectedForkId, agentStatusState, slotModels])
+
   const forkSlot = useMemo(() => {
     if (!expandedForkId || !agentStatusState) return null
     const agentId = agentStatusState.agentByForkId.get(expandedForkId)
@@ -2231,6 +2250,7 @@ function AppInner({
               composerCanFocus,
               widgetNavActive,
               isSubagentView: selectedForkId !== null,
+              supportsVision: activeModelSupportsVision,
             }}
             services={{
               submitUserMessageToFork: ({ forkId, message, attachments }) => handleSubmitViaClientBoundary({ forkId, message, attachments }),
@@ -2297,6 +2317,7 @@ function AppInner({
                   source: 'tab_close_confirm',
                 })
               },
+              showToast: (message: string) => showEphemeral(message, theme.error, 5000),
             }}
             displayMessages={(activeDisplay ?? display).messages}
             tasks={tasks}
@@ -2329,6 +2350,28 @@ function AppInner({
                 paddingRight: 2,
               }}>
                 <text style={{ fg: theme.success }}>Copied to clipboard</text>
+              </box>
+            </box>
+          </box>
+        )}
+
+        {/* Ephemeral toast — bottom-right overlay */}
+        {ephemeralMessage && (
+          <box style={{ position: 'absolute', bottom: 1, right: 2 }}>
+            <box style={{
+              borderStyle: 'single',
+              border: ['left'],
+              borderColor: ephemeralMessage.color,
+              customBorderChars: { ...BOX_CHARS, vertical: '┃' },
+            }}>
+              <box style={{
+                backgroundColor: theme.surface,
+                paddingTop: 1,
+                paddingBottom: 1,
+                paddingLeft: 2,
+                paddingRight: 2,
+              }}>
+                <text style={{ fg: ephemeralMessage.color }}>{ephemeralMessage.text}</text>
               </box>
             </box>
           </box>

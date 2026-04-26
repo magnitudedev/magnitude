@@ -38,6 +38,7 @@ export function normalizeModelsDevProvider(providerId: string, data: ModelsDevRe
       maxOutputTokens: model.limit.output,
       supportsToolCalls: model.tool_call,
       supportsReasoning: model.reasoning,
+      supportsVision: model.modalities?.input?.includes('image') ?? false,
       cost: model.cost,
       family: model.family,
       releaseDate: model.release_date ?? '1970-01-01T00:00:00.000Z',

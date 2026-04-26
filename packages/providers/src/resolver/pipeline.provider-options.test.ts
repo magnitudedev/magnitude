@@ -16,6 +16,7 @@ const model = new Model({
   contextWindow: 100_000,
   maxOutputTokens: 8192,
   costs: null as unknown as ModelCosts,
+  supportsVision: true,
 })
 
 const providerState = {

@@ -23,6 +23,7 @@ const fakeModel = new Model({
   contextWindow: 200_000,
   maxOutputTokens: null,
   costs: null,
+  supportsVision: true,
 })
 
 const zeroUsage: CallUsage = {

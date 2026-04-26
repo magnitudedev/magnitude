@@ -15,7 +15,7 @@ const TS3 = TS0 + 120_000
 
 describe('formatInbox', () => {
   test('returns empty array for empty input', () => {
-    expect(formatInbox({ results: [], timeline: [], timezone: 'UTC' })).toEqual([])
+    expect(formatInbox({ results: [], timeline: [], timezone: 'UTC', supportsVision: true })).toEqual([])
   })
 
   test('renders results-only entries (turn_results, interrupted, error, noop)', () => {
@@ -26,7 +26,7 @@ describe('formatInbox', () => {
       { kind: 'noop' },
     ]
 
-    const out = formatInbox({ results, timeline: [], timezone: 'UTC' })
+    const out = formatInbox({ results, timeline: [], timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       { type: 'text', text: '<turn_result>' + formatInterrupted() + '<error>boom</error>' + formatNoop() + '\n</turn_result>\n' },
     ])
@@ -36,7 +36,7 @@ describe('formatInbox', () => {
     const timeline: readonly TimelineEntry[] = [
       { kind: 'user_message', timestamp: TS0, text: 'hello', attachments: [] },
     ]
-    expect(formatInbox({ results: [], timeline, timezone: 'UTC' })).toEqual([
+    expect(formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })).toEqual([
       {
         type: 'text',
         text:
@@ -65,7 +65,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    expect(formatInbox({ results: [], timeline, timezone: 'UTC' })).toEqual([
+    expect(formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })).toEqual([
       {
         type: 'text',
         text: '--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hello</magnitude:message>\n<mention path="src/a.ts" type="text" truncated="true" original_bytes="42">export const a = 1</mention>',
@@ -79,7 +79,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS0, text: 'a', attachments: [] },
       { kind: 'user_message', timestamp: TS2, text: 'b', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -94,7 +94,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS2, text: 'second', attachments: [] },
       { kind: 'user_message', timestamp: TS0, text: 'first', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -122,7 +122,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -145,7 +145,7 @@ describe('formatInbox', () => {
         taskTitle: 'Investigate the crash',
       },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([])
   })
 
@@ -154,7 +154,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS0, text: 'first-input', attachments: [] },
       { kind: 'user_message', timestamp: TS0, text: 'second-input', attachments: [] },
     ]
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -177,7 +177,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -196,7 +196,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -211,6 +211,7 @@ describe('formatInbox', () => {
       results: [{ kind: 'error', message: 'failed' }],
       timeline: [{ kind: 'lifecycle_hook', timestamp: TS0, agentId: 'builder-a', role: 'builder', hookType: 'idle' }],
       timezone: 'UTC',
+      supportsVision: true,
     })
 
     expect(out).toEqual([
@@ -229,7 +230,7 @@ describe('formatInbox', () => {
       { kind: 'task_update', timestamp: TS3 + 1, action: 'cancelled', taskId: 't2', cancelledCount: 3 },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -245,7 +246,7 @@ describe('formatInbox', () => {
       { kind: 'task_tree_view', timestamp: TS1, renderedTree: '- [ ] t3 next' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -261,7 +262,7 @@ describe('formatInbox', () => {
       { kind: 'user_message', timestamp: TS1, text: 'hello', attachments: [] },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -298,7 +299,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS3 + 1, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out[0]).toEqual({
       type: 'text',
       text:
@@ -319,7 +320,7 @@ describe('formatInbox', () => {
       },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -344,7 +345,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     const text = out[0]
     expect(text).toEqual({
       type: 'text',
@@ -359,7 +360,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS1, agentId: 'builder-z', role: 'builder', hookType: 'spawn' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -394,7 +395,7 @@ describe('formatInbox', () => {
       { kind: 'lifecycle_hook', timestamp: TS3, agentId: 'builder-x', role: 'builder', hookType: 'idle' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -410,7 +411,7 @@ describe('formatInbox', () => {
       { kind: 'task_idle_hook', timestamp: TS1, taskId: 't1', title: 'Build thing', agentId: 'builder-z' },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
@@ -434,12 +435,79 @@ describe('formatInbox', () => {
       },
     ]
 
-    const out = formatInbox({ results: [], timeline, timezone: 'UTC' })
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
     expect(out).toEqual([
       {
         type: 'text',
         text:
           `--- 2024-03-28 16:00 ---\n<magnitude:message from="user">hello</magnitude:message>\n<agent id="builder-x" role="builder" status="working">\n<magnitude:message to="lead">progress update</magnitude:message>\n</agent>\n\n<reminders>\n- ${WORKER_PROGRESS_USER_MESSAGE_REMINDER}\n</reminders>`,
+      },
+    ])
+  })
+
+
+  test('replaces image attachments with placeholder when supportsVision is false', () => {
+    const timeline: readonly TimelineEntry[] = [
+      {
+        kind: 'user_message',
+        timestamp: TS0,
+        text: 'look at this',
+        attachments: [
+          { kind: 'image', image: { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1920, height: 1080 }, filename: 'screenshot.png' },
+        ],
+      },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: false })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text: `--- 2024-03-28 16:00 ---
+<magnitude\u003amessage from="user">look at this</magnitude\u003amessage>[Image placeholder: current model does not support images — screenshot.png 1920x1080]`,
+      },
+    ])
+  })
+
+  test('passes through image attachments when supportsVision is true', () => {
+    const timeline: readonly TimelineEntry[] = [
+      {
+        kind: 'user_message',
+        timestamp: TS0,
+        text: 'look at this',
+        attachments: [
+          { kind: 'image', image: { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1920, height: 1080 }, filename: 'screenshot.png' },
+        ],
+      },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: true })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text: `--- 2024-03-28 16:00 ---
+<magnitude\u003amessage from="user">look at this</magnitude\u003amessage>`,
+      },
+      { type: 'image', base64: 'abc', mediaType: 'image/png', width: 1920, height: 1080 },
+    ])
+  })
+
+  test('replaces observation images with placeholder when supportsVision is false', () => {
+    const img: ContentPart = { type: 'image', base64: 'abc', mediaType: 'image/png', width: 100, height: 100 }
+    const timeline: readonly TimelineEntry[] = [
+      {
+        kind: 'observation',
+        timestamp: TS0,
+        parts: [{ type: 'text', text: 'seen' }, img],
+      },
+      { kind: 'lifecycle_hook', timestamp: TS2, agentId: 'builder-a', role: 'builder', hookType: 'spawn' },
+    ]
+
+    const out = formatInbox({ results: [], timeline, timezone: 'UTC', supportsVision: false })
+    expect(out).toEqual([
+      {
+        type: 'text',
+        text: `--- 2024-03-28 16:00 ---
+seen[Image placeholder: current model does not support images — 100x100]`,
       },
     ])
   })

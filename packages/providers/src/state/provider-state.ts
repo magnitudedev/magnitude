@@ -113,6 +113,7 @@ export function makeProviderStateStore<TSlot extends string>(): ProviderStateSto
             cacheWritePerM: def.cost.cache_write ?? null,
           } : null,
           supportsGrammar: def?.supportsGrammar ?? providerHasGrammar,
+          supportsVision: def?.supportsVision ?? false,
         }),
         auth: s.auth,
       }

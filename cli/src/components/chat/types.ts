@@ -21,6 +21,7 @@ export type ChatControllerEnv = {
   composerCanFocus: boolean
   widgetNavActive: boolean
   isSubagentView: boolean
+  supportsVision: boolean
 }
 
 export type ChatControllerServices = {
@@ -44,6 +45,7 @@ export type ChatControllerServices = {
   exitBashMode: () => void
   requestIdleSubagentClose: (payload: { forkId: string; agentId: string }) => void
   requestActiveSubagentKill: (payload: { forkId: string; agentId: string }) => void
+  showToast: (message: string) => void
 }
 
 

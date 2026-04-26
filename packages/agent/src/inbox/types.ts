@@ -62,7 +62,7 @@ export type AgentAtom =
 // ---------------------------------------------------------------------------
 
 export type TimelineAttachment =
-  | { readonly kind: 'image'; readonly image: ImagePart }
+  | { readonly kind: 'image'; readonly image: ImagePart; readonly filename?: string }
   | ({ readonly kind: 'mention' } & ResolvedMention)
 
 // ---------------------------------------------------------------------------

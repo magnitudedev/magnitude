@@ -24,7 +24,7 @@ function renderedUserText(
         Effect.map(p.get, s => s.context?.timezone ?? null),
       ),
     )
-    const view = getView(memory.messages, timezone, 'agent')
+    const view = getView(memory.messages, timezone, 'agent', true)
     return userContextText(view as any)
   })
 }

@@ -72,7 +72,7 @@ export function getRenderedUserText(h: Effect.Effect.Success<typeof TestHarness>
     const memory = yield* h.projectionFork(MemoryProjection.Tag, null)
     const session = yield* h.runEffect(Effect.flatMap(SessionContextProjection.Tag, p => p.get))
     const timezone = session.context?.timezone ?? null
-    const rendered = getView(memory.messages, timezone, 'agent')
+    const rendered = getView(memory.messages, timezone, 'agent', true)
     return rendered
       .filter(m => m.role === 'user')
       .map(m => m.content.map(part => part.type === 'text' ? part.text : '[image]').join(''))

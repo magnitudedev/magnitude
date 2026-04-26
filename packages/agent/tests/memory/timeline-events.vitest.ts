@@ -157,7 +157,7 @@ describe('memory/timeline-events', () => {
         expect(prev.timeline.some(t => t.kind === 'observation')).toBe(false)
       }
 
-      const rendered = getView(memory.messages, 'UTC', 'agent')
+      const rendered = getView(memory.messages, 'UTC', 'agent', true)
         .filter(m => m.role === 'user')
         .flatMap(m => m.content)
       const hasObservationText = rendered.some(p => p.type === 'text' && p.text.includes('saw important output'))

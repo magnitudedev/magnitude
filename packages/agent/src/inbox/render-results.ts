@@ -11,6 +11,7 @@ import { INSPECT_CHAR_LIMIT, INSPECT_TOKEN_LIMIT } from '../constants'
 import { INTERRUPT_MESSAGE } from '../prompts/constants'
 import { ONESHOT_LIVENESS_REMINDER } from '../prompts/error-states'
 import { ContentPartBuilder, type ContentPart } from '../content'
+import { imagePlaceholder } from './render'
 import type {
   MessageAckResultItem,
   StructuralParseErrorResultItem,
@@ -37,7 +38,7 @@ function formatParseError(item: ToolParseErrorResultItem | StructuralParseErrorR
 }
 
 /** Format ordered turn results for LLM context */
-export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
+export function formatResults(items: readonly TurnResultItem[], supportsVision: boolean = true): ContentPart[] {
   const builder = new ContentPartBuilder()
 
   for (const item of items) {
@@ -58,7 +59,10 @@ export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
         const observeAttr = item.query ? ` observe="${item.query}"` : ''
         builder.pushText(`\n<${item.tagName}${observeAttr}>Output too large (~${approxTokens} tokens, limit is ${INSPECT_TOKEN_LIMIT}). Retry with a narrower observe query.</${item.tagName}>`)
         for (const part of item.content) {
-          if (part.type === 'image') builder.pushPart(part)
+          if (part.type === 'image') {
+            if (supportsVision) builder.pushPart(part)
+            else builder.pushText(imagePlaceholder({ mediaType: part.mediaType, width: part.width, height: part.height }))
+          }
         }
         continue
       }
@@ -67,7 +71,8 @@ export function formatResults(items: readonly TurnResultItem[]): ContentPart[] {
       builder.pushText(`\n<${item.tagName}${observeAttr}>`)
       for (const part of item.content) {
         if (part.type === 'text') builder.pushText(part.text)
-        else builder.pushPart(part)
+        else if (supportsVision) builder.pushPart(part)
+        else builder.pushText(imagePlaceholder({ mediaType: part.mediaType, width: part.width, height: part.height }))
       }
       builder.pushText(`</${item.tagName}>`)
       continue

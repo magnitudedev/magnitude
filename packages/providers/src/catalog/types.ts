@@ -10,6 +10,7 @@ export interface ModelsDevModel {
   status?: string
   cost?: { input: number; output: number; cache_read?: number; cache_write?: number }
   limit?: { context?: number; output?: number; input?: number }
+  modalities?: { input?: string[]; output?: string[] }
 }
 
 export interface ModelsDevProvider {

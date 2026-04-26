@@ -11,9 +11,10 @@ import type { ProviderProtocol, OpenAIOptions } from './protocol/types'
 const STATIC_MODEL_COST = { input: 0, output: 0 } as const
 const DEFAULT_TEMPERATURE = 1.0
 
-function staticModel(model: Omit<ModelDefinition, 'contextWindow' | 'supportsReasoning' | 'cost' | 'family' | 'releaseDate' | 'discovery'> & {
+function staticModel(model: Omit<ModelDefinition, 'contextWindow' | 'supportsReasoning' | 'cost' | 'family' | 'releaseDate' | 'discovery' | 'supportsVision'> & {
   contextWindow?: number
   supportsReasoning?: boolean
+  supportsVision?: boolean
   cost?: ModelDefinition['cost']
   family: string
   releaseDate: string
@@ -38,11 +39,11 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Magnitude',
     defaultBaseUrl: 'https://app.magnitude.dev/api/v1',
     models: [
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
-      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
-      staticModel({ id: 'kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
+      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
+      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
+      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 202000, contextWindow: 202000, supportsGrammar: true }),
+      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
+      staticModel({ id: 'kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
       staticModel({ id: 'minimax-m2.5', name: 'MiniMax M2.5', family: 'minimax', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000, supportsGrammar: false }),
       staticModel({ id: 'minimax-m2.7', name: 'MiniMax M2.7', family: 'minimax', releaseDate: '2025-03-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 196000, contextWindow: 196000, supportsGrammar: false }),
     ],
@@ -70,11 +71,11 @@ export const PROVIDERS: ProviderDefinition[] = [
     id: 'anthropic',
     name: 'Anthropic',
     models: [
-      staticModel({ id: 'claude-opus-4-7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-opus-4-7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
       
-      staticModel({ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 }),
     ],
     authMethods: [
       { type: 'oauth-pkce', label: 'Claude Pro/Max subscription' },
@@ -105,11 +106,11 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'OpenAI',
     oauthOnlyModelIds: ['gpt-5.5-codex-spark'],
     models: [
-      staticModel({ id: 'gpt-5.5', name: 'GPT-5.5', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.4', name: 'GPT-5.4', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', family: 'gpt', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
-      staticModel({ id: 'gpt-5.2', name: 'GPT-5.2', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 400000 }),
+      staticModel({ id: 'gpt-5.5', name: 'GPT-5.5', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
+      staticModel({ id: 'gpt-5.4', name: 'GPT-5.4', family: 'gpt', releaseDate: '2026-06-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
+      staticModel({ id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', family: 'gpt', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
+      staticModel({ id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
+      staticModel({ id: 'gpt-5.2', name: 'GPT-5.2', family: 'gpt', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 400000 }),
     ],
     authMethods: [
       { type: 'oauth-browser', label: 'ChatGPT Pro/Plus (browser)' },
@@ -162,13 +163,13 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'OpenRouter',
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
     models: [
-      staticModel({ id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
       
-      staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
-      staticModel({ id: 'z-ai/glm-5.1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-      staticModel({ id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
+      staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 }),
+      staticModel({ id: 'z-ai/glm-5.1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
+      staticModel({ id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
       staticModel({ id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', family: 'deepseek', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: false }),
     ],
     authMethods: [
@@ -190,13 +191,13 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Vercel AI Gateway',
     defaultBaseUrl: 'https://ai-gateway.vercel.sh/v1',
     models: [
-      staticModel({ id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
       
-      staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 128000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 64000, contextWindow: 200000 }),
-      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, maxOutputTokens: 16000, contextWindow: 200000 }),
-      staticModel({ id: 'zai/glm-5.1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-      staticModel({ id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
+      staticModel({ id: 'anthropic/claude-opus-4.6', name: 'Claude Opus 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 128000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 64000, contextWindow: 200000 }),
+      staticModel({ id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', family: 'claude', releaseDate: '2026-01-01', supportsToolCalls: true, supportsReasoning: false, supportsVision: true, maxOutputTokens: 16000, contextWindow: 200000 }),
+      staticModel({ id: 'zai/glm-5.1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
+      staticModel({ id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2026-04-20', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 262000, contextWindow: 262000, supportsGrammar: true }),
       staticModel({ id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', family: 'deepseek', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: false }),
     ],
     authMethods: [
@@ -285,9 +286,9 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Z.AI',
     defaultBaseUrl: 'https://api.z.ai/api/paas/v4',
     models: [
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['ZHIPU_API_KEY'] },
@@ -308,9 +309,9 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Z.AI Coding Plan',
     defaultBaseUrl: 'https://api.z.ai/api/coding/paas/v4',
     models: [
-      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
-      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-5.1', name: 'GLM-5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-5', name: 'GLM-5', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
+      staticModel({ id: 'glm-4.7', name: 'GLM-4.7', family: 'glm', releaseDate: '2024-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 1000000 }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['ZHIPU_API_KEY'] },
@@ -331,8 +332,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Moonshot AI',
     defaultBaseUrl: 'https://api.moonshot.ai/v1',
     models: [
-      staticModel({ id: 'kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+      staticModel({ id: 'kimi-k2.6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+      staticModel({ id: 'kimi-k2.5', name: 'Kimi K2.5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['MOONSHOT_API_KEY'] },
@@ -353,8 +354,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Kimi for Coding',
     defaultBaseUrl: 'https://api.kimi.com/coding',
     models: [
-      staticModel({ id: 'k2p6', name: 'K2p6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
-      staticModel({ id: 'k2p5', name: 'K2p5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+      staticModel({ id: 'k2p6', name: 'K2p6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
+      staticModel({ id: 'k2p5', name: 'K2p5', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144 }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['KIMI_API_KEY'] },
@@ -397,8 +398,8 @@ export const PROVIDERS: ProviderDefinition[] = [
     name: 'Fireworks AI',
     defaultBaseUrl: 'https://api.fireworks.ai/inference/v1',
     models: [
-      staticModel({ id: 'accounts/fireworks/models/kimi-k2p6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
-      staticModel({ id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
+      staticModel({ id: 'accounts/fireworks/models/kimi-k2p6', name: 'Kimi K2.6', family: 'kimi', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: true, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
+      staticModel({ id: 'accounts/fireworks/models/glm-5p1', name: 'GLM 5.1', family: 'glm', releaseDate: '2025-01-01', supportsToolCalls: true, supportsReasoning: true, supportsVision: false, maxOutputTokens: 131072, contextWindow: 262144, supportsGrammar: true }),
     ],
     authMethods: [
       { type: 'api-key', label: 'API key', envKeys: ['FIREWORKS_API_KEY'] },

@@ -534,7 +534,7 @@ export async function createAgentTestHarness(options: HarnessOptions = {}) {
           ])
 
           const timezone = sessionContext.context?.timezone ?? null
-          const messages = getView(memory.messages, timezone, 'agent').map((message) => ({
+          const messages = getView(memory.messages, timezone, 'agent', true).map((message) => ({
             role: message.role,
             content: message.content
               .map((part) => (part.type === 'text' ? part.text : '[image]'))

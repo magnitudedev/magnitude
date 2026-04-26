@@ -367,9 +367,9 @@ function describeSafetyStop(reason: SafetyStopReason): string {
   }
 }
 
-function transformMessage(message: Message, timezone: string | null, perspective: Perspective): LLMMessage {
+function transformMessage(message: Message, timezone: string | null, perspective: Perspective, supportsVision: boolean): LLMMessage {
   const content = message.type === 'inbox'
-    ? formatInbox({ results: message.results, timeline: message.timeline, timezone })
+    ? formatInbox({ results: message.results, timeline: message.timeline, timezone, supportsVision })
     : message.content
 
   if (message.type === 'compacted') {
@@ -390,8 +390,8 @@ function transformMessage(message: Message, timezone: string | null, perspective
   }
 }
 
-export function getView(messages: readonly Message[], timezone: string | null, perspective: Perspective): LLMMessage[] {
-  return messages.map(msg => transformMessage(msg, timezone, perspective))
+export function getView(messages: readonly Message[], timezone: string | null, perspective: Perspective, supportsVision: boolean): LLMMessage[] {
+  return messages.map(msg => transformMessage(msg, timezone, perspective, supportsVision))
 }
 
 export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryState>()({
@@ -1007,7 +1007,7 @@ export const MemoryProjection = Projection.defineForked<AppEvent, ForkMemoryStat
       const text = extractText(value.content)
       const imageAttachments: TimelineAttachment[] = (value.attachments ?? [])
         .filter((a): a is ImageAttachment => a.type === 'image')
-        .map(a => ({ kind: 'image' as const, image: { type: 'image' as const, base64: a.base64, mediaType: a.mediaType, width: a.width, height: a.height } }))
+        .map(a => ({ kind: 'image' as const, image: { type: 'image' as const, base64: a.base64, mediaType: a.mediaType, width: a.width, height: a.height }, filename: a.filename }))
       const mentionAttachments: TimelineAttachment[] = value.resolvedMentions.map(m => ({
         kind: 'mention' as const,
         ...m,

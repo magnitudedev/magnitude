@@ -19,7 +19,7 @@ describe('formatResults', () => {
           },
         ],
       },
-    ])
+    ], true)
 
     expect(output).toEqual([
       { type: 'text', text: '\n<view observe=".">' },
@@ -49,7 +49,7 @@ describe('formatResults', () => {
         },
         rawResponse: '<magnitude:invoke tool="read">\n</magnitude:invoke>',
       },
-    ])
+    ], true)
 
     expect(output).toHaveLength(1)
     expect(output[0]).toEqual({ type: 'text', text: expect.any(String) } satisfies ContentPart)
@@ -77,7 +77,7 @@ describe('formatResults', () => {
         },
         rawResponse: '<magnitude:message to="parent">Hi</magnitude:message>\n</magnitude:message>\n<magnitude:yield_user/>',
       },
-    ])
+    ], true)
 
     expect(output).toHaveLength(1)
     expect(output[0]).toEqual({ type: 'text', text: expect.any(String) } satisfies ContentPart)
@@ -99,7 +99,7 @@ describe('formatResults', () => {
         status: 'error',
         message: 'Failed to read does-not-exist.txt',
       },
-    ])
+    ], true)
 
     expect(output).toEqual([
       {
@@ -114,7 +114,7 @@ describe('formatResults', () => {
       {
         kind: 'no_tools_or_messages',
       },
-    ])
+    ], true)
 
     expect(output).toEqual([
       {

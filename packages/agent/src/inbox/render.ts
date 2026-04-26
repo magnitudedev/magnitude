@@ -13,6 +13,17 @@ export interface FormatInboxInput {
   results: readonly ResultEntry[]
   timeline: readonly TimelineEntry[]
   timezone: string | null
+  supportsVision: boolean
+}
+
+export function imagePlaceholder(desc: { filename?: string; mediaType?: string; width?: number; height?: number }): string {
+  const parts: string[] = ['Image placeholder: current model does not support images']
+  const meta: string[] = []
+  if (desc.filename) meta.push(desc.filename)
+  if (desc.width && desc.height) meta.push(`${desc.width}x${desc.height}`)
+  else if (desc.mediaType) meta.push(desc.mediaType)
+  if (meta.length > 0) parts.push('—', meta.join(' '))
+  return `[${parts.join(' ')}]`
 }
 
 function formatTime(timestamp: number, timezone: string | null): string {
@@ -80,12 +91,21 @@ function renderAgentAtom(atom: AgentAtom): string {
   }
 }
 
-function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_message' }>): ContentPart[] {
+function renderUserMessageParts(entry: Extract<TimelineEntry, { kind: 'user_message' }>, supportsVision: boolean): ContentPart[] {
   const builder = new ContentPartBuilder()
   builder.pushText(`<magnitude:message from="user">${entry.text}</magnitude:message>`)
   for (const attachment of entry.attachments) {
     if (attachment.kind === 'image') {
-      builder.pushPart(attachment.image)
+      if (supportsVision) {
+        builder.pushPart(attachment.image)
+      } else {
+        builder.pushText(imagePlaceholder({
+          filename: attachment.filename,
+          mediaType: attachment.image.mediaType,
+          width: attachment.image.width,
+          height: attachment.image.height,
+        }))
+      }
       continue
     }
 
@@ -195,7 +215,7 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
   if (input.results.length > 0) {
     builder.pushText('<turn_result>')
     for (const result of input.results) {
-      if (result.kind === 'turn_results') builder.pushParts(formatResults(result.items))
+      if (result.kind === 'turn_results') builder.pushParts(formatResults(result.items, input.supportsVision))
       else if (result.kind === 'interrupted') builder.pushText(formatInterrupted())
       else if (result.kind === 'error') builder.pushText(formatError(result.message))
       else if (result.kind === 'oneshot_liveness') builder.pushText(formatOneshotLiveness())
@@ -251,10 +271,11 @@ export function formatInbox(input: FormatInboxInput): ContentPart[] {
     if (entry.kind === 'observation') {
       for (const part of entry.parts) {
         if (part.type === 'text') builder.pushText(`\n${part.text}`)
-        else builder.pushPart(part)
+        else if (input.supportsVision) builder.pushPart(part)
+        else builder.pushText(imagePlaceholder({ mediaType: part.mediaType, width: part.width, height: part.height }))
       }
     } else if (entry.kind === 'user_message') {
-      const parts = renderUserMessageParts(entry)
+      const parts = renderUserMessageParts(entry, input.supportsVision)
       for (const part of parts) {
         if (part.type === 'text') builder.pushText(`\n${part.text}`)
         else builder.pushPart(part)

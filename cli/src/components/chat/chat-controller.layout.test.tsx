@@ -189,6 +189,7 @@ function makeProps(): ChatControllerProps {
       composerCanFocus: false,
       widgetNavActive: false,
       isSubagentView: false,
+      supportsVision: false,
     },
     services: {
       submitUserMessageToFork: noop,
@@ -205,6 +206,7 @@ function makeProps(): ChatControllerProps {
       exitBashMode: noop,
       requestIdleSubagentClose: noop,
       requestActiveSubagentKill: noop,
+      showToast: noop,
     },
     displayMessages: [],
     tasks: [makeTask()],

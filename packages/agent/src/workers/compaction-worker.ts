@@ -17,7 +17,7 @@
  * No local state needed — the worker reads pending data from the projection.
  */
 
-import { Effect } from 'effect'
+import { Effect, Either } from 'effect'
 import { Worker, type PublishFn, type WorkerReadFn, AmbientServiceTag } from '@magnitudedev/event-core'
 import { logger } from '@magnitudedev/logger'
 import { type ChatMessage } from '@magnitudedev/llm-core'
@@ -115,12 +115,18 @@ function startCompaction(
     const ambientService = yield* AmbientServiceTag
     const configState = ambientService.getValue(ConfigAmbient)
     const limits = getSlotConfig(configState, modelSlot)
+
+    const runtime = yield* ModelResolver
+    const boundModelResult = yield* runtime.resolve(modelSlot).pipe(Effect.either)
+    const supportsVision = Either.isRight(boundModelResult)
+      ? boundModelResult.right.model.supportsVision
+      : true
     const keepTokenBudget = limits.softCap * KEEP_MESSAGE_RATIO
     let keepTokens = 0
     let keepCount = 0
 
     for (let i = forkMemory.messages.length - 1; i >= 1; i--) {
-      const llmMessage = getView([forkMemory.messages[i]], timezone, 'agent')[0]
+      const llmMessage = getView([forkMemory.messages[i]], timezone, 'agent', supportsVision)[0]
       if (!llmMessage) continue
       const msgTokens = Math.ceil(textOf(llmMessage.content).length / CHARS_PER_TOKEN)
       if (keepTokens + msgTokens > keepTokenBudget) break
@@ -143,7 +149,7 @@ function startCompaction(
     })
 
     const messagesToCompact = forkMemory.messages.slice(1, 1 + compactedMessageCount)
-    const llmMessages = getView(messagesToCompact, timezone, 'agent')
+    const llmMessages = getView(messagesToCompact, timezone, 'agent', supportsVision)
     const chatMessages = toBamlMessages(llmMessages)
 
     const originalTokenEstimate = chatMessages.reduce(
@@ -154,8 +160,9 @@ function startCompaction(
     const maxRetries = 5
 
     const bamlEffect = Effect.gen(function* () {
-      const runtime = yield* ModelResolver
-      const usable = yield* runtime.resolve(modelSlot)
+      const usable = Either.isRight(boundModelResult)
+        ? boundModelResult.right
+        : yield* runtime.resolve(modelSlot)
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const result = yield* withTraceScope(
           { metadata: { callType: 'compact', forkId } },
