@@ -205,7 +205,6 @@ export type ProviderNotReadyDetail =
   | { readonly _tag: 'ProviderDisconnected'; readonly providerId: string; readonly providerName: string }
   | { readonly _tag: 'AuthFailed'; readonly providerId: string; readonly providerName: string }
   | { readonly _tag: 'MagnitudeBilling'; readonly reason: MagnitudeBillingReason }
-  | { readonly _tag: 'ClientRequestRejected' }
 
 export type ConnectionFailureDetail =
   | { readonly _tag: 'ProviderError'; readonly httpStatus: number }

@@ -102,13 +102,13 @@ function tryParseErrorMessage(text: string): string | null {
  * Classify an HTTP error by status code and message text.
  * This is the shared heuristic layer — driver-agnostic.
  */
-export function classifyHttpError(status: number, message: string): ModelError {
+export function classifyHttpError(status: number, message: string, providerContext: { providerId: string; providerName: string }): ModelError {
   const lower = message.toLowerCase()
   if (hasContextLimitSignal(lower)) {
     return new ContextLimitExceeded({ message })
   }
   if (status === 401 || status === 403 || hasAuthSignal(lower)) {
-    return new AuthFailed({ message })
+    return new AuthFailed({ message, providerId: providerContext.providerId, providerName: providerContext.providerName })
   }
   if (status === 402) {
     const code = tryParseErrorCode(message) ?? 'subscription_required'

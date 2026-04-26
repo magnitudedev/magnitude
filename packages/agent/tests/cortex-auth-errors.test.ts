@@ -12,14 +12,14 @@ import {
 describe('cortex auth reconnect messaging', () => {
   it('classifyModelError maps AuthFailed to ProviderNotReady(AuthFailed)', () => {
     const outcome = classifyModelError(
-      new AuthFailed({ message: 'missing_scope: api.responses.write' }),
+      new AuthFailed({ message: 'missing_scope: api.responses.write', providerId: 'test-provider', providerName: 'Test Provider' }),
     )
     expect(outcome).toEqual({
       _tag: 'ProviderNotReady',
       detail: {
         _tag: 'AuthFailed',
-        providerId: 'unknown',
-        providerName: 'Unknown provider',
+        providerId: 'test-provider',
+        providerName: 'Test Provider',
       },
     })
   })
@@ -44,7 +44,7 @@ describe('cortex auth reconnect messaging', () => {
 
   it('classifyRetryability marks AuthFailed cause as auth', () => {
     const reason = classifyRetryability(
-      new AuthFailed({ message: 'token expired' }),
+      new AuthFailed({ message: 'token expired', providerId: 'test', providerName: 'Test' }),
     )
     expect(reason).toBe('auth')
   })

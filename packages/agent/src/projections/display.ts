@@ -404,11 +404,11 @@ function closeThinkBlock(state: DisplayState, timestamp: number): DisplayState {
 function describeProviderNotReady(detail: ProviderNotReadyDetail): { message: string; cta?: { readonly label: string; readonly url: string } } {
   switch (detail._tag) {
     case 'NotConfigured':
-      return { message: 'No model configured' }
+      return { message: 'No model configured. Run /model to select one.' }
     case 'ProviderDisconnected':
-      return { message: `Provider ${detail.providerName} disconnected` }
+      return { message: `${detail.providerName} is not connected. Run /provider to reconnect.` }
     case 'AuthFailed':
-      return { message: `Authentication failed for ${detail.providerName}` }
+      return { message: `Authentication failed for ${detail.providerName}. Run /provider to update your API key.` }
     case 'MagnitudeBilling':
       switch (detail.reason._tag) {
         case 'SubscriptionRequired':
@@ -429,8 +429,6 @@ function describeProviderNotReady(detail: ProviderNotReadyDetail): { message: st
             }
           }
       }
-    case 'ClientRequestRejected':
-      return { message: 'Provider request rejected' }
   }
 }
 

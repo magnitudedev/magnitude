@@ -405,27 +405,13 @@ export const Cortex = Worker.defineForked<AppEvent>()({
             ? classifyModelError(errorCause as ModelError)
             : classifyUnknownTurnFailure(errorMessage)
 
-          const patchedOutcome =
-            outcome._tag === 'ProviderNotReady'
-            && outcome.detail._tag === 'AuthFailed'
-            && resolvedProviderId !== null
-              ? {
-                  _tag: 'ProviderNotReady',
-                  detail: {
-                    _tag: 'AuthFailed',
-                    providerId: resolvedProviderId,
-                    providerName: resolvedProviderName ?? resolvedProviderId,
-                  },
-                } satisfies TurnOutcome
-              : outcome
-
           yield* publish({
             type: 'turn_outcome',
             forkId,
             turnId,
             chainId,
             strategyId: 'xml-act',
-            outcome: patchedOutcome,
+            outcome,
             inputTokens: null,
             outputTokens: null,
             cacheReadTokens: null,

@@ -337,13 +337,11 @@ function describeProviderNotReady(detail: ProviderNotReadyDetail): string {
     case 'NotConfigured':
       return 'No model configured.'
     case 'ProviderDisconnected':
-      return `Provider ${detail.providerName} is disconnected.`
+      return `Provider "${detail.providerName}" is not connected.`
     case 'AuthFailed':
-      return `Authentication failed for ${detail.providerName}.`
+      return `Authentication failed for ${detail.providerName}. API key may be invalid or expired.`
     case 'MagnitudeBilling':
       return detail.reason.message
-    case 'ClientRequestRejected':
-      return 'Provider request rejected.'
   }
 }
 

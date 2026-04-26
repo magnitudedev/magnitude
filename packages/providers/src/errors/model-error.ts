@@ -12,6 +12,8 @@ export class ProviderDisconnected extends Data.TaggedError('ProviderDisconnected
 
 export class AuthFailed extends Data.TaggedError('AuthFailed')<{
   readonly message: string
+  readonly providerId: string
+  readonly providerName: string
 }> {}
 
 export class ContextLimitExceeded extends Data.TaggedError('ContextLimitExceeded')<{

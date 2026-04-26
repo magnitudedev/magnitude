@@ -42,8 +42,8 @@ export function classifyModelError(error: ModelError): TurnOutcome {
         _tag: 'ProviderNotReady',
         detail: {
           _tag: 'AuthFailed',
-          providerId: 'unknown',
-          providerName: 'Unknown provider',
+          providerId: error.providerId,
+          providerName: error.providerName,
         },
       }
     case 'SubscriptionRequired':

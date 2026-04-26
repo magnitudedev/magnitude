@@ -110,7 +110,7 @@ export const BamlDriver: ExecutableDriver = {
               const text = [e.message, e.detailed_message, e.raw_response]
                 .filter(Boolean)
                 .join(' ')
-              return classifyHttpError(e.status_code, text)
+              return classifyHttpError(e.status_code, text, { providerId: req.model.providerId, providerName: req.model.providerName })
             }
             // BAML config/construction/validation errors are non-retryable
             if (isBamlError(e)) {
@@ -131,7 +131,7 @@ export const BamlDriver: ExecutableDriver = {
           const text = [error.message, error.detailed_message, error.raw_response]
             .filter(Boolean)
             .join(' ')
-          return classifyHttpError(error.status_code, text)
+          return classifyHttpError(error.status_code, text, { providerId: req.model.providerId, providerName: req.model.providerName })
         }
         // BAML config/construction/validation errors are non-retryable
         if (isBamlError(error)) {
@@ -164,7 +164,7 @@ export const BamlDriver: ExecutableDriver = {
           const text = [error.message, error.detailed_message, error.raw_response]
             .filter(Boolean)
             .join(' ')
-          return classifyHttpError(error.status_code, text)
+          return classifyHttpError(error.status_code, text, { providerId: req.model.providerId, providerName: req.model.providerName })
         }
         // BAML config/construction/validation errors are non-retryable
         if (isBamlError(error)) {
