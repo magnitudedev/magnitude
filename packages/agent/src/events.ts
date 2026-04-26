@@ -239,6 +239,19 @@ export type TurnOutcome =
   | { readonly _tag: 'Cancelled'; readonly reason: CancelledReason }
   | { readonly _tag: 'UnexpectedError'; readonly message: string; readonly detail?: UnexpectedErrorDetail }
 
+/** Whether a turn outcome will chain-continue (start another turn automatically).
+ *  This is the single source of truth — projections that need to distinguish
+ *  "still working" from "actually idle" must use this instead of checking
+ *  Completed+invoke independently. */
+export function outcomeWillChainContinue(outcome: TurnOutcome): boolean {
+  return (
+    (outcome._tag === 'Completed' && outcome.completion.yieldTarget === 'invoke')
+    || outcome._tag === 'ParseFailure'
+    || outcome._tag === 'ConnectionFailure'
+    || outcome._tag === 'ContextWindowExceeded'
+  )
+}
+
 // =============================================================================
 // Streaming Events
 // =============================================================================

@@ -10,6 +10,7 @@ import { FSM } from '@magnitudedev/event-core'
 const { defineFSM } = FSM
 import { Data } from 'effect'
 import { logger } from '@magnitudedev/logger'
+import { outcomeWillChainContinue } from '../events'
 import type { AppEvent, TurnOutcomeEvent } from '../events'
 import type { ToolKey } from '../catalog'
 import type { ToolResult } from '@magnitudedev/xml-act'
@@ -284,12 +285,7 @@ export const TurnProjection = Projection.defineForked<AppEvent, TurnLifecycleSta
       if (fork._tag === 'idle') return fork
       if (fork.turnId !== event.turnId) return fork
 
-      const turnWantsContinue =
-        (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke')
-        || event.outcome._tag === 'ParseFailure'
-        || event.outcome._tag === 'ConnectionFailure'
-        || event.outcome._tag === 'ContextWindowExceeded'
-      const shouldEnqueueContinue = turnWantsContinue && !fork.softInterrupted
+      const shouldEnqueueContinue = outcomeWillChainContinue(event.outcome) && !fork.softInterrupted
 
       const nextTriggers = shouldEnqueueContinue
         ? [...fork.triggers, { _tag: 'chain_continue', chainId: fork.chainId } satisfies TurnTrigger]

@@ -5,6 +5,7 @@
  */
 
 import { Projection, Signal } from '@magnitudedev/event-core'
+import { outcomeWillChainContinue } from '../events'
 import type { AppEvent } from '../events'
 import type { AgentVariant } from '../agents/variants'
 
@@ -218,7 +219,7 @@ export const AgentStatusProjection = Projection.define<AppEvent, AgentStatusStat
 
     turn_outcome: ({ event, state, emit }) => {
       if (event.forkId === null) return state
-      if (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke') return state
+      if (outcomeWillChainContinue(event.outcome)) return state
 
       const agent = getAgentByForkId(state, event.forkId)
       if (!agent) return state

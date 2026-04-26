@@ -1,4 +1,5 @@
 import { Projection, type ReadFn, type ForkedState } from '@magnitudedev/event-core'
+import { outcomeWillChainContinue } from '../events'
 import type { AppEvent } from '../events'
 import {
   AgentStatusProjection,
@@ -370,7 +371,7 @@ export const TaskWorkerProjection = Projection.define<AppEvent, TaskWorkerState>
 
     turn_outcome: ({ event, state, read }) => {
       if (event.forkId === null) return rebuild({ state, read })
-      if (event.outcome._tag === 'Completed' && event.outcome.completion.yieldTarget === 'invoke') {
+      if (outcomeWillChainContinue(event.outcome)) {
         return rebuild({ state, read })
       }
       return rebuild({ state, read, workerActivityByForkId: markWorkerIdle(state.workerActivityByForkId, event.forkId, event.timestamp) })
